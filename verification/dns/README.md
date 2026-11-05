@@ -5,7 +5,7 @@ holds the Rust code to one of them:
 
 | Part | What it is | Where |
 |---|---|---|
-| TLA+ | Four specs of the engines' behaviour over time (the resolver, the exchange contract, the authority engine, the validator), checked with TLC, each with ablations that must fail | [`tla/`](tla/README.md) |
+| TLA+ | Three specs of the engines' behaviour over time (the resolver, the exchange contract, the validator), checked with TLC, each with ablations that must fail | [`tla/`](tla/README.md) |
 | Lean 4 | Proofs about the pure functions (names, the wire format, truncation, zones, partial views, DNSSEC, the algorithm policy, the chain check, the cache, the resolver), and an executable reference that writes test vectors | [`lean/`](lean/README.md) |
 | The differential test | The Rust code run on every Lean vector, compared field by field | [`tests/dns_vectors.rs`](../../tests/dns_vectors.rs) |
 

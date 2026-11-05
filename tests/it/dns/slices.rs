@@ -7,8 +7,7 @@
 //! memory, through hosts on a simulated network, and through the exchanges
 //! the first way recorded, played back. Then the same records reach it
 //! from a complete zone and from zone data signed as it grows, signed by
-//! two implementations of `Sign`. Copies of the hierarchy are tested in
-//! `fictionet-extras`.
+//! two implementations of `Sign`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};

@@ -1,8 +1,8 @@
 # DNS in TLA+
 
-Four specs model the DNS engines of `services::dns` and
+Three specs model the DNS engines of `services::dns` and
 `protocols::dns::dnssec`: the recursive resolver, the step contract every
-engine keeps, the authority engine with its lookups and providers, and the
+engine keeps, and the
 DNSSEC validator with the resolver's rendering of its result. Each spec has
 flags that remove one rule the engines follow, so one spec gives both the
 proof of the rule and the counterexample that shows why it is there.
@@ -11,7 +11,6 @@ proof of the rule and the counterexample that shows why it is there.
 |---|---|---|
 | `Resolution.tla` | The resolver against zones `.`, `tld`, `sld.tld`, and `alt.tld`, each with one good and one lame server; an address, a CNAME, an empty non-terminal, a missing name, a glued nameserver, a CNAME loop across two zones, and a wildcard; questions of type A and AAAA; queries from a port and with a DNS ID drawn for each, and an off-path attacker forging replies; a rogue server adding a record outside its bailiwick; two clients; a network that loses and truncates; one world edit; TTLs of 1 and 2 | `services/dns/resolver/{mod,cache,resolution,front}.rs` |
 | `Exchanges.tla` | The step contract of `Engine`: tokens with a generation and an exchange identity, matching on the token and the tuple, duplicate, late, and spoofed replies, `Gone`, `Advance`, one resolution shared by two clients | `services/dns/exchange.rs` (`Token`, `Generation`, `Input`, `Action`, `Engine`), kept by `AuthorityEngine` and `Resolver` |
-| `Authority.tla` | `AuthorityEngine` at a root, a TLD, and an edited zone's address: at the root and TLD, a base authority that answers from what lookups filed and returns `Need` for what it does not hold, its lookups going through an `Only` policy to an upstream that delays and fails, each lookup shared by the requests that need it; `Overlay` reading the edited zone's apex NS RRset and its target's addresses and then asking its base for its DS; `Lazy` over a `Provider` whose facts are present, absent, or unknown and change as the world runs | `services/dns/authority/{mod,engine,overlay}.rs`, `services/dns/zone/{data,lazy}.rs`, `world/net/dns/upstream.rs` |
 | `Validation.tla` | The validator on a path root, tld, sld, with the data free per config (signer, parent proof, window, algorithm, changes after signing, the world's edits), clock skew, unreachable zones, the AD/CD rendering, `check_chain`, and two validators with signers and records of their own | `protocols/dns/dnssec/{validate,policy,proof}.rs`, `services/dns/zone/chain.rs`, `services/dns/resolver/front.rs` |
 
 ## Properties
@@ -37,13 +36,6 @@ proof of the rule and the counterexample that shows why it is there.
 | | `CancelPreservesWaiters` | invariant | after `Gone(c)`, every other client still waits on live work or has its answer |
 | | `OneAnswerPerQuery` | invariant | each client query gets at most one answer |
 | | `EveryAcceptedAnswered` | liveness | every accepted query is answered unless its client goes |
-| Authority | `PolicyHolds` | invariant | no lookup the policy refuses reaches the upstream, root and TLD lookups included |
-| | `UnknownNeverNegative` | invariant | no NXDOMAIN or NODATA rests on an unknown fact of the lazy zone, or on a question a base holds no response for |
-| | `CoherentRevision` | invariant | every reply from the lazy zone agrees with one revision of it |
-| | `OneAskPerNeed` | invariant | a request needs at most one lookup per fact per generation (the question, and for a crossing question first the overlay's `fict DS`), and requests that need the same lookup wait on one: no two pending lookups are the same |
-| | `NoAskAfterReply` | invariant over steps (`PROPERTY`) | once a lookup has come back to a request (a response, or Unreachable or NoReply in its place), the request never needs it again in that generation |
-| | `NoLockAcrossAsk` | invariant | a request parked on a lookup holds no part of a view |
-| | `EveryParkedAnswered` | liveness | every request that waits on a lookup is answered or silently dropped |
 | Validation | `SecureImpliesChain` | invariant | Secure only with a valid chain from a configured anchor to the answer |
 | | `InsecureNeedsProof` | invariant | Insecure only with no covering anchor, or below a validated chain a signed no-DS proof, an opt-out cover, or a DS whose algorithm the policy does not admit, each from a DS set that was fetched |
 | | `UnreachableLinkIndeterminate` | invariant | a zone below a validated chain whose DS set cannot be fetched is Indeterminate, whatever that set would have said, as `Check::delegation` fetches it first |
@@ -85,10 +77,6 @@ Configs:
   `_cachebyname`, `_sharedbound`.
 * **Exchanges:** `_base`, `_advance`, `_cancel`. Ablations: `_idonly`,
   `_flushonly`, `_cancelshared`.
-* **Authority:** `_base`, `_fail`, `_lazy`, `_advance`, `_share` (two
-  requests waiting on one lookup). Ablations: `_nopolicy`, `_rootexempt`,
-  `_unknownasabsent`, `_mixedrevision`, `_reask`, `_parkinview`,
-  `_noshare`, `_wakeone`.
 * **Validation:** `_paths`, `_skew`, `_unreachable`, `_policy`,
   `_signers`, `_witnesses` (every reachability witness, each expected to fail), and
   `_edits` (the witness that an edited zone of the world's own can be
@@ -111,9 +99,6 @@ actions, never by a `CONSTRAINT`, so the liveness checks are sound:
 * **Exchanges:** the clock by `MaxTime` 3, exchange identities by
   `MaxExchanges` 4, generations by `MaxGeneration` 2 (1 in `_base` and
   `_cancel`); one duplicate, one spoofed reply, one `Gone`.
-* **Authority:** revisions by `MaxRevision` 2 for world changes (inserts
-  are bounded by the finite set of names, and filings by the finite set of
-  questions), generations by `MaxGeneration` 2 in `_advance`.
 * **Validation:** no counters; the data dimensions are finite sets.
 
 ## Results
@@ -161,20 +146,6 @@ in `_concurrent` explores the same states as the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
-| Authority_base | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 42000 | 30 | 1-6 s | |
-| Authority_fail | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 25488 | 25 | 0-2 s | |
-| Authority_lazy | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 296 | 11 | 0 s | |
-| Authority_advance | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 9095 | 18 | 0-1 s | |
-| Authority_share | the 5 invariants, `NoAskAfterReply`, `EveryParkedAnswered` | pass | 1026 | 14 | 0 s | |
-| Authority_nopolicy | `PolicyHolds` | violated | 7 | 2 | 0 s | Step: the root server's base holds nothing for leak.evil, and its lookup reaches the upstream |
-| Authority_rootexempt | `PolicyHolds` | violated | 7 | 2 | 0 s | Step: the same lookup, exempt because it goes to a root server |
-| Authority_unknownasabsent | `UnknownNeverNegative` | violated | 2 | 2 | 0 s | View: b.fict is unknown and the wildcard absent, so NXDOMAIN |
-| Authority_mixedrevision | `CoherentRevision` | violated | 34 | 4 | 0 s | ReadName (a.fict absent), WorldChange, ReadRest (the wildcard present): a wildcard answer no revision gives |
-| Authority_reask | `OneAskPerNeed` | violated | 129 | 4 | 0 s | Step (the policy refuses leak.evil: NoReply), Observe, Step: the request needs the lookup it made and puts it again |
-| Authority_reask | `NoAskAfterReply` | violated | 129 | 4 | 0 s | the same trace: the second Step needs the lookup whose NoReply came back |
-| Authority_parkinview | `NoLockAcrossAsk` | violated | 5 | 3 | 0 s | ReadOverlay, Step: the overlay reads the lazy zone, then parks on its DS lookup while it still holds that read |
-| Authority_noshare | `OneAskPerNeed` | violated | 6 | 3 | 0 s | Step, Step: two requests for www.real at the root server each put a lookup of it |
-| Authority_wakeone | `EveryParkedAnswered` | violated | 210 | stuttering | 0 s | the two requests for www.real at the root server wait on one lookup; when it ends, only the first is woken, and the second stays parked |
 | Validation_paths | the 11 invariants | pass | 124416 | 1 | 1-2 s | |
 | Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
 | Validation_unreachable | the 11 invariants | pass | 147456 | 1 | 0-1 s | |
@@ -199,13 +170,12 @@ General:
   and listed under `PROPERTY`; they are safety properties, checked on every
   step.
 * While writing the specs, reachability was checked with throwaway
-  invariants on every non-ablation config of Resolution, Exchanges, and
-  Authority: answers of each kind, the wildcard, shared resolutions, TC
+  invariants on every non-ablation config of Resolution and Exchanges:
+  answers of each kind, the wildcard, shared resolutions, TC
   retries, chain restarts, the chain bound in `_loop`, stale glue and the
   edit's new values, spoofed, duplicate, and late replies delivered and
   ignored, SERVFAIL after both servers, answers after `Advance` and after
-  another client's `Gone`, silent servers after a failed lookup, shared
-  lookups, and revisions growing while a request is parked. So no property holds only because its premise never
+  another client's `Gone`. So no property holds only because its premise never
   occurs. The Validation witnesses are kept as `_witnesses.cfg`.
 
 Resolution:
@@ -312,58 +282,6 @@ Exchanges:
   stated.
 * Generations start at 1, so `MaxGeneration` 2 allows one `Advance`.
 
-Authority:
-
-* The root and TLD servers' base is any authority that may return
-  `Need`: it answers a question from the response a lookup of that
-  question filed, and returns `Need` with a lookup of the client's
-  question at its own address for a question it holds no response for.
-  The engine files what the lookup gives through `Authority::file`, and
-  the base files it under that question. How an authority files a
-  response, and which other questions a response settles, is its own and
-  is not modelled. What a base filed belongs to one session: `Advance`
-  drops it. The upstream's responses are NOERROR, or NXDOMAIN for
-  `nx.real`.
-* `OneAskPerNeed` checks that a request needs at most one lookup per fact
-  per generation, and that requests needing the same lookup wait on one
-  pending lookup (`AuthorityEngine::park`); `_noshare`, which puts a lookup
-  per need, breaks the second part. `NoAskAfterReply` checks that a lookup
-  that came back is never needed again by that request in the generation,
-  where the engine stays silent instead; `_reask`, which puts it again,
-  breaks both. `_wakeone`, which wakes only the request that started a
-  lookup when it ends, leaves the others parked and breaks
-  `EveryParkedAnswered`.
-* The root and TLD servers both run `Overlay` over their base. Before it
-  asks its base for `fict DS`, the overlay reads the edited zone's apex NS
-  RRset and the addresses of its target `ns.fict` from the lazy zone, as
-  `Overlay::respond` asks the inner authority for `<apex> NS`. The TLD
-  server's base serves the parent, so the TLD server refers, and
-  SERVFAILs when the target's address is not there. The referral rests on
-  those facts and on the filed DS response, so `UnknownNeverNegative` and
-  `CoherentRevision` cover it. The root server's base does not serve the
-  parent, so the root server answers the question as its base does, after
-  a lookup of the question itself.
-* `Lazy::view` takes the zone's lock once, so the view is one atomic step.
-  `MixedRevision` splits it into two steps, reading the name and then the
-  wildcard, and the world may change between them.
-* A revision is a snapshot: the world's state (what the provider says) and
-  the names the zone has inserted. `CoherentRevision` checks a reply's facts
-  against every snapshot that existed, not against a revision number, so a
-  view that inserts the name it read still agrees with one revision.
-* The policy refuses the guest-chosen name `leak.evil` at every server, and
-  a refused lookup comes back as NoReply at once, as `Only` gives
-  `Looked::NoReply`. `_nopolicy` and `_rootexempt` both let it reach the
-  root server.
-* `Advance` drops what every base filed, abandons the pending lookups,
-  and restarts parked requests with no lookups made; what an abandoned
-  lookup gives is ignored when it arrives.
-* `NoLockAcrossAsk` holds because a view never waits and the overlay lets
-  go of what it read from the lazy zone before it parks. The overlay's read
-  is a step of its own (`ReadOverlay`), after which nothing but that
-  request's `Step` runs, as one call of `respond` would, so the read is
-  held in reachable states of every config. `_parkinview`, where the
-  overlay parks on its DS lookup while it holds its read, breaks it.
-
 Validation:
 
 * The validator is a function, so the spec has no steps: every behavior is
@@ -437,24 +355,7 @@ Exchanges:
 | `GiveUp` | the SERVFAIL every waiter gets when no server is left |
 | `Gone(c)` | `Input::Gone(Client)` |
 | `Advance` | `Engine::advance(Session)`, driven by `world::net::dns::Namespace` |
-| `cache`, `waiters` | the resolver's cache and waiters, or the authority engine's parked requests |
-
-Authority:
-
-| Model | Rust |
-|---|---|
-| `Respond(r)` | `Authority::respond(req, local, server, client) -> Step` (`Reply`, `Need(Lookup)`, `Silent`) |
-| `filed[z]` | what the base at server `z` filed through `Authority::file` in this session |
-| `looked[r]` | `Waiter::looked` |
-| `pending`, `waiting` | `AuthorityEngine.lookups: BTreeMap<Token, Pending>` and each `Pending`'s waiters |
-| `atUpstream`, `obsq` | the driver carrying `Action::Lookup` to the `Upstream` and back as `Input::Looked` |
-| `PolicyPasses` | `Only<U, P>` with `P: Fn(&Lookup) -> bool`; a refused lookup is `Looked::NoReply` |
-| `ObserveOne` | `AuthorityEngine::complete`: `Authority::file` for the lookup, then `respond` again for each waiter |
-| `View(r)` | `Lazy::view` under its one lock, then `zone::answer` |
-| `Provider(w, n)` | `Provider::lookup -> Fact<Vec<RecordSet>>` |
-| `ins`, `history`, `rev` | the lazy zone's `Mutex<Held>`: the nodes it holds and their `Revision` |
-| `ViewReply` with `"unknown"` | `Answered::Unknown`, which `Zones` answers SERVFAIL for |
-| `Crosses(r)` | `<Overlay as Authority>::respond` reading the inner authority's `<apex> NS` and asking its base `<apex> DS` before composing a referral |
+| `cache`, `waiters` | the resolver's cache and waiters |
 
 Validation:
 
