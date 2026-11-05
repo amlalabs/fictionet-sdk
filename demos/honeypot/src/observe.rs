@@ -23,10 +23,9 @@
 //!   ([`Observation::Burst`]).
 //!
 //! A SYN carries the source address its sender wrote, which a sender can
-//! spoof, so the source of a `syn` or `burst` line is a claim. Only the
-//! segments of a connection whose handshake completed name an address
-//! that sent them: the world's initial sequence numbers and SYN cookies
-//! cannot be guessed.
+//! spoof, so the source of a `syn` or `burst` line is a claim. A matching
+//! handshake ACK provides evidence of return-path reachability. It does
+//! not authenticate the sender or prove its identity.
 //!
 //! For packets to the sandbox side it records each RST the world sends,
 //! and the SYN-ACK that first answers a SYN within the handshake timeout
