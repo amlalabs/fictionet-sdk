@@ -246,9 +246,6 @@ pub const MAX_UADDR: usize = MAX_STRING;
 pub const MAX_CALL_DATA: usize = 65_536;
 /// The most bytes of a transport address in a [`Netbuf`].
 pub const MAX_NETBUF: usize = 255;
-/// The largest `maxlen` of a [`Netbuf`]: RPC_MAXDATASIZE, 9000. TI-RPC's
-/// xdr_netbuf refuses a larger one, so this module reads and writes none.
-pub const MAX_NETBUF_MAXLEN: u32 = 9000;
 /// The most entries in any list this module reads or writes: a DUMP, an
 /// address list, or the address and call lists of one [`RpcbStat`].
 pub const MAX_LIST: usize = 1024;
@@ -471,13 +468,12 @@ pub struct RmtCallResult {
 
 /// A transport address in its binary form, such as a sockaddr (netbuf).
 /// UADDR2TADDR returns one, and TADDR2UADDR takes one. Its bytes are as
-/// the host lays them out, which this module does not read. As in TI-RPC,
-/// a netbuf with more bytes than `maxlen`, or a `maxlen` over
-/// [`MAX_NETBUF_MAXLEN`], is refused when read and when written.
+/// the host lays them out, which this module does not read. A netbuf with
+/// more bytes than `maxlen` is refused when read and when written.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Netbuf {
     /// The size of the buffer the bytes came from. It must be at least
-    /// their length, and at most [`MAX_NETBUF_MAXLEN`].
+    /// their length. It is only a number: nothing of that size is made.
     pub maxlen: u32,
     /// The address, at most [`MAX_NETBUF`] bytes.
     pub buf: Vec<u8>,
@@ -486,9 +482,6 @@ pub struct Netbuf {
 impl Netbuf {
     fn read(r: &mut Reader<'_>) -> Result<Netbuf, onc_rpc::Error> {
         let maxlen = r.uint()?;
-        if maxlen > MAX_NETBUF_MAXLEN {
-            return Err(onc_rpc::Error::TooLong(maxlen));
-        }
         let max = usize::try_from(maxlen)
             .unwrap_or(usize::MAX)
             .min(MAX_NETBUF);
@@ -499,9 +492,7 @@ impl Netbuf {
     }
 
     fn write(&self, w: &mut Writer) -> Result<(), Error> {
-        if self.maxlen > MAX_NETBUF_MAXLEN
-            || !u32::try_from(self.buf.len()).is_ok_and(|n| n <= self.maxlen)
-        {
+        if !u32::try_from(self.buf.len()).is_ok_and(|n| n <= self.maxlen) {
             return Err(Error::TooLong);
         }
         w.uint(self.maxlen);
@@ -1766,30 +1757,45 @@ mod tests {
         assert_eq!(e.reply(), Reply::accepted(Accept::ProcUnavail));
     }
 
-    /// libtirpc's xdr_netbuf refuses a maxlen over RPC_MAXDATASIZE (9000),
-    /// even with no bytes, so neither side here reads or writes one.
+    /// A netbuf's maxlen is metadata: any value at least as large as its
+    /// bytes reads and writes, with no buffer of that size made. The bytes
+    /// keep their own bound and must still fit within maxlen.
     #[test]
-    fn netbuf_maxlen_within_tirpc_limit() {
-        let ok = netbuf(MAX_NETBUF_MAXLEN, vec![]);
-        check_rpcb_result(&RpcbResult::Netbuf(ok));
-        let over = netbuf(MAX_NETBUF_MAXLEN + 1, vec![]);
-        assert_eq!(
-            RpcbResult::Netbuf(over.clone()).to_bytes(),
-            Err(Error::TooLong)
-        );
-        assert_eq!(
-            RpcbRequest::Taddr2Uaddr(over).to_args(),
-            Err(Error::TooLong)
-        );
+    fn netbuf_maxlen_is_metadata() {
+        for maxlen in [9001, 1 << 20, u32::MAX] {
+            for buf in [vec![], vec![1, 2, 3, 4]] {
+                let n = netbuf(maxlen, buf);
+                check_rpcb_result(&RpcbResult::Netbuf(n.clone()));
+                let args = RpcbRequest::Taddr2Uaddr(n.clone()).to_args().unwrap();
+                assert_eq!(
+                    RpcbRequest::parse(4, procedure::TADDR2UADDR, &args),
+                    Ok(RpcbRequest::Taddr2Uaddr(n))
+                );
+            }
+        }
         let bytes = [0, 0, 0x23, 0x29, 0, 0, 0, 0];
         assert_eq!(
             RpcbResult::parse(procedure::UADDR2TADDR, &bytes),
-            Err(Error::Xdr(onc_rpc::Error::TooLong(9001)))
+            Ok(RpcbResult::Netbuf(netbuf(9001, vec![])))
         );
+        // Bytes past the address bound are refused whatever maxlen says.
+        let n = netbuf(u32::MAX, vec![0; MAX_NETBUF + 1]);
+        assert_eq!(RpcbResult::Netbuf(n).to_bytes(), Err(Error::TooLong));
+        let mut long = vec![0xff, 0xff, 0xff, 0xff, 0, 0, 1, 0];
+        long.extend_from_slice(&[0; 256]);
         assert_eq!(
-            RpcbRequest::parse(4, procedure::TADDR2UADDR, &bytes),
-            Err(Error::Xdr(onc_rpc::Error::TooLong(9001)))
+            RpcbResult::parse(procedure::UADDR2TADDR, &long),
+            Err(Error::Xdr(onc_rpc::Error::TooLong(256)))
         );
+        // A length larger than the bytes that follow is short input.
+        let short = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 200, 1, 2, 3, 4];
+        assert_eq!(
+            RpcbResult::parse(procedure::UADDR2TADDR, &short),
+            Err(Error::Xdr(onc_rpc::Error::Short))
+        );
+        // Data longer than maxlen is still refused.
+        let over = netbuf(2, vec![1, 2, 3]);
+        assert_eq!(RpcbResult::Netbuf(over).to_bytes(), Err(Error::TooLong));
     }
 
     /// Port bytes with leading zeros read as libtirpc and FreeBSD read

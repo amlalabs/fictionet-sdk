@@ -5,7 +5,7 @@
 use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::nfs::harness::check;
 use fictionet::stdlib::protocols::nfs::{
-    DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, Request, Response, Status, procedure,
+    DirOp, FileHandle, MAX_FH, MountRequest, Request, Response, Status, procedure,
 };
 use fictionet::stdlib::protocols::onc_rpc::{Body, Message};
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
         check(u32::from(p % 24), rest);
     }
 
-    // Handles and names must fit their protocol limits.
+    // Handles must fit their protocol limit. Names have none.
     let split = data
         .first()
         .map_or(0, |&n| usize::from(n) % (MAX_FH + 8))
@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
     });
     match request.to_args() {
         Ok(bytes) => assert_eq!(Request::read(procedure::REMOVE, &bytes), Ok(request)),
-        Err(_) => assert!(handle.len() > MAX_FH || name.len() > MAX_NAME),
+        Err(_) => assert!(handle.len() > MAX_FH),
     }
 
     // The bytes as a TCP stream of calls, decoded in chunks and whole.
