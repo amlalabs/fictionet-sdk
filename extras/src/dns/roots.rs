@@ -2,18 +2,16 @@
 //! them: the `gtld-servers.net` servers' names and addresses, what each
 //! server's software does wherever it answers (the payload size it
 //! advertises and its answer to QTYPE ANY) as fronts for a world's
-//! servers at their addresses, and the zones a [`Mirror`] serves there.
+//! servers at their addresses.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::protocols::dns::rr::{Name, RecordType};
+use fictionet::stdlib::protocols::dns::rr::RecordType;
 use fictionet::stdlib::services::dns::authority::{Identity, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::{NameServer, ROOT_SERVERS};
 use fictionet::stdlib::services::dns::zone::AnyResponse;
 use fictionet::stdlib::world::net::Host;
 use fictionet::stdlib::world::net::dns::internet::server_host;
-
-use super::mirror::Mirror;
 
 /// One of the thirteen root server letters, with what its operator's
 /// software does wherever it answers.
@@ -165,22 +163,4 @@ pub fn gtld_servers(build: impl Fn(&NameServer, Host) -> Host) -> Vec<Host> {
         .iter()
         .map(|server| build(server, server_host(server)))
         .collect()
-}
-
-/// `mirror`, told what the real servers at these addresses serve: the
-/// root at every root letter's addresses, and `com` and `net` at every
-/// `gtld-servers.net` server's.
-pub fn seed(mirror: Mirror) -> Mirror {
-    let root = ROOT_SERVERS
-        .iter()
-        .flat_map(|server| server.addresses())
-        .map(|addr| (addr, Name::root()));
-    let gtld = GTLD_SERVERS
-        .iter()
-        .flat_map(|server| server.addresses())
-        .flat_map(|addr| {
-            ["com.", "net."].map(|zone| (addr, Name::from_ascii(zone).expect("a valid name")))
-        });
-    root.chain(gtld)
-        .fold(mirror, |mirror, (addr, zone)| mirror.serves(addr, &zone))
 }

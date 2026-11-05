@@ -58,12 +58,6 @@ async fn main() -> Result {
             }
             return capture::urls(&downloads, &urls).await;
         }
-        if selection == "--dns" {
-            if args.next().is_some() {
-                return Err("unexpected argument".into());
-            }
-            return capture::record_dns(&downloads).await;
-        }
         let python = (selection != "--research").then(|| PathBuf::from(selection));
         if args.next().is_some() {
             return Err("unexpected argument".into());

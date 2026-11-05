@@ -20,11 +20,6 @@ pub(super) struct Corpus {
     /// When the newest page Copied serves was copied, found when first
     /// asked for.
     newest: std::sync::OnceLock<Option<time::OffsetDateTime>>,
-    /// The DNS exchanges captured beside the pages.
-    dns: Arc<fictionet_extras::dns::Replay>,
-    /// Every host Copied serves and every name above one, found when
-    /// first asked for.
-    above: std::sync::OnceLock<HashSet<String>>,
 }
 
 impl Corpus {
@@ -58,49 +53,6 @@ impl Corpus {
                 .and_then(|reference| reference.date)
                 .map(|date| date.midnight().assume_utc());
             captures.chain(dump).max()
-        })
-    }
-
-    /// When the DNS captured beside the pages was last recorded.
-    fn dns_newest(&self) -> Option<time::OffsetDateTime> {
-        self.dns.newest_capture()
-    }
-
-    /// Every host Copied serves: the search engines, the captured research
-    /// and package sites, and the reference web's.
-    fn served(&self) -> impl Iterator<Item = &str> {
-        let reference = match &self.search {
-            CorpusSearch::Reference(reference) => Some(reference),
-            CorpusSearch::Crawled(_) => None,
-        };
-        crate::route::SEARCH_HOSTS
-            .into_iter()
-            .chain(self.hosts.iter().map(String::as_str))
-            .chain(
-                self.packages
-                    .iter()
-                    .flat_map(|packages| packages.hosts.iter().map(String::as_str)),
-            )
-            .chain(
-                reference
-                    .into_iter()
-                    .flat_map(|reference| reference.hosts()),
-            )
-    }
-
-    /// Every host Copied serves, and every name above one.
-    fn above(&self) -> &HashSet<String> {
-        self.above.get_or_init(|| {
-            let mut above = HashSet::new();
-            for host in self.served() {
-                let mut name = host;
-                above.insert(name.to_owned());
-                while let Some((_, parent)) = name.split_once('.') {
-                    above.insert(parent.to_owned());
-                    name = parent;
-                }
-            }
-            above
         })
     }
 }
@@ -448,34 +400,6 @@ impl Pages {
             }
     }
 
-    /// Whether Copied serves `host` or a host below it, whatever mode is in
-    /// use.
-    pub(crate) fn serves_below(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        self.copied
-            .as_ref()
-            .is_some_and(|corpus| corpus.above().contains(&host))
-    }
-
-    /// The DNS exchanges captured beside the copied pages.
-    pub(crate) fn copied_dns(&self) -> Option<Arc<fictionet_extras::dns::Replay>> {
-        Some(self.copied.as_ref()?.dns.clone())
-    }
-
-    /// Every host Copied serves, sorted: the names whose DNS a capture
-    /// records, so a Copied session resolves each one.
-    pub fn copied_hosts(&self) -> Vec<String> {
-        let mut hosts: Vec<String> = self
-            .copied
-            .iter()
-            .flat_map(|corpus| corpus.served())
-            .map(str::to_owned)
-            .collect();
-        hosts.sort();
-        hosts.dedup();
-        hosts
-    }
-
     /// Open the corpus chosen by the world's brief, relative to the downloads root.
     /// Its search index is cached beside the immutable archives.
     pub fn from_corpus(seed: Seed, downloads: &Path) -> Result<Self, String> {
@@ -573,9 +497,6 @@ impl Pages {
         } else {
             None
         };
-        // The DNS `cargo xtask search-capture` captured beside the pages.
-        let dns =
-            fictionet_extras::dns::Replay::directory(&research_root).map_err(|e| e.to_string())?;
         let mut corpus = Corpus {
             archive,
             missing,
@@ -583,8 +504,6 @@ impl Pages {
             hosts,
             packages,
             newest: Default::default(),
-            dns: Arc::new(dns),
-            above: Default::default(),
         };
         corpus.search = if let Some(reference) = reference {
             CorpusSearch::Reference(Box::new(reference))
@@ -654,14 +573,10 @@ impl Pages {
         Some(self.copied.as_ref()?.newest()?.date())
     }
 
-    /// How far Copied's clock is behind the host's. With DNS captured
-    /// beside the pages, the clock starts at the newest of that capture
-    /// and the pages, so the captured signatures are inside their
-    /// windows, which last a day or two for zones signed as they are
-    /// asked, and no page is dated after the clock. Without one, as many
-    /// whole days as have passed since the newest page was copied, so the
-    /// guest's clock and the sites' dates are on that page's day. It is
-    /// fixed for each session when the session starts.
+    /// How far Copied's clock is behind the host's: as many whole days as
+    /// have passed since the newest page was copied, so the guest's clock
+    /// and the sites' dates are on that page's day. It is fixed for each
+    /// session when the session starts.
     pub fn copied_lag(&self) -> Option<std::time::Duration> {
         if let Some(lag) = self.settings.lock().unwrap().lag {
             return lag;
@@ -673,22 +588,8 @@ impl Pages {
     pub fn measure_lag(&self) -> Option<std::time::Duration> {
         let corpus = self.copied.as_ref()?;
         let now = time::OffsetDateTime::now_utc();
-        let seconds = match corpus.dns_newest() {
-            Some(dns) => {
-                let newest = corpus.newest().map_or(dns, |pages| pages.max(dns));
-                (now - newest).whole_seconds()
-            }
-            None => (now - corpus.newest()?).whole_days() * 86_400,
-        };
+        let seconds = (now - corpus.newest()?).whole_days() * 86_400;
         (seconds > 0).then(|| std::time::Duration::from_secs(seconds as u64))
-    }
-
-    /// Whether DNS was captured beside the copied pages. Without it a
-    /// Copied session cannot start ([`unavailable`](Self::unavailable)).
-    pub(crate) fn has_copied_dns(&self) -> bool {
-        self.copied
-            .as_ref()
-            .is_some_and(|corpus| corpus.dns_newest().is_some())
     }
 
     /// The world's day as the active source shows it now, the day of the

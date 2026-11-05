@@ -128,11 +128,6 @@ impl ReferenceWeb {
         host == "en.wikipedia.org" || self.hosts.contains(host)
     }
 
-    /// Every host [`serves`](Self::serves) takes.
-    pub fn hosts(&self) -> impl Iterator<Item = &str> {
-        std::iter::once("en.wikipedia.org").chain(self.hosts.iter().map(String::as_str))
-    }
-
     /// The Wikipedia copy's entry for `url`, when it holds one.
     fn article(&self, parsed: &url::Url) -> io::Result<Option<zim::DirectoryEntry>> {
         if parsed.host_str() != Some("en.wikipedia.org") {
@@ -266,8 +261,6 @@ impl Pages {
             hosts: HashSet::new(),
             packages: None,
             newest: Default::default(),
-            dns: Default::default(),
-            above: Default::default(),
         };
         let wikipedia = Zim::new(wiki_file(&root)).map_err(|e| e.to_string())?;
         let parent = root.join("index");

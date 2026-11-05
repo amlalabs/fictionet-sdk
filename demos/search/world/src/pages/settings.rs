@@ -64,30 +64,12 @@ impl Pages {
             namespace: Namespace::new(WallClock {
                 start: std::time::UNIX_EPOCH,
             }),
-            live_dns: Default::default(),
-            served: Default::default(),
         }
-    }
-
-    /// Runs `served` each time the session comes to serve hosts it did not
-    /// serve before: when Live-Depth allows an address on a new host, and
-    /// when a session starts. It replaces what an earlier network set.
-    pub(crate) fn on_hosts_served(&self, served: impl Fn() + Send + Sync + 'static) {
-        *self.served.0.lock().unwrap() = Some(Arc::new(served));
     }
 
     /// The session the world's DNS answers for.
     pub(crate) fn namespace(&self) -> &Namespace {
         &self.namespace
-    }
-
-    /// The internet's DNS servers, asked from the host: the upstream of
-    /// the world's learned zones in Live, Live-Depth, and Edited, and
-    /// what a Copied session asks for the names it needs in every session.
-    pub(crate) fn live_dns(&self) -> Arc<fictionet_host::dns::Internet> {
-        self.live_dns
-            .get_or_init(|| Arc::new(fictionet_host::dns::Internet::new()))
-            .clone()
     }
 
     /// Edits pages with `model` in Edited mode.
@@ -136,9 +118,6 @@ impl Pages {
     pub fn unavailable(&self, source: Source) -> Option<&'static str> {
         match source {
             Source::Copied if self.copied.is_none() => Some("This world has no copied pages"),
-            Source::Copied if !self.has_copied_dns() => Some(
-                "The copied pages have no DNS: run cargo xtask search-capture <downloads> --dns",
-            ),
             Source::Live | Source::LiveDepth | Source::Edited if self.live.is_none() => {
                 Some("Live pages need EXA_API_KEY on the host")
             }
@@ -154,10 +133,7 @@ impl Pages {
     /// resolved carries over. A scenario stays, with the account already
     /// written for it. `copied_lag` is measured once before boot so the
     /// workstation, the copied pages, and the world's DNS use the same
-    /// clock: the world's resolvers check signatures against it, so the
-    /// captured signatures of a Copied session are inside their windows.
-    /// A corpus with no DNS captured cannot start a Copied session, since
-    /// its names would not resolve.
+    /// clock.
     pub fn start_session(
         &self,
         fcx: &Cx,
@@ -180,15 +156,14 @@ impl Pages {
         settings.lag = Some(copied_lag);
         settings.source = source;
         settings.revision += 1;
-        // The DNS session starts after the mode is set, so the world's DNS
-        // sources choose for the new mode when they see it.
+        // A new DNS session empties the resolver's cache, after the mode is
+        // set, so no answer from the last mode carries over.
         let lag = copied_lag
             .filter(|_| source == Source::Copied)
             .unwrap_or_default();
         let start = std::time::SystemTime::now() - fcx.now().since_start() - lag;
         self.namespace.advance(WallClock { start });
         drop(settings);
-        self.served.run();
         Ok(())
     }
 

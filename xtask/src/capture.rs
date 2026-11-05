@@ -1,7 +1,6 @@
 //! Capture the research web and Python distributions at their original URLs,
 //! and the DNS that resolves the captured hosts.
 
-mod dns;
 mod render;
 
 use crate::Result;
@@ -246,11 +245,7 @@ pub async fn requisites(corpus: &Path, urls: &[String]) -> Result {
     };
     urls.sort_by(|a, b| a.0.cmp(&b.0));
     println!("Completing requisites for {} captured URLs", urls.len());
-    complete(&root, "requisites", &urls).await?;
-    let downloads = corpus
-        .parent()
-        .ok_or("the corpus has no downloads directory")?;
-    record_dns(downloads).await
+    complete(&root, "requisites", &urls).await
 }
 
 fn captured_at(archive: &Archive, url: &str) -> Result<(String, fictionet_extras::warc::Response)> {
@@ -646,7 +641,6 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     }
     publication.commit()?;
     let Some(python) = python else {
-        record_dns(downloads).await?;
         println!("Captured research sources in {}", root.display());
         return Ok(());
     };
@@ -775,7 +769,6 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
         return Err("offline package installation and clone validation failed".into());
     }
     publish(&packages, &root.join("packages"))?;
-    record_dns(downloads).await?;
     println!(
         "Captured research sources and package distributions in {}",
         root.display()
@@ -783,23 +776,7 @@ pub async fn run(downloads: &Path, python: Option<&Path>) -> Result {
     Ok(())
 }
 
-/// Capture requested source pages and their static dependencies, and the
-/// DNS of every host the corpus then serves.
+/// Capture requested source pages and their static dependencies.
 pub async fn urls(downloads: &Path, urls: &[String]) -> Result {
-    capture_cached(&downloads.join("security"), "zz-pages", urls).await?;
-    record_dns(downloads).await
-}
-
-/// Records the DNS of every host the corpus in `downloads` serves in a
-/// Copied session, read the way the world reads the corpus: its research
-/// and package sites, its reference web, and the search engines. Each
-/// capture that adds pages records it again, so the corpus's newest DNS
-/// is never older than its pages, and a Copied session, whose clock
-/// starts at that capture, finds its signatures valid.
-pub async fn record_dns(downloads: &Path) -> Result {
-    let seed = web_world::pages::Seed::builtin("security")?;
-    let corpus = seed.corpus.clone().ok_or("missing corpus declaration")?;
-    let root = Archive::directory_root(&downloads.join(&corpus.directory))?;
-    let pages = web_world::pages::Pages::from_corpus(seed, downloads)?;
-    dns::record(&root, &pages.copied_hosts()).await
+    capture_cached(&downloads.join("security"), "zz-pages", urls).await
 }

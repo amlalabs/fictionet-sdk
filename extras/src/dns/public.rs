@@ -31,13 +31,11 @@
 //! # }
 //! ```
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::str::FromStr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use std::sync::Arc;
 
-use fictionet::Cx;
 use fictionet::stdlib::protocols::dns::dnssec::AlgorithmPolicy;
-use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
 use fictionet::stdlib::protocols::dns::rr::rdata::{A, SVCB, TXT};
 use fictionet::stdlib::protocols::dns::rr::{
@@ -49,10 +47,8 @@ use fictionet::stdlib::services::dns::zone::special::{
     self, alpn, dohpath, ipv4_hint, ipv6_hint, port,
 };
 use fictionet::stdlib::services::dns::zone::{Shown, ZoneData};
-use fictionet::stdlib::services::dns::{Looked, Lookup};
 use fictionet::stdlib::web::httpd::Handler;
 use fictionet::stdlib::world::net::Host;
-use fictionet::stdlib::world::net::dns::Upstream;
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
 
 use super::place::ResolverSite;
@@ -91,10 +87,7 @@ pub struct PublicResolver {
 }
 
 impl PublicResolver {
-    /// The names its DNS over HTTPS service answers under. The addresses
-    /// the real hierarchy gives for them are where a world puts the
-    /// resolver's DNS over HTTPS front
-    /// ([`Mirror::front`](super::mirror::Mirror::front)).
+    /// The names its DNS over HTTPS service answers under.
     pub fn doh(&self) -> Vec<Name> {
         self.doh.iter().map(|text| name(text)).collect()
     }
@@ -528,84 +521,6 @@ const MYIP: &str = "myip.opendns.com.";
 /// Google's name for asking which address a question came from.
 const MYADDR: &str = "o-o.myaddr.l.google.com.";
 
-/// `ns1.google.com`, which answers a TXT question for [`MYADDR`] with the
-/// address the question came from.
-const MYADDR_SERVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(216, 239, 32, 10)), 53);
-
-/// The public address `upstream` asks the internet from, as a real
-/// authority sees it: the answer `ns1.google.com` gives for
-/// `o-o.myaddr.l.google.com` TXT. `None` when the server cannot be
-/// reached or its answer holds no address. A world that shows the real
-/// internet passes it to [`PublicResolver::whoami`] and
-/// [`Mirror::egress`](super::mirror::Mirror::egress).
-pub async fn egress(fcx: &Cx, upstream: &dyn Upstream) -> Option<IpAddr> {
-    myaddr_at(fcx, upstream, MYADDR_SERVER).await
-}
-
-/// The address `server` says a [`MYADDR`] question came from.
-async fn myaddr_at(fcx: &Cx, upstream: &dyn Upstream, server: SocketAddr) -> Option<IpAddr> {
-    let question = Query::query(name(MYADDR), RecordType::TXT);
-    let zone = LowerName::new(&name("google.com."));
-    let Looked::Response(response) = upstream
-        .lookup(fcx, Lookup::new(server, zone, &question))
-        .await
-    else {
-        return None;
-    };
-    response
-        .answers
-        .into_iter()
-        .find_map(|record| match record.data {
-            RData::TXT(txt) => txt
-                .txt_data
-                .iter()
-                .find_map(|text| IpAddr::from_str(std::str::from_utf8(text).ok()?).ok()),
-            _ => None,
-        })
-}
-
 fn name(text: &str) -> Name {
     Name::from_ascii(text).expect("a public resolver's name is valid")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fictionet::Seed;
-    use fictionet::stdlib::protocols::dns::op::{Message, OpCode};
-    use fictionet_host::dns::Internet;
-    use std::net::UdpSocket;
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn egress_is_the_address_in_the_whoami_answer() {
-        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let server = udp.local_addr().unwrap();
-        let server_thread = thread::spawn(move || {
-            let mut buffer = [0; 1232];
-            let (length, client) = udp.recv_from(&mut buffer).unwrap();
-            let question = Message::from_vec(&buffer[..length]).unwrap();
-            assert_eq!(question.queries[0].name().to_ascii(), MYADDR);
-            assert_eq!(question.queries[0].query_type(), RecordType::TXT);
-            let mut reply = Message::response(question.metadata.id, OpCode::Query);
-            reply.metadata.authoritative = true;
-            reply.add_query(question.queries[0].clone());
-            reply.add_answer(Record::from_rdata(
-                name(MYADDR),
-                60,
-                RData::TXT(TXT::new(vec!["203.0.113.9".to_string()])),
-            ));
-            udp.send_to(&reply.to_vec().unwrap(), client).unwrap();
-        });
-        fictionet::block_on(fictionet::run(Seed::from_u64(1), |fcx| async move {
-            let internet = Internet::new();
-            let found = myaddr_at(&fcx, &internet, server).await;
-            assert_eq!(found, Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))));
-            Ok(())
-        }))
-        .unwrap();
-        server_thread.join().unwrap();
-    }
 }

@@ -220,27 +220,4 @@ pub struct Pages {
     /// The session the world's DNS answers for, advanced by each
     /// [`start_session`](Self::start_session).
     namespace: fictionet::stdlib::world::net::dns::Namespace,
-    /// The internet's DNS servers, asked from the host: made when first
-    /// needed, and shared by every session.
-    live_dns: std::sync::OnceLock<Arc<fictionet_host::dns::Internet>>,
-    /// What runs when the session comes to serve hosts it did not.
-    served: Served,
-}
-
-/// What runs each time the session comes to serve hosts it did not, set
-/// with [`Pages::on_hosts_served`].
-#[derive(Clone, Default)]
-struct Served(Arc<Mutex<Option<OnServed>>>);
-
-/// What [`Served`] runs.
-type OnServed = Arc<dyn Fn() + Send + Sync>;
-
-impl Served {
-    /// Runs what is set, outside the lock, since it reads the pages.
-    fn run(&self) {
-        let served = self.0.lock().unwrap().clone();
-        if let Some(served) = served {
-            served();
-        }
-    }
 }

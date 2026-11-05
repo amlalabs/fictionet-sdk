@@ -108,11 +108,8 @@ fn block_length(fields: &HashMap<String, String>) -> io::Result<usize> {
 }
 
 /// Reads the one record of a gzip member: its header fields, by lowercase
-/// name, and its block when `keep` wants it after seeing the fields.
-fn read_record(
-    reader: impl Read,
-    keep: impl FnOnce(&Fields) -> bool,
-) -> io::Result<(Fields, Option<Vec<u8>>)> {
+/// name, checking that its block is all there.
+fn read_record(reader: impl Read) -> io::Result<Fields> {
     let mut reader = BufReader::new(reader);
     let mut head = Vec::new();
     loop {
@@ -126,29 +123,17 @@ fn read_record(
     }
     let fields = fields(&head[..head.len() - 4])?;
     let length = block_length(&fields)?;
-    let block = if keep(&fields) {
-        let mut block = vec![0; length];
-        reader
-            .read_exact(&mut block)
-            .map_err(|_| invalid("truncated WARC block"))?;
-        io::copy(&mut reader, &mut io::sink())?;
-        Some(block)
-    } else {
-        let remaining = io::copy(&mut reader, &mut io::sink())? as usize;
-        if remaining < length {
-            return Err(invalid("truncated WARC block"));
-        }
-        None
-    };
-    Ok((fields, block))
+    let remaining = io::copy(&mut reader, &mut io::sink())? as usize;
+    if remaining < length {
+        return Err(invalid("truncated WARC block"));
+    }
+    Ok(fields)
 }
 
 /// One record of an archive file, as [`each_record`] reads it.
 pub(crate) struct Stored {
     /// The header fields, by lowercase name.
     pub(crate) fields: Fields,
-    /// The block, when the reader asked for it.
-    pub(crate) block: Option<Vec<u8>>,
     /// Where the record's gzip member starts in the file.
     pub(crate) offset: u64,
     /// The member's compressed length.
@@ -156,20 +141,18 @@ pub(crate) struct Stored {
 }
 
 /// Reads every record of the record-at-a-time compressed archive `file`
-/// in order, with the blocks `keep` asks for.
+/// in order.
 pub(crate) fn each_record(
     file: &Path,
-    keep: impl Fn(&Fields) -> bool,
     mut visit: impl FnMut(Stored) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(File::open(file)?);
     while !reader.fill_buf()?.is_empty() {
         let offset = reader.stream_position()?;
-        let (fields, block) = read_record(GzDecoder::new(&mut reader), &keep)?;
+        let fields = read_record(GzDecoder::new(&mut reader))?;
         let length = reader.stream_position()? - offset;
         visit(Stored {
             fields,
-            block,
             offset,
             length,
         })?;
@@ -191,43 +174,8 @@ pub(crate) fn date(at: time::OffsetDateTime) -> String {
     )
 }
 
-/// The instant a `WARC-Date` value names, in any of the W3C-ISO8601 forms
-/// WARC 1.1 §5.4 allows (W3CDTF): a time with seconds, with or without a
-/// fraction, or with minutes only, each with its time zone; or a day, a
-/// month, or a year alone, which stands for its first instant in UTC.
-/// `None` for anything else.
-pub(crate) fn parse_date(text: &str) -> Option<time::OffsetDateTime> {
-    use time::format_description::well_known::Rfc3339;
-    if let Some((day, clock)) = text.split_once('T') {
-        let zone = clock.find(['Z', '+', '-'])?;
-        let (minutes, offset) = clock.split_at(zone);
-        let text = match minutes.len() {
-            5 => format!("{day}T{minutes}:00{offset}"),
-            _ => text.to_string(),
-        };
-        return time::OffsetDateTime::parse(&text, &Rfc3339).ok();
-    }
-    let digits = |part: &str, len: usize| -> Option<u16> {
-        let all = part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
-        all.then(|| part.parse().ok())?
-    };
-    let mut parts = text.split('-');
-    let year = digits(parts.next()?, 4)?;
-    let month = parts.next().map_or(Some(1), |part| digits(part, 2))?;
-    let day = parts.next().map_or(Some(1), |part| digits(part, 2))?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let month = time::Month::try_from(u8::try_from(month).ok()?).ok()?;
-    let date =
-        time::Date::from_calendar_date(i32::from(year), month, u8::try_from(day).ok()?).ok()?;
-    Some(date.midnight().assume_utc())
-}
-
 /// Where [`append_record`] put a record.
 pub(crate) struct Appended {
-    /// The record's `WARC-Record-ID`.
-    pub(crate) id: String,
     /// Where its gzip member starts in the file.
     pub(crate) offset: u64,
     /// The member's compressed length.
@@ -275,7 +223,6 @@ pub(crate) fn append_record(
         return Err(error);
     }
     Ok(Appended {
-        id,
         offset,
         length: file.metadata()?.len() - offset,
     })
@@ -351,47 +298,38 @@ impl Archive {
 
     /// Scan every gzip member once, retaining only URL and record locations.
     /// Revisit references are resolved after all archives have been scanned.
-    /// DNS records (`dns:` target URIs) in the same files are left to
-    /// [`dns::Replay`](crate::dns::Replay).
     pub fn open(files: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
         let mut archive = Self::default();
         for file in files {
             let file = std::fs::canonicalize(file)?;
-            each_record(
-                &file,
-                |_| false,
-                |stored| {
-                    let fields = stored.fields;
-                    if !matches!(
-                        fields.get("warc-type").map(String::as_str),
-                        Some("response" | "revisit")
-                    ) {
-                        return Ok(());
-                    }
-                    let target = fields.get("warc-target-uri");
-                    if target.is_some_and(|uri| crate::dns::is_dns_uri(uri)) {
-                        return Ok(());
-                    }
-                    let url = target
-                        .and_then(|url| key(url))
-                        .ok_or_else(|| invalid("response without HTTP target URI"))?;
-                    let record = Record {
-                        file: file.clone(),
-                        offset: stored.offset,
-                        length: stored.length,
-                        captured: fields.get("warc-date").cloned(),
-                        refers: fields
-                            .get("warc-refers-to")
-                            .or_else(|| fields.get("warc-refers-to-target-uri"))
-                            .cloned(),
-                    };
-                    if let Some(id) = fields.get("warc-record-id") {
-                        archive.ids.insert(id.clone(), record.clone());
-                    }
-                    archive.urls.insert(url, record);
-                    Ok(())
-                },
-            )?;
+            each_record(&file, |stored| {
+                let fields = stored.fields;
+                if !matches!(
+                    fields.get("warc-type").map(String::as_str),
+                    Some("response" | "revisit")
+                ) {
+                    return Ok(());
+                }
+                let url = fields
+                    .get("warc-target-uri")
+                    .and_then(|url| key(url))
+                    .ok_or_else(|| invalid("response without HTTP target URI"))?;
+                let record = Record {
+                    file: file.clone(),
+                    offset: stored.offset,
+                    length: stored.length,
+                    captured: fields.get("warc-date").cloned(),
+                    refers: fields
+                        .get("warc-refers-to")
+                        .or_else(|| fields.get("warc-refers-to-target-uri"))
+                        .cloned(),
+                };
+                if let Some(id) = fields.get("warc-record-id") {
+                    archive.ids.insert(id.clone(), record.clone());
+                }
+                archive.urls.insert(url, record);
+                Ok(())
+            })?;
         }
         Ok(archive)
     }

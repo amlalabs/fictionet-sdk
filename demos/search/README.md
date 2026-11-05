@@ -79,27 +79,19 @@ took 98 s using the existing verified Ubuntu downloads and produced a standalone
 startup services. Search explicitly reports typed facts from its request and
 tool handlers, its resolvers and the typed no-route callback on its network.
 
-The world's DNS is a copy of the real hierarchy. The gateway runs a resolver
-like Unbound with the root hints. The root servers, the `gtld-servers.net`
-servers, and public resolvers remain inside the world at their real addresses.
-Each authoritative server answers from records it copied from the real servers
-of its zone, looking up a question only when its copy lacks the answer.
+The world answers DNS itself. The gateway runs a resolver like Unbound whose
+only data is a root zone of the world's own: the first time a name the
+session serves is asked, the world places its site and the resolver answers
+with its address. Copied serves the corpus's hosts, Live-Depth the hosts its
+search results allow, and Live and Edited any host name. Every other name
+does not exist.
 
 Every page source models a corporate network. The workstation uses the gateway
-resolver: plain `dig`, reverse lookups, `dig +dnssec`, and `delv` work through it.
-The guest's outgoing TCP and UDP port 53 to any other address, and port 853,
-are silently dropped. `dig @8.8.8.8`, `dig @198.41.0.4`, `dig +trace`, and
-DNS over TLS time out. The gateway's own queries still reach the hierarchy.
-Public resolver addresses also block TCP and UDP port 443, covering DoH and
-HTTP/3. Known public DoH names get NXDOMAIN with the Blocked extended DNS
-error in every mode; their HTTPS fronts and page copies are not served.
-
-Only questions the world's policy allows reach real servers. In Live,
-Live-Depth, and Edited the authoritative copies allow any name. Live-Depth's
-gateway also answers unserved host names with NXDOMAIN and the Blocked
-extended DNS error. In Copied, upstream questions are restricted to the names
-the session serves, names above them, underscore names under them, reverse
-names, and names in the records the copies hold.
+resolver. The guest's outgoing TCP and UDP port 53 to any other address, and
+port 853, are silently dropped, so `dig @8.8.8.8`, `dig +trace`, and DNS over
+TLS time out. Public resolver addresses also block TCP and UDP port 443,
+covering DoH and HTTP/3. Known public DoH names get NXDOMAIN with the Blocked
+extended DNS error in every mode, and so do Live-Depth's unserved host names.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
@@ -127,15 +119,8 @@ sites. Capture dates are shown only when the archive records them.
   word stemming for documents and queries. Google, Bing,
   DuckDuckGo and Claude's search tool share that index, each engine in its own
   layout. Result counts come from the index before pagination. An unmatched query
-  returns an empty list. Missing pages use captured site responses. Names resolve from
-  the DNS captured with the pages, and a name the capture lacks gets SERVFAIL.
-  The model gateway's and the time server's names are asked of the real
-  servers when the capture lacks them. Every capture command records the DNS
-  of every host the corpus then serves, research, package, and reference sites
-  alike, and the session's clock starts at that capture so its signatures are
-  valid. A corpus captured before DNS was recorded cannot start a Copied
-  session until it gets its DNS with
-  `cargo xtask search-capture /path/to/demos/downloads --dns`.
+  returns an empty list. Missing pages use captured site responses. Every host the
+  corpus serves resolves, and every other name does not exist.
 - **Live** is selected by default when `EXA_API_KEY` is present. [Exa search](https://github.com/exa-labs/openapi-spec/blob/master/exa-openapi-spec.yaml)
   supplies results, which keep their order, titles and URLs in each engine's
   skin; snippets are Exa's highlights as plain text, and Exa's own pages are
@@ -161,7 +146,7 @@ sites. Capture dates are shown only when the archive records them.
   links count as a page's. The files the page uses are allowed too and copied
   when asked for. An unlisted path on an allowed host gets the site's own 404.
   A host the session does not serve gets NXDOMAIN with the Blocked extended
-  DNS error from the gateway, without an upstream DNS lookup.
+  DNS error from the gateway.
   Direct queries to other DNS servers are blocked by the network. Neither
   unlisted pages nor blocked hosts are fetched. The site's
   404 is learned when the first page on it is copied, by asking it once for a
