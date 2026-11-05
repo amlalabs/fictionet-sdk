@@ -1,7 +1,8 @@
 //! Learned copies of real zones, each address answering from its own.
 
+use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 };
 use fictionet::stdlib::protocols::dns::{Request, label_count};
 use fictionet::stdlib::services::dns::authority::{
-    Authority, ServerConfig, Step, bare_reply, respond_from_zones,
+    Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_from_zones,
 };
 use fictionet::stdlib::services::dns::zone::{Denied, Fact, Node, Revision, View, ZoneData};
 use fictionet::stdlib::services::dns::{Client, Generation, Looked, Lookup};
@@ -48,8 +49,13 @@ use super::learned::{Declined, Filing, Learned};
 /// gives. Each response then goes into one zone of the address that sent
 /// it, the zone it shows it came from ([`file`](Authority::file)), which
 /// adds a zone to the address when the response shows one it did not
-/// hold, such as `arpa` at a root letter. A question the real server
-/// answered from another zone than the one it was asked in, or refused
+/// hold, such as `arpa` at a root letter. An answer whose chain goes on
+/// past its zone shows another zone the server serves (RFC 1034 §4.3.2
+/// step 3a): the one that signed the data there, or, unsigned, the root
+/// zone, which holds every name. A name in none of the address's zones is
+/// looked up in the root zone too, since the real server may serve a zone
+/// that nothing has shown yet. A question the real server answered from
+/// another zone than the one it was asked in, or refused
 /// (RFC 8906 §3.1.1), or answered without authority (RFC 1034 §4.3.1),
 /// is [declined](Learned::decline) in that zone: the address answers it
 /// from its other zones, and with REFUSED when none holds the name, so it
@@ -61,7 +67,9 @@ use super::learned::{Declined, Filing, Learned};
 /// as the server sent it. So an address whose real server referred a
 /// question upward, to a cut at or above the zone asked, from a zone the
 /// address does not hold, answers it with REFUSED, as a server that does
-/// not serve the name does (RFC 8906 §3.1.1).
+/// not serve the name does (RFC 8906 §3.1.1). A referral with AA set is
+/// filed as a referral, and a client without DO gets no DNSSEC records in
+/// an answer to ANY, whatever BIND sends.
 #[derive(Default)]
 pub struct Copies {
     /// Each address's copies.
@@ -122,7 +130,8 @@ impl Copies {
     /// the zone asked: the server does not serve the zone
     /// (RFC 8906 §3.1.1, RFC 1034 §4.3.1). Any other error RCODE goes into
     /// the zone asked ([`Learned::failed`]), and a truncated response,
-    /// whose sections may be incomplete (RFC 2181 §9), files nothing.
+    /// whose sections may be incomplete (RFC 2181 §9), files nothing. A
+    /// referral down from the zone asked is filed as one even with AA set.
     pub fn keep(&self, lookup: &Lookup, looked: &Looked, generation: Generation) -> Option<Filing> {
         let Looked::Response(response) = looked else {
             return None;
@@ -135,13 +144,32 @@ impl Copies {
             zone: lookup.zone.clone(),
             sets: Vec::new(),
         };
+        let cut = referral(question, response);
+        let down = cut
+            .as_ref()
+            .is_some_and(|cut| *cut != lookup.zone && lookup.zone.zone_of(cut));
+        // Some servers set AA on a referral. A referral down from the zone
+        // asked carries no SOA, which every authoritative negative does
+        // (RFC 2308 §3), so such a response is filed as the referral it
+        // is, without AA (RFC 1034 §4.3.2 step 3b): a best-effort
+        // normalization of that quirk.
+        let response = match metadata.authoritative && down && !has_soa(response) {
+            true => {
+                let mut referral = response.clone();
+                referral.metadata.authoritative = false;
+                Cow::Owned(referral)
+            }
+            false => Cow::Borrowed(response),
+        };
+        let response = response.as_ref();
+        let metadata = &response.metadata;
         let declined = match metadata.response_code {
             _ if metadata.truncation => return Some(nothing),
             ResponseCode::Refused => Some(Declined::Refused),
             ResponseCode::NoError | ResponseCode::NXDomain | ResponseCode::YXDomain => {
-                match (metadata.authoritative, referral(question, response)) {
+                match (metadata.authoritative, cut) {
                     (true, _) => None,
-                    (false, Some(cut)) if cut != lookup.zone && lookup.zone.zone_of(&cut) => None,
+                    (false, Some(_)) if down => None,
                     (false, Some(_)) => Some(Declined::Elsewhere),
                     (false, None) => Some(Declined::Refused),
                 }
@@ -156,8 +184,58 @@ impl Copies {
         if apex != lookup.zone {
             asked.decline(generation, question, Declined::Elsewhere);
         }
+        if metadata.authoritative {
+            for sibling in siblings(&server, &apex, response) {
+                server.zone(&sibling);
+            }
+        }
         Some(server.zone(&apex).file(generation, question, response))
     }
+}
+
+/// Whether `response`'s authority section holds an SOA record.
+fn has_soa(response: &Message) -> bool {
+    response
+        .authorities
+        .iter()
+        .any(|record| record.record_type() == RecordType::SOA)
+}
+
+/// The zones `response`, an authoritative answer from the zone at `apex`
+/// of `server`, shows its real server holds besides those of `server`: a
+/// server whose CNAME and DNAME chain leaves its zone goes on in the
+/// other zones it hosts (RFC 1034 §4.3.2 step 3a), so an answer RRset
+/// owned outside every zone of `server` lies in a zone that server
+/// serves. That zone is the one that signed the RRset; for an unsigned
+/// one, whose apex the response does not show, it is the root, so the
+/// address asks the real server about any name in none of its other
+/// zones.
+fn siblings(server: &Server, apex: &LowerName, response: &Message) -> BTreeSet<LowerName> {
+    let zones = server.zones();
+    let held =
+        |name: &LowerName| apex.zone_of(name) || zones.iter().any(|zone| zone.apex().zone_of(name));
+    response
+        .answers
+        .iter()
+        .filter(|record| record.dns_class == DNSClass::IN)
+        .filter(|record| !held(&LowerName::new(&record.name)))
+        .map(|record| {
+            let owner = LowerName::new(&record.name);
+            response
+                .answers
+                .iter()
+                .find_map(|signature| match &signature.data {
+                    RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                        if LowerName::new(&signature.name) == owner =>
+                    {
+                        Some(LowerName::new(&rrsig.input().signer_name))
+                    }
+                    _ => None,
+                })
+                .filter(|signer| signer.zone_of(&owner))
+                .unwrap_or_else(|| LowerName::from(Name::root()))
+        })
+        .collect()
 }
 
 /// The cut `response` refers `question` to, when it is a referral:
@@ -352,6 +430,32 @@ impl View for Stop {
     }
 }
 
+/// `step`, a reply to `req`, less the RRSIG, NSEC, and NSEC3 records of
+/// its answer to ANY when `req` lacks DO. A copy holds the real server's
+/// answer to ANY with DO, RRSIGs included, and a server sends no DNSSEC
+/// records to a client without DO (RFC 4035 §3.1, RFC 3225 §3), whatever
+/// subset of the name's RRsets it answers ANY with (RFC 8482 §4.1). An
+/// NSEC RRset that is the whole answer stays: the name has data, and the
+/// copy knows of no other. BIND sends the DNSSEC records for ANY without
+/// DO as well, a departure the copy does not copy.
+fn without_dnssec(req: &Request, step: Step) -> Step {
+    let dnssec_ok = req.edns.is_some_and(|edns| edns.dnssec_ok);
+    match step {
+        Step::Reply(mut response) if req.question.query_type() == RecordType::ANY && !dnssec_ok => {
+            let answers = &mut response.message.answers;
+            answers.retain(|record| record.record_type() != RecordType::RRSIG);
+            let denial = |record: &Record| {
+                matches!(record.record_type(), RecordType::NSEC | RecordType::NSEC3)
+            };
+            if !answers.iter().all(denial) {
+                answers.retain(|record| !denial(record));
+            }
+            Step::Reply(response)
+        }
+        step => step,
+    }
+}
+
 impl Authority for Copies {
     /// Answers `req` at `local` from that address's copies, as the type's
     /// documentation says. A zone that declined a question the reply
@@ -368,6 +472,15 @@ impl Authority for Copies {
     ) -> Step {
         let qname = LowerName::new(req.question.name());
         let copies = self.server(local.ip()).zones();
+        // The real server may serve a zone that holds a name in none of
+        // the address's copies, which nothing has shown yet, so it is
+        // asked, from the root zone, which holds every name. A server
+        // that does not serve the name refuses it, and so does the copy.
+        let held = copies.iter().any(|learned| learned.apex().zone_of(&qname));
+        if !held && req.question.query_class() == DNSClass::IN && refuse_transfer(req).is_none() {
+            let root = LowerName::from(Name::root());
+            return Step::Need(Lookup::new(local, root, &req.question));
+        }
         let mut around: Vec<Around> = Vec::new();
         loop {
             let copies: Vec<&Arc<Learned>> = copies
@@ -435,7 +548,7 @@ impl Authority for Copies {
             });
             match next.take() {
                 Some(next) => around.push(next),
-                None => return step,
+                None => return without_dnssec(req, step),
             }
         }
     }

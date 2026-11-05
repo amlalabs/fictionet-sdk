@@ -388,11 +388,14 @@ impl Inner {
         }
         // A placed server's copies hold the real server's own answer to
         // ANY, which may be every RRset, a subset, or a made-up HINFO
-        // (RFC 8482 §4), so the server sends every RRset they hold for it.
-        // The copies ask with DO, so a client without DO gets the RRSIGs
-        // too, as BIND sends them for ANY.
+        // (RFC 8482 §4), so the server sends every RRset they hold for it,
+        // less the DNSSEC records for a client without DO
+        // ([`Copies`]). Extended DNS Errors are optional (RFC 8914 §3),
+        // and real servers differ in which they send, so a placed server
+        // makes up none.
         let config = ServerConfig {
             any: AnyResponse::All,
+            ede: false,
             ..ServerConfig::generic()
         };
         // The network refuses an address on the sandboxes' subnet or a

@@ -276,6 +276,7 @@ fn a_failure_is_laid_over_data_that_answers_no_client() {
     let failure = |key: &Key| Offer::Failure {
         key: key.clone(),
         why: FailureKind::NoReachableAuthority,
+        cd: false,
         follows: None,
     };
     cache.insert(at(100), failure(&ns_key));
@@ -428,6 +429,7 @@ fn a_persistent_failure_is_cached_longer_each_time() {
             Offer::Failure {
                 key: www.clone(),
                 why: FailureKind::NoReachableAuthority,
+                cd: false,
                 follows,
             },
         );
@@ -461,6 +463,7 @@ fn a_failure_persists_from_when_its_resolution_began() {
     let offer = |follows| Offer::Failure {
         key: www.clone(),
         why: FailureKind::NoReachableAuthority,
+        cd: false,
         follows,
     };
     cache.insert(at(0), offer(None));

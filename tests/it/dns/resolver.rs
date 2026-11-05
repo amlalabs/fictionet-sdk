@@ -160,12 +160,29 @@ fn ds(keys: &KeySet, apex: &str) -> RecordSet {
 /// When `signed`, the root, `com`, `org`, `example.com`, and `bad.com` are
 /// signed, and the second value holds the root's anchor.
 pub(super) fn internet(signed: bool) -> (MemoryNet, Option<Anchors>) {
-    internet_appending(signed, None)
+    internet_with(signed, ExampleCom::default())
 }
 
-/// [`internet`], with `appended` added to the authority section of every
-/// NXDOMAIN reply from `example.com`'s servers.
-fn internet_appending(signed: bool, appended: Option<Record>) -> (MemoryNet, Option<Anchors>) {
+/// What a test changes in [`internet`]'s `example.com`.
+#[derive(Default)]
+struct ExampleCom {
+    /// The denial records it is signed with, when the internet is signed:
+    /// NSEC when `None`.
+    denial: Option<Denial>,
+    /// RRsets it holds besides the usual ones.
+    extra: Vec<RecordSet>,
+    /// A record its servers add to the authority section of every
+    /// NXDOMAIN reply.
+    appended: Option<Record>,
+}
+
+/// [`internet`], with `example.com` changed as `example_com` says.
+fn internet_with(signed: bool, example_com: ExampleCom) -> (MemoryNet, Option<Anchors>) {
+    let ExampleCom {
+        denial,
+        extra,
+        appended,
+    } = example_com;
     let root_keys = keys(10);
     let com_keys = keys(20);
     let org_keys = keys(30);
@@ -256,10 +273,16 @@ fn internet_appending(signed: bool, appended: Option<Record>) -> (MemoryNet, Opt
         ))
         .rrset(rrset("x.y.example.com.", 300, vec![a("192.0.2.81")]))
         .rrset(rrset(long, 300, vec![a("192.0.2.82")]))
-        .rrset(rrset("big.example.com.", 300, big))
+        .rrset(rrset("big.example.com.", 300, big));
+    let example = extra
+        .into_iter()
+        .fold(example, |example, set| example.rrset(set))
         .build()
         .unwrap();
-    let example = sign(example, &example_keys);
+    let example = match denial {
+        Some(denial) if signed => example.signed(&example_keys, window(), denial).unwrap(),
+        _ => sign(example, &example_keys),
+    };
 
     let mut org = builder("org.", "ns.nic.org.").rrset(rrset("ns.nic.org.", 3600, vec![a(ORG)]));
     org = delegation(
@@ -2554,7 +2577,13 @@ fn an_nsec_record_that_does_not_verify_denies_nothing() {
             [RecordType::A],
         ))),
     );
-    let (mut net, anchors) = internet_appending(true, Some(forged));
+    let (mut net, anchors) = internet_with(
+        true,
+        ExampleCom {
+            appended: Some(forged),
+            ..ExampleCom::default()
+        },
+    );
     let mut resolver = resolver(config(anchors));
     let reply = ask(
         &mut resolver,
@@ -2754,6 +2783,257 @@ fn a_forward_zone_below_an_apex_takes_the_zone_s_negative_answers() {
             );
         }
     }
+}
+
+/// A forward zone below its zone's apex gets wildcard answers whose
+/// proof, the NSEC or NSEC3 records that show no closer name matched,
+/// is owned by names of that zone above the forward zone. It is taken
+/// with the answer (RFC 4035 §3.1.3.3), so the answer validates as it
+/// does by iteration (RFC 4035 §5.3.4, RFC 5155 §8.8).
+#[test]
+fn a_forward_zone_below_an_apex_takes_the_proof_of_a_wildcard_answer() {
+    let denials = [
+        Denial::Nsec,
+        Denial::Nsec3 {
+            opt_out: false,
+            salt: Vec::new(),
+        },
+    ];
+    // The forward zone, and a question it holds that the wildcard
+    // answers: one whose closest encloser is above the forward zone, and
+    // one whose closest encloser is the forward zone itself.
+    let cases = [
+        ("z.w.example.com.", "q.z.w.example.com."),
+        ("y.example.com.", "w.y.example.com."),
+    ];
+    for signed in [false, true] {
+        for denial in &denials {
+            for (forward, qname) in cases {
+                let reply = |forward: Vec<(Name, Vec<SocketAddr>)>| {
+                    let (mut net, anchors) = internet_with(
+                        signed,
+                        ExampleCom {
+                            denial: Some(denial.clone()),
+                            extra: vec![
+                                rrset("*.w.example.com.", 300, vec![a("192.0.2.83")]),
+                                rrset("*.y.example.com.", 300, vec![a("192.0.2.84")]),
+                            ],
+                            ..ExampleCom::default()
+                        },
+                    );
+                    let mut resolver = resolver(Config {
+                        forward,
+                        ..config(anchors)
+                    });
+                    ask(
+                        &mut resolver,
+                        &mut net,
+                        0,
+                        query(client(1), qname, RecordType::A, dnssec_ok),
+                    )
+                };
+                let iterated = reply(Vec::new());
+                let forwarded = reply(vec![(
+                    name(forward),
+                    vec![SocketAddr::new(ip(EXAMPLE_TOO), 53)],
+                )]);
+                let case = format!("{qname} {denial:?} signed {signed}");
+                assert_eq!(iterated.metadata.response_code, ResponseCode::NoError);
+                assert_eq!(iterated.metadata.authentic_data, signed, "{case}");
+                assert_eq!(
+                    forwarded.metadata.response_code,
+                    ResponseCode::NoError,
+                    "{case}: {:?}",
+                    edes(&forwarded)
+                );
+                assert_eq!(addresses(&forwarded), addresses(&iterated), "{case}");
+                assert_eq!(addresses(&forwarded).len(), 1, "{case}");
+                assert_eq!(forwarded.metadata.authentic_data, signed, "{case}");
+                let proof = |reply: &Message| -> Vec<Record> {
+                    let mut proof: Vec<Record> = reply
+                        .authorities
+                        .iter()
+                        .filter(|record| {
+                            matches!(record.record_type(), RecordType::NSEC | RecordType::NSEC3)
+                        })
+                        .cloned()
+                        .collect();
+                    proof.sort_by_key(|record| record.name.to_string());
+                    proof
+                };
+                assert_eq!(proof(&forwarded), proof(&iterated), "{case}");
+                assert_eq!(proof(&forwarded).is_empty(), !signed, "{case}");
+            }
+        }
+    }
+}
+
+/// A forward zone below a DNAME gets answers synthesized from it: the
+/// DNAME, above the forward zone, and the CNAME it makes. Both are taken
+/// (RFC 6672 §3.1), and the DNAME vouches for the unsigned CNAME
+/// (RFC 6672 §3.4), so the answer is the one iteration finds.
+#[test]
+fn a_forward_zone_below_a_dname_takes_the_dname() {
+    for signed in [false, true] {
+        let reply = |forward: Vec<(Name, Vec<SocketAddr>)>| {
+            let (mut net, anchors) = internet_with(
+                signed,
+                ExampleCom {
+                    extra: vec![rrset(
+                        "d.example.com.",
+                        300,
+                        vec![dname(&name("example.org."))],
+                    )],
+                    ..ExampleCom::default()
+                },
+            );
+            let mut resolver = resolver(Config {
+                forward,
+                ..config(anchors)
+            });
+            ask(
+                &mut resolver,
+                &mut net,
+                0,
+                query(client(1), "www.d.example.com.", RecordType::A, dnssec_ok),
+            )
+        };
+        let iterated = reply(Vec::new());
+        let forwarded = reply(vec![(
+            name("www.d.example.com."),
+            vec![SocketAddr::new(ip(EXAMPLE_TOO), 53)],
+        )]);
+        let chain = |reply: &Message| -> Vec<(Name, RecordType)> {
+            reply
+                .answers
+                .iter()
+                .filter(|record| record.record_type() != RecordType::RRSIG)
+                .map(|record| (record.name.clone(), record.record_type()))
+                .collect()
+        };
+        assert_eq!(
+            forwarded.metadata.response_code,
+            ResponseCode::NoError,
+            "signed {signed}: {:?}",
+            edes(&forwarded)
+        );
+        assert_eq!(addresses(&forwarded), ["192.0.2.90"], "signed {signed}");
+        assert_eq!(
+            chain(&forwarded),
+            [
+                (name("d.example.com."), RecordType::DNAME),
+                (name("www.d.example.com."), RecordType::CNAME),
+                (name("www.example.org."), RecordType::A),
+            ],
+            "signed {signed}"
+        );
+        assert_eq!(chain(&forwarded), chain(&iterated), "signed {signed}");
+        // `example.org` is unsigned, so the answer is Insecure.
+        assert!(!forwarded.metadata.authentic_data);
+    }
+}
+
+/// A forwarder that does not validate keeps the failure of a question
+/// with CD set, and of one no server replied to, for every question with
+/// CD: no query goes out until it expires (RFC 9520 §3.2).
+#[test]
+fn a_forwarder_keeps_failures_for_questions_with_cd() {
+    let checking_disabled: fn(&mut Message) = |message| {
+        message.metadata.checking_disabled = true;
+        dnssec_ok(message);
+    };
+    let key = Key::new(
+        LowerName::new(&name("www.example.com.")),
+        RecordType::A,
+        fictionet::stdlib::protocols::dns::rr::DNSClass::IN,
+    );
+    // Every forwarder times out, first for a question without CD, then
+    // for one with it.
+    for first_cd in [false, true] {
+        let (mut net, _) = internet(false);
+        net.lose(|_| true);
+        let mut dnsmasq = resolver(Config {
+            ede: true,
+            ..dnsmasq(vec![SocketAddr::new(ip(EXAMPLE), 53)])
+        });
+        let first = query(
+            client(1),
+            "www.example.com.",
+            RecordType::A,
+            if first_cd {
+                checking_disabled
+            } else {
+                dnssec_ok
+            },
+        );
+        let reply = ask(&mut dnsmasq, &mut net, 0, first);
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        let sent = net.recording().exchanges().len();
+        assert!(sent > 0);
+        assert!(matches!(
+            dnsmasq.cache().get(&key, at(1)),
+            Some(Entry::Failure {
+                why: FailureKind::NoReachableAuthority,
+                ..
+            })
+        ));
+        let reply = ask(
+            &mut dnsmasq,
+            &mut net,
+            1,
+            query(
+                client(2),
+                "www.example.com.",
+                RecordType::A,
+                checking_disabled,
+            ),
+        );
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(
+            edes(&reply),
+            [EdeCode::NO_REACHABLE_AUTHORITY, EdeCode::CACHED_ERROR],
+            "first with CD {first_cd}"
+        );
+        assert_eq!(
+            net.recording().exchanges().len(),
+            sent,
+            "first with CD {first_cd}"
+        );
+    }
+
+    // The forwarder replies, with a referral, to a question with CD set.
+    let (mut net, _) = internet(false);
+    let mut dnsmasq = resolver(Config {
+        ede: true,
+        ..dnsmasq(vec![SocketAddr::new(ip(ROOT), 53)])
+    });
+    let reply = ask(
+        &mut dnsmasq,
+        &mut net,
+        0,
+        query(
+            client(1),
+            "www.example.com.",
+            RecordType::A,
+            checking_disabled,
+        ),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(net.recording().exchanges().len(), 1);
+    let reply = ask(
+        &mut dnsmasq,
+        &mut net,
+        1,
+        query(
+            client(2),
+            "www.example.com.",
+            RecordType::A,
+            checking_disabled,
+        ),
+    );
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert!(edes(&reply).contains(&EdeCode::CACHED_ERROR));
+    assert_eq!(net.recording().exchanges().len(), 1);
 }
 
 /// An upstream that validates, playing a zone whose signatures fail: it

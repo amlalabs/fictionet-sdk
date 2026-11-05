@@ -702,11 +702,25 @@ impl<V: Verify> Resolver<V> {
         self.aggressive(key)
     }
 
-    /// [`cached`](Resolver::cached), less a cached failure for a lookup
-    /// that relays a client's CD bit.
+    /// [`cached`](Resolver::cached), less, for a lookup that relays a
+    /// client's CD bit, a cached failure of servers that replied with
+    /// errors to queries without CD: a server that validates may have
+    /// failed only those (RFC 4035 §3.2.2). Any other failure holds for
+    /// it too, so no query goes out until it expires (RFC 9520 §3.2).
     fn cached_for(&self, key: &Key, relay_cd: bool) -> Option<Found> {
-        self.cached(key)
-            .filter(|found| !(relay_cd && matches!(found.outcome, Outcome::Failure(_))))
+        let without_cd = || {
+            matches!(
+                self.cache.get(key, self.now),
+                Some(Entry::Failure {
+                    why: FailureKind::Unknown,
+                    cd: false,
+                    ..
+                })
+            )
+        };
+        self.cached(key).filter(|found| {
+            !(relay_cd && matches!(found.outcome, Outcome::Failure(_)) && without_cd())
+        })
     }
 
     /// What the local zones give for `request`'s question, as the
@@ -1101,9 +1115,11 @@ impl<V: Verify> Resolver<V> {
     ///
     /// With `relay_cd`, the lookup forwards a client's CD bit, as a
     /// forwarder that does not validate relays the client's header: it
-    /// shares no lookup with questions asked without CD, caches nothing it
-    /// learns, and a failure the cache holds does not answer it, since a
-    /// server that validates may have failed only the question without CD.
+    /// shares no lookup with questions asked without CD, and caches
+    /// nothing it learns but its failure. A cached failure of servers that
+    /// replied with errors to the question without CD does not answer it,
+    /// since a server that validates may have failed only that question
+    /// ([`cached_for`](Resolver::cached_for)).
     pub(super) fn depend(
         &mut self,
         from: Node,
@@ -1469,12 +1485,23 @@ impl<V: Verify> Resolver<V> {
             FailureKind::NoReachableAuthority
         };
         if !lookup.bounded {
-            let key = lookup.key.clone();
-            let follows = lookup.follows;
-            self.cache
-                .insert(self.now, Offer::Failure { key, why, follows });
+            let offer = Offer::Failure {
+                key: lookup.key.clone(),
+                why,
+                cd: self.sends_cd(lookup.relay_cd),
+                follows: lookup.follows,
+            };
+            self.cache.insert(self.now, offer);
         }
         self.finish(id, Found::fresh(Outcome::Failure(why)));
+    }
+
+    /// Whether a lookup's queries set CD. RFC 6840 §5.9: a validating
+    /// resolver sets it, so it gets the data even where the server would
+    /// find it bogus, and judges it itself. A forwarder that does not
+    /// validate sets it as the client did, `relay_cd` (RFC 4035 §3.2.2).
+    fn sends_cd(&self, relay_cd: bool) -> bool {
+        self.config.anchors.is_some() || relay_cd
     }
 
     /// Why a question of `tree` failed when the work bound stopped it
@@ -1702,11 +1729,7 @@ impl<V: Verify> Resolver<V> {
         let question = Query::query(name, question.query_type());
         let mut message = Message::new(message_id, MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = forwarded;
-        // RFC 6840 §5.9: a validating resolver sets CD, so it gets the
-        // data even where the server would find it bogus, and judges it
-        // itself. A forwarder that does not validate sets it as the
-        // client did (RFC 4035 §3.2.2).
-        message.metadata.checking_disabled = self.config.anchors.is_some() || relay_cd;
+        message.metadata.checking_disabled = self.sends_cd(relay_cd);
         message.add_query(question.clone());
         let priming = question.name().is_root() && question.query_type() == RecordType::NS;
         let payload = if priming {
@@ -1981,7 +2004,6 @@ impl<V: Verify> Resolver<V> {
         }
 
         let zone = Name::from(&exchange.zone);
-        let inside = |name: &Name| zone.zone_of(name);
         let sname = exchange.question.name().to_lowercase();
         let stype = exchange.question.query_type();
         let authoritative = message.metadata.authoritative || exchange.forwarded;
@@ -1991,26 +2013,39 @@ impl<V: Verify> Resolver<V> {
             RecordType::RRSIG => signatures(&message.answers),
             _ => rrsets(&message.answers),
         };
-        let answers: Vec<RecordSet> = answers
-            .iter()
-            .filter(|set| inside(set.name()))
-            .map(normalized)
-            .collect();
         let authority = rrsets(&message.authorities);
         // A forwarder answers the whole question (RFC 1034 §4.3.1), so
-        // its negative answer carries the SOA of the zone that holds the
-        // name, and that zone's denial records, even when its apex lies
-        // above the forward zone (RFC 2308 §2.1). Such an authority
-        // section is bounded by that zone.
-        let bound = authority
+        // its reply carries what the zone that holds the name sends with
+        // the answer, even when that zone's apex lies above the forward
+        // zone: the SOA and denial records of a negative (RFC 2308 §2.1),
+        // the denial records that show a wildcard had no closer match
+        // (RFC 4035 §3.1.3.3), and the DNAME a CNAME was synthesized from
+        // (RFC 6672 §3.1). Such a reply is bounded by that zone, which
+        // the SOA's owner, the signer of the answer, or the DNAME's owner
+        // shows.
+        let bound = if exchange.forwarded {
+            let soa = authority
+                .iter()
+                .filter(|set| set.record_type() == RecordType::SOA)
+                .map(|set| set.name().to_lowercase());
+            let signers = answers.iter().filter_map(signer);
+            let dname = answers
+                .iter()
+                .filter(|set| is_dname(set))
+                .map(|set| set.name().to_lowercase());
+            soa.chain(signers)
+                .chain(dname)
+                .filter(|apex| apex.zone_of(&sname) && apex.zone_of(&zone))
+                .min_by_key(Name::num_labels)
+                .unwrap_or_else(|| zone.clone())
+        } else {
+            zone.clone()
+        };
+        let answers: Vec<RecordSet> = answers
             .iter()
-            .filter(|_| exchange.forwarded)
-            .find(|set| {
-                set.record_type() == RecordType::SOA
-                    && set.name().zone_of(&sname)
-                    && set.name().zone_of(&zone)
-            })
-            .map_or_else(|| zone.clone(), |soa| soa.name().to_lowercase());
+            .filter(|set| bound.zone_of(set.name()))
+            .map(normalized)
+            .collect();
         let authority: Vec<RecordSet> = authority
             .iter()
             .filter(|set| bound.zone_of(set.name()))

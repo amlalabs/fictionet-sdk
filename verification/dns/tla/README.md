@@ -411,7 +411,7 @@ Resolution:
 | `cache[<<n, t>>]` | `Cache`, keyed by `(LowerName, RecordType, DNSClass)` |
 | entry `t` = `"a"` or `"cname"` | `Entry::Positive { set, rank, expires, validation }` |
 | entry `t` = `"nx"` or `"nodata"` | `Entry::Negative { kind: Negative::NxDomain` or `NoData, .. }` |
-| entry `t` = `"fail"` | `Entry::Failure { why: FailureKind, until, lasts }`, kept for `Config::failure_ttl`; Rust keeps a failure that persists longer |
+| entry `t` = `"fail"` | `Entry::Failure { why: FailureKind, cd, until, lasts }`, kept for `Config::failure_ttl`; Rust keeps a failure that persists longer. The model has no CD bit: `cd` says whether the failed queries set it, for a forwarder that relays a client's CD |
 | entry `rank` | `Rank::AuthAnswer` and `Rank::Glue` (two of the five ranks) |
 | entry `readAt + ttl` | `expires: Instant` |
 | entry `tried` of a failure | not stored: the model keeps what the failed resolution tried, since Rust writes `Entry::Failure` only after trying every address of the zone (RFC 9520 section 3.1) |

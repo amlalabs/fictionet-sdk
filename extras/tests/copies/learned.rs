@@ -1020,7 +1020,17 @@ fn through(
     local: SocketAddr,
     request: &Request,
 ) -> (Message, Vec<Lookup>) {
-    let server = ServerConfig::generic();
+    through_as(authority, &ServerConfig::generic(), real, local, request)
+}
+
+/// [`through`], with `server` as the front of `authority`.
+fn through_as(
+    authority: &dyn Authority,
+    server: &ServerConfig,
+    real: Real<'_>,
+    local: SocketAddr,
+    request: &Request,
+) -> (Message, Vec<Lookup>) {
     let client = Client {
         peer: "198.51.100.7:5353".parse().unwrap(),
         local,
@@ -1030,7 +1040,7 @@ fn through(
     };
     let mut looked = Vec::new();
     loop {
-        match authority.respond(request, local, &server, &client) {
+        match authority.respond(request, local, server, &client) {
             Step::Reply(response) => return (response.message, looked),
             Step::Need(lookup) => {
                 assert!(
@@ -2237,6 +2247,11 @@ fn mixed_servers(signing: usize) -> Vec<(SocketAddr, Zones)> {
 
 /// What `zones`, a real server at `local`, reply to `request`.
 fn real_at(zones: &Zones, local: SocketAddr, request: &Request) -> Message {
+    real_as(zones, &ServerConfig::generic(), local, request)
+}
+
+/// [`real_at`], with `server` as the real server's front.
+fn real_as(zones: &Zones, server: &ServerConfig, local: SocketAddr, request: &Request) -> Message {
     let client = Client {
         peer: "198.51.100.7:5353".parse().unwrap(),
         local,
@@ -2244,7 +2259,7 @@ fn real_at(zones: &Zones, local: SocketAddr, request: &Request) -> Message {
         connection: None,
         sandbox: None,
     };
-    match zones.respond(request, local, &ServerConfig::generic(), &client) {
+    match zones.respond(request, local, server, &client) {
         Step::Reply(response) => response.message,
         step => panic!("the real server gave {step:?}"),
     }
@@ -2603,6 +2618,182 @@ fn any_without_do_at_a_signed_copy_gets_its_servers_hinfo() {
             first_difference(&servers, &asked),
             None,
             "signing {signing}"
+        );
+    }
+}
+
+/// What `zones`, a real server with `server` as its front, reply to
+/// `lookup`'s question, asked with DO.
+fn real_lookup(zones: &Zones, server: &ServerConfig, lookup: &Lookup) -> Message {
+    let asked = request(
+        &lookup.question.name().to_ascii(),
+        lookup.question.query_type(),
+        true,
+    );
+    real_as(
+        zones,
+        server,
+        SocketAddr::new(lookup.server.ip(), 53),
+        &asked,
+    )
+}
+
+/// A placed server sends every RRset its copies hold for ANY
+/// ([`AnyResponse::All`]), and the copies hold the real server's answer
+/// to ANY with DO. A client without DO gets that answer without its
+/// RRSIGs, as from a real server that answers ANY with one RRset and
+/// sends no DNSSEC records without DO (RFC 4035 §3.1, RFC 8482 §4.1).
+#[test]
+fn any_without_do_at_a_placed_copy_gets_no_rrsigs() {
+    let one = ServerConfig {
+        any: AnyResponse::OneRrset(RecordType::SOA),
+        ..ServerConfig::generic()
+    };
+    let placed = ServerConfig {
+        any: AnyResponse::All,
+        ede: false,
+        ..ServerConfig::generic()
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    for signing in [1, 2] {
+        let real = Zones::new(vec![mixed_zone(EXAMPLE, signing)]);
+        let answer = |lookup: &Lookup| real_lookup(&real, &one, lookup);
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("example."));
+        for dnssec_ok in [true, false, true] {
+            let asked = request("example.", RecordType::ANY, dnssec_ok);
+            let (got, _) = through_as(&copies, &placed, &answer, local, &asked);
+            let want = real_as(&real, &one, local, &asked);
+            assert_eq!(
+                shape(&got),
+                shape(&want),
+                "signing {signing}, DO {dnssec_ok}"
+            );
+            let signed = got
+                .answers
+                .iter()
+                .any(|record| record.record_type() == RecordType::RRSIG);
+            assert_eq!(signed, dnssec_ok, "signing {signing}");
+        }
+    }
+}
+
+/// A zone the real server at `example`'s address also serves, which no
+/// referral names for that address.
+const OTHER: &str = "\
+other. 3600 IN SOA ns.example. hostmaster.example. 1 7200 3600 1209600 300
+other. 3600 IN NS ns.example.
+www.other. 300 IN A 192.0.2.81
+";
+
+/// A real server serves zones that no referral named it for, such as
+/// a sibling of the zone a world noted it serves. Its copy answers for
+/// them as it does, from the lookups it makes there: a name in none of
+/// the zones the address knows is looked up, and a CNAME into such a
+/// zone goes on there, as its real server's answer does (RFC 1034
+/// §4.3.2 step 3a). A name its real server does not serve is refused,
+/// as the real server refuses it.
+#[test]
+fn an_address_answers_for_a_zone_no_referral_named() {
+    let example = format!("{EXAMPLE}cross.example. 300 IN CNAME www.other.\n");
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    for signing in 0..3 {
+        let servers = [(
+            local,
+            Zones::new(vec![
+                mixed_zone(&example, signing),
+                mixed_zone(OTHER, signing),
+            ]),
+        )];
+        let asked = [
+            (local, "www.other.", RecordType::A, true),
+            (local, "www.other.", RecordType::A, false),
+            (local, "nx.other.", RecordType::A, true),
+            (local, "www.elsewhere.test.", RecordType::A, false),
+        ];
+        assert_eq!(
+            first_difference(&servers, &asked),
+            None,
+            "signing {signing}"
+        );
+        for dnssec_ok in [true, false] {
+            let asked = [(local, "cross.example.", RecordType::A, dnssec_ok)];
+            assert_eq!(
+                first_difference(&servers, &asked),
+                None,
+                "signing {signing}, DO {dnssec_ok}"
+            );
+        }
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("example."));
+        let answer = |lookup: &Lookup| reply_of(&servers[0].1, lookup);
+        let (got, _) = through(
+            &copies,
+            &answer,
+            local,
+            &request("cross.example.", RecordType::A, false),
+        );
+        let answers: Vec<(String, RecordType)> = got
+            .answers
+            .iter()
+            .map(|record| (record.name.to_string(), record.record_type()))
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                ("cross.example.".to_string(), RecordType::CNAME),
+                ("www.other.".to_string(), RecordType::A),
+            ],
+            "signing {signing}"
+        );
+        let (got, _) = through(
+            &copies,
+            &answer,
+            local,
+            &request("www.elsewhere.test.", RecordType::A, false),
+        );
+        assert_eq!(got.metadata.response_code, ResponseCode::Refused);
+    }
+}
+
+/// Some servers set AA on a referral. The copy files it as the referral
+/// it is, and refers the question as the real server did, never silent.
+#[test]
+fn a_referral_with_aa_set_is_answered_as_a_referral() {
+    let real = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>
+    ]);
+    let answer = |lookup: &Lookup| {
+        let mut message = reply_of(&real, lookup);
+        let referral = message.metadata.response_code == ResponseCode::NoError
+            && message.answers.is_empty()
+            && message
+                .authorities
+                .iter()
+                .all(|record| record.record_type() == RecordType::NS);
+        if referral {
+            message.metadata.authoritative = true;
+        }
+        message
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    for round in 0..2 {
+        let asked = request("www.child.example.", RecordType::A, false);
+        let got = answer_through(&copies, &answer, local, &asked).unwrap();
+        let want = reply_of(&real, &own(local, &asked));
+        assert_eq!(shape(&got), shape(&want), "round {round}");
+        assert!(!got.metadata.authoritative);
+        assert_eq!(
+            shape(&got).2[1],
+            ["child.example. 3600 NS ns.child.example."],
+            "round {round}"
+        );
+        assert_eq!(
+            shape(&got).2[2],
+            ["ns.child.example. 3600 A 192.0.2.54"],
+            "round {round}"
         );
     }
 }

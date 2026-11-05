@@ -2666,6 +2666,7 @@ fn offer(cache: &mut Cache, offer: &Value, now: Instant, limits: Limits) {
             Offer::Failure {
                 key,
                 why: failure_kind(field(offer, "why")),
+                cd: false,
                 follows,
             },
         );

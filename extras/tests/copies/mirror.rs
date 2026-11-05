@@ -15,7 +15,7 @@ use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, OpCode, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::TXT;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
-use fictionet::stdlib::protocols::dns::{Nsid, Parsed, Request, Response};
+use fictionet::stdlib::protocols::dns::{Ede, Nsid, Parsed, Request, Response};
 use fictionet::stdlib::services::dns::authority::{Identity, Observe, ServerConfig};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, Zone, ZoneData, answer};
@@ -767,6 +767,64 @@ fn a_mirrored_name_server_refuses_zone_transfers() {
         let reply = Message::from_vec(&replies[0]).unwrap();
         assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
         assert!(hierarchy.asked_for("direct.", RecordType::AXFR).is_empty());
+        Ok(())
+    });
+}
+
+/// A placed server refuses what its real server refuses, a name in none
+/// of its zones, and asks the real server first. Like the real server, it
+/// sends no Extended DNS Error with REFUSED, nor with any other reply:
+/// real servers differ in the ones they send, and the optional option
+/// would set every placed server apart (RFC 8914 §3).
+#[test]
+fn a_placed_server_refuses_as_its_real_server_did_without_an_ede() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let hierarchy = Hierarchy::new();
+        let at = place();
+        let (attacher, attachments) = fictionet::attachments();
+        let net = Net::new().ipv4_only();
+        let mirror = mirror(hierarchy.clone(), net.handle());
+        net.hosts(at.root_servers(|s| mirror.server(s)))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("client")?, ME);
+        let ns = v4(45, 33, 5, 53);
+        ask(
+            &fcx,
+            &m,
+            ROOT_SERVERS[0].v4,
+            &query(1, "www.direct.", RecordType::A, false),
+        )
+        .await
+        .expect("a referral that places the server");
+
+        let has_ede = |reply: &Message| {
+            reply
+                .edns
+                .iter()
+                .flat_map(|edns| edns.options().as_ref().iter())
+                .any(|(_, option)| Ede::from_option(option).is_some())
+        };
+        for (id, name) in [(2, "org."), (3, "www.example.")] {
+            let reply = ask(&fcx, &m, ns, &query(id, name, RecordType::SOA, false))
+                .await
+                .expect("an answer from the placed server");
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::Refused,
+                "{name}"
+            );
+            assert!(!has_ede(&reply), "{name}: {reply:?}");
+            assert_eq!(
+                hierarchy.asked_for(name, RecordType::SOA),
+                vec![ns],
+                "{name}: the real server is asked"
+            );
+        }
+        let reply = ask(&fcx, &m, ns, &chaos(4, "hostname.bind."))
+            .await
+            .expect("an answer from the placed server");
+        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        assert!(!has_ede(&reply), "{reply:?}");
         Ok(())
     });
 }

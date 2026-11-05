@@ -128,6 +128,9 @@ pub enum Entry {
     Failure {
         /// Why.
         why: FailureKind,
+        /// Whether the queries that failed had CD set, as in
+        /// [`Offer::Failure`].
+        cd: bool,
         /// When it stops being served.
         until: Instant,
         /// How long it is served: [`Limits::failure_ttl`], or twice as
@@ -197,6 +200,11 @@ pub enum Offer {
         key: Key,
         /// Why.
         why: FailureKind,
+        /// Whether the queries that failed had CD set. A server that
+        /// validates may fail a query without CD that it answers with CD
+        /// (RFC 4035 §3.2.2), so its error replies to queries without CD
+        /// say nothing of the same question with CD.
+        cd: bool,
         /// How long the failure before it lasted, when the resolution
         /// began while that one persisted ([`Cache::persisting`]).
         follows: Option<Duration>,
@@ -957,14 +965,25 @@ impl Cache {
                 };
                 Some((key, entry))
             }
-            Offer::Failure { key, why, follows } => {
+            Offer::Failure {
+                key,
+                why,
+                cd,
+                follows,
+            } => {
                 let first = self.limits.failure_ttl;
                 let lasts = match follows {
                     Some(lasts) => (lasts * 2).min(MAX_FAILURE_TTL.max(first)),
                     None => first,
                 };
                 let until = now + lasts;
-                Some((key, Entry::Failure { why, until, lasts }))
+                let entry = Entry::Failure {
+                    why,
+                    cd,
+                    until,
+                    lasts,
+                };
+                Some((key, entry))
             }
         }
     }
