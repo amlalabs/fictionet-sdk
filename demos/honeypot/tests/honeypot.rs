@@ -15,6 +15,7 @@ use fictionet::stdlib::protocols::mptcp::{
     self, Capable, Dss, Join, Keys, Mapping, MptcpOption, Sequence, algorithm, join_hmac, reason,
     token,
 };
+use fictionet::stdlib::protocols::ssh;
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet};
 use honeypot_world::config::{Burst, DEFAULT_ADDRESS};
 use honeypot_world::observe::Sinks;
@@ -433,6 +434,10 @@ fn http_answers_as_nginx() {
         let reply = String::from_utf8(reply).unwrap();
         assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
         assert!(reply.contains("Server: nginx/1.24.0 (Ubuntu)\r\n"));
+        assert!(reply.contains("Connection: keep-alive\r\n"));
+        assert!(reply.contains("Last-Modified: Fri, 15 Jan 2027 08:00:00 GMT\r\n"));
+        assert!(reply.contains(&format!("ETag: \"{EPOCH:x}-267\"\r\n")));
+        assert!(reply.contains("Accept-Ranges: bytes\r\n"));
         assert!(
             reply.contains("Date: Fri, 15 Jan 2027 08:00:00 GMT\r\n"),
             "{reply}"
@@ -445,6 +450,273 @@ fn http_answers_as_nginx() {
         let reply = exchange(&mut net, client(7, 46001), 80, &pieces).await;
         let reply = String::from_utf8(reply).unwrap();
         assert!(reply.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{reply}");
+        Ok(())
+    });
+}
+
+struct Client {
+    from: SocketAddr,
+    to: SocketAddr,
+    seq: u32,
+    ack: u32,
+    pending: Vec<u8>,
+}
+
+impl Client {
+    async fn open(net: &mut Internet, port: u16) -> Self {
+        let from = client(1, 41000);
+        let to = server(port);
+        net.send(segment(from, to, 1000, 0, SYN, &with_mss(&[]), b""));
+        let reply = net.recv().await.expect("SYN-ACK");
+        assert_eq!(flags(&reply), SYN | ACK);
+        let client = Self {
+            from,
+            to,
+            seq: 1001,
+            ack: seq_of(&reply).wrapping_add(1),
+            pending: Vec::new(),
+        };
+        net.send(segment(from, to, client.seq, client.ack, ACK, &[], b""));
+        client
+    }
+
+    fn send(&mut self, net: &mut Internet, data: &[u8]) {
+        net.send(segment(
+            self.from,
+            self.to,
+            self.seq,
+            self.ack,
+            PSH | ACK,
+            &[],
+            data,
+        ));
+        self.seq = self.seq.wrapping_add(data.len() as u32);
+    }
+
+    async fn receive(&mut self, net: &mut Internet) -> Packet {
+        loop {
+            let packet = net.recv().await.expect("a server packet");
+            assert_eq!(flags(&packet) & RST, 0, "the server must not reset");
+            if !payload_of(&packet).is_empty() || flags(&packet) & 1 != 0 {
+                assert_eq!(seq_of(&packet), self.ack);
+                self.pending.extend_from_slice(payload_of(&packet));
+                self.ack = self
+                    .ack
+                    .wrapping_add(payload_of(&packet).len() as u32)
+                    .wrapping_add(u32::from(flags(&packet) & 1 != 0));
+                net.send(segment(
+                    self.from,
+                    self.to,
+                    self.seq,
+                    self.ack,
+                    ACK,
+                    &[],
+                    b"",
+                ));
+                return packet;
+            }
+        }
+    }
+
+    async fn response(&mut self, net: &mut Internet, head_only: bool) -> Vec<u8> {
+        loop {
+            if let Some(end) = self.pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&self.pending[..end]).unwrap();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let end = end + 4 + if head_only { 0 } else { length };
+                if self.pending.len() >= end {
+                    return self.pending.drain(..end).collect();
+                }
+            }
+            let packet = self.receive(net).await;
+            assert_eq!(flags(&packet) & 1, 0, "a response precedes the close");
+        }
+    }
+}
+
+#[test]
+fn http_reuses_connections_and_consumes_request_bodies() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        client.send(
+            &mut net,
+            b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n",
+        );
+        client.send(&mut net, b"bodyGET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        for _ in 0..2 {
+            let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(response.contains("Connection: keep-alive\r\n"));
+            assert!(response.ends_with("</html>\n"));
+        }
+        client.send(&mut net, b"GET /missing HTTP/1.1\r\nHost: x\r\n\r\n");
+        let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(response.contains("Content-Length: 162\r\n"));
+        assert!(response.contains("Connection: keep-alive\r\n"));
+        assert!(!response.contains("Last-Modified:"));
+        assert!(!response.contains("ETag:"));
+        assert!(!response.contains("Accept-Ranges:"));
+        assert!(response.ends_with("</html>\r\n"));
+        client.send(
+            &mut net,
+            b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        let response = String::from_utf8(client.response(&mut net, true).await).unwrap();
+        assert!(response.contains("Connection: close\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+        let fin = client.receive(&mut net).await;
+        assert_eq!(flags(&fin) & 1, 1);
+        assert!(client.pending.is_empty());
+        Ok(())
+    });
+}
+
+#[test]
+fn http_closes_after_one_thousand_requests() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        for request in 1..=1000 {
+            client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+            let expected = if request == 1000 {
+                "close"
+            } else {
+                "keep-alive"
+            };
+            assert!(response.contains(&format!("Connection: {expected}\r\n")));
+        }
+        let fin = client.receive(&mut net).await;
+        assert_eq!(flags(&fin) & 1, 1);
+        Ok(())
+    });
+}
+
+#[test]
+fn http_idle_timeout_is_sixty_five_seconds() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        client.response(&mut net, false).await;
+        let answered = net.fcx.now();
+        net.fcx.sleep(Duration::from_secs(64)).await?;
+        let fin = net
+            .fcx
+            .race(
+                Some(answered + Duration::from_secs(66)),
+                net.end.recv(&net.fcx),
+            )
+            .await??;
+        assert_eq!(flags(&fin) & 1, 1);
+        assert_eq!(net.fcx.now(), answered + Duration::from_secs(65));
+        Ok(())
+    });
+}
+
+#[test]
+fn http_next_request_gets_a_header_deadline_after_idle() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        client.response(&mut net, false).await;
+        net.fcx.sleep(Duration::from_secs(64)).await?;
+        client.send(&mut net, b"G");
+        net.fcx.sleep(Duration::from_secs(59)).await?;
+        client.send(&mut net, b"ET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Connection: keep-alive\r\n"));
+        assert!(response.contains("Last-Modified: Fri, 15 Jan 2027 08:00:00 GMT\r\n"));
+        Ok(())
+    });
+}
+
+#[test]
+fn http_chunked_body_does_not_become_the_next_request() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\nGET / HTTP/1.0\r\n\r\n");
+        let first = String::from_utf8(client.response(&mut net, false).await).unwrap();
+        assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(first.contains("Connection: keep-alive\r\n"));
+        let second = String::from_utf8(client.response(&mut net, false).await).unwrap();
+        assert!(second.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(second.contains("Connection: close\r\n"));
+        Ok(())
+    });
+}
+
+#[test]
+fn service_backlogs_start_cookies_at_their_own_limits() {
+    honeypot(Config::default(), |mut net| async move {
+        for (port, backlog) in [(22, 128), (80, 511)] {
+            for n in 0..=backlog {
+                let from = client(1, 42000 + n);
+                net.send(segment(
+                    from,
+                    server(port),
+                    1000,
+                    0,
+                    SYN,
+                    &with_mss(&[3, 3, 7, 4, 2]),
+                    b"",
+                ));
+                let reply = net.recv().await.expect("a SYN-ACK");
+                assert_eq!(dst_of(&reply), from);
+                let stateful = tcp::options(tcp_of(&reply))
+                    .unwrap()
+                    .iter()
+                    .any(|option| matches!(option, TcpOption::WindowScale(_)));
+                assert_eq!(stateful, n < backlog, "port {port}, pending {n}");
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn ssh_waits_for_a_complete_version_before_key_exchange() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 22).await;
+        client.receive(&mut net).await;
+        assert_eq!(client.pending, SSH_BANNER);
+        client.pending.clear();
+        client.send(&mut net, b"SSH-2.0-OpenSSH_9.6p1\r");
+        for packet in net.drain().await {
+            assert!(payload_of(&packet).is_empty());
+        }
+        client.send(&mut net, b"\n");
+        loop {
+            client.receive(&mut net).await;
+            if client.pending.len() >= 4 {
+                let length = u32::from_be_bytes(client.pending[..4].try_into().unwrap()) as usize;
+                if client.pending.len() >= length + 4 {
+                    let packet = ssh::Packet::parse(&client.pending).unwrap();
+                    let ssh::Message::KexInit(proposal) =
+                        ssh::Message::parse(&packet.payload).unwrap()
+                    else {
+                        panic!("SSH key exchange proposal");
+                    };
+                    assert!(!proposal.kex_algorithms.is_empty());
+                    assert!(!proposal.server_host_key_algorithms.is_empty());
+                    assert_eq!(
+                        proposal.encryption_client_to_server,
+                        proposal.encryption_server_to_client
+                    );
+                    assert_eq!(proposal.mac_client_to_server, proposal.mac_server_to_client);
+                    assert!(!proposal.first_kex_packet_follows);
+                    assert_eq!(proposal.reserved, 0);
+                    assert_ne!(proposal.cookie, [0; 16]);
+                    assert_eq!(packet.padding, [0; 7]);
+                    break;
+                }
+            }
+        }
         Ok(())
     });
 }
@@ -1291,8 +1563,8 @@ fn dst_of(p: &Packet) -> SocketAddr {
 /// Spoofed SYNs that fill the backlog do not shut the real attacker out:
 /// past the backlog the server answers with SYN cookies, as Linux does, so
 /// a handshake that finishes still opens, with MPTCP, and is logged. Each
-/// spoofed attempt gets six SYN-ACKs, as from Linux, and is dropped
-/// without a RST.
+/// retained attempt gets six SYN-ACKs, while cookies are not retransmitted.
+/// Both expire without a RST.
 #[test]
 fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
     honeypot(Config::default(), |mut net| async move {
@@ -1383,9 +1655,9 @@ fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
             seen.push(p?);
         }
         assert!(seen.iter().all(|p| flags(p) & RST == 0), "no RST");
-        for n in [0, 4095] {
+        for (n, expected) in [(0, 6), (127, 6), (128, 1), (4095, 1)] {
             let syn_acks = seen.iter().filter(|p| dst_of(p) == spoofed(n)).count();
-            assert_eq!(syn_acks, 6, "SYN-ACKs to spoofed source {n}");
+            assert_eq!(syn_acks, expected, "SYN-ACKs to spoofed source {n}");
         }
         let logged = net
             .events("segment")

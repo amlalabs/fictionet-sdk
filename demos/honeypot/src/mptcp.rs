@@ -920,6 +920,10 @@ impl<S: PortServer> PortServer for Listener<S> {
         self.inner.alpn()
     }
 
+    fn backlog(&self) -> Option<usize> {
+        self.inner.backlog()
+    }
+
     fn answer(&self) -> Option<Box<dyn Answer>> {
         Some(Box::new(Answers {
             tokens: self.tokens.clone(),
