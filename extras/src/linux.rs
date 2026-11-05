@@ -14,6 +14,8 @@
 //! [challenge ACKs](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_input.c),
 //! and [MPTCP options](https://github.com/torvalds/linux/blob/v6.8/net/mptcp/options.c).
 
+pub mod mptcp;
+
 use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Reply, Ipv4Timestamp};
 use fictionet::stdlib::network::tcp::{
     self, CookieInput, CookieReply, CookieState, SynCookies, TcpOption,
@@ -90,30 +92,11 @@ impl<F: Fn() -> u32 + Send + Sync> tcp::Answer for Ipv4Answers<F> {
     }
 
     fn ipv4_options(&self, syn: &tcp::Syn<'_>) -> Option<Ipv4Reply> {
-        let (IpAddr::V4(local), IpAddr::V4(remote)) = (syn.to.ip(), syn.from.ip()) else {
-            return Some(Ipv4Reply::default());
-        };
-        ipv4_options(
-            syn.ipv4_options,
-            local,
-            remote,
-            (self.timestamp)(),
-            |address| {
-                address != local
-                    && !address.is_unspecified()
-                    && !address.is_loopback()
-                    && !address.is_multicast()
-                    && !address.is_broadcast()
-            },
-        )
+        syn_ipv4_options(syn, (self.timestamp)())
     }
 
     fn retransmit_ipv4_options(&self, handshake: &tcp::Handshake) -> Option<Vec<Ipv4Option>> {
-        retransmit_ipv4_options(
-            handshake.syn_ipv4.as_deref()?,
-            handshake.syn_ack_ipv4.as_deref()?,
-            (self.timestamp)(),
-        )
+        handshake_ipv4_options(handshake, (self.timestamp)())
     }
 
     fn cookie(&self, from: std::net::SocketAddr, handshake: &tcp::Handshake) -> Option<tcp::Kept> {
@@ -129,6 +112,28 @@ impl<F: Fn() -> u32 + Send + Sync> tcp::Answer for Ipv4Answers<F> {
     fn segments(&self, handshake: &tcp::Handshake) -> Option<Box<dyn tcp::Segments>> {
         self.inner.as_ref()?.segments(handshake)
     }
+}
+
+// Both plain TCP and MPTCP use the same address classification and clock input.
+fn syn_ipv4_options(syn: &tcp::Syn<'_>, timestamp: u32) -> Option<Ipv4Reply> {
+    let (IpAddr::V4(local), IpAddr::V4(remote)) = (syn.to.ip(), syn.from.ip()) else {
+        return Some(Ipv4Reply::default());
+    };
+    ipv4_options(syn.ipv4_options, local, remote, timestamp, |address| {
+        address != local
+            && !address.is_unspecified()
+            && !address.is_loopback()
+            && !address.is_multicast()
+            && !address.is_broadcast()
+    })
+}
+
+fn handshake_ipv4_options(handshake: &tcp::Handshake, timestamp: u32) -> Option<Vec<Ipv4Option>> {
+    retransmit_ipv4_options(
+        handshake.syn_ipv4.as_deref()?,
+        handshake.syn_ack_ipv4.as_deref()?,
+        timestamp,
+    )
 }
 
 /// IPv4 reply options following Linux receive compilation, option echo and build.

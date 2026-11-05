@@ -718,15 +718,16 @@ pub struct Listener<S> {
     port: u16,
     joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
-    clock: crate::Clock,
+    timestamp: Arc<dyn Fn() -> u32 + Send + Sync>,
 }
 
 impl<S> Listener<S> {
     /// `inner` on `port` behind an MPTCP listener whose keys come from
-    /// `fcx`.
+    /// `fcx`. `timestamp` supplies IPv4 option timestamps in milliseconds
+    /// since midnight UTC.
     pub fn new(
         fcx: &Cx,
-        clock: crate::Clock,
+        timestamp: impl Fn() -> u32 + Send + Sync + 'static,
         tokens: Arc<Tokens>,
         port: u16,
         inner: S,
@@ -737,7 +738,7 @@ impl<S> Listener<S> {
             port,
             joins: Arc::new(Mutex::new(JoinCookies::new(fcx.random_u64()))),
             fcx: fcx.clone(),
-            clock,
+            timestamp: Arc::new(timestamp),
         }
     }
 }
@@ -748,31 +749,7 @@ struct Answers {
     port: u16,
     joins: Arc<Mutex<JoinCookies>>,
     fcx: Cx,
-    clock: crate::Clock,
-}
-
-impl Answers {
-    fn echo(&self, syn: &Syn<'_>) -> Option<fictionet::stdlib::network::ip::Ipv4Reply> {
-        let (std::net::IpAddr::V4(local), std::net::IpAddr::V4(remote)) =
-            (syn.to.ip(), syn.from.ip())
-        else {
-            return Some(Default::default());
-        };
-        let timestamp = ((self.clock.micros(self.fcx.now()) / 1000) % 86_400_000) as u32;
-        fictionet_extras::linux::ipv4_options(
-            syn.ipv4_options,
-            local,
-            remote,
-            timestamp,
-            |address| {
-                address != local
-                    && !address.is_unspecified()
-                    && !address.is_loopback()
-                    && !address.is_multicast()
-                    && !address.is_broadcast()
-            },
-        )
-    }
+    timestamp: Arc<dyn Fn() -> u32 + Send + Sync>,
 }
 
 impl Answer for Answers {
@@ -798,18 +775,14 @@ impl Answer for Answers {
     }
 
     fn ipv4_options(&self, syn: &Syn<'_>) -> Option<fictionet::stdlib::network::ip::Ipv4Reply> {
-        self.echo(syn)
+        super::syn_ipv4_options(syn, (self.timestamp)())
     }
 
     fn retransmit_ipv4_options(
         &self,
         handshake: &Handshake,
     ) -> Option<Vec<fictionet::stdlib::network::ip::Ipv4Option>> {
-        fictionet_extras::linux::retransmit_ipv4_options(
-            handshake.syn_ipv4.as_deref()?,
-            handshake.syn_ack_ipv4.as_deref()?,
-            ((self.clock.micros(self.fcx.now()) / 1000) % 86_400_000) as u32,
-        )
+        super::handshake_ipv4_options(handshake, (self.timestamp)())
     }
 
     fn cookie(&self, from: SocketAddr, handshake: &Handshake) -> Option<Kept> {
@@ -841,7 +814,7 @@ impl Answer for Answers {
                         n.checksums,
                         n.first,
                     )
-                    .ack_width(fictionet_extras::linux::mptcp_ack_width()),
+                    .ack_width(super::mptcp_ack_width()),
                 ),
             ),
             Completion::Join(Some(join)) => (self.tokens.keys(join.token)?.local, None),
@@ -941,7 +914,7 @@ impl<S: PortServer> PortServer for Listener<S> {
             port: self.port,
             joins: self.joins.clone(),
             fcx: self.fcx.clone(),
-            clock: self.clock,
+            timestamp: self.timestamp.clone(),
         }))
     }
 }

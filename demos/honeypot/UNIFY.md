@@ -36,3 +36,19 @@ callbacks and wakes through eventfd; the CLI multiplexes nonblocking file
 descriptors and relay messages. A single polling pump would add adapters
 and change readiness, flush and shutdown semantics. Their bounded queues
 are real device/transport contracts, not a reason to merge those loops.
+
+## Linux behavior and protocol evidence
+
+The reusable MPTCP listener now lives at `fictionet_extras::linux::mptcp`.
+Its timestamp input is a callback in milliseconds since midnight UTC;
+it no longer depends on the demo's wall-clock type. Plain TCP and MPTCP
+share the IPv4 SYN-reply address classification and retransmission policy
+inside `linux`. JOIN cookies still retain the IPv4 options selected for
+the SYN-ACK. Simply wrapping the listener and deleting its internal hook
+would have lost those retained options, so that approach was rejected.
+
+Generic MPTCP codecs and `DataLevel` stay in core. Linux option acceptance,
+last-option preference, JOIN limits, cookie slots and reset reasons stay
+in extras. This listener still delivers application data through its
+primary connection and drains joined subflows; moving it does not turn it
+into a complete multipath application endpoint.

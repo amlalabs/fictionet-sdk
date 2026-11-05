@@ -79,7 +79,7 @@ use serde::{Serialize, Serializer};
 
 use crate::Clock;
 use crate::config::Burst;
-use crate::mptcp::Tokens;
+use fictionet_extras::linux::mptcp::Tokens;
 
 const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;

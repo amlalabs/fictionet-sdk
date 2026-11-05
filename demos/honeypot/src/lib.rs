@@ -52,7 +52,6 @@ use fictionet::time::Instant;
 use fictionet::{Attachment, Attachments, Cx, End, Interface};
 
 pub mod config;
-pub mod mptcp;
 pub mod observe;
 pub mod services;
 
@@ -62,7 +61,7 @@ pub mod raw;
 pub use raw::start_raw;
 
 pub use config::{Args, Config, HttpProfile, Port, Service};
-use mptcp::{Listener, Tokens};
+use fictionet_extras::linux::mptcp::{Listener, Tokens};
 use observe::{Direction, Observer, Sinks};
 
 /// The wall clock: the time the run's clock reads zero, so that run times
@@ -129,7 +128,7 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
                 port.number,
                 Listener::new(
                     fcx,
-                    clock,
+                    timestamp,
                     tokens.clone(),
                     port.number,
                     services::Http {
