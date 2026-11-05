@@ -2,7 +2,8 @@
 
 use crate::{Result, honeypot_probe::Selection};
 use fictionet::relay::{self, Hello, Message, unix};
-use fictionet::stdlib::network::ethernet::frame::{self, Frame};
+use fictionet::stdlib::network::ethernet::host::{self, Host, Ipv4Config, Received};
+use fictionet::stdlib::network::ethernet::stream::Decoder;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -15,7 +16,6 @@ use std::time::{Duration, Instant};
 const IMAGE: &str = "noble-server-cloudimg-amd64.img";
 const SOURCE: &str = "https://cloud-images.ubuntu.com/noble/current";
 const SERVER_MAC: [u8; 6] = [0x52, 0x54, 0, 0x20, 0, 0x10];
-const CLIENT_MAC: [u8; 6] = [0x52, 0x54, 0, 0x20, 0, 0x11];
 
 #[derive(Clone, Copy)]
 pub enum Profile {
@@ -570,6 +570,21 @@ fn forward(
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let start = Instant::now();
+    let now = || fictionet::time::Instant::from_since_start(start.elapsed());
+    let mut host = Host::new(
+        host::Config {
+            mac: SERVER_MAC,
+            mtu: 1500,
+            ipv4: Some(Ipv4Config {
+                address: "198.51.100.10".parse()?,
+                gateway: "198.51.100.1".parse()?,
+            }),
+            ipv6: None,
+        },
+        now(),
+    )?;
+    let mut decoder = Decoder::new();
     let mut buffer = [0; 65536];
     loop {
         if probe.0.try_wait()?.is_some() {
@@ -577,6 +592,9 @@ fn forward(
         }
         if Instant::now() >= deadline {
             return Err("probe guest deadline expired".into());
+        }
+        while let Some(frame) = host.transmit(now()) {
+            send_frame(&mut stream, &frame)?;
         }
         let mut fds = [
             libc::pollfd {
@@ -599,50 +617,30 @@ fn forward(
             return Err("honeypot attachment disconnected".into());
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            let mut length = [0; 4];
-            if let Err(error) = stream.read_exact(&mut length) {
-                if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return finish(probe, Duration::from_secs(30));
-                }
-                return Err(error.into());
+            let n = stream.read(decoder.spare())?;
+            if n == 0 {
+                return finish(probe, Duration::from_secs(30));
             }
-            let length = u32::from_be_bytes(length) as usize;
-            if !(14..=buffer.len()).contains(&length) {
-                return Err("invalid QEMU frame length".into());
-            }
-            stream.read_exact(&mut buffer[..length])?;
-            let Some(frame) = Frame::parse(&buffer[..length]) else {
-                continue;
-            };
-            if frame.ethertype == frame::IPV4 {
-                unix::send(world, &Message::Packet(frame.payload).encode(), false)?;
-            } else if frame.ethertype == frame::ARP
-                && frame.payload.len() >= 28
-                && frame.payload[6..8] == [0, 1]
-                && frame.payload[24..28] == [198, 51, 100, 10]
+            decoder.filled(n);
+            while let Some(frame) = decoder
+                .next_frame()
+                .map_err(|_| "invalid QEMU frame length")?
             {
-                let mut arp = frame.payload[..28].to_vec();
-                arp[6..8].copy_from_slice(&2u16.to_be_bytes());
-                arp[18..24].copy_from_slice(&frame.payload[8..14]);
-                arp[24..28].copy_from_slice(&frame.payload[14..18]);
-                arp[8..14].copy_from_slice(&SERVER_MAC);
-                arp[14..18].copy_from_slice(&[198, 51, 100, 10]);
-                send_frame(
-                    &mut stream,
-                    &frame::frame(frame.src, SERVER_MAC, frame::ARP, &arp),
-                )?;
+                if let Received::World(packet) = host.receive(now(), frame) {
+                    unix::send(world, &Message::Packet(packet).encode(), false)?;
+                }
             }
         }
+
         if fds[1].revents & libc::POLLIN != 0 {
             let n = unix::recv(world, &mut buffer, false)?;
             if n == 0 {
                 return Err("honeypot attachment closed".into());
             }
-            if let Message::Packet(packet) = relay::decode(&buffer[..n])? {
-                send_frame(
-                    &mut stream,
-                    &frame::frame(CLIENT_MAC, SERVER_MAC, frame::IPV4, packet),
-                )?;
+            if let Message::Packet(packet) = relay::decode(&buffer[..n])?
+                && let Ok(frame) = host.send(now(), packet)
+            {
+                send_frame(&mut stream, &frame)?;
             }
         }
     }

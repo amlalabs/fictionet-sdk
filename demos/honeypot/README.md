@@ -289,7 +289,8 @@ to.
 `ethernet.jsonl` has one line per frame, both ways, before the world reads
 it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`,
 `lost`, how many lines the file could not take since the last one it did,
-and `rx_queue_dropped`, frames discarded by the pump's full receive queue
+`rx_queue_dropped`, frames discarded by the pump's full receive queue,
+and `tx_queue_dropped`, frames refused by the full transmit queue
 since the last accepted log record. Both counts survive a refused log write.
 `nic_rx_dropped` is null: the driver does not expose device or backend loss
 counters, so those losses cannot be inferred from the software queue count.

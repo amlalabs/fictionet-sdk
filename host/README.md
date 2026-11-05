@@ -92,7 +92,7 @@ and flush. From the host, it then checks:
   MP_CAPABLE handshake with timestamps;
 - a fragmented ping whose echo reply is too big for one frame, which the
   Ethernet adapter must drop and keep serving;
-- an HTTP request under a DSS mapping, which must get the whole nginx page
+- an HTTP request under a DSS mapping, which must get the whole Caddy page
   with valid TCP checksums, DSS mappings, Data ACKs, and timestamp echoes;
 - in the guest, the Ethernet log, and the honeypot's log lines for the
   MPTCP SYN, its answer, and DSS.
@@ -114,3 +114,6 @@ host's NIC settings to test this code.
 The driver follows the modern PCI transport and split virtqueue rules of
 the [virtio specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
 and the Linux [VFIO interface](https://www.kernel.org/doc/html/latest/driver-api/vfio.html).
+
+The same guest then runs the shipped `raw_honeypot` example and repeats
+neighbor discovery, IPv6 SSH and the complete MPTCP HTTP exchange.

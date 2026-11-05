@@ -113,6 +113,7 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     rawnic_world::honeypot(reopened).map_err(|error| io::Error::other(error.to_string()))?;
     println!("Guest device reset and reopen passed");
+    rawnic_world::example(address, mac).map_err(|error| io::Error::other(error.to_string()))?;
     println!("RAWNIC PASS");
     Ok(())
 }

@@ -3,7 +3,7 @@
 //! frames over QEMU's socket network.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, TcpStream};
 use std::time::Instant;
 
@@ -11,6 +11,7 @@ use fictionet::stdlib::network::ethernet::frame::{self, Frame, Mac};
 use fictionet::stdlib::network::ethernet::host::{
     DELAY_FIRST_PROBE_TIME, MLD_ROBUSTNESS, REACHABLE_TIME,
 };
+use fictionet::stdlib::network::ethernet::stream::Decoder;
 use fictionet::stdlib::network::ip;
 use fictionet::stdlib::protocols::arp;
 use fictionet::stdlib::protocols::mld::{self, RecordType};
@@ -38,6 +39,7 @@ fn router() -> Ipv6Addr {
 /// bytes.
 pub struct Peer<S = TcpStream> {
     stream: S,
+    decoder: Decoder,
     link: LinkState,
 }
 
@@ -73,6 +75,7 @@ impl<S: Read + Write> Peer<S> {
     pub fn new(stream: S) -> Peer<S> {
         Peer {
             stream,
+            decoder: Decoder::new(),
             link: LinkState::default(),
         }
     }
@@ -83,17 +86,35 @@ impl<S: Read + Write> Peer<S> {
         Ok(())
     }
 
+    /// Starts observing a reopened device without discarding buffered frames.
+    pub fn reset_link(&mut self) {
+        self.link = LinkState::default();
+    }
+
     /// The next frame from the honeypot.
     pub fn recv(&mut self) -> Result<Vec<u8>> {
-        let mut size = [0; 4];
-        self.stream.read_exact(&mut size)?;
-        let size = u32::from_be_bytes(size) as usize;
-        if !(frame::HEADER..=2036).contains(&size) {
-            return Err("invalid honeypot frame length".into());
+        loop {
+            if let Some(bytes) = self.decoder.next_frame().map_err(|length| {
+                format!("QEMU frame length {} exceeds the stream buffer", length.0)
+            })? {
+                if !(frame::HEADER..=2036).contains(&bytes.len()) {
+                    return Err("invalid honeypot frame length".into());
+                }
+                return Ok(bytes.to_vec());
+            }
+            match self.stream.read(self.decoder.spare()) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "QEMU Ethernet stream closed",
+                    )
+                    .into());
+                }
+                Ok(n) => self.decoder.filled(n),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        let mut bytes = vec![0; size];
-        self.stream.read_exact(&mut bytes)?;
-        Ok(bytes)
     }
 
     /// The first frame `want` takes, answering the honeypot's ARP and

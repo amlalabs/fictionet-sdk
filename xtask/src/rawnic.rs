@@ -2,7 +2,6 @@
 use crate::Result;
 use std::{
     fs,
-    io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -127,20 +126,14 @@ fn receive_tcp(peer: &mut Peer, port: u16) -> Result<Vec<u8>> {
 }
 
 fn mapped_http(peer: &mut Peer) -> Result {
-    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::codec::{Stream, Wire};
     use fictionet::stdlib::network::{ethernet::frame, ip, tcp};
-    use fictionet::stdlib::protocols::mptcp::{self, Capable, Keys, MptcpOption, Sequence};
+    use fictionet::stdlib::protocols::http1::{Event, ResponseEvents, Version};
+    use fictionet::stdlib::protocols::mptcp::{self, Capable, Dss, Keys, MptcpOption, Sequence};
 
     let port = 0x5678u16;
-    let send = |peer: &mut Peer,
-                seq: u32,
-                ack: u32,
-                flags: u8,
-                keys: Keys,
-                echo: u32,
-                payload: &[u8]|
-     -> Result {
-        let capable = MptcpOption::Capable(Capable {
+    let capable = |keys| {
+        MptcpOption::Capable(Capable {
             version: 1,
             checksum_required: false,
             extensibility: false,
@@ -148,9 +141,18 @@ fn mapped_http(peer: &mut Peer) -> Result {
             algorithms: mptcp::algorithm::HMAC_SHA256,
             keys,
         })
-        .to_bytes()?;
-        let mut options = vec![30, capable.len() as u8 + 2];
-        options.extend(capable);
+    };
+    let send = |peer: &mut Peer,
+                seq: u32,
+                ack: u32,
+                flags: u8,
+                option: MptcpOption,
+                echo: u32,
+                payload: &[u8]|
+     -> Result {
+        let option = option.to_bytes()?;
+        let mut options = vec![mptcp::KIND, option.len() as u8 + 2];
+        options.extend(option);
         options.extend([8, 10]);
         options.extend(1000u32.to_be_bytes());
         options.extend(echo.to_be_bytes());
@@ -175,7 +177,7 @@ fn mapped_http(peer: &mut Peer) -> Result {
             &packet.0,
         ))
     };
-    send(peer, 5000, 0, 2, Keys::Absent, 0, &[])?;
+    send(peer, 5000, 0, 2, capable(Keys::Absent), 0, &[])?;
     let syn_ack = receive_tcp(peer, port)?;
     if syn_ack[13] != 0x12 || syn_ack[8..12] != 5001u32.to_be_bytes() {
         return Err("invalid MPTCP handshake response".into());
@@ -208,10 +210,10 @@ fn mapped_http(peer: &mut Peer) -> Result {
         5001,
         server_seq,
         0x10,
-        Keys::Both {
+        capable(Keys::Both {
             sender: client_key,
             receiver: key,
-        },
+        }),
         timestamp,
         &[],
     )?;
@@ -221,17 +223,21 @@ fn mapped_http(peer: &mut Peer) -> Result {
         5001,
         server_seq,
         0x18,
-        Keys::Data {
+        capable(Keys::Data {
             sender: client_key,
             receiver: key,
             data_level_length: request.len() as u16,
             checksum: None,
-        },
+        }),
         timestamp,
         request,
     )?;
     let client_data = mptcp::idsn(client_key).advance(1 + request.len() as u64);
-    let mut http = Vec::new();
+    let expected = include_bytes!("../../demos/honeypot/src/caddy.html");
+    let mut http = Stream::new(ResponseEvents::new());
+    let mut received = 0;
+    let mut body = 0;
+    let mut saw_head = false;
     loop {
         let response = receive_tcp(peer, port)?;
         if response[13] & 6 != 0 {
@@ -255,12 +261,12 @@ fn mapped_http(peer: &mut Peer) -> Result {
             })
             .ok_or("HTTP response has no DSS")?;
         let mapping = dss.mapping.ok_or("HTTP response has no data mapping")?;
-        if response[4..8] != server_seq.wrapping_add(http.len() as u32).to_be_bytes()
+        if response[4..8] != server_seq.wrapping_add(received as u32).to_be_bytes()
             || response[8..12] != (5001 + request.len() as u32).to_be_bytes()
             || dss.data_ack != Some(Sequence::Long(client_data))
             || mapping.data_sequence_number
-                != Sequence::Long(mptcp::idsn(key).advance(1 + http.len() as u64))
-            || mapping.subflow_sequence_number != 1 + http.len() as u32
+                != Sequence::Long(mptcp::idsn(key).advance(1 + received as u64))
+            || mapping.subflow_sequence_number != 1 + received as u32
             || usize::from(mapping.data_level_length) < payload.len()
             || !options
                 .iter()
@@ -268,23 +274,85 @@ fn mapped_http(peer: &mut Peer) -> Result {
         {
             return Err("invalid mapped HTTP response or timestamp echo".into());
         }
-        http.extend_from_slice(payload);
-        if http.len() > 8192 {
-            return Err("HTTP response exceeds expected page size".into());
-        }
-        if let Some(end) = http.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-            let head = std::str::from_utf8(&http[..end])?;
-            let length: usize = head
-                .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
-                .ok_or("HTTP response has no content length")?
-                .parse()?;
-            if http.len() >= end + 4 + length {
-                println!(
-                    "Honeypot completed MP_CAPABLE and returned the complete mapped HTTP page with timestamps"
-                );
-                return Ok(());
+        let mut remaining = payload;
+        let mut done = false;
+        loop {
+            let n = http.push(remaining);
+            remaining = &remaining[n..];
+            let mut progress = n != 0;
+            while let Some(event) = http.next() {
+                progress = true;
+                match event? {
+                    Event::Head(head) => {
+                        if saw_head
+                            || head.version != Version::Http11
+                            || head.status != 200
+                            || !head.headers.iter().any(|header| {
+                                header.name.eq_ignore_ascii_case("server")
+                                    && header.value == b"Caddy"
+                            })
+                            || !head.headers.iter().any(|header| {
+                                header.name.eq_ignore_ascii_case("content-length")
+                                    && header.value == expected.len().to_string().as_bytes()
+                            })
+                        {
+                            return Err("HTTP response is not the expected Caddy page".into());
+                        }
+                        saw_head = true;
+                    }
+                    Event::Body(bytes) => {
+                        if expected.get(body..body + bytes.len()) != Some(bytes.as_slice()) {
+                            return Err("HTTP response differs from the Caddy page".into());
+                        }
+                        body += bytes.len();
+                    }
+                    Event::Done => {
+                        if !saw_head
+                            || body != expected.len()
+                            || !remaining.is_empty()
+                            || http.buffered() != 0
+                        {
+                            return Err("HTTP response has an unexpected length".into());
+                        }
+                        done = true;
+                        break;
+                    }
+                }
             }
+            if remaining.is_empty() || done {
+                break;
+            }
+            if !progress {
+                return Err("HTTP response decoder made no progress".into());
+            }
+        }
+        received += payload.len();
+        let timestamp = options
+            .iter()
+            .find_map(|option| match option {
+                tcp::TcpOption::Timestamps { tsval, .. } => Some(*tsval),
+                _ => None,
+            })
+            .ok_or("HTTP response has no timestamp")?;
+        send(
+            peer,
+            5001 + request.len() as u32,
+            server_seq.wrapping_add(received as u32),
+            0x10,
+            MptcpOption::Dss(Dss {
+                data_ack: Some(Sequence::Long(
+                    mptcp::idsn(key).advance(1 + received as u64),
+                )),
+                ..Dss::default()
+            }),
+            timestamp,
+            &[],
+        )?;
+        if done {
+            println!(
+                "Honeypot completed MP_CAPABLE and returned the complete mapped HTTP page with timestamps"
+            );
+            return Ok(());
         }
     }
 }
@@ -323,6 +391,15 @@ pub fn run(directory: PathBuf) -> Result {
         "rawnic",
         "--bin",
         "rawnic-guest",
+    ]))?;
+    output(Command::new("cargo").args([
+        "build",
+        "-p",
+        "honeypot-world",
+        "--features",
+        "raw-virtio",
+        "--example",
+        "raw_honeypot",
     ]))?;
     let metadata: serde_json::Value =
         serde_json::from_slice(&output(Command::new("cargo").args([
@@ -378,6 +455,12 @@ pub fn run(directory: PathBuf) -> Result {
         &mut archive,
         &target.join("debug/rawnic-guest"),
         "init",
+        &directory,
+    )?;
+    executable(
+        &mut archive,
+        &target.join("debug/examples/raw_honeypot"),
+        "raw_honeypot",
         &directory,
     )?;
     for (index, binary) in test_binaries.iter().enumerate() {
@@ -458,7 +541,7 @@ pub fn run(directory: PathBuf) -> Result {
 
     let result = (|| -> Result {
         let deadline = Instant::now() + Duration::from_secs(120);
-        let mut stream: TcpStream = loop {
+        let stream: TcpStream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -481,17 +564,10 @@ pub fn run(directory: PathBuf) -> Result {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let mut peer = Peer::new(stream);
         for (index, frame) in frames::fixtures().into_iter().enumerate() {
-            stream.write_all(&(frame.len() as u32).to_be_bytes())?;
-            stream.write_all(&frame)?;
-            let mut size = [0; 4];
-            stream.read_exact(&mut size)?;
-            let size = u32::from_be_bytes(size) as usize;
-            if size > 65536 {
-                return Err("invalid QEMU frame length".into());
-            }
-            let mut echoed = vec![0; size];
-            stream.read_exact(&mut echoed)?;
+            peer.send(&frame)?;
+            let echoed = peer.recv()?;
             if echoed != frame {
                 return Err("guest frame differs from byte-exact input".into());
             }
@@ -501,10 +577,9 @@ pub fn run(directory: PathBuf) -> Result {
                 frame.len()
             );
         }
-        stream.write_all(&60u32.to_be_bytes())?;
         let mut acknowledgment = [0x5a; 60];
         acknowledgment[..6].copy_from_slice(&[0x52, 0x54, 0, 0x12, 0x34, 0x56]);
-        stream.write_all(&acknowledgment)?;
+        peer.send(&acknowledgment)?;
         loop {
             if fs::read_to_string(&log)?.contains("HONEYPOT READY") {
                 break;
@@ -514,7 +589,6 @@ pub fn run(directory: PathBuf) -> Result {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let mut peer = Peer::new(stream);
         peer::start_link(&mut peer)?;
         peer::neighbor_discovery(&mut peer)?;
         peer::ssh6(&mut peer)?;
@@ -550,6 +624,12 @@ pub fn run(directory: PathBuf) -> Result {
             }
         }
         oversized_ping(&mut peer)?;
+        mapped_http(&mut peer)?;
+        peer.send(&acknowledgment)?;
+        peer.reset_link();
+        peer::start_link(&mut peer)?;
+        peer::neighbor_discovery(&mut peer)?;
+        peer::ssh6(&mut peer)?;
         mapped_http(&mut peer)?;
         peer.send(&acknowledgment)?;
         loop {
