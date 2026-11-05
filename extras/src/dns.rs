@@ -58,6 +58,36 @@ use fictionet::sync::Mutex;
 
 use crate::warc;
 
+/// Public names advertised by the ECH configurations in an HTTPS or SVCB
+/// record. Invalid lists and unknown configuration versions give no names.
+pub fn ech_public_names(data: &RData) -> Vec<LowerName> {
+    use fictionet::stdlib::protocols::dns::rr::rdata::svcb::SvcParamValue;
+    use rustls::internal::msgs::{codec::Codec, handshake::EchConfigPayload};
+
+    let params = match data {
+        RData::HTTPS(record) => &record.svc_params,
+        RData::SVCB(record) => &record.svc_params,
+        _ => return Vec::new(),
+    };
+    params
+        .iter()
+        .filter_map(|(_, value)| match value {
+            SvcParamValue::EchConfigList(list) => Vec::<EchConfigPayload>::read_bytes(&list.0).ok(),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|config| match config {
+            EchConfigPayload::V18(config) => Name::from_ascii(config.public_name.as_ref())
+                .ok()
+                .map(|mut name| {
+                    name.set_fqdn(true);
+                    LowerName::new(&name)
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The media type of a DNS message in wire format (RFC 8484 §6).
 const DNS_MESSAGE: &str = "application/dns-message";
 
@@ -502,6 +532,7 @@ impl Upstream for Replay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use fictionet::Seed;
     use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
     use fictionet::stdlib::protocols::dns::dnssec::{
@@ -513,6 +544,46 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ech_names_require_a_complete_recognized_configuration() {
+        use fictionet::stdlib::protocols::dns::rr::rdata::svcb::{
+            EchConfigList, SvcParamKey, SvcParamValue,
+        };
+        use fictionet::stdlib::protocols::dns::rr::rdata::{HTTPS, SVCB};
+        let public = b"public.example";
+        let mut config = vec![0, 0, 32, 0, 1, 1, 0, 4, 0, 1, 0, 1, 0, public.len() as u8];
+        config.extend_from_slice(public);
+        config.extend_from_slice(&[0, 0]);
+        let mut list = ((config.len() + 4) as u16).to_be_bytes().to_vec();
+        list.extend_from_slice(&[0xfe, 0x0d]);
+        list.extend_from_slice(&(config.len() as u16).to_be_bytes());
+        list.extend_from_slice(&config);
+        let record = |bytes: Vec<u8>| {
+            RData::HTTPS(HTTPS(SVCB::new(
+                1,
+                Name::root(),
+                vec![(
+                    SvcParamKey::EchConfigList,
+                    SvcParamValue::EchConfigList(EchConfigList(bytes)),
+                )],
+            )))
+        };
+        assert_eq!(
+            ech_public_names(&record(list.clone())),
+            vec![LowerName::new(
+                &Name::from_ascii("public.example.").unwrap()
+            )]
+        );
+        for length in 0..list.len() {
+            assert!(ech_public_names(&record(list[..length].to_vec())).is_empty());
+        }
+        let mut trailing = list.clone();
+        trailing.push(0);
+        assert!(ech_public_names(&record(trailing)).is_empty());
+        list[2] = 0xff;
+        assert!(ech_public_names(&record(list)).is_empty());
+    }
 
     const A_ROOT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4)), 53);
     const B_ROOT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(170, 247, 170, 2)), 53);

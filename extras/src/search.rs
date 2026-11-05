@@ -133,6 +133,11 @@ const GOOGLE: Style = Style {
 "#,
     unscoped: r#".B6fmyf .csDOgf { display: none; }
 @media (max-width: 979.98px) { #gsr .logo { display: none; } }
+@media (max-width: 600px) {
+  #gsr .NDnoQ > :not(form), #gsr .ywK6Rd { display: none; }
+  #gsr .tsf { min-width: 0; width: 100%; }
+  #gsr .a4bIc { min-width: 0; }
+}
 .uEierd { margin: 0 0 24px; font: 14px/1.58 Arial, sans-serif; color: #4d5156; }
 .uEierd + .MjjYud { padding-top: 0; margin-top: 0; }
 .uEierd a { color: #1a0dab; text-decoration: none; }

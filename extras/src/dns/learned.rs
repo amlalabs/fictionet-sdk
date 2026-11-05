@@ -109,7 +109,7 @@ use fictionet::sync::Mutex;
 /// name, a target of the CNAME and DNAME chain from it, or a wildcard
 /// that could answer for one) is present with its RRsets only when the
 /// data holds the fact the question's type needs there: an RRset of that
-/// type from an answer section, a CNAME from one unless the
+/// type from an answer section, a CNAME away from the apex unless the
 /// question asks for NSEC and the name is not known to lack it, or the
 /// type known absent. A wildcard's absent type answers only a question
 /// for the wildcard itself: a name the wildcard answers for needs the
@@ -123,7 +123,9 @@ use fictionet::sync::Mutex;
 /// filed negative said so, and [`View::denial`] gives only the proof that
 /// came with it. Questions for ANY and for RRSIG are answered from the
 /// response to that same question alone, since a server may answer ANY
-/// with a subset or a made-up HINFO (RFC 8482 §4).
+/// with a subset or a made-up HINFO (RFC 8482 §4). Apex responses also
+/// keep their own records: some real servers publish a CNAME there
+/// beside SOA, NS and DNSKEY and answer each type separately.
 ///
 /// The real server may also hold zones below cuts of this one, as the
 /// root servers hold `root-servers.net` below `net`, and answers from the
@@ -191,7 +193,7 @@ struct Facts {
     declined: HashMap<(LowerName, RecordType), Declined>,
     /// The denial records that came with each negative, by what they prove.
     proofs: HashMap<(LowerName, Denied), Vec<RecordSet>>,
-    /// The answers to ANY and RRSIG questions, by name and type.
+    /// The answers to ANY, RRSIG and apex questions, by name and type.
     whole: BTreeMap<(LowerName, RecordType), Node>,
     /// The names whose NSEC question a server answered with a NODATA
     /// whose own denial records show a CNAME there, where it stopped at
@@ -580,6 +582,18 @@ impl Facts {
             .iter()
             .find(|set| set.record_type() == RecordType::SOA && LowerName::new(set.name()) == *apex)
             .cloned();
+        // Some real servers publish an apex CNAME beside their zone
+        // records. Keep their answer for each type so the alias cannot
+        // replace a DNSKEY, SOA, NS or a negative DS answer.
+        if filed.qname == apex {
+            let sets = answer
+                .iter()
+                .filter(|set| LowerName::new(set.name()) == *apex)
+                .map(|set| (set.record_type(), set.clone()))
+                .collect();
+            self.whole
+                .insert((apex.clone(), filed.qtype), Node::Data(sets));
+        }
         for set in authority {
             if set.record_type() == RecordType::NS
                 && LowerName::new(set.name()) == *apex
@@ -1356,7 +1370,7 @@ static EMPTY: Node = Node::Empty;
 impl LearnedView {
     /// Whether `known` holds the fact an answer of the view's type reads
     /// at `name`: an RRset of that type from an answer section; a CNAME
-    /// from one, which answers every type
+    /// from one away from the apex, which answers every type
     /// (RFC 1034 §3.6.2) but NSEC, whose RRset may sit beside it
     /// (RFC 4035 §2.5), unless the name is known to have none or the
     /// server stopped there for the question's name; or the type known
@@ -1377,6 +1391,7 @@ impl LearnedView {
                 .is_some_and(|(rank, _)| *rank == Section::Answer)
         };
         let alias = answers(RecordType::CNAME)
+            && name != &self.apex
             && (qtype != RecordType::NSEC
                 || known.absent.contains(&RecordType::NSEC)
                 || self.facts.stops_at_alias.contains(&self.qname));
@@ -1431,6 +1446,11 @@ impl View for LearnedView {
         let facts = &self.facts;
         if !self.apex.zone_of(name) || facts.is_absent(&self.apex, name) {
             return Fact::Absent;
+        }
+        if name == &self.apex
+            && let Some(node) = facts.whole.get(&(name.clone(), self.qtype))
+        {
+            return Fact::Present(node);
         }
         if let Some(known) = facts.names.get(name) {
             match &known.node {

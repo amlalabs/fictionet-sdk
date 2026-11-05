@@ -6683,3 +6683,31 @@ fn changing_policy_blocks_warm_answers_and_unblocks_without_negative_caching() {
         }
     }
 }
+
+#[test]
+fn cached_aliases_do_not_answer_ds() {
+    let (mut net, anchors) = internet(true);
+    let mut fresh = resolver(config(anchors.clone()));
+    let want = ask(
+        &mut fresh,
+        &mut net,
+        0,
+        query(client(1), "alias.example.com.", RecordType::DS, dnssec_ok),
+    );
+    let mut cached = resolver(config(anchors));
+    ask(
+        &mut cached,
+        &mut net,
+        0,
+        query(client(1), "alias.example.com.", RecordType::A, dnssec_ok),
+    );
+    let got = ask(
+        &mut cached,
+        &mut net,
+        0,
+        query(client(2), "alias.example.com.", RecordType::DS, dnssec_ok),
+    );
+    assert_eq!(got.metadata.response_code, want.metadata.response_code);
+    assert_eq!(rows(&got.answers), rows(&want.answers));
+    assert_eq!(got.metadata.authentic_data, want.metadata.authentic_data);
+}

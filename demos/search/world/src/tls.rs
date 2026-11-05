@@ -275,3 +275,27 @@ fn refusal(host: &str) -> Result<Option<Refusal>, NoHandshake> {
     }
     Ok(None)
 }
+
+/// Authenticates the outer name without accepting ECH, allowing the browser
+/// to retry with the site's ordinary SNI. This front serves no pages.
+#[derive(Clone)]
+pub(super) struct EchFallback;
+
+impl tower_service::Service<http::Request<fictionet::stdlib::web::Body>> for EchFallback {
+    type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+    type Error = std::convert::Infallible;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: http::Request<fictionet::stdlib::web::Body>) -> Self::Future {
+        let mut response = http::Response::new(http_body_util::Full::new(bytes::Bytes::new()));
+        *response.status_mut() = http::StatusCode::MISDIRECTED_REQUEST;
+        std::future::ready(Ok(response))
+    }
+}

@@ -460,6 +460,99 @@ fn copying(real: &TestInternet, world: TestInternet) -> MemoryNet {
     net
 }
 
+#[test]
+fn an_apex_alias_leaves_keys_available_to_a_strict_resolver() {
+    use fictionet::stdlib::protocols::dns::dnssec::{rdata::DNSSECRData, sign};
+    use fictionet::stdlib::protocols::dns::rr::rdata::CNAME;
+
+    let real = TestInternet::new();
+    let config = real.config();
+    let apex = name("example.com.");
+    let alias = Record::from_rdata(
+        apex.clone(),
+        300,
+        RData::CNAME(CNAME(name("www.example.com."))),
+    );
+    let mut set = RecordSet::with_ttl(apex.clone(), RecordType::CNAME, 300);
+    set.insert(alias.clone(), 0);
+    let keys = TestInternet::example_com_keys();
+    let signature = sign(keys.keys[0].as_ref(), &set, &apex, TestInternet::window()).unwrap();
+    for (rtype, cd) in [
+        (RecordType::A, false),
+        (RecordType::A, true),
+        (RecordType::CNAME, true),
+    ] {
+        let mut copied = copying(&real, real.clone());
+        let mut upstream = real.memory();
+        let alias = alias.clone();
+        let signature = signature.clone();
+        copied.upstream(move |lookup| {
+            let mut looked = looked_up(&mut upstream, lookup);
+            if lookup.question.name() == &name("example.com.")
+                && matches!(
+                    lookup.question.query_type(),
+                    RecordType::A | RecordType::CNAME
+                )
+                && let Looked::Response(reply) = &mut looked
+                && reply.metadata.authoritative
+            {
+                reply.answers = vec![alias.clone(), signature.clone()];
+                reply.authorities.clear();
+            }
+            looked
+        });
+        let mut alias_question = Question::new("example.com.", rtype);
+        alias_question.cd = cd;
+        let questions = [
+            alias_question,
+            Question::new("example.com.", RecordType::DNSKEY),
+            Question::new("example.com.", RecordType::SOA),
+            Question::new("example.com.", RecordType::NS),
+            Question::new("example.com.", RecordType::DS),
+            Question::new("example.com.", RecordType::A),
+            Question::new("alias.example.com.", RecordType::A),
+        ];
+        let got = in_memory(&mut copied, &config, &questions);
+        for (question, (_, outcome)) in questions.iter().zip(&got) {
+            assert_eq!(outcome.rcode, ResponseCode::NoError, "{question:?}");
+            if !question.cd {
+                assert_eq!(outcome.validation, Validation::Secure, "{question:?}");
+                assert!(outcome.ad, "{question:?}");
+            }
+        }
+        for index in [0, 5] {
+            let reply = Message::from_vec(&got[index].0).unwrap();
+            let alias = reply
+                .answers
+                .iter()
+                .find(|r| r.record_type() == RecordType::CNAME)
+                .unwrap();
+            assert_eq!(alias.ttl, 0);
+            let sig = reply
+                .answers
+                .iter()
+                .find_map(|r| match &r.data {
+                    RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                        if sig.input().type_covered == RecordType::CNAME =>
+                    {
+                        Some((r, sig))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(sig.0.ttl, 0);
+            assert_eq!(sig.1.input().original_ttl, 300);
+        }
+        let ordinary = Message::from_vec(&got[6].0).unwrap();
+        assert!(
+            ordinary
+                .answers
+                .iter()
+                .any(|r| r.record_type() == RecordType::CNAME && r.ttl > 0)
+        );
+    }
+}
+
 /// A world that copies the root, `com`, `net`, `example.com`, and
 /// `dnssec-failed.com` from their real servers, here with `example.com`
 /// signed with NSEC3, gives the resolver what the real hierarchy gives

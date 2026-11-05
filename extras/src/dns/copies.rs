@@ -69,6 +69,10 @@ use super::learned::{Declined, Filing, Learned};
 /// address does not hold, answers it with REFUSED, as a server that does
 /// not serve the name does (RFC 8906 §3.1.1). A referral with AA set is
 /// filed as a referral.
+/// An apex CNAME and its signatures are sent with zero TTL: they can
+/// answer the current question but cannot hide the zone's own DNSKEY
+/// and other apex records in a recursive cache. Lowering the wire TTL
+/// leaves the signature's original TTL and signed data intact.
 ///
 /// A copy holds the real server's answer to ANY with DO, RRSIGs
 /// included. What an address sends for ANY is what its front's
@@ -501,7 +505,7 @@ impl Authority for Copies {
                 .chain(stops)
                 .collect();
             let next = Cell::new(None);
-            let step = respond_from_zones(&zones, req, server, &|zone, asked, reached| {
+            let mut step = respond_from_zones(&zones, req, server, &|zone, asked, reached| {
                 let apex = zone.apex();
                 let Some(learned) = copies.iter().find(|learned| learned.apex() == apex) else {
                     // The chain reached a stop: the rest of the reply is
@@ -552,7 +556,27 @@ impl Authority for Copies {
             });
             match next.take() {
                 Some(next) => around.push(next),
-                None => return step,
+                None => {
+                    if let Step::Reply(reply) = &mut step {
+                        for record in &mut reply.message.answers {
+                            let alias = match &record.data {
+                                RData::CNAME(_) => true,
+                                RData::DNSSEC(DNSSECRData::RRSIG(sig)) => {
+                                    sig.input().type_covered == RecordType::CNAME
+                                }
+                                _ => false,
+                            };
+                            if alias
+                                && copies
+                                    .iter()
+                                    .any(|zone| *zone.apex() == LowerName::new(&record.name))
+                            {
+                                record.ttl = 0;
+                            }
+                        }
+                    }
+                    return step;
+                }
             }
         }
     }

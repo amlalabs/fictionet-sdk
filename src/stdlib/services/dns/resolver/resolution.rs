@@ -3258,11 +3258,13 @@ fn dname_matches(dname: &RecordSet, cname: &RecordSet) -> bool {
 /// Whether a cached CNAME answers a question of type `rtype` at its
 /// owner. A question for the CNAME itself, or for the RRSIG and NSEC
 /// records that may sit beside it (RFC 4035 §2.5, RFC 2181 §10.1), is
-/// about the alias's own records, which the alias's server answers.
+/// about the alias's own records, which the alias's server answers. A
+/// DS RRset lives on the parent's side of a cut (RFC 4035 §3.1.4.1), so
+/// a CNAME the child owns never answers for it.
 fn follows_alias(rtype: RecordType) -> bool {
     !matches!(
         rtype,
-        RecordType::CNAME | RecordType::RRSIG | RecordType::NSEC
+        RecordType::CNAME | RecordType::RRSIG | RecordType::NSEC | RecordType::DS
     )
 }
 

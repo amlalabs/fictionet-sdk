@@ -150,6 +150,9 @@ sites. Capture dates are shown only when the archive records them.
   certificate fails verification (expired, issued for other names, or from an
   untrusted issuer) presents a certificate that fails the same way. A copy is
   served dated when it is served.
+  Signed HTTPS records keep their ECH configurations. Their public TLS names
+  authenticate with the world's CA without accepting ECH, so Firefox retries
+  with the site's ordinary name. Those fallback fronts serve no pages.
 - **Live-Depth** answers searches as Live does and keeps an allowlist. Search
   results, from the engines and from Claude's search tool, are allowed at depth
   0. Nothing is fetched ahead of time: when the guest opens an allowed address,

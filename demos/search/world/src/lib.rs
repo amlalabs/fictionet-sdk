@@ -129,6 +129,7 @@ pub fn net(
         refusing: Mutex::default(),
         refused: Mutex::default(),
         addresses: PerSession::new(),
+        ech: PerSession::new(),
     });
     // A host refused once is served as soon as the session serves it.
     {
@@ -267,6 +268,8 @@ struct Sites {
     /// The IPv4 addresses the mirrored zones filed for each name this
     /// session, its own or those at the end of its CNAME chain.
     addresses: PerSession<HashMap<LowerName, HashSet<Ipv4Addr>>>,
+    /// Public TLS names advertised by each site's HTTPS records.
+    ech: PerSession<HashMap<LowerName, HashSet<LowerName>>>,
 }
 
 impl Sites {
@@ -307,6 +310,16 @@ impl Sites {
                 .flat_map(|(_, set)| set.records_without_rrsigs())
         };
         let generation = self.pages.namespace().current().generation;
+        self.ech.with(generation, |ech| {
+            for record in answers() {
+                let names = fictionet_extras::dns::ech_public_names(&record.data);
+                if !names.is_empty() {
+                    ech.entry(LowerName::new(&record.name))
+                        .or_default()
+                        .extend(names);
+                }
+            }
+        });
         let mut found: Vec<(LowerName, Ipv4Addr)> = answers()
             .filter_map(|record| match &record.data {
                 RData::A(a) if !non_public_address(a.0.into()) && !resolver_address(a.0) => {
@@ -374,6 +387,39 @@ impl Sites {
         });
         for (name, addr) in placing {
             let _ = self.handle.add_host(self.host(&name).at(addr));
+        }
+        let ech = self.ech.with(generation, |ech| ech.clone());
+        let addresses = self
+            .addresses
+            .with(generation, |addresses| addresses.clone());
+        for (owner, names) in ech {
+            if !self.outbound.admits(&owner) || !self.serves(&owner) {
+                continue;
+            }
+            for addr in addresses.get(&owner).into_iter().flatten() {
+                for name in &names {
+                    if !self.placed.lock().insert((name.clone(), *addr)) {
+                        continue;
+                    }
+                    let ca = self.ca.clone();
+                    let public_name = dns::host(name);
+                    let certificate_name = public_name.clone();
+                    let config = OnceLock::new();
+                    let host = web::Site::new(tls::EchFallback)
+                        .tls_with(move |fcx| {
+                            config
+                                .get_or_init(|| {
+                                    ca.config(fcx, &certificate_name)
+                                        .expect("a certificate for an ECH public name")
+                                        .0
+                                })
+                                .clone()
+                        })
+                        .into_host(&public_name)
+                        .at(*addr);
+                    let _ = self.handle.add_host(host);
+                }
+            }
         }
     }
 

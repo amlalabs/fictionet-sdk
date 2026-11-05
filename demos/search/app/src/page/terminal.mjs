@@ -7,7 +7,12 @@ export function mount(root, { Terminal, FitAddon }, socket, options = {}) {
   terminal.open(root);
   socket.binaryType = 'arraybuffer';
   const send = (value) => { if (socket.readyState === 1) socket.send(value); };
-  const input = terminal.onData((text) => send(new TextEncoder().encode(text)));
+  const pending = [];
+  const input = terminal.onData((text) => {
+    const bytes = new TextEncoder().encode(text);
+    if (socket.readyState === 0) pending.push(bytes);
+    else send(bytes);
+  });
   const resize = () => {
     if (!root.clientWidth || !root.clientHeight) return;
     const size = fit.proposeDimensions();
@@ -22,14 +27,19 @@ export function mount(root, { Terminal, FitAddon }, socket, options = {}) {
   };
   const observer = new ResizeObserver(resize);
   observer.observe(root);
-  socket.addEventListener('open', resize);
+  const opened = () => {
+    resize();
+    for (const bytes of pending.splice(0)) send(bytes);
+  };
+  socket.addEventListener('open', opened);
   socket.addEventListener('message', received);
   if (socket.readyState === 1) resize();
   const dispose = () => {
     observer.disconnect();
     input.dispose();
-    socket.removeEventListener('open', resize);
+    socket.removeEventListener('open', opened);
     socket.removeEventListener('message', received);
+    pending.length = 0;
     terminal.dispose();
   };
   return { dispose, setFontSize(fontSize) { terminal.options.fontSize = fontSize; resize(); } };

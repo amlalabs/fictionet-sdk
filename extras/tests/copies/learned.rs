@@ -2918,3 +2918,59 @@ fn a_referral_with_aa_set_is_answered_as_a_referral() {
         );
     }
 }
+
+#[test]
+fn an_apex_alias_does_not_replace_the_servers_other_answers() {
+    use fictionet::stdlib::protocols::dns::rr::rdata::CNAME;
+
+    let zone = signed(Denial::Nsec);
+    for alias_first in [true, false] {
+        let learned = Learned::new(&name("example."));
+        let alias_question = request("example.", RecordType::A, true);
+        let mut alias = real(&zone, &alias_question);
+        alias.answers = vec![Record::from_rdata(
+            name("example."),
+            300,
+            RData::CNAME(CNAME(name("outside.test."))),
+        )];
+        alias.authorities.clear();
+        if alias_first {
+            learned.file(Generation(0), &alias_question.question, &alias);
+            for rtype in [
+                RecordType::DNSKEY,
+                RecordType::SOA,
+                RecordType::NS,
+                RecordType::DS,
+            ] {
+                assert!(copied(&learned, &request("example.", rtype, true)).is_none());
+            }
+        }
+        for rtype in [
+            RecordType::DNSKEY,
+            RecordType::SOA,
+            RecordType::NS,
+            RecordType::DS,
+        ] {
+            let asked = request("example.", rtype, true);
+            let response = real(&zone, &asked);
+            learned.file(Generation(0), &asked.question, &response);
+        }
+        if !alias_first {
+            learned.file(Generation(0), &alias_question.question, &alias);
+        }
+        for rtype in [
+            RecordType::DNSKEY,
+            RecordType::SOA,
+            RecordType::NS,
+            RecordType::DS,
+        ] {
+            let asked = request("example.", rtype, true);
+            let got = copied(&learned, &asked).expect("the type was copied");
+            assert_eq!(shape(&got), shape(&real(&zone, &asked)), "{rtype}");
+        }
+        assert_eq!(
+            shape(&copied(&learned, &alias_question).unwrap()),
+            shape(&alias)
+        );
+    }
+}
