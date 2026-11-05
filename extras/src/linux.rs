@@ -14,7 +14,7 @@
 //! [challenge ACKs](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_input.c),
 //! and [MPTCP options](https://github.com/torvalds/linux/blob/v6.8/net/mptcp/options.c).
 
-use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Reply};
+use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Reply, Ipv4Timestamp};
 use fictionet::stdlib::network::tcp::{
     self, CookieInput, CookieReply, CookieState, SynCookies, TcpOption,
 };
@@ -22,7 +22,114 @@ use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Adds Linux's IPv4 SYN reply options to a port's handshake policy.
+/// `timestamp` supplies milliseconds since midnight UTC in the world's clock.
+/// The underlying service still chooses its TCP options and backlog.
+pub fn with_ipv4_options<S, F>(
+    server: S,
+    timestamp: F,
+) -> impl fictionet::stdlib::world::net::PortServer
+where
+    S: fictionet::stdlib::world::net::PortServer,
+    F: Fn() -> u32 + Send + Sync + 'static,
+{
+    Ipv4Server {
+        server,
+        timestamp: Arc::new(timestamp),
+    }
+}
+
+struct Ipv4Server<S, F> {
+    server: S,
+    timestamp: Arc<F>,
+}
+
+impl<S, F> fictionet::stdlib::world::net::PortServer for Ipv4Server<S, F>
+where
+    S: fictionet::stdlib::world::net::PortServer,
+    F: Fn() -> u32 + Send + Sync + 'static,
+{
+    fn serve(
+        &self,
+        fcx: fictionet::Cx,
+        arrival: fictionet::stdlib::world::net::Arrival,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.server.serve(fcx, arrival)
+    }
+
+    fn backlog(&self) -> Option<usize> {
+        self.server.backlog()
+    }
+
+    fn alpn(&self) -> Vec<Vec<u8>> {
+        self.server.alpn()
+    }
+
+    fn answer(&self) -> Option<Box<dyn tcp::Answer>> {
+        Some(Box::new(Ipv4Answers {
+            inner: self.server.answer(),
+            timestamp: self.timestamp.clone(),
+        }))
+    }
+}
+
+struct Ipv4Answers<F> {
+    inner: Option<Box<dyn tcp::Answer>>,
+    timestamp: Arc<F>,
+}
+
+impl<F: Fn() -> u32 + Send + Sync> tcp::Answer for Ipv4Answers<F> {
+    fn syn(&self, syn: &tcp::Syn<'_>) -> tcp::SynAnswer {
+        self.inner.as_ref().map_or_else(
+            || tcp::SynAnswer::Accept(Vec::new()),
+            |inner| inner.syn(syn),
+        )
+    }
+
+    fn ipv4_options(&self, syn: &tcp::Syn<'_>) -> Option<Ipv4Reply> {
+        let (IpAddr::V4(local), IpAddr::V4(remote)) = (syn.to.ip(), syn.from.ip()) else {
+            return Some(Ipv4Reply::default());
+        };
+        ipv4_options(
+            syn.ipv4_options,
+            local,
+            remote,
+            (self.timestamp)(),
+            |address| {
+                address != local
+                    && !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_multicast()
+                    && !address.is_broadcast()
+            },
+        )
+    }
+
+    fn retransmit_ipv4_options(&self, handshake: &tcp::Handshake) -> Option<Vec<Ipv4Option>> {
+        retransmit_ipv4_options(
+            handshake.syn_ipv4.as_deref()?,
+            handshake.syn_ack_ipv4.as_deref()?,
+            (self.timestamp)(),
+        )
+    }
+
+    fn cookie(&self, from: std::net::SocketAddr, handshake: &tcp::Handshake) -> Option<tcp::Kept> {
+        self.inner.as_ref()?.cookie(from, handshake)
+    }
+
+    fn ack(&self, handshake: &tcp::Handshake) -> tcp::AckAnswer {
+        self.inner
+            .as_ref()
+            .map_or(tcp::AckAnswer::Accept, |inner| inner.ack(handshake))
+    }
+
+    fn segments(&self, handshake: &tcp::Handshake) -> Option<Box<dyn tcp::Segments>> {
+        self.inner.as_ref()?.segments(handshake)
+    }
+}
 
 /// IPv4 reply options following Linux receive compilation, option echo and build.
 ///
@@ -153,6 +260,55 @@ pub fn ipv4_options(
     Some(reply)
 }
 
+/// Refreshes the send timestamp in a retained IPv4 SYN-ACK's options.
+///
+/// `syn` is the original received option list and `reply` is its first
+/// [`ipv4_options`] result. Only a timestamp slot reserved for sending is
+/// updated. The receive timestamp, pointers, overflow, addresses and unused
+/// slots retain their first values. `None` means there is no send timestamp.
+pub fn retransmit_ipv4_options(
+    syn: &[Ipv4Option],
+    reply: &[Ipv4Option],
+    timestamp: u32,
+) -> Option<Vec<Ipv4Option>> {
+    let received = syn
+        .iter()
+        .take_while(|option| !matches!(option, Ipv4Option::EndOfList))
+        .find_map(|option| match option {
+            Ipv4Option::Timestamp { pointer, .. } => Some(u16::from(*pointer)),
+            _ => None,
+        })?;
+    let mut refreshed = reply.to_vec();
+    for option in &mut refreshed {
+        let Ipv4Option::Timestamp {
+            pointer,
+            timestamps,
+            ..
+        } = option
+        else {
+            continue;
+        };
+        let step = match timestamps {
+            Ipv4Timestamp::Timestamps(_) => 4,
+            Ipv4Timestamp::Addresses(_) | Ipv4Timestamp::Prespecified(_) => 8,
+            Ipv4Timestamp::Unknown { .. } => return None,
+        };
+        if u16::from(*pointer) != received + 2 * step {
+            return None;
+        }
+        let end = usize::from(*pointer) - 1;
+        let mut bytes =
+            fictionet::stdlib::network::ip::encode_ipv4_options(std::slice::from_ref(option))
+                .ok()?;
+        bytes
+            .get_mut(end.checked_sub(4)?..end)?
+            .copy_from_slice(&timestamp.to_be_bytes());
+        *option = fictionet::stdlib::network::ip::Ipv4Options::new(&bytes).next()?;
+        return Some(refreshed);
+    }
+    None
+}
+
 /// TCP settings for a Linux server with the default Ethernet window.
 pub fn tcp() -> tcp::Options {
     tcp::Options::default().settings(settings())
@@ -225,6 +381,7 @@ pub fn settings() -> tcp::Settings {
         ack_inclusive: false,
         window_update_ratio: 2,
         challenge_ack_interval: Duration::from_millis(500).into(),
+        keep_alive_payload: tcp::KeepAlivePayload::Empty,
     };
     tcp::Settings {
         socket,

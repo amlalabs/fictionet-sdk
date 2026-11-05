@@ -381,11 +381,22 @@ pub trait Answer: Send {
 
     /// IPv4 options and an optional source-route hop for an accepted SYN-ACK.
     /// Called only for IPv4, after `syn` accepts. Retransmissions of a retained
-    /// SYN use the original reply. `None` drops the SYN without an answer.
+    /// SYN use the original reply unless [`Self::retransmit_ipv4_options`]
+    /// refreshes it. `None` drops the SYN without an answer.
     /// The default sends no IPv4 options.
     fn ipv4_options(&self, syn: &Syn<'_>) -> Option<Ipv4Reply> {
         let _ = syn;
         Some(Ipv4Reply::default())
+    }
+
+    /// Refreshes IPv4 options when a retained SYN-ACK is sent again, whether
+    /// prompted by another SYN or by its retransmission timer. The handshake
+    /// retains the first SYN and first reply; this changes only the emitted
+    /// options, not the source-route next hop. `None` or options that cannot
+    /// be encoded leave the original reply unchanged. The default retains it.
+    fn retransmit_ipv4_options(&self, handshake: &Handshake) -> Option<Vec<Ipv4Option>> {
+        let _ = handshake;
+        None
     }
 
     /// What the SYN and SYN-ACK of `handshake`, answered with a SYN cookie,
@@ -787,7 +798,7 @@ impl Default for Settings {
 }
 
 /// TCP socket settings and option layout, independent of an operating system.
-pub use smoltcp::socket::tcp::Settings as SocketSettings;
+pub use smoltcp::socket::tcp::{KeepAlivePayload, Settings as SocketSettings};
 pub use smoltcp::wire::{OptionLayout, OptionOrder};
 
 /// Starts TCP for a machine with address `addr`, on the TCP packets of
@@ -1598,7 +1609,7 @@ impl State {
 
     /// Records the sequence number of an outgoing SYN, for ICMP checks, or
     /// of a SYN-ACK, for the connection's [`Handshake`].
-    fn sent(&mut self, packet: &mut [u8]) {
+    fn sent(&mut self, packet: &mut Vec<u8>) {
         let Some(ip) = Header::parse_whole(packet) else {
             return;
         };
@@ -1626,6 +1637,7 @@ impl State {
             }
         }
         let remote = SocketAddr::new(destination, u16::from_be_bytes([t[2], t[3]]));
+        let mut refreshed = None;
         if let Some(h) = self.by_tuple.get(&(local, remote)) {
             let c = self.conns.get_mut(h).unwrap();
             let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
@@ -1633,16 +1645,40 @@ impl State {
                 (Side::Client, 0x02) => {
                     c.iss.get_or_insert(seq);
                 }
-                (Side::Server, 0x12) => c.handshake.iss = seq,
+                (Side::Server, 0x12) => {
+                    c.handshake.iss = seq;
+                    if c.iss.replace(seq).is_some()
+                        && local.is_ipv4()
+                        && let Some(answer) = self
+                            .listeners
+                            .get(&local.port())
+                            .and_then(|listener| listener.answer.as_ref())
+                    {
+                        refreshed = answer.retransmit_ipv4_options(&c.handshake);
+                    }
+                }
                 _ => {}
             }
             if c.ecn && t[13] & 0x04 == 0 && (t[13] & 0x12 == 0x12 || c.congestion_echo) {
-                let t = &mut packet[ip.payload];
+                let t = &mut packet[ip.payload.clone()];
                 t[13] |= 0x40;
                 t[16..18].fill(0);
                 let sum = transport_checksum(local.ip(), remote.ip(), TCP, t);
                 t[16..18].copy_from_slice(&sum.to_be_bytes());
             }
+        }
+        if let Some(options) = refreshed
+            && let Ok(mut bytes) = encode_ipv4_options(&options)
+        {
+            bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+            let header_len = 20 + bytes.len();
+            let Ok(length) = u16::try_from(packet.len() + header_len - ip.payload.start) else {
+                return;
+            };
+            packet.splice(20..ip.payload.start, bytes);
+            packet[0] = 0x40 | (header_len / 4) as u8;
+            packet[2..4].copy_from_slice(&length.to_be_bytes());
+            fictionet::stdlib::network::ip::set_header_checksum(&mut packet[..header_len]);
         }
     }
 
@@ -2966,8 +3002,10 @@ impl GoneWatch {
     pub fn set_keep_alive(&self, interval: Option<Duration>) {
         let mut st = self.shared.state.lock();
         if st.conns.get(&self.handle).is_some_and(|c| !c.orphaned) {
-            st.sock(self.handle)
-                .set_keep_alive(interval.map(Into::into));
+            let now = smol_now(&st.fcx);
+            let socket = st.sock(self.handle);
+            socket.set_keep_alive(interval.map(Into::into));
+            socket.restart_keep_alive(now);
             st.kick();
         }
     }
@@ -5576,6 +5614,79 @@ mod tests {
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+
+    #[test]
+    fn syn_ack_timer_refreshes_wire_ipv4_options_and_retains_the_first_reply() {
+        struct Refresh(Option<Vec<Ipv4Option>>);
+
+        impl Answer for Refresh {
+            fn syn(&self, _: &Syn<'_>) -> SynAnswer {
+                SynAnswer::Accept(Vec::new())
+            }
+
+            fn ipv4_options(&self, _: &Syn<'_>) -> Option<Ipv4Reply> {
+                Some(Ipv4Reply {
+                    options: vec![Ipv4Option::NoOperation],
+                    destination: None,
+                })
+            }
+
+            fn retransmit_ipv4_options(&self, handshake: &Handshake) -> Option<Vec<Ipv4Option>> {
+                assert_eq!(handshake.syn_ipv4.as_deref(), Some([].as_slice()));
+                assert_eq!(
+                    handshake.syn_ack_ipv4.as_deref(),
+                    Some([Ipv4Option::NoOperation].as_slice())
+                );
+                self.0.clone()
+            }
+        }
+
+        for replacement in [
+            None,
+            Some(vec![Ipv4Option::RouterAlert(1), Ipv4Option::RouterAlert(2)]),
+            Some(vec![Ipv4Option::Unknown {
+                kind: 222,
+                data: vec![0; 40],
+            }]),
+        ] {
+            block_on(lab(Seed::from_u64(7), |fcx| async move {
+                let (_raw, side) = pair();
+                let local: SocketAddr = "10.0.0.1:80".parse()?;
+                let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+                let endpoint = endpoint(&fcx, side, local.ip());
+                let mut listener = endpoint.listen(local.port())?;
+                listener.answer(Box::new(Refresh(replacement.clone())));
+                let mut state = endpoint.shared.state.lock();
+                let now = smol_now(&fcx);
+                state.ingress(local.ip(), now, segment(peer, local, 100, 0, 2).0);
+                let first = egress(&mut state, now).remove(0);
+                let first_header = Header::parse_whole(&first).unwrap();
+                assert_eq!(&first[20..first_header.payload.start], &[1, 0, 0, 0]);
+                let second =
+                    egress(&mut state, now + smoltcp::time::Duration::from_millis(1000)).remove(0);
+                let second_header = Header::parse_whole(&second).unwrap();
+                let expected = replacement
+                    .as_ref()
+                    .and_then(|options| encode_ipv4_options(options).ok());
+                assert_eq!(
+                    &second[20..second_header.payload.start],
+                    expected.as_deref().unwrap_or(&[1, 0, 0, 0])
+                );
+                assert_eq!(second_header.payload(&second), first_header.payload(&first));
+                assert_eq!(
+                    transport_checksum(local.ip(), peer.ip(), TCP, second_header.payload(&second)),
+                    0
+                );
+                let handle = state.by_tuple[&(local, peer)];
+                assert_eq!(
+                    state.conns[&handle].handshake.syn_ack_ipv4.as_deref(),
+                    Some([Ipv4Option::NoOperation].as_slice())
+                );
+                Ok(())
+            }))
+            .unwrap();
+        }
     }
 
     #[test]

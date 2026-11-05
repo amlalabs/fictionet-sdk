@@ -801,6 +801,17 @@ impl Answer for Answers {
         self.echo(syn)
     }
 
+    fn retransmit_ipv4_options(
+        &self,
+        handshake: &Handshake,
+    ) -> Option<Vec<fictionet::stdlib::network::ip::Ipv4Option>> {
+        fictionet_extras::linux::retransmit_ipv4_options(
+            handshake.syn_ipv4.as_deref()?,
+            handshake.syn_ack_ipv4.as_deref()?,
+            ((self.clock.micros(self.fcx.now()) / 1000) % 86_400_000) as u32,
+        )
+    }
+
     fn cookie(&self, from: SocketAddr, handshake: &Handshake) -> Option<Kept> {
         // Only an ACK with MP_JOIN alone looks for what a join kept.
         let (None, Some(_)) = read_ack(&handshake.ack, handshake.ack_payload) else {
@@ -1557,5 +1568,176 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn ipv4_syn_ack_retransmissions_refresh_only_the_send_timestamp_for_both_adapters() {
+        use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Timestamp};
+        use fictionet::stdlib::network::{ip, tcp};
+        use fictionet::{Interface, InterfaceExt, Packet};
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+
+        for multipath in [false, true] {
+            for mode in 0..5 {
+                fictionet::block_on(fictionet::lab(
+                    fictionet::Seed::from_u64(7),
+                    |fcx| async move {
+                        let local: Ipv4Addr = "192.0.2.1".parse()?;
+                        let peer: Ipv4Addr = "198.51.100.1".parse()?;
+                        let zero = Ipv4Addr::UNSPECIFIED;
+                        let input = match mode {
+                            0 => vec![],
+                            1 => vec![Ipv4Option::RecordRoute {
+                                pointer: 4,
+                                routes: vec![zero; 9],
+                            }],
+                            2 => vec![Ipv4Option::Timestamp {
+                                pointer: 5,
+                                overflow: 0,
+                                timestamps: Ipv4Timestamp::Timestamps(vec![0; 9]),
+                            }],
+                            3 => vec![Ipv4Option::Timestamp {
+                                pointer: 5,
+                                overflow: 0,
+                                timestamps: Ipv4Timestamp::Addresses(vec![(zero, 0); 4]),
+                            }],
+                            _ => vec![Ipv4Option::Timestamp {
+                                pointer: 5,
+                                overflow: 0,
+                                timestamps: Ipv4Timestamp::Prespecified(vec![
+                                    (local, 0),
+                                    (peer, 0),
+                                ]),
+                            }],
+                        };
+                        let expected = |sent| match mode {
+                            0 => vec![],
+                            1 => vec![Ipv4Option::RecordRoute {
+                                pointer: 12,
+                                routes: vec![
+                                    local, local, zero, zero, zero, zero, zero, zero, zero,
+                                ],
+                            }],
+                            2 => vec![Ipv4Option::Timestamp {
+                                pointer: 13,
+                                overflow: 0,
+                                timestamps: Ipv4Timestamp::Timestamps(vec![
+                                    1000, sent, 0, 0, 0, 0, 0, 0, 0,
+                                ]),
+                            }],
+                            3 => vec![Ipv4Option::Timestamp {
+                                pointer: 21,
+                                overflow: 0,
+                                timestamps: Ipv4Timestamp::Addresses(vec![
+                                    (local, 1000),
+                                    (local, sent),
+                                    (zero, 0),
+                                    (zero, 0),
+                                ]),
+                            }],
+                            _ => vec![Ipv4Option::Timestamp {
+                                pointer: 13,
+                                overflow: 0,
+                                timestamps: Ipv4Timestamp::Prespecified(vec![
+                                    (local, 1000),
+                                    (peer, 0),
+                                ]),
+                            }],
+                        };
+                        let (mut raw, side) = fictionet::pair();
+                        let endpoint = tcp::endpoint_with(
+                            &fcx,
+                            side,
+                            local.into(),
+                            fictionet_extras::linux::tcp(),
+                        );
+                        let mut listener = endpoint.listen(PORT)?;
+                        let clock = crate::Clock::at_unix_secs(1);
+                        let answers = if multipath {
+                            Listener::new(&fcx, clock, Arc::default(), PORT, H2)
+                                .answer()
+                                .unwrap()
+                        } else {
+                            let time = fcx.clone();
+                            fictionet_extras::linux::with_ipv4_options(H2, move || {
+                                (clock.micros(time.now()) / 1000) as u32
+                            })
+                            .answer()
+                            .unwrap()
+                        };
+                        listener.answer(answers);
+                        let packet = |syn: bool, ack: u32| {
+                            let options = if syn && multipath {
+                                &[30, 4, 1, 1][..]
+                            } else {
+                                &[]
+                            };
+                            let mut t = vec![0; 20 + options.len()];
+                            t[..2].copy_from_slice(&40000u16.to_be_bytes());
+                            t[2..4].copy_from_slice(&PORT.to_be_bytes());
+                            t[4..8]
+                                .copy_from_slice(&(if syn { 100u32 } else { 101 }).to_be_bytes());
+                            t[8..12].copy_from_slice(&ack.to_be_bytes());
+                            t[12] = (t.len() / 4) as u8 * 16;
+                            t[13] = if syn { 2 } else { 16 };
+                            t[14..16].copy_from_slice(&4096u16.to_be_bytes());
+                            t[20..].copy_from_slice(options);
+                            let checksum = ip::transport_checksum(peer.into(), local.into(), 6, &t);
+                            t[16..18].copy_from_slice(&checksum.to_be_bytes());
+                            ip::packet_with_ipv4_options(
+                                peer,
+                                local,
+                                6,
+                                ip::Fields::default(),
+                                if syn { &input } else { &[] },
+                                &t,
+                            )
+                            .unwrap()
+                        };
+                        let check = |packet: &Packet, sent| {
+                            let header = ip::Header::parse_whole(&packet.0).unwrap();
+                            let mut bytes = ip::encode_ipv4_options(&expected(sent)).unwrap();
+                            bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+                            assert_eq!(
+                                &packet.0[20..header.payload.start],
+                                bytes,
+                                "mode {mode}, multipath {multipath}"
+                            );
+                            let t = header.payload(&packet.0);
+                            assert_eq!(t[13], 0x12);
+                            assert_eq!(ip::transport_checksum(local.into(), peer.into(), 6, t), 0);
+                            t.to_vec()
+                        };
+                        let syn = packet(true, 0);
+                        let original = ip::ipv4_options(&syn.0).unwrap();
+                        raw.send(syn.clone());
+                        let first = raw.recv(&fcx).await?;
+                        let tcp = check(&first, 1000);
+                        fcx.sleep(Duration::from_millis(750)).await?;
+                        raw.send(syn);
+                        let repeat = raw.recv(&fcx).await?;
+                        assert_eq!(clock.micros(fcx.now()) / 1000, 1750);
+                        assert_eq!(check(&repeat, 1750), tcp);
+                        let repeated_at = fcx.now();
+                        let timer = raw.recv(&fcx).await?;
+                        assert!(fcx.now() > repeated_at);
+                        assert_eq!(check(&timer, (clock.micros(fcx.now()) / 1000) as u32), tcp);
+                        let next =
+                            u32::from_be_bytes(tcp[4..8].try_into().unwrap()).wrapping_add(1);
+                        raw.send(packet(false, next));
+                        let conn = listener.accept(&fcx).await?;
+                        let handshake = conn.handshake().unwrap();
+                        assert_eq!(handshake.syn_ipv4.as_deref(), Some(original.as_slice()));
+                        assert_eq!(
+                            handshake.syn_ack_ipv4.as_deref(),
+                            Some(expected(1000).as_slice())
+                        );
+                        Ok(())
+                    },
+                ))
+                .unwrap();
+            }
+        }
     }
 }

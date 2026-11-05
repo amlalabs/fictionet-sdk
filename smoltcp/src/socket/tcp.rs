@@ -572,6 +572,15 @@ pub struct Socket<'a> {
 
 const DEFAULT_MSS: usize = 536;
 
+/// Payload on a keep-alive probe, both forms permitted by RFC 1122 section 4.2.3.6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepAlivePayload {
+    /// Send only the acknowledgment with the preceding sequence number.
+    Empty,
+    /// Include one garbage byte for peers that require it.
+    OneByte,
+}
+
 /// Transport choices supplied by the world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -597,6 +606,8 @@ pub struct Settings {
     pub window_update_ratio: u16,
     /// Minimum interval between challenge acknowledgments on one socket.
     pub challenge_ack_interval: Duration,
+    /// Whether keep-alive probes include a garbage byte.
+    pub keep_alive_payload: KeepAlivePayload,
 }
 
 impl Default for Settings {
@@ -613,6 +624,7 @@ impl Default for Settings {
             ack_inclusive: true,
             window_update_ratio: 2,
             challenge_ack_interval: Duration::from_secs(1),
+            keep_alive_payload: KeepAlivePayload::OneByte,
         }
     }
 }
@@ -1168,6 +1180,12 @@ impl<'a> Socket<'a> {
             // until the next packet, unless we wind up the timer explicitly.
             self.timer.set_keep_alive();
         }
+    }
+
+    /// Starts the configured idle interval at `timestamp` for an established
+    /// socket whose keep-alive setting changed outside packet processing.
+    pub fn restart_keep_alive(&mut self, timestamp: Instant) {
+        self.timer.rewind_keep_alive(timestamp, self.keep_alive);
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -2776,7 +2794,10 @@ impl<'a> Socket<'a> {
 
         let is_keep_alive = if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
             repr.seq_number = repr.seq_number - 1;
-            repr.payload = b"\x00"; // RFC 1122 says we should do this
+            repr.payload = match self.settings.keep_alive_payload {
+                KeepAlivePayload::Empty => &[],
+                KeepAlivePayload::OneByte => b"\x00",
+            };
             true
         } else {
             false
@@ -10499,6 +10520,42 @@ pub(crate) mod test {
             payload:    &b"\x00"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    fn test_keep_alive_restart_and_empty_payload() {
+        let mut s = socket_established();
+        send!(s, time 50, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.settings.keep_alive_payload = KeepAlivePayload::Empty;
+        s.set_keep_alive(Some(Duration::from_millis(100)));
+        s.restart_keep_alive(Instant::from_millis(50));
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(150))
+        );
+        recv_nothing!(s, time 149);
+        recv!(s, time 150, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &[],
+            ..RECV_TEMPL
+        }));
+        send!(s, time 175, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_millis(275))
+        );
+        s.set_keep_alive(None);
+        s.restart_keep_alive(Instant::from_millis(200));
+        recv_nothing!(s, time 275);
     }
 
     // =========================================================================================//

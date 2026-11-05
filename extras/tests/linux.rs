@@ -204,6 +204,64 @@ fn ipv4_timestamp_overflow_and_unknown_flags_follow_receive_rules() {
 }
 
 #[test]
+fn ipv4_retransmission_refreshes_only_the_reserved_timestamp_slot() {
+    for (input, expected) in [
+        (
+            vec![68, 12, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![68, 12, 13, 0, 1, 2, 3, 4, 17, 34, 51, 68],
+        ),
+        (
+            vec![68, 16, 6, 0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 88, 77, 66],
+            vec![68, 16, 14, 0, 99, 1, 2, 3, 4, 17, 34, 51, 68, 88, 77, 66],
+        ),
+        (
+            vec![68, 20, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![
+                68, 20, 21, 1, 203, 0, 113, 10, 1, 2, 3, 4, 203, 0, 113, 10, 17, 34, 51, 68,
+            ],
+        ),
+        (
+            vec![
+                68, 28, 9, 3, 9, 9, 9, 9, 203, 0, 113, 10, 0, 0, 0, 0, 203, 0, 113, 10, 0, 0, 0, 0,
+                8, 8, 8, 8,
+            ],
+            vec![
+                68, 28, 25, 3, 9, 9, 9, 9, 203, 0, 113, 10, 1, 2, 3, 4, 203, 0, 113, 10, 17, 34,
+                51, 68, 8, 8, 8, 8,
+            ],
+        ),
+    ] {
+        let syn: Vec<_> = ip::Ipv4Options::new(&input).collect();
+        let reply = ipv4_reply(&input).unwrap();
+        let refreshed = linux::retransmit_ipv4_options(&syn, &reply.options, 0x11223344).unwrap();
+        assert_eq!(ip::encode_ipv4_options(&refreshed).unwrap(), expected);
+        assert_eq!(ip::encode_ipv4_options(&syn).unwrap(), input);
+        assert_eq!(reply, ipv4_reply(&input).unwrap());
+    }
+}
+
+#[test]
+fn ipv4_retransmission_preserves_options_without_a_send_timestamp() {
+    for input in [
+        vec![7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![68, 8, 5, 0, 0, 0, 0, 0],
+        vec![68, 4, 5, 0xe0],
+        vec![68, 4, 255, 0xf3],
+        vec![68, 8, 5, 2, 1, 2, 3, 4],
+        vec![
+            68, 20, 5, 3, 203, 0, 113, 10, 0, 0, 0, 0, 192, 0, 2, 1, 0, 0, 0, 0,
+        ],
+    ] {
+        let syn: Vec<_> = ip::Ipv4Options::new(&input).collect();
+        let reply = ipv4_reply(&input).unwrap();
+        assert_eq!(
+            linux::retransmit_ipv4_options(&syn, &reply.options, 0x11223344),
+            None
+        );
+    }
+}
+
+#[test]
 fn ipv4_source_routes_reverse_consumed_hops_and_remove_duplicate_source() {
     for kind in [131, 137] {
         for pointer in [16, 255] {
