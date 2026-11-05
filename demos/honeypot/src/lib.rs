@@ -12,7 +12,7 @@
 //! uses ordinary TCP for HTTP. Both addresses serve the same ports. On a
 //! Caddy port, a SYN with MP_CAPABLE gets an RFC 8684 SYN-ACK with a key, its data
 //! then carries DSS, and an MP_JOIN is answered, taken or refused as Linux
-//! answers, takes and refuses it ([`mptcp`]). The internet reaches the
+//! answers, takes and refuses it ([`fictionet_extras::linux::mptcp`]). The internet reaches the
 //! host through an attachment called [`INTERNET`], which carries both
 //! families and is routed at [`Config::internet`] with `Net::route`, and
 //! reaches nothing else: its packets for any other address are logged and
@@ -35,7 +35,7 @@
 //! | Module | Contents |
 //! | --- | --- |
 //! | [`config`] | The command line and the world's settings |
-//! | [`mptcp`] | How the listener answers MP_CAPABLE and MP_JOIN |
+//! | [`fictionet_extras::linux::mptcp`] | How the listener answers MP_CAPABLE and MP_JOIN |
 //! | [`services`] | SSH and HTTP once a connection is open |
 //! | [`observe`] | The packet log and the observations |
 
