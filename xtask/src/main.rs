@@ -1,6 +1,8 @@
 //! Host tooling for demo images and offline web captures.
 
 mod capture;
+mod honeypot_diff;
+mod honeypot_probe;
 mod image;
 mod mptcp_verify;
 mod rawnic;
@@ -17,6 +19,16 @@ async fn main() -> Result {
     let task = args
         .next()
         .ok_or("expected search-image or search-capture")?;
+    if task == "honeypot-diff" {
+        return honeypot_diff::run(&args.collect::<Vec<_>>()).await;
+    }
+    if task == "honeypot-probe" {
+        let directory = PathBuf::from(args.next().ok_or("missing probe output directory")?);
+        if args.next().is_some() {
+            return Err("unexpected probe argument".into());
+        }
+        return honeypot_probe::run(&directory);
+    }
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());
     }
