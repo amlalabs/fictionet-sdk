@@ -5,7 +5,7 @@ use core::fmt::Debug;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::codec::{Frames, Prefixed};
 use fictionet::stdlib::protocols::{asn1, kerberos, ldap, ocsp, spnego, x509};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 #[test]
 fn announced_prefixes_keep_extents_without_bodies_or_allocations() {
@@ -166,7 +166,11 @@ fn ldap_oversized_announcements_keep_the_full_total() {
             assert_eq!(ldap::Message::parse_prefix(&header[..split], &0), Ok(None));
         }
         assert_eq!(
-            contract::check_decode(Frames::<ldap::Message>::new, &header),
+            decode_chunks(
+                &mut Stream::new(Frames::<ldap::Message>::new()),
+                chunks(&header, &[1, 7, 64]),
+                |_| {}
+            ),
             (vec![], Some(Fail::Protocol(ldap::Error::TooLarge(total))))
         );
     }
@@ -366,7 +370,10 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    let (items, failure) = contract::check_decode_with_held_limit(&make, bytes, 0);
+    let (items, failure) =
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+            assert_eq!(s.held(), 0);
+        });
     assert_eq!(items, expected);
     assert_eq!(failure, None);
     let mut stream = Stream::new(make());
@@ -401,11 +408,22 @@ fn asn1_elements_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &der,
         core::slice::from_ref(&der),
     );
-    contract::check_truncated(|| asn1::Elements::new(asn1::Rules::Ber), &ber);
     assert_eq!(
-        contract::check_decode(
-            || asn1::Elements::new(asn1::Rules::Der),
-            &[0x04, 0x83, 0x10, 0, 0]
+        decode_all(|| asn1::Elements::new(asn1::Rules::Ber), &[]),
+        (vec![], None)
+    );
+    for cut in 1..ber.len() {
+        assert_eq!(
+            decode_all(|| asn1::Elements::new(asn1::Rules::Ber), &ber[..cut]),
+            (vec![], Some(Fail::Truncated { unread: cut })),
+            "prefix {cut}"
+        );
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(asn1::Elements::new(asn1::Rules::Der)),
+            chunks(&[0x04, 0x83, 0x10, 0, 0], &[1, 7, 64]),
+            |_| {}
         ),
         (vec![], Some(Fail::Protocol(asn1::Error::TooLong)))
     );
@@ -437,9 +455,23 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &both,
         &[Ok(request.clone()), Ok(request)],
     );
-    contract::check_truncated(Frames::<ldap::Message>::new, &bytes);
     assert_eq!(
-        contract::check_decode(|| Frames::<ldap::Message>::with_limit(8), &[0x30, 9]),
+        decode_all(Frames::<ldap::Message>::new, &[]),
+        (vec![], None)
+    );
+    for cut in 1..bytes.len() {
+        assert_eq!(
+            decode_all(Frames::<ldap::Message>::new, &bytes[..cut]),
+            (vec![], Some(Fail::Truncated { unread: cut })),
+            "prefix {cut}"
+        );
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<ldap::Message>::with_limit(8)),
+            chunks(&[0x30, 9], &[1, 7, 64]),
+            |_| {}
+        ),
         (vec![], Some(Fail::Protocol(ldap::Error::TooLarge(11))))
     );
     Ok(())
@@ -477,11 +509,25 @@ fn ocsp_requests_and_responses_round_trip() -> Result<(), Box<dyn core::error::E
         &both,
         &[Ok(response.clone()), Ok(response)],
     );
-    contract::check_truncated(fictionet::stdlib::codec::Frames::<ocsp::Frame>::new, &bytes);
     assert_eq!(
-        contract::check_decode(
-            fictionet::stdlib::codec::Frames::<ocsp::Frame>::new,
-            &[0x30, 0x83, 1, 0, 0]
+        decode_all(fictionet::stdlib::codec::Frames::<ocsp::Frame>::new, &[]),
+        (vec![], None)
+    );
+    for cut in 1..bytes.len() {
+        assert_eq!(
+            decode_all(
+                fictionet::stdlib::codec::Frames::<ocsp::Frame>::new,
+                &bytes[..cut]
+            ),
+            (vec![], Some(Fail::Truncated { unread: cut })),
+            "prefix {cut}"
+        );
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(fictionet::stdlib::codec::Frames::<ocsp::Frame>::new()),
+            chunks(&[0x30, 0x83, 1, 0, 0], &[1, 7, 64]),
+            |_| {}
         ),
         (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
     );
@@ -516,14 +562,25 @@ fn spnego_tokens_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &bytes,
         &[Ok(init), Ok(response)],
     );
-    contract::check_truncated(
-        fictionet::stdlib::codec::Frames::<spnego::Frame>::new,
-        &bytes[..first_len],
-    );
     assert_eq!(
-        contract::check_decode(
-            fictionet::stdlib::codec::Frames::<spnego::Frame>::new,
-            &[0x60, 0x83, 1, 0, 0]
+        decode_all(fictionet::stdlib::codec::Frames::<spnego::Frame>::new, &[]),
+        (vec![], None)
+    );
+    for cut in 1..bytes[..first_len].len() {
+        assert_eq!(
+            decode_all(
+                fictionet::stdlib::codec::Frames::<spnego::Frame>::new,
+                &bytes[..first_len][..cut]
+            ),
+            (vec![], Some(Fail::Truncated { unread: cut })),
+            "prefix {cut}"
+        );
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(fictionet::stdlib::codec::Frames::<spnego::Frame>::new()),
+            chunks(&[0x60, 0x83, 1, 0, 0], &[1, 7, 64]),
+            |_| {}
         ),
         (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
     );
@@ -535,40 +592,43 @@ fn x509_writers_preserve_errors_and_destinations() -> Result<(), Box<dyn core::e
     use x509::Error;
 
     assert_eq!(
-        contract::check_refused(&x509::BasicConstraints {
+        assert_write(&x509::BasicConstraints {
             ca: false,
             path_len: Some(1),
-        }),
+        })
+        .unwrap_err(),
         Error::Value
     );
-    assert_eq!(contract::check_refused(&x509::KeyUsage(0)), Error::Value);
-    assert_eq!(contract::check_refused(&x509::CrlReason(7)), Error::Value);
+    assert_eq!(assert_write(&x509::KeyUsage(0)).unwrap_err(), Error::Value);
+    assert_eq!(assert_write(&x509::CrlReason(7)).unwrap_err(), Error::Value);
     assert_eq!(
-        contract::check_refused(&x509::ExtendedKeyUsage(vec![])),
+        assert_write(&x509::ExtendedKeyUsage(vec![])).unwrap_err(),
         Error::Empty
     );
     assert_eq!(
-        contract::check_refused(&x509::SubjectAltName(vec![
+        assert_write(&x509::SubjectAltName(vec![
             x509::GeneralName::Dns(
                 "a".into()
             );
             x509::MAX_GENERAL_NAMES + 1
-        ])),
+        ]))
+        .unwrap_err(),
         Error::TooMany
     );
     assert_eq!(
-        contract::check_refused(&x509::CrlNumber(vec![0, 1])),
+        assert_write(&x509::CrlNumber(vec![0, 1])).unwrap_err(),
         Error::Unwritable
     );
     assert_eq!(
-        contract::check_refused(&x509::Value::Raw(vec![0x0c, 1, b'a'])),
+        assert_write(&x509::Value::Raw(vec![0x0c, 1, b'a'])).unwrap_err(),
         Error::Value
     );
     assert_eq!(
-        contract::check_refused(&x509::Value::Text {
+        assert_write(&x509::Value::Text {
             kind: asn1::StringKind::Printable,
             text: "@".into(),
-        }),
+        })
+        .unwrap_err(),
         Error::Asn1(asn1::Error::Charset)
     );
 
@@ -584,18 +644,18 @@ fn x509_writers_preserve_errors_and_destinations() -> Result<(), Box<dyn core::e
         Err(Error::Asn1(asn1::Error::TooDeep))
     );
     let value = x509::Value::Raw(raw);
-    assert_eq!(contract::check_refused(&value), Error::Unwritable);
+    assert_eq!(assert_write(&value).unwrap_err(), Error::Unwritable);
     let mut name = x509::Name::default();
     name.push(asn1::Oid::from_contents(x509::oid::COMMON_NAME)?, value);
     assert_eq!(
-        contract::check_refused(&name),
+        assert_write(&name).unwrap_err(),
         Error::Asn1(asn1::Error::TooDeep)
     );
 
     let cert = x509::Certificate::parse(include_bytes!("fixtures/tls/ed25519.cert.der"))?;
     let mut key = cert.tbs.public_key.clone();
     key.algorithm.parameters = Some(vec![0x05, 0]);
-    assert_eq!(contract::check_refused(&key), Error::Value);
+    assert_eq!(assert_write(&key).unwrap_err(), Error::Value);
     let mut tbs = cert.tbs.clone();
     tbs.version = x509::Version::V1;
     tbs.extensions = vec![x509::Extension {
@@ -603,13 +663,13 @@ fn x509_writers_preserve_errors_and_destinations() -> Result<(), Box<dyn core::e
         critical: false,
         value: vec![0x03, 2, 7, 0x80],
     }];
-    assert_eq!(contract::check_refused(&tbs), Error::Version);
+    assert_eq!(assert_write(&tbs).unwrap_err(), Error::Version);
     tbs.version = x509::Version::V3;
     tbs.extensions.push(tbs.extensions[0].clone());
-    assert_eq!(contract::check_refused(&tbs), Error::DuplicateExtension);
+    assert_eq!(assert_write(&tbs).unwrap_err(), Error::DuplicateExtension);
     tbs.extensions.truncate(1);
     tbs.extensions[0].value = vec![0; x509::MAX_CERT];
-    assert_eq!(contract::check_refused(&tbs), Error::TooLong);
+    assert_eq!(assert_write(&tbs).unwrap_err(), Error::TooLong);
     Ok(())
 }
 
@@ -626,12 +686,15 @@ fn x509_signed_writes_check_fields_and_preserve_bytes() -> Result<(), Box<dyn co
 
     let mut changed = cert.clone();
     changed.tbs.serial.push(0);
-    assert_eq!(contract::check_refused(&changed), Error::Unwritable);
+    assert_eq!(assert_write(&changed).unwrap_err(), Error::Unwritable);
     // Decode errors still take precedence over the changed signed fields.
     changed.signature_algorithm.oid = asn1::Oid::from_contents(x509::oid::ECDSA_WITH_SHA256)?;
-    assert_eq!(contract::check_refused(&changed), Error::SignatureMismatch);
+    assert_eq!(
+        assert_write(&changed).unwrap_err(),
+        Error::SignatureMismatch
+    );
     changed.signature_algorithm.parameters = Some(vec![0x05, 0]);
-    assert_eq!(contract::check_refused(&changed), Error::Value);
+    assert_eq!(assert_write(&changed).unwrap_err(), Error::Value);
 
     let tbs = x509::TbsCertList {
         version: x509::Version::V2,
@@ -643,15 +706,18 @@ fn x509_signed_writes_check_fields_and_preserve_bytes() -> Result<(), Box<dyn co
         extensions: Vec::new(),
     };
     let crl = x509::Crl::assemble(&tbs.to_bytes()?, cert.signature_algorithm, cert.signature)?;
-    contract::check_wire_value(&crl);
+    let _ = assert_write(&crl);
     let mut changed = crl.clone();
     changed.tbs.issuer.rdns.clear();
-    assert_eq!(contract::check_refused(&changed), Error::Unwritable);
+    assert_eq!(assert_write(&changed).unwrap_err(), Error::Unwritable);
     changed.signature_algorithm.oid = asn1::Oid::from_contents(x509::oid::ECDSA_WITH_SHA256)?;
-    assert_eq!(contract::check_refused(&changed), Error::SignatureMismatch);
+    assert_eq!(
+        assert_write(&changed).unwrap_err(),
+        Error::SignatureMismatch
+    );
     changed.signature_algorithm.parameters = Some(vec![0x05, 0]);
-    assert_eq!(contract::check_refused(&changed), Error::Value);
-    assert_eq!(contract::check_refused(&changed.tbs), Error::Empty);
+    assert_eq!(assert_write(&changed).unwrap_err(), Error::Value);
+    assert_eq!(assert_write(&changed.tbs).unwrap_err(), Error::Empty);
 
     let unexpected = Error::Asn1(asn1::Error::Unexpected {
         expected: asn1::Tag::SEQUENCE,
@@ -659,10 +725,10 @@ fn x509_signed_writes_check_fields_and_preserve_bytes() -> Result<(), Box<dyn co
     });
     changed = crl;
     changed.tbs_der = vec![0x05, 0];
-    assert_eq!(contract::check_refused(&changed), unexpected);
+    assert_eq!(assert_write(&changed).unwrap_err(), unexpected);
     let mut changed = x509::Certificate::parse(der)?;
     changed.tbs_der = vec![0x05, 0];
-    assert_eq!(contract::check_refused(&changed), unexpected);
+    assert_eq!(assert_write(&changed).unwrap_err(), unexpected);
     Ok(())
 }
 
@@ -721,11 +787,19 @@ fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         .windows(b"-----END".len())
         .position(|w| w == b"-----END")
         .unwrap();
-    let (items, failure) = contract::check_decode(x509::PemBlocks::new, bytes.get(..cut).unwrap());
+    let (items, failure) = decode_chunks(
+        &mut Stream::new(x509::PemBlocks::new()),
+        chunks(bytes.get(..cut).unwrap(), &[1, 7, 64]),
+        |_| {},
+    );
     assert!(items.is_empty());
     assert!(matches!(failure, Some(Fail::Truncated { .. })));
     assert_eq!(
-        contract::check_decode(|| x509::PemBlocks::with_limit(32), &bytes),
+        decode_chunks(
+            &mut Stream::new(x509::PemBlocks::with_limit(32)),
+            chunks(&bytes, &[1, 7, 64]),
+            |_| {}
+        ),
         (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
     Ok(())
@@ -748,8 +822,11 @@ fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
         let expected = x509::pem_decode(input.as_bytes())?;
         round_trip(x509::PemBlocks::new, input.as_bytes(), &expected);
     }
-    let (items, failure) =
-        contract::check_decode(x509::PemBlocks::new, b"-----BEGIN TEST-----\nAQID");
+    let (items, failure) = decode_chunks(
+        &mut Stream::new(x509::PemBlocks::new()),
+        chunks(b"-----BEGIN TEST-----\nAQID", &[1, 7, 64]),
+        |_| {},
+    );
     assert!(items.is_empty());
     assert!(matches!(failure, Some(Fail::Truncated { .. })));
     Ok(())
@@ -772,7 +849,11 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
         &x509::pem_decode(input.as_bytes())?,
     );
     assert_eq!(
-        contract::check_decode(|| x509::PemBlocks::with_limit(limit - 1), text.as_bytes()),
+        decode_chunks(
+            &mut Stream::new(x509::PemBlocks::with_limit(limit - 1)),
+            chunks(text.as_bytes(), &[1, 7, 64]),
+            |_| {}
+        ),
         (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
 
@@ -782,12 +863,20 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
     round_trip(|| x509::PemBlocks::with_limit(0), &line, &[]);
     *line.last_mut().unwrap() = b'#';
     assert_eq!(
-        contract::check_decode(|| x509::PemBlocks::with_limit(0), &line),
+        decode_chunks(
+            &mut Stream::new(x509::PemBlocks::with_limit(0)),
+            chunks(&line, &[1, 7, 64]),
+            |_| {}
+        ),
         (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
     line.push(b'\n');
     assert_eq!(
-        contract::check_decode(|| x509::PemBlocks::with_limit(0), &line),
+        decode_chunks(
+            &mut Stream::new(x509::PemBlocks::with_limit(0)),
+            chunks(&line, &[1, 7, 64]),
+            |_| {}
+        ),
         (vec![], Some(Fail::Protocol(x509::Error::TooLong)))
     );
     Ok(())
@@ -797,23 +886,32 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
 fn frame_limits_refuse_lengths_before_bodies() {
     for limit in [0, 1, 2, 15, 16, 32] {
         assert_eq!(
-            contract::check_decode(
-                || fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(limit),
-                &[0x30, 0x81, 0x80]
+            decode_chunks(
+                &mut Stream::new(fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(
+                    limit
+                )),
+                chunks(&[0x30, 0x81, 0x80], &[1, 7, 64]),
+                |_| {}
             ),
             (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
         );
         assert_eq!(
-            contract::check_decode(
-                || fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(limit),
-                &[0xa1, 0x81, 0x80]
+            decode_chunks(
+                &mut Stream::new(
+                    fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(limit)
+                ),
+                chunks(&[0xa1, 0x81, 0x80], &[1, 7, 64]),
+                |_| {}
             ),
             (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
         );
         assert_eq!(
-            contract::check_decode(
-                || fictionet::stdlib::codec::Frames::<kerberos::Frame>::with_limit(limit),
-                &[0, 0, 0, 128]
+            decode_chunks(
+                &mut Stream::new(
+                    fictionet::stdlib::codec::Frames::<kerberos::Frame>::with_limit(limit)
+                ),
+                chunks(&[0, 0, 0, 128], &[1, 7, 64]),
+                |_| {}
             ),
             (
                 vec![],
@@ -834,16 +932,20 @@ fn frame_limits_refuse_lengths_before_bodies() {
         );
     }
     assert_eq!(
-        contract::check_decode(
-            || fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(0),
-            &[0x30, 0]
+        decode_chunks(
+            &mut Stream::new(fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(
+                0
+            )),
+            chunks(&[0x30, 0], &[1, 7, 64]),
+            |_| {}
         ),
         (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
     );
     assert_eq!(
-        contract::check_decode(
-            || fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(0),
-            &[0xa1, 0]
+        decode_chunks(
+            &mut Stream::new(fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(0)),
+            chunks(&[0xa1, 0], &[1, 7, 64]),
+            |_| {}
         ),
         (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
     );
@@ -915,15 +1017,29 @@ fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>>
         &both,
         &[Ok(message.clone()), Ok(message)],
     );
-    contract::check_truncated(
-        fictionet::stdlib::codec::Frames::<kerberos::Frame>::new,
-        &bytes,
+    assert_eq!(
+        decode_all(
+            fictionet::stdlib::codec::Frames::<kerberos::Frame>::new,
+            &[]
+        ),
+        (vec![], None)
     );
+    for cut in 1..bytes.len() {
+        assert_eq!(
+            decode_all(
+                fictionet::stdlib::codec::Frames::<kerberos::Frame>::new,
+                &bytes[..cut]
+            ),
+            (vec![], Some(Fail::Truncated { unread: cut })),
+            "prefix {cut}"
+        );
+    }
     let length = kerberos::MAX_MESSAGE as u32 + 1;
     assert_eq!(
-        contract::check_decode(
-            fictionet::stdlib::codec::Frames::<kerberos::Frame>::new,
-            &length.to_be_bytes()
+        decode_chunks(
+            &mut Stream::new(fictionet::stdlib::codec::Frames::<kerberos::Frame>::new()),
+            chunks(&length.to_be_bytes(), &[1, 7, 64]),
+            |_| {}
         ),
         (
             vec![],

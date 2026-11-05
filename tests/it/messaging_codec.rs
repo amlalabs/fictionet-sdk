@@ -4,7 +4,7 @@ use core::fmt::Debug;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire};
 use fictionet::stdlib::protocols::{amqp, coap, dhcpv6, mqtt, syslog};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
@@ -12,7 +12,10 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     let limit = 2 * make().capacity();
-    contract::check_decode_limits(make, bytes, 0, limit)
+    decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+        assert_eq!(s.held(), 0);
+        assert!(s.allocated() <= limit);
+    })
 }
 
 #[test]
@@ -33,7 +36,7 @@ fn amqp_broker_round_trip_and_payload_errors() {
     .unwrap();
     let mut bytes = amqp::PROTOCOL_HEADER.to_vec();
     for frame in &frames {
-        bytes.extend(contract::check_written(frame));
+        bytes.extend(assert_write(frame).unwrap());
     }
     let make = || {
         let mut decoder = amqp::Frames::server();
@@ -52,7 +55,7 @@ fn amqp_broker_round_trip_and_payload_errors() {
     );
     let response = amqp::Frame::heartbeat();
     assert_eq!(
-        check(amqp::Frames::new, &contract::check_written(&response)),
+        check(amqp::Frames::new, &assert_write(&response).unwrap()),
         (vec![response], None)
     );
 
@@ -75,10 +78,8 @@ fn amqp_broker_round_trip_and_payload_errors() {
         channel: 1,
         payload: vec![0],
     };
-    let mut bytes = contract::check_written(&bad_method);
-    bytes.extend(contract::check_written(
-        &amqp::Frame::method(1, &publish).unwrap(),
-    ));
+    let mut bytes = assert_write(&bad_method).unwrap();
+    bytes.extend(assert_write(&amqp::Frame::method(1, &publish).unwrap()).unwrap());
     let make = || amqp::Frames::new().map(|frame| amqp::Method::parse(&frame.payload));
     let (items, error) = check(make, &bytes);
     assert_eq!(error, None);
@@ -99,7 +100,10 @@ fn mqtt_broker_round_trip_and_terminal_errors() {
         }),
         mqtt::Packet::PingReq,
     ];
-    let bytes: Vec<u8> = packets.iter().flat_map(contract::check_written).collect();
+    let bytes: Vec<u8> = packets
+        .iter()
+        .flat_map(|value| assert_write(value).unwrap())
+        .collect();
     let make = || Frames::<mqtt::Packet>::with_limit(64);
     let (got, error) = check(make, &bytes);
     assert_eq!((got.clone(), error), (packets.clone(), None));
@@ -111,7 +115,10 @@ fn mqtt_broker_round_trip_and_terminal_errors() {
             _ => panic!("unexpected packet"),
         })
         .collect();
-    let bytes: Vec<u8> = replies.iter().flat_map(contract::check_written).collect();
+    let bytes: Vec<u8> = replies
+        .iter()
+        .flat_map(|value| assert_write(value).unwrap())
+        .collect();
     assert_eq!(check(make, &bytes), (replies, None));
 
     // The complete PUBACK body is invalid. MQTT ends this connection.
@@ -127,11 +134,11 @@ fn coap_udp_and_tcp_round_trip() {
     let mut request = coap::Message::new(coap::Type::Confirmable, coap::Code::GET, 17);
     request.token = vec![7];
     request.options.set_uri_path("/temperature");
-    let datagram = contract::check_written(&request);
+    let datagram = assert_write(&request).unwrap();
     let got = <coap::Message as Wire>::parse(&datagram).unwrap();
     let mut reply = got.reply(coap::Code::CONTENT, 18);
     reply.payload = b"21.5".to_vec();
-    contract::check_written(&reply);
+    assert_write(&reply).unwrap();
 
     let request = coap::Frame {
         code: request.code,
@@ -140,7 +147,10 @@ fn coap_udp_and_tcp_round_trip() {
         payload: request.payload,
     };
     let frames = vec![coap::Frame::csm(4096, true), request.clone()];
-    let bytes: Vec<u8> = frames.iter().flat_map(contract::check_written).collect();
+    let bytes: Vec<u8> = frames
+        .iter()
+        .flat_map(|value| assert_write(value).unwrap())
+        .collect();
     assert_eq!(
         check(Frames::<coap::Frame>::new, &bytes),
         (frames.clone(), None)
@@ -148,7 +158,7 @@ fn coap_udp_and_tcp_round_trip() {
     let mut reply = request.reply(coap::Code::CONTENT);
     reply.payload = b"21.5".to_vec();
     assert_eq!(
-        check(Frames::<coap::Frame>::new, &contract::check_written(&reply)),
+        check(Frames::<coap::Frame>::new, &assert_write(&reply).unwrap()),
         (vec![reply], None)
     );
 
@@ -171,11 +181,11 @@ fn dhcpv6_tcp_recovers_messages_and_replies() {
     request
         .options
         .push(dhcpv6::DhcpOption::Oro(vec![dhcpv6::opt::DNS_SERVERS]));
-    contract::check_written(&request);
+    assert_write(&request).unwrap();
     let mut bytes = vec![0, 0]; // A delimited empty message is an item error.
-    bytes.extend(contract::check_written(&dhcpv6::Frame(request.clone())));
+    bytes.extend(assert_write(&dhcpv6::Frame(request.clone())).unwrap());
     bytes.extend_from_slice(&[0, 5, 1, 0, 0, 1, 0]); // Torn option inside a whole message.
-    bytes.extend(contract::check_written(&dhcpv6::Frame(request.clone())));
+    bytes.extend(assert_write(&dhcpv6::Frame(request.clone())).unwrap());
     check(Frames::<dhcpv6::Message>::new, &bytes);
     let expected = vec![
         Err(dhcpv6::Error::Short),
@@ -189,7 +199,7 @@ fn dhcpv6_tcp_recovers_messages_and_replies() {
     let mut replies = Vec::new();
     for message in items.into_iter().flatten() {
         let answer = message.answer(dhcpv6::msg::ADVERTISE, &dhcpv6::Duid::en(32473, b"server"));
-        let bytes = contract::check_written(&dhcpv6::Frame(answer.clone()));
+        let bytes = assert_write(&dhcpv6::Frame(answer.clone())).unwrap();
         assert_eq!(
             check(Frames::<dhcpv6::Message>::new, &bytes),
             (vec![Ok(answer.clone())], None)
@@ -214,8 +224,8 @@ fn syslog_mixed_framing_and_final_unterminated_message() {
         b"<13>1 - host app - - - last\r".to_vec(),
     );
     let mut bytes = b"\n\r\n".to_vec();
-    bytes.extend(contract::check_written(&first));
-    bytes.extend(contract::check_written(&second));
+    bytes.extend(assert_write(&first).unwrap());
+    bytes.extend(assert_write(&second).unwrap());
     bytes.extend(b"invalid message\n");
     bytes.extend_from_slice(&last.message); // No delimiter at EOF; the CR is data.
     check(syslog::Frames::new, &bytes);
@@ -231,7 +241,10 @@ fn syslog_mixed_framing_and_final_unterminated_message() {
     let (entries, error) = check(make, &bytes);
     assert_eq!(error, None);
     assert!(entries[0].is_ok() && entries[1].is_ok() && entries[2].is_err() && entries[3].is_ok());
-    let bytes: Vec<u8> = expected.iter().flat_map(contract::check_written).collect();
+    let bytes: Vec<u8> = expected
+        .iter()
+        .flat_map(|value| assert_write(value).unwrap())
+        .collect();
     assert_eq!(check(syslog::Frames::new, &bytes), (expected.clone(), None));
 
     let mut stream = Stream::new(syslog::Frames::new());
@@ -349,7 +362,7 @@ fn partial_units_and_header_faults() {
 #[test]
 fn exact_parsers_and_transactional_writers() {
     let frame = amqp::Frame::heartbeat();
-    let mut bytes = contract::check_written(&frame);
+    let mut bytes = assert_write(&frame).unwrap();
     bytes.push(0);
     assert_eq!(
         <amqp::Frame as Wire>::parse(&bytes),
@@ -359,12 +372,13 @@ fn exact_parsers_and_transactional_writers() {
         <amqp::Frame as Wire>::parse(&[]),
         Err(amqp::Error::Truncated)
     );
-    contract::check_refused(&amqp::Frame {
+    assert_write(&amqp::Frame {
         channel: 1,
         ..frame
-    });
-    contract::check_refused(&amqp::Frame::body(0, vec![1]));
-    contract::check_refused(&amqp::Frame::body(1, vec![0; amqp::MAX_PAYLOAD + 1]));
+    })
+    .unwrap_err();
+    assert_write(&amqp::Frame::body(0, vec![1])).unwrap_err();
+    assert_write(&amqp::Frame::body(1, vec![0; amqp::MAX_PAYLOAD + 1])).unwrap_err();
 
     assert_eq!(
         <mqtt::Packet as Wire>::parse(&[0xc0, 0, 0]),
@@ -374,11 +388,12 @@ fn exact_parsers_and_transactional_writers() {
         <mqtt::Packet as Wire>::parse(&[0xc0]),
         Err(mqtt::Error::Truncated)
     );
-    contract::check_refused(&mqtt::Packet::PubAck(0));
-    contract::check_refused(&mqtt::Packet::ConnAck(mqtt::ConnAck {
+    assert_write(&mqtt::Packet::PubAck(0)).unwrap_err();
+    assert_write(&mqtt::Packet::ConnAck(mqtt::ConnAck {
         session_present: true,
         code: mqtt::ConnectReturnCode::NotAuthorized,
-    }));
+    }))
+    .unwrap_err();
 
     let mut frame = coap::Frame::new(coap::Code::GET);
     assert_eq!(
@@ -386,7 +401,7 @@ fn exact_parsers_and_transactional_writers() {
         Err(coap::Error::Trailing)
     );
     frame.token = vec![0; coap::MAX_TOKEN + 1];
-    contract::check_refused(&frame);
+    assert_write(&frame).unwrap_err();
     frame.token.clear();
     frame.options.0 = vec![
         coap::CoapOption {
@@ -398,32 +413,32 @@ fn exact_parsers_and_transactional_writers() {
             value: vec![],
         },
     ];
-    contract::check_refused(&frame); // Wire refuses options out of number order.
+    assert_write(&frame).unwrap_err(); // Wire refuses options out of number order.
     frame.options.0.clear();
     frame.payload = vec![0; coap::MAX_FRAME_BODY]; // The marker also needs a byte.
-    contract::check_refused(&frame);
+    assert_write(&frame).unwrap_err();
     let mut message = coap::Message::empty_ack(1);
     message.payload = vec![1];
-    contract::check_refused(&message);
+    assert_write(&message).unwrap_err();
     // Parsed UDP options remain writable, including reserved block sizes.
     let mut message = coap::Message::new(coap::Type::Confirmable, coap::Code::GET, 1);
     message.options.set_uint(coap::option::BLOCK1, 7);
     assert_eq!(message.bad_block(), Some(coap::option::BLOCK1));
-    contract::check_written(&message);
+    assert_write(&message).unwrap();
 
     let mut message = dhcpv6::Message::new(dhcpv6::msg::SOLICIT, 1);
     message.transaction = 1 << 24;
-    contract::check_refused(&message);
-    contract::check_refused(&dhcpv6::Frame(message.clone()));
+    assert_write(&message).unwrap_err();
+    assert_write(&dhcpv6::Frame(message.clone())).unwrap_err();
     message.transaction = 1;
     message.hop_count = 1;
-    contract::check_refused(&message);
+    assert_write(&message).unwrap_err();
     message.hop_count = 0;
     message.options.push(dhcpv6::DhcpOption::Other {
         code: dhcpv6::opt::PREFERENCE,
         data: vec![7],
     });
-    contract::check_refused(&message); // It would read as Preference, not Other.
+    assert_write(&message).unwrap_err(); // It would read as Preference, not Other.
     assert_eq!(
         <dhcpv6::Frame as Wire>::parse(&[0]),
         Err(dhcpv6::Error::Truncated)
@@ -450,7 +465,7 @@ fn exact_parsers_and_transactional_writers() {
             vec![0; syslog::MAX_MESSAGE_LEN + 1],
         ),
     ] {
-        contract::check_refused(&frame);
+        assert_write(&frame).unwrap_err();
     }
     assert_eq!(
         <syslog::Frame as Wire>::parse(b"one\ntwo\n"),
@@ -460,10 +475,11 @@ fn exact_parsers_and_transactional_writers() {
         <syslog::Frame as Wire>::parse(b"4 abc"),
         Err(syslog::Error::Truncated)
     );
-    contract::check_written(&syslog::Frame::new(
+    assert_write(&syslog::Frame::new(
         syslog::Framing::NonTransparent,
         b"\r".to_vec(),
-    ));
+    ))
+    .unwrap();
 }
 
 #[test]
@@ -474,9 +490,9 @@ fn dhcpv6_tcp_limit_and_stream_backpressure() {
         dhcpv6::MAX_TCP_MESSAGE
             - 8
     ]));
-    contract::check_refused(&message); // This message fits TCP but exceeds the UDP limit.
+    assert_write(&message).unwrap_err(); // This message fits TCP but exceeds the UDP limit.
     let frame = dhcpv6::Frame(message.clone());
-    let bytes = contract::check_written(&frame);
+    let bytes = assert_write(&frame).unwrap();
     assert_eq!(bytes.len(), dhcpv6::MAX_BUFFERED);
     assert_eq!(
         check(Frames::<dhcpv6::Message>::new, &bytes),

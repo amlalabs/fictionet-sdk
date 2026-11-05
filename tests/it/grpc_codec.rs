@@ -1,8 +1,9 @@
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Wire};
 use fictionet::stdlib::protocols::grpc::{Code, Error, HEADER_LEN, Message, fail_status};
 use fictionet::stdlib::test_support;
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 use std::collections::BTreeMap;
 
 const MESSAGE_LIMIT: usize = 8;
@@ -197,10 +198,24 @@ fn route(chunk_size: usize) {
         for message in items.iter().flatten() {
             // The writer round-trips through the decoder bytewise.
             let bytes = message.to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(
-                || Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(MESSAGE_LIMIT),
-                &bytes,
-                2 * (HEADER_LEN + MESSAGE_LIMIT),
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(
+                        Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(
+                            MESSAGE_LIMIT
+                        )
+                    ),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |s| {
+                        assert!(s.allocated() <= 2 * (HEADER_LEN + MESSAGE_LIMIT));
+                    }
+                ),
+                decode_all(
+                    || Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(
+                        MESSAGE_LIMIT
+                    ),
+                    &bytes
+                )
             );
             let (decoded, failure) = test_support::decode_all(
                 || Frames::<fictionet::stdlib::protocols::grpc::Message>::with_limit(MESSAGE_LIMIT),
@@ -339,7 +354,14 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
         ),
     ];
     for (bytes, expected, failure) in cases {
-        contract::check_decode(make, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(make, &bytes)
+        );
         let (items, failed) = test_support::decode_all(make, &bytes);
         assert_eq!(
             items,

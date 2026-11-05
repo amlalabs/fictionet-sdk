@@ -1,11 +1,11 @@
 //! Session modes and byte-preserving handoffs through the shared driver.
 
 use core::{convert::Infallible, fmt::Debug};
+use fictionet::stdlib::test_support::{assert_write, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Step, Stream, Wire},
     protocols::{proxy_protocol as proxy, rfb, socks},
     test_support::chunks,
-    test_support::contract,
 };
 use std::net::Ipv4Addr;
 
@@ -34,7 +34,8 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     let wire = [units, PAYLOAD].concat();
-    let (items, failure) = contract::check_decode(&make, &wire);
+    let (items, failure) =
+        decode_chunks(&mut Stream::new(make()), chunks(&wire, &[1, 7, 64]), |_| {});
     assert_eq!(items, expected);
     assert_eq!(failure, None);
     for pattern in [
@@ -121,8 +122,11 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
+    let alloc_limit = make().capacity().saturating_mul(2);
     assert_eq!(
-        contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2)),
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc_limit);
+        }),
         (vec![], Some(failure))
     );
     let mut stream = Stream::new(make());
@@ -137,8 +141,11 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
+    let alloc_limit = make().capacity().saturating_mul(2);
     assert_eq!(
-        contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2)),
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc_limit);
+        }),
         (
             vec![],
             Some(Fail::Truncated {
@@ -186,8 +193,10 @@ fn proxy_v1_v2_round_trip_and_handoff() {
     ));
     for header in headers {
         let bytes = Wire::to_bytes(&header).unwrap();
-        contract::check_wire::<proxy::Header>(&bytes);
-        contract::check_wire_value(&header);
+        if let Ok(value) = <proxy::Header as Wire>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
+        let _ = assert_write(&header);
         handoff(proxy::Headers::new, &bytes, &[Ok(header)]);
     }
 }
@@ -340,7 +349,9 @@ fn socks4_and_4a_round_trip_and_handoff() {
             user_id: b"user".to_vec(),
         };
         let bytes = Wire::to_bytes(&request).unwrap();
-        contract::check_wire::<socks::Socks4Request>(&bytes);
+        if let Ok(value) = <socks::Socks4Request as Wire>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         handoff(
             socks::ClientMessages::new,
             &bytes,
@@ -461,10 +472,15 @@ fn socks_modes_and_complete_request_errors() {
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
     assert_eq!(stream.into_parts().0.unread(), PAYLOAD);
-    contract::check_decode_with_alloc_limit(
-        socks::ClientMessages::new,
-        &bytes,
-        2 * socks::MAX_MESSAGE,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(socks::ClientMessages::new()),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * socks::MAX_MESSAGE);
+            }
+        ),
+        decode_all(socks::ClientMessages::new, &bytes)
     ); // Pending decisions preserve bytes below capacity.
 }
 
@@ -922,43 +938,53 @@ fn rfb_body_errors_are_items_and_mode_changes_require_boundaries() {
     assert!(stream.decoder().set_phase(rfb::Phase::Closed).is_ok());
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
-    contract::check_decode_with_alloc_limit(
-        || client_decoder(rfb::Phase::Normal, LIMIT),
-        &bytes,
-        2 * LIMIT,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(client_decoder(rfb::Phase::Normal, LIMIT)),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * LIMIT);
+            }
+        ),
+        decode_all(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes)
     );
 }
 
 #[test]
 fn strict_wire_writers_refuse_changes_transactionally() {
-    contract::check_wire_value(&proxy::Header::V1(proxy::V1::Unknown(b"bad".to_vec())));
-    contract::check_wire_value(&proxy::Header::V2(proxy::V2 {
+    let _ = assert_write(&proxy::Header::V1(proxy::V1::Unknown(b"bad".to_vec())));
+    let _ = assert_write(&proxy::Header::V2(proxy::V2 {
         command: proxy::Command::Proxy,
         addresses: proxy::Addresses::Unspec,
         tlvs: vec![proxy::Tlv::Crc32c(0)],
     }));
-    contract::check_wire_value(&socks::Greeting {
+    let _ = assert_write(&socks::Greeting {
         methods: vec![socks::Method::Other(0)],
     });
-    contract::check_wire_value(&socks::AuthRequest {
+    let _ = assert_write(&socks::AuthRequest {
         username: vec![0; 256],
         password: vec![],
     });
-    contract::check_wire_value(&socks::Socks4Request {
+    let _ = assert_write(&socks::Socks4Request {
         command: socks::Socks4Command::Connect,
         destination: socks::Socks4Destination::Ip(Ipv4Addr::new(0, 0, 0, 1)),
         port: 80,
         user_id: b"a\0b".to_vec(),
     });
-    contract::check_wire_value(&rfb::Version {
+    let _ = assert_write(&rfb::Version {
         major: 1000,
         minor: 8,
     });
-    contract::check_wire_value(&rfb::ClientMessage::SecurityType(1));
-    contract::check_wire_value(&format());
-    contract::check_wire_value(&init());
-    contract::check_wire::<rfb::Version>(&Wire::to_bytes(&rfb::Version::V3_8).unwrap());
-    contract::check_wire::<rfb::ServerInit>(&Wire::to_bytes(&init()).unwrap());
+    let _ = assert_write(&rfb::ClientMessage::SecurityType(1));
+    let _ = assert_write(&format());
+    let _ = assert_write(&init());
+    if let Ok(value) = <rfb::Version as Wire>::parse(&Wire::to_bytes(&rfb::Version::V3_8).unwrap())
+    {
+        assert_write(&value).unwrap();
+    }
+    if let Ok(value) = <rfb::ServerInit as Wire>::parse(&Wire::to_bytes(&init()).unwrap()) {
+        assert_write(&value).unwrap();
+    }
     for bytes in [
         Wire::to_bytes(&rfb::Version::V3_8).unwrap(),
         Wire::to_bytes(&init()).unwrap(),
@@ -1328,7 +1354,12 @@ fn rfb_frame_scan_accepts_raw_and_cursor_at_each_pixel_width() {
                 .unwrap();
             d
         };
-        contract::check_decode_with_alloc_limit(make, &bytes, 2 * LIMIT);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(&bytes, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= 2 * LIMIT);
+            }),
+            decode_all(make, &bytes)
+        );
         let mut stream = Stream::new(make());
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok(Ok(message))));
@@ -1341,35 +1372,86 @@ fn contract_checks_small_arbitrary_inputs_and_wire_values() {
     let mut random = codec::Lcg::new(0x1234_5678);
     for len in 0..80 {
         let bytes = random.bytes(len);
-        contract::check_decode_with_alloc_limit(|| proxy::Headers::with_limit(32), &bytes, 2 * 32);
-        contract::check_decode_with_alloc_limit(
-            || SocksHandshake(socks::ClientMessages::with_limit(16)),
-            &bytes,
-            2 * 16,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(proxy::Headers::with_limit(32)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * 32);
+                }
+            ),
+            decode_all(|| proxy::Headers::with_limit(32), &bytes)
         );
-        contract::check_decode_with_alloc_limit(
-            || socks::ServerMessages::socks5(socks::Command::Bind),
-            &bytes,
-            2 * socks::MAX_MESSAGE,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(SocksHandshake(socks::ClientMessages::with_limit(16))),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * 16);
+                }
+            ),
+            decode_all(
+                || SocksHandshake(socks::ClientMessages::with_limit(16)),
+                &bytes
+            )
         );
-        contract::check_decode_with_alloc_limit(
-            || server_decoder(rfb::Phase::Normal, LIMIT),
-            &bytes,
-            2 * LIMIT,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(socks::ServerMessages::socks5(socks::Command::Bind)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * socks::MAX_MESSAGE);
+                }
+            ),
+            decode_all(
+                || socks::ServerMessages::socks5(socks::Command::Bind),
+                &bytes
+            )
         );
-        contract::check_decode_with_alloc_limit(
-            || client_decoder(rfb::Phase::Normal, LIMIT),
-            &bytes,
-            2 * LIMIT,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(server_decoder(rfb::Phase::Normal, LIMIT)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * LIMIT);
+                }
+            ),
+            decode_all(|| server_decoder(rfb::Phase::Normal, LIMIT), &bytes)
         );
-        contract::check_wire::<proxy::Header>(&bytes);
-        contract::check_wire::<socks::Greeting>(&bytes);
-        contract::check_wire::<socks::AuthRequest>(&bytes);
-        contract::check_wire::<socks::Request>(&bytes);
-        contract::check_wire::<rfb::Version>(&bytes);
-        contract::check_wire::<rfb::PixelFormat>(&bytes);
-        contract::check_wire::<rfb::ServerInit>(&bytes);
-        contract::check_wire::<rfb::ClientMessage>(&bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(client_decoder(rfb::Phase::Normal, LIMIT)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * LIMIT);
+                }
+            ),
+            decode_all(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes)
+        );
+        if let Ok(value) = <proxy::Header as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <socks::Greeting as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <socks::AuthRequest as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <socks::Request as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <rfb::Version as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <rfb::PixelFormat as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <rfb::ServerInit as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <rfb::ClientMessage as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
     }
 }
 

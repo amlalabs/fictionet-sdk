@@ -7,7 +7,7 @@ use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::protocols::{
     json, mime_multipart as mime, protobuf, urlencoded_form as form, xml,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use fictionet::stdlib::test_support::{decode_all, mutate};
 use std::fmt::Debug;
 
@@ -17,7 +17,12 @@ where
     D::Error: Clone + Debug + PartialEq,
 {
     let allocation = 2 * make().capacity();
-    contract::check_decode_with_alloc_limit(&make, input, allocation);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(input, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= allocation);
+        }),
+        decode_all(&make, input)
+    );
 }
 
 #[test]
@@ -41,7 +46,7 @@ fn multipart_body_for_http_form_data() {
         Ok(body.multipart.clone())
     );
     assert_eq!(mime::Body::parse(&bytes), Ok(body.clone()));
-    contract::check_wire_value(&body);
+    let _ = assert_write(&body);
 }
 
 #[test]
@@ -54,12 +59,16 @@ fn multipart_body_boundaries_and_refusals() {
     ] {
         let body = mime::Body::parse(input).unwrap();
         assert!(body.multipart.preamble.is_empty());
-        contract::check_wire_value(&body);
-        contract::check_wire::<mime::Body>(input);
+        let _ = assert_write(&body);
+        if let Ok(value) = <mime::Body as Wire>::parse(input) {
+            assert_write(&value).unwrap();
+        }
     }
     for input in [b"preamble\r\n--b--".as_slice(), b"--b\r\n\r\npart"] {
         assert!(mime::Body::parse(input).is_err());
-        contract::check_wire::<mime::Body>(input);
+        if let Ok(value) = <mime::Body as Wire>::parse(input) {
+            assert_write(&value).unwrap();
+        }
     }
     let mut body = mime::Body {
         boundary: "b".into(),
@@ -76,12 +85,12 @@ fn multipart_body_boundaries_and_refusals() {
     body.boundary = "b--".into();
     assert_eq!(body.write(&mut out), Err(mime::Error::Unwritable));
     assert_eq!(out, b"keep");
-    contract::check_wire_value(&body);
+    let _ = assert_write(&body);
     body.boundary = "b".into();
     body.multipart.parts[0].body = b"--b".to_vec();
     assert_eq!(body.write(&mut out), Err(mime::Error::BoundaryInData));
     assert_eq!(out, b"keep");
-    contract::check_wire_value(&body);
+    let _ = assert_write(&body);
 }
 
 #[test]
@@ -94,7 +103,9 @@ fn json_chunked_round_trip_and_eof() {
     let mut written = Vec::new();
     for value in &values {
         let one = Wire::to_bytes(value).unwrap();
-        contract::check_wire::<json::Value>(&one);
+        if let Ok(value) = <json::Value as Wire>::parse(&one) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(<json::Value as Wire>::parse(&one).as_ref(), Ok(value));
         Wire::write(value, &mut written).unwrap();
         written.push(b' ');
@@ -371,7 +382,9 @@ fn grpc_composes_with_protobuf_messages() {
 fn xml_chunked_round_trip_and_eof() {
     let bytes = br#"<?xml version="1.0"?><!DOCTYPE r [<!ATTLIST r n CDATA "v">]><r xmlns:p="urn:p"><p:c/>text&amp;more</r><!--tail--> "#;
     check(xml::Events::new, bytes);
-    contract::check_wire::<xml::Document>(bytes);
+    if let Ok(value) = <xml::Document as Wire>::parse(bytes) {
+        assert_write(&value).unwrap();
+    }
     let expected = xml::Document::parse(bytes).unwrap().events().unwrap();
     assert_eq!(
         decode_all(xml::Events::new, bytes),
@@ -438,7 +451,9 @@ fn form_chunked_round_trip_and_eof() {
     let mut written = Vec::new();
     for frame in &expected {
         let one = Wire::to_bytes(frame).unwrap();
-        contract::check_wire::<form::Field>(&one);
+        if let Ok(value) = <form::Field as Wire>::parse(&one) {
+            assert_write(&value).unwrap();
+        }
         assert_eq!(<form::Field as Wire>::parse(&one).as_ref(), Ok(frame));
         if !written.is_empty() {
             written.push(b'&');
@@ -495,7 +510,9 @@ fn multipart_chunked_round_trip_and_eof() {
     let mut parts = Vec::new();
     for part in &body.parts {
         let one = Wire::to_bytes(part).unwrap();
-        contract::check_wire::<mime::Part>(&one);
+        if let Ok(value) = <mime::Part as Wire>::parse(&one) {
+            assert_write(&value).unwrap();
+        }
         parts.push(<mime::Part as Wire>::parse(&one).unwrap());
     }
     let rewritten = mime::Multipart {
@@ -552,8 +569,18 @@ fn multipart_all_boundary_lengths_streaming() {
             let input = format!(
                 "--{almost}\r\n--{boundary}{pad}\r\n\r\n{body}\r\n--{boundary}{pad}\r\n\r\n\r\n--{boundary}--{pad}\r\nepilogue"
             );
-            // The contract includes one-byte chunks, splitting every CRLF and candidate.
-            check(make, input.as_bytes());
+            // One-byte chunks split every CRLF and boundary candidate.
+            let allocation = 2 * make().capacity();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(make()),
+                    chunks(input.as_bytes(), &[1]),
+                    |s| {
+                        assert!(s.allocated() <= allocation);
+                    }
+                ),
+                (expected.clone(), None)
+            );
             assert_eq!(decode_all(make, input.as_bytes()), (expected.clone(), None));
             assert_eq!(
                 mime::Multipart::parse(input.as_bytes(), &boundary)
@@ -758,8 +785,8 @@ fn protobuf_round_trip_and_eof() {
         }],
     };
     let frame = protobuf::Frame::from_message(&message).unwrap();
-    contract::check_wire_value(&message);
-    contract::check_wire_value(&frame);
+    let _ = assert_write(&message);
+    let _ = assert_write(&frame);
     let bytes = Wire::to_bytes(&frame).unwrap();
     check(Frames::<protobuf::Frame>::new, &bytes);
     for cut in 1..bytes.len() {
@@ -816,21 +843,21 @@ fn protobuf_rejects_oversize_at_named_capacity() {
 
 #[test]
 fn strict_writers_leave_existing_output_unchanged() {
-    contract::check_wire_value(&json::Value::String("a".repeat(json::MAX_SIZE)));
-    contract::check_wire_value(&xml::Document {
+    let _ = assert_write(&json::Value::String("a".repeat(json::MAX_SIZE)));
+    let _ = assert_write(&xml::Document {
         data: b"<a>".to_vec(),
     });
-    contract::check_wire_value(&form::Field((" ".repeat(form::MAX_INPUT), "x".into())));
-    contract::check_wire_value(&mime::Part {
+    let _ = assert_write(&form::Field((" ".repeat(form::MAX_INPUT), "x".into())));
+    let _ = assert_write(&mime::Part {
         headers: mime::Headers {
             fields: vec![("bad:name".into(), "x".into())],
         },
         body: vec![],
     });
-    contract::check_wire_value(&protobuf::Frame {
+    let _ = assert_write(&protobuf::Frame {
         data: vec![0; protobuf::MAX_MESSAGE + 1],
     });
-    contract::check_wire_value(&protobuf::Message {
+    let _ = assert_write(&protobuf::Message {
         fields: vec![protobuf::Field {
             number: 0,
             value: protobuf::Value::Varint(0),
@@ -859,17 +886,39 @@ fn contracts_on_malformed_and_mutated_inputs() {
             check(form::Fields::new, &bytes);
             check(|| mime::Parts::new("b").unwrap(), &bytes);
             check(Frames::<protobuf::Frame>::new, &bytes);
-            contract::check_wire::<json::Value>(&bytes);
-            contract::check_wire::<xml::Document>(&bytes);
-            contract::check_wire::<form::Field>(&bytes);
-            contract::check_wire::<mime::Part>(&bytes);
-            contract::check_wire::<protobuf::Frame>(&bytes);
-            contract::check_wire::<protobuf::Varint>(&bytes);
-            contract::check_wire::<form::Form>(&bytes);
-            contract::check_wire::<form::PercentEncoded>(&bytes);
-            contract::check_wire::<mime::Entity>(&bytes);
-            contract::check_wire::<mime::ParamValue>(&bytes);
-            contract::check_wire::<protobuf::Message>(&bytes);
+            if let Ok(value) = <json::Value as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <xml::Document as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <form::Field as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <mime::Part as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <protobuf::Frame as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <protobuf::Varint as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <form::Form as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <form::PercentEncoded as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <mime::Entity as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <mime::ParamValue as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
+            if let Ok(value) = <protobuf::Message as Wire>::parse(&bytes) {
+                let _ = assert_write(&value);
+            }
         }
     }
 }

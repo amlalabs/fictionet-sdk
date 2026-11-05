@@ -452,7 +452,7 @@ because manual `advance` is only available to standalone harnesses.
 For decoder tests with caller decisions, `stdlib::test_support::Scripted`
 holds a decoder and caller state. Its hooks run before each decode call and
 after each item. Record a pending decision in the after-item hook to apply
-it on the next call. Use it with `test_support::contract` to check chunking.
+it on the next call. Drive it with `test_support::decode_chunks` to check chunking.
 
 ## 3. A network
 

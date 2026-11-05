@@ -1,8 +1,6 @@
 use fictionet::stdlib::codec::{Lcg, Stream, Wire, finish};
 use fictionet::stdlib::protocols::sse::{Event, Events, Limits, Line, RawLines};
-use fictionet::stdlib::test_support::contract::{
-    check_decode, check_decode_with_held_limit, check_wire, check_wire_value, check_written,
-};
+use fictionet::stdlib::test_support::{assert_write, decode_chunks};
 use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
 #[test]
@@ -22,25 +20,67 @@ fn decoder_contracts_and_chunking() {
         b"0123456789012345678901234567890123456789\n",
     ];
     for bytes in samples {
-        check_decode(|| RawLines::with_limit(limits.line), bytes);
-        check_decode(|| Events::with_limits(limits), bytes);
-        check_decode_with_held_limit(|| RawLines::with_limit(limits.line), bytes, 0);
-        check_decode_with_held_limit(
-            || Events::with_limits(limits),
-            bytes,
-            limits.event + 2 * limits.line,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(RawLines::with_limit(limits.line)),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| RawLines::with_limit(limits.line), bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::with_limits(limits)),
+                chunks(bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Events::with_limits(limits), bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(RawLines::with_limit(limits.line)),
+                chunks(bytes, &[1, 7, 64]),
+                |s| {
+                    assert_eq!(s.held(), 0);
+                }
+            ),
+            decode_all(|| RawLines::with_limit(limits.line), bytes)
+        );
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::with_limits(limits)),
+                chunks(bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.held() <= limits.event + 2 * limits.line);
+                }
+            ),
+            decode_all(|| Events::with_limits(limits), bytes)
         );
     }
     // Zero and tiny limits still recognize a split BOM and make progress.
     for line in 0..8 {
         for event in [0, 1, 12, 32] {
-            check_decode(
-                || RawLines::with_limit(line),
-                b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n",
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RawLines::with_limit(line)),
+                    chunks(b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n", &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(
+                    || RawLines::with_limit(line),
+                    b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n"
+                )
             );
-            check_decode(
-                || Events::with_limits(Limits { line, event }),
-                b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n",
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Events::with_limits(Limits { line, event })),
+                    chunks(b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n", &[1, 7, 64]),
+                    |_| {}
+                ),
+                decode_all(
+                    || Events::with_limits(Limits { line, event }),
+                    b"\xef\xbb\xbfdata\r\n\r\ndata:xxx\n\n"
+                )
             );
         }
     }
@@ -63,11 +103,25 @@ fn wire_contracts_and_decoded_round_trips() {
         },
     ];
     for value in values {
-        let bytes = check_written(&value);
-        assert_eq!(check_decode(Events::default, &bytes), (vec![value], None));
+        let bytes = assert_write(&value).unwrap();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Events::default()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            (vec![value], None)
+        );
         for line in decode_all(RawLines::default, &bytes).0 {
-            let bytes = check_written(&line);
-            assert_eq!(check_decode(RawLines::default, &bytes), (vec![line], None));
+            let bytes = assert_write(&line).unwrap();
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(RawLines::default()),
+                    chunks(&bytes, &[1, 7, 64]),
+                    |_| {}
+                ),
+                (vec![line], None)
+            );
         }
     }
     for bytes in [
@@ -76,7 +130,9 @@ fn wire_contracts_and_decoded_round_trips() {
         b"id:bad\0\n",
         b"unknown: x\r",
     ] {
-        check_wire::<Line>(bytes);
+        if let Ok(value) = <Line as Wire>::parse(bytes) {
+            assert_write(&value).unwrap();
+        }
         let line = Line::parse(bytes).unwrap();
         let bytes = line.to_bytes().unwrap();
         assert_eq!(decode_all(RawLines::default, &bytes), (vec![line], None));
@@ -144,24 +200,47 @@ fn mutations_and_small_limit_contracts() {
         for _ in 0..8 {
             mutate(&mut rng, &mut data);
         }
-        check_decode(|| RawLines::with_limit(24), &data);
-        check_decode(
-            || {
-                Events::with_limits(Limits {
-                    line: 24,
-                    event: 64,
-                })
-            },
-            &data,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(RawLines::with_limit(24)),
+                chunks(&data, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| RawLines::with_limit(24), &data)
         );
-        check_wire::<Event>(&data);
-        check_wire::<Line>(&data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new({
+                    Events::with_limits(Limits {
+                        line: 24,
+                        event: 64,
+                    })
+                }),
+                chunks(&data, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(
+                || {
+                    Events::with_limits(Limits {
+                        line: 24,
+                        event: 64,
+                    })
+                },
+                &data
+            )
+        );
+        if let Ok(value) = <Event as Wire>::parse(&data) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <Line as Wire>::parse(&data) {
+            let _ = assert_write(&value);
+        }
         for value in decode_all(Events::default, &data).0 {
             let bytes = value.to_bytes().unwrap();
             assert_eq!(decode_all(Events::default, &bytes), (vec![value], None));
         }
         for value in decode_all(RawLines::default, &data).0 {
-            check_wire_value(&value);
+            let _ = assert_write(&value);
             // A later BOM in an unknown name has no context-free encoding.
             if let Ok(bytes) = value.to_bytes() {
                 assert_eq!(decode_all(RawLines::default, &bytes), (vec![value], None));

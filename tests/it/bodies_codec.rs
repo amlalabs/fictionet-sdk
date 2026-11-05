@@ -1,10 +1,10 @@
 //! Session handoffs and bounded mail and print bodies through the codec driver.
 
 use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Step, Stream, Wire, pump};
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::{imf, ipp, postgres as pg};
 use fictionet::stdlib::test_support::chunks;
+use fictionet::stdlib::test_support::{assert_write, decode_chunks};
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> (Vec<D::Item>, Option<Fail<D::Error>>)
 where
@@ -12,7 +12,10 @@ where
     D::Item: PartialEq + core::fmt::Debug,
 {
     let capacity = make().capacity();
-    contract::check_decode_limits(make, bytes, 0, 2 * capacity)
+    decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+        assert_eq!(s.held(), 0);
+        assert!(s.allocated() <= 2 * capacity);
+    })
 }
 
 fn failure<D: Decode>(decoder: D, bytes: &[u8], eof: bool, expected: Fail<D::Error>)
@@ -43,7 +46,7 @@ fn postgres_frontend_and_backend_round_trips() {
     ];
     let mut bytes = Vec::new();
     for message in &frontend {
-        bytes.extend_from_slice(&contract::check_written(message));
+        bytes.extend_from_slice(&assert_write(message).unwrap());
     }
     assert_eq!(
         check(pg::FrontendMessages::new, &bytes),
@@ -62,7 +65,7 @@ fn postgres_frontend_and_backend_round_trips() {
     ];
     let mut bytes = Vec::new();
     for message in &backend {
-        bytes.extend_from_slice(&contract::check_written(message));
+        bytes.extend_from_slice(&assert_write(message).unwrap());
     }
     assert_eq!(
         check(pg::BackendEvents::new, &bytes),
@@ -460,8 +463,10 @@ where
 fn imf_header_and_collected_body_round_trip() {
     let header = mail_header();
     let mut bytes = Wire::to_bytes(&header).unwrap();
-    contract::check_wire::<imf::Header>(&bytes);
-    contract::check_wire_value(&header);
+    if let Ok(value) = <imf::Header as Wire>::parse(&bytes) {
+        assert_write(&value).unwrap();
+    }
+    let _ = assert_write(&header);
     let body: Vec<u8> = (0..=255).cycle().take(1031).collect();
     bytes.extend_from_slice(&body);
     let make = || imf::Head::with_limit(128);
@@ -529,8 +534,10 @@ fn print_head() -> ipp::Header {
 fn ipp_head_and_collected_document_round_trip() {
     let head = print_head();
     let mut bytes = Wire::to_bytes(&head).unwrap();
-    contract::check_wire::<ipp::Header>(&bytes);
-    contract::check_wire_value(&head);
+    if let Ok(value) = <ipp::Header as Wire>::parse(&bytes) {
+        assert_write(&value).unwrap();
+    }
+    let _ = assert_write(&head);
     let document: Vec<u8> = (0..=255).rev().cycle().take(2057).collect();
     bytes.extend_from_slice(&document);
     let make = || ipp::Head::with_limit(512);
@@ -794,7 +801,7 @@ fn strict_writers_reject_lossy_values_without_changing_the_destination() {
             secret_key: vec![],
         },
     ] {
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         assert!(value.write(&mut out).is_err());
         assert_eq!(out, b"prefix");
     }
@@ -802,12 +809,12 @@ fn strict_writers_reject_lossy_values_without_changing_the_destination() {
         name: "a\0b".into(),
         value: "v".into(),
     };
-    contract::check_wire_value(&backend);
+    let _ = assert_write(&backend);
     assert!(backend.write(&mut out).is_err());
     assert_eq!(out, b"prefix");
     let mut header = mail_header();
     header.push("Subject", " leading");
-    contract::check_wire_value(&header);
+    let _ = assert_write(&header);
     assert!(header.write(&mut out).is_err());
     assert_eq!(out, b"prefix");
     let mut head = print_head();
@@ -815,7 +822,7 @@ fn strict_writers_reject_lossy_values_without_changing_the_destination() {
         tag: 0,
         attributes: vec![],
     });
-    contract::check_wire_value(&head);
+    let _ = assert_write(&head);
     assert!(head.write(&mut out).is_err());
     assert_eq!(out, b"prefix");
     head.groups.pop();
@@ -826,7 +833,7 @@ fn strict_writers_reject_lossy_values_without_changing_the_destination() {
             ipp::Value::OctetString(vec![0; ipp::MAX_FIELD + 1]),
         )],
     });
-    contract::check_wire_value(&head);
+    let _ = assert_write(&head);
     assert!(head.write(&mut out).is_err());
     assert_eq!(out, b"prefix");
 }

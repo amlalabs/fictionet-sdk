@@ -7,7 +7,7 @@ use fictionet::stdlib::codec::{
     Decode, Fail, Prefixed, Stream, Wire, finish, pump, signed_frame_prefix,
 };
 use fictionet::stdlib::protocols::{bgp, fastcgi, kafka, thrift, zabbix};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 #[test]
 fn signed_prefix_waits_for_header_and_payload() {
@@ -134,11 +134,19 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
+    let alloc_limit = 2 * make().capacity();
     let (items, failure) =
-        contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc_limit);
+        });
     assert_eq!(items, expected);
     assert_eq!(failure, None);
-    contract::check_decode_with_held_limit(&make, bytes, 0);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+            assert_eq!(s.held(), 0);
+        }),
+        decode_all(&make, bytes)
+    );
     let mut stream = Stream::new(make());
     assert_eq!(pump(&mut stream, bytes, |_| {}).unwrap(), bytes.len());
     finish(&mut stream, |_| {}).unwrap();
@@ -153,7 +161,21 @@ where
 {
     let mut bytes = Vec::new();
     for value in values {
-        bytes.extend_from_slice(&contract::check_exact(value));
+        let written = assert_write(value).unwrap();
+        for cut in 0..written.len() {
+            assert!(
+                <D::Item as Wire>::parse(&written[..cut]).is_err(),
+                "prefix {cut}"
+            );
+        }
+        for tail in [0x00, 0xff] {
+            let trailing = [written.as_slice(), &[tail]].concat();
+            assert!(
+                <D::Item as Wire>::parse(&trailing).is_err(),
+                "trailing byte {tail}"
+            );
+        }
+        bytes.extend_from_slice(&written);
     }
     stack(&make, &bytes, values);
 
@@ -167,7 +189,11 @@ where
     assert!(unread > 0);
     let error = Fail::Truncated { unread };
     assert_eq!(
-        contract::check_decode(&make, partial),
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(partial, &[1, 7, 64]),
+            |_| {}
+        ),
         (items, Some(error.clone()))
     );
     assert_eq!(
@@ -183,8 +209,11 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
+    let alloc_limit = 2 * make().capacity();
     assert_eq!(
-        contract::check_decode_with_alloc_limit(&make, header, 2 * make().capacity()),
+        decode_chunks(&mut Stream::new(make()), chunks(header, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= alloc_limit);
+        }),
         (vec![], Some(Fail::Protocol(error.clone())))
     );
     let capacity = make().capacity();
@@ -471,29 +500,31 @@ fn zabbix_rejects_oversize_at_named_limit() {
 
 #[test]
 fn strict_writers_are_transactional() {
-    contract::check_refused(&bgp::Frame {
+    assert_write(&bgp::Frame {
         kind: 255,
         body: vec![0; bgp::MAX_BODY_LEN + 1],
-    });
+    })
+    .unwrap_err();
     let record = fastcgi::Record {
         kind: 255,
         request_id: 1,
         content: vec![0; fastcgi::MAX_CONTENT + 1],
         padding: 255,
     };
-    contract::check_refused(&record);
-    contract::check_refused(&kafka::Frame(vec![0; kafka::MAX_FRAME + 1]));
-    contract::check_refused(&thrift::Frame(vec![0; thrift::MAX_FRAME + 1]));
+    assert_write(&record).unwrap_err();
+    assert_write(&kafka::Frame(vec![0; kafka::MAX_FRAME + 1])).unwrap_err();
+    assert_write(&thrift::Frame(vec![0; thrift::MAX_FRAME + 1])).unwrap_err();
     let packet = zabbix::Packet {
         flags: 0xff,
         reserved: u64::MAX,
         data: vec![1, 2],
     };
-    contract::check_refused(&packet);
-    contract::check_refused(&zabbix::Packet {
+    assert_write(&packet).unwrap_err();
+    assert_write(&zabbix::Packet {
         flags: zabbix::flags::PROTOCOL,
         ..packet.clone()
-    });
+    })
+    .unwrap_err();
 }
 
 #[test]

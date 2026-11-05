@@ -7,11 +7,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use fictionet::stdlib::codec::{
     Collect, CollectError, Decode, Fail, Lcg, Stream, Wire, finish, pump,
 };
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::{
     geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp, wake_on_lan as wol,
 };
+use fictionet::stdlib::test_support::{assert_write, decode_chunks};
 use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
 fn round_trip<M>(value: &M, limit: usize) -> Vec<u8>
@@ -20,13 +20,15 @@ where
     M::ParseError: Clone + Debug + PartialEq,
     M::WriteError: Debug,
 {
-    let bytes = contract::check_written(value);
+    let bytes = assert_write(value).unwrap();
     assert!(bytes.len() <= limit);
     assert_eq!(
-        contract::check_decode_with_alloc_limit(
-            || Collect::<M>::new(limit),
-            &bytes,
-            2 * (limit + 1)
+        decode_chunks(
+            &mut Stream::new(Collect::<M>::new(limit)),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * (limit + 1));
+            }
         ),
         (vec![value.clone()], None)
     );
@@ -46,10 +48,12 @@ where
     if !bytes.is_empty() {
         let small = bytes.len() - 1;
         assert_eq!(
-            contract::check_decode_with_alloc_limit(
-                || Collect::<M>::new(small),
-                &bytes,
-                2 * (small + 1)
+            decode_chunks(
+                &mut Stream::new(Collect::<M>::new(small)),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * (small + 1));
+                }
             ),
             (
                 vec![],
@@ -71,10 +75,12 @@ where
 {
     let expected = M::parse(bytes).unwrap_err();
     assert_eq!(
-        contract::check_decode_with_alloc_limit(
-            || Collect::<M>::new(limit),
-            bytes,
-            2 * (limit + 1)
+        decode_chunks(
+            &mut Stream::new(Collect::<M>::new(limit)),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * (limit + 1));
+            }
         ),
         (
             vec![],
@@ -116,7 +122,7 @@ fn geneve_datagram() {
     parse_failure::<geneve::Packet>(&[], geneve::MAX_DATAGRAM);
     let mut bad = packet;
     bad.header.vni = geneve::MAX_VNI + 1;
-    contract::check_refused(&bad);
+    assert_write(&bad).unwrap_err();
 }
 
 #[test]
@@ -147,10 +153,11 @@ fn gre_packets_and_exact_pptp_boundary() {
     );
     parse_failure::<gre::Packet>(&padded, gre::MAX_PACKET);
     parse_failure::<gre::Packet>(&[], gre::MAX_PACKET);
-    contract::check_refused(&gre::Packet {
+    assert_write(&gre::Packet {
         payload: vec![],
         ..pptp
-    });
+    })
+    .unwrap_err();
 }
 
 fn igmp_checksum(bytes: &mut [u8]) {
@@ -165,7 +172,7 @@ fn igmp_checksum(bytes: &mut [u8]) {
 #[test]
 fn igmp_versions_auxiliary_data_and_exact_boundary() {
     round_trip(&igmp::Code(992), 1);
-    contract::check_refused(&igmp::Code(1000));
+    assert_write(&igmp::Code(1000)).unwrap_err();
     let group = Ipv4Addr::new(239, 1, 2, 3);
     let messages = [
         igmp::Message::Query {
@@ -214,17 +221,28 @@ fn igmp_versions_auxiliary_data_and_exact_boundary() {
         <igmp::Message as Wire>::parse(&auxiliary).as_ref(),
         Ok(report)
     );
-    contract::check_wire::<igmp::Message>(&auxiliary);
-    contract::check_decode_with_alloc_limit(
-        || Collect::<igmp::Message>::new(igmp::MAX_MESSAGE),
-        &auxiliary,
-        2 * (igmp::MAX_MESSAGE + 1),
+    if let Ok(value) = <igmp::Message as Wire>::parse(&auxiliary) {
+        assert_write(&value).unwrap();
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<igmp::Message>::new(igmp::MAX_MESSAGE)),
+            chunks(&auxiliary, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * (igmp::MAX_MESSAGE + 1));
+            }
+        ),
+        decode_all(
+            || Collect::<igmp::Message>::new(igmp::MAX_MESSAGE),
+            &auxiliary
+        )
     );
     parse_failure::<igmp::Message>(&[], igmp::MAX_MESSAGE);
-    contract::check_refused(&igmp::Message::Query {
+    assert_write(&igmp::Message::Query {
         max_resp_time: 0,
         group,
-    });
+    })
+    .unwrap_err();
 }
 
 #[test]
@@ -259,10 +277,10 @@ fn ipsec_carriers() {
     parse_failure::<ipsec::EspPacket>(&[], ipsec::MAX_PACKET);
     parse_failure::<ipsec::AhPacket>(&[], ipsec::MAX_PACKET);
     parse_failure::<ipsec::Datagram>(&[], ipsec::MAX_DATAGRAM);
-    contract::check_refused(&ipsec::EspPacket { spi: 0, ..esp });
+    assert_write(&ipsec::EspPacket { spi: 0, ..esp }).unwrap_err();
     let mut bad = ah;
     bad.header.icv.push(0);
-    contract::check_refused(&bad);
+    assert_write(&bad).unwrap_err();
 }
 
 #[test]
@@ -301,7 +319,7 @@ fn rip_and_ripng_messages() {
         command: rip::Command::Response,
         entries: rip::NgEntries::Entries(vec![rip::NgEntry::NextHop(Ipv6Addr::LOCALHOST)]),
     };
-    contract::check_refused(&ng); // The parser normalizes this next hop to ::.
+    assert_write(&ng).unwrap_err(); // The parser normalizes this next hop to ::.
     parse_failure::<rip::Message>(&[], rip::MAX_MESSAGE);
     parse_failure::<rip::NgMessage>(&[], rip::MAX_NG_MESSAGE);
 }
@@ -312,19 +330,32 @@ fn context_round_trip<M: Debug + PartialEq, E: Debug + PartialEq>(
     limit: usize,
     parse: impl Fn(&[u8]) -> Result<M, E>,
 ) {
-    let raw =
-        contract::check_decode_with_alloc_limit(|| Collect::bytes(limit), bytes, 2 * (limit + 1));
+    let raw = decode_chunks(
+        &mut Stream::new(Collect::bytes(limit)),
+        chunks(bytes, &[1, 7, 64]),
+        |s| {
+            assert!(s.allocated() <= 2 * (limit + 1));
+        },
+    );
     assert_eq!(raw, (vec![bytes.to_vec()], None));
     let make = || Collect::bytes(limit).map(|datagram| parse(&datagram));
-    let (items, failure) = contract::check_decode_with_alloc_limit(make, bytes, 2 * (limit + 1));
+    let (items, failure) =
+        decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= 2 * (limit + 1));
+        });
     assert_eq!(items, vec![parse(bytes)]);
     assert_eq!(failure, None);
 }
 
 fn raw_too_long(limit: usize) {
     let bytes = vec![0; limit + 1];
-    let (items, failure) =
-        contract::check_decode_with_alloc_limit(|| Collect::bytes(limit), &bytes, 2 * (limit + 1));
+    let (items, failure) = decode_chunks(
+        &mut Stream::new(Collect::bytes(limit)),
+        chunks(&bytes, &[1, 7, 64]),
+        |s| {
+            assert!(s.allocated() <= 2 * (limit + 1));
+        },
+    );
     assert!(items.is_empty());
     assert_eq!(
         failure,
@@ -508,15 +539,23 @@ fn wake_on_lan_payload_and_exact_packet() {
         Some(wol::Password::Six([1, 2, 3, 4, 5, 6])),
     ] {
         let packet = wol::MagicPacket { mac: MAC, password };
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         let bytes = Wire::to_bytes(&packet).unwrap();
-        contract::check_wire::<wol::MagicPacket>(&bytes);
+        if let Ok(value) = <wol::MagicPacket as Wire>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         let mut payload = b"prefix".to_vec();
         payload.extend_from_slice(&bytes);
-        contract::check_decode_with_alloc_limit(
-            wol::MagicPackets::new,
-            &payload,
-            2 * wol::MagicPackets::new().capacity(),
+        let alloc_limit = 2 * wol::MagicPackets::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(wol::MagicPackets::new()),
+                chunks(&payload, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(wol::MagicPackets::new, &payload)
         );
         assert!(<wol::MagicPacket as Wire>::parse(&payload).is_err());
         let mut stream = Stream::new(wol::MagicPackets::new());
@@ -539,10 +578,16 @@ fn wake_on_lan_payload_and_exact_packet() {
             (vec![(0, wol::MagicPacket::new(MAC))], None)
         );
     }
-    contract::check_decode_with_alloc_limit(
-        wol::MagicPackets::new,
-        b"no packet",
-        2 * wol::MagicPackets::new().capacity(),
+    let alloc_limit = 2 * wol::MagicPackets::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(wol::MagicPackets::new()),
+            chunks(b"no packet", &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(wol::MagicPackets::new, b"no packet")
     );
     assert_eq!(
         decode_all(wol::MagicPackets::new, b"no packet"),
@@ -573,10 +618,16 @@ fn wake_on_lan_rejects_oversize_payload() {
         Some(Err(Fail::Protocol(wol::Error::TooLong)))
     );
     assert!(stream.next().is_none());
-    contract::check_decode_with_alloc_limit(
-        wol::MagicPackets::new,
-        &payload,
-        2 * wol::MagicPackets::new().capacity(),
+    let alloc_limit = 2 * wol::MagicPackets::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(wol::MagicPackets::new()),
+            chunks(&payload, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= alloc_limit);
+            }
+        ),
+        decode_all(wol::MagicPackets::new, &payload)
     );
 }
 
@@ -593,10 +644,16 @@ fn wake_on_lan_contracts_on_mutated_payloads() {
         }
         let end = rng.index(bytes.len() + 1);
         bytes.truncate(end);
-        contract::check_decode_with_alloc_limit(
-            wol::MagicPackets::new,
-            &bytes,
-            2 * wol::MagicPackets::new().capacity(),
+        let alloc_limit = 2 * wol::MagicPackets::new().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(wol::MagicPackets::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= alloc_limit);
+                }
+            ),
+            decode_all(wol::MagicPackets::new, &bytes)
         );
         // Adapter consistency: the decoder finds the packet as `find` does.
         let expected = match wol::MagicPacket::find(&bytes) {

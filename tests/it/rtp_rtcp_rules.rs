@@ -1,11 +1,11 @@
 //! RTCP protocol cases moved from the former RTP control-packet implementation.
+use fictionet::stdlib::test_support::assert_write;
 use fictionet::stdlib::{
     codec::Wire,
     protocols::{
         rtcp::{self, *},
         rtp,
     },
-    test_support::contract,
 };
 
 fn report() -> Packet {
@@ -44,7 +44,7 @@ fn transport(message: TransportMessage) -> Packet {
 }
 fn refuses(body: Body) {
     let packet = Packet::from(body);
-    contract::check_wire_value(&packet);
+    let _ = assert_write(&packet);
     assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
 }
 
@@ -258,7 +258,7 @@ fn sdes_bye_app_bytes() {
             reason,
         }));
         assert!(bye.to_bytes().is_ok());
-        contract::check_wire_value(&bye);
+        let _ = assert_write(&bye);
     }
     assert_eq!(
         Packet::from(Body::Bye(Bye {
@@ -323,13 +323,13 @@ fn feedback_bytes() {
         data: vec![0xf8, 0],
     }));
     assert_eq!(&rpsi.to_bytes().unwrap()[12..], &[11, 96, 0xf8, 0]);
-    contract::check_wire_value(&rpsi);
+    let _ = assert_write(&rpsi);
     let other = transport(TransportMessage::Other {
         fmt: 15,
         fci: vec![1, 2, 3, 4],
     });
     assert!(other.to_bytes().is_ok());
-    contract::check_wire_value(&other);
+    let _ = assert_write(&other);
     // FMT 3 has the TMMBR layout in the shared implementation.
     assert_eq!(
         transport(TransportMessage::Other {
@@ -518,7 +518,7 @@ fn padding_on_the_last_packet() {
     let mut out = vec![9, 8, 7];
     assert_eq!(packet.write(&mut out), Err(rtp::Error::Unwritable));
     assert_eq!(out, [9, 8, 7]);
-    contract::check_wire_value(&packet);
+    let _ = assert_write(&packet);
     let mut first = report();
     first.padding = 4;
     assert_eq!(
@@ -594,7 +594,7 @@ fn compound_rules_and_cname_order() {
         payload(PayloadMessage::Pli),
     ]);
     assert!(valid.to_bytes().is_ok());
-    contract::check_wire_value(&valid);
+    let _ = assert_write(&valid);
     for late in [report(), cname()] {
         let packets = vec![report(), cname(), payload(PayloadMessage::Pli), late];
         let bytes = Datagram(packets.clone()).to_bytes().unwrap();
@@ -837,7 +837,7 @@ fn long_text_is_refused_without_cutting_characters() {
             reason: Some(text),
         }));
         assert!(bye.to_bytes().is_ok());
-        contract::check_wire_value(&bye);
+        let _ = assert_write(&bye);
     }
 }
 
@@ -853,7 +853,9 @@ fn priv_prefix_length_is_checked() {
         vec![0x81, 202, 0, 3, 0, 0, 0, 1, 8, 4, 2, b'a', b'b', b'x', 0, 0],
         vec![0x81, 202, 0, 2, 0, 0, 0, 1, 8, 1, 0, 0],
     ] {
-        contract::check_wire::<Datagram>(&bytes);
+        if let Ok(value) = <Datagram as Wire>::parse(&bytes) {
+            assert_write(&value).unwrap();
+        }
         assert!(Datagram::parse(&bytes).is_ok());
     }
     for text in [vec![], vec![5, b'a'], [vec![255], vec![b'p'; 300]].concat()] {
@@ -873,5 +875,5 @@ fn priv_prefix_length_is_checked() {
         }],
     }]));
     assert!(valid.to_bytes().is_ok());
-    contract::check_wire_value(&valid);
+    let _ = assert_write(&valid);
 }

@@ -5,7 +5,7 @@ use fictionet::stdlib::protocols::json_schema::{
     Dialect, ErrorMode, GenerationLimits, Options, Schema, ValidationKind,
 };
 use fictionet::stdlib::test_support;
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 
 fn parse(bytes: &[u8]) -> Value {
     json::parse_with(bytes, &json::Limits::default()).unwrap()
@@ -50,7 +50,7 @@ fn mcp_tool_input_schema_and_mock_arguments() {
             example,
             schema.generate(seed, GenerationLimits::default()).unwrap()
         );
-        contract::check_wire_value(&example);
+        let _ = assert_write(&example);
         let bytes = example.to_bytes().unwrap();
         let (streamed, failure) = test_support::decode_all(json::Values::default, &bytes);
         assert!(failure.is_none());
@@ -154,7 +154,7 @@ fn openapi_document_entries_only_compile_reachable_schemas() {
         );
         let example = schema.generate(17, GenerationLimits::default()).unwrap();
         assert!(schema.validate(&example).is_valid());
-        contract::check_wire_value(&example);
+        let _ = assert_write(&example);
     }
 }
 
