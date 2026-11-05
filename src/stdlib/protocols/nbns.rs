@@ -67,10 +67,6 @@ use fictionet::stdlib::protocols::netbios;
 
 use std::net::Ipv4Addr;
 
-#[cfg(test)]
-use fictionet::stdlib::protocols::netbios::ENCODED_LEN;
-#[cfg(any(doc, test))]
-use fictionet::stdlib::protocols::netbios::MAX_LABEL;
 use fictionet::stdlib::protocols::netbios::{MAX_NAME_LEN, NAME_LEN, decode_first_level};
 
 /// The UDP port the name service listens on.
@@ -162,7 +158,7 @@ pub struct Name {
     /// The 16 bytes: up to 15 characters padded with spaces, then the
     /// suffix.
     pub bytes: [u8; NAME_LEN],
-    /// The scope labels. Writers refuse empty labels, labels above [`MAX_LABEL`],
+    /// The scope labels. Writers refuse empty labels, labels above [`MAX_LABEL`](netbios::MAX_LABEL),
     /// and names above [`MAX_NAME_LEN`].
     pub scope: Vec<Vec<u8>>,
 }
@@ -189,7 +185,7 @@ impl Name {
 
     /// This name with the scope `scope`, given with dots between labels.
     /// Empty labels are skipped. Other labels are kept as given, so the
-    /// writer refuses labels above [`MAX_LABEL`] and names above
+    /// writer refuses labels above [`MAX_LABEL`](netbios::MAX_LABEL) and names above
     /// [`MAX_NAME_LEN`].
     pub fn with_scope(mut self, scope: &str) -> Name {
         self.scope = netbios::dotted_labels(scope);
@@ -1371,6 +1367,7 @@ fn reply_list_limit(name: &Name, fixed_data: usize, entry_len: usize) -> usize {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::protocols::netbios::{ENCODED_LEN, MAX_LABEL};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
