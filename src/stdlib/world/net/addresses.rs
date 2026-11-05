@@ -146,6 +146,28 @@ pub(super) fn may_serve_v6(a: Ipv6Addr, subnet: &Subnet6) -> bool {
         || a.to_ipv4_mapped().is_some())
 }
 
+/// Prefixes inside which no host may have an IPv4 address, beside the
+/// sandboxes' subnet: `0.0.0.0`, loopback, multicast and the limited
+/// broadcast address. [`may_serve_v4`] refuses the same addresses.
+const NOT_HOSTS_V4: [Prefix; 4] = [
+    Prefix {
+        addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        len: 32,
+    },
+    Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
+        len: 8,
+    },
+    Prefix {
+        addr: IpAddr::V4(Ipv4Addr::new(224, 0, 0, 0)),
+        len: 4,
+    },
+    Prefix {
+        addr: IpAddr::V4(Ipv4Addr::BROADCAST),
+        len: 32,
+    },
+];
+
 /// Prefixes inside which no host may have an IPv6 address, beside the
 /// sandboxes' subnet: `::` and `::1`, IPv4-mapped addresses, link-local
 /// unicast and multicast. [`may_serve_v6`] refuses the same addresses.
@@ -217,8 +239,9 @@ impl Allocator {
 
     /// The next free IPv4 address of the pool, after the last one handed
     /// out: not the pool's first or last address, not occupied, and one a
-    /// host may have here. `None` when there is no pool or it is full; a
-    /// full pool is remembered, so it is not searched again.
+    /// host may have here. Ranges no host may have are stepped over whole,
+    /// as in [`Allocator::free_auto6`]. `None` when there is no pool or it
+    /// is full; a full pool is remembered, so it is not searched again.
     pub(super) fn free_auto<T>(
         &mut self,
         subnet: &Subnet,
@@ -228,11 +251,23 @@ impl Allocator {
         if self.auto_full {
             return None;
         }
+        let mut skipped = NOT_HOSTS_V4.to_vec();
+        skipped.push(subnet.prefix);
+        if skipped
+            .iter()
+            .any(|s| s.len <= pool.len && s.overlaps(pool))
+        {
+            self.auto_full = true;
+            return None;
+        }
         // The offset of the pool's last address. Its length is at most 30.
         let last = u32::MAX >> pool.len;
-        for _ in 0..=u64::from(last) {
+        let step = |n: u32| if n >= last { 0 } else { n + 1 };
+        // One pass meets each occupied address once, the pool's first and
+        // last addresses and each range at most twice.
+        for _ in 0..occupied.len() + 2 * skipped.len() + 4 {
             let n = self.next_auto;
-            self.next_auto = if n >= last { 0 } else { n + 1 };
+            self.next_auto = step(n);
             if n == 0 || n == last {
                 continue;
             }
@@ -242,7 +277,18 @@ impl Allocator {
             else {
                 unreachable!("the IPv4 pool contains IPv4 addresses")
             };
-            if may_serve_v4(a, subnet) && !occupied.contains_key(&a.into()) {
+            if let Some(range) = skipped.iter().find(|s| s.contains(a.into())) {
+                let IpAddr::V4(end) = range.last() else {
+                    unreachable!("an IPv4 range has an IPv4 last address")
+                };
+                // Prefixes nest, and none covers the pool, so the range
+                // ends inside it.
+                let past = n + (u32::from(end) - u32::from(a));
+                self.next_auto = if past >= last { 0 } else { past + 1 };
+                continue;
+            }
+            debug_assert!(may_serve_v4(a, subnet));
+            if !occupied.contains_key(&a.into()) {
                 return Some(a);
             }
         }
@@ -585,6 +631,15 @@ mod tests {
             Some("255.255.255.254".parse().unwrap())
         );
         assert_eq!(w.free_auto(&subnet), Some("0.0.0.1".parse().unwrap()));
+        // Loopback, the subnet and multicast are stepped over whole.
+        for (from, want) in [
+            ("127.0.0.0", "128.0.0.0"),
+            ("10.0.0.7", "10.0.1.0"),
+            ("224.0.0.0", "240.0.0.0"),
+        ] {
+            w.addresses.next_auto = u32::from(from.parse::<Ipv4Addr>().unwrap());
+            assert_eq!(w.free_auto(&subnet), Some(want.parse().unwrap()));
+        }
         // `::1` is loopback, so `::2` is the first.
         assert_eq!(w.free_auto6(&s6), Some("::2".parse().unwrap()));
         // Multicast runs to the end of the space; the search wraps to the start.
@@ -728,6 +783,16 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn pools_no_host_may_use_are_full_at_once() {
+        let subnet = Subnet::new("10.0.0.0/24".parse().unwrap()).unwrap();
+        for pool in ["224.0.0.0/4", "127.0.0.0/16", "10.0.0.0/28"] {
+            let mut w = World::new(MAX_HOSTS, pools(pool, "2001:db8:1::/64"));
+            assert_eq!(w.free_auto(&subnet), None, "{pool}");
+            assert!(w.addresses.auto_full, "{pool}");
+        }
     }
 
     #[test]
