@@ -17,8 +17,8 @@
 //!
 //! A world writes its own [`ZoneData`] for anything else, such as data
 //! that files what other servers answered its lookups. [`rrsets`],
-//! [`expanded_from`], [`wildcard`], and
-//! [`additional_targets`] are the pieces such data reads records with.
+//! [`expanded_from`], [`wildcard`], [`additional_targets`], and
+//! [`owned`] are the pieces such data reads records with.
 //!
 //! Signing is data too. [`Zone::signed`] signs a complete zone once, with
 //! a complete NSEC or NSEC3 chain, as `dnssec-signzone` does. [`Signed`]
@@ -46,7 +46,7 @@ pub mod special;
 mod zone;
 
 pub use super::records::{expanded_from, rrsets};
-pub use answer::{Answered, AnyResponse, Onward, answer, answer_onward};
+pub use answer::{Answered, AnyResponse, Onward, answer, answer_onward, owned};
 pub use apex::EmptyApex;
 pub use chain::{ChainProblem, check_chain};
 pub use cover::cover;

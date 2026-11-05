@@ -1538,6 +1538,29 @@ fn rrsigs_travel_only_with_do() {
             row("www.signed.", RecordType::RRSIG)
         ]
     );
+    // One that sends every RRset only as DO asks leaves them out without
+    // DO (RFC 3225 §3), and sends them with it.
+    let following = |dnssec_ok| match answer(
+        &zone,
+        &request("www.signed.", RecordType::ANY, dnssec_ok),
+        AnyResponse::AllFollowingDo,
+    ) {
+        Answered::Response(response) => response.message,
+        Answered::Unknown { name, .. } => panic!("unknown at {name}"),
+    };
+    assert_eq!(
+        rows(&following(false).answers),
+        vec![row("www.signed.", RecordType::A)]
+    );
+    let types: BTreeSet<RecordType> = following(true)
+        .answers
+        .iter()
+        .map(|r| r.record_type())
+        .collect();
+    assert_eq!(
+        types,
+        BTreeSet::from([RecordType::A, RecordType::NSEC, RecordType::RRSIG])
+    );
     // One that sends one RRset leaves them out.
     let one = |qname: &str, rtype| match answer(
         &zone,

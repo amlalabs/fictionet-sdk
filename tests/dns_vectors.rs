@@ -1407,16 +1407,25 @@ fn zone_answers() {
         }
         let zone = vector_zone(field(input, "zone"))?;
         let req = vector_request(field(input, "request"), false);
-        let any = any_response(input);
-        match answer(&zone, &req, any) {
-            Answered::Response(response) => {
-                compare_answer(&zone, &req, any, expected, &response, tally)
+        // Without DO, Lean's `all` is both `All` and `AllFollowingDo`.
+        let anys = match any_response(input) {
+            AnyResponse::All => vec![AnyResponse::All, AnyResponse::AllFollowingDo],
+            any => vec![any],
+        };
+        for any in anys {
+            match answer(&zone, &req, any) {
+                Answered::Response(response) => {
+                    compare_answer(&zone, &req, any, expected, &response, tally)?
+                }
+                Answered::Unknown { name, .. } => {
+                    return Err(format!(
+                        "a complete zone answered Unknown at {}",
+                        name_text(&Name::from(&name))
+                    ));
+                }
             }
-            Answered::Unknown { name, .. } => Err(format!(
-                "a complete zone answered Unknown at {}",
-                name_text(&Name::from(&name))
-            )),
         }
+        Ok(())
     });
 }
 

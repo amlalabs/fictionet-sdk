@@ -2082,6 +2082,11 @@ impl<V: Verify> Resolver<V> {
                 .then(|| self.too_long(&answers, &sname, stype, rank, &denial, &zone))
                 .flatten();
             return match too_long {
+                // RFC 9156 §2.3: the answer for a minimised name says
+                // nothing of the names below it, and a CNAME holds only
+                // at its owner (RFC 1034 §3.6.2), so the resolution goes
+                // on toward QNAME.
+                Some(_) if exchange.minimised => self.through(id, &sname, entropy),
                 Some((outcome, rest)) => self.finish(
                     id,
                     Found {
@@ -3193,14 +3198,26 @@ fn material(subject: &Subject, outcome: &Outcome) -> Option<(Material, Name)> {
 /// as good as that DNAME, so the DNAME is validated in its place
 /// (RFC 6672 §3.4).
 fn vouched(set: &RecordSet, proof: &[RecordSet], zone: &Name) -> (Material, Name) {
-    let dname = proof.iter().find(|set| is_dname(set));
-    let set = match (signer(set), dname) {
-        (None, Some(dname)) if dname_matches(dname, set) => dname.clone(),
-        _ => set.clone(),
-    };
+    let set = synthesized_from(set, proof).unwrap_or(set).clone();
     let zone = signer(&set).unwrap_or_else(|| zone.clone());
     let authority = proof.iter().filter(|set| !is_dname(set)).cloned().collect();
     (Material::Rrset { set, authority }, zone)
+}
+
+/// The DNAME in `proof` that `set` is an unsigned CNAME synthesized from
+/// (RFC 6672 §2.2). Such a CNAME is only as good as that DNAME, and is
+/// validated in its place (RFC 6672 §3.4).
+pub(super) fn synthesized_from<'p>(
+    set: &RecordSet,
+    proof: &'p [RecordSet],
+) -> Option<&'p RecordSet> {
+    if signer(set).is_some() {
+        return None;
+    }
+    proof
+        .iter()
+        .find(|set| is_dname(set))
+        .filter(|dname| dname_matches(dname, set))
 }
 
 /// The NSEC or NSEC3 RRsets among `denial`, those of a reply from `zone`,

@@ -68,8 +68,14 @@ use super::learned::{Declined, Filing, Learned};
 /// question upward, to a cut at or above the zone asked, from a zone the
 /// address does not hold, answers it with REFUSED, as a server that does
 /// not serve the name does (RFC 8906 §3.1.1). A referral with AA set is
-/// filed as a referral, and a client without DO gets no DNSSEC records in
-/// an answer to ANY, whatever BIND sends.
+/// filed as a referral.
+///
+/// A copy holds the real server's answer to ANY with DO, RRSIGs
+/// included. What an address sends for ANY is what its front's
+/// [`AnyResponse`](fictionet::stdlib::services::dns::zone::AnyResponse)
+/// says, as from [`Zones`](fictionet::stdlib::services::dns::authority::Zones):
+/// `All` sends the DNSSEC records without DO too, as the root letters do,
+/// and `AllFollowingDo` only with DO.
 #[derive(Default)]
 pub struct Copies {
     /// Each address's copies.
@@ -209,12 +215,16 @@ fn has_soa(response: &Message) -> bool {
 /// serves. That zone is the one that signed the RRset; for an unsigned
 /// one, whose apex the response does not show, it is the root, so the
 /// address asks the real server about any name in none of its other
-/// zones.
+/// zones. A chain that ends in a negative in such a zone shows it in the
+/// authority section instead, which carries that zone's SOA and the
+/// denial records it signed (RFC 2308 §2.1 and §2.2, RFC 4035 §3.1.3), so
+/// the zone of such an SOA or signer that holds a CNAME target of the
+/// answer is one too.
 fn siblings(server: &Server, apex: &LowerName, response: &Message) -> BTreeSet<LowerName> {
     let zones = server.zones();
     let held =
         |name: &LowerName| apex.zone_of(name) || zones.iter().any(|zone| zone.apex().zone_of(name));
-    response
+    let answered = response
         .answers
         .iter()
         .filter(|record| record.dns_class == DNSClass::IN)
@@ -234,8 +244,28 @@ fn siblings(server: &Server, apex: &LowerName, response: &Message) -> BTreeSet<L
                 })
                 .filter(|signer| signer.zone_of(&owner))
                 .unwrap_or_else(|| LowerName::from(Name::root()))
+        });
+    let targets: Vec<LowerName> = response
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::CNAME(target) => Some(LowerName::new(&target.0)),
+            _ => None,
         })
-        .collect()
+        .collect();
+    let negative = response
+        .authorities
+        .iter()
+        .filter(|record| record.dns_class == DNSClass::IN)
+        .filter_map(|record| match &record.data {
+            RData::SOA(_) => Some(LowerName::new(&record.name)),
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
+                Some(LowerName::new(&rrsig.input().signer_name))
+            }
+            _ => None,
+        })
+        .filter(|zone| !held(zone) && targets.iter().any(|target| zone.zone_of(target)));
+    answered.chain(negative).collect()
 }
 
 /// The cut `response` refers `question` to, when it is a referral:
@@ -430,32 +460,6 @@ impl View for Stop {
     }
 }
 
-/// `step`, a reply to `req`, less the RRSIG, NSEC, and NSEC3 records of
-/// its answer to ANY when `req` lacks DO. A copy holds the real server's
-/// answer to ANY with DO, RRSIGs included, and a server sends no DNSSEC
-/// records to a client without DO (RFC 4035 §3.1, RFC 3225 §3), whatever
-/// subset of the name's RRsets it answers ANY with (RFC 8482 §4.1). An
-/// NSEC RRset that is the whole answer stays: the name has data, and the
-/// copy knows of no other. BIND sends the DNSSEC records for ANY without
-/// DO as well, a departure the copy does not copy.
-fn without_dnssec(req: &Request, step: Step) -> Step {
-    let dnssec_ok = req.edns.is_some_and(|edns| edns.dnssec_ok);
-    match step {
-        Step::Reply(mut response) if req.question.query_type() == RecordType::ANY && !dnssec_ok => {
-            let answers = &mut response.message.answers;
-            answers.retain(|record| record.record_type() != RecordType::RRSIG);
-            let denial = |record: &Record| {
-                matches!(record.record_type(), RecordType::NSEC | RecordType::NSEC3)
-            };
-            if !answers.iter().all(denial) {
-                answers.retain(|record| !denial(record));
-            }
-            Step::Reply(response)
-        }
-        step => step,
-    }
-}
-
 impl Authority for Copies {
     /// Answers `req` at `local` from that address's copies, as the type's
     /// documentation says. A zone that declined a question the reply
@@ -548,7 +552,7 @@ impl Authority for Copies {
             });
             match next.take() {
                 Some(next) => around.push(next),
-                None => return without_dnssec(req, step),
+                None => return step,
             }
         }
     }

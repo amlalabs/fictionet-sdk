@@ -32,7 +32,7 @@ use fictionet::stdlib::protocols::dns::{EdeCode, Request, Response, label_count}
 
 use super::exchange::{Client, Generation};
 use super::lookup::{Looked, Lookup};
-use super::zone::{Answered, ZoneData, answer_onward};
+use super::zone::{Answered, Fact, Node, ZoneData, answer_onward};
 
 mod engine;
 mod observe;
@@ -181,11 +181,11 @@ pub type OnUnknown<'a> = &'a dyn Fn(&dyn ZoneData, &Query, LowerName) -> Step;
 /// What a server hosting `zones` does with `req`, with `server` as its
 /// front, as [`Zones`] describes: the authoritative answer of RFC 1034
 /// §4.3.2 over every zone it hosts, with CNAME and DNAME chains that go
-/// on in the other hosted zones, and DS at a zone's apex asked of the
-/// zone above it first (RFC 4035 §3.1.4.1). Where a zone's view does not
-/// know a fact the reply needs, the step is what `unknown` gives: [`Zones`]
-/// answers SERVFAIL there, and an authority that learns its data may
-/// return [`Step::Need`].
+/// on in the other hosted zones, and DS at a zone's apex asked first of
+/// the zone above it that holds the cut (RFC 4035 §3.1.4.1). Where a
+/// zone's view does not know a fact the reply needs, the step is what
+/// `unknown` gives: [`Zones`] answers SERVFAIL there, and an authority
+/// that learns its data may return [`Step::Need`].
 pub fn respond_from_zones(
     zones: &[Arc<dyn ZoneData>],
     req: &Request,
@@ -266,6 +266,7 @@ fn respond_hosted(
     if qtype == RecordType::DS
         && zone.apex() == &qname
         && let Some(above) = deepest(zones, &qname, true)
+        && !lacks_cut(above, &req.question, &qname)
     {
         // A zone above that refers the question on is not the parent,
         // so the zone itself answers NODATA from its apex (RFC 4035
@@ -276,6 +277,19 @@ fn respond_hosted(
         }
     }
     answer_from(zone, seen)
+}
+
+/// Whether `above` is known to hold no zone cut at `apex`: it has no
+/// node there, or a node that is not a cut. Such a zone is not the
+/// parent of the zone at `apex`, and its NXDOMAIN or NODATA would deny a
+/// name the server answers for from that zone (RFC 8020 §2). A view that
+/// does not know the node is not known to lack the cut, so the zone
+/// above is asked all the same.
+fn lacks_cut(above: &dyn ZoneData, question: &Query, apex: &LowerName) -> bool {
+    match above.view(question).node(apex) {
+        Fact::Present(Node::Cut { .. }) | Fact::Unknown => false,
+        Fact::Present(_) | Fact::Absent => true,
+    }
 }
 
 /// `chain`, the reply that holds a CNAME and DNAME chain up to the name

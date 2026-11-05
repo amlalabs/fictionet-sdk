@@ -568,6 +568,51 @@ fn ds_at_a_hosted_zone_whose_parent_is_not_hosted_is_nodata_from_the_zone() {
     assert_eq!(reply.authorities[0].name, name("example.sub.test."));
 }
 
+/// A hosted zone above a zone's apex that holds no cut there is not the
+/// zone's parent: its NXDOMAIN would deny a name the server answers for
+/// (RFC 8020 §2). DS at the apex is NODATA from the zone itself, and so
+/// it is when the zone above holds other data at the apex.
+#[test]
+fn ds_at_an_apex_the_zone_above_does_not_delegate_is_nodata_from_the_zone() {
+    let without_node = Zone::builder(name("test."), soa("test."), 3600)
+        .rrset(rrset("test.", 3600, vec![ns("ns1.test.")]))
+        .rrset(rrset("ns1.test.", 3600, vec![a("192.0.2.2")]))
+        .build()
+        .unwrap();
+    let with_data = Zone::builder(name("test."), soa("test."), 3600)
+        .rrset(rrset("test.", 3600, vec![ns("ns1.test.")]))
+        .rrset(rrset("ns1.test.", 3600, vec![a("192.0.2.2")]))
+        .rrset(rrset("example.test.", 3600, vec![a("192.0.2.9")]))
+        .build()
+        .unwrap();
+    for above in [without_node, with_data] {
+        let mut engine = AuthorityEngine::new(
+            zones(vec![above, example()]),
+            ServerConfig::generic(),
+            local(),
+        );
+        let reply = the_answer(&ask_with(
+            &mut engine,
+            &query("example.test.", RecordType::DS, |_| {}),
+            Transport::Udp,
+        ));
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.metadata.authoritative);
+        assert!(reply.answers.is_empty());
+        assert_eq!(reply.authorities.len(), 1);
+        assert_eq!(reply.authorities[0].record_type(), RecordType::SOA);
+        assert_eq!(reply.authorities[0].name, name("example.test."));
+
+        let reply = the_answer(&ask_with(
+            &mut engine,
+            &query("www.example.test.", RecordType::A, |_| {}),
+            Transport::Udp,
+        ));
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers[0].data, a("192.0.2.10"));
+    }
+}
+
 #[test]
 fn a_referral_carries_the_address_its_zone_holds_for_a_name_server() {
     // RFC 1034 §4.3.2 step 3b: the addresses available go in the

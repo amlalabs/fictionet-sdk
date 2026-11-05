@@ -3578,6 +3578,62 @@ fn a_yxdomain_after_an_alias_is_passed_on_with_the_chain() {
     }
 }
 
+/// A minimised question for an ancestor of QNAME that gets YXDOMAIN says
+/// nothing of QNAME: the ancestor's CNAME holds only at its owner (RFC
+/// 1034 §3.6.2), so the resolution goes on toward QNAME (RFC 9156 §2.3)
+/// and gets its data, as without minimisation.
+#[test]
+fn a_yxdomain_for_a_minimised_name_does_not_end_the_resolution() {
+    let target = format!(
+        "{}.{}.{}.example.org.",
+        "t".repeat(60),
+        "u".repeat(60),
+        "v".repeat(60)
+    );
+    let alias = format!("{}.long.example.com.", "y".repeat(60));
+    for config in [
+        Config {
+            minimise: None,
+            ..config(None)
+        },
+        config(None),
+    ] {
+        let mut net = delegated(
+            |zone| {
+                zone.rrset(rrset("long.example.com.", 300, vec![dname(&name(&target))]))
+                    .rrset(rrset(
+                        "x.example.com.",
+                        300,
+                        vec![RData::CNAME(CNAME(name(&alias)))],
+                    ))
+                    .rrset(rrset("www.x.example.com.", 300, vec![a("192.0.2.77")]))
+            },
+            3600,
+            3600,
+        );
+        let mut resolver = resolver(config);
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "www.x.example.com.", RecordType::A, |_| {}),
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "{:?}",
+            edes(&reply)
+        );
+        assert_eq!(addresses(&reply), ["192.0.2.77"]);
+        assert!(
+            reply
+                .answers
+                .iter()
+                .all(|record| record.record_type() == RecordType::A)
+        );
+    }
+}
+
 #[test]
 fn glue_with_ttl_0_serves_the_resolution_it_came_in() {
     // RFC 1035 §7.4: data with TTL 0 is not cached, but is used for the
@@ -4720,6 +4776,52 @@ fn a_fresh_secure_answer_lives_no_longer_than_its_signatures() {
         let limit = 61 - seconds as u32;
         for record in &reply.answers {
             assert!(record.ttl <= limit, "{seconds}: {record}");
+        }
+    }
+}
+
+/// A CNAME synthesized from a signed DNAME stands on the DNAME's RRSIG
+/// (RFC 6672 §3.4), so in a fresh Secure answer it lives no longer than
+/// that RRSIG either, whether the question is for the name's data or for
+/// the CNAME itself.
+#[test]
+fn a_fresh_secure_alias_from_a_dname_lives_no_longer_than_its_signatures() {
+    for qtype in [RecordType::A, RecordType::CNAME] {
+        let (mut net, anchors) = internet_with(
+            true,
+            ExampleCom {
+                extra: vec![rrset(
+                    "d.example.com.",
+                    300,
+                    vec![dname(&name("example.com."))],
+                )],
+                ..ExampleCom::default()
+            },
+        );
+        // The signatures expire 60 seconds after the run starts.
+        let mut resolver = Resolver::new(
+            config(anchors),
+            Ring,
+            WallClock {
+                start: date(1_800_000_000 - 60),
+            },
+        );
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            0,
+            query(client(1), "www.d.example.com.", qtype, dnssec_ok),
+        );
+        assert!(reply.metadata.authentic_data, "{qtype}");
+        assert!(
+            reply
+                .answers
+                .iter()
+                .any(|record| record.record_type() == RecordType::CNAME),
+            "{qtype}"
+        );
+        for record in &reply.answers {
+            assert!(record.ttl <= 61, "{qtype}: {record}");
         }
     }
 }

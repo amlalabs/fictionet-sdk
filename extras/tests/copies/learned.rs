@@ -2638,11 +2638,12 @@ fn real_lookup(zones: &Zones, server: &ServerConfig, lookup: &Lookup) -> Message
     )
 }
 
-/// A placed server sends every RRset its copies hold for ANY
-/// ([`AnyResponse::All`]), and the copies hold the real server's answer
-/// to ANY with DO. A client without DO gets that answer without its
-/// RRSIGs, as from a real server that answers ANY with one RRset and
-/// sends no DNSSEC records without DO (RFC 4035 §3.1, RFC 8482 §4.1).
+/// A placed server sends every RRset its copies hold for ANY, with the
+/// DNSSEC records only as DO asks ([`AnyResponse::AllFollowingDo`]), and
+/// the copies hold the real server's answer to ANY with DO. A client
+/// without DO gets that answer without its RRSIGs, as from a real server
+/// that answers ANY with one RRset and sends no DNSSEC records without DO
+/// (RFC 3225 §3, RFC 8482 §4.1).
 #[test]
 fn any_without_do_at_a_placed_copy_gets_no_rrsigs() {
     let one = ServerConfig {
@@ -2650,7 +2651,7 @@ fn any_without_do_at_a_placed_copy_gets_no_rrsigs() {
         ..ServerConfig::generic()
     };
     let placed = ServerConfig {
-        any: AnyResponse::All,
+        any: AnyResponse::AllFollowingDo,
         ede: false,
         ..ServerConfig::generic()
     };
@@ -2674,6 +2675,40 @@ fn any_without_do_at_a_placed_copy_gets_no_rrsigs() {
                 .iter()
                 .any(|record| record.record_type() == RecordType::RRSIG);
             assert_eq!(signed, dnssec_ok, "signing {signing}");
+        }
+    }
+}
+
+/// A front's answer to ANY means the same over copies as over the real
+/// zones: a copy whose front is [`AnyResponse::All`], as at most root
+/// letters, sends the NSEC RRset and the RRSIGs without DO too, as its
+/// real server does.
+#[test]
+fn any_at_a_copy_follows_its_front_as_the_real_server_does() {
+    let all = ServerConfig {
+        any: AnyResponse::All,
+        ..ServerConfig::generic()
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    for signing in [1, 2] {
+        let real = Zones::new(vec![mixed_zone(EXAMPLE, signing)]);
+        let answer = |lookup: &Lookup| real_lookup(&real, &all, lookup);
+        let copies = Copies::new();
+        copies.serves(local.ip(), &lower("example."));
+        for dnssec_ok in [true, false, true] {
+            let asked = request("example.", RecordType::ANY, dnssec_ok);
+            let (got, _) = through_as(&copies, &all, &answer, local, &asked);
+            let want = real_as(&real, &all, local, &asked);
+            assert_eq!(
+                shape(&got),
+                shape(&want),
+                "signing {signing}, DO {dnssec_ok}"
+            );
+            let signed = got
+                .answers
+                .iter()
+                .any(|record| record.record_type() == RecordType::RRSIG);
+            assert!(signed, "signing {signing}, DO {dnssec_ok}");
         }
     }
 }
@@ -2753,6 +2788,92 @@ fn an_address_answers_for_a_zone_no_referral_named() {
             &request("www.elsewhere.test.", RecordType::A, false),
         );
         assert_eq!(got.metadata.response_code, ResponseCode::Refused);
+    }
+}
+
+/// A CNAME chain into a zone no referral named that ends in NXDOMAIN or
+/// NODATA there shows that zone only by the SOA and denial records of its
+/// authority section. The copy goes on in that zone as the real server
+/// does, with its RCODE, its SOA, and its proofs (RFC 1034 §4.3.2 step
+/// 3a, RFC 2308 §2.1 and §2.2), asked first or again.
+#[test]
+fn a_chain_into_another_zone_ends_in_that_zones_negative() {
+    let example = format!(
+        "{EXAMPLE}crossnx.example. 300 IN CNAME nx.other.\ncross.example. 300 IN CNAME www.other.\n"
+    );
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    for signing in 0..3 {
+        let servers = [(
+            local,
+            Zones::new(vec![
+                mixed_zone(&example, signing),
+                mixed_zone(OTHER, signing),
+            ]),
+        )];
+        for dnssec_ok in [true, false] {
+            for (qname, qtype) in [
+                ("crossnx.example.", RecordType::A),
+                ("cross.example.", RecordType::TXT),
+            ] {
+                let asked = [
+                    (local, qname, qtype, dnssec_ok),
+                    (local, qname, qtype, dnssec_ok),
+                ];
+                assert_eq!(
+                    first_difference(&servers, &asked),
+                    None,
+                    "signing {signing}, DO {dnssec_ok}"
+                );
+            }
+        }
+    }
+}
+
+/// BIND sends the SOA of a negative to QTYPE SOA with TTL 0, and with
+/// min(SOA TTL, MINIMUM) for every other type (RFC 2308 §3). The copy
+/// answers each negative it holds with the SOA its server sent for that
+/// type, so one SOA question leaves the negative TTL of the others as
+/// they were.
+#[test]
+fn each_question_type_keeps_the_negative_soa_its_server_sent() {
+    let zones = Zones::new(vec![
+        Arc::new(Zone::from_master(EXAMPLE, None).unwrap()) as Arc<dyn ZoneData>
+    ]);
+    let answer = |lookup: &Lookup| {
+        let mut reply = reply_of(&zones, lookup);
+        if lookup.question.query_type() == RecordType::SOA {
+            for record in &mut reply.authorities {
+                record.ttl = 0;
+            }
+        }
+        reply
+    };
+    let local: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let copies = Copies::new();
+    copies.serves(local.ip(), &lower("example."));
+    for (qname, qtype, ttl, filed) in [
+        ("nothere.example.", RecordType::A, 300, false),
+        ("zzz.example.", RecordType::SOA, 0, false),
+        ("nothere.example.", RecordType::A, 300, true),
+        ("x.nothere.example.", RecordType::MX, 300, true),
+        ("zzz.example.", RecordType::SOA, 0, true),
+    ] {
+        let (got, looked) = through(&copies, &answer, local, &request(qname, qtype, false));
+        assert_eq!(
+            got.metadata.response_code,
+            ResponseCode::NXDomain,
+            "{qname} {qtype}"
+        );
+        let soa: Vec<u32> = got
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::SOA)
+            .map(|record| record.ttl)
+            .collect();
+        assert_eq!(soa, [ttl], "{qname} {qtype}");
+        if filed {
+            assert!(looked.is_empty(), "{qname} {qtype}: {looked:?}");
+        }
     }
 }
 

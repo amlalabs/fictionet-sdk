@@ -22,7 +22,7 @@ use super::super::event::{Event, ReplyFlags};
 use super::super::exchange::Client;
 use super::super::records::rrsets;
 use super::cache::{Entry, Negative, ttl_left};
-use super::resolution::{Outcome, is_dname, with_ttl};
+use super::resolution::{Outcome, is_dname, synthesized_from, with_ttl};
 use super::{Asker, Delegation, Piece, Resolver, worse};
 use fictionet::stdlib::protocols::dns::dnssec::Verify;
 
@@ -152,15 +152,22 @@ impl<V: Verify> Resolver<V> {
             // it within the cache's limit, counted down from when it
             // arrived, and, when it is Secure, no longer than the RRSIG
             // that verified it allows (RFC 4035 §5.3.3), as it would from
-            // the cache.
+            // the cache. A CNAME synthesized from a DNAME stands on the
+            // DNAME's RRSIG, so that RRSIG bounds it (RFC 6672 §3.4).
             let secure = !piece.checks.is_empty() && piece.validation() == Validation::Secure;
+            let proof: &[RecordSet] = match &piece.outcome {
+                Outcome::Alias { proof, .. } | Outcome::Data { proof, .. } => proof,
+                _ => &[],
+            };
             let ttl = |set: &RecordSet| {
                 let ttl = if piece.stale {
                     stale_ttl
                 } else {
                     let ttl = Duration::from_secs(u64::from(set.ttl().min(max_ttl)));
                     let mut expires = piece.at + ttl;
-                    if secure && let Some(until) = self.secure_until(set, piece.at, &piece.verified)
+                    let signed = synthesized_from(set, proof).unwrap_or(set);
+                    if secure
+                        && let Some(until) = self.secure_until(signed, piece.at, &piece.verified)
                     {
                         expires = expires.min(until);
                     }

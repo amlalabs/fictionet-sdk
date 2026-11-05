@@ -186,7 +186,9 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   `Zone.answer`'s response (`SignedZone.answerDo`); the answers of `Zone.answer` are the DO=0 answers. An
   answer to ANY with DO=1 also carries the DNSSEC RRsets of the name it matched, which ANY asks for
   (`anyExtra`): the NSEC there in an NSEC zone, the DNSKEY set at the apex, each owned by the question's
-  name, as Rust's `AnyResponse::All` answers; the NSEC3PARAM RRset is zone data.
+  name, as Rust's `AnyResponse::All` answers; the NSEC3PARAM RRset is zone data. `all` is also Rust's
+  `AnyResponse::AllFollowingDo`, which differs from `All` only in leaving the DNSSEC RRsets out at DO=0, as
+  `Zone.answer`'s DO=0 answers do.
 - **The CNAME chase** answers SERVFAIL with AA and the chain at the first repeated name, since a loop is an error
   (RFC 1034 §3.6.2), and stops at a name outside the zone or at YXDOMAIN. An
   RRset it reaches twice, such as a DNAME it passes again, goes out once (RFC 2181 §5). The

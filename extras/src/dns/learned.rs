@@ -14,7 +14,7 @@ use fictionet::stdlib::protocols::dns::rr::{
 use fictionet::stdlib::services::dns::Generation;
 use fictionet::stdlib::services::dns::zone::{
     Denied, Fact, Node, Revision, View, ZoneData, additional_targets, dname_target, expanded_from,
-    rrsets, wildcard,
+    owned, rrsets, wildcard,
 };
 use fictionet::sync::Mutex;
 
@@ -197,9 +197,11 @@ struct Facts {
     /// whose own denial records show a CNAME there, where it stopped at
     /// an alias that RFC 1034 §4.3.2 step 3a follows.
     stops_at_alias: BTreeSet<LowerName>,
-    /// The SOA RRset a negative answer carried, with its TTL already the
-    /// negative TTL (RFC 2308 §3).
-    negative_soa: Option<RecordSet>,
+    /// The SOA RRset the last negative answer to a question of each type
+    /// carried, with its TTL already the negative TTL (RFC 2308 §3). A
+    /// server may send another TTL for some types, as BIND sends TTL 0
+    /// with a negative to QTYPE SOA, so each type keeps its own.
+    negative_soa: BTreeMap<RecordType, RecordSet>,
 }
 
 /// What a [`Learned`] zone holds at one name.
@@ -412,12 +414,23 @@ impl ZoneData for Learned {
 
     fn view(&self, question: &Query) -> Arc<dyn View + Send + Sync> {
         let facts = self.held.lock().facts.clone();
+        // A negative goes out with the SOA its server sent with a negative
+        // to a question of the same type. Without one, the zone's SOA
+        // gives the negative TTL of RFC 2308 §3; without that, the longest
+        // a negative carried, since a server lowers it only for some
+        // types.
         let soa = facts
-            .names
-            .get(&self.apex)
-            .and_then(|known| known.sets.get(&RecordType::SOA))
-            .map(|(_, set)| set.clone())
-            .or_else(|| facts.negative_soa.clone())
+            .negative_soa
+            .get(&question.query_type())
+            .or_else(|| {
+                facts
+                    .names
+                    .get(&self.apex)
+                    .and_then(|known| known.sets.get(&RecordType::SOA))
+                    .map(|(_, set)| set)
+            })
+            .or_else(|| facts.negative_soa.values().max_by_key(|soa| soa.ttl()))
+            .cloned()
             // Every negative the view gives rests on a filed NXDOMAIN or
             // NODATA, which came with the SOA, and no positive answer
             // reads it.
@@ -449,7 +462,7 @@ impl Facts {
             proofs: HashMap::new(),
             whole: BTreeMap::new(),
             stops_at_alias: BTreeSet::new(),
-            negative_soa: None,
+            negative_soa: BTreeMap::new(),
         }
     }
 
@@ -664,7 +677,7 @@ impl Facts {
         let Some(soa) = soa else {
             return;
         };
-        self.negative_soa = Some(soa);
+        self.negative_soa.insert(filed.qtype, soa);
         match filed.rcode {
             // An NSEC RRset may sit beside a CNAME (RFC 4035 §2.5), and
             // without one the CNAME is followed, so such a NODATA is no
@@ -876,7 +889,7 @@ impl Facts {
         let Some(at) = self.expansion(apex, &owner, labels, denial) else {
             return false;
         };
-        self.put(apex, renamed(set, &Name::from(&at)), rank)
+        self.put(apex, owned(set, &Name::from(&at)), rank)
     }
 
     /// Files `at_end`, the RRsets of an answer to ANY or RRSIG at `end`,
@@ -900,7 +913,7 @@ impl Facts {
         let owner = Name::from(&at);
         let sets = at_end
             .iter()
-            .map(|set| (set.record_type(), renamed(set, &owner)))
+            .map(|set| (set.record_type(), owned(set, &owner)))
             .collect();
         self.whole.insert((at, filed.qtype), Node::Data(sets));
         true
@@ -1261,20 +1274,6 @@ fn same_data(a: &RecordSet, b: &RecordSet) -> bool {
     a.ttl() == b.ttl()
         && a_data.len() == b_data.len()
         && a_data.iter().all(|record| b_data.contains(record))
-}
-
-/// `set` with `owner` as the owner of every record and RRSIG.
-fn renamed(set: &RecordSet, owner: &Name) -> RecordSet {
-    let rename = |record: &Record| {
-        let mut record = record.clone();
-        record.name = owner.clone();
-        record
-    };
-    let mut renamed = RecordSet::with_ttl(owner.clone(), set.record_type(), set.ttl());
-    renamed.set_dns_class(set.dns_class());
-    renamed.set_records(set.records_without_rrsigs().map(rename).collect());
-    renamed.set_rrsigs(set.rrsigs().iter().map(rename).collect());
-    renamed
 }
 
 /// The names in the zone at `apex` where an answer to `qname` may end,

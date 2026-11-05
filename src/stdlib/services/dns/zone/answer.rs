@@ -59,6 +59,10 @@ pub enum AnyResponse {
     /// NSEC RRset and the RRSIGs even without DO: such servers count ANY as
     /// asking for them (RFC 4035 §3.2.1).
     All,
+    /// Every RRset of the name, with the NSEC RRset and the RRSIGs only
+    /// when the query sets DO (RFC 3225 §3), unless the name holds nothing
+    /// else.
+    AllFollowingDo,
 }
 
 /// RFC 1034 §4.3.2 over one view. Pure: the reply depends only on the
@@ -637,11 +641,11 @@ impl<'v> Walk<'v> {
                     let set = sets.iter().find(|set| set.record_type() == rtype);
                     vec![owned(set.unwrap_or(first), &owner)]
                 }
-                (AnyResponse::All, _) => {
+                (AnyResponse::All | AnyResponse::AllFollowingDo, _) => {
                     let mut answer: Vec<RecordSet> =
                         sets.iter().map(|set| owned(set, &owner)).collect();
                     // With DO the RRSIGs go out inside their RRsets.
-                    if !self.dnssec_ok {
+                    if !self.dnssec_ok && self.any == AnyResponse::All {
                         answer.extend(rrsigs_of(&sets, &owner));
                     }
                     answer
@@ -763,8 +767,10 @@ fn positive(answer: Vec<RecordSet>, authority: Vec<RecordSet>) -> Found {
     }
 }
 
-/// `set` with `owner` as the owner of every record and RRSIG.
-fn owned(set: &RecordSet, owner: &Name) -> RecordSet {
+/// `set` with `owner` as the owner of every record and RRSIG, with its
+/// type, class, and TTL kept, such as what a wildcard expands to at a name
+/// (RFC 4592 §3.3.1).
+pub fn owned(set: &RecordSet, owner: &Name) -> RecordSet {
     let rename = |record: &Record| {
         let mut record = record.clone();
         record.name = owner.clone();
