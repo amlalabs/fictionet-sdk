@@ -21,11 +21,19 @@ none. The internet comes in by one attachment that carries both families,
 from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
 
 - **SSH** (`--ssh`, 22 by default): the identification line of OpenSSH 9.6p1
-  on Ubuntu 24.04. It reads whatever comes back until the client leaves or
+  on Ubuntu 24.04, followed by its key exchange proposal after the client's
+  version line. It reads whatever comes back until the client leaves or
   120 seconds pass, as sshd's `LoginGraceTime` does. No keepalives: on
   Linux sshd's first comes after two hours idle, so a client sees none.
-- **HTTP** (`--http`, 80 by default): nginx's default page for one request,
-  then it closes. No keepalives, as nginx asks for none.
+- **HTTP** (`--http`, 80 by default): nginx's default page, with HTTP/1.1
+  connection reuse for up to 1,000 requests and 65 seconds between requests.
+  TCP keepalives remain disabled, as in nginx.
+
+The transport profile targets Ubuntu 24.04's Linux 6.8 kernel. The measured
+comparison and remaining differences are in [DIFF.md](DIFF.md).
+The requested 65-second HTTP timeout and 128-entry SSH backlog are explicit
+profile choices: the updated reference guest measured 75 seconds and an SSH
+socket owned by systemd with backlog 4,096. nginx's backlog was 511.
 
 The MPTCP listener follows RFC 8684, and reads MPTCP options as Linux does:
 an option Linux ignores counts for nothing, and of several that count the
@@ -152,8 +160,8 @@ to 63 seconds, the listener's handshake timeout, and an MPTCP token only while
 its connection is open. Burst, answer and probe state expires even when traffic is
 quiet, so a flood from spoofed addresses leaves no permanent state.
 
-Spoofed SYNs cannot shut real attackers out either. Each port holds 4,096
-handshakes. Past that, the server answers with SYN cookies, as Linux does, and
+Spoofed SYNs cannot shut real attackers out either. SSH holds 128 pending
+handshakes and HTTP holds 511. Past that, the server answers with SYN cookies and
 keeps nothing until the ACK that returns one. A handshake whose last ACK never
 comes gets six SYN-ACKs, at 0, 1, 3, 7, 15 and 31 seconds, and is dropped at 63
 seconds without a RST, as on Linux. A closed connection whose client never
@@ -176,46 +184,43 @@ forwards from, such as loopback, multicast or broadcast addresses, and the
 server answers no SYN from an address that cannot be one host's, as Linux
 answers none.
 
-## Running it locally
+## Comparing with Ubuntu locally
 
-This is the internal test: the same world, with a sandbox attached the normal
-way.
+The comparison uses two QEMU guests and the honeypot's socket mode beside
+them. One guest runs updated Ubuntu 24.04, its generic 6.8 kernel, OpenSSH,
+nginx and enabled MPTCP. The other runs every probe. QEMU's userspace
+socket backends connect the guest NICs; a userspace Ethernet adapter forwards
+the probe guest's IP packets into the honeypot's Unix socket. No host NIC,
+network namespace, route, firewall or kernel module is changed.
 
-Build the world and the attach command:
-
-```sh
-cargo build -p honeypot-world -p fictionet-cli
-```
-
-Start the world. It prints its address and where it logs:
-
-```sh
-target/debug/honeypot --world unix:/tmp/honeypot.sock \
-    --log /tmp/honeypot.jsonl --pcap /tmp/honeypot.pcapng
-```
-
-Attach a sandbox in a new network namespace. The sandboxes' subnet is
-`10.0.0.0/24`, with the gateway and DNS at `10.0.0.1`:
+Prerequisites are accessible KVM, `qemu-system-x86_64`, `qemu-img`,
+`genisoimage`, `objcopy`, `ldd`, `sha256sum`, and a user systemd manager.
+From this worktree on the home volume:
 
 ```sh
-sudo ip netns add agent
-sudo target/debug/fictionet attach tun --world unix:/tmp/honeypot.sock \
-    --name agent --netns /run/netns/agent \
-    --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1
+mkdir -p target/honeypot-diff/tmp
+export TMPDIR="$PWD/target/honeypot-diff/tmp"
+systemd-run --user --scope -p MemoryMax=32G env CARGO_BUILD_JOBS=8 \
+    cargo xtask honeypot-diff prepare
+systemd-run --user --scope -p MemoryMax=32G env CARGO_BUILD_JOBS=8 \
+    cargo build -p honeypot-world
+systemd-run --user --scope -p MemoryMax=32G env CARGO_BUILD_JOBS=8 \
+    cargo xtask honeypot-diff run comparison
 ```
 
-Anything in that namespace now reaches the server at `203.0.113.10`, and
-nothing else:
+`prepare` downloads the official cloud image and verifies its published
+SHA-256 checksum, then installs current updates inside the guests. All images,
+seeds and results stay under the ignored `target/honeypot-diff` directory.
+Prepared disks are reused; remove that directory to provision fresh updates.
+Each run requires a new name so observations cannot be overwritten. An optional
+third argument selects a previously built honeypot binary for baseline runs.
 
-```sh
-sudo ip netns exec agent nc 203.0.113.10 22
-sudo ip netns exec agent curl http://203.0.113.10/
-```
-
-Run the agent under test in the same namespace. Its every packet is in
-`/tmp/honeypot.pcapng`, and its SYNs, payloads and bursts are in
-`/tmp/honeypot.jsonl`, named `agent`. Linux clients send MP_CAPABLE when the
-program opens an MPTCP socket, or through `mptcpize run`.
+The result directory is `target/honeypot-diff/share/comparison`. It holds
+the guest kernel and package versions, sshd/nginx configurations, wire bytes
+and decoded packet fields, SSH proposals, both HTTP exchanges, nmap output,
+serial logs, and the honeypot capture. Differences in random sequence numbers,
+timestamps and cookies remain in the raw evidence. The probe entry point
+refuses to run outside the marked QEMU guest.
 
 ## A NIC of its own
 
@@ -252,8 +257,12 @@ AWS and Google Cloud. `--world` is not used: there is no socket to attach
 to.
 
 `ethernet.jsonl` has one line per frame, both ways, before the world reads
-it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`, and
-`lost`, how many lines the file could not take since the last one it did.
+it: `direction` (`in` or `out`), `at_us`, the frame in hex as `bytes`,
+`lost`, how many lines the file could not take since the last one it did,
+and `rx_queue_dropped`, frames discarded by the pump's full receive queue
+since the last accepted log record. Both counts survive a refused log write.
+`nic_rx_dropped` is null: the driver does not expose device or backend loss
+counters, so those losses cannot be inferred from the software queue count.
 So it keeps frames the world ignores: VLAN tags, unknown EtherTypes,
 malformed headers and Ethernet padding. `honeypot.pcapng` and
 `honeypot.jsonl` are as above.
