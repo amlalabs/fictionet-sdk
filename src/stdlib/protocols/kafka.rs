@@ -1232,14 +1232,15 @@ pub struct ApiVersionsResponse {
 }
 
 impl ApiVersionsResponse {
-    /// Reads the body of an ApiVersions response of version `version`.
-    /// A broker that does not speak that version answers in version 0
-    /// with [`error_code::UNSUPPORTED_VERSION`], so bytes that do not
-    /// read in `version` are read again in version 0, and taken if they
-    /// carry that error. The body's tagged fields 0 to 3 must hold what
-    /// Kafka defines for them.
-    /// A body longer than [`MAX_FRAME`] is [`Error::TooLarge`] for a supported version.
+    /// Reads the body of an ApiVersions response of version `version`,
+    /// one this module speaks. A broker that does not speak that version
+    /// answers in version 0 with [`error_code::UNSUPPORTED_VERSION`], so
+    /// bytes that do not read in `version` are read again in version 0,
+    /// and taken if they carry that error. The body's tagged fields 0 to
+    /// 3 must hold what Kafka defines for them.
+    /// A body longer than [`MAX_FRAME`] is [`Error::TooLarge`].
     pub fn parse(body: &[u8], version: i16) -> Result<ApiVersionsResponse, Error> {
+        check_version(api_key::API_VERSIONS, version)?;
         match ApiVersionsResponse::parse_exact(body, version) {
             Err(e) if version > 0 => match ApiVersionsResponse::parse_exact(body, 0) {
                 Ok(r) if r.error_code == error_code::UNSUPPORTED_VERSION => Ok(r),
@@ -3514,9 +3515,14 @@ mod tests {
         // With the APIs the broker speaks, as Kafka 2.4 and later send.
         let p = [0, 0x23, 0, 0, 0, 1, 0, 18, 0, 0, 0, 2];
         let got = ApiVersionsResponse::parse(&p, 3).unwrap();
+        // A version this module does not speak is refused, as the writer
+        // refuses it; a whole response in such a version stays bytes.
         assert_eq!(
             ApiVersionsResponse::parse(&p, API_VERSIONS_MAX_VERSION + 1),
-            Ok(got.clone())
+            Err(Error::UnsupportedVersion {
+                api_key: api_key::API_VERSIONS,
+                api_version: API_VERSIONS_MAX_VERSION + 1,
+            })
         );
         assert_eq!(
             got.api_keys,
@@ -3529,6 +3535,28 @@ mod tests {
         );
         // Only for UNSUPPORTED_VERSION.
         assert!(ApiVersionsResponse::parse(&[0, 0, 0, 0, 0, 0], 3).is_err());
+    }
+
+    #[test]
+    fn every_api_versions_answer_read_writes_back() {
+        // A version 0 answer with UNSUPPORTED_VERSION and no APIs.
+        let body = [0, 0x23, 0, 0, 0, 0];
+        for v in -1..=API_VERSIONS_MAX_VERSION + 8 {
+            if let Ok(got) = ApiVersionsResponse::parse(&body, v) {
+                let response = Response {
+                    header: ResponseHeader::default(),
+                    body: ResponseBody::ApiVersions(got),
+                };
+                let frame = response.to_frame(api_key::API_VERSIONS, v).unwrap();
+                assert_eq!(
+                    Response::parse(&frame.0, api_key::API_VERSIONS, v),
+                    Ok(response),
+                    "{v}"
+                );
+            } else {
+                assert!(!has_body(api_key::API_VERSIONS, v), "{v}");
+            }
+        }
     }
 
     #[test]
