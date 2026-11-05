@@ -94,7 +94,9 @@
 
 use std::num::NonZeroU32;
 
-use fictionet::stdlib::protocols::onc_rpc::{Accept, Call, Error, Message, Reader, Reply, Writer};
+use fictionet::stdlib::protocols::onc_rpc::{
+    Accept, Call, Error, MAX_RECORD, Message, Reader, Reply, Writer,
+};
 
 /// The port NFS listens on, over TCP and UDP.
 pub const PORT: u16 = 2049;
@@ -109,14 +111,8 @@ pub const MOUNT_VERSION: u32 = 3;
 
 /// The longest file handle, in bytes (NFS3_FHSIZE and FHSIZE3).
 pub const MAX_FH: usize = 64;
-/// The longest file name in a directory, in bytes. RFC 1813 sets no limit
-/// on filename3, so this is the common one of 255.
-pub const MAX_NAME: usize = 255;
 /// The longest MOUNT directory path, in bytes (MNTPATHLEN).
 pub const MAX_PATH: usize = 1024;
-/// The longest symbolic link target, in bytes. RFC 1813 sets no limit on
-/// nfspath3, so this is PATH_MAX on Linux, which its servers use.
-pub const MAX_SYMLINK: usize = 4096;
 /// The longest host or group name in MOUNT results, in bytes (MNTNAMLEN).
 pub const MAX_MOUNT_NAME: usize = 255;
 /// The most bytes one READ result or WRITE call carries.
@@ -743,8 +739,9 @@ impl Sattr {
 pub struct DirOp {
     /// The directory's handle.
     pub dir: FileHandle,
-    /// The name, at most [`MAX_NAME`] bytes, in whatever character set
-    /// the client uses.
+    /// The name, in whatever character set the client uses. RFC 1813
+    /// sets no limit on filename3: how long a name may be is the file
+    /// system's choice, which [`PathConfOk::name_max`] reports.
     pub name: Vec<u8>,
 }
 
@@ -753,15 +750,14 @@ impl DirOp {
     pub fn read(r: &mut Reader<'_>) -> Result<DirOp, Error> {
         Ok(DirOp {
             dir: FileHandle::read(r)?,
-            name: read_name(r)?,
+            name: read_bytes(r)?,
         })
     }
 
-    /// Writes the diropargs3. A name longer than [`MAX_NAME`] bytes is
-    /// refused by the writer.
+    /// Writes the diropargs3.
     pub fn write(&self, w: &mut Writer) {
         self.dir.write(w);
-        w.opaque_bounded(&self.name, MAX_NAME);
+        w.opaque(&self.name);
     }
 }
 
@@ -990,8 +986,7 @@ pub enum Request {
         location: DirOp,
         /// The attributes to set.
         attributes: Sattr,
-        /// The link's target, at most [`MAX_SYMLINK`] bytes. A longer
-        /// one is refused by the writer.
+        /// The link's target. RFC 1813 sets no limit on nfspath3.
         target: Vec<u8>,
     },
     /// Procedure 11: make a device, socket or named pipe.
@@ -1130,7 +1125,7 @@ impl Request {
             procedure::SYMLINK => Request::Symlink {
                 location: DirOp::read(r)?,
                 attributes: Sattr::read(r)?,
-                target: read_symlink(r)?,
+                target: read_bytes(r)?,
             },
             procedure::MKNOD => Request::Mknod {
                 location: DirOp::read(r)?,
@@ -1276,7 +1271,7 @@ impl Request {
             } => {
                 location.write(w);
                 attributes.write(w);
-                w.opaque_bounded(target, MAX_SYMLINK);
+                w.opaque(target);
             }
             Request::Mknod { location, what } => {
                 location.write(w);
@@ -1356,8 +1351,7 @@ pub struct AccessOk {
 pub struct ReadLinkOk {
     /// The link's attributes.
     pub attributes: Option<Fattr>,
-    /// The link's target, at most [`MAX_SYMLINK`] bytes. A longer one is
-    /// refused by the writer.
+    /// The link's target. RFC 1813 sets no limit on nfspath3.
     pub target: Vec<u8>,
 }
 
@@ -1425,8 +1419,7 @@ pub struct LinkWcc {
 pub struct Entry {
     /// The file's number within the file system.
     pub fileid: u64,
-    /// The name, at most [`MAX_NAME`] bytes. A longer name makes the
-    /// result unwritable.
+    /// The name.
     pub name: Vec<u8>,
     /// Where a later READDIR goes on from after this entry.
     pub cookie: u64,
@@ -1452,8 +1445,7 @@ pub struct ReadDirOk {
 pub struct EntryPlus {
     /// The file's number within the file system.
     pub fileid: u64,
-    /// The name, at most [`MAX_NAME`] bytes. A longer name makes the
-    /// result unwritable.
+    /// The name.
     pub name: Vec<u8>,
     /// Where a later READDIRPLUS goes on from after this entry.
     pub cookie: u64,
@@ -1678,7 +1670,7 @@ impl Response {
                 |r| {
                     Ok(ReadLinkOk {
                         attributes: read_post_op(r)?,
-                        target: read_symlink(r)?,
+                        target: read_bytes(r)?,
                     })
                 },
                 read_post_op,
@@ -1731,7 +1723,7 @@ impl Response {
                         entries: r.list(MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
                             Ok(Entry {
                                 fileid: r.uhyper()?,
-                                name: read_name(r)?,
+                                name: read_bytes(r)?,
                                 cookie: r.uhyper()?,
                             })
                         })?,
@@ -1749,7 +1741,7 @@ impl Response {
                         entries: r.list(MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
                             Ok(EntryPlus {
                                 fileid: r.uhyper()?,
-                                name: read_name(r)?,
+                                name: read_bytes(r)?,
                                 cookie: r.uhyper()?,
                                 attributes: read_post_op(r)?,
                                 handle: r.optional(FileHandle::read)?,
@@ -1898,7 +1890,7 @@ impl Response {
                 res,
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
-                    w.opaque_bounded(&ok.target, MAX_SYMLINK);
+                    w.opaque(&ok.target);
                 },
                 write_post_op,
             ),
@@ -1959,7 +1951,7 @@ impl Response {
                     let named = ok.entries.iter();
                     w.list(named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
                         w.uhyper(e.fileid);
-                        w.opaque_bounded(&e.name, MAX_NAME);
+                        w.opaque(&e.name);
                         w.uhyper(e.cookie);
                     });
                     w.bool(ok.eof);
@@ -1975,7 +1967,7 @@ impl Response {
                     let named = ok.entries.iter();
                     w.list(named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
                         w.uhyper(e.fileid);
-                        w.opaque_bounded(&e.name, MAX_NAME);
+                        w.opaque(&e.name);
                         w.uhyper(e.cookie);
                         write_post_op(w, &e.attributes);
                         w.optional(e.handle.as_ref(), |w, fh| fh.write(w));
@@ -2443,16 +2435,15 @@ fn read_verifier(r: &mut Reader<'_>) -> Result<[u8; VERIFIER_LEN], Error> {
     Ok(v)
 }
 
-fn read_name(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
-    Ok(r.opaque(MAX_NAME)?.to_vec())
+/// Variable-length bytes with no limit of their own, such as a name or a
+/// link's target. They are copied only once all of them are in the input,
+/// and no field longer than one RPC message, [`MAX_RECORD`], is read.
+fn read_bytes(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
+    Ok(r.opaque(MAX_RECORD)?.to_vec())
 }
 
 fn read_path(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
     Ok(r.opaque(MAX_PATH)?.to_vec())
-}
-
-fn read_symlink(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
-    Ok(r.opaque(MAX_SYMLINK)?.to_vec())
 }
 
 fn read_mount_name(r: &mut Reader<'_>) -> Result<String, Error> {
@@ -3194,13 +3185,14 @@ mod tests {
             Request::read(procedure::GETATTR, &b),
             Err(Error::TooLong(65))
         );
-        // A name over 255 bytes.
+        // A name over 255 bytes is not a bad field: its length is the
+        // file system's choice.
         let long = "n".repeat(256);
         let mut w = Writer::new();
         w.opaque(&[1]).string(&long);
         assert_eq!(
             Request::read(procedure::LOOKUP, w.as_bytes()),
-            Err(Error::TooLong(256))
+            Ok(Request::Lookup(op(&[1], &long)))
         );
         // Padding that is not zero.
         assert_eq!(
@@ -3262,15 +3254,35 @@ mod tests {
             Request::read(procedure::WRITE, w.as_bytes()),
             Err(Error::TooLong(MAX_DATA as u32 + 1))
         );
-        // A symlink target over MAX_SYMLINK.
+        // A symlink target longer than the bytes left, refused before any
+        // copy.
         let mut w = Writer::new();
         w.opaque(&[1]).string("l");
         Sattr::default().write(&mut w);
-        w.string(&"t".repeat(MAX_SYMLINK + 1));
+        w.uint(1 << 20).opaque_fixed(b"tttt");
         assert_eq!(
             Request::read(procedure::SYMLINK, w.as_bytes()),
-            Err(Error::TooLong(4097))
+            Err(Error::Short)
         );
+        // A name longer than one RPC message, refused by its length alone.
+        let mut w = Writer::new();
+        w.opaque(&[1]).uint(MAX_RECORD as u32 + 1);
+        assert_eq!(
+            Request::read(procedure::LOOKUP, w.as_bytes()),
+            Err(Error::TooLong(MAX_RECORD as u32 + 1))
+        );
+        // A name cut short, and one missing its padding.
+        let mut w = Writer::new();
+        w.opaque(&[1]).uint(6).opaque_fixed(b"name");
+        assert_eq!(
+            Request::read(procedure::LOOKUP, w.as_bytes()),
+            Err(Error::Short)
+        );
+        let mut w = Writer::new();
+        w.opaque(&[1]).uint(6);
+        let mut b = w.finish().unwrap();
+        b.extend_from_slice(b"names\0");
+        assert_eq!(Request::read(procedure::LOOKUP, &b), Err(Error::Short));
         // Too many auth flavors.
         let mut w = Writer::new();
         w.uint(0).opaque(&[1]).uint(17);
@@ -3289,32 +3301,28 @@ mod tests {
 
     #[test]
     fn symlink_targets_are_not_mount_paths() {
-        // nfspath3 is string<>, with no MNTPATHLEN bound. Linux servers
-        // allow PATH_MAX (4096) bytes, so a 2000-byte target must read.
-        let target = "t".repeat(2000);
-        let req = Request::Symlink {
-            location: op(&[1], "l"),
-            attributes: Sattr::default(),
-            target: target.into(),
-        };
-        assert_eq!(
-            Request::read(procedure::SYMLINK, &req.to_args().unwrap()),
-            Ok(req)
-        );
-        let resp = Response::ReadLink(Ok(ReadLinkOk {
-            attributes: None,
-            target: vec![b'x'; MAX_SYMLINK],
-        }));
-        assert_eq!(
-            Response::parse(procedure::READLINK, &resp.to_results().unwrap()),
-            Ok(resp)
-        );
-        let mut w = Writer::new();
-        w.uint(0).bool(false).string(&"x".repeat(MAX_SYMLINK + 1));
-        assert_eq!(
-            Response::parse(procedure::READLINK, w.as_bytes()),
-            Err(Error::TooLong(4097))
-        );
+        // nfspath3 is string<>, with no MNTPATHLEN bound and no limit of
+        // its own. A target longer than any one file system allows reads
+        // and writes; the world decides whether its file system takes it.
+        for len in [2000, 4097, 70_000] {
+            let req = Request::Symlink {
+                location: op(&[1], "l"),
+                attributes: Sattr::default(),
+                target: vec![b't'; len],
+            };
+            assert_eq!(
+                Request::read(procedure::SYMLINK, &req.to_args().unwrap()),
+                Ok(req)
+            );
+            let resp = Response::ReadLink(Ok(ReadLinkOk {
+                attributes: None,
+                target: vec![b'x'; len],
+            }));
+            assert_eq!(
+                Response::parse(procedure::READLINK, &resp.to_results().unwrap()),
+                Ok(resp)
+            );
+        }
         // A MOUNT dirpath keeps its MNTPATHLEN bound.
         let mut w = Writer::new();
         w.string(&"p".repeat(MAX_PATH + 1));
@@ -3392,6 +3400,75 @@ mod tests {
         assert_eq!(resp.to_results().unwrap(), b);
     }
 
+    /// filename3 is string<> with no limit of its own. A name longer than
+    /// common file systems allow reads and writes in every procedure that
+    /// carries one; the world's file system decides whether it exists.
+    #[test]
+    fn names_have_no_limit_of_their_own() {
+        let name = vec![b'n'; 4096];
+        for request in [
+            Request::Lookup(DirOp {
+                dir: fh(&[1]),
+                name: name.clone(),
+            }),
+            Request::Remove(DirOp {
+                dir: fh(&[1]),
+                name: name.clone(),
+            }),
+            Request::Rename {
+                from: DirOp {
+                    dir: fh(&[1]),
+                    name: name.clone(),
+                },
+                to: DirOp {
+                    dir: fh(&[2]),
+                    name: name.clone(),
+                },
+            },
+        ] {
+            assert_eq!(
+                Request::read(request.procedure(), &request.to_args().unwrap()),
+                Ok(request)
+            );
+        }
+        let resp = Response::ReadDir(Ok(ReadDirOk {
+            entries: vec![fixture_entry(2, name.clone(), 2)],
+            eof: true,
+            ..ReadDirOk::default()
+        }));
+        assert_eq!(
+            Response::parse(procedure::READDIR, &resp.to_results().unwrap()),
+            Ok(resp)
+        );
+        let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk {
+            entries: vec![EntryPlus {
+                name,
+                ..EntryPlus::default()
+            }],
+            ..ReadDirPlusOk::default()
+        }));
+        assert_eq!(
+            Response::parse(procedure::READDIRPLUS, &resp.to_results().unwrap()),
+            Ok(resp)
+        );
+        // Past one RPC message, the writer refuses the name without
+        // copying it, and the call is refused.
+        let huge = DirOp {
+            dir: fh(&[1]),
+            name: vec![b'n'; MAX_RECORD + 1],
+        };
+        let mut w = Writer::new();
+        w.uint(7);
+        huge.write(&mut w);
+        // The word, the handle and the name's length; none of its bytes.
+        assert_eq!(w.as_bytes().len(), 4 + 8 + 4);
+        assert!(matches!(w.finish(), Err(Error::TooLong(_))));
+        assert!(matches!(
+            Request::Lookup(huge).to_args(),
+            Err(Error::TooLong(_))
+        ));
+    }
+
     #[test]
     fn writers_refuse_long_handles_names_and_paths() {
         let long_fh = FileHandle(vec![1; MAX_FH + 1]);
@@ -3409,13 +3486,13 @@ mod tests {
         for request in [
             Request::GetAttr(long_fh.clone()),
             Request::Lookup(DirOp {
-                dir: fh(&[1]),
-                name: vec![b'n'; MAX_NAME + 1],
+                dir: long_fh.clone(),
+                name: b"n".to_vec(),
             }),
             Request::Symlink {
                 location: op(&[1], "l"),
                 attributes: Sattr::default(),
-                target: vec![b't'; MAX_SYMLINK + 1],
+                target: vec![b't'; MAX_RECORD + 1],
             },
         ] {
             assert!(request.to_args().is_err());
@@ -3423,7 +3500,7 @@ mod tests {
         for response in [
             Response::ReadLink(Ok(ReadLinkOk {
                 attributes: None,
-                target: vec![b'x'; MAX_SYMLINK + 1],
+                target: vec![b'x'; MAX_RECORD + 1],
             })),
             Response::Create(Ok(CreateOk {
                 object: Some(long_fh.clone()),
@@ -3454,14 +3531,14 @@ mod tests {
     #[test]
     fn list_writers_refuse_invalid_entries() {
         let response = Response::ReadDir(Ok(ReadDirOk {
-            entries: vec![fixture_entry(2, vec![b'n'; MAX_NAME + 1], 2)],
+            entries: vec![fixture_entry(2, vec![b'n'; MAX_DIR_BYTES + 1], 2)],
             eof: true,
             ..ReadDirOk::default()
         }));
         assert!(response.to_results().is_err());
         for entry in [
             EntryPlus {
-                name: vec![b'n'; MAX_NAME + 1],
+                name: vec![b'n'; MAX_DIR_BYTES + 1],
                 ..EntryPlus::default()
             },
             EntryPlus {
@@ -3680,8 +3757,10 @@ mod tests {
     #[test]
     fn largest_messages_fit_in_a_record() {
         // Values within each protocol limit fit in a strict RPC record.
+        // Names and link targets have none: these are as long as common
+        // file systems allow.
         let fat = FileHandle(vec![1; MAX_FH]);
-        let name = vec![b'n'; MAX_NAME];
+        let name = vec![b'n'; 255];
         let path = vec![b'p'; MAX_PATH];
         let group = "g".repeat(MAX_MOUNT_NAME);
         let plus = EntryPlus {
@@ -3743,7 +3822,7 @@ mod tests {
             Request::Symlink {
                 location: DirOp { dir: fat, name },
                 attributes: sattr(),
-                target: vec![b't'; MAX_SYMLINK],
+                target: vec![b't'; 4096],
             }
             .call(3)
             .unwrap(),
@@ -3888,17 +3967,13 @@ mod tests {
                         .entries
                         .iter()
                         .find_map(|entry| {
-                            if entry.name.len() > MAX_NAME {
-                                Some(entry.name.len())
-                            } else {
-                                entry
-                                    .handle
-                                    .as_ref()
-                                    .filter(|handle| handle.0.len() > MAX_FH)
-                                    .map(|handle| handle.0.len())
-                            }
+                            entry
+                                .handle
+                                .as_ref()
+                                .filter(|handle| handle.0.len() > MAX_FH)
+                                .map(|handle| handle.0.len())
                         })
-                        .expect("a name or handle must exceed its limit");
+                        .expect("a handle must exceed its limit");
                     assert_eq!(error, Error::TooLong(length as u32));
                 }
             }

@@ -56,7 +56,7 @@ fn call_args(u: &mut Unstructured) -> Result<CallArgs> {
     })
 }
 
-/// A netbuf, usually with `maxlen` at least its length and at most 9000,
+/// A netbuf, usually with `maxlen` at least its length,
 /// sometimes not.
 fn netbuf(u: &mut Unstructured) -> Result<Netbuf> {
     let buf = bytes(u, 300)?;

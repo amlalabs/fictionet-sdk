@@ -348,6 +348,8 @@ pub enum Error {
     /// An inline command had a quote that does not close, or a closing
     /// quote followed by something other than a space.
     UnbalancedQuotes,
+    /// An inline command's line held a NUL byte.
+    InlineNul,
     /// A value or command took more than [`Limits::frame`] bytes.
     FrameTooLarge,
     /// The input ended inside a frame.
@@ -370,6 +372,7 @@ fictionet::error_display!(Error, f, {
     Error::ValueSyntax(c) => write!(f, "malformed value of type '{}'", c.escape_ascii()),
     Error::ExpectedBulk(c) => write!(f, "expected '$', got '{}'", c.escape_ascii()),
     Error::UnbalancedQuotes => f.write_str("unbalanced quotes in request"),
+    Error::InlineNul => f.write_str("NUL byte in inline request"),
     Error::FrameTooLarge => f.write_str("value too large"),
     Error::Incomplete => f.write_str("incomplete RESP frame"),
     Error::Trailing => f.write_str("bytes follow the RESP frame"),
@@ -669,13 +672,12 @@ struct Scan {
     quiet: Option<Quiet>,
 }
 
-/// A line with no end yet: where it starts, how far it holds no line end,
-/// and, for an inline command, whether a NUL came before any LF.
+/// A line with no end yet: where it starts, and how far it holds no line
+/// end.
 #[derive(Debug, Clone, Copy)]
 struct Quiet {
     start: usize,
     to: usize,
-    stuck: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -763,11 +765,7 @@ impl Scan {
             && b.len() - start <= max
             && !b[start..].iter().any(|&c| c == b'\r' || c == b'\n')
         {
-            self.quiet = Some(Quiet {
-                start,
-                to: b.len(),
-                stuck: false,
-            });
+            self.quiet = Some(Quiet { start, to: b.len() });
         }
     }
 }
@@ -988,27 +986,22 @@ fn scan_inline(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
         && q.start == 0
         && q.to <= b.len()
         && b.len() <= lim.line
+        && !b[q.to..].iter().any(|&c| c == b'\n' || c == 0)
     {
-        let first = b[q.to..].iter().find(|&&c| c == b'\n' || c == 0);
-        let stuck = q.stuck || first == Some(&0);
-        if stuck || first.is_none() {
-            s.quiet = Some(Quiet {
-                start: 0,
-                to: b.len(),
-                stuck,
-            });
-            return Some(b.len().saturating_add(1));
-        }
+        s.quiet = Some(Quiet {
+            start: 0,
+            to: b.len(),
+        });
+        return Some(b.len().saturating_add(1));
     }
     match inline_text(b, lim) {
         Err(Fail::Need(n)) => {
-            // Needing more, a line no longer than the limit holds no LF,
-            // or a NUL before it.
+            // Needing more, a line no longer than the limit holds no LF
+            // and no NUL.
             if b.len() <= lim.line {
                 s.quiet = Some(Quiet {
                     start: 0,
                     to: b.len(),
-                    stuck: b.contains(&0),
                 });
             }
             Some(n)
@@ -1368,18 +1361,24 @@ fn stream_end(b: &[u8], pos: usize, lim: &Limits) -> Result<Option<usize>, Fail>
 fn inline_text<'a>(b: &'a [u8], lim: &Limits) -> Step<&'a [u8]> {
     // The text may be line bytes, then CR LF.
     let window = &b[..b.len().min(lim.line.saturating_add(2))];
-    // Redis finds the LF with strchr, which stops at a NUL, so after a
-    // NUL the line never ends, and the bytes run into the limit.
+    // The line ends at its LF. A NUL before it is a protocol error.
     let end = window.iter().position(|&c| c == b'\n' || c == 0);
-    let Some(i) = end.filter(|&i| window[i] == b'\n') else {
+    let Some(i) = end else {
         // Without an LF, the bytes past the longest text can only be a CR,
         // and only before a LF that can still come.
         let over = window.len().saturating_sub(lim.line);
-        if over > 1 || (over == 1 && (end.is_some() || window.last() != Some(&b'\r'))) {
+        if over > 1 || (over == 1 && window.last() != Some(&b'\r')) {
             return Err(Error::LineTooLong.into());
         }
         return Err(Fail::Need(b.len().saturating_add(1)));
     };
+    if window[i] == 0 {
+        // Past the longest text only a CR and its LF may come.
+        if i >= lim.line {
+            return Err(Error::LineTooLong.into());
+        }
+        return Err(Error::InlineNul.into());
+    }
     let text = b[..i].strip_suffix(b"\r").unwrap_or(&b[..i]);
     if text.len() > lim.line {
         return Err(Error::LineTooLong.into());
@@ -1393,8 +1392,8 @@ fn is_space(c: u8) -> bool {
 }
 
 /// Splits an inline command's line into arguments, as Redis's
-/// `sdssplitargs` does. The line holds no NUL: [`inline_text`] ends no line
-/// after one.
+/// `sdssplitargs` does. The line holds no NUL: [`inline_text`] refuses
+/// one.
 fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let after_quote_ok = |i: usize| text.get(i + 1).is_none_or(|&c| is_space(c));
     let mut args = Vec::new();
@@ -1618,7 +1617,8 @@ impl Wire for Command {
     /// An initial `*` selects an array of bulk strings. Otherwise, a line
     /// ending with LF or CRLF is split at spaces. Double quotes allow
     /// `\n`, `\r`, `\t`, `\b`, `\a`, `\xHH`, and a backslash before any
-    /// other byte. Single quotes allow `\'`. A NUL hides any later LF.
+    /// other byte. Single quotes allow `\'`. A literal NUL in the line is
+    /// refused; `\x00` in double quotes is an argument's NUL byte.
     /// Array counts and bulk lengths allow no `+`, leading zero, or `-0`.
     /// Blank lines and arrays with zero or negative counts have no arguments.
     /// Refuses malformed, incomplete, oversized, or trailing input and
@@ -2473,7 +2473,7 @@ mod tests {
             assert_eq!(Command::parse(bytes), Ok(Command::default()));
             assert_eq!(decode_all(Commands::new, bytes), (vec![], None));
         }
-        assert_eq!(Command::parse(b"GET a\0b\n"), Err(Error::Incomplete));
+        assert_eq!(Command::parse(b"GET a\0b\n"), Err(Error::InlineNul));
     }
 
     #[test]
@@ -3410,24 +3410,58 @@ mod tests {
         assert_eq!(attr.to_bytes().unwrap(), b"|0\r\n>1\r\n$1\r\na\r\n");
     }
 
-    /// Redis looks for an inline command's LF with strchr, which stops at
-    /// a NUL: after a NUL the line never ends, and runs into the limit.
+    /// A literal NUL in an inline command's line is a protocol error, found
+    /// as soon as it comes, however the bytes are split, and nothing after
+    /// it is read. A NUL the grammar encodes is an argument's byte.
     #[test]
-    fn inline_nul_hides_the_line_end() {
-        assert_eq!(Command::parse(b"GET a\0b\nPING\n"), Err(Error::Incomplete));
+    fn inline_nul_is_refused() {
+        assert_eq!(Command::parse(b"GET a\0b\nPING\n"), Err(Error::InlineNul));
+        assert_eq!(
+            command_step(b"GET a\0", Limits::DEFAULT),
+            Err(Error::InlineNul)
+        );
+        assert_eq!(command_step(b"GET a", Limits::DEFAULT), Ok(Decoded::Need));
         let limits = Limits {
             line: 12,
             ..Limits::DEFAULT
         };
+        for b in [&b"GET a\0b\nPING\n"[..], b"PING\nGET a\0b\nPING\n"] {
+            check_commands(b, limits);
+            check_commands(b, Limits::DEFAULT);
+        }
         assert_eq!(
-            command_step(b"GET a\0b\nPING\n", limits),
+            decode_chunks(
+                &mut Stream::new(Commands::new()),
+                chunks(b"PING\nGET a\0b\nPING\n", &[1]),
+                |_| {}
+            ),
+            (
+                vec![Command::new(["PING"])],
+                Some(codec::Fail::Protocol(Error::InlineNul))
+            )
+        );
+        // Past the longest line and its CR, a NUL ends a line too long.
+        assert_eq!(
+            command_step(b"GET abcdefgh\0", limits),
             Err(Error::LineTooLong)
         );
-        assert_eq!(command_step(b"GET a\0b\nPIN\n", limits), Ok(Decoded::Need));
-        check_commands(b"GET a\0b\nPING\n", limits);
         assert_eq!(
-            decode_all(|| Commands::with_limits(limits), b"GET a\0b\nPING\n"),
-            (vec![], Some(codec::Fail::Protocol(Error::LineTooLong)))
+            command_step(b"GET abcdefg\0", limits),
+            Err(Error::InlineNul)
+        );
+        assert_eq!(
+            Command::parse(b"SET k \"a\\x00b\"\n"),
+            Ok(Command::new([&b"SET"[..], b"k", b"a\0b"]))
+        );
+        let binary = b"*2\r\n$4\r\nECHO\r\n$3\r\na\0b\r\n";
+        assert_eq!(
+            Command::parse(binary),
+            Ok(Command::new([&b"ECHO"[..], b"a\0b"]))
+        );
+        check_commands(binary, Limits::DEFAULT);
+        assert_eq!(
+            Value::parse(b"$3\r\na\0b\r\n"),
+            Ok(Value::bulk(&b"a\0b"[..]))
         );
     }
 
