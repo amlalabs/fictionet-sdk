@@ -60,7 +60,10 @@
 //!     )?;
 //!     let zones = Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>]);
 //!     let server = Authoritative::new(zones, ServerConfig::generic());
-//!     Net::new()
+//!     Net::new(fictionet::stdlib::world::net::Pools {
+//!         v4: Some("192.0.2.0/24".parse()?),
+//!         v6: Some("2001:db8:1::/64".parse()?),
+//!     })
 //!         .host("ns1", |h| h.at(Ipv4Addr::new(104, 18, 32, 5)).program(server))
 //!         .start(&fcx, attachments)?;
 //!     Ok(())

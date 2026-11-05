@@ -109,7 +109,9 @@
 //!
 //! A callback that opens a whole domain, such as every name under
 //! `github.com`, gives a site, and a machine (about 11 KiB) for each of its
-//! addresses, to every such name the agent tries.
+//! addresses, to every such name the agent tries. At most 20,000 names
+//! get a site, unless [`Sites::max_sites`] sets another limit. Past it,
+//! a new site gets SERVFAIL before it receives an address or a machine.
 //!
 //! A world can report typed facts from its name-resolution callback.
 //!
@@ -545,9 +547,9 @@ use std::sync::Arc;
 use http::{Request, Response};
 
 use fictionet::stdlib::network::route::Prefix;
-use fictionet::stdlib::services::dns::{Event, WallClock};
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{EmptyApex, ZoneData, special};
+use fictionet::stdlib::services::dns::{Event, WallClock};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::world::net::dns::{self, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, Pools};
@@ -559,6 +561,7 @@ use httpd::{Handler, Server};
 /// [module docs](fictionet::stdlib::web).
 pub struct Sites {
     site_for: Arc<SiteFor>,
+    max_sites: usize,
     net: Net,
     date: Option<std::time::SystemTime>,
     on_dns_event: Option<Arc<OnDnsEvent>>,
@@ -588,6 +591,7 @@ impl Sites {
     {
         Sites {
             site_for: Arc::new(site_for),
+            max_sites: 20_000,
             net: Net::new(pools),
             date: None,
             on_dns_event: None,
@@ -628,6 +632,14 @@ impl Sites {
         self
     }
 
+    /// Limits how many names the callback may give a site. The default is
+    /// 20,000. A new site past the limit gets SERVFAIL before an address or
+    /// machine is allocated; existing sites keep answering.
+    pub fn max_sites(mut self, max_sites: usize) -> Sites {
+        self.max_sites = max_sites;
+        self
+    }
+
     /// The network these sites run on, before it starts: to add hosts
     /// with other services next to the websites.
     ///
@@ -644,14 +656,18 @@ impl Sites {
         let clock = WallClock {
             start: date.unwrap_or(std::time::SystemTime::UNIX_EPOCH),
         };
-        let sites: Arc<dyn ZoneData> = Arc::new(dns::placing(self.net.handle(), move |name| {
-            site_for(name).map(|mut site| {
-                if let Some(date) = date {
-                    site = site.date(date);
-                }
-                site.into_host(name)
-            })
-        }));
+        let sites: Arc<dyn ZoneData> = Arc::new(dns::placing_limited(
+            self.net.handle(),
+            move |name| {
+                site_for(name).map(|mut site| {
+                    if let Some(date) = date {
+                        site = site.date(date);
+                    }
+                    site.into_host(name)
+                })
+            },
+            self.max_sites,
+        ));
         self.net.gateway(move |host, _declared| {
             let localhost = special::localhost(&EmptyApex::rfc6303());
             let config = Config {

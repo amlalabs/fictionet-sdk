@@ -1661,7 +1661,8 @@ fn a_resolver_with_no_hints_answers_servfail_with_ede_22() {
         query(client(1), "1.0.0.10.in-addr.arpa.", RecordType::PTR, |_| {}),
     );
     assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
-    assert!(!reply.metadata.authoritative);
+    // Unbound sets AA on answers from its local zones.
+    assert!(reply.metadata.authoritative);
     assert!(net.recording().exchanges().is_empty());
 }
 

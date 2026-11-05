@@ -278,8 +278,8 @@ impl TestInternet {
         };
         let generic = ServerConfig::generic;
         let fict_servers: Arc<dyn Authority> = Arc::new(Zones::new(vec![fict.clone()]));
-        let gtld =
-            Overlay::new(Zones::new(vec![com, net]), name("com.")).below(name("fict.com."), fict_servers.clone());
+        let gtld = Overlay::new(Zones::new(vec![com, net]), name("com."))
+            .below(name("fict.com."), fict_servers.clone());
         let zones = |zone: &Arc<dyn ZoneData>| -> Arc<dyn Authority> {
             Arc::new(Zones::new(vec![zone.clone()]))
         };

@@ -59,7 +59,10 @@
 //! # use fictionet::{Attachments, Cx, Result};
 //! # use fictionet::stdlib::world::net::{Endpoints, Host, Net};
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let net = Net::new();
+//! let net = Net::new(fictionet::stdlib::world::net::Pools {
+//!     v4: Some("192.0.2.0/24".parse()?),
+//!     v6: Some("2001:db8:1::/64".parse()?),
+//! });
 //! let handle = net.handle();
 //! let net = net.host("spawner", |h| {
 //!     h.program(move |_fcx: Cx, _machine: Endpoints| {
@@ -174,7 +177,6 @@ mod names;
 
 pub use addresses::Placed;
 use addresses::{Leases, Subnet, Subnet6, check_pools};
-pub use attachments::connection_limit;
 use attachments::{Hooks, filter, udp_packet};
 use dns::Recursive;
 use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};

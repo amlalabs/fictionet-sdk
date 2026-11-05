@@ -41,7 +41,10 @@
 //! # use fictionet::stdlib::world::net::{Net, dns::Recursive};
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! let clock = WallClock { start: SystemTime::UNIX_EPOCH };
-//! Net::new()
+//! Net::new(fictionet::stdlib::world::net::Pools {
+//!     v4: Some("192.0.2.0/24".parse()?),
+//!     v6: Some("2001:db8:1::/64".parse()?),
+//! })
 //!     .host("www", |h| h.dns_name("intranet.corp.test"))
 //!     .gateway(move |h, declared| {
 //!         let config = Config { hints: Vec::new(), ..Config::new() };
@@ -118,8 +121,16 @@ const PLACING_NEGATIVE_TTL: u32 = 60;
 ///
 /// `host_for` is world code: it runs while the resolver that asked waits,
 /// and while the zone holds its own lock, so it must return quickly. It
-/// may place hosts of its own with the same handle.
+/// may place hosts of its own with the same handle. This zone places at
+/// most 20,000 hosts; past that limit a new name stays unknown.
 pub fn placing<F>(handle: NetHandle, host_for: F) -> impl ZoneData
+where
+    F: Fn(&str) -> Option<Host> + Send + Sync + 'static,
+{
+    placing_limited(handle, host_for, 20_000)
+}
+
+pub(crate) fn placing_limited<F>(handle: NetHandle, host_for: F, max_hosts: usize) -> impl ZoneData
 where
     F: Fn(&str) -> Option<Host> + Send + Sync + 'static,
 {
@@ -135,7 +146,8 @@ where
         ns,
         handle,
         host_for,
-        placing: Mutex::new(()),
+        placing: Mutex::new(0),
+        max_hosts,
     }
 }
 
@@ -148,7 +160,8 @@ struct Placing<F> {
     host_for: F,
     /// Held while a question asks `host_for` and places its host, so two
     /// questions for one name place one host.
-    placing: Mutex<()>,
+    placing: Mutex<usize>,
+    max_hosts: usize,
 }
 
 impl<F> ZoneData for Placing<F>
@@ -164,7 +177,7 @@ where
         let Ok(shared) = self.handle.shared() else {
             return Arc::new(Facts::unknown(self.root.clone()));
         };
-        let _placing = self.placing.lock();
+        let mut placed = self.placing.lock();
         // A `*` label is no host name (RFC 1123 §2.1), so the zone has no
         // wildcards (RFC 4592) and a name with no host stays NXDOMAIN.
         let asks = !qname.is_root()
@@ -173,11 +186,16 @@ where
         if asks {
             let text = normalize(&qname.to_ascii());
             if let Some(mut host) = (self.host_for)(&text) {
+                if *placed >= self.max_hosts {
+                    return Arc::new(Facts::unknown(self.root.clone()));
+                }
                 if !host.names.contains(&text) {
                     host.names.insert(0, text);
                 }
                 // A host that cannot be placed counts as no host.
-                let _ = self.handle.add_host(host);
+                if self.handle.add_host(host).is_ok() {
+                    *placed += 1;
+                }
             }
         }
         let apex_sets = [self.soa.clone(), self.ns.clone()];

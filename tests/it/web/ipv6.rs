@@ -434,7 +434,9 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             .udp(49152, Arc::new(()), || Quiet);
         let good = site("good", false).served_by(Host::new("good").at(v4).at(v6));
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new(fictionet_extras::network::cdn_pools()).add_host(first).add_host(occupied);
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .add_host(first)
+            .add_host(occupied);
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let m4 = default_machine(&fcx, &attacher);

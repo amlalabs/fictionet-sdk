@@ -27,7 +27,7 @@ pub mod web_fixture;
 
 pub mod dns;
 
-pub mod world;
 pub mod lookup_authority;
+pub mod world;
 
 pub use response::{EchoSocket, async_handler, handler, reply_handler};

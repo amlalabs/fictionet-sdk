@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use fictionet::stdlib::protocols::dns::Request;
 use fictionet::stdlib::protocols::dns::op::{Message, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, Record, RecordType};
-use fictionet::stdlib::protocols::dns::Request;
 use fictionet::stdlib::services::dns::authority::{
     Authority, ServerConfig, Step, bare_reply, refuse_transfer, respond_from_zones,
 };

@@ -18,7 +18,10 @@
 //! # use fictionet::stdlib::world::net::dns::internet;
 //! # async fn world(fcx: Cx, attachments: Attachments, root: &str) -> Result {
 //! let root = Arc::new(internet::root_zone(root)?);
-//! Net::new()
+//! Net::new(fictionet::stdlib::world::net::Pools {
+//!     v4: Some("192.0.2.0/24".parse()?),
+//!     v6: Some("2001:db8:1::/64".parse()?),
+//! })
 //!     .hosts(internet::root_servers(|_, host| {
 //!         let server = ServerConfig::generic();
 //!         host.program(Authoritative::new(Zones::new(vec![root.clone()]), server))

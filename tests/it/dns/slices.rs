@@ -370,7 +370,7 @@ fn on_packets(internet: &TestInternet, config: &Config, questions: &[Question]) 
             }
         });
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .hosts(hosts)
             .hosts([Host::new("resolver").at(RESOLVER).program(resolver)])
             .start(&fcx, attachments)?;

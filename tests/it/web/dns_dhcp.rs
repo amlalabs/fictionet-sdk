@@ -87,7 +87,7 @@ fn sites_are_placed_on_first_lookup_even_under_a_used_top_level_domain() {
     run_world::world(Duration::from_secs(60), |fcx| async move {
         let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let record = asked.clone();
-        let net = web::Sites::new(move |host| {
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             match host {
                 "a.test" => Some(web::Site::new(Plain("a"))),
@@ -131,7 +131,7 @@ fn one_lookup_places_one_site() {
     run_world::world(Duration::from_secs(60), |fcx| async move {
         let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let record = asked.clone();
-        let net = web::Sites::new(move |host| {
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             host.ends_with(".wild.test")
                 .then(|| web::Site::new(Plain("wild")))
@@ -163,7 +163,7 @@ fn an_internationalized_name_is_asked_about_in_ascii() {
     run_world::world(Duration::from_secs(60), |fcx| async move {
         let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let record = asked.clone();
-        let net = web::Sites::new(move |host| {
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             host.ends_with(".test")
                 .then(|| web::Site::new(Plain("idn")))
@@ -190,7 +190,7 @@ fn a_name_above_a_site_can_get_a_site_later() {
         let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (record, opened) = (asked.clone(), open.clone());
-        let net = web::Sites::new(move |host| {
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             match host {
                 "www.shop.test" => Some(web::Site::new(Plain("www"))),
@@ -229,7 +229,7 @@ fn a_declared_name_below_a_site_leaves_the_site_to_the_callback() {
     run_world::world(Duration::from_secs(60), |fcx| async move {
         let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let record = asked.clone();
-        let net = web::Sites::new(move |host| {
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             (host == "shop.test").then(|| web::Site::new(Plain("shop")))
         })
@@ -258,7 +258,7 @@ fn the_callback_decides_names_under_home_arpa() {
     run_world::world(Duration::from_secs(60), |fcx| async move {
         let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let record = asked.clone();
-        let net = web::Sites::new(move |host| {
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             (host == "nas.home.arpa").then(|| web::Site::new(Plain("nas")))
         })
@@ -281,20 +281,22 @@ fn a_sites_world_sees_its_gateways_dns_events() {
         // Each event as `query <name>` or `reply <name> <rcode>`.
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let log = seen.clone();
-        let net = web::Sites::new(|host| (host == "a.test").then(|| web::Site::new(Plain("a"))))
-            .on_dns_event(move |event| {
-                let entry = match event {
-                    Event::Query { question, .. } => format!("query {}", question.name()),
-                    Event::Reply {
-                        question: Some(question),
-                        rcode,
-                        ..
-                    } => format!("reply {} {rcode:?}", question.name()),
-                    _ => return,
-                };
-                log.lock().unwrap().push(entry.to_ascii_lowercase());
-            })
-            .into_net();
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
+            (host == "a.test").then(|| web::Site::new(Plain("a")))
+        })
+        .on_dns_event(move |event| {
+            let entry = match event {
+                Event::Query { question, .. } => format!("query {}", question.name()),
+                Event::Reply {
+                    question: Some(question),
+                    rcode,
+                    ..
+                } => format!("reply {} {rcode:?}", question.name()),
+                _ => return,
+            };
+            log.lock().unwrap().push(entry.to_ascii_lowercase());
+        })
+        .into_net();
         let (attacher, attachments) = fictionet::attachments();
         net.start(&fcx, attachments)?;
         let m = default_machine(&fcx, &attacher);
@@ -324,12 +326,14 @@ fn a_sites_world_sees_its_gateways_dns_events() {
 #[test]
 fn the_gateway_answers_pings_and_counts_toward_the_peer_limit() {
     run_world::world(Duration::from_secs(60), |fcx| async move {
-        let net = web::Sites::new(|host| (host == "a.test").then(|| web::Site::new(Plain("a"))))
-            .into_net()
-            .limits(Limits {
-                connections_per_peer: 2,
-                ..Limits::default()
-            });
+        let net = web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
+            (host == "a.test").then(|| web::Site::new(Plain("a")))
+        })
+        .into_net()
+        .limits(Limits {
+            connections_per_peer: 2,
+            ..Limits::default()
+        });
         let (attacher, attachments) = fictionet::attachments();
         net.start(&fcx, attachments)?;
         let pinger = Ipv4Addr::new(10, 0, 0, 3);

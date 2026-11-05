@@ -269,7 +269,7 @@ fn start(fcx: &Cx, attachments: fictionet::Attachments) -> fictionet::Result<Env
         .names([name("dns.example.")])
         .date(date(NOW));
     let fronts = fronts.clone().fallback(Arc::new(BothJson(fronts)));
-    Net::new()
+    Net::new(fictionet_extras::network::cdn_pools())
         .ipv4_only()
         .hosts(hosts)
         .hosts([fronts.doh(fronts.dot(Host::new("resolver").at(RESOLVER).program(resolver)))])
@@ -882,7 +882,7 @@ fn a_front_on_another_host_answers_from_the_resolvers_cache() {
         let fronts =
             Fronts::new(resolver.handle(), move |_| config.clone()).names(cloudflare.doh());
         let away = fronts.clone().resolver_at(IpAddr::V4(one));
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .hosts(hosts)
             .hosts([
@@ -952,7 +952,7 @@ fn dns_over_tls_to_cloudflare_checks_its_documented_name() {
         let resolver = recursive(anchors, &sent);
         let fronts =
             Fronts::new(resolver.handle(), move |_| config.clone()).names(cloudflare.doh());
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .hosts(hosts)
             .hosts([fronts.dot(Host::new("one.one.one.one").at(one).program(resolver))])
@@ -997,10 +997,13 @@ fn a_site_cannot_take_a_fronts_name_at_its_address() {
         let fronts =
             Fronts::new(resolver.handle(), move |_| config.clone()).names(cloudflare.doh());
         let away = fronts.clone().resolver_at(IpAddr::V4(one));
-        let net = Net::new().ipv4_only().hosts(hosts).hosts([
-            fronts.dot(Host::new("one.one.one.one").at(one).program(resolver)),
-            away.doh(Host::new("cloudflare-dns.com").at(elsewhere)),
-        ]);
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .hosts(hosts)
+            .hosts([
+                fronts.dot(Host::new("one.one.one.one").at(one).program(resolver)),
+                away.doh(Host::new("cloudflare-dns.com").at(elsewhere)),
+            ]);
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let doh = "cloudflare-dns.com";
@@ -1065,7 +1068,7 @@ fn each_public_resolver_answers_dns_over_https_as_its_operator() {
                     .doh(Host::new(names[n]).at(address(n)))
             })
             .collect();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .hosts(hosts)
             .hosts([Host::new("resolver").at(RESOLVER).program(resolver)])

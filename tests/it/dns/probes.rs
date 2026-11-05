@@ -70,7 +70,7 @@ where
         let gateway = Arc::new(Mutex::new(Vec::new()));
         let seen = gateway.clone();
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .hosts(internet.hosts())
             .hosts(at.public_resolvers(|resolver, site, host| {
                 let config = resolver.config(site.identity.clone());

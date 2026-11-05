@@ -95,7 +95,7 @@ fn a_policy_refused_lookup_leaves_the_server_silent() {
         let program = Authoritative::new(zones, ServerConfig::generic())
             .upstream(Only::new(policy, upstream.clone()));
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("copy", |h| h.at(address).program(program))
             .start(&fcx, attachments)?;
@@ -142,7 +142,7 @@ fn a_namespace_advance_clears_what_lookups_filed() {
             .upstream(upstream.clone())
             .namespace(&namespace);
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("copy", |h| h.at(address).program(program))
             .start(&fcx, attachments)?;

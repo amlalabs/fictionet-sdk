@@ -383,7 +383,7 @@ fn a_root_letter_answers_the_root_ns_as_dig_sees_it() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle());
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .hosts(at.gtld_servers(|s| mirror.server(s)))
@@ -457,7 +457,7 @@ fn a_mirrored_server_names_one_instance_by_chaos_and_by_nsid() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle());
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
@@ -536,7 +536,7 @@ fn the_mirror_places_a_server_at_referral_glue_before_the_reply_leaves() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let mirror = mirror(hierarchy.clone(), handle.clone());
         net.hosts(at.root_servers(|s| mirror.server(s)))
@@ -588,7 +588,7 @@ fn a_placed_server_answers_any_as_its_real_server_did() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let mirror = mirror(hierarchy.clone(), handle.clone());
         net.hosts(at.root_servers(|s| mirror.server(s)))
@@ -634,7 +634,7 @@ fn the_mirror_knows_its_server_names_before_observers_run() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let ns = v4(45, 33, 5, 53);
         let ns_name = LowerName::new(&Name::from_ascii("ns.direct.").unwrap());
@@ -693,7 +693,7 @@ fn a_namespace_advance_makes_the_mirror_forget_what_it_learned() {
         };
         let namespace = dns::Namespace::new(clock);
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle()).namespace(&namespace);
         let servers = mirror.servers();
         net.hosts(at.root_servers(|s| mirror.server(s)))
@@ -735,7 +735,7 @@ fn a_mirrored_name_server_refuses_zone_transfers() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle());
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
@@ -782,7 +782,7 @@ fn a_placed_server_refuses_as_its_real_server_did_without_an_ede() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle());
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .start(&fcx, attachments)?;
@@ -838,7 +838,7 @@ fn the_mirror_places_no_server_at_the_egress() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let mirror = mirror(hierarchy.clone(), handle.clone());
         net.hosts(at.root_servers(|s| mirror.server(s)))
@@ -892,7 +892,7 @@ fn a_glueless_delegation_resolves_through_the_answer_for_its_name_server() {
             ..unbound::config()
         };
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let mirror = mirror(hierarchy.clone(), handle.clone());
         net.hosts(at.root_servers(|s| mirror.server(s)))
@@ -942,7 +942,7 @@ fn a_glueless_name_server_known_before_its_delegation_gets_a_server() {
             ..unbound::config()
         };
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let mirror = mirror(hierarchy.clone(), handle.clone());
         net.hosts(at.root_servers(|s| mirror.server(s)))
@@ -994,7 +994,7 @@ fn a_name_server_joins_a_site_placed_at_its_address_first() {
             ..unbound::config()
         };
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let sites = handle.clone();
         // A site at each address an answer gives, as a world that serves
@@ -1049,7 +1049,7 @@ fn addresses_on_the_sandbox_subnet_or_off_the_internet_are_never_placed() {
         let at = place();
         let me = Ipv4Addr::new(45, 60, 0, 2);
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new()
+        let net = Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .subnet("45.60.0.0/24".parse::<Prefix>()?);
         let handle = net.handle();
@@ -1083,7 +1083,7 @@ fn a_front_goes_at_the_addresses_answered_for_its_name() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let fronted: Arc<Mutex<Vec<String>>> = Arc::default();
         let seen = fronted.clone();
@@ -1133,7 +1133,7 @@ fn a_front_for_an_alias_goes_at_its_targets_addresses() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let mirror = mirror(hierarchy.clone(), handle.clone())
             .front(Name::from_ascii("alias-dns.com.")?, |host| host);
@@ -1167,7 +1167,7 @@ fn a_front_below_a_dname_goes_at_its_substitutes_addresses() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let mirror = mirror(hierarchy.clone(), handle.clone())
             .front(Name::from_ascii("doh.renamed.")?, |host| host);
@@ -1207,7 +1207,7 @@ fn observers_see_each_filing_before_the_reply_leaves() {
         let hierarchy = Hierarchy::new();
         let at = place();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         let filings: Arc<Mutex<Vec<Kept>>> = Arc::default();
         let seen = filings.clone();
@@ -1279,7 +1279,7 @@ fn whoami_names_are_answered_from_the_egress_and_never_looked_up() {
             start: SystemTime::UNIX_EPOCH,
         };
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle());
         net.hosts(at.root_servers(|s| mirror.server(s)))
             .hosts(at.public_resolvers(|r, site, h| {
@@ -1383,7 +1383,7 @@ fn an_echoed_address_is_the_public_resolvers_egress() {
             start: SystemTime::UNIX_EPOCH,
         };
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle());
         // The test root is unsigned, so the resolvers do not validate.
         net.hosts(at.root_servers(|s| mirror.server(s)))
@@ -1500,7 +1500,7 @@ fn public_resolvers_keep_one_cache_per_sandbox() {
         let served_www: Arc<Mutex<Vec<IpAddr>>> = Arc::default();
         let served = served_www.clone();
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let mirror = mirror(hierarchy.clone(), net.handle()).wrap(move |authority| {
             let served = served.clone();
             Arc::new(Observe::new(

@@ -413,5 +413,4 @@ mod tests {
             assert_eq!(display.info, "Standard query 0x1234 ");
         }
     }
-
 }

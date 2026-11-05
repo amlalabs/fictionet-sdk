@@ -21,7 +21,7 @@
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! let place = Place::san_francisco_bay_area();
 //! let clock = WallClock { start: SystemTime::now() };
-//! Net::new()
+//! Net::new(fictionet_extras::network::cdn_pools())
 //!     .hosts(place.public_resolvers(|resolver, site, host| {
 //!         let config = resolver.config(site.identity.clone());
 //!         host.program(Recursive::new(config, clock).per_sandbox())

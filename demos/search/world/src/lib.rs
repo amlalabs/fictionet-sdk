@@ -99,7 +99,9 @@ pub fn net(
         .collect();
     let namespace = pages.namespace().clone();
     let clock = namespace.current().clock;
-    let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only().drop_unrouted();
+    let net = Net::new(fictionet_extras::network::cdn_pools())
+        .ipv4_only()
+        .drop_unrouted();
     let handle = net.handle();
 
     let outbound = Outbound::new(pages.clone(), forwarded.keys().cloned());

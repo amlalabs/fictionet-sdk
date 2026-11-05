@@ -1859,7 +1859,10 @@ mod tests {
             .filter(|(_, reachable)| !reachable)
             .map(|(block, _)| *block);
         let reserved = RESERVED_RANGES.iter().copied();
-        for (range, is_reserved) in reserved.map(|r| (r, true)).chain(unreachable.map(|r| (r, false))) {
+        for (range, is_reserved) in reserved
+            .map(|r| (r, true))
+            .chain(unreachable.map(|r| (r, false)))
+        {
             for address in [range.addr, range.last()] {
                 if !is_reserved {
                     assert!(non_public_address(address), "{address}");
@@ -1878,18 +1881,40 @@ mod tests {
         // and IPv6 outside global unicast are no public host's, but are not
         // reserved.
         for address in [
-            "10.0.0.1", "172.31.255.255", "192.168.1.1", "127.0.0.1", "169.254.0.1",
-            "::ffff:10.0.0.1", "fc00::1", "fdff::1", "::1", "fe80::1", "224.0.0.1",
-            "0.0.0.1", "ff02::1", "fe7f:ffff::1", "fec0::1", "fbff::1", "fe00::1",
+            "10.0.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.0.1",
+            "::ffff:10.0.0.1",
+            "fc00::1",
+            "fdff::1",
+            "::1",
+            "fe80::1",
+            "224.0.0.1",
+            "0.0.0.1",
+            "ff02::1",
+            "fe7f:ffff::1",
+            "fec0::1",
+            "fbff::1",
+            "fe00::1",
         ] {
             let address = address.parse().unwrap();
             assert!(!reserved_address(address), "{address}");
             assert!(non_public_address(address), "{address}");
         }
         for address in [
-            "104.18.0.1", "104.19.255.254", "2606:4700:100::1",
-            "172.15.255.255", "172.32.0.0", "100.63.255.255", "100.128.0.0",
-            "169.253.255.255", "169.255.0.0", "192.0.0.9", "2001:4:112::1",
+            "104.18.0.1",
+            "104.19.255.254",
+            "2606:4700:100::1",
+            "172.15.255.255",
+            "172.32.0.0",
+            "100.63.255.255",
+            "100.128.0.0",
+            "169.253.255.255",
+            "169.255.0.0",
+            "192.0.0.9",
+            "2001:4:112::1",
             "::ffff:104.18.0.1",
         ] {
             let address = address.parse().unwrap();

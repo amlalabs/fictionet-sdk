@@ -13,7 +13,7 @@
 //! the priming, the referrals, the minimised steps, the DS and DNSKEY sets
 //! of each chain, and the addresses of name servers that referrals named
 //! without glue, which a Copied session plays back from
-//! [`Replay`](fictionet_extras::dns::Replay). The public resolver presets
+//! [`Replay`]. The public resolver presets
 //! minimise and ask for DNSSEC records as that configuration does, so one
 //! walk holds what they ask too.
 
@@ -140,7 +140,9 @@ async fn walk(
     let clock = WallClock {
         start: SystemTime::now() - fcx.now().since_start(),
     };
-    let net = Net::new().ipv4_only().drop_unrouted();
+    let net = Net::new(fictionet_extras::network::cdn_pools())
+        .ipv4_only()
+        .drop_unrouted();
     let mirror = roots::seed(Mirror::new(upstream, net.handle()));
     let recursive = Recursive::new(unbound::config(), clock);
     let resolver = recursive.handle();

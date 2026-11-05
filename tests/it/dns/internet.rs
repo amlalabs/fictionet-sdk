@@ -108,7 +108,7 @@ fn the_root_hints_are_the_root_letters() {
 fn a_placed_host_makes_the_names_above_it_exist() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let zone = dns::placing(handle, |name| {
@@ -146,7 +146,7 @@ fn a_placed_host_makes_the_names_above_it_exist() {
 fn the_placing_root_answers_its_ns_set() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let zone = dns::placing(handle, |_| None);

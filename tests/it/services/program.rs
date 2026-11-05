@@ -42,7 +42,7 @@ fn a_program_connects_to_another_host_through_the_router() {
                     }
                 });
         let (_attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .add_host(echo_host("echo", ECHO_AT))
             .add_host(client)
@@ -83,7 +83,7 @@ fn a_program_receives_and_sends_udp() {
                     }
                 });
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .add_host(answerer)
             .start(&fcx, attachments)?;
@@ -123,7 +123,7 @@ fn a_delay_holds_each_packet_that_long_each_way() {
                     }
                 });
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .add_host(far)
             .start(&fcx, attachments)?;
@@ -149,7 +149,7 @@ fn a_delay_holds_each_packet_that_long_each_way() {
 fn a_host_added_while_running_is_reached_by_a_sandbox() {
     world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let placed = handle.add_host(echo_host("late", LATE_AT).dns_name("late.test"))?;
@@ -191,7 +191,9 @@ fn a_host_added_while_running_is_reached_by_a_sandbox() {
 fn a_program_added_at_an_existing_machine_runs_there() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only().add_host(echo_host("echo", ECHO_AT));
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .add_host(echo_host("echo", ECHO_AT));
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -222,7 +224,7 @@ fn a_program_added_at_an_existing_machine_runs_there() {
 fn a_program_uses_the_handle_from_its_first_line() {
     world(Duration::from_secs(10), |fcx| async move {
         let (_attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only();
+        let net = Net::new(fictionet_extras::network::cdn_pools()).ipv4_only();
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -247,7 +249,9 @@ fn a_program_uses_the_handle_from_its_first_line() {
 fn adding_a_host_fails_before_start_and_on_the_sandboxes_subnet() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only().add_host(echo_host("echo", ECHO_AT));
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .add_host(echo_host("echo", ECHO_AT));
         let handle = net.handle();
         assert!(handle.add_host(echo_host("early", LATE_AT)).is_err());
         assert!(!handle.has_machine(ECHO_AT.into()));
@@ -267,7 +271,9 @@ fn adding_a_host_fails_before_start_and_on_the_sandboxes_subnet() {
 fn has_machine_reports_placed_addresses_only() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only().add_host(echo_host("echo", ECHO_AT));
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .add_host(echo_host("echo", ECHO_AT));
         let handle: NetHandle = net.handle();
         net.start(&fcx, attachments)?;
         assert!(handle.has_machine(ECHO_AT.into()));
@@ -280,11 +286,13 @@ fn has_machine_reports_placed_addresses_only() {
 fn hosts_adds_each_host() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_attacher, attachments) = fictionet::attachments();
-        let net = Net::new().ipv4_only().hosts([
-            echo_host("one", ECHO_AT),
-            echo_host("two", CLIENT_AT),
-            echo_host("three", LATE_AT),
-        ]);
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .hosts([
+                echo_host("one", ECHO_AT),
+                echo_host("two", CLIENT_AT),
+                echo_host("three", LATE_AT),
+            ]);
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         for addr in [ECHO_AT, CLIENT_AT, LATE_AT] {

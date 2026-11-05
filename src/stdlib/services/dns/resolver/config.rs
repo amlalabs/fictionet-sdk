@@ -246,7 +246,6 @@ impl Config {
                 depth: 11,
             },
             failure_ttl: Duration::from_secs(5),
-
             max_ttl: Duration::from_secs(604800),
             max_negative_ttl: Duration::from_secs(10800),
             serve_stale: None,

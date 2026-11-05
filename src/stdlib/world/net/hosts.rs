@@ -1,7 +1,6 @@
 use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_serve_v6};
-use super::attachments::answered_closed;
 use super::dns::HOST_TTL;
-use super::{Hooks, LanSeg, Limits, connection_limit, link, normalize};
+use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
@@ -1150,7 +1149,7 @@ impl Installation<'_> {
         host: &Host,
         attach: impl FnOnce(Box<dyn Interface>) -> Result<(), String>,
     ) -> Result<tcp::Endpoint, String> {
-        let mut machine = Machine::stage(self, addr, &host.label, None);
+        let mut machine = Machine::stage(self, addr, &host.label, None, host.tcp_options);
         let ports = machine.machine.prepare(host)?;
         if let Some(side) = machine.route.take() {
             attach(self.wire(side, host))?;
@@ -1680,16 +1679,6 @@ impl Machine {
                 .spawn(move |fcx| async move { program.run(fcx, machine).await });
         }
     }
-
-    /// Whether TCP `port` is open here.
-    pub(super) fn serves_tcp(&self, port: u16) -> bool {
-        self.ports.lock().contains_key(&port)
-    }
-
-    /// Whether UDP `port` is open here.
-    pub(super) fn serves_udp(&self, port: u16) -> bool {
-        self.udp_ports.lock().contains(&port)
-    }
 }
 
 /// The route to one address: `/32` or `/128`.
@@ -1827,7 +1816,6 @@ mod tests {
     use super::super::{Net, TEST_POOLS};
     use super::*;
 
-
     #[test]
     fn tls_sharing_uses_the_first_installed_accept() {
         struct Offers(&'static str, Arc<Mutex<Vec<&'static str>>>);
@@ -1927,6 +1915,4 @@ mod tests {
             .unwrap();
         }
     }
-
-
 }

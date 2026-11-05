@@ -47,7 +47,10 @@
 //! let resolver = Recursive::new(Config::new(), clock);
 //! let fronts = Fronts::new(resolver.handle(), move |_| tls.clone())
 //!     .names([Name::from_ascii("dns.example.")?]);
-//! Net::new()
+//! Net::new(fictionet::stdlib::world::net::Pools {
+//!     v4: Some("192.0.2.0/24".parse()?),
+//!     v6: Some("2001:db8:1::/64".parse()?),
+//! })
 //!     .host("resolver", |h| fronts.doh(fronts.dot(h.at(Ipv4Addr::new(45, 33, 9, 9)).program(resolver))))
 //!     .start(&fcx, attachments)?;
 //! # Ok(())

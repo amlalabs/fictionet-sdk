@@ -8,10 +8,10 @@ use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::Zone;
 use fictionet::stdlib::services::dns::{Client, Event, Looked, Lookup, WallClock};
 use fictionet::stdlib::services::serve::Transport;
-use fictionet::stdlib::world::net::{Lan, Pools};
 use fictionet::stdlib::world::net::dns::{
     Authoritative, Namespace, Only, Recursive, ResolverHandle, Upstream,
 };
+use fictionet::stdlib::world::net::{Lan, Pools};
 use fictionet_test_support::ended_with_done;
 use fictionet_test_support::lookup_authority::LookupAuthority;
 
@@ -96,7 +96,7 @@ fn a_name_declared_under_home_arpa_answers() {
     world(Duration::from_secs(60), move |fcx| async move {
         let nas = Ipv4Addr::new(10, 30, 0, 5);
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("nas", |h| h.at(nas).dns_name("nas.home.arpa"))
             .start(&fcx, attachments)?;
@@ -681,7 +681,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
 /// are served at once, and the next one is reset.
 #[test]
 fn net_serves_the_default_cap_of_connections_on_a_tcp_port() {
-    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 3);
         Net::new(fictionet_extras::network::cdn_pools())
@@ -1309,7 +1309,7 @@ fn lower(name: &str) -> LowerName {
 fn the_gateway_answers_declared_names_as_a_resolver_with_no_internet() {
     world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("plc", |h| h.at(PLC_ADDR).dns_name("plc1.plant.test"))
             .start(&fcx, attachments)?;
@@ -1408,7 +1408,7 @@ fn only_looks_up_what_its_policy_allows() {
         );
         let zones = LookupAuthority::new("test.");
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("copy", |h| {
                 h.at(address)
@@ -1484,7 +1484,7 @@ fn transparent_declared_names_leave_the_names_above_them_to_iteration() {
             ServerConfig::generic(),
         );
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("root", |h| h.at(root).program(server))
             .host("api", |h| h.at(PLC_ADDR).dns_name("api.www.example"))
@@ -1566,7 +1566,7 @@ fn advancing_a_namespace_reaches_a_running_resolver() {
         .hints(&[(Name::from_ascii("ns.")?, IpAddr::V4(root))]);
         let resolvers = namespace.clone();
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("root", |h| h.at(root).program(server))
             .gateway(move |h, _| {
@@ -1608,7 +1608,7 @@ fn a_resolver_handle_answers_as_udp_does() {
         let handles: Arc<Mutex<Vec<ResolverHandle>>> = Arc::default();
         let kept = handles.clone();
         let (attacher, attachments) = fictionet::attachments();
-        Net::new()
+        Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("plc", |h| h.at(PLC_ADDR).dns_name("plc1.plant.test"))
             .gateway(move |h, declared| {

@@ -36,30 +36,40 @@ pub(super) struct Hooks {
 }
 
 impl Hooks {
-    /// The sandbox that last bound `addr`, if one did.
+    /// The sandbox that bound the address, or the route with the longest
+    /// prefix that holds it.
     pub(super) fn sandbox_of(&self, addr: IpAddr) -> Option<Sandbox> {
-        self.by_addr.lock().get(&addr).cloned()
+        if let Some(sandbox) = self.by_addr.lock().get(&addr).cloned() {
+            return Some(sandbox);
+        }
+        let routes = self.routes.lock();
+        let (_, sandbox) = longest_route(&routes, addr)?;
+        let mut sandbox = sandbox.clone();
+        sandbox.addr = match addr {
+            IpAddr::V4(a) => Some(a),
+            _ => None,
+        };
+        sandbox.addr_v6 = match addr {
+            IpAddr::V6(a) => Some(a),
+            _ => None,
+        };
+        Some(sandbox)
     }
 
-    /// The sandbox that `addr` belongs to: the one that bound it, or else
-    /// the route with the longest prefix that holds it. One with id 0 and
-    /// no name if neither does.
+    /// The sandbox at the address, or an unnamed sandbox with id zero.
     pub(super) fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
-        if let Some(s) = self.sandbox_of(addr) {
-            return s;
-        }
-        let (v4, v6) = match addr {
-            IpAddr::V4(a) => (Some(a), None),
-            IpAddr::V6(a) => (None, Some(a)),
-        };
-        let (id, name) = longest_route(&self.routes.lock(), addr)
-            .map_or((0, Arc::from("")), |(_, s)| (s.id, s.name.clone()));
-        Sandbox {
-            id,
-            name,
-            addr: v4,
-            addr_v6: v6,
-        }
+        self.sandbox_of(addr).unwrap_or_else(|| Sandbox {
+            id: 0,
+            name: Arc::from(""),
+            addr: match addr {
+                IpAddr::V4(a) => Some(a),
+                _ => None,
+            },
+            addr_v6: match addr {
+                IpAddr::V6(a) => Some(a),
+                _ => None,
+            },
+        })
     }
 
     /// The budget of the sandbox with id `id`, while it is attached.

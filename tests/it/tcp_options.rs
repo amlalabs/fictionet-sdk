@@ -4,7 +4,7 @@
 //! cookies past its backlog. The peer is hand-made packets on one end of a
 //! cable.
 
-use crate::common::world;
+use fictionet_test_support::world;
 
 use world::world;
 

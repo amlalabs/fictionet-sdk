@@ -589,9 +589,9 @@ impl Bindings {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::*;
     use super::super::hosts::{PortSpec, UdpStart};
+    use super::super::*;
+    use super::*;
     use fictionet::stdlib::test_support::rounds;
 
     fn pools(v4: &str, v6: &str) -> Pools {
@@ -725,53 +725,73 @@ mod tests {
 
     #[test]
     fn failed_hosts_give_their_automatic_addresses_back() {
-        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
-            let shared = network(&fcx, "10.0.0.0/24", Some("2001:db8::/64"));
-            let bind = || {
-                let mut host = Host::new("bind.test").dns_name("bind.test");
-                let start: UdpStart = Arc::new(|_, _, _, _| panic!("not committed"));
-                host.ports.push((0, PortSpec::Udp(start.clone())));
-                host.ports.push((49152, PortSpec::Udp(start)));
-                host
-            };
-            let rejected = [
-                Host::new("address.test").dns_name("address.test").at(Ipv6Addr::LOCALHOST),
-                bind(),
-                bind(),
-            ];
-            for host in rejected {
-                let mut world = shared.world.lock();
-                assert!(shared.place(&mut world, host).is_err());
-                assert!(world.machines.is_empty());
-                assert!(world.declared.is_empty());
-                assert_eq!((world.addresses.next_auto, world.addresses.next_auto6), (1, 1));
-                assert!(!world.addresses.auto_full);
-            }
-            let placed = shared
-                .place(&mut shared.world.lock(), Host::new("good.test"))
-                .expect("a valid host fits after rejected hosts");
-            assert_eq!(placed.v4, Some("104.18.0.1".parse().unwrap()));
-            assert_eq!(placed.v6, Some("2606:4700:100::1".parse().unwrap()));
-            fcx.cancel();
-            Ok(())
-        })).unwrap();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let shared = network(&fcx, "10.0.0.0/24", Some("2001:db8::/64"));
+                let bind = || {
+                    let mut host = Host::new("bind.test").dns_name("bind.test");
+                    let start: UdpStart = Arc::new(|_, _, _, _| panic!("not committed"));
+                    host.ports.push((0, PortSpec::Udp(start.clone())));
+                    host.ports.push((49152, PortSpec::Udp(start)));
+                    host
+                };
+                let rejected = [
+                    Host::new("address.test")
+                        .dns_name("address.test")
+                        .at(Ipv6Addr::LOCALHOST),
+                    bind(),
+                    bind(),
+                ];
+                for host in rejected {
+                    let mut world = shared.world.lock();
+                    assert!(shared.place(&mut world, host).is_err());
+                    assert!(world.machines.is_empty());
+                    assert!(world.declared.is_empty());
+                    assert_eq!(
+                        (world.addresses.next_auto, world.addresses.next_auto6),
+                        (1, 1)
+                    );
+                    assert!(!world.addresses.auto_full);
+                }
+                let placed = shared
+                    .place(&mut shared.world.lock(), Host::new("good.test"))
+                    .expect("a valid host fits after rejected hosts");
+                assert_eq!(placed.v4, Some("104.18.0.1".parse().unwrap()));
+                assert_eq!(placed.v6, Some("2606:4700:100::1".parse().unwrap()));
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     #[test]
     fn failed_hosts_remember_an_exhausted_automatic_range() {
-        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |fcx| async move {
-            let shared = network(&fcx, "104.18.0.0/15", None);
-            for name in ["first.test", "second.test"] {
-                let mut world = shared.world.lock();
-                assert!(shared.place(&mut world, Host::new(name).dns_name(name)).is_err());
-                assert!(world.addresses.auto_full);
-                assert!(world.machines.is_empty());
-                assert!(world.declared.is_empty());
-                assert_eq!((world.addresses.next_auto, world.addresses.next_auto6), (1, 1));
-            }
-            fcx.cancel();
-            Ok(())
-        })).unwrap();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let shared = network(&fcx, "104.18.0.0/15", None);
+                for name in ["first.test", "second.test"] {
+                    let mut world = shared.world.lock();
+                    assert!(
+                        shared
+                            .place(&mut world, Host::new(name).dns_name(name))
+                            .is_err()
+                    );
+                    assert!(world.addresses.auto_full);
+                    assert!(world.machines.is_empty());
+                    assert!(world.declared.is_empty());
+                    assert_eq!(
+                        (world.addresses.next_auto, world.addresses.next_auto6),
+                        (1, 1)
+                    );
+                }
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     #[test]
