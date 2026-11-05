@@ -344,7 +344,7 @@
 //! | [`protocols::soupbintcp`] | SoupBinTCP packets, framing and client and server sessions. |
 //! | [`protocols::spnego`] | SPNEGO negotiation tokens. |
 //! | [`protocols::sse`] | Server-sent event lines, events and encoding. |
-//! | [`protocols::ssh`] | SSH version exchange and transport packets before encryption. |
+//! | [`protocols::ssh`] | SSH transport encryption, authentication and connection messages. |
 //! | [`protocols::stun`] | STUN messages, attributes and binding replies. |
 //! | [`protocols::syslog`] | Syslog messages and stream framing. |
 //! | [`protocols::tcp_reassembly`] | TCP capture reassembly, gaps and end signals. |

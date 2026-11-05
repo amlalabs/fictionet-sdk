@@ -1,9 +1,8 @@
-//! The SSH transport layer before encryption: reading and writing the
-//! version exchange, binary packets and the first messages, with no I/O.
+//! SSH wire codecs and an encrypted server transport, with no I/O.
 //!
-//! A real client such as OpenSSH can receive the world's version line and
-//! KEXINIT, but the world can only disconnect at key exchange because this
-//! module cannot complete it.
+//! [`transport::Transport`] completes key exchange and authenticates encrypted
+//! packets for real clients such as OpenSSH. [`auth`] and [`connection`] provide
+//! the user authentication and multiplexed channel message codecs.
 //!
 //! SSH runs over TCP, usually on port 22. Each side first sends a line that
 //! names its protocol version and software, such as
@@ -14,16 +13,14 @@
 //! send NEWKEYS. From then on the packets are encrypted. This module
 //! follows RFC 4253 (the transport layer) and RFC 4251 (the data types).
 //!
-//! It covers what comes before encryption: the version line and the lines
+//! The top-level codecs cover the version line and the lines
 //! before it, packet framing with the padding rules for the unencrypted
 //! phase, the data types (byte, boolean, uint32, uint64, string, mpint and
 //! name-list), and the messages DISCONNECT, IGNORE, UNIMPLEMENTED, DEBUG,
-//! SERVICE_REQUEST, SERVICE_ACCEPT, KEXINIT and NEWKEYS. It does no
-//! cryptography, so it cannot run a key exchange or read encrypted
-//! packets. A world can send DISCONNECT when the client requests a key
-//! exchange.
+//! SERVICE_REQUEST, SERVICE_ACCEPT, KEXINIT and NEWKEYS. Use [`transport`]
+//! for seeded cryptography, algorithm negotiation, encryption and rekeying.
 //!
-//! A [`Service`](fictionet::stdlib::services::serve::Service) served by
+//! A plaintext [`Service`](fictionet::stdlib::services::serve::Service) served by
 //! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
 //! [`Events`] for the version exchange and numbered packets, or
 //! `codec::Frames<Packet>` after the version exchange. It reads payloads with
@@ -72,6 +69,10 @@
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Reader as ByteReader, Step, Truncated, Wire};
+
+pub mod auth;
+pub mod connection;
+pub mod transport;
 
 /// The TCP port SSH servers listen on.
 pub const PORT: u16 = 22;
