@@ -118,7 +118,7 @@ impl Present for Dns {
 fn dns_display(msg: &[u8]) -> Display {
     let mut packet = Decoded::default();
     let d = &mut packet;
-    use fictionet::stdlib::protocols::dns::op::{Message, MessageType};
+    use fictionet::stdlib::protocols::dns::op::{Message, MessageType, ResponseCode};
     let (buf, base) = (0, 0);
     let mut l = Layer::new("Domain Name System", buf, (base, base + msg.len()));
     let Ok(m) = Message::from_vec(msg) else {
@@ -197,13 +197,12 @@ fn dns_display(msg: &[u8]) -> Display {
         q_text.join(" ")
     );
     if response {
-        let code = md.response_code.to_string();
-        if code != "No Error" {
+        if md.response_code != ResponseCode::NoError {
             #[expect(
                 clippy::let_underscore_must_use,
                 reason = "fmt::Write for String never returns Err"
             )]
-            let _ = write!(text, " {code}");
+            let _ = write!(text, " {}", md.response_code);
             d.tag("dns-error");
         }
         if !a_text.is_empty() {
@@ -220,4 +219,47 @@ fn dns_display(msg: &[u8]) -> Display {
     d.info = text;
     d.cap_info();
     Display::from_packet(packet, "DNS message")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, ResponseCode};
+
+    #[test]
+    fn response_codes_preserve_summary_and_error_tags() {
+        for (code, suffix, tags) in [
+            (ResponseCode::NoError, "", &[][..]),
+            (
+                ResponseCode::ServFail,
+                " Server Failure",
+                &["dns-error"][..],
+            ),
+            (
+                ResponseCode::NXDomain,
+                " Non-Existent Domain",
+                &["dns-error"][..],
+            ),
+            (
+                ResponseCode::Unknown(15),
+                " Unknown response code",
+                &["dns-error"][..],
+            ),
+        ] {
+            let mut message = Message::response(0x1234, OpCode::Query);
+            message.metadata.response_code = code;
+            let display = dns_display(&message.to_vec().unwrap());
+            assert_eq!(display.tags, tags);
+            assert_eq!(
+                display.info,
+                format!("Standard query response 0x1234 {suffix}")
+            );
+            assert_eq!(display.summary(), display.info);
+
+            message.metadata.message_type = MessageType::Query;
+            let display = dns_display(&message.to_vec().unwrap());
+            assert!(display.tags.is_empty());
+            assert_eq!(display.info, "Standard query 0x1234 ");
+        }
+    }
 }

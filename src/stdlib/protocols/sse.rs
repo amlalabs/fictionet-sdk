@@ -134,6 +134,26 @@ fictionet::error_display!(Error, f, {
     Self::Unwritable { reason } => write!(f, "unwritable SSE value: {reason}"),
 });
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeError {
+    LineLimit,
+    EventLimit,
+    LineOverflow,
+    EventOverflow,
+    Unrepresentable(&'static str),
+}
+impl From<SizeError> for Error {
+    fn from(error: SizeError) -> Self {
+        unwritable(match error {
+            SizeError::LineLimit => "line limit",
+            SizeError::EventLimit => "event limit",
+            SizeError::LineOverflow => "line size overflow",
+            SizeError::EventOverflow => "event size overflow",
+            SizeError::Unrepresentable(reason) => reason,
+        })
+    }
+}
+
 /// One interpreted line. Values retain all spaces after the one optional
 /// space following the colon. Comments retain everything after the colon.
 /// Invalid ID and retry fields remain visible as [`Ignored`](Self::Ignored).
@@ -202,47 +222,53 @@ impl Line {
             Self::Ignored { name, value } => Some((name, value)),
         }
     }
-    fn encoded_len(&self) -> Result<usize, Error> {
+    fn encoded_len(&self) -> Result<usize, SizeError> {
         let size = match self {
             Self::Empty => return Ok(1),
             Self::Comment(v) => {
                 if newline(v) {
-                    return Err(unwritable("comment contains CR or LF"));
+                    return Err(SizeError::Unrepresentable("comment contains CR or LF"));
                 }
                 v.len().checked_add(1)
             }
             _ => {
-                let (name, value) = self.parts().ok_or(unwritable("line kind"))?;
+                let (name, value) = self
+                    .parts()
+                    .ok_or(SizeError::Unrepresentable("line kind"))?;
                 if name.is_empty()
                     || name.contains(':')
                     || newline(name)
                     || name.starts_with('\u{feff}')
                     || newline(value)
                 {
-                    return Err(unwritable("field name or value"));
+                    return Err(SizeError::Unrepresentable("field name or value"));
                 }
                 match self {
-                    Self::Id(v) if v.contains('\0') => return Err(unwritable("ID contains NULL")),
+                    Self::Id(v) if v.contains('\0') => {
+                        return Err(SizeError::Unrepresentable("ID contains NULL"));
+                    }
                     Self::Retry(v) if !digits(v) => {
-                        return Err(unwritable("retry is not ASCII digits"));
+                        return Err(SizeError::Unrepresentable("retry is not ASCII digits"));
                     }
                     Self::Ignored { name, value }
                         if matches!(name.as_str(), "event" | "data")
                             || (name == "id" && !value.contains('\0'))
                             || (name == "retry" && digits(value)) =>
                     {
-                        return Err(unwritable("ignored field would be interpreted"));
+                        return Err(SizeError::Unrepresentable(
+                            "ignored field would be interpreted",
+                        ));
                     }
                     _ => {}
                 }
                 field_len(name, value)
             }
         }
-        .ok_or(unwritable("line size overflow"))?;
+        .ok_or(SizeError::LineOverflow)?;
         if size > MAX_LINE {
-            return Err(unwritable("line limit"));
+            return Err(SizeError::LineLimit);
         }
-        size.checked_add(1).ok_or(unwritable("line size overflow"))
+        size.checked_add(1).ok_or(SizeError::LineOverflow)
     }
     fn append(&self, out: &mut Vec<u8>) {
         match self {
@@ -316,28 +342,30 @@ impl Event {
             id: String::new(),
         }
     }
-    fn encoded_len(&self, limits: Limits) -> Result<usize, Error> {
+    fn encoded_len(&self, limits: Limits) -> Result<usize, SizeError> {
         if self.event.is_empty() || newline(&self.event) {
-            return Err(unwritable("event type is empty or contains CR or LF"));
+            return Err(SizeError::Unrepresentable(
+                "event type is empty or contains CR or LF",
+            ));
         }
         if newline(&self.id) || self.id.contains('\0') {
-            return Err(unwritable("ID contains CR, LF, or NULL"));
+            return Err(SizeError::Unrepresentable("ID contains CR, LF, or NULL"));
         }
         if self.data.contains('\r') {
-            return Err(unwritable("data contains CR"));
+            return Err(SizeError::Unrepresentable("data contains CR"));
         }
         let mut size = 1usize; // Dispatching blank line.
-        let mut field = |name: &str, value: &str| -> Result<(), Error> {
-            let n = field_len(name, value).ok_or(unwritable("event size overflow"))?;
+        let mut field = |name: &str, value: &str| -> Result<(), SizeError> {
+            let n = field_len(name, value).ok_or(SizeError::EventOverflow)?;
             if n > limits.line {
-                return Err(unwritable("line limit"));
+                return Err(SizeError::LineLimit);
             }
             size = size
                 .checked_add(n)
                 .and_then(|n| n.checked_add(1))
-                .ok_or(unwritable("event size overflow"))?;
+                .ok_or(SizeError::EventOverflow)?;
             if size > limits.event {
-                return Err(unwritable("event limit"));
+                return Err(SizeError::EventLimit);
             }
             Ok(())
         };
@@ -571,23 +599,17 @@ impl Events {
         };
         // Inherited IDs and canonical field spelling can add bytes. Check
         // them before publishing an event so default-decoded events write.
-        if let Err(error) = event.encoded_len(self.limits) {
-            return Err(
-                if error
-                    == (Error::Unwritable {
-                        reason: "line limit",
-                    })
-                {
-                    Error::LineTooLong {
-                        limit: self.limits.line,
-                    }
-                } else {
-                    Error::EventTooLong {
-                        limit: self.limits.event,
-                    }
+        event
+            .encoded_len(self.limits)
+            .map_err(|error| match error {
+                SizeError::LineLimit | SizeError::LineOverflow => Error::LineTooLong {
+                    limit: self.limits.line,
                 },
-            );
-        }
+                SizeError::EventLimit | SizeError::EventOverflow => Error::EventTooLong {
+                    limit: self.limits.event,
+                },
+                SizeError::Unrepresentable(_) => Error::from(error),
+            })?;
         Ok(Some(event))
     }
 }
@@ -1031,6 +1053,71 @@ mod tests {
             ) =>
                 Some(Fail::Protocol(Error::EventTooLong { limit: 20 })),
         );
+        let inherited = b"id:1234567890\n\ndata:123456\n\n";
+        assert_eq!(
+            decode_all(
+                || Events::with_limits(Limits {
+                    line: 32,
+                    event: 27
+                }),
+                inherited,
+            ),
+            (vec![event("message", "123456", "1234567890")], None)
+        );
+        assert_eq!(
+            decode_all(
+                || Events::with_limits(Limits {
+                    line: 32,
+                    event: 26
+                }),
+                inherited,
+            ),
+            (
+                vec![],
+                Some(Fail::Protocol(Error::EventTooLong { limit: 26 }))
+            )
+        );
+    }
+
+    #[test]
+    fn dispatch_distinguishes_canonical_line_and_event_limits() {
+        assert_eq!(
+            decode_all(
+                || Events::with_limits(Limits { line: 4, event: 32 }),
+                b"data\n\n",
+            ),
+            (
+                vec![],
+                Some(Fail::Protocol(Error::LineTooLong { limit: 4 }))
+            )
+        );
+        assert_eq!(
+            decode_all(
+                || Events::with_limits(Limits { line: 5, event: 10 }),
+                b"data\n\n",
+            ),
+            (
+                vec![],
+                Some(Fail::Protocol(Error::EventTooLong { limit: 10 }))
+            )
+        );
+        assert_eq!(
+            decode_all(
+                || Events::with_limits(Limits { line: 5, event: 11 }),
+                b"data\n\n",
+            ),
+            (vec![Event::new("")], None)
+        );
+    }
+
+    #[test]
+    fn output_size_overflow_preserves_existing_bytes() {
+        let mut out = b"prefix".to_vec();
+        assert_eq!(
+            reserve(&mut out, usize::MAX),
+            Err(unwritable("output size overflow"))
+        );
+        assert_eq!(out, b"prefix");
     }
 
     #[test]
