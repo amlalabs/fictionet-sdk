@@ -354,6 +354,12 @@ impl<V: Verify> Resolver<V> {
         self.render_with(request, response, false, false)
     }
 
+    pub(super) fn render_blocked(&self, request: &Request) -> Vec<u8> {
+        let mut reply = bare_reply(request, ResponseCode::NXDomain, None);
+        set_edes(&mut reply.message, &[EdeCode::BLOCKED]);
+        self.render_response(request, reply)
+    }
+
     /// SERVFAIL for `request`, with `edes`.
     fn servfail(&self, request: &Request, edes: &[EdeCode]) -> Vec<u8> {
         let mut reply = bare_reply(request, ResponseCode::ServFail, None);

@@ -15,6 +15,19 @@ use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::world::net::Pools;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Ordinary guests use only the gateway's resolver. This predicate is
+/// applied outside the gateway and does not see server-to-server traffic.
+pub fn corporate_egress(destination: std::net::SocketAddr) -> bool {
+    !matches!(destination.port(), 53 | 853)
+        && !(destination.port() == 443
+            && crate::dns::public::PUBLIC_RESOLVERS.iter().any(|resolver| {
+                resolver.addresses.iter().any(|address| {
+                    destination.ip() == IpAddr::V4(address.v4)
+                        || destination.ip() == IpAddr::V6(address.v6)
+                })
+            }))
+}
+
 /// Public CDN space for hosts without a fixed address: `104.18.0.0/15`
 /// and `2606:4700:100::/48`, Cloudflare's, where many real sites are.
 pub fn cdn_pools() -> Pools {
@@ -39,6 +52,28 @@ pub const UBIQUITI_ROUTER: Mac = [0x74, 0x83, 0xc2, 0x9a, 0x47, 0xd1];
 mod tests {
     use super::*;
     use fictionet::stdlib::network::ip::non_public_address;
+
+    #[test]
+    fn corporate_dns_policy_covers_both_address_families() {
+        for resolver in crate::dns::public::PUBLIC_RESOLVERS {
+            for address in resolver.addresses {
+                for ip in [IpAddr::V4(address.v4), IpAddr::V6(address.v6)] {
+                    for port in [53, 853, 443] {
+                        assert!(!corporate_egress(std::net::SocketAddr::new(ip, port)));
+                    }
+                }
+            }
+        }
+        for ip in ["198.41.0.4", "2001:503:ba3e::2:30", "93.184.215.14"] {
+            let ip = ip.parse().unwrap();
+            for port in [53, 853] {
+                assert!(!corporate_egress(std::net::SocketAddr::new(ip, port)));
+            }
+            for port in [22, 80, 443] {
+                assert!(corporate_egress(std::net::SocketAddr::new(ip, port)));
+            }
+        }
+    }
 
     #[test]
     fn cdn_pools_avoid_non_public_ranges() {

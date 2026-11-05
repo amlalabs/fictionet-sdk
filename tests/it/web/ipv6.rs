@@ -1376,3 +1376,69 @@ fn refused_headers_to_nowhere_get_address_unreachable() {
         Ok(())
     });
 }
+
+#[test]
+fn egress_filters_ipv6_after_fragment_reassembly() {
+    use fictionet::stdlib::world::net::Net;
+    run_world::world(Duration::from_secs(20), |fcx| async move {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .egress(move |destination| {
+                recorded.lock().unwrap().push(destination);
+                false
+            })
+            .start(&fcx, attachments)?;
+        let mut raw = attacher.attach("agent")?;
+        let destination: Ipv6Addr = "2001:503:ba3e::2:30".parse()?;
+        let packet = udp6(ME6, 4000, destination, 53, b"a fragmented DNS question");
+        raw.send(fragment6(
+            ME6,
+            destination,
+            7,
+            0,
+            true,
+            17,
+            &packet.0[40..56],
+        ));
+        assert!(
+            bind_by_ping(&fcx, &mut raw, ME6.into(), GATEWAY6.into())
+                .await
+                .is_empty()
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        raw.send(fragment6(
+            ME6,
+            destination,
+            7,
+            16,
+            false,
+            17,
+            &packet.0[56..],
+        ));
+        assert!(
+            bind_by_ping(&fcx, &mut raw, ME6.into(), GATEWAY6.into())
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [SocketAddr::new(destination.into(), 53)]
+        );
+        raw.send(syn6(ME6, 4001, destination, 853));
+        assert!(
+            bind_by_ping(&fcx, &mut raw, ME6.into(), GATEWAY6.into())
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                SocketAddr::new(destination.into(), 53),
+                SocketAddr::new(destination.into(), 853)
+            ]
+        );
+        Ok(())
+    });
+}

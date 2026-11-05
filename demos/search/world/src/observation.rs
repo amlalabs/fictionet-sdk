@@ -34,6 +34,8 @@ pub enum SearchObs {
         #[serde(serialize_with = "rcode_name")]
         rcode: ResponseCode,
         dnssec: Dnssec,
+        /// The resolver refused this name by network policy.
+        blocked: bool,
         /// The first address in the answer, for an A or AAAA question.
         address: Option<IpAddr>,
     },
@@ -199,6 +201,7 @@ impl SearchObs {
             rcode,
             answers,
             validation,
+            ede,
             ..
         } = event
         else {
@@ -216,6 +219,7 @@ impl SearchObs {
             qtype: question.query_type(),
             rcode: *rcode,
             dnssec: (*validation).into(),
+            blocked: *ede == Some(fictionet::stdlib::protocols::dns::EdeCode::BLOCKED),
             address,
         })
     }

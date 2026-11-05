@@ -32,10 +32,9 @@ use fictionet::Cx;
 use fictionet::stdlib::network::ip::non_public_address;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::services::dns::Event;
-use fictionet::stdlib::services::dns::resolver::{Config, NegativeAnchors};
+use fictionet::stdlib::services::dns::resolver::{BlockedNames, Config, NegativeAnchors};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web;
-use fictionet::stdlib::world::net::dns::encrypted::Fronts;
 use fictionet::stdlib::world::net::dns::{Only, PerSession, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, NetHandle};
 use fictionet::sync::Mutex;
@@ -105,12 +104,16 @@ pub fn net(
     let handle = net.handle();
 
     let outbound = Outbound::new(pages.clone(), forwarded.keys().cloned());
+    let blocked_names: BlockedNames = {
+        let outbound = outbound.clone();
+        Arc::new(move |name| outbound.blocks_client(name))
+    };
+    let gateway_blocked_names = blocked_names.clone();
     let upstream = Arc::new(SessionUpstream::new(
         pages.clone(),
         forwarded.keys().cloned(),
     ));
     let negative_anchors: NegativeAnchors = Arc::new(upstream.negative_anchors());
-    let resolver_ca = ca.clone();
     let mirror = Mirror::new(Only::new(outbound.policy(), upstream), handle.clone());
     let sites = Arc::new(Sites {
         handle,
@@ -136,6 +139,7 @@ pub fn net(
             }
         });
     }
+    let net = net.egress(fictionet_extras::network::corporate_egress);
     let mut mirror = roots::seed(
         mirror
             .delay(place.authority_rtt / 2)
@@ -152,26 +156,24 @@ pub fn net(
             .egress(IpAddr::V4(egress))
             .wrap(move |authority| echo.over(authority));
     }
-    // Each public resolver's DNS over HTTPS names, such as
-    // `cloudflare-dns.com`, have addresses of their own, where the mirror
-    // places a front that puts queries to the resolver's primary address.
-    // The fronts are kept by the resolver's primary address.
-    let doh: Arc<Mutex<HashMap<IpAddr, Fronts>>> = Arc::default();
-    for resolver in &PUBLIC_RESOLVERS {
-        let primary = IpAddr::V4(resolver.addresses[0].v4);
-        for name in resolver.doh() {
-            let doh = doh.clone();
-            mirror = mirror.front(name, move |host| match doh.lock().get(&primary) {
-                Some(fronts) => fronts.doh(host),
-                None => host,
-            });
-        }
-    }
-
     let observe = {
         let (fcx, pages) = (fcx.clone(), pages.clone());
+        let blocked_names = blocked_names.clone();
         move |event: &Event| {
-            if let Some(fact) = SearchObs::resolved(event) {
+            if let Some(mut fact) = SearchObs::resolved(event) {
+                if let SearchObs::Resolved {
+                    name,
+                    rcode,
+                    blocked,
+                    ..
+                } = &mut fact
+                {
+                    let mut name = name.clone();
+                    name.set_fqdn(true);
+                    *blocked |= *rcode
+                        == fictionet::stdlib::protocols::dns::op::ResponseCode::NXDomain
+                        && blocked_names(&LowerName::new(&name));
+                }
                 pages.report(&fcx, fact);
             }
         }
@@ -188,6 +190,7 @@ pub fn net(
                 None => config,
             };
             let config = Config {
+                blocked_names: Some(blocked_names.clone()),
                 negative_anchors: Some(negative_anchors.clone()),
                 ..config
             };
@@ -197,33 +200,15 @@ pub fn net(
                 .per_sandbox()
                 .namespace(&namespace)
                 .on_event(observe.clone());
-            let (ca, served) = (resolver_ca.clone(), *resolver);
-            let config = OnceLock::new();
-            let tls = move |fcx: &Cx| {
-                config
-                    .get_or_init(|| {
-                        ca.resolver_config(fcx, &served)
-                            .expect("a certificate for a public resolver")
-                    })
-                    .clone()
-            };
-            let fronts = Fronts::new(recursive.handle(), tls)
-                .names(resolver.doh())
-                .date(start);
-            // The primary address comes first, and its fronts serve the
-            // resolver's DNS over HTTPS names elsewhere.
-            let primary = IpAddr::V4(resolver.addresses[0].v4);
-            doh.lock()
-                .entry(primary)
-                .or_insert_with(|| resolver.doh_fronts(fronts.clone().resolver_at(primary)));
-            let fronts = resolver.doh_fronts(fronts);
-            fronts.doh(fronts.dot(host.program(recursive)))
+            host.program(recursive)
         }))
         .gateway(move |host, _declared| {
             // No declared data: every site the world places declares its
             // name, and every name it serves is real, so the real
             // hierarchy answers for all of them.
             let config = Config {
+                ede: true,
+                blocked_names: Some(gateway_blocked_names.clone()),
                 negative_anchors: Some(negative_anchors.clone()),
                 ..unbound::config()
             };
@@ -301,9 +286,8 @@ impl Sites {
     /// The network has no IPv6, so AAAA records place nothing. An address
     /// the network refuses, such as one on the sandboxes' subnet, or one
     /// whose port 443 already serves the world's infrastructure, keeps no
-    /// machine for the name. So does a public resolver's address, whose
-    /// port 443 answers every name with its DNS over HTTPS front, as
-    /// `1dot1dot1dot1.cloudflare-dns.com` at 1.1.1.1 does. A name at a name
+    /// machine for the name. So does a public resolver's address, which
+    /// the guest cannot reach over DNS or HTTPS. A name at a name
     /// server's address gets its site there, as a small domain often runs
     /// its web site and its name server on one machine, and so does the
     /// name of a name server: a name is known to name one only once a

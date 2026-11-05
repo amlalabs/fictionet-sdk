@@ -620,6 +620,7 @@ mod tests {
             fixed: Vec::new(),
             peers: Peers::new(Limits::default().connections_per_peer),
             limits: Limits::default(),
+            egress: None,
             lans: BTreeMap::new(),
         })
     }

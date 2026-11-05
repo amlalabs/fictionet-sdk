@@ -1191,3 +1191,80 @@ fn json_data_is_in_presentation_format() {
         Ok(())
     });
 }
+
+#[test]
+fn corporate_egress_keeps_gateway_recursion_and_drops_direct_dns() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let (hosts, anchors) = authorities();
+        let resolver_ip = PUBLIC_RESOLVERS[0].addresses[0].v4;
+        let (_ca, leaf) = certs::issue(&fcx, "World CA", &[DOH_NAME])?;
+        let tls = leaf.server_config(&fcx, date(NOW))?;
+        let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
+        let external = recursive(anchors.clone(), &sent);
+        let fronts = Fronts::new(external.handle(), move |_| tls.clone()).names([name(DOH_NAME)]);
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .egress(fictionet_extras::network::corporate_egress)
+            .hosts(hosts)
+            .add_host(
+                fictionet::stdlib::web::Site::new(super::Plain("page"))
+                    .into_host("www.example")
+                    .at(WWW),
+            )
+            .add_host(
+                fronts.doh(fronts.dot(Host::new("public-dns").at(resolver_ip).program(external))),
+            )
+            .gateway(move |host, _| host.program(recursive(anchors.clone(), &sent)))
+            .start(&fcx, attachments)?;
+        let m = machine(&fcx, attacher.attach("agent")?, ME);
+        let gateway = Ipv4Addr::new(10, 0, 0, 1);
+        let reply = udp(&fcx, &m, gateway, &query(1, "www.example.", RecordType::A)).await;
+        assert_eq!(answers(&reply), [(WWW, TTL)]);
+        assert!(reply.metadata.authentic_data);
+        let connection = m.tcp.connect(&fcx, at(gateway, 53)).await?;
+        drop(connection);
+        let web = m.tcp.connect(&fcx, at(WWW, 80)).await?;
+        drop(web);
+        for server in [ROOT, EXAMPLE, resolver_ip] {
+            for port in [53, 853] {
+                assert!(
+                    timeout(
+                        &fcx,
+                        Duration::from_secs(1),
+                        m.tcp.connect(&fcx, at(server, port))
+                    )
+                    .await
+                    .is_none()
+                );
+                let mut socket = m.udp.bind(0)?;
+                socket.send_to(
+                    &query(2, "www.example.", RecordType::A).to_vec()?,
+                    at(server, port),
+                );
+                assert!(
+                    timeout(&fcx, Duration::from_secs(1), socket.recv(&fcx))
+                        .await
+                        .is_none()
+                );
+            }
+        }
+        assert!(
+            timeout(
+                &fcx,
+                Duration::from_secs(1),
+                m.tcp.connect(&fcx, at(resolver_ip, 443))
+            )
+            .await
+            .is_none()
+        );
+        let mut socket = m.udp.bind(0)?;
+        socket.send_to(b"encrypted DNS", at(resolver_ip, 443));
+        assert!(
+            timeout(&fcx, Duration::from_secs(1), socket.recv(&fcx))
+                .await
+                .is_none()
+        );
+        Ok(())
+    });
+}

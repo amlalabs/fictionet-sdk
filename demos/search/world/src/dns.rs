@@ -5,8 +5,8 @@
 //! the root and `gtld-servers.net` addresses, and at every name server
 //! address the copied records name, answer from records copied from the
 //! real server there. So the guest sees each site's real address and real
-//! signatures, whether it asks the gateway, a public resolver, or a root
-//! server itself. [`Outbound`] is the world's policy for the lookups
+//! signatures through the gateway. Guest traffic to external DNS and
+//! encrypted public resolvers is blocked at the network attachment. [`Outbound`] is the world's policy for the lookups
 //! those servers make of the real servers, and [`SessionUpstream`] is the
 //! upstream the lookups it allows go to: the internet, or in a Copied
 //! session the DNS captured with the pages.
@@ -31,6 +31,18 @@ use fictionet_extras::dns::{Replay, public};
 use fictionet_host::dns::Internet;
 
 use crate::pages::{Pages, Source as Mode};
+
+/// Public encrypted resolvers are unavailable to guests in every mode.
+pub(crate) fn encrypted_resolver(host: &str) -> bool {
+    public::PUBLIC_RESOLVERS
+        .iter()
+        .flat_map(|resolver| resolver.doh())
+        .any(|name| {
+            name.to_ascii()
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(host.trim_end_matches('.'))
+        })
+}
 
 /// Top-level domains that never resolve on the internet: reserved by RFC
 /// 2606 and 6761, used for mDNS, or used only inside private networks.
@@ -195,8 +207,8 @@ fn targets<'a>(
 ///
 /// 1. it passes `admit` and the session serves it, or it is a name the
 ///    world serves in every session (the model gateway's and the time
-///    server's). Live-Depth uses Live's boundary here: DNS stays real,
-///    and the site's machine refuses names outside the depth;
+///    server's). Live-Depth uses Live's boundary for authoritative
+///    queries; its recursive resolvers block unserved host names first;
 /// 2. it is the root or a single label, which the root servers answer; in
 ///    the live modes, any name at all, whatever its labels or top-level
 ///    domain; in Copied, a name above a captured host. Priming,
@@ -252,6 +264,17 @@ struct Named {
 }
 
 impl Outbound {
+    /// Public DoH names are blocked in every mode. Live-Depth also filters
+    /// unserved host names. The gateway still resolves infrastructure.
+    pub(crate) fn blocks_client(&self, name: &LowerName) -> bool {
+        let host = host(name);
+        encrypted_resolver(&host)
+            || (self.inner.pages.source() == Mode::LiveDepth
+                && admit(&host).is_ok()
+                && !self.inner.always.contains(name)
+                && !self.inner.pages.serves_host(&host))
+    }
+
     /// The policy for the sessions of `pages`, with `always` the names the
     /// world serves in every session.
     pub fn new(pages: Arc<Pages>, always: impl IntoIterator<Item = LowerName>) -> Outbound {

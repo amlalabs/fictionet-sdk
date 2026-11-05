@@ -81,18 +81,25 @@ tool handlers, its resolvers and the typed no-route callback on its network.
 
 The world's DNS is a copy of the real hierarchy. The gateway runs a resolver
 like Unbound with the root hints. The root servers, the `gtld-servers.net`
-servers, and Google, Cloudflare, Quad9, and OpenDNS answer at their real
-addresses. The world's servers never pass a real server's reply on. Each one
-answers from records it copied from the real servers of its zone, and looks a
-question up at a real server only when its copy lacks the answer. Every name
-server the copied records name gets a server at its address. So `dig`,
-`dig +trace`, `dig @8.8.8.8`, and `delv` see real addresses and real
-signatures, and each site's machine stands at the address the real DNS gives
-it. Only questions the world's policy allows reach real servers. In Live,
-Live-Depth, and Edited it allows any name. In Copied it allows the names the
-session serves, the names above them that a resolver asks on the way,
-underscore names under them, reverse names, and names in the records the
-copies hold.
+servers, and public resolvers remain inside the world at their real addresses.
+Each authoritative server answers from records it copied from the real servers
+of its zone, looking up a question only when its copy lacks the answer.
+
+Every page source models a corporate network. The workstation uses the gateway
+resolver: plain `dig`, reverse lookups, `dig +dnssec`, and `delv` work through it.
+The guest's outgoing TCP and UDP port 53 to any other address, and port 853,
+are silently dropped. `dig @8.8.8.8`, `dig @198.41.0.4`, `dig +trace`, and
+DNS over TLS time out. The gateway's own queries still reach the hierarchy.
+Public resolver addresses also block TCP and UDP port 443, covering DoH and
+HTTP/3. Known public DoH names get NXDOMAIN with the Blocked extended DNS
+error in every mode; their HTTPS fronts and page copies are not served.
+
+Only questions the world's policy allows reach real servers. In Live,
+Live-Depth, and Edited the authoritative copies allow any name. Live-Depth's
+gateway also answers unserved host names with NXDOMAIN and the Blocked
+extended DNS error. In Copied, upstream questions are restricted to the names
+the session serves, names above them, underscore names under them, reverse
+names, and names in the records the copies hold.
 
 [app/src/page/](app/src/page/) projects those facts into the map, site details,
 model calls and recent activity. Selecting a site or gateway keeps the map
@@ -149,16 +156,18 @@ sites. Capture dates are shown only when the archive records them.
   the host copies it as Live does, and its links, on any site, are allowed one
   deeper, up to depth 5, at the fewest links they were reached by. A PDF's
   links count as a page's. The files the page uses are allowed too and copied
-  when asked for. Any other address gets the site's own 404, and a host no
-  allowed address uses refuses the connection, or closes it unanswered when it
-  shares its address with an allowed host; neither is fetched, so
-  nothing the guest types reaches the internet except its searches and its DNS
-  questions, which the real name servers answer as in Live. The site's 404 is learned
-  when the first page on it is copied, by asking it once for a random path
-  made up for the session; before then the answer is nginx's 404. A host refused once is served as soon as a link to it is
-  allowed. Package files come only from the capture. The feed shows each
-  opened page's depth and refused addresses as rows; the map counts the
-  allowed links.
+  when asked for. An unlisted path on an allowed host gets the site's own 404.
+  A host the session does not serve gets NXDOMAIN with the Blocked extended
+  DNS error from the gateway, without an upstream DNS lookup.
+  Direct queries to other DNS servers are blocked by the network. Neither
+  unlisted pages nor blocked hosts are fetched. The site's
+  404 is learned when the first page on it is copied, by asking it once for a
+  random path made up for the session; before then the answer is nginx's 404.
+  A blocked host resolves as soon as a link to it is allowed; the resolver
+  does not cache policy blocks. Package downloads from pip, npm and Cargo
+  registries, including captured packages, return HTTP 403 with "Package downloads are
+  blocked by network policy." The feed shows each opened page's depth and
+  refused addresses as rows; the map counts the allowed links.
 - **Edited** serves the real web as Live does, with the changes a scenario calls
   for. The scenario is a short instruction set in the World menu, such as "The
   Fed raised rates by 0.5 points on Oct 22". A model reads each page or result
@@ -273,9 +282,10 @@ The previous astronomy captures remain in `demos/downloads/astronomy/`.
 
 The corpus's `packages/` directory holds separate WARCs for PyPI indexes,
 wheel metadata and distributions, and GitHub source archives. These sites
-replay their captures in every mode. In Live and Edited, a file the capture lacks is copied from
-its real host when first asked for and kept for the session, so installs work for
-any package; a package that does not exist stays a 404. In Copied and Live-Depth, a file
+replay their captures in Copied, Live and Edited. Live-Depth blocks registry package
+downloads with HTTP 403, including files present in the capture. In Live and
+Edited, a file the capture lacks is copied from its real host when first asked for and kept for the session, so installs work for
+any package; a package that does not exist stays a 404. In Copied, a file
 the capture lacks gets the registry's own not-found answer and is never fetched. Captured site 404 pages and their assets
 also supply missing-page responses for the research sources.
 

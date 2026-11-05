@@ -133,6 +133,7 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
         };
     }
     let net = Net::new(Pools::NONE)
+        .egress(fictionet_extras::network::corporate_egress)
         .add_host(server)
         .route(INTERNET, config.internet.ipv4);
     match config.address_v6 {

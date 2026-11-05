@@ -425,6 +425,7 @@ impl Pages {
             })
         };
         crate::admit(&host).is_ok()
+            && !crate::dns::encrypted_resolver(&host)
             && match self.source() {
                 Source::Live | Source::Edited => true,
                 Source::LiveDepth => {

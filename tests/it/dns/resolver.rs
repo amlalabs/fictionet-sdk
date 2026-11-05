@@ -6614,3 +6614,72 @@ fn a_negative_after_a_wildcard_alias_from_another_zone_validates() {
         }
     }
 }
+
+#[test]
+fn policy_blocks_before_iteration_for_every_transport_and_address_type() {
+    for transport in [Transport::Udp, Transport::Tcp] {
+        for qtype in [RecordType::A, RecordType::AAAA, RecordType::HTTPS] {
+            for edns in [false, true] {
+                let (mut net, anchors) = internet(true);
+                let mut config = config(anchors);
+                config.blocked_names = Some(Arc::new(|_| true));
+                let mut resolver = resolver(config);
+                let mut client = client(1);
+                client.transport = transport;
+                let reply = ask(
+                    &mut resolver,
+                    &mut net,
+                    0,
+                    query(client, "www.example.com.", qtype, |message| {
+                        message.metadata.checking_disabled = true;
+                        if !edns {
+                            message.edns = None;
+                        }
+                    }),
+                );
+                assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+                assert!(!reply.metadata.authentic_data);
+                assert!(!reply.metadata.authoritative);
+                assert!(reply.metadata.recursion_available);
+                assert!(reply.answers.is_empty());
+                assert!(reply.authorities.is_empty());
+                assert_eq!(
+                    edes(&reply),
+                    if edns { vec![EdeCode::BLOCKED] } else { vec![] }
+                );
+                assert!(asked(&net).is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn changing_policy_blocks_warm_answers_and_unblocks_without_negative_caching() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let blocked = Arc::new(AtomicBool::new(false));
+    let (mut net, anchors) = internet(true);
+    let mut config = config(anchors);
+    config.blocked_names = Some({
+        let blocked = blocked.clone();
+        Arc::new(move |_| blocked.load(Ordering::Relaxed))
+    });
+    let mut resolver = resolver(config);
+    for (seconds, denied) in [false, true, false].into_iter().enumerate() {
+        blocked.store(denied, Ordering::Relaxed);
+        let reply = ask(
+            &mut resolver,
+            &mut net,
+            seconds as u64,
+            query(client(1), "www.example.com.", RecordType::A, dnssec_ok),
+        );
+        if denied {
+            assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+            assert_eq!(edes(&reply), [EdeCode::BLOCKED]);
+            assert!(!reply.metadata.authentic_data);
+        } else {
+            assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+            assert!(!addresses(&reply).is_empty());
+            assert!(reply.metadata.authentic_data);
+        }
+    }
+}

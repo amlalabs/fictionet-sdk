@@ -199,6 +199,7 @@ pub fn network(
     };
     let mut net = web::Sites::new(fictionet_extras::network::cdn_pools(), |_| None)
         .into_net()
+        .egress(fictionet_extras::network::corporate_egress)
         .subnet(route::Prefix {
             addr: SUBNET.0.into(),
             len: SUBNET.1,

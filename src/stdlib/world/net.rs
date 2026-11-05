@@ -153,7 +153,7 @@
 
 use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
@@ -322,6 +322,7 @@ pub struct Net {
     gateway: Arc<Gateway>,
     unreachable: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
     drop_unrouted: bool,
+    egress: Option<Arc<Egress>>,
     routes: Vec<(String, Prefix)>,
     limits: Limits,
     lans: Vec<Lan>,
@@ -348,6 +349,7 @@ impl Net {
             gateway: Arc::new(default_gateway),
             unreachable: None,
             drop_unrouted: false,
+            egress: None,
             routes: Vec::new(),
             limits: Limits::default(),
             lans: Vec::new(),
@@ -443,6 +445,15 @@ impl Net {
     /// [`Net::on_unreachable`] still reports each dropped packet.
     pub fn drop_unrouted(mut self) -> Self {
         self.drop_unrouted = true;
+        self
+    }
+
+    /// Filters ordinary sandboxes' TCP and UDP destinations outside their
+    /// gateway. False silently drops the packet after IP reassembly. Hosts,
+    /// trusted routes and LAN members are unaffected. The predicate must
+    /// return quickly and must not call back into the network.
+    pub fn egress(mut self, allow: impl Fn(SocketAddr) -> bool + Send + Sync + 'static) -> Self {
+        self.egress = Some(Arc::new(allow));
         self
     }
 
@@ -585,6 +596,7 @@ impl Net {
             fixed: routes.iter().map(|(_, p)| *p).collect(),
             peers: Peers::new(self.limits.connections_per_peer),
             limits: self.limits,
+            egress: self.egress,
             lans,
         });
         start_gateway(&shared, &*self.gateway)?;
@@ -690,6 +702,8 @@ impl NetHandle {
 // ---------------------------------------------------------------------------
 // What the network's tasks share
 
+type Egress = dyn Fn(SocketAddr) -> bool + Send + Sync;
+
 /// Network state assembled into capability contexts for its subsystems.
 struct Shared {
     peers: Arc<Peers>,
@@ -704,6 +718,7 @@ struct Shared {
     /// Prefixes of routes ([`Net::route`]).
     fixed: Vec<Prefix>,
     limits: Limits,
+    egress: Option<Arc<Egress>>,
     /// The LANs, by name.
     lans: BTreeMap<String, LanSeg>,
 }
@@ -749,6 +764,7 @@ impl Shared {
             bindings: addresses::Bindings::new(self.subnet, self.subnet6, self.leases.clone()),
             hooks: self.hooks.clone(),
             sandbox_budget: self.limits.sandbox_budget,
+            egress: self.egress.clone(),
             router: self.router.clone(),
             destinations: attachments::Destinations {
                 gateways: std::iter::once(IpAddr::V4(self.subnet.gateway))
@@ -1020,6 +1036,7 @@ mod tests {
                     fixed: Vec::new(),
                     peers: Peers::new(Limits::default().connections_per_peer),
                     limits: Limits::default(),
+                    egress: None,
                     lans,
                 });
                 start_gateway(&shared, &default_gateway)?;

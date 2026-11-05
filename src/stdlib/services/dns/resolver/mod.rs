@@ -73,7 +73,8 @@ mod servers;
 
 pub use cache::{Cache, Checked, Entry, FailureKind, Key, Limits, Negative, Offer, Rank};
 pub use config::{
-    Config, LocalZone, Minimise, NameServer, NegativeAnchors, ROOT_SERVERS, Stale, Work, root_hints,
+    BlockedNames, Config, LocalZone, Minimise, NameServer, NegativeAnchors, ROOT_SERVERS, Stale,
+    Work, root_hints,
 };
 
 use resolution::{AskerId, CheckId, Graph, LookupId, Outcome, Subject, TreeId};
@@ -322,6 +323,16 @@ impl<V: Verify> Resolver<V> {
                 let bytes = self.render_response(&request, refused);
                 return self.send_answer(client, bytes, Validation::NotPerformed, false);
             }
+        }
+
+        if self
+            .config
+            .blocked_names
+            .as_ref()
+            .is_some_and(|blocked| blocked(&LowerName::new(request.question.name())))
+        {
+            let bytes = self.render_blocked(&request);
+            return self.send_answer(client, bytes, Validation::NotPerformed, false);
         }
 
         // When the client asked for recursion, a local answer that does

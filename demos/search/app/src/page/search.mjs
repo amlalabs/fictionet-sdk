@@ -380,7 +380,7 @@ function activityItem(row) {
     }
     case 'no_route': return { title: `Tried ${fact.to}`, meta: 'No route', target: 'router' };
     case 'certificate': return { title: `${hostName(fact.host)} certificate ${CERTIFICATE[fact.problem]}`, meta: `TLS · ${sourceName(fact.source)}`, target: `site:${hostName(fact.host)}`, failed: true };
-    case 'resolved': return { title: fact.rcode === 'NXDOMAIN' ? `${hostName(fact.name)} not found` : `${hostName(fact.name)} did not resolve`, meta: `${fact.qtype} · ${fact.rcode}`, target: 'dns', failed: true };
+    case 'resolved': if (fact.blocked) return { title: `Refused ${hostName(fact.name)}`, meta: `${fact.qtype} · NXDOMAIN · Network policy`, target: 'dns', failed: true }; return { title: fact.rcode === 'NXDOMAIN' ? `${hostName(fact.name)} not found` : `${hostName(fact.name)} did not resolve`, meta: `${fact.qtype} · ${fact.rcode}`, target: 'dns', failed: true };
   }
 }
 // How a real site's certificate fails, as the feed says it.

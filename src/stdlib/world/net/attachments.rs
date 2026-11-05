@@ -88,6 +88,7 @@ pub(super) struct Context {
     pub(super) bindings: Bindings,
     pub(super) hooks: Arc<Hooks>,
     pub(super) sandbox_budget: usize,
+    pub(super) egress: Option<Arc<super::Egress>>,
     pub(super) router: Router<Box<dyn Interface>>,
     pub(super) destinations: Destinations,
     pub(super) abort_peers: Arc<PeerAbort>,
@@ -573,6 +574,23 @@ impl Filter {
                 }
             }
         };
+        if let Some(allow) = &self.context.egress {
+            let Some(header) = Header::parse_whole(&packet.0) else {
+                return;
+            };
+            let gateway = header.dst == IpAddr::V4(self.context.bindings.subnet.gateway)
+                || self
+                    .context
+                    .bindings
+                    .subnet6
+                    .is_some_and(|subnet| header.dst == IpAddr::V6(subnet.gateway));
+            if !gateway
+                && let Some(port) = header.dst_port(&packet.0)
+                && !allow(SocketAddr::new(header.dst, port))
+            {
+                return;
+            }
+        }
         if let Some(port) = route {
             self.ports.send(port, packet);
         }

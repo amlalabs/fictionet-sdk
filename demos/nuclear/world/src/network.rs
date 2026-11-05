@@ -53,7 +53,10 @@ pub const CONTROLLERS: [(&str, Plc, Ipv4Addr); 4] = [
 /// controller as a host on port 502.
 pub fn builder(driver: &Driver) -> Net {
     let plant = driver.plant();
-    let mut net = Net::new(Pools::NONE).subnet(OPERATIONS).ipv4_only();
+    let mut net = Net::new(Pools::NONE)
+        .subnet(OPERATIONS)
+        .ipv4_only()
+        .egress(|destination| !matches!(destination.port(), 53 | 853));
     for (label, plc, addr) in CONTROLLERS {
         let plant = plant.clone();
         // `Host::tcp` takes an `Arc` of the service's state. The state is the

@@ -14,6 +14,9 @@ use super::super::zone::{AnyResponse, EmptyApex, ZoneData, special};
 /// Whether a name is a negative trust anchor ([`Config::negative_anchors`]).
 pub type NegativeAnchors = Arc<dyn Fn(&LowerName) -> bool + Send + Sync>;
 
+/// Whether a client name is blocked by resolver policy.
+pub type BlockedNames = Arc<dyn Fn(&LowerName) -> bool + Send + Sync>;
+
 /// How a recursive resolver behaves.
 ///
 /// Every field is a knob real resolver software has. [`Config::new`]
@@ -41,6 +44,10 @@ pub struct Config {
     /// question on to the next, and after the last to the cache and
     /// iteration.
     pub local: Vec<LocalZone>,
+    /// Client names answered with NXDOMAIN and Extended DNS Error Blocked,
+    /// before local data, caches or iteration. Called for every question;
+    /// policy answers are not cached. None permits every name.
+    pub blocked_names: Option<BlockedNames>,
     /// The EDNS payload size offered to servers and advertised to clients
     /// (RFC 6891 §6.2.5).
     pub payload: u16,
@@ -240,6 +247,7 @@ impl Config {
             case_randomise: false,
             anchors: Some(Anchors::iana_root()),
             negative_anchors: None,
+            blocked_names: None,
             policy: AlgorithmPolicy::iana(),
             work: Work {
                 queries: 200,
