@@ -23,16 +23,18 @@ async fn main() -> Result {
         return honeypot_diff::run(&args.collect::<Vec<_>>()).await;
     }
     if task == "honeypot-probe" {
+        let profile = honeypot_diff::Profile::parse(&args.next().ok_or("missing probe profile")?)?;
         let directory = PathBuf::from(args.next().ok_or("missing probe output directory")?);
         let selection = match args.next().as_deref() {
             None => honeypot_probe::Selection::All,
             Some("--defaults") => honeypot_probe::Selection::Defaults,
-            _ => return Err("expected --defaults".into()),
+            Some("--ip-options") => honeypot_probe::Selection::IpOptions,
+            _ => return Err("expected --defaults or --ip-options".into()),
         };
         if args.next().is_some() {
             return Err("unexpected probe argument".into());
         }
-        return honeypot_probe::run(&directory, selection);
+        return honeypot_probe::run(&directory, selection, profile);
     }
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());

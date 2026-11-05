@@ -17,6 +17,36 @@ const SOURCE: &str = "https://cloud-images.ubuntu.com/noble/current";
 const SERVER_MAC: [u8; 6] = [0x52, 0x54, 0, 0x20, 0, 0x10];
 const CLIENT_MAC: [u8; 6] = [0x52, 0x54, 0, 0x20, 0, 0x11];
 
+#[derive(Clone, Copy)]
+pub enum Profile {
+    Nginx,
+    Caddy,
+}
+
+impl Profile {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "nginx" => Ok(Self::Nginx),
+            "caddy" => Ok(Self::Caddy),
+            _ => Err("expected nginx or caddy".into()),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Nginx => "nginx",
+            Self::Caddy => "caddy",
+        }
+    }
+
+    pub fn idle_observation(self) -> Duration {
+        Duration::from_secs(match self {
+            Self::Nginx => 85,
+            Self::Caddy => 315,
+        })
+    }
+}
+
 struct Process(Child);
 
 fn own_child(command: &mut Command) {
@@ -58,13 +88,15 @@ pub async fn run(args: &[String]) -> Result {
     fs::create_dir_all(root.join("share"))?;
     let root = root.canonicalize()?;
     match args.first().map(String::as_str) {
-        Some("prepare") if args.len() == 1 => prepare(&root).await,
-        Some(mode @ ("run" | "defaults")) if (2..=3).contains(&args.len()) => {
+        Some("prepare") if args.len() == 2 => prepare(&root, Profile::parse(&args[1])?).await,
+        Some(mode @ ("run" | "defaults" | "ip-options")) if (3..=4).contains(&args.len()) => {
+            let profile = Profile::parse(&args[1])?;
             let selection = match mode {
                 "defaults" => Selection::Defaults,
+                "ip-options" => Selection::IpOptions,
                 _ => Selection::All,
             };
-            let label = &args[1];
+            let label = &args[2];
             if label.is_empty()
                 || !label
                     .bytes()
@@ -73,12 +105,12 @@ pub async fn run(args: &[String]) -> Result {
                 return Err("run name must contain only letters, digits and hyphens".into());
             }
             let binary = args
-                .get(2)
+                .get(3)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| root.parent().unwrap().join("debug/honeypot"));
-            compare(&root, label, &binary.canonicalize()?, selection)
+            compare(&root, profile, label, &binary.canonicalize()?, selection)
         }
-        _ => Err("usage: cargo xtask honeypot-diff prepare | run NAME [HONEYPOT_BINARY] | defaults NAME [HONEYPOT_BINARY]".into()),
+        _ => Err("usage: cargo xtask honeypot-diff prepare PROFILE | run PROFILE NAME [HONEYPOT_BINARY] | defaults PROFILE NAME [HONEYPOT_BINARY] | ip-options PROFILE NAME [HONEYPOT_BINARY]; PROFILE is nginx or caddy".into()),
     }
 }
 
@@ -277,9 +309,10 @@ fn finish(guest: &mut Process, timeout: Duration) -> Result {
     }
 }
 
-async fn prepare(root: &Path) -> Result {
+async fn prepare(root: &Path, profile: Profile) -> Result {
     download(root).await?;
-    for (name, probe) in [("ubuntu", false), ("probe", true)] {
+    let reference = format!("ubuntu-{}", profile.name());
+    for (name, probe) in [(reference.as_str(), false), ("probe", true)] {
         let disk = root.join(format!("{name}.qcow2"));
         let ready = root.join("share").join(format!("{name}-prepared"));
         if disk.exists() && ready.exists() {
@@ -293,9 +326,33 @@ async fn prepare(root: &Path) -> Result {
         }
         overlay(&root.join(IMAGE), &disk)?;
         let mut commands = mount_commands();
-        commands.push(command(&["sh", "-ec", &format!(
-            "export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get -y dist-upgrade; apt-get install -y linux-generic openssh-server nginx nmap curl; printf '1\\n' > /proc/sys/net/mptcp/enabled; dpkg-query -W linux-generic openssh-server nginx nmap > /mnt/comparison/{name}-packages.txt; touch /mnt/comparison/{name}-prepared"
-        )]));
+        let mut setup = format!(
+            "export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get -y dist-upgrade; apt-get install -y linux-generic openssh-server nmap curl; dpkg-query -W linux-generic openssh-server nmap > /mnt/comparison/{name}-packages.txt; "
+        );
+        if !probe {
+            let install = match profile {
+                Profile::Nginx => "apt-get install -y nginx",
+                Profile::Caddy => concat!(
+                    "apt-get install -y debian-keyring debian-archive-keyring apt-transport-https gpg; ",
+                    "curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o /root/caddy-stable.gpg; ",
+                    "gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg /root/caddy-stable.gpg; ",
+                    "curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list; ",
+                    "chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list; ",
+                    "apt-get update; apt-get install -y caddy; ",
+                    "dpkg --compare-versions \"$(dpkg-query -W -f='${Version}' caddy)\" ge 2.10; ",
+                    "systemctl enable --now caddy"
+                ),
+            };
+            setup.push_str(install);
+            setup.push_str("; ");
+            if matches!(profile, Profile::Caddy) {
+                setup.push_str(&format!(
+                    "cp /usr/share/caddy/index.html /mnt/comparison/{name}-index.html; cp /etc/caddy/Caddyfile /mnt/comparison/{name}-Caddyfile; caddy version > /mnt/comparison/{name}-version.txt; caddy build-info > /mnt/comparison/{name}-build-info.txt; "
+                ));
+            }
+        }
+        setup.push_str(&format!("touch /mnt/comparison/{name}-prepared"));
+        commands.push(command(&["sh", "-ec", &setup]));
         commands.push(command(&["poweroff"]));
         let iso = seed(root, &format!("prepare-{name}"), probe, false, commands)?;
         let log = root.join(format!("{name}-prepare.log"));
@@ -331,8 +388,15 @@ fn guest_executable(root: &Path) -> Result {
     Ok(())
 }
 
-fn compare(root: &Path, label: &str, binary: &Path, selection: Selection) -> Result {
-    for name in ["ubuntu", "probe"] {
+fn compare(
+    root: &Path,
+    profile: Profile,
+    label: &str,
+    binary: &Path,
+    selection: Selection,
+) -> Result {
+    let reference = format!("ubuntu-{}", profile.name());
+    for name in [reference.as_str(), "probe"] {
         if !root.join("share").join(format!("{name}-prepared")).exists() {
             return Err("run cargo xtask honeypot-diff prepare first".into());
         }
@@ -357,6 +421,7 @@ fn compare(root: &Path, label: &str, binary: &Path, selection: Selection) -> Res
             .arg(result.join("honeypot.jsonl"))
             .arg("--pcap")
             .arg(result.join("honeypot.pcapng"))
+            .args(["--http-profile", profile.name()])
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()?,
@@ -402,18 +467,22 @@ fn compare(root: &Path, label: &str, binary: &Path, selection: Selection) -> Res
     let reference_address = reference_port.local_addr()?;
     drop(reference_port);
     let mut commands = mount_commands();
-    commands.push(command(&["mkdir", "-p", "/run/sshd"]));
-    commands.push(command(&[
-        "sh",
-        "-ec",
-        &format!("cat /boot/config-$(uname -r) > {guest_result}/ubuntu-kernel-config.txt; ss -ltnp > {guest_result}/listeners.txt; {{ systemctl cat ssh.socket; systemctl show ssh.socket -p Backlog; printf 'net.core.somaxconn='; cat /proc/sys/net/core/somaxconn; }} > {guest_result}/ssh-socket.txt"),
-    ]));
-    commands.push(command(&["sh", "-ec", &format!(
-        "uname -r > {guest_result}/ubuntu-kernel.txt; case $(uname -r) in 6.8.*) ;; *) exit 1;; esac; printf '1\\n' > /proc/sys/net/mptcp/enabled; cat /proc/sys/net/mptcp/enabled > {guest_result}/mptcp-enabled.txt; /usr/sbin/sshd -T > {guest_result}/sshd-config.txt; nginx -T > {guest_result}/nginx-config.txt 2>&1; dpkg-query -W linux-generic openssh-server nginx > {guest_result}/ubuntu-packages.txt; touch {guest_result}/ubuntu-ready"
-    )]));
+    let mut collect = format!(
+        "systemctl start {service}; mkdir -p /run/sshd; cat /boot/config-$(uname -r) > {guest_result}/ubuntu-kernel-config.txt; ss -ltnp > {guest_result}/listeners.txt; {{ systemctl cat ssh.socket; systemctl show ssh.socket -p Backlog; printf 'net.core.somaxconn='; cat /proc/sys/net/core/somaxconn; }} > {guest_result}/ssh-socket.txt; uname -r > {guest_result}/ubuntu-kernel.txt; case $(uname -r) in 6.8.*) ;; *) exit 1;; esac; cat /proc/sys/net/mptcp/enabled > {guest_result}/mptcp-enabled.txt; /usr/sbin/sshd -T > {guest_result}/sshd-config.txt; dpkg-query -W linux-generic openssh-server {service} > {guest_result}/ubuntu-packages.txt; ",
+        service = profile.name()
+    );
+    let evidence = match profile {
+        Profile::Nginx => format!("nginx -T > {guest_result}/nginx-config.txt 2>&1; "),
+        Profile::Caddy => format!(
+            "test \"$(cat /proc/sys/net/mptcp/enabled)\" = 1; caddy version > {guest_result}/caddy-version.txt; caddy build-info > {guest_result}/caddy-build-info.txt; cp /etc/caddy/Caddyfile {guest_result}/Caddyfile; cp /usr/share/caddy/index.html {guest_result}/caddy-index.html; caddy adapt --config /etc/caddy/Caddyfile > {guest_result}/caddy-config.json; systemctl cat caddy > {guest_result}/caddy-service.txt; systemctl show caddy -p Environment > {guest_result}/caddy-environment.txt; apt-cache policy caddy > {guest_result}/caddy-package-policy.txt; "
+        ),
+    };
+    collect.push_str(&evidence);
+    collect.push_str(&format!("touch {guest_result}/ubuntu-ready"));
+    commands.push(command(&["sh", "-ec", &collect]));
     let iso = seed(root, &format!("{label}-ubuntu"), false, true, commands)?;
     let disk = root.join(format!("{label}-ubuntu.qcow2"));
-    overlay(&root.join("ubuntu.qcow2"), &disk)?;
+    overlay(&root.join(format!("{reference}.qcow2")), &disk)?;
     let mut ubuntu = launch(
         root,
         &disk,
@@ -437,9 +506,10 @@ fn compare(root: &Path, label: &str, binary: &Path, selection: Selection) -> Res
     let selection_arg = match selection {
         Selection::All => "",
         Selection::Defaults => " --defaults",
+        Selection::IpOptions => " --ip-options",
     };
     commands.push(command(&["sh", "-c", &format!(
-        "/mnt/comparison/lib/ld-linux-x86-64.so.2 --library-path /mnt/comparison/lib /mnt/comparison/xtask honeypot-probe {guest_result}{selection_arg} > {guest_result}/probe.log 2>&1; echo $? > {guest_result}/probe-status; poweroff"
+        "/mnt/comparison/lib/ld-linux-x86-64.so.2 --library-path /mnt/comparison/lib /mnt/comparison/xtask honeypot-probe {} {guest_result}{selection_arg} > {guest_result}/probe.log 2>&1; echo $? > {guest_result}/probe-status; poweroff", profile.name()
     )]));
     let iso = seed(root, &format!("{label}-probe"), true, true, commands)?;
     let disk = root.join(format!("{label}-probe.qcow2"));
