@@ -201,6 +201,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
                         Arc::new(()),
                         || Mail { tls: false },
                         opts,
+                        serve::DEFAULT_MAX_CONNS,
                     )
                 })
                 .start(&fcx, attachments)?;
@@ -248,8 +249,13 @@ fn net_limits_a_starttls_handshake() {
             .ipv4_only()
             .limits(limits)
             .host("mail", |h| {
-                h.at(addr)
-                    .tcp_with(25, Arc::new(()), || Mail { tls: false }, opts)
+                h.at(addr).tcp_with(
+                    25,
+                    Arc::new(()),
+                    || Mail { tls: false },
+                    opts,
+                    serve::DEFAULT_MAX_CONNS,
+                )
             })
             .start(&fcx, attachments)?;
         let s = machine(&fcx, attacher.attach("agent")?, ME);

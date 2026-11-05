@@ -604,15 +604,13 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
             sandbox_budget: 100 << 10,
             ..Default::default()
         };
-        let capped = ServeOptions::default().max_conns(1);
-        let wide = ServeOptions::default();
         Net::new()
             .ipv4_only()
             .limits(limits)
             .host("svc", |h| {
                 h.at(addr)
-                    .tcp_with(7, Arc::new(()), || Echo, capped)
-                    .tcp_with(8, Arc::new(()), || Wide, wide)
+                    .tcp_with(7, Arc::new(()), || Echo, ServeOptions::default(), 1)
+                    .tcp(8, Arc::new(()), || Wide)
             })
             .start(&fcx, attachments)?;
         let s = machine(&fcx, attacher.attach("agent")?, ME);
@@ -632,6 +630,36 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
         assert_eq!(read_some(&fcx, &mut d, 6).await, b"hello\n");
         let mut e = s.tcp.connect(&fcx, to).await?;
         assert_eq!(read_some(&fcx, &mut e, 6).await, b"");
+        Ok(())
+    });
+}
+
+/// A port served with `tcp` takes the default cap: that many connections
+/// are served at once, and the next one is reset.
+#[test]
+fn net_serves_the_default_cap_of_connections_on_a_tcp_port() {
+    crate::common::world::world(Duration::from_secs(60), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let addr = Ipv4Addr::new(10, 40, 0, 3);
+        Net::new()
+            .ipv4_only()
+            .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Echo))
+            .start(&fcx, attachments)?;
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
+        let to = SocketAddr::new(addr.into(), 7);
+        let mut open = Vec::new();
+        for _ in 0..serve::DEFAULT_MAX_CONNS {
+            let mut conn = s.tcp.connect(&fcx, to).await?;
+            assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
+            open.push(conn);
+        }
+        let mut past = s.tcp.connect(&fcx, to).await?;
+        let mut buf = [0u8; 16];
+        let r = timeout(&fcx, Duration::from_secs(2), past.read(&fcx, &mut buf))
+            .await
+            .expect("an answer");
+        assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
+        drop(open);
         Ok(())
     });
 }

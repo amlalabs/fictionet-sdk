@@ -96,7 +96,15 @@ fn listen_serves_each_connection() {
     crate::common::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let opts = ServeOptions::default();
-        serve::listen(&fcx, server.listen(7)?, Arc::new(()), || Echo, opts, None);
+        serve::listen(
+            &fcx,
+            server.listen(7)?,
+            Arc::new(()),
+            || Echo,
+            opts,
+            serve::DEFAULT_MAX_CONNS,
+            None,
+        );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
             .await?;
@@ -120,6 +128,7 @@ fn timers_tick_and_idle_connections_close() {
             Arc::new(()),
             || Ticker { ticks: 0 },
             ServeOptions::default(),
+            serve::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -130,7 +139,15 @@ fn timers_tick_and_idle_connections_close() {
         assert!(fcx.now().since_start() - started.since_start() >= Duration::from_millis(90));
 
         let opts = ServeOptions::default().idle(Some(Duration::from_millis(100)));
-        serve::listen(&fcx, server.listen(2)?, Arc::new(()), || Echo, opts, None);
+        serve::listen(
+            &fcx,
+            server.listen(2)?,
+            Arc::new(()),
+            || Echo,
+            opts,
+            serve::DEFAULT_MAX_CONNS,
+            None,
+        );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 2))
             .await?;
@@ -191,7 +208,8 @@ fn a_connection_cap_resets_connections_past_it() {
             server.listen(7)?,
             Arc::new(()),
             || Echo,
-            ServeOptions::default().max_conns(2),
+            ServeOptions::default(),
+            2,
             None,
         );
         let to = SocketAddr::new(SERVER.into(), 7);
@@ -332,6 +350,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
             Arc::new(()),
             || Short,
             ServeOptions::default(),
+            serve::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -436,6 +455,7 @@ fn another_connection_wakes_a_service_to_push_a_fill() {
                 inbox: Arc::default(),
             },
             ServeOptions::default(),
+            serve::DEFAULT_MAX_CONNS,
             None,
         );
         let to = SocketAddr::new(SERVER.into(), 9000);
@@ -555,6 +575,7 @@ fn continuous_input_cannot_starve_a_timer() {
             Arc::new(()),
             || Session { lines: 0, beats: 0 },
             ServeOptions::default(),
+            serve::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -704,6 +725,7 @@ fn keyed_work_interleaves_two_responses_while_reads_go_on() {
                 baton: shared.clone(),
             },
             ServeOptions::default(),
+            serve::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -891,6 +913,7 @@ fn a_seeded_run_repeats_its_randomness() {
                     Arc::new(()),
                     || Dice,
                     ServeOptions::default(),
+                    serve::DEFAULT_MAX_CONNS,
                     None,
                 );
                 let mut got = Vec::new();
@@ -926,7 +949,8 @@ fn a_connection_counts_until_its_socket_is_gone() {
             server.listen(7)?,
             Arc::new(()),
             || Echo,
-            ServeOptions::default().max_conns(1),
+            ServeOptions::default(),
+            1,
             None,
         );
         let to = SocketAddr::new(SERVER.into(), 7);

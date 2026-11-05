@@ -15,7 +15,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::services::serve::{Flow, ServeOptions};
+use fictionet::stdlib::services::serve::{DEFAULT_MAX_CONNS, Flow, ServeOptions};
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::{
     network::{Connection, delay, filter},
@@ -148,6 +148,7 @@ async fn episode(
                 Arc::new(()),
                 || Echo,
                 ServeOptions::default().idle(Some(Duration::from_secs(120))),
+                DEFAULT_MAX_CONNS,
             )
         })
         .host("https", |h| {

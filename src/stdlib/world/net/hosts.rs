@@ -141,15 +141,22 @@ struct ServiceAccept<S: Service, M> {
     state: Arc<S::State>,
     make: M,
     opts: ServeOptions,
+    max_conns: usize,
     open: Arc<AtomicUsize>,
 }
 
 impl<S: Service, M> ServiceAccept<S, M> {
-    fn new(state: Arc<S::State>, make: M, opts: ServeOptions) -> ServiceAccept<S, M> {
+    fn new(
+        state: Arc<S::State>,
+        make: M,
+        opts: ServeOptions,
+        max_conns: usize,
+    ) -> ServiceAccept<S, M> {
         ServiceAccept {
             state,
             make,
             opts,
+            max_conns,
             open: Arc::default(),
         }
     }
@@ -162,7 +169,7 @@ where
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
+        let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
             arrival.socket.reset();
             return Box::pin(async {});
         };
@@ -309,7 +316,8 @@ impl Host {
     }
 
     /// Serves TCP `port` with a [`Service`] made by `make` for each
-    /// connection, sharing `world`, with the default [`ServeOptions`].
+    /// connection, sharing `world`, with the default [`ServeOptions`], at
+    /// most [`DEFAULT_MAX_CONNS`](serve::DEFAULT_MAX_CONNS) at once.
     /// Connections are numbered and identify their sandbox in [`ConnInfo`].
     pub fn tcp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
@@ -317,26 +325,34 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
-        self.tcp_with(port, state, make, ServeOptions::default())
+        self.tcp_with(
+            port,
+            state,
+            make,
+            ServeOptions::default(),
+            serve::DEFAULT_MAX_CONNS,
+        )
     }
 
-    /// The same with these options: a transcript, a fault plan, an idle
-    /// limit, a connection cap, a STARTTLS config. The sandbox's budget
-    /// applies when `opts` has none. A STARTTLS handshake has
-    /// [`Limits::handshake`], whatever `opts` says.
+    /// The same with these options (an idle limit, a STARTTLS config) and
+    /// at most `max_conns` connections at once. Past that, a new one is
+    /// reset as soon as it is accepted, and each counts until its socket is
+    /// gone. The sandbox's budget applies when `opts` has none. A STARTTLS
+    /// handshake has [`Limits::handshake`], whatever `opts` says.
     pub fn tcp_with<S, M>(
         self,
         port: u16,
         state: Arc<S::State>,
         make: M,
         opts: ServeOptions,
+        max_conns: usize,
     ) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
-        self.port_server(port, ServiceAccept::new(state, make, opts))
+        self.port_server(port, ServiceAccept::new(state, make, opts, max_conns))
     }
 
     /// Serves TCP `port` with TLS for the names `sni` gives, then a
@@ -356,7 +372,12 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
-        let accept = ServiceAccept::new(state, make, ServeOptions::default());
+        let accept = ServiceAccept::new(
+            state,
+            make,
+            ServeOptions::default(),
+            serve::DEFAULT_MAX_CONNS,
+        );
         self.tls_accept(port, sni, config_for, accept)
     }
 

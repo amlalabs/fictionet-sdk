@@ -67,7 +67,7 @@
 //! # fn start(fcx: &Cx, side: fictionet::End) -> Result {
 //! let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, side);
 //! let machine = tcp::endpoint(fcx, tcp, "10.0.0.10".parse()?);
-//! serve::listen(fcx, machine.listen(7)?, Arc::new(()), || Echo, serve::ServeOptions::default(), None);
+//! serve::listen(fcx, machine.listen(7)?, Arc::new(()), || Echo, serve::ServeOptions::default(), serve::DEFAULT_MAX_CONNS, None);
 //! # Ok(())
 //! # }
 //! ```
@@ -981,14 +981,16 @@ pub type SandboxOf = Arc<dyn Fn(std::net::IpAddr) -> Option<Sandbox> + Send + Sy
 /// rejects the handshake with `unrecognized_name`.
 pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> + Send + Sync>;
 
-/// How [`listen`] and [`connection`] run a stream service.
+/// The connections a listener serves at once unless told otherwise: what
+/// [`Host::tcp`](fictionet::stdlib::world::net::Host::tcp) and
+/// [`Host::tls`](fictionet::stdlib::world::net::Host::tls) use. See
+/// [`listen`].
+pub const DEFAULT_MAX_CONNS: usize = 64;
+
+/// How [`connection`] serves one stream connection, for itself or for a
+/// listener.
 #[derive(Clone)]
 pub struct ServeOptions {
-    /// Connections served at once, by a listener ([`listen`], or a port of
-    /// [`Net`](fictionet::stdlib::world::net::Net)); past this, a new one is
-    /// reset as soon as it is accepted, and counts until its socket is
-    /// gone. Default 64.
-    pub max_conns: usize,
     /// Close a connection after this long with no bytes from the client,
     /// while the driver waits for them. Default 10 seconds. `None` waits
     /// forever.
@@ -1015,7 +1017,6 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
-            max_conns: 64,
             idle: Some(Duration::from_secs(10)),
             write_timeout: Some(Duration::from_secs(10)),
             tls: None,
@@ -1030,7 +1031,6 @@ impl Default for ServeOptions {
 impl std::fmt::Debug for ServeOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServeOptions")
-            .field("max_conns", &self.max_conns)
             .field("idle", &self.idle)
             .field("write_timeout", &self.write_timeout)
             .field("tls", &self.tls.is_some())
@@ -1080,11 +1080,6 @@ impl ServeOptions {
             write_timeout,
             ..self
         }
-    }
-
-    /// Sets the connection cap.
-    pub fn max_conns(self, max_conns: usize) -> ServeOptions {
-        ServeOptions { max_conns, ..self }
     }
 
     /// Charges every connection to `budget`.
@@ -2346,12 +2341,13 @@ pub async fn accept_tls<C: Connection, F: Future<Output = Option<Arc<ServerConfi
 /// Accepts connections on `listener` and serves each with a fresh service
 /// from `make`, in a task of its own, until the listener closes or the
 /// region is cancelled. With [`ServeOptions::tls`], each connection shakes
-/// hands first. Past [`ServeOptions::max_conns`], a new connection is
-/// reset; each counts until its socket is gone, so a client that never
-/// finishes closing cannot open more. Connections are numbered from 1, in
-/// the order they are accepted. `sandbox` names the sandbox each
-/// connection came from, by its peer address, in its [`ConnInfo`].
-/// Returns the accepting task.
+/// hands first. At most `max_conns` connections are served at once
+/// ([`DEFAULT_MAX_CONNS`] is the usual choice); past that, a new one is
+/// reset as soon as it is accepted. Each counts until its socket is gone,
+/// so a client that never finishes closing cannot open more. Connections
+/// are numbered from 1, in the order they are accepted. `sandbox` names
+/// the sandbox each connection came from, by its peer address, in its
+/// [`ConnInfo`]. Returns the accepting task.
 ///
 /// A connection's failure ends its task with `Ok`, so it does not fail the world.
 pub fn listen<S, M, A: Accept>(
@@ -2360,6 +2356,7 @@ pub fn listen<S, M, A: Accept>(
     state: Arc<S::State>,
     make: M,
     opts: ServeOptions,
+    max_conns: usize,
     sandbox: Option<SandboxOf>,
 ) -> Task
 where
@@ -2382,7 +2379,7 @@ where
             info.sandbox = info
                 .peer
                 .and_then(|peer| sandbox.as_ref().and_then(|f| f(peer.ip())));
-            let Some(guard) = Counted::enter(&open, opts.max_conns) else {
+            let Some(guard) = Counted::enter(&open, max_conns) else {
                 conn.reset();
                 continue;
             };
@@ -2911,8 +2908,8 @@ where
     }
 
     /// The same with `opts`: an idle limit and a budget.
-    /// The standalone entropy stream starts from `seed`. TLS and the
-    /// connection cap are not used.
+    /// The standalone entropy stream starts from `seed`. TLS is not
+    /// used.
     pub fn with_options(seed: Seed, service: S, state: S::State, opts: ServeOptions) -> Harness<S> {
         let info = ConnInfo {
             id: Some(1),

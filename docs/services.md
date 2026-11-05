@@ -521,8 +521,9 @@ body framing, so a clean FIN short of Content-Length is not detected.
 
 Other kinds of port:
 
-- `tcp_with(port, world, make, opts)`: the same, with `ServeOptions` for
-  a connection cap, an idle limit or a STARTTLS config.
+- `tcp_with(port, world, make, opts, max_conns)`: the same, with
+  `ServeOptions` for an idle limit or a STARTTLS config, and a cap on the
+  connections served at once (`tcp` uses `DEFAULT_MAX_CONNS`, 64).
 - `udp(port, world, make)`: one `DatagramService` for the port, which
   gets every datagram, each decoded on its own as DNS and Modbus over UDP
   frame their messages. Its `on_item` replies to the datagram's sender and
