@@ -2370,8 +2370,7 @@ mod tests {
             ),
             (Response::Data(vec![]), b"*\r\n"),
         ] {
-            assert_eq!(value.to_bytes().unwrap(), bytes);
-            let _ = assert_write(&value);
+            assert_eq!(assert_write(&value).unwrap(), bytes);
         }
         let fetch = Response::fetch(
             1,
@@ -3212,6 +3211,7 @@ mod tests {
     fn generated_streams_obey_contracts() {
         let mut rng = Lcg::new(0x1ee7_1ee7);
         let (mut commands, mut replies) = (0, 0);
+        // These short inputs stay writable after parsing, including section quoting.
         for _ in 0..1024 {
             let bytes = generated_stream(&mut rng);
             let chunked_commands = decode_chunks(
@@ -3231,10 +3231,10 @@ mod tests {
                 },
             );
             if let Ok(value) = Command::parse(&bytes) {
-                let _ = assert_write(&value);
+                assert_write(&value).unwrap();
             }
             if let Ok(value) = Response::parse(&bytes) {
-                let _ = assert_write(&value);
+                assert_write(&value).unwrap();
             }
             let whole_commands = decode_all(Inputs::new, &bytes);
             let whole_responses = decode_all(Responses::new, &bytes);
@@ -3243,12 +3243,12 @@ mod tests {
             for item in whole_commands.0 {
                 if let Ok(Input::Command(command)) = item {
                     commands += 1;
-                    let _ = assert_write(&command);
+                    assert_write(&command).unwrap();
                 }
             }
             for reply in whole_responses.0.into_iter().flatten() {
                 replies += 1;
-                let _ = assert_write(&reply);
+                assert_write(&reply).unwrap();
             }
         }
         assert!(commands > 100);
@@ -3313,7 +3313,7 @@ mod tests {
                 code: Some(text.clone()),
                 text: text.clone(),
             });
-            let _ = assert_write(&Response::continue_req(&text));
+            assert_write(&Response::continue_req(&text)).unwrap();
         }
         assert!(
             commands_written > 500,

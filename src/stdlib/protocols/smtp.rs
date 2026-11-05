@@ -1356,12 +1356,9 @@ mod tests {
         let message = Data {
             bytes: b"Subject: hi\r\n\r\n.\r\n..dots\r\n\xff\r\n".to_vec(),
         };
-        let wire = message.to_bytes().unwrap();
+        let wire = assert_write(&message).unwrap();
         assert_eq!(wire, b"Subject: hi\r\n\r\n..\r\n...dots\r\n\xff\r\n.\r\n");
         assert_eq!(Data::parse(&wire), Ok(message));
-        if let Ok(value) = <Data as Wire>::parse(&wire) {
-            let _ = assert_write(&value);
-        }
         decode_chunks(
             &mut Stream::new(data_server()),
             chunks(&wire, &[1, 7, 64]),
@@ -1568,16 +1565,16 @@ mod tests {
             );
             assert_eq!(fragmented, decode_all(data_server, &bytes));
             if let Ok(value) = <Command as Wire>::parse(&bytes) {
-                let _ = assert_write(&value);
+                assert_write(&value).unwrap();
             }
             if let Ok(value) = <Request as Wire>::parse(&bytes) {
-                let _ = assert_write(&value);
+                assert_write(&value).unwrap();
             }
             if let Ok(value) = <Reply as Wire>::parse(&bytes) {
-                let _ = assert_write(&value);
+                assert_write(&value).unwrap();
             }
             if let Ok(value) = <Data as Wire>::parse(&bytes) {
-                let _ = assert_write(&value);
+                assert_write(&value).unwrap();
             }
             let _ = assert_write(&Command::new(&rng.text(20), Some(&rng.text(520))));
             let _ = assert_write(&Data {
