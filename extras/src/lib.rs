@@ -32,6 +32,7 @@ pub mod args;
 pub mod hyper_io;
 pub mod linux;
 pub mod log;
+pub mod whois;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod dom;

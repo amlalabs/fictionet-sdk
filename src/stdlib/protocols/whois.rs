@@ -10,14 +10,8 @@
 //! answers with free text and closes the connection, and the close is the
 //! only sign the answer is over. This module follows RFC 3912.
 //!
-//! RFC 3912 says nothing about what a query or an answer holds, so this
-//! module also reads what the large registries have in common. Queries
-//! may start with flags in the style of the RIPE database, such as
-//! `-B -T inetnum 193.0.0.0`, which RIPE, APNIC, AFRINIC, LACNIC, RADb and
-//! DENIC accept. [`Query::flags`] splits them out as text and
-//! [`Query::terms`] gives the rest. Other forms stay in the terms as they
-//! were sent: ARIN's `n + 8.8.8.8`, Verisign's `domain example.com` and
-//! `=example.com`, and JPRS's `example.jp/e`. Answers are mostly lines of
+//! RFC 3912 leaves query contents to the registry. Queries preserve that
+//! text without interpreting flags. Answers are mostly lines of
 //! `Key: value`, with comment lines, blank lines between objects, and
 //! values that go on over more lines. A [`FieldReader`] reads that layout
 //! into [`Field`]s, and [`Referral::from_field`] finds where a thin answer
@@ -51,8 +45,7 @@
 //! let bytes = b"example.com\r\n";
 //! assert_eq!(decoder.push(bytes), bytes.len());
 //! let got = decoder.next().unwrap().unwrap().unwrap();
-//! assert!(got.flags().is_empty());
-//! assert_eq!(got.terms(), "example.com");
+//! assert_eq!(got.as_str(), "example.com");
 //!
 //! // It answers with two fields, then closes the connection.
 //! let fields = [
@@ -100,69 +93,6 @@ pub const MAX_HOST: usize = 253;
 /// value.
 pub const CONTINUATION_INDENT: &str = "        ";
 
-/// Flags in the style of the RIPE database that take the word after them
-/// as an argument, such as `-T inetnum`. [`Query::flags`] uses this list.
-///
-/// `-C` is not in it. The RIPE database reads `-C` (`--no-irt`) on its
-/// own, while DENIC reads `-C` with a character set, as in
-/// `-T dn,ace -C UTF-8 example.de`. So `-C` takes the next word only when
-/// that word is one of DENIC's character sets: `UTF-8`, `ISO-8859-1` or
-/// `US-ASCII`, in any case.
-pub const FLAGS_WITH_ARGUMENT: &[&str] = &[
-    "-i",
-    "-T",
-    "-s",
-    "-S",
-    "-t",
-    "-v",
-    "-q",
-    "-V",
-    "-g",
-    "-Z",
-    "--inverse",
-    "--select-types",
-    "--sources",
-    "--resources",
-    "--template",
-    "--verbose",
-    "--client",
-    "--show-version",
-    "--diff-versions",
-    "--charset",
-];
-
-/// The character sets DENIC's `-C` takes. See [`FLAGS_WITH_ARGUMENT`].
-const DENIC_CHARSETS: &[&str] = &["UTF-8", "ISO-8859-1", "US-ASCII"];
-
-/// Whether flag word `w` takes the next word as its argument. A word of
-/// short flags grouped together, such as `-Bi`, reads as getopt reads it:
-/// the first flag in it that takes an argument takes the rest of the word,
-/// or the next word if it is last.
-fn takes_next_word(w: &str, next: &str) -> bool {
-    if FLAGS_WITH_ARGUMENT.contains(&w) {
-        return true;
-    }
-    if w == "-C" {
-        return DENIC_CHARSETS.iter().any(|c| c.eq_ignore_ascii_case(next));
-    }
-    let Some(group) = w.strip_prefix('-') else {
-        return false;
-    };
-    if group.starts_with('-') {
-        return false;
-    }
-    let mut chars = group.chars();
-    while let Some(c) = chars.next() {
-        let wants = FLAGS_WITH_ARGUMENT
-            .iter()
-            .any(|f| f.strip_prefix('-').is_some_and(|r| r.chars().eq([c])));
-        if wants {
-            return chars.as_str().is_empty();
-        }
-    }
-    false
-}
-
 /// Why a query line or a response could not be read or written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
@@ -173,11 +103,6 @@ pub enum Error {
     /// The query line held a control character other than a tab, such as
     /// a CR on its own. The value is the character.
     Control(char),
-    /// [`Query::build`] was given flags and terms that would not read back
-    /// as given: a flag that is empty or holds a space or tab, a word that
-    /// does not start with a dash where a flag should be, a flag that wants
-    /// an argument and has none, or terms whose first word reads as a flag.
-    Flags,
     /// The query line was not terminated.
     Incomplete,
     /// Bytes followed the query line.
@@ -203,7 +128,6 @@ fictionet::error_display!(Error, f, {
     Error::Control(c) => {
         write!(f, "control character {:#x} in a query line", u32::from(*c))
     }
-    Error::Flags => f.write_str("query flags and terms that would not read back as given"),
     Error::Incomplete => f.write_str("incomplete WHOIS query"),
     Error::Trailing => f.write_str("bytes after WHOIS query"),
     Error::Unwritable => f.write_str("value cannot be written without changing it"),
@@ -219,17 +143,6 @@ pub struct Query {
     text: String,
 }
 
-/// A flag at the start of a query, as text, such as `-B`, or `-T` with
-/// its argument `inetnum`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Flag<'a> {
-    /// The flag itself, with its dashes.
-    pub name: &'a str,
-    /// The word after the flag, for flags that take one. See
-    /// [`Query::flags`].
-    pub argument: Option<&'a str>,
-}
-
 impl Query {
     /// A query with this text. It is an error if the text is longer than
     /// [`MAX_QUERY`] bytes or holds a control character other than a tab.
@@ -238,39 +151,6 @@ impl Query {
         Ok(Query {
             text: text.to_string(),
         })
-    }
-
-    /// A query of `flags` and then `terms`, each word with one space
-    /// between. A flag's argument is its own word in `flags`, as in
-    /// `["-T", "inetnum"]`. The same checks as [`Query::new`] apply. It is
-    /// also an error, [`Error::Flags`], if [`Query::flags`] and
-    /// [`Query::terms`] would not read the query back as these flags and
-    /// these terms without space at either end.
-    pub fn build(flags: &[&str], terms: &str) -> Result<Query, Error> {
-        let mut text = String::new();
-        for f in flags {
-            if f.is_empty() || f.contains([' ', '\t']) {
-                return Err(Error::Flags);
-            }
-            if text.len().saturating_add(f.len()) > MAX_QUERY {
-                return Err(Error::QueryTooLong);
-            }
-            text.push_str(f);
-            text.push(' ');
-        }
-        if text.len().saturating_add(terms.len()) > MAX_QUERY {
-            return Err(Error::QueryTooLong);
-        }
-        text.push_str(terms);
-        let query = Query::new(&text)?;
-        let (read, read_terms) = query.split();
-        let words = read
-            .iter()
-            .flat_map(|f| std::iter::once(f.name).chain(f.argument));
-        if !words.eq(flags.iter().copied()) || read_terms != trim(terms) {
-            return Err(Error::Flags);
-        }
-        Ok(query)
     }
 
     /// Reads a query line: the bytes before its line ending, with no CR
@@ -287,67 +167,6 @@ impl Query {
     pub fn as_str(&self) -> &str {
         &self.text
     }
-
-    /// The flags at the start of the query: each word that starts with a
-    /// dash and has more after it, up to the first word that does not.
-    /// A flag in [`FLAGS_WITH_ARGUMENT`] takes the next word with it, and
-    /// so does a group of short flags in one word, such as `-Bi`, that
-    /// ends with one. A group with such a flag inside, such as `-Tinetnum`,
-    /// holds its argument and stays one [`Flag`] with no `argument`. Flags
-    /// after the first term are part of the terms.
-    pub fn flags(&self) -> Vec<Flag<'_>> {
-        self.split().0
-    }
-
-    /// The query after its flags, without space at either end. For a
-    /// query with no flags, this is the whole text, trimmed.
-    pub fn terms(&self) -> &str {
-        self.split().1
-    }
-
-    fn split(&self) -> (Vec<Flag<'_>>, &str) {
-        let words = words(&self.text);
-        let mut flags = Vec::new();
-        let mut i = 0;
-        while let Some(&(_, w)) = words.get(i) {
-            if !(w.len() > 1 && w.starts_with('-')) {
-                break;
-            }
-            i += 1;
-            let mut argument = None;
-            if let Some(&(_, a)) = words.get(i)
-                && takes_next_word(w, a)
-            {
-                argument = Some(a);
-                i += 1;
-            }
-            flags.push(Flag { name: w, argument });
-        }
-        let terms = match words.get(i) {
-            Some(&(start, _)) => trim(&self.text[start..]),
-            None => "",
-        };
-        (flags, terms)
-    }
-}
-
-/// The words of `s`, split at spaces and tabs, with where each starts.
-fn words(s: &str) -> Vec<(usize, &str)> {
-    let mut out = Vec::new();
-    let mut start = None;
-    for (i, c) in s.char_indices() {
-        if c == ' ' || c == '\t' {
-            if let Some(st) = start.take() {
-                out.push((st, &s[st..i]));
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    if let Some(st) = start {
-        out.push((st, &s[st..]));
-    }
-    out
 }
 
 fn check_query(text: &str) -> Result<(), Error> {
@@ -1043,10 +862,6 @@ mod tests {
         assert_write, chunks, decode_all, decode_chunks, mutate,
     };
 
-    fn flag<'a>(name: &'a str, argument: Option<&'a str>) -> Flag<'a> {
-        Flag { name, argument }
-    }
-
     fn referral(kind: ReferralKind, host: String, port: u16) -> Referral {
         Referral { kind, host, port }
     }
@@ -1139,67 +954,21 @@ mod tests {
     }
 
     #[test]
-    fn registry_flags() {
-        let q = Query::new("-B -T inetnum 193.0.0.1").unwrap();
-        assert_eq!(q.flags(), [flag("-B", None), flag("-T", Some("inetnum"))]);
-        assert_eq!(q.terms(), "193.0.0.1");
-        let q = Query::new("-T dn,ace example.de").unwrap();
-        assert_eq!(q.flags(), [flag("-T", Some("dn,ace"))]);
-        assert_eq!(q.terms(), "example.de");
-        let q = Query::new("  --sources\tRIPE  -r   AS3333  ").unwrap();
-        assert_eq!(
-            q.flags(),
-            [flag("--sources", Some("RIPE")), flag("-r", None)]
-        );
-        assert_eq!(q.terms(), "AS3333");
-        // ARIN and Verisign keywords stay in the terms.
-        let q = Query::new("n + 8.8.8.8").unwrap();
-        assert!(q.flags().is_empty());
-        assert_eq!(q.terms(), "n + 8.8.8.8");
-        assert_eq!(
-            Query::new("domain example.com").unwrap().terms(),
-            "domain example.com"
-        );
-        assert_eq!(Query::new("=example.com").unwrap().terms(), "=example.com");
-        // A flag that wants an argument at the end has none.
-        let q = Query::new("-i").unwrap();
-        assert_eq!(q.flags(), [flag("-i", None)]);
-        assert_eq!(q.terms(), "");
-        // A dash alone is a term.
-        assert_eq!(Query::new("- x").unwrap().terms(), "- x");
-        // Built from parts.
-        let q = Query::build(&["-B", "-T", "inetnum"], "193.0.0.1").unwrap();
-        assert_eq!(q.as_str(), "-B -T inetnum 193.0.0.1");
-    }
-
-    #[test]
-    fn denic_charset_flag() {
-        // DENIC's `-C` takes a character set, as whois clients send it.
-        let q = Query::new("-T dn,ace -C UTF-8 example.de").unwrap();
-        assert_eq!(
-            q.flags(),
-            [flag("-T", Some("dn,ace")), flag("-C", Some("UTF-8"))]
-        );
-        assert_eq!(q.terms(), "example.de");
-    }
-
-    #[test]
-    fn build_reads_back_as_given() {
-        // Terms that start like a flag would be read as one.
-        assert_eq!(Query::build(&["-B"], "-r 193.0.0.1"), Err(Error::Flags));
-        // A flag word that is not a flag would be read as a term.
-        assert_eq!(Query::build(&["inetnum"], "193.0.0.1"), Err(Error::Flags));
-        // Flags must be one word each.
-        assert_eq!(Query::build(&["-B -r"], "x"), Err(Error::Flags));
-        assert_eq!(Query::build(&[""], "x"), Err(Error::Flags));
-        // A flag that takes an argument and has none eats the terms.
-        assert_eq!(Query::build(&["-T"], "inetnum"), Err(Error::Flags));
-        // These read back as given.
-        let q = Query::build(&["-T", "dn,ace", "-C", "UTF-8"], " example.de ").unwrap();
-        assert_eq!(q.terms(), "example.de");
-        assert_eq!(q.flags().len(), 2);
-        assert_eq!(Query::build(&["-B"], "").unwrap().as_str(), "-B ");
-        assert_eq!(Query::build(&[], "- x").unwrap().terms(), "- x");
+    fn queries_preserve_registry_text() {
+        for text in [
+            "-B -T inetnum 193.0.0.1",
+            "-T dn,ace -C UTF-8 example.de",
+            "  --sources\tRIPE  -r   AS3333  ",
+            "n + 8.8.8.8",
+            "domain example.com",
+            "=example.com",
+            "-i",
+            "- x",
+        ] {
+            let query = Query::new(text).unwrap();
+            assert_eq!(query.as_str(), text);
+            assert_eq!(Query::parse(&query.to_bytes().unwrap()), Ok(query));
+        }
     }
 
     #[test]
@@ -1218,17 +987,7 @@ mod tests {
             Query::new(&"a".repeat(MAX_QUERY + 1)),
             Err(Error::QueryTooLong)
         );
-        assert_eq!(Query::build(&["x"; 2000], ""), Err(Error::QueryTooLong));
-        assert_eq!(
-            Query::build(&[&"a".repeat(MAX_QUERY)], "b"),
-            Err(Error::QueryTooLong)
-        );
-        for e in [
-            Error::QueryTooLong,
-            Error::NotUtf8,
-            Error::Control('\0'),
-            Error::Flags,
-        ] {
+        for e in [Error::QueryTooLong, Error::NotUtf8, Error::Control('\0')] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1625,21 +1384,6 @@ mod tests {
             for q in decode_all(Queries::new, &data).0.iter().flatten() {
                 let _ = assert_write(q);
                 q.to_bytes().unwrap();
-                assert!(q.flags().len() <= q.as_str().len());
-                assert!(q.terms().len() <= q.as_str().len());
-            }
-            let text = String::from_utf8_lossy(&data);
-            let mut parts: Vec<_> = text.split(' ').collect();
-            let terms = parts.pop().unwrap_or("");
-            if let Ok(query) = Query::build(&parts, terms) {
-                let words: Vec<_> = query
-                    .flags()
-                    .iter()
-                    .flat_map(|f| std::iter::once(f.name).chain(f.argument))
-                    .collect();
-                assert_eq!(words, parts);
-                assert_eq!(query.terms(), trim(terms));
-                let _ = assert_write(&query);
             }
             let response = &decode_all(CollectedResponses::new, &data).0[0].response;
             let fields = response.fields().unwrap();
@@ -1712,50 +1456,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn ripe_flags_read_as_ripe_documents_them() {
-        // RIPE's `-C` (`--no-irt`) takes no argument, so the address is the
-        // term. DENIC's `-C` takes a character set name.
-        let q = Query::new("-C 193.0.0.1").unwrap();
-        assert_eq!(q.flags(), [flag("-C", None)]);
-        assert_eq!(q.terms(), "193.0.0.1");
-        assert_eq!(Query::new("-C AS3333 x").unwrap().terms(), "AS3333 x");
-        assert_eq!(
-            Query::new("-C utf-8 example.de").unwrap().flags()[0].argument,
-            Some("utf-8")
-        );
-        assert_eq!(
-            Query::build(&["-C"], "193.0.0.1").unwrap().terms(),
-            "193.0.0.1"
-        );
-        // `-Z` (`--charset`) and `-S` (`--resources`) take an argument.
-        let q = Query::new("-Z UTF-8 AS3333").unwrap();
-        assert_eq!(q.flags(), [flag("-Z", Some("UTF-8"))]);
-        assert_eq!(q.terms(), "AS3333");
-        assert_eq!(
-            Query::new("-S ARIN-GRS 193.201.1.1").unwrap().terms(),
-            "193.201.1.1"
-        );
-        assert_eq!(
-            Query::new("--charset UTF-8 AS3333").unwrap().terms(),
-            "AS3333"
-        );
-        // Short flags grouped in one word: the last one may take the
-        // next word, and one inside the group takes the rest of the word.
-        let q = Query::new("-Bi tech-c DW-RIPE").unwrap();
-        assert_eq!(q.flags(), [flag("-Bi", Some("tech-c"))]);
-        assert_eq!(q.terms(), "DW-RIPE");
-        let q = Query::new("-Tas-set AS-FOO").unwrap();
-        assert_eq!(q.flags(), [flag("-Tas-set", None)]);
-        assert_eq!(q.terms(), "AS-FOO");
-        assert_eq!(Query::new("-rB AS3333").unwrap().terms(), "AS3333");
-        assert_eq!(
-            Query::build(&["-Bi", "origin"], "AS3333").unwrap().terms(),
-            "AS3333"
-        );
-        assert_eq!(Query::build(&["-Bi"], "origin AS3333"), Err(Error::Flags));
     }
 
     #[test]

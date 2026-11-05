@@ -21,19 +21,6 @@ fn built(data: &[u8]) -> Result<()> {
     if let Ok(q) = Query::new(&text) {
         assert_eq!(decode_all(Queries::new, &q.to_bytes().unwrap()).0, [Ok(q)]);
     }
-    let flags: Vec<&str> = u.arbitrary()?;
-    let terms: &str = u.arbitrary()?;
-    if let Ok(q) = Query::build(&flags, terms) {
-        // The flags and terms read back as given.
-        let words: Vec<&str> = q
-            .flags()
-            .iter()
-            .flat_map(|f| std::iter::once(f.name).chain(f.argument))
-            .collect();
-        assert_eq!(words, flags);
-        assert_eq!(q.terms(), terms.trim_matches([' ', '\t']));
-        assert_eq!(decode_all(Queries::new, &q.to_bytes().unwrap()).0, [Ok(q)]);
-    }
     let n = u.int_in_range(0..=8usize)?;
     let mut fields = Vec::new();
     let mut block = 0usize;
@@ -124,7 +111,6 @@ fuzz_target!(|data: &[u8]| {
     for query in decode_all(Queries::new, data).0.iter().flatten() {
         let _ = assert_write(query);
         assert_eq!(Query::parse(&query.to_bytes().unwrap()).as_ref(), Ok(query));
-        let _ = (query.flags(), query.terms());
     }
 
     let (responses, failure) = decode_all(CollectedResponses::new, data);
