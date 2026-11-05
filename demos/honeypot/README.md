@@ -9,8 +9,7 @@ The honeypot contains no exploit code.
 Nothing in the world is a real kernel. The server is Fictionet's TCP stack
 and world code, and it never executes client commands. The deployment host
 still needs a fixed kernel: disabling MPTCP does not protect ordinary IPv4
-TCP listeners. See [MPTCP-TARGET.md](MPTCP-TARGET.md) for the scope, vendor
-status and reference-server choice.
+TCP listeners.
 
 ## What the server presents
 
@@ -35,9 +34,8 @@ from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
   ordinary TCP, with up to 1,000 requests, 75 seconds between requests and no
   TCP keepalives. The default profile is `--http-profile caddy`.
 
-The transport profile targets Ubuntu 24.04's Linux 6.8 kernel. The measured
-comparison and remaining differences are in [DIFF.md](DIFF.md).
-Listener backlogs match the reference guest: 4,096 for systemd's `ssh.socket`
+The transport profile targets Ubuntu 24.04's Linux 6.8 kernel.
+Listener backlogs match Ubuntu 24.04: 4,096 for systemd's `ssh.socket`
 and Caddy, capped by the kernel's `net.core.somaxconn`; nginx uses 511.
 The unmodified [Caddy page](src/caddy.html) comes from
 [caddyserver/dist](https://github.com/caddyserver/dist/tree/master/welcome),
@@ -196,61 +194,6 @@ cannot draw answers to the sandbox. It drops those from addresses no router
 forwards from, such as loopback, multicast or broadcast addresses, and the
 server answers no SYN from an address that cannot be one host's, as Linux
 answers none.
-
-## Comparing with Ubuntu locally
-
-The comparison uses two QEMU guests and the honeypot's socket mode beside
-them. One guest runs updated Ubuntu 24.04, its generic 6.8 kernel, OpenSSH,
-the selected Caddy or nginx package. Caddy requires the guest's observed MPTCP
-setting to be enabled; the harness does not change that setting. The other runs every probe. QEMU's userspace
-socket backends connect the guest NICs; a userspace Ethernet adapter forwards
-the probe guest's IP packets into the honeypot's Unix socket. No host NIC,
-network namespace, route, firewall or kernel module is changed.
-
-Prerequisites are accessible KVM, `qemu-system-x86_64`, `qemu-img`,
-`genisoimage`, `objcopy`, `ldd`, `sha256sum`, and a user systemd manager.
-From this worktree on the home volume:
-
-```sh
-mkdir -p target/honeypot-diff/tmp
-export TMPDIR="$PWD/target/honeypot-diff/tmp"
-systemd-run --user --scope -p MemoryMax=32G env CARGO_BUILD_JOBS=8 \
-    cargo xtask honeypot-diff prepare caddy
-systemd-run --user --scope -p MemoryMax=32G env CARGO_BUILD_JOBS=8 \
-    cargo build -p honeypot-world
-systemd-run --user --scope -p MemoryMax=32G env CARGO_BUILD_JOBS=8 \
-    cargo xtask honeypot-diff run caddy comparison
-```
-
-`prepare` downloads the official cloud image and verifies its published
-SHA-256 checksum, then installs current updates inside the guests. All images,
-seeds and results stay under the ignored `target/honeypot-diff` directory.
-Prepared disks are reused; remove that directory to provision fresh updates.
-Each run requires a new name so observations cannot be overwritten. An optional
-argument after the name selects a previously built honeypot binary. Use `nginx`
-instead of `caddy` to prepare and compare the separate nginx reference disk.
-
-Use `cargo xtask honeypot-diff defaults PROFILE NAME [HONEYPOT_BINARY]` in the same
-systemd scope to repeat only the HTTP idle-close probes and guest configuration
-inspection, including listener backlogs. This omits SSH, raw packet and Nmap
-probes. The honeypot's exact backlog boundaries are covered by
-`service_backlogs_start_cookies_at_their_own_limits` in its integration tests.
-
-`cargo xtask honeypot-diff ip-options PROFILE NAME [HONEYPOT_BINARY]` runs only
-the benign IPv4-option comparison. The guest sends two identical well-formed
-SYNs, 750 ms apart, with no completing ACK or close. An unassigned guest-side
-source address and userspace ARP prevent automatic kernel resets without
-changing network settings. This observes normal pending retransmission, never
-the connection-setup race. The full comparison also includes these probes.
-
-The result directory is `target/honeypot-diff/share/comparison`. It holds
-the guest kernel and package versions, service configurations, Caddy build
-information and page, wire bytes and decoded packet fields, SSH proposals,
-HTTP exchanges over TCP and MPTCP with kernel negotiation status, idle-close
-timing and keepalive frames, nmap output,
-serial logs, and the honeypot capture. Differences in random sequence numbers,
-timestamps and cookies remain in the raw evidence. The probe entry point
-refuses to run outside the marked QEMU guest.
 
 ## A NIC of its own
 
