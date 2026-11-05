@@ -73,6 +73,12 @@ pub trait PortServer: Any + Send + Sync {
     /// Serves one connection.
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
+    /// Pending connection limit for this port. The first server opening
+    /// a shared port chooses its limit; `None` uses the host's TCP default.
+    fn backlog(&self) -> Option<usize> {
+        None
+    }
+
     /// The protocols to offer with ALPN when this serves a TLS port, such
     /// as `h2` and `http/1.1`. Default none: the config's own list.
     fn alpn(&self) -> Vec<Vec<u8>> {
@@ -1116,6 +1122,9 @@ impl Machine {
                             PortSpec::Tcp(accept) | PortSpec::Tls { accept, .. } => accept,
                             PortSpec::Udp(_) => unreachable!(),
                         };
+                        if let Some(backlog) = opener.backlog() {
+                            listener.backlog(backlog);
+                        }
                         if let Some(answer) = opener.answer() {
                             listener.answer(answer);
                         }

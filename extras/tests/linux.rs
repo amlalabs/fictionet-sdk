@@ -267,7 +267,9 @@ fn syn_ack_bytes_offsets_and_repeated_syn() {
             &options,
         ));
         let second = receive(&mut raw, &cx).await;
-        assert_ne!(timestamp(&second), ts);
+        assert_eq!(timestamp(&second), ts);
+        raw.send(packet("10.0.0.3:1000".parse()?, local, 100, 0, 2, &options));
+        assert_ne!(timestamp(&receive(&mut raw, &cx).await), ts);
         raw.send(packet(
             SocketAddr::new(peer.ip(), 1002),
             local,
@@ -298,6 +300,68 @@ fn syn_ack_bytes_offsets_and_repeated_syn() {
         let sack = receive(&mut raw, &cx).await;
         assert_eq!(&sack[20..24], &[1, 1, 8, 10]);
         assert_eq!(&sack[32..44], &[1, 1, 5, 10, 0, 0, 0, 102, 0, 0, 0, 107]);
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn idle_connections_do_not_probe_or_expire_without_socket_options() {
+    block_on(lab(Seed::from_u64(19), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp());
+        let mut listener = server.listen(80)?;
+        raw.send(packet(peer, local, 100, 0, 2, &[]));
+        let next = sequence(&receive(&mut raw, &cx).await).wrapping_add(1);
+        raw.send(packet(peer, local, 101, next, 16, &[]));
+        let mut connection = listener.accept(&cx).await?;
+        assert!(
+            cx.race(Some(cx.now() + Duration::from_secs(130)), raw.recv(&cx))
+                .await
+                .is_err()
+        );
+        use fictionet::stdlib::network::ConnectionExt;
+        connection.write_all(&cx, b"hello").await?;
+        let sent = receive(&mut raw, &cx).await;
+        assert_eq!(&sent[usize::from(sent[12] >> 4) * 4..], b"hello");
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn challenge_ack_rate_limit_is_half_a_second() {
+    block_on(lab(Seed::from_u64(17), |cx| async move {
+        let (mut raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1000".parse()?;
+        let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp());
+        let mut listener = server.listen(80)?;
+        raw.send(packet(peer, local, 100, 0, 2, &[]));
+        let next = sequence(&receive(&mut raw, &cx).await).wrapping_add(1);
+        raw.send(packet(peer, local, 101, next, 16, &[]));
+        let _connection = listener.accept(&cx).await?;
+        let reset = packet(peer, local, 102, 0, 4, &[]);
+        raw.send(reset.clone());
+        assert_eq!(receive(&mut raw, &cx).await[13], 16);
+        raw.send(reset.clone());
+        assert!(
+            cx.race(Some(cx.now() + Duration::from_millis(499)), raw.recv(&cx))
+                .await
+                .is_err()
+        );
+        raw.send(reset.clone());
+        assert!(
+            cx.race(Some(cx.now() + Duration::from_millis(1)), raw.recv(&cx))
+                .await
+                .is_err()
+        );
+        raw.send(reset);
+        assert_eq!(receive(&mut raw, &cx).await[13], 16);
         cx.cancel();
         Ok(())
     }))
@@ -388,21 +452,16 @@ fn cookie_connection_restores_timestamp_and_window_scale() {
         let peer: SocketAddr = "10.0.0.2:1000".parse()?;
         let server = tcp::endpoint_with(&cx, side, local.ip(), linux::tcp().backlog(1));
         let mut listener = server.listen(80)?;
-        raw.send(packet(peer, local, 100, 0, 2, &[]));
-        receive(&mut raw, &cx).await;
+        let options = [
+            2, 4, 5, 180, 4, 2, 8, 10, 0, 0, 0, 9, 0, 0, 0, 0, 1, 3, 3, 7,
+        ];
+        raw.send(packet(peer, local, 100, 0, 2, &options));
+        let stateful = timestamp(&receive(&mut raw, &cx).await);
         let peer = SocketAddr::new(peer.ip(), 1001);
-        raw.send(packet(
-            peer,
-            local,
-            100,
-            0,
-            2,
-            &[
-                2, 4, 5, 180, 4, 2, 8, 10, 0, 0, 0, 9, 0, 0, 0, 0, 1, 3, 3, 7,
-            ],
-        ));
+        raw.send(packet(peer, local, 100, 0, 2, &options));
         let syn_ack = receive(&mut raw, &cx).await;
         let ts = timestamp(&syn_ack);
+        assert!(stateful.wrapping_sub(ts) < 64);
         let mut options = vec![1, 1, 8, 10];
         options.extend_from_slice(&10u32.to_be_bytes());
         options.extend_from_slice(&ts.to_be_bytes());

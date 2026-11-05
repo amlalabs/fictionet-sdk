@@ -593,6 +593,8 @@ pub struct Settings {
     pub ack_inclusive: bool,
     /// Window growth ratio that triggers an immediate window update.
     pub window_update_ratio: u16,
+    /// Minimum interval between challenge acknowledgments on one socket.
+    pub challenge_ack_interval: Duration,
 }
 
 impl Default for Settings {
@@ -608,6 +610,7 @@ impl Default for Settings {
             ack_segments: 2,
             ack_inclusive: true,
             window_update_ratio: 2,
+            challenge_ack_interval: Duration::from_secs(1),
         }
     }
 }
@@ -1705,8 +1708,7 @@ impl<'a> Socket<'a> {
             return None;
         }
 
-        // Rate-limit to 1 per second max.
-        self.challenge_ack_timer = cx.now() + Duration::from_secs(1);
+        self.challenge_ack_timer = cx.now() + self.settings.challenge_ack_interval;
 
         Some(self.ack_reply(cx, ip_repr, repr))
     }

@@ -1,18 +1,19 @@
 //! Linux transport choices for worlds that emulate a Linux host.
 //!
-//! Based on Linux v6.12: `net/ipv4/tcp_output.c` (`tcp_options_write`,
+//! Based on Linux v6.8: `net/ipv4/tcp_output.c` (`tcp_options_write`,
 //! `tcp_select_initial_window`), `net/ipv4/syncookies.c`,
 //! `net/ipv6/syncookies.c`, and `include/net/tcp.h` (`TCP_TIMEWAIT_LEN`).
 //! The window values assume an Ethernet MTU of 1500 and default receive
 //! memory settings. Linux sysctls and route metrics can change them.
 //!
-//! Sources: [TCP output](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/tcp_output.c),
-//! [IPv4 cookies](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/syncookies.c),
-//! [IPv6 cookies](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/syncookies.c),
-//! [TCP timers](https://github.com/torvalds/linux/blob/v6.12/include/net/tcp.h),
-//! and [MPTCP options](https://github.com/torvalds/linux/blob/v6.12/net/mptcp/options.c).
+//! Sources: [TCP output](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_output.c),
+//! [IPv4 cookies](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/syncookies.c),
+//! [IPv6 cookies](https://github.com/torvalds/linux/blob/v6.8/net/ipv6/syncookies.c),
+//! [TCP timers](https://github.com/torvalds/linux/blob/v6.8/include/net/tcp.h),
+//! [timestamp offsets](https://github.com/torvalds/linux/blob/v6.8/net/core/secure_seq.c),
+//! [challenge ACKs](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/tcp_input.c),
+//! and [MPTCP options](https://github.com/torvalds/linux/blob/v6.8/net/mptcp/options.c).
 
-use fictionet::Cx;
 use fictionet::stdlib::network::ip::{Ipv4Option, Ipv4Reply};
 use fictionet::stdlib::network::tcp::{
     self, CookieInput, CookieReply, CookieState, SynCookies, TcpOption,
@@ -33,7 +34,7 @@ use std::time::Duration;
 /// Unknown options are not echoed. Source routes return their first hop
 /// separately; TCP's checksum still uses the original peer address.
 ///
-/// See [Linux option handling](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/ip_options.c),
+/// See [Linux option handling](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/ip_options.c),
 /// [IPv4 options](https://www.rfc-editor.org/rfc/rfc791.html#section-3.1), and
 /// [source routes](https://www.rfc-editor.org/rfc/rfc1812.html#section-5.2.4.1).
 pub fn ipv4_options(
@@ -173,12 +174,16 @@ pub fn settings() -> tcp::Settings {
         ack_segments: 1,
         ack_inclusive: false,
         window_update_ratio: 2,
+        challenge_ack_interval: Duration::from_millis(500).into(),
     };
     tcp::Settings {
         socket,
         cookies: Some(&Cookies),
+        backlog_per_peer: None,
         timestamp_offset: Some(offset),
         timestamp_clock: Some(|now| (now.total_micros() / 1000) as u32),
+        timeout: None,
+        keep_alive: None,
         handshake_timeout: Duration::from_secs(63),
         orphan_timeout: Duration::from_secs(60),
         reset_full_queue: false,
@@ -186,10 +191,15 @@ pub fn settings() -> tcp::Settings {
     }
 }
 
-fn offset(cx: &Cx) -> u32 {
-    let mut bytes = [0; 4];
-    cx.fill_random(&mut bytes);
-    u32::from_le_bytes(bytes)
+fn offset(key: &[u8; 32], local: IpAddr, remote: IpAddr) -> u32 {
+    let mut hash = SipHasher24::new_with_key(key[..16].try_into().unwrap());
+    for address in [local, remote] {
+        match address {
+            IpAddr::V4(a) => hash.write(&a.octets()),
+            IpAddr::V6(a) => hash.write(&a.octets()),
+        }
+    }
+    hash.finish() as u32
 }
 
 /// Linux SYN cookie encoding, including options in the timestamp echo.
@@ -219,19 +229,6 @@ fn hash(input: &CookieInput<'_>, count: u32, key: usize) -> u32 {
             hash.write(&input.local.port().to_be_bytes());
         }
         _ => unreachable!("a TCP tuple has one address family"),
-    }
-    hash.finish() as u32
-}
-
-fn timestamp_offset(input: &CookieInput<'_>) -> u32 {
-    // A secret-derived offset can be recovered without retaining the SYN.
-    let mut hash = SipHasher24::new_with_key(input.key[..16].try_into().unwrap());
-    hash.write(b"timestamp");
-    for address in [input.local.ip(), input.remote.ip()] {
-        match address {
-            IpAddr::V4(a) => hash.write(&a.octets()),
-            IpAddr::V6(a) => hash.write(&a.octets()),
-        }
     }
     hash.finish() as u32
 }
@@ -279,7 +276,7 @@ impl SynCookies for Cookies {
                 options.extend([TcpOption::NoOperation, TcpOption::NoOperation]);
             }
             options.push(TcpOption::Timestamps {
-                tsval: stamp.wrapping_add(timestamp_offset(input)),
+                tsval: stamp.wrapping_add(offset(input.key, input.local.ip(), input.remote.ip())),
                 tsecr: remote,
             });
             if scale.is_some() {
@@ -315,7 +312,7 @@ impl SynCookies for Cookies {
             TcpOption::Timestamps { tsval, tsecr } => Some((*tsval, *tsecr)),
             _ => None,
         }) {
-            let offset = timestamp_offset(input);
+            let offset = offset(input.key, input.local.ip(), input.remote.ip());
             let bits = echo.wrapping_sub(offset);
             state.scale = (bits & 15 != 15).then_some((bits & 15) as u8);
             state.sack = bits & 16 != 0;

@@ -734,10 +734,17 @@ pub struct Settings {
     pub socket: SocketSettings,
     /// Stateless handshake codec. With none, a full SYN queue drops new SYNs.
     pub cookies: Option<&'static dyn SynCookies>,
-    /// Per-connection timestamp offset drawn from the world's random stream.
-    pub timestamp_offset: Option<fn(&Cx) -> u32>,
-    /// Timestamp clock; an offset is added separately for each connection.
+    /// Optional pending connection limit for each peer address on a port.
+    /// `None` uses only the port's total backlog limit.
+    pub backlog_per_peer: Option<usize>,
+    /// Timestamp offset derived from the endpoint secret and address pair.
+    pub timestamp_offset: Option<TimestampOffset>,
+    /// Timestamp clock; the configured address-pair offset is added separately.
     pub timestamp_clock: Option<smoltcp::wire::TcpTimestampGenerator>,
+    /// Time without a peer response before giving up a connection.
+    pub timeout: Option<Duration>,
+    /// Idle interval before sending keepalive probes; `None` disables them.
+    pub keep_alive: Option<Duration>,
     /// How long an incomplete handshake may occupy the backlog.
     pub handshake_timeout: Duration,
     /// How long a detached connection may remain in FIN-WAIT-2.
@@ -749,13 +756,20 @@ pub struct Settings {
     pub ignore_malformed_options: bool,
 }
 
+/// Derives a timestamp offset from an endpoint secret and its local and
+/// remote addresses, in that order.
+pub type TimestampOffset = fn(&[u8; 32], IpAddr, IpAddr) -> u32;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             socket: SocketSettings::default(),
             cookies: None,
+            backlog_per_peer: Some(BACKLOG_PER_PEER),
             timestamp_offset: None,
             timestamp_clock: Some(|now| (now.total_micros() / 1000) as u32),
+            timeout: Some(TIMEOUT),
+            keep_alive: Some(KEEPALIVE),
             handshake_timeout: TIMEOUT,
             orphan_timeout: TIMEOUT,
             reset_full_queue: false,
@@ -878,8 +892,9 @@ impl Options {
     /// arrived but not been accepted yet: handshakes under way, and
     /// connections waiting for [`Listener::accept`]. The default is 4,096.
     /// Values below 1 or above 65,536 are raised or lowered to those
-    /// limits. At most 256 attempts from one peer address keep handshake
-    /// state, whatever the backlog. A configured cookie codec can answer
+    /// limits. By default at most 256 attempts from one peer address keep
+    /// handshake state; [`Settings::backlog_per_peer`] changes that limit.
+    /// A configured cookie codec can answer
     /// further SYNs without allocating connection state.
     ///
     /// Past the backlog, a SYN is dropped unless [`Settings::cookies`]
@@ -992,7 +1007,6 @@ pub fn prepare_endpoint(
             isolated_peer: None,
             cookie_key,
             settings: options.settings,
-            fcx: fcx.clone(),
         }),
     });
     let driver = shared.clone();
@@ -1117,7 +1131,6 @@ struct State {
     /// The key of this endpoint's SYN cookies.
     cookie_key: [u8; 32],
     settings: Settings,
-    fcx: Cx,
     /// Sources whose ownership the enclosing network verifies.
     isolated_peer: Option<Box<dyn Fn(IpAddr) -> bool + Send>>,
 }
@@ -1125,6 +1138,8 @@ struct State {
 /// One listening port.
 #[derive(Default)]
 struct Listen {
+    /// Connections not accepted yet, including incomplete handshakes.
+    backlog: usize,
     /// Sockets in LISTEN, waiting for a SYN.
     idle: Vec<Id>,
     /// Sockets that got a SYN and wait for the handshake to finish, each
@@ -1393,8 +1408,6 @@ fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Pages>) {
     };
     s.set_tsval_generator(Some(|now| (now.total_micros() / 1000) as u32));
     s.set_nagle_enabled(false);
-    s.set_timeout(Some(TIMEOUT.into()));
-    s.set_keep_alive(Some(KEEPALIVE.into()));
     (s, pages)
 }
 
@@ -1408,11 +1421,21 @@ impl State {
     /// Adds a socket made by [`new_socket`].
     fn add_socket(&mut self, (mut s, pages): (stcp::Socket<'static>, Option<Pages>)) -> Id {
         s.set_settings(self.settings.socket);
+        s.set_timeout(self.settings.timeout.map(Into::into));
+        s.set_keep_alive(self.settings.keep_alive.map(Into::into));
         if s.state() != TcpState::SynReceived {
             s.set_tsval_generator(self.settings.timestamp_clock);
         }
-        if let Some(offset) = self.settings.timestamp_offset {
-            s.set_timestamp_offset(offset(&self.fcx));
+        if let (Some(offset), Some(local), Some(remote)) = (
+            self.settings.timestamp_offset,
+            s.local_endpoint(),
+            s.remote_endpoint(),
+        ) {
+            s.set_timestamp_offset(offset(
+                &self.cookie_key,
+                SocketAddr::from(local).ip(),
+                SocketAddr::from(remote).ip(),
+            ));
         }
         let h = Id(self.next_id);
         self.next_id += 1;
@@ -1911,15 +1934,15 @@ impl State {
     ) -> Option<Attempt> {
         let (src, dst) = (arrived.from, arrived.to);
         let l = &self.listeners[&dst.port()];
-        let peer_full = l
-            .per_peer
-            .get(&src.ip())
-            .is_some_and(|&n| n >= BACKLOG_PER_PEER);
-        if l.ready.len() >= self.backlog && self.settings.reset_full_queue {
+        let peer_full = self
+            .settings
+            .backlog_per_peer
+            .is_some_and(|limit| l.per_peer.get(&src.ip()).is_some_and(|&n| n >= limit));
+        if l.ready.len() >= l.backlog && self.settings.reset_full_queue {
             self.dev.tx.push(arrived.reset(&[]));
             return None;
         }
-        if l.ready.len() >= self.backlog
+        if l.ready.len() >= l.backlog
             || (peer_full
                 && self
                     .isolated_peer
@@ -1929,7 +1952,7 @@ impl State {
             return None;
         }
         let syn = segment_options(t);
-        let cookie = l.embryonic.len() + l.ready.len() >= self.backlog || peer_full;
+        let cookie = l.embryonic.len() + l.ready.len() >= l.backlog || peer_full;
         let asked = Syn {
             options: &syn,
             ipv4_options: syn_ipv4.as_deref().unwrap_or_default(),
@@ -2039,7 +2062,7 @@ impl State {
             socket.set_timestamp_offset(
                 self.settings
                     .timestamp_offset
-                    .map_or(0, |offset| offset(&self.fcx)),
+                    .map_or(0, |offset| offset(&self.cookie_key, dst.ip(), src.ip())),
             );
         }
         Some(Attempt {
@@ -2078,11 +2101,11 @@ impl State {
             return true;
         };
         let l = &self.listeners[&dst.port()];
-        if l.ready.len() >= self.backlog
-            || (l
-                .per_peer
-                .get(&src.ip())
-                .is_some_and(|&n| n >= BACKLOG_PER_PEER)
+        if l.ready.len() >= l.backlog
+            || (self
+                .settings
+                .backlog_per_peer
+                .is_some_and(|limit| l.per_peer.get(&src.ip()).is_some_and(|&n| n >= limit))
                 && self
                     .isolated_peer
                     .as_ref()
@@ -2539,7 +2562,14 @@ impl Endpoint {
                 self.shared.addr
             )));
         }
-        st.listeners.insert(port, Listen::default());
+        let backlog = st.backlog;
+        st.listeners.insert(
+            port,
+            Listen {
+                backlog,
+                ..Listen::default()
+            },
+        );
         st.take_port(port);
         Ok(Listener {
             shared: self.shared.clone(),
@@ -2652,6 +2682,19 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// Sets this port's limit of connections not accepted yet, including
+    /// incomplete handshakes. Uses the bounds of [`Options::backlog`].
+    /// Existing connections remain when the limit is lowered.
+    pub fn backlog(&mut self, connections: usize) {
+        self.shared
+            .state
+            .lock()
+            .listeners
+            .get_mut(&self.port)
+            .expect("a listener has its port")
+            .backlog = connections.clamp(1, MAX_BACKLOG);
+    }
+
     /// Answers each connection attempt from now on with `answer`.
     ///
     /// [`Answer::syn`] sees each SYN's options. [`SynAnswer::Accept`] adds
@@ -4868,6 +4911,42 @@ mod tests {
                 ports.push(listener.accept(&fcx).await?.peer_addr().port());
             }
             assert_eq!(ports, [1001, 1002, 1003, 1009]);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn listener_backlogs_are_independent() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let address = "10.0.0.1".parse()?;
+            let server = endpoint_with(&fcx, side, address, cookie_options().backlog(4));
+            let mut small = server.listen(80)?;
+            let _large = server.listen(81)?;
+            small.backlog(1);
+            let now = smol_now(&fcx);
+            {
+                let mut st = server.shared.state.lock();
+                for port in [80, 81] {
+                    for source in [1000, 1001] {
+                        let peer = SocketAddr::new("10.0.0.2".parse()?, source);
+                        let local = SocketAddr::new(address, port);
+                        st.ingress(address, now, segment(peer, local, 7, 0, 0x02).0);
+                        assert_eq!(egress(&mut st, now).len(), 1);
+                    }
+                }
+                assert_eq!(st.listeners[&80].embryonic.len(), 1);
+                assert_eq!(st.listeners[&81].embryonic.len(), 2);
+            }
+            small.backlog(0);
+            assert_eq!(server.shared.state.lock().listeners[&80].backlog, 1);
+            small.backlog(usize::MAX);
+            assert_eq!(
+                server.shared.state.lock().listeners[&80].backlog,
+                MAX_BACKLOG
+            );
             fcx.cancel();
             Ok(())
         }))
