@@ -6,6 +6,7 @@ mod dns_verify;
 mod image;
 mod mptcp_verify;
 mod rawnic;
+mod ssh_connect;
 mod web;
 mod workstation;
 
@@ -24,6 +25,9 @@ async fn main() -> Result {
     }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "ssh-connect" {
+        return ssh_connect::run(&args.collect::<Vec<_>>()).await;
     }
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
     if task == "rawnic" {

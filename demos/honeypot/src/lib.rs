@@ -8,7 +8,7 @@
 //! The world is one host at a public IPv4 address ([`Config::address`]),
 //! and at a public IPv6 address too when it has one
 //! ([`Config::address_v6`]), with ordinary OpenSSH on port 22 and Caddy's
-//! packaged HTTP site on port 80 ([`services`]). The explicit nginx profile
+//! packaged HTTP site on port 80 ([`ssh`], [`services`]). The explicit nginx profile
 //! uses ordinary TCP for HTTP. Both addresses serve the same ports. On a
 //! Caddy port, a SYN with MP_CAPABLE gets an RFC 8684 SYN-ACK with a key, its data
 //! then carries DSS, and an MP_JOIN is answered, taken or refused as Linux
@@ -36,7 +36,8 @@
 //! | --- | --- |
 //! | [`config`] | The command line and the world's settings |
 //! | [`fictionet_extras::linux::mptcp`] | How the listener answers MP_CAPABLE and MP_JOIN |
-//! | [`services`] | SSH and HTTP once a connection is open |
+//! | [`services`] | HTTP once a connection is open |
+//! | [`ssh`] | SSH authentication, fake shell and read-only SFTP |
 //! | [`observe`] | The packet log and the observations |
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -54,6 +55,7 @@ use fictionet::{Attachment, Attachments, Cx, End, Interface};
 pub mod config;
 pub mod observe;
 pub mod services;
+pub mod ssh;
 
 #[cfg(all(feature = "raw-virtio", target_os = "linux"))]
 pub mod raw;
@@ -105,7 +107,13 @@ impl Clock {
 
 /// The network before it starts: the server with its ports, and the route
 /// the internet comes in by.
-pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) -> Net {
+pub fn network(
+    fcx: &Cx,
+    config: &Config,
+    clock: Clock,
+    tokens: &Arc<Tokens>,
+    observer: Arc<Mutex<Observer>>,
+) -> Net {
     let mut server = Host::new("server")
         .at(config.address)
         .tcp_options(fictionet_extras::linux::tcp())
@@ -122,7 +130,10 @@ pub fn network(fcx: &Cx, config: &Config, clock: Clock, tokens: &Arc<Tokens>) ->
         server = match port.service {
             Service::Ssh => server.port_server(
                 port.number,
-                fictionet_extras::linux::with_ipv4_options(services::Ssh, timestamp),
+                fictionet_extras::linux::with_ipv4_options(
+                    ssh::server(fcx, config.ssh_auth.clone(), observer.clone()),
+                    timestamp,
+                ),
             ),
             Service::Http if config.http_profile == HttpProfile::Caddy => server.port_server(
                 port.number,
@@ -201,7 +212,7 @@ pub fn start(
         observer: observer.clone(),
     };
     let (attacher, inner) = fictionet::attachments();
-    network(fcx, config, clock, &tokens).start(fcx, inner)?;
+    network(fcx, config, clock, &tokens, observer.clone()).start(fcx, inner)?;
     let expiring = observer.clone();
     fcx.spawn(move |fcx| async move {
         let mut timer = fictionet::Timer::new(&fcx);

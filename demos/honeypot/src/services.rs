@@ -1,29 +1,18 @@
-//! What the server says once a connection is open: an OpenSSH
-//! identification and key exchange proposal, or a packaged HTTP site.
-//! The packet log keeps whatever the client sends; SSH never authenticates
-//! or executes commands.
+//! Packaged HTTP sites served by the simulated host. SSH uses the separate
+//! application in [`crate::ssh`].
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use fictionet::Cx;
-use fictionet::stdlib::codec::{Fail, Stream, Wire};
+use fictionet::stdlib::codec::{Fail, Stream};
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::protocols::http1::{self, Event, RequestEvents};
-use fictionet::stdlib::protocols::ssh;
 use fictionet::stdlib::web::httpd::http_date;
 use fictionet::stdlib::world::net::{Arrival, PortServer};
 
 use crate::{Clock, HttpProfile};
-
-/// The identification line of OpenSSH on Ubuntu 24.04 (RFC 4253 section
-/// 4.2).
-pub const SSH_BANNER: &[u8] = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20\r\n";
-
-/// OpenSSH's `LoginGraceTime`: how long sshd keeps a connection that has
-/// not logged in.
-pub const LOGIN_GRACE: Duration = Duration::from_secs(120);
 
 /// Caddy's and nginx's request-header deadline. Caddy also uses this
 /// duration for its rolling body-read and response-write inactivity limits.
@@ -185,123 +174,6 @@ impl Page {
             response.push_str(body);
         }
         response
-    }
-}
-
-/// SSH: the identification line and key exchange proposal, then reads
-/// until the client goes or [`LOGIN_GRACE`] passes. Key exchange and
-/// authentication are not implemented. No keepalives: sshd asks for them,
-/// but on Linux the first comes after two hours idle (`tcp_keepalive_time`),
-/// long after the grace time ends the connection.
-pub struct Ssh;
-
-fn ssh_proposal() -> ssh::KexInit {
-    let names = |values: &[&str]| {
-        values
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect::<Vec<_>>()
-    };
-    let encryption = names(&[
-        "chacha20-poly1305@openssh.com",
-        "aes128-ctr",
-        "aes192-ctr",
-        "aes256-ctr",
-        "aes128-gcm@openssh.com",
-        "aes256-gcm@openssh.com",
-    ]);
-    let mac = names(&[
-        "umac-64-etm@openssh.com",
-        "umac-128-etm@openssh.com",
-        "hmac-sha2-256-etm@openssh.com",
-        "hmac-sha2-512-etm@openssh.com",
-        "hmac-sha1-etm@openssh.com",
-        "umac-64@openssh.com",
-        "umac-128@openssh.com",
-        "hmac-sha2-256",
-        "hmac-sha2-512",
-        "hmac-sha1",
-    ]);
-    let compression = names(&["none", "zlib@openssh.com"]);
-    ssh::KexInit {
-        kex_algorithms: names(&[
-            "sntrup761x25519-sha512@openssh.com",
-            "curve25519-sha256",
-            "curve25519-sha256@libssh.org",
-            "ecdh-sha2-nistp256",
-            "ecdh-sha2-nistp384",
-            "ecdh-sha2-nistp521",
-            "diffie-hellman-group-exchange-sha256",
-            "diffie-hellman-group16-sha512",
-            "diffie-hellman-group18-sha512",
-            "diffie-hellman-group14-sha256",
-            "ext-info-s",
-            "kex-strict-s-v00@openssh.com",
-        ]),
-        server_host_key_algorithms: names(&[
-            "rsa-sha2-512",
-            "rsa-sha2-256",
-            "ecdsa-sha2-nistp256",
-            "ssh-ed25519",
-        ]),
-        encryption_client_to_server: encryption.clone(),
-        encryption_server_to_client: encryption,
-        mac_client_to_server: mac.clone(),
-        mac_server_to_client: mac,
-        compression_client_to_server: compression.clone(),
-        compression_server_to_client: compression,
-        ..ssh::KexInit::default()
-    }
-}
-
-impl PortServer for Ssh {
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        arrival.socket.set_keep_alive(None);
-        let mut conn = arrival.conn;
-        Box::pin(async move {
-            let deadline = fcx.now() + LOGIN_GRACE;
-            if conn.write_all(&fcx, SSH_BANNER).await.is_err() {
-                return;
-            }
-            let mut input = Stream::new(ssh::Events::new());
-            loop {
-                match input.next() {
-                    Some(Ok(ssh::Event::Version(version))) => {
-                        if !matches!(version.proto(), "2.0" | "1.99") {
-                            return;
-                        }
-                        break;
-                    }
-                    Some(_) => return,
-                    None => match fcx
-                        .race(Some(deadline), conn.read(&fcx, input.spare()))
-                        .await
-                    {
-                        Ok(Ok(n @ 1..)) => input.commit(n),
-                        _ => return,
-                    },
-                }
-            }
-            let mut proposal = ssh_proposal();
-            fcx.fill_random(&mut proposal.cookie);
-            let packet = ssh::Packet::from_message(&ssh::Message::KexInit(proposal))
-                .expect("the server's SSH proposal is valid");
-            if conn
-                .write_all(&fcx, &packet.to_bytes().expect("valid SSH packet"))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            let mut buf = [0; 4096];
-            while let Ok(Ok(1..)) = fcx.race(Some(deadline), conn.read(&fcx, &mut buf)).await {}
-        })
-    }
-
-    fn backlog(&self) -> Option<usize> {
-        // Ubuntu 24.04's systemd ssh.socket owns the listener; the kernel's
-        // net.core.somaxconn caps its backlog at 4096, as measured with ss.
-        Some(4096)
     }
 }
 

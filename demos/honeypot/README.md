@@ -21,11 +21,14 @@ IPv4 connection setup. The IPv6 address is optional, as many servers have
 none. The internet comes in by one attachment that carries both families,
 from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
 
-- **SSH** (`--ssh`, 22 by default): the identification line of OpenSSH 9.6p1
-  on Ubuntu 24.04, followed by its key exchange proposal after the client's
-  version line. It reads whatever comes back until the client leaves or
-  120 seconds pass, as sshd's `LoginGraceTime` does. No keepalives: on
-  Linux sshd's first comes after two hours idle, so a client sees none.
+- **SSH** (`--ssh`, 22 by default): Ubuntu 24.04's OpenSSH 9.6 identification,
+  encrypted authentication, interactive shells, exec requests and a small
+  read-only SFTP directory. Shell commands return simulated Ubuntu data and
+  never execute. `--ssh-auth accept` accepts any password or signed public key;
+  `--ssh-auth reject` refuses credentials; `--ssh-auth password:VALUE` requires
+  that password or a signed public key. The default is `accept`. `none` is
+  always refused. Authentication has a 120-second deadline and six-failure
+  limit. Forwarding is refused.
 - **HTTP** (`--http`, 80 by default): the official Caddy 2.11.9 package's page,
   with MPTCP, persistent HTTP/1.1, a 300-second idle timeout and 15-second TCP
   keepalives. It has no request-count limit per connection. The untouched
@@ -33,6 +36,18 @@ from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
 - **nginx comparison** (`--http-profile nginx`): Ubuntu's nginx page over
   ordinary TCP, with up to 1,000 requests, 75 seconds between requests and no
   TCP keepalives. The default profile is `--http-profile caddy`.
+
+SSH offers implemented algorithms in OpenSSH preference order: Curve25519,
+P-256 and P-384 key exchange, ChaCha20-Poly1305 and AES-GCM, and the demo's
+Ed25519 host key. Core also supports RSA SHA-2 host keys and user signatures.
+This is a subset of OpenSSH's full proposal: it does not offer post-quantum KEX,
+finite-field DH, CTR ciphers, UMAC or compression. The reference preferences
+and source citations live in `fictionet_extras::ssh::Profile`.
+
+The line editor supports echo, backspace, Control-C, Control-D and Control-U.
+Shell and exec recognize `id`, `whoami`, `pwd`, `hostname`, `uname`,
+`cat /etc/os-release`, `ls`, `uptime`, `ps` and `echo`. Unsupported commands
+return an error. The SFTP subsystem presents an empty read-only home directory.
 
 The transport profile targets Ubuntu 24.04's Linux 6.8 kernel.
 Listener backlogs match Ubuntu 24.04: 4,096 for systemd's `ssh.socket`
@@ -113,6 +128,7 @@ kind it is:
 | `segment` | Any other segment in with a payload, a FIN, a RST or MPTCP options | Flags, sequence number, every TCP option in order, `options_fault`, each MPTCP option decoded, and the payload in hex |
 | `answer` | A RST from the world, or the SYN-ACK that first answers a SYN | Flags, every TCP option in order, and each MPTCP option decoded, such as the key the server issued |
 | `burst` | A source's SYNs, or its SYNs with MP_JOIN, reach the burst threshold | Source address, which kind, how many, and the window |
+| `ssh` | An SSH protocol or application event | Connection identity, timestamp, client version and proposal, credentials and signature validity, channel requests, terminal settings, raw input/output bytes, stderr and exit status |
 | `lost` | The log takes lines again after a file could not be written, such as while the disk was full | How many packets the capture and how many lines the log left out |
 
 Times are `at_us`, microseconds since the Unix epoch. Keys, tokens and HMACs
@@ -284,3 +300,29 @@ Every test of the driver and of raw frames runs in QEMU:
 ```sh
 cargo xtask rawnic target/rawnic-qemu
 ```
+
+## SSH through the world socket
+
+Build the world and the stdio connector on the home volume:
+
+```console
+systemd-run --user --scope -p MemoryMax=32G env CARGO_TARGET_DIR="$PWD/target" cargo build -p honeypot-world -p xtask
+./target/debug/honeypot --world unix:/tmp/honeypot.sock --ssh-auth password:ubuntu --log /tmp/honeypot.jsonl --pcap /tmp/honeypot.pcapng
+```
+
+In another terminal, connect without configuring any host network interface:
+
+```console
+ssh -o 'ProxyCommand=./target/debug/xtask ssh-connect /tmp/honeypot.sock %h %p' ubuntu@203.0.113.10
+```
+
+The same ProxyCommand works with `sftp`, `ssh ... id`, `-tt` for a terminal,
+and `-i` for a key. The connector joins the Unix relay, obtains a simulated
+DHCP lease, and carries its TCP packets through the world. Its stdout is only
+the SSH byte stream. Stop the world by its own process ID when finished.
+
+Each transcript record has a wall-clock `at_us` and a nested `ssh` event with
+run-relative microseconds. Byte arrays preserve commands, credentials and
+streams exactly. Output records are emitted when queued bytes enter SSH
+packets, so their order respects channel flow control. Input and output can be
+replayed by connection and channel without inspecting encrypted packet data.

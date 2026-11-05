@@ -1058,6 +1058,37 @@ impl Observer {
         self.write_observations(self.clock.micros(now), observations);
     }
 
+    /// Write an SSH transcript fact through the packet log's record sink.
+    /// Failed writes join the same loss counters as packet observations.
+    pub fn ssh(
+        &mut self,
+        context: &fictionet::stdlib::services::ssh::Context<'_>,
+        event: &fictionet::stdlib::services::ssh::Event,
+    ) {
+        #[derive(Serialize)]
+        struct Ssh<'a> {
+            event: &'static str,
+            at_us: u64,
+            ssh: fictionet_extras::ssh::honeypot::Record<'a>,
+        }
+        let at_us = self.clock.micros(context.now);
+        self.write_observations(at_us, Vec::new());
+        let record = Ssh {
+            event: "ssh",
+            at_us,
+            ssh: fictionet_extras::ssh::honeypot::Record::new(context, event, Instant::ZERO),
+        };
+        match serde_json::to_vec(&record) {
+            Ok(mut line) => {
+                line.push(b'\n');
+                if !self.log.put(&line) {
+                    self.lost.observations += 1;
+                }
+            }
+            Err(_) => self.lost.observations += 1,
+        }
+    }
+
     fn write_observations(&mut self, at_us: u64, mut observations: Vec<Observation>) {
         if self.lost != Lost::default() && self.capturing {
             let lost = Observation::Lost {

@@ -5,6 +5,7 @@
 //!          [--address IPV4] [--address-v6 IPV6] [--internet PREFIX]...
 //!          [--gateway IPV4] [--gateway-v6 IPV6]
 //!          [--ssh PORT]... [--http PORT]... [--http-profile caddy|nginx]
+//!          [--ssh-auth accept|reject|password:VALUE]
 //!          [--burst-window-ms MS] [--burst-syns N]
 //! ```
 //!
@@ -40,7 +41,7 @@ pub struct Config {
     /// The addresses the `internet` attachment carries.
     pub internet: Internet,
     /// The IPv4 default gateway of the raw Ethernet adapter
-    /// ([`start_raw`](crate::start_raw)): the router every IPv4 packet goes
+    /// (`start_raw`, with feature `raw-virtio`): the router every IPv4 packet goes
     /// to.
     pub gateway: Ipv4Addr,
     /// Where the raw Ethernet adapter's IPv6 default gateway comes from: an
@@ -54,6 +55,20 @@ pub struct Config {
     pub http_profile: HttpProfile,
     /// When SYNs from one source count as a burst.
     pub burst: Burst,
+    /// Authentication policy of the simulated SSH server.
+    pub ssh_auth: SshAuth,
+}
+
+/// Authentication policy for decoy accounts; public keys still require proof.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SshAuth {
+    /// Refuse every authentication attempt.
+    Reject,
+    /// Accept any supplied password or signed public key, but not `none`.
+    #[default]
+    AnyCredentials,
+    /// Accept this password or any correctly signed public key.
+    PasswordOrPublicKey(Vec<u8>),
 }
 
 /// The addresses the internet comes in from, one prefix per family. The
@@ -105,7 +120,7 @@ pub struct Port {
 /// What a port serves once a connection is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Service {
-    /// An OpenSSH server's identification line.
+    /// A simulated SSH server with authentication and session hooks.
     Ssh,
     /// The configured HTTP profile's default page.
     Http,
@@ -160,6 +175,7 @@ impl Default for Config {
             ],
             burst: Burst::default(),
             http_profile: HttpProfile::default(),
+            ssh_auth: SshAuth::default(),
         }
     }
 }
@@ -228,6 +244,8 @@ pub enum Flag {
     GatewayV6,
     /// `--ssh`: a port with [`Service::Ssh`].
     Ssh,
+    /// `--ssh-auth`: reject, accept, or password:VALUE.
+    SshAuth,
     /// `--http`: a port with [`Service::Http`].
     Http,
     /// `--http-profile`: [`Config::http_profile`].
@@ -240,7 +258,7 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag.
-    pub const ALL: [Flag; 13] = [
+    pub const ALL: [Flag; 14] = [
         Flag::World,
         Flag::Log,
         Flag::Pcap,
@@ -250,6 +268,7 @@ impl Flag {
         Flag::Gateway,
         Flag::GatewayV6,
         Flag::Ssh,
+        Flag::SshAuth,
         Flag::Http,
         Flag::HttpProfile,
         Flag::BurstWindowMs,
@@ -268,6 +287,7 @@ impl Flag {
             Flag::Gateway => "--gateway",
             Flag::GatewayV6 => "--gateway-v6",
             Flag::Ssh => "--ssh",
+            Flag::SshAuth => "--ssh-auth",
             Flag::Http => "--http",
             Flag::HttpProfile => "--http-profile",
             Flag::BurstWindowMs => "--burst-window-ms",
@@ -319,6 +339,19 @@ impl Args {
                     number: value.parse().map_err(|_| bad())?,
                     service: Service::Ssh,
                 }),
+                Flag::SshAuth => {
+                    config.ssh_auth = match value.as_str() {
+                        "accept" => SshAuth::AnyCredentials,
+                        "reject" => SshAuth::Reject,
+                        _ => SshAuth::PasswordOrPublicKey(
+                            value
+                                .strip_prefix("password:")
+                                .ok_or_else(bad)?
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                    };
+                }
                 Flag::Http => config.ports.push(Port {
                     number: value.parse().map_err(|_| bad())?,
                     service: Service::Http,
