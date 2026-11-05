@@ -2,6 +2,7 @@
 //! server reads them, and values a world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::test_support::assert_write;
 use fictionet_fuzz::input::bytes;
 
 use arbitrary::{Result, Unstructured};
@@ -11,7 +12,6 @@ use fictionet::stdlib::protocols::ntlmssp::{
     MAX_FIELD, MAX_MESSAGE, MIC_END, MIC_LEN, Message, MicInput, Negotiate, NtResponse,
     NtlmV2Response, UnicodeName, Version, av_id, flags,
 };
-use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// Any bytes read as each kind of thing this module reads. Whatever reads
@@ -31,7 +31,7 @@ fn read(b: &[u8]) {
             // A message with a MIC can have it zeroed, and nothing else changes.
             if let Some(z) = Authenticate::mic_input(b) {
                 assert!(a.mic.is_some());
-                contract::check_wire_value(&z);
+                let _ = assert_write(&z);
                 let z = z.to_bytes().unwrap();
                 assert_eq!(z[MIC_END - MIC_LEN..MIC_END], [0; MIC_LEN]);
                 assert_eq!(z.len(), b.len());
@@ -184,7 +184,7 @@ fn message(u: &mut Unstructured) -> Result<Message> {
 fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let m = message(&mut u)?;
-    contract::check_wire_value(&m);
+    let _ = assert_write(&m);
     if let Ok(bytes) = m.to_bytes() {
         assert!(bytes.len() <= MAX_MESSAGE);
         assert_eq!(Message::parse(&bytes), Ok(m.clone()));
@@ -198,7 +198,7 @@ fn built(data: &[u8]) -> Result<()> {
         nested(&m);
     }
     let list = av_pairs(&mut u)?;
-    contract::check_wire_value(&AvPairs(list.clone()));
+    let _ = assert_write(&AvPairs(list.clone()));
     match AvPairs(list.clone()).to_bytes() {
         Ok(bytes) => {
             assert!(bytes.len() <= MAX_FIELD);
@@ -230,7 +230,7 @@ fn built(data: &[u8]) -> Result<()> {
             },
         }),
     };
-    contract::check_wire_value(&nt);
+    let _ = assert_write(&nt);
     if let Ok(bytes) = nt.to_bytes() {
         assert!(bytes.len() <= MAX_FIELD);
         if let NtResponse::V2(v2) = &nt {
@@ -242,19 +242,45 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Version>(data);
-    contract::check_wire::<UnicodeName>(data);
-    contract::check_wire::<MicInput>(data);
-    contract::check_wire::<AvPairs>(data);
-    contract::check_wire::<Negotiate>(data);
-    contract::check_wire::<Challenge>(data);
-    contract::check_wire::<Authenticate>(data);
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<LmV2Response>(data);
-    contract::check_wire::<NtResponse>(data);
-    contract::check_wire::<NtlmV2Response>(data);
-    contract::check_wire::<ClientChallenge>(data);
-    contract::check_wire::<AvPair>(data);
+    if let Ok(value) = <Version as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <UnicodeName as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <MicInput as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <AvPairs as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Negotiate as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Challenge as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Authenticate as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <LmV2Response as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <NtResponse as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <NtlmV2Response as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ClientChallenge as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <AvPair as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     read(data);
     // Every prefix of a message that reads is read too, as a world sees a
     // token cut short.

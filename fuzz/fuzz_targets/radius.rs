@@ -4,6 +4,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::Wire;
@@ -12,7 +14,6 @@ use fictionet::stdlib::protocols::radius::{
     Attribute, Code, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet, RESERVED_EXTENDED_TYPES,
     Value, Vsa,
 };
-use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// Takes bytes off the front of the fuzzer's input.
@@ -170,7 +171,7 @@ fn construct(data: &[u8]) -> Option<()> {
             }
         }
     }
-    contract::check_wire_value(&p);
+    let _ = assert_write(&p);
     // A packet is written whole or not at all.
     match p.to_bytes() {
         Ok(bytes) => {
@@ -189,17 +190,55 @@ fn construct(data: &[u8]) -> Option<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_capacity(Frames::<Packet>::new, data);
-    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(0), data);
-    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(64), data);
-    contract::check_wire::<Packet>(data);
+    let bound = 2 * Frames::<Packet>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Packet>::new, data),
+    );
+    let bound = 2 * Frames::<Packet>::with_limit(0).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(0)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(0), data),
+    );
+    let bound = 2 * Frames::<Packet>::with_limit(64).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(64)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(64), data),
+    );
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     check_datagram(data);
 
     // The bytes as instructions for building packets and values.
     let _ = construct(data);
 
-    contract::check_wire::<Attribute>(data);
-    contract::check_wire::<Vsa>(data);
-    contract::check_wire::<Evs>(data);
+    if let Ok(value) = <Attribute as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Vsa as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Evs as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 });

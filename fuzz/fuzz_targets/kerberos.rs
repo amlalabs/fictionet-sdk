@@ -7,14 +7,14 @@ use fictionet::stdlib::protocols::asn1::Rules;
 use fictionet::stdlib::protocols::kerberos::{
     EncryptedData, Error, Frame, KdcReqBody, MAX_MESSAGE, Message, MethodData, Ticket,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// A message read from `b` writes back, and reads back the same.
 fn round_trip(b: &[u8]) {
     for rules in [Rules::Der, Rules::Ber] {
         if let Ok(m) = Message::parse_with(b, rules) {
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             // Written again, a message near the size limit may grow past it.
             match m.to_bytes() {
                 Ok(der) => assert_eq!(Message::parse(&der), Ok(m.clone())),
@@ -40,25 +40,51 @@ fn round_trip(b: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     fictionet::stdlib::protocols::asn1::harness::check(data);
-    contract::check_decode(Frames::<Frame>::new, data);
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Frame>(data);
-    contract::check_wire_value(&Frame(data.get(..MAX_MESSAGE + 1).unwrap_or(data).to_vec()));
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Frame>::new, data),
+    );
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&Frame(data.get(..MAX_MESSAGE + 1).unwrap_or(data).to_vec()));
 
     let mut stream = Stream::new(Frames::<Frame>::new());
     let _ = pump(&mut stream, data, |record| round_trip(&record));
     let _ = finish(&mut stream, |record| round_trip(&record));
-    contract::check_wire::<Ticket>(data);
-    contract::check_wire::<EncryptedData>(data);
-    contract::check_wire::<KdcReqBody>(data);
-    contract::check_wire::<MethodData>(data);
+    if let Ok(value) = <Ticket as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <EncryptedData as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <KdcReqBody as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <MethodData as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     // Any bytes as a UDP datagram.
     round_trip(data);
 
     let frame = Frame(data.to_vec());
     if let Ok(bytes) = frame.to_bytes() {
-        contract::check_decode(Frames::<Frame>::new, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Frame>::new, &bytes),
+        );
         assert_eq!(Frame::parse(&bytes), Ok(frame));
     }
 });

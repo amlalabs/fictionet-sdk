@@ -9,14 +9,14 @@ use fictionet::stdlib::protocols::x509::{
     BasicConstraints, ExtensionValue, GeneralName, KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name,
     PemBlock, PemBlocks, SubjectAltName, Value, pem_decode,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// A value built from the input, not read from it: its writer either
 /// refuses it or writes bytes that read back as the same value.
 fn built(data: &[u8]) {
     fn same<T: ExtensionValue + PartialEq + std::fmt::Debug>(v: T) {
-        contract::check_wire_value(&v);
+        let _ = assert_write(&v);
         if let Ok(der) = v.to_bytes() {
             assert_eq!(T::parse(&der).unwrap(), v);
         }
@@ -71,17 +71,42 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    contract::check_decode(PemBlocks::new, data);
-    contract::check_decode(|| PemBlocks::with_limit(128), data);
-    contract::check_wire::<PemBlock>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(PemBlocks::new()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(PemBlocks::new, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(PemBlocks::with_limit(128)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| PemBlocks::with_limit(128), data),
+    );
+    if let Ok(value) = <PemBlock as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let block = PemBlock {
         label: "CERTIFICATE".into(),
         data: data.get(..MAX_PEM_DATA + 1).unwrap_or(data).to_vec(),
     };
-    contract::check_wire_value(&block);
+    let _ = assert_write(&block);
     if let Ok(text) = block.to_bytes() {
-        contract::check_decode(PemBlocks::new, &text);
-        contract::check_wire::<PemBlock>(&text);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(PemBlocks::new()),
+                chunks(&text, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(PemBlocks::new, &text),
+        );
+        if let Ok(value) = <PemBlock as Wire>::parse(&text) {
+            let _ = assert_write(&value);
+        }
     }
 
     check(data);
@@ -89,7 +114,7 @@ fuzz_target!(|data: &[u8]| {
 
     let mut stream = Stream::new(PemBlocks::new());
     let mut inspect = |block: PemBlock| {
-        contract::check_wire_value(&block);
+        let _ = assert_write(&block);
         check(&block.data);
     };
     let _ = pump(&mut stream, data, &mut inspect);

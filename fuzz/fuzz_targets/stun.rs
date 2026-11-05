@@ -4,18 +4,38 @@
 
 use fictionet::stdlib::codec::{Decode, Frames, Stream, Wire};
 use fictionet::stdlib::protocols::stun::{Attribute, Frame, MAX_VALUE, Message, answer_binding};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::<Frame>::new, data);
-    contract::check_decode(
-        || Frames::<Frame>::new().map(|frame| <Message as Wire>::parse(&frame.0)),
-        data,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Frame>::new, data),
     );
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Frame>(data);
-    contract::check_wire_value(&Frame(data.to_vec()));
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(
+                Frames::<Frame>::new().map(|frame| <Message as Wire>::parse(&frame.0))
+            ),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(
+            || Frames::<Frame>::new().map(|frame| <Message as Wire>::parse(&frame.0)),
+            data
+        ),
+    );
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&Frame(data.to_vec()));
 
     // MESSAGE-INTEGRITY uses each frame's original bytes at its stream offset.
     let mut stream = Stream::new(Frames::<Frame>::new());
@@ -70,7 +90,7 @@ fuzz_target!(|data: &[u8]| {
         );
         let source = "192.0.2.1:32853".parse().unwrap();
         if let Some(reply) = answer_binding(&m, source) {
-            contract::check_wire_value(&reply);
+            let _ = assert_write(&reply);
             let back = <Message as Wire>::parse(&reply.to_bytes().unwrap()).unwrap();
             assert_eq!(back.transaction, m.transaction);
         }
@@ -86,13 +106,13 @@ fuzz_target!(|data: &[u8]| {
             typ,
             value: value.iter().take(MAX_VALUE + 1).copied().collect(),
         });
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
         message.method = typ;
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
         if let Ok(attribute) = &r {
             message.method = 1;
             message.attributes = vec![attribute.clone()];
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
         }
         if value.len() > MAX_VALUE {
             assert!(r.is_err());

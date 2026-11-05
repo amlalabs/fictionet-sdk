@@ -6,7 +6,7 @@ use fictionet::stdlib::protocols::json_schema::{
     CompileKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,
     PatternPolicy, Schema,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
@@ -74,7 +74,7 @@ fuzz_target!(|input: &[u8]| {
         assert_eq!(result, schema.generate(seed, bounds));
         if let Ok(example) = result {
             assert!(schema.validate(&example).is_valid());
-            contract::check_wire_value(&example);
+            let _ = assert_write(&example);
         }
     };
     if let Ok(schema) = Schema::compile_with(&source, options) {

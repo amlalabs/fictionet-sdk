@@ -1,11 +1,12 @@
 //! RFB (VNC) sessions, as a world playing a server or a client reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::Wire,
     protocols::rfb::{ClientMessages, ServerMessages},
     test_support::chunks,
-    test_support::contract,
 };
 
 use fictionet::stdlib::protocols::rfb::harness;
@@ -15,23 +16,43 @@ use fictionet::stdlib::protocols::rfb::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Version>(data);
-    contract::check_wire::<Text>(data);
-    contract::check_wire::<PixelFormat>(data);
-    contract::check_wire::<ServerInit>(data);
-    contract::check_wire::<ClientMessage>(data);
-    contract::check_wire_value(&ClientMessage::ClientCutText(
+    if let Ok(value) = <Version as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Text as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <PixelFormat as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ServerInit as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ClientMessage as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&ClientMessage::ClientCutText(
         data.iter().take(4097).copied().collect(),
     ));
-    contract::check_decode_with_alloc_limit(
-        ClientMessages::new,
-        data,
-        2 * fictionet::stdlib::protocols::rfb::MAX_CLIENT_MESSAGE,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(ClientMessages::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * fictionet::stdlib::protocols::rfb::MAX_CLIENT_MESSAGE);
+            }
+        ),
+        decode_all(ClientMessages::new, data),
     );
-    contract::check_decode_with_alloc_limit(
-        ServerMessages::new,
-        data,
-        2 * fictionet::stdlib::protocols::rfb::MAX_MESSAGE,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(ServerMessages::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * fictionet::stdlib::protocols::rfb::MAX_MESSAGE);
+            }
+        ),
+        decode_all(ServerMessages::new, data),
     );
     let selectors = [
         data.first().copied().unwrap_or(0),
@@ -73,23 +94,35 @@ fuzz_target!(|data: &[u8]| {
             ..PixelFormat::TRUE_COLOR_32
         },
     ][usize::from(selectors[3]) % 3];
-    contract::check_decode_with_alloc_limit(
-        || {
-            let mut d = ClientMessages::with_limit(4096);
-            d.set_phase(client_phase).unwrap();
-            d
-        },
-        input,
-        8192,
+    let client = || {
+        let mut d = ClientMessages::with_limit(4096);
+        d.set_phase(client_phase).unwrap();
+        d
+    };
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(client()),
+            chunks(input, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 8192);
+            }
+        ),
+        decode_all(client, input),
     );
-    contract::check_decode_with_alloc_limit(
-        || {
-            let mut d = ServerMessages::with_limit(4096);
-            d.set_phase(server_phase, dialect, format).unwrap();
-            d
-        },
-        input,
-        8192,
+    let server = || {
+        let mut d = ServerMessages::with_limit(4096);
+        d.set_phase(server_phase, dialect, format).unwrap();
+        d
+    };
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(server()),
+            chunks(input, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 8192);
+            }
+        ),
+        decode_all(server, input),
     );
     let Some((&choice, data)) = data.split_first() else {
         return;
@@ -112,7 +145,7 @@ fuzz_target!(|data: &[u8]| {
     for message in whole.iter().flatten().flatten() {
         if !message.is_handshake() {
             assert!(message.to_bytes().is_ok());
-            contract::check_wire_value(message);
+            let _ = assert_write(message);
         }
     }
     let whole = harness::as_client(version, vnc, [data]);

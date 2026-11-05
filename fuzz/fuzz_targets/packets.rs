@@ -3,10 +3,11 @@
 //! messages (`dhcp::Message::parse`).
 #![no_main]
 
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::assert_write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::Packet;
-use fictionet::stdlib::test_support::contract::check_wire;
 use fictionet::stdlib::{
     network::{icmp, udp},
     protocols::dhcp,
@@ -38,7 +39,9 @@ fuzz_target!(|data: &[u8]| {
             assert!(icmp::echo_reply(&reply, addr).is_none());
         }
     }
-    check_wire::<dhcp::Message>(data);
+    if let Ok(value) = <dhcp::Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     if let Some(datagram) = udp::Datagram::parse(data) {
         assert!(datagram.as_bytes().len() <= data.len());
         for (src, dst) in [

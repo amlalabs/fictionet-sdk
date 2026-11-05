@@ -4,15 +4,14 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::whois::{
     CollectedResponses, Field, MAX_QUERY, MAX_RESPONSE, Queries, Query, RESPONSE_WINDOW, Referral,
     ReferralKind, Response, find_referral, parse_fields,
 };
-use fictionet::stdlib::test_support::contract::{
-    check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value,
-};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// Values a world builds: whatever a writer accepts reads back the same.
@@ -49,7 +48,7 @@ fn built(data: &[u8]) -> Result<()> {
         });
     }
     if let Ok(response) = Response::from_fields(&fields) {
-        check_wire_value(&response);
+        let _ = assert_write(&response);
         assert!(response.as_bytes().len() <= MAX_RESPONSE);
         assert_eq!(response.fields().unwrap(), fields);
     }
@@ -82,20 +81,48 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode_with_alloc_limit(Queries::new, data, 2 * (MAX_QUERY + 2));
-    check_decode_with_alloc_limit(CollectedResponses::new, data, 2 * RESPONSE_WINDOW);
-    check_decode_with_held_limit(CollectedResponses::new, data, MAX_RESPONSE);
-    check_decode_with_alloc_limit(
-        || CollectedResponses::with_limit(17),
-        data,
-        2 * RESPONSE_WINDOW,
+    let bound = 2 * (MAX_QUERY + 2);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Queries::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Queries::new, data),
     );
-    check_decode_with_held_limit(|| CollectedResponses::with_limit(17), data, 17);
-    check_wire::<Query>(data);
-    check_wire::<Response>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(CollectedResponses::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * RESPONSE_WINDOW);
+                assert!(s.held() <= MAX_RESPONSE);
+            }
+        ),
+        decode_all(CollectedResponses::new, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(CollectedResponses::with_limit(17)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * RESPONSE_WINDOW);
+                assert!(s.held() <= 17);
+            }
+        ),
+        decode_all(|| CollectedResponses::with_limit(17), data),
+    );
+    if let Ok(value) = <Query as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Response as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     for query in decode_all(Queries::new, data).0.iter().flatten() {
-        check_wire_value(query);
+        let _ = assert_write(query);
         assert_eq!(Query::parse(&query.to_bytes().unwrap()).as_ref(), Ok(query));
         let _ = (query.flags(), query.terms());
     }
@@ -105,12 +132,12 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(responses.len(), 1);
     let collected = &responses[0];
     let response = &collected.response;
-    check_wire_value(response);
+    let _ = assert_write(response);
     assert_eq!(response.as_bytes(), &data[..data.len().min(MAX_RESPONSE)]);
     assert_eq!(collected.truncated, data.len() > MAX_RESPONSE);
     if let Ok(fields) = response.fields() {
         if let Ok(built) = Response::from_fields(&fields) {
-            check_wire_value(&built);
+            let _ = assert_write(&built);
             assert_eq!(built.fields().unwrap(), fields);
         }
         for field in &fields {

@@ -2,10 +2,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::bacnet::*;
-use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -21,33 +22,77 @@ fuzz_target!(|data: &[u8]| {
     }
     layers(data);
     writers(data);
-    contract::check_wire::<Bvlc>(data);
-    contract::check_wire::<Npdu>(data);
-    contract::check_wire::<Apdu>(data);
-    contract::check_decode_capacity(Frames::<Tag>::new, data);
-    contract::check_decode_capacity(Frames::<Value>::new, data);
+    if let Ok(value) = <Bvlc as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Npdu as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Apdu as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * Frames::<Tag>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Tag>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Tag>::new, data),
+    );
+    let bound = 2 * Frames::<Value>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Value>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Value>::new, data),
+    );
     let _ = ContextValue::<9>::read(data, data.first().copied().unwrap_or(0));
-    contract::check_wire::<Tag>(data);
-    contract::check_wire::<Value>(data);
-    contract::check_wire::<ValueList>(data);
-    contract::check_wire::<WhoIs>(data);
-    contract::check_wire::<IAm>(data);
+    if let Ok(value) = <Tag as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Value as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ValueList as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <WhoIs as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <IAm as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     macro_rules! context_values {
-        ($($tag:literal),+) => {$(contract::check_wire::<ContextValue<$tag>>(data);)+};
+        ($($tag:literal),+) => {$(
+            if let Ok(value) = <ContextValue<$tag> as Wire>::parse(data) {
+                let _ = assert_write(&value);
+            }
+        )+};
     }
     context_values!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
 });
 
 /// Checks an NPDU and its APDU payload through their complete units.
 fn layers(data: &[u8]) {
-    contract::check_wire::<Npdu>(data);
+    if let Ok(value) = <Npdu as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     if let Ok(npdu) = Npdu::parse(data)
         && let Some(apdu) = npdu.apdu()
     {
-        contract::check_wire::<Apdu>(apdu);
+        if let Ok(value) = <Apdu as Wire>::parse(apdu) {
+            let _ = assert_write(&value);
+        }
     }
     if let Ok(apdu) = Apdu::parse(data) {
-        contract::check_wire_value(&apdu);
+        let _ = assert_write(&apdu);
         assert_eq!(
             apdu.data().is_some(),
             apdu.service().is_some() && !matches!(apdu, Apdu::SimpleAck { .. })
@@ -61,7 +106,7 @@ fn writers(b: &[u8]) {
     let byte = |i: usize| b.get(i).copied().unwrap_or(0);
     let word = |i: usize| u16::from_be_bytes([byte(i), byte(i + 1)]);
     let instance = u32::from(word(0)) << 16 | u32::from(word(2));
-    contract::check_wire_value(&ContextValue::<{ tag::UNSIGNED }> {
+    let _ = assert_write(&ContextValue::<{ tag::UNSIGNED }> {
         number: byte(2),
         value: Value::Unsigned(u64::from(word(0))),
     });
@@ -81,8 +126,8 @@ fn writers(b: &[u8]) {
         priority: Priority::from_bits(byte(3) >> 3),
         body: NpduBody::Apdu(b.to_vec()),
     };
-    contract::check_wire_value(&npdu);
-    contract::check_wire_value(&Npdu::local(b.to_vec()));
+    let _ = assert_write(&npdu);
+    let _ = assert_write(&Npdu::local(b.to_vec()));
     let id = ObjectId {
         object_type: word(4),
         instance,
@@ -91,11 +136,11 @@ fn writers(b: &[u8]) {
         id.to_u32().is_some(),
         id.object_type <= MAX_OBJECT_TYPE && instance <= MAX_INSTANCE
     );
-    contract::check_wire_value(&Value::ObjectId(id));
-    contract::check_wire_value(&WhoIs {
+    let _ = assert_write(&Value::ObjectId(id));
+    let _ = assert_write(&WhoIs {
         range: Some((instance, u32::from(word(6)))),
     });
-    contract::check_wire_value(&IAm {
+    let _ = assert_write(&IAm {
         device: ObjectId::from_u32(instance),
         max_apdu: u32::from(word(4)),
         segmentation: [
@@ -110,5 +155,5 @@ fn writers(b: &[u8]) {
         charset: byte(0),
         bytes: b.to_vec(),
     };
-    contract::check_wire_value(&Value::CharacterString(string));
+    let _ = assert_write(&Value::CharacterString(string));
 }

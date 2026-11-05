@@ -7,7 +7,7 @@ use fictionet::stdlib::protocols::ouch::{
     EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Outbound, Price,
 };
 use fictionet::stdlib::protocols::session::Action;
-use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
@@ -17,9 +17,15 @@ fuzz_target!(|input: &[u8]| {
     let data = input
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
-    check_wire::<Inbound>(data);
-    check_wire::<Outbound>(data);
-    check_wire::<EnterOrder>(data);
+    if let Ok(value) = <Inbound as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Outbound as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <EnterOrder as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     // Split on 0xff: each piece is one inbound message for one exchange.
     // The first byte after each message steers the world's answers.
@@ -37,14 +43,16 @@ fuzz_target!(|input: &[u8]| {
         let steer = piece.last().copied().unwrap_or(0);
         for action in exchange.receive(&message, now).unwrap() {
             match action {
-                Action::Send(out) => check_wire_value(&out),
+                Action::Send(out) => {
+                    let _ = assert_write(&out);
+                }
                 Action::Event(Event::EnterRequested(t)) => {
                     let out = if steer & 1 == 0 {
                         exchange.accept(t, now).unwrap()
                     } else {
                         exchange.reject(t, u16::from(steer), now).unwrap()
                     };
-                    check_wire_value(&out);
+                    let _ = assert_write(&out);
                 }
                 Action::Event(Event::ReplaceRequested { replacement, .. }) => {
                     let out = if steer & 2 == 0 {
@@ -53,7 +61,7 @@ fuzz_target!(|input: &[u8]| {
                         exchange.reject(replacement, 1, now)
                     };
                     if let Ok(out) = out {
-                        check_wire_value(&out);
+                        let _ = assert_write(&out);
                     }
                 }
                 Action::Event(Event::Ignored(_)) => {}
@@ -72,7 +80,7 @@ fuzz_target!(|input: &[u8]| {
             } else {
                 exchange.cancel(token, shares, b'U', now)
             };
-            check_wire_value(&out.unwrap());
+            let _ = assert_write(&out.unwrap());
         }
         if steer & 8 != 0 {
             let _ = exchange.break_trade(u64::from(steer), b'E', now);

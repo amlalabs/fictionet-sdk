@@ -4,26 +4,42 @@
 use fictionet::stdlib::protocols::rip::{
     Entries, MAX_PREFIX_LEN, Message, NgEntries, NgEntry, NgMessage, Received,
 };
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Collect, Stream, Wire},
     protocols::rip,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        || Collect::<rip::Message>::new(rip::MAX_MESSAGE),
-        data,
-        2 * (rip::MAX_MESSAGE + 1),
+    let bound = 2 * (rip::MAX_MESSAGE + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<rip::Message>::new(rip::MAX_MESSAGE)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::<rip::Message>::new(rip::MAX_MESSAGE), data),
     );
-    contract::check_wire::<rip::Message>(data);
-    contract::check_decode_with_alloc_limit(
-        || Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE),
-        data,
-        2 * (rip::MAX_NG_MESSAGE + 1),
+    if let Ok(value) = <rip::Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * (rip::MAX_NG_MESSAGE + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE), data),
     );
-    contract::check_wire::<rip::NgMessage>(data);
+    if let Ok(value) = <rip::NgMessage as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     let message = Message {
         command: rip::Command::Request,
@@ -34,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
         }),
         entries: Entries::WholeTable,
     };
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
     let parsed = Message::parse(data);
     if let Ok(m) = &parsed {
         assert_eq!(m.fits_datagram(), data.len() <= rip::MAX_DATAGRAM);

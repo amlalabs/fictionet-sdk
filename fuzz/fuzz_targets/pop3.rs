@@ -1,8 +1,9 @@
 //! POP3 commands, reply expectations, AUTH lines, and strict wire values.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::pop3::{
     Command, Error, Input, Inputs, MAX_AUTH_LINE, MAX_REPLY_HELD, Output, Outputs, Reply, Request,
@@ -12,14 +13,19 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fn check_reply(reply: &Reply) {
-    contract::check_wire_value(reply);
+    let _ = assert_write(reply);
     if let Ok(bytes) = reply.to_bytes() {
         let make = || {
             let mut replies = Outputs::new();
             replies.expect(reply.body.is_some()).unwrap();
             replies
         };
-        contract::check_decode_with_held_limit(make, &bytes, MAX_REPLY_HELD);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(&bytes, &[1, 7, 64]), |s| {
+                assert!(s.held() <= MAX_REPLY_HELD);
+            }),
+            decode_all(make, &bytes),
+        );
         assert_eq!(
             decode_all(make, &bytes),
             (vec![Ok(Output::Reply(reply.clone()))], None)
@@ -28,14 +34,29 @@ fn check_reply(reply: &Reply) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Inputs::new, data, 2 * (MAX_AUTH_LINE + 2));
-    contract::check_decode_with_held_limit(Inputs::new, data, 0);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Inputs::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+                assert_eq!(s.held(), 0);
+            }
+        ),
+        decode_all(Inputs::new, data),
+    );
     let raw = || {
         let mut commands = Inputs::new();
         commands.expect_line().unwrap();
         commands
     };
-    contract::check_decode_with_alloc_limit(raw, data, 2 * (MAX_AUTH_LINE + 2));
+    let bound = 2 * (MAX_AUTH_LINE + 2);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(raw()), chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= bound);
+        }),
+        decode_all(raw, data),
+    );
     let auth = || {
         let mut replies = Outputs::new();
         replies.expect(false).unwrap();
@@ -48,8 +69,13 @@ fuzz_target!(|data: &[u8]| {
             item
         })
     };
-    contract::check_decode_with_alloc_limit(auth, data, 2 * (MAX_AUTH_LINE + 2));
-    contract::check_decode_with_held_limit(auth, data, MAX_REPLY_HELD);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(auth()), chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+            assert!(s.held() <= MAX_REPLY_HELD);
+        }),
+        decode_all(auth, data),
+    );
     for multi in [false, true] {
         let make = || {
             let mut replies = Outputs::new();
@@ -58,8 +84,13 @@ fuzz_target!(|data: &[u8]| {
             }
             replies
         };
-        contract::check_decode_with_alloc_limit(make, data, 2 * (MAX_AUTH_LINE + 2));
-        contract::check_decode_with_held_limit(make, data, MAX_REPLY_HELD);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= 2 * (MAX_AUTH_LINE + 2));
+                assert!(s.held() <= MAX_REPLY_HELD);
+            }),
+            decode_all(make, data),
+        );
         for item in decode_all(make, data).0 {
             if let Ok(Output::Reply(reply)) = item {
                 check_reply(&reply);
@@ -70,22 +101,40 @@ fuzz_target!(|data: &[u8]| {
                     assert_eq!(Reply::stat(count, size).drop_listing(), Some((count, size)));
                 }
                 for line in reply.lines() {
-                    contract::check_wire::<ScanListing>(line);
-                    contract::check_wire::<UniqueIdListing>(line);
+                    if let Ok(value) = <ScanListing as Wire>::parse(line) {
+                        let _ = assert_write(&value);
+                    }
+                    if let Ok(value) = <UniqueIdListing as Wire>::parse(line) {
+                        let _ = assert_write(&value);
+                    }
                 }
             }
         }
     }
-    contract::check_wire::<Command>(data);
-    contract::check_wire::<Request>(data);
-    contract::check_wire::<Reply>(data);
-    contract::check_wire::<ScanListing>(data);
-    contract::check_wire::<UniqueIdListing>(data);
+    if let Ok(value) = <Command as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Request as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Reply as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ScanListing as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <UniqueIdListing as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     for item in decode_all(Inputs::new, data).0 {
         if let Ok(Input::Command(command)) = item {
-            contract::check_wire::<Command>(&command.to_bytes().unwrap());
+            if let Ok(value) = <Command as Wire>::parse(&command.to_bytes().unwrap()) {
+                let _ = assert_write(&value);
+            }
             if let Ok(request) = Request::from_command(&command) {
-                contract::check_wire::<Request>(&request.to_bytes().unwrap());
+                if let Ok(value) = <Request as Wire>::parse(&request.to_bytes().unwrap()) {
+                    let _ = assert_write(&value);
+                }
             }
         }
     }
@@ -96,7 +145,7 @@ fuzz_target!(|data: &[u8]| {
         keyword: sa.to_string(),
         argument: Some(sb.to_string()),
     };
-    contract::check_wire_value(&command);
+    let _ = assert_write(&command);
     check_reply(&Reply {
         ok: pick & 1 == 0,
         code: (pick & 2 != 0).then(|| sa.to_string()),
@@ -112,9 +161,9 @@ fuzz_target!(|data: &[u8]| {
             digest: [pick; 16],
         },
     ] {
-        contract::check_wire_value(&request);
+        let _ = assert_write(&request);
     }
-    contract::check_wire_value(&UniqueIdListing {
+    let _ = assert_write(&UniqueIdListing {
         message: std::num::NonZeroU32::MIN,
         id: sa.to_string(),
     });

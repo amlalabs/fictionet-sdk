@@ -84,8 +84,9 @@ the process grows by less than 200 MiB and that another sandbox is still
 served.
 
 The `dnp3`, `iec104`, `enip`, `opcua`, and `rdp` targets drive `Frames`
-through `codec::Stream` and `test_support::contract`. OPC UA also checks `Messages`
-with its assembly limit. Typed values use `Wire` writer contracts.
+through `codec::Stream`, comparing chunked and whole input with
+`test_support::decode_chunks` and `decode_all`. OPC UA also checks `Messages`
+with its assembly limit. Typed values go through `test_support::assert_write`.
 RDP uses `DataBlocks` for bounded GCC block sequences.
 The module docs describe the APIs:
 [DNP3](../src/stdlib/protocols/dnp3.rs), [IEC 104](../src/stdlib/protocols/iec104.rs),

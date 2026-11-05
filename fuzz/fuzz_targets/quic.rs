@@ -2,21 +2,23 @@
 #![no_main]
 
 use fictionet::stdlib::protocols::quic::harness::check_payload;
+use fictionet::stdlib::test_support::assert_write;
 use fictionet::stdlib::{
     codec::Wire,
     protocols::quic::{self, Datagram, Frame, Reassembler, VarInt},
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
 fn datagram<const N: usize>(bytes: &[u8]) {
-    contract::check_wire::<Datagram<N>>(bytes);
+    if let Ok(value) = <Datagram<N> as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
     let (packets, _) = quic::split_datagram(bytes, N);
     // With a legal ID length, every packet read can be written, together and one at a time.
     let writable = N <= 20;
     if !packets.is_empty() {
         let value = Datagram::<N>(packets.clone());
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         if writable {
             assert_eq!(
                 quic::split_datagram(&value.to_bytes().unwrap(), N),
@@ -29,7 +31,7 @@ fn datagram<const N: usize>(bytes: &[u8]) {
             check_payload(payload);
         }
         let value = Datagram::<N>(vec![packet]);
-        contract::check_wire_value(&value);
+        let _ = assert_write(&value);
         let written = value.to_bytes();
         if writable {
             assert!(written.is_ok());
@@ -47,8 +49,12 @@ fuzz_target!(|input: &[u8]| {
     let Some((&pick, bytes)) = input.split_first() else {
         return;
     };
-    contract::check_wire::<VarInt>(bytes);
-    contract::check_wire::<Frame>(bytes);
+    if let Ok(value) = <VarInt as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Frame as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
     check_payload(bytes);
     // Every legal short-header ID length, plus one past the limit.
     macro_rules! dispatch {

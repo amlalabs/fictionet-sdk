@@ -6,13 +6,19 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::ntp::{
     KissCode, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<Timestamp>(data);
-    contract::check_wire::<KissCode>(data);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Timestamp as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <KissCode as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     if let Ok(p) = Packet::parse(data) {
         // Every field is kept, so what was read writes back the same bytes.
@@ -31,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
             answer.map(|m| (m, p.version))
         );
         if let Ok(r) = r {
-            contract::check_wire_value(&r);
+            let _ = assert_write(&r);
             assert!(r.to_bytes().is_ok());
             assert_eq!(Packet::parse(&r.to_bytes().unwrap()).as_ref(), Ok(&r));
         }
@@ -41,7 +47,7 @@ fuzz_target!(|data: &[u8]| {
             answer.map(|m| (m, p.version))
         );
         if let Ok(r) = r {
-            contract::check_wire_value(&r);
+            let _ = assert_write(&r);
             assert!(r.to_bytes().is_ok());
             assert_eq!(Packet::parse(&r.to_bytes().unwrap()).as_ref(), Ok(&r));
         }

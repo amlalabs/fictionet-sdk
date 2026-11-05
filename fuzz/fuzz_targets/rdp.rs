@@ -2,9 +2,10 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::rdp::harness::{check_parsers, plaintext, roundtrip};
 use fictionet::stdlib::protocols::rdp::{
@@ -46,7 +47,7 @@ fn security(data: &[u8]) {
 }
 
 fn frame(value: &Frame) -> Vec<u8> {
-    check_wire_value(value);
+    let _ = assert_write(value);
     let bytes = value.to_bytes().unwrap();
     assert!(bytes.len() <= MAX_FRAME);
     if let Frame::SlowPath(packet) = value {
@@ -68,7 +69,7 @@ fn built(data: &[u8]) {
     macro_rules! check {
         ($ty:ty, $value:expr) => {{
             let value: $ty = $value;
-            check_wire_value(&value);
+            let _ = assert_write(&value);
             if let Ok(bytes) = value.to_bytes() {
                 assert!(bytes.len() <= MAX_PDU);
             }
@@ -109,7 +110,7 @@ fn built(data: &[u8]) {
         header: byte(0),
         payload: prefix(data, MAX_FAST_PATH).to_vec(),
     };
-    check_wire_value(&fast);
+    let _ = assert_write(&fast);
     check!(
         DataBlock,
         DataBlock::Other {
@@ -235,8 +236,17 @@ fn built(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     let data = prefix(data, MAX_FUZZ_INPUT);
-    check_decode(Frames::<Frame>::new, data);
-    check_wire::<Frame>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Frame>::new, data),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     pdu(data);
     let (frames, _) = decode_all(Frames::<Frame>::new, data);
     for value in frames {

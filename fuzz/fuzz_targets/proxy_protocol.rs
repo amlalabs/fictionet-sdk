@@ -2,10 +2,11 @@
 //! reads them at the start of a connection.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Decode, Step, Wire},
     protocols::proxy_protocol::Headers,
-    test_support::contract,
 };
 
 use fictionet::stdlib::protocols::proxy_protocol::{
@@ -39,17 +40,47 @@ fuzz_target!(|data: &[u8]| {
             check_exact_and_streaming(&bytes);
         }
     }
-    contract::check_decode_with_alloc_limit(Headers::new, data, 2 * MAX_HEADER_LEN);
-    contract::check_decode_with_alloc_limit(|| Headers::with_limit(32), data, 64);
-    contract::check_wire::<Header>(data);
-    contract::check_wire_value(&Header::V1(V1::Unknown(
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Headers::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_HEADER_LEN);
+            }
+        ),
+        decode_all(Headers::new, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Headers::with_limit(32)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 64);
+            }
+        ),
+        decode_all(|| Headers::with_limit(32), data),
+    );
+    if let Ok(value) = <Header as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&Header::V1(V1::Unknown(
         data.iter().take(108).copied().collect(),
     )));
-    contract::check_wire::<V1>(data);
-    contract::check_wire::<V2>(data);
-    contract::check_wire::<Tlv>(data);
-    contract::check_wire::<Ssl>(data);
-    contract::check_wire::<SslTlv>(data);
+    if let Ok(value) = <V1 as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <V2 as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Tlv as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Ssl as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <SslTlv as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     // Headers built from socket addresses taken from the input read back.
     if let Some(a) = data.get(..38) {
@@ -81,7 +112,7 @@ fuzz_target!(|data: &[u8]| {
             }),
         ];
         for h in headers {
-            contract::check_wire_value(&h);
+            let _ = assert_write(&h);
             let bytes = h.to_bytes().unwrap();
             assert_eq!(Header::parse(&bytes), Ok(h));
         }
@@ -158,6 +189,6 @@ fuzz_target!(|data: &[u8]| {
             addresses: Addresses::Unspec,
             tlvs,
         });
-        contract::check_wire_value(&h);
+        let _ = assert_write(&h);
     }
 });

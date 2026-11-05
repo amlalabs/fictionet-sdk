@@ -1,8 +1,9 @@
 //! Form bodies, query strings, and percent-encoded URL components.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Fail, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::urlencoded_form::{
     EncodeSet, Error, Field, Fields, Form, MAX_INPUT, MAX_PAIRS, PercentEncoded, decode_component,
@@ -12,11 +13,27 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Fields::new, data, 2 * (MAX_INPUT + 1));
-    contract::check_wire::<Field>(data);
-    contract::check_wire::<Form>(data);
-    contract::check_wire::<PercentEncoded>(data);
-    contract::check_wire_value(&Field((
+    let bound = 2 * (MAX_INPUT + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Fields::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Fields::new, data),
+    );
+    if let Ok(value) = <Field as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Form as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <PercentEncoded as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&Field((
         String::from_utf8_lossy(data).into_owned(),
         String::new(),
     )));
@@ -42,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
     let form = Form {
         pairs: fields.into_iter().map(|field| field.0).collect(),
     };
-    contract::check_wire_value(&form);
+    let _ = assert_write(&form);
     match Form::parse(data) {
         Ok(whole) => {
             assert_eq!(error, None);
@@ -72,7 +89,7 @@ fuzz_target!(|data: &[u8]| {
                 continue;
             }
         };
-        contract::check_wire_value(&encoded);
+        let _ = assert_write(&encoded);
         let bytes = encoded.to_bytes().unwrap();
         if set == EncodeSet::Form {
             assert_eq!(

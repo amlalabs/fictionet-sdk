@@ -3,13 +3,14 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::protocols::json::{self, Limits, Value};
 use fictionet::stdlib::protocols::zabbix::{
     Error, Header, Kind, MAX_DEPTH, Message, Packet, SenderValue,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 fn check_message(data: &[u8]) {
@@ -45,14 +46,45 @@ fn check_message(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_capacity(Frames::<Packet>::new, data);
-    contract::check_wire::<Packet>(data);
+    let bound = 2 * Frames::<Packet>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Packet>::new, data),
+    );
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(limit), data);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::new().map(|packet| Message::parse(&packet.data)),
-        data,
-        2 * Frames::<Packet>::new().capacity(),
+    let bound = 2 * Frames::<Packet>::with_limit(limit).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(limit)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(limit), data),
+    );
+    let bound = 2 * Frames::<Packet>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::new().map(|packet| Message::parse(&packet.data))),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(
+            || Frames::<Packet>::new().map(|packet| Message::parse(&packet.data)),
+            data
+        ),
     );
     let reserved = data
         .get(..8)
@@ -71,30 +103,44 @@ fuzz_target!(|data: &[u8]| {
             .copied()
             .collect(),
     };
-    contract::check_wire_value(&built);
+    let _ = assert_write(&built);
 
-    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(4096), data);
-    contract::check_wire::<Header>(data);
-    contract::check_wire::<Message>(data);
+    let bound = 2 * Frames::<Packet>::with_limit(4096).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(4096)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(4096), data),
+    );
+    if let Ok(value) = <Header as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     check_message(data);
     let mut json = br#"{"request":"agent data","value":"#.to_vec();
     json.extend_from_slice(data);
     json.push(b'}');
     check_message(&json);
     for p in decode_all(|| Frames::<Packet>::with_limit(4096), data).0 {
-        contract::check_wire_value(&p);
+        let _ = assert_write(&p);
         if let Ok(m) = Message::parse(&p.data) {
             assert_eq!(m.json().as_bytes(), &p.data[..]);
-            contract::check_wire_value(&m);
+            let _ = assert_write(&m);
             assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
         }
     }
     // Constructed messages within their limits read back unchanged.
     let text = String::from_utf8_lossy(data);
     let m = Message::active_checks(&text).unwrap();
-    contract::check_wire_value(&m);
+    let _ = assert_write(&m);
     let m = Message::response(false, Some(&text)).unwrap();
-    contract::check_wire_value(&m);
+    let _ = assert_write(&m);
     assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
     let v = SenderValue {
         host: text.to_string(),
@@ -102,5 +148,5 @@ fuzz_target!(|data: &[u8]| {
         value: text.to_string(),
     };
     let m = Message::sender_data(&[v]).unwrap();
-    contract::check_wire_value(&m);
+    let _ = assert_write(&m);
 });

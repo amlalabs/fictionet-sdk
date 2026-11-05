@@ -2,10 +2,11 @@
 //! writer given whatever text the agent sent.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use std::sync::Arc;
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::xml::{
     Attribute, Builder, Document, ErrorKind, Event, Events, Name, Start, XMLNS_NAMESPACE,
@@ -14,13 +15,21 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Events::new,
-        data,
-        2 * (fictionet::stdlib::protocols::xml::MAX_DOCUMENT + 1),
+    let bound = 2 * (fictionet::stdlib::protocols::xml::MAX_DOCUMENT + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Events::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Events::new, data),
     );
-    contract::check_wire::<fictionet::stdlib::protocols::xml::Document>(data);
-    contract::check_wire_value(&fictionet::stdlib::protocols::xml::Document {
+    if let Ok(value) = <fictionet::stdlib::protocols::xml::Document as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&fictionet::stdlib::protocols::xml::Document {
         data: data.to_vec(),
     });
     let whole = decode_all(Events::new, data);
@@ -64,7 +73,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = w.text(&s);
     if let Ok(out) = w.build() {
-        contract::check_wire_value(&out);
+        let _ = assert_write(&out);
         assert!(Document::parse(&out.to_bytes().unwrap()).is_ok());
     }
 

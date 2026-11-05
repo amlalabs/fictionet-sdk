@@ -2,9 +2,10 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::tds::*;
 use libfuzzer_sys::fuzz_target;
@@ -55,7 +56,7 @@ fn check_nbcrows(data: &[u8]) {
         }
     }
     let stream = TokenStream::parse(&bytes).unwrap();
-    contract::check_wire_value(&stream);
+    let _ = assert_write(&stream);
     assert_eq!(
         TokenReader::with_columns(&bytes[start..], columns)
             .unwrap()
@@ -105,11 +106,29 @@ fn check_nbcrows(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     check_nbcrows(data);
-    contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
-    contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), data, 128);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_PACKET);
+            }
+        ),
+        decode_all(Frames::<Packet>::new, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(64)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 128);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(64), data),
+    );
     harness::check_payload(data, LIMIT);
     harness::check_payload(data, 64);
-    contract::check_wire_value(&Packet {
+    let _ = assert_write(&Packet {
         packet_type: data.first().copied().unwrap_or(0),
         status: data.get(1).copied().unwrap_or(0),
         spid: u16::from(data.get(2).copied().unwrap_or(0)),
@@ -149,7 +168,7 @@ fuzz_target!(|data: &[u8]| {
     if valid {
         assert!(prelogin.to_bytes().is_ok(), "{prelogin:?}");
     }
-    contract::check_wire_value(&prelogin);
+    let _ = assert_write(&prelogin);
     let login = Login7 {
         option_flags3: head.first().copied().unwrap_or(0) & !option_flags3::EXTENSION,
         user_name: text.chars().take(200).collect(),
@@ -167,7 +186,7 @@ fuzz_target!(|data: &[u8]| {
                     && !login.change_password.is_empty())
         );
     }
-    contract::check_wire_value(&login);
+    let _ = assert_write(&login);
     let mut batch = SqlBatch::new(&text);
     batch.headers.as_mut().unwrap().extend(
         rest.chunks(13)
@@ -189,7 +208,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(message) = message {
         assert_eq!(SqlBatch::parse(&message.data, true), Ok(batch));
         assert!(message.to_bytes().is_ok(), "{message:?}");
-        contract::check_wire_value(&message);
+        let _ = assert_write(&message);
     }
     let kinds = [
         TypeInfo::nullable(data_type::INTN, 4),
@@ -207,7 +226,7 @@ fuzz_target!(|data: &[u8]| {
     ];
     let columns = kinds.iter().map(|t| Column::new("c", t.clone())).collect();
     let row = kinds.iter().map(|t| value_for(t.ty, rest)).collect();
-    contract::check_wire_value(&TokenStream(vec![
+    let _ = assert_write(&TokenStream(vec![
         Token::ColMetadata(Some(columns)),
         Token::Row(row),
     ]));

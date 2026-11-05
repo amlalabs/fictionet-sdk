@@ -3,7 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::coap::Reassembler;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::coap::Block;
 
@@ -28,20 +30,34 @@ use fictionet::stdlib::protocols::coap::option;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::coap::harness::check_blocks;
 use fictionet::stdlib::protocols::coap::peek_header;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_BUFFERED);
-    contract::check_wire::<fictionet::stdlib::protocols::coap::Uint>(data);
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Frame>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_BUFFERED);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, data),
+    );
+    if let Ok(value) = <fictionet::stdlib::protocols::coap::Uint as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let mut built = Message::new(Type::Reset, Code(data.first().copied().unwrap_or(0)), 1);
     built.token = data.iter().take(9).copied().collect();
     built.payload = data.iter().take(MAX_DATAGRAM + 1).copied().collect();
-    contract::check_wire_value(&built);
-    contract::check_wire_value(&Frame {
+    let _ = assert_write(&built);
+    let _ = assert_write(&Frame {
         code: built.code,
         token: built.token.clone(),
         options: Options::new(),
@@ -51,10 +67,10 @@ fuzz_target!(|data: &[u8]| {
     // message, so a message read writes back as the same bytes.
     let _ = peek_header(data);
     if let Ok(m) = Message::parse(data) {
-        contract::check_wire_value(&m);
+        let _ = assert_write(&m);
         let mut reordered = m.clone();
         reordered.options.0.reverse();
-        contract::check_wire_value(&reordered);
+        let _ = assert_write(&reordered);
         assert_eq!(m.to_bytes().unwrap(), data);
         // RFC 7252 sections 4.2 and 4.3: a reader keeps only the forms a
         // type allows.
@@ -148,9 +164,9 @@ fuzz_target!(|data: &[u8]| {
     }
 
     for frame in decode_all(Frames::<Frame>::new, data).0 {
-        contract::check_wire_value(&frame);
+        let _ = assert_write(&frame);
         let _ = (frame.bad_option(), frame.max_message_size());
         assert!(frame.pong().to_bytes().is_ok());
-        contract::check_wire_value(&frame.pong());
+        let _ = assert_write(&frame.pong());
     }
 });

@@ -7,16 +7,28 @@ use fictionet::stdlib::protocols::wireguard::{
     CookieReply, Data, Error, Initiation, MAX_ENCRYPTED, MAX_PLAINTEXT, Message, Plaintext,
     REJECT_AFTER_MESSAGES, ReplayWindow, Response, TAG_LEN, padding,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Initiation>(data);
-    contract::check_wire::<Response>(data);
-    contract::check_wire::<CookieReply>(data);
-    contract::check_wire::<Data>(data);
-    contract::check_wire::<Plaintext>(data);
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Initiation as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Response as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <CookieReply as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Data as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Plaintext as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     // A message read can be written, and gives back the same bytes.
     if let Ok(m) = Message::parse(data) {
@@ -44,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
             counter,
             encrypted: data[12..].to_vec(),
         };
-        contract::check_wire_value(&d);
+        let _ = assert_write(&d);
         let n = d.encrypted.len();
         match d.to_bytes() {
             Ok(b) => {
@@ -82,7 +94,7 @@ fuzz_target!(|data: &[u8]| {
         let n = padding(plaintext.len(), mtu);
         match Plaintext::padded(plaintext, mtu) {
             Ok(padded) => {
-                contract::check_wire_value(&padded);
+                let _ = assert_write(&padded);
                 let padded = padded.to_bytes().unwrap();
                 assert_eq!(padded.len(), plaintext.len() + n);
                 assert_eq!(&padded[..plaintext.len()], plaintext);

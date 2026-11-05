@@ -3,12 +3,13 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::protocols::wake_on_lan::{
     Error, MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, MagicPackets, PACKET_LEN, Password, wakes,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// Whether `payload` wakes the card, checked the slow way: some offset
@@ -58,7 +59,7 @@ fn built(data: &[u8]) -> Result<()> {
         _ => Some(Password::Six(u.arbitrary()?)),
     };
     let packet = MagicPacket { mac, password };
-    contract::check_wire_value(&packet);
+    let _ = assert_write(&packet);
     let bytes = packet.to_bytes().unwrap();
     assert_eq!(bytes.len(), packet.len());
     assert!(bytes.len() <= MAX_PACKET_LEN);
@@ -68,8 +69,20 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(MagicPackets::new, data, 2 * (MAX_PAYLOAD + 1));
-    contract::check_wire::<MagicPacket>(data);
+    let bound = 2 * (MAX_PAYLOAD + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(MagicPackets::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(MagicPackets::new, data),
+    );
+    if let Ok(value) = <MagicPacket as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // Adapter consistency only: MagicPackets delegates to find at EOF.
     let found = MagicPacket::find(data);
     let expected = match found {

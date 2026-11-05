@@ -2,15 +2,16 @@
 //! playing a file server, or a client, reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::nfs::harness::check;
 use fictionet::stdlib::protocols::nfs::{
     DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, Request, Response, Status, procedure,
 };
 use fictionet::stdlib::protocols::onc_rpc::{Body, Message};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use fictionet::stdlib::{
     codec::{Assembled, Decode, Wire},
     protocols::onc_rpc,
-    test_support::contract,
     test_support::decode_all,
 };
 use libfuzzer_sys::fuzz_target;
@@ -39,22 +40,41 @@ fuzz_target!(|data: &[u8]| {
 
     // The bytes as a TCP stream of calls, across the contract partitions.
     let limit = 1 << 16;
-    contract::check_decode(|| onc_rpc::Fragments::with_limit(limit), data);
-    contract::check_decode(|| onc_rpc::records(limit), data);
-    contract::check_decode(
-        || {
-            onc_rpc::messages(limit).map(|message| {
-                message.map(|message| match message.body {
-                    Body::Call(call) => Some((message.xid, Request::parse(&call))),
-                    Body::Reply(_) => None,
-                })
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(onc_rpc::Fragments::with_limit(limit)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| onc_rpc::Fragments::with_limit(limit), data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(onc_rpc::records(limit)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| onc_rpc::records(limit), data),
+    );
+    let calls = || {
+        onc_rpc::messages(limit).map(|message| {
+            message.map(|message| match message.body {
+                Body::Call(call) => Some((message.xid, Request::parse(&call))),
+                Body::Reply(_) => None,
             })
-        },
-        data,
+        })
+    };
+    assert_eq!(
+        decode_chunks(&mut Stream::new(calls()), chunks(data, &[1, 7, 64]), |_| {}),
+        decode_all(calls, data),
     );
     // NFS arguments need a procedure; Wire belongs to the RPC envelope.
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<onc_rpc::Record>(data);
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <onc_rpc::Record as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let (records, _) = decode_all(|| onc_rpc::records(limit), data);
 
     // Each record, and the bytes on their own as a UDP datagram.
@@ -66,7 +86,9 @@ fuzz_target!(|data: &[u8]| {
         })
         .chain([data])
     {
-        contract::check_wire::<Message>(bytes);
+        if let Ok(value) = <Message as Wire>::parse(bytes) {
+            let _ = assert_write(&value);
+        }
         let Ok(Message {
             xid,
             body: Body::Call(call),

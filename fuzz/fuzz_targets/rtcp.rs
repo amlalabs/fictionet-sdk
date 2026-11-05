@@ -2,6 +2,8 @@
 //! reads them, and packets a world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use fictionet_fuzz::input::{bytes, list};
 
 use arbitrary::{Result, Unstructured};
@@ -14,7 +16,6 @@ use fictionet::stdlib::protocols::rtcp::{
     SdesChunk, SdesItem, SenderReport, Sli, Tmmb, TransportFeedback, TransportMessage, XrBlock,
     harness::datagram,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
@@ -191,7 +192,7 @@ fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let packets = list(&mut u, 6, packet)?;
     for p in &packets {
-        contract::check_wire_value(p);
+        let _ = assert_write(p);
         if let Ok(bytes) = p.to_bytes() {
             assert!(bytes.len() <= MAX_PACKET && bytes.len() % 4 == 0);
             assert_eq!(Packet::parse(&bytes), Ok(p.clone()));
@@ -233,23 +234,58 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * (MAX_DATAGRAM + 2));
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
-        data,
-        514,
+    let bound = 2 * (MAX_DATAGRAM + 2);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, data),
     );
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Frame>::new().map(|frame| Datagram::parse(&frame.0)),
-        data,
-        2 * (MAX_DATAGRAM + 2),
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::with_limit(usize::from(
+                data.first().copied().unwrap_or(0)
+            ))),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 514);
+            }
+        ),
+        decode_all(
+            || Frames::<Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+            data
+        ),
     );
-    contract::check_wire::<Frame>(data);
-    contract::check_wire::<Packet>(data);
+    let bound = 2 * (MAX_DATAGRAM + 2);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new().map(|frame| Datagram::parse(&frame.0))),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(
+            || Frames::<Frame>::new().map(|frame| Datagram::parse(&frame.0)),
+            data
+        ),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let envelope = Frame(data.get(..MAX_DATAGRAM + 1).unwrap_or(data).to_vec());
-    contract::check_wire_value(&envelope);
+    let _ = assert_write(&envelope);
     if let Ok(bytes) = Wire::to_bytes(&envelope) {
-        contract::check_wire::<Frame>(&bytes);
+        if let Ok(value) = <Frame as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
     }
 
     // The bytes as one datagram.

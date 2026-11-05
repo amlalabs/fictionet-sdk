@@ -2,21 +2,30 @@
 //! them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::gre::{Header, Packet};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Collect, Wire},
     protocols::gre,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        || Collect::<gre::Packet>::new(gre::MAX_PACKET),
-        data,
-        2 * (gre::MAX_PACKET + 1),
+    let bound = 2 * (gre::MAX_PACKET + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<gre::Packet>::new(gre::MAX_PACKET)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::<gre::Packet>::new(gre::MAX_PACKET), data),
     );
-    contract::check_wire::<gre::Packet>(data);
+    if let Ok(value) = <gre::Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     let payload = data.iter().take(gre::MAX_PACKET + 1).copied().collect();
     let packet = Packet {
@@ -27,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
         }),
         payload,
     };
-    contract::check_wire_value(&packet);
+    let _ = assert_write(&packet);
 
     let parsed = Packet::parse(data);
 

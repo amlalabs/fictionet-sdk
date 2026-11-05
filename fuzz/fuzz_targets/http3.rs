@@ -1,11 +1,11 @@
 //! HTTP/3 streams, field sections, and Priority dictionaries.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Frames};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::codec::Wire;
-
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
 
@@ -65,7 +65,7 @@ fn check_headers(headers: &HeaderList, kind: HeaderKind) {
             kind,
         )
         .unwrap();
-    contract::check_wire_value(&section);
+    let _ = assert_write(&section);
     let SectionResult::Fields { fields, ack } =
         qpack::decode_section(&Table::new(0), 0, &section.to_bytes().unwrap()).unwrap()
     else {
@@ -86,7 +86,10 @@ fn check_event(event: &Event, request: Option<HeaderKind>) {
         Event::Informational(headers) => (headers, HeaderKind::Response),
         Event::Trailers(headers) => (headers, HeaderKind::Trailers),
         Event::PushPromise { headers, .. } => (headers, HeaderKind::Promise),
-        Event::Unknown(frame) => return contract::check_wire_value(frame),
+        Event::Unknown(frame) => {
+            let _ = assert_write(frame);
+            return;
+        }
         Event::Data(data) => return assert!(data.len() <= http3::MAX_FRAME),
     };
     assert_eq!(headers.validate(kind), Ok(()));
@@ -110,7 +113,7 @@ fn request_result(
         }
         Ok(RequestResult::Event { event, ack }) => {
             if let Some(ack) = ack {
-                contract::check_wire_value(&ack);
+                let _ = assert_write(&ack);
             }
             if let Ok(event) = event {
                 let request = (side == MessageSide::Request).then_some(HeaderKind::Request {
@@ -123,7 +126,7 @@ fn request_result(
         Err(_) => {}
     }
     if let Some(cancel) = held.cancel(table, id) {
-        contract::check_wire_value(&cancel);
+        let _ = assert_write(&cancel);
     }
     let _ = session.remove(id);
     false
@@ -226,38 +229,77 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
     }
     for state in &mut states {
         let _ = state.finish();
-        contract::check_wire_value(&held.cancel(&table, state.stream_id()).unwrap());
+        let _ = assert_write(&held.cancel(&table, state.stream_id()).unwrap());
         let _ = session.remove(state.stream_id());
     }
 }
 
 fuzz_target!(|input: &[u8]| {
     let bytes = &input[..input.len().min(MAX_FUZZ_INPUT)];
-    contract::check_wire::<Frame>(bytes);
-    contract::check_wire::<Settings>(bytes);
-    contract::check_wire::<Priority>(bytes);
-    contract::check_wire::<StreamHeader>(bytes);
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, bytes, 2 * http3::MAX_FRAME);
-    contract::check_decode_with_alloc_limit(
-        StreamHeaders::new,
-        bytes,
-        2 * http3::MAX_STREAM_HEADER,
+    if let Ok(value) = <Frame as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Settings as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Priority as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <StreamHeader as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * http3::MAX_FRAME);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, bytes),
     );
-    contract::check_decode_with_alloc_limit(
-        StreamItems::request,
-        bytes,
-        2 * StreamItems::request().capacity(),
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(StreamHeaders::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * http3::MAX_STREAM_HEADER);
+            }
+        ),
+        decode_all(StreamHeaders::new, bytes),
     );
-    contract::check_decode_with_alloc_limit(
-        StreamItems::unidirectional,
-        bytes,
-        2 * StreamItems::unidirectional().capacity(),
+    let bound = 2 * StreamItems::request().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(StreamItems::request()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(StreamItems::request, bytes),
+    );
+    let bound = 2 * StreamItems::unidirectional().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(StreamItems::unidirectional()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(StreamItems::unidirectional, bytes),
     );
     for sender in [Side::Client, Side::Server] {
-        contract::check_decode_with_alloc_limit(
-            || http3::ControlFrames::new(sender),
-            bytes,
-            2 * http3::MAX_FRAME,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(http3::ControlFrames::new(sender)),
+                chunks(bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * http3::MAX_FRAME);
+                }
+            ),
+            decode_all(|| http3::ControlFrames::new(sender), bytes),
         );
         for header in [
             StreamHeader::Control,
@@ -266,7 +308,13 @@ fuzz_target!(|input: &[u8]| {
             StreamHeader::Unknown(64),
         ] {
             let make = || StreamItems::after_header(header, sender);
-            contract::check_decode_with_alloc_limit(make, bytes, 2 * make().capacity());
+            let bound = 2 * make().capacity();
+            assert_eq!(
+                decode_chunks(&mut Stream::new(make()), chunks(bytes, &[1, 7, 64]), |s| {
+                    assert!(s.allocated() <= bound);
+                }),
+                decode_all(make, bytes),
+            );
         }
     }
     let budget = http3::MAX_FRAME + MAX_FUZZ_INPUT;
@@ -274,7 +322,7 @@ fuzz_target!(|input: &[u8]| {
     let table = Table::new(0);
     let (items, _) = decode_all(Frames::<Frame>::new, bytes);
     for frame in items.iter().flatten() {
-        contract::check_wire_value(frame);
+        let _ = assert_write(frame);
     }
     for extended_connect in [false, true] {
         let request = Some(HeaderKind::Request { extended_connect });
@@ -306,7 +354,7 @@ fuzz_target!(|input: &[u8]| {
                     }) => {
                         check_event(&event, request);
                         if let Some(ack) = ack {
-                            contract::check_wire_value(&ack);
+                            let _ = assert_write(&ack);
                         }
                     }
                     _ => break,
@@ -330,7 +378,7 @@ fuzz_target!(|input: &[u8]| {
             if let Ok(headers) = HeaderList::from_fields(fields.clone(), kind) {
                 check_headers(&headers, kind);
                 if let Ok(priority) = headers.priority() {
-                    contract::check_wire_value(&priority);
+                    let _ = assert_write(&priority);
                 }
             }
         }
@@ -365,9 +413,9 @@ fuzz_target!(|input: &[u8]| {
             value: bytes.to_vec(),
         },
     ] {
-        contract::check_wire_value(&frame);
+        let _ = assert_write(&frame);
     }
-    contract::check_wire_value(&Priority {
+    let _ = assert_write(&Priority {
         urgency: input.first().copied(),
         incremental: Some(true),
     });
@@ -394,7 +442,7 @@ fuzz_target!(|input: &[u8]| {
     );
     if headers.validate(kind).is_ok() {
         let section = result.unwrap();
-        contract::check_wire_value(&section);
+        let _ = assert_write(&section);
         let SectionResult::Fields { fields, ack } =
             qpack::decode_section(&Table::new(0), 0, &section.to_bytes().unwrap()).unwrap()
         else {

@@ -7,7 +7,7 @@ use fictionet::stdlib::protocols::nbns::{
     Error, MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, RrName, rcode,
 };
 use fictionet::stdlib::protocols::netbios::decode_first_level;
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;
 
@@ -20,9 +20,15 @@ fn prefixes(len: usize) -> impl Iterator<Item = usize> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Name>(data);
-    contract::check_wire::<RrName>(data);
-    contract::check_wire::<Packet>(data);
+    if let Ok(value) = <Name as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <RrName as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // The bytes as one datagram, and its prefixes, as if it came a byte at
     // a time. None of them panics.
     for n in prefixes(data.len()) {
@@ -69,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
                 p.wack(name, 2),
                 p.wack(RrName::null(), 2),
             ] {
-                contract::check_wire_value(&r);
+                let _ = assert_write(&r);
                 assert!(r.to_bytes().unwrap().len() <= MAX_DATAGRAM);
             }
         }

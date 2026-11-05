@@ -2,10 +2,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use std::collections::BTreeMap;
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::protobuf::harness::total_fields;
 use fictionet::stdlib::protocols::protobuf::{
@@ -15,14 +16,26 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Frame>::new,
-        data,
-        2 * (MAX_MESSAGE + MAX_VARINT_LEN),
+    let bound = 2 * (MAX_MESSAGE + MAX_VARINT_LEN);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, data),
     );
-    contract::check_wire::<Frame>(data);
-    contract::check_wire::<Varint>(data);
-    contract::check_wire::<Message>(data);
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Varint as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // Any bytes as a message: what parses writes, and reads back the same.
     if let Ok(m) = Message::parse(data) {
         let bytes = m.to_bytes().unwrap();
@@ -62,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     for frame in decode_all(Frames::<Frame>::new, data).0 {
-        contract::check_wire_value(&frame);
+        let _ = assert_write(&frame);
         let _ = Message::parse(&frame.data);
     }
 });

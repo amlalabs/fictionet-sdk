@@ -4,14 +4,13 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::mongodb::{
     Body, Bson, Compressed, Document, MAX_MESSAGE_SIZE, Message, Msg, Query, Reply, Sequence,
 };
-use fictionet::stdlib::test_support::contract::{
-    check_decode_with_alloc_limit, check_wire, check_wire_value,
-};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// Bytes taken one at a time from the input, then zeros.
@@ -126,23 +125,54 @@ fn message(b: &mut Bytes<'_>) -> Message {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE_SIZE);
-    check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(64), data, 128);
-    check_wire::<Message>(data);
-    check_wire::<Document>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE);
+            }
+        ),
+        decode_all(Frames::<Message>::new, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::with_limit(64)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 128);
+            }
+        ),
+        decode_all(|| Frames::<Message>::with_limit(64), data),
+    );
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Document as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     for message in decode_all(Frames::<Message>::new, data)
         .0
         .into_iter()
         .flatten()
     {
         assert!(message.to_bytes().is_ok(), "{message:?}");
-        check_wire_value(&message);
+        let _ = assert_write(&message);
     }
     let mut bytes = Bytes(data);
-    check_wire_value(&document(&mut bytes, 4));
+    let _ = assert_write(&document(&mut bytes, 4));
     let message = message(&mut bytes);
-    check_wire_value(&message);
+    let _ = assert_write(&message);
     if let Ok(encoded) = message.to_bytes() {
-        check_decode_with_alloc_limit(Frames::<Message>::new, &encoded, 2 * MAX_MESSAGE_SIZE);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::new()),
+                chunks(&encoded, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * MAX_MESSAGE_SIZE);
+                }
+            ),
+            decode_all(Frames::<Message>::new, &encoded),
+        );
     }
 });

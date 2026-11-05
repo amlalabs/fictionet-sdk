@@ -1,8 +1,9 @@
 //! Complete JSON-RPC bodies, batch errors, bounded collection, and writes.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::{
     json::{self, Limits, Value},
@@ -15,7 +16,7 @@ fn check_error(error: Error) {
     let reply = Message::Response(error.response());
     reply.to_bytes().expect("parse error response must fit");
     reply.write_line(&mut Vec::new()).unwrap();
-    contract::check_wire_value(&reply);
+    let _ = assert_write(&reply);
 }
 
 fn check_incoming(incoming: Result<Incoming, Error>) {
@@ -27,7 +28,9 @@ fn check_incoming(incoming: Result<Incoming, Error>) {
             };
             for item in items {
                 match item {
-                    Ok(message) => contract::check_wire_value(&message),
+                    Ok(message) => {
+                        let _ = assert_write(&message);
+                    }
                     Err(error) => check_error(error),
                 }
             }
@@ -50,9 +53,21 @@ fuzz_target!(|input: &[u8]| {
         _ => (json::MAX_SIZE, Limits::default(), input),
     };
     let make = || Collect::<Body>::new(limit);
-    contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+    let bound = 2 * make().capacity();
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= bound);
+        }),
+        decode_all(make, data),
+    );
     let server = || Collect::<Value>::new(limit);
-    contract::check_decode_with_alloc_limit(server, data, 2 * server().capacity());
+    let bound = 2 * server().capacity();
+    assert_eq!(
+        decode_chunks(&mut Stream::new(server()), chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= bound);
+        }),
+        decode_all(server, data),
+    );
     let (values, failure) = decode_all(server, data);
     if let Some(Fail::Protocol(CollectError::Parse(error))) = failure {
         check_error(error.into());
@@ -60,9 +75,15 @@ fuzz_target!(|input: &[u8]| {
     for value in values {
         check_incoming(Incoming::from_value(value));
     }
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Batch>(data);
-    contract::check_wire::<Body>(data);
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Batch as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Body as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let (bodies, failure) = decode_all(make, data);
     if let Some(Fail::Protocol(CollectError::Parse(error))) = failure {
         check_error(error);
@@ -78,7 +99,7 @@ fuzz_target!(|input: &[u8]| {
         check_error(error);
     }
     for body in bodies {
-        contract::check_wire_value(&body);
+        let _ = assert_write(&body);
         let bytes = body.to_bytes().unwrap();
         assert_eq!(decode_all(make, &bytes), (vec![body], None));
     }
@@ -102,7 +123,7 @@ fuzz_target!(|input: &[u8]| {
                 .map(|value| Message::Response(jsonrpc::Response { value }))
                 .collect(),
         };
-        contract::check_wire_value(&batch);
-        contract::check_wire_value(&Body::Batch(batch));
+        let _ = assert_write(&batch);
+        let _ = assert_write(&Body::Batch(batch));
     }
 });

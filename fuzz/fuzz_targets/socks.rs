@@ -1,10 +1,11 @@
 //! SOCKS handshake units, method decisions, UDP datagrams and strict writers.
 #![no_main]
 
+use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Decode, Step},
     protocols::socks::*,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -37,23 +38,52 @@ impl Decode for Handshake {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(ClientMessages::new, data, 2 * MAX_MESSAGE);
-    contract::check_decode_with_alloc_limit(
-        || Handshake(ClientMessages::new()),
-        data,
-        2 * MAX_MESSAGE,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(ClientMessages::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE);
+            }
+        ),
+        decode_all(ClientMessages::new, data),
     );
-    contract::check_decode_with_alloc_limit(|| ClientMessages::with_limit(16), data, 32);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Handshake(ClientMessages::new())),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE);
+            }
+        ),
+        decode_all(|| Handshake(ClientMessages::new()), data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(ClientMessages::with_limit(16)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 32);
+            }
+        ),
+        decode_all(|| ClientMessages::with_limit(16), data),
+    );
     for method in [Method::NoAuth, Method::UsernamePassword] {
-        contract::check_decode_with_alloc_limit(
-            || {
-                let mut d = ClientMessages::with_limit(16);
-                d.decode(&[5, 1, method.code()], false).unwrap();
-                assert!(d.select(method));
-                d
-            },
-            data,
-            32,
+        let selected = || {
+            let mut d = ClientMessages::with_limit(16);
+            d.decode(&[5, 1, method.code()], false).unwrap();
+            assert!(d.select(method));
+            d
+        };
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(selected()),
+                chunks(data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 32);
+                }
+            ),
+            decode_all(selected, data),
         );
     }
     for make in [
@@ -61,9 +91,20 @@ fuzz_target!(|data: &[u8]| {
         || ServerMessages::socks5(Command::Bind),
         || ServerMessages::socks4(Socks4Command::Bind),
     ] {
-        contract::check_decode_with_alloc_limit(make, data, 2 * MAX_MESSAGE);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE);
+            }),
+            decode_all(make, data),
+        );
     }
-    macro_rules! wires { ($($ty:ty),+) => {$(contract::check_wire::<$ty>(data);)+}; }
+    macro_rules! wires {
+        ($($ty:ty),+) => {$(
+            if let Ok(value) = <$ty as Wire>::parse(data) {
+                let _ = assert_write(&value);
+            }
+        )+};
+    }
     wires!(
         Greeting,
         Selection,
@@ -80,28 +121,28 @@ fuzz_target!(|data: &[u8]| {
     let bounded = &data[..data.len().min(MAX_DATAGRAM + 1)];
     let (left, right) = bounded.split_at(bounded.len() / 2);
     let first = data.first().copied().unwrap_or(0);
-    contract::check_wire_value(&Greeting {
+    let _ = assert_write(&Greeting {
         methods: data
             .iter()
             .take(MAX_METHODS + 1)
             .map(|&c| Method::Other(c))
             .collect(),
     });
-    contract::check_wire_value(&AuthRequest {
+    let _ = assert_write(&AuthRequest {
         username: left.to_vec(),
         password: right.to_vec(),
     });
-    contract::check_wire_value(&Request {
+    let _ = assert_write(&Request {
         command: Command::Connect,
         address: Address::Domain(left.to_vec()),
         port: 1,
     });
-    contract::check_wire_value(&Reply {
+    let _ = assert_write(&Reply {
         code: ReplyCode::Other(first),
         address: Address::Domain(left.to_vec()),
         port: 1,
     });
-    contract::check_wire_value(&Socks4Reply {
+    let _ = assert_write(&Socks4Reply {
         code: Socks4Code::Other(first),
         port: 1,
         ip: std::net::Ipv4Addr::LOCALHOST,
@@ -110,14 +151,14 @@ fuzz_target!(|data: &[u8]| {
         Socks4Destination::Ip(std::net::Ipv4Addr::new(0, 0, 0, first)),
         Socks4Destination::Domain(right.to_vec()),
     ] {
-        contract::check_wire_value(&Socks4Request {
+        let _ = assert_write(&Socks4Request {
             command: Socks4Command::Connect,
             port: 1,
             destination,
             user_id: left.to_vec(),
         });
     }
-    contract::check_wire_value(
+    let _ = assert_write(
         &UdpHeader {
             fragment: first,
             address: Address::Domain(right.to_vec()),

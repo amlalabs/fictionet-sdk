@@ -6,7 +6,7 @@ use fictionet::stdlib::protocols::asn1::harness::check;
 use fictionet::stdlib::protocols::asn1::{
     Frame, MAX_INPUT, Reader, Rules, StringKind, Tag, Writer,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 /// Runs writer calls named by the bytes of `ops`, from the front, until
@@ -55,7 +55,7 @@ fn script(ops: &mut &[u8], w: &mut Writer, level: usize) {
 
 fuzz_target!(|data: &[u8]| {
     check(data);
-    contract::check_wire_value(&Frame(data.get(..MAX_INPUT + 1).unwrap_or(data).to_vec()));
+    let _ = assert_write(&Frame(data.get(..MAX_INPUT + 1).unwrap_or(data).to_vec()));
 
     // Whatever a script of writer calls does, the writer does not panic,
     // and what it finishes with reads under DER, element by element, with

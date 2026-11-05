@@ -4,6 +4,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::protocols::bgp::Attribute;
@@ -37,7 +39,6 @@ use fictionet::stdlib::protocols::bgp::afi;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::protocols::bgp::harness::{CONTEXTS, check_frame, encode, mixes};
 use fictionet::stdlib::protocols::bgp::safi;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
@@ -116,19 +117,44 @@ fn update_from(data: &[u8]) -> Update {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_capacity(Frames::<Frame>::new, data);
-    contract::check_wire::<Frame>(data);
-    contract::check_wire::<Open>(data);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Frame>::new().map(|frame| Message::decode(&frame, &Context::default())),
-        data,
-        2 * Frames::<Frame>::new().capacity(),
+    let bound = 2 * Frames::<Frame>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, data),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Open as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * Frames::<Frame>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(
+                Frames::<Frame>::new().map(|frame| Message::decode(&frame, &Context::default()))
+            ),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(
+            || Frames::<Frame>::new().map(|frame| Message::decode(&frame, &Context::default())),
+            data
+        ),
     );
     let built = Frame {
         kind: data.first().copied().unwrap_or(0),
         body: data.iter().take(MAX_BODY_LEN + 1).copied().collect(),
     };
-    contract::check_wire_value(&built);
+    let _ = assert_write(&built);
 
     let frames = decode_all(Frames::<Frame>::new, data).0;
 

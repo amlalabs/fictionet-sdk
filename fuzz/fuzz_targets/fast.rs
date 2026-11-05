@@ -1,10 +1,9 @@
 //! FAST 1.1 wire units, blocks, XML templates, messages, and strict writers.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract::{
-    check_decode_with_alloc_limit, check_wire, check_wire_value,
-};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::fast::*;
 use fictionet::stdlib::test_support::decode_all;
@@ -31,40 +30,89 @@ const XML: &[u8] = br#"<templates xmlns="http://www.fixprotocol.org/ns/fast/td/1
 fuzz_target!(|data: &[u8]| {
     // The harness checks partitions and EOF prefixes. Bound its workload too.
     let input = data.get(..data.len().min(4096)).unwrap_or_default();
-    check_wire::<Int32>(input);
-    check_wire::<UInt32>(input);
-    check_wire::<Int64>(input);
-    check_wire::<UInt64>(input);
-    check_wire::<Nullable<Int32>>(input);
-    check_wire::<Nullable<UInt32>>(input);
-    check_wire::<Nullable<Int64>>(input);
-    check_wire::<Nullable<UInt64>>(input);
-    check_wire::<Ascii>(input);
-    check_wire::<Nullable<Ascii>>(input);
-    check_wire::<Unicode>(input);
-    check_wire::<Nullable<Unicode>>(input);
-    check_wire::<ByteVector>(input);
-    check_wire::<Nullable<ByteVector>>(input);
-    check_wire::<Decimal>(input);
-    check_wire::<Nullable<Decimal>>(input);
-    check_wire::<PresenceMap>(input);
-    check_wire_value(&ByteVector(input.to_vec()));
-    check_wire_value(&Ascii(String::from_utf8_lossy(input).into_owned()));
+    if let Ok(value) = <Int32 as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <UInt32 as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Int64 as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <UInt64 as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<Int32> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<UInt32> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<Int64> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<UInt64> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Ascii as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<Ascii> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Unicode as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<Unicode> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ByteVector as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<ByteVector> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Decimal as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Nullable<Decimal> as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <PresenceMap as Wire>::parse(input) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&ByteVector(input.to_vec()));
+    let _ = assert_write(&Ascii(String::from_utf8_lossy(input).into_owned()));
     let templates = Templates::from_xml(XML).expect("test templates");
-    check_decode_with_alloc_limit(
-        || Blocks,
-        input,
-        2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+    let bound = 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(Blocks), chunks(input, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= bound);
+        }),
+        decode_all(|| Blocks, input),
     );
-    check_decode_with_alloc_limit(
-        || BlockMessages::new(Messages::new(templates.clone())),
-        input,
-        2 * MAX_MESSAGE_BYTES,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(BlockMessages::new(Messages::new(templates.clone()))),
+            chunks(input, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES);
+            }
+        ),
+        decode_all(
+            || BlockMessages::new(Messages::new(templates.clone())),
+            input
+        ),
     );
-    check_decode_with_alloc_limit(
-        || Messages::new(templates.clone()),
-        input,
-        2 * MAX_MESSAGE_BYTES,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new(templates.clone())),
+            chunks(input, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES);
+            }
+        ),
+        decode_all(|| Messages::new(templates.clone()), input),
     );
     let (messages, _) = decode_all(|| Messages::new(templates.clone()), input);
     let mut encoder = Encoder::new(templates.clone());
@@ -105,10 +153,15 @@ fuzz_target!(|data: &[u8]| {
                 let mut bytes = vec![0xc0];
                 UInt32(id).write(&mut bytes).expect("integer");
                 bytes.extend_from_slice(input.get(..input.len().min(128)).unwrap_or_default());
-                check_decode_with_alloc_limit(
-                    || Messages::new(t.clone()),
-                    &bytes,
-                    2 * MAX_MESSAGE_BYTES,
+                assert_eq!(
+                    decode_chunks(
+                        &mut Stream::new(Messages::new(t.clone())),
+                        chunks(&bytes, &[1, 7, 64]),
+                        |s| {
+                            assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES);
+                        }
+                    ),
+                    decode_all(|| Messages::new(t.clone()), &bytes),
                 );
             }
         }
