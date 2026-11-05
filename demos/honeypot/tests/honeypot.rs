@@ -18,6 +18,7 @@ use fictionet::stdlib::protocols::mptcp::{
 use fictionet::stdlib::protocols::ssh;
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet};
 use honeypot_world::config::{Burst, DEFAULT_ADDRESS};
+use honeypot_world::config::{HttpProfile, Port, Service};
 use honeypot_world::observe::Sinks;
 use honeypot_world::services::SSH_BANNER;
 use honeypot_world::{Clock, Config, Honeypot};
@@ -304,7 +305,12 @@ fn ipv4_options_echo_and_pending_retransmission_are_observed() {
         net.send(syn());
         let repeated = net.recv().await.unwrap();
         assert_eq!(ip::ipv4_options(&repeated.0).unwrap(), echoed);
-        assert_eq!(net.events("ip_options_retransmit").len(), 1);
+        let retransmits = net.events("ip_options_retransmit");
+        assert_eq!(retransmits.len(), 1);
+        assert_eq!(retransmits[0]["phase"], "pending");
+        assert_eq!(retransmits[0]["first_syn_us"], EPOCH * 1_000_000);
+        assert_eq!(retransmits[0]["answered_us"], EPOCH * 1_000_000);
+        assert!(retransmits[0].get("completed_us").is_none());
         assert!(net.events("mptcp_no_data").is_empty());
         assert_eq!(
             net.events("syn")[0]["ipv4_options"][0]["kind"],
@@ -321,7 +327,11 @@ fn ipv4_options_echo_and_pending_retransmission_are_observed() {
         ));
         net.send(syn());
         net.drain().await;
-        assert_eq!(net.events("ip_options_retransmit").len(), 1);
+        let retransmits = net.events("ip_options_retransmit");
+        assert_eq!(retransmits.len(), 2);
+        assert_eq!(retransmits[1]["phase"], "completed");
+        assert_eq!(retransmits[1]["completed_us"], EPOCH * 1_000_000);
+        assert_eq!(retransmits[1]["since_completed_us"], 0);
         Ok(())
     });
 }
@@ -415,9 +425,18 @@ async fn exchange_with(
         seq += piece.len() as u32;
     }
     let mut reply = Vec::new();
-    for p in net.drain().await {
+    let mut ack = iss + 1;
+    while let Some(p) = net.recv().await {
         if tcp_of(&p)[2..4] == from.port().to_be_bytes() {
-            reply.extend_from_slice(payload_of(&p));
+            if seq_of(&p) == ack {
+                reply.extend_from_slice(payload_of(&p));
+                ack = ack
+                    .wrapping_add(payload_of(&p).len() as u32)
+                    .wrapping_add(u32::from(flags(&p) & 1 != 0));
+            }
+            if !payload_of(&p).is_empty() || flags(&p) & 1 != 0 {
+                net.send(segment(from, to, seq, ack, ACK, &[], b""));
+            }
         }
     }
     reply
@@ -427,31 +446,37 @@ async fn exchange_with(
 /// and a head past nginx's limit with a 400.
 #[test]
 fn http_answers_as_nginx() {
-    honeypot(Config::default(), |mut net| async move {
-        let request: &[u8] = b"GET / HTTP/1.1\r\nHost: 203.0.113.10\r\n\r\n";
-        let (a, b) = request.split_at(request.len() - 2);
-        let reply = exchange(&mut net, client(7, 46000), 80, &[a, b]).await;
-        let reply = String::from_utf8(reply).unwrap();
-        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
-        assert!(reply.contains("Server: nginx/1.24.0 (Ubuntu)\r\n"));
-        assert!(reply.contains("Connection: keep-alive\r\n"));
-        assert!(reply.contains("Last-Modified: Fri, 15 Jan 2027 08:00:00 GMT\r\n"));
-        assert!(reply.contains(&format!("ETag: \"{EPOCH:x}-267\"\r\n")));
-        assert!(reply.contains("Accept-Ranges: bytes\r\n"));
-        assert!(
-            reply.contains("Date: Fri, 15 Jan 2027 08:00:00 GMT\r\n"),
-            "{reply}"
-        );
-        assert!(reply.ends_with("</html>\n"));
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            let request: &[u8] = b"GET / HTTP/1.1\r\nHost: 203.0.113.10\r\n\r\n";
+            let (a, b) = request.split_at(request.len() - 2);
+            let reply = exchange(&mut net, client(7, 46000), 80, &[a, b]).await;
+            let reply = String::from_utf8(reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+            assert!(reply.contains("Server: nginx/1.24.0 (Ubuntu)\r\n"));
+            assert!(reply.contains("Connection: keep-alive\r\n"));
+            assert!(reply.contains("Last-Modified: Fri, 15 Jan 2027 08:00:00 GMT\r\n"));
+            assert!(reply.contains(&format!("ETag: \"{EPOCH:x}-267\"\r\n")));
+            assert!(reply.contains("Accept-Ranges: bytes\r\n"));
+            assert!(
+                reply.contains("Date: Fri, 15 Jan 2027 08:00:00 GMT\r\n"),
+                "{reply}"
+            );
+            assert!(reply.ends_with("</html>\n"));
 
-        let long = vec![b'a'; 1000];
-        let mut pieces: Vec<&[u8]> = vec![b"GET /"];
-        pieces.extend([&long[..]; 9]);
-        let reply = exchange(&mut net, client(7, 46001), 80, &pieces).await;
-        let reply = String::from_utf8(reply).unwrap();
-        assert!(reply.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{reply}");
-        Ok(())
-    });
+            let long = vec![b'a'; 1000];
+            let mut pieces: Vec<&[u8]> = vec![b"GET /"];
+            pieces.extend([&long[..]; 9]);
+            let reply = exchange(&mut net, client(7, 46001), 80, &pieces).await;
+            let reply = String::from_utf8(reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{reply}");
+            Ok(())
+        },
+    );
 }
 
 struct Client {
@@ -540,157 +565,387 @@ impl Client {
 }
 
 #[test]
-fn http_accepts_many_short_headers_within_the_head_limit() {
-    honeypot(Config::default(), |mut net| async move {
-        let mut client = Client::open(&mut net, 80).await;
-        let mut request = String::from("GET / HTTP/1.1\r\nHost: x\r\n");
-        request.push_str(&"X: a\r\n".repeat(200));
-        request.push_str("\r\n");
-        client.send(&mut net, request.as_bytes());
-        let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-        Ok(())
-    });
-}
-
-#[test]
-fn http_reuses_connections_and_consumes_request_bodies() {
+fn the_default_http_profile_serves_caddy_and_reuses_connections() {
     honeypot(Config::default(), |mut net| async move {
         let mut client = Client::open(&mut net, 80).await;
         client.send(
             &mut net,
             b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n",
         );
-        client.send(&mut net, b"bodyGET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        for _ in 0..2 {
-            let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
-            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-            assert!(response.contains("Connection: keep-alive\r\n"));
-            assert!(response.ends_with("</html>\n"));
-        }
-        client.send(&mut net, b"GET /missing HTTP/1.1\r\nHost: x\r\n\r\n");
+        client.send(&mut net, b"bodyGET /missing HTTP/1.1\r\nHost: x\r\n\r\n");
         let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
-        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
-        assert!(response.contains("Content-Length: 162\r\n"));
-        assert!(response.contains("Connection: keep-alive\r\n"));
-        assert!(!response.contains("Last-Modified:"));
-        assert!(!response.contains("ETag:"));
-        assert!(!response.contains("Accept-Ranges:"));
-        assert!(response.ends_with("</html>\r\n"));
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Server: Caddy\r\n"));
+        assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(response.contains("Accept-Ranges: bytes\r\n"));
+        assert!(!response.contains("Connection:"));
+        assert!(!response.contains("Alt-Svc:"));
+        assert!(response.contains("<title>Caddy works!</title>"));
+        let missing = String::from_utf8(client.response(&mut net, false).await).unwrap();
+        assert!(missing.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(missing.contains("Server: Caddy\r\n"));
+        assert!(missing.contains("Content-Length: 0\r\n"));
+        assert!(missing.ends_with("\r\n\r\n"));
+        assert!(!missing.contains("Content-Type:"));
         client.send(
             &mut net,
-            b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            b"HEAD /index.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         );
-        let response = String::from_utf8(client.response(&mut net, true).await).unwrap();
-        assert!(response.contains("Connection: close\r\n"));
-        assert!(response.ends_with("\r\n\r\n"));
-        let fin = client.receive(&mut net).await;
-        assert_eq!(flags(&fin) & 1, 1);
-        assert!(client.pending.is_empty());
+        let head = String::from_utf8(client.response(&mut net, true).await).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.contains("Connection: close\r\n"));
+        assert!(head.ends_with("\r\n\r\n"));
+        assert_eq!(flags(&client.receive(&mut net).await) & 1, 1);
         Ok(())
     });
+}
+
+#[test]
+fn only_caddy_http_accepts_mptcp_and_https_is_closed() {
+    for profile in [HttpProfile::Caddy, HttpProfile::Nginx] {
+        honeypot(
+            Config {
+                http_profile: profile,
+                ..Config::default()
+            },
+            move |mut net| async move {
+                for port in [22, 80, 443] {
+                    let from = client(1, 41000 + port);
+                    net.send(segment(
+                        from,
+                        server(port),
+                        1000,
+                        0,
+                        SYN,
+                        &with_mss(&mptcp_bytes(linux_capable())),
+                        b"",
+                    ));
+                    let answer = net.recv().await.expect("the port's answer");
+                    if port == 443 {
+                        assert_eq!(flags(&answer) & RST, RST);
+                    } else {
+                        assert_eq!(flags(&answer), SYN | ACK);
+                    }
+                    if port == 80 && profile == HttpProfile::Caddy {
+                        assert!(matches!(mptcp_of(&answer)[..], [MptcpOption::Capable(_)]));
+                    } else {
+                        assert!(mptcp_of(&answer).is_empty());
+                    }
+                }
+                Ok(())
+            },
+        );
+    }
+}
+
+#[test]
+fn caddy_keepalives_start_after_fifteen_seconds() {
+    honeypot(Config::default(), |mut net| async move {
+        let client = Client::open(&mut net, 80).await;
+        let opened = net.fcx.now();
+        let probe = net
+            .fcx
+            .race(
+                Some(opened + Duration::from_secs(16)),
+                net.end.recv(&net.fcx),
+            )
+            .await??;
+        assert_eq!(flags(&probe), ACK);
+        assert!(
+            payload_of(&probe).is_empty(),
+            "at {:?}: {:02x?}",
+            net.fcx.now(),
+            payload_of(&probe)
+        );
+        assert_eq!(seq_of(&probe), client.ack.wrapping_sub(1));
+        assert_eq!(net.fcx.now(), opened + Duration::from_secs(15));
+        Ok(())
+    });
+}
+
+#[test]
+fn caddy_has_no_one_thousand_request_limit() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        for _ in 0..1001 {
+            client.send(&mut net, b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+            let response = String::from_utf8(client.response(&mut net, true).await).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(!response.contains("Connection:"));
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn caddy_header_and_idle_deadlines_are_distinct() {
+    for (requested, seconds) in [(false, 60), (true, 300)] {
+        honeypot(Config::default(), move |mut net| async move {
+            let mut client = Client::open(&mut net, 80).await;
+            if requested {
+                client.send(&mut net, b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+                client.response(&mut net, true).await;
+            }
+            let started = net.fcx.now();
+            loop {
+                let packet = net
+                    .fcx
+                    .race(
+                        Some(started + Duration::from_secs(seconds + 1)),
+                        net.end.recv(&net.fcx),
+                    )
+                    .await??;
+                assert!(payload_of(&packet).is_empty());
+                if flags(&packet) & 1 != 0 {
+                    assert_eq!(flags(&packet), ACK | 1);
+                    assert_eq!(net.fcx.now(), started + Duration::from_secs(seconds));
+                    break;
+                }
+                assert_eq!(flags(&packet), ACK);
+                assert_eq!(seq_of(&packet), client.ack.wrapping_sub(1));
+                net.send(segment(
+                    client.from,
+                    client.to,
+                    client.seq,
+                    client.ack,
+                    ACK,
+                    &[],
+                    b"",
+                ));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn caddy_body_reads_reset_the_inactivity_deadline() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        client.send(
+            &mut net,
+            b"HEAD / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n",
+        );
+        for _ in 0..2 {
+            net.fcx.sleep(Duration::from_secs(59)).await?;
+            client.send(&mut net, b"x");
+        }
+        let response = String::from_utf8(client.response(&mut net, true).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        Ok(())
+    });
+}
+
+#[test]
+fn caddy_accepts_header_lines_larger_than_nginx_buffers() {
+    honeypot(Config::default(), |mut net| async move {
+        let mut client = Client::open(&mut net, 80).await;
+        let mut request = String::from("HEAD / HTTP/1.1\r\nHost: x\r\nX-Long: ");
+        request.push_str(&"a".repeat(9000));
+        request.push_str("\r\n\r\n");
+        for bytes in request.as_bytes().chunks(1000) {
+            client.send(&mut net, bytes);
+        }
+        let response = String::from_utf8(client.response(&mut net, true).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        Ok(())
+    });
+}
+
+#[test]
+fn http_accepts_many_short_headers_within_the_head_limit() {
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            let mut client = Client::open(&mut net, 80).await;
+            let mut request = String::from("GET / HTTP/1.1\r\nHost: x\r\n");
+            request.push_str(&"X: a\r\n".repeat(200));
+            request.push_str("\r\n");
+            client.send(&mut net, request.as_bytes());
+            let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn http_reuses_connections_and_consumes_request_bodies() {
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            let mut client = Client::open(&mut net, 80).await;
+            client.send(
+                &mut net,
+                b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n",
+            );
+            client.send(&mut net, b"bodyGET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            for _ in 0..2 {
+                let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+                assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+                assert!(response.contains("Connection: keep-alive\r\n"));
+                assert!(response.ends_with("</html>\n"));
+            }
+            client.send(&mut net, b"GET /missing HTTP/1.1\r\nHost: x\r\n\r\n");
+            let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+            assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+            assert!(response.contains("Content-Length: 162\r\n"));
+            assert!(response.contains("Connection: keep-alive\r\n"));
+            assert!(!response.contains("Last-Modified:"));
+            assert!(!response.contains("ETag:"));
+            assert!(!response.contains("Accept-Ranges:"));
+            assert!(response.ends_with("</html>\r\n"));
+            client.send(
+                &mut net,
+                b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            );
+            let response = String::from_utf8(client.response(&mut net, true).await).unwrap();
+            assert!(response.contains("Connection: close\r\n"));
+            assert!(response.ends_with("\r\n\r\n"));
+            let fin = client.receive(&mut net).await;
+            assert_eq!(flags(&fin) & 1, 1);
+            assert!(client.pending.is_empty());
+            Ok(())
+        },
+    );
 }
 
 #[test]
 fn http_closes_after_one_thousand_requests() {
-    honeypot(Config::default(), |mut net| async move {
-        let mut client = Client::open(&mut net, 80).await;
-        for request in 1..=1000 {
-            client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-            let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
-            let expected = if request == 1000 {
-                "close"
-            } else {
-                "keep-alive"
-            };
-            assert!(response.contains(&format!("Connection: {expected}\r\n")));
-        }
-        let fin = client.receive(&mut net).await;
-        assert_eq!(flags(&fin) & 1, 1);
-        Ok(())
-    });
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            let mut client = Client::open(&mut net, 80).await;
+            for request in 1..=1000 {
+                client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+                let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+                let expected = if request == 1000 {
+                    "close"
+                } else {
+                    "keep-alive"
+                };
+                assert!(response.contains(&format!("Connection: {expected}\r\n")));
+            }
+            let fin = client.receive(&mut net).await;
+            assert_eq!(flags(&fin) & 1, 1);
+            Ok(())
+        },
+    );
 }
 
 #[test]
 fn http_idle_timeout_is_seventy_five_seconds() {
-    honeypot(Config::default(), |mut net| async move {
-        let mut client = Client::open(&mut net, 80).await;
-        client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        client.response(&mut net, false).await;
-        let answered = net.fcx.now();
-        net.fcx.sleep(Duration::from_secs(74)).await?;
-        let fin = net
-            .fcx
-            .race(
-                Some(answered + Duration::from_secs(76)),
-                net.end.recv(&net.fcx),
-            )
-            .await??;
-        assert_eq!(flags(&fin) & 1, 1);
-        assert_eq!(net.fcx.now(), answered + Duration::from_secs(75));
-        Ok(())
-    });
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            let mut client = Client::open(&mut net, 80).await;
+            client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            client.response(&mut net, false).await;
+            let answered = net.fcx.now();
+            net.fcx.sleep(Duration::from_secs(74)).await?;
+            let fin = net
+                .fcx
+                .race(
+                    Some(answered + Duration::from_secs(76)),
+                    net.end.recv(&net.fcx),
+                )
+                .await??;
+            assert_eq!(flags(&fin) & 1, 1);
+            assert_eq!(net.fcx.now(), answered + Duration::from_secs(75));
+            Ok(())
+        },
+    );
 }
 
 #[test]
 fn http_next_request_gets_a_header_deadline_after_idle() {
-    honeypot(Config::default(), |mut net| async move {
-        let mut client = Client::open(&mut net, 80).await;
-        client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        client.response(&mut net, false).await;
-        net.fcx.sleep(Duration::from_secs(74)).await?;
-        client.send(&mut net, b"G");
-        net.fcx.sleep(Duration::from_secs(59)).await?;
-        client.send(&mut net, b"ET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(response.contains("Connection: keep-alive\r\n"));
-        assert!(response.contains("Last-Modified: Fri, 15 Jan 2027 08:00:00 GMT\r\n"));
-        Ok(())
-    });
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            let mut client = Client::open(&mut net, 80).await;
+            client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            client.response(&mut net, false).await;
+            net.fcx.sleep(Duration::from_secs(74)).await?;
+            client.send(&mut net, b"G");
+            net.fcx.sleep(Duration::from_secs(59)).await?;
+            client.send(&mut net, b"ET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            let response = String::from_utf8(client.response(&mut net, false).await).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(response.contains("Connection: keep-alive\r\n"));
+            assert!(response.contains("Last-Modified: Fri, 15 Jan 2027 08:00:00 GMT\r\n"));
+            Ok(())
+        },
+    );
 }
 
 #[test]
 fn http_chunked_body_does_not_become_the_next_request() {
-    honeypot(Config::default(), |mut net| async move {
-        let mut client = Client::open(&mut net, 80).await;
-        client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\nGET / HTTP/1.0\r\n\r\n");
-        let first = String::from_utf8(client.response(&mut net, false).await).unwrap();
-        assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(first.contains("Connection: keep-alive\r\n"));
-        let second = String::from_utf8(client.response(&mut net, false).await).unwrap();
-        assert!(second.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(second.contains("Connection: close\r\n"));
-        Ok(())
-    });
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            let mut client = Client::open(&mut net, 80).await;
+            client.send(&mut net, b"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\nGET / HTTP/1.0\r\n\r\n");
+            let first = String::from_utf8(client.response(&mut net, false).await).unwrap();
+            assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(first.contains("Connection: keep-alive\r\n"));
+            let second = String::from_utf8(client.response(&mut net, false).await).unwrap();
+            assert!(second.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(second.contains("Connection: close\r\n"));
+            Ok(())
+        },
+    );
 }
 
 #[test]
 fn service_backlogs_start_cookies_at_their_own_limits() {
-    honeypot(Config::default(), |mut net| async move {
-        for (port, backlog) in [(22, 4096), (80, 511)] {
-            for n in 0..=backlog {
-                let from = client(1, 42000 + n);
-                net.send(segment(
-                    from,
-                    server(port),
-                    1000,
-                    0,
-                    SYN,
-                    &with_mss(&[3, 3, 7, 4, 2]),
-                    b"",
-                ));
-                let reply = net.recv().await.expect("a SYN-ACK");
-                assert_eq!(dst_of(&reply), from);
-                let stateful = tcp::options(tcp_of(&reply))
-                    .unwrap()
-                    .iter()
-                    .any(|option| matches!(option, TcpOption::WindowScale(_)));
-                assert_eq!(stateful, n < backlog, "port {port}, pending {n}");
+    honeypot(
+        Config {
+            http_profile: HttpProfile::Nginx,
+            ..Config::default()
+        },
+        |mut net| async move {
+            for (port, backlog) in [(22, 4096), (80, 511)] {
+                for n in 0..=backlog {
+                    let from = client(1, 42000 + n);
+                    net.send(segment(
+                        from,
+                        server(port),
+                        1000,
+                        0,
+                        SYN,
+                        &with_mss(&[3, 3, 7, 4, 2]),
+                        b"",
+                    ));
+                    let reply = net.recv().await.expect("a SYN-ACK");
+                    assert_eq!(dst_of(&reply), from);
+                    let stateful = tcp::options(tcp_of(&reply))
+                        .unwrap()
+                        .iter()
+                        .any(|option| matches!(option, TcpOption::WindowScale(_)));
+                    assert_eq!(stateful, n < backlog, "port {port}, pending {n}");
+                }
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+    );
 }
 
 #[test]
@@ -833,7 +1088,7 @@ fn ipv6_gets_the_same_ssh_and_http() {
         .await;
         let page = String::from_utf8(page).unwrap();
         assert!(page.starts_with("HTTP/1.1 200 OK\r\n"), "{page}");
-        assert!(page.contains("Welcome to nginx!"));
+        assert!(page.contains("Caddy works!"));
 
         let elsewhere = SocketAddr::new("2001:db8:113::11".parse().unwrap(), 22);
         net.send(segment(from, elsewhere, 1, 0, SYN, &with_mss(&[]), b""));
@@ -933,60 +1188,91 @@ fn an_mptcp_connection_speaks_dss_until_the_client_falls_back() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(2, 40001);
         let client_key = 0x1111_2222_3333_4444;
-        let (key, iss) = open_mptcp(&mut net, from, 22, client_key).await;
-        let banner = net.recv().await.expect("the banner");
-        assert_eq!(payload_of(&banner), SSH_BANNER);
-        assert_eq!(net.honeypot.mptcp_connections(), 1);
-        assert_eq!(
-            dss_of(&banner),
-            Some(Dss {
-                data_ack: Some(Sequence::Short(mptcp::idsn(client_key).advance(1).short())),
-                mapping: Some(Mapping {
-                    data_sequence_number: Sequence::Long(mptcp::idsn(key).advance(1)),
-                    subflow_sequence_number: 1,
-                    data_level_length: SSH_BANNER.len() as u16,
-                    checksum: None,
-                }),
-                data_fin: false,
-            })
-        );
-        let acked = iss + 1 + SSH_BANNER.len() as u32;
-        // Mapped data, with a 64-bit data sequence number, is acknowledged
-        // at the data level in 8 octets.
-        let hello = b"SSH-2.0-x\r\n";
-        let dss = mptcp_bytes(MptcpOption::Dss(Dss {
-            data_ack: Some(Sequence::Long(
-                mptcp::idsn(key).advance(1 + SSH_BANNER.len() as u64),
-            )),
+        let (key, iss) = open_mptcp(&mut net, from, 80, client_key).await;
+        let request = b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mapping = mptcp_bytes(MptcpOption::Dss(Dss {
+            data_ack: None,
             mapping: Some(Mapping {
                 data_sequence_number: Sequence::Long(mptcp::idsn(client_key).advance(1)),
                 subflow_sequence_number: 1,
-                data_level_length: hello.len() as u16,
+                data_level_length: request.len() as u16,
                 checksum: None,
             }),
             data_fin: false,
         }));
         net.send(segment(
             from,
-            server(22),
+            server(80),
             5001,
+            iss + 1,
+            PSH | ACK,
+            &mapping,
+            request,
+        ));
+        let response = loop {
+            let p = net.recv().await.expect("the HTTP response");
+            if !payload_of(&p).is_empty() {
+                break p;
+            }
+        };
+        assert!(payload_of(&response).starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(net.honeypot.mptcp_connections(), 1);
+        assert_eq!(
+            dss_of(&response),
+            Some(Dss {
+                data_ack: Some(Sequence::Long(
+                    mptcp::idsn(client_key).advance(1 + request.len() as u64)
+                )),
+                mapping: Some(Mapping {
+                    data_sequence_number: Sequence::Long(mptcp::idsn(key).advance(1)),
+                    subflow_sequence_number: 1,
+                    data_level_length: payload_of(&response).len() as u16,
+                    checksum: None,
+                }),
+                data_fin: false,
+            })
+        );
+        let acked = iss + 1 + payload_of(&response).len() as u32;
+        // Mapped data, with a 64-bit data sequence number, is acknowledged
+        // at the data level in 8 octets.
+        let hello = b"GET /";
+        let dss = mptcp_bytes(MptcpOption::Dss(Dss {
+            data_ack: Some(Sequence::Long(
+                mptcp::idsn(key).advance(1 + payload_of(&response).len() as u64),
+            )),
+            mapping: Some(Mapping {
+                data_sequence_number: Sequence::Long(
+                    mptcp::idsn(client_key).advance(1 + request.len() as u64),
+                ),
+                subflow_sequence_number: 1 + request.len() as u32,
+                data_level_length: hello.len() as u16,
+                checksum: None,
+            }),
+            data_fin: false,
+        }));
+        let seq = 5001 + request.len() as u32;
+        net.send(segment(
+            from,
+            server(80),
+            seq,
             acked,
             PSH | ACK,
             &dss,
             hello,
         ));
         let ack = net.recv().await.expect("an ACK");
-        assert_eq!(ack_of(&ack), 5001 + hello.len() as u32);
-        let data_ack = mptcp::idsn(client_key).advance(1 + hello.len() as u64);
+        assert_eq!(ack_of(&ack), seq + hello.len() as u32);
+        let data_ack =
+            mptcp::idsn(client_key).advance(1 + request.len() as u64 + hello.len() as u64);
         assert_eq!(
             dss_of(&ack).unwrap().data_ack,
             Some(Sequence::Long(data_ack))
         );
         // Data with no mapping: the connection falls back.
-        let seq = 5001 + hello.len() as u32;
+        let seq = seq + hello.len() as u32;
         net.send(segment(
             from,
-            server(22),
+            server(80),
             seq,
             acked,
             PSH | ACK,
@@ -1009,21 +1295,24 @@ fn an_mptcp_connection_speaks_dss_until_the_client_falls_back() {
 /// token.
 #[test]
 fn joins_are_answered_taken_and_refused_as_on_linux() {
-    honeypot(Config::default(), |mut net| async move {
+    let mut config = Config::default();
+    config.ports.push(Port {
+        number: 8080,
+        service: Service::Http,
+    });
+    honeypot(config, |mut net| async move {
         let from = client(2, 40001);
         let client_key = 0x1111_2222_3333_4444;
-        let (key, iss) = open_mptcp(&mut net, from, 22, client_key).await;
-        let banner = net.recv().await.expect("the banner");
-        assert_eq!(payload_of(&banner), SSH_BANNER);
-        let acked = iss + 1 + SSH_BANNER.len() as u32;
-        net.send(segment(from, server(22), 5001, acked, ACK, &[], b""));
+        let (key, iss) = open_mptcp(&mut net, from, 80, client_key).await;
+        let acked = iss + 1;
+        net.send(segment(from, server(80), 5001, acked, ACK, &[], b""));
         net.drain().await;
         assert_eq!(net.honeypot.mptcp_connections(), 1);
 
         // A join on another port.
         let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
         let elsewhere = client(2, 40002);
-        net.send(segment(elsewhere, server(80), 7000, 0, SYN, &join, b""));
+        net.send(segment(elsewhere, server(8080), 7000, 0, SYN, &join, b""));
         let refused = net.recv().await.expect("a RST");
         assert_eq!(flags(&refused) & RST, RST);
         let prohibited = [MptcpOption::TcpRst {
@@ -1037,7 +1326,7 @@ fn joins_are_answered_taken_and_refused_as_on_linux() {
         let mut taken = None;
         for (port, right) in [(40003, false), (40004, true)] {
             let joiner = client(2, port);
-            net.send(segment(joiner, server(22), 7000, 0, SYN, &join, b""));
+            net.send(segment(joiner, server(80), 7000, 0, SYN, &join, b""));
             let join_syn_ack = net.recv().await.expect("a SYN-ACK");
             assert_eq!(flags(&join_syn_ack), SYN | ACK);
             assert_eq!(ack_of(&join_syn_ack), 7001);
@@ -1065,7 +1354,7 @@ fn joins_are_answered_taken_and_refused_as_on_linux() {
             let third = mptcp_bytes(MptcpOption::Join(Join::Ack { hmac: hmac_a }));
             net.send(segment(
                 joiner,
-                server(22),
+                server(80),
                 7001,
                 join_iss + 1,
                 ACK,
@@ -1079,7 +1368,7 @@ fn joins_are_answered_taken_and_refused_as_on_linux() {
                 assert!(payload_of(&fourth).is_empty());
                 net.send(segment(
                     joiner,
-                    server(22),
+                    server(80),
                     7001,
                     join_iss + 1,
                     PSH | ACK,
@@ -1107,7 +1396,7 @@ fn joins_are_answered_taken_and_refused_as_on_linux() {
 
         // The client ends the connection with a RST: its token goes, and
         // the joined subflow closes.
-        net.send(segment(from, server(22), 5001, 0, RST, &[], b""));
+        net.send(segment(from, server(80), 5001, 0, RST, &[], b""));
         let joiner = taken.unwrap();
         let fin = net
             .drain()
@@ -1118,7 +1407,7 @@ fn joins_are_answered_taken_and_refused_as_on_linux() {
         let fin_ack = seq_of(&fin) + 1;
         net.send(segment(
             joiner,
-            server(22),
+            server(80),
             7005,
             fin_ack,
             ACK | 0x01,
@@ -1128,7 +1417,7 @@ fn joins_are_answered_taken_and_refused_as_on_linux() {
         net.drain().await;
         assert_eq!(net.honeypot.mptcp_connections(), 0);
         let joiner = client(2, 40005);
-        net.send(segment(joiner, server(22), 8000, 0, SYN, &join, b""));
+        net.send(segment(joiner, server(80), 8000, 0, SYN, &join, b""));
         let refused = net.recv().await.expect("a RST");
         assert_eq!(
             mptcp_of(&refused),
@@ -1229,7 +1518,7 @@ fn a_burst_of_joins_is_flagged_once() {
         for n in 0..20u16 {
             let from = client(3, 41000 + n);
             let join = with_mss(&mptcp_bytes(join_syn(0xdead_beef, u32::from(n))));
-            net.send(segment(from, server(22), 100, 0, SYN, &join, b""));
+            net.send(segment(from, server(80), 100, 0, SYN, &join, b""));
             net.fcx.sleep(Duration::from_millis(1)).await?;
         }
         let answers = net.drain().await;
@@ -1251,7 +1540,7 @@ fn a_burst_of_joins_is_flagged_once() {
         // Another source sending slowly is never a burst.
         for n in 0..10u16 {
             let from = client(4, 42000 + n);
-            net.send(segment(from, server(22), 100, 0, SYN, &with_mss(&[]), b""));
+            net.send(segment(from, server(80), 100, 0, SYN, &with_mss(&[]), b""));
             net.fcx.sleep(Duration::from_millis(200)).await?;
         }
         net.drain().await;
@@ -1278,7 +1567,7 @@ fn malformed_options_are_logged_and_survived() {
         // what read.
         let from = client(5, 43000);
         let runs_past = with_mss(&[30, 12, 0x01, 0x81]);
-        net.send(segment(from, server(22), 1, 0, SYN, &runs_past, b""));
+        net.send(segment(from, server(80), 1, 0, SYN, &runs_past, b""));
         let syn_ack = net.recv().await.expect("a SYN-ACK");
         assert_eq!(flags(&syn_ack), SYN | ACK);
         assert!(mptcp_of(&syn_ack).is_empty());
@@ -1286,7 +1575,7 @@ fn malformed_options_are_logged_and_survived() {
         let odd_mss = [2, 3, 5, 0xb4];
         net.send(segment(
             client(5, 43005),
-            server(22),
+            server(80),
             1,
             0,
             SYN,
@@ -1297,14 +1586,14 @@ fn malformed_options_are_logged_and_survived() {
         assert_eq!(flags(&syn_ack), SYN | ACK);
         // An MPTCP option with an unassigned subtype: plain TCP.
         let odd = with_mss(&[30, 4, 0x90, 0]);
-        net.send(segment(client(5, 43001), server(22), 1, 0, SYN, &odd, b""));
+        net.send(segment(client(5, 43001), server(80), 1, 0, SYN, &odd, b""));
         let syn_ack = net.recv().await.expect("a SYN-ACK");
         assert!(mptcp_of(&syn_ack).is_empty());
         // MP_CAPABLE with a bad length and with no algorithm: plain TCP.
         let bad_len = with_mss(&[30, 5, 0x01, 0x81, 0, 0, 0, 0]);
         net.send(segment(
             client(5, 43002),
-            server(22),
+            server(80),
             1,
             0,
             SYN,
@@ -1314,7 +1603,7 @@ fn malformed_options_are_logged_and_survived() {
         let no_alg = with_mss(&[30, 4, 0x01, 0x80]);
         net.send(segment(
             client(5, 43003),
-            server(22),
+            server(80),
             1,
             0,
             SYN,
@@ -1327,7 +1616,7 @@ fn malformed_options_are_logged_and_survived() {
         }
         // Garbage of every length, a TCP header length past the packet,
         // and a truncated IP header.
-        let good = segment(client(5, 43004), server(22), 1, 0, SYN, &with_mss(&[]), b"");
+        let good = segment(client(5, 43004), server(80), 1, 0, SYN, &with_mss(&[]), b"");
         for n in 0..good.0.len() {
             net.send(Packet(good.0[..n].to_vec()));
         }
@@ -1335,7 +1624,7 @@ fn malformed_options_are_logged_and_survived() {
         let mut long_header = good.0.clone();
         long_header[20 + 12] = 15 << 4;
         long_header[20 + 16..20 + 18].copy_from_slice(&[0, 0]);
-        let sum = transport_checksum(from.ip(), server(22).ip(), 6, &long_header[20..]);
+        let sum = transport_checksum(from.ip(), server(80).ip(), 6, &long_header[20..]);
         long_header[20 + 16..20 + 18].copy_from_slice(&sum.to_be_bytes());
         net.send(Packet(long_header));
         let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -1409,7 +1698,7 @@ fn many_sources_leave_nothing_behind() {
         let syn = with_mss(&mptcp_bytes(linux_capable()));
         for n in 0..sources {
             let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + n)), 50000);
-            net.send(segment(from, server(22), n, 0, SYN, &syn, b""));
+            net.send(segment(from, server(80), n, 0, SYN, &syn, b""));
         }
         // SYN-ACKs to sources that never answer are resent, so count the
         // sources answered.
@@ -1551,7 +1840,7 @@ fn attached_sandbox_reaches_the_server(name: &'static str) {
             let mut agent = attacher.attach(name)?;
             let from = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 45000);
             let syn = with_mss(&mptcp_bytes(linux_capable()));
-            agent.send(segment(from, server(22), 1, 0, SYN, &syn, b""));
+            agent.send(segment(from, server(80), 1, 0, SYN, &syn, b""));
             let deadline = fcx.now() + Duration::from_secs(1);
             let syn_ack = fcx.race(Some(deadline), agent.recv(&fcx)).await??;
             assert_eq!(flags(&syn_ack), SYN | ACK);
@@ -1586,7 +1875,7 @@ fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
         for n in 0..4097 {
             net.send(segment(
                 spoofed(n),
-                server(22),
+                server(80),
                 n,
                 0,
                 SYN,
@@ -1601,7 +1890,7 @@ fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
         let from = client(5, 43100);
         let mut offer = with_mss(&[3, 3, 7, 4, 2]);
         offer.extend_from_slice(&mptcp_bytes(linux_capable()));
-        net.send(segment(from, server(22), 1000, 0, SYN, &offer, b""));
+        net.send(segment(from, server(80), 1000, 0, SYN, &offer, b""));
         let mut seen = Vec::new();
         let syn_ack = loop {
             let p = net.recv().await.expect("an answer");
@@ -1627,30 +1916,41 @@ fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
         let Keys::Sender(key) = answer.keys else {
             panic!("a key")
         };
+        let request = b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n";
         let third = mptcp_bytes(MptcpOption::Capable(Capable {
-            keys: Keys::Both {
+            keys: Keys::Data {
                 sender: 0x1111,
                 receiver: key,
+                data_level_length: request.len() as u16,
+                checksum: None,
             },
             ..answer
         }));
         let iss = seq_of(&syn_ack);
-        net.send(segment(from, server(22), 1001, iss + 1, ACK, &third, b""));
-        let banner = loop {
-            let p = net.recv().await.expect("the banner");
+        net.send(segment(
+            from,
+            server(80),
+            1001,
+            iss + 1,
+            ACK,
+            &third,
+            request,
+        ));
+        let response = loop {
+            let p = net.recv().await.expect("the HTTP response");
             seen.push(p.clone());
             if dst_of(&p) == from && !payload_of(&p).is_empty() {
                 break p;
             }
         };
-        assert_eq!(payload_of(&banner), SSH_BANNER);
+        assert!(payload_of(&response).starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert_eq!(net.honeypot.mptcp_connections(), 1, "MPTCP after a cookie");
-        let hello = b"SSH-2.0-Go\r\n";
-        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        let hello = b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let acked = iss + 1 + payload_of(&response).len() as u32;
         net.send(segment(
             from,
-            server(22),
-            1001,
+            server(80),
+            1001 + request.len() as u32,
             acked,
             PSH | ACK,
             &[],
@@ -1659,6 +1959,8 @@ fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
 
         // The rest of the spoofed SYN-ACKs, then quiet.
         let fcx = net.fcx.clone();
+        let mut next = acked;
+        let mut sent = 1001 + request.len() as u32 + hello.len() as u32;
         while let Ok(p) = fcx
             .race(
                 Some(fcx.now() + Duration::from_secs(40)),
@@ -1666,7 +1968,24 @@ fn a_spoofed_syn_flood_leaves_room_for_the_real_attacker() {
             )
             .await
         {
-            seen.push(p?);
+            let p = p?;
+            if dst_of(&p) == from && (!payload_of(&p).is_empty() || flags(&p) & 1 != 0) {
+                if seq_of(&p) == next {
+                    next += payload_of(&p).len() as u32 + u32::from(flags(&p) & 1 != 0);
+                }
+                let closing = flags(&p) & 1;
+                net.send(segment(
+                    from,
+                    server(80),
+                    sent,
+                    next,
+                    ACK | closing,
+                    &[],
+                    b"",
+                ));
+                sent += u32::from(closing != 0);
+            }
+            seen.push(p);
         }
         assert!(seen.iter().all(|p| flags(p) & RST == 0), "no RST");
         for (n, expected) in [(0, 6), (127, 6), (128, 6), (4095, 6), (4096, 1)] {
@@ -1778,7 +2097,7 @@ fn a_fragmented_syn_is_logged() {
         let from = client(8, 47000);
         let syn = segment(
             from,
-            server(22),
+            server(80),
             1000,
             0,
             SYN,
@@ -1837,7 +2156,7 @@ fn fragments_for_elsewhere_cannot_hide_a_syn() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(8, 47000);
         let options = with_mss(&mptcp_bytes(linux_capable()));
-        let syn = segment(from, server(22), 1000, 0, SYN, &options, b"");
+        let syn = segment(from, server(80), 1000, 0, SYN, &options, b"");
         let tcp = syn.0[20..].to_vec();
         net.send(fragment(&syn, 77, 0, true, &tcp[..8]));
         let junk = segment(
@@ -1875,7 +2194,7 @@ fn fragments_expire_for_the_log_as_for_the_world() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(8, 47000);
         let options = with_mss(&mptcp_bytes(linux_capable()));
-        let syn = segment(from, server(22), 1000, 0, SYN, &options, b"");
+        let syn = segment(from, server(80), 1000, 0, SYN, &options, b"");
         let tcp = syn.0[20..].to_vec();
         net.send(fragment(&syn, 77, 0, true, &tcp[..8]));
         net.fcx.sleep(Duration::from_secs(40)).await?;
@@ -1894,7 +2213,7 @@ fn a_syn_s_payload_is_logged() {
         let from = client(9, 47001);
         let options = with_mss(&mptcp_bytes(linux_capable()));
         let data = b"PAYLOAD-IN-SYN";
-        net.send(segment(from, server(22), 1000, 0, SYN, &options, data));
+        net.send(segment(from, server(80), 1000, 0, SYN, &options, data));
         net.drain().await;
         let syns = net.events("syn");
         assert_eq!(syns.len(), 1);
@@ -1964,14 +2283,10 @@ fn a_data_fin_alone_is_acknowledged_at_once() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(3, 41001);
         let client_key = 0x1111_2222_3333_4444;
-        let (key, iss) = open_mptcp(&mut net, from, 22, client_key).await;
-        let banner = net.recv().await.expect("the banner");
-        assert_eq!(payload_of(&banner), SSH_BANNER);
-        let acked = iss + 1 + SSH_BANNER.len() as u32;
+        let (key, iss) = open_mptcp(&mut net, from, 80, client_key).await;
+        let acked = iss + 1;
         let data_fin = mptcp_bytes(MptcpOption::Dss(Dss {
-            data_ack: Some(Sequence::Long(
-                mptcp::idsn(key).advance(1 + SSH_BANNER.len() as u64),
-            )),
+            data_ack: Some(Sequence::Long(mptcp::idsn(key).advance(1))),
             mapping: Some(Mapping {
                 data_sequence_number: Sequence::Long(mptcp::idsn(client_key).advance(1)),
                 subflow_sequence_number: 0,
@@ -1980,7 +2295,7 @@ fn a_data_fin_alone_is_acknowledged_at_once() {
             }),
             data_fin: true,
         }));
-        net.send(segment(from, server(22), 5001, acked, ACK, &data_fin, b""));
+        net.send(segment(from, server(80), 5001, acked, ACK, &data_fin, b""));
         let ack = net.recv().await.expect("an ACK at once");
         assert_eq!(flags(&ack) & (SYN | RST), 0);
         assert_eq!(ack_of(&ack), 5001, "no subflow byte");
@@ -1997,7 +2312,7 @@ fn a_data_fin_alone_is_acknowledged_at_once() {
 /// from its SYN-ACK. SYN-ACKs to others that come first are skipped.
 async fn join(net: &mut Internet, joiner: SocketAddr, key: u64) -> (u32, u32) {
     let syn = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
-    net.send(segment(joiner, server(22), 7000, 0, SYN, &syn, b""));
+    net.send(segment(joiner, server(80), 7000, 0, SYN, &syn, b""));
     let syn_ack = loop {
         let p = net.recv().await.expect("a SYN-ACK");
         if dst_of(&p) == joiner {
@@ -2017,13 +2332,13 @@ async fn join(net: &mut Internet, joiner: SocketAddr, key: u64) -> (u32, u32) {
 fn a_join_ack_without_mp_join_is_an_mptcp_error() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(4, 42000);
-        let (key, _) = open_mptcp(&mut net, from, 22, 0x1111_2222_3333_4444).await;
+        let (key, _) = open_mptcp(&mut net, from, 80, 0x1111_2222_3333_4444).await;
         net.drain().await;
         let joiner = client(4, 42001);
         let (_, join_iss) = join(&mut net, joiner, key).await;
         net.send(segment(
             joiner,
-            server(22),
+            server(80),
             7001,
             join_iss + 1,
             ACK,
@@ -2052,13 +2367,13 @@ fn a_join_answered_with_a_syn_cookie_is_taken() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(5, 43000);
         let client_key = 0x1111_2222_3333_4444;
-        let (key, _) = open_mptcp(&mut net, from, 22, client_key).await;
+        let (key, _) = open_mptcp(&mut net, from, 80, client_key).await;
         net.drain().await;
         let spoofed = |n: u32| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + n)), 50000);
         for n in 0..4096 {
             net.send(segment(
                 spoofed(n),
-                server(22),
+                server(80),
                 n,
                 0,
                 SYN,
@@ -2076,7 +2391,7 @@ fn a_join_answered_with_a_syn_cookie_is_taken() {
         let (random, join_iss) = join(&mut net, joiner, key).await;
         net.send(segment(
             joiner,
-            server(22),
+            server(80),
             7001,
             join_iss + 1,
             ACK,
@@ -2085,7 +2400,7 @@ fn a_join_answered_with_a_syn_cookie_is_taken() {
         ));
         net.send(segment(
             joiner,
-            server(22),
+            server(80),
             7001,
             join_iss + 1,
             PSH | ACK,
@@ -2104,7 +2419,7 @@ fn a_join_answered_with_a_syn_cookie_is_taken() {
         // Another join, whose connection the client ends before the ACK.
         let late = client(5, 43002);
         let (random, join_iss) = join(&mut net, late, key).await;
-        net.send(segment(from, server(22), 5001, 0, RST, &[], b""));
+        net.send(segment(from, server(80), 5001, 0, RST, &[], b""));
         net.drain().await;
         assert_eq!(
             net.honeypot.mptcp_connections(),
@@ -2113,7 +2428,7 @@ fn a_join_answered_with_a_syn_cookie_is_taken() {
         );
         net.send(segment(
             late,
-            server(22),
+            server(80),
             7001,
             join_iss + 1,
             ACK,
@@ -2206,7 +2521,7 @@ fn syns_with_a_wrong_checksum_are_in_the_capture_only() {
         for port in 40001..=40008 {
             let from = client(3, port);
             let options = with_mss(&mptcp_bytes(linux_capable()));
-            let mut syn = segment(from, server(22), 1000, 0, SYN, &options, b"");
+            let mut syn = segment(from, server(80), 1000, 0, SYN, &options, b"");
             syn.0[20 + 16] ^= 0xff;
             net.send(syn);
         }
@@ -2309,18 +2624,17 @@ fn a_full_disk_does_not_stop_the_world() {
 fn fastclose_resets_the_connection_and_removes_its_token() {
     honeypot(Config::default(), |mut net| async move {
         let from = client(2, 43000);
-        let (key, iss) = open_mptcp(&mut net, from, 22, 123456).await;
-        let banner = net.recv().await.expect("the banner");
-        let ack = iss + 1 + payload_of(&banner).len() as u32;
+        let (key, iss) = open_mptcp(&mut net, from, 80, 123456).await;
+        let ack = iss + 1;
         let wrong = mptcp_bytes(MptcpOption::FastClose {
             receiver_key: key ^ 1,
         });
-        net.send(segment(from, server(22), 5001, ack, ACK, &wrong, b""));
+        net.send(segment(from, server(80), 5001, ack, ACK, &wrong, b""));
         net.drain().await;
         assert_eq!(net.honeypot.mptcp_connections(), 1);
         let joiner = client(2, 43002);
         let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
-        net.send(segment(joiner, server(22), 7000, 0, SYN, &join, b""));
+        net.send(segment(joiner, server(80), 7000, 0, SYN, &join, b""));
         let syn_ack = net.recv().await.expect("the join SYN ACK");
         let [MptcpOption::Join(Join::SynAck { random, .. })] = mptcp_of(&syn_ack)[..] else {
             panic!("join nonce")
@@ -2330,7 +2644,7 @@ fn fastclose_resets_the_connection_and_removes_its_token() {
         let third = mptcp_bytes(MptcpOption::Join(Join::Ack { hmac }));
         net.send(segment(
             joiner,
-            server(22),
+            server(80),
             7001,
             join_iss + 1,
             ACK,
@@ -2341,7 +2655,7 @@ fn fastclose_resets_the_connection_and_removes_its_token() {
         assert_eq!(flags(&fourth), ACK);
         assert_eq!(ack_of(&fourth), 7001);
         let close = mptcp_bytes(MptcpOption::FastClose { receiver_key: key });
-        net.send(segment(from, server(22), 5001, ack, ACK, &close, b""));
+        net.send(segment(from, server(80), 5001, ack, ACK, &close, b""));
         // Each subflow's RST carries MP_TCPRST, as Linux sends it.
         let unspecified = [MptcpOption::TcpRst {
             transient: false,
@@ -2358,7 +2672,7 @@ fn fastclose_resets_the_connection_and_removes_its_token() {
         let join = with_mss(&mptcp_bytes(join_syn(token(key), 99)));
         net.send(segment(
             client(2, 43001),
-            server(22),
+            server(80),
             7000,
             0,
             SYN,
@@ -2394,7 +2708,7 @@ fn mappings_with_invalid_checksum_mode_or_contents_reset_before_delivery() {
                 keys: Keys::Absent,
             };
             let syn = with_mss(&mptcp_bytes(MptcpOption::Capable(capable)));
-            net.send(segment(from, server(22), 5000, 0, SYN, &syn, b""));
+            net.send(segment(from, server(80), 5000, 0, SYN, &syn, b""));
             let answer = net.recv().await.expect("the SYN ACK");
             let [
                 MptcpOption::Capable(Capable {
@@ -2422,7 +2736,7 @@ fn mappings_with_invalid_checksum_mode_or_contents_reset_before_delivery() {
             let third = mptcp_bytes(MptcpOption::Capable(Capable { keys, ..capable }));
             net.send(segment(
                 from,
-                server(22),
+                server(80),
                 5001,
                 iss + 1,
                 ACK,
@@ -2430,7 +2744,6 @@ fn mappings_with_invalid_checksum_mode_or_contents_reset_before_delivery() {
                 if handshake_data { b"hello" } else { b"" },
             ));
             if !handshake_data {
-                let banner = net.recv().await.expect("the banner");
                 let mapping = mptcp_bytes(MptcpOption::Dss(Dss {
                     data_ack: None,
                     mapping: Some(Mapping {
@@ -2443,9 +2756,9 @@ fn mappings_with_invalid_checksum_mode_or_contents_reset_before_delivery() {
                 }));
                 net.send(segment(
                     from,
-                    server(22),
+                    server(80),
                     5001,
-                    iss + 1 + payload_of(&banner).len() as u32,
+                    iss + 1,
                     PSH | ACK,
                     &mapping,
                     b"hello",

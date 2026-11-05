@@ -1,5 +1,5 @@
 //! What the server says once a connection is open: an OpenSSH
-//! identification and key exchange proposal, or nginx's default page.
+//! identification and key exchange proposal, or a packaged HTTP site.
 //! The packet log keeps whatever the client sends; SSH never authenticates
 //! or executes commands.
 
@@ -8,14 +8,14 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use fictionet::Cx;
-use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::codec::{Fail, Stream, Wire};
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::protocols::http1::{self, Event, RequestEvents};
 use fictionet::stdlib::protocols::ssh;
 use fictionet::stdlib::web::httpd::http_date;
 use fictionet::stdlib::world::net::{Arrival, PortServer};
 
-use crate::Clock;
+use crate::{Clock, HttpProfile};
 
 /// The identification line of OpenSSH on Ubuntu 24.04 (RFC 4253 section
 /// 4.2).
@@ -25,7 +25,9 @@ pub const SSH_BANNER: &[u8] = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20\r\n";
 /// not logged in.
 pub const LOGIN_GRACE: Duration = Duration::from_secs(120);
 
-/// nginx's `client_header_timeout`: how long it waits for a request's head.
+/// Caddy's and nginx's request-header deadline. Caddy also uses this
+/// duration for its rolling body-read and response-write inactivity limits.
+/// Caddy 2.11.9 sets these defaults in `modules/caddyhttp/app.go`.
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The maximum complete request head retained by this service.
@@ -37,6 +39,17 @@ pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// nginx's maximum number of requests on one connection.
 pub const KEEPALIVE_REQUESTS: usize = 1000;
+
+/// Caddy's built-in `IdleTimeout` from `modules/caddyhttp/app.go`.
+pub const CADDY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Go's `net/http/server.go` default maximum request head, including its
+/// read buffer allowance.
+const CADDY_HEADER_LIMIT: usize = (1 << 20) + 4096;
+
+/// The official Caddy package's unmodified welcome page, measured with
+/// Caddy 2.11.9 on Ubuntu 24.04.
+const CADDY_WELCOME: &str = include_str!("caddy.html");
 
 /// The body of nginx's default page on Ubuntu.
 const WELCOME: &str = "<!DOCTYPE html>
@@ -87,6 +100,8 @@ enum Page {
     Welcome,
     NotFound,
     BadRequest,
+    HeaderTooLarge,
+    MethodNotAllowed,
 }
 
 impl Page {
@@ -94,7 +109,9 @@ impl Page {
         let (status, body) = match self {
             Self::Welcome => ("200 OK", WELCOME),
             Self::NotFound => ("404 Not Found", NOT_FOUND),
-            Self::BadRequest => ("400 Bad Request", BAD_REQUEST),
+            Self::BadRequest | Self::HeaderTooLarge | Self::MethodNotAllowed => {
+                ("400 Bad Request", BAD_REQUEST)
+            }
         };
         let connection = if keep_alive { "keep-alive" } else { "close" };
         let mut response = format!(
@@ -111,6 +128,57 @@ impl Page {
                 "ETag: \"{modified:x}-{:x}\"\r\nAccept-Ranges: bytes\r\n",
                 body.len()
             ));
+        }
+        response.push_str("\r\n");
+        if !head_only {
+            response.push_str(body);
+        }
+        response
+    }
+
+    fn caddy_response(
+        &self,
+        date: &str,
+        keep_alive: bool,
+        head_only: bool,
+        http10: bool,
+    ) -> String {
+        let (status, body) = match self {
+            Self::Welcome => ("200 OK", CADDY_WELCOME),
+            Self::NotFound => ("404 Not Found", ""),
+            Self::MethodNotAllowed => ("405 Method Not Allowed", ""),
+            Self::BadRequest => ("400 Bad Request", "400 Bad Request"),
+            Self::HeaderTooLarge => (
+                "431 Request Header Fields Too Large",
+                "431 Request Header Fields Too Large",
+            ),
+        };
+        if matches!(self, Self::BadRequest | Self::HeaderTooLarge) {
+            return format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{body}"
+            );
+        }
+        let version = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
+        let mut response = format!("{version} {status}\r\n");
+        if matches!(self, Self::Welcome) {
+            // File metadata from the official Caddy package, independent of
+            // the simulated host's boot time.
+            response.push_str(&format!("Accept-Ranges: bytes\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nEtag: \"dmmvf07hm0ow-egx\"\r\nLast-Modified: Thu, 05 Nov 2026 01:03:05 GMT\r\n", body.len()));
+        } else if matches!(self, Self::MethodNotAllowed) {
+            response.push_str("Allow: GET, HEAD\r\n");
+        }
+        response.push_str("Server: Caddy\r\n");
+        if matches!(self, Self::Welcome) {
+            response.push_str("Vary: Accept-Encoding\r\n");
+        }
+        response.push_str(&format!("Date: {date}\r\n"));
+        if !matches!(self, Self::Welcome) {
+            response.push_str("Content-Length: 0\r\n");
+        }
+        if !keep_alive && !http10 {
+            response.push_str("Connection: close\r\n");
+        } else if keep_alive && http10 {
+            response.push_str("Connection: keep-alive\r\n");
         }
         response.push_str("\r\n");
         if !head_only {
@@ -237,30 +305,46 @@ impl PortServer for Ssh {
     }
 }
 
-/// HTTP: nginx's default page, with persistent connections and bounded
-/// request framing. TCP keepalives remain disabled, as in nginx.
+/// HTTP with the selected server's packaged page and connection defaults.
 pub struct Http {
     /// The wall clock, for the `Date` header.
     pub clock: Clock,
+    /// The packaged server to emulate.
+    pub profile: HttpProfile,
 }
 
 impl PortServer for Http {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        arrival.socket.set_keep_alive(None);
+        let profile = self.profile;
+        arrival.socket.set_keep_alive(match profile {
+            // Go's net.defaultTCPKeepAliveIdle, used by Caddy's ListenConfig.
+            HttpProfile::Caddy => Some(Duration::from_secs(15)),
+            HttpProfile::Nginx => None,
+        });
         let mut conn = arrival.conn;
         let clock = self.clock;
         Box::pin(async move {
+            let head_limit = match profile {
+                HttpProfile::Caddy => CADDY_HEADER_LIMIT,
+                HttpProfile::Nginx => HEADER_LIMIT,
+            };
             let mut input = Stream::new(RequestEvents::with_limits(http1::Limits {
-                head: HEADER_LIMIT,
-                headers: usize::MAX,
+                head: head_limit,
+                start_line: head_limit,
+                header_line: head_limit,
+                headers: if profile == HttpProfile::Caddy {
+                    500
+                } else {
+                    usize::MAX
+                },
                 ..http1::Limits::default()
             }));
-            let mut deadline = fcx.now() + HEADER_TIMEOUT;
+            let mut deadline = Some(fcx.now() + HEADER_TIMEOUT);
             let mut idle = false;
             let mut request = None;
             let mut requests = 0;
             loop {
-                let (page, keep_alive, head_only) = match input.next() {
+                let (page, keep_alive, head_only, http10) = match input.next() {
                     Some(Ok(Event::Head(head))) => {
                         if head.expects_continue()
                             && conn
@@ -271,34 +355,55 @@ impl PortServer for Http {
                             return;
                         }
                         request = Some(head);
-                        deadline = fcx.now() + HEADER_TIMEOUT;
+                        deadline = Some(fcx.now() + HEADER_TIMEOUT);
                         continue;
                     }
                     Some(Ok(Event::Body(_))) => continue,
                     Some(Ok(Event::Done)) => {
                         let head = request.take().expect("a request head precedes its body");
                         requests += 1;
-                        let page = match head.target.split('?').next() {
-                            Some("/" | "/index.nginx-debian.html") => Page::Welcome,
+                        let page = match (profile, head.target.split('?').next()) {
+                            (HttpProfile::Caddy, Some("/" | "/index.html"))
+                                if !matches!(head.method.as_str(), "GET" | "HEAD") =>
+                            {
+                                Page::MethodNotAllowed
+                            }
+                            (HttpProfile::Caddy, Some("/" | "/index.html"))
+                            | (HttpProfile::Nginx, Some("/" | "/index.nginx-debian.html")) => {
+                                Page::Welcome
+                            }
                             _ => Page::NotFound,
                         };
                         (
                             page,
-                            head.keep_alive().unwrap_or(false) && requests < KEEPALIVE_REQUESTS,
+                            head.keep_alive().unwrap_or(false)
+                                && (profile == HttpProfile::Caddy || requests < KEEPALIVE_REQUESTS),
                             head.method == "HEAD",
+                            head.version == http1::Version::Http10,
                         )
                     }
-                    Some(Err(_)) => (Page::BadRequest, false, false),
+                    Some(Err(error)) => {
+                        let page = match error {
+                            Fail::Protocol(http1::RequestError::Parse(
+                                http1::Error::HeadTooLong
+                                | http1::Error::HeaderLineTooLong
+                                | http1::Error::StartLineTooLong,
+                            )) => Page::HeaderTooLarge,
+                            _ => Page::BadRequest,
+                        };
+                        (page, false, false, false)
+                    }
                     None => {
-                        match fcx
-                            .race(Some(deadline), conn.read(&fcx, input.spare()))
-                            .await
-                        {
+                        match fcx.race(deadline, conn.read(&fcx, input.spare())).await {
                             Ok(Ok(n @ 1..)) => {
                                 input.commit(n);
-                                if idle {
+                                if profile == HttpProfile::Caddy && request.is_some() {
+                                    deadline = Some(fcx.now() + HEADER_TIMEOUT);
+                                }
+                                if idle && (profile == HttpProfile::Nginx || input.buffered() >= 4)
+                                {
                                     idle = false;
-                                    deadline = fcx.now() + HEADER_TIMEOUT;
+                                    deadline = Some(fcx.now() + HEADER_TIMEOUT);
                                 }
                             }
                             _ => return,
@@ -307,43 +412,60 @@ impl PortServer for Http {
                     }
                 };
                 let date = http_date(clock.unix_secs(fcx.now()));
-                let response = page.response(
-                    &date,
-                    clock.unix_secs(fictionet::time::Instant::ZERO),
-                    keep_alive,
-                    head_only,
-                );
-                if !matches!(
-                    fcx.race(
-                        Some(fcx.now() + HEADER_TIMEOUT),
-                        conn.write_all(&fcx, response.as_bytes())
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    return;
+                let modified = clock.unix_secs(fictionet::time::Instant::ZERO);
+                let response = match profile {
+                    HttpProfile::Caddy => page.caddy_response(&date, keep_alive, head_only, http10),
+                    HttpProfile::Nginx => page.response(&date, modified, keep_alive, head_only),
+                };
+                let mut remaining = response.as_bytes();
+                let mut write_deadline = fcx.now() + HEADER_TIMEOUT;
+                while !remaining.is_empty() {
+                    match fcx
+                        .race(Some(write_deadline), conn.write(&fcx, remaining))
+                        .await
+                    {
+                        Ok(Ok(n @ 1..)) => {
+                            remaining = &remaining[n..];
+                            if profile == HttpProfile::Caddy {
+                                write_deadline = fcx.now() + HEADER_TIMEOUT;
+                            }
+                        }
+                        _ => return,
+                    }
                 }
                 if !keep_alive {
                     break;
                 }
-                idle = input.buffered() == 0;
-                deadline = fcx.now()
-                    + if idle {
-                        KEEPALIVE_TIMEOUT
-                    } else {
-                        HEADER_TIMEOUT
-                    };
+                idle = input.buffered() < if profile == HttpProfile::Caddy { 4 } else { 1 };
+                deadline = Some(
+                    fcx.now()
+                        + if idle {
+                            match profile {
+                                HttpProfile::Caddy => CADDY_IDLE_TIMEOUT,
+                                HttpProfile::Nginx => KEEPALIVE_TIMEOUT,
+                            }
+                        } else {
+                            HEADER_TIMEOUT
+                        },
+                );
             }
             let _ = conn.shutdown(&fcx).await;
+            if profile == HttpProfile::Caddy {
+                return;
+            }
             // Bytes the client sends after the request are read, so the
             // close is a FIN and not a RST.
             let mut buf = [0; 4096];
-            while let Ok(Ok(1..)) = fcx.race(Some(deadline), conn.read(&fcx, &mut buf)).await {}
+            while let Ok(Ok(1..)) = fcx.race(deadline, conn.read(&fcx, &mut buf)).await {}
         })
     }
 
     fn backlog(&self) -> Option<usize> {
-        // nginx's built-in listen backlog on Linux, unchanged by Ubuntu 24.04.
-        Some(511)
+        Some(match self.profile {
+            // Go reads net.core.somaxconn, which is 4096 on Ubuntu 24.04.
+            HttpProfile::Caddy => 4096,
+            // nginx's built-in listen backlog on Linux.
+            HttpProfile::Nginx => 511,
+        })
     }
 }

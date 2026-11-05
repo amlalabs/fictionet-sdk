@@ -4,7 +4,7 @@
 //! honeypot [--world unix:PATH] [--log PATH] [--pcap PATH]
 //!          [--address IPV4] [--address-v6 IPV6] [--internet PREFIX]...
 //!          [--gateway IPV4] [--gateway-v6 IPV6]
-//!          [--ssh PORT]... [--http PORT]...
+//!          [--ssh PORT]... [--http PORT]... [--http-profile caddy|nginx]
 //!          [--burst-window-ms MS] [--burst-syns N]
 //! ```
 //!
@@ -48,8 +48,10 @@ pub struct Config {
     /// on the link, as on AWS and Google Cloud. Unused without
     /// [`address_v6`](Config::address_v6).
     pub gateway_v6: Ipv6Gateway,
-    /// The server's open TCP ports, each with an MPTCP listener.
+    /// The server's open TCP ports.
     pub ports: Vec<Port>,
+    /// The HTTP server persona. Caddy accepts MPTCP; nginx uses ordinary TCP.
+    pub http_profile: HttpProfile,
     /// When SYNs from one source count as a burst.
     pub burst: Burst,
 }
@@ -105,8 +107,18 @@ pub struct Port {
 pub enum Service {
     /// An OpenSSH server's identification line.
     Ssh,
-    /// nginx's default page.
+    /// The configured HTTP profile's default page.
     Http,
+}
+
+/// The packaged HTTP server whose behavior is exposed to clients.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HttpProfile {
+    /// Official Caddy with its packaged site and default MPTCP listener.
+    #[default]
+    Caddy,
+    /// Ubuntu nginx with its packaged site and ordinary TCP listener.
+    Nginx,
 }
 
 /// When SYNs from one source address count as a burst: at least `syns`
@@ -147,6 +159,7 @@ impl Default for Config {
                 },
             ],
             burst: Burst::default(),
+            http_profile: HttpProfile::default(),
         }
     }
 }
@@ -217,6 +230,8 @@ pub enum Flag {
     Ssh,
     /// `--http`: a port with [`Service::Http`].
     Http,
+    /// `--http-profile`: [`Config::http_profile`].
+    HttpProfile,
     /// `--burst-window-ms`: [`Burst::window`].
     BurstWindowMs,
     /// `--burst-syns`: [`Burst::syns`].
@@ -225,7 +240,7 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag.
-    pub const ALL: [Flag; 12] = [
+    pub const ALL: [Flag; 13] = [
         Flag::World,
         Flag::Log,
         Flag::Pcap,
@@ -236,6 +251,7 @@ impl Flag {
         Flag::GatewayV6,
         Flag::Ssh,
         Flag::Http,
+        Flag::HttpProfile,
         Flag::BurstWindowMs,
         Flag::BurstSyns,
     ];
@@ -253,6 +269,7 @@ impl Flag {
             Flag::GatewayV6 => "--gateway-v6",
             Flag::Ssh => "--ssh",
             Flag::Http => "--http",
+            Flag::HttpProfile => "--http-profile",
             Flag::BurstWindowMs => "--burst-window-ms",
             Flag::BurstSyns => "--burst-syns",
         }
@@ -306,6 +323,13 @@ impl Args {
                     number: value.parse().map_err(|_| bad())?,
                     service: Service::Http,
                 }),
+                Flag::HttpProfile => {
+                    config.http_profile = match value.as_str() {
+                        "caddy" => HttpProfile::Caddy,
+                        "nginx" => HttpProfile::Nginx,
+                        _ => return Err(bad()),
+                    };
+                }
                 Flag::BurstWindowMs => {
                     config.burst.window = Duration::from_millis(value.parse().map_err(|_| bad())?)
                 }
@@ -340,6 +364,7 @@ mod tests {
                 Flag::Address | Flag::Gateway => "192.0.2.1",
                 Flag::AddressV6 | Flag::GatewayV6 => "2001:db8::1",
                 Flag::Internet => "0.0.0.0/0",
+                Flag::HttpProfile => "caddy",
                 _ => "7",
             };
             assert!(
@@ -360,6 +385,40 @@ mod tests {
             Ipv6Gateway::FromRouterAdvertisements
         );
         assert_eq!(parsed.log, PathBuf::from("honeypot.jsonl"));
+        assert_eq!(parsed.config.http_profile, HttpProfile::Caddy);
+    }
+
+    #[test]
+    fn http_profile_is_explicit_and_independent_of_port_order() {
+        for flags in [
+            "--http-profile nginx --http 8080",
+            "--http 8080 --http-profile nginx",
+        ] {
+            let config = args(flags).unwrap().config;
+            assert_eq!(config.http_profile, HttpProfile::Nginx);
+            assert_eq!(
+                config.ports,
+                [Port {
+                    number: 8080,
+                    service: Service::Http
+                }]
+            );
+        }
+        assert_eq!(
+            args("--http-profile caddy").unwrap().config,
+            Config::default()
+        );
+        assert_eq!(
+            args("--http-profile").unwrap_err(),
+            ArgsError::Missing(Flag::HttpProfile)
+        );
+        assert_eq!(
+            args("--http-profile other").unwrap_err(),
+            ArgsError::Bad {
+                flag: Flag::HttpProfile,
+                value: "other".into()
+            }
+        );
     }
 
     #[test]
