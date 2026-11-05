@@ -193,6 +193,67 @@ impl TcpOption {
     }
 }
 
+/// An option's decoded value and its original wire bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OptionRead<'a> {
+    /// A complete option, including its Kind and Length bytes when present.
+    Option {
+        /// The original bytes, without re-encoding or normalization.
+        bytes: &'a [u8],
+        /// The decoded option. Known kinds with unsupported lengths are unknown.
+        value: TcpOption,
+    },
+    /// End of Option List, followed by uninterpreted header padding.
+    End {
+        /// The one-byte End of Option List marker.
+        bytes: &'a [u8],
+        /// Every remaining byte in the option area.
+        padding: &'a [u8],
+    },
+    /// A missing or invalid length, ending the walk.
+    Malformed {
+        /// The malformed option and every byte after it.
+        bytes: &'a [u8],
+    },
+}
+
+/// Reads a TCP header's option area, preserving every original byte.
+/// Stops after End of Option List or the first malformed option. The same
+/// parser reads the options used by the TCP endpoint and [`options`].
+pub fn read_options(mut bytes: &[u8]) -> impl Iterator<Item = OptionRead<'_>> {
+    std::iter::from_fn(move || {
+        if bytes.is_empty() {
+            return None;
+        }
+        let original = bytes;
+        Some(match WireOption::parse(original) {
+            Ok((remaining, option)) => {
+                let consumed = &original[..original.len() - remaining.len()];
+                match TcpOption::from_wire(option) {
+                    Some(value) => {
+                        bytes = remaining;
+                        OptionRead::Option {
+                            bytes: consumed,
+                            value,
+                        }
+                    }
+                    None => {
+                        bytes = &[];
+                        OptionRead::End {
+                            bytes: consumed,
+                            padding: remaining,
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                bytes = &[];
+                OptionRead::Malformed { bytes: original }
+            }
+        })
+    })
+}
+
 /// Why [`options`] could not read all of a segment's options.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OptionsError {

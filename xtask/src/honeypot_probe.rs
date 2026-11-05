@@ -10,8 +10,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::dissect::hex;
 use fictionet::stdlib::network::ethernet::frame::{self, Frame};
-use fictionet::stdlib::network::ip;
+use fictionet::stdlib::network::{ip, tcp};
 use fictionet::stdlib::protocols::{arp, ssh};
 use serde_json::{Value, json};
 
@@ -154,15 +155,6 @@ fn save(directory: &Path, target: &Target, kind: &str, record: Value) -> Result 
         &bytes,
     )?;
     Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut result, "{byte:02x}").unwrap();
-    }
-    result
 }
 
 fn address(ip: Ipv4Addr) -> libc::sockaddr_in {
@@ -925,50 +917,44 @@ fn decode_ip_option(option: ip::Ipv4Option) -> Value {
     }
 }
 
-fn tcp_options(mut bytes: &[u8]) -> Vec<Value> {
-    let mut result = Vec::new();
-    while let Some(&kind) = bytes.first() {
-        let length = if kind <= 1 {
-            1
-        } else {
-            usize::from(*bytes.get(1).unwrap_or(&0))
-        };
-        if (kind > 1 && length < 2) || length > bytes.len() {
-            result.push(json!({"kind":kind,"malformed_hex":hex(bytes)}));
-            break;
-        }
-        let option = &bytes[..length];
-        let mut decoded = json!({"kind":kind,"hex":hex(option)});
-        match (kind, length) {
-            (0, _) => decoded["name"] = json!("end"),
-            (1, _) => decoded["name"] = json!("nop"),
-            (2, 4) => {
-                decoded["name"] = json!("mss");
-                decoded["value"] = json!(u16::from_be_bytes([option[2], option[3]]));
+fn tcp_options(bytes: &[u8]) -> Vec<Value> {
+    tcp::read_options(bytes)
+        .map(|read| {
+            let (bytes, value) = match read {
+                tcp::OptionRead::Option { bytes, value } => (bytes, value),
+                tcp::OptionRead::End { bytes, .. } => {
+                    return json!({"kind":0,"hex":hex(bytes),"name":"end"});
+                }
+                tcp::OptionRead::Malformed { bytes } => {
+                    return json!({"kind":bytes[0],"malformed_hex":hex(bytes)});
+                }
+            };
+            let mut decoded = json!({"kind":bytes[0],"hex":hex(bytes)});
+            match value {
+                tcp::TcpOption::NoOperation => decoded["name"] = json!("nop"),
+                tcp::TcpOption::MaxSegmentSize(value) => {
+                    decoded["name"] = json!("mss");
+                    decoded["value"] = json!(value);
+                }
+                tcp::TcpOption::WindowScale(value) => {
+                    decoded["name"] = json!("window_scale");
+                    decoded["value"] = json!(value);
+                }
+                tcp::TcpOption::SackPermitted => decoded["name"] = json!("sack_permitted"),
+                tcp::TcpOption::Timestamps { tsval, tsecr } => {
+                    decoded["name"] = json!("timestamps");
+                    decoded["value"] = json!(tsval);
+                    decoded["echo"] = json!(tsecr);
+                }
+                tcp::TcpOption::Unknown { kind: 30, data } if !data.is_empty() => {
+                    decoded["name"] = json!("mptcp");
+                    decoded["subtype"] = json!(data[0] >> 4);
+                }
+                _ => {}
             }
-            (3, 3) => {
-                decoded["name"] = json!("window_scale");
-                decoded["value"] = json!(option[2]);
-            }
-            (4, 2) => decoded["name"] = json!("sack_permitted"),
-            (8, 10) => {
-                decoded["name"] = json!("timestamps");
-                decoded["value"] = json!(u32::from_be_bytes(option[2..6].try_into().unwrap()));
-                decoded["echo"] = json!(u32::from_be_bytes(option[6..10].try_into().unwrap()));
-            }
-            (30, _) if length >= 3 => {
-                decoded["name"] = json!("mptcp");
-                decoded["subtype"] = json!(option[2] >> 4);
-            }
-            _ => {}
-        }
-        result.push(decoded);
-        bytes = &bytes[length..];
-        if kind == 0 {
-            break;
-        }
-    }
-    result
+            decoded
+        })
+        .collect()
 }
 
 fn connect(target: &Target, port: u16) -> Result<TcpStream> {
@@ -1327,39 +1313,36 @@ fn tcp_frame_direction(
 }
 
 fn http_response(stream: &mut BufReader<TcpStream>, request: &str) -> Result<Value> {
+    use fictionet::stdlib::codec::Stream;
+    use fictionet::stdlib::protocols::http1::Responses;
+
     stream.get_mut().write_all(request.as_bytes())?;
-    let mut headers = Vec::new();
+    let mut decoder = Stream::new(Responses::new());
     loop {
-        let mut line = Vec::new();
-        stream.by_ref().take(8192).read_until(b'\n', &mut line)?;
-        if line.is_empty() || line.last() != Some(&b'\n') {
-            return Err("connection ended before the next complete HTTP header".into());
+        let input = stream.fill_buf()?;
+        let eof = input.is_empty();
+        let n = decoder.push(input);
+        if eof {
+            decoder.end();
         }
-        let end = line == b"\r\n";
-        headers.extend_from_slice(&line);
-        if headers.len() > 65536 {
-            return Err("oversized HTTP headers".into());
+        if let Some(record) = decoder.with_next(|_, wire, _| -> Result<Value> {
+            let head_end = wire
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .ok_or("decoded HTTP response has no header boundary")?
+                + 4;
+            let headers = std::str::from_utf8(&wire[..head_end])?;
+            Ok(json!({"headers":headers, "response_hex":hex(wire)}))
+        }) {
+            let record = record??;
+            // Leave read-ahead in the caller's buffer for the next response
+            // or for the idle probe to record as unsolicited bytes.
+            stream.consume(n - decoder.buffered());
+            return Ok(record);
         }
-        if end {
-            break;
+        stream.consume(n);
+        if eof {
+            return Err("connection ended before a complete HTTP response".into());
         }
     }
-    let text = String::from_utf8(headers.clone())?;
-    let length: usize = text
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("Content-Length")
-                .then_some(value.trim())
-        })
-        .ok_or("HTTP response has no content length")?
-        .parse()?;
-    if length > 1024 * 1024 {
-        return Err("oversized HTTP body".into());
-    }
-    let mut body = vec![0; length];
-    stream.read_exact(&mut body)?;
-    let mut response = headers;
-    response.extend_from_slice(&body);
-    Ok(json!({"headers":text, "response_hex":hex(&response)}))
 }

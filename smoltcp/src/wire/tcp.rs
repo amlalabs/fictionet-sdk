@@ -606,7 +606,10 @@ pub enum TcpOption<'a> {
 }
 
 impl<'a> TcpOption<'a> {
-    pub(crate) fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], TcpOption<'a>)> {
+    /// Reads the first option, returning the remaining bytes and its value.
+    /// End of Option List consumes one byte; the remainder is padding.
+    /// Fails if the option's length is missing, under two, or exceeds the buffer.
+    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], TcpOption<'a>)> {
         let (length, option);
         match *buffer.first().ok_or(Error)? {
             field::OPT_END => {

@@ -52,3 +52,17 @@ last-option preference, JOIN limits, cookie slots and reset reasons stay
 in extras. This listener still delivers application data through its
 primary connection and drains joined subflows; moving it does not turn it
 into a complete multipath application endpoint.
+
+TCP option walking now delegates to the same smoltcp parser in the endpoint,
+dissector and differential probe. Core's lossless iterator retains each
+option's original bytes, end-of-list padding and a malformed suffix. The
+probe keeps its raw evidence and presentation. The dissector no longer
+inventories malformed-size SACK options as valid blocks. The observer
+already used the shared TCP/MPTCP codecs; its JSON enums remain application
+presentation, not another protocol implementation. Hex serialization uses
+the existing dissector helper.
+
+The differential HTTP probe uses core's whole-response decoder instead of
+its own Content-Length parser and header/body caps. It records the decoder's
+original wire bytes, including header order and body framing. Unconsumed
+read-ahead stays in its BufReader for the next response or idle observation.

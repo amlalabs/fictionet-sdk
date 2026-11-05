@@ -795,11 +795,7 @@ impl Hex {
 
 impl Serialize for Hex {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut text = String::with_capacity(self.0.len() * 2);
-        for byte in &self.0 {
-            text.push_str(&format!("{byte:02x}"));
-        }
-        s.serialize_str(&text)
+        s.serialize_str(&fictionet::stdlib::dissect::hex(&self.0))
     }
 }
 
