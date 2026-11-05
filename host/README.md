@@ -10,12 +10,13 @@ The [raw world example](examples/raw_world.rs) parses a `PciAddress`, opens
 `VirtioNet`, and calls `RawPump::attach` before `fictionet::run`.
 
 - The pump polls the device on its own thread, and parks when there is
-  nothing to do or the world is not keeping up.
+  nothing to do.
 - The world awaits `RawAttachment::recv`. It never polls the device.
 - Each direction holds at most 64 frames, plus one the pump holds.
   `send` waits for room, and `try_send` drops the frame when there is
-  none. When the receive queue is full, the pump stops reading, and the
-  card may drop frames.
+  none. When the receive queue is full, the pump keeps reading and counts
+  discarded frames. `receive_stats` and `transmit_stats` expose queue loss;
+  losses inside the card or backend remain unknown.
 - Receive, send, and flush end when the world is cancelled.
 - A driver failure closes both directions, and the world gets the error.
 - Dropping the pump stops its thread and resets the device.

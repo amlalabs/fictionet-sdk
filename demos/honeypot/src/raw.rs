@@ -10,7 +10,7 @@ use fictionet::stdlib::network::ethernet::host::{self, Host, Ipv4Config, Ipv6Con
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Interface, Packet};
-use fictionet_host::raw::{EthernetFrame, RawAttachment, RawReceiveStats, RawSender};
+use fictionet_host::raw::{EthernetFrame, QueueStats, RawAttachment, RawSender};
 use serde::Serialize;
 
 use crate::observe::{Direction, Hex, Sink, Sinks};
@@ -23,8 +23,10 @@ struct Capture {
     writer: Sink,
     lost: u64,
     clock: Clock,
-    receive_stats: RawReceiveStats,
+    receive_stats: QueueStats,
+    transmit_stats: QueueStats,
     reported_queue_dropped: u64,
+    reported_tx_queue_dropped: u64,
 }
 
 #[derive(Serialize)]
@@ -34,18 +36,21 @@ struct FrameRecord {
     bytes: Hex,
     lost: u64,
     rx_queue_dropped: u64,
+    tx_queue_dropped: u64,
     nic_rx_dropped: Option<u64>,
 }
 
 impl Capture {
-    fn frame(&mut self, fcx: &Cx, direction: Direction, bytes: &[u8]) {
+    fn frame(&mut self, fcx: &Cx, direction: Direction, bytes: Vec<u8>) {
         let queue_dropped = self.receive_stats.queue_dropped();
+        let tx_queue_dropped = self.transmit_stats.queue_dropped();
         let record = FrameRecord {
             at_us: self.clock.micros(fcx.now()),
             direction,
-            bytes: Hex(bytes.to_vec()),
+            bytes: Hex(bytes),
             lost: self.lost,
             rx_queue_dropped: queue_dropped.saturating_sub(self.reported_queue_dropped),
+            tx_queue_dropped: tx_queue_dropped.saturating_sub(self.reported_tx_queue_dropped),
             nic_rx_dropped: None,
         };
         let mut line = serde_json::to_vec(&record).expect("a frame record is serializable");
@@ -53,6 +58,7 @@ impl Capture {
         if self.writer.put(&line) {
             self.lost = 0;
             self.reported_queue_dropped = queue_dropped;
+            self.reported_tx_queue_dropped = tx_queue_dropped;
         } else {
             self.lost = self.lost.saturating_add(1);
         }
@@ -71,12 +77,12 @@ struct Link {
 }
 
 impl Link {
-    /// Logs `frame`, then queues it on the card. A frame the full transmit
-    /// queue cannot take is dropped, as a host's full queue drops it.
+    /// Queues and logs `frame`, including a queue rejection in its record.
+    /// A frame the full transmit queue cannot take is dropped.
     fn put(&mut self, fcx: &Cx, frame: Vec<u8>) -> fictionet::Result {
-        self.capture.frame(fcx, Direction::Out, &frame);
-        self.sender.try_send(EthernetFrame(frame))?;
-        Ok(())
+        let sent = self.sender.try_send(EthernetFrame(frame.clone()));
+        self.capture.frame(fcx, Direction::Out, frame);
+        sent.map(|_| ())
     }
 
     /// Sends every frame the host has to send now, and wakes the timer
@@ -123,9 +129,9 @@ fn host(config: &Config, mac: Mac, now: Instant) -> fictionet::Result<Host> {
 /// `raw_log` receives every frame reaching the world, both ways, including
 /// malformed headers, VLAN tags, unknown EtherTypes and Ethernet padding,
 /// as hexadecimal JSON lines before parsing. `lost` counts refused log records and
-/// `rx_queue_dropped` counts frames the full host receive queue discarded,
-/// both since the last accepted record. `nic_rx_dropped` is null because
-/// device and backend losses are unavailable, not zero. Partial records
+/// `rx_queue_dropped` and `tx_queue_dropped` count frames the full host
+/// queues discarded, all since the last accepted record. `nic_rx_dropped`
+/// is null because device and backend losses are unavailable, not zero. Partial records
 /// are completed before the next one. `sinks`
 /// retain the existing IP capture and TCP option observations.
 ///
@@ -161,6 +167,7 @@ pub fn start_raw(
 ) -> fictionet::Result<Honeypot> {
     let host = host(config, raw.mac_address(), fcx.now())?;
     let receive_stats = raw.receive_stats();
+    let transmit_stats = raw.transmit_stats();
     let (sender, mut receiver) = raw.split();
     let (attacher, attachments) = fictionet::attachments();
     let end = Arc::new(Mutex::new(attacher.attach(INTERNET)?));
@@ -172,7 +179,9 @@ pub fn start_raw(
             lost: 0,
             clock,
             receive_stats,
+            transmit_stats,
             reported_queue_dropped: 0,
+            reported_tx_queue_dropped: 0,
         },
         sender,
         timer: None,
@@ -184,7 +193,10 @@ pub fn start_raw(
         let _attacher = attacher;
         loop {
             let EthernetFrame(bytes) = receiver.recv(&fcx).await?;
-            incoming.lock().capture.frame(&fcx, Direction::In, &bytes);
+            incoming
+                .lock()
+                .capture
+                .frame(&fcx, Direction::In, bytes.clone());
             fcx.yield_now().await?;
             let mut link = incoming.lock();
             if let Received::World(packet) = link.host.receive(fcx.now(), &bytes) {

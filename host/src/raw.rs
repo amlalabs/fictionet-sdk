@@ -29,28 +29,24 @@ pub struct RawAttachment {
     sender: RawSender,
     receiver: RawReceiver,
     mac: [u8; 6],
-    receive_stats: RawReceiveStats,
+    receive_stats: QueueStats,
 }
 
-/// Receive losses the host can observe. Device and backend losses are unknown.
+/// Losses from one attachment queue. Device and backend losses are unknown.
 #[derive(Clone, Default)]
-pub struct RawReceiveStats {
+pub struct QueueStats {
     queue_dropped: Arc<AtomicU64>,
 }
 
-impl RawReceiveStats {
-    /// Frames discarded because the world's receive queue was full, since
+impl QueueStats {
+    /// Frames discarded because this queue was full, since
     /// attachment creation. The counter saturates rather than wrapping.
     pub fn queue_dropped(&self) -> u64 {
         self.queue_dropped.load(Ordering::Relaxed)
     }
 
-    fn enqueue(
-        &self,
-        incoming: &mpsc::Sender<EthernetFrame>,
-        frame: EthernetFrame,
-    ) -> Result<bool> {
-        match incoming.try_send(frame) {
+    fn enqueue<T>(&self, sender: &mpsc::Sender<T>, value: T) -> Result<bool> {
+        match sender.try_send(value) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let _ =
@@ -71,6 +67,7 @@ impl RawReceiveStats {
 #[derive(Clone)]
 pub struct RawSender {
     tx: mpsc::Sender<Command>,
+    stats: QueueStats,
     failure: Arc<Mutex<Option<Error>>>,
 }
 
@@ -106,8 +103,13 @@ fn closed(failure: &Mutex<Option<Error>>) -> Error {
 
 impl RawAttachment {
     /// A live view of receive queue losses, retained across [`Self::split`].
-    pub fn receive_stats(&self) -> RawReceiveStats {
+    pub fn receive_stats(&self) -> QueueStats {
         self.receive_stats.clone()
+    }
+
+    /// A live view of transmit queue losses, retained across [`Self::split`].
+    pub fn transmit_stats(&self) -> QueueStats {
+        self.sender.stats.clone()
     }
 
     /// The device's configured Ethernet address.
@@ -144,7 +146,7 @@ impl RawAttachment {
 pub struct RawWire {
     incoming: mpsc::Sender<EthernetFrame>,
     outgoing: mpsc::Receiver<Command>,
-    receive_stats: RawReceiveStats,
+    receive_stats: QueueStats,
 }
 
 impl RawAttachment {
@@ -155,11 +157,12 @@ impl RawAttachment {
         let (incoming, rx) = mpsc::channel(CAPACITY);
         let (tx, outgoing) = mpsc::channel(CAPACITY);
         let failure = Arc::new(Mutex::new(None));
-        let receive_stats = RawReceiveStats::default();
+        let receive_stats = QueueStats::default();
         (
             RawAttachment {
                 sender: RawSender {
                     tx,
+                    stats: QueueStats::default(),
                     failure: failure.clone(),
                 },
                 receiver: RawReceiver { rx, failure },
@@ -232,11 +235,9 @@ impl RawSender {
     /// host's full transmit queue drops it.
     pub fn try_send(&self, frame: EthernetFrame) -> Result<bool> {
         check_length(&frame)?;
-        match self.tx.try_send(Command::Frame(frame)) {
-            Ok(()) => Ok(true),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(closed(&self.failure)),
-        }
+        self.stats
+            .enqueue(&self.tx, Command::Frame(frame))
+            .map_err(|_| closed(&self.failure))
     }
 
     async fn command(&self, fcx: &Cx, command: Command) -> Result {
@@ -269,21 +270,20 @@ pub struct RawPump {
 impl RawPump {
     /// Starts host polling and returns the bounded world attachment.
     pub fn attach(nic: VirtioNet) -> io::Result<(Self, RawAttachment)> {
-        let mac = nic.mac_address();
-        let (incoming, rx) = mpsc::channel(CAPACITY);
-        let (tx, outgoing) = mpsc::channel(CAPACITY);
-        let failure = Arc::new(Mutex::new(None));
+        let (attachment, wire) = RawAttachment::in_memory(nic.mac_address());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
-        let thread_failure = failure.clone();
-        let receive_stats = RawReceiveStats::default();
-        let thread_stats = receive_stats.clone();
+        let thread_failure = attachment.sender.failure.clone();
         let thread = thread::Builder::new()
             .name("raw-ethernet".into())
             .spawn(move || {
                 // Keep channels alive until the failure is published, so waiters see it.
-                let mut outgoing = outgoing;
-                let result = pump(nic, &thread_stop, &incoming, &mut outgoing, &thread_stats);
+                let RawWire {
+                    incoming,
+                    mut outgoing,
+                    receive_stats,
+                } = wire;
+                let result = pump(nic, &thread_stop, &incoming, &mut outgoing, &receive_stats);
                 if let Err(error) = &result {
                     *thread_failure.lock().unwrap() = Some(error.clone());
                 }
@@ -294,15 +294,7 @@ impl RawPump {
                 stop,
                 thread: Some(thread),
             },
-            RawAttachment {
-                sender: RawSender {
-                    tx,
-                    failure: failure.clone(),
-                },
-                receiver: RawReceiver { rx, failure },
-                mac,
-                receive_stats,
-            },
+            attachment,
         ))
     }
 
@@ -334,7 +326,7 @@ fn pump(
     stop: &AtomicBool,
     incoming: &mpsc::Sender<EthernetFrame>,
     outgoing: &mut mpsc::Receiver<Command>,
-    receive_stats: &RawReceiveStats,
+    receive_stats: &QueueStats,
 ) -> Result {
     let mut buffer = [0u8; MAX_FRAME];
     let mut pending_tx = None;
@@ -427,6 +419,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let sender = RawSender {
             tx,
+            stats: QueueStats::default(),
             failure: Arc::new(Mutex::new(None)),
         };
         fictionet::block_on(fictionet::run(fictionet::Seed::from_u64(0), move |fcx| async move {
@@ -446,6 +439,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let sender = RawSender {
             tx,
+            stats: QueueStats::default(),
             failure: Arc::new(Mutex::new(None)),
         };
         assert!(sender.try_send(EthernetFrame(vec![1; 14])).unwrap());
@@ -489,6 +483,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let sender = RawSender {
             tx,
+            stats: QueueStats::default(),
             failure: Arc::new(Mutex::new(None)),
         };
         fictionet::block_on(fictionet::run(
