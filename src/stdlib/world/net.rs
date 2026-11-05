@@ -133,7 +133,6 @@ mod hosts;
 mod names;
 
 use addresses::{AUTO, AUTO6, Leases, Subnet, Subnet6};
-pub use attachments::connection_limit;
 use attachments::{Hooks, filter, udp_packet};
 use dns::start_dns;
 use hosts::{
@@ -142,7 +141,6 @@ use hosts::{
 pub use hosts::{Arrival, ConfigFor, ConfigFuture, Host, PortServer, PreparedShare, Sni};
 pub use names::normalize;
 
-const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 
 /// Each link inside the network holds at most this many bytes of packets
@@ -812,13 +810,14 @@ async fn unreachable(
 
 #[cfg(test)]
 mod tests {
-    use super::attachments::answered_closed;
     use super::*;
     use crate::stdlib::services::serve::ConnInfo;
     use fictionet::stdlib::network::ConnectionExt;
-    use fictionet::stdlib::network::{ip, udp};
+    use fictionet::stdlib::network::ip;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PROTO_TCP: u8 = 6;
 
     #[test]
     fn lan_dns_endpoints_start_in_name_order() {
@@ -880,50 +879,6 @@ mod tests {
             },
         ))
         .unwrap();
-    }
-
-    /// A packet for an open port is let through without its checksum being
-    /// checked; only one for a closed port has it checked. Before, every
-    /// forwarded packet was checksummed first, and a bad one was never
-    /// looked up.
-    #[test]
-    fn the_port_is_looked_up_before_the_checksum() {
-        let (src, dst) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 40, 0, 1));
-        let good = udp_packet(src, 5000, dst, 9, b"hello").0;
-        let mut bad = good.clone();
-        *bad.last_mut().unwrap() ^= 0xff;
-        let looked = AtomicUsize::new(0);
-        let open = |is_open: bool| {
-            let looked = &looked;
-            move |_: u8, _: u16| {
-                looked.fetch_add(1, Ordering::Relaxed);
-                is_open
-            }
-        };
-        assert!(!answered_closed(&bad, open(true)));
-        assert_eq!(
-            looked.load(Ordering::Relaxed),
-            1,
-            "the port of a packet with a bad checksum is looked up"
-        );
-        assert!(!answered_closed(&good, open(true)));
-        assert!(answered_closed(&good, open(false)));
-        assert!(
-            !answered_closed(&bad, open(false)),
-            "a bad checksum to a closed port is dropped, not answered"
-        );
-        // A TCP SYN to a closed port is answered; a RST is not.
-        let tcp = |flags: u8| {
-            let mut t = vec![0u8; 20];
-            t[2..4].copy_from_slice(&80u16.to_be_bytes());
-            t[12] = 5 << 4;
-            t[13] = flags;
-            let sum = ip::transport_checksum(src.into(), dst.into(), PROTO_TCP, &t);
-            t[16..18].copy_from_slice(&sum.to_be_bytes());
-            ip::packet(src.into(), dst.into(), PROTO_TCP, &t).0
-        };
-        assert!(answered_closed(&tcp(0x02), open(false)));
-        assert!(!answered_closed(&tcp(0x04), open(false)));
     }
 
     /// Records who each connection is from. With `hold`, keeps it until it is
@@ -1310,47 +1265,6 @@ mod tests {
             },
         ))
         .unwrap();
-    }
-
-    #[test]
-    fn closed_udp_ports_use_the_declared_datagram_boundary() {
-        for (src, dst) in [
-            ("10.0.0.2", "10.40.0.1"),
-            ("2001:db8::2", "2606:4700:100::1"),
-        ] {
-            let src: IpAddr = src.parse().unwrap();
-            let dst: IpAddr = dst.parse().unwrap();
-            let packet = |u: &[u8]| ip::packet(src, dst, PROTO_UDP, u).0;
-            let mut u = [0; 10];
-            udp::encode(
-                SocketAddr::new(src, 5000),
-                SocketAddr::new(dst, 9),
-                b"hi",
-                &mut u,
-            )
-            .unwrap();
-            let mut trailing = u.to_vec();
-            trailing.extend_from_slice(b"outside UDP");
-            assert!(answered_closed(&packet(&trailing), |_, _| false));
-            assert!(!answered_closed(&packet(&trailing), |_, _| true));
-            // A checksum over the entire IP payload does not validate the
-            // datagram whose UDP length ends before that payload does.
-            trailing[6..8].fill(0);
-            let sum = ip::transport_checksum(src, dst, PROTO_UDP, &trailing);
-            trailing[6..8].copy_from_slice(&sum.to_be_bytes());
-            assert!(!answered_closed(&packet(&trailing), |_, _| false));
-            for len in [0u16, 7, 11, u16::MAX] {
-                let mut bad = u;
-                bad[4..6].copy_from_slice(&len.to_be_bytes());
-                bad[6..8].fill(0);
-                if src.is_ipv4() {
-                    assert!(!answered_closed(&packet(&bad), |_, _| false));
-                }
-                let sum = ip::transport_checksum(src, dst, PROTO_UDP, &bad);
-                bad[6..8].copy_from_slice(&sum.to_be_bytes());
-                assert!(!answered_closed(&packet(&bad), |_, _| false));
-            }
-        }
     }
 }
 

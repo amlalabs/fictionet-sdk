@@ -1,20 +1,19 @@
 use super::addresses::{Bind, Bindings};
 use super::hosts::Machines;
-use super::{PROTO_TCP, PROTO_UDP, host_prefix, link};
+use super::{PROTO_UDP, host_prefix, link};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly};
 use fictionet::stdlib::network::ports::{self, Ports};
 use fictionet::stdlib::network::route::{Lan, Prefix, Router};
 use fictionet::stdlib::network::{ip, udp};
 use fictionet::stdlib::protocols::dhcp;
-use fictionet::stdlib::services::serve::Sandbox;
-use fictionet::stdlib::services::serve::{Budget, Counted};
+use fictionet::stdlib::services::serve::{Budget, Sandbox};
 use fictionet::sync::Mutex;
 use fictionet::{Attachment, Cx, Interface, Packet};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 
 /// Sandbox addresses, connection numbering and admission budgets.
@@ -58,10 +57,6 @@ impl Hooks {
         }
     }
 
-    pub(super) fn is_attached(&self, id: u64) -> bool {
-        self.attached.lock().contains_key(&id)
-    }
-
     /// The budget of the sandbox with id `id`, while it is attached.
     pub(super) fn budget(&self, id: u64) -> Option<Budget> {
         self.attached.lock().get(&id).cloned().flatten()
@@ -86,7 +81,7 @@ pub(super) struct Context {
 /// Resets every connection whose peer address the argument accepts.
 pub(super) type PeerAbort = dyn Fn(&dyn Fn(IpAddr) -> bool) + Send + Sync;
 
-/// Only the destination facts needed to classify forwarded packets.
+/// Network destinations used for source validation and reassembly replies.
 pub(super) struct Destinations {
     pub(super) gateways: Vec<IpAddr>,
     pub(super) trusted: Vec<Prefix>,
@@ -424,19 +419,6 @@ pub(super) async fn filter(
     }
 }
 
-/// Why the network dropped or refused a packet from a sandbox.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-enum BlockedWhy {
-    NoRoute,
-    ClosedPort,
-}
-
-/// Counts an accepted connection or records why the connection limit refused it.
-pub fn connection_limit(open: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
-    Counted::enter(open, max)
-}
-
 struct Filter {
     context: Arc<Context>,
     owner: u64,
@@ -576,7 +558,6 @@ impl Filter {
                 }
             }
         };
-        if let Some(_why) = self.context.destinations.refused(&packet.0) {}
         if let Some(port) = route {
             self.ports.send(port, packet);
         }
@@ -595,46 +576,5 @@ impl Destinations {
             return false;
         };
         self.is_gateway(dst) || self.machines.contains(dst)
-    }
-
-    /// Why the network will refuse `p`: no machine has its address, or its
-    /// port is not served there. `None` if it will be delivered.
-    fn refused(&self, p: &[u8]) -> Option<BlockedWhy> {
-        let dst = ip::destination(p)?;
-        let closed = |open: &dyn Fn(u8, u16) -> bool| answered_closed(p, open);
-        if self.is_gateway(dst) {
-            return closed(&|_, p| p == 53).then_some(BlockedWhy::ClosedPort);
-        }
-        match self.machines.closed(dst, p) {
-            Some(closed) => closed.then_some(BlockedWhy::ClosedPort),
-            // A route's prefix, or a LAN, which reports its own
-            // drops.
-            None if self.trusted.iter().any(|p| p.contains(dst)) => None,
-            None => Some(BlockedWhy::NoRoute),
-        }
-    }
-}
-
-/// Whether `p`, a whole TCP or UDP packet, is for a port that `open` says
-/// is closed, and will be answered as such: it is not a TCP RST, and its
-/// checksum is good. The port is looked up first, so only a packet for a
-/// closed port has its checksum checked.
-pub(super) fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
-    let Some(h) = Header::parse_whole(p) else {
-        return false;
-    };
-    if !matches!(h.protocol, PROTO_TCP | PROTO_UDP) {
-        return false;
-    }
-    let t = h.payload(p);
-    if t.len() < 8 || open(h.protocol, u16::from_be_bytes([t[2], t[3]])) {
-        return false;
-    }
-    if h.protocol == PROTO_TCP && t.get(13).is_some_and(|flags| flags & 0x04 != 0) {
-        return false;
-    }
-    match h.protocol {
-        PROTO_UDP => udp::Datagram::parse(t).is_some_and(|u| u.checksum_ok(h.src, h.dst)),
-        _ => ip::transport_checksum(h.src, h.dst, h.protocol, t) == 0,
     }
 }

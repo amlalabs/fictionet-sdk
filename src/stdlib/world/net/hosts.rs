@@ -1,11 +1,10 @@
 use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_serve_v6};
-use super::attachments::answered_closed;
-use super::{Hooks, LanSeg, PROTO_TCP, Resolver, connection_limit, link, normalize};
+use super::{Hooks, LanSeg, Resolver, link, normalize};
 use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::serve::{self, Budget, ServeOptions, Service};
+use fictionet::stdlib::services::serve::{self, Budget, Counted, ServeOptions, Service};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -161,7 +160,7 @@ where
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let Some(guard) = connection_limit(&self.open, self.opts.max_conns) else {
+        let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
             arrival.socket.reset();
             return Box::pin(async {});
         };
@@ -795,17 +794,6 @@ impl Machines {
         self.world.lock().machines.contains_key(&addr)
     }
 
-    pub(super) fn closed(&self, addr: IpAddr, packet: &[u8]) -> Option<bool> {
-        let machine = self.world.lock().machines.get(&addr).cloned()?;
-        Some(answered_closed(packet, |proto, port| {
-            if proto == PROTO_TCP {
-                machine.serves_tcp(port)
-            } else {
-                machine.serves_udp(port)
-            }
-        }))
-    }
-
     pub(super) fn abort_peers(&self, which: &dyn Fn(IpAddr) -> bool) {
         let machines: Vec<_> = self.world.lock().machines.values().cloned().collect();
         for machine in machines {
@@ -1271,16 +1259,6 @@ impl Machine {
             }
         }
     }
-
-    /// Whether TCP `port` is open here.
-    pub(super) fn serves_tcp(&self, port: u16) -> bool {
-        self.ports.lock().contains_key(&port)
-    }
-
-    /// Whether UDP `port` is open here.
-    pub(super) fn serves_udp(&self, port: u16) -> bool {
-        self.udp_ports.lock().contains(&port)
-    }
 }
 
 /// The route to one address: `/32` or `/128`.
@@ -1386,10 +1364,8 @@ async fn connection(
             Some(config)
         }
     };
-    let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
     let deadline = accepted + handshake;
-    let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, select, deadline, detached).await
-    else {
+    let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, select, deadline).await else {
         return;
     };
     let Some(name) = chosen.lock().take() else {

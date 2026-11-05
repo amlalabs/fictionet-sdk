@@ -2117,7 +2117,6 @@ where
             &info,
             |sni, fcx| std::future::ready(select(sni, fcx)),
             fcx.now() + opts.handshake,
-            || false,
         )
         .await
         {
@@ -2127,21 +2126,9 @@ where
         conn = Box::new(tls);
         info = i;
     }
-    let mut first = true;
     let wake = WakeHandle::new();
     loop {
-        let served = run(
-            fcx,
-            conn,
-            info.clone(),
-            service,
-            state,
-            opts,
-            first,
-            wake.clone(),
-        )
-        .await?;
-        first = false;
+        let served = run(fcx, conn, info.clone(), service, state, opts, wake.clone()).await?;
         let rest = match served {
             Served::Upgraded(Upgrade::Tls, rest) => rest,
             other => return Ok(other),
@@ -2151,7 +2138,7 @@ where
         };
         let deadline = fcx.now() + opts.handshake;
         let ready = |sni: Option<&str>, fcx: &Cx| std::future::ready(select(sni, fcx));
-        let (tls, i) = match accept_tls(fcx, rest, &info, ready, deadline, || false).await {
+        let (tls, i) = match accept_tls(fcx, rest, &info, ready, deadline).await {
             Ok(done) => done,
             Err(e) => return tls_failed(e),
         };
@@ -2169,7 +2156,6 @@ fn tls_failed<E>(e: HandshakeError) -> Result<Served<Box<dyn Connection>>, Serve
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[deny(clippy::let_underscore_must_use)]
 async fn run<S, C>(
     fcx: &Cx,
@@ -2178,7 +2164,6 @@ async fn run<S, C>(
     service: &mut S,
     state: &S::State,
     opts: &ServeOptions,
-    _first: bool,
     wake: WakeHandle,
 ) -> Result<Served<C>, ServeError<S::Error>>
 where
@@ -2336,7 +2321,6 @@ pub async fn accept_tls<C: Connection, F: Future<Output = Option<Arc<ServerConfi
     info: &ConnInfo,
     select: impl FnOnce(Option<&str>, &Cx) -> F,
     deadline: Instant,
-    _detached: impl Fn() -> bool,
 ) -> Result<(TlsConnection<C>, ConnInfo), HandshakeError> {
     let mut sni: Option<String> = None;
     let handshake = async {
@@ -2400,9 +2384,7 @@ where
             info.sandbox = info
                 .peer
                 .and_then(|peer| opts.sandbox.as_ref().and_then(|f| f(peer.ip())));
-            let Some(guard) =
-                fictionet::stdlib::world::net::connection_limit(&open, opts.max_conns)
-            else {
+            let Some(guard) = Counted::enter(&open, opts.max_conns) else {
                 conn.reset();
                 continue;
             };

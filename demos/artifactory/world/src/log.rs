@@ -127,45 +127,25 @@ mod tests {
     }
 
     #[test]
-    fn gateway_dns_stays_separate_from_other_ports() {
-        use fictionet::events::ConnInfo;
-        use fictionet_observe::Aggregate;
-        use std::sync::{Arc, atomic::AtomicUsize};
-        let output = Output::default();
-        let log = Arc::new(Log::start(Box::new(output.clone())).unwrap());
-        let aggregate = Arc::new(Aggregate::new(log.clone()));
-        let drain = log.clone();
-        fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(aggregate),
-            |cx| async move {
-                log.attach(&cx, ServedNames::default());
-                let open = Arc::new(AtomicUsize::new(0));
-                for (id, port) in [53, 80, 53, 53, 80, 80].into_iter().enumerate() {
-                    let conn = ConnInfo::new(
-                        id as u64,
-                        ([10, 0, 0, 1], port).into(),
-                        ([10, 0, 0, 2], 1234).into(),
-                    );
-                    assert!(
-                        fictionet::stdlib::world::net::connection_limit(&cx, &conn, &open, 0)
-                            .is_none()
-                    );
-                }
-                Ok(())
-            },
-        ))
-        .unwrap();
-        drain.finish().unwrap();
-        let lines = output.lines();
-        for (port, count) in [(53, 3), (80, 3)] {
-            let matching: u64 = lines
-                .iter()
-                .filter(|line| line["dst_port"] == port || line["ports"] == json!([port, port]))
-                .map(|line| line["count"].as_u64().unwrap_or(1))
-                .sum();
-            assert_eq!(matching, count);
-        }
-        assert!(lines.iter().all(|line| line["ports"] != json!([53, 80])));
+    fn connection_counts_are_released_when_the_guard_drops() {
+        use fictionet::stdlib::services::serve::Counted;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let open = Arc::new(AtomicUsize::new(0));
+        assert!(Counted::enter(&open, 0).is_none());
+        assert_eq!(open.load(Ordering::Acquire), 0);
+
+        let guard = Counted::enter(&open, 1).unwrap();
+        assert_eq!(open.load(Ordering::Acquire), 1);
+        assert!(Counted::enter(&open, 1).is_none());
+        assert_eq!(open.load(Ordering::Acquire), 1);
+
+        drop(guard);
+        assert_eq!(open.load(Ordering::Acquire), 0);
+        let guard = Counted::enter(&open, 1).unwrap();
+        assert_eq!(open.load(Ordering::Acquire), 1);
+        drop(guard);
+        assert_eq!(open.load(Ordering::Acquire), 0);
     }
 
     #[test]
