@@ -4,6 +4,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::protocols::smb2::harness::no_longer;
 use fictionet::stdlib::protocols::smb2::{
@@ -11,8 +12,8 @@ use fictionet::stdlib::protocols::smb2::{
     MAX_FRAME, MAX_MESSAGE, Message, NegotiateContext, NegotiateResponse, Packet, ReadRequest,
     Request, Response, Transform, TreeConnectRequest, WriteRequest, command, status,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// A body read alone can fit while its message header or CREATE padding
@@ -20,7 +21,7 @@ use libfuzzer_sys::fuzz_target;
 fn written_body(message: Result<Message, Error>, command: u16, old: &[u8]) -> Option<Vec<u8>> {
     match message {
         Ok(message) => {
-            contract::check_wire_value(&message);
+            let _ = assert_write(&message);
             assert!(no_longer(command, &message.body, old));
             Some(message.body)
         }
@@ -260,30 +261,57 @@ fn constructed(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_FRAME);
-    contract::check_wire::<Frame>(data);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)),
-        data,
-        2 * MAX_FRAME,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_FRAME);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, data),
     );
-    contract::check_wire_value(&Frame {
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new().map(|f| Packet::parse(&f.payload))),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_FRAME);
+            }
+        ),
+        decode_all(
+            || Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)),
+            data
+        ),
+    );
+    let _ = assert_write(&Frame {
         payload: data.to_vec(),
     });
     if data.first() == Some(&0xff) {
-        contract::check_wire_value(&Frame {
+        let _ = assert_write(&Frame {
             payload: vec![0; MAX_MESSAGE + 1],
         });
     }
 
     for frame in decode_all(Frames::<Frame>::new, data).0 {
-        contract::check_wire_value(&frame);
+        let _ = assert_write(&frame);
         payload(&frame.payload, 0);
     }
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Transform>(data);
-    contract::check_wire::<Compressed>(data);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Transform as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Compressed as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // Any bytes as a payload on their own, through each reader, and as a
     // body.
     payload(data, 0xc000_0016);

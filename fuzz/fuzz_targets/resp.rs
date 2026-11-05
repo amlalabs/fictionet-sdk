@@ -1,8 +1,9 @@
 //! RESP values, commands, custom limits, and strict writer contracts.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::resp::harness::wire_same;
 use fictionet::stdlib::protocols::resp::{
@@ -33,16 +34,22 @@ impl Wire for WireValue {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<WireValue>(data);
-    contract::check_wire::<Command>(data);
-    contract::check_wire::<Resp2>(data);
-    contract::check_wire_value(&WireValue(Value::simple(
+    if let Ok(value) = <WireValue as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Command as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Resp2 as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&WireValue(Value::simple(
         data.iter()
             .take(MAX_LINE_LEN + 1)
             .copied()
             .collect::<Vec<_>>(),
     )));
-    contract::check_wire_value(&Command::new([data.get(..MAX_LINE_LEN).unwrap_or(data)]));
+    let _ = assert_write(&Command::new([data.get(..MAX_LINE_LEN).unwrap_or(data)]));
     let mut rng = Lcg::new(data.iter().fold(0x9e37_79b9_7f4a_7c15, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     }));
@@ -69,15 +76,25 @@ fuzz_target!(|data: &[u8]| {
         // exercise whole input without repeating those expensive schedules.
         if index < 2 {
             let allocation = 2 * limits.frame.clamp(1, MAX_FRAME_LEN);
-            contract::check_decode_with_alloc_limit(
-                || Values::with_limits(limits).map(WireValue),
-                data,
-                allocation,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Values::with_limits(limits).map(WireValue)),
+                    chunks(data, &[1, 7, 64]),
+                    |s| {
+                        assert!(s.allocated() <= allocation);
+                    }
+                ),
+                decode_all(|| Values::with_limits(limits).map(WireValue), data),
             );
-            contract::check_decode_with_alloc_limit(
-                || Commands::with_limits(limits),
-                data,
-                allocation,
+            assert_eq!(
+                decode_chunks(
+                    &mut Stream::new(Commands::with_limits(limits)),
+                    chunks(data, &[1, 7, 64]),
+                    |s| {
+                        assert!(s.allocated() <= allocation);
+                    }
+                ),
+                decode_all(|| Commands::with_limits(limits), data),
             );
         }
         let values = decode_all(|| Values::with_limits(limits), data);
@@ -90,14 +107,14 @@ fuzz_target!(|data: &[u8]| {
             });
         }
         for command in commands.0 {
-            contract::check_wire_value(&command);
+            let _ = assert_write(&command);
         }
         for value in values.0 {
             if let Ok(bytes) = value.to_bytes() {
                 assert_eq!(Value::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
             }
-            contract::check_wire_value(&Resp2(value.clone()));
-            contract::check_wire_value(&Resp2::mapped(value));
+            let _ = assert_write(&Resp2(value.clone()));
+            let _ = assert_write(&Resp2::mapped(value));
         }
     }
 });

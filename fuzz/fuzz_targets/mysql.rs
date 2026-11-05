@@ -2,9 +2,10 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::mysql::harness::check_payload;
 use fictionet::stdlib::protocols::mysql::*;
@@ -52,8 +53,8 @@ fn values(bytes: &[u8]) {
     let row = Row((0..usize::from(first) * 17)
         .map(|i| rest.get(i).map(|&x| vec![x; usize::from(x) % 4]))
         .collect());
-    contract::check_wire_value(&row);
-    contract::check_wire_value(&HandshakeResponse {
+    let _ = assert_write(&row);
+    let _ = assert_write(&HandshakeResponse {
         capabilities: u32::from_le_bytes([first, rest.first().copied().unwrap_or(0), 0x7f, 0x1f]),
         username: rest.to_vec(),
         auth_response: rest.to_vec(),
@@ -67,7 +68,7 @@ fn values(bytes: &[u8]) {
         zstd_level: first,
         ..HandshakeResponse::default()
     });
-    contract::check_wire_value(&Handshake {
+    let _ = assert_write(&Handshake {
         server_version: rest.to_vec(),
         auth_data: rest.to_vec(),
         capabilities: u32::from(first) << 12,
@@ -116,19 +117,38 @@ fn values(bytes: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_FRAME);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(64),
-        data,
-        2 * (64 + HEADER_LEN),
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_FRAME);
+            }
+        ),
+        decode_all(Frames::<Packet>::new, data),
     );
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<Message>(data);
+    let bound = 2 * (64 + HEADER_LEN);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(64)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(64), data),
+    );
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let frame = Packet {
         seq: data.first().copied().unwrap_or(0),
         payload: data.to_vec(),
     };
-    contract::check_wire_value(&frame);
+    let _ = assert_write(&frame);
     let limit = data.first().map_or(MAX_MESSAGE, |&b| {
         if b & 1 == 1 {
             usize::from(b) * 3
@@ -136,15 +156,21 @@ fuzz_target!(|data: &[u8]| {
             MAX_MESSAGE
         }
     });
-    contract::check_decode_with_alloc_limit(
-        || Messages::with_limit(limit),
-        data,
-        2 * (HEADER_LEN + limit.min(MAX_PACKET_PAYLOAD)),
+    let bound = 2 * (HEADER_LEN + limit.min(MAX_PACKET_PAYLOAD));
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::with_limit(limit)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Messages::with_limit(limit), data),
     );
     let messages = decode_all(|| Messages::with_limit(limit), data).0;
     for message in &messages {
         assert!(message.to_bytes().is_ok(), "{message:?}");
-        contract::check_wire_value(message);
+        let _ = assert_write(message);
         check_payload(&message.payload, &CAPS);
     }
     for caps in CAPS {

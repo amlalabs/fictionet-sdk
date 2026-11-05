@@ -6,7 +6,9 @@
 //! built straight from the fuzz bytes, not only from what the parser
 //! accepts, so the writer sees values the parser never makes.
 #![no_main]
+use fictionet::stdlib::codec::{CollectError, Decode, Fail, Stream};
 use fictionet::stdlib::network::ip::Endpoints;
+use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -14,7 +16,7 @@ use fictionet::stdlib::protocols::vrrp::{
     Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Error, GROUP_V4, GROUP_V6,
     MAX_ADDRESSES, checksum, checksum_rfc5798,
 };
-use fictionet::stdlib::{codec::Collect, protocols::vrrp, test_support::contract};
+use fictionet::stdlib::{codec::Collect, protocols::vrrp};
 use libfuzzer_sys::fuzz_target;
 
 const LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
@@ -146,14 +148,35 @@ fn endpoints_from(data: &[u8]) -> Endpoints {
 }
 
 fn check(data: &[u8], e: &Endpoints) {
-    contract::check_decode_with_alloc_limit(
-        || Collect::bytes(vrrp::MAX_MESSAGE),
-        data,
-        2 * (vrrp::MAX_MESSAGE + 1),
+    let bound = 2 * (vrrp::MAX_MESSAGE + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::bytes(vrrp::MAX_MESSAGE)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::bytes(vrrp::MAX_MESSAGE), data),
     );
-    let parsed = contract::check_collect_with(data, vrrp::MAX_MESSAGE, |datagram| {
-        Advertisement::parse(datagram, e)
-    });
+    let parsed = Advertisement::parse(data, e);
+    let collected = decode_chunks(
+        &mut Stream::new(Collect::bytes(vrrp::MAX_MESSAGE).map(|d| Advertisement::parse(&d, e))),
+        chunks(data, &[1, 7, 64]),
+        |s| assert!(s.allocated() <= bound),
+    );
+    if data.len() <= vrrp::MAX_MESSAGE {
+        assert_eq!(collected, (vec![parsed.clone()], None));
+    } else {
+        let limit = vrrp::MAX_MESSAGE;
+        assert_eq!(
+            collected,
+            (
+                vec![],
+                Some(Fail::Protocol(CollectError::TooLong { limit }))
+            )
+        );
+    }
 
     // A checksum neither formula gives is never taken.
     let got = data.get(6..8).map(|c| u16::from_be_bytes([c[0], c[1]]));

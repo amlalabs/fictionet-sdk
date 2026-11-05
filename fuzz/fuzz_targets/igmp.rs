@@ -2,6 +2,8 @@
 //! them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use std::net::Ipv4Addr;
 
 use fictionet::stdlib::network::ip::checksum;
@@ -10,7 +12,6 @@ use fictionet::stdlib::protocols::igmp::harness::conforms;
 use fictionet::stdlib::{
     codec::{Collect, Wire},
     protocols::igmp,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -29,15 +30,25 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(data: &[u8]) {
-    contract::check_decode_with_alloc_limit(
-        || Collect::<igmp::Message>::new(igmp::MAX_MESSAGE),
-        data,
-        2 * (igmp::MAX_MESSAGE + 1),
+    let bound = 2 * (igmp::MAX_MESSAGE + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<igmp::Message>::new(igmp::MAX_MESSAGE)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::<igmp::Message>::new(igmp::MAX_MESSAGE), data),
     );
-    contract::check_wire::<igmp::Message>(data);
-    contract::check_wire::<igmp::Code>(data);
+    if let Ok(value) = <igmp::Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <igmp::Code as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     if let Some((value, _)) = data.split_first_chunk::<4>() {
-        contract::check_wire_value(&igmp::Code(u32::from_be_bytes(*value)));
+        let _ = assert_write(&igmp::Code(u32::from_be_bytes(*value)));
     }
 
     let query = Message::QueryV3(igmp::QueryV3 {
@@ -48,7 +59,7 @@ fn check(data: &[u8]) {
         qqic: 125,
         sources: vec![],
     });
-    contract::check_wire_value(&query);
+    let _ = assert_write(&query);
     let parsed = Message::parse(data);
 
     if let Ok(m) = &parsed {

@@ -2,21 +2,31 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::dnp3::{Fragment, Frame, MAX_FRAGMENT, Reassembler, Segment};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(Frames::<Frame>::new, data);
-    check_wire::<Frame>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Frame>::new, data),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let (frames, _) = decode_all(Frames::<Frame>::new, data);
     for frame in &frames {
-        check_wire_value(frame);
+        let _ = assert_write(frame);
         if let Ok(segment) = frame.segment() {
-            check_wire_value(&segment);
+            let _ = assert_write(&segment);
         }
     }
     // Structured input reaches CRC-protected payloads even for random bytes.
@@ -27,14 +37,21 @@ fuzz_target!(|data: &[u8]| {
             source: 1024,
             data: chunk.to_vec(),
         };
-        check_wire_value(&frame);
+        let _ = assert_write(&frame);
         let bytes = frame.to_bytes().unwrap();
-        check_decode(Frames::<Frame>::new, &bytes);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Frame>::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Frames::<Frame>::new, &bytes),
+        );
         let (back, failure) = decode_all(Frames::<Frame>::new, &bytes);
         assert!(failure.is_none());
         assert_eq!(back, [frame]);
     }
-    check_wire_value(&Frame {
+    let _ = assert_write(&Frame {
         control: data.first().copied().unwrap_or(0),
         destination: 1,
         source: 1024,
@@ -47,8 +64,12 @@ fuzz_target!(|data: &[u8]| {
             .unwrap_or_default()
             .to_vec(),
     });
-    check_wire::<Segment>(data);
-    check_wire::<Fragment>(data);
+    if let Ok(value) = <Segment as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Fragment as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     if data.len() >= 4 {
         let fragment = Fragment {
             control: data[0],
@@ -56,7 +77,7 @@ fuzz_target!(|data: &[u8]| {
             indications: (data[2] & 1 != 0).then_some(u16::from_le_bytes([data[2], data[3]])),
             objects: data[4..].to_vec(),
         };
-        check_wire_value(&fragment);
+        let _ = assert_write(&fragment);
     }
     let mut reassembler = Reassembler::new();
     for chunk in data.chunks(250) {

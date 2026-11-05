@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::nbdgm::{
     Body, Error, ErrorCode, MAX_PENDING, Name, Packet, Reassembler,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;
 
@@ -121,8 +121,12 @@ fuzz_target!(|data: &[u8]| {
         sequence(data);
         return;
     }
-    contract::check_wire::<Name>(data);
-    contract::check_wire::<Packet>(data);
+    if let Ok(value) = <Name as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     let here = Ipv4Addr::new(10, 0, 0, 1);
     let mut reassembler = Reassembler::new();
@@ -139,12 +143,12 @@ fuzz_target!(|data: &[u8]| {
         // Replies and fragments read back too.
         for present in [true, false] {
             if let Some(r) = p.query_response(here, 138, present) {
-                contract::check_wire_value(&r);
+                let _ = assert_write(&r);
                 assert!(r.to_bytes().is_ok());
             }
         }
         let e = p.error(here, 138, ErrorCode::DestinationNameNotPresent);
-        contract::check_wire_value(&e);
+        let _ = assert_write(&e);
         assert!(e.to_bytes().is_ok());
         let mut whole = None;
         let fragments = if matches!(p.body, Body::Fragment(_)) {
@@ -154,7 +158,7 @@ fuzz_target!(|data: &[u8]| {
             p.split(1 + n % 128).unwrap()
         };
         for f in fragments {
-            contract::check_wire_value(&f);
+            let _ = assert_write(&f);
             assert!(f.to_bytes().is_ok());
             if let Some(w) = reassembler.push(f) {
                 assert!(w.flags.first && !w.flags.more);

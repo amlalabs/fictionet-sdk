@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::protocols::diameter::{Avp, MAX_AVP_DATA, Message, harness};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -17,11 +17,11 @@ fuzz_target!(|data: &[u8]| {
         protected: false,
         data: data.to_vec(),
     });
-    contract::check_wire_value(&built);
+    let _ = assert_write(&built);
     if data.first() == Some(&0xff) {
         // Keep the command valid so the oversized AVP reaches the length check.
         built.command = 1;
         built.avps[0].data = vec![0; MAX_AVP_DATA + 1];
-        contract::check_wire_value(&built);
+        let _ = assert_write(&built);
     }
 });

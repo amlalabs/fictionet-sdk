@@ -6,7 +6,7 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::ldap::{
     DerefAliases, Error, Filter, MAX_TEXT, Message, Op, Scope, SearchRequest, harness,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
         }),
         controls: Vec::new(),
     };
-    contract::check_wire_value(&search);
+    let _ = assert_write(&search);
     if let Ok(bytes) = search.to_bytes() {
         assert_eq!(Message::parse(&bytes).as_ref(), Ok(&search));
     }

@@ -3,6 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::opcua::Messages;
 use fictionet::stdlib::protocols::opcua::harness::check_reader;
@@ -10,8 +11,8 @@ use fictionet::stdlib::protocols::opcua::{
     Chunk, ChunkType, DataValue, DiagnosticInfo, ExpandedNodeId, ExtensionObject, Limits,
     LocalizedText, Message, MessageType, NodeId, QualifiedName, ResponseHeader, Service, Variant,
 };
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -34,8 +35,17 @@ fuzz_target!(|data: &[u8]| {
         },
     };
 
-    check_decode(|| Frames::<Chunk>::with_limit(limits), data);
-    check_wire::<Chunk>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Chunk>::with_limit(limits)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Frames::<Chunk>::with_limit(limits), data),
+    );
+    if let Ok(value) = <Chunk as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let chunk = Chunk {
         message_type: match pick % 4 {
             0 => MessageType::Hello,
@@ -57,12 +67,18 @@ fuzz_target!(|data: &[u8]| {
             .unwrap_or_default()
             .to_vec(),
     };
-    check_wire_value(&chunk);
+    let _ = assert_write(&chunk);
 
-    fictionet::stdlib::test_support::contract::check_decode_with_held_limit(
-        || Messages::with_limits(limits),
-        data,
-        limits.message_limit() as usize,
+    let held = limits.message_limit() as usize;
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::with_limits(limits)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.held() <= held);
+            }
+        ),
+        decode_all(|| Messages::with_limits(limits), data),
     );
     let (messages, _) = decode_all(|| Messages::with_limits(limits), data);
     for message in messages {
@@ -74,22 +90,44 @@ fuzz_target!(|data: &[u8]| {
         assert!(failure.is_none());
         assert_eq!(back, [message.clone()]);
         if let Message::Secure(s) = message {
-            check_wire::<Service>(&s.body);
+            if let Ok(value) = <Service as Wire>::parse(&s.body) {
+                let _ = assert_write(&value);
+            }
         }
     }
 
     // Any bytes as values on their own.
-    check_wire::<Variant>(data);
-    check_wire::<DataValue>(data);
-    check_wire::<DiagnosticInfo>(data);
+    if let Ok(value) = <Variant as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <DataValue as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <DiagnosticInfo as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     check_reader::<Variant>(data);
     check_reader::<DataValue>(data);
     check_reader::<DiagnosticInfo>(data);
-    check_wire::<ExpandedNodeId>(data);
-    check_wire::<NodeId>(data);
-    check_wire::<QualifiedName>(data);
-    check_wire::<LocalizedText>(data);
-    check_wire::<ExtensionObject>(data);
-    check_wire::<ResponseHeader>(data);
-    check_wire::<Service>(data);
+    if let Ok(value) = <ExpandedNodeId as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <NodeId as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <QualifiedName as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <LocalizedText as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ExtensionObject as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ResponseHeader as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Service as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 });

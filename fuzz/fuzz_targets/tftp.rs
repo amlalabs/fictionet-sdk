@@ -3,12 +3,13 @@
 //! the agent picks.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::tftp::{
     DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, NetasciiByte,
     NetasciiBytes, Packet, ReadTransfer, TftpOption, negotiate, parse_number,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// Runs a transfer to the end as a client would: ACK 0 for an OACK, then
@@ -20,7 +21,7 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
     let mut got = Vec::new();
     let mut packet = t.current().expect("a new transfer has a packet in flight");
     loop {
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         assert!(packet.to_bytes().is_ok());
         let ack = match &packet {
             Packet::OptionAck { options } => {
@@ -59,9 +60,22 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<NetasciiByte>(data);
-    contract::check_decode_with_alloc_limit(|| NetasciiBytes, data, 4);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <NetasciiByte as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(NetasciiBytes),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 4);
+            }
+        ),
+        decode_all(|| NetasciiBytes, data),
+    );
     if let Ok(p) = Packet::parse(data) {
         // What was read can be written, and reads back the same.
         let bytes = p.to_bytes().unwrap();
@@ -79,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
             let oack = Packet::OptionAck {
                 options: agreed.oack().to_vec(),
             };
-            contract::check_wire_value(&oack);
+            let _ = assert_write(&oack);
             assert!(oack.to_bytes().is_ok());
             assert_eq!(
                 Negotiated::from_oack(agreed.oack().to_vec()),

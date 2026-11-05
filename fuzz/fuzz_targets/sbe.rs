@@ -1,12 +1,13 @@
 //! Bounded SBE XML schemas, dynamic messages, and codec contracts.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::sbe::harness::{CAR_BYTES, Car};
 use fictionet::stdlib::protocols::sbe::{
     MAX_MESSAGE_BYTES, MessageWire, Messages, Scalar, Schema, SchemaSource, Value,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_BYTES: usize = 8192;
@@ -22,10 +23,15 @@ fuzz_target!(|input: &[u8]| {
         if let (Some(xml), Some(bytes)) = (data.get(..at), data.get(at + 1..)) {
             if let Ok(xml) = std::str::from_utf8(xml) {
                 if let Ok(schema) = Schema::parse(xml) {
-                    contract::check_decode_with_alloc_limit(
-                        || Messages::new(&schema),
-                        bytes,
-                        2 * MAX_MESSAGE_BYTES,
+                    assert_eq!(
+                        decode_chunks(
+                            &mut Stream::new(Messages::new(&schema)),
+                            chunks(bytes, &[1, 7, 64]),
+                            |s| {
+                                assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES);
+                            }
+                        ),
+                        decode_all(|| Messages::new(&schema), bytes),
                     );
                     if let Ok(message) = schema.decode(bytes) {
                         let mut out = vec![0xaa];
@@ -37,8 +43,19 @@ fuzz_target!(|input: &[u8]| {
         }
     }
     let schema = Car::schema().unwrap();
-    contract::check_decode_with_alloc_limit(|| Messages::new(schema), data, 2 * MAX_MESSAGE_BYTES);
-    contract::check_wire::<MessageWire<Car>>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new(schema)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES);
+            }
+        ),
+        decode_all(|| Messages::new(schema), data),
+    );
+    if let Ok(value) = <MessageWire<Car> as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // Mutate valid framing so fuzzing reaches values and nested groups.
     let mut bytes = CAR_BYTES.to_vec();
     for pair in data.chunks_exact(2) {
@@ -49,11 +66,18 @@ fuzz_target!(|input: &[u8]| {
             }
         }
     }
-    contract::check_wire::<MessageWire<Car>>(&bytes);
-    contract::check_decode_with_alloc_limit(
-        || Messages::new(schema),
-        &bytes,
-        2 * MAX_MESSAGE_BYTES,
+    if let Ok(value) = <MessageWire<Car> as Wire>::parse(&bytes) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new(schema)),
+            chunks(&bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE_BYTES);
+            }
+        ),
+        decode_all(|| Messages::new(schema), &bytes),
     );
     let mut value = MessageWire::<Car>::parse(CAR_BYTES).unwrap();
     if let Some(first) = data.first() {
@@ -67,5 +91,5 @@ fuzz_target!(|input: &[u8]| {
             };
         }
     }
-    contract::check_wire_value(&value);
+    let _ = assert_write(&value);
 });

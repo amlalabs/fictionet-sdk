@@ -4,11 +4,13 @@
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::arp::{LEN, Packet};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Packet>(data);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     if let Ok(p) = Packet::receive(data) {
         // A packet read writes back as the bytes it came from.
         assert_eq!(&p.encode()[..], &data[..LEN]);

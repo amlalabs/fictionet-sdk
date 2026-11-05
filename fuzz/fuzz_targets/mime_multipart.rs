@@ -1,8 +1,9 @@
 //! Multipart body framing, MIME entities, parts, and parameterized headers.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Fail, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::mime_multipart::{
     Body, Entity, Error, Headers, MAX_BOUNDARY, MAX_ENTITY, MAX_HEADER_BYTES, Multipart,
@@ -24,14 +25,28 @@ fn check(input: &[u8], len: usize) {
         _ => ("a".to_string(), input),
     };
     let make = || Parts::new(&bnd).unwrap();
-    contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
-    contract::check_wire::<Part>(data);
-    contract::check_wire::<Entity>(data);
-    contract::check_wire::<Body>(data);
-    contract::check_wire::<ParamValue>(data);
+    let bound = 2 * make().capacity();
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= bound);
+        }),
+        decode_all(make, data),
+    );
+    if let Ok(value) = <Part as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Entity as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Body as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ParamValue as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let (parts, error) = decode_all(make, data);
     for part in &parts {
-        contract::check_wire_value(part);
+        let _ = assert_write(part);
         let _ = (
             part.name(),
             part.filename(),
@@ -51,8 +66,8 @@ fn check(input: &[u8], len: usize) {
                     .expect("a parsed body picks a boundary");
                 let bytes = entity.to_bytes().expect("a parsed body writes again");
                 assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
-                contract::check_wire_value(&entity);
-                contract::check_wire_value(&Body {
+                let _ = assert_write(&entity);
+                let _ = assert_write(&Body {
                     boundary: entity.boundary,
                     multipart: entity.multipart,
                 });
@@ -78,9 +93,9 @@ fn check(input: &[u8], len: usize) {
             }],
             ..Multipart::default()
         };
-        contract::check_wire_value(&multipart.parts[0]);
+        let _ = assert_write(&multipart.parts[0]);
         if let Ok(entity) = multipart.with_free_boundary(&bnd) {
-            contract::check_wire_value(&entity);
+            let _ = assert_write(&entity);
         }
     }
     if let Ok(text) = std::str::from_utf8(data) {
@@ -122,7 +137,9 @@ fn check(input: &[u8], len: usize) {
             let input = format!("Content-Type: {value}\r\n\r\n--b--");
             if text.contains(['\r', '\n']) {
                 // The entity parser can accept CRLF followed by folding whitespace.
-                contract::check_wire::<Entity>(input.as_bytes());
+                if let Ok(value) = <Entity as Wire>::parse(input.as_bytes()) {
+                    let _ = assert_write(&value);
+                }
             } else if value.len() + 18 <= MAX_HEADER_BYTES {
                 // The field name, separator and empty line also count toward the cap.
                 assert_eq!(

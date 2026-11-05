@@ -1,29 +1,78 @@
 #![no_main]
-use fictionet::stdlib::{codec::Wire, protocols::http2, test_support::contract};
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
+use fictionet::stdlib::{codec::Wire, protocols::http2};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     http2::harness::check_actions(data);
     let bytes = &data[..data.len().min(4096)];
-    contract::check_decode(|| http2::Inputs::with_limit(4096), bytes);
-    contract::check_decode(|| http2::Inputs::client_side(4096), bytes);
-    contract::check_wire::<http2::FrameHeader>(bytes);
-    contract::check_wire::<http2::Frame>(bytes);
-    contract::check_wire::<http2::Data>(bytes);
-    contract::check_wire::<http2::Headers>(bytes);
-    contract::check_wire::<http2::Priority>(bytes);
-    contract::check_wire::<http2::Reset>(bytes);
-    contract::check_wire::<http2::Settings>(bytes);
-    contract::check_wire::<http2::PushPromise>(bytes);
-    contract::check_wire::<http2::Ping>(bytes);
-    contract::check_wire::<http2::GoAway>(bytes);
-    contract::check_wire::<http2::WindowUpdate>(bytes);
-    contract::check_wire::<http2::Continuation>(bytes);
-    contract::check_wire::<http2::Unknown>(bytes);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(http2::Inputs::with_limit(4096)),
+            chunks(bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| http2::Inputs::with_limit(4096), bytes),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(http2::Inputs::client_side(4096)),
+            chunks(bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| http2::Inputs::client_side(4096), bytes),
+    );
+    if let Ok(value) = <http2::FrameHeader as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Frame as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Data as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Headers as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Priority as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Reset as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Settings as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::PushPromise as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Ping as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::GoAway as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::WindowUpdate as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Continuation as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <http2::Unknown as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
     // Capture checks stay below the oversized read-ahead policy threshold.
-    contract::check_decode(
-        || fictionet::stdlib::dissect::http2::Capture::new(4096),
-        bytes,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(fictionet::stdlib::dissect::http2::Capture::new(4096)),
+            chunks(bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(
+            || fictionet::stdlib::dissect::http2::Capture::new(4096),
+            bytes
+        ),
     );
     let mut framed = http2::Settings {
         flags: 0,

@@ -3,13 +3,14 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::protocols::openvpn::Frame;
 use fictionet::stdlib::protocols::openvpn::{
     Ack, Authenticated, Control, ControlBody, ControlKind, Encrypted, Error, MAX_HMAC_LEN,
     MAX_PACKET, MAX_TCP_FRAME, Packet, TlsAuth, TlsCrypt, Wrapping, split_first_byte,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 const WRAPPINGS: [Wrapping; 6] = [
@@ -127,25 +128,68 @@ fn build(data: &[u8]) -> Packet {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_TCP_FRAME);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
-        data,
-        514,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_TCP_FRAME);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, data),
     );
-    contract::check_wire::<Frame>(data);
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<Authenticated<0>>(data);
-    contract::check_wire::<Authenticated<20>>(data);
-    contract::check_wire::<Authenticated<32>>(data);
-    contract::check_wire::<Authenticated<64>>(data);
-    contract::check_wire::<Encrypted>(data);
-    contract::check_wire_value(&Frame(data[..data.len().min(MAX_PACKET + 1)].to_vec()));
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::with_limit(usize::from(
+                data.first().copied().unwrap_or(0)
+            ))),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 514);
+            }
+        ),
+        decode_all(
+            || Frames::<Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+            data
+        ),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Authenticated<0> as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Authenticated<20> as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Authenticated<32> as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Authenticated<64> as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Encrypted as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&Frame(data[..data.len().min(MAX_PACKET + 1)].to_vec()));
     for wrapping in WRAPPINGS {
-        contract::check_decode_with_alloc_limit(
-            || Frames::<Frame>::new().map(|frame| Packet::parse_with(&frame.0, wrapping)),
-            data,
-            2 * MAX_TCP_FRAME,
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(
+                    Frames::<Frame>::new().map(|frame| Packet::parse_with(&frame.0, wrapping))
+                ),
+                chunks(data, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * MAX_TCP_FRAME);
+                }
+            ),
+            decode_all(
+                || Frames::<Frame>::new().map(|frame| Packet::parse_with(&frame.0, wrapping)),
+                data
+            ),
         );
     }
     for wrapping in [Wrapping::None, Wrapping::TlsCrypt]
@@ -175,13 +219,15 @@ fuzz_target!(|data: &[u8]| {
         );
     }
     let packet = build(data);
-    contract::check_wire_value(&packet);
-    contract::check_wire_value(&Authenticated::<0>(packet.clone()));
-    contract::check_wire_value(&Authenticated::<20>(packet.clone()));
-    contract::check_wire_value(&Authenticated::<32>(packet.clone()));
-    contract::check_wire_value(&Authenticated::<64>(packet.clone()));
-    contract::check_wire::<Authenticated<65>>(data);
-    contract::check_wire_value(&Authenticated::<65>(packet.clone()));
+    let _ = assert_write(&packet);
+    let _ = assert_write(&Authenticated::<0>(packet.clone()));
+    let _ = assert_write(&Authenticated::<20>(packet.clone()));
+    let _ = assert_write(&Authenticated::<32>(packet.clone()));
+    let _ = assert_write(&Authenticated::<64>(packet.clone()));
+    if let Ok(value) = <Authenticated<65> as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let _ = assert_write(&Authenticated::<65>(packet.clone()));
     for wrapping in WRAPPINGS.into_iter().chain([packet.wrapping(), too_long]) {
         let mut bytes = Vec::new();
         let result = packet.write_with(wrapping, &mut bytes);
@@ -200,5 +246,5 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    contract::check_wire_value(&Encrypted(packet));
+    let _ = assert_write(&Encrypted(packet));
 });

@@ -1,8 +1,9 @@
 //! RTSP messages, interleaved frames, and header values through codec contracts.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::rtsp::harness::{round_trip, text_value};
 use fictionet::stdlib::protocols::rtsp::{
@@ -13,31 +14,65 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
-    contract::check_decode_with_held_limit(Frames::new, data, 0);
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Frame>(data);
-    contract::check_wire::<Interleaved>(data);
-    contract::check_wire::<Session>(data);
-    contract::check_wire::<Range>(data);
-    contract::check_wire::<Transport>(data);
-    contract::check_wire::<Transports>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE);
+                assert_eq!(s.held(), 0);
+            }
+        ),
+        decode_all(Frames::new, data),
+    );
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Interleaved as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Session as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Range as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Transport as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Transports as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     let frame = Interleaved {
         channel: data.first().copied().unwrap_or(0),
         data: data.get(..MAX_INTERLEAVED + 1).unwrap_or(data).to_vec(),
     };
-    contract::check_wire_value(&frame);
+    let _ = assert_write(&frame);
     let mut message = Message::response(Version::Rtsp20, 200, "OK");
     message.body = data.get(..MAX_BODY + 1).unwrap_or(data).to_vec();
     message.push_header("Content-Length", &message.body.len().to_string());
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
     if let Ok(bytes) = message.to_bytes() {
-        contract::check_wire::<Message>(&bytes);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        if let Ok(value) = <Message as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * MAX_MESSAGE);
+                }
+            ),
+            decode_all(Frames::new, &bytes),
+        );
     }
     message.push_header("X", " leading");
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
 
     let (items, _) = decode_all(Frames::new, data);
     for item in items.iter().flatten() {
@@ -88,7 +123,7 @@ fn writers(data: &[u8]) {
         .last()
         .map(|p| p.as_bytes().to_vec())
         .unwrap_or_default();
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
     message.set_header("Content-Length", &message.body.len().to_string());
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
 }

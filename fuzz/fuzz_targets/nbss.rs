@@ -3,6 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::protocols::nbss::{
     Error, HEADER_LEN, MAX_LENGTH, Name, NegativeCode, Packet,
@@ -10,15 +11,47 @@ use fictionet::stdlib::protocols::nbss::{
 use fictionet::stdlib::protocols::netbios::{
     MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_capacity(Frames::<Packet>::new, data);
-    contract::check_wire::<Packet>(data);
-    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(0), data);
-    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(64), data);
+    let bound = 2 * Frames::<Packet>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Packet>::new, data),
+    );
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * Frames::<Packet>::with_limit(0).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(0)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(0), data),
+    );
+    let bound = 2 * Frames::<Packet>::with_limit(64).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(64)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(64), data),
+    );
 
     let (packets, _) = decode_all(Frames::<Packet>::new, data);
 
@@ -39,7 +72,9 @@ fuzz_target!(|data: &[u8]| {
         let bytes = p.to_bytes().unwrap();
         assert_eq!(Packet::parse(&bytes), Ok(p.clone()));
     }
-    contract::check_wire::<Name>(data);
+    if let Ok(value) = <Name as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     if let Ok(name) = Name::parse(data) {
         assert_eq!(name.to_bytes().unwrap(), data);
     }
@@ -68,7 +103,7 @@ fuzz_target!(|data: &[u8]| {
             called: name.clone(),
             calling: name,
         };
-        contract::check_wire_value(&req);
+        let _ = assert_write(&req);
         match req.to_bytes() {
             Ok(bytes) => {
                 assert!(fits);
@@ -81,7 +116,7 @@ fuzz_target!(|data: &[u8]| {
         }
         let code = NegativeCode::Other(first);
         let neg = Packet::Negative(code);
-        contract::check_wire_value(&neg);
+        let _ = assert_write(&neg);
         match neg.to_bytes() {
             Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(neg)),
             Err(e) => {
@@ -92,7 +127,7 @@ fuzz_target!(|data: &[u8]| {
         // A message past the limit is refused, not cut.
         if first == 0xff {
             let long = Packet::Message(vec![0; MAX_LENGTH + 1]);
-            contract::check_wire_value(&long);
+            let _ = assert_write(&long);
             assert_eq!(long.to_bytes(), Err(Error::Unwritable));
         }
     }

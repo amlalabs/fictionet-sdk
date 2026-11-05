@@ -1,15 +1,17 @@
 //! Shared HPACK/QPACK Huffman contracts and byte round trips.
 #![no_main]
+use fictionet::stdlib::test_support::assert_write;
 use fictionet::stdlib::{
     codec::Wire,
     protocols::huffman::{self, HuffmanString},
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|bytes: &[u8]| {
     let bytes = &bytes[..bytes.len().min(huffman::MAX_ENCODED + 1)];
-    contract::check_wire::<HuffmanString>(bytes);
+    if let Ok(value) = <HuffmanString as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
     let limit = bytes.len().saturating_mul(8) / 5;
     if let Ok(decoded) = huffman::decode_limited(bytes, limit) {
         assert!(decoded.len() <= limit);
@@ -18,7 +20,7 @@ fuzz_target!(|bytes: &[u8]| {
         }
     }
     let value = HuffmanString(bytes[..bytes.len().min(huffman::MAX_STRING + 1)].to_vec());
-    contract::check_wire_value(&value);
+    let _ = assert_write(&value);
     if let Ok(encoded) = value.to_bytes() {
         assert_eq!(HuffmanString::parse(&encoded).unwrap(), value);
         assert_eq!(huffman::encoded_len(&value.0).unwrap(), encoded.len());

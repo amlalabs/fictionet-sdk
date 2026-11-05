@@ -1,24 +1,42 @@
 //! HPACK wire contracts, complete blocks, table recovery, and round trips.
 #![no_main]
+use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::Collect,
     protocols::{
         hpack::{self, Encoder, Field, StringLiteral, Table},
         prefix_int::Integer,
     },
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
     let bytes = &input[..input.len().min(hpack::MAX_BLOCK + 1)];
-    contract::check_wire::<Integer<1>>(bytes);
-    contract::check_wire::<Integer<5>>(bytes);
-    contract::check_wire::<Integer<8>>(bytes);
-    contract::check_wire::<StringLiteral>(bytes);
-    contract::check_wire::<Field>(bytes);
+    if let Ok(value) = <Integer<1> as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Integer<5> as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Integer<8> as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <StringLiteral as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Field as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
     let short = &bytes[..bytes.len().min(512)];
-    contract::check_decode(|| Collect::<Field>::new(hpack::MAX_BLOCK), short);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<Field>::new(hpack::MAX_BLOCK)),
+            chunks(short, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Collect::<Field>::new(hpack::MAX_BLOCK), short),
+    );
     for mut decoder in [Table::default(), Table::new(0), Table::for_observation()] {
         let _ = decoder.decode_block(bytes, hpack::MAX_DECODED);
         assert!(decoder.table_size() <= hpack::MAX_TABLE);
@@ -38,13 +56,13 @@ fuzz_target!(|input: &[u8]| {
         .iter()
         .take(8)
         .fold(0u64, |v, b| (v << 8) | u64::from(*b));
-    contract::check_wire_value(&Integer::<5> {
+    let _ = assert_write(&Integer::<5> {
         flags: 0x20,
         value: integer,
     });
     let value = &bytes[..bytes.len().min(hpack::MAX_STRING + 1)];
-    contract::check_wire_value(&StringLiteral(value.to_vec()));
-    contract::check_wire_value(&Field::new(b"x-fuzz", value));
+    let _ = assert_write(&StringLiteral(value.to_vec()));
+    let _ = assert_write(&Field::new(b"x-fuzz", value));
     let mut encoder = Encoder::default();
     let mut decoder = Table::default();
     for (i, piece) in short.chunks(64).enumerate() {

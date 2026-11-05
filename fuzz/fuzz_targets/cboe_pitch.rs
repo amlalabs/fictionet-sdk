@@ -4,7 +4,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::cboe_pitch::AddOrderExpanded;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::cboe_pitch::Book;
 
@@ -20,7 +22,6 @@ use fictionet::stdlib::protocols::cboe_pitch::Message;
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::cboe_pitch::Unit;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
@@ -30,12 +31,34 @@ fuzz_target!(|input: &[u8]| {
     let data = input
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
-    check_wire::<Unit>(data);
-    check_wire::<Message>(data);
-    check_wire::<Control>(data);
-    check_wire::<AddOrderExpanded>(data);
-    check_decode(Frames::<Unit>::default, data);
-    check_decode(|| Frames::<Unit>::with_limit(HEADER_LENGTH + 64), data);
+    if let Ok(value) = <Unit as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Control as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <AddOrderExpanded as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Unit>::default()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Unit>::default, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Unit>::with_limit(HEADER_LENGTH + 64)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Frames::<Unit>::with_limit(HEADER_LENGTH + 64), data),
+    );
     let (units, _) = decode_all(Frames::<Unit>::default, data);
 
     // Every unit that parses goes through the gap detector, and its new
@@ -48,7 +71,7 @@ fuzz_target!(|input: &[u8]| {
     let mut book = Book::new(config).unwrap();
     let mut gaps = GapDetector::new();
     for unit in units.into_iter().flatten() {
-        check_wire_value(&unit);
+        let _ = assert_write(&unit);
         let seen = gaps.receive(&unit);
         assert_eq!(seen.skip + seen.count, unit.messages.len());
         if let Some(gap) = seen.gap {
@@ -59,7 +82,7 @@ fuzz_target!(|input: &[u8]| {
             let Ok(message) = Message::parse(bytes) else {
                 continue;
             };
-            check_wire_value(&message);
+            let _ = assert_write(&message);
             let before = format!("{book:?}");
             if book.apply(unit.unit, &message).is_err() {
                 assert_eq!(format!("{book:?}"), before);

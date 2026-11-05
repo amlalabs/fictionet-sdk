@@ -2,11 +2,12 @@
 //! headers built from any field values, as a world writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::geneve::{GeneveOption, Header, Packet};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Collect, Wire},
     protocols::geneve,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -44,13 +45,26 @@ fn packet_from(data: &[u8]) -> Option<Packet> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        || Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM),
-        data,
-        2 * (geneve::MAX_DATAGRAM + 1),
+    let bound = 2 * (geneve::MAX_DATAGRAM + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(
+            || Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM),
+            data
+        ),
     );
-    contract::check_wire::<geneve::Packet>(data);
-    contract::check_wire::<Header>(data);
+    if let Ok(value) = <geneve::Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Header as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     let parsed = Packet::parse(data);
 
@@ -78,8 +92,8 @@ fuzz_target!(|data: &[u8]| {
     // The writer, on any field values: it writes bytes that read back the
     // same, or refuses and leaves the buffer alone.
     if let Some(p) = packet_from(data) {
-        contract::check_wire_value(&p);
-        contract::check_wire_value(&p.header);
+        let _ = assert_write(&p);
+        let _ = assert_write(&p.header);
         let mut out = vec![0xee];
         match p.write(&mut out) {
             Ok(()) => assert_eq!(Packet::parse(&out[1..]).as_ref(), Ok(&p)),

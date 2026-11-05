@@ -1,7 +1,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Stream, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 use fictionet::stdlib::protocols::http1::{Request, Requests};
 use fictionet::stdlib::test_support;
@@ -11,7 +11,13 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     let limits = message_limits();
     let make = || Requests::with_limits(limits);
-    contract::check_decode_limits(make, data, 3072, 8194);
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.held() <= 3072);
+            assert!(s.allocated() <= 8194);
+        }),
+        decode_all(make, data),
+    );
     // Also exercise valid pipelined messages with arbitrary body bytes.
     let body = &data[..data.len().min(512)];
     let mut input = format!(
@@ -22,7 +28,14 @@ fuzz_target!(|data: &[u8]| {
     input.extend_from_slice(body);
     let first_len = input.len();
     input.extend_from_slice(b"GET /next HTTP/1.1\r\nHost:test\r\n\r\n");
-    contract::check_decode(make, &input);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(&input, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(make, &input),
+    );
     let expected = [
         Request::parse(&input[..first_len]).unwrap(),
         Request::parse(&input[first_len..]).unwrap(),
@@ -41,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
                 request
             }) {
                 let request = result.unwrap();
-                contract::check_wire_value(&request);
+                let _ = assert_write(&request);
                 request.write(&mut encoded).unwrap();
                 requests.push(request);
             }
@@ -56,8 +69,17 @@ fuzz_target!(|data: &[u8]| {
         assert!(stream.is_done());
         assert_eq!(test_support::decode_all(make, &encoded), (requests, None));
     }
-    contract::check_wire::<Request>(data);
+    if let Ok(value) = <Request as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     if let Ok(request) = Request::parse(data) {
-        contract::check_decode(Requests::default, &request.to_bytes().unwrap());
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Requests::default()),
+                chunks(&request.to_bytes().unwrap(), &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(Requests::default, &request.to_bytes().unwrap()),
+        );
     }
 });

@@ -2,13 +2,14 @@
 //! world playing a VPN gateway reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::ipsec::{
     AhPacket, Datagram, Envelope, Error, EspPacket, MAX_DATAGRAM, MAX_PADDING, Plaintext,
 };
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Collect, Wire},
     protocols::ipsec,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -31,32 +32,59 @@ fuzz_target!(|data: &[u8]| {
         }
     };
     assert_eq!(Datagram::parse(data), datagram);
-    contract::check_decode_with_alloc_limit(
-        || Collect::<ipsec::EspPacket>::new(ipsec::MAX_PACKET),
-        data,
-        2 * (ipsec::MAX_PACKET + 1),
+    let bound = 2 * (ipsec::MAX_PACKET + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<ipsec::EspPacket>::new(ipsec::MAX_PACKET)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::<ipsec::EspPacket>::new(ipsec::MAX_PACKET), data),
     );
-    contract::check_wire::<ipsec::EspPacket>(data);
-    contract::check_decode_with_alloc_limit(
-        || Collect::<ipsec::AhPacket>::new(ipsec::MAX_PACKET),
-        data,
-        2 * (ipsec::MAX_PACKET + 1),
+    if let Ok(value) = <ipsec::EspPacket as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * (ipsec::MAX_PACKET + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<ipsec::AhPacket>::new(ipsec::MAX_PACKET)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::<ipsec::AhPacket>::new(ipsec::MAX_PACKET), data),
     );
-    contract::check_wire::<ipsec::AhPacket>(data);
-    contract::check_decode_with_alloc_limit(
-        || Collect::<ipsec::Datagram>::new(ipsec::MAX_DATAGRAM),
-        data,
-        2 * (ipsec::MAX_DATAGRAM + 1),
+    if let Ok(value) = <ipsec::AhPacket as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * (ipsec::MAX_DATAGRAM + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::<ipsec::Datagram>::new(ipsec::MAX_DATAGRAM)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(
+            || Collect::<ipsec::Datagram>::new(ipsec::MAX_DATAGRAM),
+            data
+        ),
     );
-    contract::check_wire::<ipsec::Datagram>(data);
+    if let Ok(value) = <ipsec::Datagram as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     let packet = ipsec::EspPacket {
         spi: data.first().copied().map_or(0, u32::from),
         sequence: 1,
         payload: data.iter().take(ipsec::MAX_PACKET + 1).copied().collect(),
     };
-    contract::check_wire_value(&packet);
-    contract::check_wire_value(&Datagram::Esp(packet));
+    let _ = assert_write(&packet);
+    let _ = assert_write(&Datagram::Esp(packet));
     if let Ok(a) = AhPacket::parse(data) {
         assert_eq!(a.to_bytes().unwrap(), data);
         let (header, payload) = AhPacket::split(data).unwrap();
@@ -66,7 +94,7 @@ fuzz_target!(|data: &[u8]| {
         for tag in [0, 12, 16, 32, a.header.icv.len()] {
             match a.header.for_icv(tag) {
                 Ok(header) => {
-                    contract::check_wire_value(&header);
+                    let _ = assert_write(&header);
                     let z = header.to_bytes().unwrap();
                     assert_eq!(z.len(), a.header.len());
                     assert_eq!(&z[..12], &header_bytes[..12]);
@@ -93,8 +121,12 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    contract::check_wire::<Plaintext>(data);
-    contract::check_wire::<ipsec::AhHeader>(data);
+    if let Ok(value) = <Plaintext as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ipsec::AhHeader as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     // Any bytes as a decrypted ESP payload.
     if let Ok(plain) = Plaintext::parse(data) {

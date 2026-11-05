@@ -2,10 +2,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Frames, Stream};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::codec::Wire;
-
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
 
@@ -55,7 +54,7 @@ fn blocked_sections(bytes: &[u8]) {
                 }
                 Ok(SectionResult::Fields { ack, .. }) => {
                     if let Some(ack) = ack {
-                        contract::check_wire_value(&ack);
+                        let _ = assert_write(&ack);
                     }
                 }
                 Err(_) => break,
@@ -75,7 +74,7 @@ fn blocked_sections(bytes: &[u8]) {
                 assert_eq!(result, sent[k][taken[k]].clone().retry(&table));
                 assert!(!matches!(result, Ok(SectionResult::Blocked(_))));
                 if let Ok(SectionResult::Fields { ack: Some(ack), .. }) = result {
-                    contract::check_wire_value(&ack);
+                    let _ = assert_write(&ack);
                 }
                 taken[k] += 1;
                 assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
@@ -85,7 +84,7 @@ fn blocked_sections(bytes: &[u8]) {
         assert_eq!(held.len(), pending.iter().sum::<usize>());
         for (k, id) in [0, 4].into_iter().enumerate() {
             let before = held.len();
-            contract::check_wire_value(&held.cancel(&table, id).unwrap());
+            let _ = assert_write(&held.cancel(&table, id).unwrap());
             assert_eq!(held.len(), before - pending[k]);
             assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
         }
@@ -96,22 +95,46 @@ fn blocked_sections(bytes: &[u8]) {
 
 fuzz_target!(|input: &[u8]| {
     let bytes = &input[..input.len().min(16 << 10)];
-    contract::check_wire::<Integer<5>>(bytes);
-    contract::check_wire::<Integer<8>>(bytes);
-    contract::check_wire::<HuffmanString>(bytes);
-    contract::check_wire::<EncoderInstruction>(bytes);
-    contract::check_wire::<DecoderInstruction>(bytes);
-    contract::check_wire::<Representation>(bytes);
-    contract::check_wire::<FieldSection>(bytes);
-    contract::check_decode_with_alloc_limit(
-        Frames::<EncoderInstruction>::new,
-        bytes,
-        2 * qpack::MAX_INSTRUCTION,
+    if let Ok(value) = <Integer<5> as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Integer<8> as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <HuffmanString as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <EncoderInstruction as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <DecoderInstruction as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Representation as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <FieldSection as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<EncoderInstruction>::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * qpack::MAX_INSTRUCTION);
+            }
+        ),
+        decode_all(Frames::<EncoderInstruction>::new, bytes),
     );
-    contract::check_decode_with_alloc_limit(
-        Frames::<DecoderInstruction>::new,
-        bytes,
-        2 * qpack::MAX_INTEGER_BYTES,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<DecoderInstruction>::new()),
+            chunks(bytes, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * qpack::MAX_INTEGER_BYTES);
+            }
+        ),
+        decode_all(Frames::<DecoderInstruction>::new, bytes),
     );
 
     let integer = input
@@ -132,17 +155,17 @@ fuzz_target!(|input: &[u8]| {
             value: value.clone(),
         },
     ] {
-        contract::check_wire_value(&instruction);
+        let _ = assert_write(&instruction);
     }
     for instruction in [
         DecoderInstruction::SectionAck(integer),
         DecoderInstruction::StreamCancel(integer),
         DecoderInstruction::InsertCountIncrement(integer),
     ] {
-        contract::check_wire_value(&instruction);
+        let _ = assert_write(&instruction);
     }
-    contract::check_wire_value(&HuffmanString(value.clone()));
-    contract::check_wire_value(&Representation::LiteralName {
+    let _ = assert_write(&HuffmanString(value.clone()));
+    let _ = assert_write(&Representation::LiteralName {
         never_index: integer & 1 != 0,
         name: b"x-fuzz".to_vec(),
         value,
@@ -166,11 +189,11 @@ fuzz_target!(|input: &[u8]| {
         match section {
             SectionResult::Fields { fields, ack } => {
                 if let Some(ack) = ack {
-                    contract::check_wire_value(&ack);
+                    let _ = assert_write(&ack);
                 }
                 let mut encoder = qpack::Encoder::new(0, qpack::MAX_FIELD_SECTION_SIZE);
                 let value = encoder.section(0, &fields).unwrap();
-                contract::check_wire_value(&value);
+                let _ = assert_write(&value);
                 assert_eq!(
                     qpack::decode_section(&Table::new(0), 0, &value.to_bytes().unwrap()),
                     Ok(SectionResult::Fields { fields, ack: None })
@@ -184,17 +207,17 @@ fuzz_target!(|input: &[u8]| {
                     if let Some((_, Ok(SectionResult::Fields { ack: Some(ack), .. }))) =
                         held.next_ready(&table)
                     {
-                        contract::check_wire_value(&ack);
+                        let _ = assert_write(&ack);
                     }
                 }
             }
         }
     }
     if let Some(ack) = held.cancel(&table, 0) {
-        contract::check_wire_value(&ack);
+        let _ = assert_write(&ack);
     }
     if let Some(ack) = table.take_increment() {
-        contract::check_wire_value(&ack);
+        let _ = assert_write(&ack);
     }
 
     let mut encoder = qpack::Encoder::new(4096, qpack::MAX_FIELD_SECTION_SIZE);
@@ -204,7 +227,7 @@ fuzz_target!(|input: &[u8]| {
         .unwrap();
     let value = &bytes[..bytes.len().min(256)];
     let (_, instruction) = encoder.insert(b"x-fuzz", value).unwrap();
-    contract::check_wire_value(&instruction);
+    let _ = assert_write(&instruction);
     receiving.apply(instruction).unwrap();
     encoder
         .apply_instruction(receiving.take_increment().unwrap())
@@ -224,7 +247,7 @@ fuzz_target!(|input: &[u8]| {
                 ],
             )
             .unwrap();
-        contract::check_wire_value(&section);
+        let _ = assert_write(&section);
     }
     let (acks, _) = decode_all(Frames::<DecoderInstruction>::new, bytes);
     for ack in acks {

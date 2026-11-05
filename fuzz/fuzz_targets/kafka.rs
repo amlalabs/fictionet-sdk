@@ -2,27 +2,63 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::codec::{Decode, Reader, Wire, leb128};
-use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::protocols::kafka::*;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_capacity(Frames::<Frame>::new, data);
-    let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_capacity(|| Frames::<Frame>::with_limit(limit), data);
-    contract::check_wire::<Frame>(data);
-    contract::check_wire::<Request>(data);
-    contract::check_wire::<RequestHeader>(data);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Frame>::new().map(|frame| Request::parse(&frame.0)),
-        data,
-        2 * Frames::<Frame>::new().capacity(),
+    let bound = 2 * Frames::<Frame>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Frame>::new, data),
     );
-    contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
+    let limit = usize::from(data.first().copied().unwrap_or(0));
+    let bound = 2 * Frames::<Frame>::with_limit(limit).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::with_limit(limit)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Frame>::with_limit(limit), data),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Request as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <RequestHeader as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * Frames::<Frame>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new().map(|frame| Request::parse(&frame.0))),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(
+            || Frames::<Frame>::new().map(|frame| Request::parse(&frame.0)),
+            data
+        ),
+    );
+    let _ = assert_write(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
 
     let frames = decode_all(Frames::<Frame>::new, data).0;
     for payload in frames
@@ -31,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
         .chain(core::iter::once(data))
     {
         if let Ok(request) = Request::parse(payload) {
-            contract::check_wire_value(&request);
+            let _ = assert_write(&request);
             let frame = request.to_frame().unwrap();
             assert_eq!(
                 decode_all(Frames::<Frame>::new, &frame.to_bytes().unwrap()),
@@ -42,7 +78,7 @@ fuzz_target!(|data: &[u8]| {
             for version in 0..=13 {
                 if let Ok(response) = Response::parse(payload, key, version) {
                     let frame = response.to_frame(key, version).unwrap();
-                    contract::check_wire_value(&frame);
+                    let _ = assert_write(&frame);
                     assert_eq!(Response::parse(&frame.0, key, version), Ok(response));
                 }
             }
@@ -61,7 +97,7 @@ fuzz_target!(|data: &[u8]| {
             ] {
                 if let Ok(body) = body {
                     assert!(payload.len() <= MAX_FRAME);
-                    contract::check_wire_value(&Request {
+                    let _ = assert_write(&Request {
                         header: RequestHeader {
                             api_key: key,
                             api_version: version,
@@ -88,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
                         body,
                     };
                     let frame = response.to_frame(key, version).unwrap();
-                    contract::check_wire_value(&frame);
+                    let _ = assert_write(&frame);
                     assert_eq!(Response::parse(&frame.0, key, version), Ok(response));
                 }
             }
@@ -116,7 +152,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(reader.is_empty());
         }
     }
-    contract::check_wire_value(&RequestHeader {
+    let _ = assert_write(&RequestHeader {
         api_key: api_key::METADATA,
         api_version: 9,
         tagged_fields: vec![TaggedField {

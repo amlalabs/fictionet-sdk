@@ -2,14 +2,15 @@
 //! and the receiver's gap recovery driven by whatever parses.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::moldudp64::{
     Blocks, Downstream, Event, HEADER_LENGTH, Receiver, ReceiverConfig, Request, Retransmitter,
     Session, StoreConfig,
 };
 use fictionet::stdlib::protocols::session::Action;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
@@ -19,9 +20,16 @@ fuzz_target!(|input: &[u8]| {
     let data = input
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
-    check_wire::<Downstream>(data);
-    check_wire::<Request>(data);
-    check_decode(|| Blocks, data);
+    if let Ok(value) = <Downstream as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Request as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(&mut Stream::new(Blocks), chunks(data, &[1, 7, 64]), |_| {}),
+        decode_all(|| Blocks, data),
+    );
     let _ = decode_all(|| Blocks, data);
 
     // Every 64-byte slice is a datagram for one receiver; requests it
@@ -50,7 +58,7 @@ fuzz_target!(|input: &[u8]| {
         let _ = store.push(datagram);
         let mut packets = Vec::new();
         if let Ok(packet) = Downstream::parse(datagram) {
-            check_wire_value(&packet);
+            let _ = assert_write(&packet);
             packets.push(packet);
         }
         // A header over the fuzz session, so sequence numbers vary.
@@ -68,9 +76,9 @@ fuzz_target!(|input: &[u8]| {
                 match action {
                     Action::Send(request) => {
                         assert!(request.count >= 1 && request.count <= 8);
-                        check_wire_value(request);
+                        let _ = assert_write(request);
                         if let Some(answer) = store.answer(request) {
-                            check_wire_value(&answer);
+                            let _ = assert_write(&answer);
                             assert!(answer.wire_len() <= 200);
                         }
                     }
@@ -86,7 +94,7 @@ fuzz_target!(|input: &[u8]| {
         }
         for action in receiver.tick(now).unwrap() {
             if let Action::Send(request) = action {
-                check_wire_value(&request);
+                let _ = assert_write(&request);
             }
         }
     }

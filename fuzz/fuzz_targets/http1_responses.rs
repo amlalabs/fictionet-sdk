@@ -1,7 +1,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Stream, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 use fictionet::stdlib::protocols::http1::{Response, Responses};
 use fictionet::stdlib::test_support;
@@ -17,7 +17,13 @@ fuzz_target!(|data: &[u8]| {
             decoder.expect_method("GET").unwrap();
             decoder
         };
-        contract::check_decode_limits(make, data, 3074, 8194);
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                assert!(s.held() <= 3074);
+                assert!(s.allocated() <= 8194);
+            }),
+            decode_all(make, data),
+        );
     }
     let body = &data[..data.len().min(512)];
     let interim = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n";
@@ -34,7 +40,14 @@ fuzz_target!(|data: &[u8]| {
         decoder.expect_method("GET").unwrap();
         decoder
     };
-    contract::check_decode(make, &input);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(make()),
+            chunks(&input, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(make, &input),
+    );
     let expected = [
         Response::parse(interim).unwrap(),
         Response::parse_for(head, "HEAD").unwrap(),
@@ -55,7 +68,7 @@ fuzz_target!(|data: &[u8]| {
                     assert_eq!(bytes, head);
                     encoded.extend_from_slice(bytes);
                 } else {
-                    contract::check_wire_value(&response);
+                    let _ = assert_write(&response);
                     response.write(&mut encoded).unwrap();
                 }
                 response

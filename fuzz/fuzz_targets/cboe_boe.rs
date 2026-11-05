@@ -3,6 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::cboe_boe::{
     ClientHeartbeat, CloseReason, Error, Event, Exchange, ExchangeConfig, Header, Inbound,
@@ -10,7 +11,7 @@ use fictionet::stdlib::protocols::cboe_boe::{
     ParamGroups, Price, ReturnTable, Server, ServerPhase, Text, Timers, UnitSequence,
 };
 use fictionet::stdlib::protocols::session::Action;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_written};
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
@@ -19,7 +20,7 @@ const MAX_ORDERS: usize = 16;
 fn check_actions<E>(actions: &[Action<Outbound, E>]) {
     for action in actions {
         if let Action::Send(out) = action {
-            check_written(out);
+            assert_write(out).unwrap();
         }
     }
 }
@@ -46,7 +47,7 @@ fn check_negotiation(groups: &[ParamGroup], steer: u8, count: u8) {
         kind: 0x99,
         data: vec![0; len - request.wire_len() - 3],
     });
-    let bytes = check_written(&request);
+    let bytes = assert_write(&request).unwrap();
     assert_eq!(bytes.len(), len);
     let mut server = Server::new(Timers::default(), 0).unwrap();
     check_actions(&server.receive(&request.into(), 0).unwrap());
@@ -91,22 +92,22 @@ fn check_history(server: &Server, fields: &Optional<ReturnTable>, shares: u32, p
                 .with(Opt::Price(Price(price)))
                 .unwrap(),
         };
-        check_written(&order);
+        assert_write(&order).unwrap();
         let actions = exchange.receive(&order.into(), now);
         check_actions(&actions);
         assert_eq!(actions, [Action::Event(OrderEvent::NewOrderRequested(id))]);
-        check_written(&exchange.accept(id, 1, now).unwrap());
+        assert_write(&exchange.accept(id, 1, now).unwrap()).unwrap();
         if now == 1 {
-            check_written(&exchange.execute(id, shares, Price(9), b'A', 2).unwrap());
+            assert_write(&exchange.execute(id, shares, Price(9), b'A', 2).unwrap()).unwrap();
             if partial {
-                check_written(&exchange.cancel(id, b'A', 3).unwrap());
+                assert_write(&exchange.cancel(id, b'A', 3).unwrap()).unwrap();
             }
             assert!(exchange.order(id).is_none());
         }
     }
     let before = exchange.order(id).cloned();
     let bust = exchange.bust(1, Price(0), 6).unwrap();
-    check_written(&bust);
+    assert_write(&bust).unwrap();
     let Outbound::TradeCancelOrCorrect(bust) = bust else {
         panic!("missing bust")
     };
@@ -130,12 +131,34 @@ fuzz_target!(|input: &[u8]| {
     let data = input
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
-    check_wire::<Inbound>(data);
-    check_wire::<Outbound>(data);
-    check_wire::<NewOrder>(data);
-    check_wire::<LoginRequest>(data);
-    check_decode(Frames::<Inbound>::default, data);
-    check_decode(Frames::<Outbound>::default, data);
+    if let Ok(value) = <Inbound as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Outbound as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <NewOrder as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <LoginRequest as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Inbound>::default()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Inbound>::default, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Outbound>::default()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Outbound>::default, data),
+    );
 
     let steer = data.first().copied().unwrap_or(0);
     let count = data.get(1).copied().unwrap_or(0);
@@ -176,7 +199,7 @@ fuzz_target!(|input: &[u8]| {
         params: ParamGroups(groups),
         ..LoginRequest::default()
     };
-    let bytes = check_written(&request);
+    let bytes = assert_write(&request).unwrap();
     let inbound = Inbound::parse(&bytes).expect("login bytes parse as Inbound");
     assert_eq!(inbound, Inbound::LoginRequest(request.clone()));
     check_actions(&server.receive(&inbound, 0).unwrap());
@@ -215,7 +238,7 @@ fuzz_target!(|input: &[u8]| {
         for action in actions {
             match action {
                 Action::Send(out) => {
-                    check_written(&out);
+                    assert_write(&out).unwrap();
                 }
                 Action::Event(Event::Application) => {
                     for a in exchange.receive(&message, now) {
@@ -231,9 +254,9 @@ fuzz_target!(|input: &[u8]| {
                             Action::Event(_) => continue,
                         };
                         if let Ok(out) = out {
-                            check_written(&out);
+                            assert_write(&out).unwrap();
                             if let Ok(numbered) = server.send(out, now) {
-                                check_written(&numbered);
+                                assert_write(&numbered).unwrap();
                             }
                         }
                     }
@@ -254,11 +277,11 @@ fuzz_target!(|input: &[u8]| {
                 1 => exchange.restate(id, leaves - shares, b'L', now),
                 _ => exchange.cancel(id, b'A', now),
             };
-            check_written(&out.unwrap());
+            assert_write(&out.unwrap()).unwrap();
         }
         if steer & 8 != 0 {
             if let Ok(out) = exchange.bust(u64::from(steer), Price(0), now) {
-                check_written(&out);
+                assert_write(&out).unwrap();
             }
         }
         assert!(exchange.orders().count() <= MAX_ORDERS);

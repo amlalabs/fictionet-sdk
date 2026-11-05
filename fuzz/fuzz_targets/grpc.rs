@@ -3,14 +3,15 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Fail, Wire};
 use fictionet::stdlib::protocols::grpc::harness::strings;
 use fictionet::stdlib::protocols::grpc::{
     Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, MethodPath, Rejection, Request,
     Status, Timeout, decode_message, encode_message,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// The request headers with the fields that make a call: POST, a path
@@ -94,11 +95,27 @@ fn check_limit_agreement(data: &[u8], limit: usize) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE), data);
-    contract::check_wire::<Message>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::with_limit(MAX_MESSAGE)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Frames::<Message>::with_limit(MAX_MESSAGE), data),
+    );
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     if let Some(&limit) = data.first() {
-        contract::check_decode(|| Frames::<Message>::with_limit(usize::from(limit)), data);
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Frames::<Message>::with_limit(usize::from(limit))),
+                chunks(data, &[1, 7, 64]),
+                |_| {}
+            ),
+            decode_all(|| Frames::<Message>::with_limit(usize::from(limit)), data),
+        );
         check_limit_agreement(data, usize::from(limit));
     }
     // A message built from the input, not read from it, writes and reads
@@ -107,10 +124,19 @@ fuzz_target!(|data: &[u8]| {
         compressed: data.first().is_some_and(|b| b & 1 == 1),
         data: data.get(..MAX_MESSAGE).unwrap_or(data).to_vec(),
     };
-    contract::check_wire_value(&built);
+    let _ = assert_write(&built);
     let bytes = built.to_bytes().unwrap();
-    contract::check_wire::<Message>(&bytes);
-    contract::check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE), &bytes);
+    if let Ok(value) = <Message as Wire>::parse(&bytes) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::with_limit(MAX_MESSAGE)),
+            chunks(&bytes, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Frames::<Message>::with_limit(MAX_MESSAGE), &bytes),
+    );
     check_limit_agreement(&bytes, data.first().copied().map_or(0, usize::from));
     assert_eq!(<Message as Wire>::parse(&bytes), Ok(built));
 

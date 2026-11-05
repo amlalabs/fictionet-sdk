@@ -3,15 +3,14 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field::Alpha;
 use fictionet::stdlib::protocols::session::Action;
 use fictionet::stdlib::protocols::soupbintcp::harness::{check_actions, login};
 use fictionet::stdlib::protocols::soupbintcp::{Client, MAX_PACKET, Packet, Server, Timers};
-use fictionet::stdlib::test_support::contract::{
-    check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
-};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
@@ -21,15 +20,30 @@ fuzz_target!(|input: &[u8]| {
     let data = input
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
-    check_wire::<Packet>(data);
-    if let Ok(packet) = Packet::parse_body(data) {
-        check_wire_value(&packet);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
     }
-    check_decode(Frames::<Packet>::default, data);
-    check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(SMALL_LIMIT),
-        data,
-        2 * (SMALL_LIMIT + 3),
+    if let Ok(packet) = Packet::parse_body(data) {
+        let _ = assert_write(&packet);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::default()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Packet>::default, data),
+    );
+    let bound = 2 * (SMALL_LIMIT + 3);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(SMALL_LIMIT)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(SMALL_LIMIT), data),
     );
     let (frames, _) = decode_all(Frames::<Packet>::default, data);
 
@@ -48,7 +62,7 @@ fuzz_target!(|input: &[u8]| {
     let mut now = 0u64;
     for frame in &frames {
         if let Ok(packet) = frame {
-            check_wire_value(packet);
+            let _ = assert_write(packet);
             assert!(packet.to_bytes().unwrap().len() <= MAX_PACKET);
         }
         now += frame.as_ref().map_or(0, |p| u64::from(p.kind()) * 50);
@@ -63,10 +77,10 @@ fuzz_target!(|input: &[u8]| {
         check_actions(&client.tick(now).unwrap());
         check_actions(&server.tick(now).unwrap());
         if let Ok(packet) = server.send(&data[..data.len().min(16)], now) {
-            check_wire_value(&packet);
+            let _ = assert_write(&packet);
         }
         if let Ok(packet) = client.send(&data[..data.len().min(16)], now) {
-            check_wire_value(&packet);
+            let _ = assert_write(&packet);
         }
     }
 

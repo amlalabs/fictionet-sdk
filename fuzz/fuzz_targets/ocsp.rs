@@ -10,7 +10,7 @@ use fictionet::stdlib::protocols::ocsp::{
     Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus, SingleRequest,
     SingleResponse, decode_get_path, find_nonce,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 /// Takes the next `n` bytes, or what is left.
@@ -69,7 +69,7 @@ fn written(mut data: &[u8]) {
         }
         Err(_) => assert!(nonce.is_empty() || nonce.len() > MAX_NONCE),
     }
-    contract::check_wire_value(&req);
+    let _ = assert_write(&req);
     if let Ok(der) = req.to_bytes() {
         assert_eq!(Request::parse(&der).unwrap(), req);
         // Unsigned, the request is a SEQUENCE header and the TBSRequest.
@@ -115,7 +115,7 @@ fn written(mut data: &[u8]) {
     };
     if let Some(status) = ResponseStatus::from_code(code) {
         let resp = Response { status, bytes };
-        contract::check_wire_value(&resp);
+        let _ = assert_write(&resp);
         if let Ok(der) = resp.to_bytes() {
             assert_eq!(Response::parse(&der).unwrap(), resp);
         }

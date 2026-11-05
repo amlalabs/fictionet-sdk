@@ -4,12 +4,13 @@
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::modbus::{
     Exception, Frame, MAX_PDU, Request, Response, function,
 };
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// A PDU read as a request and as a response. Whatever reads is written
@@ -125,7 +126,7 @@ fn built(data: &[u8]) -> Result<()> {
         unit: u.arbitrary()?,
         pdu: u.bytes(n)?.to_vec(),
     };
-    check_wire_value(&frame);
+    let _ = assert_write(&frame);
     if let Ok(bytes) = frame.to_bytes() {
         assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame));
     }
@@ -133,12 +134,21 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(Frames::<Frame>::new, data);
-    check_wire::<Frame>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Frame>::new, data),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     let (frames, _) = decode_all(Frames::<Frame>::new, data);
     for frame in frames {
-        check_wire_value(&frame);
+        let _ = assert_write(&frame);
         pdu(&frame.pdu);
     }
     // Any bytes as a PDU on their own, including ones longer than a frame

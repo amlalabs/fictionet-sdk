@@ -1,14 +1,16 @@
 //! PIM version 2 messages, as a world playing a multicast router reads
 //! them.
 #![no_main]
+use fictionet::stdlib::codec::{CollectError, Decode, Fail, Stream};
 use fictionet::stdlib::network::ip::Endpoints;
+use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::protocols::pim::{
     ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Error, Message, checksum,
 };
-use fictionet::stdlib::{codec::Collect, protocols::pim, test_support::contract};
+use fictionet::stdlib::{codec::Collect, protocols::pim};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -35,14 +37,35 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(data: &[u8], e: &Endpoints) {
-    contract::check_decode_with_alloc_limit(
-        || Collect::bytes(pim::MAX_MESSAGE),
-        data,
-        2 * (pim::MAX_MESSAGE + 1),
+    let bound = 2 * (pim::MAX_MESSAGE + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::bytes(pim::MAX_MESSAGE)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::bytes(pim::MAX_MESSAGE), data),
     );
-    let parsed = contract::check_collect_with(data, pim::MAX_MESSAGE, |datagram| {
-        Message::parse(datagram, e)
-    });
+    let parsed = Message::parse(data, e);
+    let collected = decode_chunks(
+        &mut Stream::new(Collect::bytes(pim::MAX_MESSAGE).map(|d| Message::parse(&d, e))),
+        chunks(data, &[1, 7, 64]),
+        |s| assert!(s.allocated() <= bound),
+    );
+    if data.len() <= pim::MAX_MESSAGE {
+        assert_eq!(collected, (vec![parsed.clone()], None));
+    } else {
+        let limit = pim::MAX_MESSAGE;
+        assert_eq!(
+            collected,
+            (
+                vec![],
+                Some(Fail::Protocol(CollectError::TooLong { limit }))
+            )
+        );
+    }
 
     if let Ok(m) = &parsed {
         assert!(

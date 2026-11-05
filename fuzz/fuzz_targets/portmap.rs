@@ -2,6 +2,8 @@
 //! portmapper reads them, and values a world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet_fuzz::input::bytes;
 
 use arbitrary::{Result, Unstructured};
@@ -14,7 +16,6 @@ use fictionet::stdlib::protocols::portmap::{
 use fictionet::stdlib::{
     codec::{Decode, Wire},
     protocols::onc_rpc,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, SocketAddr};
@@ -211,22 +212,41 @@ fn built(data: &[u8]) -> Result<()> {
 
 fuzz_target!(|data: &[u8]| {
     const RECORD_LIMIT: usize = 1 << 16;
-    contract::check_decode(|| onc_rpc::Fragments::with_limit(RECORD_LIMIT), data);
-    contract::check_decode(|| onc_rpc::records(RECORD_LIMIT), data);
-    contract::check_decode(
-        || {
-            onc_rpc::messages(RECORD_LIMIT).map(|message| {
-                message.map(|message| match message.body {
-                    Body::Call(call) => Some((message.xid, Request::from_call(&call))),
-                    Body::Reply(_) => None,
-                })
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(onc_rpc::Fragments::with_limit(RECORD_LIMIT)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| onc_rpc::Fragments::with_limit(RECORD_LIMIT), data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(onc_rpc::records(RECORD_LIMIT)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| onc_rpc::records(RECORD_LIMIT), data),
+    );
+    let calls = || {
+        onc_rpc::messages(RECORD_LIMIT).map(|message| {
+            message.map(|message| match message.body {
+                Body::Call(call) => Some((message.xid, Request::from_call(&call))),
+                Body::Reply(_) => None,
             })
-        },
-        data,
+        })
+    };
+    assert_eq!(
+        decode_chunks(&mut Stream::new(calls()), chunks(data, &[1, 7, 64]), |_| {}),
+        decode_all(calls, data),
     );
     // Portmap arguments need version and procedure; Wire is the envelope.
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<onc_rpc::Record>(data);
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <onc_rpc::Record as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // Any bytes as a whole message: a call a portmapper reads.
     if let Ok(msg) = <Message as Wire>::parse(data) {
         if let Body::Call(call) = &msg.body {

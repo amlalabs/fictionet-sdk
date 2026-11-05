@@ -1,8 +1,9 @@
 //! PostgreSQL startup, authentication, and typed messages.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::postgres::{
     BackendEvent, BackendEvents, BackendMessage, EncryptionReply, FrontendMessage,
@@ -17,7 +18,13 @@ fuzz_target!(|data: &[u8]| {
         || FrontendMessages::established(64),
         || FrontendMessages::established(SMALL_MESSAGE),
     ] {
-        contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+        let bound = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= bound);
+            }),
+            decode_all(make, data),
+        );
         for message in decode_all(make, data).0.into_iter().flatten() {
             if let FrontendMessage::Startup(startup) = &message {
                 if startup.database().is_some() {
@@ -28,16 +35,22 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             if let FrontendMessage::AuthResponse(body) = &message {
-                contract::check_wire::<Password>(body);
-                contract::check_wire::<SaslInitialResponse>(body);
+                if let Ok(value) = <Password as Wire>::parse(body) {
+                    let _ = assert_write(&value);
+                }
+                if let Ok(value) = <SaslInitialResponse as Wire>::parse(body) {
+                    let _ = assert_write(&value);
+                }
                 if let Ok(sasl) = SaslInitialResponse::parse(body) {
-                    contract::check_wire_value(&sasl.to_message().unwrap());
+                    let _ = assert_write(&sasl.to_message().unwrap());
                 }
             }
             let m = message;
             let b = m.to_bytes().unwrap();
             assert_eq!(FrontendMessage::parse(&b), Ok(m));
-            contract::check_wire::<FrontendMessage>(&b);
+            if let Ok(value) = <FrontendMessage as Wire>::parse(&b) {
+                let _ = assert_write(&value);
+            }
         }
     }
     for make in [
@@ -54,29 +67,47 @@ fuzz_target!(|data: &[u8]| {
             messages
         },
     ] {
-        contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+        let bound = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= bound);
+            }),
+            decode_all(make, data),
+        );
         for item in decode_all(make, data).0.into_iter().flatten() {
             if let BackendEvent::Message(m) = item {
                 let b = m.to_bytes().unwrap();
                 assert_eq!(BackendMessage::parse(&b), Ok(m));
-                contract::check_wire::<BackendMessage>(&b);
+                if let Ok(value) = <BackendMessage as Wire>::parse(&b) {
+                    let _ = assert_write(&value);
+                }
             }
         }
     }
-    contract::check_wire::<FrontendMessage>(data);
-    contract::check_wire::<BackendMessage>(data);
-    contract::check_wire::<EncryptionReply>(data);
-    contract::check_wire::<Password>(data);
-    contract::check_wire::<SaslInitialResponse>(data);
+    if let Ok(value) = <FrontendMessage as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <BackendMessage as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <EncryptionReply as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Password as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <SaslInitialResponse as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let text = String::from_utf8_lossy(data.get(..4096).unwrap_or(data)).into_owned();
-    contract::check_wire_value(&FrontendMessage::Query(text.clone()));
-    contract::check_wire_value(&Password(text.clone()));
-    contract::check_wire_value(&BackendMessage::CommandComplete(text.clone()));
-    contract::check_wire_value(&SaslInitialResponse {
+    let _ = assert_write(&FrontendMessage::Query(text.clone()));
+    let _ = assert_write(&Password(text.clone()));
+    let _ = assert_write(&BackendMessage::CommandComplete(text.clone()));
+    let _ = assert_write(&SaslInitialResponse {
         mechanism: text,
         data: Some(data.get(..4096).unwrap_or(data).to_vec()),
     });
-    contract::check_wire_value(&FrontendMessage::CancelRequest {
+    let _ = assert_write(&FrontendMessage::CancelRequest {
         process_id: 7,
         secret_key: data.get(..257).unwrap_or(data).to_vec(),
     });
@@ -88,11 +119,23 @@ fuzz_target!(|data: &[u8]| {
         || FrontendMessages::with_limit(64),
         || FrontendMessages::with_limit(SMALL_MESSAGE),
     ] {
-        contract::check_decode_with_alloc_limit(make, &startup, 2 * make().capacity());
+        let bound = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(make()),
+                chunks(&startup, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= bound);
+                }
+            ),
+            decode_all(make, &startup),
+        );
         for m in decode_all(make, &startup).0.into_iter().flatten() {
             let b = m.to_bytes().unwrap();
             assert_eq!(FrontendMessage::parse(&b), Ok(m));
-            contract::check_wire::<FrontendMessage>(&b);
+            if let Ok(value) = <FrontendMessage as Wire>::parse(&b) {
+                let _ = assert_write(&value);
+            }
         }
     }
 });

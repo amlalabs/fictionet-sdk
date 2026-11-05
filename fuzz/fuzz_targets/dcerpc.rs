@@ -2,6 +2,8 @@
 //! reads them, and values a world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use fictionet_fuzz::input::{bytes, list};
 
 use arbitrary::{Result, Unstructured};
@@ -12,7 +14,6 @@ use fictionet::stdlib::protocols::dcerpc::{
     Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error, MAX_FRAG,
     MAX_FRAGMENTS, MAX_STUB, Pdu, Reassembler, SyntaxId, Uuid, flags,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
@@ -129,7 +130,7 @@ fn alloc_hint(p: &Pdu) -> Option<u32> {
 fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let p = pdu(&mut u)?;
-    contract::check_wire_value(&p);
+    let _ = assert_write(&p);
     if let Ok(bytes) = p.to_bytes() {
         assert!(bytes.len() <= MAX_FRAG);
         assert_eq!(Pdu::parse(&bytes), Ok(p.clone()));
@@ -323,10 +324,42 @@ fuzz_target!(|data: &[u8]| {
         representations(data);
         return;
     }
-    contract::check_decode_capacity(Frames::<Pdu>::new, data);
-    contract::check_wire::<Pdu>(data);
-    contract::check_decode_capacity(|| Frames::<Pdu>::with_limit(0), data);
-    contract::check_decode_capacity(|| Frames::<Pdu>::with_limit(64), data);
+    let bound = 2 * Frames::<Pdu>::new().capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Pdu>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(Frames::<Pdu>::new, data),
+    );
+    if let Ok(value) = <Pdu as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    let bound = 2 * Frames::<Pdu>::with_limit(0).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Pdu>::with_limit(0)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Pdu>::with_limit(0), data),
+    );
+    let bound = 2 * Frames::<Pdu>::with_limit(64).capacity();
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Pdu>::with_limit(64)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Pdu>::with_limit(64), data),
+    );
 
     let (results, _) = decode_all(Frames::<Pdu>::new, data);
     let mut rest = data;

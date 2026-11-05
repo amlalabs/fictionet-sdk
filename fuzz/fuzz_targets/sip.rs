@@ -1,8 +1,9 @@
 //! SIP messages and header values through codec contracts.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::sip::harness::{cseq_round_trip, round_trip, text_value};
 use fictionet::stdlib::protocols::sip::{
@@ -13,21 +14,53 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
-    contract::check_decode_with_held_limit(Messages::new, data, 0);
-    contract::check_wire::<Message>(data);
-    contract::check_wire::<Uri>(data);
-    contract::check_wire::<NameAddr>(data);
-    contract::check_wire::<Contacts>(data);
-    contract::check_wire::<Via>(data);
-    contract::check_wire::<CSeq>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Messages::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE);
+                assert_eq!(s.held(), 0);
+            }
+        ),
+        decode_all(Messages::new, data),
+    );
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Uri as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <NameAddr as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Contacts as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Via as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <CSeq as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let mut message = Message::response(200, "OK");
     message.body = data.get(..MAX_BODY + 1).unwrap_or(data).to_vec();
     message.push_header("l", &message.body.len().to_string());
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
     if let Ok(bytes) = message.to_bytes() {
-        contract::check_wire::<Message>(&bytes);
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
+        if let Ok(value) = <Message as Wire>::parse(&bytes) {
+            let _ = assert_write(&value);
+        }
+        assert_eq!(
+            decode_chunks(
+                &mut Stream::new(Messages::new()),
+                chunks(&bytes, &[1, 7, 64]),
+                |s| {
+                    assert!(s.allocated() <= 2 * MAX_MESSAGE);
+                }
+            ),
+            decode_all(Messages::new, &bytes),
+        );
     }
 
     let (messages, _) = decode_all(Messages::new, data);
@@ -92,15 +125,15 @@ fn writers(data: &[u8]) {
     uri.user = opt(1);
     uri.password = opt(2);
     uri.params = params(3);
-    contract::check_wire_value(&uri);
+    let _ = assert_write(&uri);
     let address = NameAddr {
         display: opt(0),
         uri: part(1),
         params: params(2),
     };
-    contract::check_wire_value(&address);
-    contract::check_wire_value(&Contacts::List(vec![address]));
-    contract::check_wire_value(&Via {
+    let _ = assert_write(&address);
+    let _ = assert_write(&Contacts::List(vec![address]));
+    let _ = assert_write(&Via {
         transport: part(0),
         host: part(1),
         port: None,
@@ -109,7 +142,7 @@ fn writers(data: &[u8]) {
     let seq = bounded
         .iter()
         .fold(0u32, |n, &b| n.rotate_left(8) ^ u32::from(b));
-    contract::check_wire_value(&CSeq {
+    let _ = assert_write(&CSeq {
         seq,
         method: part(0),
     });
@@ -125,7 +158,7 @@ fn writers(data: &[u8]) {
         .last()
         .map(|p| p.as_bytes().to_vec())
         .unwrap_or_default();
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
     message.set_header("Content-Length", &message.body.len().to_string());
-    contract::check_wire_value(&message);
+    let _ = assert_write(&message);
 }

@@ -3,7 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::protocols::mqtt::ConnAck;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::mqtt::ConnectReturnCode;
 
@@ -21,13 +23,16 @@ use fictionet::stdlib::protocols::mqtt::check_topic_name;
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::mqtt::topic_matches;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<fictionet::stdlib::protocols::mqtt::RemainingLength>(data);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <fictionet::stdlib::protocols::mqtt::RemainingLength as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let small = usize::from(data.first().copied().unwrap_or(0) & 0x3f);
     for limit in [
         fictionet::stdlib::protocols::mqtt::DEFAULT_MAX_PACKET,
@@ -35,7 +40,13 @@ fuzz_target!(|data: &[u8]| {
         small,
     ] {
         let make = || Frames::<Packet>::with_limit(limit);
-        contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+        let bound = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= bound);
+            }),
+            decode_all(make, data),
+        );
     }
     let packets = decode_all(Frames::<Packet>::new, data).0;
     if let Ok(packet) = Packet::parse(data) {
@@ -52,7 +63,7 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     for packet in packets {
-        contract::check_wire_value(&packet);
+        let _ = assert_write(&packet);
         assert_eq!(packet.encoded_len(), Ok(packet.to_bytes().unwrap().len()));
     }
 
@@ -81,7 +92,7 @@ fuzz_target!(|data: &[u8]| {
             }));
         }
         for p in built {
-            contract::check_wire_value(&p);
+            let _ = assert_write(&p);
             let written = p.to_bytes();
             assert_eq!(
                 p.encoded_len(),

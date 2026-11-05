@@ -2,13 +2,14 @@
 //! world playing a broker reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::protocols::amqp::{
     BasicProperties, ContentHeader, Frame, FrameKind, Frames, MAX_PAYLOAD, Method, Table,
     content_frames, frame_limit, plain_credentials,
 };
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 /// Writes a message with `content_frames` and reads it back through a
@@ -46,9 +47,15 @@ fn message(method: &Method, properties: &BasicProperties, body: &[u8], frame_max
 /// A payload read as each kind of thing it might be. Whatever reads can be
 /// written, and what is written reads back to the same bytes.
 fn payload(p: &[u8], frame_max: u32) {
-    contract::check_wire::<Method>(p);
-    contract::check_wire::<ContentHeader>(p);
-    contract::check_wire::<Table>(p);
+    if let Ok(value) = <Method as Wire>::parse(p) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <ContentHeader as Wire>::parse(p) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Table as Wire>::parse(p) {
+        let _ = assert_write(&value);
+    }
     if let Ok(m) = Method::parse(p) {
         let bytes = m.to_bytes().unwrap();
         assert_eq!(Method::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
@@ -80,16 +87,30 @@ fn payload(p: &[u8], frame_max: u32) {
 
 fuzz_target!(|data: &[u8]| {
     let frame_max = data.first().map_or(0, |&b| u32::from(b) << 9);
-    contract::check_wire::<Frame>(data);
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     for make in [Frames::new as fn() -> Frames, Frames::server] {
-        contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+        let bound = 2 * make().capacity();
+        assert_eq!(
+            decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                assert!(s.allocated() <= bound);
+            }),
+            decode_all(make, data),
+        );
         for frame in decode_all(make, data).0 {
-            contract::check_wire_value(&frame);
+            let _ = assert_write(&frame);
             payload(&frame.payload, frame_max);
         }
     }
     let make = || Frames::with_limit(frame_max);
-    contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+    let bound = 2 * make().capacity();
+    assert_eq!(
+        decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+            assert!(s.allocated() <= bound);
+        }),
+        decode_all(make, data),
+    );
     // A frame built from any bytes: whatever its writer writes, its reader
     // reads back as the same frame.
     if let [kind, c0, c1, rest @ ..] = data {
@@ -104,7 +125,7 @@ fuzz_target!(|data: &[u8]| {
             channel: u16::from_be_bytes([*c0, *c1]),
             payload: rest.to_vec(),
         };
-        contract::check_wire_value(&f);
+        let _ = assert_write(&f);
         if let Ok(bytes) = f.to_bytes() {
             assert!(f.payload.len() <= MAX_PAYLOAD);
             assert_eq!(Frame::parse(&bytes), Ok(f));

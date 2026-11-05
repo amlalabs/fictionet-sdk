@@ -2,15 +2,18 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::iec104::{Asdu, Frame, Object};
 use libfuzzer_sys::fuzz_target;
 
 fn asdu(bytes: &[u8]) {
-    check_wire::<Asdu>(bytes);
+    if let Ok(value) = <Asdu as Wire>::parse(bytes) {
+        let _ = assert_write(&value);
+    }
     if let Ok(asdu) = <Asdu as Wire>::parse(bytes) {
         for width in [0, 1, 2, 3, 5, 7, 8, 12, usize::MAX] {
             if let Ok(objects) = asdu.objects(width) {
@@ -23,11 +26,20 @@ fn asdu(bytes: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(Frames::<Frame>::new, data);
-    check_wire::<Frame>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Frame>::new()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Frame>::new, data),
+    );
+    if let Ok(value) = <Frame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     let (frames, _) = decode_all(Frames::<Frame>::new, data);
     for frame in &frames {
-        check_wire_value(frame);
+        let _ = assert_write(frame);
         if let Frame::Information { asdu: bytes, .. } = frame {
             asdu(bytes);
         }
@@ -44,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
             },
             Frame::Supervisory { receive },
         ] {
-            check_wire_value(&frame);
+            let _ = assert_write(&frame);
         }
         let mut built = Asdu {
             type_id: data[0],
@@ -57,7 +69,7 @@ fuzz_target!(|data: &[u8]| {
             common_address: 1,
             data: data[4..].to_vec(),
         };
-        check_wire_value(&built);
+        let _ = assert_write(&built);
         let objects: Vec<_> = data
             .chunks(4)
             .map(|b| Object {

@@ -3,12 +3,13 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::itch::{
     AddOrder, Book, BookConfig, MAX_MESSAGE_LENGTH, Message, Noii, OrderReplace, StockDirectory,
 };
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
@@ -17,13 +18,37 @@ fuzz_target!(|input: &[u8]| {
     let data = input
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
-    check_wire::<Message>(data);
-    check_wire::<AddOrder>(data);
-    check_wire::<OrderReplace>(data);
-    check_wire::<StockDirectory>(data);
-    check_wire::<Noii>(data);
-    check_decode(Frames::<Message>::default, data);
-    check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH), data);
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <AddOrder as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <OrderReplace as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <StockDirectory as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Noii as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::default()),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(Frames::<Message>::default, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH)),
+            chunks(data, &[1, 7, 64]),
+            |_| {}
+        ),
+        decode_all(|| Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH), data),
+    );
     let (items, _) = decode_all(Frames::<Message>::default, data);
 
     // Every framed message that parses goes to a small book, whose
@@ -35,7 +60,7 @@ fuzz_target!(|input: &[u8]| {
     };
     let mut book = Book::new(config).unwrap();
     for message in items.into_iter().flatten() {
-        check_wire_value(&message);
+        let _ = assert_write(&message);
         let before = format!("{book:?}");
         if book.apply(&message).is_err() {
             assert_eq!(format!("{book:?}"), before);

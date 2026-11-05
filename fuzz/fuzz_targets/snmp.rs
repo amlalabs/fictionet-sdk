@@ -3,8 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
 use fictionet::stdlib::protocols::snmp::harness::{check_message, check_scalars};
 use fictionet::stdlib::protocols::snmp::{
@@ -13,13 +14,34 @@ use fictionet::stdlib::protocols::snmp::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Message>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
-        data,
-        510,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_MESSAGE);
+            }
+        ),
+        decode_all(Frames::<Message>::new, data),
     );
-    contract::check_wire::<Message>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Message>::with_limit(usize::from(
+                data.first().copied().unwrap_or(0)
+            ))),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 510);
+            }
+        ),
+        decode_all(
+            || Frames::<Message>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+            data
+        ),
+    );
+    if let Ok(value) = <Message as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     check_message(data);
 
@@ -43,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
             ],
         )),
     };
-    contract::check_wire_value(&built);
+    let _ = assert_write(&built);
     match built.to_bytes() {
         Ok(b) => {
             assert_eq!(b.len(), built.encoded_len());

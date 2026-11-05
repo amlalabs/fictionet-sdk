@@ -2,6 +2,8 @@
 //! them, and values a world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::{CollectError, Decode, Fail, Stream};
+use fictionet::stdlib::test_support::{chunks, decode_all, decode_chunks};
 use fictionet_fuzz::input::list;
 
 use fictionet::stdlib::network::ip::Endpoints;
@@ -20,7 +22,6 @@ use fictionet::stdlib::protocols::ospf::{
 use fictionet::stdlib::{
     codec::{Collect, Wire},
     protocols::ospf,
-    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -38,14 +39,35 @@ fn ends() -> [Endpoints; 2] {
 }
 
 fn check(data: &[u8], e: &Endpoints) {
-    contract::check_decode_with_alloc_limit(
-        || Collect::bytes(ospf::MAX_MESSAGE),
-        data,
-        2 * (ospf::MAX_MESSAGE + 1),
+    let bound = 2 * (ospf::MAX_MESSAGE + 1);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Collect::bytes(ospf::MAX_MESSAGE)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Collect::bytes(ospf::MAX_MESSAGE), data),
     );
-    let parsed = contract::check_collect_with(data, ospf::MAX_MESSAGE, |datagram| {
-        Packet::parse(datagram, e)
-    });
+    let parsed = Packet::parse(data, e);
+    let collected = decode_chunks(
+        &mut Stream::new(Collect::bytes(ospf::MAX_MESSAGE).map(|d| Packet::parse(&d, e))),
+        chunks(data, &[1, 7, 64]),
+        |s| assert!(s.allocated() <= bound),
+    );
+    if data.len() <= ospf::MAX_MESSAGE {
+        assert_eq!(collected, (vec![parsed.clone()], None));
+    } else {
+        let limit = ospf::MAX_MESSAGE;
+        assert_eq!(
+            collected,
+            (
+                vec![],
+                Some(Fail::Protocol(CollectError::TooLong { limit }))
+            )
+        );
+    }
 
     if let Ok(p) = &parsed {
         // A packet read can be written, and reads back the same. LSAs an

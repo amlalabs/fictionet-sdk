@@ -3,43 +3,105 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::memcache::{
     BINARY_HEADER_LEN, Command, Commands, CounterExtras, Error, MAX_BINARY_BUFFERED, MAX_LINE,
     MAX_TEXT_HELD, MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras,
     UDP_HEADER_LEN, UDP_MAX_DATAGRAM, UdpFrame,
 };
-use fictionet::stdlib::test_support::contract::{
-    check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value,
-};
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    check_decode_with_alloc_limit(Commands::new, data, 2 * MAX_LINE);
-    check_decode_with_alloc_limit(Responses::new, data, 2 * MAX_LINE);
-    check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_BINARY_BUFFERED);
-    check_decode_with_held_limit(Commands::new, data, MAX_TEXT_HELD);
-    check_decode_with_held_limit(Responses::new, data, MAX_TEXT_HELD);
-    check_decode_with_alloc_limit(|| Commands::with_limit(17), data, 2 * MAX_LINE);
-    check_decode_with_alloc_limit(|| Responses::with_limit(17), data, 2 * MAX_LINE);
-    check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(17),
-        data,
-        2 * (BINARY_HEADER_LEN + 17),
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Commands::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_LINE);
+                assert!(s.held() <= MAX_TEXT_HELD);
+            }
+        ),
+        decode_all(Commands::new, data),
     );
-    check_decode_with_held_limit(|| Commands::with_limit(17), data, MAX_TEXT_HELD);
-    check_decode_with_held_limit(|| Responses::with_limit(17), data, MAX_TEXT_HELD);
-    check_decode_with_held_limit(Frames::<Packet>::new, data, 0);
-    check_wire::<Command>(data);
-    check_wire::<Response>(data);
-    check_wire::<Packet>(data);
-    check_wire::<UdpFrame>(data);
-    check_wire::<StoreExtras>(data);
-    check_wire::<CounterExtras>(data);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Responses::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_LINE);
+                assert!(s.held() <= MAX_TEXT_HELD);
+            }
+        ),
+        decode_all(Responses::new, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::new()),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_BINARY_BUFFERED);
+                assert_eq!(s.held(), 0);
+            }
+        ),
+        decode_all(Frames::<Packet>::new, data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Commands::with_limit(17)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_LINE);
+                assert!(s.held() <= MAX_TEXT_HELD);
+            }
+        ),
+        decode_all(|| Commands::with_limit(17), data),
+    );
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Responses::with_limit(17)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * MAX_LINE);
+                assert!(s.held() <= MAX_TEXT_HELD);
+            }
+        ),
+        decode_all(|| Responses::with_limit(17), data),
+    );
+    let bound = 2 * (BINARY_HEADER_LEN + 17);
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Frames::<Packet>::with_limit(17)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= bound);
+            }
+        ),
+        decode_all(|| Frames::<Packet>::with_limit(17), data),
+    );
+    if let Ok(value) = <Command as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Response as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <UdpFrame as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <StoreExtras as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <CounterExtras as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
 
     for command in decode_all(Commands::new, data).0.iter().flatten() {
-        check_wire_value(command);
+        let _ = assert_write(command);
         let bytes = command.to_bytes().unwrap();
         assert_eq!(
             decode_all(Commands::new, &bytes),
@@ -47,7 +109,7 @@ fuzz_target!(|data: &[u8]| {
         );
     }
     for response in decode_all(Responses::new, data).0.iter().flatten() {
-        check_wire_value(response);
+        let _ = assert_write(response);
         let bytes = response.to_bytes().unwrap();
         assert_eq!(
             decode_all(Responses::new, &bytes),
@@ -63,45 +125,49 @@ fuzz_target!(|data: &[u8]| {
         .filter_map(|w| Some(MetaFlag::new(*w.first()?, &w[1..])))
         .collect();
     let first = words.first().cloned().unwrap_or_default();
-    check_wire_value(&Command::Get {
+    let _ = assert_write(&Command::Get {
         keys: words.clone(),
         cas: data.len() % 2 == 0,
     });
-    check_wire_value(&Command::Stats {
+    let _ = assert_write(&Command::Stats {
         args: words.clone(),
     });
-    check_wire_value(&Command::MetaGet {
+    let _ = assert_write(&Command::MetaGet {
         key: first.clone(),
         flags: flags.clone(),
     });
-    check_wire_value(&Command::MetaArithmetic {
+    let _ = assert_write(&Command::MetaArithmetic {
         key: first.clone(),
         flags: flags.clone(),
     });
-    check_wire_value(&Command::MetaSet {
+    let _ = assert_write(&Command::MetaSet {
         key: first.clone(),
         flags: flags.clone(),
         data: data.to_vec(),
     });
-    check_wire_value(&Response::ServerError(data.to_vec()));
-    check_wire_value(&Response::Stat {
+    let _ = assert_write(&Response::ServerError(data.to_vec()));
+    let _ = assert_write(&Response::Stat {
         name: first.clone(),
         value: data.to_vec(),
     });
-    check_wire_value(&Response::Meta {
+    let _ = assert_write(&Response::Meta {
         status: MetaStatus::Header,
         flags,
     });
 
     for packet in decode_all(Frames::<Packet>::new, data).0 {
-        check_wire_value(&packet);
+        let _ = assert_write(&packet);
         assert_eq!(
             Packet::parse(&packet.to_bytes().unwrap()),
             Ok(packet.clone())
         );
         assert_eq!(Status::from_code(packet.status).code(), packet.status);
-        check_wire::<StoreExtras>(&packet.extras);
-        check_wire::<CounterExtras>(&packet.extras);
+        if let Ok(value) = <StoreExtras as Wire>::parse(&packet.extras) {
+            let _ = assert_write(&value);
+        }
+        if let Ok(value) = <CounterExtras as Wire>::parse(&packet.extras) {
+            let _ = assert_write(&value);
+        }
     }
 
     // Any bytes as one UDP datagram.

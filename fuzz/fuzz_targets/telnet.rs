@@ -1,8 +1,9 @@
 //! Telnet events, option negotiation, and strict wire values.
 #![no_main]
 
+use fictionet::stdlib::codec::Stream;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{assert_write, chunks, decode_chunks};
 
 use fictionet::stdlib::protocols::telnet::harness::merged;
 use fictionet::stdlib::protocols::telnet::{
@@ -44,7 +45,7 @@ impl Decode for Session {
         if let Step::Item(Event::Negotiation { verb, option }, _) = &step {
             let reaction = self.options.receive(*verb, *option);
             if let Some(reply) = reaction.send {
-                contract::check_wire_value(&reply);
+                let _ = assert_write(&reply);
             }
             if let Some(change) = reaction.change
                 && change.side == Side::Remote
@@ -122,9 +123,15 @@ fn check_control_scanner(data: &[u8], chunk: usize) {
 fuzz_target!(|data: &[u8]| {
     check_control_scanner(data, 1);
     check_control_scanner(data, telnet::MAX_EVENT_WIRE);
-    contract::check_wire::<Event>(data);
-    contract::check_wire::<BinaryEvent>(data);
-    contract::check_wire::<Subnegotiation>(data);
+    if let Ok(value) = <Event as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <BinaryEvent as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <Subnegotiation as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     for binary in [false, true] {
         for limit in [1, telnet::MAX_DATA] {
             let make = || {
@@ -132,8 +139,13 @@ fuzz_target!(|data: &[u8]| {
                 events.set_binary(binary);
                 events
             };
-            contract::check_decode_with_alloc_limit(make, data, 2 * telnet::MAX_EVENT_WIRE);
-            contract::check_decode_with_held_limit(make, data, 0);
+            assert_eq!(
+                decode_chunks(&mut Stream::new(make()), chunks(data, &[1, 7, 64]), |s| {
+                    assert!(s.allocated() <= 2 * telnet::MAX_EVENT_WIRE);
+                    assert_eq!(s.held(), 0);
+                }),
+                decode_all(make, data),
+            );
             let (events, _) = decode_all(make, data);
             let kept: Vec<_> = events
                 .into_iter()
@@ -143,17 +155,17 @@ fuzz_target!(|data: &[u8]| {
             for event in &kept {
                 if binary {
                     let event = BinaryEvent(event.clone());
-                    contract::check_wire_value(&event);
+                    let _ = assert_write(&event);
                     event.write(&mut written).unwrap();
                 } else {
-                    contract::check_wire_value(event);
+                    let _ = assert_write(event);
                     event.write(&mut written).unwrap();
                 }
                 if let Event::Subnegotiation { option, data } = event
                     && let Ok(sub) = Subnegotiation::parse_data(*option, data)
                 {
                     assert_eq!(sub.to_event().unwrap(), *event);
-                    contract::check_wire_value(&sub);
+                    let _ = assert_write(&sub);
                 }
             }
             let (back, failure) = decode_all(make, &written);
@@ -162,26 +174,31 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     let mode = data.first().copied().unwrap_or_default();
-    contract::check_decode_with_alloc_limit(
-        || Session::new(mode & 2 != 0, mode & 4 != 0),
-        data,
-        2 * telnet::MAX_EVENT_WIRE,
+    assert_eq!(
+        decode_chunks(
+            &mut Stream::new(Session::new(mode & 2 != 0, mode & 4 != 0)),
+            chunks(data, &[1, 7, 64]),
+            |s| {
+                assert!(s.allocated() <= 2 * telnet::MAX_EVENT_WIRE);
+            }
+        ),
+        decode_all(|| Session::new(mode & 2 != 0, mode & 4 != 0), data),
     );
     let event = Event::Data(data.iter().take(telnet::MAX_DATA + 1).copied().collect());
-    contract::check_wire_value(&event);
-    contract::check_wire_value(&BinaryEvent(event));
+    let _ = assert_write(&event);
+    let _ = assert_write(&BinaryEvent(event));
     let payload: Vec<_> = data
         .iter()
         .take(telnet::MAX_SUBNEGOTIATION + 1)
         .copied()
         .collect();
-    contract::check_wire_value(&Event::Subnegotiation {
+    let _ = assert_write(&Event::Subnegotiation {
         option: mode,
         data: payload.clone(),
     });
     for option in 0..=255u8 {
         if let Ok(sub) = Subnegotiation::parse_data(option, data) {
-            contract::check_wire_value(&sub);
+            let _ = assert_write(&sub);
             assert_eq!(
                 sub.to_event().unwrap(),
                 Event::Subnegotiation {
@@ -190,15 +207,15 @@ fuzz_target!(|data: &[u8]| {
                 }
             );
         }
-        contract::check_wire_value(&Subnegotiation::Other {
+        let _ = assert_write(&Subnegotiation::Other {
             option,
             data: payload.clone(),
         });
     }
-    contract::check_wire_value(&Subnegotiation::TerminalTypeIs(
+    let _ = assert_write(&Subnegotiation::TerminalTypeIs(
         String::from_utf8_lossy(&payload).into_owned(),
     ));
-    contract::check_wire_value(&Event::Error(telnet::Error::Truncated));
+    let _ = assert_write(&Event::Error(telnet::Error::Truncated));
     let mut options = Negotiation::new();
     for option in 0..=255u8 {
         options.allow_local(option, option % 2 == 0);

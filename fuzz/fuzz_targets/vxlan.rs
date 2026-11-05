@@ -6,12 +6,16 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::vxlan::{
     Error, GpePacket, HEADER_LEN, MAX_DATAGRAM, MAX_PAYLOAD, MAX_VNI, Packet,
 };
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::assert_write;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Packet>(data);
-    contract::check_wire::<GpePacket>(data);
+    if let Ok(value) = <Packet as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
+    if let Ok(value) = <GpePacket as Wire>::parse(data) {
+        let _ = assert_write(&value);
+    }
     // The bytes as a VXLAN datagram. A packet read can be written, at the
     // same length, and reads back the same.
     if let Ok(p) = Packet::parse(data) {
@@ -75,7 +79,7 @@ fuzz_target!(|data: &[u8]| {
         vni,
         frame: payload.clone(),
     };
-    contract::check_wire_value(&p);
+    let _ = assert_write(&p);
     assert_eq!(p.to_bytes().is_ok(), vni <= MAX_VNI && len <= MAX_PAYLOAD);
     let g = GpePacket {
         vni,
@@ -84,7 +88,7 @@ fuzz_target!(|data: &[u8]| {
         oam: head[4] & 4 != 0,
         payload,
     };
-    contract::check_wire_value(&g);
+    let _ = assert_write(&g);
     assert_eq!(
         g.to_bytes().is_ok(),
         next_protocol != Some(0) && vni <= MAX_VNI && len <= MAX_PAYLOAD
