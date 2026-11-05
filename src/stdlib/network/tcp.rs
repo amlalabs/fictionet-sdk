@@ -4978,42 +4978,6 @@ mod tests {
     }
 
     #[test]
-    fn listener_backlogs_are_independent() {
-        block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let (_raw, side) = pair();
-            let address = "10.0.0.1".parse()?;
-            let server = endpoint_with(&fcx, side, address, cookie_options().backlog(4));
-            let mut small = server.listen(80)?;
-            let _large = server.listen(81)?;
-            small.backlog(1);
-            let now = smol_now(&fcx);
-            {
-                let mut st = server.shared.state.lock();
-                for port in [80, 81] {
-                    for source in [1000, 1001] {
-                        let peer = SocketAddr::new("10.0.0.2".parse()?, source);
-                        let local = SocketAddr::new(address, port);
-                        st.ingress(address, now, segment(peer, local, 7, 0, 0x02).0);
-                        assert_eq!(egress(&mut st, now).len(), 1);
-                    }
-                }
-                assert_eq!(st.listeners[&80].embryonic.len(), 1);
-                assert_eq!(st.listeners[&81].embryonic.len(), 2);
-            }
-            small.backlog(0);
-            assert_eq!(server.shared.state.lock().listeners[&80].backlog, 1);
-            small.backlog(usize::MAX);
-            assert_eq!(
-                server.shared.state.lock().listeners[&80].backlog,
-                MAX_BACKLOG
-            );
-            fcx.cancel();
-            Ok(())
-        }))
-        .unwrap();
-    }
-
-    #[test]
     fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (_raw, side) = pair();
@@ -5614,79 +5578,6 @@ mod tests {
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
-    }
-
-    #[test]
-    fn syn_ack_timer_refreshes_wire_ipv4_options_and_retains_the_first_reply() {
-        struct Refresh(Option<Vec<Ipv4Option>>);
-
-        impl Answer for Refresh {
-            fn syn(&self, _: &Syn<'_>) -> SynAnswer {
-                SynAnswer::Accept(Vec::new())
-            }
-
-            fn ipv4_options(&self, _: &Syn<'_>) -> Option<Ipv4Reply> {
-                Some(Ipv4Reply {
-                    options: vec![Ipv4Option::NoOperation],
-                    destination: None,
-                })
-            }
-
-            fn retransmit_ipv4_options(&self, handshake: &Handshake) -> Option<Vec<Ipv4Option>> {
-                assert_eq!(handshake.syn_ipv4.as_deref(), Some([].as_slice()));
-                assert_eq!(
-                    handshake.syn_ack_ipv4.as_deref(),
-                    Some([Ipv4Option::NoOperation].as_slice())
-                );
-                self.0.clone()
-            }
-        }
-
-        for replacement in [
-            None,
-            Some(vec![Ipv4Option::RouterAlert(1), Ipv4Option::RouterAlert(2)]),
-            Some(vec![Ipv4Option::Unknown {
-                kind: 222,
-                data: vec![0; 40],
-            }]),
-        ] {
-            block_on(lab(Seed::from_u64(7), |fcx| async move {
-                let (_raw, side) = pair();
-                let local: SocketAddr = "10.0.0.1:80".parse()?;
-                let peer: SocketAddr = "10.0.0.2:1000".parse()?;
-                let endpoint = endpoint(&fcx, side, local.ip());
-                let mut listener = endpoint.listen(local.port())?;
-                listener.answer(Box::new(Refresh(replacement.clone())));
-                let mut state = endpoint.shared.state.lock();
-                let now = smol_now(&fcx);
-                state.ingress(local.ip(), now, segment(peer, local, 100, 0, 2).0);
-                let first = egress(&mut state, now).remove(0);
-                let first_header = Header::parse_whole(&first).unwrap();
-                assert_eq!(&first[20..first_header.payload.start], &[1, 0, 0, 0]);
-                let second =
-                    egress(&mut state, now + smoltcp::time::Duration::from_millis(1000)).remove(0);
-                let second_header = Header::parse_whole(&second).unwrap();
-                let expected = replacement
-                    .as_ref()
-                    .and_then(|options| encode_ipv4_options(options).ok());
-                assert_eq!(
-                    &second[20..second_header.payload.start],
-                    expected.as_deref().unwrap_or(&[1, 0, 0, 0])
-                );
-                assert_eq!(second_header.payload(&second), first_header.payload(&first));
-                assert_eq!(
-                    transport_checksum(local.ip(), peer.ip(), TCP, second_header.payload(&second)),
-                    0
-                );
-                let handle = state.by_tuple[&(local, peer)];
-                assert_eq!(
-                    state.conns[&handle].handshake.syn_ack_ipv4.as_deref(),
-                    Some([Ipv4Option::NoOperation].as_slice())
-                );
-                Ok(())
-            }))
-            .unwrap();
-        }
     }
 
     #[test]

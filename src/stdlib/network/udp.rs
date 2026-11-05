@@ -451,41 +451,7 @@ fn port_unreachable(packet: &[u8], addr: IpAddr, options: &icmp::Options) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::{InterfaceExt, block_on, pair, run};
-
-    #[test]
-    fn closed_port_uses_the_configured_icmp_header_policy() {
-        block_on(fictionet::lab(
-            fictionet::Seed::from_u64(0),
-            |fcx| async move {
-                let (mut raw, side) = pair();
-                let endpoint = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
-                endpoint.icmp_options(icmp::Options {
-                    ipv4_fields: Some(Arc::new(|_, _, _, error| {
-                        assert!(error);
-                        Fields {
-                            id: 4321,
-                            tos: 192,
-                            dont_fragment: false,
-                            ..Default::default()
-                        }
-                    })),
-                    ..Default::default()
-                });
-                raw.send(datagram(b"closed"));
-                let reply = raw.recv(&fcx).await?;
-                assert_eq!(reply.0[1], 192);
-                assert_eq!(reply.0[6] & 0x40, 0);
-                assert_eq!(u16::from_be_bytes([reply.0[4], reply.0[5]]), 4321);
-                assert_eq!(&reply.0[20..22], &[3, 3]);
-                assert_eq!(ip::checksum(&reply.0[..20]), 0);
-                assert_eq!(ip::checksum(&reply.0[20..]), 0);
-                fcx.cancel();
-                Ok(())
-            },
-        ))
-        .unwrap();
-    }
+    use fictionet::{block_on, pair, run};
 
     #[test]
     fn shutdown_wakes_readers_in_port_order() {

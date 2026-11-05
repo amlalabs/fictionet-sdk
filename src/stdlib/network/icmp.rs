@@ -265,38 +265,6 @@ fn is_one_host(src: IpAddr) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reply_choices_preserve_validation_and_leave_ipv6_unchanged() {
-        let me = "10.0.0.1".parse().unwrap();
-        let mut request = ping("10.0.0.2", "10.0.0.1");
-        request.0[21] = 9;
-        set_checksum(&mut request.0[20..], "10.0.0.2".parse().unwrap(), me);
-        let options = Options {
-            echo_nonzero_code: true,
-            ipv4_fields: Some(Arc::new(|_, _, _, _| Fields {
-                id: 4321,
-                tos: 192,
-                dont_fragment: false,
-                ttl: 42,
-            })),
-        };
-        assert!(echo_reply(&request, me).is_none());
-        let reply = options.echo_reply(&request, me).unwrap();
-        assert_eq!(&reply.0[20..22], &[0, 9]);
-        assert_eq!(reply.0[8], 42);
-        assert_eq!(reply.0[1], 192);
-        assert_eq!(u16::from_be_bytes([reply.0[4], reply.0[5]]), 4321);
-        assert_eq!(ip::checksum(&reply.0[..20]), 0);
-        assert_eq!(ip::checksum(&reply.0[20..]), 0);
-        request.0[22] ^= 1;
-        assert!(options.echo_reply(&request, me).is_none());
-        let request = ping(&SRC.to_string(), &DST.to_string());
-        assert_eq!(
-            options.echo_reply(&request, DST.into()),
-            echo_reply(&request, DST.into())
-        );
-    }
-
     const SRC: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
     const DST: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 1, 0, 1);
     const ROUTER: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);

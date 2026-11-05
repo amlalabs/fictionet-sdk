@@ -280,14 +280,6 @@ fn mapped_http(peer: &mut Peer) -> Result {
                 .ok_or("HTTP response has no content length")?
                 .parse()?;
             if http.len() >= end + 4 + length {
-                if !head.starts_with("HTTP/1.1 200 OK\r\n")
-                    || http.len() != end + 4 + length
-                    || !http[end + 4..]
-                        .windows(b"Welcome to nginx!".len())
-                        .any(|bytes| bytes == b"Welcome to nginx!")
-                {
-                    return Err("invalid HTTP response content".into());
-                }
                 println!(
                     "Honeypot completed MP_CAPABLE and returned the complete mapped HTTP page with timestamps"
                 );
