@@ -1,9 +1,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Collect;
-use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
 use fictionet::stdlib::protocols::http1::{
-    Chunk, Header, Request, RequestEvents, RequestHead, Version,
+    Chunk, Header, Request, RequestError, RequestEvents, RequestHead, Version,
 };
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet_fuzz::http1::event_limits;
@@ -11,17 +11,36 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let limits = event_limits();
-    assert_eq!(
-        decode_chunks(
-            &mut Stream::new(RequestEvents::with_limits(limits)),
-            chunks(data, &[1, 7, 64]),
-            |s| {
-                assert_eq!(s.held(), 0);
-                assert!(s.allocated() <= 4096);
-            }
-        ),
-        decode_all(|| RequestEvents::with_limits(limits), data),
-    );
+    let mut stream = Stream::new(RequestEvents::with_limits(limits));
+    let fragmented = decode_chunks(&mut stream, chunks(data, &[1, 7, 64]), |s| {
+        assert_eq!(s.held(), 0);
+        assert!(s.allocated() <= 4096);
+    });
+    let whole = decode_all(|| RequestEvents::with_limits(limits), data);
+    assert_eq!(fragmented.0, whole.0);
+    match (fragmented.1, whole.1) {
+        (
+            Some(Fail::Protocol(RequestError::Rejected(fragmented))),
+            Some(Fail::Protocol(RequestError::Rejected(whole))),
+        ) => {
+            assert_eq!(
+                (
+                    &fragmented.error,
+                    &fragmented.head,
+                    fragmented.head_bytes,
+                    fragmented.framing
+                ),
+                (&whole.error, &whole.head, whole.head_bytes, whole.framing)
+            );
+            assert!(fragmented.received_body_bytes <= stream.buffered() - fragmented.head_bytes);
+            // The payload snapshot reflects the bytes present at rejection.
+            assert_eq!(
+                RequestEvents::with_limits(limits).decode(stream.unread(), stream.is_eof()),
+                Err(RequestError::Rejected(fragmented))
+            );
+        }
+        (fragmented, whole) => assert_eq!(fragmented, whole),
+    }
     assert_eq!(
         decode_chunks(
             &mut Stream::new(Collect::<Request>::new(4096)),

@@ -12,8 +12,8 @@
 //!
 //! [`RequestEvents`] reports a rejected parsed head through [`RequestError`],
 //! preserving the original fields and known body framing. Rejected requests
-//! never produce head or body events. [`RequestEvents::rejected_body_len`]
-//! counts buffered payload bytes through the same body framer, including
+//! never produce head or body events. [`RejectedRequest::received_body_bytes`]
+//! carries the buffered payload count from the same body framer, including
 //! partial bodies, so an endpoint can retain its body-limit rejection policy.
 //! Whole-message and `Wire` parsers report the underlying [`Error`].
 
@@ -398,6 +398,11 @@ pub struct RejectedRequest {
     pub head_bytes: usize,
     /// Body framing, or the reason its boundary cannot be trusted.
     pub framing: Result<Framing, Error>,
+    /// Payload bytes buffered when the head was rejected, including a partial
+    /// body block. Counting stops at the message boundary or malformed framing;
+    /// chunk metadata and pipelined requests are excluded. Zero when the body
+    /// framing cannot be trusted. This snapshot can differ with input chunking.
+    pub received_body_bytes: usize,
 }
 
 impl RequestError {
@@ -459,18 +464,9 @@ impl From<RequestError> for Error {
 pub struct RequestEvents {
     core: Reader,
     empty_lines: usize,
-    rejected_body_bytes: usize,
 }
 
 impl RequestEvents {
-    /// Payload bytes already buffered when a head was rejected. The ordinary
-    /// body framer counts these, including a partial body block, and stops at
-    /// the message boundary or malformed framing. Chunk metadata and later
-    /// pipelined requests are excluded. No rejected body is emitted as an event.
-    pub fn rejected_body_len(&self) -> usize {
-        self.rejected_body_bytes
-    }
-
     /// Number of body bytes at the start of an unread buffer of `buffered`
     /// bytes that has not yet filled a body event. Use after decoding stops
     /// to observe a partial body.
@@ -496,7 +492,6 @@ impl RequestEvents {
         Self {
             core: Reader::new(limits),
             empty_lines: 0,
-            rejected_body_bytes: 0,
         }
     }
 }
@@ -821,19 +816,19 @@ impl RequestEvents {
             Ok(info) => info,
             Err(error) => {
                 let framing = fields(&head.headers, head.version).and_then(request_framing);
-                self.rejected_body_bytes = 0;
+                let mut received_body_bytes = 0;
                 if let Ok(framing) = framing {
                     self.core.begin(framing, true);
                     let mut rest = &input[n..];
                     loop {
                         match self.core.body::<RequestHead>(rest, eof) {
                             Ok(Some(Step::Item(BorrowedEvent::Body(bytes), used))) => {
-                                self.rejected_body_bytes += bytes.len();
+                                received_body_bytes += bytes.len();
                                 rest = &rest[used..];
                             }
                             Ok(Some(Step::Skip(used))) => rest = &rest[used..],
                             _ => {
-                                self.rejected_body_bytes += self.pending_body_len(rest.len());
+                                received_body_bytes += self.pending_body_len(rest.len());
                                 break;
                             }
                         }
@@ -844,6 +839,7 @@ impl RequestEvents {
                     head,
                     head_bytes: n,
                     framing,
+                    received_body_bytes,
                 })));
             }
         };
@@ -2480,7 +2476,7 @@ mod tests {
                 );
                 assert_eq!(rejected.head_bytes, head.len());
                 assert_eq!(rejected.framing, Ok(framing));
-                assert_eq!(decoder.rejected_body_len(), received);
+                assert_eq!(rejected.received_body_bytes, received);
             }
         }
     }
@@ -2498,7 +2494,7 @@ mod tests {
             };
             assert_eq!(rejected.error, Error::Host);
             assert_eq!(rejected.framing, Err(Error::ConflictingContentLength));
-            assert_eq!(decoder.rejected_body_len(), 0);
+            assert_eq!(rejected.received_body_bytes, 0);
             assert_eq!(
                 rejected.head.headers.len(),
                 2 + host.matches("Host:").count()
@@ -4407,14 +4403,37 @@ mod tests {
                 CHUNKED.to_vec()
             };
             test_support::mutate(&mut rng, &mut bytes);
-            assert_eq!(
-                decode_chunks(
-                    &mut Stream::new(RequestEvents::with_limits(small())),
-                    chunks(&bytes, &[1, 7, 64]),
-                    |_| {}
-                ),
-                decode_all(|| RequestEvents::with_limits(small()), &bytes)
-            );
+            let mut stream = Stream::new(RequestEvents::with_limits(small()));
+            let fragmented = decode_chunks(&mut stream, chunks(&bytes, &[1, 7, 64]), |_| {});
+            let whole = decode_all(|| RequestEvents::with_limits(small()), &bytes);
+            assert_eq!(fragmented.0, whole.0);
+            match (fragmented.1, whole.1) {
+                (
+                    Some(Fail::Protocol(RequestError::Rejected(fragmented))),
+                    Some(Fail::Protocol(RequestError::Rejected(whole))),
+                ) => {
+                    assert_eq!(
+                        (
+                            &fragmented.error,
+                            &fragmented.head,
+                            fragmented.head_bytes,
+                            fragmented.framing
+                        ),
+                        (&whole.error, &whole.head, whole.head_bytes, whole.framing)
+                    );
+                    assert!(
+                        fragmented.received_body_bytes <= stream.buffered() - fragmented.head_bytes
+                    );
+                    // Replaying the bytes present at rejection preserves every
+                    // field, including the received payload snapshot.
+                    assert_eq!(
+                        RequestEvents::with_limits(small())
+                            .decode(stream.unread(), stream.is_eof()),
+                        Err(RequestError::Rejected(fragmented))
+                    );
+                }
+                (fragmented, whole) => assert_eq!(fragmented, whole),
+            }
             if let Ok(value) = Request::parse(&bytes) {
                 assert_write(&value).unwrap();
             }

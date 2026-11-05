@@ -400,7 +400,7 @@ impl serve::Service for Http1 {
                 .any(|h| h.name.eq_ignore_ascii_case("host"))
         {
             self.started = driver.now();
-            self.too_big = driver.peek_decoder().rejected_body_len() > self.opts.body;
+            self.too_big = rejected.received_body_bytes > self.opts.body;
             self.head = Some(rejected.head.clone());
             self.dispatch(driver, Body::empty(), true, 0);
             return Ok(());
