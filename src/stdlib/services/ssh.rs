@@ -282,6 +282,7 @@ pub struct Output {
     bytes: usize,
     exited: bool,
     disconnect: bool,
+    hangup: bool,
 }
 
 /// Output would exceed the queue bound or follow an exit or disconnect.
@@ -335,6 +336,13 @@ impl Output {
         self.disconnect = true;
         self.chunks.clear();
         self.bytes = 0;
+    }
+    /// Drain this channel's queued output, then silently close the connection.
+    /// Channel flow control and key exchange continue while output drains;
+    /// further application input and requests are ignored.
+    pub fn hangup(&mut self) {
+        self.exited = true;
+        self.hangup = true;
     }
     /// Remaining room for queued output bytes.
     pub fn available(&self) -> usize {
@@ -542,6 +550,15 @@ impl<H: Handler> Ssh<H> {
             );
         }
         self.flush(driver)?;
+        if self.channels.values().any(|channel| channel.output.hangup)
+            && self
+                .channels
+                .values()
+                .filter(|channel| channel.output.hangup)
+                .all(|channel| channel.output.chunks.is_empty())
+        {
+            return Ok(Flow::Close);
+        }
         if driver.peek_decoder().needs_rekey() && !driver.peek_decoder().is_rekeying() {
             let mut bytes = Vec::new();
             driver.decoder().rekey(&mut bytes)?;
@@ -1163,6 +1180,16 @@ impl<H: Handler> Service for Ssh<H> {
             let Some((sequence, payload)) = self.pending_packets.pop_front() else {
                 break;
             };
+            if self.channels.values().any(|channel| channel.output.hangup) {
+                match payload.first() {
+                    Some(93) => {
+                        self.connection_message(wire::Message::parse(&payload)?, driver)?;
+                    }
+                    Some(97) => return Ok(Flow::Close),
+                    _ => {}
+                }
+                continue;
+            }
             if self.user.is_none()
                 && (self.attempts >= self.config.max_attempts
                     || self.auth_requests >= MAX_AUTH_REQUESTS)
@@ -1289,5 +1316,32 @@ impl<H: Handler> Service for Ssh<H> {
                 .iter()
                 .map(|(_, bytes)| bytes.capacity())
                 .sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hangup_preserves_pending_output_and_refuses_more() {
+        let mut output = Output::default();
+        output.write(b"pending terminal echo").unwrap();
+        output.stderr(b"pending diagnostic").unwrap();
+        output.hangup();
+        assert!(output.write(b"late output").is_err());
+        assert!(output.stderr(b"late diagnostic").is_err());
+        output.exit(0);
+        assert!(!output.chunks.is_empty());
+        assert!(
+            output
+                .chunks
+                .iter()
+                .all(|chunk| matches!(chunk, Chunk::Data { .. }))
+        );
+
+        output.disconnect();
+        assert!(output.chunks.is_empty());
+        assert!(output.write(b"after disconnect").is_err());
     }
 }

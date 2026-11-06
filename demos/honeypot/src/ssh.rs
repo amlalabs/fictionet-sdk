@@ -159,7 +159,7 @@ impl ssh::Handler for Application {
         };
         match &request.program {
             ssh::Program::Exec(_) | ssh::Program::Subsystem(_) => {
-                output.disconnect();
+                output.hangup();
                 Some(Shell::new(user, request.pty.is_some()))
             }
             ssh::Program::Shell => {
@@ -177,8 +177,14 @@ impl ssh::Session for Shell {
         let mut echo = Vec::new();
         for &byte in bytes {
             match self.terminal.push(byte, &mut echo) {
+                Ok(Some(terminal::Event::Line(line))) if line.is_empty() => {
+                    put(output, &echo);
+                    echo.clear();
+                    self.prompt(output);
+                }
                 Ok(Some(terminal::Event::Line(_) | terminal::Event::End)) | Err(_) => {
-                    output.disconnect();
+                    put(output, &echo);
+                    output.hangup();
                     return;
                 }
                 Ok(Some(terminal::Event::Interrupt)) => {
@@ -198,9 +204,9 @@ impl ssh::Session for Shell {
         output: &mut ssh::Output,
     ) {
         match event {
-            ssh::SessionEvent::Eof => output.disconnect(),
+            ssh::SessionEvent::Eof => output.hangup(),
             ssh::SessionEvent::Signal(signal) if signal == "TERM" || signal == "KILL" => {
-                output.disconnect();
+                output.hangup();
             }
             ssh::SessionEvent::Signal(signal) if signal == "INT" => {
                 self.input(context, &[3], output);
@@ -246,7 +252,7 @@ impl Shell {
 
 fn put(output: &mut ssh::Output, bytes: &[u8]) {
     if output.write(bytes).is_err() {
-        output.disconnect();
+        output.hangup();
     }
 }
 
@@ -271,17 +277,42 @@ mod tests {
                 let mut shell = Shell::new("root".into(), pty);
                 let mut output = ssh::Output::default();
                 for fragment in [b"un".as_slice(), b"ame", b"\x7f", b"\x15", b"id"] {
+                    let available = output.available();
                     shell.input(&context, fragment, &mut output);
                     assert!(output.write(&[]).is_ok());
+                    assert_eq!(output.available() < available, pty);
                 }
                 shell.input(&context, ending, &mut output);
                 assert!(output.write(&[]).is_err());
             }
         }
-        for input in [vec![b'\n'], vec![4], vec![b'a'; 8193]] {
+        for input in [vec![4], vec![b'a'; 8193]] {
             let mut shell = Shell::new("root".into(), true);
             let mut output = ssh::Output::default();
             shell.input(&context, &input, &mut output);
+            assert!(output.write(&[]).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_and_erased_lines_allow_another_command() {
+        let connection = serve::ConnInfo::new(
+            1,
+            "127.0.0.1:22".parse().unwrap(),
+            "127.0.0.2:30000".parse().unwrap(),
+        );
+        let context = ssh::Context {
+            connection: &connection,
+            now: fictionet::time::Instant::ZERO,
+        };
+        for pty in [false, true] {
+            let mut shell = Shell::new("root".into(), pty);
+            let mut output = ssh::Output::default();
+            for fragment in [b"\r".as_slice(), b"\n", b"\n", b"id\x15\r", b"x\x7f\n"] {
+                shell.input(&context, fragment, &mut output);
+                assert!(output.write(&[]).is_ok());
+            }
+            shell.input(&context, b"id\r\n", &mut output);
             assert!(output.write(&[]).is_err());
         }
     }

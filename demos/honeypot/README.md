@@ -23,8 +23,8 @@ from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
 
 - **SSH** (`--ssh`, 22 by default): Ubuntu 24.04's OpenSSH 9.6 identification,
   encrypted authentication and a simulated bash prompt. Submitting the first
-  line disconnects the entire SSH connection before any command runs. Exec
-  and subsystem requests, including SFTP, disconnect immediately.
+  nonempty line disconnects the entire SSH connection before any command runs.
+  Exec and subsystem requests, including SFTP, disconnect immediately.
   `--ssh-auth accept` accepts any password or signed public key;
   `--ssh-auth reject` refuses credentials; `--ssh-auth password:VALUE` requires
   that password or a signed public key. The default is `accept`. `none` is
@@ -46,8 +46,9 @@ finite-field DH, CTR ciphers, UMAC or compression. The reference preferences
 and source citations live in `fictionet_extras::ssh::Profile`.
 
 The line editor supports echo, backspace, Control-C, Control-D and Control-U.
-Raw input and exec requests are logged before disconnecting. Empty lines,
-Control-D, EOF and overlong input also disconnect. There is no command
+Raw input and exec requests are logged before disconnecting. Terminal input
+is echoed before silently closing the connection. Empty lines show another
+prompt. Control-D, EOF and overlong input also disconnect. There is no command
 interpreter, SFTP filesystem or guest shell.
 
 The transport profile targets Ubuntu 24.04's Linux 6.8 kernel.
@@ -318,7 +319,7 @@ ssh -o 'ProxyCommand=./target/debug/xtask ssh-connect /tmp/honeypot.sock %h %p' 
 ```
 
 Use `-tt` for a terminal and `-i` for a key. An interactive session shows a
-prompt and hangs up on the first submitted line; `ssh ... id` and `sftp`
+prompt and hangs up on the first nonempty submitted line; `ssh ... id` and `sftp`
 hang up immediately. The connector joins the Unix relay, obtains a simulated
 DHCP lease, and carries its TCP packets through the world. Its stdout is only
 the SSH byte stream. Stop the world by its own process ID when finished.
