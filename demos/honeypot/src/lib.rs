@@ -37,7 +37,7 @@
 //! | [`config`] | The command line and the world's settings |
 //! | [`fictionet_extras::linux::mptcp`] | How the listener answers MP_CAPABLE and MP_JOIN |
 //! | [`services`] | HTTP once a connection is open |
-//! | [`ssh`] | SSH authentication, fake shell and read-only SFTP |
+//! | [`ssh`] | SSH authentication, fake prompt and command hangup |
 //! | [`observe`] | The packet log and the observations |
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

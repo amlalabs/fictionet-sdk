@@ -1,17 +1,13 @@
-//! A simulated Ubuntu shell and read-only SFTP directory over the SSH hook.
+//! A simulated bash prompt that disconnects before the first command runs.
 //! All replies are made from world data; client bytes never reach a process,
 //! a host file, a socket destination or an operating-system terminal.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use fictionet::stdlib::codec::{Frames, Stream, Wire};
-use fictionet::stdlib::protocols::{
-    sftp,
-    ssh::{
-        auth, connection,
-        transport::{HostKey, Transport},
-    },
+use fictionet::stdlib::protocols::ssh::{
+    auth, connection,
+    transport::{HostKey, Transport},
 };
 use fictionet::stdlib::services::{serve, ssh};
 use fictionet::sync::Mutex;
@@ -21,8 +17,6 @@ use fictionet_extras::ssh::{
 
 use crate::config::SshAuth;
 use crate::observe::Observer;
-
-const OS_RELEASE: &[u8] = b"PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION=\"24.04 LTS (Noble Numbat)\"\nID=ubuntu\nID_LIKE=debian\n";
 
 /// The application's authentication policy and simulated shell factory.
 pub struct Application {
@@ -75,7 +69,7 @@ pub fn server(
 }
 
 impl ssh::Handler for Application {
-    type Session = Session;
+    type Session = Shell;
     fn authenticate(
         &self,
         context: &ssh::Context<'_>,
@@ -151,7 +145,7 @@ impl ssh::Handler for Application {
         _: &ssh::Context<'_>,
         request: &ssh::SessionRequest,
         output: &mut ssh::Output,
-    ) -> Option<Session> {
+    ) -> Option<Shell> {
         let user: String = request
             .user
             .chars()
@@ -164,160 +158,58 @@ impl ssh::Handler for Application {
             user
         };
         match &request.program {
-            ssh::Program::Subsystem(name) if name == "sftp" => Some(Session::Sftp {
-                input: Stream::new(Frames::new()),
-                initialized: false,
-            }),
-            ssh::Program::Subsystem(_) => None,
-            ssh::Program::Exec(command) => {
-                let mut shell = Shell::new(user, request.pty.is_some());
-                let status = shell.command(command, output);
-                output.exit(status);
-                Some(Session::Shell(shell))
+            ssh::Program::Exec(_) | ssh::Program::Subsystem(_) => {
+                output.disconnect();
+                Some(Shell::new(user, request.pty.is_some()))
             }
             ssh::Program::Shell => {
                 let shell = Shell::new(user, request.pty.is_some());
                 put(output, self.profile.login_text(true, false));
                 shell.prompt(output);
-                Some(Session::Shell(shell))
+                Some(shell)
             }
         }
     }
 }
 
-/// A simulated program's running state.
-pub enum Session {
-    /// A bounded line editor and a small command vocabulary.
-    Shell(Shell),
-    /// SFTP framing for an empty, read-only home directory.
-    Sftp {
-        input: Stream<Frames<sftp::Packet>>,
-        initialized: bool,
-    },
-}
-
-impl ssh::Session for Session {
+impl ssh::Session for Shell {
     fn input(&mut self, _: &ssh::Context<'_>, bytes: &[u8], output: &mut ssh::Output) {
-        match self {
-            Session::Shell(shell) => {
-                let mut echo = Vec::new();
-                for &byte in bytes {
-                    let event = shell.terminal.push(byte, &mut echo);
-                    if !matches!(event, Ok(None)) {
-                        put(output, &echo);
-                        echo.clear();
-                    }
-                    match event {
-                        Ok(Some(terminal::Event::Line(line))) => {
-                            let status = shell.command(&line, output);
-                            if line == b"exit" || line == b"logout" {
-                                output.exit(status);
-                                return;
-                            }
-                            shell.prompt(output);
-                        }
-                        Ok(Some(terminal::Event::Interrupt)) => shell.prompt(output),
-                        Ok(Some(terminal::Event::End)) => {
-                            output.exit(0);
-                            return;
-                        }
-                        Err(_) => {
-                            put(output, b"bash: input line too long\r\n");
-                            output.exit(2);
-                            return;
-                        }
-                        Ok(None) => {}
-                    }
-                }
-                put(output, &echo);
-            }
-            Session::Sftp { input, initialized } => {
-                if input.push(bytes) != bytes.len() {
-                    output.exit(1);
+        let mut echo = Vec::new();
+        for &byte in bytes {
+            match self.terminal.push(byte, &mut echo) {
+                Ok(Some(terminal::Event::Line(_) | terminal::Event::End)) | Err(_) => {
+                    output.disconnect();
                     return;
                 }
-                while let Some(packet) = input.next() {
-                    let Ok(packet) = packet else {
-                        output.exit(1);
-                        return;
-                    };
-                    let Ok(request) = sftp::Request::from_packet(&packet) else {
-                        output.exit(1);
-                        return;
-                    };
-                    let response = match request {
-                        sftp::Request::Init { .. } if !*initialized => {
-                            *initialized = true;
-                            sftp::Response::Version {
-                                version: 3,
-                                extensions: Vec::new(),
-                            }
-                        }
-                        _ if !*initialized => {
-                            output.exit(1);
-                            return;
-                        }
-                        sftp::Request::Realpath { id, .. } => sftp::Response::Name {
-                            id,
-                            names: vec![sftp::NameEntry {
-                                filename: b"/home/ubuntu".to_vec(),
-                                longname: b"/home/ubuntu".to_vec(),
-                                attrs: sftp::Attrs::default(),
-                            }],
-                        },
-                        sftp::Request::Opendir { id, .. } => sftp::Response::Handle {
-                            id,
-                            handle: b"home".to_vec(),
-                        },
-                        sftp::Request::Readdir { id, .. } => {
-                            sftp::Response::status(id, sftp::Status::Eof, "End of directory")
-                        }
-                        sftp::Request::Close { id, .. } => {
-                            sftp::Response::status(id, sftp::Status::Ok, "")
-                        }
-                        other => {
-                            let Some(id) = other.id() else {
-                                output.exit(1);
-                                return;
-                            };
-                            sftp::Response::status(
-                                id,
-                                sftp::Status::PermissionDenied,
-                                "Permission denied",
-                            )
-                        }
-                    };
-                    match response.to_packet().and_then(|p| p.to_bytes()) {
-                        Ok(bytes) => put(output, &bytes),
-                        Err(_) => {
-                            output.exit(1);
-                            return;
-                        }
-                    }
+                Ok(Some(terminal::Event::Interrupt)) => {
+                    put(output, &echo);
+                    echo.clear();
+                    self.prompt(output);
                 }
+                Ok(None) => {}
             }
         }
+        put(output, &echo);
     }
-    fn event(&mut self, _: &ssh::Context<'_>, event: &ssh::SessionEvent, output: &mut ssh::Output) {
+    fn event(
+        &mut self,
+        context: &ssh::Context<'_>,
+        event: &ssh::SessionEvent,
+        output: &mut ssh::Output,
+    ) {
         match event {
-            ssh::SessionEvent::Eof => output.exit(0),
+            ssh::SessionEvent::Eof => output.disconnect(),
             ssh::SessionEvent::Signal(signal) if signal == "TERM" || signal == "KILL" => {
-                output.exit(128 + if signal == "TERM" { 15 } else { 9 })
+                output.disconnect();
             }
             ssh::SessionEvent::Signal(signal) if signal == "INT" => {
-                if let Session::Shell(shell) = self {
-                    put(output, b"^C\r\n");
-                    shell.prompt(output);
-                }
+                self.input(context, &[3], output);
             }
             _ => {}
         }
     }
     fn held(&self) -> usize {
-        match self {
-            Self::Shell(shell) => shell.user.capacity() + shell.terminal.held(),
-            Self::Sftp { input, .. } => input.held(),
-        }
+        self.user.capacity() + self.terminal.held()
     }
 }
 
@@ -350,48 +242,82 @@ impl Shell {
             );
         }
     }
-    fn command(&mut self, command: &[u8], output: &mut ssh::Output) -> u32 {
-        let Ok(command) = std::str::from_utf8(command) else {
-            put(output, b"bash: invalid command\n");
-            return 127;
-        };
-        let text = match command.trim() {
-            "" | "exit" | "logout" | "true" => String::new(),
-            "false" => return 1,
-            "whoami" => format!("{}\n", self.user),
-            "id" if self.user == "root" => "uid=0(root) gid=0(root) groups=0(root)\n".into(),
-            "id" => format!("uid=1000({0}) gid=1000({0}) groups=1000({0}),27(sudo)\n", self.user),
-            "pwd" => if self.user == "root" { "/root\n".into() } else { format!("/home/{}\n", self.user) },
-            "hostname" => "server\n".into(),
-            "uname" | "uname -s" => "Linux\n".into(),
-            "uname -r" => "6.8.0-31-generic\n".into(),
-            "uname -m" | "arch" => "x86_64\n".into(),
-            "uname -a" => "Linux server 6.8.0-31-generic #31-Ubuntu SMP PREEMPT_DYNAMIC Sat Apr 20 00:40:06 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux\n".into(),
-            "cat /etc/os-release" => String::from_utf8_lossy(OS_RELEASE).into_owned(),
-            "ls" | "ls -l" => String::new(),
-            "ls -la" => "total 20\ndrwxr-x--- 2 ubuntu ubuntu 4096 Apr 25 12:00 .\ndrwxr-xr-x 3 root   root   4096 Apr 25 12:00 ..\n-rw-r--r-- 1 ubuntu ubuntu  220 Mar 31  2024 .bash_logout\n-rw-r--r-- 1 ubuntu ubuntu 3771 Mar 31  2024 .bashrc\n-rw-r--r-- 1 ubuntu ubuntu  807 Mar 31  2024 .profile\n".into(),
-            "uptime" => " 12:04:19 up 3 days,  2:11,  1 user,  load average: 0.00, 0.01, 0.00\n".into(),
-            "ps" | "ps aux" => "  PID TTY          TIME CMD\n 1201 pts/0    00:00:00 bash\n 1240 pts/0    00:00:00 ps\n".into(),
-            "echo" => "\n".into(),
-            c if c.starts_with("echo ") => format!("{}\n", &c[5..]),
-            c => {
-                let name: String = c.split_whitespace().next().unwrap_or("").chars().filter(|c| !c.is_control()).take(128).collect();
-                let message = format!("bash: {name}: command not found\n");
-                if output.stderr(message.as_bytes()).is_err() { output.exit(1); }
-                return 127;
-            }
-        };
-        if self.pty {
-            put(output, text.replace('\n', "\r\n").as_bytes());
-        } else {
-            put(output, text.as_bytes());
-        }
-        0
-    }
 }
 
 fn put(output: &mut ssh::Output, bytes: &[u8]) {
     if output.write(bytes).is_err() {
-        output.exit(1);
+        output.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssh::{Handler, Session};
+
+    #[test]
+    fn shell_accepts_editing_but_closes_on_submission() {
+        let connection = serve::ConnInfo::new(
+            1,
+            "127.0.0.1:22".parse().unwrap(),
+            "127.0.0.2:30000".parse().unwrap(),
+        );
+        let context = ssh::Context {
+            connection: &connection,
+            now: fictionet::time::Instant::ZERO,
+        };
+        for pty in [false, true] {
+            for ending in [b"\r".as_slice(), b"\n", b"\r\n", b"\x04"] {
+                let mut shell = Shell::new("root".into(), pty);
+                let mut output = ssh::Output::default();
+                for fragment in [b"un".as_slice(), b"ame", b"\x7f", b"\x15", b"id"] {
+                    shell.input(&context, fragment, &mut output);
+                    assert!(output.write(&[]).is_ok());
+                }
+                shell.input(&context, ending, &mut output);
+                assert!(output.write(&[]).is_err());
+            }
+        }
+        for input in [vec![b'\n'], vec![4], vec![b'a'; 8193]] {
+            let mut shell = Shell::new("root".into(), true);
+            let mut output = ssh::Output::default();
+            shell.input(&context, &input, &mut output);
+            assert!(output.write(&[]).is_err());
+        }
+    }
+
+    #[test]
+    fn exec_and_subsystems_close_immediately() {
+        let application = Application {
+            policy: SshAuth::AnyCredentials,
+            profile: Profile::ubuntu_24_04(),
+            delay_secret: 0,
+        };
+        let connection = serve::ConnInfo::new(
+            1,
+            "127.0.0.1:22".parse().unwrap(),
+            "127.0.0.2:30000".parse().unwrap(),
+        );
+        let context = ssh::Context {
+            connection: &connection,
+            now: fictionet::time::Instant::ZERO,
+        };
+        for program in [
+            ssh::Program::Exec(b"id; uname -a".to_vec()),
+            ssh::Program::Exec(vec![0, 255]),
+            ssh::Program::Subsystem("sftp".into()),
+            ssh::Program::Subsystem("unknown".into()),
+        ] {
+            let mut output = ssh::Output::default();
+            let request = ssh::SessionRequest {
+                user: "root".into(),
+                channel: 0,
+                program,
+                pty: None,
+                environment: Vec::new(),
+            };
+            assert!(application.open(&context, &request, &mut output).is_some());
+            assert!(output.write(&[]).is_err());
+        }
     }
 }

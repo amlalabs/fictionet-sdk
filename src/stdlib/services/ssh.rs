@@ -2,7 +2,8 @@
 //!
 //! [`Handler`] chooses authentication and starts sessions. [`Session`] consumes
 //! input bytes and terminal events; [`Output`] queues stdout, stderr and exit
-//! status under a fixed bound. Channel windows apply when the queue is sent.
+//! status under a fixed bound, or disconnects the entire connection. Channel
+//! windows apply when the queue is sent.
 //! The world supplies identity, authentication policy and application behavior.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -274,15 +275,16 @@ enum Chunk {
     Exit(u32),
 }
 
-/// Bounded stdout, stderr and exit-status output for a session byte stream.
+/// Bounded session output and connection-wide disconnect requests.
 #[derive(Default, Debug)]
 pub struct Output {
     chunks: VecDeque<Chunk>,
     bytes: usize,
     exited: bool,
+    disconnect: bool,
 }
 
-/// Output would exceed the queue bound or follow an exit status.
+/// Output would exceed the queue bound or follow an exit or disconnect.
 #[derive(Clone, Copy, Debug)]
 pub struct OutputFull;
 impl std::fmt::Display for OutputFull {
@@ -325,6 +327,14 @@ impl Output {
             self.exited = true;
             self.chunks.push_back(Chunk::Exit(status));
         }
+    }
+    /// Disconnect the whole SSH connection, discarding queued channel output.
+    /// This takes precedence over channel flow control and pending requests.
+    pub fn disconnect(&mut self) {
+        self.exited = true;
+        self.disconnect = true;
+        self.chunks.clear();
+        self.bytes = 0;
     }
     /// Remaining room for queued output bytes.
     pub fn available(&self) -> usize {
@@ -518,6 +528,17 @@ impl<H: Handler> Ssh<H> {
                 driver,
                 ssh::DisconnectReason::NoMoreAuthMethodsAvailable,
                 "Too many authentication failures",
+            );
+        }
+        if self
+            .channels
+            .values()
+            .any(|channel| channel.output.disconnect)
+        {
+            return disconnect(
+                driver,
+                ssh::DisconnectReason::ByApplication,
+                "Connection closed by application",
             );
         }
         self.flush(driver)?;
@@ -1133,7 +1154,12 @@ impl<H: Handler> Service for Ssh<H> {
             }
             self.failure_ready = false;
         }
-        while !driver.peek_decoder().is_rekeying() {
+        while !driver.peek_decoder().is_rekeying()
+            && !self
+                .channels
+                .values()
+                .any(|channel| channel.output.disconnect)
+        {
             let Some((sequence, payload)) = self.pending_packets.pop_front() else {
                 break;
             };

@@ -22,9 +22,10 @@ none. The internet comes in by one attachment that carries both families,
 from `0.0.0.0/0` and `::/0` unless `--internet` narrows one of them.
 
 - **SSH** (`--ssh`, 22 by default): Ubuntu 24.04's OpenSSH 9.6 identification,
-  encrypted authentication, interactive shells, exec requests and a small
-  read-only SFTP directory. Shell commands return simulated Ubuntu data and
-  never execute. `--ssh-auth accept` accepts any password or signed public key;
+  encrypted authentication and a simulated bash prompt. Submitting the first
+  line disconnects the entire SSH connection before any command runs. Exec
+  and subsystem requests, including SFTP, disconnect immediately.
+  `--ssh-auth accept` accepts any password or signed public key;
   `--ssh-auth reject` refuses credentials; `--ssh-auth password:VALUE` requires
   that password or a signed public key. The default is `accept`. `none` is
   always refused. Authentication has a 120-second deadline and six-failure
@@ -45,9 +46,9 @@ finite-field DH, CTR ciphers, UMAC or compression. The reference preferences
 and source citations live in `fictionet_extras::ssh::Profile`.
 
 The line editor supports echo, backspace, Control-C, Control-D and Control-U.
-Shell and exec recognize `id`, `whoami`, `pwd`, `hostname`, `uname`,
-`cat /etc/os-release`, `ls`, `uptime`, `ps` and `echo`. Unsupported commands
-return an error. The SFTP subsystem presents an empty read-only home directory.
+Raw input and exec requests are logged before disconnecting. Empty lines,
+Control-D, EOF and overlong input also disconnect. There is no command
+interpreter, SFTP filesystem or guest shell.
 
 The transport profile targets Ubuntu 24.04's Linux 6.8 kernel.
 Listener backlogs match Ubuntu 24.04: 4,096 for systemd's `ssh.socket`
@@ -316,8 +317,9 @@ In another terminal, connect without configuring any host network interface:
 ssh -o 'ProxyCommand=./target/debug/xtask ssh-connect /tmp/honeypot.sock %h %p' ubuntu@203.0.113.10
 ```
 
-The same ProxyCommand works with `sftp`, `ssh ... id`, `-tt` for a terminal,
-and `-i` for a key. The connector joins the Unix relay, obtains a simulated
+Use `-tt` for a terminal and `-i` for a key. An interactive session shows a
+prompt and hangs up on the first submitted line; `ssh ... id` and `sftp`
+hang up immediately. The connector joins the Unix relay, obtains a simulated
 DHCP lease, and carries its TCP packets through the world. Its stdout is only
 the SSH byte stream. Stop the world by its own process ID when finished.
 
