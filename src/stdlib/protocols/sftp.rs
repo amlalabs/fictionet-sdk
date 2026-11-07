@@ -1,13 +1,10 @@
 //! SFTP version 3: reading and writing packets, requests and responses,
 //! with no I/O.
 //!
-//! A real client such as OpenSSH's sftp stops at SSH key exchange before it
-//! can send SFTP requests, unless the world supplies an SSH transport and
-//! channel from elsewhere.
-//!
 //! `Packet` implements `Wire` and supports `codec::Frames<Packet>`. Request and
-//! response helpers interpret its payload. There is no file-transfer session,
-//! filesystem `Service`, SSH channel implementation, or encrypted transport.
+//! response helpers interpret its payload. This module provides no file-transfer
+//! session or filesystem policy; [`services::ssh`](crate::stdlib::services::ssh)
+//! supplies encrypted transport, authentication and channels.
 //!
 //! SFTP is how most file transfers over SSH happen. The client opens an
 //! SSH channel, asks for the `sftp` subsystem, and then sends requests
@@ -16,12 +13,13 @@
 //! draft-ietf-secsh-filexfer-02, which describes version 3, the version
 //! OpenSSH and almost every other implementation speak.
 //!
-//! The stdlib provides no SSH channel; a world with an external SSH
-//! transport passes bytes from its channel
-//! to [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets
-//! [`Packet`]s back, reads each one's [`Request`], and writes the bytes of
-//! a [`Response`] back to the channel. Which files exist, what they hold
-//! and who may touch them is up to world code.
+//! A world can accept [`Program::Subsystem`](crate::stdlib::services::ssh::Program::Subsystem)
+//! with the name [`SUBSYSTEM`] in its [`Handler::open`](crate::stdlib::services::ssh::Handler::open).
+//! Its [`Session`](crate::stdlib::services::ssh::Session) passes input bytes to
+//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), reads
+//! each decoded [`Packet`]'s [`Request`], and queues encoded [`Response`] bytes
+//! through [`Output`](crate::stdlib::services::ssh::Output). Which files exist,
+//! what they hold and who may touch them is up to world code.
 //!
 //! Each field has a limit (see [`MAX_PATH`], [`MAX_DATA`] and the
 //! others), and readers and writers refuse fields over their limits.
