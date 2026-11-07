@@ -3,8 +3,8 @@
 This pass models the runtime of the SDK at `8ccf47fae`: task spawning and
 cancellation, wakers and their release order relative to locks, timers and the
 clock, regions and joins, and `block_on`. The models are TLA+ specifications in
-[verification/runtime/tla](verification/runtime/tla), checked with TLC through
-`cargo xtask runtime-verify tlc`. [verification/runtime/README.md](verification/runtime/README.md)
+[verification/runtime/tla](tla), checked with TLC through
+`cargo xtask runtime-verify tlc`. [verification/runtime/README.md](README.md)
 has the table of specs, their correspondence to the Rust, the bounds, and the
 ablations.
 
