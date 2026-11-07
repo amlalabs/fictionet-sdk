@@ -22,10 +22,15 @@ and timestamps. Its behavior differs from upstream in these fixes:
   A passive SYN-RECEIVED socket returns to LISTEN on an accepted reset.
 - Closing SYN-SENT sends nothing.
 
-Future personality hooks belong in `src/socket/tcp.rs` for negotiation,
-ISNs, windows, timestamps, hop limits, and resets; in `src/wire/tcp.rs` for
-option order and ECN flags; and in `src/wire/ipv4.rs` and `src/wire/ipv6.rs`
-for emitted IP fields. No personalities are implemented.
+Worlds configure transport behavior through
+[`tcp::Settings`](../src/stdlib/network/tcp.rs), which composes endpoint
+choices with this fork's [`socket::tcp::Settings`](src/socket/tcp.rs).
+The interface receives its initial sequence number function from Fictionet;
+socket settings control windows, option layout, acknowledgment policy,
+TIME-WAIT, and keep-alive probes. Socket methods supply timestamps, hop limits,
+IPv4 identification, and SYN options. `SegmentOptions` composes per-connection
+protocol extensions, including Multipath TCP, with the socket's own options
+and receive processing. Operating system presets belong above this crate.
 
 `managed` supports the SDK's borrowed and owned buffers. `byteorder` keeps
 packet field access concise. Test-only `rand` drives assembler tests.
