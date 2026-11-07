@@ -5,6 +5,7 @@ mod capture;
 mod dns_verify;
 mod image;
 mod mptcp_verify;
+mod port_zero_verify;
 mod rawnic;
 mod ssh_connect;
 mod web;
@@ -25,6 +26,9 @@ async fn main() -> Result {
     }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "port-zero-verify" {
+        return port_zero_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "ssh-connect" {
         return ssh_connect::run(&args.collect::<Vec<_>>()).await;

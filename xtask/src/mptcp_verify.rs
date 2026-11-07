@@ -43,14 +43,19 @@ pub fn run(args: &[String]) -> Result {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["tlc", filter @ ..] if filter.len() <= 2 => {
-            let report = tlc(&paths, filter.first().copied(), filter.get(1).copied())?;
+            let report = tlc(
+                &paths.tla,
+                &paths.out,
+                filter.first().copied(),
+                filter.get(1).copied(),
+            )?;
             report.print();
-            report.result()
+            report.result("mptcp-verify")
         }
         ["lean"] => {
             let report = lean(&paths)?;
             report.print();
-            report.result()
+            report.result("mptcp-verify")
         }
         ["vectors", seed @ ..] if seed.len() <= 1 => {
             let mut report = Report::new("vectors");
@@ -58,12 +63,12 @@ pub fn run(args: &[String]) -> Result {
                 report.absorb(vectors(&paths, seed)?);
             }
             report.print();
-            report.result()
+            report.result("mptcp-verify")
         }
         ["diff", seed @ ..] if seed.len() <= 1 => {
             let report = diff(&paths, &seeds_of(seed)?)?;
             report.print();
-            report.result()
+            report.result("mptcp-verify")
         }
         ["all"] => all(&paths),
         _ => Err(
@@ -99,20 +104,7 @@ struct Paths {
 
 impl Paths {
     fn new() -> Result<Paths> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or("xtask lives in the repository")?
-            .to_path_buf();
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .map(|dir| {
-                if dir.is_relative() {
-                    root.join(dir)
-                } else {
-                    dir
-                }
-            })
-            .unwrap_or_else(|| root.join("target"));
+        let (root, target) = repository()?;
         let verification = root.join("verification").join("mptcp");
         Ok(Paths {
             tla: verification.join("tla"),
@@ -123,8 +115,28 @@ impl Paths {
     }
 }
 
+/// The repository and Cargo's target directory (`CARGO_TARGET_DIR`, or
+/// `target/`).
+pub(crate) fn repository() -> Result<(PathBuf, PathBuf)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask lives in the repository")?
+        .to_path_buf();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|dir| {
+            if dir.is_relative() {
+                root.join(dir)
+            } else {
+                dir
+            }
+        })
+        .unwrap_or_else(|| root.join("target"));
+    Ok((root, target))
+}
+
 /// What one step found: a line per check, and whether every check passed.
-struct Report {
+pub(crate) struct Report {
     step: &'static str,
     lines: Vec<String>,
     failures: usize,
@@ -156,7 +168,7 @@ impl Report {
         }
     }
 
-    fn print(&self) {
+    pub(crate) fn print(&self) {
         for line in &self.lines {
             println!("{line}");
         }
@@ -170,11 +182,12 @@ impl Report {
         self.failures += other.failures;
     }
 
-    fn result(&self) -> Result {
+    /// Fails when a check did, naming the xtask `command` that ran the step.
+    pub(crate) fn result(&self, command: &str) -> Result {
         if self.failures == 0 {
             Ok(())
         } else {
-            Err(format!("mptcp-verify {}: {} failed", self.step, self.failures).into())
+            Err(format!("{command} {}: {} failed", self.step, self.failures).into())
         }
     }
 }
@@ -374,10 +387,10 @@ fn statistics(text: &str) -> String {
     }
 }
 
-/// Every config of `verification/mptcp/tla`, or those of `spec`, or the one
-/// config `config` names (as `Connection_base` or as `base`).
-fn configs(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Vec<Config>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&paths.tla)?
+/// Every config in `tla`, or those of `spec`, or the one config `config`
+/// names (as `Connection_base` or as `base`).
+fn configs(tla: &Path, spec: Option<&str>, config: Option<&str>) -> Result<Vec<Config>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(tla)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.extension().is_some_and(|e| e == "cfg"))
         .collect();
@@ -399,24 +412,32 @@ fn configs(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Ve
     Ok(chosen)
 }
 
-/// Passing configs check every property together in one complete exploration.
+/// TLC over the specs and configs in `tla`, writing under `out`. Passing
+/// configs check every property together in one complete exploration.
 /// Expected violations run separately and must name exactly the listed checks.
-fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report> {
+pub(crate) fn tlc(
+    tla: &Path,
+    out: &Path,
+    spec: Option<&str>,
+    config: Option<&str>,
+) -> Result<Report> {
     let jar = std::env::var_os("TLA2TOOLS").ok_or("TLA2TOOLS must name tla2tools.jar")?;
     let java = std::env::var_os("JAVA").unwrap_or_else(|| "java".into());
-    let out = paths.out.join("tlc");
+    let temp = out.join("temp");
+    std::fs::create_dir_all(&temp)?;
+    let out = out.join("tlc");
     // TLC looks for a config in the directory of its spec, so the specs
     // are copied next to the full passing configs and single-property ablations.
     let specs = out.join("specs");
     std::fs::create_dir_all(&specs)?;
-    for entry in std::fs::read_dir(&paths.tla)? {
+    for entry in std::fs::read_dir(tla)? {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "tla") {
             std::fs::copy(&path, specs.join(path.file_name().ok_or("a file name")?))?;
         }
     }
     let mut report = Report::new("tlc");
-    for config in configs(paths, spec, config)? {
+    for config in configs(tla, spec, config)? {
         let listed: BTreeSet<String> = config.checks.iter().map(|(p, _)| p.clone()).collect();
         if !config.expected.is_empty() && config.expected != listed {
             report.fail(format!(
@@ -458,10 +479,7 @@ fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report
             command
                 .arg("-XX:+UseParallelGC")
                 .arg("-Xmx6g")
-                .arg(format!(
-                    "-Djava.io.tmpdir={}",
-                    paths.out.join("temp").display()
-                ))
+                .arg(format!("-Djava.io.tmpdir={}", temp.display()))
                 .arg("-cp")
                 .arg(&jar)
                 .arg("tlc2.TLC")
@@ -673,7 +691,7 @@ type Step = fn(&Paths) -> Result<Report>;
 /// Every step, each run even when one before it failed, and the summary.
 fn all(paths: &Paths) -> Result {
     let steps: [(&'static str, Step); 3] = [
-        ("tlc", |paths| tlc(paths, None, None)),
+        ("tlc", |paths| tlc(&paths.tla, &paths.out, None, None)),
         ("lean", lean),
         ("diff", |paths| diff(paths, &SEEDS.collect::<Vec<_>>())),
     ];
