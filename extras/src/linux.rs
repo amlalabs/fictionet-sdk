@@ -314,7 +314,9 @@ pub fn retransmit_ipv4_options(
     None
 }
 
-/// TCP settings for a Linux server with the default Ethernet window.
+/// TCP settings for a Linux server with the default Ethernet window,
+/// including what a closed port and a SYN from source port 0 get
+/// ([`settings`]).
 pub fn tcp() -> tcp::Options {
     tcp::Options::default().settings(settings())
 }
@@ -406,6 +408,21 @@ pub fn settings() -> tcp::Settings {
         orphan_timeout: Duration::from_secs(60),
         reset_full_queue: false,
         ignore_malformed_options: true,
+        // Measured on Linux 7.2.6 (2026-11-07) over IPv4 and IPv6, on
+        // loopback and on a veth pair, 20 probes each: a SYN to a port with
+        // no socket, port 0 included, gets RST|ACK with sequence number 0,
+        // acknowledging the SYN, like any other closed port. A SYN from
+        // source port 0 to a listening port gets a SYN-ACK and the
+        // handshake completes, which the kernel code says and Luchs and
+        // Doerr (IFIP Networking 2019) contradict for Ubuntu. The server
+        // then closes the connection the moment it calls accept() with an
+        // address buffer, as nearly every server does: inet_getname()
+        // refuses a peer port of 0 (net/ipv4/af_inet.c, net/ipv6/af_inet6.c),
+        // do_accept() turns that into ECONNABORTED and releases the child
+        // (net/socket.c), and the release sends a FIN. So on the wire a
+        // Linux server answers SYN, SYN-ACK, ACK with a FIN|ACK.
+        closed_port: tcp::ClosedPort::Reset,
+        source_port_zero: tcp::SourcePortZero::CloseAfterHandshake,
     }
 }
 

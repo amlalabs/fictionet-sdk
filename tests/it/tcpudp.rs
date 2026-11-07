@@ -225,6 +225,189 @@ fn a_closed_port_refuses_at_once() {
     });
 }
 
+fn with_settings(
+    fcx: &Cx,
+    side: fictionet::End,
+    addr: IpAddr,
+    settings: tcp::Settings,
+) -> tcp::Endpoint {
+    tcp::endpoint_with(fcx, side, addr, tcp::Options::default().settings(settings))
+}
+
+#[test]
+fn a_syn_to_port_zero_gets_the_closed_port_reset() {
+    for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
+        world(Duration::from_secs(10), move |fcx| async move {
+            let (mut raw, cb) = pair();
+            let eb = tcp::endpoint(&fcx, cb, ip(b));
+            let _open = eb.listen(80)?;
+            // Port 0 has no listener, so it answers as any closed port does
+            // (RFC 9293 section 3.10.7.1): RST|ACK from port 0, with the
+            // sequence number 0 and acknowledging the SYN.
+            raw.send(tcp_segment(ip(a), 40000, ip(b), 0, 1000, 0, SYN, &[]));
+            let t = next_tcp(&fcx, &mut raw).await?;
+            assert_eq!(t[13] & (RST | ACK | SYN), RST | ACK);
+            assert_eq!(u16::from_be_bytes([t[0], t[1]]), 0);
+            assert_eq!(u16::from_be_bytes([t[2], t[3]]), 40000);
+            assert_eq!(seq_of(&t), 0);
+            assert_eq!(ack_of(&t), 1001);
+            // From port 0 to port 0, the same.
+            raw.send(tcp_segment(ip(a), 0, ip(b), 0, 7, 0, SYN, &[]));
+            let t = next_tcp(&fcx, &mut raw).await?;
+            assert_eq!(t[13] & (RST | ACK | SYN), RST | ACK);
+            assert_eq!(u16::from_be_bytes([t[2], t[3]]), 0);
+            assert_eq!(ack_of(&t), 8);
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn closed_ports_can_be_silent() {
+    for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
+        world(Duration::from_secs(10), move |fcx| async move {
+            let (mut raw, cb) = pair();
+            let settings = tcp::Settings {
+                closed_port: tcp::ClosedPort::Silent,
+                ..tcp::Settings::default()
+            };
+            let eb = with_settings(&fcx, cb, ip(b), settings);
+            let _open = eb.listen(80)?;
+            // A SYN to a closed port, to port 0 and from port 0 to port 0,
+            // and a bare ACK to a closed port: nothing comes back.
+            for (sport, dport, flags) in [
+                (40000, 22, SYN),
+                (40001, 0, SYN),
+                (0, 0, SYN),
+                (40002, 23, ACK),
+            ] {
+                raw.send(tcp_segment(ip(a), sport, ip(b), dport, 1000, 5, flags, &[]));
+            }
+            assert!(quiet(&fcx, &mut raw).await, "a closed port answered");
+            // The open port still answers.
+            raw.send(tcp_segment(ip(a), 40003, ip(b), 80, 1000, 0, SYN, &[]));
+            let t = next_tcp(&fcx, &mut raw).await?;
+            assert_eq!(t[13] & (SYN | ACK | RST), SYN | ACK);
+            assert_eq!(ack_of(&t), 1001);
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn a_syn_from_source_port_zero_makes_a_connection_by_default() {
+    for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
+        world(Duration::from_secs(10), move |fcx| async move {
+            let (mut raw, cb) = pair();
+            let eb = tcp::endpoint(&fcx, cb, ip(b));
+            let mut listener = eb.listen(80)?;
+            raw.send(tcp_segment(ip(a), 0, ip(b), 80, 1000, 0, SYN, &[]));
+            let t = next_tcp(&fcx, &mut raw).await?;
+            assert_eq!(t[13] & (SYN | ACK | RST), SYN | ACK);
+            assert_eq!(u16::from_be_bytes([t[2], t[3]]), 0, "to port 0");
+            assert_eq!(ack_of(&t), 1001);
+            let ack = seq_of(&t).wrapping_add(1);
+            raw.send(tcp_segment(ip(a), 0, ip(b), 80, 1001, ack, ACK, &[]));
+            // The listener gets a working connection whose peer is port 0.
+            let mut conn = listener.accept(&fcx).await?;
+            assert_eq!(conn.peer_addr(), SocketAddr::new(ip(a), 0));
+            conn.write_all(&fcx, b"hello").await?;
+            let t = next_tcp(&fcx, &mut raw).await?;
+            assert_eq!(u16::from_be_bytes([t[2], t[3]]), 0);
+            assert_eq!(&t[usize::from(t[12] >> 4) * 4..], b"hello");
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn a_syn_from_source_port_zero_can_be_dropped() {
+    for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
+        world(Duration::from_secs(10), move |fcx| async move {
+            let (mut raw, cb) = pair();
+            let settings = tcp::Settings {
+                source_port_zero: tcp::SourcePortZero::Drop,
+                ..tcp::Settings::default()
+            };
+            let eb = with_settings(&fcx, cb, ip(b), settings);
+            let _open = eb.listen(80)?;
+            // To the open port, to a closed one and to port 0: nothing,
+            // neither a SYN-ACK nor a RST.
+            for dport in [80, 22, 0] {
+                raw.send(tcp_segment(ip(a), 0, ip(b), dport, 1000, 0, SYN, &[]));
+            }
+            assert!(
+                quiet(&fcx, &mut raw).await,
+                "a SYN from port 0 was answered"
+            );
+            // From any other port the listener answers, and a closed port
+            // still resets.
+            raw.send(tcp_segment(ip(a), 1, ip(b), 80, 1000, 0, SYN, &[]));
+            let t = next_tcp(&fcx, &mut raw).await?;
+            assert_eq!(t[13] & (SYN | ACK | RST), SYN | ACK);
+            raw.send(tcp_segment(ip(a), 1, ip(b), 22, 1000, 0, SYN, &[]));
+            let t = next_tcp(&fcx, &mut raw).await?;
+            assert_eq!(t[13] & (RST | SYN), RST);
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn a_syn_from_source_port_zero_can_be_closed_after_the_handshake() {
+    for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
+        for data in [&b""[..], b"GET / HTTP/1.0\r\n\r\n"] {
+            world(Duration::from_secs(10), move |fcx| async move {
+                let (mut raw, cb) = pair();
+                let settings = tcp::Settings {
+                    source_port_zero: tcp::SourcePortZero::CloseAfterHandshake,
+                    ..tcp::Settings::default()
+                };
+                let eb = with_settings(&fcx, cb, ip(b), settings);
+                let mut listener = eb.listen(80)?;
+                raw.send(tcp_segment(ip(a), 0, ip(b), 80, 1000, 0, SYN, &[]));
+                let t = next_tcp(&fcx, &mut raw).await?;
+                assert_eq!(t[13] & (SYN | ACK | RST), SYN | ACK, "the SYN is answered");
+                assert_eq!(ack_of(&t), 1001);
+                let server_seq = seq_of(&t).wrapping_add(1);
+                let flags = if data.is_empty() { ACK } else { ACK | PSH };
+                raw.send(tcp_segment(
+                    ip(a),
+                    0,
+                    ip(b),
+                    80,
+                    1001,
+                    server_seq,
+                    flags,
+                    data,
+                ));
+                let t = next_fin_or_rst(&fcx, &mut raw).await?;
+                if data.is_empty() {
+                    assert_eq!(t[13] & (FIN | ACK | RST), FIN | ACK, "closed with a FIN");
+                    assert_eq!(seq_of(&t), server_seq);
+                    assert_eq!(ack_of(&t), 1001);
+                } else {
+                    assert_eq!(t[13] & RST, RST, "bytes that would be lost get a RST");
+                }
+                // Nothing reached the listener.
+                {
+                    let mut accept = std::pin::pin!(listener.accept(&fcx));
+                    assert!(poll_fn(|cx| Poll::Ready(accept.as_mut().poll(cx).is_pending())).await);
+                }
+                // A SYN from any other port makes a connection as before.
+                raw.send(tcp_segment(ip(a), 45000, ip(b), 80, 3000, 0, SYN, &[]));
+                let t = next_tcp(&fcx, &mut raw).await?;
+                assert_eq!(t[13] & (SYN | ACK | RST), SYN | ACK);
+                let ack = seq_of(&t).wrapping_add(1);
+                raw.send(tcp_segment(ip(a), 45000, ip(b), 80, 3001, ack, ACK, &[]));
+                let conn = listener.accept(&fcx).await?;
+                assert_eq!(conn.peer_addr(), SocketAddr::new(ip(a), 45000));
+                Ok(())
+            });
+        }
+    }
+}
+
 #[test]
 fn icmp_fails_only_the_quoted_connect() {
     use fictionet::stdlib::network::{icmp, ip};
@@ -881,13 +1064,67 @@ fn udp_packet(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8]) -> 
 }
 
 fn tcp_syn(src: IpAddr, sport: u16, dst: IpAddr, dport: u16) -> Packet {
+    tcp_segment(src, sport, dst, dport, 1000, 0, SYN, &[])
+}
+
+const FIN: u8 = 0x01;
+const SYN: u8 = 0x02;
+const RST: u8 = 0x04;
+const PSH: u8 = 0x08;
+const ACK: u8 = 0x10;
+
+/// A TCP segment with no options, a full window and `data`.
+#[allow(clippy::too_many_arguments)]
+fn tcp_segment(
+    src: IpAddr,
+    sport: u16,
+    dst: IpAddr,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    data: &[u8],
+) -> Packet {
     let mut t = Vec::new();
     t.extend_from_slice(&sport.to_be_bytes());
     t.extend_from_slice(&dport.to_be_bytes());
-    t.extend_from_slice(&1000u32.to_be_bytes());
-    t.extend_from_slice(&0u32.to_be_bytes());
-    t.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+    t.extend_from_slice(&seq.to_be_bytes());
+    t.extend_from_slice(&ack.to_be_bytes());
+    t.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+    t.extend_from_slice(data);
     ip_packet(src, dst, 6, t, 16)
+}
+
+/// The next packet's TCP header and payload. The machines here send no IP
+/// options or extension headers.
+async fn next_tcp(fcx: &Cx, raw: &mut fictionet::End) -> Result<Vec<u8>, RecvError> {
+    let p = raw.recv(fcx).await?;
+    let header = if p.0[0] >> 4 == 4 { 20 } else { 40 };
+    Ok(p.0[header..].to_vec())
+}
+
+/// Reads segments until one ends the connection, with FIN or RST.
+async fn next_fin_or_rst(fcx: &Cx, raw: &mut fictionet::End) -> Result<Vec<u8>, RecvError> {
+    loop {
+        let t = next_tcp(fcx, raw).await?;
+        if t[13] & (FIN | RST) != 0 {
+            return Ok(t);
+        }
+    }
+}
+
+fn seq_of(t: &[u8]) -> u32 {
+    u32::from_be_bytes(t[4..8].try_into().unwrap())
+}
+
+fn ack_of(t: &[u8]) -> u32 {
+    u32::from_be_bytes(t[8..12].try_into().unwrap())
+}
+
+/// Whether nothing more comes out of `raw` once the world has nothing
+/// left to do.
+async fn quiet(fcx: &Cx, raw: &mut fictionet::End) -> bool {
+    fcx.idle().await.is_ok() && poll_fn(|cx| Poll::Ready(raw.poll_recv(fcx, cx).is_pending())).await
 }
 
 /// A connection handed to tokio code with `into_tokio`, served from tokio

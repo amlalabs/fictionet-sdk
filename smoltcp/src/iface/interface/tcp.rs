@@ -18,7 +18,9 @@ impl InterfaceInner {
                 return socket.process(self, &ip, &tcp, packet.options());
             }
         }
-        // A reset never answers another reset.
-        (tcp.control != TcpControl::Rst).then(|| crate::socket::tcp::Socket::rst_reply(&ip, &tcp))
+        // A reset never answers another reset, and a host set to answer
+        // nothing for a closed port answers nothing.
+        (self.reset_closed_ports && tcp.control != TcpControl::Rst)
+            .then(|| crate::socket::tcp::Socket::rst_reply(&ip, &tcp))
     }
 }

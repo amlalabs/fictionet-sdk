@@ -798,6 +798,39 @@ pub trait SynCookies: Send + Sync + std::fmt::Debug {
     fn validate(&self, input: &CookieInput<'_>, cookie: u32) -> Option<CookieState>;
 }
 
+/// What answers a segment for a port with no listener and no connection:
+/// [`Settings::closed_port`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClosedPort {
+    /// A RST, as RFC 9293 section 3.10.7.1 says of the CLOSED state. A
+    /// segment that is itself a RST gets nothing. The default.
+    #[default]
+    Reset,
+    /// Nothing. The segment is dropped, as a host behind a firewall that
+    /// drops rather than rejects looks from outside.
+    Silent,
+}
+
+/// What a SYN from source port 0 gets: [`Settings::source_port_zero`].
+/// Port 0 is reserved (RFC 6335), but TCP itself gives it no meaning, so
+/// stacks differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourcePortZero {
+    /// The same as a SYN from any other port: it is matched against the
+    /// listeners, and a connection it makes goes to `accept`. The default.
+    #[default]
+    Accept,
+    /// Nothing. The SYN is dropped before any listener is looked for, so
+    /// neither a SYN-ACK nor a RST goes back.
+    Drop,
+    /// The handshake runs to the end, and the connection is then closed as
+    /// an application that found no usable peer address would close it:
+    /// with a FIN, or a RST if the last ACK carried data. It never reaches
+    /// `accept`. A SYN for a port with no listener still gets what
+    /// [`Settings::closed_port`] says.
+    CloseAfterHandshake,
+}
+
 /// Transport choices for an endpoint. Core defaults use the buffer window,
 /// compact options, and a four minute TIME-WAIT (RFC 9293).
 #[derive(Clone, Copy, Debug)]
@@ -832,6 +865,11 @@ pub struct Settings {
     /// Accept the valid prefix of a malformed option list. Otherwise, answer
     /// illegal option lengths with a reset, as suggested by RFC 9293 section 3.1.
     pub ignore_malformed_options: bool,
+    /// What answers a segment for a port with no listener and no
+    /// connection. Default a RST.
+    pub closed_port: ClosedPort,
+    /// What a SYN from source port 0 gets. Default the same as any other.
+    pub source_port_zero: SourcePortZero,
 }
 
 /// Derives a timestamp offset from an endpoint secret and its local and
@@ -854,6 +892,8 @@ impl Default for Settings {
             orphan_timeout: TIMEOUT,
             reset_full_queue: false,
             ignore_malformed_options: false,
+            closed_port: ClosedPort::Reset,
+            source_port_zero: SourcePortZero::Accept,
         }
     }
 }
@@ -868,7 +908,9 @@ pub use smoltcp::wire::{OptionLayout, OptionOrder};
 /// Starts a background task and returns immediately with an [`Endpoint`].
 /// The task takes TCP packets sent to `addr` and drops the rest. A
 /// connection attempt to a port with no listener gets a RST, because that
-/// is part of TCP's job. Everything it sends goes into `inner`.
+/// is part of TCP's job; [`Settings::closed_port`] can make it silent
+/// instead, and [`Settings::source_port_zero`] says what a SYN from port 0
+/// gets. Everything it sends goes into `inner`.
 ///
 /// The task stops when the caller's [region](fictionet::Cx#regions) is
 /// cancelled or `inner` closes. The endpoint's listeners and connections
@@ -1059,6 +1101,7 @@ pub fn prepare_endpoint(
     };
     let mut iface = Iface::new(config, &mut dev, smol_now(fcx));
     iface.set_ignore_malformed_options(options.settings.ignore_malformed_options);
+    iface.set_reset_closed_ports(options.settings.closed_port == ClosedPort::Reset);
     let shared = Arc::new(Shared {
         addr,
         state: Mutex::new(State {
@@ -1895,6 +1938,12 @@ impl State {
         let congestion = ip_ecn == 3;
         let ecn = flags & 0xc0 == 0xc0 && (self.settings.ecn_syn)(ip_ecn, t[12] & 15);
         let (syn, rst, ack) = (flags & 6 == 2, flags & 4 != 0, flags & 16 != 0);
+        // A SYN from source port 0 that the settings drop goes before any
+        // listener is looked for: nothing is sent and nothing is counted.
+        if syn && !ack && src.port() == 0 && self.settings.source_port_zero == SourcePortZero::Drop
+        {
+            return false;
+        }
         if syn
             && !ack
             && !self.by_tuple.contains_key(&(dst, src))
@@ -2327,6 +2376,16 @@ impl State {
                     let s = self.sockets.get_mut(self.handles[&h]);
                     s.set_segment_options(Box::new(SegmentsOnWire(segments)));
                     s.process_handshake_data(handshake.irs.wrapping_add(1), &options);
+                }
+                if arrived.from.port() == 0
+                    && self.settings.source_port_zero == SourcePortZero::CloseAfterHandshake
+                {
+                    // Closed as an application that gets no usable peer
+                    // address closes it the moment it is accepted: the
+                    // listener never sees it.
+                    l.left(arrived.from.ip());
+                    self.orphan(h, false);
+                    return;
                 }
                 l.ready.push_back(h);
                 if let Some(w) = l.waker.take() {

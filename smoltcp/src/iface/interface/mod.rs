@@ -31,6 +31,7 @@ pub struct InterfaceInner {
     initial_seq: InitialSeq,
     ip_addr: IpAddress,
     ignore_malformed_options: bool,
+    reset_closed_ports: bool,
 }
 
 /// Picks the initial sequence number of a connection from its local and
@@ -57,6 +58,7 @@ impl Interface {
                 initial_seq: config.initial_seq,
                 ip_addr: config.ip_addr,
                 ignore_malformed_options: false,
+                reset_closed_ports: true,
             },
         }
     }
@@ -64,6 +66,13 @@ impl Interface {
     /// Selects whether a malformed option list retains its valid prefix.
     pub fn set_ignore_malformed_options(&mut self, ignore: bool) {
         self.inner.ignore_malformed_options = ignore;
+    }
+
+    /// Selects whether a segment that no socket accepts gets a RST, as
+    /// RFC 9293 section 3.10.7.1 says of the CLOSED state, or nothing.
+    /// The default is a RST.
+    pub fn set_reset_closed_ports(&mut self, reset: bool) {
+        self.inner.reset_closed_ports = reset;
     }
 
     /// Context for connecting a TCP socket.
