@@ -52,7 +52,7 @@ page = ["tokio", "dep:axum", "dep:serde", "dep:tokio-stream"]
 
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(kani)"] }
 
 [dependencies]
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio", "json"] }

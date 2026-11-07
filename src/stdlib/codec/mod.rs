@@ -442,6 +442,10 @@ where
 #[cfg(test)]
 mod tests;
 
+#[cfg(kani)]
+#[path = "../../../verification/codec/kani/mod.rs"]
+mod proofs;
+
 /// One side of a protocol connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
