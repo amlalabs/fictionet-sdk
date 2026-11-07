@@ -1372,6 +1372,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "artifactory-world",
+ "axum",
  "bytes",
  "crc32fast",
  "fictionet",
@@ -1388,6 +1389,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower-service",
  "vhost-user-backend",
@@ -2858,12 +2860,16 @@ dependencies = [
 name = "nuclear-world"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "fictionet",
+ "fictionet-test-support",
  "http",
+ "http-body-util",
  "serde",
  "serde_json",
  "tokio",
+ "tower-service",
 ]
 
 [[package]]
