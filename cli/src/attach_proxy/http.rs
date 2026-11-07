@@ -265,7 +265,7 @@ fn push_headers(out: &mut Vec<u8>, headers: &[Header], skip: &[String]) {
 }
 
 /// The request head as the world's site gets it: origin form, no
-/// hop-by-hop fields, a `Host` if the client sent none, and
+/// hop-by-hop fields, a `Host` from the target authority, and
 /// `Connection: close`, or `Connection: upgrade` with its `Upgrade` field
 /// for a request that asks to switch protocols.
 pub fn forward_head(req: &Request) -> Vec<u8> {
@@ -282,10 +282,10 @@ pub fn forward_head(req: &Request) -> Vec<u8> {
         req.head.version.as_str()
     )
     .into_bytes();
-    if req.header("host").is_none() {
-        out.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
-    }
-    push_headers(&mut out, &req.head.headers, &hop_by_hop(&req.head.headers));
+    out.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
+    let mut skip = hop_by_hop(&req.head.headers);
+    skip.push("host".into());
+    push_headers(&mut out, &req.head.headers, &skip);
     out.extend_from_slice(connection(&req.head.headers));
     out
 }
@@ -493,6 +493,35 @@ mod tests {
         let many: String = (0..200).map(|i| format!("X-{i}: y\r\n")).collect();
         let e = parse(&format!("GET http://a/ HTTP/1.1\r\n{many}\r\n")).unwrap_err();
         assert_eq!(e.status, 431);
+    }
+
+    #[test]
+    fn forwarding_keeps_the_target_and_origin_authority_together() {
+        for authority in ["example.test", "example.test:8080", "[::1]:8080"] {
+            for fields in [
+                "",
+                "Host: other.test\r\n",
+                "Host: other.test\r\nHost: third.test\r\n",
+                "Host: other.test\r\nConnection: Host\r\n",
+            ] {
+                let request =
+                    parse(&format!("GET http://{authority}/ HTTP/1.1\r\n{fields}\r\n")).unwrap();
+                let bytes = forward_head(&request);
+                let (forwarded, _) = RequestHead::parse_lenient(&bytes).unwrap().unwrap();
+                let hosts: Vec<_> = forwarded
+                    .headers
+                    .iter()
+                    .filter(|header| header.name.eq_ignore_ascii_case("host"))
+                    .collect();
+                let [host] = hosts.as_slice() else {
+                    panic!("forwarding must supply one origin authority");
+                };
+                let Target::Forward { authority, .. } = request.target else {
+                    unreachable!();
+                };
+                assert_eq!(host.value, authority.as_bytes());
+            }
+        }
     }
 
     #[test]

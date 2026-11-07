@@ -7,8 +7,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use fictionet::stdlib::protocols::dns::op::{Message, MessageType, Query, ResponseCode};
-use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
+use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use fictionet::stdlib::protocols::dns::rr::{DNSClass, Name, RData, RecordType};
 
 /// Answers are kept at most this long, whatever their TTL.
 pub const MAX_TTL: u32 = 60;
@@ -61,7 +61,8 @@ pub fn query(name: &str, id: u16) -> Option<Vec<u8>> {
 /// up to 16 `CNAME` aliases from the queried name and returns the first
 /// `A` record for the final name, or why there is none. The lifetime is
 /// the shortest TTL among those records, capped at [`MAX_TTL`]. Unrelated
-/// records are ignored; cycles and longer chains fail the lookup.
+/// records and records outside the Internet class are ignored; cycles
+/// and longer chains fail the lookup.
 pub fn answer(
     bytes: &[u8],
     from: SocketAddr,
@@ -73,12 +74,16 @@ pub fn answer(
         return None;
     }
     let m = Message::from_vec(bytes).ok()?;
-    if m.metadata.id != id || m.metadata.message_type != MessageType::Response {
+    if m.metadata.id != id
+        || m.metadata.message_type != MessageType::Response
+        || m.metadata.op_code != OpCode::Query
+    {
         return None;
     }
     let asked = Name::from_ascii(format!("{name}.")).ok()?;
     let same_question = m.queries.len() == 1
         && m.queries[0].query_type() == RecordType::A
+        && m.queries[0].query_class() == DNSClass::IN
         && m.queries[0].name().to_lowercase() == asked.to_lowercase();
     if !same_question {
         return None;
@@ -98,7 +103,9 @@ pub fn answer(
         }
         seen.push(name);
         let alias = m.answers.iter().find_map(|r| match &r.data {
-            RData::CNAME(target) if &r.name == name => Some((&target.0, r.ttl)),
+            RData::CNAME(target) if &r.name == name && r.dns_class == DNSClass::IN => {
+                Some((&target.0, r.ttl))
+            }
             _ => None,
         });
         if let Some((target, alias_ttl)) = alias {
@@ -107,7 +114,9 @@ pub fn answer(
             continue;
         }
         let found = m.answers.iter().find_map(|r| match &r.data {
-            RData::A(a) if &r.name == name => Some((a.0, ttl.min(r.ttl))),
+            RData::A(a) if &r.name == name && r.dns_class == DNSClass::IN => {
+                Some((a.0, ttl.min(r.ttl)))
+            }
             _ => None,
         });
         return Some(found.ok_or(Lookup::NoSuchName));
@@ -153,6 +162,53 @@ mod tests {
         ] {
             assert_eq!(normalize(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn only_matching_questions_and_internet_records_resolve() {
+        let name = "example.test";
+        let id = 7;
+        let q = query(name, id).unwrap();
+        let response = |edit: fn(&mut Message)| {
+            reply(&q, |r| {
+                r.answers.push(address(name, 30));
+                edit(r);
+            })
+        };
+        assert!(
+            answer(&response(|_| {}), server(), server(), name, id)
+                .unwrap()
+                .is_ok()
+        );
+        for bytes in [
+            response(|r| {
+                r.queries[0].set_query_class(DNSClass::CH);
+            }),
+            response(|r| {
+                r.metadata.op_code = OpCode::Status;
+            }),
+        ] {
+            assert!(answer(&bytes, server(), server(), name, id).is_none());
+        }
+        let bytes = response(|r| {
+            r.answers[0].dns_class = DNSClass::CH;
+        });
+        assert!(
+            answer(&bytes, server(), server(), name, id)
+                .unwrap()
+                .is_err()
+        );
+        let bytes = reply(&q, |r| {
+            let mut cname = alias(name, "other.test", 30);
+            cname.dns_class = DNSClass::CH;
+            r.answers.push(cname);
+            r.answers.push(address("other.test", 30));
+        });
+        assert!(
+            answer(&bytes, server(), server(), name, id)
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
