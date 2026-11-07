@@ -51,6 +51,11 @@ are implicit stutters; API return values are not modeled. Payload, options,
 retransmission, clocks and address family validation are outside this
 abstraction. Timeout closure is included
 in the unconditional abort transition. There is no fairness or liveness claim.
+The endpoint's choices for what a closed port answers and what a SYN from
+source port 0 gets (`tcp::Settings::closed_port` and `source_port_zero`)
+are outside it too: they act in the interface's fallback for a segment no
+socket accepts, before any socket is asked, or after the handshake has
+completed, and leave `accepts` and `process` as modeled.
 
 ## Binding and host preparation
 
