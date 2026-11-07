@@ -1392,7 +1392,18 @@ impl Pages {
                 0,
             )
         };
-        (ptr != libc::MAP_FAILED).then_some(Pages {
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        // A huge page can span adjacent socket mappings and make a quiet
+        // connection pay for another connection's buffers. Keep these
+        // independently reclaimable buffers on ordinary pages.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            // SAFETY: this is the complete, freshly allocated mapping.
+            libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE);
+        }
+        Some(Pages {
             ptr: ptr.cast(),
             len,
         })
