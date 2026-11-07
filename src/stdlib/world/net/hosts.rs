@@ -1213,6 +1213,11 @@ impl Machines {
         self.world.lock().machines.contains_key(&addr)
     }
 
+    /// The machines' addresses now.
+    pub(super) fn addresses(&self) -> HashSet<IpAddr> {
+        self.world.lock().machines.keys().copied().collect()
+    }
+
     pub(super) fn abort_peers(&self, which: &dyn Fn(IpAddr) -> bool) {
         let machines: Vec<_> = self.world.lock().machines.values().cloned().collect();
         for machine in machines {

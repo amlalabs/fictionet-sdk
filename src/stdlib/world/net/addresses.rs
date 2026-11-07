@@ -603,12 +603,15 @@ mod tests {
 
     /// The network's shared state with no hosts, on `subnet` and `subnet6`.
     fn network(fcx: &Cx, subnet: &str, subnet6: Option<&str>) -> Arc<Shared> {
+        let subnet = Subnet::new(subnet.parse().unwrap()).unwrap();
+        let subnet6 = subnet6.map(|s| Subnet6::new(s.parse().unwrap()).unwrap());
+        let world = Arc::new(Mutex::new(World::new(TEST_POOLS)));
         Arc::new(Shared {
             fcx: fcx.clone(),
-            subnet: Subnet::new(subnet.parse().unwrap()).unwrap(),
-            subnet6: subnet6.map(|s| Subnet6::new(s.parse().unwrap()).unwrap()),
+            subnet,
+            subnet6,
             router: route::router(fcx, Vec::new()),
-            world: Arc::new(Mutex::new(World::new(TEST_POOLS))),
+            world: world.clone(),
             leases: Arc::default(),
             gateway_tcp: Arc::default(),
             hooks: Arc::new(Hooks {
@@ -621,8 +624,17 @@ mod tests {
                 routes: Mutex::default(),
                 conns: AtomicU64::new(0),
                 attached: Mutex::default(),
+                destinations: super::super::attachments::Destinations {
+                    subnets: std::iter::once(subnet.prefix)
+                        .chain(subnet6.map(|s| s.prefix))
+                        .collect(),
+                    gateways: std::iter::once(std::net::IpAddr::V4(subnet.gateway))
+                        .chain(subnet6.map(|s| IpAddr::V6(s.gateway)))
+                        .collect(),
+                    trusted: Vec::new(),
+                    machines: super::super::hosts::Machines::new(world),
+                },
             }),
-            fixed: Vec::new(),
             peers: Peers::new(Limits::default().connections_per_peer),
             limits: Limits::default(),
             egress: None,

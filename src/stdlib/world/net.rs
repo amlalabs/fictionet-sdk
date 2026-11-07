@@ -177,7 +177,7 @@ mod names;
 
 pub use addresses::Placed;
 use addresses::{Leases, Subnet, Subnet6, check_pools};
-use attachments::{Hooks, filter, udp_packet};
+use attachments::{Destinations, Hooks, filter, udp_packet};
 use dns::Recursive;
 use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};
 pub use hosts::{
@@ -654,6 +654,44 @@ impl Net {
         let router = route::router::<Box<dyn Interface>>(fcx, Vec::new());
         // Every host is one hop from the sandbox: the router is private.
         router.keep_ttl();
+        let lans = make_lans(
+            fcx,
+            &router,
+            &subnet,
+            subnet6.as_ref(),
+            &self.pools,
+            self.lans,
+            &self.members,
+        )?;
+        let world = Arc::new(Mutex::new(World::new(self.pools)));
+        let routes: Vec<(String, Prefix)> = self.routes;
+        let fixed: Vec<Prefix> = routes.iter().map(|(_, p)| *p).collect();
+        let hooks = Arc::new(Hooks {
+            by_addr: Mutex::default(),
+            routes: Mutex::default(),
+            conns: AtomicU64::new(0),
+            attached: Mutex::default(),
+            destinations: Destinations {
+                subnets: std::iter::once(subnet.prefix)
+                    .chain(subnet6.map(|s| s.prefix))
+                    .collect(),
+                gateways: std::iter::once(IpAddr::V4(subnet.gateway))
+                    .chain(subnet6.map(|s| IpAddr::V6(s.gateway)))
+                    .chain(lans.values().map(|l| l.dns))
+                    .collect(),
+                trusted: fixed
+                    .iter()
+                    .copied()
+                    .chain(lans.values().map(|l| l.prefix))
+                    .collect(),
+                machines: Machines::new(world.clone()),
+            },
+            http_observe: self.http_observe,
+            refused_observe: self.refused_observe,
+            tls_observe: self.tls_observe,
+            attachment_observe: self.attachment_observe,
+            dns_observe: self.dns_observe,
+        });
 
         // Everything without a better route: answered with "host unreachable".
         let (router_side, unreachable_side) = link();
@@ -664,17 +702,6 @@ impl Net {
             },
             Box::new(router_side),
         );
-        let hooks = Arc::new(Hooks {
-            by_addr: Mutex::default(),
-            routes: Mutex::default(),
-            conns: AtomicU64::new(0),
-            attached: Mutex::default(),
-            http_observe: self.http_observe,
-            refused_observe: self.refused_observe,
-            tls_observe: self.tls_observe,
-            attachment_observe: self.attachment_observe,
-            dns_observe: self.dns_observe,
-        });
         let gateway = subnet.gateway;
         let report = self.unreachable.clone();
         let drop_unrouted = self.drop_unrouted;
@@ -712,26 +739,15 @@ impl Net {
                 )
             });
         }
-        let lans = make_lans(
-            fcx,
-            &router,
-            &subnet,
-            subnet6.as_ref(),
-            &self.pools,
-            self.lans,
-            &self.members,
-        )?;
-        let routes: Vec<(String, Prefix)> = self.routes;
         let shared = Arc::new(Shared {
             fcx: fcx.clone(),
             subnet,
             subnet6,
             router,
-            world: Arc::new(Mutex::new(World::new(self.pools))),
+            world,
             leases: Arc::new(Mutex::new(Leases::default())),
             gateway_tcp: Arc::new(Mutex::new(Vec::new())),
             hooks,
-            fixed: routes.iter().map(|(_, p)| *p).collect(),
             peers: Peers::new(self.limits.connections_per_peer),
             limits: self.limits,
             egress: self.egress,
@@ -853,8 +869,6 @@ struct Shared {
     leases: Arc<Mutex<Leases>>,
     gateway_tcp: Arc<Mutex<Vec<tcp::Endpoint>>>,
     hooks: Arc<Hooks>,
-    /// Prefixes of routes ([`Net::route`]).
-    fixed: Vec<Prefix>,
     limits: Limits,
     egress: Option<Arc<Egress>>,
     /// The LANs, by name.
@@ -895,8 +909,7 @@ impl Shared {
     }
 
     fn attachments(&self) -> Arc<attachments::Context> {
-        let machines = Machines::new(self.world.clone());
-        let abort = machines.clone();
+        let abort = self.hooks.destinations.machines.clone();
         let gateway_tcp = self.gateway_tcp.clone();
         Arc::new(attachments::Context {
             bindings: addresses::Bindings::new(self.subnet, self.subnet6, self.leases.clone()),
@@ -904,19 +917,6 @@ impl Shared {
             sandbox_budget: self.limits.sandbox_budget,
             egress: self.egress.clone(),
             router: self.router.clone(),
-            destinations: attachments::Destinations {
-                gateways: std::iter::once(IpAddr::V4(self.subnet.gateway))
-                    .chain(self.subnet6.map(|s| IpAddr::V6(s.gateway)))
-                    .chain(self.lans.values().map(|l| l.dns))
-                    .collect(),
-                trusted: self
-                    .fixed
-                    .iter()
-                    .copied()
-                    .chain(self.lans.values().map(|l| l.prefix))
-                    .collect(),
-                machines,
-            },
             abort_peers: Arc::new(move |which| {
                 abort.abort_peers(which);
                 for tcp in gateway_tcp.lock().iter() {
@@ -1143,17 +1143,6 @@ mod tests {
             |fcx| async move {
                 let subnet = Subnet::new("104.18.0.0/16".parse().unwrap()).unwrap();
                 let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
-                let hooks = Arc::new(Hooks {
-                    by_addr: Mutex::default(),
-                    routes: Mutex::default(),
-                    conns: AtomicU64::new(0),
-                    attached: Mutex::default(),
-                    http_observe: None,
-                    refused_observe: None,
-                    tls_observe: None,
-                    attachment_observe: None,
-                    dns_observe: None,
-                });
                 let lans = make_lans(
                     &fcx,
                     &router,
@@ -1169,16 +1158,35 @@ mod tests {
                     .into(),
                     &[],
                 )?;
+                let world = Arc::new(Mutex::new(World::new(TEST_POOLS)));
+                let hooks = Arc::new(Hooks {
+                    by_addr: Mutex::default(),
+                    routes: Mutex::default(),
+                    conns: AtomicU64::new(0),
+                    attached: Mutex::default(),
+                    destinations: Destinations {
+                        subnets: vec![subnet.prefix],
+                        gateways: std::iter::once(IpAddr::V4(subnet.gateway))
+                            .chain(lans.values().map(|l| l.dns))
+                            .collect(),
+                        trusted: lans.values().map(|l| l.prefix).collect(),
+                        machines: Machines::new(world.clone()),
+                    },
+                    http_observe: None,
+                    refused_observe: None,
+                    tls_observe: None,
+                    attachment_observe: None,
+                    dns_observe: None,
+                });
                 let shared = Arc::new(Shared {
                     fcx: fcx.clone(),
                     subnet,
                     subnet6: None,
                     router,
-                    world: Arc::new(Mutex::new(World::new(TEST_POOLS))),
+                    world,
                     leases: Arc::default(),
                     gateway_tcp: Arc::default(),
                     hooks,
-                    fixed: Vec::new(),
                     peers: Peers::new(Limits::default().connections_per_peer),
                     limits: Limits::default(),
                     egress: None,
@@ -1331,6 +1339,116 @@ mod tests {
                 assert!(net.hooks.by_addr.lock().is_empty());
                 assert_eq!(net.hooks.routes.lock().len(), 1);
                 drop(held);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// After `after`, connects to `to` and keeps the connection until it
+    /// is gone, which it counts in `gone`. Counts connecting in
+    /// `connected`.
+    struct Caller {
+        to: SocketAddr,
+        after: Duration,
+        connected: Arc<AtomicUsize>,
+        gone: Arc<AtomicUsize>,
+    }
+
+    impl Program for Caller {
+        fn run(
+            &self,
+            fcx: Cx,
+            machine: Endpoints,
+        ) -> std::pin::Pin<Box<dyn Future<Output = fictionet::Result> + Send>> {
+            let (to, after) = (self.to, self.after);
+            let (connected, gone) = (self.connected.clone(), self.gone.clone());
+            Box::pin(async move {
+                fcx.sleep(after).await?;
+                let conn = machine.tcp.connect(&fcx, to).await?;
+                connected.fetch_add(1, Ordering::SeqCst);
+                let watch = conn.gone_watch();
+                std::future::poll_fn(|cx| watch.poll_gone(cx)).await;
+                drop(conn);
+                gone.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// A route carries only sources the network has nowhere else, so a
+    /// connection between two hosts is not the route's, whether the route's
+    /// sandbox attached before or after it was made: it names no sandbox,
+    /// and it outlives the route's sandbox, whose detaching resets only
+    /// the connections the route carried.
+    #[test]
+    fn a_route_detaching_leaves_host_connections_alone() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let (a, b, c) = (
+                    Ipv4Addr::new(10, 40, 0, 1),
+                    Ipv4Addr::new(10, 40, 0, 2),
+                    Ipv4Addr::new(10, 40, 0, 3),
+                );
+                let from = Arc::new(Mutex::new(Vec::new()));
+                let gone = Arc::new(AtomicUsize::new(0));
+                let connected = Arc::new(AtomicUsize::new(0));
+                let caller = |after| Caller {
+                    to: SocketAddr::new(b.into(), 23),
+                    after: Duration::from_secs(after),
+                    connected: connected.clone(),
+                    gone: gone.clone(),
+                };
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new(TEST_POOLS)
+                    .ipv4_only()
+                    .host("b", |h| {
+                        h.at(b).port_server(
+                            23,
+                            Spy {
+                                from: from.clone(),
+                                hold: true,
+                                gone: gone.clone(),
+                            },
+                        )
+                    })
+                    .host("a", |h| h.at(a).program(caller(0)))
+                    .host("c", |h| h.at(c).program(caller(2)))
+                    .route("internet", "0.0.0.0/0".parse()?)
+                    .start(&fcx, attachments)?;
+                fcx.sleep(Duration::from_secs(1)).await?;
+                assert_eq!(connected.load(Ordering::SeqCst), 1);
+
+                let internet = attacher.attach("internet")?;
+                fcx.sleep(Duration::from_secs(2)).await?;
+                assert_eq!(connected.load(Ordering::SeqCst), 2);
+
+                drop(internet);
+                fcx.sleep(Duration::from_secs(1)).await?;
+                assert_eq!(
+                    gone.load(Ordering::SeqCst),
+                    0,
+                    "the hosts' connections outlive the route's sandbox"
+                );
+                let sandboxes: Vec<(u64, Arc<str>)> = from
+                    .lock()
+                    .iter()
+                    .map(|info| {
+                        let s = info
+                            .sandbox
+                            .as_ref()
+                            .expect("a port server names a sandbox");
+                        (s.id, s.name.clone())
+                    })
+                    .collect();
+                let unnamed = (0, Arc::from(""));
+                assert_eq!(
+                    sandboxes,
+                    [unnamed.clone(), unnamed],
+                    "a host is no sandbox, before or after the route attached"
+                );
                 fcx.cancel();
                 Ok(())
             },

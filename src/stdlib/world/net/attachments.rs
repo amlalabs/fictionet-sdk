@@ -10,7 +10,7 @@ use fictionet::stdlib::protocols::dhcp;
 use fictionet::stdlib::services::serve::{Budget, Sandbox};
 use fictionet::sync::Mutex;
 use fictionet::{Attachment, Cx, Interface, Packet};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +39,9 @@ pub(super) struct Hooks {
     pub(super) conns: AtomicU64,
     /// The sandboxes attached now, by id, each with its budget.
     pub(super) attached: Mutex<HashMap<u64, Option<Budget>>>,
+    /// Where the network has addresses other than at its routes, which
+    /// decides what a route carries and so whose a source is.
+    pub(super) destinations: Destinations,
 }
 
 impl Hooks {
@@ -84,15 +87,23 @@ impl Hooks {
         }
     }
 
-    /// The sandbox that bound the address, or the route with the longest
-    /// prefix that holds it.
+    /// The sandbox that bound the address, or the one at the route with
+    /// the longest prefix that holds it, when the network routes the
+    /// address there ([`Destinations::routes_to`]). `None` for an address
+    /// the network has elsewhere: a machine's, a gateway's, or one of the
+    /// sandboxes' subnet that no sandbox bound.
     pub(super) fn sandbox_of(&self, addr: IpAddr) -> Option<Sandbox> {
         if let Some(sandbox) = self.by_addr.lock().get(&addr).cloned() {
             return Some(sandbox);
         }
-        let routes = self.routes.lock();
-        let (_, sandbox) = longest_route(&routes, addr)?;
-        let mut sandbox = sandbox.clone();
+        let (prefix, mut sandbox) = {
+            let routes = self.routes.lock();
+            let (prefix, sandbox) = longest_route(&routes, addr)?;
+            (*prefix, sandbox.clone())
+        };
+        if !self.destinations.routes_to(prefix, addr) {
+            return None;
+        }
         sandbox.addr = match addr {
             IpAddr::V4(a) => Some(a),
             _ => None,
@@ -138,15 +149,19 @@ pub(super) struct Context {
     pub(super) sandbox_budget: usize,
     pub(super) egress: Option<Arc<super::Egress>>,
     pub(super) router: Router<Box<dyn Interface>>,
-    pub(super) destinations: Destinations,
     pub(super) abort_peers: Arc<PeerAbort>,
 }
 
 /// Resets every connection whose peer address the argument accepts.
 pub(super) type PeerAbort = dyn Fn(&dyn Fn(IpAddr) -> bool) + Send + Sync;
 
-/// Network destinations used for source validation and reassembly replies.
+/// Where the network has addresses other than at its routes: the
+/// sandboxes' subnets, the gateways, the prefixes of the LANs and the
+/// routes, and the machines. A route carries only sources the network has
+/// nowhere else ([`routes_to`](Destinations::routes_to)), and a
+/// reassembly's answers go to hosts.
 pub(super) struct Destinations {
+    pub(super) subnets: Vec<Prefix>,
     pub(super) gateways: Vec<IpAddr>,
     pub(super) trusted: Vec<Prefix>,
     pub(super) machines: Machines,
@@ -250,26 +265,6 @@ fn martian(addr: IpAddr) -> bool {
     }
 }
 
-impl Context {
-    /// Whether the network routes `addr` to the route at `prefix`: it is in
-    /// `prefix`, it is no martian, and no subnet, gateway, machine or route
-    /// with a longer prefix has it.
-    fn routes_to(&self, prefix: Prefix, addr: IpAddr) -> bool {
-        let bindings = &self.bindings;
-        let destinations = &self.destinations;
-        prefix.contains(addr)
-            && !martian(addr)
-            && !bindings.subnet.prefix.contains(addr)
-            && !bindings.subnet6.is_some_and(|s| s.prefix.contains(addr))
-            && !destinations.is_gateway(addr)
-            && !destinations
-                .trusted
-                .iter()
-                .any(|p| p.len > prefix.len && p.contains(addr))
-            && !destinations.machines.contains(addr)
-    }
-}
-
 /// A sandbox wired to the router at its prefixes
 /// ([`Net::route`](super::Net::route)). It passes packets as they are and
 /// keeps no state per source.
@@ -297,10 +292,11 @@ impl Interface for Routed {
     ) -> Poll<Result<Packet, fictionet::RecvError>> {
         loop {
             let packet = std::task::ready!(self.sandbox.poll_recv(fcx, cx))?;
+            let destinations = &self.context.hooks.destinations;
             if ip::source(&packet.0).is_some_and(|src| {
                 self.prefixes
                     .iter()
-                    .any(|p| self.context.routes_to(*p, src))
+                    .any(|p| destinations.routes_to(*p, src))
             }) {
                 return Poll::Ready(Ok(packet));
             }
@@ -313,21 +309,16 @@ impl Interface for Routed {
 }
 
 impl Drop for Routed {
-    /// Resets the connections of every peer the route's prefixes give this
-    /// sandbox: addresses that no sandbox binds and no route with a longer
-    /// prefix holds.
+    /// Resets the connections of every peer the route carried: the
+    /// sources the network routes to it
+    /// ([`Destinations::routes_to`]), as they are now.
     fn drop(&mut self) {
         let hooks = &self.context.hooks;
         hooks.attached.lock().remove(&self.owner);
-        // Copied first: the aborts ask about each peer with the endpoints
-        // locked.
-        let bound: HashSet<IpAddr> = hooks.by_addr.lock().keys().copied().collect();
-        let routes = hooks.routes.lock().clone();
-        let prefixes = &self.prefixes;
-        (self.context.abort_peers)(&|peer| {
-            !bound.contains(&peer)
-                && longest_route(&routes, peer).is_some_and(|(p, _)| prefixes.contains(p))
-        });
+        let sources = hooks
+            .destinations
+            .sources(std::mem::take(&mut self.prefixes));
+        (self.context.abort_peers)(&sources);
         hooks.attachment(
             &self.fcx,
             Sandbox {
@@ -661,7 +652,7 @@ impl Filter {
             Intake::Whole(p) => p,
             Intake::Waiting => return,
             Intake::Refused { packet, answer } => {
-                if !self.context.destinations.is_host(&packet.0) {
+                if !self.context.hooks.destinations.is_host(&packet.0) {
                     packet
                 } else {
                     if let Some(answer) = answer {
@@ -698,6 +689,44 @@ impl Filter {
 }
 
 impl Destinations {
+    /// Whether the network routes `addr` to the route at `prefix`: it is in
+    /// `prefix`, it is no martian, and no subnet, gateway, machine or route
+    /// with a longer prefix has it.
+    pub(super) fn routes_to(&self, prefix: Prefix, addr: IpAddr) -> bool {
+        self.routes_to_among(prefix, addr, &|a| self.machines.contains(a))
+    }
+
+    /// [`routes_to`](Self::routes_to), with `machine` saying which
+    /// addresses machines have: the machines now, or a copy of them.
+    fn routes_to_among(
+        &self,
+        prefix: Prefix,
+        addr: IpAddr,
+        machine: &dyn Fn(IpAddr) -> bool,
+    ) -> bool {
+        prefix.contains(addr)
+            && !martian(addr)
+            && !self.subnets.iter().any(|s| s.contains(addr))
+            && !self.is_gateway(addr)
+            && !self
+                .trusted
+                .iter()
+                .any(|p| p.len > prefix.len && p.contains(addr))
+            && !machine(addr)
+    }
+
+    /// The sources a route at `prefixes` carries, decided against a copy
+    /// of the machines' addresses taken now, for a caller that asks about
+    /// many peers with the endpoints locked.
+    pub(super) fn sources(&self, prefixes: Vec<Prefix>) -> impl Fn(IpAddr) -> bool + '_ {
+        let machines = self.machines.addresses();
+        move |addr| {
+            prefixes
+                .iter()
+                .any(|p| self.routes_to_among(*p, addr, &|a| machines.contains(&a)))
+        }
+    }
+
     /// Whether `dst` is the gateway, or a LAN's DNS address.
     fn is_gateway(&self, dst: IpAddr) -> bool {
         self.gateways.contains(&dst)
