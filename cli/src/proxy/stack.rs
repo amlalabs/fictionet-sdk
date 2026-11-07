@@ -60,7 +60,7 @@ pub(crate) enum Fail {
     TimedOut,
     /// The world is gone: the connection to it closed.
     WorldGone,
-    /// An address this stack cannot reach: IPv6, or port 0.
+    /// An address this stack cannot reach: IPv6.
     BadAddress(&'static str),
 }
 
@@ -260,9 +260,6 @@ impl Stack {
         host: &Host,
         port: u16,
     ) -> Result<(TcpConnection, Ipv4Addr), Fail> {
-        if port == 0 {
-            return Err(Fail::BadAddress("port 0"));
-        }
         let addr = self.resolve(host).await?;
         let to = SocketAddr::new(IpAddr::V4(addr), port);
         let opened = self.tcp.connect(&self.fcx, to);
@@ -282,6 +279,58 @@ impl Stack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Port 0 is a literal port: a world may listen on it, and the core
+    /// connects to it, so the stack every door goes through reaches it too.
+    #[tokio::test]
+    async fn port_zero_reaches_a_listener_through_the_stack() {
+        fictionet::lab(fictionet::Seed::from_u64(9), move |fcx| async move {
+            let (client, world) = fictionet::pair();
+            let (tcp_end, udp_end, _, _) = ip::split_protocols(&fcx, client);
+            let addr = Ipv4Addr::new(10, 0, 0, 2);
+            let server = Ipv4Addr::new(10, 0, 0, 1);
+            let stack = Stack {
+                fcx: fcx.clone(),
+                tcp: tcp::endpoint(&fcx, tcp_end, addr.into()),
+                udp: udp::endpoint(&fcx, udp_end, addr.into()),
+                dns: SocketAddr::new(server.into(), 53),
+                cache: Arc::default(),
+                pending: Arc::default(),
+            };
+            let (world_tcp, _world_udp, _, _) = ip::split_protocols(&fcx, world);
+            let world_tcp = tcp::endpoint(&fcx, world_tcp, server.into());
+            let mut listener = world_tcp.listen(0)?;
+            let held = Arc::new(Mutex::new(Vec::new()));
+            let keep = held.clone();
+            fcx.spawn(move |fcx| async move {
+                while let Ok(conn) = listener.accept(&fcx).await {
+                    keep.lock().unwrap().push(conn);
+                }
+                Ok(())
+            });
+            let direct = stack
+                .tcp
+                .connect(&fcx, SocketAddr::new(server.into(), 0))
+                .await;
+            assert!(
+                direct.is_ok(),
+                "direct connect: {:?}",
+                direct.as_ref().err()
+            );
+            let through = stack.connect(&Host::V4(server), 0).await;
+            assert!(
+                through.is_ok(),
+                "through the stack: {:?}",
+                through.as_ref().err()
+            );
+            drop(direct);
+            drop(through);
+            fcx.cancel();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn an_expired_alias_is_looked_up_again() {
