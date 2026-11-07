@@ -23,14 +23,13 @@ Run these commands with four sets of flags:
 The command turns on the SDK's `tokio` feature, which is not a default, and
 Cargo builds the SDK once for all the packages in one command. So the first
 two sets name their packages and leave the command out, and a plain
-`cargo nextest run` in the top directory tests the SDK with `tokio`. The
+`cargo test` in the top directory tests the SDK with `tokio`. The
 example worlds enable `web-proxy`, so only the all-features set builds them.
 Add the set's flags to each Cargo command, before `-- -D warnings` for clippy:
 
 ```console
 $ cargo build --locked --all-targets
-$ cargo nextest run --locked
-$ cargo test --locked --doc
+$ cargo test --locked
 $ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 $ cargo clippy --locked --all-targets --test host -- -D warnings
 $ cargo fmt --all
@@ -56,11 +55,9 @@ $ cargo fmt --all --manifest-path fuzz/Cargo.toml
 
 ## Tests
 
-The tests run under [cargo-nextest](https://nexte.st), installed with
-`cargo install cargo-nextest --locked`. `cargo nextest run` does not run
-doctests, so `cargo test --doc` runs them. `.config/nextest.toml` holds the
-settings: tests are never retried, a test is flagged after 15 seconds, and the
-tests that run whole worlds run a few at a time.
+Run unit tests, integration tests and doctests with `cargo test`. Tests are
+not retried. Use `-- --test-threads=1` when running whole worlds on a machine
+with limited resources.
 
 The SDK and the command each have two integration test binaries. `tests/it`
 and `cli/tests/it` run on any machine, one module per area. They need node,
@@ -71,7 +68,7 @@ several test binaries or benchmarks use are in `tests/support`, the
 `fictionet-test-support` crate. The host tests run only when named:
 
 ```console
-$ cargo nextest run --locked --test host
+$ cargo test --locked --test host
 ```
 
 The Python package's tests run with uv, and need Docker and helm:

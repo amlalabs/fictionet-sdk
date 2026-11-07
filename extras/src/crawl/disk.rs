@@ -143,7 +143,7 @@ impl DiskIndex {
             let mut alternatives: Vec<(Occur, Box<dyn Query>)> = Vec::new();
             for domain in domains {
                 let domain = regex::escape(&domain.trim_matches('.').to_ascii_lowercase());
-                let pattern = format!("https?://([^/]+\\.)?{domain}(:[0-9]+)?/.*");
+                let pattern = format!("https?://([^/@:]+\\.)?{domain}\\.?(:[0-9]+)?/.*");
                 alternatives.push((
                     Occur::Should,
                     Box::new(
@@ -220,8 +220,11 @@ impl DiskWriter {
     /// Update a private copy of a published index.
     pub fn open(path: &Path) -> io::Result<Self> {
         let index = Index::open_in_dir(path).map_err(io::Error::other)?;
+        let (schema, fields) = schema();
+        if index.schema() != schema {
+            return Err(io::Error::other("search index needs rebuilding"));
+        }
         analyzer(&index);
-        let (_, fields) = schema();
         let threads = std::thread::available_parallelism()?.get().div_ceil(2);
         let writer = index
             .writer_with_num_threads(threads, threads * 64_000_000)
@@ -264,5 +267,77 @@ impl DiskWriter {
         commit.set_payload(source);
         commit.commit().map_err(io::Error::other)?;
         self.writer.wait_merging_threads().map_err(io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::tools::{Domains, allowed};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn domain_restrictions_agree_with_url_admission() {
+        let urls = [
+            "https://example.com/",
+            "https://example.com./",
+            "https://sub.example.com./page",
+            "http://sub.example.com:8080/page",
+            "https://other.test/",
+            "https://example.com.other.test/",
+            "https://user@sub.example.com/",
+        ];
+        let (schema, fields) = schema();
+        let index = Index::create_in_ram(schema);
+        analyzer(&index);
+        let writer = DiskWriter {
+            writer: index.writer_with_num_threads(1, 15_000_000).unwrap(),
+            fields,
+        };
+        for url in urls {
+            writer.add(url, "document", "document").unwrap();
+        }
+        writer.finish("test corpus").unwrap();
+        let index = DiskIndex {
+            reader: index.reader().unwrap(),
+            index,
+            fields,
+        };
+        for blocked_domains in [None, Some(vec!["sub.example.com".into()])] {
+            let domains = Domains {
+                allowed_domains: Some(vec![".EXAMPLE.COM.".into()]),
+                blocked_domains,
+            };
+            let expected: BTreeSet<_> = urls
+                .iter()
+                .filter(|url| allowed(&domains, url))
+                .map(|url| (*url).to_owned())
+                .collect();
+            let results = index
+                .search_in("document", 0, urls.len(), &domains, |_| {
+                    Ok("document".into())
+                })
+                .unwrap();
+            assert_eq!(results.total, Some(expected.len()));
+            assert_eq!(
+                results
+                    .results
+                    .into_iter()
+                    .map(|hit| hit.url)
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_indexes_cannot_be_opened_for_writing() {
+        let path = fictionet_test_support::temp::dir();
+        let mut schema = Schema::builder();
+        schema.add_text_field("unrelated", STRING);
+        Index::create_in_dir(&path, schema.build()).unwrap();
+        assert!(DiskIndex::open(&path).is_err());
+        assert!(DiskWriter::open(&path).is_err());
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
