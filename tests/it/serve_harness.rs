@@ -75,3 +75,64 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
     assert_eq!(h.service().unread, bad);
     assert_eq!(h.end_reason(), Some(Ended::Failed));
 }
+
+/// The idle clock counts only while the driver waits for the client.
+/// Ordered work suspends it: once the work is done, the client has the
+/// whole idle time to speak before the connection closes as idle.
+#[test]
+fn the_idle_clock_restarts_after_ordered_work() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use fictionet::stdlib::codec::{Ending, LineError, Lines};
+    use fictionet::stdlib::services::serve::{Pending, PendingDriver, ServeOptions};
+
+    /// Work that ends once the flag is set.
+    struct Gated(Arc<AtomicBool>);
+    impl Pending for Gated {
+        fn poll_next(
+            &mut self,
+            _: &mut PendingDriver<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
+            if self.0.load(Ordering::SeqCst) {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    struct Deferring(Arc<AtomicBool>);
+    service_fixture! {
+        Deferring => (Lines, (), Infallible);
+        decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
+        on_item(self, _: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+            driver.defer(Gated(self.0.clone()));
+            Ok(Flow::Continue)
+        }
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let idle = Duration::from_secs(10);
+    let mut h = Harness::with_options(
+        fictionet::Seed::from_u64(0),
+        Deferring(done.clone()),
+        (),
+        ServeOptions::default().idle(Some(idle)),
+    );
+    h.push(b"work\n").unwrap();
+    // The work outlasts the idle limit; the driver waits for it, not the client.
+    h.advance(idle + idle).unwrap();
+    assert!(!h.closed(), "running work is not a silent client");
+    done.store(true, Ordering::SeqCst);
+    h.poll().unwrap();
+    assert!(
+        !h.closed(),
+        "the client had no time to speak since the work ended"
+    );
+    h.advance(idle - Duration::from_secs(1)).unwrap();
+    assert!(!h.closed());
+    h.advance(Duration::from_secs(1)).unwrap();
+    assert_eq!(h.end_reason(), Some(Ended::Idle));
+}

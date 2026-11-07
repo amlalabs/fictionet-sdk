@@ -108,7 +108,8 @@
 //!   ends: concurrent responses, as HTTP/2 streams need.
 //! - **Idle.** With [`ServeOptions::idle`], a connection that sends nothing
 //!   for that long while the driver waits for it is closed, after
-//!   [`Service::on_end`] with [`Ended::Idle`].
+//!   [`Service::on_end`] with [`Ended::Idle`]. Deferred work suspends the
+//!   clock: once it ends, the client has the whole idle time again.
 //! - **Writes.** A write that takes no bytes for
 //!   [`ServeOptions::write_timeout`] ends the connection with
 //!   [`Ended::Conn`]`(`[`ConnError::TimedOut`]`)`: a client that stops
@@ -1055,8 +1056,8 @@ pub const DEFAULT_MAX_CONNS: usize = 64;
 #[derive(Clone)]
 pub struct ServeOptions {
     /// Close a connection after this long with no bytes from the client,
-    /// while the driver waits for them. Default 10 seconds. `None` waits
-    /// forever.
+    /// while the driver waits for them; deferred work suspends the clock.
+    /// Default 10 seconds. `None` waits forever.
     pub idle: Option<Duration>,
     /// End a connection whose write takes no bytes for this long: a client
     /// that stops reading. Default 10 seconds. `None` waits forever; a
@@ -1361,7 +1362,11 @@ struct Core<S: Service> {
     info: ConnInfo,
     timers: Vec<(S::Timer, Instant)>,
     idle: Option<Duration>,
+    /// When the idle clock last started: the client's last bytes, or the
+    /// driver resuming its wait for them after deferred work.
     idle_from: Instant,
+    /// Deferred work ran at the last `advance`: the idle clock was suspended.
+    working: bool,
     eof: bool,
     ordered: VecDeque<Work>,
     keyed: Vec<(u64, Work)>,
@@ -1434,6 +1439,7 @@ where
             timers: Vec::new(),
             idle: opts.idle,
             idle_from: now,
+            working: false,
             eof: false,
             ordered: VecDeque::new(),
             keyed: Vec::new(),
@@ -1747,10 +1753,10 @@ where
 
     fn next_deadline(&self) -> Option<Instant> {
         let timer = self.timers.iter().map(|(_, at)| *at).min();
-        // Keyed work running is not a silent client.
+        // Deferred work running is not a silent client.
         let idle = self
             .idle
-            .filter(|_| self.keyed.is_empty())
+            .filter(|_| !self.has_work())
             .map(|i| self.idle_from + i);
         match (timer, idle) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1768,6 +1774,13 @@ where
             State::Ending { end, called } => return self.ending(service, state, now, end, called),
             State::Running => {}
         }
+        // The idle clock runs only while the driver waits for the client,
+        // not under deferred work: it restarts when that wait resumes.
+        let working = self.has_work();
+        if self.working && !working {
+            self.idle_from = now;
+        }
+        self.working = working;
         if !self.ordered.is_empty() {
             // Reads, timers and wakes wait for ordered work.
             return Next::Wait {
@@ -1793,7 +1806,7 @@ where
             return Next::Again;
         }
         if let Some(idle) = self.idle
-            && self.keyed.is_empty()
+            && !working
             && now >= self.idle_from + idle
         {
             self.finish(Ended::Idle);
@@ -1809,7 +1822,6 @@ where
             }
             match self.next_item() {
                 Some(Ok(item)) => {
-                    self.idle_from = now;
                     self.call(now, |driver| service.on_item(item, state, driver));
                     return Next::Again;
                 }
@@ -1991,7 +2003,6 @@ where
             };
             let (key, work) = self.keyed.remove(i);
             progress = true;
-            self.idle_from = now;
             self.call(now, |driver| service.on_done(key, done, state, driver));
             if work.close {
                 self.finish_after_work();
