@@ -41,6 +41,8 @@ pub type Shared = Arc<Mutex<Plant>>;
 
 /// The Modbus/TCP server for one controller.
 pub struct PlcService {
+    /// Receives accepted changes from this controller.
+    pub facts: facts::Observer,
     /// The controller whose register map this connection serves.
     pub plc: Plc,
 }
@@ -49,6 +51,7 @@ impl serve::Service for PlcService {
     type Decoder = Frames<Frame>;
     type State = Shared;
     type Error = Infallible;
+    type Timer = ();
 
     fn decoder(&self) -> Self::Decoder {
         Frames::new()
@@ -61,7 +64,7 @@ impl serve::Service for PlcService {
         driver: &mut serve::Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         let source = facts::source_of(driver.conn());
-        let pdu = self.answer(&frame, state, source, &*driver);
+        let pdu = self.answer(&frame, state, source, &self.facts);
         frame
             .reply(pdu)
             .write(driver.reply())
@@ -324,11 +327,11 @@ mod tests {
     use super::*;
     use crate::Config;
     use crate::command::{FaultCommand, Loop};
+    use crate::facts::tests::{Memory, observations, observer};
     use crate::faults::{Fault, FaultChange, SensorFault};
     use crate::sensors::Sensor;
-    use fictionet::events::ConnInfo;
+    use fictionet::stdlib::services::serve::ConnInfo;
     use fictionet::stdlib::services::serve::Harness;
-    use fictionet_observe::Memory;
     use std::error::Error;
 
     const TRANSACTION: u16 = 7;
@@ -340,7 +343,10 @@ mod tests {
     fn harness(plc: Plc, plant: &Shared) -> serve::Harness<PlcService> {
         serve::Harness::new(
             fictionet::Seed::from_u64(0),
-            PlcService { plc },
+            PlcService {
+                plc,
+                facts: facts::Observer::default(),
+            },
             plant.clone(),
         )
     }
@@ -356,9 +362,15 @@ mod tests {
 
     /// A harness whose connection comes from `peer`, with its facts kept in `memory`.
     fn observed(plc: Plc, plant: &Shared, peer: &str, memory: &Arc<Memory>) -> Harness<PlcService> {
-        harness(plc, plant)
-            .with_conn(from(peer))
-            .observer(memory.clone())
+        serve::Harness::new(
+            fictionet::Seed::from_u64(0),
+            PlcService {
+                plc,
+                facts: observer(memory),
+            },
+            plant.clone(),
+        )
+        .with_conn(from(peer))
     }
 
     /// Sends one request frame through the harness and reads back the reply.
@@ -858,7 +870,12 @@ mod tests {
     fn a_write_from_the_hmi_address_logs_its_action_as_hmi() -> Result<(), Box<dyn Error>> {
         let plant = plant();
         let memory = Arc::new(Memory::default());
-        let mut h = observed(Plc::Rps1, &plant, "10.40.0.20:51000", &memory);
+        let mut h = observed(
+            Plc::Rps1,
+            &plant,
+            &format!("{}:51000", facts::HMI_ADDRESS),
+            &memory,
+        );
         exchange(
             &mut h,
             &Request::WriteSingleRegister {
@@ -866,13 +883,13 @@ mod tests {
                 value: 480,
             },
         )?;
-        let actions = memory.checked_of("plant", "action")?;
+        let actions = observations(&memory, "action");
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].str("source"), Some("hmi"));
-        assert_eq!(actions[0].str("command"), Some("rod_demand"));
-        assert_eq!(actions[0].u64("operator_actions"), Some(1));
-        assert_eq!(actions[0].u64("revision"), Some(0));
-        assert_eq!(actions[0].u64("at_ms"), Some(0));
+        assert_eq!(actions[0]["source"].as_str(), Some("hmi"));
+        assert_eq!(actions[0]["command"].as_str(), Some("rod_demand"));
+        assert_eq!(actions[0]["operator_actions"].as_u64(), Some(1));
+        assert_eq!(actions[0]["revision"].as_u64(), Some(0));
+        assert_eq!(actions[0]["at_ms"].as_u64(), Some(0));
         Ok(())
     }
 
@@ -888,9 +905,9 @@ mod tests {
                 value: 480,
             },
         )?;
-        let actions = memory.checked_of("plant", "action")?;
+        let actions = observations(&memory, "action");
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].str("source"), Some("modbus"));
+        assert_eq!(actions[0]["source"].as_str(), Some("modbus"));
         Ok(())
     }
 
@@ -898,7 +915,12 @@ mod tests {
     fn a_refused_write_logs_its_rejection_and_no_action() -> Result<(), Box<dyn Error>> {
         let plant = plant();
         let memory = Arc::new(Memory::default());
-        let mut h = observed(Plc::Bop1, &plant, "10.40.0.20:51000", &memory);
+        let mut h = observed(
+            Plc::Bop1,
+            &plant,
+            &format!("{}:51000", facts::HMI_ADDRESS),
+            &memory,
+        );
         exchange(
             &mut h,
             &Request::WriteSingleRegister {
@@ -906,12 +928,12 @@ mod tests {
                 value: 500,
             },
         )?;
-        assert!(memory.checked_of("plant", "action")?.is_empty());
-        let refused = memory.checked_of("plant", "rejected")?;
+        assert!(observations(&memory, "action").is_empty());
+        let refused = observations(&memory, "rejected");
         assert_eq!(refused.len(), 1);
-        assert_eq!(refused[0].str("command"), Some("valve_demand"));
-        assert_eq!(refused[0].str("source"), Some("hmi"));
-        assert_eq!(refused[0].str("reason"), Some("wrong_mode"));
+        assert_eq!(refused[0]["command"].as_str(), Some("valve_demand"));
+        assert_eq!(refused[0]["source"].as_str(), Some("hmi"));
+        assert_eq!(refused[0]["reason"].as_str(), Some("wrong_mode"));
         Ok(())
     }
 
@@ -920,7 +942,12 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let plant = plant();
         let memory = Arc::new(Memory::default());
-        let mut h = observed(Plc::Bop1, &plant, "10.40.0.20:51000", &memory);
+        let mut h = observed(
+            Plc::Bop1,
+            &plant,
+            &format!("{}:51000", facts::HMI_ADDRESS),
+            &memory,
+        );
         exchange(
             &mut h,
             &Request::WriteSingleCoil {
@@ -937,12 +964,12 @@ mod tests {
                 values: vec![300, 400],
             },
         )?;
-        let actions = memory.checked_of("plant", "action")?;
+        let actions = observations(&memory, "action");
         assert_eq!(actions.len(), 1, "only the mode change was accepted");
-        assert_eq!(actions[0].str("command"), Some("controller"));
-        let refused = memory.checked_of("plant", "rejected")?;
+        assert_eq!(actions[0]["command"].as_str(), Some("controller"));
+        let refused = observations(&memory, "rejected");
         assert_eq!(refused.len(), 1);
-        assert_eq!(refused[0].u64("at_ms"), Some(0));
+        assert_eq!(refused[0]["at_ms"].as_u64(), Some(0));
         Ok(())
     }
 
@@ -964,14 +991,22 @@ mod tests {
             .expect("the first fault is accepted");
         plant.lock().advance(2_000);
 
-        let mut h = observed(Plc::Rps1, &plant, "10.40.0.20:51000", &memory);
+        let mut h = observed(
+            Plc::Rps1,
+            &plant,
+            &format!("{}:51000", facts::HMI_ADDRESS),
+            &memory,
+        );
         for value in [480, 400] {
             exchange(&mut h, &Request::WriteSingleRegister { address: 0, value })?;
         }
-        let firsts = memory.checked_of("plant", "first_action")?;
+        let firsts = observations(&memory, "first_action");
         assert_eq!(firsts.len(), 1, "a second command does not log again");
-        assert_eq!(firsts[0].u64("first_action_after_fault_ms"), Some(2_000));
-        assert_eq!(firsts[0].u64("at_ms"), Some(2_000));
+        assert_eq!(
+            firsts[0]["first_action_after_fault_ms"].as_u64(),
+            Some(2_000)
+        );
+        assert_eq!(firsts[0]["at_ms"].as_u64(), Some(2_000));
 
         // A second fault start at 2500 ms arms the next first action. The write
         // at 2750 ms is 250 ms after it, and that logs once more.
@@ -988,10 +1023,10 @@ mod tests {
                 value: 420,
             },
         )?;
-        let firsts = memory.checked_of("plant", "first_action")?;
+        let firsts = observations(&memory, "first_action");
         assert_eq!(firsts.len(), 2);
-        assert_eq!(firsts[1].u64("first_action_after_fault_ms"), Some(250));
-        assert_eq!(firsts[1].u64("at_ms"), Some(2_750));
+        assert_eq!(firsts[1]["first_action_after_fault_ms"].as_u64(), Some(250));
+        assert_eq!(firsts[1]["at_ms"].as_u64(), Some(2_750));
         Ok(())
     }
 
@@ -999,7 +1034,12 @@ mod tests {
     fn a_manual_trip_coil_logs_a_manual_trip() -> Result<(), Box<dyn Error>> {
         let plant = plant();
         let memory = Arc::new(Memory::default());
-        let mut h = observed(Plc::Rps1, &plant, "10.40.0.20:51000", &memory);
+        let mut h = observed(
+            Plc::Rps1,
+            &plant,
+            &format!("{}:51000", facts::HMI_ADDRESS),
+            &memory,
+        );
         exchange(
             &mut h,
             &Request::WriteSingleCoil {
@@ -1007,12 +1047,12 @@ mod tests {
                 value: true,
             },
         )?;
-        let trips = memory.checked_of("plant", "trip")?;
+        let trips = observations(&memory, "trip");
         assert_eq!(trips.len(), 1);
-        assert_eq!(trips[0].str("cause"), Some("manual"));
-        assert_eq!(trips[0].u64("tripped_ms"), Some(0));
-        let actions = memory.checked_of("plant", "action")?;
-        assert_eq!(actions[0].str("command"), Some("manual_trip"));
+        assert_eq!(trips[0]["cause"].as_str(), Some("manual"));
+        assert_eq!(trips[0]["tripped_ms"].as_u64(), Some(0));
+        let actions = observations(&memory, "action");
+        assert_eq!(actions[0]["command"].as_str(), Some("manual_trip"));
         Ok(())
     }
 }

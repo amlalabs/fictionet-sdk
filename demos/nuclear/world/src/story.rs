@@ -33,9 +33,10 @@ use std::task::Poll;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use fictionet::stdlib::codec::{Stream, Wire};
 use fictionet::stdlib::network::route::Prefix;
+use fictionet::stdlib::network::{ConnectionExt, ip, tcp};
 use fictionet::stdlib::protocols::http1::{self, Header, RequestHead, Version};
-use fictionet::stdlib::world::sandbox::{self, Machine};
 use fictionet::{Cx, Error};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -51,7 +52,7 @@ use crate::steam;
 
 /// The operator's address on the operations network. It is a trusted route,
 /// like hmi01, so the operator console can reach hmi01.
-pub const OPERATOR: Ipv4Addr = Ipv4Addr::new(10, 40, 0, 50);
+pub const OPERATOR: Ipv4Addr = Ipv4Addr::new(10, 41, 0, 50);
 
 const OPERATOR_NAME: &str = "operator";
 
@@ -156,9 +157,9 @@ pub struct Report {
 }
 
 /// Builds the operations network: hmi01 at its fixed address, with the
-/// operator's console as a trusted route. Returns the operator's machine. The
+/// operator's console as a trusted route. Returns the operator's TCP endpoint. The
 /// controllers and hmi01 start on `fcx`, so call this inside the run.
-pub fn start_network(fcx: &Cx, driver: &Driver) -> Result<Machine, Error> {
+pub fn start_network(fcx: &Cx, driver: &Driver) -> Result<tcp::Endpoint, Error> {
     let (attacher, attachments) = fictionet::attachments();
     let operator_route = Prefix {
         addr: IpAddr::V4(OPERATOR),
@@ -167,18 +168,22 @@ pub fn start_network(fcx: &Cx, driver: &Driver) -> Result<Machine, Error> {
     hmi::with_hmi(driver)
         .route(OPERATOR_NAME, operator_route)
         .start(fcx, attachments)?;
-    let hmi_machine = sandbox::machine(fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
+    let hmi_tcp = tcp::endpoint(
+        fcx,
+        ip::split_protocols(fcx, attacher.attach(hmi::NAME)?).0,
+        hmi::ADDR.into(),
+    );
     hmi::start(
         fcx,
-        hmi_machine,
+        hmi_tcp,
         hmi::controllers(),
         hmi::Site::default(),
         driver,
     )?;
-    Ok(sandbox::machine(
+    Ok(tcp::endpoint(
         fcx,
-        attacher.attach(OPERATOR_NAME)?,
-        OPERATOR,
+        ip::split_protocols(fcx, attacher.attach(OPERATOR_NAME)?).0,
+        OPERATOR.into(),
     ))
 }
 
@@ -203,7 +208,7 @@ pub async fn clock(
             let had_end = previous.is_some_and(|(last_generation, last_ms, ended)| {
                 generation == last_generation && at_ms >= last_ms && ended
             });
-            driver.advance_to(fcx, pace.target(run_ms));
+            driver.advance_to(&driver.facts(), pace.target(run_ms));
             let snapshot = driver.snapshot();
             if snapshot.end.is_some() && !had_end {
                 pace.set_speed(run_ms, snapshot.at_ms, 0)
@@ -233,7 +238,7 @@ pub fn run_ms(fcx: &Cx) -> u64 {
 pub async fn run(
     fcx: &Cx,
     driver: &Driver,
-    operator: &Machine,
+    operator: &tcp::Endpoint,
     say: impl FnMut(Line),
 ) -> Result<Option<Report>, Error> {
     let generation = driver.generation();
@@ -251,7 +256,7 @@ pub async fn run(
 async fn steps(
     fcx: &Cx,
     driver: &Driver,
-    operator: &Machine,
+    operator: &tcp::Endpoint,
     mut say: impl FnMut(Line),
 ) -> Result<Report, Error> {
     let hot_b = Sensor::HotLeg(Loop::B);
@@ -352,7 +357,6 @@ async fn steps(
     let stuck_count = (now.readings[hot_b.index()].reading.value / resolution).round() as i16;
     let stuck_c = f64::from(stuck_count) * resolution;
     inject(
-        fcx,
         driver,
         FaultChange::Inject(Fault::Sensor {
             sensor: hot_b,
@@ -360,7 +364,6 @@ async fn steps(
         }),
     )?;
     inject(
-        fcx,
         driver,
         FaultChange::Inject(Fault::Process(ProcessFault::CoolantPumpTrip {
             pump: Loop::B,
@@ -516,9 +519,8 @@ async fn steps(
             settled.truth.reactor.neutron_power_percent, settled.truth.reactor.decay_heat_percent
         ),
     ));
-    inject(fcx, driver, FaultChange::Clear(FaultTarget::Sensor(hot_b)))?;
+    inject(driver, FaultChange::Clear(FaultTarget::Sensor(hot_b)))?;
     inject(
-        fcx,
         driver,
         FaultChange::Clear(FaultTarget::Process(ProcessFault::CoolantPumpTrip {
             pump: Loop::B,
@@ -585,7 +587,7 @@ async fn steps(
         "Feed valve A opened to 20% from the HMI for level recovery",
     ));
     wait_for(fcx, driver, driver.snapshot().at_ms + 3_000).await?;
-    inject(fcx, driver, FaultChange::Inject(Fault::TelemetryQuiet))?;
+    inject(driver, FaultChange::Inject(Fault::TelemetryQuiet))?;
     let quiet_from = driver.snapshot().at_ms;
     say(line(quiet_from, 6, "Fault: telemetry goes quiet"));
     // The baseline is taken after the last sample before the fault, so every
@@ -646,7 +648,7 @@ async fn steps(
             heartbeat_before[0], level_after, true_levels[0], true_levels[1]
         ),
     ));
-    inject(fcx, driver, FaultChange::Clear(FaultTarget::TelemetryQuiet))?;
+    inject(driver, FaultChange::Clear(FaultTarget::TelemetryQuiet))?;
     let quiet_to = driver.snapshot().at_ms;
     say(line(quiet_to, 6, "Fault cleared: telemetry quiet"));
     let resumed = wait_for(fcx, driver, quiet_to + RESUME_MS).await?;
@@ -776,13 +778,13 @@ fn heartbeats(view: &Value) -> Result<[u16; 3], Error> {
     Ok(counts)
 }
 
-/// Applies a fault change on the driver, logging it on `fcx`. The expected
+/// Applies a fault change on the driver, reporting it through the driver's observer. The expected
 /// revision is the plant's current one, since the story acts on what it reads.
-fn inject(fcx: &Cx, driver: &Driver, change: FaultChange) -> Result<(), Error> {
+fn inject(driver: &Driver, change: FaultChange) -> Result<(), Error> {
     let expected_revision = driver.snapshot().revision;
     driver
         .apply_fault(
-            fcx,
+            &driver.facts(),
             FaultCommand {
                 change,
                 expected_revision,
@@ -814,7 +816,7 @@ async fn wait_for(fcx: &Cx, driver: &Driver, at_ms: u64) -> Result<PlantSnapshot
 async fn until_hmi(
     fcx: &Cx,
     driver: &Driver,
-    operator: &Machine,
+    operator: &tcp::Endpoint,
     limit_ms: u64,
     what: &str,
     done: impl Fn(&Value) -> Result<bool, Error>,
@@ -834,7 +836,7 @@ async fn until_hmi(
 }
 
 /// Sends a control POST to hmi01. A null body sends no fields.
-async fn control(fcx: &Cx, operator: &Machine, kind: &str, body: Value) -> Result<(), Error> {
+async fn control(fcx: &Cx, operator: &tcp::Endpoint, kind: &str, body: Value) -> Result<(), Error> {
     let bytes = if body.is_null() {
         Vec::new()
     } else {
@@ -866,7 +868,7 @@ async fn control(fcx: &Cx, operator: &Machine, kind: &str, body: Value) -> Resul
 }
 
 /// Reads the complete HMI view over the operator connection.
-async fn hmi_view(fcx: &Cx, operator: &Machine) -> Result<Value, Error> {
+async fn hmi_view(fcx: &Cx, operator: &tcp::Endpoint) -> Result<Value, Error> {
     let request = http1::Request {
         head: RequestHead {
             method: "GET".to_owned(),
@@ -894,14 +896,34 @@ fn header(name: &str, value: &str) -> Header {
 /// One request on a new connection from the operator to hmi01.
 async fn exchange(
     fcx: &Cx,
-    operator: &Machine,
+    operator: &tcp::Endpoint,
     request: &http1::Request,
 ) -> Result<http1::Response, Error> {
     let to = SocketAddr::new(IpAddr::V4(hmi::ADDR), hmi::PORT);
     let mut conn = operator
-        .tcp
         .connect(fcx, to)
         .await
         .map_err(|e| Error::msg(format!("the operator cannot reach hmi01: {e:?}")))?;
-    sandbox::request(fcx, &mut conn, request).await
+    let mut decoder = http1::Responses::new();
+    decoder.expect_method(&request.head.method)?;
+    let mut stream = Stream::new(decoder);
+    conn.write_all(fcx, &request.to_bytes()?).await?;
+    let mut buf = [0; 4096];
+    loop {
+        while let Some(response) = stream.next() {
+            let response = response?;
+            if response.head.status >= 200 || response.head.status == 101 {
+                return Ok(response);
+            }
+        }
+        if stream.is_done() {
+            return Err(Error::msg("connection ended before an HTTP response"));
+        }
+        let n = conn.read(fcx, &mut buf).await?;
+        if n == 0 {
+            stream.end();
+        } else if stream.push(&buf[..n]) != n {
+            return Err(Error::msg("HTTP response exceeds the buffer limit"));
+        }
+    }
 }
