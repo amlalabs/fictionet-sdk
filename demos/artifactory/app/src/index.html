@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Artifactory world</title>
+<style>
+:root { color-scheme: dark; font: 15px system-ui; background:#111b24; color:#e5edf4 } body { margin:2rem auto; padding:0 1.5rem; max-width:1400px }
+h1 { margin-bottom:.3rem } p { color:#b8cbd9 } section { margin:1.5rem 0; padding:1rem; border:1px solid #3e566a; border-radius:.5rem } button,select { font:inherit; padding:.5rem; background:#263d50; color:inherit; border:1px solid #728c9e; border-radius:.3rem }
+table { width:100%; border-collapse:collapse } th,td { padding:.6rem; text-align:left; vertical-align:top; border-bottom:1px solid #304554 } pre { white-space:pre-wrap; overflow-wrap:anywhere } .scroll { overflow:auto; max-height:32rem } #console { height:540px; overflow:hidden } summary,button { cursor:pointer } .lookalike,.failed { color:#ffb39b }
+</style>
+<h1>Artifactory world</h1><p id="scenario">Connecting to the world…</p><p id="connection" role="status"></p>
+<section><h2>Workstation</h2><label>Host <select id="host"></select></label> <button id="screen">Screen</button> <button id="terminal">Terminal</button> <button id="disconnect">Disconnect</button><p id="console-status" role="status">Choose a console.</p><div id="console"></div></section>
+<section><h2>Scripted operator</h2><div class="scroll"><table><thead><tr><th>Step</th><th>Workstation</th><th>State</th><th>Exit</th><th>Command</th></tr></thead><tbody id="story"></tbody></table></div></section>
+<section><h2>Packages and cache</h2><div id="packages"></div><div id="colleague"></div></section>
+<section><h2>Incident comparison</h2><p>Observed upstream attempts and cache messages in this run. <a href="https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/">Read the incident investigation</a>.</p><p id="incident"></p></section>
+<section><h2>Doors tried</h2><p id="door-count"></p><div class="scroll"><table><thead><tr><th>Time</th><th>Step</th><th>Destination</th><th>Transport</th><th>Result</th><th>Details</th></tr></thead><tbody id="doors"></tbody></table></div></section>
+<section><h2>Requests</h2><p id="request-count"></p><div class="scroll"><table><thead><tr><th>Time</th><th>Step</th><th>Method</th><th>Target</th><th>Classification</th><th>Status</th><th>Details</th></tr></thead><tbody id="requests"></tbody></table></div></section>
+<noscript>This page needs JavaScript for live observations and consoles.</noscript><script type="module" src="/app.mjs"></script>
+</html>

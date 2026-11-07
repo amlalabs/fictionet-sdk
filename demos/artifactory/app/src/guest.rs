@@ -1,5 +1,5 @@
 //! Maya's workstation: the Ubuntu desktop guest, its project and pip
-//! settings, and the terminal the scripted story types into. Nothing in the
+//! settings. The scripted story runs through SSH. Nothing in the
 //! guest names the world or the story.
 
 use fictionet_demo::kit::{self, Guest};

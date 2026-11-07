@@ -3,35 +3,32 @@
 //! `fictionet::run`, so the page shows real world facts. The screen says
 //! NO VM, and steps have no exit status because no guest runs.
 
+use super::page::{Host, Server};
 use super::{
     Result,
     facts::{Facts, Publisher, Store},
     story::{self, Mode, Who},
 };
 use artifactory_world::{
-    Identity, NAMES, ServedNames,
+    Identity, NAMES,
     log::Log,
     packages::Variant,
     repository::{Contents, Sessions},
 };
-use fictionet::{
-    Cx, RunOptions, Seed,
-    events::Fanout,
-    stdlib::{
-        protocols::{dns::rr::RecordType, http1},
-        world::sandbox::{self, Machine},
+use fictionet::stdlib::{
+    codec::{Stream, Wire},
+    network::{ip, tcp, udp},
+    protocols::{
+        dns::op::{Message, MessageType, Query},
+        dns::rr::{Name, RecordType},
+        http1,
     },
 };
+use fictionet::tokio::ConnectionTokioExt;
+use fictionet::{Cx, Seed};
 use fictionet_demo::kit::preview::{Console, Input, Story};
-use fictionet_observe::{
-    DashboardObserver, DashboardOptions,
-    page::{Host, HostState, HostStatus, Server, StateLimits, StateTopic},
-};
-use std::{
-    net::Ipv4Addr,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The replay's sandboxes: its client, and the colleague's in `--sessions`.
 pub const SANDBOXES: [&str; 2] = ["replay", "replay-colleague"];
@@ -54,7 +51,6 @@ impl Replay {
             colleague.as_ref().map(Contents::inventory),
             super::page::scenario(variant, true, mode.map(|mode| (mode, SANDBOXES))),
             SANDBOXES,
-            ServedNames::default(),
         ));
         let main = facts.listen(Store::Main, main);
         let colleague = colleague.map(|contents| facts.listen(Store::Colleague, contents));
@@ -73,24 +69,17 @@ impl Replay {
 pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> Result {
     let replay = Replay::new(variant, mode).map_err(std::io::Error::other)?;
     let facts = replay.facts.clone();
-    let dashboard = DashboardObserver::new(DashboardOptions {
-        collector: fictionet_observe::Options::default(),
-        ..Default::default()
-    });
     let screen = Console::new();
-    let page = bind(&dashboard, &facts, screen.clone()).await?;
-    println!(
-        "Replay without VMs: an in-process client sends the story's requests. No guest runs, so steps have no exit status."
-    );
+    let page = bind(&facts, screen.clone()).await?;
+    println!("Replay without VMs: an in-process client sends the story requests. No guest runs.");
     let _access = fictionet_demo::kit::PageAccess::new(page.url())?;
     let mut input = Input::stdin(Story::Once, Some(screen))?;
-    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
-    let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
-        dashboard.observer(),
-        audit.clone(),
-        facts.clone(),
-    ])));
-    let mut story = Box::pin(run(options, replay, Duration::from_secs(1), extra_reads));
+    let mut story = Box::pin(run(
+        Seed::from_u64(1),
+        replay,
+        Duration::from_secs(1),
+        extra_reads,
+    ));
     let mut replaying = true;
     loop {
         tokio::select! {
@@ -103,84 +92,65 @@ pub async fn serve(variant: Variant, mode: Option<Mode>, extra_reads: usize) -> 
         }
     }
     drop(story);
-    audit.check()?;
     drop(page);
     Ok(())
 }
 
-async fn bind(
-    dashboard: &DashboardObserver,
-    facts: &Facts,
-    screen: Console,
-) -> std::io::Result<Server> {
-    let status = StateTopic::new(StateLimits::default());
-    status
-        .publish(
-            fictionet::time::Instant::ZERO,
-            &HostStatus {
-                state: HostState::NetworkUp,
-                addresses: vec!["10.0.0.2".into()],
-                screen: true,
-                terminal: false,
-            },
-        )
-        .map_err(std::io::Error::other)?;
-    let inventory = facts.state.lock().unwrap().inventory.clone();
-    super::page::compose(
-        &inventory,
-        dashboard.handle(),
-        vec![Host::new(SANDBOXES[0]).status(status).console(screen)],
+async fn bind(facts: &Facts, screen: Console) -> std::io::Result<Server> {
+    super::page::serve(
         facts.topics.clone(),
-        true,
+        vec![Host {
+            name: SANDBOXES[0].into(),
+            console: Arc::new(screen),
+        }],
+        fictionet_demo::kit::PAGE_PORT,
     )
-    .bind_loopback(fictionet_demo::kit::PAGE_PORT)
     .await
 }
 
-async fn run(
-    options: RunOptions,
-    replay: Replay,
-    pace: Duration,
-    extra_reads: usize,
-) -> fictionet::Result {
+async fn run(seed: Seed, replay: Replay, pace: Duration, extra_reads: usize) -> fictionet::Result {
     let Replay {
         facts,
         main: contents,
         sessions,
         mode,
     } = replay;
-    let log = Log::start(Box::new(std::io::sink()))?;
+    let observer = facts.clone();
+    let log = Log::start(Box::new(std::io::sink()))?
+        .observe(move |observation| observer.record(observation));
     let output = log.clone();
-    let result = fictionet::run(options, move |cx| async move {
+    let result = fictionet::run(seed, move |cx| async move {
         let identity = Identity::new(&cx)?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(identity.ca_der.clone())?;
+        let tls = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
         let (attacher, attachments) = fictionet::attachments();
         artifactory_world::start(&cx, sessions, identity, log, attachments)?;
-        let machine = sandbox::machine(
+        let mut client = Client::new(
             &cx,
             attacher.attach(SANDBOXES[0])?,
             Ipv4Addr::new(10, 0, 0, 2),
+            &contents,
+            tls.clone(),
         );
-        let mut client = Client {
-            cx: &cx,
-            machine: &machine,
-            contents: &contents,
-            upload: None,
-        };
-        let colleague_machine = mode
+        let mut colleague = mode
             .map(|_| {
-                Ok::<_, fictionet::Error>(sandbox::machine(
+                Ok::<_, fictionet::Error>(Client::new(
                     &cx,
                     attacher.attach(SANDBOXES[1])?,
                     Ipv4Addr::new(10, 0, 0, 3),
+                    &contents,
+                    tls,
                 ))
             })
             .transpose()?;
-        let mut colleague = colleague_machine.as_ref().map(|machine| Client {
-            cx: &cx,
-            machine,
-            contents: &contents,
-            upload: None,
-        });
         let publisher = Publisher::start(facts.clone());
         cx.sleep(pace).await?;
         for step in story::steps(contents.variant, mode) {
@@ -228,11 +198,72 @@ async fn run(
 
 struct Client<'a> {
     cx: &'a Cx,
-    machine: &'a Machine,
+    tcp: tcp::Endpoint,
+    udp: udp::Endpoint,
+    tls: Arc<rustls::ClientConfig>,
     contents: &'a Contents,
     upload: Option<(String, Vec<u8>)>,
 }
-impl Client<'_> {
+impl<'a> Client<'a> {
+    fn new(
+        cx: &'a Cx,
+        link: impl fictionet::Interface,
+        addr: Ipv4Addr,
+        contents: &'a Contents,
+        tls: Arc<rustls::ClientConfig>,
+    ) -> Self {
+        let (tcp, udp, _, _) = ip::split_protocols(cx, link);
+        Self {
+            cx,
+            tcp: tcp::endpoint(cx, tcp, addr.into()),
+            udp: udp::endpoint(cx, udp, addr.into()),
+            contents,
+            tls,
+            upload: None,
+        }
+    }
+
+    async fn lookup(&self, name: &str) -> fictionet::Result {
+        let mut socket = self.udp.bind(0)?;
+        let mut query = Message::query();
+        query.metadata.id = self.cx.random_u64() as u16;
+        query.metadata.recursion_desired = true;
+        let mut question = Name::from_ascii(name)?;
+        // Wire-format names are absolute, including the echoed question.
+        question.set_fqdn(true);
+        query.add_query(Query::query(question, RecordType::A));
+        let server = "10.0.0.1:53".parse()?;
+        socket.send_to(&query.to_vec()?, server);
+        loop {
+            let (bytes, from) = socket.recv(self.cx).await?;
+            let answer = Message::from_vec(&bytes)?;
+            if from == server
+                && answer.metadata.message_type == MessageType::Response
+                && answer.metadata.op_code == query.metadata.op_code
+                && answer.metadata.id == query.metadata.id
+                && answer.queries == query.queries
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn tls(
+        &self,
+        addr: std::net::SocketAddr,
+        name: &str,
+    ) -> fictionet::Result<
+        tokio_rustls::client::TlsStream<fictionet::tokio::Compat<tcp::TcpConnection>>,
+    > {
+        let stream = self.tcp.connect(self.cx, addr).await?.into_tokio(self.cx);
+        Ok(tokio_rustls::TlsConnector::from(self.tls.clone())
+            .connect(
+                rustls::pki_types::ServerName::try_from(name.to_owned())?,
+                stream,
+            )
+            .await?)
+    }
+
     async fn request(
         &self,
         site: usize,
@@ -242,18 +273,8 @@ impl Client<'_> {
         body: &[u8],
     ) -> fictionet::Result<http1::Response> {
         let (name, addr) = NAMES[site];
-        self.machine
-            .lookup(
-                self.cx,
-                Ipv4Addr::new(10, 0, 0, 1).into(),
-                name,
-                RecordType::A,
-            )
-            .await?;
-        let mut io = self
-            .machine
-            .tls(self.cx, (addr, 443).into(), name, None, SystemTime::now())
-            .await?;
+        self.lookup(name).await?;
+        let mut io = self.tls((addr, 443).into(), name).await?;
         let mut fields = vec![
             http1::Header {
                 name: "Host".into(),
@@ -268,20 +289,42 @@ impl Client<'_> {
             name: (*name).into(),
             value: value.as_bytes().to_vec(),
         }));
-        sandbox::request(
-            self.cx,
-            &mut io,
-            &http1::Request {
-                head: http1::RequestHead {
-                    method: method.into(),
-                    target: path.into(),
-                    version: http1::Version::Http11,
-                    headers: fields,
-                },
-                body: body.to_vec(),
+        let request = http1::Request {
+            head: http1::RequestHead {
+                method: method.into(),
+                target: path.into(),
+                version: http1::Version::Http11,
+                headers: fields,
             },
-        )
-        .await
+            body: body.to_vec(),
+        };
+        io.write_all(&request.to_bytes()?).await?;
+        let mut responses = http1::Responses::new();
+        responses.expect_method(method)?;
+        let mut responses = Stream::new(responses);
+        let mut buffer = [0; 8192];
+        loop {
+            while let Some(response) = responses.next() {
+                let response = response
+                    .map_err(|error| fictionet::Error::msg(format!("HTTP response: {error:?}")))?;
+                if response.head.status >= 200 {
+                    return Ok(response);
+                }
+            }
+            if responses.is_done() {
+                return Err(fictionet::Error::msg(
+                    "the HTTP connection ended before a response",
+                ));
+            }
+            let count = io.read(&mut buffer).await?;
+            if count == 0 {
+                responses.end();
+            } else if responses.push(&buffer[..count]) != count {
+                return Err(fictionet::Error::msg(
+                    "the HTTP response exceeds the buffer limit",
+                ));
+            }
+        }
     }
 
     async fn download(
@@ -385,14 +428,7 @@ impl Client<'_> {
                 .await?;
             }
             "Connect to GitHub" | "Look up GitHub" => {
-                self.machine
-                    .lookup(
-                        self.cx,
-                        Ipv4Addr::new(10, 0, 0, 1).into(),
-                        "github.com",
-                        RecordType::A,
-                    )
-                    .await?;
+                self.lookup("github.com").await?;
             }
             "Try the proxy port" | "Knock on port 22" => {
                 let addr = if title == "Try the proxy port" {
@@ -400,34 +436,18 @@ impl Client<'_> {
                 } else {
                     "10.20.0.15:22"
                 };
-                if self
-                    .machine
-                    .tcp
-                    .connect(self.cx, addr.parse()?)
-                    .await
-                    .is_ok()
-                {
+                if self.tcp.connect(self.cx, addr.parse()?).await.is_ok() {
                     return Err(fictionet::Error::msg(format!(
                         "unexpected connection to {addr}"
                     )));
                 }
             }
             "Send public UDP" => {
-                self.machine
-                    .udp
-                    .bind(0)?
-                    .send_to(b"x", "198.51.100.7:123".parse()?);
+                self.udp.bind(0)?.send_to(b"x", "198.51.100.7:123".parse()?);
             }
             "Try a public TLS address" => {
                 if self
-                    .machine
-                    .tls(
-                        self.cx,
-                        (NAMES[1].1, 443).into(),
-                        "151.101.0.223",
-                        None,
-                        SystemTime::now(),
-                    )
+                    .tls((NAMES[1].1, 443).into(), "151.101.0.223")
                     .await
                     .is_ok()
                 {
@@ -542,10 +562,10 @@ mod tests {
         for (variant, mode) in RUNS {
             let replay = Replay::new(variant, mode).unwrap();
             let facts = replay.facts.clone();
-            let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
+            let seed = Seed::from_u64(1);
             tokio::time::timeout(
                 Duration::from_secs(30),
-                run(options, replay, Duration::ZERO, 0),
+                run(seed, replay, Duration::ZERO, 0),
             )
             .await
             .unwrap()
@@ -594,88 +614,26 @@ mod tests {
         for (variant, mode) in RUNS {
             let replay = Replay::new(variant, mode).unwrap();
             let facts = replay.facts.clone();
-            let dashboard = DashboardObserver::new(DashboardOptions {
-                collector: fictionet_observe::Options::default(),
-                ..Default::default()
-            });
-            let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
-            let options = RunOptions::new(Seed::from_u64(1)).observer(Arc::new(Fanout::new(vec![
-                dashboard.observer(),
-                facts.clone(),
-            ])));
+            let page = bind(&facts, Console::new()).await.unwrap();
             tokio::time::timeout(
                 Duration::from_secs(30),
-                run(options, replay, Duration::ZERO, 0),
+                run(Seed::from_u64(1), replay, Duration::ZERO, 0),
             )
             .await
             .unwrap()
             .unwrap();
-            let summary = super::super::page::check(page.url(), variant, mode)
+            super::super::page::check(page.url(), variant, mode)
                 .await
                 .unwrap();
-            assert!(summary.starts_with("page API: "), "{summary}");
-            // Each moment's filter picks out exactly one event of the story.
-            let client = fictionet_demo::kit::client::PageClient::from_url(page.url()).unwrap();
-            client.bootstrap().await.unwrap();
-            let description = client.get_json("/api/page").await.unwrap();
-            let moments = description["moments"].as_array().unwrap();
-            let expected: &[&str] = match variant {
-                Variant::Lookalike => &["Lookalike wheel requested"],
-                Variant::Peer => &["Reply folder created"],
-                Variant::Normal | Variant::Missing => &[],
-            };
+            let shown: super::super::facts::Rows<super::super::facts::RequestRow> =
+                super::super::page::read(page.url(), "/api/requests")
+                    .await
+                    .unwrap();
+            let published = facts.topics.requests.borrow();
             assert_eq!(
-                moments.iter().map(|m| &m["title"]).collect::<Vec<_>>(),
-                expected
+                serde_json::to_value(shown).unwrap(),
+                serde_json::to_value(&*published).unwrap()
             );
-            for moment in moments {
-                let table = client
-                    .get_json(moment["events"].as_str().unwrap())
-                    .await
-                    .unwrap();
-                let rows = table["rows"].as_array().unwrap();
-                assert_eq!(rows.len(), 1, "{variant:?}: {table}");
-                let fields = &rows[0]["fields"];
-                match variant {
-                    Variant::Lookalike => {
-                        assert_eq!(fields["role"], "lookalike");
-                        assert_eq!(fields["label"], "file");
-                    }
-                    _ => assert_eq!(fields["peer_reply"], "zzREPLY_still-missing/"),
-                }
-            }
-            // Each panel module loads its file from the assets.
-            for (panel, file) in [
-                ("doors-tried", "doors"),
-                ("packages", "packages"),
-                ("requests", "requests"),
-            ] {
-                let entry = client
-                    .request("GET", &format!("/panels/{panel}.mjs"), None, true)
-                    .await
-                    .unwrap();
-                assert_eq!(entry.status, 200);
-                let source = String::from_utf8(entry.body).unwrap();
-                assert!(
-                    source.contains(&format!("'../assets/artifactory/{file}.mjs'")),
-                    "{source}"
-                );
-                let module = client
-                    .request(
-                        "GET",
-                        &format!("/assets/artifactory/{file}.mjs"),
-                        None,
-                        true,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(module.status, 200, "{file}");
-                assert!(
-                    String::from_utf8(module.body)
-                        .unwrap()
-                        .contains("export function mount")
-                );
-            }
         }
     }
 
@@ -686,8 +644,8 @@ mod tests {
         let variant = Variant::Lookalike;
         let replay = Replay::new(variant, None).unwrap();
         let facts = replay.facts.clone();
-        let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
-        run(options, replay, Duration::ZERO, 0).await.unwrap();
+        let seed = Seed::from_u64(1);
+        run(seed, replay, Duration::ZERO, 0).await.unwrap();
         let state = facts.state.lock().unwrap();
         let requests = Rows {
             rows: state.requests.clone(),
@@ -761,8 +719,8 @@ mod tests {
         let mode = Some(Mode::Separate);
         let replay = Replay::new(Variant::Peer, mode).unwrap();
         let facts = replay.facts.clone();
-        let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
-        run(options, replay, Duration::ZERO, 0).await.unwrap();
+        let seed = Seed::from_u64(1);
+        run(seed, replay, Duration::ZERO, 0).await.unwrap();
         let state = facts.state.lock().unwrap();
         let requests = Rows {
             rows: state.requests.clone(),
@@ -830,28 +788,28 @@ mod tests {
     async fn extra_reads_fill_the_page_bound() {
         let replay = Replay::new(Variant::Normal, None).unwrap();
         let facts = replay.facts.clone();
-        let dashboard = DashboardObserver::new(DashboardOptions {
-            collector: fictionet_observe::Options::default(),
-            ..Default::default()
-        });
-        let page = bind(&dashboard, &facts, Console::new()).await.unwrap();
-        let options = RunOptions::new(Seed::from_u64(1)).observer(facts.clone());
+        let page = bind(&facts, Console::new()).await.unwrap();
+        let seed = Seed::from_u64(1);
         let reads = super::super::facts::PAGE_ROWS + 20;
         tokio::time::timeout(
             Duration::from_secs(60),
-            run(options, replay, Duration::ZERO, reads),
+            run(seed, replay, Duration::ZERO, reads),
         )
         .await
         .unwrap()
         .unwrap();
-        let client = fictionet_demo::kit::client::PageClient::from_url(page.url()).unwrap();
-        client.bootstrap().await.unwrap();
-        let value: serde_json::Value = client.get_json("/api/state/requests").await.unwrap();
-        assert_eq!(value["status"]["too_large"], false);
-        let rows = value["value"]["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), super::super::facts::PAGE_ROWS);
-        assert!(value["value"]["dropped"].as_u64().unwrap() >= 20);
-        assert!(rows.iter().all(|row| row["traffic"] == "after"));
+        let value: super::super::facts::Rows<super::super::facts::RequestRow> =
+            super::super::page::read(page.url(), "/api/requests")
+                .await
+                .unwrap();
+        assert_eq!(value.rows.len(), super::super::facts::PAGE_ROWS);
+        assert!(value.dropped >= 20);
+        assert!(
+            value
+                .rows
+                .iter()
+                .all(|row| row.traffic == super::super::facts::Traffic::After)
+        );
         facts.state.lock().unwrap().check_complete().unwrap();
     }
 }

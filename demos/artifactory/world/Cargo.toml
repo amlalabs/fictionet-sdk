@@ -17,7 +17,9 @@ path = "src/main.rs"
 [dependencies]
 fictionet-extras = { path = "../../../extras" }
 bytes = "1"
-fictionet = { path = "../../.." }
+fictionet = { path = "../../..", features = ["page"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
 http = "1"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }

@@ -10,7 +10,7 @@ use artifactory_world::{
 use fictionet::{Cx, Result, stdlib::web};
 use fictionet_demo::kit;
 use std::collections::BTreeMap;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 
 /// One shared repository state, or Maya's and her colleague's by sandbox.
 pub fn sessions(
@@ -27,20 +27,14 @@ pub fn sessions(
     }
 }
 
-pub fn start(
-    fcx: &Cx,
-    mut world: kit::World,
-    sessions: Sessions,
-    log: Log,
-    closed: Arc<AtomicBool>,
-) -> Result {
+pub fn start(fcx: &Cx, mut world: kit::World, sessions: Sessions, log: Log) -> Result {
     let identity = Identity::with_names(fcx, kit::desktop::HOSTS)?;
     world.trust("northwind", &identity.ca_pem)?;
     let configs = kit::desktop::HOSTS
         .iter()
         .map(|name| identity.server_config(fcx, name))
         .collect::<Result<Vec<_>>>()?;
-    let mirror = kit::mirror::Closable::new(world.mirror(fcx)?, closed);
+    let mirror = world.mirror(fcx)?;
     let mut net = artifactory_world::network(fcx, sessions, identity, log)?
         .route(kit::JUMP, kit::jump_prefix());
     for name in ["archive.ubuntu.com", "security.ubuntu.com"] {

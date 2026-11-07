@@ -18,10 +18,10 @@ use artifactory_world::repository::Contents;
 use artifactory_world::repository::Sessions;
 use artifactory_world::{Identity, Result};
 use fictionet_extras::args::{Args, configuration, unknown};
-use fictionet_extras::names::{name, parse};
 
-fn main() {
-    if let Err(e) = serve() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = serve().await {
         eprintln!("artifactory-world: {e}");
         std::process::exit(1);
     }
@@ -43,7 +43,7 @@ struct Configuration {
     private_seed: Option<String>,
 }
 
-fn serve() -> Result {
+async fn serve() -> Result {
     let mut argv = std::env::args().skip(1);
     let config: Configuration = configuration(&mut argv).map_err(fictionet::Error::msg)?;
     let args = Args {
@@ -58,9 +58,10 @@ fn serve() -> Result {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let variant = parse::<Variant>(&config.variant).ok_or_else(|| {
-        fictionet::Error::msg("variant must be normal, missing, lookalike or peer")
-    })?;
+    let variant = config
+        .variant
+        .parse::<Variant>()
+        .map_err(|_| fictionet::Error::msg("variant must be normal, missing, lookalike or peer"))?;
     let private = private_seed(config.private_seed.as_deref())?;
     let contents = Arc::new(Contents::new(variant, &config.seed, &private)?);
     std::fs::create_dir_all(&args.state_dir)?;
@@ -74,12 +75,34 @@ fn serve() -> Result {
     let finalization = Arc::new(log.finalization(&args.state_dir)?);
     let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
-    let (options, _observation) = fictionet_observe::serve_observation(
-        fictionet::RunOptions::new(fictionet::Seed::random()),
-        args.observation.clone(),
-        Some(Arc::new(log.clone())),
-    )?;
-    let result = fictionet::block_on(fictionet::run(options, move |fcx| async move {
+    let (updates, snapshots) = tokio::sync::watch::channel(Snapshot::default());
+    let log = if args.observation.is_some() {
+        log.observe(move |fact| {
+            updates.send_modify(|snapshot| snapshot.record(fact));
+        })
+    } else {
+        log
+    };
+    let observation = if let Some(path) = &args.observation {
+        parent(path)?;
+        let listener = tokio::net::UnixListener::bind(path)?;
+        let current = snapshots.clone();
+        let routes = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(move || {
+                    let current = current.clone();
+                    async move { axum::Json(current.borrow().clone()) }
+                }),
+            )
+            .merge(fictionet::stdlib::page::state(snapshots));
+        Some(tokio::spawn(
+            async move { axum::serve(listener, routes).await },
+        ))
+    } else {
+        None
+    };
+    let result = fictionet::run(fictionet::Seed::random(), move |fcx| async move {
         let identity = Identity::new(&fcx)?;
         std::fs::create_dir_all(&args.ca_dir)?;
         std::fs::write(args.ca_dir.join("ca.pem"), &identity.ca_pem)?;
@@ -96,17 +119,49 @@ fn serve() -> Result {
             attacher,
         )?;
         parent(&args.ready)?;
-        let variant = name(&variant);
-        std::fs::write(&args.ready, &variant)?;
+        let variant = variant.as_str();
+        std::fs::write(&args.ready, variant)?;
         println!(
             "artifactory world up: variant={variant} seed={}",
             contents.seed
         );
         shutdown.wait(&fcx).await
-    }));
+    })
+    .await;
+    if let Some(task) = observation {
+        task.abort();
+    }
     finalization.acknowledge(result)?;
     // Keep the container available for the harness to read the finalized files.
     loop {
         std::thread::park();
+    }
+}
+
+/// Recent typed facts. Counts expose truncation without retaining an unbounded log.
+#[derive(Clone, Default, serde::Serialize)]
+struct Snapshot {
+    requests: std::collections::VecDeque<artifactory_world::facts::Request>,
+    doors: std::collections::VecDeque<artifactory_world::facts::Door>,
+    dropped: u64,
+}
+
+impl Snapshot {
+    fn record(&mut self, fact: &artifactory_world::facts::Observation) {
+        const LIMIT: usize = 256;
+        if let Some(request) = &fact.request {
+            self.requests.push_back(request.clone());
+            if self.requests.len() > LIMIT {
+                self.requests.pop_front();
+                self.dropped += 1;
+            }
+        }
+        if let Some(door) = &fact.door {
+            self.doors.push_back(door.clone());
+            if self.doors.len() > LIMIT {
+                self.doors.pop_front();
+                self.dropped += 1;
+            }
+        }
     }
 }

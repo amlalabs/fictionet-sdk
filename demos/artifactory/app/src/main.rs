@@ -17,19 +17,15 @@ mod story;
 mod world;
 
 use artifactory_world::{
-    ServedNames,
     log::Log,
     packages::{Variant, private_seed},
     repository::Contents,
 };
-use fictionet::events::Fanout;
-use fictionet_demo::kit::{self, Kit};
-use fictionet_extras::names;
-use fictionet_observe::Aggregate;
+use fictionet_demo::kit;
 use guest::HOSTNAME;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 use story::Mode;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -61,8 +57,7 @@ fn args(mut args: impl Iterator<Item = String>) -> Result<Args> {
         match flag.as_str() {
             "--variant" if !selected => {
                 selected = true;
-                parsed.variant = names::parse(&args.next().ok_or("--variant needs a value")?)
-                    .ok_or("variant must be normal, missing, lookalike or peer")?;
+                parsed.variant = args.next().ok_or("--variant needs a value")?.parse()?;
             }
             "--sessions" if parsed.sessions.is_none() => {
                 parsed.sessions = Some(
@@ -114,7 +109,7 @@ async fn execute() -> Result {
     let state = || {
         Contents::new(
             variant,
-            &format!("artifactory-demo-{}", names::name(&variant)),
+            &format!("artifactory-demo-{}", variant.as_str()),
             &private,
         )
         .map_err(io::Error::other)
@@ -127,10 +122,8 @@ async fn execute() -> Result {
         colleague.as_ref().map(Contents::inventory),
         page::scenario(variant, false, sessions.map(|mode| (mode, names))),
         names,
-        ServedNames::new(kit::desktop::HOSTS),
     ));
-    let publisher = Arc::new(facts::Publisher::start(facts.clone()));
-    let inventory = contents.inventory();
+    let publisher = facts::Publisher::start(facts.clone());
     let states = world::sessions(
         facts.listen(facts::Store::Main, contents),
         colleague.map(|contents| facts.listen(facts::Store::Colleague, contents)),
@@ -143,34 +136,83 @@ async fn execute() -> Result {
             guest::COLLEAGUE
         );
     }
-    let closed = Arc::new(AtomicBool::new(false));
-    let mirror_closed = closed.clone();
-    let world_log = log.clone();
-    let topics = facts.topics.clone();
-    let mut kit = Kit::new("artifactory").guest(guest::definition());
+    let observer = facts.clone();
+    let world_log = log
+        .clone()
+        .observe(move |observation| observer.record(observation));
+    let mut guests = vec![guest::definition()];
     if sessions.is_some() {
-        kit = kit.guest(guest::colleague());
+        guests.push(guest::colleague());
     }
-    let two = sessions.is_some();
-    let kit = kit
-        .page(move |dashboard, hosts| {
-            let mut list = vec![hosts.take(HOSTNAME)];
-            if two {
-                list.push(hosts.take(guest::COLLEAGUE));
-            }
-            page::compose(&inventory, dashboard, list, topics, false)
+    let run = kit::boot(
+        "artifactory",
+        guests,
+        &downloads,
+        |_| {},
+        move |fcx, world| async move { world::start(&fcx, world, states, world_log) },
+    )
+    .await?;
+    let hosts = run
+        .guests()
+        .iter()
+        .map(|host| page::Host {
+            name: host.name().into(),
+            console: Arc::new(host.console()),
         })
-        .observer(Arc::new(Aggregate::new(Arc::new(Fanout::new(vec![
-            Arc::new(log.clone()),
-            facts.clone(),
-        ])))))
-        .world(move |fcx, world| async move {
-            world::start(&fcx, world, states, world_log, mirror_closed)
-        });
-    let result = kit.run_app(&downloads, HOSTNAME).await;
+        .collect();
+    let server = page::serve(facts.topics.clone(), hosts, kit::PAGE_PORT).await?;
+    let _access = kit::PageAccess::new(server.url())?;
+    let work = async {
+        run.app_ready(HOSTNAME).await?;
+        for step in story::steps(variant, sessions) {
+            facts.phase(step.name, step.destinations, step.who);
+            publisher.flush().await?;
+            let host = names[step.who as usize];
+            let (user, command) = if step.who == story::Who::Maya {
+                (
+                    guest::USER,
+                    format!(
+                        "cd {} && . .venv/bin/activate && {}",
+                        guest::PROJECT,
+                        step.command
+                    ),
+                )
+            } else {
+                ("dana", step.command.clone())
+            };
+            let command = format!("sudo -u {user} bash -lc {}", kit::ssh::quote(&command));
+            let output = run.guest(host).ssh().run_bounded(&command, 1 << 20).await?;
+            print!("{}", output.stdout);
+            eprint!("{}", output.stderr);
+            let checked = facts.wait_for(&step).await;
+            let complete = output.code >= 0
+                && checked.is_ok()
+                && (!step.checks.is_empty() || output.code == 0);
+            facts.finish(Some(output.code), complete);
+            publisher.flush().await?;
+            checked?;
+            if !complete {
+                return Err(io::Error::other(format!(
+                    "{} did not complete successfully",
+                    step.name
+                )));
+            }
+        }
+        facts.phase("after", &[], story::Who::Maya);
+        publisher.flush().await?;
+        println!("Story complete. The page stays open until Ctrl-C.");
+        std::future::pending::<io::Result<()>>().await
+    };
+    let result = tokio::select! {
+        result = work => result,
+        signal = tokio::signal::ctrl_c() => signal,
+    };
+    drop(server);
+    let shutdown = run.shutdown().await;
     publisher.flush().await?;
     log.finish()?;
     result?;
+    shutdown?;
     Ok(())
 }
 
@@ -183,7 +225,10 @@ mod tests {
         assert_eq!(parse(&["downloads"]).unwrap().variant, Variant::Lookalike);
         for variant in ["normal", "missing", "lookalike", "peer"] {
             assert_eq!(
-                names::name(&parse(&["downloads", "--variant", variant]).unwrap().variant),
+                parse(&["downloads", "--variant", variant])
+                    .unwrap()
+                    .variant
+                    .as_str(),
                 variant
             );
         }

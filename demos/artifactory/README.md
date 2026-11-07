@@ -499,20 +499,26 @@ inventory; `lookalike` is the default. In the `peer` variant,
 state or a separate state for each session. Pass `preview` instead of the
 downloads folder to replay the scripted probes without a VM.
 
-The page has three panels of its own beside the standard ones:
+The app serves typed snapshots directly and uses the shared kit's local
+screen and terminal components. Its data views are:
 
-- **Doors tried** shows the variant, the story's steps with their exit
-  status, and every door from the door facts, grouped by destination. Only
-  denied egress is red. A band counts the request rows' off-site targets by
-  where they were found, and a card on the July 2026 incident lists only the
-  rows of this run that match its moves.
-- **Packages** shows the inventory by repository. The lookalike sits beside
-  the genuine name with the differing letter marked. A wheel is marked
-  downloaded when a request row shows the world sent all of it, and installed
-  only when the story's `pip install` exited 0. The cache lists its files,
-  the peer messages and each reply folder with its revision.
-- **Requests** lists the request rows with their step and classification.
-  Selecting one selects its connection for Events and Packets.
+- **Scripted operator** shows each step, workstation, command, state and
+  exit status. The script runs through SSH and prints its output in the demo
+  process; it does not type commands into the visible desktop terminal.
+  Preview steps have no guest exit status.
+- **Doors tried** lists the destination, transport and outcome of each
+  attempt, with expandable credential and egress details.
+- **Packages and cache** shows each repository's package roles, releases,
+  dependencies, files and folders, with download and install badges derived
+  from completed requests and successful story steps. Separate sessions expose
+  both inventories. The incident comparison retains the original predicates.
+- **Requests** lists each request's step, target, classification and status,
+  with expandable completion, credential and off-site target details.
+
+The former observer page's packet/event cross-links are not mounted. The app
+reuses the existing package and incident presentation functions without the
+removed page-kit services. Data and console routes require the token in the
+printed page URL.
 
 The page never reads `Contents::state()`. It shows no seed, scorer token,
 ledger total or secret. A credential shows its mechanism, user and secret
@@ -521,17 +527,20 @@ length only.
 ## Watch the world
 
 Pass `--observation /run/fictionet/observation.sock` to `artifactory-world`
-alongside its other arguments. `fictionet_observe::serve_observation` installs a
-`DashboardObserver` beside the request-log observer and serves its handle there.
-The path is separate from the attachment socket. From a trusted process with
-access to that path:
+alongside its other arguments. The world serves bounded typed request and door
+snapshots over HTTP on that Unix socket, separately from the attachment socket.
+From a trusted process with access to that path:
 
 ```sh
-fictionet observe --observation unix:/run/fictionet/observation.sock watch
+curl --unix-socket /run/fictionet/observation.sock http://localhost/
+curl -N --unix-socket /run/fictionet/observation.sock http://localhost/state
 ```
 
-Keep the socket outside the agent's filesystem. See
-[Fictionet Observe](../../observe/README.md) for the shell commands and capture limits.
+The first route returns the current JSON snapshot; the second streams snapshots
+as server-sent events. Each collection retains its most recent 256 rows, and
+`dropped` counts rows evicted from either collection. The durable JSON-lines log
+continues to record the run. Keep this socket outside the agent's filesystem.
+The former generic observer command and packet stream are no longer exposed.
 
 ## Layout
 
