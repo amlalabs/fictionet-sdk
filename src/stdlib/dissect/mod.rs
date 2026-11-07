@@ -465,13 +465,9 @@ impl Dissector {
         let ihl = header.payload.start;
         let total = usize::from(u16::from_be_bytes([p[2], p[3]]));
         context.complete &= total <= p.len();
-        let end = header.payload.end;
         let (src, dst, proto) = (header.src, header.dst, header.protocol);
         let flags = p[6] >> 5;
-        let Some(fragment) = be16(p, 6) else {
-            return truncated(d, "IPv4", p.len());
-        };
-        let offset = (usize::from(fragment) & 0x1fff) * 8;
+        let offset = header.fragment.map_or(0, |fragment| fragment.offset);
         let mut l = Layer::new("Internet Protocol Version 4", 0, (0, ihl));
         l.summary = format!("Src: {src}, Dst: {dst}");
         l.field("Version", "4", (0, 1));
@@ -518,19 +514,7 @@ impl Dissector {
         d.push(l);
         d.src = src.to_string();
         d.dst = dst.to_string();
-        if offset != 0 || flags & 1 != 0 {
-            d.proto = "IPv4".into();
-            d.info = format!(
-                "Fragment of a {} packet (offset {offset}, {} bytes)",
-                ip_proto_name(proto),
-                end - ihl
-            );
-            d.tag("fragment");
-            if offset != 0 {
-                return;
-            }
-        }
-        self.transport(p, ihl, end, proto, src, dst, d, keys, context);
+        self.transport(p, &header, d, keys, context);
     }
 
     fn ipv6(
@@ -587,48 +571,50 @@ impl Dissector {
         }
         l.range.1 = header.payload.start;
         d.push(l);
-        if let Some(fragment) = header.fragment.filter(|fragment| !fragment.is_atomic()) {
-            d.proto = "IPv6".into();
-            d.info = format!("Fragment (offset {})", fragment.offset);
-            d.tag("fragment");
-            return;
-        }
         context.complete &= 40 + payload <= p.len();
-        self.transport(
-            p,
-            header.payload.start,
-            header.payload.end,
-            header.protocol,
-            src,
-            dst,
-            d,
-            keys,
-            context,
-        );
+        self.transport(p, &header, d, keys, context);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Decodes what follows the IP header. A fragment after the first
+    /// carries no transport header, so the packet ends at IP. A first
+    /// fragment carries the transport header and only the start of the
+    /// payload: the header is shown, and the payload is incomplete, so no
+    /// byte of it reaches stream reassembly or an application decoder.
     fn transport(
         &mut self,
         p: &[u8],
-        at: usize,
-        end: usize,
-        proto: u8,
-        src: IpAddr,
-        dst: IpAddr,
+        header: &Header,
         d: &mut Decoded,
         keys: &[KeyLine],
-        context: DecodeContext<'_>,
+        mut context: DecodeContext<'_>,
     ) {
-        let body = &p[at..end];
+        let (at, end, proto) = (header.payload.start, header.payload.end, header.protocol);
+        if let Some(fragment) = header.fragment.filter(|fragment| !fragment.is_atomic()) {
+            d.tag("fragment");
+            if fragment.offset != 0 {
+                d.proto = match header.src {
+                    IpAddr::V4(_) => "IPv4",
+                    IpAddr::V6(_) => "IPv6",
+                }
+                .into();
+                d.info = format!(
+                    "Fragment of a {} packet (offset {}, {} bytes)",
+                    ip_proto_name(proto),
+                    fragment.offset,
+                    end - at
+                );
+                return;
+            }
+            context.complete = false;
+        }
         match proto {
-            6 => self.tcp(p, at, end, src, dst, d, keys, context),
+            6 => self.tcp(p, at, end, header.src, header.dst, d, keys, context),
             17 => udp(p, at, end, d, &self.registry, context),
             1 => icmp(p, at, end, d, false),
             58 => icmp(p, at, end, d, true),
             other => {
                 d.proto = ip_proto_name(other).into();
-                d.info = format!("IP protocol {other}, {} bytes", body.len());
+                d.info = format!("IP protocol {other}, {} bytes", end - at);
             }
         }
     }
@@ -902,9 +888,11 @@ fn udp(
     };
     let (sport, dport, len) = (source_port, destination_port, length);
     // The datagram is as long as its header says, if the packet holds that
-    // much: bytes after it are not part of it.
+    // much: bytes after it are not part of it. A copy that does not hold
+    // the whole packet, such as a first fragment, cannot be held to the
+    // length its header says.
     let datagram = fictionet::stdlib::network::udp::Datagram::parse(u);
-    let short = datagram.is_none();
+    let short = context.complete && datagram.is_none();
     let end = datagram.map_or(end, |datagram| at + 8 + datagram.payload().len());
     let u = &p[at..end];
     let mut l = Layer::new("User Datagram Protocol", 0, (at, at + 8));
@@ -1197,7 +1185,8 @@ mod tests {
         assert_eq!(d.info, "50000 → 80 [SYN] Seq=0 Win=64240 Len=0 MSS=1460");
     }
 
-    fn tcp(sport: u16, dport: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+    /// A TCP segment: a 20-byte header and the payload.
+    fn segment(sport: u16, dport: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
         let mut t = vec![0u8; 20];
         t[0..2].copy_from_slice(&sport.to_be_bytes());
         t[2..4].copy_from_slice(&dport.to_be_bytes());
@@ -1205,7 +1194,189 @@ mod tests {
         t[12] = 0x50;
         t[13] = flags;
         t.extend_from_slice(payload);
-        ipv4(6, [10, 0, 0, 2], [10, 0, 0, 1], &t)
+        t
+    }
+
+    fn tcp(sport: u16, dport: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        ipv4(
+            6,
+            [10, 0, 0, 2],
+            [10, 0, 0, 1],
+            &segment(sport, dport, seq, flags, payload),
+        )
+    }
+
+    const V6_SRC: &str = "2001:db8::2";
+    const V6_DST: &str = "2001:db8::1";
+
+    fn ipv6(proto: u8, body: &[u8]) -> Vec<u8> {
+        fictionet::stdlib::network::ip::packet(
+            V6_SRC.parse().unwrap(),
+            V6_DST.parse().unwrap(),
+            proto,
+            body,
+        )
+        .0
+    }
+
+    /// The first `cut` bytes of an IPv4 packet's payload as its first
+    /// fragment, and the rest as the second.
+    fn fragments4(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
+        let fragment = |flags: u16, body: &[u8]| {
+            let mut f = packet[..20].to_vec();
+            f[6..8].copy_from_slice(&flags.to_be_bytes());
+            f.extend_from_slice(body);
+            let total = f.len() as u16;
+            f[2..4].copy_from_slice(&total.to_be_bytes());
+            fictionet::stdlib::network::ip::set_header_checksum(&mut f[..20]);
+            f
+        };
+        (
+            fragment(0x2000, &packet[20..20 + cut]),
+            fragment((cut / 8) as u16, &packet[20 + cut..]),
+        )
+    }
+
+    /// An IPv6 packet whose Fragment header carries `body` of protocol
+    /// `proto` at `offset`.
+    fn fragment6(proto: u8, offset: usize, more: bool, body: &[u8]) -> Vec<u8> {
+        let mut f = vec![proto, 0];
+        f.extend_from_slice(&(offset as u16 | u16::from(more)).to_be_bytes());
+        f.extend_from_slice(&7u32.to_be_bytes());
+        f.extend_from_slice(body);
+        ipv6(44, &f)
+    }
+
+    /// `payload` of protocol `proto` as two IPv6 fragments, cut `cut`
+    /// bytes in.
+    fn fragments6(proto: u8, payload: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
+        (
+            fragment6(proto, 0, true, &payload[..cut]),
+            fragment6(proto, cut, false, &payload[cut..]),
+        )
+    }
+
+    /// Both families: the name, the addresses, a whole packet of a
+    /// transport payload, and the same payload as two fragments.
+    type Whole = fn(u8, &[u8]) -> Vec<u8>;
+    type Split = fn(u8, &[u8], usize) -> (Vec<u8>, Vec<u8>);
+    const FAMILIES: [(&str, &str, &str, Whole, Split); 2] = [
+        (
+            "IPv4",
+            "10.0.0.2",
+            "10.0.0.1",
+            |proto, body| ipv4(proto, [10, 0, 0, 2], [10, 0, 0, 1], body),
+            |proto, body, cut| fragments4(&ipv4(proto, [10, 0, 0, 2], [10, 0, 0, 1], body), cut),
+        ),
+        ("IPv6", V6_SRC, V6_DST, ipv6, fragments6),
+    ];
+
+    fn has_layer(d: &Decoded, name: &str) -> bool {
+        d.layers.iter().any(|layer| layer.name == name)
+    }
+
+    /// A first fragment shows its TCP header, ports and flags, but holds
+    /// only the start of the segment's payload, so nothing in it is
+    /// decoded as a message, and none of it enters the stream. A fragment
+    /// after the first shows no ports.
+    #[test]
+    fn a_first_fragment_shows_tcp_and_decodes_no_message() {
+        // The first request ends inside the first fragment: 20 bytes of
+        // TCP header and 24 of payload, a multiple of 8.
+        let request = b"GET / HTTP/1.1\r\n\r\nGET /two HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        for (family, src, dst, whole, split) in FAMILIES {
+            let mut dis = Dissector::default();
+            dis.decode(&whole(6, &segment(40000, 80, 100, 0x02, b"")), &[]);
+            let data = segment(40000, 80, 101, 0x18, request);
+            let (first, second) = split(6, &data, 20 + 24);
+            let d = dis.decode(&first, &[]);
+            assert_eq!(d.proto, "TCP", "{family}");
+            assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
+            assert_eq!(
+                (d.src.as_str(), d.dst.as_str()),
+                (sock(src, 40000).as_str(), sock(dst, 80).as_str()),
+                "{family}"
+            );
+            assert!(
+                d.info.contains("PSH") && d.info.contains("ACK"),
+                "{family}: {}",
+                d.info
+            );
+            assert!(
+                !has_layer(&d, "Hypertext Transfer Protocol"),
+                "{family}: a partial payload is not a message"
+            );
+            let d = dis.decode(&second, &[]);
+            assert_eq!(d.proto, family);
+            assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
+            assert_eq!(
+                (d.src.as_str(), d.dst.as_str()),
+                (src, dst),
+                "{family}: no ports after the first fragment"
+            );
+            assert!(!has_layer(&d, "Transmission Control Protocol"), "{family}");
+            // The segment sent whole decodes from its first byte, so both
+            // requests are found in this packet alone: the fragment left
+            // nothing in the stream.
+            let d = dis.decode(&whole(6, &data), &[]);
+            let http: Vec<_> = d
+                .layers
+                .iter()
+                .filter(|layer| layer.name == "Hypertext Transfer Protocol")
+                .collect();
+            assert_eq!(http.len(), 2, "{family}: {}", d.info);
+            assert!(http.iter().all(|layer| layer.buf == 0), "{family}");
+            assert!(!d.tags.contains(&"retransmission"), "{family}");
+        }
+    }
+
+    /// A first fragment shows its UDP header and ports. Its payload is
+    /// only the start of the datagram, so the length its header says is
+    /// not a fault, and nothing in it is decoded as a message. A fragment
+    /// after the first shows no ports.
+    #[test]
+    fn a_first_fragment_shows_udp_and_decodes_no_message() {
+        // A query for example.test, type A: 8 bytes of UDP header and 16
+        // of the query go in the first fragment.
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
+        let mut udp = vec![0xc0, 0x00, 0, 53, 0, (8 + q.len()) as u8, 0, 0];
+        udp.extend_from_slice(&q);
+        for (family, src, dst, whole, split) in FAMILIES {
+            let mut dis = Dissector::default();
+            assert_eq!(dis.decode(&whole(17, &udp), &[]).proto, "DNS", "{family}");
+            let (first, second) = split(17, &udp, 24);
+            let d = dis.decode(&first, &[]);
+            assert_eq!(d.proto, "UDP", "{family}");
+            assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
+            assert!(!d.tags.contains(&"malformed"), "{family}: {}", d.info);
+            assert_eq!(
+                (d.src.as_str(), d.dst.as_str()),
+                (sock(src, 49152).as_str(), sock(dst, 53).as_str()),
+                "{family}"
+            );
+            let d = dis.decode(&second, &[]);
+            assert_eq!(d.proto, family);
+            assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
+            assert_eq!(
+                (d.src.as_str(), d.dst.as_str()),
+                (src, dst),
+                "{family}: no ports after the first fragment"
+            );
+            assert!(!has_layer(&d, "User Datagram Protocol"), "{family}");
+        }
+    }
+
+    /// An IPv6 Fragment header at offset 0 with no more to come wraps a
+    /// whole packet (RFC 6946), which is decoded as one.
+    #[test]
+    fn an_atomic_ipv6_fragment_is_a_whole_packet() {
+        let mut dis = Dissector::default();
+        dis.decode(&ipv6(6, &segment(40000, 80, 100, 0x02, b"")), &[]);
+        let data = segment(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n");
+        let d = dis.decode(&fragment6(6, 0, false, &data), &[]);
+        assert_eq!(d.proto, "HTTP");
+        assert!(!d.tags.contains(&"fragment"), "{:?}", d.tags);
     }
 
     #[test]
