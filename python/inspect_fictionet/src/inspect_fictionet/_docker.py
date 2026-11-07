@@ -128,9 +128,23 @@ def write_compose(cfg: _Config, cache: Path) -> Path:
     """Writes the compose file into `cache` and returns its path. The same
     configuration gives the same path."""
     token = _proxy_token(cache) if cfg.proxy else None
-    text = _HEADER + yaml.safe_dump(compose_config(cfg, cache, token), sort_keys=False, width=1000)
+    text = _HEADER + yaml.safe_dump(_compose_literals(compose_config(cfg, cache, token)), sort_keys=False, width=1000)
     # A proxy type's compose file holds the token: readable by its owner only.
     return _write_once(cache / "compose", "compose.yaml", text, 0o600 if cfg.proxy else 0o644)
+
+
+def _compose_literals(value: Any) -> Any:
+    """Protect literal values from Compose's host environment interpolation.
+
+    Compose interpolates YAML values, but not mapping keys.
+    """
+    if isinstance(value, str):
+        return value.replace("$", "$$")
+    if isinstance(value, list):
+        return [_compose_literals(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _compose_literals(item) for key, item in value.items()}
+    return value
 
 
 def _volume(source: str, target: str, read_only: bool = False) -> dict[str, Any]:
