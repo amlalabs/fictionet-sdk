@@ -835,7 +835,7 @@ impl<I: Interface> Clone for Lan<I> {
 }
 
 impl<I: Interface> Lan<I> {
-    /// Adds the member at `addr`, with optional ingress attachment identity.
+    /// Adds the member at `addr`.
     /// Packets for `addr` now go out on
     /// `interface`, and packets that arrive on it are forwarded like any
     /// others.
