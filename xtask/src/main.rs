@@ -7,6 +7,7 @@ mod image;
 mod mptcp_verify;
 mod port_zero_verify;
 mod rawnic;
+mod runtime_verify;
 mod ssh_connect;
 mod web;
 mod workstation;
@@ -23,6 +24,9 @@ async fn main() -> Result {
         .ok_or("expected search-image or search-capture")?;
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "runtime-verify" {
+        return runtime_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());
