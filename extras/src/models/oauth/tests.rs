@@ -45,6 +45,94 @@ fn answer(socket: &mut std::net::TcpStream, status: u16, body: &str) {
 }
 
 #[test]
+fn dropped_run_releases_unpolled_refresh() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let dir = directory();
+    let store = Store::open(dir.join("credentials.redb")).unwrap();
+    store.put(Login::Claude, tokens(now() - 1)).unwrap();
+    for _ in 0..2 {
+        let stored = store.clone();
+        let mut run = Box::pin(fictionet::run(
+            fictionet::Seed::from_u64(3),
+            |cx| async move {
+                let authority =
+                    OAuth::at(&cx, Login::Claude, stored, "http://127.0.0.1:1".parse()?)?;
+                authority.ensure_fresh().await
+            },
+        ));
+        assert!(
+            run.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(
+            store.flights[Login::Claude.index()]
+                .lock()
+                .unwrap()
+                .waiters
+                .is_some()
+        );
+        drop(run);
+        assert!(
+            store.flights[Login::Claude.index()]
+                .lock()
+                .unwrap()
+                .waiters
+                .is_none()
+        );
+    }
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dropped_context_refuses_refresh_without_retaining_waiters() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let dir = directory();
+    let store = Store::open(dir.join("credentials.redb")).unwrap();
+    store.put(Login::Claude, tokens(now() - 1)).unwrap();
+    let stored = store.clone();
+    let (sender, mut receiver) = oneshot::channel();
+    let mut run = Box::pin(fictionet::run(
+        fictionet::Seed::from_u64(3),
+        |cx| async move {
+            let authority = OAuth::at(&cx, Login::Claude, stored, "http://127.0.0.1:1".parse()?)?;
+            assert!(sender.send(authority).is_ok());
+            std::future::pending().await
+        },
+    ));
+    assert!(
+        run.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let authority = receiver.try_recv().unwrap();
+    drop(run);
+    let mut refresh = Box::pin(authority.ensure_fresh());
+    assert!(matches!(
+        refresh
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(_))
+    ));
+    assert!(
+        store.flights[Login::Claude.index()]
+            .lock()
+            .unwrap()
+            .waiters
+            .is_none()
+    );
+    drop(refresh);
+    drop(authority);
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn both_logins_refresh_once_and_persist_rotated_tokens() {
     for login in [Login::Claude, Login::Codex] {
         let dir = directory();

@@ -10,6 +10,7 @@
 //! [`OAuth::guest_files`] in the guest, with owner-only permissions. Refresh
 //! starts ten minutes before expiry and survives cancellation of a requester;
 //! cancelling the world's context shuts down the authority.
+//! Dropping the owning run releases its refresh so later authorities can retry.
 //!
 //! Subscription stops use the unified limit headers exercised by
 //! [Claude clients](https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/runtime/executor/claude_executor_ratelimit_test.go)
@@ -142,6 +143,22 @@ fn encoded(tokens: &Tokens) -> Value {
 struct Flight {
     waiters: Option<Vec<oneshot::Sender<()>>>,
     retry_at: Option<Instant>,
+}
+struct Refresh {
+    store: Arc<Store>,
+    login: Login,
+}
+impl Drop for Refresh {
+    fn drop(&mut self) {
+        let waiters = self.store.flights[self.login.index()]
+            .lock()
+            .unwrap()
+            .waiters
+            .take();
+        for waiter in waiters.into_iter().flatten() {
+            let _ = waiter.send(());
+        }
+    }
 }
 /// A private ReDB store shared by both authorities and all their clones.
 /// Keep one store handle for a file; ReDB excludes other processes.
@@ -348,7 +365,7 @@ impl OAuth {
         if tokens.expires_at > now().saturating_add(LEAD) {
             return Ok(());
         }
-        let receiver = {
+        let (receiver, refresh) = {
             let mut flight = self.store.flights[self.login.index()].lock().unwrap();
             if flight
                 .retry_at
@@ -361,29 +378,33 @@ impl OAuth {
                 };
             }
             let (tx, rx) = oneshot::channel();
-            if let Some(waiters) = &mut flight.waiters {
+            let refresh = if let Some(waiters) = &mut flight.waiters {
                 waiters.push(tx);
+                None
             } else {
                 flight.waiters = Some(vec![tx]);
-                let authority = self.clone();
-                self.cx.spawn(move |_| async move {
-                    let revision = authority.store.row(authority.login)?.revision;
-                    let result = authority.refresh().await;
-                    let mut flight = authority.store.flights[authority.login.index()]
-                        .lock()
-                        .unwrap();
-                    if result.is_err() && authority.store.row(authority.login)?.revision == revision
-                    {
-                        flight.retry_at = Some(Instant::now() + Duration::from_secs(60));
-                    }
-                    for waiter in flight.waiters.take().unwrap_or_default() {
-                        let _ = waiter.send(());
-                    }
-                    Ok(())
-                });
-            }
-            rx
+                Some(Refresh {
+                    store: self.store.clone(),
+                    login: self.login,
+                })
+            };
+            (rx, refresh)
         };
+        if let Some(refresh) = refresh {
+            let authority = self.clone();
+            self.cx.spawn(move |_| async move {
+                let _refresh = refresh;
+                let revision = authority.store.row(authority.login)?.revision;
+                let result = authority.refresh().await;
+                let mut flight = authority.store.flights[authority.login.index()]
+                    .lock()
+                    .unwrap();
+                if result.is_err() && authority.store.row(authority.login)?.revision == revision {
+                    flight.retry_at = Some(Instant::now() + Duration::from_secs(60));
+                }
+                Ok(())
+            });
+        }
         self.cx
             .race(None, receiver)
             .await
