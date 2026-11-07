@@ -252,6 +252,7 @@ pub struct Host {
     programs: Vec<Arc<dyn Program>>,
     delay: Option<Duration>,
     icmp_options: icmp::Options,
+    udp_settings: udp::Settings,
 }
 
 impl Host {
@@ -269,6 +270,7 @@ impl Host {
             programs: Vec::new(),
             delay: None,
             icmp_options: icmp::Options::default(),
+            udp_settings: udp::Settings::default(),
         }
     }
 
@@ -281,6 +283,12 @@ impl Host {
     /// Sets this host's echo and UDP error reply choices.
     pub fn icmp_options(mut self, options: icmp::Options) -> Self {
         self.icmp_options = options;
+        self
+    }
+
+    /// Sets the choices for this host's UDP endpoints.
+    pub fn udp_settings(mut self, settings: udp::Settings) -> Self {
+        self.udp_settings = settings;
         self
     }
 
@@ -1071,6 +1079,7 @@ impl Installation<'_> {
                     world.machines.get(&addr),
                     host.tcp_options,
                     host.icmp_options.clone(),
+                    host.udp_settings,
                 );
                 let ports = machine.machine.prepare(&host)?;
                 Ok((machine, ports))
@@ -1140,6 +1149,7 @@ impl Installation<'_> {
             world.machines.get(&addr),
             host.tcp_options,
             host.icmp_options.clone(),
+            host.udp_settings,
         );
         let ports = machine.machine.prepare(host)?;
         // Joining is the last fallible step. No service or program has
@@ -1181,6 +1191,7 @@ impl Installation<'_> {
             None,
             host.tcp_options,
             host.icmp_options.clone(),
+            host.udp_settings,
         );
         let ports = machine.machine.prepare(host)?;
         if let Some(side) = machine.route.take() {
@@ -1442,6 +1453,7 @@ impl Machine {
         existing: Option<&Arc<Machine>>,
         options: tcp::Options,
         icmp_options: icmp::Options,
+        udp_settings: udp::Settings,
     ) -> PreparedMachine {
         if let Some(machine) = existing {
             return PreparedMachine {
@@ -1492,6 +1504,7 @@ impl Machine {
             }
         }
         udp.icmp_options(icmp_options.clone());
+        udp.settings(udp_settings);
         let machine = Arc::new(Machine {
             fcx: fcx.clone(),
             addr,

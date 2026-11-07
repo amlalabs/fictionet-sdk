@@ -117,7 +117,8 @@ pub fn network(
     let mut server = Host::new("server")
         .at(config.address)
         .tcp_options(fictionet_extras::linux::tcp())
-        .icmp_options(fictionet_extras::linux::icmp(fcx));
+        .icmp_options(fictionet_extras::linux::icmp(fcx))
+        .udp_settings(fictionet_extras::linux::udp());
     server = match config.address_v6 {
         Some(address_v6) => server.at(address_v6),
         None => server.ipv4_only(),

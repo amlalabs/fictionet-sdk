@@ -982,6 +982,47 @@ fn udp_closed_port_gets_port_unreachable() {
 }
 
 #[test]
+fn udp_to_port_zero_is_unreachable_by_default_and_can_be_silent() {
+    for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
+        world(Duration::from_secs(10), move |fcx| async move {
+            let (mut raw, cb) = pair();
+            let ub = udp::endpoint(&fcx, cb, ip(b));
+            let mut open = ub.bind(53)?;
+            // No socket can be on port 0, so it is unreachable like any
+            // other closed port.
+            let sent = udp_packet(ip(a), 4000, ip(b), 0, b"anyone?");
+            raw.send(sent.clone());
+            let reply = raw.recv(&fcx).await?;
+            assert!(
+                is_port_unreachable(&reply, &sent),
+                "port 0 answers like a closed port"
+            );
+            // A datagram from source port 0 reaches its socket, from port 0.
+            raw.send(udp_packet(ip(a), 0, ip(b), 53, b"hi"));
+            let (data, from) = open.recv(&fcx).await?;
+            assert_eq!(
+                (data.as_slice(), from),
+                (&b"hi"[..], SocketAddr::new(ip(a), 0))
+            );
+            assert!(quiet(&fcx, &mut raw).await);
+            // Set to be silent about port 0, the endpoint drops those
+            // datagrams and still answers for any other closed port.
+            ub.settings(udp::Settings {
+                port_zero: udp::PortZero::Silent,
+            });
+            raw.send(udp_packet(ip(a), 4000, ip(b), 0, b"anyone?"));
+            raw.send(udp_packet(ip(a), 0, ip(b), 0, b"anyone?"));
+            assert!(quiet(&fcx, &mut raw).await, "port 0 answered");
+            let sent = udp_packet(ip(a), 4000, ip(b), 99, b"anyone?");
+            raw.send(sent.clone());
+            let reply = raw.recv(&fcx).await?;
+            assert!(is_port_unreachable(&reply, &sent));
+            Ok(())
+        });
+    }
+}
+
+#[test]
 fn udp_packets_have_good_checksums_and_bad_ones_are_dropped() {
     world(Duration::from_secs(10), |fcx| async move {
         let (mut raw, cb) = pair();
@@ -1125,6 +1166,16 @@ fn ack_of(t: &[u8]) -> u32 {
 /// left to do.
 async fn quiet(fcx: &Cx, raw: &mut fictionet::End) -> bool {
     fcx.idle().await.is_ok() && poll_fn(|cx| Poll::Ready(raw.poll_recv(fcx, cx).is_pending())).await
+}
+
+/// Whether `reply` is an ICMP port unreachable that quotes `sent`.
+fn is_port_unreachable(reply: &Packet, sent: &Packet) -> bool {
+    let r = &reply.0;
+    if r[0] >> 4 == 4 {
+        r[9] == 1 && (r[20], r[21]) == (3, 3) && r[28..] == sent.0[..]
+    } else {
+        r[6] == 58 && (r[40], r[41]) == (1, 4) && r[48..] == sent.0[..]
+    }
 }
 
 /// A connection handed to tokio code with `into_tokio`, served from tokio

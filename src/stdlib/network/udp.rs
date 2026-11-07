@@ -56,6 +56,28 @@ const QUEUE: usize = 1 << 20;
 /// its place in the queue. So a flood of tiny datagrams is bounded too.
 const DATAGRAM_COST: usize = 64;
 
+/// Choices for a machine's UDP that a world passes in with
+/// [`Endpoint::settings`]. The default is what the standards say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// What a datagram to destination port 0 gets.
+    pub port_zero: PortZero,
+}
+
+/// What a datagram to destination port 0 gets: [`Settings::port_zero`]. No
+/// socket is ever bound there, since [`Endpoint::bind`] takes 0 to mean a
+/// free port, so the choice is between the answer any other port with no
+/// socket gets and none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortZero {
+    /// ICMP port unreachable, as for any other port with no socket
+    /// (RFC 1122 section 4.1.3.1). The default.
+    #[default]
+    Unreachable,
+    /// Nothing. The datagram is dropped.
+    Silent,
+}
+
 /// Starts UDP for a machine with address `addr`, on the UDP packets of
 /// `inner`.
 ///
@@ -63,8 +85,8 @@ const DATAGRAM_COST: usize = 64;
 /// The task takes UDP packets sent to `addr`, and to the multicast groups
 /// the endpoint [joined](Endpoint::join), and drops the rest. A packet for
 /// `addr` and a port with no socket gets an ICMP "port unreachable" reply,
-/// because that is part of UDP's job. Everything it sends goes into
-/// `inner`.
+/// because that is part of UDP's job; [`Settings::port_zero`] can make
+/// port 0 silent. Everything it sends goes into `inner`.
 ///
 /// The task stops when the caller's [region](fictionet::Cx#regions) is
 /// cancelled or `inner` closes. The endpoint's sockets then return
@@ -124,6 +146,7 @@ pub fn prepare_endpoint(
             groups: Vec::new(),
             next_port: 49152,
             icmp_options: icmp::Options::default(),
+            settings: Settings::default(),
         }),
     });
     let driver = shared.clone();
@@ -162,6 +185,7 @@ struct State {
     ip_id: u16,
     next_port: u16,
     icmp_options: icmp::Options,
+    settings: Settings,
 }
 
 #[derive(Default)]
@@ -244,7 +268,11 @@ fn deliver(shared: &Shared, packet: Packet) {
             None if group => None,
             None => {
                 refused = st.refused.clone();
-                port_unreachable(&packet.0, ip.dst, &st.icmp_options)
+                if udp.destination_port() == 0 && st.settings.port_zero == PortZero::Silent {
+                    None
+                } else {
+                    port_unreachable(&packet.0, ip.dst, &st.icmp_options)
+                }
             }
         }
     };
@@ -274,6 +302,11 @@ impl Endpoint {
     /// Sets the header choices for this endpoint's ICMP errors.
     pub fn icmp_options(&self, options: icmp::Options) {
         self.shared.state.lock().icmp_options = options;
+    }
+
+    /// Sets the choices a world makes for this endpoint's UDP.
+    pub fn settings(&self, settings: Settings) {
+        self.shared.state.lock().settings = settings;
     }
 
     /// Joins the multicast group `group`: datagrams sent to it reach this
