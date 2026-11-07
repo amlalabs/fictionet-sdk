@@ -17,11 +17,11 @@
 //! command. Such a coil already reads as off, so the write is accepted and
 //! changes nothing.
 //!
-//! The event log records each accepted command as `plant.action`, with the
-//! source of the connection: `hmi` from [`facts::HMI_ADDRESS`], otherwise
-//! `modbus`. A refused write records one `plant.rejected`. Trips and the first
-//! action after a fault start are recorded when the write makes them. Facts of
-//! a write are delivered only when the whole write is accepted.
+//! Each accepted command emits a [`facts::Detail::Action`] with the connection's
+//! [`Source`]: [`Source::Hmi`] from [`facts::HMI_ADDRESS`], otherwise
+//! [`Source::Modbus`]. A write refused by the plant emits one [`facts::Detail::Rejected`].
+//! Trips and the first action after a fault start are recorded when the write
+//! makes them. Facts of a write are delivered only when the whole write is accepted.
 
 use std::convert::Infallible;
 use std::sync::Arc;
