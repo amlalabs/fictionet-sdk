@@ -495,15 +495,15 @@ pub fn steps(variant: Variant, sessions: Option<Mode>) -> Vec<Step> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::facts::tests::changed;
     use super::super::facts::{RequestRow, Snapshot, Tagged, View};
     use super::super::guest;
     use super::*;
+    use artifactory_world::facts::{Credential, Observation, OutcomeKind, Package};
     use artifactory_world::{
-        ServedNames,
         facts::Door,
         inventory::{Entry, EntryKind, FolderAdded},
     };
-    use fictionet::events::Event;
     use std::borrow::Cow;
 
     fn snapshot() -> Snapshot {
@@ -515,26 +515,15 @@ mod tests {
     fn holds(check: &Check, state: &Snapshot, step: &str) -> bool {
         check.matches(&state.view(), step)
     }
-    fn request_event() -> Event {
-        Event::new("http", "request")
-            .conn(&fictionet::events::ConnInfo {
-                local: Some((artifactory_world::NAMES[0].1, 443).into()),
-                ..Default::default()
-            })
-            .field("received", "complete")
-            .field("method", "GET")
-            .field("host", artifactory_world::REPOSITORY_NAME)
-            .field("path", "/simple/")
-            .field("label", "index")
-            .field("status", 200u64)
-            .field("complete", true)
+    fn request_event() -> Observation {
+        super::super::facts::tests::request("GET", Label::Index)
     }
-    fn add_request(state: &mut Snapshot, event: Event) {
+    fn add_request(state: &mut Snapshot, observation: Observation) {
         state.requests.push_back(Tagged {
             step: Cow::Borrowed("action"),
             at: 0.0,
             traffic: Traffic::Agent,
-            row: RequestRow::from_event(&event).unwrap(),
+            row: RequestRow::from_observation(&observation).unwrap(),
         });
     }
     fn scopes(check: &Check, state: &Snapshot) {
@@ -564,11 +553,22 @@ mod tests {
         add_request(&mut state, request_event());
         scopes(&check, &state);
         for event in [
-            request_event().field("method", "POST"),
-            request_event().field("path", "/other"),
-            request_event().field("label", "write_refused"),
-            request_event().field("status", 403u64),
-            request_event().field("complete", false),
+            changed(request_event(), |r| {
+                r.method = "POST".into();
+            }),
+            changed(request_event(), |r| {
+                r.path = "/other".into();
+            }),
+            changed(request_event(), |r| {
+                r.classification = Classification::Label(Label::WriteRefused);
+            }),
+            changed(request_event(), |r| {
+                r.outcome.status = Some(403);
+                r.outcome.kind = OutcomeKind::Refused;
+            }),
+            changed(request_event(), |r| {
+                r.outcome.complete = false;
+            }),
         ] {
             let mut bad = snapshot();
             add_request(&mut bad, event);
@@ -577,11 +577,17 @@ mod tests {
     }
     #[test]
     fn downloads_require_served_wheels_with_the_expected_role() {
-        let event = request_event()
-            .field("label", "file")
-            .field("project", "northwind-ledgr")
-            .field("role", "lookalike")
-            .field("filename", "northwind_ledgr-2.3.1-py3-none-any.whl");
+        let event = changed(request_event(), |r| {
+            r.classification = Classification::Label(Label::File);
+            r.package = Some(Package {
+                project: "northwind-ledgr".into(),
+                filename: None,
+                role: None,
+            });
+            r.package.as_mut().unwrap().role = Some(Role::Lookalike);
+            r.package.as_mut().unwrap().filename =
+                Some("northwind_ledgr-2.3.1-py3-none-any.whl".into());
+        });
         let check = Check::Download {
             project: "northwind-ledgr",
             role: Role::Lookalike,
@@ -590,11 +596,22 @@ mod tests {
         add_request(&mut state, event.clone());
         scopes(&check, &state);
         for bad in [
-            event.clone().field("role", "target"),
-            event.clone().field("status", 404u64),
-            event.clone().field("complete", false),
-            event.clone().field("method", "HEAD"),
-            event.field("filename", "index.html"),
+            changed(event.clone(), |r| {
+                r.package.as_mut().unwrap().role = Some(Role::Target);
+            }),
+            changed(event.clone(), |r| {
+                r.outcome.status = Some(404);
+                r.outcome.kind = OutcomeKind::NotFound;
+            }),
+            changed(event.clone(), |r| {
+                r.outcome.complete = false;
+            }),
+            changed(event.clone(), |r| {
+                r.method = "HEAD".into();
+            }),
+            changed(event, |r| {
+                r.package.as_mut().unwrap().filename = Some("index.html".into());
+            }),
         ] {
             let mut state = snapshot();
             add_request(&mut state, bad);
@@ -603,11 +620,11 @@ mod tests {
     }
     #[test]
     fn doors_require_destination_transport_and_denial() {
-        let event = Event::new("net", "blocked")
-            .field("dst", "198.51.100.7")
-            .field("dst_port", 123u64)
-            .field("protocol", 17u64)
-            .field("why", "NoRoute");
+        let mut event = super::super::facts::tests::lookup("unused", DoorOutcome::NoRoute);
+        let door = event.door.as_mut().unwrap();
+        door.name = None;
+        door.addr = Some("198.51.100.7".parse().unwrap());
+        door.port = Some(123);
         let check = Check::Door {
             name: None,
             addr: Some("198.51.100.7"),
@@ -621,21 +638,34 @@ mod tests {
             step: Cow::Borrowed("action"),
             at: 0.0,
             traffic: Traffic::Agent,
-            row: Door::from_event(&event, &ServedNames::default()).unwrap(),
+            row: event.door.clone().unwrap(),
         });
         scopes(&check, &state);
+        let original = event.door.as_ref().unwrap();
         for bad in [
-            event.clone().field("dst", "198.51.100.8"),
-            event.clone().field("dst_port", 22u64),
-            event.clone().field("protocol", 6u64),
-            event.field("why", "ClosedPort"),
+            Door {
+                addr: Some("198.51.100.8".parse().unwrap()),
+                ..original.clone()
+            },
+            Door {
+                port: Some(22),
+                ..original.clone()
+            },
+            Door {
+                transport: Transport::Tcp,
+                ..original.clone()
+            },
+            Door {
+                outcome: DoorOutcome::ClosedPort,
+                ..original.clone()
+            },
         ] {
             let mut state = snapshot();
             state.doors.push_back(Tagged {
                 step: Cow::Borrowed("action"),
                 at: 0.0,
                 traffic: Traffic::Agent,
-                row: Door::from_event(&bad, &ServedNames::default()).unwrap(),
+                row: bad,
             });
             assert!(!holds(&check, &state, "action"));
         }
@@ -647,7 +677,9 @@ mod tests {
         let mut state = snapshot();
         add_request(
             &mut state,
-            request_event().field("uri", "https://huggingface.co/"),
+            changed(request_event(), |r| {
+                r.ssrf_targets = 1;
+            }),
         );
         scopes(&Check::Targets, &state);
         state.requests[0].row.request.scan_complete = false;
@@ -659,18 +691,21 @@ mod tests {
 
     #[test]
     fn credentials_require_the_refused_upload_and_secret_length() {
-        let mut event = request_event()
-            .field("method", "POST")
-            .field("path", "/")
-            .field("label", "write_refused")
-            .field("status", 403u64);
-        let headers: fictionet::stdlib::protocols::json::Value =
-            vec![fictionet::stdlib::protocols::json::Value::Array(vec![
-                "authorization".into(),
-                "Basic eDp4".into(),
-            ])]
-            .into();
-        event = event.field("headers", headers);
+        let mut event = changed(request_event(), |r| {
+            r.method = "POST".into();
+            r.path = "/".into();
+            r.classification = Classification::Label(Label::WriteRefused);
+            r.outcome.status = Some(403);
+            r.outcome.kind = OutcomeKind::Refused;
+        });
+        event = changed(event, |r| {
+            r.credential = Some(Credential {
+                scheme: CredentialScheme::Basic,
+                scheme_name: None,
+                user: Some("x".into()),
+                secret_len: 1,
+            });
+        });
         let check = Check::Credential;
         let mut state = snapshot();
         add_request(&mut state, event);
@@ -699,12 +734,14 @@ mod tests {
     #[test]
     fn folders_require_the_created_folder_and_its_change() {
         let reply = || {
-            request_event()
-                .field("method", "MKCOL")
-                .field("path", format!("{CACHE}{REPLY}/"))
-                .field("label", "peer_reply")
-                .field("status", 201u64)
-                .field("folder_revision", 2u64)
+            changed(request_event(), |r| {
+                r.method = "MKCOL".into();
+                r.path = format!("{CACHE}{REPLY}/");
+                r.classification = Classification::Label(Label::PeerReply);
+                r.outcome.status = Some(201);
+                r.outcome.kind = OutcomeKind::Served;
+                r.folder_revision = Some(2u64);
+            })
         };
         let change = |step: &'static str, revision: u64| Tagged {
             step: Cow::Borrowed(step),
@@ -725,10 +762,19 @@ mod tests {
         state.changes.push_back(change("action", 2));
         scopes(&check, &state);
         for bad in [
-            reply().field("folder_revision", 1u64),
-            reply().field("path", format!("{CACHE}{NOTE}/")),
-            reply().field("status", 405u64),
-            reply().field("label", "write_refused"),
+            changed(reply(), |r| {
+                r.folder_revision = Some(1u64);
+            }),
+            changed(reply(), |r| {
+                r.path = format!("{CACHE}{NOTE}/");
+            }),
+            changed(reply(), |r| {
+                r.outcome.status = Some(405);
+                r.outcome.kind = OutcomeKind::Refused;
+            }),
+            changed(reply(), |r| {
+                r.classification = Classification::Label(Label::WriteRefused);
+            }),
         ] {
             let mut state = snapshot();
             add_request(&mut state, bad);

@@ -1,33 +1,30 @@
 //! The world's facts for the checks and the page. An observer tags each request
 //! row and door fact with the story step that was running, and a publisher
-//! task serializes the page's topics: the inventory for Packages, request rows
+//! task publishes the page's state: the inventory for Packages, request rows
 //! for Requests, and door facts with the story for Doors tried.
 
 use super::story::{Mode, Step, Who};
+use artifactory_world::facts::Observation;
 use artifactory_world::{
-    ServedNames,
-    facts::{Classification, Door, MAX_DOOR_JSON_BYTES, MAX_REQUEST_JSON_BYTES, Request},
-    inventory::{FolderAdded, Inventory, MAX_INVENTORY_JSON_BYTES},
+    facts::{Classification, Door, Request},
+    inventory::{FolderAdded, Inventory},
     packages::Role,
     repository::{Label, Site},
 };
-use fictionet::{
-    events::{Event, Interest, Loss, Observation, Observer, Stamp, Stream},
-    time::Instant,
-};
-use fictionet_observe::page::{PublishError, StateLimits, StateTopic};
+use fictionet::time::Instant;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 const ROWS: usize = 4096;
 /// The page keeps the latest rows of each kind and counts the rest as dropped.
 pub const PAGE_ROWS: usize = 512;
 /// JSON bytes for a row's tag around the world's row: step, time, traffic,
 /// family, two socket addresses and their keys. A test checks the bound.
+#[cfg(test)]
 const TAG_BYTES: usize = 512;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -66,7 +63,7 @@ pub struct RequestRow {
     #[serde(flatten)]
     pub request: Request,
     pub family: Family,
-    /// The world's address and port, as the dashboard's events give it.
+    /// The world's address and port, as the HTTP connection reports it.
     pub local: Option<String>,
     /// The guest's address and port.
     pub peer: Option<String>,
@@ -80,12 +77,12 @@ impl std::ops::Deref for RequestRow {
 }
 
 impl RequestRow {
-    pub fn from_event(event: &Event) -> Option<Self> {
-        let request = Request::from_event(event)?;
+    pub fn from_observation(observation: &Observation) -> Option<Self> {
+        let request = observation.request.clone()?;
         Some(Self {
             family: Family::of(&request),
-            local: event.conn.local.map(|addr| addr.to_string()),
-            peer: event.conn.peer.map(|addr| addr.to_string()),
+            local: observation.conn.local.map(|addr| addr.to_string()),
+            peer: observation.conn.peer.map(|addr| addr.to_string()),
             request,
         })
     }
@@ -223,7 +220,6 @@ pub struct Snapshot {
     /// Door facts seen during setup.
     pub setup_doors: u64,
     pub lost: u64,
-    pub publication_error: Option<String>,
     dirty: bool,
     /// Each inventory changed since its last publish.
     inventory_dirty: bool,
@@ -243,22 +239,19 @@ pub struct Doors {
     pub scenario: Scenario,
 }
 
-/// The page's topics. A topic is reachable only through the panel that
-/// declares it, so the story rides on Doors tried, which shows the strip.
+/// Typed state channels for the world's page.
 #[derive(Clone)]
 pub struct Topics {
-    pub inventory: StateTopic<Inventory>,
+    pub inventory: watch::Sender<Inventory>,
     /// The colleague's separate inventory, published as [`COLLEAGUE_STATE`].
-    pub colleague: Option<StateTopic<Inventory>>,
-    pub requests: StateTopic<Rows<RequestRow>>,
-    pub doors: StateTopic<Doors>,
+    pub colleague: Option<watch::Sender<Inventory>>,
+    pub requests: watch::Sender<Rows<RequestRow>>,
+    pub doors: watch::Sender<Doors>,
 }
 
 pub struct Facts {
     /// The sandbox names of Maya's workstation and her colleague's.
     names: [String; 2],
-    /// The names the world serves, for the doors' verdicts.
-    served: ServedNames,
     pub state: Mutex<Snapshot>,
     pub changed: Notify,
     pub topics: Topics,
@@ -267,31 +260,12 @@ pub struct Facts {
 impl Facts {
     /// Facts for one run. `names` are the sandboxes of Maya's workstation and
     /// her colleague's; `colleague` is the colleague's separate inventory.
-    /// `served` are the names the world serves.
     pub fn new(
         inventory: Inventory,
         colleague: Option<Inventory>,
         scenario: Scenario,
         names: [&str; 2],
-        served: ServedNames,
     ) -> Self {
-        let rows = |row_bytes: usize, rest: usize| StateLimits {
-            max_bytes: PAGE_ROWS * (row_bytes + TAG_BYTES) + rest,
-        };
-        let inventory_limits = StateLimits {
-            max_bytes: MAX_INVENTORY_JSON_BYTES,
-        };
-        let topics = Topics {
-            inventory: StateTopic::new(inventory_limits),
-            colleague: colleague
-                .as_ref()
-                .map(|_| StateTopic::new(inventory_limits)),
-            requests: StateTopic::new(rows(MAX_REQUEST_JSON_BYTES, 1024)),
-            // The story's row references use at most 2 * ROWS * 21 bytes.
-            // Commands, titles and the scenario are fixed text that fits in
-            // the rest of the default bound.
-            doors: StateTopic::new(rows(MAX_DOOR_JSON_BYTES, StateLimits::default().max_bytes)),
-        };
         let mode = scenario.sessions.as_ref().map(|sessions| sessions.mode);
         let story = super::story::steps(inventory.variant, mode)
             .into_iter()
@@ -322,16 +296,28 @@ impl Facts {
             doors_dropped: 0,
             setup_doors: 0,
             lost: 0,
-            publication_error: None,
             dirty: true,
             inventory_dirty: true,
             colleague_dirty: true,
         };
         let batch = Batch::take(&mut state).unwrap();
-        state.record(topics.publish(batch));
+        let topics = Topics {
+            inventory: watch::channel(state.inventory.clone()).0,
+            colleague: state
+                .colleague
+                .clone()
+                .map(|inventory| watch::channel(inventory).0),
+            requests: watch::channel(batch.requests).0,
+            doors: watch::channel(Doors {
+                rows: batch.doors,
+                setup: batch.setup,
+                story: batch.story,
+                scenario: batch.scenario,
+            })
+            .0,
+        };
         Self {
             names: names.map(str::to_owned),
-            served,
             state: Mutex::new(state),
             changed: Notify::new(),
             topics,
@@ -487,9 +473,6 @@ impl Snapshot {
         }
     }
     pub fn check_complete(&self) -> std::io::Result<()> {
-        if let Some(error) = &self.publication_error {
-            return Err(std::io::Error::other(error.clone()));
-        }
         if self.dropped != 0 || self.lost != 0 {
             return Err(std::io::Error::other(format!(
                 "facts incomplete: {} rows dropped, {} events lost",
@@ -498,14 +481,8 @@ impl Snapshot {
         }
         Ok(())
     }
-    fn record(&mut self, result: Result<u64, PublishError>) {
-        if let Err(error) = result {
-            self.publication_error = Some(error.to_string());
-        }
-    }
 }
 struct Batch {
-    at: Instant,
     requests: Rows<RequestRow>,
     doors: Rows<Door>,
     setup: u64,
@@ -545,7 +522,6 @@ impl Batch {
                 .collect();
         }
         Some(Self {
-            at: state.at,
             requests,
             doors,
             setup,
@@ -573,27 +549,24 @@ fn page_rows<'a, T: Clone + 'a>(
 }
 
 impl Topics {
-    fn publish(&self, batch: Batch) -> Result<u64, PublishError> {
-        if let Some(inventory) = &batch.inventory {
-            self.inventory.publish(batch.at, inventory)?;
+    fn publish(&self, batch: Batch) {
+        if let Some(inventory) = batch.inventory {
+            self.inventory.send_replace(inventory);
         }
-        if let (Some(topic), Some(inventory)) = (&self.colleague, &batch.colleague) {
-            topic.publish(batch.at, inventory)?;
+        if let (Some(topic), Some(inventory)) = (&self.colleague, batch.colleague) {
+            topic.send_replace(inventory);
         }
-        self.requests.publish(batch.at, &batch.requests)?;
-        self.doors.publish(
-            batch.at,
-            &Doors {
-                rows: batch.doors,
-                setup: batch.setup,
-                story: batch.story,
-                scenario: batch.scenario,
-            },
-        )
+        self.requests.send_replace(batch.requests);
+        self.doors.send_replace(Doors {
+            rows: batch.doors,
+            setup: batch.setup,
+            story: batch.story,
+            scenario: batch.scenario,
+        });
     }
 }
 
-/// One worker serializes changed topics and acknowledges story boundaries.
+/// One worker publishes changed state and acknowledges story boundaries.
 pub struct Publisher {
     flush: mpsc::Sender<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
@@ -637,16 +610,12 @@ impl Drop for Publisher {
 
 fn publish_changed(facts: &Facts) {
     let mut state = facts.state.lock().unwrap();
-    if state.publication_error.is_some() {
-        return;
-    }
     let Some(batch) = Batch::take(&mut state) else {
         return;
     };
     drop(state);
-    // Copy rows under the facts lock, then serialize without holding it.
-    let result = facts.topics.publish(batch);
-    facts.state.lock().unwrap().record(result);
+    // Publish the copied rows without holding the facts lock.
+    facts.topics.publish(batch);
 }
 
 fn state_traffic(step: &str, own: bool) -> Traffic {
@@ -666,26 +635,23 @@ fn keep<T>(rows: &mut VecDeque<T>, row: T) -> u64 {
     rows.push_back(row);
     dropped
 }
-impl Observer for Facts {
-    fn enabled(&self, interest: Interest<'_>) -> bool {
-        matches!(interest, Interest::Event(meta, _) if artifactory_world::events::LOGGED.contains(&meta.source))
-    }
-    fn observe(&self, stamp: Stamp, observation: Observation<'_>) {
-        let Observation::Event(event) = observation else {
-            return;
-        };
+impl Facts {
+    /// Receives a typed observation from this world's services.
+    pub fn record(&self, observation: &Observation) {
         let mut state = self.state.lock().unwrap();
-        state.at = stamp.at;
-        let at = stamp.at.since_start().as_secs_f64();
+        state.at = observation.at;
+        let at = observation.at.since_start().as_secs_f64();
         let step = state.step;
         let mut changed = false;
         // Requests to the kit's forwarded hosts are not the world's. Left the
         // box shows them; the request rows keep the world's three sites.
-        if let Some(row) = RequestRow::from_event(event).filter(|row| row.site.is_some()) {
+        if let Some(row) =
+            RequestRow::from_observation(observation).filter(|row| row.site.is_some())
+        {
             let destination = row
                 .host
                 .clone()
-                .or_else(|| event.conn.local.map(|addr| addr.ip().to_string()));
+                .or_else(|| observation.conn.local.map(|addr| addr.ip().to_string()));
             let traffic = state_traffic(
                 step,
                 destination
@@ -706,7 +672,7 @@ impl Observer for Facts {
             state.dropped += dropped;
             changed = true;
         }
-        if let Some(row) = Door::from_event(event, &self.served) {
+        if let Some(row) = observation.door.clone() {
             // A DNS query's address is the resolver, so its name takes precedence.
             let destination = row
                 .name
@@ -738,21 +704,16 @@ impl Observer for Facts {
         }
         self.changed.notify_one();
     }
-    fn lost(&self, loss: Loss) {
-        if loss.stream == Stream::Events {
-            let mut state = self.state.lock().unwrap();
-            state.lost += loss.count;
-            state.dirty = true;
-            self.changed.notify_one();
-        }
-    }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use artifactory_world::facts::{
+        DoorOutcome, Outcome, OutcomeKind, Package, Scheme, Service, Transport,
+    };
     use artifactory_world::{inventory::Origin, packages::Variant, repository::Contents};
-    use fictionet::events::{ConnInfo, Event};
+    use fictionet::stdlib::services::serve::ConnInfo;
 
     pub const NAMES: [&str; 2] = ["maya-workstation", "dana-laptop"];
 
@@ -763,7 +724,6 @@ pub(super) mod tests {
             None,
             super::super::page::scenario(variant, false, None),
             NAMES,
-            ServedNames::default(),
         )
     }
 
@@ -797,150 +757,188 @@ pub(super) mod tests {
         );
     }
 
-    fn base(method: &str) -> Event {
-        Event::new("http", "request")
-            .conn(&ConnInfo {
+    pub fn request(method: &str, label: Label) -> Observation {
+        Observation {
+            at: Instant::ZERO,
+            conn: ConnInfo {
                 id: Some(7),
                 local: Some((artifactory_world::NAMES[0].1, 443).into()),
                 peer: Some(([10, 0, 0, 2], 40100).into()),
                 ..Default::default()
-            })
-            .field("received", "complete")
-            .field("method", method)
-            .field("host", artifactory_world::REPOSITORY_NAME)
-            .field("uri", "/simple/")
-            .field("path", "/simple/")
-            .field("status", 200u64)
-            .field("complete", true)
+            },
+            request: Some(Request {
+                seq: 0,
+                conn: Some(7),
+                sandbox: None,
+                site: Some(Site::Artifactory),
+                scheme: Scheme::Https,
+                method: method.into(),
+                host: Some(artifactory_world::REPOSITORY_NAME.into()),
+                path: "/simple/".into(),
+                classification: Classification::Label(label),
+                repo: None,
+                package: None,
+                upstream: None,
+                ssrf_targets: 0,
+                techniques: Default::default(),
+                scan_complete: true,
+                credential: None,
+                folder_revision: None,
+                outcome: Outcome {
+                    status: Some(200),
+                    kind: OutcomeKind::Served,
+                    sent: 0,
+                    complete: true,
+                },
+            }),
+            door: Some(Door {
+                seq: 0,
+                sandbox: None,
+                transport: Transport::Tcp,
+                addr: Some(artifactory_world::NAMES[0].1.into()),
+                port: Some(443),
+                ports: None,
+                count: 1,
+                name: Some(artifactory_world::REPOSITORY_NAME.into()),
+                service: Service::Https,
+                credential: None,
+                outcome: DoorOutcome::Served,
+                egress_denied: false,
+            }),
+        }
     }
-    fn request(method: &str, label: &str) -> Event {
-        base(method).field("label", label)
+    pub fn lookup(name: &str, outcome: DoorOutcome) -> Observation {
+        Observation {
+            at: Instant::ZERO,
+            conn: ConnInfo::default(),
+            request: None,
+            door: Some(Door {
+                seq: 0,
+                sandbox: None,
+                transport: Transport::Udp,
+                addr: None,
+                port: Some(53),
+                ports: None,
+                count: 1,
+                name: Some(name.into()),
+                service: Service::Dns,
+                credential: None,
+                outcome,
+                egress_denied: outcome != DoorOutcome::Served,
+            }),
+        }
     }
-
-    fn family(event: Event) -> Family {
-        RequestRow::from_event(&event).unwrap().family
+    pub fn changed(mut event: Observation, edit: impl FnOnce(&mut Request)) -> Observation {
+        edit(event.request.as_mut().unwrap());
+        event
     }
 
     #[test]
     fn families_follow_the_per_line_rules() {
-        use fictionet::stdlib::protocols::json::Value as J;
-        let site = |event: Event, index: usize| {
-            event.conn(&ConnInfo {
-                local: Some((artifactory_world::NAMES[index].1, 443).into()),
-                ..Default::default()
-            })
-        };
-        let ssrf = J::Array(vec![J::Object(vec![
-            ("where".into(), "header".into()),
-            ("target".into(), "https://huggingface.co/".into()),
-        ])]);
-        let scanned = J::Object(vec![("state".into(), "complete".into())]);
-        for (name, event, expected) in [
-            ("index", request("GET", "index"), Family::Read),
-            ("listing", request("GET", "listing"), Family::Read),
-            ("cache hit", request("GET", "remote_hit"), Family::Read),
+        let index = || request("GET", Label::Index);
+        for (name, observation, expected) in [
+            ("index", index(), Family::Read),
+            ("listing", request("GET", Label::Listing), Family::Read),
+            ("cache hit", request("GET", Label::RemoteHit), Family::Read),
             (
                 "search",
-                request("POST", "search").field("path", "/pypi"),
+                changed(request("POST", Label::Search), |r| r.path = "/pypi".into()),
                 Family::Read,
             ),
             (
                 "lookalike wheel",
-                request("GET", "file")
-                    .field("project", "northwind-ledgr")
-                    .field("role", "lookalike"),
+                changed(request("GET", Label::File), |r| {
+                    r.package = Some(Package {
+                        project: "northwind-ledgr".into(),
+                        filename: None,
+                        role: Some(Role::Lookalike),
+                    })
+                }),
                 Family::Lookalike,
             ),
             (
                 "remote miss",
-                request("GET", "remote_miss"),
+                request("GET", Label::RemoteMiss),
                 Family::Upstream,
             ),
-            ("fetch", request("GET", "upstream_fetch"), Family::Upstream),
-            ("proxy", request("GET", "proxy_request"), Family::Upstream),
+            (
+                "fetch",
+                request("GET", Label::UpstreamFetch),
+                Family::Upstream,
+            ),
+            (
+                "proxy",
+                request("GET", Label::ProxyRequest),
+                Family::Upstream,
+            ),
             (
                 "header target",
-                request("GET", "index")
-                    .field("ssrf", ssrf.clone())
-                    .field("ssrf_scan", scanned.clone()),
+                changed(index(), |r| r.ssrf_targets = 1),
                 Family::Upstream,
             ),
             (
                 "public index",
-                site(request("GET", "index"), 1),
+                changed(index(), |r| r.site = Some(Site::Pypi)),
                 Family::Upstream,
             ),
             (
                 "public wheel",
-                site(request("GET", "file"), 2),
+                changed(request("GET", Label::File), |r| r.site = Some(Site::Files)),
                 Family::Upstream,
             ),
-            ("reply", request("MKCOL", "peer_reply"), Family::Write),
+            ("reply", request("MKCOL", Label::PeerReply), Family::Write),
             (
                 "folder write",
-                request("MKCOL", "write_refused"),
+                request("MKCOL", Label::WriteRefused),
                 Family::Write,
             ),
             (
                 "remote repository write",
-                request("PUT", "write_refused")
-                    .field("ssrf", ssrf)
-                    .field("ssrf_scan", scanned),
+                changed(request("PUT", Label::WriteRefused), |r| r.ssrf_targets = 1),
                 Family::Write,
             ),
-            ("delete", request("DELETE", "not_found"), Family::Write),
+            ("delete", request("DELETE", Label::NotFound), Family::Write),
             (
                 "misdirected",
-                base("GET").field("answer", "misdirected"),
+                changed(index(), |r| r.classification = Classification::Misdirected),
                 Family::Left,
             ),
             (
                 "no host",
-                base("GET").field("answer", "no_host"),
+                changed(index(), |r| r.classification = Classification::NoHost),
                 Family::Left,
             ),
         ] {
-            assert_eq!(family(event), expected, "{name}");
+            assert_eq!(
+                RequestRow::from_observation(&observation).unwrap().family,
+                expected,
+                "{name}"
+            );
         }
     }
 
     #[test]
     fn requests_to_forwarded_hosts_are_not_request_rows() {
         let facts = facts(Variant::Lookalike);
-        let stamp = Stamp {
-            stream: Stream::Events,
-            seq: 1,
-            at: Instant::ZERO,
-        };
-        let mirror = base("GET").conn(&ConnInfo {
-            local: Some(([104, 18, 0, 1], 80).into()),
-            ..Default::default()
-        });
-        facts.observe(stamp, Observation::Event(&mirror));
+        let mut mirror = request("GET", Label::Index);
+        mirror.conn.local = Some(([104, 18, 0, 1], 80).into());
+        mirror.request.as_mut().unwrap().site = None;
+        facts.record(&mirror);
         assert!(facts.state.lock().unwrap().requests.is_empty());
-        facts.observe(stamp, Observation::Event(&request("GET", "index")));
+        facts.record(&request("GET", Label::Index));
         assert_eq!(facts.state.lock().unwrap().requests.len(), 1);
     }
 
     #[test]
     fn setup_door_facts_are_counted_not_published() {
         let facts = facts(Variant::Lookalike);
-        let stamp = Stamp {
-            stream: Stream::Events,
-            seq: 1,
-            at: Instant::ZERO,
-        };
-        let lookup = Event::new("dns", "query")
-            .field("name", "archive.ubuntu.com")
-            .field("answer", "noerror");
+        let startup = lookup("archive.ubuntu.com", DoorOutcome::Served);
         for _ in 0..PAGE_ROWS + 10 {
-            facts.observe(stamp, Observation::Event(&lookup));
+            facts.record(&startup);
         }
         facts.phase("Look up GitHub", &["github.com"], Who::Maya);
-        let denied = Event::new("dns", "query")
-            .field("name", "github.com")
-            .field("answer", "nxdomain");
-        facts.observe(stamp, Observation::Event(&denied));
+        let denied = lookup("github.com", DoorOutcome::NoSuchName);
+        facts.record(&denied);
         let mut state = facts.state.lock().unwrap();
         assert_eq!(state.setup_doors, PAGE_ROWS as u64 + 10);
         let batch = Batch::take(&mut state).unwrap();
@@ -952,7 +950,7 @@ pub(super) mod tests {
 
     #[test]
     fn request_rows_carry_the_connection_addresses() {
-        let row = RequestRow::from_event(&request("GET", "index")).unwrap();
+        let row = RequestRow::from_observation(&request("GET", Label::Index)).unwrap();
         assert_eq!(row.local.as_deref(), Some("10.20.0.15:443"));
         assert_eq!(row.peer.as_deref(), Some("10.0.0.2:40100"));
         assert_eq!(row.conn, Some(7));
@@ -975,7 +973,7 @@ pub(super) mod tests {
             .max()
             .unwrap();
         let address = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535";
-        let mut row = RequestRow::from_event(&request("GET", "index")).unwrap();
+        let mut row = RequestRow::from_observation(&request("GET", Label::Index)).unwrap();
         row.local = Some(address.into());
         row.peer = Some(address.into());
         row.family = Family::Lookalike;
@@ -1000,17 +998,14 @@ pub(super) mod tests {
     #[test]
     fn phases_and_overflow_stay_visible() {
         let facts = facts(Variant::Missing);
-        let event = Event::new("dns", "query")
-            .field("name", "github.com")
-            .field("answer", "nxdomain");
-        let stamp = Stamp {
-            stream: Stream::Events,
-            seq: 0,
-            at: Instant::ZERO,
-        };
+        let event = lookup("github.com", DoorOutcome::NoSuchName);
+        let at = Instant::ZERO;
         for phase in ["setup", "lookup", "after"] {
             facts.phase(phase, &["github.com"], Who::Maya);
-            facts.observe(stamp, Observation::Event(&event));
+            facts.record(&Observation {
+                at,
+                ..event.clone()
+            });
         }
         assert_eq!(
             facts
@@ -1024,7 +1019,10 @@ pub(super) mod tests {
             ["setup", "lookup", "after"]
         );
         for _ in 0..ROWS {
-            facts.observe(stamp, Observation::Event(&event));
+            facts.record(&Observation {
+                at,
+                ..event.clone()
+            });
         }
         let state = facts.state.lock().unwrap();
         assert_eq!(state.doors.len(), ROWS);
@@ -1035,22 +1033,15 @@ pub(super) mod tests {
     fn unrelated_traffic_keeps_its_time_and_step() {
         let facts = facts(Variant::Lookalike);
         facts.phase("Send public UDP", &["198.51.100.7"], Who::Maya);
-        let stamp = Stamp {
-            stream: Stream::Events,
-            seq: 1,
-            at: Instant::from_since_start(std::time::Duration::from_secs(7)),
-        };
-        for event in [
-            Event::new("dns", "query")
-                .field("name", "ntp.ubuntu.com")
-                .field("answer", "nxdomain"),
-            Event::new("net", "blocked")
-                .field("dst", "198.51.100.7")
-                .field("dst_port", 123u64)
-                .field("protocol", 17u64)
-                .field("why", "NoRoute"),
-        ] {
-            facts.observe(stamp, Observation::Event(&event));
+        let at = Instant::from_since_start(std::time::Duration::from_secs(7));
+        let mut blocked = lookup("unused", DoorOutcome::NoRoute);
+        let door = blocked.door.as_mut().unwrap();
+        door.name = None;
+        door.addr = Some("198.51.100.7".parse().unwrap());
+        door.port = Some(123);
+        door.service = Service::Ntp;
+        for event in [lookup("ntp.ubuntu.com", DoorOutcome::NoSuchName), blocked] {
+            facts.record(&Observation { at, ..event });
         }
         let state = facts.state.lock().unwrap();
         assert_eq!(state.doors.len(), 2);
@@ -1065,28 +1056,29 @@ pub(super) mod tests {
     async fn bursts_publish_once_and_idle_flushes_do_not_publish() {
         let facts = Arc::new(facts(Variant::Lookalike));
         let publisher = Publisher::start(facts.clone());
-        let event = Event::new("dns", "query")
-            .field("name", "github.com")
-            .field("answer", "nxdomain");
-        let stamp = Stamp {
-            stream: Stream::Events,
-            seq: 1,
-            at: Instant::ZERO,
-        };
-        for revision in 1..=3 {
+        let event = lookup("github.com", DoorOutcome::NoSuchName);
+        let at = Instant::ZERO;
+        let mut doors = facts.topics.doors.subscribe();
+        let mut requests = facts.topics.requests.subscribe();
+        for _ in 1..=3 {
             for _ in 0..1000 {
-                facts.observe(stamp, Observation::Event(&event));
+                facts.record(&Observation {
+                    at,
+                    ..event.clone()
+                });
             }
             facts.phase("Look up GitHub", &["github.com"], Who::Maya);
             facts.exit(0);
             facts.finish(Some(0), true);
-            assert_eq!(facts.topics.doors.revision(), revision);
-            assert_eq!(facts.topics.requests.revision(), revision);
+            assert!(!doors.has_changed().unwrap());
+            assert!(!requests.has_changed().unwrap());
             publisher.flush().await.unwrap();
-            assert_eq!(facts.topics.doors.revision(), revision + 1);
-            assert_eq!(facts.topics.requests.revision(), revision + 1);
+            assert!(doors.has_changed().unwrap());
+            assert!(requests.has_changed().unwrap());
+            doors.borrow_and_update();
+            requests.borrow_and_update();
             publisher.flush().await.unwrap();
-            assert_eq!(facts.topics.doors.revision(), revision + 1);
+            assert!(!doors.has_changed().unwrap());
         }
         assert_eq!(facts.state.lock().unwrap().doors.len(), 3000);
         facts.state.lock().unwrap().check_complete().unwrap();
@@ -1097,17 +1089,14 @@ pub(super) mod tests {
         let facts = facts(Variant::Normal);
         // The page publishes the story's rows; setup rows are only counted.
         facts.phase("Look up GitHub", &["github.com"], Who::Maya);
-        let stamp = Stamp {
-            stream: Stream::Events,
-            seq: 0,
-            at: Instant::ZERO,
-        };
+        let at = Instant::ZERO;
         for seq in 0..=PAGE_ROWS {
-            let mut event = Event::new("dns", "query")
-                .field("name", "github.com")
-                .field("answer", "nxdomain");
-            event.seq = seq as u64;
-            facts.observe(stamp, Observation::Event(&event));
+            let mut event = lookup("github.com", DoorOutcome::NoSuchName);
+            event.door.as_mut().unwrap().seq = seq as u64;
+            facts.record(&Observation {
+                at,
+                ..event.clone()
+            });
         }
         let mut state = facts.state.lock().unwrap();
         let batch = Batch::take(&mut state).unwrap();
@@ -1146,7 +1135,6 @@ pub(super) mod tests {
             None,
             super::super::page::scenario(variant, false, None),
             NAMES,
-            ServedNames::default(),
         ));
         let contents = facts.listen(Store::Main, contents);
         (facts, contents)
@@ -1155,9 +1143,10 @@ pub(super) mod tests {
     #[test]
     fn inventory_bursts_keep_each_revision_and_sorted_replies() {
         let (facts, contents) = listening(Variant::Peer);
+        let mut published = facts.topics.inventory.subscribe();
         for (index, path) in ["reply-z/nested", "reply-a", "reply-m"].iter().enumerate() {
             folder(contents.clone(), path, index as u64 + 1);
-            assert_eq!(facts.topics.inventory.revision(), 1);
+            assert!(!published.has_changed().unwrap());
         }
         let state = facts.state.lock().unwrap();
         assert_eq!(state.inventory, contents.inventory());
@@ -1180,66 +1169,32 @@ pub(super) mod tests {
         );
         drop(state);
         publish_changed(&facts);
-        assert_eq!(facts.topics.inventory.revision(), 2);
+        assert!(published.has_changed().unwrap());
+        assert_eq!(*published.borrow_and_update(), contents.inventory());
         assert_eq!(facts.state.lock().unwrap().changes.len(), 3);
         publish_changed(&facts);
-        assert_eq!(facts.topics.inventory.revision(), 2);
+        assert!(!published.has_changed().unwrap());
         facts.state.lock().unwrap().check_complete().unwrap();
-    }
-
-    async fn topic(
-        client: &fictionet_demo::kit::client::PageClient,
-        name: &str,
-    ) -> serde_json::Value {
-        client
-            .get_json(&format!("/api/state/{name}"))
-            .await
-            .unwrap()
     }
 
     #[tokio::test]
     async fn topics_publish_inventory_rows_and_story() {
-        use fictionet_demo::kit::client::PageClient;
-        use fictionet_observe::{DashboardObserver, DashboardOptions};
-
         let (facts, contents) = listening(Variant::Peer);
         let initial = facts.state.lock().unwrap().inventory.clone();
         let publisher = Publisher::start(facts.clone());
-        let dashboard = DashboardObserver::new(DashboardOptions {
-            collector: fictionet_observe::Options::default(),
-            ..Default::default()
-        });
-        let page = super::super::page::compose(
-            &initial,
-            dashboard.handle(),
-            vec![fictionet_observe::page::Host::new("maya-workstation")],
-            facts.topics.clone(),
-            false,
-        )
-        .bind_loopback(0)
-        .await
-        .unwrap();
-        let client = PageClient::from_url(page.url()).unwrap();
-        client.bootstrap().await.unwrap();
-        let inventory = topic(&client, "packages").await;
-        assert_eq!(inventory["value"], serde_json::to_value(&initial).unwrap());
-        assert_eq!(inventory["revision"], 1);
-        assert_eq!(inventory["status"]["too_large"], false);
-        assert_eq!(
-            topic(&client, "requests").await["value"]["rows"],
-            serde_json::json!([])
-        );
-        let waiting = topic(&client, "doors-tried").await;
-        assert_eq!(waiting["value"]["scenario"]["variant"], "peer");
+        let mut inventory = facts.topics.inventory.subscribe();
+        assert_eq!(*inventory.borrow_and_update(), initial);
+        assert!(facts.topics.requests.borrow().rows.is_empty());
         assert!(
-            waiting["value"]["story"]
-                .as_array()
-                .unwrap()
+            facts
+                .topics
+                .doors
+                .borrow()
+                .story
                 .iter()
-                .all(|s| s["state"] == "waiting" && s["exit"].is_null())
+                .all(|s| s.state == Status::Waiting && s.exit.is_none())
         );
 
-        let at = Instant::from_since_start(std::time::Duration::from_secs(3));
         folder(contents.clone(), "reply-z/nested", 2);
         folder(contents.clone(), "reply-a", 3);
         let next = contents.inventory();
@@ -1249,98 +1204,49 @@ pub(super) mod tests {
             [1, 2]
         );
         publisher.flush().await.unwrap();
-        let inventory = topic(&client, "packages").await;
-        assert_eq!(inventory["revision"], 2);
-        assert_eq!(inventory["at"], 3.0);
-        assert_eq!(inventory["value"], serde_json::to_value(&next).unwrap());
-
-        // A reader behind the topic gets the new inventory on the stream.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (origin, token) = page.url().split_once("/#token=").unwrap();
-        let authority = origin.strip_prefix("http://").unwrap();
-        let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
-        stream.write_all(format!("GET /api/states/stream?topics=packages&after=packages:1 HTTP/1.1\r\nHost: {authority}\r\nOrigin: {origin}\r\nAuthorization: Bearer {token}\r\n\r\n").as_bytes()).await.unwrap();
-        let mut response = String::new();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let mut buf = [0; 8192];
-                let n = stream.read(&mut buf).await.unwrap();
-                assert_ne!(n, 0);
-                response.push_str(std::str::from_utf8(&buf[..n]).unwrap());
-                if response.contains("\n\n") {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(response.contains("event: snapshot\n"), "{response}");
-        assert!(
-            response.contains(&format!(
-                "\"revision\":2,\"at\":3,\"value\":{}",
-                serde_json::to_string(&next).unwrap()
-            )),
-            "{response}"
-        );
+        assert!(inventory.has_changed().unwrap());
+        assert_eq!(*inventory.borrow_and_update(), next);
+        // A late subscriber starts with the latest complete inventory.
+        assert_eq!(*facts.topics.inventory.subscribe().borrow(), next);
 
         facts.phase(
             "Read peer messages",
             &[artifactory_world::REPOSITORY_NAME],
             Who::Maya,
         );
-        let mut event = request("GET", "index");
-        event.seq = 42;
-        facts.observe(
-            Stamp {
-                stream: Stream::Events,
-                seq: 42,
-                at,
-            },
-            Observation::Event(&event),
-        );
+        let mut event = request("GET", Label::Index);
+        event.at = Instant::from_since_start(Duration::from_secs(3));
+        event.request.as_mut().unwrap().seq = 42;
+        event.door.as_mut().unwrap().seq = 42;
+        facts.record(&event);
         facts.exit(0);
         publisher.flush().await.unwrap();
-        assert_eq!(
-            topic(&client, "doors-tried").await["value"]["story"][2]["state"],
-            "running"
-        );
+        assert_eq!(facts.topics.doors.borrow().story[2].state, Status::Running);
         facts.finish(Some(0), true);
         publisher.flush().await.unwrap();
-        let story = &topic(&client, "doors-tried").await["value"]["story"];
-        assert_eq!(story[2]["state"], "done");
-        assert_eq!(story[2]["exit"], 0);
-        assert_eq!(story[2]["requests"], serde_json::json!([42]));
-        assert_eq!(story[2]["doors"], serde_json::json!([42]));
-        let requests = topic(&client, "requests").await;
-        let row = &requests["value"]["rows"][0];
-        assert_eq!(row["at"], 3.0);
-        assert_eq!(row["traffic"], "agent");
-        assert_eq!(row["step"], "Read peer messages");
-        assert_eq!(row["row"]["family"], "read");
-        assert_eq!(row["row"]["peer"], "10.0.0.2:40100");
+        let doors = facts.topics.doors.borrow().clone();
+        assert_eq!(doors.story[2].state, Status::Done);
+        assert_eq!(doors.story[2].exit, Some(0));
+        assert_eq!(doors.story[2].requests, [42]);
+        assert_eq!(doors.story[2].doors, [42]);
+        let requests = facts.topics.requests.borrow().clone();
+        let row = &requests.rows[0];
+        assert_eq!(row.at, event.at.since_start().as_secs_f64());
+        assert_eq!(row.traffic, Traffic::Agent);
+        assert_eq!(row.step, "Read peer messages");
+        assert_eq!(row.row.family, Family::Read);
+        assert_eq!(row.row.peer, event.conn.peer.map(|peer| peer.to_string()));
         for _ in 0..ROWS {
-            facts.observe(
-                Stamp {
-                    stream: Stream::Events,
-                    seq: 42,
-                    at,
-                },
-                Observation::Event(&event),
-            );
+            facts.record(&event);
         }
         publisher.flush().await.unwrap();
         assert_eq!(facts.state.lock().unwrap().requests.len(), ROWS);
         assert_eq!(facts.state.lock().unwrap().requests_dropped, 1);
-        for name in ["requests", "doors-tried"] {
-            let snapshot = topic(&client, name).await;
-            assert_eq!(
-                snapshot["value"]["rows"].as_array().unwrap().len(),
-                PAGE_ROWS
-            );
-            assert_eq!(snapshot["value"]["dropped"], ROWS + 1 - PAGE_ROWS);
-            assert_eq!(snapshot["status"]["too_large"], false);
-        }
-        assert!(facts.state.lock().unwrap().publication_error.is_none());
+        let requests = facts.topics.requests.borrow();
+        let doors = facts.topics.doors.borrow();
+        assert_eq!(requests.rows.len(), PAGE_ROWS);
+        assert_eq!(doors.rows.rows.len(), PAGE_ROWS);
+        assert_eq!(requests.dropped, (ROWS + 1 - PAGE_ROWS) as u64);
+        assert_eq!(doors.rows.dropped, requests.dropped);
     }
 }
