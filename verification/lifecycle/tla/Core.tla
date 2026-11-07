@@ -14,7 +14,7 @@
 (*   WriteStep           the write loop at the top of `run`'s loop          *)
 (*   YieldCancel         Next::Again's yield_now observing a cancel        *)
 (*   CloseReturn         Next::Closed: shutdown, then what `run` returns    *)
-(*   UpgradeReturn       Next::Upgrade                                      *)
+(*   UpgradeCancelled, UpgradeReturn   Next::Upgrade                        *)
 (*                                                                         *)
 (* The service is abstract: every call may append a reply, defer ordered   *)
 (* or keyed work, arm the timer, and hand back any Flow or an error.       *)
@@ -209,9 +209,18 @@ CloseReturn ==
                  elapsed, quiet, suspended>>
   /\ charged' = Holding(c, input)
 
-\* advance: State::Upgrading, then run's Next::Upgrade
+\* advance: State::Upgrading, then run's Next::Upgrade.  With the fix the
+\* exit observes a cancel first and hands nothing on.
+UpgradeCancelled ==
+  /\ Ready /\ c.state = "Upgrading" /\ TotalBroken /\ cancelled
+  /\ observed' = TRUE
+  /\ c' = Broken(c, "Cancelled")
+  /\ charged' = Holding(c, input)
+  /\ UNCHANGED <<pc, waitKind, input, eof, timer, woken, cancelled, returned,
+                 elapsed, quiet, suspended>>
+
 UpgradeReturn ==
-  /\ Ready /\ c.state = "Upgrading"
+  /\ Ready /\ c.state = "Upgrading" /\ (~TotalBroken \/ ~cancelled)
   /\ pc' = "Done"
   /\ returned' = "Upgraded"
   /\ c' = [c EXCEPT !.wakeClosed = c.wakeClosed \/ c.how = "Handoff"]
@@ -459,7 +468,7 @@ TimerFires ==
 -----------------------------------------------------------------------------
 Driver ==
   \/ WriteStep \/ BudgetBlow \/ YieldCancel
-  \/ CloseReturn \/ UpgradeReturn
+  \/ CloseReturn \/ UpgradeCancelled \/ UpgradeReturn
   \/ EndingWaits \/ EndingEnds \/ EndingCalls
   \/ AdvanceOrdered \/ AdvanceHeld \/ AdvanceTimer \/ AdvanceWake \/ AdvanceIdle
   \/ AdvanceItem \/ AdvanceEof \/ AdvanceWaits
