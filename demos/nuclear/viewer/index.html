@@ -3,24 +3,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Nuclear unit 1 control room</title>
+<link rel="stylesheet" href="/viewer.css">
+<link rel="stylesheet" href="/control-room.css">
+<script type="importmap">{"imports":{"/vendor/three/build/three.module.js":"https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js"}}</script>
 <style>
-:root { color-scheme: dark; font: 16px system-ui; background: #101820; color: #e3edf4 }
-body { max-width: 1100px; margin: auto; padding: 2rem }
-h1 { margin-bottom: .3rem } p { color: #bacbd7 } section { margin: 1.5rem 0; padding: 1rem; border: 1px solid #405564; border-radius: .5rem }
-.controls, #readings { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center }
-button, input, select { font: inherit; padding: .5rem; border: 1px solid #718a9c; border-radius: .3rem; background: #223542; color: inherit }
-button { cursor: pointer } button:disabled { opacity: .5; cursor: wait } label { display: flex; gap: .5rem; align-items: center }
-output { display: block; font-size: 1.3rem; font-variant-numeric: tabular-nums } #readings > div { flex: 1 1 180px }
+:root { font: 16px system-ui; background: var(--surface); color: var(--ink) }
+body { margin: 0; padding: 1rem }
+h1 { margin-bottom: .3rem } body > p { color: var(--text) } body > section { margin: 1.5rem 0; padding: 1rem; border: 1px solid var(--line); border-radius: .5rem }
+.controls { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center }
+body > section button, body > section input, body > section select { font: inherit; padding: .5rem; border: 1px solid var(--line-strong); border-radius: .3rem; background: var(--surface-raised); color: inherit }
+button { cursor: pointer } button:disabled { opacity: .5; cursor: wait } .controls label { display: flex; gap: .5rem; align-items: center }
 pre { white-space: pre-wrap; max-height: 24rem; overflow: auto } summary { cursor: pointer } #status { min-height: 1.5rem }
 </style>
 <h1>Nuclear unit 1</h1>
 <p>Educational plant model · Live controls, plant facts, and the scripted operator. Starting a scenario replaces the running story.</p>
 <p id="connection" role="status">Connecting to the plant…</p>
-<section><h2>Plant readings</h2><div id="readings"></div></section>
-<section><h2>Operator controls</h2>
-<form id="rods" class="controls"><label>Rod demand (%) <input id="rod-demand" type="number" min="0" max="100" step="0.1" value="50" required></label><button>Set rod demand</button></form>
-<div class="controls"><button data-command="manual_trip">Trip reactor</button><button data-command="reset_trip">Reset trip</button><button data-command="acknowledge_alarms">Acknowledge alarms</button></div>
-</section>
+<main id="control-room"></main>
 <section><h2>Scenarios and faults</h2>
 <form id="scenario" class="controls"><label>Scenario <select id="scenario-name"><option value="normal">Normal operation</option><option value="loop_b_unattended">Loop B unattended</option><option value="steam_line_break">Steam line break</option><option value="stuck_open_relief">Stuck open relief</option><option value="station_blackout">Station blackout</option><option value="injection_returns">Injection returns</option></select></label><button>Start scenario</button></form>
 <form id="pace" class="controls"><label>Plant speed <select id="speed"><option value="0">Paused</option><option value="1" selected>Real time</option><option value="10">10 times</option><option value="60">60 times</option><option value="600">600 times</option></select></label><button>Set speed</button></form>

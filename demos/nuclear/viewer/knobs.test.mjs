@@ -154,19 +154,16 @@ test('a posted command carries the revision of the snapshot it was made from', (
     post(path, body) {
       sent.push({ path, body });
       return Promise.resolve({
-        status: 'applied',
-        request_id: body.request_id,
-        reply: { Ok: { revision: 43, at_ms: 9000 } },
+        Ok: { revision: 43, at_ms: 9000 },
       });
     },
   };
-  return postCommand(transport, '/api/faults/command', command, { requestId: 'req-1' }).then((outcome) => {
+  return postCommand(transport, '/api/faults/command', command).then((outcome) => {
     assert.equal(outcome.state, 'applied');
     assert.equal(sent.length, 1);
     assert.equal(sent[0].path, '/api/faults/command');
-    assert.equal(sent[0].body.request_id, 'req-1');
-    assert.equal(sent[0].body.command.expected_revision, 42);
-    assert.deepEqual(sent[0].body.command.change, { inject: 'telemetry_quiet' });
+    assert.equal(sent[0].body.expected_revision, 42);
+    assert.deepEqual(sent[0].body.change, { inject: 'telemetry_quiet' });
   });
 });
 
@@ -194,27 +191,25 @@ test('a pushbutton depresses and springs back', () => {
   assert.equal(button.depth, 0, 'it springs fully back');
 });
 
-test('outcomes name the reply: applied, refused, pending, no reply, failed', () => {
-  assert.equal(outcomeOf({ status: 'applied', reply: { Ok: { revision: 1, at_ms: 0 } } }).state, 'applied');
-  assert.equal(outcomeOf({ status: 'pending' }).state, 'pending');
+test('outcomes distinguish application, refusal and an unreadable reply', () => {
+  assert.equal(outcomeOf({ Ok: { revision: 1, at_ms: 0 } }).state, 'applied');
 
-  const refused = outcomeOf({ status: 'applied', reply: { Err: { reason: 'tripped', revision: 3 } } });
+  const refused = outcomeOf({ Err: { reason: 'tripped', revision: 3 } });
   assert.equal(refused.state, 'refused');
   assert.match(refused.text, /reactor has tripped/);
 
-  const rejected = outcomeOf({ status: 'rejected', rejection: { reason: 'stale_revision', current: 9 } });
+  const rejected = outcomeOf({ Err: { reason: 'stale_revision', revision: 9 } });
   assert.equal(rejected.state, 'refused');
   assert.match(rejected.text, /changed/);
 
-  assert.equal(outcomeOf({ status: 'timeout' }).state, 'no-reply');
   assert.equal(outcomeOf(null).state, 'failed');
 });
 
-test('a refused post reads the 409 body and a timeout reads the 504 body', async () => {
+test('a refused post reads its typed body and an interrupted request remains unconfirmed', async () => {
   const refuse = {
     post() {
       const error = new Error('409');
-      error.body = { status: 'rejected', request_id: 'x', rejection: { reason: 'stale_revision', current: 10 } };
+      error.body = { Err: { reason: 'stale_revision', revision: 10 } };
       return Promise.reject(error);
     },
   };
@@ -224,7 +219,6 @@ test('a refused post reads the 409 body and a timeout reads the 504 body', async
   const late = {
     post() {
       const error = new Error('504');
-      error.body = { status: 'timeout', request_id: 'x', error: 'no reply' };
       return Promise.reject(error);
     },
   };
@@ -421,7 +415,7 @@ test('fault replies show stale, already active and inactive refusals', async () 
     ['already_active', /already in effect/],
     ['not_active', /nothing to reset/],
   ]) {
-    const transport = { post: async () => ({ status: 'applied', reply: { Err: { reason, revision: 73 } } }) };
+    const transport = { post: async () => ({ Err: { reason, revision: 73 } }) };
     const outcome = await postCommand(
       transport,
       '/api/faults/command',

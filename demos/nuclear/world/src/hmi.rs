@@ -1,9 +1,9 @@
-//! The supervisory client hmi01, at 10.40.0.20 on the operations network.
+//! The supervisory client hmi01, at 10.41.0.20 on the trusted operations network.
 //!
 //! hmi01 is a trusted sandbox. [`network`] attaches it with `Net::route`, so
 //! its packets skip the sandbox filter and reach the controllers through the
-//! router. An ordinary sandbox on the operations subnet cannot reach it, since
-//! the filter drops packets to that subnet except the ones for the gateway.
+//! router. Ordinary sandboxes cannot reach the trusted operations subnet;
+//! the network's egress policy blocks it.
 //!
 //! Two world tasks run on hmi01:
 //!
@@ -45,15 +45,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use fictionet::events::ConnInfo;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::tcp::{self, TcpConnection};
 use fictionet::stdlib::network::{ConnError, ConnectionExt};
 use fictionet::stdlib::protocols::modbus::{self, Exception, Frame};
-use fictionet::stdlib::web::httpd::{self, Handler, HttpOptions, Router};
+use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::web::httpd::{self, Handler, HttpOptions};
 use fictionet::stdlib::world::net::Net;
-use fictionet::stdlib::world::sandbox::Machine;
 use fictionet::sync::Mutex;
 use fictionet::{Cx, Error, RaceError};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -66,7 +65,7 @@ use crate::registers::Plc;
 /// The sandbox name of hmi01 on the network.
 pub const NAME: &str = "hmi01";
 /// hmi01's address on the operations subnet.
-pub const ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 40, 0, 20);
+pub const ADDR: std::net::Ipv4Addr = crate::facts::HMI_ADDRESS;
 /// The HTTP port.
 pub const PORT: u16 = 80;
 /// Run time between poll cycles, in ms.
@@ -1464,11 +1463,10 @@ fn mark_offline(held: &Mutex<Held>, plc: Plc, error: String) {
 /// region is cancelled.
 async fn poll(
     fcx: Cx,
-    machine: Machine,
+    tcp: tcp::Endpoint,
     controllers: Controllers,
     held: Arc<Mutex<Held>>,
 ) -> fictionet::Result {
-    let tcp = machine.tcp.clone();
     let mut sessions: [Option<Session>; PLCS.len()] = std::array::from_fn(|_| None);
     while !fcx.is_cancelled() {
         for plc in PLCS {
@@ -1534,28 +1532,35 @@ async fn serve(
     }
 }
 
-/// Starts hmi01 on its machine: the poll task and the HTTP server on port 80.
-/// Returns the state the poll task keeps. The machine must be the one
+/// Starts the poll task and HTTP server on hmi01's TCP endpoint.
+/// Returns the state the poll task keeps. The endpoint must use the address
 /// [`network`] attached.
 pub fn start(
     fcx: &Cx,
-    machine: Machine,
+    tcp: tcp::Endpoint,
     controllers: Controllers,
     site: Site,
     driver: &Driver,
 ) -> Result<Arc<Mutex<Held>>, Error> {
     let held = Arc::new(Mutex::new(Held::warm(site, driver)));
-    let tcp = machine.tcp.clone();
     let listener = tcp.listen(PORT)?;
-    let handler: Arc<dyn Handler> = Arc::new(WebServer(router(held.clone(), tcp, controllers)));
+    let handler: Arc<dyn Handler> = Arc::new(WebServer {
+        held: held.clone(),
+        tcp: tcp.clone(),
+        controllers,
+    });
     let local = SocketAddr::new(IpAddr::V4(ADDR), PORT);
     fcx.spawn(move |fcx| serve(fcx, listener, handler, local, site));
     let poll_state = held.clone();
-    fcx.spawn(move |fcx| poll(fcx, machine, controllers, poll_state));
+    fcx.spawn(move |fcx| poll(fcx, tcp, controllers, poll_state));
     Ok(held)
 }
 
-struct WebServer(Router);
+struct WebServer {
+    held: Arc<Mutex<Held>>,
+    tcp: tcp::Endpoint,
+    controllers: Controllers,
+}
 
 fn server_header<T>(mut response: Response<T>) -> Response<T> {
     response
@@ -1565,70 +1570,72 @@ fn server_header<T>(mut response: Response<T>) -> Response<T> {
 }
 
 impl Handler for WebServer {
-    fn call(&self, request: Request<httpd::Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        match self.0.call(request, ex) {
-            httpd::Reply::Now(response) => httpd::Reply::Now(server_header(response)),
-            httpd::Reply::Later(work) => httpd::Reply::Later(Box::new(move |fcx| {
-                Box::pin(async move { work(fcx).await.map(server_header) })
-            })),
-            reply => reply,
+    fn call(&self, request: Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        let Some(body) = request.body().bytes() else {
+            return httpd::Reply::Now(
+                server_header(refusal(StatusCode::BAD_REQUEST, "incomplete body", None))
+                    .map(httpd::Body::from),
+            );
+        };
+        let request = request.map(|_| body);
+        if request.method() == Method::POST && request.uri().path().starts_with(CONTROL_PREFIX) {
+            let (tcp, held, controllers) = (self.tcp.clone(), self.held.clone(), self.controllers);
+            return httpd::Reply::Later(Box::new(move |fcx| {
+                Box::pin(async move {
+                    Ok(
+                        server_header(control(fcx, tcp, controllers, held, request).await)
+                            .map(httpd::Body::from),
+                    )
+                })
+            }));
         }
-    }
-}
-
-fn router(held: Arc<Mutex<Held>>, tcp: tcp::Endpoint, controllers: Controllers) -> Router {
-    let plant = held.clone();
-    let history = held.clone();
-    Router::new()
-        .get("/", |_, _| {
-            respond(
-                StatusCode::OK,
-                "text/html; charset=utf-8",
-                Bytes::from_static(INDEX_HTML.as_bytes()),
-            )
-        })
-        .get("/hmi.css", |_, _| {
-            respond(
-                StatusCode::OK,
-                "text/css; charset=utf-8",
-                Bytes::from_static(STYLE_CSS.as_bytes()),
-            )
-        })
-        .get("/hmi.mjs", |_, _| {
-            respond(
-                StatusCode::OK,
-                "text/javascript; charset=utf-8",
-                Bytes::from_static(SCRIPT_JS.as_bytes()),
-            )
-        })
-        .get("/api/plant", move |_, _| {
-            json(StatusCode::OK, &view(&plant.lock()))
-        })
-        .get("/api/trend", move |_, request| {
-            let query: BTreeMap<_, _> = request
-                .uri()
-                .query()
-                .unwrap_or_default()
-                .split('&')
-                .filter_map(|part| part.split_once('='))
-                .collect();
-            let point = query.get("point").copied().unwrap_or_default();
-            let minutes = query
-                .get("minutes")
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(10);
-            match history.lock().trend(point, minutes) {
-                Some(samples) => json(
+        let response = if request.method() != Method::GET {
+            refusal(StatusCode::METHOD_NOT_ALLOWED, "method not allowed", None)
+        } else {
+            match request.uri().path() {
+                "/" => respond(
                     StatusCode::OK,
-                    &serde_json::json!({ "point": point, "samples": samples }),
+                    "text/html; charset=utf-8",
+                    Bytes::from_static(INDEX_HTML.as_bytes()),
                 ),
-                None => refusal(StatusCode::NOT_FOUND, "unknown point", None),
+                "/hmi.css" => respond(
+                    StatusCode::OK,
+                    "text/css; charset=utf-8",
+                    Bytes::from_static(STYLE_CSS.as_bytes()),
+                ),
+                "/hmi.mjs" => respond(
+                    StatusCode::OK,
+                    "text/javascript; charset=utf-8",
+                    Bytes::from_static(SCRIPT_JS.as_bytes()),
+                ),
+                "/api/plant" => json(StatusCode::OK, &view(&self.held.lock())),
+                "/api/trend" => {
+                    let query: BTreeMap<_, _> = request
+                        .uri()
+                        .query()
+                        .unwrap_or_default()
+                        .split('&')
+                        .filter_map(|part| part.split_once('='))
+                        .collect();
+                    let point = query.get("point").copied().unwrap_or_default();
+                    let minutes = query
+                        .get("minutes")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(10);
+                    match self.held.lock().trend(point, minutes) {
+                        Some(samples) => json(
+                            StatusCode::OK,
+                            &serde_json::json!({ "point": point, "samples": samples }),
+                        ),
+                        None => refusal(StatusCode::NOT_FOUND, "unknown point", None),
+                    }
+                }
+                _ => refusal(StatusCode::NOT_FOUND, "not found", None),
             }
-        })
-        .route_async(Some(Method::POST), "/api/control/*", move |fcx, request| {
-            control(fcx, tcp.clone(), controllers, held.clone(), request)
-        })
+        };
+        httpd::Reply::Now(server_header(response).map(httpd::Body::from))
+    }
 }
 
 /// One control: the register or coil it writes, and whether it acknowledges

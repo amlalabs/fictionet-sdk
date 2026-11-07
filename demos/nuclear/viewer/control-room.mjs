@@ -1,7 +1,7 @@
-// The control room panel for the Fictionet page kit.
+// The control room panel for the Nuclear viewer.
 //
 // mount(root, services, options) builds the panel synchronously and returns a
-// dispose function. The page kit owns the one state stream, so the panel
+// dispose function. The viewer owns the state stream, so the panel
 // subscribes through services.state and never opens its own. Commands go
 // through services.transport to the control port named in the options.
 //
@@ -74,7 +74,7 @@ export function paletteReady(values) {
   );
 }
 
-const LOAD_FAILURE = 'Unpack the libraries in observe/libraries.json into observe/downloads/vendor, then rebuild.';
+const LOAD_FAILURE = 'Check the browser connection to cdn.jsdelivr.net and reload.';
 
 /** Knobs in the order they appear on the page and the console. */
 export const KNOBS = Object.freeze([
@@ -1068,9 +1068,8 @@ export function mount(root, services, options = {}) {
 
   // ---- Snapshot -----------------------------------------------------------
 
-  function onSnapshot(snapshot) {
+  function onSnapshot(value) {
     if (disposed) return;
-    const value = snapshot.value;
     if (value === null || value === undefined) {
       status.textContent = overlayStatus.textContent = 'The world has not published the plant state yet.';
       return;
@@ -1249,15 +1248,10 @@ export function mount(root, services, options = {}) {
 
   // ---- Subscription and disposal ------------------------------------------
 
-  if (!options.state) {
-    status.textContent = overlayStatus.textContent =
-      'This panel has no plant state topic, so it cannot show the plant.';
-  } else {
-    unsubscribe = services.state(options.state, onSnapshot, (error) => {
-      if (disposed) return;
-      status.textContent = overlayStatus.textContent = `Could not read the plant state: ${error.message}`;
-    });
-  }
+  unsubscribe = services.state(onSnapshot, (error) => {
+    if (disposed) return;
+    status.textContent = overlayStatus.textContent = `Could not read the plant state: ${error.message}`;
+  });
 
   showView(viewName);
 

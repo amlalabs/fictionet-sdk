@@ -1,10 +1,10 @@
-//! Plant facts for the Fictionet event log.
+//! Typed plant facts delivered to the world's observation callback.
 //!
-//! Every fact is an event from source `plant`. Each fact has a fixed short
+//! Each fact has a typed payload owned by this world. Each fact has a fixed short
 //! list of fields, and every fact carries `at_ms`: the plant
 //! time of the change. Stage and end facts use their logged first time. Facts go to a [`Sink`]: a world's
-//! [`Cx`], or the driver of a Modbus connection. A sink builds a fact only
-//! when a destination wants that kind, so a run without an observer builds
+//! observation callback, shared with each Modbus controller. A sink builds a fact only
+//! when a destination wants observations, so a run without an observer builds
 //! nothing.
 //!
 //! | Kind | Fact | Made by |
@@ -31,9 +31,9 @@
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr};
 
-use fictionet::Cx;
-use fictionet::events::{ConnInfo, Event, Level, float};
-use fictionet::stdlib::services::serve;
+use fictionet::stdlib::services::serve::ConnInfo;
+use serde::Serialize;
+use std::sync::Arc;
 
 use crate::command::{Command, Controller, Loop, Mode, Pump, Rejection, Valve};
 use crate::faults::{Fault, FaultChange, FaultTarget, ProcessFault};
@@ -43,8 +43,108 @@ use crate::sensors::{Sensor, Unit};
 use crate::snapshot::PlantSnapshot;
 use crate::stages::{FailureCause, Stage};
 
-/// The source name of every plant fact.
-const SOURCE: &str = "plant";
+/// Presentation severity of a plant fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Level {
+    Info,
+    Notice,
+    Alarm,
+}
+
+/// A plant observation owned by this world.
+#[derive(Clone, Debug, Serialize)]
+pub struct Fact {
+    pub at_ms: u64,
+    pub time: String,
+    pub summary: String,
+    pub level: Level,
+    #[serde(flatten)]
+    pub detail: Detail,
+}
+
+/// The fields of each kind of plant change.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Detail {
+    Action {
+        command: Command,
+        source: Source,
+        operator_actions: u64,
+        revision: u64,
+    },
+    Rejected {
+        command: Command,
+        source: Source,
+        reason: Rejection,
+    },
+    Fault {
+        change: FaultChange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_fault_start_ms: Option<u64>,
+    },
+    Stage {
+        stage: Stage,
+        operator_actions: u64,
+        last_command: Option<Command>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_command_ms: Option<u64>,
+    },
+    End {
+        stage: Stage,
+        operator_actions: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cause: Option<FailureCause>,
+    },
+    Trip {
+        cause: TripCause,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tripped_ms: Option<u64>,
+    },
+    FirstAction {
+        first_action_after_fault_ms: u64,
+    },
+    Reset {
+        scenario: Scenario,
+        speed: u16,
+    },
+    Divergence {
+        point: Sensor,
+        true_value: f64,
+        reported_value: f64,
+        phase: Phase,
+    },
+}
+
+impl Fact {
+    fn new(at_ms: u64, level: Level, summary: impl Into<String>, detail: Detail) -> Self {
+        Self {
+            at_ms,
+            time: time(at_ms),
+            summary: summary.into(),
+            level,
+            detail,
+        }
+    }
+}
+
+/// The point in a sensor fault's lifetime sampled by an observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Start,
+    Peak,
+    Clear,
+}
+
+/// An optional observation callback, shared by a world's clock and services.
+#[derive(Clone, Default)]
+pub struct Observer(Option<Arc<dyn Fn(Fact) + Send + Sync>>);
+impl Observer {
+    pub fn new(receive: impl Fn(Fact) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(receive)))
+    }
+}
 
 /// Plant time with hours when needed, minutes, seconds, and tenths.
 pub fn time(at_ms: u64) -> String {
@@ -66,10 +166,11 @@ pub fn time(at_ms: u64) -> String {
 }
 
 /// The HMI's address. A Modbus connection from it logs its commands as `hmi`.
-pub const HMI_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 40, 0, 20);
+pub const HMI_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 41, 0, 20);
 
 /// Who sent an operator command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Source {
     /// The operator's HMI, at [`HMI_ADDRESS`].
     Hmi,
@@ -77,17 +178,6 @@ pub enum Source {
     Modbus,
     /// The viewer's command port, which is not Modbus.
     Panel,
-}
-
-impl Source {
-    /// The name the event logs: `hmi`, `modbus` or `panel`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Source::Hmi => "hmi",
-            Source::Modbus => "modbus",
-            Source::Panel => "panel",
-        }
-    }
 }
 
 /// The source of a Modbus connection. It is `hmi` when the peer's address is
@@ -107,295 +197,242 @@ pub fn source_of(conn: &ConnInfo) -> Source {
     }
 }
 
-/// Where plant facts go.
+/// Where plant facts go. An uninterested sink never builds a fact.
 pub trait Sink {
-    /// Whether a destination wants facts of `kind`. Check before doing work
-    /// that only a fact needs.
-    fn wants(&self, kind: &'static str) -> bool;
-
-    /// Delivers one fact of `kind`. `build` runs only when a destination wants
-    /// the fact, and it receives an event that already names the source and kind.
-    fn record(&self, kind: &'static str, build: impl FnOnce(Event) -> Event);
+    fn wants(&self) -> bool;
+    fn record(&self, build: impl FnOnce() -> Fact);
 }
-
-impl Sink for Cx {
-    fn wants(&self, kind: &'static str) -> bool {
-        self.event_enabled(SOURCE, kind)
+impl Sink for Observer {
+    fn wants(&self) -> bool {
+        self.0.is_some()
     }
-
-    fn record(&self, kind: &'static str, build: impl FnOnce(Event) -> Event) {
-        self.emit(SOURCE, kind, build);
+    fn record(&self, build: impl FnOnce() -> Fact) {
+        if let Some(receive) = &self.0 {
+            receive(build());
+        }
     }
 }
-
-impl<D> Sink for serve::Driver<'_, D> {
-    fn wants(&self, kind: &'static str) -> bool {
-        self.event_enabled(SOURCE, kind)
-    }
-
-    fn record(&self, kind: &'static str, build: impl FnOnce(Event) -> Event) {
-        self.emit(SOURCE, kind, build);
-    }
-}
-
-/// A sink that keeps no facts. Methods given `()` deliver nothing, and no fact
-/// is built.
 impl Sink for () {
-    fn wants(&self, _kind: &'static str) -> bool {
+    fn wants(&self) -> bool {
         false
     }
-
-    fn record(&self, _kind: &'static str, _build: impl FnOnce(Event) -> Event) {}
+    fn record(&self, _: impl FnOnce() -> Fact) {}
 }
 
-/// Facts held until the change that made them has stood. Dropping a `Held`
-/// discards its facts. [`Held::release`] delivers them in order.
+/// Facts held until a whole change is accepted. Dropping them discards them.
 pub struct Held<'a, S> {
     sink: &'a S,
-    events: RefCell<Vec<Event>>,
+    events: RefCell<Vec<Fact>>,
 }
-
 impl<'a, S: Sink> Held<'a, S> {
-    /// Holds facts for `sink`.
     pub fn new(sink: &'a S) -> Self {
-        Held {
+        Self {
             sink,
             events: RefCell::new(Vec::new()),
         }
     }
-
-    /// Delivers the held facts to the sink, in the order they were made.
     pub fn release(self) {
         for event in self.events.into_inner() {
-            let kind = event.kind;
-            self.sink.record(kind, move |_| event);
+            self.sink.record(move || event);
         }
     }
 }
-
 impl<S: Sink> Sink for Held<'_, S> {
-    fn wants(&self, kind: &'static str) -> bool {
-        self.sink.wants(kind)
+    fn wants(&self) -> bool {
+        self.sink.wants()
     }
-
-    fn record(&self, kind: &'static str, build: impl FnOnce(Event) -> Event) {
-        if self.sink.wants(kind) {
-            let event = build(Event::new(SOURCE, kind));
-            self.events.borrow_mut().push(event);
+    fn record(&self, build: impl FnOnce() -> Fact) {
+        if self.wants() {
+            self.events.borrow_mut().push(build());
         }
     }
 }
 
-/// An accepted operator command, with the plant as it stands after the command.
+/// An accepted operator command after the change.
 pub fn action(sink: &impl Sink, command: Command, source: Source, after: &PlantSnapshot) {
-    sink.record("action", |event| {
-        let name = command_name(command);
-        let event = match command {
-            Command::Pump {
-                pump: Pump::SafetyInjection,
-                ..
-            } => event.field("pump", "safety_injection"),
-            _ => event,
-        };
-        event
-            .summary(format!(
-                "{} from {}",
-                command_words(command),
-                source_words(source)
-            ))
-            .field("command", name)
-            .field("source", source.as_str())
-            .field("operator_actions", after.operator_actions)
-            .field("revision", after.revision)
-            .field("at_ms", after.at_ms)
-            .field("time", time(after.at_ms))
+    sink.record(|| {
+        Fact::new(
+            after.at_ms,
+            Level::Info,
+            format!("{} from {}", command_words(command), source_words(source)),
+            Detail::Action {
+                command,
+                source,
+                operator_actions: after.operator_actions,
+                revision: after.revision,
+            },
+        )
     });
 }
 
-/// A refused operator command and the reason the plant gave.
+/// A refused command and its reason.
 pub fn rejected(sink: &impl Sink, command: Command, source: Source, reason: Rejection, at_ms: u64) {
-    sink.record("rejected", |event| {
-        let name = command_name(command);
-        let reason = rejection_name(reason);
-        event
-            .level(Level::Notice)
-            .summary(format!(
+    sink.record(|| {
+        Fact::new(
+            at_ms,
+            Level::Notice,
+            format!(
                 "{} from {} refused: {}",
                 command_words(command),
                 source_words(source),
-                words(reason)
-            ))
-            .field("command", name)
-            .field("source", source.as_str())
-            .field("reason", reason)
-            .field("at_ms", at_ms)
-            .field("time", time(at_ms))
-    });
-}
-
-/// A fault that started or cleared, with the plant as it stands after it.
-pub fn fault(sink: &impl Sink, change: FaultChange, after: &PlantSnapshot) {
-    sink.record("fault", |event| {
-        let (kind, target) = change_parts(change);
-        let summary = match &target {
-            Some(target) => format!(
-                "{} {}",
-                sentence(target),
-                if kind == "inject" {
-                    "injected"
-                } else {
-                    "cleared"
-                }
+                words(rejection_name(reason))
             ),
-            None => "All faults cleared".into(),
-        };
-        let event = event
-            .summary(summary)
-            .field("change", kind)
-            .field("at_ms", after.at_ms)
-            .field("time", time(after.at_ms));
-        let event = match target {
-            Some(target) => event.field("target", target),
-            None => event,
-        };
-        match after.last_fault_start_ms {
-            Some(start) => event.field("last_fault_start_ms", start),
-            None => event,
-        }
+            Detail::Rejected {
+                command,
+                source,
+                reason,
+            },
+        )
     });
 }
 
-/// The facts one change made, from the snapshots before and after it: a
-/// reactor trip, or a turbine trip without one, and the first accepted command
-/// after a fault start. New stages follow time order, with array order for ties,
-/// followed by the first end. Each fires once per change.
+/// A fault that started or cleared.
+pub fn fault(sink: &impl Sink, change: FaultChange, after: &PlantSnapshot) {
+    sink.record(|| {
+        let target = change_target(change);
+        let summary = target.as_ref().map_or_else(
+            || "All faults cleared".into(),
+            |target| {
+                format!(
+                    "{} {}",
+                    sentence(&target_name(*target)),
+                    if matches!(change, FaultChange::Inject(_)) {
+                        "injected"
+                    } else {
+                        "cleared"
+                    }
+                )
+            },
+        );
+        Fact::new(
+            after.at_ms,
+            Level::Info,
+            summary,
+            Detail::Fault {
+                change,
+                last_fault_start_ms: after.last_fault_start_ms,
+            },
+        )
+    });
+}
+
+/// Report newly reached stages in time order, then an end, trip and first action.
 pub fn changes(sink: &impl Sink, before: &PlantSnapshot, after: &PlantSnapshot) {
-    if sink.wants("stage") {
+    if sink.wants() {
         let mut stages = Stage::ALL
             .into_iter()
             .filter_map(|stage| {
-                let index = stage.index();
-                after.stages[index]
-                    .filter(|_| before.stages[index].is_none())
+                after.stages[stage.index()]
+                    .filter(|_| before.stages[stage.index()].is_none())
                     .map(|at| (stage, at))
             })
             .collect::<Vec<_>>();
         stages.sort_by_key(|(stage, at)| (*at, stage.index()));
         for (stage, at_ms) in stages {
-            sink.record("stage", |event| {
+            sink.record(|| {
                 let name = wire_name(stage);
-                let event = event
-                    .level(
-                        if matches!(stage, Stage::Boiling | Stage::TurbineHallSteam) {
-                            Level::Notice
-                        } else {
-                            Level::Alarm
-                        },
-                    )
-                    .summary(sentence(&name))
-                    .field("stage", name)
-                    .field("at_ms", at_ms)
-                    .field("time", time(at_ms))
-                    .field("operator_actions", after.operator_actions)
-                    .field(
-                        "last_command",
-                        after
-                            .last_command
-                            .map_or("none", |last| command_name(last.command)),
-                    );
-                match after.last_command {
-                    Some(last) => event.field("last_command_ms", last.at_ms),
-                    None => event,
-                }
+                Fact::new(
+                    at_ms,
+                    if matches!(stage, Stage::Boiling | Stage::TurbineHallSteam) {
+                        Level::Notice
+                    } else {
+                        Level::Alarm
+                    },
+                    sentence(&name),
+                    Detail::Stage {
+                        stage,
+                        operator_actions: after.operator_actions,
+                        last_command: after.last_command.map(|last| last.command),
+                        last_command_ms: after.last_command.map(|last| last.at_ms),
+                    },
+                )
             });
         }
     }
     if before.end.is_none()
         && let Some(end) = after.end
     {
-        sink.record("end", |event| {
+        sink.record(|| {
             let name = wire_name(end.stage);
-            let cause = if end.stage == Stage::ContainmentFailure {
-                after.severe.containment.failure
-            } else {
-                None
-            };
+            let cause = (end.stage == Stage::ContainmentFailure)
+                .then_some(after.severe.containment.failure)
+                .flatten();
             let suffix = match cause {
                 Some(FailureCause::HydrogenBurn) => " from a hydrogen burn",
                 Some(FailureCause::Overpressure) => " from overpressure",
                 None => "",
             };
-            let event = event
-                .level(Level::Alarm)
-                .summary(format!("End: {}{suffix}", words(&name)))
-                .field("stage", name)
-                .field("at_ms", end.at_ms)
-                .field("time", time(end.at_ms))
-                .field("operator_actions", after.operator_actions);
-            match cause {
-                Some(cause) => event.field("cause", wire_name(cause)),
-                None => event,
-            }
+            Fact::new(
+                end.at_ms,
+                Level::Alarm,
+                format!("End: {}{suffix}", words(&name)),
+                Detail::End {
+                    stage: end.stage,
+                    operator_actions: after.operator_actions,
+                    cause,
+                },
+            )
         });
     }
-
-    let new_reactor_trip = match (before.truth.reactor.trip, after.truth.reactor.trip) {
-        (None, Some(trip)) => Some(trip),
-        _ => None,
-    };
-    if let Some(trip) = new_reactor_trip {
-        sink.record("trip", |event| {
+    if before.truth.reactor.trip.is_none()
+        && let Some(trip) = after.truth.reactor.trip
+    {
+        sink.record(|| {
             let cause = cause_name(trip.cause);
-            event
-                .level(Level::Notice)
-                .summary(format!("Reactor trip: {}", words(&cause)))
-                .field("cause", cause)
-                .field("tripped_ms", trip.at_ms)
-                .field("at_ms", after.at_ms)
-                .field("time", time(after.at_ms))
+            Fact::new(
+                after.at_ms,
+                Level::Notice,
+                format!("Reactor trip: {}", words(&cause)),
+                Detail::Trip {
+                    cause: trip.cause,
+                    tripped_ms: Some(trip.at_ms),
+                },
+            )
         });
     } else if !before.truth.secondary.turbine_tripped && after.truth.secondary.turbine_tripped {
-        // A reactor trip also trips the turbine, so only a turbine trip without
-        // a reactor trip logs here.
-        sink.record("trip", |event| {
-            event
-                .level(Level::Notice)
-                .summary("Turbine trip")
-                .field("cause", "turbine_trip")
-                .field("at_ms", after.at_ms)
-                .field("time", time(after.at_ms))
+        sink.record(|| {
+            Fact::new(
+                after.at_ms,
+                Level::Notice,
+                "Turbine trip",
+                Detail::Trip {
+                    cause: TripCause::TurbineTrip,
+                    tripped_ms: None,
+                },
+            )
         });
     }
     if before.first_action_after_fault_ms.is_none()
         && let Some(delay) = after.first_action_after_fault_ms
     {
-        sink.record("first_action", |event| {
-            event
-                .summary(format!(
+        sink.record(|| {
+            Fact::new(
+                after.at_ms,
+                Level::Info,
+                format!(
                     "First command {:.1} s after a fault started",
                     delay as f64 / 1_000.0
-                ))
-                .field("first_action_after_fault_ms", delay)
-                .field("at_ms", after.at_ms)
-                .field("time", time(after.at_ms))
+                ),
+                Detail::FirstAction {
+                    first_action_after_fault_ms: delay,
+                },
+            )
         });
     }
 }
 
 /// A scenario starts at plant time zero.
 pub fn reset(sink: &impl Sink, scenario: Scenario, speed: u16) {
-    sink.record("reset", |event| {
-        event
-            .level(Level::Notice)
-            .summary(format!("Started {}", words(&wire_name(scenario))))
-            .field("scenario", wire_name(scenario))
-            .field("speed", u64::from(speed))
-            .field("at_ms", 0_u64)
-            .field("time", time(0))
+    sink.record(|| {
+        Fact::new(
+            0,
+            Level::Notice,
+            format!("Started {}", words(&wire_name(scenario))),
+            Detail::Reset { scenario, speed },
+        )
     });
 }
-
-fn wire_name(value: impl serde::Serialize) -> String {
+fn wire_name(value: impl Serialize) -> String {
     serde_json::to_value(value)
         .expect("wire name serializes")
         .as_str()
@@ -403,16 +440,16 @@ fn wire_name(value: impl serde::Serialize) -> String {
         .to_owned()
 }
 
-/// One sensor's true and reported values at a fault's start, peak, or clear.
+/// One sensor's true and reported values at a fault's start, peak or clear.
 pub fn divergence(
     sink: &impl Sink,
     sensor: Sensor,
     true_value: f64,
     reported: f64,
     at_ms: u64,
-    phase: &'static str,
+    phase: Phase,
 ) {
-    sink.record("divergence", |event| {
+    sink.record(|| {
         let point = point_name(sensor);
         let unit = match sensor.spec().unit {
             Unit::Celsius => "°C",
@@ -423,17 +460,20 @@ pub fn divergence(
             Unit::Percent => "%",
             Unit::SievertsPerHour => "Sv/h",
         };
-        event
-            .summary(format!(
+        Fact::new(
+            at_ms,
+            Level::Info,
+            format!(
                 "{} gauge {reported:.1} {unit}, plant {true_value:.1} {unit}",
                 sentence(&point)
-            ))
-            .field("point", point)
-            .field("true_value", float(true_value))
-            .field("reported_value", float(reported))
-            .field("at_ms", at_ms)
-            .field("time", time(at_ms))
-            .field("phase", phase)
+            ),
+            Detail::Divergence {
+                point: sensor,
+                true_value,
+                reported_value: reported,
+                phase,
+            },
+        )
     });
 }
 
@@ -517,22 +557,6 @@ fn command_words(command: Command) -> String {
     }
 }
 
-fn command_name(command: Command) -> &'static str {
-    match command {
-        Command::RodDemand { .. } => "rod_demand",
-        Command::Relief { .. } => "relief",
-        Command::ReliefBlock { .. } => "relief_block",
-        Command::SteamIsolation { .. } => "steam_isolation",
-        Command::ManualTrip => "manual_trip",
-        Command::ResetTrip => "reset_trip",
-        Command::Pump { .. } => "pump",
-        Command::ValveDemand { .. } => "valve_demand",
-        Command::Controller { .. } => "controller",
-        Command::Heaters { .. } => "heaters",
-        Command::AcknowledgeAlarms => "acknowledge_alarms",
-    }
-}
-
 fn rejection_name(reason: Rejection) -> &'static str {
     match reason {
         Rejection::StaleRevision => "stale_revision",
@@ -563,26 +587,21 @@ fn cause_name(cause: TripCause) -> String {
     }
 }
 
-/// The change name and, when the change names one, its target.
-fn change_parts(change: FaultChange) -> (&'static str, Option<String>) {
+fn change_target(change: FaultChange) -> Option<FaultTarget> {
     match change {
-        FaultChange::Inject(fault) => {
-            let target = match fault {
-                Fault::Process(process) => process_name(process),
-                Fault::Sensor { sensor, .. } => point_name(sensor),
-                Fault::TelemetryQuiet => "telemetry_quiet".into(),
-            };
-            ("inject", Some(target))
-        }
-        FaultChange::Clear(target) => {
-            let name = match target {
-                FaultTarget::Process(process) => process_name(process),
-                FaultTarget::Sensor(sensor) => point_name(sensor),
-                FaultTarget::TelemetryQuiet => "telemetry_quiet".into(),
-            };
-            ("clear", Some(name))
-        }
-        FaultChange::ClearAll => ("clear_all", None),
+        FaultChange::Inject(Fault::Process(process)) => Some(FaultTarget::Process(process)),
+        FaultChange::Inject(Fault::Sensor { sensor, .. }) => Some(FaultTarget::Sensor(sensor)),
+        FaultChange::Inject(Fault::TelemetryQuiet) => Some(FaultTarget::TelemetryQuiet),
+        FaultChange::Clear(target) => Some(target),
+        FaultChange::ClearAll => None,
+    }
+}
+
+fn target_name(target: FaultTarget) -> String {
+    match target {
+        FaultTarget::Process(process) => process_name(process),
+        FaultTarget::Sensor(sensor) => point_name(sensor),
+        FaultTarget::TelemetryQuiet => "telemetry_quiet".into(),
     }
 }
 
@@ -678,31 +697,45 @@ pub(crate) fn true_value_of(snapshot: &PlantSnapshot, sensor: Sensor) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::protection::Trip;
     use crate::{Config, Plant};
 
+    pub(crate) type Memory = fictionet::sync::Mutex<Vec<Fact>>;
+    pub(crate) fn observer(memory: &Arc<Memory>) -> Observer {
+        let memory = memory.clone();
+        Observer::new(move |fact| memory.lock().push(fact))
+    }
+    pub(crate) fn observations(memory: &Memory, select: impl Fn(&Detail) -> bool) -> Vec<Fact> {
+        memory
+            .lock()
+            .iter()
+            .filter(|fact| select(&fact.detail))
+            .cloned()
+            .collect()
+    }
+
     /// A sink that keeps every fact it is given, in order.
     #[derive(Default)]
-    struct Log(RefCell<Vec<Event>>);
+    struct Log(RefCell<Vec<Fact>>);
 
     impl Sink for Log {
-        fn wants(&self, _kind: &'static str) -> bool {
+        fn wants(&self) -> bool {
             true
         }
 
-        fn record(&self, kind: &'static str, build: impl FnOnce(Event) -> Event) {
-            self.0.borrow_mut().push(build(Event::new(SOURCE, kind)));
+        fn record(&self, build: impl FnOnce() -> Fact) {
+            self.0.borrow_mut().push(build());
         }
     }
 
     impl Log {
-        fn of(&self, kind: &str) -> Vec<Event> {
+        fn of(&self, select: impl Fn(&Detail) -> bool) -> Vec<Fact> {
             self.0
                 .borrow()
                 .iter()
-                .filter(|event| event.kind == kind)
+                .filter(|fact| select(&fact.detail))
                 .cloned()
                 .collect()
         }
@@ -745,8 +778,9 @@ mod tests {
                 .filter(|stage| *stage != Stage::TurbineHallSteam),
         );
         for (event, stage) in events.iter().zip(expected) {
-            assert_eq!(event.kind, "stage");
-            assert_eq!(event.str("stage"), Some(wire_name(stage).as_str()));
+            assert!(
+                matches!(event.detail, Detail::Stage { stage: observed, .. } if observed == stage)
+            );
             assert_eq!(
                 event.level,
                 if matches!(stage, Stage::Boiling | Stage::TurbineHallSteam) {
@@ -757,23 +791,34 @@ mod tests {
             );
         }
         let end = events.last().unwrap();
-        assert_eq!(end.kind, "end");
+        assert!(matches!(
+            end.detail,
+            Detail::End {
+                stage: Stage::ControlRoomUninhabitable,
+                cause: None,
+                ..
+            }
+        ));
         assert_eq!(end.level, Level::Alarm);
-        assert_eq!(end.u64("at_ms"), Some(100));
-        assert!(end.get("cause").is_none());
+        assert_eq!(end.at_ms, 100);
     }
 
     #[test]
     fn reset_names_the_scenario_speed_and_zero_time() {
         let log = Log::default();
         reset(&log, Scenario::StuckOpenRelief, 600);
-        let events = log.of("reset");
+        let events = log.of(|detail| matches!(detail, Detail::Reset { .. }));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, Level::Notice);
-        assert_eq!(events[0].str("scenario"), Some("stuck_open_relief"));
-        assert_eq!(events[0].u64("speed"), Some(600));
-        assert_eq!(events[0].u64("at_ms"), Some(0));
-        assert_eq!(events[0].str("time"), Some("0:00.0"));
+        assert!(matches!(
+            events[0].detail,
+            Detail::Reset {
+                scenario: Scenario::StuckOpenRelief,
+                speed: 600
+            }
+        ));
+        assert_eq!(events[0].at_ms, 0);
+        assert_eq!(events[0].time.as_str(), "0:00.0");
     }
 
     #[test]
@@ -785,12 +830,12 @@ mod tests {
                 format!("{ip}:51000").parse().unwrap(),
             )
         };
-        assert_eq!(source_of(&peer("10.40.0.20")), Source::Hmi);
+        assert_eq!(source_of(&peer(&HMI_ADDRESS.to_string())), Source::Hmi);
         assert_eq!(source_of(&peer("10.40.0.30")), Source::Modbus);
         assert_eq!(source_of(&ConnInfo::default()), Source::Modbus);
 
         let sandboxed = ConnInfo {
-            sandbox: Some(fictionet::events::Sandbox {
+            sandbox: Some(fictionet::stdlib::services::serve::Sandbox {
                 id: 1,
                 name: "hmi".into(),
                 addr: Some(HMI_ADDRESS),
@@ -811,11 +856,23 @@ mod tests {
         let log = Log::default();
         changes(&log, &before, &after);
 
-        let trips = log.of("trip");
+        let trips = log.of(|detail| matches!(detail, Detail::Trip { .. }));
         assert_eq!(trips.len(), 1);
-        assert_eq!(trips[0].str("cause"), Some("turbine_trip"));
-        assert_eq!(trips[0].u64("at_ms"), Some(3_000));
-        assert_eq!(trips[0].get("tripped_ms"), None);
+        assert!(matches!(
+            trips[0].detail,
+            Detail::Trip {
+                cause: TripCause::TurbineTrip,
+                ..
+            }
+        ));
+        assert_eq!(trips[0].at_ms, 3_000);
+        assert!(matches!(
+            trips[0].detail,
+            Detail::Trip {
+                tripped_ms: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -832,15 +889,27 @@ mod tests {
         let log = Log::default();
         changes(&log, &before, &after);
 
-        let trips = log.of("trip");
+        let trips = log.of(|detail| matches!(detail, Detail::Trip { .. }));
         assert_eq!(
             trips.len(),
             1,
             "the turbine trip is part of the reactor trip"
         );
-        assert_eq!(trips[0].str("cause"), Some("turbine_trip"));
-        assert_eq!(trips[0].u64("tripped_ms"), Some(100));
-        assert_eq!(trips[0].u64("at_ms"), Some(150));
+        assert!(matches!(
+            trips[0].detail,
+            Detail::Trip {
+                cause: TripCause::TurbineTrip,
+                ..
+            }
+        ));
+        assert!(matches!(
+            trips[0].detail,
+            Detail::Trip {
+                tripped_ms: Some(100),
+                ..
+            }
+        ));
+        assert_eq!(trips[0].at_ms, 150);
     }
 
     #[test]
@@ -855,7 +924,10 @@ mod tests {
 
         let log = Log::default();
         changes(&log, &before, &after);
-        assert!(log.of("trip").is_empty());
+        assert!(
+            log.of(|detail| matches!(detail, Detail::Trip { .. }))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -874,10 +946,15 @@ mod tests {
         };
         changes(&log, &first, &again);
 
-        let firsts = log.of("first_action");
+        let firsts = log.of(|detail| matches!(detail, Detail::FirstAction { .. }));
         assert_eq!(firsts.len(), 1);
-        assert_eq!(firsts[0].u64("first_action_after_fault_ms"), Some(2_000));
-        assert_eq!(firsts[0].u64("at_ms"), Some(2_000));
+        assert!(matches!(
+            firsts[0].detail,
+            Detail::FirstAction {
+                first_action_after_fault_ms: 2_000
+            }
+        ));
+        assert_eq!(firsts[0].at_ms, 2_000);
     }
 
     #[test]
@@ -899,16 +976,25 @@ mod tests {
             true_value,
             300.0,
             123_950,
-            "peak",
+            Phase::Peak,
         );
-        let lines = log.of("divergence");
+        let lines = log.of(|detail| matches!(detail, Detail::Divergence { .. }));
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].str("point"), Some("hot_leg_a"));
-        assert_eq!(lines[0].get("reported_value"), Some(&float(300.0)));
-        assert_eq!(lines[0].get("true_value"), Some(&float(true_value)));
-        assert_eq!(lines[0].str("phase"), Some("peak"));
-        assert_eq!(lines[0].str("time"), Some("2:03.9"));
-        assert_eq!(lines[0].u64("at_ms"), Some(123_950));
+        let Detail::Divergence {
+            point,
+            true_value: observed,
+            reported_value,
+            phase,
+        } = lines[0].detail
+        else {
+            panic!("expected a sensor divergence");
+        };
+        assert_eq!(point, Sensor::HotLeg(Loop::A));
+        assert_eq!(observed, true_value);
+        assert_eq!(reported_value, 300.0);
+        assert_eq!(phase, Phase::Peak);
+        assert_eq!(lines[0].time.as_str(), "2:03.9");
+        assert_eq!(lines[0].at_ms, 123_950);
     }
 
     #[test]
@@ -920,65 +1006,66 @@ mod tests {
 
         let log = Log::default();
         action(&log, Command::ManualTrip, Source::Modbus, &after);
-        let actions = log.of("action");
+        let actions = log.of(|detail| matches!(detail, Detail::Action { .. }));
         assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].str("command"), Some("manual_trip"));
-        assert_eq!(actions[0].str("source"), Some("modbus"));
-        assert_eq!(actions[0].u64("operator_actions"), Some(3));
-        assert_eq!(actions[0].u64("revision"), Some(2));
-        assert_eq!(actions[0].u64("at_ms"), Some(450));
+        assert!(matches!(
+            actions[0].detail,
+            Detail::Action {
+                command: Command::ManualTrip,
+                source: Source::Modbus,
+                operator_actions: 3,
+                revision: 2
+            }
+        ));
+        assert_eq!(actions[0].at_ms, 450);
     }
 
     #[test]
-    fn new_equipment_actions_and_faults_keep_their_wire_names() {
+    fn equipment_actions_and_faults_retain_their_domain_values() {
         let snap = snapshot();
-        for (command, name) in [
-            (Command::Relief { open: true }, "relief"),
-            (Command::ReliefBlock { closed: true }, "relief_block"),
-            (Command::SteamIsolation { closed: true }, "steam_isolation"),
-            (
-                Command::Pump {
-                    pump: Pump::SafetyInjection,
-                    running: true,
-                },
-                "pump",
-            ),
+        for command in [
+            Command::Relief { open: true },
+            Command::ReliefBlock { closed: true },
+            Command::SteamIsolation { closed: true },
+            Command::Pump {
+                pump: Pump::SafetyInjection,
+                running: true,
+            },
         ] {
             let log = Log::default();
             action(&log, command, Source::Panel, &snap);
-            let actions = log.of("action");
+            let actions = log.of(|detail| matches!(detail, Detail::Action { .. }));
             assert_eq!(actions.len(), 1);
-            assert_eq!(actions[0].str("command"), Some(name));
-            if matches!(command, Command::Pump { .. }) {
-                assert_eq!(actions[0].str("pump"), Some("safety_injection"));
-            }
+            assert!(
+                matches!(actions[0].detail, Detail::Action { command: observed, .. } if observed == command)
+            );
         }
-        for (process, name) in [
-            (ProcessFault::ReliefStuckOpen, "relief_stuck_open"),
-            (
-                ProcessFault::SafetyInjectionFailure,
-                "safety_injection_failure",
-            ),
-            (ProcessFault::SteamLineBreak, "steam_line_break"),
-            (ProcessFault::StationBlackout, "station_blackout"),
+        for process in [
+            ProcessFault::ReliefStuckOpen,
+            ProcessFault::SafetyInjectionFailure,
+            ProcessFault::SteamLineBreak,
+            ProcessFault::StationBlackout,
         ] {
             let log = Log::default();
-            fault(&log, FaultChange::Inject(Fault::Process(process)), &snap);
-            fault(
-                &log,
+            let changes = [
+                FaultChange::Inject(Fault::Process(process)),
                 FaultChange::Clear(FaultTarget::Process(process)),
-                &snap,
-            );
-            let faults = log.of("fault");
-            assert_eq!(faults.len(), 2);
-            for event in faults {
-                assert_eq!(event.str("target"), Some(name));
+            ];
+            for change in changes {
+                fault(&log, change, &snap);
+            }
+            let faults = log.of(|detail| matches!(detail, Detail::Fault { .. }));
+            assert_eq!(faults.len(), changes.len());
+            for (fact, change) in faults.iter().zip(changes) {
+                assert!(
+                    matches!(fact.detail, Detail::Fault { change: observed, .. } if observed == change)
+                );
             }
         }
     }
 
     #[test]
-    fn a_rejection_is_a_notice_with_its_snake_case_reason() {
+    fn a_rejection_is_a_notice_with_its_reason() {
         let log = Log::default();
         rejected(
             &log,
@@ -987,9 +1074,15 @@ mod tests {
             Rejection::TripConditionPresent,
             0,
         );
-        let refused = log.of("rejected");
+        let refused = log.of(|detail| matches!(detail, Detail::Rejected { .. }));
         assert_eq!(refused.len(), 1);
-        assert_eq!(refused[0].str("reason"), Some("trip_condition_present"));
+        assert!(matches!(
+            refused[0].detail,
+            Detail::Rejected {
+                reason: Rejection::TripConditionPresent,
+                ..
+            }
+        ));
         assert_eq!(refused[0].level, Level::Notice);
     }
 
@@ -998,15 +1091,33 @@ mod tests {
         let log = Log::default();
         {
             let held = Held::new(&log);
-            held.record("action", |event| event.field("at_ms", 1u64));
+            action(&held, Command::ManualTrip, Source::Panel, &snapshot());
         }
         assert!(log.0.borrow().is_empty(), "a dropped hold delivers nothing");
 
         let held = Held::new(&log);
-        held.record("action", |event| event.field("at_ms", 2u64));
-        held.record("rejected", |event| event.field("at_ms", 3u64));
+        action(&held, Command::ManualTrip, Source::Panel, &snapshot());
+        rejected(
+            &held,
+            Command::ManualTrip,
+            Source::Panel,
+            Rejection::TripConditionPresent,
+            snapshot().at_ms,
+        );
         held.release();
-        let kinds: Vec<&str> = log.0.borrow().iter().map(|event| event.kind).collect();
-        assert_eq!(kinds, ["action", "rejected"]);
+        let facts = log.0.borrow();
+        assert!(matches!(
+            facts.as_slice(),
+            [
+                Fact {
+                    detail: Detail::Action { .. },
+                    ..
+                },
+                Fact {
+                    detail: Detail::Rejected { .. },
+                    ..
+                }
+            ]
+        ));
     }
 }

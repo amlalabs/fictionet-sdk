@@ -12,10 +12,8 @@ import { POINTS, tagKey } from './instruments.mjs';
 // and faults.rs). Rod positions are tenths of a percent. Valve demands are
 // permille. Hot leg counts are tenths of a degree C.
 //
-// Replies: the world answers a posted command with the page's reply
-// (applied, rejected, pending or timeout). An accepted plant command replies
-// with the serde form of Result<Applied, Rejected>, so a refusal is the
-// `Err` form, and its reason says why the plant refused.
+// Replies use Result<Applied, Rejected> directly. A transport failure leaves
+// the outcome unknown: the command may have reached the world.
 
 /** Travel of a large dial from its minimum stop to its maximum stop, in degrees. */
 export const DIAL_SWEEP_DEG = 300;
@@ -408,12 +406,6 @@ export function faultCommand(snapshot, change) {
   return { change, expected_revision: wholeIn(snapshot.revision, 0, Number.MAX_SAFE_INTEGER, 'revision') };
 }
 
-/** The body a knob posts to the control port. */
-export function commandRequest(command, requestId) {
-  if (typeof requestId !== 'string' || requestId === '') throw new TypeError('a request needs an ID');
-  return { request_id: requestId, command };
-}
-
 const REFUSALS = Object.freeze({
   stale_revision: 'the plant changed before this turn arrived',
   out_of_range: 'the value is outside the range the plant accepts',
@@ -432,41 +424,19 @@ function refused(rejection) {
   return { state: 'refused', text: `Refused: ${detail}.` };
 }
 
-/**
- * What a knob shows for a reply: 'applied', 'refused', 'pending', 'no-reply'
- * or 'failed', with a line of text for the knob's status.
- */
+/** What a knob shows for the world's typed command reply. */
 export function outcomeOf(reply) {
-  switch (reply?.status) {
-    case 'applied':
-      return reply.reply?.Err ? refused(reply.reply.Err) : { state: 'applied', text: 'Applied.' };
-    case 'rejected':
-      return refused(reply.rejection);
-    case 'pending':
-      return { state: 'pending', text: 'Sending.' };
-    case 'timeout':
-      return { state: 'no-reply', text: 'No reply yet. It may still apply. Read the state before trying again.' };
-    default:
-      return { state: 'failed', text: 'Not sent: the reply was not understood.' };
-  }
+  if (reply && Object.hasOwn(reply, 'Err')) return refused(reply.Err);
+  if (reply && Object.hasOwn(reply, 'Ok')) return { state: 'applied', text: 'Applied.' };
+  return { state: 'failed', text: 'The reply was not understood. Read the state before trying again.' };
 }
 
-/**
- * Posts a command through the page's transport and returns what the knob
- * shows. The transport rejects a reply that is not 2xx, and its body is the
- * command reply. Nothing here touches the DOM.
- */
-export async function postCommand(
-  transport,
-  path,
-  command,
-  { requestId = globalThis.crypto.randomUUID(), signal } = {},
-) {
-  const body = commandRequest(command, requestId);
+/** Posts the command directly and leaves an interrupted request unconfirmed. */
+export async function postCommand(transport, path, command, { signal } = {}) {
   try {
-    return outcomeOf(await transport.post(path, body, signal));
+    return outcomeOf(await transport.post(path, command, signal));
   } catch (error) {
     if (error?.body) return outcomeOf(error.body);
-    return { state: 'failed', text: `Not sent: ${error?.message ?? 'the request failed'}.` };
+    return { state: 'no-reply', text: `No confirmed reply: ${error?.message ?? 'the request failed'}. It may still apply. Read the state before trying again.` };
   }
 }
