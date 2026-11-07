@@ -1,5 +1,5 @@
 //! `cargo xtask port-zero-verify`: TLC over the models of literal TCP port 0
-//! in `verification/tcp-port-zero/`, which `MODEL.md` describes. It uses the
+//! in `verification/tcp-port-zero/`, which its README describes. It uses the
 //! runner of `mptcp-verify tlc`: each config's properties are checked
 //! together, and the negative control, the config with an
 //! `\* expect violation:` line, must fail on exactly that property.

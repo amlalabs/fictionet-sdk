@@ -9,14 +9,14 @@ not a reported implementation bug. No runtime Rust implementation is changed.
 
 ## Socket lifecycle
 
-[Socket.tla](verification/tcp-port-zero/Socket.tla) models all eleven smoltcp
+[Socket.tla](Socket.tla) models all eleven smoltcp
 TCP states, passive listening, active and simultaneous opens, accepted SYN,
 ACK, FIN and RST events, local close, abort, reset dispatch, TIME-WAIT expiry,
 and reuse. The finite domain has ports `{0, 1, 65535}`, two abstract valid
 addresses, specific and wildcard listeners, and all 36 endpoint tuples.
 `Absent` represents `None`; a listener with port zero remains present.
 
-The correspondence to [the socket implementation](smoltcp/src/socket/tcp.rs)
+The correspondence to [the socket implementation](../../smoltcp/src/socket/tcp.rs)
 is by transition and field:
 
 | Model | Rust |
@@ -34,11 +34,11 @@ handshake reset, and closure of active opens after reset. Closed sockets may
 retain listener metadata; aborted sockets may retain a tuple until reset
 dispatch. The model preserves both behaviors.
 
-[Socket.cfg](verification/tcp-port-zero/Socket.cfg) completed with **18,192
+[Socket.cfg](Socket.cfg) completed with **18,192
 generated states, 1,072 distinct states, depth 6, and an empty queue**. All
 four invariants and both action properties passed together.
 
-[Socket_nonzero_reset.cfg](verification/tcp-port-zero/Socket_nonzero_reset.cfg)
+[Socket_nonzero_reset.cfg](Socket_nonzero_reset.cfg)
 replaces the Option-based reset guard with the old nonzero-port guard while
 still admitting port zero. TLC reports `PassiveResetRestores` violated:
 closed → listen on zero → passive SYN → RST closes the socket. It exits 13
@@ -54,10 +54,10 @@ in the unconditional abort transition. There is no fairness or liveness claim.
 
 ## Binding and host preparation
 
-[Binding.tla](verification/tcp-port-zero/Binding.tla) checks two separate
+[Binding.tla](Binding.tla) checks two separate
 state spaces. Allocation models `Endpoint::listen`, the cyclic allocator in
 `Endpoint::connect`, `take_port`, `free_port`, `remove_conn`, and listener
-drop in [network TCP](src/stdlib/network/tcp.rs). The model checks reservation
+drop in [network TCP](../../src/stdlib/network/tcp.rs). The model checks reservation
 conservation, exclusion between listeners and outgoing connections, ephemeral
 source selection, availability, and preservation of the requested destination.
 Connection removal represents actual resource release, not handle drop.
@@ -68,7 +68,7 @@ exhaustion, skipping occupied ports, wraparound, release and rebinding; it does
 not exhaustively enumerate the real 16,384-port allocator.
 
 Preparation models plain, nonsharing TCP service declarations in
-[`Machine::prepare` and the installation path](src/stdlib/world/net/hosts.rs):
+[`Machine::prepare` and the installation path](../../src/stdlib/world/net/hosts.rs):
 temporary listener ownership, duplicate rejection, release on error, and
 publication only after every declaration succeeds. All declaration sequences
 of lengths one through three over the same four ports are explored, including
@@ -95,7 +95,7 @@ The ordinary Cargo lint configuration recognizes that conditional compilation
 name. The socket harness also uses the existing in-memory unit-test setup.
 No runtime path or existing test assertion is changed.
 
-[`SocketProof.rs`](verification/tcp-port-zero/SocketProof.rs) checks all
+[`SocketProof.rs`](SocketProof.rs) checks all
 `u16` local/remote port pairs and both passive and active origins. It calls
 `listen` or `connect`, then the actual `accepts` and `process` paths for SYN
 and valid RST, and finally close and relisten. Assertions relate endpoint
@@ -105,7 +105,7 @@ The unwind bound is 17 and unwinding assertions remain enabled. This proof
 uses representative IPv4 addresses, fixed sequence numbers, 64-byte buffers,
 and empty payload/options; it does not prove arbitrary sequence validation.
 
-[`Wire.rs`](verification/tcp-port-zero/Wire.rs) contains a minimal-segment
+[`Wire.rs`](Wire.rs) contains a minimal-segment
 roundtrip/checksum proof and a port-renaming proof for arbitrary 24-byte
 segments. Both use the actual packet setters, checksum calculation and parser.
 They relate decoded results to input ports, not golden packet snapshots.
