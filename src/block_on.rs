@@ -12,8 +12,7 @@ use std::task::{Context, Poll, Wake, Waker};
 /// [`listen`](crate::listen) and the timers wake it. A world on tokio awaits
 /// [`run`](crate::run) inside the tokio runtime instead.
 ///
-/// Without `std`, this spins instead of sleeping. In a browser
-/// (wasm32-unknown-unknown) a thread cannot sleep, and only
+/// In a browser (wasm32-unknown-unknown) a thread cannot sleep, and only
 /// the run's own timers can wake the future. There `block_on` fires the
 /// timers itself and spins while it waits for the next one, which holds
 /// the page's thread for as long as the world runs. It suits a test, a Web
