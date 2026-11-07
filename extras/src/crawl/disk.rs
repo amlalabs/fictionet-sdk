@@ -118,7 +118,7 @@ impl DiskIndex {
         while stream.advance() {
             words.insert(stream.token().text.clone());
         }
-        if words.is_empty() || limit == 0 {
+        if words.is_empty() {
             return Ok(search::Search {
                 total: Some(0),
                 ..Default::default()
@@ -166,7 +166,7 @@ impl DiskIndex {
         let query = BooleanQuery::new(clauses);
         let searcher = self.reader.searcher();
         let count = searcher.search(&query, &Count).map_err(io::Error::other)?;
-        if start >= count {
+        if start >= count || limit == 0 {
             return Ok(search::Search {
                 total: Some(count),
                 ..Default::default()
@@ -319,6 +319,13 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(results.total, Some(expected.len()));
+            let empty_page = index
+                .search_in("document", 0, 0, &domains, |_| {
+                    panic!("an empty page must not fetch document text")
+                })
+                .unwrap();
+            assert_eq!(empty_page.total, results.total);
+            assert!(empty_page.results.is_empty());
             assert_eq!(
                 results
                     .results
