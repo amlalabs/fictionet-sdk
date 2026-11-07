@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(row.upstream.unwrap().chars().count(), 300);
         assert_eq!(row.package.unwrap().filename.unwrap().chars().count(), 300);
         assert_eq!(row.sandbox.unwrap().chars().count(), 64);
-        let door = Some(Door::from_http(1, &e)).unwrap();
+        let door = Door::from_http(1, &e);
         assert_eq!(door.name.unwrap().chars().count(), 253);
         assert_eq!(door.sandbox.unwrap().chars().count(), 64);
         let auth = format!(

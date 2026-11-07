@@ -1591,12 +1591,11 @@ mod tests {
                 .unwrap()
                 .contains_key("reply-199")
         );
-        assert_eq!(
+        assert!(
             h.storage("github-remote-cache/")
                 .details
                 .peer_shown
-                .unwrap(),
-            true
+                .unwrap()
         );
     }
 
