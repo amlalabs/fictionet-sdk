@@ -887,6 +887,9 @@ mod tests {
     use fictionet::InterfaceExt;
     use std::time::Duration;
 
+    #[cfg(kani)]
+    include!("../../../verification/world-net/kani/Prefix.rs");
+
     #[test]
     fn stopped_changes_drop_values_outside_the_lock() {
         struct Pending(std::sync::Weak<Mutex<Changes<Pending>>>);
