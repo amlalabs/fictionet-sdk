@@ -131,6 +131,44 @@ fn connect_accept_echo_and_addresses() {
 }
 
 #[test]
+fn literal_ports_carry_streams_and_keep_their_identity() {
+    for (a, b) in [(A, B), ("fd00::1", "fd00::2")] {
+        for port in [0, 1, u16::MAX] {
+            world(Duration::from_secs(10), move |fcx| async move {
+                let (client, server) = two_tcp(&fcx, a, b);
+                let target = SocketAddr::new(server.addr(), port);
+                let mut listener = server.listen(port)?;
+                assert!(server.listen(port).is_err());
+                let payload = pattern(4097 + usize::from(port), u64::from(port));
+                let sent = payload.clone();
+                let accepted = fcx.spawn(move |fcx| async move {
+                    let mut stream = listener.accept(&fcx).await?;
+                    assert_eq!(stream.local_addr(), target);
+                    let request = read_to_end(&fcx, &mut stream).await?;
+                    assert_eq!(request, sent);
+                    stream.write_all(&fcx, &request).await?;
+                    stream.shutdown(&fcx).await?;
+                    Ok(())
+                });
+                let mut stream = client.connect(&fcx, target).await?;
+                assert_eq!(stream.peer_addr(), target);
+                stream.write_all(&fcx, &payload).await?;
+                stream.shutdown(&fcx).await?;
+                assert_eq!(read_to_end(&fcx, &mut stream).await?, payload);
+                drop(stream);
+                accepted.join(&fcx).await?;
+                assert!(matches!(
+                    client.connect(&fcx, target).await,
+                    Err(ConnError::Refused)
+                ));
+                let _rebound = server.listen(port)?;
+                Ok(())
+            });
+        }
+    }
+}
+
+#[test]
 fn ten_megabytes_both_ways() {
     const LEN: usize = 10 * 1024 * 1024;
     let elapsed = Arc::new(Mutex::new(Duration::ZERO));

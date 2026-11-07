@@ -20,14 +20,12 @@ mod reno;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ListenError {
     InvalidState,
-    Unaddressable,
 }
 
 impl Display for ListenError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             ListenError::InvalidState => write!(f, "invalid state"),
-            ListenError::Unaddressable => write!(f, "unaddressable destination"),
         }
     }
 }
@@ -474,7 +472,7 @@ pub struct Socket<'a> {
     hop_limit: Option<u8>,
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
-    listen_endpoint: IpListenEndpoint,
+    listen_endpoint: Option<IpListenEndpoint>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -750,7 +748,7 @@ impl<'a> Socket<'a> {
             timeout: None,
             keep_alive: None,
             hop_limit: None,
-            listen_endpoint: IpListenEndpoint::default(),
+            listen_endpoint: None,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -1257,7 +1255,7 @@ impl<'a> Socket<'a> {
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
-        self.listen_endpoint = IpListenEndpoint::default();
+        self.listen_endpoint = None;
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
@@ -1300,19 +1298,16 @@ impl<'a> Socket<'a> {
 
     /// Start listening on the given endpoint.
     ///
-    /// Returns an error if the socket is already open or the port is zero.
+    /// Every port is a literal wire port, including zero. An already open
+    /// socket must still be listening on this endpoint.
     pub fn listen<T>(&mut self, local_endpoint: T) -> Result<(), ListenError>
     where
         T: Into<IpListenEndpoint>,
     {
         let local_endpoint = local_endpoint.into();
-        if local_endpoint.port == 0 {
-            return Err(ListenError::Unaddressable);
-        }
-
         if self.is_open() {
             // Listening again on the same endpoint preserves pending connections.
-            if matches!(self.state, State::Listen) && self.listen_endpoint == local_endpoint {
+            if matches!(self.state, State::Listen) && self.listen_endpoint == Some(local_endpoint) {
                 return Ok(());
             } else {
                 return Err(ListenError::InvalidState);
@@ -1320,7 +1315,7 @@ impl<'a> Socket<'a> {
         }
 
         self.reset();
-        self.listen_endpoint = local_endpoint;
+        self.listen_endpoint = Some(local_endpoint);
         self.tuple = None;
         self.set_state(State::Listen);
         Ok(())
@@ -1328,7 +1323,8 @@ impl<'a> Socket<'a> {
 
     /// Connect to a given endpoint.
     ///
-    /// Both endpoints must specify an address and a nonzero port.
+    /// Both endpoints must specify an address. Ports are literal wire ports,
+    /// including zero.
     /// Returns an error if the socket is already open or either endpoint is invalid.
     ///
     /// ```no_run
@@ -1368,10 +1364,10 @@ impl<'a> Socket<'a> {
         if self.is_open() {
             return Err(ConnectError::InvalidState);
         }
-        if remote_endpoint.port == 0 || remote_endpoint.addr.is_unspecified() {
+        if remote_endpoint.addr.is_unspecified() {
             return Err(ConnectError::Unaddressable);
         }
-        if local_endpoint.port == 0 || local_endpoint.addr.is_unspecified() {
+        if local_endpoint.addr.is_unspecified() {
             return Err(ConnectError::Unaddressable);
         }
 
@@ -1791,13 +1787,15 @@ impl<'a> Socket<'a> {
                 && repr.dst_port == tuple.local.port
                 && ip_repr.src_addr() == tuple.remote.addr
                 && repr.src_port == tuple.remote.port
-        } else {
+        } else if let Some(endpoint) = self.listen_endpoint {
             // We're listening, reject packets not matching the listen endpoint.
-            let addr_ok = match self.listen_endpoint.addr {
+            let addr_ok = match endpoint.addr {
                 Some(addr) => ip_repr.dst_addr() == addr,
                 None => true,
             };
-            addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
+            addr_ok && repr.dst_port == endpoint.port
+        } else {
+            false
         }
     }
 
@@ -2040,7 +2038,7 @@ impl<'a> Socket<'a> {
             // that SYN-RECEIVED was actually converted from the LISTEN state (another possible
             // reason is TCP simultaneous open).
             // Nothing of the old peer's connection carries over to the next one.
-            (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
+            (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.is_some() => {
                 let listen_endpoint = self.listen_endpoint;
                 self.reset();
                 self.listen_endpoint = listen_endpoint;
@@ -3401,7 +3399,7 @@ pub(crate) mod test {
     fn socket_listen() -> TestSocket {
         let mut s = socket();
         s.state = State::Listen;
-        s.listen_endpoint = LISTEN_END;
+        s.listen_endpoint = Some(LISTEN_END);
         s
     }
 
@@ -3473,7 +3471,7 @@ pub(crate) mod test {
         ] {
             let mut s = socket_with_buffer_sizes(64, *buffer_size);
             s.state = State::Listen;
-            s.listen_endpoint = LISTEN_END;
+            s.listen_endpoint = Some(LISTEN_END);
             assert_eq!(s.remote_win_shift, *shift_amt);
             send!(
                 s,
@@ -3540,7 +3538,7 @@ pub(crate) mod test {
         let mut s = socket();
         s.listen(LOCAL_PORT).unwrap();
         assert_eq!(s.state(), State::Listen);
-        assert_eq!(s.listen_endpoint, LISTEN_END);
+        assert_eq!(s.listen_endpoint, Some(LISTEN_END));
         assert_eq!(s.local_endpoint(), None);
         assert_eq!(s.remote_endpoint(), None);
         assert_eq!(s.send_slice(b"x"), Err(SendError::InvalidState));
@@ -3592,9 +3590,40 @@ pub(crate) mod test {
     }
 
     #[test]
-    fn test_listen_validation() {
-        let mut s = socket();
-        assert_eq!(s.listen(0), Err(ListenError::Unaddressable));
+    fn literal_port_listeners_match_syn_and_survive_reset() {
+        for port in [0, 1, u16::MAX] {
+            let mut s = socket();
+            let local = IpListenEndpoint { port, ..LISTEN_END };
+            s.listen(local).unwrap();
+            let syn = TcpRepr {
+                dst_port: port,
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            };
+            assert!(s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &syn));
+            assert!(!s.socket.accepts(
+                &mut s.cx,
+                &SEND_IP_TEMPL,
+                &TcpRepr {
+                    dst_port: port.wrapping_add(1),
+                    ..syn
+                }
+            ));
+            send!(s, syn);
+            let reset = TcpRepr {
+                dst_port: port,
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ),
+                ..SEND_TEMPL
+            };
+            send!(s, reset);
+            assert!(matches!(s.state, State::Listen));
+            assert!(s.tuple.is_none());
+            assert!(s.socket.accepts(&mut s.cx, &SEND_IP_TEMPL, &syn));
+        }
     }
 
     #[test]
@@ -3828,7 +3857,7 @@ pub(crate) mod test {
     #[test]
     fn test_syn_received_rst() {
         let mut s = socket_syn_received();
-        s.listen_endpoint = LISTEN_END;
+        s.listen_endpoint = Some(LISTEN_END);
         recv!(
             s,
             [TcpRepr {
@@ -3849,7 +3878,7 @@ pub(crate) mod test {
             }
         );
         assert_eq!(s.state, State::Listen);
-        assert_eq!(s.listen_endpoint, LISTEN_END);
+        assert_eq!(s.listen_endpoint, Some(LISTEN_END));
         assert_eq!(s.tuple, None);
     }
 
@@ -3911,7 +3940,7 @@ pub(crate) mod test {
     #[test]
     fn test_syn_options_end_with_the_connection() {
         let mut s = socket_syn_received();
-        s.listen_endpoint = LISTEN_END;
+        s.listen_endpoint = Some(LISTEN_END);
         s.set_syn_options(&[MP_CAPABLE]).unwrap();
         recv!(
             s,
@@ -4663,6 +4692,44 @@ pub(crate) mod test {
             .connect(&mut s.cx, REMOTE_END, LOCAL_END)
             .expect("Connect failed with valid parameters");
         assert_eq!(s.tuple, Some(TUPLE));
+    }
+
+    #[test]
+    fn literal_ports_in_simultaneous_open_close_on_reset() {
+        for (local_port, remote_port) in [(0, 0), (0, u16::MAX), (u16::MAX, 0)] {
+            let mut s = socket();
+            let local = IpEndpoint {
+                port: local_port,
+                ..LOCAL_END
+            };
+            let remote = IpEndpoint {
+                port: remote_port,
+                ..REMOTE_END
+            };
+            s.socket.connect(&mut s.cx, remote, local).unwrap();
+            assert_eq!(s.local_endpoint(), Some(local));
+            assert_eq!(s.remote_endpoint(), Some(remote));
+            let syn = TcpRepr {
+                src_port: remote_port,
+                dst_port: local_port,
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            };
+            send!(s, syn);
+            assert!(matches!(s.state, State::SynReceived));
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: REMOTE_SEQ + 1,
+                    ..syn
+                }
+            );
+            assert!(matches!(s.state, State::Closed));
+            assert!(s.tuple.is_none());
+        }
     }
 
     #[test]
@@ -9583,7 +9650,7 @@ pub(crate) mod test {
         let mut s = socket_with_buffer_sizes(64, 1 << 30);
         for _ in 0..2 {
             s.state = State::Listen;
-            s.listen_endpoint = LISTEN_END;
+            s.listen_endpoint = Some(LISTEN_END);
             send!(
                 s,
                 TcpRepr {

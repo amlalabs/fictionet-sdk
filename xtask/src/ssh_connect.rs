@@ -1,4 +1,5 @@
 //! OpenSSH ProxyCommand through a world's relay socket and simulated TCP.
+//! Destination ports are literal wire ports, including zero.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -22,9 +23,6 @@ pub async fn run(args: &[String]) -> crate::Result {
         return Err("usage: cargo xtask ssh-connect WORLD_UNIX_SOCKET IPV4_ADDRESS PORT".into());
     };
     let target = SocketAddr::new(address.parse::<Ipv4Addr>()?.into(), port.parse()?);
-    if target.port() == 0 {
-        return Err("destination port must be nonzero".into());
-    }
     let seed = fictionet::Seed::random();
     let name = format!(
         "ssh-{}-{:02x}{:02x}{:02x}{:02x}",

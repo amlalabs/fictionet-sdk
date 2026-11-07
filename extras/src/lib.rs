@@ -41,6 +41,7 @@ pub mod linux;
 pub mod log;
 pub mod network;
 pub mod ntp;
+pub mod reverse_modbus;
 pub mod sql_server;
 pub mod ssh;
 pub mod whois;

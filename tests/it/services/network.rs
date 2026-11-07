@@ -176,10 +176,32 @@ fn rejected_port_sharing_discards_preparations_at_every_endpoint() {
 }
 
 #[test]
+fn zero_port_host_serves_a_conversation() {
+    world(Duration::from_secs(60), move |fcx| async move {
+        let addr = Ipv4Addr::new(203, 0, 113, 8);
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("console", |h| h.at(addr).tcp(0, Arc::new(()), || Echo))
+            .start(&fcx, attachments)?;
+        let machine = machine(&fcx, attacher.attach("client")?, ME);
+        let target = SocketAddr::new(addr.into(), 0);
+        let mut stream = machine.tcp.connect(&fcx, target).await?;
+        assert_eq!(stream.peer_addr(), target);
+        let greeting = read_some(&fcx, &mut stream, 6).await;
+        assert!(!greeting.is_empty());
+        stream.write_all(&fcx, &greeting).await?;
+        let reply = read_some(&fcx, &mut stream, greeting.len()).await;
+        assert_eq!(reply, greeting);
+        Ok(())
+    });
+}
+
+#[test]
 fn failed_host_binding_leaves_no_route_service_or_registration() {
     for failure in [
         "bind",
-        "port-zero",
+        "zero-duplicate",
         "udp-duplicate",
         "tcp-duplicate",
         "tls-plain",
@@ -208,7 +230,9 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                     bad.udp(0, Arc::new(()), || EchoDatagrams)
                         .udp(49152, Arc::new(()), || EchoDatagrams)
                 }
-                "port-zero" => bad.tcp(0, Arc::new(()), || Echo),
+                "zero-duplicate" => bad
+                    .tcp(0, Arc::new(()), || Echo)
+                    .tcp(0, Arc::new(()), || Echo),
                 "udp-duplicate" => bad.udp(9, Arc::new(()), || EchoDatagrams),
                 "tcp-duplicate" => bad
                     .tcp(81, Arc::new(()), || Echo)

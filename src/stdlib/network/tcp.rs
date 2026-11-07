@@ -2705,16 +2705,12 @@ impl Endpoint {
         st.kick();
     }
 
-    /// Listens on `port`.
+    /// Listens on the literal wire `port`, including zero.
     ///
-    /// Fails if `port` is 0, if something already listens there, or if an
-    /// outgoing connection uses the port. Dropping the listener frees the
-    /// port.
+    /// Fails if something already listens there, or if an outgoing
+    /// connection uses the port. Dropping the listener frees the port.
     pub fn listen(&self, port: u16) -> Result<Listener, Error> {
         let mut st = self.shared.state.lock();
-        if port == 0 {
-            return Err(fictionet::Error::msg("TCP port 0 cannot be listened on"));
-        }
         if st.listeners.contains_key(&port) || st.ports.contains_key(&port) {
             return Err(fictionet::Error::msg(format!(
                 "TCP port {port} is already in use on {}",
@@ -2739,11 +2735,14 @@ impl Endpoint {
 
     /// Opens a connection from this machine to `to`.
     ///
+    /// The destination port is literal, including zero. The local port is
+    /// selected from the ephemeral range.
+    ///
     /// Fails with [`ConnError::Refused`] if the other side answers with a
     /// RST. It also fails with `Refused` immediately, without sending
-    /// anything, if `to` has port 0, an
-    /// unspecified address, or not the same IP version as this machine's
-    /// address, or if every local port from 49152 up is taken. Fails with
+    /// anything, if `to` has an unspecified address, or not the same IP
+    /// version as this machine's address, or if every local port from 49152
+    /// up is taken. Fails with
     /// [`ConnError::TimedOut`] if nothing answers for two minutes, and with
     /// [`ConnError::Closed`] once the endpoint has stopped.
     ///
@@ -2759,7 +2758,7 @@ impl Endpoint {
             return Err(ConnError::Cancelled);
         }
         let addr = self.shared.addr;
-        if to.port() == 0 || to.is_ipv4() != addr.is_ipv4() || to.ip().is_unspecified() {
+        if to.is_ipv4() != addr.is_ipv4() || to.ip().is_unspecified() {
             return Err(ConnError::Refused);
         }
         let conn = {

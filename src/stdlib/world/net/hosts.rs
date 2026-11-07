@@ -341,9 +341,10 @@ impl Host {
         self
     }
 
-    /// Serves TCP `port` with a [`Service`] made by `make` for each
-    /// connection, sharing `world`, with the default [`ServeOptions`], at
-    /// most [`DEFAULT_MAX_CONNS`](serve::DEFAULT_MAX_CONNS) at once.
+    /// Serves the literal TCP `port`, including zero, with a [`Service`]
+    /// made by `make` for each connection, sharing `world`, with the default
+    /// [`ServeOptions`], at most [`DEFAULT_MAX_CONNS`](serve::DEFAULT_MAX_CONNS)
+    /// at once.
     /// Connections are numbered and identify their sandbox in [`ConnInfo`].
     pub fn tcp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
@@ -1532,11 +1533,6 @@ impl Machine {
                     start: start.clone(),
                 });
                 continue;
-            }
-            if *number == 0 {
-                return Err(format!(
-                    "TCP port {number} at {addr}: TCP port 0 cannot be listened on"
-                ));
             }
             let port = match ports.entry(*number) {
                 Entry::Occupied(entry) => entry.into_mut(),
