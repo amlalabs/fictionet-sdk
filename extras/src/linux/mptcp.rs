@@ -251,24 +251,29 @@ impl Joined {
             .entries
             .get_mut(&self.token)
             .and_then(|e| e.joined.iter_mut().find(|(id, _)| *id == self.id));
-        match slot {
-            Some((_, waker)) => {
-                match waker {
-                    Some(w) if w.will_wake(cx.waker()) => {}
-                    _ => *waker = Some(cx.waker().clone()),
-                }
-                Poll::Pending
-            }
-            None => Poll::Ready(()),
-        }
+        let Some((_, waker)) = slot else {
+            return Poll::Ready(());
+        };
+        let old = match waker {
+            Some(w) if w.will_wake(cx.waker()) => None,
+            _ => waker.replace(cx.waker().clone()),
+        };
+        drop(open);
+        drop(old);
+        Poll::Pending
     }
 }
 
 impl Drop for Joined {
     fn drop(&mut self) {
-        if let Some(entry) = self.tokens.0.lock().entries.get_mut(&self.token) {
-            entry.joined.retain(|(id, _)| *id != self.id);
-        }
+        let removed = {
+            let mut open = self.tokens.0.lock();
+            open.entries.get_mut(&self.token).and_then(|entry| {
+                let at = entry.joined.iter().position(|(id, _)| *id == self.id)?;
+                Some(entry.joined.remove(at))
+            })
+        };
+        drop(removed);
     }
 }
 
@@ -875,8 +880,9 @@ impl<S: PortServer> PortServer for Listener<S> {
                             socket.reset();
                             return Poll::Ready(());
                         };
-                        entry.primary = Some(cx.waker().clone());
+                        let old = entry.primary.replace(cx.waker().clone());
                         drop(open);
+                        drop(old);
                         service.as_mut().poll(cx)
                     })
                     .await;
@@ -916,5 +922,89 @@ impl<S: PortServer> PortServer for Listener<S> {
             fcx: self.fcx.clone(),
             timestamp: self.timestamp.clone(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+    use std::task::Wake;
+
+    struct CheckDrop(Weak<Tokens>, Arc<AtomicBool>);
+
+    impl Wake for CheckDrop {
+        fn wake(self: Arc<Self>) {
+            panic!("releasing a waiter must not wake it");
+        }
+    }
+
+    impl Drop for CheckDrop {
+        fn drop(&mut self) {
+            assert!(self.0.upgrade().unwrap().0.try_lock().is_some());
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn replacing_a_subflow_waker_releases_it_outside_the_tokens_lock() {
+        let tokens = Arc::new(Tokens::default());
+        let opened = tokens
+            .open(
+                KeyPair {
+                    local: 1,
+                    remote: 2,
+                },
+                80,
+            )
+            .unwrap();
+        let joined = tokens.join(opened.token).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(CheckDrop(
+            Arc::downgrade(&tokens),
+            dropped.clone(),
+        )));
+        assert!(
+            joined
+                .poll_gone(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(
+            joined
+                .poll_gone(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_a_subflow_releases_its_waker_outside_the_tokens_lock() {
+        let tokens = Arc::new(Tokens::default());
+        let opened = tokens
+            .open(
+                KeyPair {
+                    local: 1,
+                    remote: 2,
+                },
+                80,
+            )
+            .unwrap();
+        let joined = tokens.join(opened.token).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(CheckDrop(
+            Arc::downgrade(&tokens),
+            dropped.clone(),
+        )));
+        assert!(
+            joined
+                .poll_gone(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(joined);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
