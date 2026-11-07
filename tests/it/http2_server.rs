@@ -156,6 +156,94 @@ fn completion_counts_data_frames_and_distinguishes_cancelled_streams() {
 }
 
 #[test]
+fn response_length_follows_the_body_and_shared_policy() {
+    use fictionet_extras::hyper_io::Io;
+    use hyper_util::rt::TokioIo;
+
+    fictionet::block_on(fictionet::lab(Seed::from_u64(71), |cx| async move {
+        let payload = Bytes::from(vec![b'x'; 20_000]);
+        let body = payload.clone();
+        let handler = fictionet_test_support::handler(
+            move |_: &mut httpd::Exchange<'_>, request: http::Request<Bytes>| {
+                http::Response::builder()
+                    .status(if request.uri().path() == "/empty" {
+                        http::StatusCode::NO_CONTENT
+                    } else {
+                        http::StatusCode::OK
+                    })
+                    .header(
+                        "content-length",
+                        if request.method() == http::Method::HEAD {
+                            "invalid".to_owned()
+                        } else {
+                            (body.len() / 2).to_string()
+                        },
+                    )
+                    .body(body.clone())
+                    .unwrap()
+            },
+        );
+        let (attach, arrivals) = fictionet::attachments();
+        net::Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("site", |host| {
+                host.at(SITE)
+                    .dns_name("localhost")
+                    .port_server(80, httpd::Server::new(handler))
+            })
+            .start(&cx, arrivals)?;
+        let machine = sandbox::machine(&cx, attach.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
+        let conn = machine
+            .tcp
+            .connect(&cx, SocketAddr::new(SITE.into(), 80))
+            .await?;
+        let (mut sender, connection) = h2::client::handshake(TokioIo::new(Io {
+            fcx: cx.clone(),
+            conn,
+        }))
+        .await?;
+        cx.spawn(move |_| async move {
+            connection.await?;
+            Ok(())
+        });
+        for (method, path) in [
+            (http::Method::GET, "/"),
+            (http::Method::HEAD, "/"),
+            (http::Method::GET, "/empty"),
+        ] {
+            sender = sender.ready().await?;
+            let (reply, _) = sender.send_request(
+                http::Request::builder()
+                    .method(method.clone())
+                    .uri(format!("http://localhost{path}"))
+                    .body(())?,
+                true,
+            )?;
+            let response = reply.await?;
+            if response.status() == http::StatusCode::NO_CONTENT {
+                assert!(!response.headers().contains_key("content-length"));
+            } else {
+                let length: usize = response.headers()["content-length"].to_str()?.parse()?;
+                assert_eq!(length, payload.len());
+            }
+            let mut body = response.into_body();
+            let mut received = Vec::new();
+            while let Some(chunk) = body.data().await {
+                received.extend_from_slice(&chunk?);
+            }
+            if method == http::Method::HEAD || path == "/empty" {
+                assert!(received.is_empty());
+            } else {
+                assert_eq!(received.len(), payload.len());
+            }
+        }
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn windows_settings_and_concurrent_streams() {
     let router = fictionet_test_support::handler(
         |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {

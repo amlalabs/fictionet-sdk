@@ -1241,6 +1241,7 @@ impl Pending for Sending {
                 if matches!(
                     name.as_str(),
                     "connection"
+                        | "content-length"
                         | "proxy-connection"
                         | "keep-alive"
                         | "transfer-encoding"
@@ -1250,9 +1251,7 @@ impl Pending for Sending {
                 }
                 fields.push(hpack::Field::new(name.as_str(), value.as_bytes()));
             }
-            if !parts.headers.contains_key("content-length")
-                && let Some(length) = policy.len
-            {
+            if let Some(length) = policy.len {
                 fields.push(hpack::Field::new("content-length", length.to_string()));
             }
             if let Some(date) = policy.date {
