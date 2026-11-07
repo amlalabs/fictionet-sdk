@@ -92,8 +92,7 @@ $ cargo bench --locked --bench network -- --list
 scheduling and unread-link memory. `services` covers relay traffic, HTTPS sites
 and proxy DNS caching. `runtime::http` measures HTTPS throughput over HTTP/1
 and HTTP/2.
-`network::sched::packet_round_trips` compares no observer, event-only
-interest and packet interest. `runtime::timers` covers timers.
+`runtime::timers` covers timers.
 `decoders` feeds TPKT/COTP, HTTP/1 requests and ITCH add orders in 16 KiB
 chunks. Divan reports timings, rates and allocation counts; no benchmark has a
 pass or fail threshold. Compare two commits on the same machine.
