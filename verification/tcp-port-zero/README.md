@@ -147,12 +147,10 @@ build jobs and a `systemd-run --user --scope -p MemoryMax=10G` scope.
 
 ## Repeating the model checks
 
-TLC was version 2.19. `cargo xtask port-zero-verify` runs the four configs
-below with the runner of `mptcp-verify tlc`, under `port-zero-verify/` in
-Cargo's target directory; `Socket_nonzero_reset.cfg` carries the
-`\* expect violation: PassiveResetRestores` line that runner reads, so it
-passes only by failing on that property. To run TLC by hand from this
-directory, use the installed JDK and jar:
+TLC was version 2.19. Three configs must report "No error has been found".
+`Socket_nonzero_reset.cfg` is the negative control: its
+`\* expect violation: PassiveResetRestores` line names the property it must
+violate. Run the four from the repository root:
 
 ```sh
 export CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.pz-formal-target

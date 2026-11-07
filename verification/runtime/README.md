@@ -1,7 +1,6 @@
 # Runtime verification
 
-TLA+ models of the runtime's state machines, checked with TLC through
-`cargo xtask runtime-verify`, the way `mptcp-verify` checks the MPTCP models.
+TLA+ models of the runtime's state machines, checked with TLC.
 The models are finite cuts through `src/run.rs`, `src/cx.rs`, `src/cx/region.rs`,
 `src/cx/task.rs`, `src/cx/timer.rs`, `src/clock.rs` and `src/timer.rs`. Each
 locked section of the Rust is one step of a model, and anything another thread
@@ -9,18 +8,20 @@ can do between two locked sections is a separate step, so the interleavings the
 Rust allows are the ones TLC explores.
 
 ```sh
-export TLA2TOOLS=/home/souvik/.cache/adorably-fv/tla2tools.jar
 export JAVA=/home/souvik/.local/jdk21/bin/java
-export TMPDIR="$CARGO_TARGET_DIR/runtime-verify/temp"
-mkdir -p "$TMPDIR"
-systemd-run --user --scope -p MemoryMax=12G -q cargo xtask runtime-verify tlc
+export TLA2TOOLS=/home/souvik/.cache/adorably-fv/tla2tools.jar
+cd verification/runtime/tla
+for cfg in *.cfg; do
+  "$JAVA" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC -workers 4 \
+    -metadir "$CARGO_TARGET_DIR/runtime-tlc/${cfg%.cfg}" \
+    -config "$cfg" "${cfg%%_*}.tla"
+done
 ```
 
-`runtime-verify tlc [spec] [config]` checks every config, those of one spec, or
-one config. A passing config runs once with all of its properties; a config
-with an `\* expect violation:` line is an ablation that turns one line of the
-Rust off and must violate exactly the property it names. Output goes under
-`runtime-verify/tlc/` in Cargo's target directory.
+Each config is named after its spec. A passing config checks all of its
+properties at once and must report "No error has been found". A config with an
+`\* expect violation:` line is an ablation that turns one line of the Rust off
+and must violate exactly the property it names.
 
 | Spec | Cut and Rust correspondence | Properties |
 |---|---|---|

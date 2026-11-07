@@ -3,8 +3,7 @@
 This pass models the runtime of the SDK at `8ccf47fae`: task spawning and
 cancellation, wakers and their release order relative to locks, timers and the
 clock, regions and joins, and `block_on`. The models are TLA+ specifications in
-[verification/runtime/tla](tla), checked with TLC through
-`cargo xtask runtime-verify tlc`. [verification/runtime/README.md](README.md)
+[verification/runtime/tla](tla), checked with TLC. [verification/runtime/README.md](README.md)
 has the table of specs, their correspondence to the Rust, the bounds, and the
 ablations.
 
@@ -123,12 +122,14 @@ world code chooses.
 ## Rerunning
 
 ```sh
-export TLA2TOOLS=/home/souvik/.cache/adorably-fv/tla2tools.jar
 export JAVA=/home/souvik/.local/jdk21/bin/java
-export TMPDIR="$CARGO_TARGET_DIR/runtime-verify/temp"
-mkdir -p "$TMPDIR"
-systemd-run --user --scope -p MemoryMax=12G -q cargo xtask runtime-verify tlc
+export TLA2TOOLS=/home/souvik/.cache/adorably-fv/tla2tools.jar
+cd verification/runtime/tla
+for cfg in *.cfg; do
+  "$JAVA" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC -workers 4 \
+    -metadir "$CARGO_TARGET_DIR/runtime-tlc/${cfg%.cfg}" \
+    -config "$cfg" "${cfg%%_*}.tla"
+done
 ```
 
-TLC's output for each config is under `runtime-verify/tlc/` in Cargo's target
-directory.
+Each ablation's config names the property it must violate.
