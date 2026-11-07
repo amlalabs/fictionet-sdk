@@ -193,6 +193,157 @@ fn http1_response_policy_preserves_native_framing() {
     }
 }
 
+/// A body of unknown length: `pieces`, one data frame each, in order.
+pub(crate) fn streamed(pieces: &'static [&'static [u8]]) -> httpd::Body {
+    struct Pieces(std::slice::Iter<'static, &'static [u8]>);
+
+    impl http_body::Body for Pieces {
+        type Data = Bytes;
+        type Error = fictionet::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, fictionet::Error>>> {
+            Poll::Ready(
+                self.get_mut()
+                    .0
+                    .next()
+                    .map(|piece| Ok(http_body::Frame::data(Bytes::from_static(piece)))),
+            )
+        }
+    }
+
+    httpd::Body::new(Pieces(pieces.iter()))
+}
+
+/// Answers every request with `status`, `supplied` as its `Content-Length`
+/// if any, and the body "body", held in full with its length known or
+/// streamed without one.
+pub(crate) fn framing_case(
+    status: u16,
+    supplied: Option<&'static str>,
+    known: bool,
+) -> Arc<impl httpd::Handler> {
+    fictionet_test_support::reply_handler(move |_, _| {
+        let mut response = http::Response::builder().status(status);
+        if let Some(supplied) = supplied {
+            response = response.header("content-length", supplied);
+        }
+        let body = if known {
+            httpd::Body::from(Bytes::from_static(b"body"))
+        } else {
+            streamed(&[b"bo", b"dy"])
+        };
+        httpd::Reply::Now(response.body(body).unwrap())
+    })
+}
+
+/// RFC 9110 sections 8.6, 9.3.2 and 9.3.6 and RFC 9112 section 6, for
+/// every request version and method, response status, supplied
+/// `Content-Length` and body the shared policy tells apart. The checks are
+/// the theorems of verification/http/lean/Http/Framing.lean; each reply
+/// must also read back under its request's method as the body the handler
+/// wrote, or none.
+#[test]
+fn http1_framing_follows_the_rfcs_for_every_case() {
+    use fictionet::stdlib::services::serve::Ended;
+
+    let mut lengths = std::collections::HashMap::new();
+    for version in ["1.0", "1.1"] {
+        for status in [103u16, 200, 204, 304, 404] {
+            for supplied in [None, Some("7"), Some("x")] {
+                for known in [true, false] {
+                    for method in ["GET", "HEAD", "CONNECT"] {
+                        let mut h = Harness::new(
+                            fictionet::Seed::from_u64(0),
+                            Http1::new(framing_case(status, supplied, known)),
+                            (),
+                        );
+                        let target = if method == "CONNECT" {
+                            "a.test:443"
+                        } else {
+                            "/"
+                        };
+                        let request =
+                            format!("{method} {target} HTTP/{version}\r\nHost: a.test\r\n\r\n");
+                        let reply = h.push(request.as_bytes()).unwrap();
+                        let text = String::from_utf8_lossy(&reply).into_owned();
+                        let case = format!(
+                            "HTTP/{version} {method} answered {status} with content-length \
+                             {supplied:?} and a body of {} length: {text:?}",
+                            if known { "known" } else { "unknown" }
+                        );
+                        let head = text.split("\r\n\r\n").next().unwrap().to_owned();
+                        let field = |name: &str| {
+                            head.lines().skip(1).find_map(|line| {
+                                let (n, v) = line.split_once(':')?;
+                                n.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                            })
+                        };
+                        let length = field("content-length");
+                        let coding = field("transfer-encoding");
+                        let informational = status < 200;
+                        let tunnel = method == "CONNECT" && (200..300).contains(&status);
+                        let bodiless = bodiless_status(status) || tunnel || method == "HEAD";
+                        // RFC 9112 section 6.1: never both fields.
+                        assert!(length.is_none() || coding.is_none(), "{case}");
+                        // RFC 9112 section 6.1: an HTTP/1.0 client reads no chunked body.
+                        assert!(version == "1.1" || coding.is_none(), "{case}");
+                        // RFC 9110 section 8.6: no Content-Length on 1xx or 204.
+                        assert!(
+                            !(informational || status == 204) || length.is_none(),
+                            "{case}"
+                        );
+                        // RFC 9110 section 9.3.6: a 2xx to CONNECT has no framing.
+                        assert!(!tunnel || (length.is_none() && coding.is_none()), "{case}");
+                        // RFC 9112 section 6.3: the reader finds the body the handler
+                        // wrote, or none, and an HTTP/1.1 body is delimited.
+                        let expected: &[u8] = if bodiless { b"" } else { b"body" };
+                        let closes = version == "1.0" && !known && !bodiless;
+                        let parsed = fictionet_test_support::response(&reply, method, closes);
+                        assert_eq!(parsed.head.status, status, "{case}");
+                        assert_eq!(parsed.body, expected, "{case}");
+                        if let Some(n) = &length
+                            && !bodiless
+                        {
+                            assert_eq!(n.parse::<usize>().unwrap(), expected.len(), "{case}");
+                        }
+                        // RFC 9112 section 6.3: an HTTP/1.0 body of unknown length
+                        // ends with the connection.
+                        if closes {
+                            assert_eq!(h.end_reason(), Some(Ended::Closed), "{case}");
+                        }
+                        // A handler that drops the HEAD body names the GET length
+                        // itself, and the server passes it on.
+                        if method == "HEAD" && supplied == Some("7") && !bodiless_status(status) {
+                            assert_eq!(length.as_deref(), Some("7"), "{case}");
+                        }
+                        lengths.insert((version, status, supplied, known, method), length);
+                    }
+                }
+            }
+        }
+    }
+    // RFC 9110 section 9.3.2: HEAD's Content-Length is GET's when the
+    // handler leaves the length to the server.
+    for (&(version, status, supplied, known, method), length) in &lengths {
+        if method == "HEAD" && supplied != Some("7") {
+            let get = &lengths[&(version, status, supplied, known, "GET")];
+            assert_eq!(
+                length, get,
+                "HTTP/{version} HEAD and GET answered {status} with content-length {supplied:?}"
+            );
+        }
+    }
+}
+
+/// Whether `status` never has a body (RFC 9110 sections 15.2, 15.3.5 and
+/// 15.4.5).
+pub(crate) fn bodiless_status(status: u16) -> bool {
+    status < 200 || status == 204 || status == 304
+}
+
 /// Pending polls and empty frames do not terminate a chunked response.
 /// The next response on the connection starts after the body's EOF.
 /// Before, an HTTP/1.1 body of unknown length began with the zero-size

@@ -295,6 +295,140 @@ fn connect_success_has_no_length_and_ends_the_stream() {
     assert!(answered, "{output:?}");
 }
 
+/// RFC 9110 sections 8.6, 9.3.2 and 9.3.6 and RFC 9113 section 8.1, for
+/// every method, response status, supplied `content-length` and body the
+/// shared policy tells apart. The checks are the theorems of
+/// verification/http/lean/Http/Framing.lean.
+#[test]
+fn http2_framing_follows_the_rfcs_for_every_case() {
+    let mut lengths = std::collections::HashMap::new();
+    for status in [103u16, 200, 204, 304, 404] {
+        for supplied in [None, Some("7"), Some("x")] {
+            for known in [true, false] {
+                for method in ["GET", "HEAD", "CONNECT"] {
+                    let mut harness = Harness::new(
+                        Seed::from_u64(1),
+                        Http2::new(crate::httpd::framing_case(status, supplied, known)),
+                        (),
+                    );
+                    let mut input = preface();
+                    let mut fragment = Vec::new();
+                    let request: &[(&str, &str)] = if method == "CONNECT" {
+                        &[(":method", "CONNECT"), (":authority", "a.test:443")]
+                    } else {
+                        &[
+                            (":method", method),
+                            (":scheme", "https"),
+                            (":authority", "a.test"),
+                            (":path", "/"),
+                        ]
+                    };
+                    for (name, value) in request {
+                        hpack::Field::new(name, value).write(&mut fragment).unwrap();
+                    }
+                    http2::Headers {
+                        stream: 1,
+                        flags: 5,
+                        fragment,
+                        priority: None,
+                        padding: None,
+                    }
+                    .write(&mut input)
+                    .unwrap();
+                    let output = frames(&harness.push(&input).unwrap());
+                    let case = format!(
+                        "{method} answered {status} with content-length {supplied:?} and a \
+                         body of {} length: {output:?}",
+                        if known { "known" } else { "unknown" }
+                    );
+                    let mut blocks = http2::HeaderBlocks::with_limits(Default::default());
+                    let mut head: Option<(Vec<hpack::Field>, bool)> = None;
+                    let mut data = Vec::new();
+                    let mut ended_by_data = false;
+                    for frame in &output {
+                        if let Frame::Data(frame) = frame {
+                            if frame.stream != 1 {
+                                continue;
+                            }
+                            // RFC 9113 section 8.1: DATA comes after HEADERS and
+                            // nothing follows END_STREAM.
+                            let (_, ended) = head.as_ref().expect(&case);
+                            assert!(!ended && !ended_by_data, "{case}");
+                            data.extend_from_slice(&frame.data);
+                            ended_by_data = frame.flags & 1 != 0;
+                            continue;
+                        }
+                        let read = blocks.read_frame(frame).unwrap();
+                        if let Some(block) = read.block {
+                            assert_eq!(read.stream, 1, "{case}");
+                            assert!(head.is_none(), "{case}");
+                            head = Some((block.headers, read.end));
+                        }
+                    }
+                    let (fields, end_on_headers) = head.expect(&case);
+                    let field = |name: &[u8]| {
+                        fields
+                            .iter()
+                            .find(|f| f.name == name)
+                            .map(|f| String::from_utf8(f.value.clone()).unwrap())
+                    };
+                    assert_eq!(field(b":status"), Some(status.to_string()), "{case}");
+                    let length = field(b"content-length");
+                    let informational = status < 200;
+                    let tunnel = method == "CONNECT" && (200..300).contains(&status);
+                    let bodiless =
+                        crate::httpd::bodiless_status(status) || tunnel || method == "HEAD";
+                    // RFC 9113 section 8.1: every response ends its stream.
+                    assert!(end_on_headers || ended_by_data, "{case}");
+                    // RFC 9110 section 8.6: no content-length on 1xx or 204.
+                    assert!(
+                        !(informational || status == 204) || length.is_none(),
+                        "{case}"
+                    );
+                    // RFC 9110 section 9.3.6: a 2xx to CONNECT has no length.
+                    assert!(!tunnel || length.is_none(), "{case}");
+                    // A response without a body ends the stream on its HEADERS
+                    // and sends no DATA; one with a body sends the body.
+                    assert_eq!(end_on_headers, bodiless, "{case}");
+                    let expected: &[u8] = if bodiless { b"" } else { b"body" };
+                    assert_eq!(data, expected, "{case}");
+                    // RFC 9113 section 8.1.1: a content-length matches its DATA.
+                    if let Some(n) = &length
+                        && !bodiless
+                    {
+                        assert_eq!(n.parse::<usize>().unwrap(), data.len(), "{case}");
+                    }
+                    // RFC 9110 section 15.4.5: a 304 keeps the length the handler
+                    // supplied for the representation.
+                    if status == 304 && supplied == Some("7") {
+                        assert_eq!(length.as_deref(), Some("7"), "{case}");
+                    }
+                    // A handler that drops the HEAD body names the GET length
+                    // itself, and the server passes it on.
+                    if method == "HEAD"
+                        && supplied == Some("7")
+                        && !crate::httpd::bodiless_status(status)
+                    {
+                        assert_eq!(length.as_deref(), Some("7"), "{case}");
+                    }
+                    lengths.insert((status, supplied, known, method), length);
+                }
+            }
+        }
+    }
+    // RFC 9110 section 9.3.2: HEAD's content-length is GET's when the
+    // handler leaves the length to the server.
+    for (&(status, supplied, known, method), length) in &lengths {
+        if method == "HEAD" && supplied != Some("7") {
+            let get = &lengths[&(status, supplied, known, "GET")];
+            assert_eq!(
+                length, get,
+                "HEAD and GET answered {status} with content-length {supplied:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn windows_settings_and_concurrent_streams() {
     let router = fictionet_test_support::handler(
