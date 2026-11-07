@@ -57,6 +57,18 @@ pub enum Routing {
 // ---------------------------------------------------------------------------
 // Virtual hosts
 
+/// A response selected by virtual-host routing before reaching a site's handler.
+/// Present in that response's extensions; absent for a handler's own answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// The request did not name a host.
+    NoHost,
+    /// The requested site is not served on this connection.
+    Misdirected,
+    /// The site requires HTTPS.
+    Redirect,
+}
+
 /// One site of [`VirtualHosts`].
 #[derive(Clone)]
 pub struct VHost {
@@ -92,8 +104,7 @@ impl VHost {
 ///   its extensions. Its [`Target::routing`] distinguishes a registered
 ///   host from a default-site fallback.
 ///
-/// Its own answers put `answer` in the request's event: `no_host`,
-/// `misdirected` or `redirect`.
+/// Its own answers carry an [`Answer`] in their response extensions.
 #[derive(Clone, Default)]
 pub struct VirtualHosts {
     inner: Arc<VInner>,
@@ -168,10 +179,12 @@ impl Handler for VirtualHosts {
             return Reply::Now(no_host());
         };
         let misdirected = || {
-            Reply::Now(text(
+            let mut response = text(
                 StatusCode::MISDIRECTED_REQUEST,
                 "This server does not serve that host.\n",
-            ))
+            );
+            response.extensions_mut().insert(Answer::Misdirected);
+            Reply::Now(response)
         };
         let Some((site, routing)) = self.site_or_default(&host) else {
             return misdirected();
@@ -194,6 +207,7 @@ impl Handler for VirtualHosts {
                 if let Ok(value) = location.parse() {
                     response.headers_mut().insert(LOCATION, value);
                 }
+                response.extensions_mut().insert(Answer::Redirect);
                 Reply::Now(response)
             }
             _ => {
@@ -213,10 +227,12 @@ impl Handler for VirtualHosts {
 }
 
 /// The answer to a request that names no host: `400`, with `answer`
-/// `no_host` in its event. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
+/// [`Answer::NoHost`] in its extensions. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
 /// gives it to an HTTP/1.1 request without `Host` before any handler.
 pub(super) fn no_host() -> http::Response<Body> {
-    text(StatusCode::BAD_REQUEST, "The request names no host.\n")
+    let mut response = text(StatusCode::BAD_REQUEST, "The request names no host.\n");
+    response.extensions_mut().insert(Answer::NoHost);
+    response
 }
 
 /// The host a request is for: the authority of its URI (HTTP/2's
@@ -255,6 +271,7 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 /// ```
 #[derive(Clone)]
 pub struct Server {
+    observe: Option<super::Observe>,
     vhost: VHost,
     default_host: bool,
     limits: Limits,
@@ -272,6 +289,7 @@ impl Server {
     /// The same, from a shared handler.
     pub fn shared(handler: Arc<dyn Handler>) -> Server {
         Server {
+            observe: None,
             vhost: VHost {
                 handler,
                 https: false,
@@ -310,6 +328,13 @@ impl Server {
     /// check [`Target::routing`].
     pub fn default_host(mut self) -> Server {
         self.default_host = true;
+        self
+    }
+
+    /// Observes response delivery on this port. Sites sharing the port use
+    /// the first server's callback, as they do its limits and date.
+    pub fn observe(mut self, observe: super::Observe) -> Self {
+        self.observe = Some(observe);
         self
     }
 
@@ -383,6 +408,7 @@ impl PortServer for Server {
         });
         let handler: Arc<dyn Handler> = Arc::new(vhosts.unwrap_or_default());
         let opts = HttpOptions {
+            observe: self.observe.clone().or(arrival.http_observe.clone()),
             limits: self.limits,
             first_bytes: (!arrival.info.tls).then_some(arrival.limits.handshake),
             budget: arrival.budget,

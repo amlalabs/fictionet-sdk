@@ -97,8 +97,10 @@
 //!
 //! # Observation
 //!
-//! A world reports typed facts directly from its handlers. A body wrapper
-//! can report streaming progress and completion to that world's own stream.
+//! A world reports typed facts directly from its handlers. For delivery
+//! accounting, [`HttpOptions::observe`] receives the request and response heads,
+//! receipt outcome, and body bytes in completely written pieces. Response
+//! extensions carry world-owned facts without a shared event schema.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -127,7 +129,7 @@ pub use handlers::{
 pub use http2::{Http2, Timer as Http2Timer};
 pub use native::{Http1, Timer as Http1Timer};
 pub use response::{date_header, http_date};
-pub use sites::{Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
+pub use sites::{Answer, Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
 
 /// How receipt of a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +144,121 @@ pub enum Received {
     Timeout,
     /// The request could not fit in the service budget.
     Budget,
+}
+
+/// A finished or interrupted response to a dispatched HTTP request.
+/// Rejections before dispatch (including malformed heads and body timeouts)
+/// are outside this callback. Request and response extensions belong to the
+/// world; the server does not interpret them.
+pub struct Observation {
+    /// When the request was dispatched.
+    pub at: fictionet::time::Instant,
+    /// The connection carrying the request.
+    pub conn: serve::ConnInfo,
+    /// The parsed request head, without its body.
+    pub request: http::request::Parts,
+    /// The response selected for transmission, if one was produced.
+    pub response: Option<http::response::Parts>,
+    /// Whether the entire request arrived.
+    pub received: Received,
+    /// Response body bytes in fully written pieces. An interrupted piece is
+    /// not counted, so this is a lower bound on bytes accepted by the transport.
+    pub sent: u64,
+    /// The response stream ended normally and all emitted framing was written.
+    pub complete: bool,
+}
+
+/// Receives one observation when a dispatched response finishes or is cancelled.
+/// Callbacks run synchronously and should hand off slow work themselves.
+pub type Observe = Arc<dyn Fn(Observation) + Send + Sync>;
+
+struct Delivery {
+    observe: Observe,
+    observation: Option<Observation>,
+    produced: u64,
+    pending: Option<(u64, usize)>,
+    held: usize,
+}
+
+impl Delivery {
+    fn new(
+        observe: &Option<Observe>,
+        request: &http::Request<Body>,
+        conn: &serve::ConnInfo,
+        at: fictionet::time::Instant,
+        received: Received,
+    ) -> Option<Self> {
+        let observe = observe.as_ref()?.clone();
+        let mut head = http::Request::new(());
+        *head.method_mut() = request.method().clone();
+        *head.uri_mut() = request.uri().clone();
+        *head.version_mut() = request.version();
+        *head.headers_mut() = request.headers().clone();
+        *head.extensions_mut() = request.extensions().clone();
+        let held = response::request_held(&head);
+        Some(Self {
+            held,
+            observe,
+            observation: Some(Observation {
+                at,
+                conn: conn.clone(),
+                request: head.into_parts().0,
+                response: None,
+                received,
+                sent: 0,
+                complete: false,
+            }),
+            produced: 0,
+            pending: None,
+        })
+    }
+
+    fn response(&mut self, parts: &http::response::Parts) {
+        if let Some(observation) = &mut self.observation {
+            let headers = &parts.headers;
+            self.held += std::mem::size_of::<http::response::Parts>()
+                + (headers.capacity() + headers.len() - headers.keys_len())
+                    * std::mem::size_of::<(http::HeaderName, http::HeaderValue)>()
+                + headers
+                    .iter()
+                    .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
+                    .sum::<usize>();
+            observation.response = Some(parts.clone());
+        }
+    }
+
+    fn piece(&mut self, length: usize, body: usize) {
+        self.produced += length as u64;
+        self.pending = Some((self.produced, body));
+    }
+
+    fn update(&mut self, written: u64) {
+        if let Some((end, body)) = self.pending
+            && written >= end
+        {
+            if let Some(observation) = &mut self.observation {
+                observation.sent += body as u64;
+            }
+            self.pending = None;
+        }
+    }
+
+    fn finish(&mut self, written: u64, complete: bool) {
+        self.update(written);
+        if let Some(mut observation) = self.observation.take() {
+            self.held = 0;
+            observation.complete = complete;
+            (self.observe)(observation);
+        }
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        if let Some(observation) = self.observation.take() {
+            (self.observe)(observation);
+        }
+    }
 }
 
 /// HTTP's limits and timers, for both versions.
@@ -196,6 +313,8 @@ const PIECE: usize = 16 * 1024;
 /// How [`serve_connection`] serves a connection.
 #[derive(Clone, Default)]
 pub struct HttpOptions {
+    /// Optional completion callback, shared by both HTTP versions.
+    pub observe: Option<Observe>,
     /// Limits and timers, for both versions.
     pub limits: Limits,
     /// On a connection without TLS, how long the client has from
@@ -274,6 +393,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     if h2 {
         let mut service = Http2::with(handler, opts.limits);
+        service.observe = opts.observe.clone();
         service.date = opts
             .date
             .and_then(|date| date.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -285,6 +405,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
     }
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
+    service.observe = opts.observe.clone();
     if !info.tls && opts.first_bytes.is_none() {
         service.first_head_deadline = Some(head_deadline);
     }

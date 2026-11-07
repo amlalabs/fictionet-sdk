@@ -39,6 +39,7 @@ const ERROR_RESET_MAX: usize = 1024;
 /// Uses the shared frame codec and HPACK decoder, with independently scheduled
 /// responses. No runtime is required, including in a [`serve::Harness`].
 pub struct Http2 {
+    pub(super) observe: Option<super::Observe>,
     handler: Arc<dyn Handler>,
     limits: Limits,
     pub(super) date: Option<u64>,
@@ -109,6 +110,7 @@ impl Http2 {
     /// Answers requests using the supplied handler and limits.
     pub fn with(handler: Arc<dyn Handler>, limits: Limits) -> Self {
         Self {
+            observe: None,
             handler,
             limits,
             date: None,
@@ -139,6 +141,12 @@ impl Http2 {
             shutdown_requested: false,
             goaway_last: None,
         }
+    }
+
+    /// Receives response completion and cancellation observations.
+    pub fn observe(mut self, observe: super::Observe) -> Self {
+        self.observe = Some(observe);
+        self
     }
 
     /// Begins graceful shutdown on the next driver wake or input.
@@ -247,6 +255,13 @@ impl Http2 {
 
         *request.body_mut() = Body::from(std::mem::take(&mut stream.body));
         let head_only = request.method() == Method::HEAD;
+        let delivery = super::Delivery::new(
+            &self.observe,
+            &request,
+            driver.conn(),
+            driver.now(),
+            received,
+        );
         let reply = match received {
             Received::Complete => self.handler.call(
                 request,
@@ -286,6 +301,7 @@ impl Http2 {
         driver.defer_keyed(
             u64::from(id),
             Sending {
+                delivery,
                 id,
                 send: self.send.clone(),
                 // Only work still making its response holds the request.
@@ -1110,6 +1126,7 @@ fn over_budget() -> Response<Body> {
 type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
 
 struct Sending {
+    delivery: Option<super::Delivery>,
     budget: Option<serve::Budget>,
     id: u32,
     send: Arc<Mutex<Outbound>>,
@@ -1127,7 +1144,7 @@ struct Sending {
 }
 
 impl Sending {
-    fn headers(&self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
+    fn headers(&mut self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
         let mut block = Vec::new();
         // A zero-capacity table keeps response storage bounded while still
         // honoring the peer's required table-size updates.
@@ -1156,6 +1173,9 @@ impl Sending {
             }
             .write(&mut out)?;
         }
+        if let Some(delivery) = &mut self.delivery {
+            delivery.piece(out.len(), 0);
+        }
         Ok(out)
     }
 }
@@ -1166,6 +1186,9 @@ impl Pending for Sending {
         driver: &mut PendingDriver<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Vec<u8>, Error>>> {
+        if let Some(delivery) = &mut self.delivery {
+            delivery.update(driver.written());
+        }
         if let Some(work) = self.work.take() {
             self.making = Some(match driver.fcx() {
                 Some(fcx) => work(fcx.clone()),
@@ -1197,6 +1220,9 @@ impl Pending for Sending {
         }
         if let Some(response) = self.response.take() {
             let (parts, body) = response.into_parts();
+            if let Some(delivery) = &mut self.delivery {
+                delivery.response(&parts);
+            }
             let now = driver.fcx().map_or(self.asked, Cx::now);
             let date = self.date.and_then(|date| {
                 HeaderValue::from_str(&super::http_date(
@@ -1266,6 +1292,9 @@ impl Pending for Sending {
                     self.rest = Bytes::new();
                     self.rest_held = 0;
                 }
+                if let Some(delivery) = &mut self.delivery {
+                    delivery.piece(9 + data.len(), data.len());
+                }
                 return Poll::Ready(Some(
                     wire::Data {
                         stream: self.id,
@@ -1278,10 +1307,16 @@ impl Pending for Sending {
                 ));
             }
             if self.end_sent {
+                if let Some(delivery) = &mut self.delivery {
+                    delivery.finish(driver.written(), true);
+                }
                 return Poll::Ready(None);
             }
             let Some(body) = &mut self.body else {
                 self.end_sent = true;
+                if let Some(delivery) = &mut self.delivery {
+                    delivery.piece(9, 0);
+                }
                 return Poll::Ready(Some(
                     wire::Data {
                         stream: self.id,
@@ -1328,10 +1363,15 @@ impl Pending for Sending {
         }
     }
 
-    fn cancel(&mut self, _driver: &mut PendingDriver<'_>) {}
+    fn cancel(&mut self, driver: &mut PendingDriver<'_>) {
+        if let Some(delivery) = &mut self.delivery {
+            delivery.finish(driver.written(), false);
+        }
+    }
 
     fn held(&self) -> usize {
-        self.request_held
+        self.delivery.as_ref().map_or(0, |delivery| delivery.held)
+            + self.request_held
             + self.rest_held
             + self.body.as_ref().map_or(0, Body::full_len)
             + self.response.as_ref().map_or(0, response_held)

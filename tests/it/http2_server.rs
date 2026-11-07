@@ -88,6 +88,74 @@ async fn read_frame(cx: &Cx, connection: &mut impl Connection) -> Frame {
 }
 
 #[test]
+fn completion_counts_data_frames_and_distinguishes_cancelled_streams() {
+    for length in [0, 7, 20_000] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collect = seen.clone();
+        let handler = fictionet_test_support::handler(
+            move |_: &mut httpd::Exchange<'_>, _: http::Request<Bytes>| {
+                http::Response::new(Bytes::from(vec![b'x'; length]))
+            },
+        );
+        let mut harness = Harness::new(
+            Seed::from_u64(1),
+            Http2::new(handler).observe(Arc::new(move |observation| {
+                collect.lock().unwrap().push(observation)
+            })),
+            (),
+        );
+        let mut input = preface();
+        input.extend(headers(1, "/", true));
+        let output = frames(&harness.push(&input).unwrap());
+        let delivered: usize = output
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Data(data) => Some(data.data.len()),
+                _ => None,
+            })
+            .sum();
+        let seen = seen.lock().unwrap();
+        let [observation] = seen.as_slice() else {
+            panic!("one completion per stream");
+        };
+        assert!(observation.complete);
+        assert_eq!(observation.sent as usize, delivered);
+        assert_eq!(delivered, length);
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let collect = seen.clone();
+    let handler =
+        fictionet_test_support::handler(|_: &mut httpd::Exchange<'_>, _: http::Request<Bytes>| {
+            http::Response::new(Bytes::from(vec![b'x'; 100_000]))
+        });
+    let mut harness = Harness::new(
+        Seed::from_u64(1),
+        Http2::new(handler).observe(Arc::new(move |observation| {
+            collect.lock().unwrap().push(observation)
+        })),
+        (),
+    );
+    let mut input = preface();
+    input.extend(headers(1, "/", true));
+    let output = frames(&harness.push(&input).unwrap());
+    let delivered: usize = output
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Data(data) => Some(data.data.len()),
+            _ => None,
+        })
+        .sum();
+    assert!(seen.lock().unwrap().is_empty());
+    drop(harness);
+    let seen = seen.lock().unwrap();
+    let [observation] = seen.as_slice() else {
+        panic!("one cancellation per stream");
+    };
+    assert!(!observation.complete);
+    assert_eq!(observation.sent as usize, delivered);
+}
+
+#[test]
 fn windows_settings_and_concurrent_streams() {
     let router = fictionet_test_support::handler(
         |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {

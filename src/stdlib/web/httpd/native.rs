@@ -37,6 +37,7 @@ pub enum Timer {
 
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
+    pub(super) observe: Option<super::Observe>,
     handler: Arc<dyn Handler>,
     opts: Limits,
     /// The world's date at the start of the run, for `Date` headers.
@@ -58,6 +59,7 @@ impl Http1 {
     /// Answers with `handler` and `opts`.
     pub fn with(handler: Arc<dyn Handler>, opts: Limits) -> Http1 {
         Http1 {
+            observe: None,
             handler,
             opts,
             date: None,
@@ -75,6 +77,12 @@ impl Http1 {
     /// [Dates](super#dates).
     pub fn date(mut self, start: SystemTime) -> Http1 {
         self.date = Some(start);
+        self
+    }
+
+    /// Receives response completion and cancellation observations.
+    pub fn observe(mut self, observe: super::Observe) -> Self {
+        self.observe = Some(observe);
         self
     }
 
@@ -119,6 +127,14 @@ impl Http1 {
         // from the service, unless its body is too large. The decoder
         // refuses such a head, so only `on_fail` brings one here.
         let lacks_host = version == Version::HTTP_11 && !request.headers().contains_key(HOST);
+        let received = if self.too_big {
+            super::Received::TooLarge
+        } else if close {
+            super::Received::CutOff
+        } else {
+            super::Received::Complete
+        };
+        let delivery = super::Delivery::new(&self.observe, &request, &conn, now, received);
         let reply = if self.too_big {
             Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
         } else if lacks_host {
@@ -142,9 +158,10 @@ impl Http1 {
             Reply::Now(response) => (None, Some(response)),
             Reply::Later(work) => (Some(work), None),
         };
-        let streaming = Streaming::new(work, response, version, wants, close)
+        let mut streaming = Streaming::new(work, response, version, wants, close)
             .dated(self.date, now)
             .holding_request(held);
+        streaming.delivery = delivery;
         driver.cancel_timer(Timer::Body);
         if self.upgrade.is_some() {
             driver.defer(streaming);
@@ -431,6 +448,7 @@ type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>
 
 /// A response being made or streamed, as deferred work of a connection.
 struct Streaming {
+    delivery: Option<super::Delivery>,
     work: Option<Later>,
     making: Option<Making>,
     body: Option<Body>,
@@ -445,9 +463,6 @@ struct Streaming {
     /// Woken once the response is written, when the connection stays
     /// open for another request.
     written: Option<WakeHandle>,
-    /// Body bytes the connection took.
-    /// Bytes returned to the driver, and the body bytes in the last piece,
-    /// which count once the driver has written that far.
     /// The world's date at the start of the run, and when the request was
     /// answered, for the `Date` header.
     date: Option<SystemTime>,
@@ -463,6 +478,7 @@ impl Streaming {
         close: bool,
     ) -> Streaming {
         Streaming {
+            delivery: None,
             work,
             making: None,
             body: None,
@@ -513,7 +529,10 @@ impl Streaming {
     }
 
     /// Hands the driver `bytes`, of which `body` are body bytes.
-    fn piece(&mut self, bytes: Vec<u8>, _body: usize) -> Poll<Option<Result<Vec<u8>, Error>>> {
+    fn piece(&mut self, bytes: Vec<u8>, body: usize) -> Poll<Option<Result<Vec<u8>, Error>>> {
+        if let Some(delivery) = &mut self.delivery {
+            delivery.piece(bytes.len(), body);
+        }
         Poll::Ready(Some(Ok(bytes)))
     }
 
@@ -536,6 +555,9 @@ impl Pending for Streaming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Vec<u8>, Error>>> {
         // The driver polls again only once the last piece is written.
+        if let Some(delivery) = &mut self.delivery {
+            delivery.update(driver.written());
+        }
 
         loop {
             if let Some(work) = self.work.take() {
@@ -560,6 +582,9 @@ impl Pending for Streaming {
             }
             if let Some(response) = self.response.take() {
                 let (parts, body) = response.into_parts();
+                if let Some(delivery) = &mut self.delivery {
+                    delivery.response(&parts);
+                }
                 let now = driver.fcx().map_or(self.asked, Cx::now);
                 let policy = ResponsePolicy::new(
                     &parts,
@@ -603,6 +628,9 @@ impl Pending for Streaming {
                 return self.piece(out, piece.len());
             }
             let Some(body) = &mut self.body else {
+                if let Some(delivery) = &mut self.delivery {
+                    delivery.finish(driver.written(), true);
+                }
                 if let Some(written) = self.written.take() {
                     written.wake();
                 }
@@ -634,10 +662,20 @@ impl Pending for Streaming {
         }
     }
 
+    fn cancel(&mut self, driver: &mut PendingDriver<'_>) {
+        if let Some(delivery) = &mut self.delivery {
+            delivery.finish(driver.written(), false);
+        }
+    }
+
     fn held(&self) -> usize {
         let response = self.response.as_ref().map_or(0, |r| r.body().full_len());
         let body = self.body.as_ref().map_or(0, Body::full_len);
-        self.request_held + self.rest_held + response + body
+        self.delivery.as_ref().map_or(0, |delivery| delivery.held)
+            + self.request_held
+            + self.rest_held
+            + response
+            + body
     }
 }
 
@@ -646,6 +684,97 @@ mod router_tests {
     use super::*;
 
     use fictionet::sync::Mutex;
+
+    #[test]
+    fn delivery_matches_written_body_and_retains_response_extensions() {
+        #[derive(Clone)]
+        struct Length(usize);
+        struct Echo;
+        impl Handler for Echo {
+            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+                let bytes = request.body().bytes().unwrap();
+                let mut response = Response::new(Body::from(bytes.clone()));
+                response.extensions_mut().insert(Length(bytes.len()));
+                Reply::Now(response)
+            }
+        }
+        for length in [0, 7, PIECE + 31] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let collect = seen.clone();
+            let mut harness = serve::Harness::new(
+                fictionet::Seed::from_u64(1),
+                Http1::new(Echo).observe(Arc::new(move |observation| {
+                    collect.lock().push(observation)
+                })),
+                (),
+            );
+            let mut request = format!(
+                "POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: {length}\r\n\r\n"
+            )
+            .into_bytes();
+            request.extend((0..length).map(|n| n as u8));
+            harness.push(&request).unwrap();
+            let response = http1::Response::parse_for(harness.output(), "POST").unwrap();
+            let seen = seen.lock();
+            let [observation] = seen.as_slice() else {
+                panic!("one completion per request");
+            };
+            assert!(observation.complete);
+            assert_eq!(observation.sent as usize, response.body.len());
+            assert_eq!(
+                observation
+                    .response
+                    .as_ref()
+                    .unwrap()
+                    .extensions
+                    .get::<Length>()
+                    .unwrap()
+                    .0,
+                response.body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn abandoning_a_stream_reports_incomplete_delivery_once() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collect = seen.clone();
+        struct Waiting;
+        impl http_body::Body for Waiting {
+            type Data = Bytes;
+            type Error = Infallible;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+                Poll::Pending
+            }
+        }
+        struct Wait;
+        impl Handler for Wait {
+            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+                Reply::Now(Response::new(Body::new(Waiting)))
+            }
+        }
+        let mut harness = serve::Harness::new(
+            fictionet::Seed::from_u64(1),
+            Http1::new(Wait).observe(Arc::new(move |observation| {
+                collect.lock().push(observation)
+            })),
+            (),
+        );
+        harness
+            .push(b"GET /slow HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .unwrap();
+        assert!(seen.lock().is_empty());
+        drop(harness);
+        let seen = seen.lock();
+        let [observation] = seen.as_slice() else {
+            panic!("one cancellation per request");
+        };
+        assert!(!observation.complete);
+        assert!(observation.response.is_some());
+    }
 
     #[test]
     fn response_suffix_keeps_the_original_charge() {
