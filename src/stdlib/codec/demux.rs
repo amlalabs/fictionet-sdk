@@ -153,13 +153,16 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
                 .get(&key)
                 .and_then(|entry| entry.stream.as_ref())
         {
+            let after = Self::bytes(stream);
             let total = self
                 .total
                 .get()
                 .saturating_sub(before)
-                .saturating_add(Self::bytes(stream));
+                .saturating_add(after);
             self.total.set(total);
-            if total > self.max_bytes {
+            // The excess is this stream's only if it grew. A stream that
+            // changed nothing, or shrank, leaves the blame where it was.
+            if total > self.max_bytes && after > before {
                 self.excess.set(Some(key));
             }
         }

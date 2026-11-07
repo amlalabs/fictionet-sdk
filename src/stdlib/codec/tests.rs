@@ -2596,3 +2596,28 @@ fn regression_skip_that_raises_capacity_is_not_stuck() {
     assert_eq!(s.limit(), 3);
     assert_eq!(finish(&mut s, |_| panic!("no more records")), Ok(()));
 }
+
+#[test]
+fn regression_demux_charges_the_excess_to_the_stream_that_grew() {
+    // Stream 3 grows over the budget through mutable access. Mutable access
+    // to stream 1 afterwards, which changes no bytes, must not move the
+    // blame: the refusal lands on stream 3 and stream 1 still delivers.
+    let mut d = Demux::new(3, 4, |_: &u8| Collect::<Body>::new(64));
+    assert_eq!(d.push(&1, b"a"), 1);
+    assert_eq!(d.push(&3, b"c"), 1);
+    assert!(d.next().is_none());
+    assert_eq!(d.get_mut(&3).unwrap().push(b"excess"), 6);
+    d.get_mut(&1).unwrap().end();
+    assert_eq!(
+        d.next(),
+        Some((
+            3,
+            Err(Fail::Refused {
+                unread: 7,
+                limit: 4
+            })
+        ))
+    );
+    assert_eq!(d.total(), 1);
+    assert_eq!(d.next(), Some((1, Ok(Body(b"a".to_vec())))));
+}
