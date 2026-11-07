@@ -3295,3 +3295,9 @@ impl<S: Service> Drop for Harness<S> {
         self.core.s.wake.close();
     }
 }
+
+/// Bounded proofs over the timers, the budget, the connection count and
+/// the wake handle, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/lifecycle/kani/ServeProof.rs"]
+mod proofs;

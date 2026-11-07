@@ -51,7 +51,8 @@ web-proxy = []
 page = ["tokio", "dep:axum", "dep:serde", "dep:tokio-stream"]
 
 [lints.rust]
-# `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`.
+# `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`;
+# `cargo kani` with `--cfg kani`, which adds the proofs in `verification/`.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(kani)"] }
 
 [dependencies]
