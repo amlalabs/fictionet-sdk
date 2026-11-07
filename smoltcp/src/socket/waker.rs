@@ -11,18 +11,11 @@ impl WakerRegistration {
         Self { waker: None }
     }
 
-    /// Register a waker. Overwrites the previous waker, if any.
-    pub(crate) fn register(&mut self, w: &Waker) {
+    /// Registers a waker and returns a displaced waker for release by the caller.
+    pub(crate) fn register(&mut self, w: &Waker) -> Option<Waker> {
         match self.waker {
-            // Optimization: If both the old and new Wakers wake the same task, we can simply
-            // keep the old waker, skipping the clone. (In most executor implementations,
-            // cloning a waker is somewhat expensive, comparable to cloning an Arc).
-            Some(ref w2) if (w2.will_wake(w)) => {}
-            // In all other cases
-            // - we have no waker registered
-            // - we have a waker registered but it's for a different task.
-            // then clone the new waker and store it
-            _ => self.waker = Some(w.clone()),
+            Some(ref old) if old.will_wake(w) => None,
+            _ => self.waker.replace(w.clone()),
         }
     }
 
@@ -31,5 +24,38 @@ impl WakerRegistration {
         if let Some(w) = self.waker.take() {
             w.wake()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Wake;
+
+    #[test]
+    fn replacement_transfers_the_old_waker_to_the_owner() {
+        struct CheckDrop(Arc<AtomicBool>);
+        impl Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("replacing or releasing a waiter must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(CheckDrop(dropped.clone())));
+        let mut registration = WakerRegistration::new();
+        assert!(registration.register(&waker).is_none());
+        assert!(registration.register(&waker).is_none());
+        drop(waker);
+        let old = registration.register(Waker::noop());
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(old);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

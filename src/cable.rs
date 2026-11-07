@@ -110,7 +110,7 @@ impl Interface for End {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
-        {
+        let old = {
             let mut dir = self.cable.dirs[self.side].lock();
             if let Some(packet) = dir.queue.pop() {
                 return Poll::Ready(Ok(packet));
@@ -119,10 +119,11 @@ impl Interface for End {
                 return Poll::Ready(Err(RecvError::Closed));
             }
             match &dir.waker {
-                Some(w) if w.will_wake(cx.waker()) => {}
-                _ => dir.waker = Some(cx.waker().clone()),
+                Some(w) if w.will_wake(cx.waker()) => None,
+                _ => dir.waker.replace(cx.waker().clone()),
             }
-        }
+        };
+        drop(old);
         if fcx.register_cancel(cx.waker(), &mut self.wait) {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
@@ -153,8 +154,7 @@ impl Drop for End {
         let lost = {
             let mut dir = self.cable.dirs[self.side].lock();
             dir.closed = true;
-            dir.waker = None;
-            std::mem::take(&mut dir.queue)
+            (dir.waker.take(), std::mem::take(&mut dir.queue))
         };
         drop(lost);
         let waker = {
@@ -186,5 +186,53 @@ impl End {
 impl std::fmt::Debug for End {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("End").field("side", &self.side).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Wake;
+
+    #[test]
+    fn receiver_replacement_and_close_release_wakers_outside_the_lock() {
+        struct CheckDrop(Weak<Cable>, usize, Arc<AtomicBool>);
+        impl Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("replacing or releasing a waiter must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(self.0.upgrade().unwrap().dirs[self.1].try_lock().is_some());
+                self.2.store(true, Ordering::SeqCst);
+            }
+        }
+        crate::block_on(crate::lab(crate::Seed::from_u64(0), |fcx| async move {
+            for close in [false, true] {
+                let (mut receiver, _sender) = pair();
+                let dropped = Arc::new(AtomicBool::new(false));
+                receiver.cable.dirs[receiver.side].lock().waker =
+                    Some(Waker::from(Arc::new(CheckDrop(
+                        Arc::downgrade(&receiver.cable),
+                        receiver.side,
+                        dropped.clone(),
+                    ))));
+                if close {
+                    drop(receiver);
+                } else {
+                    assert!(
+                        receiver
+                            .poll_recv(&fcx, &mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                }
+                assert!(dropped.load(Ordering::SeqCst));
+            }
+            Ok(())
+        }))
+        .unwrap();
     }
 }

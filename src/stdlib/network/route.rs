@@ -501,10 +501,12 @@ impl<C> Receiver<C> {
         if !s.queue.is_empty() || (s.closed && !closed) {
             return Poll::Ready(());
         }
-        match &s.waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => s.waker = Some(cx.waker().clone()),
-        }
+        let old = match &s.waker {
+            Some(w) if w.will_wake(cx.waker()) => None,
+            _ => s.waker.replace(cx.waker().clone()),
+        };
+        drop(s);
+        drop(old);
         Poll::Pending
     }
 }

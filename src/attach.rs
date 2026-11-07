@@ -357,7 +357,7 @@ impl Attachments {
             return Poll::Ready(Err(Cancelled));
         }
         let gone;
-        {
+        let old = {
             let mut state = self.hub.state.lock();
             gone = state.take_detached();
             if let Some(found) = state
@@ -371,10 +371,11 @@ impl Attachments {
                 return Poll::Ready(Ok(found));
             }
             match &state.waker {
-                Some(w) if w.will_wake(cx.waker()) => {}
-                _ => state.waker = Some(cx.waker().clone()),
+                Some(w) if w.will_wake(cx.waker()) => None,
+                _ => state.waker.replace(cx.waker().clone()),
             }
-        }
+        };
+        drop(old);
         // Dropped outside the lock: closing them frees their names, which
         // takes the lock.
         drop(gone);
@@ -390,8 +391,7 @@ impl Drop for Attachments {
         let pending = {
             let mut state = self.hub.state.lock();
             state.closed = true;
-            state.waker = None;
-            std::mem::take(&mut state.pending)
+            (state.waker.take(), std::mem::take(&mut state.pending))
         };
         drop(pending);
     }

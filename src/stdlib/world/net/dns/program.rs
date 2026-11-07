@@ -1031,7 +1031,9 @@ impl<T> Mailbox<T> {
         if slot.closed {
             return Poll::Ready(None);
         }
-        slot.waker = Some(cx.waker().clone());
+        let old = slot.waker.replace(cx.waker().clone());
+        drop(slot);
+        drop(old);
         Poll::Pending
     }
 

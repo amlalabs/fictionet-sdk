@@ -594,7 +594,8 @@ impl WakeHandle {
     }
 
     fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
-        *self.inner.waker.lock() = Some(cx.waker().clone());
+        let old = self.inner.waker.lock().replace(cx.waker().clone());
+        drop(old);
         if self.inner.woken.load(Ordering::Acquire) {
             Poll::Ready(())
         } else {
@@ -608,7 +609,57 @@ impl WakeHandle {
 
     fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
-        self.inner.waker.lock().take();
+        let old = self.inner.waker.lock().take();
+        drop(old);
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn service_waiter_replacement_and_close_release_wakers_outside_the_lock() {
+        struct CheckDrop(std::sync::Weak<WakeInner>, Arc<AtomicBool>);
+        impl Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("replacing or releasing a waiter must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(self.0.upgrade().unwrap().waker.try_lock().is_some());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        for close in [false, true] {
+            let handle = WakeHandle::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let waker = Waker::from(Arc::new(CheckDrop(
+                Arc::downgrade(&handle.inner),
+                dropped.clone(),
+            )));
+            assert!(handle.poll(&mut Context::from_waker(&waker)).is_pending());
+            drop(waker);
+            if close {
+                handle.close();
+                assert!(handle.is_closed());
+            } else {
+                assert!(
+                    handle
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                handle.wake();
+                assert!(
+                    handle
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                );
+                assert!(handle.take());
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+        }
     }
 }
 

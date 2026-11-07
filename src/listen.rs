@@ -695,7 +695,8 @@ impl SocketLink {
                     // Hand the connection to the helper thread, then read
                     // once more: a packet may have come in before the
                     // waker was in place.
-                    *self.slot.waker.lock() = Some(cx.waker().clone());
+                    let old = self.slot.waker.lock().replace(cx.waker().clone());
+                    drop(old);
                     registered = true;
                     if fcx.register_cancel(cx.waker(), &mut self.wait) {
                         return Poll::Ready(Err(RecvError::Cancelled));

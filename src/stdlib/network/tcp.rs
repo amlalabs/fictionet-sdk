@@ -2537,12 +2537,12 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
                 Poll::Pending => break,
             }
         }
-        let next = {
+        let (next, old_driver) = {
             let mut st = shared.state.lock();
-            match &st.driver {
-                Some(w) if w.will_wake(cx.waker()) => {}
-                _ => st.driver = Some(cx.waker().clone()),
-            }
+            let old_driver = match &st.driver {
+                Some(w) if w.will_wake(cx.waker()) => None,
+                _ => st.driver.replace(cx.waker().clone()),
+            };
             let now = smol_now(fcx);
             st.iface.poll_maintenance(now);
             received = batch.len();
@@ -2586,11 +2586,13 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
                 }
             }
             let at = st.iface.poll_at(now, &st.sockets);
-            [at, st.next_release, st.next_expiry()]
+            let next = [at, st.next_release, st.next_expiry()]
                 .into_iter()
                 .flatten()
-                .min()
+                .min();
+            (next, old_driver)
         };
+        drop(old_driver);
         for p in out.drain(..) {
             inner.send(Packet(p));
         }
@@ -2766,7 +2768,7 @@ impl Endpoint {
             if fcx.is_cancelled() {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
-            {
+            let old = {
                 let mut st = conn.shared.state.lock();
                 if st.stopped {
                     return Poll::Ready(Err(ConnError::Closed));
@@ -2782,7 +2784,8 @@ impl Endpoint {
                     }
                     _ => return Poll::Ready(Ok(())),
                 }
-            }
+            };
+            drop(old);
             if fcx.register_cancel(cx.waker(), &mut wait) {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
@@ -2866,7 +2869,7 @@ impl Listener {
             if fcx.is_cancelled() {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
-            {
+            let old = {
                 let mut st = shared.state.lock();
                 if st.stopped {
                     return Poll::Ready(Err(ConnError::Closed));
@@ -2894,10 +2897,11 @@ impl Listener {
                     }));
                 }
                 match &l.waker {
-                    Some(w) if w.will_wake(cx.waker()) => {}
-                    _ => l.waker = Some(cx.waker().clone()),
+                    Some(w) if w.will_wake(cx.waker()) => None,
+                    _ => l.waker.replace(cx.waker().clone()),
                 }
-            }
+            };
+            drop(old);
             if fcx.register_cancel(cx.waker(), wait) {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
@@ -3120,7 +3124,7 @@ impl Connection for TcpConnection {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
-        {
+        let old = {
             let mut st = self.shared.state.lock();
             if st.stopped {
                 return Poll::Ready(Err(ConnError::Closed));
@@ -3144,7 +3148,8 @@ impl Connection for TcpConnection {
                     return Poll::Ready(Err(st.closed_reason(h)));
                 }
             }
-        }
+        };
+        drop(old);
         if fcx.register_cancel(cx.waker(), &mut self.read_wait) {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
@@ -3160,7 +3165,7 @@ impl Connection for TcpConnection {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
-        {
+        let old = {
             let mut st = self.shared.state.lock();
             if st.stopped {
                 return Poll::Ready(Err(ConnError::Closed));
@@ -3187,7 +3192,8 @@ impl Connection for TcpConnection {
                 // The FIN went out already.
                 _ => return Poll::Ready(Err(ConnError::Closed)),
             }
-        }
+        };
+        drop(old);
         if fcx.register_cancel(cx.waker(), &mut self.write_wait) {
             return Poll::Ready(Err(ConnError::Cancelled));
         }

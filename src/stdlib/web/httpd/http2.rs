@@ -1253,7 +1253,9 @@ impl Pending for Sending {
                     .min(window.available.max(0) as usize)
                     .min(frame);
                 if n == 0 {
-                    window.waker = Some(cx.waker().clone());
+                    let old = window.waker.replace(cx.waker().clone());
+                    drop(send);
+                    drop(old);
                     return Poll::Pending;
                 }
                 window.available -= n as i32;

@@ -1058,7 +1058,10 @@ impl<'a> Socket<'a> {
     /// - The Waker is woken only once. Once woken, you must register it again to receive more wakes.
     /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `recv` has
     ///   necessarily changed.
-    pub fn register_recv_waker(&mut self, waker: &Waker) {
+    ///
+    /// Returns the displaced waker so an owner can drop it after unlocking.
+    #[must_use = "drop the displaced waker after releasing the socket lock"]
+    pub fn register_recv_waker(&mut self, waker: &Waker) -> Option<Waker> {
         self.rx_waker.register(waker)
     }
 
@@ -1075,7 +1078,10 @@ impl<'a> Socket<'a> {
     /// - The Waker is woken only once. Once woken, you must register it again to receive more wakes.
     /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `send` has
     ///   necessarily changed.
-    pub fn register_send_waker(&mut self, waker: &Waker) {
+    ///
+    /// Returns the displaced waker so an owner can drop it after unlocking.
+    #[must_use = "drop the displaced waker after releasing the socket lock"]
+    pub fn register_send_waker(&mut self, waker: &Waker) -> Option<Waker> {
         self.tx_waker.register(waker)
     }
 

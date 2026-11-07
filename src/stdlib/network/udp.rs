@@ -370,7 +370,7 @@ impl Socket {
             if fcx.is_cancelled() {
                 return Poll::Ready(Err(RecvError::Cancelled));
             }
-            {
+            let old = {
                 let mut st = shared.state.lock();
                 let stopped = st.stopped;
                 let q = st
@@ -385,10 +385,11 @@ impl Socket {
                     return Poll::Ready(Err(RecvError::Closed));
                 }
                 match &q.waker {
-                    Some(w) if w.will_wake(cx.waker()) => {}
-                    _ => q.waker = Some(cx.waker().clone()),
+                    Some(w) if w.will_wake(cx.waker()) => None,
+                    _ => q.waker.replace(cx.waker().clone()),
                 }
-            }
+            };
+            drop(old);
             if fcx.register_cancel(cx.waker(), wait) {
                 return Poll::Ready(Err(RecvError::Cancelled));
             }

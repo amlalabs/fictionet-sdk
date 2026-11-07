@@ -428,12 +428,12 @@ impl RunState {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result> {
         let mut turn = std::mem::take(&mut self.turn);
         debug_assert!(turn.is_empty());
-        {
+        let old = {
             let mut q = self.shared.queue.lock();
-            match &q.outer {
-                Some(w) if w.will_wake(cx.waker()) => {}
-                _ => q.outer = Some(cx.waker().clone()),
-            }
+            let old = match &q.outer {
+                Some(w) if w.will_wake(cx.waker()) => None,
+                _ => q.outer.replace(cx.waker().clone()),
+            };
             q.polling = true;
             std::mem::swap(&mut q.incoming, &mut self.incoming);
             for new in self.incoming.drain(..) {
@@ -467,7 +467,9 @@ impl RunState {
                 }
             }
             std::mem::swap(&mut q.ready, &mut turn);
-        }
+            old
+        };
+        drop(old);
 
         while let Some(id) = turn.pop_front() {
             let Some(slot) = self.slots.get_mut(&id) else {
@@ -566,12 +568,12 @@ impl RunState {
 
 impl Drop for RunState {
     fn drop(&mut self) {
-        let incoming = {
+        let (incoming, outer) = {
             let mut q = self.shared.queue.lock();
             q.closed = true;
-            q.outer = None;
-            std::mem::take(&mut q.incoming)
+            (std::mem::take(&mut q.incoming), q.outer.take())
         };
+        drop(outer);
         // The dropped work, as its region and joiner see it ending.
         let ended: Vec<(Arc<Region>, Arc<JoinState>)> = incoming
             .iter()
@@ -626,6 +628,48 @@ mod tests {
     use super::*;
     use crate::time::ms;
     use crate::{Cancelled, block_on};
+
+    #[test]
+    fn outer_waiter_replacement_and_close_release_wakers_outside_the_lock() {
+        struct CheckDrop(Weak<RunShared>, Arc<AtomicBool>);
+        impl Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("replacing or releasing a waiter must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(self.0.upgrade().unwrap().queue.try_lock().is_some());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        for close in [false, true] {
+            let shared = RunShared::new(Seed::from_u64(0), crate::RunMode::Real);
+            let root = Region::root(Arc::downgrade(&shared));
+            let mut state = RunState {
+                shared: shared.clone(),
+                root,
+                slots: BTreeMap::new(),
+                turn: VecDeque::new(),
+                incoming: Vec::new(),
+            };
+            let dropped = Arc::new(AtomicBool::new(false));
+            shared.queue.lock().outer = Some(Waker::from(Arc::new(CheckDrop(
+                Arc::downgrade(&shared),
+                dropped.clone(),
+            ))));
+            if close {
+                drop(state);
+            } else {
+                assert!(
+                    state
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                );
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
 
     /// A `Cx::idle` polled outside the run, as by a harness that keeps a
     /// clone of the world's `Cx`, is woken when the run goes idle. The lab

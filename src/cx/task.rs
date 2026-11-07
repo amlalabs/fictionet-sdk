@@ -76,11 +76,12 @@ impl Task {
             if fcx.is_cancelled() {
                 return Poll::Ready(Err(JoinError::Cancelled));
             }
-            match &state.waker {
-                Some(w) if w.will_wake(cx.waker()) => {}
-                _ => state.waker = Some(cx.waker().clone()),
-            }
+            let old = match &state.waker {
+                Some(w) if w.will_wake(cx.waker()) => None,
+                _ => state.waker.replace(cx.waker().clone()),
+            };
             drop(state);
+            drop(old);
             if fcx.register_cancel(cx.waker(), &mut wait) {
                 return Poll::Ready(Err(JoinError::Cancelled));
             }
@@ -112,5 +113,51 @@ impl JoinState {
         if let Some(w) = waker {
             w.wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::Weak;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Wake};
+
+    #[test]
+    fn join_waiter_replacement_releases_wakers_outside_the_lock() {
+        struct CheckDrop(Weak<JoinState>, Arc<AtomicBool>);
+        impl Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("replacing or releasing a waiter must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(self.0.upgrade().unwrap().state.try_lock().is_some());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        crate::block_on(crate::lab(crate::Seed::from_u64(0), |fcx| async move {
+            let join = Arc::new(JoinState::default());
+            let dropped = Arc::new(AtomicBool::new(false));
+            join.state.lock().waker = Some(Waker::from(Arc::new(CheckDrop(
+                Arc::downgrade(&join),
+                dropped.clone(),
+            ))));
+            let task = Task { join: join.clone() };
+            let mut future = std::pin::pin!(task.join(&fcx));
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(dropped.load(Ordering::SeqCst));
+            join.finish(Ok(()));
+            assert!(future.await.is_ok());
+            Ok(())
+        }))
+        .unwrap();
     }
 }

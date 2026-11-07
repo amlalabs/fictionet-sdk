@@ -201,7 +201,9 @@ impl Region {
             state.completed = true;
             Poll::Ready(())
         } else {
-            state.done = Some(cx.waker().clone());
+            let old = state.done.replace(cx.waker().clone());
+            drop(state);
+            drop(old);
             Poll::Pending
         }
     }
@@ -218,6 +220,47 @@ mod tests {
     use crate::{Cancelled, Cx, JoinError, block_on, run};
     use std::future::{Future, poll_fn};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn completion_waiter_replacement_releases_wakers_outside_the_lock() {
+        struct CheckDrop(Weak<Region>, Arc<AtomicBool>);
+        impl std::task::Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("replacing or releasing a waiter must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(self.0.upgrade().unwrap().state.try_lock().is_some());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let region = Region::root(Weak::new());
+        assert!(region.try_start_task());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(CheckDrop(
+            Arc::downgrade(&region),
+            dropped.clone(),
+        )));
+        assert!(
+            region
+                .poll_done(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        assert!(
+            region
+                .poll_done(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        region.task_done(false);
+        assert!(
+            region
+                .poll_done(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    }
 
     #[test]
     fn cancellation_registration_releases_wakers_outside_the_lock() {
