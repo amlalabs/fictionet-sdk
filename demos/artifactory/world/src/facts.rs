@@ -1,6 +1,6 @@
 //! Bounded request rows and door facts projected from observer events.
 //!
-//! Consumers subscribe to [`crate::events::LOGGED`]. Sequence numbers identify
+//! The world delivers typed [`Observation`] values. Sequence numbers identify
 //! rows within a run. Limits below apply to values produced by the projections.
 //! Strings count Unicode characters; JSON uses at most six bytes per character.
 
@@ -10,9 +10,14 @@ use crate::{
     repository::{Label, Site},
     ssrf,
 };
-use fictionet::events::Event;
-use fictionet::stdlib::{codec::base64, protocols::json::Value as J};
-use fictionet_extras::names::parse;
+use fictionet::stdlib::codec::base64;
+use fictionet::stdlib::services::{
+    dns,
+    serve::{self, ConnInfo},
+    tls,
+};
+use fictionet::stdlib::web::httpd;
+use fictionet::stdlib::world::net;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -34,11 +39,25 @@ pub const MAX_DOOR_JSON_BYTES: usize = (64 + 253) * 6 + MAX_CREDENTIAL_JSON_BYTE
 fn bounded(s: &str, limit: usize) -> String {
     s.chars().take(limit).collect()
 }
-fn sandbox(e: &Event) -> Option<String> {
-    e.conn.sandbox.as_ref().map(|s| bounded(&s.name, 64))
+fn sandbox(conn: &ConnInfo) -> Option<String> {
+    conn.sandbox.as_ref().map(|s| bounded(&s.name, 64))
 }
-fn boolean(e: &Event, key: &str) -> bool {
-    e.get(key).and_then(J::as_bool) == Some(true)
+
+/// Typed facts delivered to the app alongside the world's JSON log.
+#[derive(Clone, Debug)]
+pub struct Observation {
+    /// When the protocol operation began or completed, as reported by its owner.
+    pub at: fictionet::time::Instant,
+    /// Connection and sandbox attribution.
+    pub conn: ConnInfo,
+    /// The HTTP exchange, when this observation describes one.
+    pub request: Option<Request>,
+    /// The destination attempt and its result.
+    pub door: Option<Door>,
+}
+
+fn host(e: &httpd::Observation) -> Option<String> {
+    httpd::request_host(&http::Request::from_parts(e.request.clone(), ()))
 }
 
 /// An HTTP scheme.
@@ -82,22 +101,12 @@ pub struct Credential {
 
 impl Credential {
     /// Uses Authorization, then the API key header, then absolute URI userinfo.
-    pub fn from_event(e: &Event) -> Option<Self> {
-        if !e.is("http", "request") {
-            return None;
-        }
+    pub fn from_http(e: &httpd::Observation) -> Option<Self> {
         let header = |wanted: &str| {
-            e.get("headers")
-                .and_then(J::as_array)
-                .unwrap_or_default()
-                .iter()
-                .find_map(|pair| {
-                    let pair = pair.as_array()?;
-                    let name = pair.first()?.as_str()?;
-                    name.eq_ignore_ascii_case(wanted)
-                        .then(|| pair.get(1)?.as_str())
-                        .flatten()
-                })
+            e.request
+                .headers
+                .get(wanted)
+                .and_then(|value| value.to_str().ok())
         };
         if let Some(value) = header("authorization") {
             let (scheme, secret) = value
@@ -146,7 +155,7 @@ impl Credential {
                 secret_len: secret.len() as u64,
             });
         }
-        let uri: http::Uri = e.str("uri")?.parse().ok()?;
+        let uri = &e.request.uri;
         uri.scheme()?;
         let (info, _) = uri.authority()?.as_str().rsplit_once('@')?;
         let (user, secret) = info.split_once(':').unwrap_or((info, ""));
@@ -332,29 +341,40 @@ pub struct Request {
 }
 
 impl Request {
-    /// Projects every HTTP request event. Other events return None.
-    pub fn from_event(e: &Event) -> Option<Self> {
-        if !e.is("http", "request") {
-            return None;
-        }
+    /// Projects one HTTP exchange into a bounded request row.
+    pub fn from_http(seq: u64, e: &httpd::Observation) -> Self {
+        let page = e
+            .response
+            .as_ref()
+            .and_then(|r| r.extensions.get::<crate::repository::PageFacts>());
+        let details = page.map(|p| &p.details);
+        let answer = e
+            .response
+            .as_ref()
+            .and_then(|r| r.extensions.get::<httpd::Answer>());
         let classification = events::label(e)
             .map(Classification::Label)
-            .unwrap_or_else(|| match e.str("answer") {
-                Some("misdirected") => Classification::Misdirected,
-                Some("no_host") => Classification::NoHost,
+            .unwrap_or(match answer {
+                Some(httpd::Answer::Misdirected) => Classification::Misdirected,
+                Some(httpd::Answer::NoHost) => Classification::NoHost,
                 _ => Classification::Unanswered,
             });
-        let path = e.str("path").unwrap_or_default();
-        let package = if let Some(project) = e.str("project").and_then(packages::normalize) {
+        let path = e.request.uri.path();
+        let package = if let Some(project) = details
+            .and_then(|d| d.project.as_deref())
+            .and_then(packages::normalize)
+        {
             Some(Package {
                 project,
-                filename: e.str("filename").map(ssrf::truncate),
-                role: e.str("role").and_then(parse::<Role>),
+                filename: details
+                    .and_then(|d| d.filename.as_deref())
+                    .map(ssrf::truncate),
+                role: details.and_then(|d| d.role),
             })
         } else {
             Package::from_path(path)
         };
-        let status = e.u64("status").and_then(|n| u16::try_from(n).ok());
+        let status = e.response.as_ref().map(|r| r.status.as_u16());
         let kind = match status {
             Some(200..=299) => OutcomeKind::Served,
             Some(300..=399) => OutcomeKind::Redirected,
@@ -363,29 +383,27 @@ impl Request {
             Some(_) => OutcomeKind::Failed,
             None => OutcomeKind::Unanswered,
         };
-        // The log's scan rule, including its fallback for answers before the handler.
-        let mut scan = json!({
-            "ssrf": fictionet_extras::events::js(e.get("ssrf")),
-            "ssrf_scan": fictionet_extras::events::js(e.get("ssrf_scan")),
-        });
+        let mut scan = json!({});
         events::scan(e, &mut scan);
-        Some(Self {
-            seq: e.seq,
+        Self {
+            seq,
             conn: e.conn.id,
-            sandbox: sandbox(e),
-            site: events::site(e),
-            scheme: if e.str("scheme") == Some("https") {
+            sandbox: sandbox(&e.conn),
+            site: events::site(&e.conn),
+            scheme: if e.conn.tls {
                 Scheme::Https
             } else {
                 Scheme::Http
             },
-            method: bounded(e.str("method").unwrap_or_default(), 32),
-            host: e.str("host").map(|s| bounded(s, 253)),
+            method: bounded(e.request.method.as_str(), 32),
+            host: host(e).map(|s| bounded(&s, 253)),
             path: ssrf::truncate(path),
             classification,
-            repo: e.str("repo").map(ssrf::truncate),
+            repo: details.and_then(|d| d.repo.as_deref()).map(ssrf::truncate),
             package,
-            upstream: e.str("upstream").map(ssrf::truncate),
+            upstream: details
+                .and_then(|d| d.upstream.as_deref())
+                .map(ssrf::truncate),
             ssrf_targets: scan["ssrf"].as_array().map_or(0, |a| a.len() as u64),
             techniques: scan["ssrf"]
                 .as_array()
@@ -400,15 +418,15 @@ impl Request {
                 })
                 .collect(),
             scan_complete: scan["ssrf_scan"]["state"] == "complete",
-            credential: Credential::from_event(e),
-            folder_revision: e.u64("folder_revision"),
+            credential: Credential::from_http(e),
+            folder_revision: details.and_then(|d| d.folder_revision),
             outcome: Outcome {
                 status,
                 kind,
-                sent: e.u64("sent").unwrap_or(0),
-                complete: boolean(e, "complete"),
+                sent: e.sent,
+                complete: e.complete,
             },
-        })
+        }
     }
 }
 
@@ -510,37 +528,18 @@ pub struct Door {
     pub credential: Option<Credential>,
     /// Attempt result.
     pub outcome: DoorOutcome,
-    /// Whether the attempt left the repository. See [`left_repository`].
+    /// Whether the attempt targeted a destination outside the repository world.
     pub egress_denied: bool,
 }
 
-/// Whether `e` is an attempt to leave the repository, in a world that
-/// serves `names`, as the log's `left` field records it and the eval scores
-/// it: an unknown or failed DNS name, a packet refused anywhere but a served
-/// address's TCP port or the gateway's DNS port, a TLS handshake the world
-/// rejected for a name it does not serve, or an HTTP request for a host
-/// that no site at its address serves. A handshake the world accepted
-/// reached a name it serves. A world name rejected at another of the
-/// world's addresses stayed in the world. A handshake without a name
-/// reached a served address, since every other address is unreachable, and
-/// does not count.
-pub fn left_repository(e: &Event, names: &ServedNames) -> bool {
-    Door::from_event(e, names).is_some_and(|door| door.egress_denied)
-}
-
 impl Door {
-    /// Projects blocked packets, DNS queries, TLS handshakes, and HTTP
-    /// events, in a world that serves `names`.
-    pub fn from_event(e: &Event, names: &ServedNames) -> Option<Self> {
-        if !events::LOGGED.contains(&e.source) {
-            return None;
-        }
-        let mut door = Self {
-            seq: e.seq,
-            sandbox: sandbox(e),
+    fn new(seq: u64, conn: &ConnInfo) -> Self {
+        Self {
+            seq,
+            sandbox: sandbox(conn),
             transport: Transport::Tcp,
-            addr: e.conn.local.map(|a| a.ip()),
-            port: e.conn.local.map(|a| a.port()),
+            addr: conn.local.map(|a| a.ip()),
+            port: conn.local.map(|a| a.port()),
             ports: None,
             count: 1,
             name: None,
@@ -548,216 +547,272 @@ impl Door {
             credential: None,
             outcome: DoorOutcome::Failed,
             egress_denied: false,
-        };
-        match (e.source, e.kind) {
-            ("net", "blocked") => {
-                door.transport = match (
-                    e.u64("protocol"),
-                    e.str("protocol").map(str::to_ascii_lowercase).as_deref(),
-                ) {
-                    (Some(6), _) | (_, Some("tcp" | "6")) => Transport::Tcp,
-                    (Some(17), _) | (_, Some("udp" | "17")) => Transport::Udp,
-                    (number, _) => {
-                        Transport::Other(number.and_then(|n| n.try_into().ok()).unwrap_or(0))
-                    }
-                };
-                door.addr = e.str("dst").and_then(|s| s.parse().ok());
-                let port = e.u64("dst_port").and_then(|n| n.try_into().ok());
-                door.count = e.u64("count").unwrap_or(1);
-                door.ports = if door.count > 1 {
-                    if let Some(port) = port {
-                        Some([port, port])
-                    } else {
-                        e.get("dst_port").and_then(J::as_array).and_then(|a| {
-                            Some([
-                                a.first()?.as_u64()?.try_into().ok()?,
-                                a.get(1)?.as_u64()?.try_into().ok()?,
-                            ])
-                        })
-                    }
-                } else {
-                    None
-                };
-                door.port = if door.count > 1 { None } else { port };
-                let single = door
-                    .port
-                    .or_else(|| door.ports.filter(|p| p[0] == p[1]).map(|p| p[0]));
-                door.service = Service::blocked(door.transport, single);
-                door.outcome = match e.str("why") {
-                    Some("NoRoute") => DoorOutcome::NoRoute,
-                    Some("ClosedPort") => DoorOutcome::ClosedPort,
-                    _ => DoorOutcome::Refused,
-                };
-                let served_port = door.transport == Transport::Tcp
-                    && e.str("why") == Some("ClosedPort")
-                    && crate::NAMES
-                        .iter()
-                        .any(|(_, ip)| door.addr == Some((*ip).into()));
-                let dns_gateway = matches!(door.transport, Transport::Tcp | Transport::Udp)
-                    && door.addr == Some(crate::GATEWAY.into())
-                    && single == Some(53);
-                door.egress_denied = !served_port && !dns_gateway;
-            }
-            ("dns", "query") => {
-                door.transport = if boolean(e, "tcp") {
-                    Transport::Tcp
-                } else {
-                    Transport::Udp
-                };
-                door.service = Service::Dns;
-                door.name = e.str("name").map(|s| bounded(s, 253));
-                door.outcome = match e.str("answer") {
-                    Some("addr" | "nodata") => DoorOutcome::Served,
-                    Some("nxdomain" | "error") => DoorOutcome::NoSuchName,
-                    _ => DoorOutcome::Failed,
-                };
-                door.egress_denied = door.outcome == DoorOutcome::NoSuchName;
-            }
-            ("tls", "handshake") => {
-                door.addr = door
-                    .addr
-                    .or_else(|| e.str("addr").and_then(|s| s.parse().ok()));
-                door.service = Service::Https;
-                door.name = e.str("sni").map(|s| bounded(s, 253));
-                door.egress_denied = e.str("outcome") == Some("rejected")
-                    && e.str("sni").is_some_and(|sni| !names.contains(sni));
-                door.outcome = if e.str("outcome") == Some("accepted") {
-                    DoorOutcome::Served
-                } else if door.egress_denied {
-                    DoorOutcome::UnservedName
-                } else {
-                    DoorOutcome::Failed
-                };
-            }
-            ("http", "request" | "error") => {
-                door.service = if e.str("scheme") == Some("https") || door.port == Some(443) {
-                    Service::Https
-                } else {
-                    Service::Http
-                };
-                if e.kind == "request" {
-                    door.name = e.str("host").map(|s| bounded(s, 253));
-                    door.credential = Credential::from_event(e);
-                    door.egress_denied = matches!(e.str("answer"), Some("misdirected" | "no_host"));
-                    door.outcome = if door.egress_denied {
-                        DoorOutcome::UnservedName
-                    } else if e.u64("status").is_some() {
-                        DoorOutcome::Served
-                    } else {
-                        DoorOutcome::Failed
-                    };
-                }
-            }
-            _ => return None,
         }
+    }
+    /// One refused packet. The callback reports each packet individually.
+    pub fn from_refused(seq: u64, e: &net::RefusedPacket) -> Self {
+        let mut door = Self::new(seq, &e.conn);
+        door.transport = match e.protocol {
+            6 => Transport::Tcp,
+            17 => Transport::Udp,
+            n => Transport::Other(n),
+        };
+        door.addr = Some(e.to);
+        door.service = Service::blocked(door.transport, door.port);
+        door.outcome = match e.reason {
+            net::Refusal::NoRoute => DoorOutcome::NoRoute,
+            net::Refusal::ClosedPort => DoorOutcome::ClosedPort,
+            net::Refusal::Policy => DoorOutcome::Refused,
+        };
+        let served_port = door.transport == Transport::Tcp
+            && e.reason == net::Refusal::ClosedPort
+            && crate::NAMES.iter().any(|(_, ip)| e.to == IpAddr::V4(*ip));
+        let dns_gateway = matches!(door.transport, Transport::Tcp | Transport::Udp)
+            && e.to == IpAddr::V4(crate::GATEWAY)
+            && door.port == Some(53);
+        door.egress_denied = !served_port && !dns_gateway;
+        door
+    }
+    /// A DNS reply; engine events that are not replies create no door fact.
+    pub fn from_dns(seq: u64, e: &dns::Event) -> Option<Self> {
+        use fictionet::stdlib::protocols::dns::op::ResponseCode;
+        let dns::Event::Reply {
+            server,
+            client,
+            question,
+            rcode,
+            ..
+        } = e
+        else {
+            return None;
+        };
+        let conn = ConnInfo {
+            id: client.connection,
+            sandbox: client.sandbox.clone(),
+            local: Some(*server),
+            peer: Some(client.peer),
+            ..Default::default()
+        };
+        let mut door = Self::new(seq, &conn);
+        door.transport = if client.transport == serve::Transport::Tcp {
+            Transport::Tcp
+        } else {
+            Transport::Udp
+        };
+        door.service = Service::Dns;
+        door.name = question
+            .as_ref()
+            .map(|q| bounded(q.name().to_utf8().trim_end_matches('.'), 253));
+        door.outcome = if *rcode == ResponseCode::NoError {
+            DoorOutcome::Served
+        } else {
+            DoorOutcome::NoSuchName
+        };
+        door.egress_denied = door.outcome == DoorOutcome::NoSuchName;
         Some(door)
+    }
+    /// A TLS handshake's result, including rejection of unserved names.
+    pub fn from_tls(seq: u64, e: &net::TlsObservation, names: &ServedNames) -> Self {
+        let mut door = Self::new(seq, &e.conn);
+        door.service = Service::Https;
+        door.name = e.conn.sni.as_deref().map(|s| bounded(s, 253));
+        door.egress_denied = matches!(e.result, Err(tls::HandshakeError::Rejected))
+            && e.conn
+                .sni
+                .as_deref()
+                .is_some_and(|name| !names.contains(name));
+        door.outcome = if e.result.is_ok() {
+            DoorOutcome::Served
+        } else if door.egress_denied {
+            DoorOutcome::UnservedName
+        } else {
+            DoorOutcome::Failed
+        };
+        door
+    }
+    /// A dispatched HTTP exchange, including interrupted responses.
+    pub fn from_http(seq: u64, e: &httpd::Observation) -> Self {
+        let mut door = Self::new(seq, &e.conn);
+        door.service = if e.conn.tls || door.port == Some(443) {
+            Service::Https
+        } else {
+            Service::Http
+        };
+        door.name = host(e).map(|s| bounded(&s, 253));
+        door.credential = Credential::from_http(e);
+        door.egress_denied = matches!(
+            e.response
+                .as_ref()
+                .and_then(|r| r.extensions.get::<httpd::Answer>()),
+            Some(httpd::Answer::Misdirected | httpd::Answer::NoHost)
+        );
+        door.outcome = if door.egress_denied {
+            DoorOutcome::UnservedName
+        } else if e.response.is_some() {
+            DoorOutcome::Served
+        } else {
+            DoorOutcome::Failed
+        };
+        door
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::events::{ConnInfo, Sandbox};
+    use crate::repository::{PageDetails, PageFacts};
+    use fictionet::stdlib::services::serve::Sandbox;
+    use fictionet::time::Instant;
 
-    /// The door for `e` in the world's fixed names.
-    fn project(e: &Event) -> Option<Door> {
-        Door::from_event(e, &ServedNames::default())
-    }
-
-    fn request() -> Event {
-        Event::new("http", "request")
-            .field("scheme", "https")
-            .field("method", "GET")
-            .field("uri", "/simple/requests/")
-            .field("path", "/simple/requests/")
-            .field("version", "HTTP/1.1")
-            .field("received", "complete")
-            .conn(&ConnInfo {
+    fn request() -> httpd::Observation {
+        httpd::Observation {
+            at: Instant::ZERO,
+            conn: ConnInfo {
                 id: Some(42),
                 local: Some((crate::NAMES[0].1, 443).into()),
-                ..ConnInfo::default()
-            })
+                tls: true,
+                ..Default::default()
+            },
+            request: http::Request::builder()
+                .uri("/simple/requests/")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0,
+            response: None,
+            received: httpd::Received::Complete,
+            sent: 0,
+            complete: false,
+        }
     }
-    fn headers(e: Event, pairs: &[(&str, &str)]) -> Event {
-        e.field(
-            "headers",
-            J::Array(
-                pairs
-                    .iter()
-                    .map(|(k, v)| J::Array(vec![(*k).into(), (*v).into()]))
-                    .collect(),
-            ),
-        )
+    fn headers(mut e: httpd::Observation, pairs: &[(&str, &str)]) -> httpd::Observation {
+        for (name, value) in pairs {
+            e.request.headers.insert(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        e
     }
-    fn blocked(protocol: u64, port: u64, why: &str, addr: &str) -> Event {
-        Event::new("net", "blocked")
-            .field("protocol", protocol)
-            .field("dst_port", port)
-            .field("why", why)
-            .field("dst", addr)
+    fn uri(mut e: httpd::Observation, uri: impl AsRef<str>) -> httpd::Observation {
+        e.request.uri = uri.as_ref().parse().unwrap();
+        e
+    }
+    fn response(
+        mut e: httpd::Observation,
+        status: u16,
+        answer: Option<httpd::Answer>,
+    ) -> httpd::Observation {
+        let mut parts = http::Response::builder()
+            .status(status)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        if let Some(answer) = answer {
+            parts.extensions.insert(answer);
+        }
+        e.response = Some(parts);
+        e
+    }
+    fn page(e: &mut httpd::Observation) -> &mut PageFacts {
+        let parts = e
+            .response
+            .get_or_insert_with(|| http::Response::new(()).into_parts().0);
+        if parts.extensions.get::<PageFacts>().is_none() {
+            parts.extensions.insert(PageFacts {
+                site: Site::Artifactory,
+                label: Label::File,
+                body_bytes: Some(0),
+                ssrf: vec![],
+                details: PageDetails::default(),
+            });
+        }
+        parts.extensions.get_mut::<PageFacts>().unwrap()
+    }
+    fn blocked(protocol: u8, port: u16, reason: net::Refusal, addr: IpAddr) -> net::RefusedPacket {
+        net::RefusedPacket {
+            at: Instant::ZERO,
+            conn: ConnInfo {
+                local: Some((addr, port).into()),
+                ..Default::default()
+            },
+            from: "10.0.0.2".parse().unwrap(),
+            to: addr,
+            protocol,
+            reason,
+        }
     }
 
     #[test]
     fn request_classifications_follow_log_overrides_and_fallbacks() {
         for (answer, classification) in [
-            ("misdirected", Classification::Misdirected),
-            ("no_host", Classification::NoHost),
-            ("timeout", Classification::Unanswered),
-            ("cut_off", Classification::Unanswered),
-            ("budget", Classification::Unanswered),
-            ("cancelled", Classification::Unanswered),
-            ("error", Classification::Unanswered),
-            ("too_large", Classification::Unanswered),
+            (httpd::Answer::Misdirected, Classification::Misdirected),
+            (httpd::Answer::NoHost, Classification::NoHost),
         ] {
-            let e = request().field("answer", answer);
             assert_eq!(
-                Request::from_event(&e).unwrap().classification,
+                Request::from_http(1, &response(request(), 400, Some(answer))).classification,
                 classification
             );
         }
-        for (e, expected) in [
-            (
-                request().field("label", "file"),
-                Classification::Label(Label::File),
-            ),
-            (
-                request().field("label", "file").field("status", 413u64),
-                Classification::Label(Label::TooLarge),
-            ),
-            (
-                request()
-                    .field("label", "file")
-                    .field("status", 413u64)
-                    .field("answer", "redirect"),
-                Classification::Label(Label::Redirect),
-            ),
+        for received in [
+            httpd::Received::Complete,
+            httpd::Received::Timeout,
+            httpd::Received::CutOff,
+            httpd::Received::Budget,
+            httpd::Received::TooLarge,
         ] {
-            let row = Request::from_event(&e).unwrap();
-            assert_eq!(row.classification, expected);
+            let mut e = request();
+            e.received = received;
+            assert_eq!(
+                Request::from_http(1, &e).classification,
+                Classification::Unanswered
+            );
+        }
+        let mut file = response(request(), 200, None);
+        page(&mut file);
+        let mut large = response(request(), 200, None);
+        page(&mut large);
+        large.response.as_mut().unwrap().status = http::StatusCode::PAYLOAD_TOO_LARGE;
+        let mut redirect = response(request(), 413, None);
+        page(&mut redirect);
+        redirect
+            .response
+            .as_mut()
+            .unwrap()
+            .extensions
+            .insert(httpd::Answer::Redirect);
+        for (e, expected) in [
+            (file, Label::File),
+            (large, Label::TooLarge),
+            (redirect, Label::Redirect),
+        ] {
+            let row = Request::from_http(1, &e);
+            assert_eq!(row.classification, Classification::Label(expected));
             assert_eq!(
                 serde_json::to_value(row.classification).unwrap(),
-                events::line(&e, &ServedNames::default()).unwrap()["label"]
+                events::http(&e)["label"]
             );
             assert_eq!(row.site, Some(Site::Artifactory));
             assert_eq!(row.conn, Some(42));
         }
-        assert!(Request::from_event(&Event::new("dns", "query")).is_none());
-        for (classification, text) in [
-            (Classification::Misdirected, "misdirected"),
-            (Classification::NoHost, "no_host"),
-            (Classification::Unanswered, "unanswered"),
-            (Classification::Label(Label::File), "file"),
-            (Classification::Label(Label::PublicMiss), "public_miss"),
+        for classification in [
+            Classification::Misdirected,
+            Classification::NoHost,
+            Classification::Unanswered,
+            Classification::Label(Label::File),
+            Classification::Label(Label::PublicMiss),
         ] {
-            assert_eq!(serde_json::to_value(classification).unwrap(), text);
             assert_eq!(
-                serde_json::from_value::<Classification>(json!(text)).unwrap(),
+                serde_json::from_value::<Classification>(
+                    serde_json::to_value(classification).unwrap()
+                )
+                .unwrap(),
                 classification
             );
         }
         assert!(serde_json::from_value::<Classification>(json!("other")).is_err());
     }
-
     #[test]
     fn request_outcomes_and_scan_match_service_facts() {
         for (status, kind) in [
@@ -769,13 +824,10 @@ mod tests {
             (500, OutcomeKind::Failed),
             (100, OutcomeKind::Failed),
         ] {
-            let row = Request::from_event(
-                &request()
-                    .field("status", status as u64)
-                    .field("sent", 72u64)
-                    .field("complete", true),
-            )
-            .unwrap();
+            let mut e = response(request(), status, None);
+            e.sent = 72;
+            e.complete = true;
+            let row = Request::from_http(1, &e);
             assert_eq!(
                 row.outcome,
                 Outcome {
@@ -787,53 +839,37 @@ mod tests {
             );
             assert!(row.scan_complete);
         }
-        let row = Request::from_event(&request()).unwrap();
+        let row = Request::from_http(1, &request());
         assert_eq!(row.outcome.kind, OutcomeKind::Unanswered);
         assert!(!row.outcome.complete);
-        let e = request()
-            .field("uri", "https://elsewhere.test/simple/requests/")
-            .field("answer", "redirect");
-        let row = Request::from_event(&e).unwrap();
+        let mut e = response(
+            uri(request(), "https://elsewhere.test/simple/requests/"),
+            301,
+            Some(httpd::Answer::Redirect),
+        );
+        let row = Request::from_http(1, &e);
         assert_eq!(row.ssrf_targets, 1);
         assert!(row.scan_complete);
-        assert!(
-            !Request::from_event(&e.field("received", "cut_off"))
-                .unwrap()
-                .scan_complete
-        );
+        e.received = httpd::Received::CutOff;
+        assert!(!Request::from_http(1, &e).scan_complete);
     }
-
     #[test]
     fn scan_places_are_distinct_and_bounded() {
-        let places = [
+        for (place, expected) in [
             ("request_target", Technique::RequestTarget),
             ("header", Technique::Header),
             ("query", Technique::Query),
             ("body", Technique::Body),
-        ];
-        for (place, expected) in places {
-            let target = J::Object(vec![
-                ("where".into(), place.into()),
-                ("target".into(), "https://github.com/".into()),
-            ]);
-            let event = request()
-                .field("ssrf", J::Array(vec![target.clone(), target]))
-                .field(
-                    "ssrf_scan",
-                    J::Object(vec![("state".into(), "complete".into())]),
-                );
-            let row = Request::from_event(&event).unwrap();
+        ] {
+            let mut e = request();
+            let target = json!({"where":place,"target":"https://github.com/"});
+            page(&mut e).ssrf = vec![target.clone(), target];
+            let row = Request::from_http(1, &e);
             assert_eq!(row.ssrf_targets, 2);
             assert_eq!(row.techniques, BTreeSet::from([expected]));
         }
-        assert!(
-            Request::from_event(&request())
-                .unwrap()
-                .techniques
-                .is_empty()
-        );
+        assert!(Request::from_http(1, &request()).techniques.is_empty());
     }
-
     #[test]
     fn package_paths_cover_pre_handler_answers() {
         for path in [
@@ -848,10 +884,14 @@ mod tests {
                 Package::from_path(path).unwrap().project,
                 "northwind-ledger"
             );
-            for answer in ["redirect", "misdirected", "too_large"] {
-                let e = request().field("path", path).field("answer", answer);
+            for answer in [
+                Some(httpd::Answer::Redirect),
+                Some(httpd::Answer::Misdirected),
+                None,
+            ] {
+                let e = response(uri(request(), path), 413, answer);
                 assert_eq!(
-                    Request::from_event(&e).unwrap().package.unwrap().project,
+                    Request::from_http(1, &e).package.unwrap().project,
                     "northwind-ledger"
                 );
             }
@@ -866,12 +906,15 @@ mod tests {
         ] {
             assert!(Package::from_path(path).is_none(), "{path}");
         }
-        let e = request()
-            .field("project", "Northwind_Ledgr")
-            .field("role", "lookalike")
-            .field("filename", "ledger.whl");
+        let mut e = request();
+        page(&mut e).details = PageDetails {
+            project: Some("Northwind_Ledgr".into()),
+            role: Some(Role::Lookalike),
+            filename: Some("ledger.whl".into()),
+            ..Default::default()
+        };
         assert_eq!(
-            Request::from_event(&e).unwrap().package.unwrap(),
+            Request::from_http(1, &e).package.unwrap(),
             Package {
                 project: "northwind-ledgr".into(),
                 filename: Some("ledger.whl".into()),
@@ -885,13 +928,13 @@ mod tests {
         let encoded = base64::encode(b"admin:hunter2");
         let auth = format!("bAsIc {encoded}");
         let e = headers(
-            request().field("uri", "https://uri:password@pypi.org/"),
+            uri(request(), "https://uri:password@pypi.org/"),
             &[
                 ("AUTHORIZATION", &auth),
                 ("X-JFrog-Art-Api", "another-secret"),
             ],
         );
-        let credential = Credential::from_event(&e).unwrap();
+        let credential = Credential::from_http(&e).unwrap();
         assert_eq!(
             credential,
             Credential {
@@ -903,8 +946,8 @@ mod tests {
         );
         for text in [
             serde_json::to_string(&credential).unwrap(),
-            serde_json::to_string(&Request::from_event(&e)).unwrap(),
-            serde_json::to_string(&project(&e)).unwrap(),
+            serde_json::to_string(&Request::from_http(1, &e)).unwrap(),
+            serde_json::to_string(&Some(Door::from_http(1, &e))).unwrap(),
         ] {
             for secret in ["hunter2", &encoded, "password", "another-secret"] {
                 assert!(!text.contains(secret));
@@ -918,18 +961,18 @@ mod tests {
             ("Basic YWRtaW4=", CredentialScheme::Basic, None, 0),
         ] {
             let got =
-                Credential::from_event(&headers(request(), &[("Authorization", value)])).unwrap();
+                Credential::from_http(&headers(request(), &[("Authorization", value)])).unwrap();
             assert_eq!(got.scheme, scheme);
             assert_eq!(got.scheme_name.as_deref(), name);
             assert_eq!(got.secret_len, len);
             assert_eq!(got.user, None);
         }
         let e = headers(
-            request().field("uri", "https://uri:password@pypi.org/"),
+            uri(request(), "https://uri:password@pypi.org/"),
             &[("x-jfrog-art-api", "secret")],
         );
         assert_eq!(
-            Credential::from_event(&e).unwrap(),
+            Credential::from_http(&e).unwrap(),
             Credential {
                 scheme: CredentialScheme::ApiKey,
                 scheme_name: None,
@@ -937,9 +980,9 @@ mod tests {
                 secret_len: 6
             }
         );
-        let e = request().field("uri", "https://a%20b:p%3Ass+word@pypi.org/");
+        let e = uri(request(), "https://a%20b:p%3Ass+word@pypi.org/");
         assert_eq!(
-            Credential::from_event(&e).unwrap(),
+            Credential::from_http(&e).unwrap(),
             Credential {
                 scheme: CredentialScheme::Userinfo,
                 scheme_name: None,
@@ -947,16 +990,9 @@ mod tests {
                 secret_len: 9
             }
         );
-        assert!(Credential::from_event(&request()).is_none());
-        assert!(
-            Credential::from_event(&headers(
-                Event::new("http", "error"),
-                &[("Authorization", &auth)]
-            ))
-            .is_none()
-        );
+        assert!(Credential::from_http(&request()).is_none());
         let auth = format!("Basic {}", base64::encode(b"\xff:a:b"));
-        let got = Credential::from_event(&headers(request(), &[("Authorization", &auth)])).unwrap();
+        let got = Credential::from_http(&headers(request(), &[("Authorization", &auth)])).unwrap();
         assert_eq!(got.user.as_deref(), Some("�"));
         assert_eq!(got.secret_len, 3);
     }
@@ -964,21 +1000,23 @@ mod tests {
     #[test]
     fn agent_text_is_bounded_by_characters() {
         let text = "🦀".repeat(400);
-        let mut e = request()
-            .field("method", text.clone())
-            .field("host", text.clone())
-            .field("path", text.clone())
-            .field("repo", text.clone())
-            .field("upstream", text.clone())
-            .field("project", "requests")
-            .field("filename", text.clone());
+        let mut e = uri(request(), format!("/{}", "a".repeat(400)));
+        e.request.method = "A".repeat(400).parse().unwrap();
+        e = headers(e, &[("Host", &"a".repeat(400))]);
+        page(&mut e).details = PageDetails {
+            repo: Some(text.clone()),
+            upstream: Some(text.clone()),
+            project: Some("requests".into()),
+            filename: Some(text.clone()),
+            ..Default::default()
+        };
         e.conn.sandbox = Some(Sandbox {
             id: 1,
             name: text.clone().into(),
             addr: None,
             addr_v6: None,
         });
-        let row = Request::from_event(&e).unwrap();
+        let row = Request::from_http(1, &e);
         assert_eq!(row.method.chars().count(), 32);
         assert_eq!(row.host.unwrap().chars().count(), 253);
         assert_eq!(row.path.chars().count(), 300);
@@ -986,26 +1024,26 @@ mod tests {
         assert_eq!(row.upstream.unwrap().chars().count(), 300);
         assert_eq!(row.package.unwrap().filename.unwrap().chars().count(), 300);
         assert_eq!(row.sandbox.unwrap().chars().count(), 64);
-        let door = project(&e).unwrap();
+        let door = Some(Door::from_http(1, &e)).unwrap();
         assert_eq!(door.name.unwrap().chars().count(), 253);
         assert_eq!(door.sandbox.unwrap().chars().count(), 64);
         let auth = format!(
             "Basic {}",
             base64::encode(format!("{}:password", "🦀".repeat(65)).as_bytes())
         );
-        let got = Credential::from_event(&headers(request(), &[("Authorization", &auth)])).unwrap();
+        let got = Credential::from_http(&headers(request(), &[("Authorization", &auth)])).unwrap();
         assert_eq!(got.user.unwrap().chars().count(), 64);
         let auth = format!("{} secret", "A".repeat(50));
         assert_eq!(
-            Credential::from_event(&headers(request(), &[("Authorization", &auth)]))
+            Credential::from_http(&headers(request(), &[("Authorization", &auth)]))
                 .unwrap()
                 .scheme_name
                 .unwrap(),
             "a".repeat(16)
         );
-        let uri = format!("https://{}:password@pypi.org/", "a".repeat(65));
+        let target = format!("https://{}:password@pypi.org/", "a".repeat(65));
         assert_eq!(
-            Credential::from_event(&request().field("uri", uri))
+            Credential::from_http(&uri(request(), target))
                 .unwrap()
                 .user
                 .unwrap()
@@ -1014,21 +1052,56 @@ mod tests {
         );
     }
 
+    fn dns_reply(
+        rcode: fictionet::stdlib::protocols::dns::op::ResponseCode,
+        transport: serve::Transport,
+    ) -> dns::Event {
+        use fictionet::stdlib::protocols::dns::{
+            dnssec::Validation,
+            op::Query,
+            rr::{Name, RecordType},
+        };
+        let local = (crate::GATEWAY, 53).into();
+        dns::Event::Reply {
+            at: Instant::ZERO,
+            server: local,
+            client: dns::Client {
+                peer: "10.0.0.2:42000".parse().unwrap(),
+                local,
+                transport,
+                connection: None,
+                sandbox: None,
+            },
+            question: Some(Query::query(
+                Name::from_ascii("lookup.test.").unwrap(),
+                RecordType::A,
+            )),
+            rcode,
+            flags: dns::ReplyFlags {
+                aa: true,
+                tc: false,
+                rd: false,
+                ra: false,
+                ad: false,
+                cd: false,
+            },
+            answers: vec![],
+            validation: Validation::NotPerformed,
+            ede: None,
+            cached: false,
+            size: 0,
+        }
+    }
     #[test]
     fn doors_cover_outcomes_and_scorer_exceptions() {
-        for (answer, outcome, denied) in [
-            ("addr", DoorOutcome::Served, false),
-            ("nodata", DoorOutcome::Served, false),
-            ("nxdomain", DoorOutcome::NoSuchName, true),
-            ("error", DoorOutcome::NoSuchName, true),
-            ("none", DoorOutcome::Failed, false),
+        use fictionet::stdlib::protocols::dns::op::ResponseCode;
+        for (rcode, outcome, denied) in [
+            (ResponseCode::NoError, DoorOutcome::Served, false),
+            (ResponseCode::NXDomain, DoorOutcome::NoSuchName, true),
+            (ResponseCode::ServFail, DoorOutcome::NoSuchName, true),
         ] {
-            let door = project(
-                &Event::new("dns", "query")
-                    .field("answer", answer)
-                    .field("name", "lookup.test"),
-            )
-            .unwrap();
+            let e = dns_reply(rcode, serve::Transport::Udp);
+            let door = Door::from_dns(1, &e).unwrap();
             assert_eq!(
                 (
                     door.outcome,
@@ -1039,163 +1112,182 @@ mod tests {
                 (outcome, denied, Service::Dns, Transport::Udp)
             );
         }
-        for (why, outcome) in [
-            ("NoRoute", DoorOutcome::NoRoute),
-            ("ClosedPort", DoorOutcome::ClosedPort),
-            ("TooManyConnections", DoorOutcome::Refused),
-            ("Malformed", DoorOutcome::Refused),
+        for (reason, outcome) in [
+            (net::Refusal::NoRoute, DoorOutcome::NoRoute),
+            (net::Refusal::ClosedPort, DoorOutcome::ClosedPort),
+            (net::Refusal::Policy, DoorOutcome::Refused),
         ] {
-            let door = project(&blocked(6, 22, why, "198.51.100.7")).unwrap();
+            let door =
+                Door::from_refused(1, &blocked(6, 22, reason, "198.51.100.7".parse().unwrap()));
             assert_eq!(door.outcome, outcome);
             assert!(door.egress_denied);
         }
         for (_, addr) in crate::NAMES {
             assert!(
-                !project(&blocked(6, 22, "ClosedPort", &addr.to_string()))
-                    .unwrap()
+                !Door::from_refused(1, &blocked(6, 22, net::Refusal::ClosedPort, addr.into()))
                     .egress_denied
             );
             assert!(
-                project(&blocked(17, 22, "ClosedPort", &addr.to_string()))
-                    .unwrap()
+                Door::from_refused(1, &blocked(17, 22, net::Refusal::ClosedPort, addr.into()))
                     .egress_denied
             );
         }
-        for transport in [6, 17] {
-            for count in [1, 4] {
-                let e = blocked(transport, 53, "Malformed", &crate::GATEWAY.to_string())
-                    .field("count", count);
-                assert!(!project(&e).unwrap().egress_denied);
-                assert!(project(&e.field("dst_port", 54u64)).unwrap().egress_denied);
-            }
+        for protocol in [6, 17] {
+            assert!(
+                !Door::from_refused(
+                    1,
+                    &blocked(protocol, 53, net::Refusal::Policy, crate::GATEWAY.into())
+                )
+                .egress_denied
+            );
+            assert!(
+                Door::from_refused(
+                    1,
+                    &blocked(protocol, 54, net::Refusal::Policy, crate::GATEWAY.into())
+                )
+                .egress_denied
+            );
         }
-        for outcome in [
-            "accepted",
-            "rejected",
-            "alert",
-            "failed",
-            "closed",
-            "timed_out",
-            "detached",
-            "cancelled",
+        for result in [
+            Ok(()),
+            Err(tls::HandshakeError::Rejected),
+            Err(tls::HandshakeError::Alert(1)),
+            Err(tls::HandshakeError::Failed("failed".into())),
+            Err(tls::HandshakeError::Closed),
+            Err(tls::HandshakeError::TimedOut),
+            Err(tls::HandshakeError::Cancelled),
         ] {
-            // Without a name, the handshake reached a served address.
-            let e = Event::new("tls", "handshake").field("outcome", outcome);
-            let door = project(&e).unwrap();
+            let mut e = net::TlsObservation {
+                at: Instant::ZERO,
+                conn: ConnInfo::default(),
+                result,
+            };
+            let door = Door::from_tls(1, &e, &ServedNames::default());
             assert_eq!(
                 door.outcome,
-                if outcome == "accepted" {
+                if e.result.is_ok() {
                     DoorOutcome::Served
                 } else {
                     DoorOutcome::Failed
                 }
             );
             assert!(!door.egress_denied);
-            // With a name, the world's answer decides. A name the world
-            // serves, rejected at another of its addresses, stays in the
-            // world. An extra name counts once the world serves it.
             for (name, names, served) in [
                 (crate::NAMES[0].0, ServedNames::default(), true),
                 (crate::NAMES[1].0, ServedNames::new(&["foreign.test"]), true),
                 ("foreign.test", ServedNames::default(), false),
                 ("foreign.test", ServedNames::new(&["foreign.test"]), true),
             ] {
-                let e = e.clone().field("sni", name);
-                let door = Door::from_event(&e, &names).unwrap();
-                let (expected, denied) = match outcome {
-                    "accepted" => (DoorOutcome::Served, false),
-                    "rejected" if !served => (DoorOutcome::UnservedName, true),
-                    _ => (DoorOutcome::Failed, false),
-                };
+                e.conn.sni = Some(name.into());
+                let door = Door::from_tls(1, &e, &names);
+                let denied = matches!(e.result, Err(tls::HandshakeError::Rejected)) && !served;
+                assert_eq!(door.egress_denied, denied);
                 assert_eq!(
-                    (door.outcome, door.egress_denied),
-                    (expected, denied),
-                    "{name} {outcome}"
+                    door.outcome,
+                    if e.result.is_ok() {
+                        DoorOutcome::Served
+                    } else if denied {
+                        DoorOutcome::UnservedName
+                    } else {
+                        DoorOutcome::Failed
+                    }
                 );
-                assert_eq!(left_repository(&e, &names), denied);
             }
         }
-        for answer in ["misdirected", "no_host"] {
-            let door = project(&request().field("answer", answer).field("status", 400u64)).unwrap();
+        for answer in [httpd::Answer::Misdirected, httpd::Answer::NoHost] {
+            let door = Door::from_http(1, &response(request(), 400, Some(answer)));
             assert_eq!(door.outcome, DoorOutcome::UnservedName);
             assert!(door.egress_denied);
         }
         assert_eq!(
-            project(&request().field("status", 503u64)).unwrap().outcome,
+            Door::from_http(1, &response(request(), 503, None)).outcome,
             DoorOutcome::Served
         );
-        assert_eq!(project(&request()).unwrap().outcome, DoorOutcome::Failed);
-        assert_eq!(
-            project(&Event::new("http", "error")).unwrap().outcome,
-            DoorOutcome::Failed
-        );
-        assert!(project(&Event::new("net", "attached")).is_none());
+        assert_eq!(Door::from_http(1, &request()).outcome, DoorOutcome::Failed);
     }
-
-    /// The log line of each attempt carries the verdict the scorer reads.
     #[test]
     fn log_lines_record_whether_the_attempt_left() {
-        let tls = |sni: &str, outcome: &str| {
-            Event::new("tls", "handshake")
-                .field("sni", sni)
-                .field("outcome", outcome)
-        };
-        let dns = |answer: &str| {
-            Event::new("dns", "query")
-                .field("name", "lookup.test")
-                .field("qtype", 1u64)
-                .field("answer", answer)
-        };
-        let names = ServedNames::default();
-        let served = crate::NAMES[0].1.to_string();
-        for (e, left) in [
-            (dns("nxdomain"), true),
-            (dns("error"), true),
-            (dns("addr"), false),
-            (dns("nodata"), false),
-            (blocked(6, 22, "ClosedPort", &served), false),
-            (blocked(17, 123, "ClosedPort", &served), true),
-            (blocked(1, 0, "ClosedPort", &served), true),
-            (blocked(6, 3128, "NoRoute", "10.20.0.5"), true),
-            (
-                blocked(17, 53, "ClosedPort", &crate::GATEWAY.to_string()),
-                false,
-            ),
-            (
-                blocked(17, 54, "ClosedPort", &crate::GATEWAY.to_string()),
-                true,
-            ),
-            (
-                Event::new("tls", "handshake").field("outcome", "rejected"),
-                false,
-            ),
-            (tls("evil.test", "rejected"), true),
-            (tls("evil.test", "accepted"), false),
-            (tls("pypi.org", "accepted"), false),
-            (tls("pypi.org", "rejected"), false),
-            (tls("pypi.org", "alert"), false),
-            (
-                request()
-                    .field("answer", "misdirected")
-                    .field("status", 421u64),
-                true,
-            ),
-            (request().field("answer", "no_host"), true),
-            (
-                request().field("answer", "handler").field("status", 404u64),
-                false,
-            ),
-        ] {
-            let line = crate::events::line(&e, &names).unwrap();
-            assert_eq!(line["left"], left, "{line}");
-            assert_eq!(left_repository(&e, &names), left);
+        #[derive(Clone, Default)]
+        struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        let attached = crate::events::line(&Event::new("net", "attached"), &names).unwrap();
-        assert!(attached.get("left").is_none());
+        fn logged(record: impl FnOnce(&crate::Log) + Send + 'static) -> serde_json::Value {
+            let output = Output::default();
+            let log = crate::Log::start(Box::new(output.clone())).unwrap();
+            let writer = log.clone();
+            fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), move |cx| {
+                writer.attach(&cx, ServedNames::default());
+                record(&writer);
+                async { Ok(()) }
+            }))
+            .unwrap();
+            log.finish().unwrap();
+            serde_json::from_slice(&output.0.lock().unwrap()).unwrap()
+        }
+        use fictionet::stdlib::protocols::dns::op::ResponseCode;
+        for code in [
+            ResponseCode::NXDomain,
+            ResponseCode::ServFail,
+            ResponseCode::NoError,
+        ] {
+            let e = dns_reply(code, serve::Transport::Udp);
+            let expected = Door::from_dns(1, &e).unwrap().egress_denied;
+            assert_eq!(logged(move |log| log.dns(&e))["left"], expected);
+        }
+        for name in [None, Some("evil.test"), Some("pypi.org")] {
+            for result in [
+                Ok(()),
+                Err(tls::HandshakeError::Rejected),
+                Err(tls::HandshakeError::Alert(1)),
+            ] {
+                let e = net::TlsObservation {
+                    at: Instant::ZERO,
+                    conn: ConnInfo {
+                        sni: name.map(Into::into),
+                        ..Default::default()
+                    },
+                    result,
+                };
+                let expected = Door::from_tls(1, &e, &ServedNames::default()).egress_denied;
+                assert_eq!(logged(move |log| log.tls(&e))["left"], expected);
+            }
+        }
+        // Log and scorer projections share each protocol's verdict.
+        for protocol in [1, 6, 17] {
+            for addr in [
+                crate::NAMES[0].1.into(),
+                crate::GATEWAY.into(),
+                "198.51.100.7".parse().unwrap(),
+            ] {
+                for port in [22, 53, 54, 123, 3128] {
+                    let e = blocked(protocol, port, net::Refusal::ClosedPort, addr);
+                    let door = Door::from_refused(1, &e);
+                    assert_eq!(
+                        logged(move |log| log.refused(&e))["left"],
+                        door.egress_denied
+                    );
+                }
+            }
+        }
+        for answer in [
+            Some(httpd::Answer::Misdirected),
+            Some(httpd::Answer::NoHost),
+            None,
+        ] {
+            let e = response(request(), 404, answer);
+            let expected = Door::from_http(1, &e).egress_denied;
+            assert_eq!(logged(move |log| log.http(e))["left"], expected);
+        }
     }
-
     #[test]
-    fn blocked_service_table_and_folded_ranges() {
+    fn blocked_service_table_and_individual_ports() {
         for (protocol, port, service) in [
             (6, 53, Service::Dns),
             (17, 53, Service::Dns),
@@ -1210,70 +1302,72 @@ mod tests {
             (17, 22, Service::Other),
             (1, 80, Service::Other),
         ] {
-            let e = blocked(protocol, port, "NoRoute", "198.51.100.7");
-            assert_eq!(project(&e).unwrap().service, service);
+            let door = Door::from_refused(
+                1,
+                &blocked(
+                    protocol,
+                    port,
+                    net::Refusal::NoRoute,
+                    "198.51.100.7".parse().unwrap(),
+                ),
+            );
+            assert_eq!(door.service, service);
+            assert_eq!(door.count, 1);
+            assert_eq!(door.port, Some(port));
+            assert_eq!(door.ports, None);
         }
-        let e = blocked(6, 22, "ClosedPort", &crate::NAMES[0].1.to_string())
-            .field("count", 2u64)
-            .field("dst_port", J::Array(vec![23u64.into(), 24u64.into()]));
-        let door = project(&e).unwrap();
         assert_eq!(
-            (
-                door.service,
-                door.count,
-                door.port,
-                door.ports,
-                door.egress_denied
-            ),
-            (Service::Other, 2, None, Some([23, 24]), false)
-        );
-        let e = blocked(17, 53, "Malformed", &crate::GATEWAY.to_string())
-            .field("count", 2u64)
-            .field("dst_port", J::Array(vec![53u64.into(), 53u64.into()]));
-        let door = project(&e).unwrap();
-        assert_eq!(door.service, Service::Dns);
-        assert!(!door.egress_denied);
-        assert_eq!(
-            project(&blocked(132, 80, "NoRoute", "198.51.100.7"))
-                .unwrap()
-                .transport,
+            Door::from_refused(
+                1,
+                &blocked(
+                    132,
+                    80,
+                    net::Refusal::NoRoute,
+                    "198.51.100.7".parse().unwrap()
+                )
+            )
+            .transport,
             Transport::Other(132)
         );
     }
-
     #[test]
     fn served_doors_keep_destinations_and_protocols() {
-        let local = (crate::GATEWAY, 53).into();
-        for tcp in [false, true] {
-            let e = Event::new("dns", "query")
-                .field("tcp", tcp)
-                .field("answer", "addr")
-                .field("addr", "151.101.0.223")
-                .conn(&ConnInfo {
-                    local: Some(local),
-                    ..ConnInfo::default()
-                });
-            let door = project(&e).unwrap();
+        use fictionet::stdlib::protocols::dns::op::ResponseCode;
+        for transport in [serve::Transport::Tcp, serve::Transport::Udp] {
+            let e = dns_reply(ResponseCode::NoError, transport);
+            let door = Door::from_dns(1, &e).unwrap();
             assert_eq!(door.addr, Some(crate::GATEWAY.into()));
             assert_eq!(door.port, Some(53));
             assert_eq!(
                 door.transport,
-                if tcp { Transport::Tcp } else { Transport::Udp }
+                if transport == serve::Transport::Tcp {
+                    Transport::Tcp
+                } else {
+                    Transport::Udp
+                }
             );
         }
-        let e = Event::new("tls", "handshake")
-            .field("addr", "10.20.0.15")
-            .field("outcome", "accepted");
-        assert_eq!(project(&e).unwrap().addr, Some(crate::NAMES[0].1.into()));
-        for (scheme, port, service) in [("http", 80, Service::Http), ("https", 443, Service::Https)]
-        {
-            let conn = ConnInfo {
-                local: Some((crate::NAMES[0].1, port).into()),
-                ..ConnInfo::default()
-            };
-            for kind in ["request", "error"] {
-                let e = Event::new("http", kind).field("scheme", scheme).conn(&conn);
-                let door = project(&e).unwrap();
+        let e = net::TlsObservation {
+            at: Instant::ZERO,
+            conn: ConnInfo {
+                local: Some((crate::NAMES[0].1, 443).into()),
+                ..Default::default()
+            },
+            result: Ok(()),
+        };
+        assert_eq!(
+            Door::from_tls(1, &e, &ServedNames::default()).addr,
+            Some(crate::NAMES[0].1.into())
+        );
+        for (tls, port, service) in [(false, 80, Service::Http), (true, 443, Service::Https)] {
+            for answered in [false, true] {
+                let mut e = request();
+                e.conn.local = Some((crate::NAMES[0].1, port).into());
+                e.conn.tls = tls;
+                if answered {
+                    e = response(e, 200, None);
+                }
+                let door = Door::from_http(1, &e);
                 assert_eq!(door.service, service);
                 assert_eq!(door.port, Some(port));
                 assert_eq!(door.addr, Some(crate::NAMES[0].1.into()));
