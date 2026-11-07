@@ -1370,7 +1370,6 @@ struct PortPlan {
 /// One service with its socket and sharing decision ready to commit.
 enum PreparedPort {
     Udp {
-        number: u16,
         socket: udp::Socket,
         start: UdpStart,
     },
@@ -1420,7 +1419,6 @@ pub(super) struct Machine {
     tcp: tcp::Endpoint,
     udp: udp::Endpoint,
     ports: Mutex<HashMap<u16, Arc<Port>>>,
-    udp_ports: Mutex<HashSet<u16>>,
     admission: Admission,
     limits: Limits,
 }
@@ -1495,7 +1493,6 @@ impl Machine {
             tcp,
             udp,
             ports: Mutex::new(HashMap::new()),
-            udp_ports: Mutex::new(HashSet::new()),
             admission: installation.admission.clone(),
             limits: installation.limits,
         });
@@ -1515,20 +1512,15 @@ impl Machine {
     fn prepare(&self, host: &Host) -> Result<Vec<PreparedPort>, String> {
         let addr = self.addr;
         let mut ports = HashMap::<u16, PortPlan>::new();
-        let mut udp_ports = HashSet::new();
         let mut prepared = Vec::new();
         for (number, spec) in &host.ports {
             let local = SocketAddr::new(addr, *number);
             if let PortSpec::Udp(start) = spec {
-                if !udp_ports.insert(*number) || self.udp_ports.lock().contains(number) {
-                    return Err(format!("UDP port {number} at {addr} is already served"));
-                }
                 let socket = self
                     .udp
                     .bind(*number)
                     .map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
                 prepared.push(PreparedPort::Udp {
-                    number: *number,
                     socket,
                     start: start.clone(),
                 });
@@ -1683,18 +1675,9 @@ impl Machine {
         let sandbox = self.admission.sandbox();
         for prepared in prepared {
             match prepared {
-                PreparedPort::Udp {
-                    number,
-                    socket,
-                    start,
-                } => {
-                    self.udp_ports.lock().insert(number);
-                    start(
-                        &self.fcx,
-                        socket,
-                        SocketAddr::new(self.addr, number),
-                        sandbox.clone(),
-                    );
+                PreparedPort::Udp { socket, start } => {
+                    let local = socket.local_addr();
+                    start(&self.fcx, socket, local, sandbox.clone());
                 }
                 PreparedPort::Tcp {
                     number,

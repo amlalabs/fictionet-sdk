@@ -641,6 +641,85 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
     });
 }
 
+#[test]
+fn ephemeral_udp_service_reports_its_wire_endpoint() {
+    struct Announce {
+        to: SocketAddr,
+    }
+    datagram_fixture! {
+        Announce => (Lines, Mutex<Option<SocketAddr>>, Infallible);
+        decoder(self) {
+            Lines::new(64, Ending::LfOrCrlf)
+        }
+        on_open(self; reported, driver) -> () {
+            *reported.lock().unwrap() = driver.conn().local;
+            driver.send_to(self.to, vec![1]);
+            Ok(())
+        }
+        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> DatagramFlow {
+            Ok(DatagramFlow::Continue)
+        }
+    }
+    world(Duration::from_secs(60), |fcx| async move {
+        let reported = Arc::new(Mutex::new(None));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_attacher, attachments) = fictionet::attachments();
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("receiver", |h| {
+                h.at(Ipv4Addr::new(10, 40, 0, 2)).program(
+                    move |fcx: Cx, machine: fictionet::stdlib::world::net::Endpoints| {
+                        let tx = tx.clone();
+                        async move {
+                            let mut socket = machine.udp.bind(0)?;
+                            tx.send(socket.local_addr())?;
+                            let (_, wire_source) = socket.recv(&fcx).await?;
+                            tx.send(wire_source)?;
+                            Ok(())
+                        }
+                    },
+                )
+            });
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
+        let to = rx.recv().await.expect("the receiving socket opened");
+        handle.add_host(Host::new("announcer").at(Ipv4Addr::new(10, 40, 0, 1)).udp(
+            0,
+            reported.clone(),
+            move || Announce { to },
+        ))?;
+        let wire_source = rx.recv().await.expect("the datagram arrived");
+        let observed = reported.lock().unwrap().expect("the service opened");
+        assert_eq!(
+            observed, wire_source,
+            "service metadata must identify its actual socket"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn two_ephemeral_udp_services_fit_on_one_machine() {
+    world(Duration::from_secs(60), move |fcx| async move {
+        let addr = Ipv4Addr::new(203, 0, 113, 9);
+        let (_attacher, attachments) = fictionet::attachments();
+        let net = Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("first", move |h| {
+                h.at(addr).udp(0, Arc::new(()), || EchoDatagrams)
+            });
+        let handle = net.handle();
+        net.start(&fcx, attachments)?;
+        let second = Host::new("second")
+            .at(addr)
+            .udp(0, Arc::new(()), || EchoDatagrams);
+        handle
+            .add_host(second)
+            .map_err(|e| fictionet::Error::msg(format!("second ephemeral UDP service: {e}")))?;
+        Ok(())
+    });
+}
+
 /// Says hello, then takes lines up to 40 KiB: a decoder that holds up to
 /// that much, charged to the connection's budget.
 struct Wide;
