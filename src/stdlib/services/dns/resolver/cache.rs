@@ -899,6 +899,12 @@ impl Cache {
                 .fold(persists, Instant::max);
             stored.generation == generation && now < last + stale
         });
+        // Aggressive denial proofs are usable only with a live SOA and
+        // live NSEC records. They have no stale-serving path.
+        self.nsec.retain(|_, zone| {
+            zone.sets.retain(|_, (_, expires)| now < *expires);
+            now < zone.soa_expires && !zone.sets.is_empty()
+        });
         self.swept = self.entries.len();
     }
 
@@ -1051,4 +1057,52 @@ pub(super) fn normalized(set: &RecordSet) -> RecordSet {
         out.insert_rrsig(rrsig);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::stdlib::protocols::dns::rr::Name;
+
+    #[test]
+    fn sweeping_reclaims_expired_denial_proofs_and_preserves_live_ones() {
+        let mut cache = Cache::new(Limits {
+            max_ttl: Duration::from_secs(100),
+            max_negative_ttl: Duration::from_secs(100),
+            failure_ttl: Duration::from_secs(1),
+            stale: Duration::from_secs(100),
+        });
+        let at = |seconds| Instant::from_since_start(Duration::from_secs(seconds));
+        let set =
+            |owner: &str, rtype| RecordSet::with_ttl(Name::from_ascii(owner).unwrap(), rtype, 100);
+        for (zone, soa_until, proof_until) in [
+            ("soa-expired.example.", at(1), at(3)),
+            ("proof-expired.example.", at(3), at(1)),
+            ("live.example.", at(3), at(3)),
+        ] {
+            cache.add_secure_nsec(
+                &set(zone, RecordType::SOA),
+                Some(soa_until),
+                &[
+                    (set(zone, RecordType::NSEC), Some(proof_until)),
+                    (set(&format!("old.{zone}"), RecordType::NSEC), Some(at(1))),
+                ],
+                at(0),
+            );
+        }
+        let before = cache.nsec.len();
+        cache.sweep(at(2));
+        assert!(cache.nsec.len() < before);
+        assert!(!cache.nsec.is_empty());
+        for zone in cache.nsec.values() {
+            assert!(zone.soa_expires > at(2));
+            assert!(!zone.sets.is_empty());
+            assert!(zone.sets.values().all(|(_, expires)| *expires > at(2)));
+        }
+        let live = LowerName::new(&Name::from_ascii("live.example.").unwrap());
+        assert!(cache.secure_nsec(&live, at(2)).is_some());
+        cache.sweep(at(3));
+        assert!(cache.nsec.is_empty());
+        assert!(cache.secure_nsec(&live, at(3)).is_none());
+    }
 }
