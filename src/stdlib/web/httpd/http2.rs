@@ -254,7 +254,7 @@ impl Http2 {
         let mut request = stream.request.take().expect("request dispatched once");
 
         *request.body_mut() = Body::from(std::mem::take(&mut stream.body));
-        let head_only = request.method() == Method::HEAD;
+        let wants = Asked::of(request.method());
         let delivery = super::Delivery::new(
             &self.observe,
             &request,
@@ -313,7 +313,7 @@ impl Http2 {
                 body: None,
                 rest: Bytes::new(),
                 rest_held: 0,
-                head_only,
+                wants,
                 date: self.date,
                 asked: driver.now(),
                 end_sent: false,
@@ -1137,7 +1137,8 @@ struct Sending {
     rest: Bytes,
     rest_held: usize,
     request_held: usize,
-    head_only: bool,
+    /// What the request's method asks of the response's body.
+    wants: Asked,
     date: Option<u64>,
     asked: Instant,
     end_sent: bool,
@@ -1230,12 +1231,7 @@ impl Pending for Sending {
                 ))
                 .ok()
             });
-            let asked = if self.head_only {
-                Asked::Head
-            } else {
-                Asked::Body
-            };
-            let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), asked, date);
+            let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), self.wants, date);
             let mut fields = vec![hpack::Field::new(":status", parts.status.as_str())];
             for (name, value) in &parts.headers {
                 if matches!(

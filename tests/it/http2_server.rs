@@ -243,6 +243,58 @@ fn response_length_follows_the_body_and_shared_policy() {
     .unwrap();
 }
 
+/// A 2xx to CONNECT carries no `content-length` and ends the stream on its
+/// HEADERS frame: RFC 9110 section 9.3.6 forbids length fields there, and
+/// the server tunnels nothing, as native HTTP/1 does.
+#[test]
+fn connect_success_has_no_length_and_ends_the_stream() {
+    let handler = fictionet_test_support::handler(
+        |_: &mut httpd::Exchange<'_>, request: http::Request<Bytes>| {
+            assert_eq!(request.method(), http::Method::CONNECT);
+            http::Response::new(Bytes::from_static(b"tunnel"))
+        },
+    );
+    let mut harness = Harness::new(Seed::from_u64(1), Http2::new(handler), ());
+    let mut input = preface();
+    let mut fragment = Vec::new();
+    for (name, value) in [(":method", "CONNECT"), (":authority", "a.test:443")] {
+        hpack::Field::new(name, value).write(&mut fragment).unwrap();
+    }
+    http2::Headers {
+        stream: 1,
+        flags: 5,
+        fragment,
+        priority: None,
+        padding: None,
+    }
+    .write(&mut input)
+    .unwrap();
+    let output = frames(&harness.push(&input).unwrap());
+    let mut blocks = http2::HeaderBlocks::with_limits(Default::default());
+    let mut answered = false;
+    for frame in &output {
+        assert!(!matches!(frame, Frame::Data(_)), "{output:?}");
+        let read = blocks.read_frame(frame).unwrap();
+        let Some(block) = read.block else {
+            continue;
+        };
+        assert_eq!(read.stream, 1);
+        assert!(read.end, "{output:?}");
+        let fields: Vec<(&[u8], &[u8])> = block
+            .headers
+            .iter()
+            .map(|h| (h.name.as_slice(), h.value.as_slice()))
+            .collect();
+        assert!(fields.contains(&(b":status", b"200")), "{fields:?}");
+        assert!(
+            !fields.iter().any(|(name, _)| *name == b"content-length"),
+            "{fields:?}"
+        );
+        answered = true;
+    }
+    assert!(answered, "{output:?}");
+}
+
 #[test]
 fn windows_settings_and_concurrent_streams() {
     let router = fictionet_test_support::handler(
