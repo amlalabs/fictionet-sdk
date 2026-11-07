@@ -25,7 +25,6 @@ pub const NAMES: &[&str] = &[
     "fictionet",
     "amlalabs",
     "fakewiki",
-    "artifactory-world",
     "border-world",
     "scan-world",
     "web_world",
@@ -856,11 +855,11 @@ mod tests {
             "download",
             &gzip(&wheel(
                 "package.dist-info/WHEEL",
-                b"Generator: artifactory-world\n",
+                b"Generator: border-world\n",
             )),
         );
         let error = audit.check().unwrap_err();
-        assert!(error.contains("artifactory-world"), "{error}");
+        assert!(error.contains("border-world"), "{error}");
         let audit = Audit::default();
         audit.inspect("download", &wheel("package/fixture.py", b"value = 1\n"));
         assert!(audit.check().unwrap_err().contains("fixture artifact"));
@@ -899,10 +898,10 @@ mod tests {
             drop(sink);
             assert!(audit.check().is_ok());
             let mut sink = audit.sink("package", "", Content::VendorArchive);
-            sink.write(&wheel("lib/metadata", b"Generator: artifactory-world\n"));
+            sink.write(&wheel("lib/metadata", b"Generator: border-world\n"));
             sink.finish();
             drop(sink);
-            assert!(audit.check().unwrap_err().contains("artifactory-world"));
+            assert!(audit.check().unwrap_err().contains("border-world"));
         }
         let audit = Audit::default();
         let mut sink = audit.sink("page", "", Content::VendorArchive);
@@ -943,9 +942,9 @@ mod tests {
         let audit = Audit::default();
         audit.inspect(
             "download",
-            &[xz(b"first article"), xz(b"Generator: artifactory-world")].concat(),
+            &[xz(b"first article"), xz(b"Generator: border-world")].concat(),
         );
-        assert!(audit.check().unwrap_err().contains("artifactory-world"));
+        assert!(audit.check().unwrap_err().contains("border-world"));
     }
 
     #[test]

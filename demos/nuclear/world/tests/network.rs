@@ -7,8 +7,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::{ConnError, ConnectionExt};
 use fictionet::stdlib::protocols::modbus::{Frame, Request, Response};
-use fictionet::{Cx, Seed};
-use fictionet_test_support::sandbox;
+use fictionet::stdlib::world::sandbox;
+use fictionet::{Cx, RunOptions, Seed};
 use nuclear_world::driver::Driver;
 use nuclear_world::registers::{self, Plc};
 use nuclear_world::{Config, network};
@@ -53,107 +53,113 @@ async fn exchange<C: ConnectionExt + Send>(fcx: &Cx, conn: &mut C, request: &Req
 
 #[test]
 fn a_sandbox_reads_rcs1_and_a_closed_port_refuses() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let (attacher, attachments) = fictionet::attachments();
-        network::start(&fcx, &driver, attachments)?;
-        let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(1)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let (attacher, attachments) = fictionet::attachments();
+            network::start(&fcx, &driver, attachments)?;
+            let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
 
-        let mut conn = client
-            .tcp
-            .connect(&fcx, SocketAddr::new(RCS1.into(), MODBUS))
-            .await
-            .expect("rcs1 accepts Modbus/TCP on port 502");
-        let expected = registers::input_registers(Plc::Rcs1, &driver.snapshot());
-        let response = exchange(
-            &fcx,
-            &mut conn,
-            &Request::ReadInputRegisters {
-                address: 4,
-                quantity: 1,
-            },
-        )
-        .await;
-        assert_ne!(expected[4], 0, "pressurizer pressure is a live count");
-        assert_eq!(response, Response::Registers(vec![expected[4]]));
+            let mut conn = client
+                .tcp
+                .connect(&fcx, SocketAddr::new(RCS1.into(), MODBUS))
+                .await
+                .expect("rcs1 accepts Modbus/TCP on port 502");
+            let expected = registers::input_registers(Plc::Rcs1, &driver.snapshot());
+            let response = exchange(
+                &fcx,
+                &mut conn,
+                &Request::ReadInputRegisters {
+                    address: 4,
+                    quantity: 1,
+                },
+            )
+            .await;
+            assert_ne!(expected[4], 0, "pressurizer pressure is a live count");
+            assert_eq!(response, Response::Registers(vec![expected[4]]));
 
-        let refused = client
-            .tcp
-            .connect(&fcx, SocketAddr::new(RCS1.into(), 102))
-            .await
-            .err();
-        assert_eq!(refused, Some(ConnError::Refused));
-        fcx.cancel();
-        Ok(())
-    }));
+            let refused = client
+                .tcp
+                .connect(&fcx, SocketAddr::new(RCS1.into(), 102))
+                .await
+                .err();
+            assert_eq!(refused, Some(ConnError::Refused));
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
 #[test]
 fn each_controller_serves_its_own_map_and_a_write_reaches_the_shared_plant() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(2), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let (attacher, attachments) = fictionet::attachments();
-        network::start(&fcx, &driver, attachments)?;
-        let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(2)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let (attacher, attachments) = fictionet::attachments();
+            network::start(&fcx, &driver, attachments)?;
+            let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
 
-        for (addr, plc) in [
-            (RPS1, Plc::Rps1),
-            (RCS1, Plc::Rcs1),
-            (BOP1, Plc::Bop1),
-            (PAM1, Plc::Pam1),
-        ] {
-            let mut conn = client
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), MODBUS))
-                .await
-                .expect("each controller accepts Modbus/TCP on port 502");
-            let expected = registers::input_registers(plc, &driver.snapshot());
-            if plc == Plc::Rps1 {
-                assert_eq!(expected.len(), 5);
-                assert_eq!(expected[4], driver.snapshot().telemetry.heartbeat);
+            for (addr, plc) in [
+                (RPS1, Plc::Rps1),
+                (RCS1, Plc::Rcs1),
+                (BOP1, Plc::Bop1),
+                (PAM1, Plc::Pam1),
+            ] {
+                let mut conn = client
+                    .tcp
+                    .connect(&fcx, SocketAddr::new(addr.into(), MODBUS))
+                    .await
+                    .expect("each controller accepts Modbus/TCP on port 502");
+                let expected = registers::input_registers(plc, &driver.snapshot());
+                if plc == Plc::Rps1 {
+                    assert_eq!(expected.len(), 5);
+                    assert_eq!(expected[4], driver.snapshot().telemetry.heartbeat);
+                }
+                let response = exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::ReadInputRegisters {
+                        address: 0,
+                        quantity: expected.len() as u16,
+                    },
+                )
+                .await;
+                assert_eq!(response, Response::Registers(expected), "{plc:?}");
             }
-            let response = exchange(
+
+            // A rod demand written through rps1 is applied to the plant the
+            // driver holds, so the driver's snapshot counts it.
+            let mut rps = client
+                .tcp
+                .connect(&fcx, SocketAddr::new(RPS1.into(), MODBUS))
+                .await
+                .expect("rps1 accepts Modbus/TCP on port 502");
+            let echo = exchange(
                 &fcx,
-                &mut conn,
-                &Request::ReadInputRegisters {
+                &mut rps,
+                &Request::WriteSingleRegister {
                     address: 0,
-                    quantity: expected.len() as u16,
+                    value: 480,
                 },
             )
             .await;
-            assert_eq!(response, Response::Registers(expected), "{plc:?}");
-        }
-
-        // A rod demand written through rps1 is applied to the plant the
-        // driver holds, so the driver's snapshot counts it.
-        let mut rps = client
-            .tcp
-            .connect(&fcx, SocketAddr::new(RPS1.into(), MODBUS))
-            .await
-            .expect("rps1 accepts Modbus/TCP on port 502");
-        let echo = exchange(
-            &fcx,
-            &mut rps,
-            &Request::WriteSingleRegister {
-                address: 0,
-                value: 480,
-            },
-        )
-        .await;
-        assert_eq!(
-            echo,
-            Response::WriteSingleRegister {
-                address: 0,
-                value: 480
-            }
-        );
-        assert_eq!(driver.snapshot().operator_actions, 1);
-        fcx.cancel();
-        Ok(())
-    }));
+            assert_eq!(
+                echo,
+                Response::WriteSingleRegister {
+                    address: 0,
+                    value: 480
+                }
+            );
+            assert_eq!(driver.snapshot().operator_actions, 1);
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
@@ -179,50 +185,22 @@ fn emergency_writes_recover_the_plant_over_modbus() {
         ),
         (Scenario::SteamLineBreak, 1, Plc::Bop1, BOP1, vec![7], 0),
     ] {
-        fictionet::block_on(fictionet::lab(Seed::from_u64(31), |fcx| async move {
+        fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(31)), |fcx| async move {
             let driver = Driver::new(scenario.config());
             driver.advance_to(&(), minute * 60_000);
             let (attacher, attachments) = fictionet::attachments();
             network::start(&fcx, &driver, attachments)?;
             let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
-            let mut conn = client
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), MODBUS))
-                .await
-                .unwrap();
+            let mut conn = client.tcp.connect(&fcx, SocketAddr::new(addr.into(), MODBUS)).await.unwrap();
             for address in coils {
-                assert_eq!(
-                    exchange(
-                        &fcx,
-                        &mut conn,
-                        &Request::WriteSingleCoil {
-                            address,
-                            value: true
-                        }
-                    )
-                    .await,
-                    Response::WriteSingleCoil {
-                        address,
-                        value: true
-                    }
-                );
+                assert_eq!(exchange(&fcx, &mut conn, &Request::WriteSingleCoil { address, value: true }).await,
+                    Response::WriteSingleCoil { address, value: true });
                 if scenario == Scenario::SteamLineBreak {
                     driver.advance_to(&(), driver.snapshot().at_ms + 50);
                     assert_eq!(driver.snapshot().severe.steam_break_kg_s, 0.0);
                 }
                 driver.advance_to(&(), driver.snapshot().at_ms + 250);
-                assert_eq!(
-                    exchange(
-                        &fcx,
-                        &mut conn,
-                        &Request::ReadCoils {
-                            address,
-                            quantity: 1
-                        }
-                    )
-                    .await,
-                    Response::Bits(vec![true, false, false, false, false, false, false, false])
-                );
+                assert_eq!(exchange(&fcx, &mut conn, &Request::ReadCoils { address, quantity: 1 }).await, Response::Bits(vec![true, false, false, false, false, false, false, false]));
                 assert!(registers::coils(plc, &driver.snapshot())[address as usize]);
             }
             if scenario == Scenario::SteamLineBreak {
@@ -235,107 +213,101 @@ fn emergency_writes_recover_the_plant_over_modbus() {
                 assert!(snap.end.is_none());
                 assert_eq!(snap.severe.uncovered_percent, 0.0);
                 for stage in Stage::ALL {
-                    assert_eq!(
-                        snap.stages[stage.index()],
-                        if stage == Stage::Boiling {
-                            Some(boiling)
-                        } else {
-                            None
-                        }
-                    );
+                    assert_eq!(snap.stages[stage.index()], if stage == Stage::Boiling { Some(boiling) } else { None });
                 }
-                println!(
-                    "{scenario:?}: twelve hours, uncovered {}%, no end, boiling at {boiling} ms",
-                    snap.severe.uncovered_percent
-                );
+                println!("{scenario:?}: twelve hours, uncovered {}%, no end, boiling at {boiling} ms", snap.severe.uncovered_percent);
             }
             fcx.cancel();
             Ok(())
-        }))
-        .unwrap();
+        })).unwrap();
     }
 }
 
 #[test]
 fn post_accident_monitor_serves_pressure_and_refuses_coils() {
     use fictionet::stdlib::protocols::modbus::Exception;
-    fictionet::block_on(fictionet::lab(Seed::from_u64(34), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        let (attacher, attachments) = fictionet::attachments();
-        network::start(&fcx, &driver, attachments)?;
-        let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
-        let mut conn = client
-            .tcp
-            .connect(&fcx, SocketAddr::new(PAM1.into(), MODBUS))
-            .await
-            .expect("pam1 accepts Modbus");
-        let sensor: nuclear_world::sensors::Sensor =
-            serde_json::from_value(serde_json::json!("containment_pressure")).unwrap();
-        let expected =
-            (driver.snapshot().readings[sensor.index()].reading.value * 10.0).round() as u16;
-        assert_eq!(
-            exchange(
-                &fcx,
-                &mut conn,
-                &Request::ReadInputRegisters {
-                    address: 2,
-                    quantity: 1
-                }
-            )
-            .await,
-            Response::Registers(vec![expected])
-        );
-        assert_eq!(
-            exchange(
-                &fcx,
-                &mut conn,
-                &Request::ReadCoils {
-                    address: 0,
-                    quantity: 1
-                }
-            )
-            .await,
-            Response::Exception(Exception::IllegalDataAddress)
-        );
-        assert_eq!(
-            exchange(
-                &fcx,
-                &mut conn,
-                &Request::ReadHoldingRegisters {
-                    address: 0,
-                    quantity: 1
-                }
-            )
-            .await,
-            Response::Exception(Exception::IllegalDataAddress)
-        );
-        assert_eq!(
-            exchange(
-                &fcx,
-                &mut conn,
-                &Request::WriteSingleCoil {
-                    address: 0,
-                    value: true
-                }
-            )
-            .await,
-            Response::Exception(Exception::IllegalDataAddress)
-        );
-        assert_eq!(
-            exchange(
-                &fcx,
-                &mut conn,
-                &Request::WriteSingleRegister {
-                    address: 0,
-                    value: 1
-                }
-            )
-            .await,
-            Response::Exception(Exception::IllegalDataAddress)
-        );
-        println!("pam1 containment pressure count: {expected}; target snapshot count {expected}");
-        fcx.cancel();
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(34)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let (attacher, attachments) = fictionet::attachments();
+            network::start(&fcx, &driver, attachments)?;
+            let client = sandbox::machine(&fcx, attacher.attach("operator")?, CLIENT);
+            let mut conn = client
+                .tcp
+                .connect(&fcx, SocketAddr::new(PAM1.into(), MODBUS))
+                .await
+                .expect("pam1 accepts Modbus");
+            let sensor: nuclear_world::sensors::Sensor =
+                serde_json::from_value(serde_json::json!("containment_pressure")).unwrap();
+            let expected =
+                (driver.snapshot().readings[sensor.index()].reading.value * 10.0).round() as u16;
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::ReadInputRegisters {
+                        address: 2,
+                        quantity: 1
+                    }
+                )
+                .await,
+                Response::Registers(vec![expected])
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::ReadCoils {
+                        address: 0,
+                        quantity: 1
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::ReadHoldingRegisters {
+                        address: 0,
+                        quantity: 1
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::WriteSingleCoil {
+                        address: 0,
+                        value: true
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            assert_eq!(
+                exchange(
+                    &fcx,
+                    &mut conn,
+                    &Request::WriteSingleRegister {
+                        address: 0,
+                        value: 1
+                    }
+                )
+                .await,
+                Response::Exception(Exception::IllegalDataAddress)
+            );
+            println!(
+                "pam1 containment pressure count: {expected}; target snapshot count {expected}"
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ))
     .unwrap();
 }

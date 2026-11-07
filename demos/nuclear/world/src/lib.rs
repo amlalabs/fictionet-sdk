@@ -64,10 +64,10 @@
 //! | [`sensors`] | Instrument ranges, lag, noise and sampling |
 //! | [`faults`] | Fixed fault slots and schedules |
 //! | [`command`] | Integer commands and replies |
-//! | [`snapshot`] | Bounded projection for the world's observation page |
+//! | [`snapshot`] | Bounded projection for a future state topic |
 //! | [`driver`] | Shared handle that owns the plant behind a mutex |
 //! | [`plc`] | Modbus/TCP service of one controller over the shared plant |
-//! | [`facts`] | Typed plant facts for a world-owned observer |
+//! | [`facts`] | Plant facts for the Fictionet event log |
 //! | [`hmi`] | Supervisory client hmi01: polls the controllers, serves the mimic page and control API |
 //! | [`network`] | Operations and control networks, with the controllers on port 502 |
 //! | [`story`] | The scripted operator story: six steps with automatic protection off |

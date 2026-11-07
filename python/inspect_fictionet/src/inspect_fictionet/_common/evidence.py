@@ -72,9 +72,8 @@ def delivered(line: Mapping, methods: Iterable[str], min_sent: int | None, *,
 
     Validate all required fields before evaluating the predicate. Missing or
     malformed fields yield Unknown, even when another field rules out delivery.
-    Pass min_sent=None only for metrics with no byte requirement (Artifactory's
-    installed metric). Otherwise sent must be a nonnegative int, including when
-    min_sent is zero. HEAD is excluded by the caller's explicit methods.
+    Pass min_sent=None only for metrics with no byte requirement. Otherwise
+    sent must be a nonnegative int, including when min_sent is zero. HEAD is excluded by the caller's explicit methods.
     With length_field, also require a nonnegative integer body length in that
     field and sent equal to it. This requires sent even when min_sent is None.
     """

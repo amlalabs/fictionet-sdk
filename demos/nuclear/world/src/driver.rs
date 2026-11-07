@@ -27,7 +27,6 @@ use crate::{Config, Plant};
 /// A cheaply cloneable, thread-safe handle to one plant. Clones share the plant.
 #[derive(Clone)]
 pub struct Driver {
-    facts: facts::Observer,
     plant: Arc<Mutex<Plant>>,
     generation: Arc<AtomicU64>,
     divergence: Arc<Mutex<[Option<Peak>; SENSOR_COUNT]>>,
@@ -98,22 +97,10 @@ impl Driver {
     /// Starts a plant built from `config` at plant time zero.
     pub fn new(config: Config) -> Driver {
         Driver {
-            facts: facts::Observer::default(),
             plant: Arc::new(Mutex::new(Plant::new(config))),
             generation: Arc::new(AtomicU64::new(0)),
             divergence: Arc::new(Mutex::new([None; SENSOR_COUNT])),
         }
-    }
-
-    /// Receives this world's typed facts from the clock and controller services.
-    pub fn observe(mut self, receive: impl Fn(facts::Fact) + Send + Sync + 'static) -> Self {
-        self.facts = facts::Observer::new(receive);
-        self
-    }
-
-    /// The observation sink shared by this driver's services.
-    pub fn facts(&self) -> facts::Observer {
-        self.facts.clone()
     }
 
     /// Replace the plant without replacing any shared handles.
@@ -214,8 +201,13 @@ mod tests {
     use crate::command::Loop;
     use crate::faults::{Fault, FaultChange, FaultTarget, ProcessFault, SensorFault};
     use crate::sensors::Sensor;
+    use fictionet::events::float;
+    use fictionet_observe::Memory;
 
-    use crate::facts::tests::{Memory, observations, observer};
+    /// Run options that keep the run's facts in `memory`.
+    fn options(memory: &Arc<Memory>) -> fictionet::RunOptions {
+        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(memory.clone())
+    }
 
     fn fault(change: FaultChange, expected_revision: u64) -> FaultCommand {
         FaultCommand {
@@ -238,58 +230,51 @@ mod tests {
         let memory = Arc::new(Memory::default());
         let driver = Driver::new(Scenario::LoopBUnattended.config());
         let observed = driver.clone();
-        let sink = observer(&memory);
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            move |_cx| async move {
-                driver.advance_to(&sink, 1_800_000);
-                driver.apply(&sink, Command::AcknowledgeAlarms).unwrap();
-                driver.advance_to(&sink, 24 * 3_600_000);
-                let ended = driver.snapshot();
-                assert_eq!(ended.at_ms, ended.end.unwrap().at_ms);
-                driver.advance_to(&sink, ended.at_ms + 50);
-                assert_eq!(driver.snapshot().at_ms, ended.at_ms + 50);
-                Ok(())
-            },
-        ))?;
+        fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+            driver.advance_to(&cx, 1_800_000);
+            driver.apply(&cx, Command::AcknowledgeAlarms).unwrap();
+            driver.advance_to(&cx, 24 * 3_600_000);
+            let ended = driver.snapshot();
+            assert_eq!(ended.at_ms, ended.end.unwrap().at_ms);
+            driver.advance_to(&cx, ended.at_ms + 50);
+            assert_eq!(driver.snapshot().at_ms, ended.at_ms + 50);
+            Ok(())
+        }))?;
         let snapshot = observed.snapshot();
         let mut expected = Stage::ALL
             .into_iter()
             .filter_map(|stage| snapshot.stages[stage.index()].map(|at| (stage, at)))
             .collect::<Vec<_>>();
         expected.sort_by_key(|(stage, at)| (*at, stage.index()));
-        let stages = observations(&memory, "stage");
+        let stages = memory.checked_of("plant", "stage")?;
         assert_eq!(stages.len(), expected.len());
         for (fact, (stage, at)) in stages.iter().zip(expected) {
             let name = serde_json::to_value(stage).unwrap();
-            assert_eq!(fact["stage"].as_str(), name.as_str());
-            assert_eq!(fact["at_ms"].as_u64(), Some(at));
-            assert_eq!(fact["time"].as_str(), Some(facts::time(at).as_str()));
-            assert!(!fact["summary"].as_str().unwrap().contains('_'));
+            assert_eq!(fact.str("stage"), name.as_str());
+            assert_eq!(fact.u64("at_ms"), Some(at));
+            assert_eq!(fact.str("time"), Some(facts::time(at).as_str()));
+            assert!(!fact.summary.contains('_'));
         }
         let boiling = stages
             .iter()
-            .find(|fact| fact["stage"].as_str() == Some("boiling"))
+            .find(|fact| fact.str("stage") == Some("boiling"))
             .unwrap();
-        assert_eq!(boiling["last_command"].as_str(), Some("none"));
+        assert_eq!(boiling.str("last_command"), Some("none"));
         assert!(boiling.get("last_command_ms").is_none());
-        assert_eq!(boiling["operator_actions"].as_u64(), Some(0));
+        assert_eq!(boiling.u64("operator_actions"), Some(0));
         let uncovered = stages
             .iter()
-            .find(|fact| fact["stage"].as_str() == Some("core_uncovered"))
+            .find(|fact| fact.str("stage") == Some("core_uncovered"))
             .unwrap();
-        assert_eq!(uncovered["operator_actions"].as_u64(), Some(1));
-        assert_eq!(
-            uncovered["last_command"].as_str(),
-            Some("acknowledge_alarms")
-        );
-        assert_eq!(uncovered["last_command_ms"].as_u64(), Some(1_800_000));
-        let ends = observations(&memory, "end");
+        assert_eq!(uncovered.u64("operator_actions"), Some(1));
+        assert_eq!(uncovered.str("last_command"), Some("acknowledge_alarms"));
+        assert_eq!(uncovered.u64("last_command_ms"), Some(1_800_000));
+        let ends = memory.checked_of("plant", "end")?;
         assert_eq!(ends.len(), 1);
-        assert_eq!(ends[0]["stage"].as_str(), Some("containment_failure"));
-        assert_eq!(ends[0]["cause"].as_str(), Some("hydrogen_burn"));
-        assert_eq!(ends[0]["at_ms"].as_u64(), Some(snapshot.end.unwrap().at_ms));
-        assert_eq!(ends[0]["operator_actions"].as_u64(), Some(1));
+        assert_eq!(ends[0].str("stage"), Some("containment_failure"));
+        assert_eq!(ends[0].str("cause"), Some("hydrogen_burn"));
+        assert_eq!(ends[0].u64("at_ms"), Some(snapshot.end.unwrap().at_ms));
+        assert_eq!(ends[0].u64("operator_actions"), Some(1));
         Ok(())
     }
 
@@ -379,37 +364,33 @@ mod tests {
     fn a_fault_start_and_clear_are_logged_with_their_target() -> fictionet::Result {
         let memory = Arc::new(Memory::default());
         let driver = Driver::new(Config::default());
-        let sink = observer(&memory);
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            move |_cx| async move {
-                driver.advance_to(&sink, 500);
-                driver
-                    .apply_fault(&sink, fault(stuck_hot_leg(3000), 0))
-                    .expect("the fault is accepted");
-                driver.advance_to(&sink, 1_000);
-                driver
-                    .apply_fault(
-                        &sink,
-                        fault(
-                            FaultChange::Clear(FaultTarget::Sensor(Sensor::HotLeg(Loop::A))),
-                            1,
-                        ),
-                    )
-                    .expect("the clear is accepted");
-                Ok(())
-            },
-        ))?;
+        fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+            driver.advance_to(&cx, 500);
+            driver
+                .apply_fault(&cx, fault(stuck_hot_leg(3000), 0))
+                .expect("the fault is accepted");
+            driver.advance_to(&cx, 1_000);
+            driver
+                .apply_fault(
+                    &cx,
+                    fault(
+                        FaultChange::Clear(FaultTarget::Sensor(Sensor::HotLeg(Loop::A))),
+                        1,
+                    ),
+                )
+                .expect("the clear is accepted");
+            Ok(())
+        }))?;
 
-        let faults = observations(&memory, "fault");
+        let faults = memory.checked_of("plant", "fault")?;
         assert_eq!(faults.len(), 2);
-        assert_eq!(faults[0]["change"].as_str(), Some("inject"));
-        assert_eq!(faults[0]["target"].as_str(), Some("hot_leg_a"));
-        assert_eq!(faults[0]["last_fault_start_ms"].as_u64(), Some(500));
-        assert_eq!(faults[0]["at_ms"].as_u64(), Some(500));
-        assert_eq!(faults[1]["change"].as_str(), Some("clear"));
-        assert_eq!(faults[1]["target"].as_str(), Some("hot_leg_a"));
-        assert_eq!(faults[1]["at_ms"].as_u64(), Some(1_000));
+        assert_eq!(faults[0].str("change"), Some("inject"));
+        assert_eq!(faults[0].str("target"), Some("hot_leg_a"));
+        assert_eq!(faults[0].u64("last_fault_start_ms"), Some(500));
+        assert_eq!(faults[0].u64("at_ms"), Some(500));
+        assert_eq!(faults[1].str("change"), Some("clear"));
+        assert_eq!(faults[1].str("target"), Some("hot_leg_a"));
+        assert_eq!(faults[1].u64("at_ms"), Some(1_000));
         Ok(())
     }
 
@@ -417,25 +398,21 @@ mod tests {
     fn a_manual_trip_applied_here_is_logged_as_a_trip_not_an_action() -> fictionet::Result {
         let memory = Arc::new(Memory::default());
         let driver = Driver::new(Config::default());
-        let sink = observer(&memory);
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            move |_cx| async move {
-                driver.advance_to(&sink, 1_000);
-                driver
-                    .apply(&sink, Command::ManualTrip)
-                    .expect("the manual trip is accepted");
-                Ok(())
-            },
-        ))?;
+        fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+            driver.advance_to(&cx, 1_000);
+            driver
+                .apply(&cx, Command::ManualTrip)
+                .expect("the manual trip is accepted");
+            Ok(())
+        }))?;
 
-        let trips = observations(&memory, "trip");
+        let trips = memory.checked_of("plant", "trip")?;
         assert_eq!(trips.len(), 1);
-        assert_eq!(trips[0]["cause"].as_str(), Some("manual"));
-        assert_eq!(trips[0]["tripped_ms"].as_u64(), Some(1_000));
-        assert_eq!(trips[0]["at_ms"].as_u64(), Some(1_000));
+        assert_eq!(trips[0].str("cause"), Some("manual"));
+        assert_eq!(trips[0].u64("tripped_ms"), Some(1_000));
+        assert_eq!(trips[0].u64("at_ms"), Some(1_000));
         // The caller logs the action with its source. This method does not.
-        assert!(observations(&memory, "action").is_empty());
+        assert!(memory.checked_of("plant", "action")?.is_empty());
         Ok(())
     }
 
@@ -447,33 +424,29 @@ mod tests {
             FaultChange::Inject(Fault::Process(ProcessFault::CondenserCoolingLoss)),
             0,
         );
-        let sink = observer(&memory);
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            move |_cx| async move {
-                driver
-                    .apply_fault(&sink, loss)
-                    .expect("the cooling loss is accepted");
-                // The condenser passes 15 kPa within about 15 s at full power, which
-                // trips the turbine and, above 20% power, the reactor.
-                driver.advance_to(&sink, 30_000);
-                assert!(driver.snapshot().truth.reactor.trip.is_some());
-                Ok(())
-            },
-        ))?;
+        fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+            driver
+                .apply_fault(&cx, loss)
+                .expect("the cooling loss is accepted");
+            // The condenser passes 15 kPa within about 15 s at full power, which
+            // trips the turbine and, above 20% power, the reactor.
+            driver.advance_to(&cx, 30_000);
+            assert!(driver.snapshot().truth.reactor.trip.is_some());
+            Ok(())
+        }))?;
 
-        let trips = observations(&memory, "trip");
+        let trips = memory.checked_of("plant", "trip")?;
         assert_eq!(
             trips.len(),
             1,
             "the turbine trip is part of the reactor trip"
         );
-        assert_eq!(trips[0]["cause"].as_str(), Some("turbine_trip"));
-        let tripped = trips[0]["tripped_ms"]
-            .as_u64()
+        assert_eq!(trips[0].str("cause"), Some("turbine_trip"));
+        let tripped = trips[0]
+            .u64("tripped_ms")
             .ok_or_else(|| fictionet::Error::msg("the trip has its step"))?;
         assert!(tripped > 0 && tripped <= 30_000, "tripped at {tripped} ms");
-        assert_eq!(trips[0]["at_ms"].as_u64(), Some(30_000));
+        assert_eq!(trips[0].u64("at_ms"), Some(30_000));
         Ok(())
     }
 
@@ -482,51 +455,40 @@ mod tests {
         for gaps in [[1.0, 2.0, 2.0, 4.0], [1.0, 2.0, 3.0, 4.0]] {
             let memory = Arc::new(Memory::default());
             let observed = memory.clone();
-            let sink = observer(&memory);
-            fictionet::block_on(fictionet::lab(
-                fictionet::Seed::from_u64(1),
-                move |_cx| async move {
-                    let mut peaks = [None; SENSOR_COUNT];
-                    let mut snapshot = Plant::new(Config::default()).snapshot();
-                    let sensor = Sensor::HotLeg(Loop::A);
-                    snapshot.readings[sensor.index()].fault =
-                        Some(SensorFault::Stuck { value: 3000 });
-                    snapshot.readings[sensor.index()].reading.value = 300.0;
-                    for (step, gap) in gaps.into_iter().enumerate() {
-                        snapshot.at_ms = step as u64 * 50;
-                        snapshot.truth.primary.loops[0].hot_leg_c = 300.0 + gap;
-                        track(&sink, &mut peaks, &snapshot);
-                    }
-                    let before_clear = observations(&observed, "divergence");
-                    assert_eq!(before_clear.len(), if gaps[2] == 2.0 { 2 } else { 1 });
-                    snapshot.at_ms = 200;
-                    snapshot.readings[sensor.index()].fault = None;
-                    track(&sink, &mut peaks, &snapshot);
-                    snapshot.at_ms = 250;
-                    track(&sink, &mut peaks, &snapshot);
-                    Ok(())
-                },
-            ))?;
-            let lines = observations(&memory, "divergence");
+            fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+                let mut peaks = [None; SENSOR_COUNT];
+                let mut snapshot = Plant::new(Config::default()).snapshot();
+                let sensor = Sensor::HotLeg(Loop::A);
+                snapshot.readings[sensor.index()].fault = Some(SensorFault::Stuck { value: 3000 });
+                snapshot.readings[sensor.index()].reading.value = 300.0;
+                for (step, gap) in gaps.into_iter().enumerate() {
+                    snapshot.at_ms = step as u64 * 50;
+                    snapshot.truth.primary.loops[0].hot_leg_c = 300.0 + gap;
+                    track(&cx, &mut peaks, &snapshot);
+                }
+                let before_clear = observed.checked_of("plant", "divergence")?;
+                assert_eq!(before_clear.len(), if gaps[2] == 2.0 { 2 } else { 1 });
+                snapshot.at_ms = 200;
+                snapshot.readings[sensor.index()].fault = None;
+                track(&cx, &mut peaks, &snapshot);
+                snapshot.at_ms = 250;
+                track(&cx, &mut peaks, &snapshot);
+                Ok(())
+            }))?;
+            let lines = memory.checked_of("plant", "divergence")?;
             assert_eq!(lines.len(), 3);
-            assert_eq!(lines[0]["phase"].as_str(), Some("start"));
-            assert_eq!(lines[1]["phase"].as_str(), Some("peak"));
-            assert_eq!(lines[2]["phase"].as_str(), Some("clear"));
+            assert_eq!(lines[0].str("phase"), Some("start"));
+            assert_eq!(lines[1].str("phase"), Some("peak"));
+            assert_eq!(lines[2].str("phase"), Some("clear"));
             let (peak_time, peak_value) = if gaps[2] == 2.0 {
                 (50, 302.0)
             } else {
                 (150, 304.0)
             };
-            assert_eq!(lines[1]["at_ms"].as_u64(), Some(peak_time));
-            assert_eq!(
-                lines[1].get("true_value"),
-                Some(&serde_json::json!(peak_value))
-            );
-            assert_eq!(
-                lines[1].get("reported_value"),
-                Some(&serde_json::json!(300.0))
-            );
-            assert_eq!(lines[2]["at_ms"].as_u64(), Some(200));
+            assert_eq!(lines[1].u64("at_ms"), Some(peak_time));
+            assert_eq!(lines[1].get("true_value"), Some(&float(peak_value)));
+            assert_eq!(lines[1].get("reported_value"), Some(&float(300.0)));
+            assert_eq!(lines[2].u64("at_ms"), Some(200));
         }
         Ok(())
     }
@@ -535,50 +497,43 @@ mod tests {
     fn divergence_follows_a_sensor_fault_and_stops_when_it_clears() -> fictionet::Result {
         let memory = Arc::new(Memory::default());
         let driver = Driver::new(Config::default());
-        let sink = observer(&memory);
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(1),
-            move |_cx| async move {
-                // No fault, no line.
-                driver.advance_to(&sink, 1_000);
-                // A stuck reading 25 C below the plant's hot leg.
-                driver
-                    .apply_fault(&sink, fault(stuck_hot_leg(3000), 0))
-                    .expect("the fault is accepted");
-                driver.advance_to(&sink, 3_000);
-                driver
-                    .apply_fault(
-                        &sink,
-                        fault(
-                            FaultChange::Clear(FaultTarget::Sensor(Sensor::HotLeg(Loop::A))),
-                            1,
-                        ),
-                    )
-                    .expect("the clear is accepted");
-                driver.advance_to(&sink, 4_000);
-                Ok(())
-            },
-        ))?;
+        fictionet::block_on(fictionet::lab(options(&memory), move |cx| async move {
+            // No fault, no line.
+            driver.advance_to(&cx, 1_000);
+            // A stuck reading 25 C below the plant's hot leg.
+            driver
+                .apply_fault(&cx, fault(stuck_hot_leg(3000), 0))
+                .expect("the fault is accepted");
+            driver.advance_to(&cx, 3_000);
+            driver
+                .apply_fault(
+                    &cx,
+                    fault(
+                        FaultChange::Clear(FaultTarget::Sensor(Sensor::HotLeg(Loop::A))),
+                        1,
+                    ),
+                )
+                .expect("the clear is accepted");
+            driver.advance_to(&cx, 4_000);
+            Ok(())
+        }))?;
 
-        let lines = observations(&memory, "divergence");
+        let lines = memory.checked_of("plant", "divergence")?;
         assert_eq!(lines.len(), 3, "one start, peak, and clear, none after");
-        assert_eq!(lines[0]["point"].as_str(), Some("hot_leg_a"));
+        assert_eq!(lines[0].str("point"), Some("hot_leg_a"));
         assert_eq!(
             lines
                 .iter()
-                .map(|line| line["phase"].as_str())
+                .map(|line| line.str("phase"))
                 .collect::<Vec<_>>(),
             [Some("start"), Some("peak"), Some("clear")]
         );
-        assert_eq!(lines[0]["at_ms"].as_u64(), Some(1_000));
-        assert_eq!(lines[2]["at_ms"].as_u64(), Some(3_000));
-        assert_eq!(lines[2]["time"].as_str(), Some("0:03.0"));
-        assert_eq!(
-            lines[1].get("reported_value"),
-            Some(&serde_json::json!(300.0))
-        );
-        assert!(lines[1]["at_ms"].as_u64().unwrap() >= 1_000);
-        assert!(lines[1]["at_ms"].as_u64().unwrap() <= 3_000);
+        assert_eq!(lines[0].u64("at_ms"), Some(1_000));
+        assert_eq!(lines[2].u64("at_ms"), Some(3_000));
+        assert_eq!(lines[2].str("time"), Some("0:03.0"));
+        assert_eq!(lines[1].get("reported_value"), Some(&float(300.0)));
+        assert!(lines[1].u64("at_ms").unwrap() >= 1_000);
+        assert!(lines[1].u64("at_ms").unwrap() <= 3_000);
         let true_value = lines[1]
             .get("true_value")
             .and_then(|value| value.as_f64())

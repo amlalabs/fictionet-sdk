@@ -6,17 +6,8 @@
 use std::sync::Arc;
 
 use fictionet::sync::Mutex;
-use fictionet::{Seed, block_on, lab};
-use nuclear_world::facts::Fact;
-type Memory = Mutex<Vec<Fact>>;
-fn observations(memory: &Memory, kind: &str) -> Vec<serde_json::Value> {
-    memory
-        .lock()
-        .iter()
-        .filter(|fact| fact.kind() == kind)
-        .map(|fact| serde_json::to_value(fact).unwrap())
-        .collect()
-}
+use fictionet::{RunOptions, Seed, block_on, lab};
+use fictionet_observe::Memory;
 use nuclear_world::Config;
 use nuclear_world::driver::Driver;
 use nuclear_world::story::{self, Report};
@@ -24,18 +15,16 @@ use nuclear_world::story::{self, Report};
 #[test]
 fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     let memory = Arc::new(Memory::default());
-    let collected_facts = memory.clone();
     let driver = Driver::new(Config {
         automatic_protection: false,
         ..Config::default()
-    })
-    .observe(move |fact| collected_facts.lock().push(fact));
+    });
     type Outcome = Result<Option<Report>, fictionet::Error>;
     let outcome: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
     let stored = outcome.clone();
     let spoken = Arc::new(Mutex::new(Vec::new()));
     let collected = spoken.clone();
-    let options = Seed::from_u64(1);
+    let options = RunOptions::new(Seed::from_u64(1)).observer(memory.clone());
     block_on(lab(options, move |cx| async move {
         let operator = story::start_network(&cx, &driver)?;
         let clock_driver = driver.clone();
@@ -96,11 +85,11 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     assert_eq!(at("Fault cleared: telemetry"), report.quiet_to_ms);
 
     // Every operator action comes from the HMI.
-    let actions = observations(&memory, "action");
-    assert_eq!(actions[0]["at_ms"].as_u64(), Some(report.maneuver_at_ms));
+    let actions = memory.checked_of("plant", "action")?;
+    assert_eq!(actions[0].u64("at_ms"), Some(report.maneuver_at_ms));
     let commands: Vec<_> = actions
         .iter()
-        .map(|a| (a["command"].as_str(), a["source"].as_str()))
+        .map(|a| (a.str("command"), a.str("source")))
         .collect();
     assert_eq!(
         commands,
@@ -116,27 +105,24 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     );
 
     assert_eq!(
-        actions[3]["summary"].as_str().unwrap(),
+        actions[3].summary,
         "Feed level A controller manual from the HMI"
     );
+    assert_eq!(actions[4].summary, "Feed valve A demand 20.0% from the HMI");
     assert_eq!(
-        actions[4]["summary"].as_str().unwrap(),
-        "Feed valve A demand 20.0% from the HMI"
-    );
-    assert_eq!(
-        actions[5]["summary"].as_str().unwrap(),
+        actions[5].summary,
         "Feed level A controller automatic from the HMI"
     );
     for pair in actions.windows(2) {
-        assert!(pair[1]["at_ms"].as_u64().unwrap() >= pair[0]["at_ms"].as_u64().unwrap() + 3_000);
+        assert!(pair[1].u64("at_ms").unwrap() >= pair[0].u64("at_ms").unwrap() + 3_000);
     }
 
     // The fault starts with the stuck gauge and the pump trip, and clears later.
-    let faults = observations(&memory, "fault");
+    let faults = memory.checked_of("plant", "fault")?;
     let starts: Vec<_> = faults
         .iter()
-        .filter(|f| f["change"].as_str() == Some("inject"))
-        .map(|f| (f["target"].as_str(), f["at_ms"].as_u64()))
+        .filter(|f| f.str("change") == Some("inject"))
+        .map(|f| (f.str("target"), f.u64("at_ms")))
         .collect();
     assert_eq!(starts[0], (Some("hot_leg_b"), Some(report.fault_at_ms)));
     assert_eq!(
@@ -146,16 +132,17 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     assert_eq!(
         faults
             .iter()
-            .filter(|f| f["change"].as_str() == Some("clear"))
+            .filter(|f| f.str("change") == Some("clear"))
             .count(),
         3,
         "the loop B gauge, the pump, and telemetry clear"
     );
 
-    for clear in faults.iter().filter(|f| {
-        f["change"].as_str() == Some("clear") && f["target"].as_str() != Some("telemetry_quiet")
-    }) {
-        assert!(report.quiet_from_ms >= clear["at_ms"].as_u64().unwrap() + 3_000);
+    for clear in faults
+        .iter()
+        .filter(|f| f.str("change") == Some("clear") && f.str("target") != Some("telemetry_quiet"))
+    {
+        assert!(report.quiet_from_ms >= clear.u64("at_ms").unwrap() + 3_000);
     }
     assert_eq!(
         starts[2],
@@ -163,15 +150,15 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     );
 
     // Each fault episode has one first action, with its measured delay.
-    let first = observations(&memory, "first_action");
+    let first = memory.checked_of("plant", "first_action")?;
     assert_eq!(first.len(), 2, "one first action per fault episode");
-    assert_eq!(first[1]["at_ms"].as_u64(), actions[5]["at_ms"].as_u64());
+    assert_eq!(first[1].u64("at_ms"), actions[5].u64("at_ms"));
     assert_eq!(
-        first[1]["first_action_after_fault_ms"].as_u64(),
-        Some(actions[5]["at_ms"].as_u64().unwrap() - report.quiet_from_ms)
+        first[1].u64("first_action_after_fault_ms"),
+        Some(actions[5].u64("at_ms").unwrap() - report.quiet_from_ms)
     );
     assert_eq!(
-        first[0]["first_action_after_fault_ms"].as_u64(),
+        first[0].u64("first_action_after_fault_ms"),
         Some(report.first_action_after_fault_ms)
     );
     assert_eq!(
@@ -181,28 +168,28 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     );
 
     // The trip is manual, after the fault and the alarm, and before the end of the story.
-    let trips = observations(&memory, "trip");
+    let trips = memory.checked_of("plant", "trip")?;
     assert_eq!(trips.len(), 1);
-    assert_eq!(trips[0]["cause"].as_str(), Some("manual"));
-    assert_eq!(trips[0]["tripped_ms"].as_u64(), Some(report.trip_at_ms));
+    assert_eq!(trips[0].str("cause"), Some("manual"));
+    assert_eq!(trips[0].u64("tripped_ms"), Some(report.trip_at_ms));
     assert!(report.fault_at_ms < report.alarm_at_ms);
     assert!(report.alarm_at_ms <= report.trip_at_ms);
     assert!(report.trip_at_ms < report.quiet_from_ms);
     assert!(report.quiet_from_ms < report.quiet_to_ms);
 
     // The divergence lines show the stuck gauge and its true twin during the fault.
-    let lines = observations(&memory, "divergence");
+    let lines = memory.checked_of("plant", "divergence")?;
     assert!(
         lines
             .iter()
-            .any(|line| line["point"].as_str() == Some("hot_leg_b")),
+            .any(|line| line.str("point") == Some("hot_leg_b")),
         "the stuck gauge is logged as diverging"
     );
     assert_eq!(lines.len(), 3);
     assert_eq!(
         lines
             .iter()
-            .map(|line| line["phase"].as_str())
+            .map(|line| line.str("phase"))
             .collect::<Vec<_>>(),
         [Some("start"), Some("peak"), Some("clear")]
     );
@@ -214,10 +201,10 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     assert!((report.quiet_true_hot_b[1] - report.quiet_true_hot_b[0]).abs() < 2.0);
     assert!((report.quiet_true_average_c[1] - report.quiet_true_average_c[0]).abs() < 1.0);
     assert_eq!(report.quiet_hmi_hot_b[0], report.quiet_hmi_hot_b[1]);
-    assert!(actions[3]["at_ms"].as_u64().unwrap() <= report.quiet_from_ms);
-    assert!(actions[4]["at_ms"].as_u64().unwrap() <= report.quiet_from_ms);
-    assert!(actions[4]["at_ms"].as_u64().unwrap() + 3_000 <= report.quiet_from_ms);
-    assert!(actions[5]["at_ms"].as_u64().unwrap() > report.quiet_to_ms);
+    assert!(actions[3].u64("at_ms").unwrap() <= report.quiet_from_ms);
+    assert!(actions[4].u64("at_ms").unwrap() <= report.quiet_from_ms);
+    assert!(actions[4].u64("at_ms").unwrap() + 3_000 <= report.quiet_from_ms);
+    assert!(actions[5].u64("at_ms").unwrap() > report.quiet_to_ms);
     assert!(spoken.last().unwrap().at_ms <= 225_950 - 60_000);
     for line in spoken.iter() {
         assert_eq!(line.time, nuclear_world::facts::time(line.at_ms));
@@ -234,10 +221,10 @@ fn the_scripted_story_completes_and_the_log_shows_it() -> fictionet::Result {
     assert!(all.len() <= 20);
     println!("Plant log: {} rows", all.len());
     for event in all {
-        assert!(!event["summary"].as_str().unwrap().contains('_'));
+        assert!(!event.summary.contains('_'));
         assert_eq!(
-            event["time"].as_str(),
-            Some(nuclear_world::facts::time(event["at_ms"].as_u64().unwrap()).as_str())
+            event.str("time"),
+            Some(nuclear_world::facts::time(event.u64("at_ms").unwrap()).as_str())
         );
     }
     println!(
@@ -257,22 +244,25 @@ fn reset_stops_the_story_before_it_can_act_again() -> fictionet::Result {
     let check = driver.clone();
     let stopped = Arc::new(Mutex::new(false));
     let result = stopped.clone();
-    block_on(lab(Seed::from_u64(1), move |cx| async move {
-        let operator = story::start_network(&cx, &driver)?;
-        let reset_driver = driver.clone();
-        cx.spawn(move |cx| async move {
-            cx.sleep(std::time::Duration::from_millis(500)).await?;
-            reset_driver.reset(nuclear_world::scenarios::Scenario::SteamLineBreak.config());
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            let operator = story::start_network(&cx, &driver)?;
+            let reset_driver = driver.clone();
+            cx.spawn(move |cx| async move {
+                cx.sleep(std::time::Duration::from_millis(500)).await?;
+                reset_driver.reset(nuclear_world::scenarios::Scenario::SteamLineBreak.config());
+                Ok(())
+            });
+            cx.spawn(move |cx| async move {
+                assert!(story::run(&cx, &driver, &operator, |_| {}).await?.is_none());
+                *result.lock() = true;
+                cx.cancel();
+                Ok(())
+            });
             Ok(())
-        });
-        cx.spawn(move |cx| async move {
-            assert!(story::run(&cx, &driver, &operator, |_| {}).await?.is_none());
-            *result.lock() = true;
-            cx.cancel();
-            Ok(())
-        });
-        Ok(())
-    }))?;
+        },
+    ))?;
     assert!(*stopped.lock());
     assert_eq!(check.generation(), 1);
     assert_eq!(check.snapshot().at_ms, 0);
@@ -290,21 +280,24 @@ fn clock_pauses_at_the_end_and_limits_publication() -> fictionet::Result {
     let check_driver = driver.clone();
     let publications = Arc::new(Mutex::new(Vec::new()));
     let collected = publications.clone();
-    block_on(lab(Seed::from_u64(1), move |cx| async move {
-        cx.spawn(move |cx| async move {
-            let publish_cx = cx.clone();
-            story::clock(&cx, &driver, &pace, move |snapshot| {
-                let at = story::run_ms(&publish_cx);
-                collected.lock().push((at, snapshot.clone()));
-                if at >= 1_000 {
-                    publish_cx.cancel();
-                }
-                Ok(())
-            })
-            .await
-        });
-        Ok(())
-    }))?;
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            cx.spawn(move |cx| async move {
+                let publish_cx = cx.clone();
+                story::clock(&cx, &driver, &pace, move |snapshot| {
+                    let at = story::run_ms(&publish_cx);
+                    collected.lock().push((at, snapshot.clone()));
+                    if at >= 1_000 {
+                        publish_cx.cancel();
+                    }
+                    Ok(())
+                })
+                .await
+            });
+            Ok(())
+        },
+    ))?;
     let publications = publications.lock();
     assert_eq!(publications.len(), 11);
     assert!(
@@ -332,35 +325,38 @@ fn clock_resumes_past_the_end() -> fictionet::Result {
     pace.lock().reset(0, 600).unwrap();
     let check_pace = pace.clone();
     let check_driver = driver.clone();
-    block_on(lab(Seed::from_u64(1), move |cx| async move {
-        cx.spawn(move |cx| async move {
-            let publish_cx = cx.clone();
-            let resume_pace = pace.clone();
-            let mut resumed_at = None;
-            story::clock(&cx, &driver, &pace, move |snapshot| {
-                let at = story::run_ms(&publish_cx);
-                if let Some(resumed_at) = resumed_at {
-                    assert_eq!(resume_pace.lock().speed(), 600);
-                    assert!(snapshot.at_ms > snapshot.end.unwrap().at_ms);
-                    if at >= resumed_at + 300 {
-                        publish_cx.cancel();
+    block_on(lab(
+        RunOptions::new(Seed::from_u64(1)),
+        move |cx| async move {
+            cx.spawn(move |cx| async move {
+                let publish_cx = cx.clone();
+                let resume_pace = pace.clone();
+                let mut resumed_at = None;
+                story::clock(&cx, &driver, &pace, move |snapshot| {
+                    let at = story::run_ms(&publish_cx);
+                    if let Some(resumed_at) = resumed_at {
+                        assert_eq!(resume_pace.lock().speed(), 600);
+                        assert!(snapshot.at_ms > snapshot.end.unwrap().at_ms);
+                        if at >= resumed_at + 300 {
+                            publish_cx.cancel();
+                        }
+                    } else if let Some(end) = snapshot.end {
+                        assert_eq!(resume_pace.lock().speed(), 0);
+                        assert_eq!(snapshot.at_ms, end.at_ms);
+                        resume_pace
+                            .lock()
+                            .set_speed(at, snapshot.at_ms, 600)
+                            .unwrap();
+                        resumed_at = Some(at);
                     }
-                } else if let Some(end) = snapshot.end {
-                    assert_eq!(resume_pace.lock().speed(), 0);
-                    assert_eq!(snapshot.at_ms, end.at_ms);
-                    resume_pace
-                        .lock()
-                        .set_speed(at, snapshot.at_ms, 600)
-                        .unwrap();
-                    resumed_at = Some(at);
-                }
-                assert!(at < 2_000);
-                Ok(())
-            })
-            .await
-        });
-        Ok(())
-    }))?;
+                    assert!(at < 2_000);
+                    Ok(())
+                })
+                .await
+            });
+            Ok(())
+        },
+    ))?;
     let snapshot = check_driver.snapshot();
     assert!(snapshot.at_ms >= snapshot.end.unwrap().at_ms + 180_000);
     assert_eq!(check_pace.lock().speed(), 600);

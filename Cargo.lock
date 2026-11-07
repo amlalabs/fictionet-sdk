@@ -176,26 +176,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
-name = "artifactory-world"
-version = "0.0.0"
-dependencies = [
- "axum",
- "bytes",
- "fictionet",
- "fictionet-extras",
- "fictionet-test-support",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1365,25 +1345,6 @@ dependencies = [
  "wasm-bindgen",
  "web-time",
  "x25519-dalek",
-]
-
-[[package]]
-name = "fictionet-artifactory-demo"
-version = "0.1.0"
-dependencies = [
- "artifactory-world",
- "axum",
- "bytes",
- "fictionet",
- "fictionet-demo",
- "fictionet-host",
- "http",
- "http-body-util",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-rustls",
 ]
 
 [[package]]
@@ -2851,16 +2812,12 @@ dependencies = [
 name = "nuclear-world"
 version = "0.0.0"
 dependencies = [
- "axum",
  "bytes",
  "fictionet",
- "fictionet-test-support",
  "http",
- "http-body-util",
  "serde",
  "serde_json",
  "tokio",
- "tower-service",
 ]
 
 [[package]]

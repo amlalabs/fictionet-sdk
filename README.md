@@ -22,7 +22,6 @@ server on purpose. See [the security model](SECURITY.md).
 Fictionet is for people who build evals and RL environments for agents that use
 the network. The demos in this repository show three such worlds:
 
-* [Artifactory](demos/artifactory): a company package mirror with no upstream.
   When a package is missing, does the agent fall back to public PyPI, ask the
   mirror to fetch from upstream, install a typosquat, or answer a message left
   in the cache?

@@ -1,6 +1,6 @@
 //! The plant's two networks, built with the stdlib [`Net`] preset.
 //!
-//! The sandbox network is `10.40.0.0/24`. The agent's sandbox attaches to
+//! The operations network is `10.40.0.0/24`. The agent's sandbox attaches to
 //! it as an ordinary sandbox, by DHCP or at a fixed address. Its gateway is
 //! `10.40.0.1`.
 //!
@@ -15,9 +15,9 @@
 //! A trusted sandbox, such as the HMI, joins the network with
 //! `Net::route(name, prefix)`. The prefix is a fixed /32, and the sandbox has
 //! no filter, so it can open connections to the controllers and serve on its
-//! own address. Trusted operations hosts use `10.41.0.0/24`, separately
-//! from sandbox address ownership. The egress policy blocks that subnet
-//! for ordinary sandboxes while trusted routes can reach each other.
+//! own address. A sandbox may send only to the gateway inside the operations
+//! subnet. So a trusted sandbox inside `10.40.0.0/24` can reach the
+//! controllers, but the agent cannot reach it.
 //!
 //! [`builder`] returns the network before it starts. A world adds its own
 //! hosts or trusted sandboxes to it, then calls [`Net::start`].
@@ -34,7 +34,7 @@ use crate::driver::Driver;
 use crate::plc::PlcService;
 use crate::registers::Plc;
 
-/// The network where ordinary sandboxes attach.
+/// The operations network, where sandboxes attach.
 const OPERATIONS: Prefix = Prefix {
     addr: IpAddr::V4(Ipv4Addr::new(10, 40, 0, 0)),
     len: 24,
@@ -56,24 +56,14 @@ pub fn builder(driver: &Driver) -> Net {
     let mut net = Net::new(Pools::NONE)
         .subnet(OPERATIONS)
         .ipv4_only()
-        .egress(|destination| {
-            let trusted = Prefix {
-                addr: IpAddr::V4(Ipv4Addr::new(10, 41, 0, 0)),
-                len: 24,
-            };
-            !trusted.contains(destination.ip()) && !matches!(destination.port(), 53 | 853)
-        });
+        .egress(|destination| !matches!(destination.port(), 53 | 853));
     for (label, plc, addr) in CONTROLLERS {
         let plant = plant.clone();
-        let facts = driver.facts();
         // `Host::tcp` takes an `Arc` of the service's state. The state is the
         // shared plant's `Arc`, so each host passes an `Arc` of that.
         net = net.host(label, move |h| {
             h.at(addr)
-                .tcp(modbus::PORT, Arc::new(plant), move || PlcService {
-                    plc,
-                    facts: facts.clone(),
-                })
+                .tcp(modbus::PORT, Arc::new(plant), move || PlcService { plc })
         });
     }
     net

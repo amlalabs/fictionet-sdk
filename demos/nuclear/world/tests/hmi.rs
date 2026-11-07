@@ -10,9 +10,9 @@ use std::time::Duration;
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ConnectionExt};
 use fictionet::stdlib::protocols::http1::{self, Header, RequestHead, Version};
+use fictionet::stdlib::world::sandbox::{self, Machine};
 use fictionet::sync::Mutex;
-use fictionet::{Attacher, Cx, Error, Seed};
-use fictionet_test_support::sandbox::{self, Machine};
+use fictionet::{Attacher, Cx, Error, RunOptions, Seed};
 use nuclear_world::Config;
 use nuclear_world::driver::Driver;
 use nuclear_world::hmi::{self, Held};
@@ -20,7 +20,7 @@ use nuclear_world::registers::{self, Plc};
 use nuclear_world::sensors::Sensor;
 use serde_json::{Value, json};
 
-const OPERATOR: Ipv4Addr = Ipv4Addr::new(10, 41, 0, 50);
+const OPERATOR: Ipv4Addr = Ipv4Addr::new(10, 40, 0, 50);
 const VISITOR: Ipv4Addr = Ipv4Addr::new(10, 40, 0, 52);
 
 /// The network with hmi01 and the trusted operator console.
@@ -57,7 +57,7 @@ fn start_world_at(
         .route("operator", operator_route)
         .start(fcx, attachments)?;
     let hmi_machine = sandbox::machine(fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
-    let held = hmi::start(fcx, hmi_machine.tcp, controllers, site, driver)?;
+    let held = hmi::start(fcx, hmi_machine, controllers, site, driver)?;
     let operator = sandbox::machine(fcx, attacher.attach("operator")?, OPERATOR);
     Ok(World {
         attacher,
@@ -210,41 +210,44 @@ fn assert_close(actual: f64, expected: f64, tolerance: f64, what: &str) {
 
 #[test]
 fn hmi_serves_the_mimic_page_and_its_assets() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(3), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let world = start_world(&fcx, &driver)?;
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(3)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
 
-        let page = send(&fcx, &world.operator, &get("/")).await;
-        assert_eq!(page.head.status, 200);
-        assert_eq!(
-            content_type(&page),
-            Some("text/html; charset=utf-8".to_owned())
-        );
-        let html = String::from_utf8_lossy(&page.body);
-        assert!(html.contains("<main id=\"hmi\""), "the page has the screen");
-        assert!(html.contains("hmi.mjs"), "the page loads the script");
+            let page = send(&fcx, &world.operator, &get("/")).await;
+            assert_eq!(page.head.status, 200);
+            assert_eq!(
+                content_type(&page),
+                Some("text/html; charset=utf-8".to_owned())
+            );
+            let html = String::from_utf8_lossy(&page.body);
+            assert!(html.contains("<main id=\"hmi\""), "the page has the screen");
+            assert!(html.contains("hmi.mjs"), "the page loads the script");
 
-        let script = send(&fcx, &world.operator, &get("/hmi.mjs")).await;
-        assert_eq!(script.head.status, 200);
-        assert_eq!(
-            content_type(&script),
-            Some("text/javascript; charset=utf-8".to_owned())
-        );
-        let style = send(&fcx, &world.operator, &get("/hmi.css")).await;
-        assert_eq!(style.head.status, 200);
-        assert_eq!(
-            content_type(&style),
-            Some("text/css; charset=utf-8".to_owned())
-        );
+            let script = send(&fcx, &world.operator, &get("/hmi.mjs")).await;
+            assert_eq!(script.head.status, 200);
+            assert_eq!(
+                content_type(&script),
+                Some("text/javascript; charset=utf-8".to_owned())
+            );
+            let style = send(&fcx, &world.operator, &get("/hmi.css")).await;
+            assert_eq!(style.head.status, 200);
+            assert_eq!(
+                content_type(&style),
+                Some("text/css; charset=utf-8".to_owned())
+            );
 
-        let missing = send(&fcx, &world.operator, &get("/nothing")).await;
-        assert_eq!(missing.head.status, 404);
-        let wrong_method = send(&fcx, &world.operator, &post("/api/plant", &json!({}))).await;
-        assert_eq!(wrong_method.head.status, 405);
-        fcx.cancel();
-        Ok(())
-    }));
+            let missing = send(&fcx, &world.operator, &get("/nothing")).await;
+            assert_eq!(missing.head.status, 404);
+            let wrong_method = send(&fcx, &world.operator, &post("/api/plant", &json!({}))).await;
+            assert_eq!(wrong_method.head.status, 405);
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
@@ -259,350 +262,362 @@ fn content_type(response: &http1::Response) -> Option<String> {
 
 #[test]
 fn poll_holds_each_controller_block_and_plant_json_matches_the_snapshot() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(4), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let world = start_world(&fcx, &driver)?;
-        let first_history = send(
-            &fcx,
-            &world.operator,
-            &get("/api/trend?point=hot_leg_a&minutes=10"),
-        )
-        .await;
-        let first_history = json_body(&first_history);
-        let samples = first_history["samples"].as_array().unwrap();
-        assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
-        for (n, sample) in samples.iter().enumerate() {
-            assert_eq!(
-                sample["time"],
-                hmi::Site::default().timestamp(-600_000 + n as i64 * 250)
-            );
-            assert!(sample["value"].as_f64().is_some());
-        }
-        let view = next_poll(&fcx, &world.operator, "").await;
-
-        for reading in view["readings"].as_object().unwrap().values() {
-            assert!(!reading["tag"].as_str().unwrap().is_empty());
-        }
-        assert_eq!(
-            view["plant_time"],
-            hmi::Site::default().timestamp(world.held.lock().clock_ms.unwrap())
-        );
-        assert!(
-            view["links"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|link| link["error"].is_null())
-        );
-        let trend = send(
-            &fcx,
-            &world.operator,
-            &get("/api/trend?point=neutron_power&minutes=10"),
-        )
-        .await;
-        assert_eq!(trend.head.status, 200);
-        let trend = json_body(&trend);
-        assert_eq!(trend["point"], "neutron_power");
-        let samples = trend["samples"].as_array().unwrap();
-        assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
-        assert_eq!(
-            samples.last().unwrap()["value"],
-            view["readings"]["neutron_power"]["value"]
-        );
-        assert!(samples[0]["time"].as_str().unwrap().ends_with("+00:00"));
-        for query in ["", "&minutes=no", "&minutes=0", "&minutes=-1"] {
-            let reply = send(
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(4)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
+            let first_history = send(
                 &fcx,
                 &world.operator,
-                &get(&format!("/api/trend?point=neutron_power{query}")),
+                &get("/api/trend?point=hot_leg_a&minutes=10"),
             )
             .await;
-            assert_eq!(reply.head.status, 200);
-            assert!(!json_body(&reply)["samples"].as_array().unwrap().is_empty());
-        }
-        let missing = send(&fcx, &world.operator, &get("/api/trend?point=missing")).await;
-        assert_eq!(missing.head.status, 404);
-        let snapshot = driver.snapshot();
-        // The blocks the HMI holds are the controllers' own blocks.
-        {
-            let held = world.held.lock();
-            for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1, Plc::Pam1] {
-                let block = &held.blocks[match plc {
-                    Plc::Rps1 => 0,
-                    Plc::Rcs1 => 1,
-                    Plc::Bop1 => 2,
-                    Plc::Pam1 => 3,
-                }];
-                assert!(block.online, "{plc:?} is online");
+            let first_history = json_body(&first_history);
+            let samples = first_history["samples"].as_array().unwrap();
+            assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
+            for (n, sample) in samples.iter().enumerate() {
                 assert_eq!(
-                    block.input,
-                    registers::input_registers(plc, &snapshot),
-                    "{plc:?} input registers"
+                    sample["time"],
+                    hmi::Site::default().timestamp(-600_000 + n as i64 * 250)
                 );
-                assert_eq!(
-                    block.discrete,
-                    registers::discrete_inputs(plc, &snapshot),
-                    "{plc:?} discrete inputs"
-                );
-                assert_eq!(
-                    block.coils,
-                    registers::coils(plc, &snapshot),
-                    "{plc:?} coils"
-                );
-                assert_eq!(
-                    block.holding,
-                    registers::holding_registers(plc, &snapshot),
-                    "{plc:?} holding registers"
-                );
+                assert!(sample["value"].as_f64().is_some());
             }
-        }
+            let view = next_poll(&fcx, &world.operator, "").await;
 
-        // Engineering values agree with the plant's own readings, to one
-        // instrument count.
-        let reading = |sensor: Sensor| snapshot.readings[sensor.index()].reading.value;
-        assert!(view["readings"].get("reactivity").is_none());
-        assert_close(
-            value(&view, "shutdown_rods"),
-            reading(Sensor::ShutdownRodPosition),
-            0.05,
-            "shutdown rods",
-        );
-        assert_eq!(world.held.lock().blocks[0].input.len(), 5);
-        assert_eq!(
-            world.held.lock().blocks[0].input[4],
-            snapshot.telemetry.heartbeat
-        );
-        assert_close(
-            value(&view, "pressurizer_pressure"),
-            reading(Sensor::PressurizerPressure),
-            0.005,
-            "pressurizer pressure",
-        );
-        assert_close(
-            value(&view, "neutron_power"),
-            reading(Sensor::NeutronPower),
-            0.05,
-            "neutron power",
-        );
-        assert_close(
-            value(&view, "hot_leg_a"),
-            reading(Sensor::HotLeg(nuclear_world::command::Loop::A)),
-            0.05,
-            "hot leg A",
-        );
-        assert_close(
-            value(&view, "pressurizer_pressure"),
-            15.5,
-            0.05,
-            "pressurizer pressure near 15.5 MPa at full power",
-        );
-        assert_close(
-            value(&view, "neutron_power"),
-            100.0,
-            1.0,
-            "neutron power near 100 %",
-        );
+            for reading in view["readings"].as_object().unwrap().values() {
+                assert!(!reading["tag"].as_str().unwrap().is_empty());
+            }
+            assert_eq!(
+                view["plant_time"],
+                hmi::Site::default().timestamp(world.held.lock().clock_ms.unwrap())
+            );
+            assert!(
+                view["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|link| link["error"].is_null())
+            );
+            let trend = send(
+                &fcx,
+                &world.operator,
+                &get("/api/trend?point=neutron_power&minutes=10"),
+            )
+            .await;
+            assert_eq!(trend.head.status, 200);
+            let trend = json_body(&trend);
+            assert_eq!(trend["point"], "neutron_power");
+            let samples = trend["samples"].as_array().unwrap();
+            assert_eq!(samples.len(), hmi::HISTORY_CAPACITY);
+            assert_eq!(
+                samples.last().unwrap()["value"],
+                view["readings"]["neutron_power"]["value"]
+            );
+            assert!(samples[0]["time"].as_str().unwrap().ends_with("+00:00"));
+            for query in ["", "&minutes=no", "&minutes=0", "&minutes=-1"] {
+                let reply = send(
+                    &fcx,
+                    &world.operator,
+                    &get(&format!("/api/trend?point=neutron_power{query}")),
+                )
+                .await;
+                assert_eq!(reply.head.status, 200);
+                assert!(!json_body(&reply)["samples"].as_array().unwrap().is_empty());
+            }
+            let missing = send(&fcx, &world.operator, &get("/api/trend?point=missing")).await;
+            assert_eq!(missing.head.status, 404);
+            let snapshot = driver.snapshot();
+            // The blocks the HMI holds are the controllers' own blocks.
+            {
+                let held = world.held.lock();
+                for plc in [Plc::Rps1, Plc::Rcs1, Plc::Bop1, Plc::Pam1] {
+                    let block = &held.blocks[match plc {
+                        Plc::Rps1 => 0,
+                        Plc::Rcs1 => 1,
+                        Plc::Bop1 => 2,
+                        Plc::Pam1 => 3,
+                    }];
+                    assert!(block.online, "{plc:?} is online");
+                    assert_eq!(
+                        block.input,
+                        registers::input_registers(plc, &snapshot),
+                        "{plc:?} input registers"
+                    );
+                    assert_eq!(
+                        block.discrete,
+                        registers::discrete_inputs(plc, &snapshot),
+                        "{plc:?} discrete inputs"
+                    );
+                    assert_eq!(
+                        block.coils,
+                        registers::coils(plc, &snapshot),
+                        "{plc:?} coils"
+                    );
+                    assert_eq!(
+                        block.holding,
+                        registers::holding_registers(plc, &snapshot),
+                        "{plc:?} holding registers"
+                    );
+                }
+            }
 
-        assert_eq!(view["status"]["reactor_tripped"], json!(false));
-        assert_eq!(view["status"]["coolant_pump_a"], json!(true));
-        assert_eq!(view["modes"]["pressurizer"], json!("automatic"));
-        assert_eq!(view["links"][1]["online"], json!(true));
-        assert_eq!(
-            view["readings"]["pressurizer_pressure"]["unit"],
-            json!("MPa")
-        );
-        assert_eq!(
-            view["readings"]["pressurizer_pressure"]["stale"],
-            json!(false)
-        );
-        // No alarm is active at steady full power.
-        for alarm in view["alarms"].as_array().expect("an alarm list") {
-            assert_eq!(alarm["state"], json!("normal"), "{alarm}");
-        }
-        fcx.cancel();
-        Ok(())
-    }));
+            // Engineering values agree with the plant's own readings, to one
+            // instrument count.
+            let reading = |sensor: Sensor| snapshot.readings[sensor.index()].reading.value;
+            assert!(view["readings"].get("reactivity").is_none());
+            assert_close(
+                value(&view, "shutdown_rods"),
+                reading(Sensor::ShutdownRodPosition),
+                0.05,
+                "shutdown rods",
+            );
+            assert_eq!(world.held.lock().blocks[0].input.len(), 5);
+            assert_eq!(
+                world.held.lock().blocks[0].input[4],
+                snapshot.telemetry.heartbeat
+            );
+            assert_close(
+                value(&view, "pressurizer_pressure"),
+                reading(Sensor::PressurizerPressure),
+                0.005,
+                "pressurizer pressure",
+            );
+            assert_close(
+                value(&view, "neutron_power"),
+                reading(Sensor::NeutronPower),
+                0.05,
+                "neutron power",
+            );
+            assert_close(
+                value(&view, "hot_leg_a"),
+                reading(Sensor::HotLeg(nuclear_world::command::Loop::A)),
+                0.05,
+                "hot leg A",
+            );
+            assert_close(
+                value(&view, "pressurizer_pressure"),
+                15.5,
+                0.05,
+                "pressurizer pressure near 15.5 MPa at full power",
+            );
+            assert_close(
+                value(&view, "neutron_power"),
+                100.0,
+                1.0,
+                "neutron power near 100 %",
+            );
+
+            assert_eq!(view["status"]["reactor_tripped"], json!(false));
+            assert_eq!(view["status"]["coolant_pump_a"], json!(true));
+            assert_eq!(view["modes"]["pressurizer"], json!("automatic"));
+            assert_eq!(view["links"][1]["online"], json!(true));
+            assert_eq!(
+                view["readings"]["pressurizer_pressure"]["unit"],
+                json!("MPa")
+            );
+            assert_eq!(
+                view["readings"]["pressurizer_pressure"]["stale"],
+                json!(false)
+            );
+            // No alarm is active at steady full power.
+            for alarm in view["alarms"].as_array().expect("an alarm list") {
+                assert_eq!(alarm["state"], json!("normal"), "{alarm}");
+            }
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
 #[test]
 fn a_control_post_changes_the_plant_and_the_next_poll_shows_it() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(5), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let world = start_world(&fcx, &driver)?;
-        let before = next_poll(&fcx, &world.operator, "").await;
-        assert_eq!(
-            value(&before, "rod_demand"),
-            50.0,
-            "full power starts at 50 %"
-        );
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(5)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
+            let before = next_poll(&fcx, &world.operator, "").await;
+            assert_eq!(
+                value(&before, "rod_demand"),
+                50.0,
+                "full power starts at 50 %"
+            );
 
-        let posted = send(
-            &fcx,
-            &world.operator,
-            &post("/api/control/rod-demand", &json!({ "percent": 40.0 })),
-        )
-        .await;
-        assert_eq!(
-            posted.head.status,
-            200,
-            "{}",
-            String::from_utf8_lossy(&posted.body)
-        );
-        assert_eq!(json_body(&posted), json!({ "ok": true }));
-        assert_eq!(
-            driver.snapshot().operator_actions,
-            1,
-            "one accepted operator action"
-        );
+            let posted = send(
+                &fcx,
+                &world.operator,
+                &post("/api/control/rod-demand", &json!({ "percent": 40.0 })),
+            )
+            .await;
+            assert_eq!(
+                posted.head.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&posted.body)
+            );
+            assert_eq!(json_body(&posted), json!({ "ok": true }));
+            assert_eq!(
+                driver.snapshot().operator_actions,
+                1,
+                "one accepted operator action"
+            );
 
-        driver.advance_to(&(), 6_000);
-        let after = next_poll(
-            &fcx,
-            &world.operator,
-            before["plant_time"].as_str().unwrap(),
-        )
-        .await;
-        assert_eq!(
-            value(&after, "rod_demand"),
-            40.0,
-            "the next poll holds the new demand"
-        );
-        let snapshot = driver.snapshot();
-        assert_eq!(snapshot.truth.reactor.rod_demand_percent, 40.0);
-        assert_close(
-            value(&after, "neutron_power"),
-            snapshot.readings[Sensor::NeutronPower.index()]
-                .reading
-                .value,
-            0.05,
-            "neutron power after the rods move",
-        );
-        assert!(
-            value(&after, "neutron_power") < value(&before, "neutron_power"),
-            "inserted rods lower the power"
-        );
-        fcx.cancel();
-        Ok(())
-    }));
+            driver.advance_to(&(), 6_000);
+            let after = next_poll(
+                &fcx,
+                &world.operator,
+                before["plant_time"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(
+                value(&after, "rod_demand"),
+                40.0,
+                "the next poll holds the new demand"
+            );
+            let snapshot = driver.snapshot();
+            assert_eq!(snapshot.truth.reactor.rod_demand_percent, 40.0);
+            assert_close(
+                value(&after, "neutron_power"),
+                snapshot.readings[Sensor::NeutronPower.index()]
+                    .reading
+                    .value,
+                0.05,
+                "neutron power after the rods move",
+            );
+            assert!(
+                value(&after, "neutron_power") < value(&before, "neutron_power"),
+                "inserted rods lower the power"
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
 #[test]
 fn a_refused_control_comes_back_as_the_controllers_exception() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(6), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let world = start_world(&fcx, &driver)?;
-        next_poll(&fcx, &world.operator, "").await;
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(6)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
+            next_poll(&fcx, &world.operator, "").await;
 
-        // Feed valve A is under automatic control, so the controller
-        // refuses a demand for it: illegal data value, code 3.
-        let refused = send(
-            &fcx,
-            &world.operator,
-            &post(
-                "/api/control/valve",
-                &json!({ "name": "feed-a", "percent": 30.0 }),
-            ),
-        )
-        .await;
-        assert_eq!(refused.head.status, 400);
-        let body = json_body(&refused);
-        assert_eq!(body["ok"], json!(false));
-        assert_eq!(body["exception"], json!(3));
-        assert_eq!(body["reason"], json!("illegal data value"));
-        assert_eq!(
-            driver.snapshot().operator_actions,
-            0,
-            "a refused write is no action"
-        );
+            // Feed valve A is under automatic control, so the controller
+            // refuses a demand for it: illegal data value, code 3.
+            let refused = send(
+                &fcx,
+                &world.operator,
+                &post(
+                    "/api/control/valve",
+                    &json!({ "name": "feed-a", "percent": 30.0 }),
+                ),
+            )
+            .await;
+            assert_eq!(refused.head.status, 400);
+            let body = json_body(&refused);
+            assert_eq!(body["ok"], json!(false));
+            assert_eq!(body["exception"], json!(3));
+            assert_eq!(body["reason"], json!("illegal data value"));
+            assert_eq!(
+                driver.snapshot().operator_actions,
+                0,
+                "a refused write is no action"
+            );
 
-        let unknown = send(
-            &fcx,
-            &world.operator,
-            &post("/api/control/shutdown", &json!({})),
-        )
-        .await;
-        assert_eq!(unknown.head.status, 400);
-        fcx.cancel();
-        Ok(())
-    }));
+            let unknown = send(
+                &fcx,
+                &world.operator,
+                &post("/api/control/shutdown", &json!({})),
+            )
+            .await;
+            assert_eq!(unknown.head.status, 400);
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
 #[test]
 fn a_pump_stop_shows_in_status_and_its_alarm_clears_on_acknowledge() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(7), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let world = start_world(&fcx, &driver)?;
-        let before = next_poll(&fcx, &world.operator, "").await;
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(7)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
+            let before = next_poll(&fcx, &world.operator, "").await;
 
-        let stop = send(
-            &fcx,
-            &world.operator,
-            &post(
-                "/api/control/pump",
-                &json!({ "name": "coolant-b", "running": false }),
-            ),
-        )
-        .await;
-        assert_eq!(stop.head.status, 200);
-        driver.advance_to(&(), 4_000);
-        let stopped = next_poll(
-            &fcx,
-            &world.operator,
-            before["plant_time"].as_str().unwrap(),
-        )
-        .await;
-        assert_eq!(stopped["status"]["coolant_pump_b"], json!(false));
-        assert_eq!(alarm_state(&stopped, "coolant_pump_stopped"), "active");
-        let in_time = stopped["alarms"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|a| a["id"] == "coolant_pump_stopped")
-            .unwrap()["arrived_at"]
-            .clone();
-        assert_eq!(in_time, stopped["plant_time"]);
-
-        let ack = send(
-            &fcx,
-            &world.operator,
-            &post("/api/control/acknowledge", &json!({})),
-        )
-        .await;
-        assert_eq!(ack.head.status, 200);
-        let acknowledged = next_poll(
-            &fcx,
-            &world.operator,
-            stopped["plant_time"].as_str().unwrap(),
-        )
-        .await;
-        assert_eq!(
-            alarm_state(&acknowledged, "coolant_pump_stopped"),
-            "acknowledged"
-        );
-        assert_eq!(
-            acknowledged["alarms"]
+            let stop = send(
+                &fcx,
+                &world.operator,
+                &post(
+                    "/api/control/pump",
+                    &json!({ "name": "coolant-b", "running": false }),
+                ),
+            )
+            .await;
+            assert_eq!(stop.head.status, 200);
+            driver.advance_to(&(), 4_000);
+            let stopped = next_poll(
+                &fcx,
+                &world.operator,
+                before["plant_time"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(stopped["status"]["coolant_pump_b"], json!(false));
+            assert_eq!(alarm_state(&stopped, "coolant_pump_stopped"), "active");
+            let in_time = stopped["alarms"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|a| a["id"] == "coolant_pump_stopped")
-                .unwrap()["arrived_at"],
-            in_time
-        );
-        assert_eq!(
-            driver.snapshot().operator_actions,
-            2,
-            "stop and acknowledge"
-        );
-        fcx.cancel();
-        Ok(())
-    }));
+                .unwrap()["arrived_at"]
+                .clone();
+            assert_eq!(in_time, stopped["plant_time"]);
+
+            let ack = send(
+                &fcx,
+                &world.operator,
+                &post("/api/control/acknowledge", &json!({})),
+            )
+            .await;
+            assert_eq!(ack.head.status, 200);
+            let acknowledged = next_poll(
+                &fcx,
+                &world.operator,
+                stopped["plant_time"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(
+                alarm_state(&acknowledged, "coolant_pump_stopped"),
+                "acknowledged"
+            );
+            assert_eq!(
+                acknowledged["alarms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|a| a["id"] == "coolant_pump_stopped")
+                    .unwrap()["arrived_at"],
+                in_time
+            );
+            assert_eq!(
+                driver.snapshot().operator_actions,
+                2,
+                "stop and acknowledge"
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
@@ -616,26 +631,29 @@ fn alarm_state<'a>(view: &'a Value, id: &str) -> &'a str {
 
 #[test]
 fn an_ordinary_sandbox_cannot_reach_hmi01() {
-    let result = fictionet::block_on(fictionet::lab(Seed::from_u64(8), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let world = start_world(&fcx, &driver)?;
-        let visitor = sandbox::machine(&fcx, world.attacher.attach("visitor")?, VISITOR);
-        // Packets to the operations subnet, other than the gateway's, are
-        // dropped by the sandbox filter, so the connection never opens.
-        let refused = visitor
-            .tcp
-            .connect(&fcx, SocketAddr::new(hmi::ADDR.into(), hmi::PORT))
-            .await
-            .err();
-        assert_eq!(
-            refused,
-            Some(ConnError::TimedOut),
-            "the SYN is dropped, so the visitor never reaches hmi01"
-        );
-        fcx.cancel();
-        Ok(())
-    }));
+    let result = fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(8)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
+            let visitor = sandbox::machine(&fcx, world.attacher.attach("visitor")?, VISITOR);
+            // Packets to the operations subnet, other than the gateway's, are
+            // dropped by the sandbox filter, so the connection never opens.
+            let refused = visitor
+                .tcp
+                .connect(&fcx, SocketAddr::new(hmi::ADDR.into(), hmi::PORT))
+                .await
+                .err();
+            assert_eq!(
+                refused,
+                Some(ConnError::TimedOut),
+                "the SYN is dropped, so the visitor never reaches hmi01"
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ));
     result.unwrap();
 }
 
@@ -643,63 +661,66 @@ fn an_ordinary_sandbox_cannot_reach_hmi01() {
 fn telemetry_heartbeats_hold_across_polls_and_resume_after_clearing() {
     use nuclear_world::command::FaultCommand;
     use nuclear_world::faults::{Fault, FaultChange, FaultTarget};
-    fictionet::block_on(fictionet::lab(Seed::from_u64(9), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver.advance_to(&(), 2_000);
-        let world = start_world(&fcx, &driver)?;
-        let before = next_poll(&fcx, &world.operator, "").await;
-        let counts = |view: &Value| {
-            view["links"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|link| link["heartbeat"].as_u64().unwrap())
-                .collect::<Vec<_>>()
-        };
-        let held_counts = counts(&before);
-        assert_eq!(
-            held_counts,
-            vec![u64::from(driver.snapshot().telemetry.heartbeat); 4]
-        );
-        driver
-            .apply_fault(
-                &driver.facts(),
-                FaultCommand {
-                    change: FaultChange::Inject(Fault::TelemetryQuiet),
-                    expected_revision: driver.snapshot().revision,
-                },
-            )
-            .unwrap();
-        let mut updated = before["plant_time"].as_str().unwrap().to_owned();
-        for at_ms in [3_000, 4_000, 5_000, 6_000] {
-            driver.advance_to(&(), at_ms);
-            let view = next_poll(&fcx, &world.operator, &updated).await;
-            let next = view["plant_time"].as_str().unwrap().to_owned();
-            assert!(next > updated);
-            assert_eq!(counts(&view), held_counts);
-            updated = next;
-        }
-        assert_eq!(driver.snapshot().at_ms, 6_000);
-        driver
-            .apply_fault(
-                &driver.facts(),
-                FaultCommand {
-                    change: FaultChange::Clear(FaultTarget::TelemetryQuiet),
-                    expected_revision: driver.snapshot().revision,
-                },
-            )
-            .unwrap();
-        driver.advance_to(&(), 7_000);
-        let resumed = next_poll(&fcx, &world.operator, &updated).await;
-        assert!(
-            counts(&resumed)
-                .iter()
-                .zip(&held_counts)
-                .all(|(a, b)| a > b)
-        );
-        fcx.cancel();
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(9)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver.advance_to(&(), 2_000);
+            let world = start_world(&fcx, &driver)?;
+            let before = next_poll(&fcx, &world.operator, "").await;
+            let counts = |view: &Value| {
+                view["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|link| link["heartbeat"].as_u64().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let held_counts = counts(&before);
+            assert_eq!(
+                held_counts,
+                vec![u64::from(driver.snapshot().telemetry.heartbeat); 4]
+            );
+            driver
+                .apply_fault(
+                    &fcx,
+                    FaultCommand {
+                        change: FaultChange::Inject(Fault::TelemetryQuiet),
+                        expected_revision: driver.snapshot().revision,
+                    },
+                )
+                .unwrap();
+            let mut updated = before["plant_time"].as_str().unwrap().to_owned();
+            for at_ms in [3_000, 4_000, 5_000, 6_000] {
+                driver.advance_to(&(), at_ms);
+                let view = next_poll(&fcx, &world.operator, &updated).await;
+                let next = view["plant_time"].as_str().unwrap().to_owned();
+                assert!(next > updated);
+                assert_eq!(counts(&view), held_counts);
+                updated = next;
+            }
+            assert_eq!(driver.snapshot().at_ms, 6_000);
+            driver
+                .apply_fault(
+                    &fcx,
+                    FaultCommand {
+                        change: FaultChange::Clear(FaultTarget::TelemetryQuiet),
+                        expected_revision: driver.snapshot().revision,
+                    },
+                )
+                .unwrap();
+            driver.advance_to(&(), 7_000);
+            let resumed = next_poll(&fcx, &world.operator, &updated).await;
+            assert!(
+                counts(&resumed)
+                    .iter()
+                    .zip(&held_counts)
+                    .all(|(a, b)| a > b)
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -774,59 +795,56 @@ fn history_is_bounded_and_failed_reads_are_gaps() {
 
 #[test]
 fn failed_controller_links_serve_classified_reasons() {
-    fictionet::block_on(fictionet::lab(Seed::from_u64(10), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        let mut controllers = hmi::controllers();
-        controllers.rcs1.set_port(5999);
-        controllers.bop1 = SocketAddr::new(OPERATOR.into(), 5998);
-        controllers
-            .rps1
-            .set_ip(Ipv4Addr::new(192, 168, 95, 99).into());
-        let (attacher, attachments) = fictionet::attachments();
-        hmi::with_hmi(&driver)
-            .route(
-                "operator",
-                Prefix {
-                    addr: OPERATOR.into(),
-                    len: 32,
-                },
-            )
-            .route(
-                "disconnected-controller",
-                Prefix {
-                    addr: controllers.rps1.ip(),
-                    len: 32,
-                },
-            )
-            .start(&fcx, attachments)?;
-        let _disconnected = attacher.attach("disconnected-controller")?;
-        let machine = sandbox::machine(&fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
-        hmi::start(
-            &fcx,
-            machine.tcp,
-            controllers,
-            hmi::Site::default(),
-            &driver,
-        )?;
-        let operator = sandbox::machine(&fcx, attacher.attach("operator")?, OPERATOR);
-        let mut listener = operator.tcp.listen(5998)?;
-        fcx.spawn(move |fcx| async move {
-            let mut conn = listener.accept(&fcx).await?;
-            let mut request = [0; 64];
-            conn.read(&fcx, &mut request).await?;
-            conn.write_all(&fcx, &[0, 1, 0, 1, 0, 2, 1, 3]).await?;
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(10)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let mut controllers = hmi::controllers();
+            controllers.rcs1.set_port(5999);
+            controllers.bop1 = SocketAddr::new(OPERATOR.into(), 5998);
+            controllers
+                .rps1
+                .set_ip(Ipv4Addr::new(192, 168, 95, 99).into());
+            let (attacher, attachments) = fictionet::attachments();
+            hmi::with_hmi(&driver)
+                .route(
+                    "operator",
+                    Prefix {
+                        addr: OPERATOR.into(),
+                        len: 32,
+                    },
+                )
+                .route(
+                    "disconnected-controller",
+                    Prefix {
+                        addr: controllers.rps1.ip(),
+                        len: 32,
+                    },
+                )
+                .start(&fcx, attachments)?;
+            let _disconnected = attacher.attach("disconnected-controller")?;
+            let machine = sandbox::machine(&fcx, attacher.attach(hmi::NAME)?, hmi::ADDR);
+            hmi::start(&fcx, machine, controllers, hmi::Site::default(), &driver)?;
+            let operator = sandbox::machine(&fcx, attacher.attach("operator")?, OPERATOR);
+            let mut listener = operator.tcp.listen(5998)?;
+            fcx.spawn(move |fcx| async move {
+                let mut conn = listener.accept(&fcx).await?;
+                let mut request = [0; 64];
+                conn.read(&fcx, &mut request).await?;
+                conn.write_all(&fcx, &[0, 1, 0, 1, 0, 2, 1, 3]).await?;
+                Ok(())
+            });
+            let view = next_poll(&fcx, &operator, "").await;
+            assert_eq!(view["links"][0]["error"], "timeout");
+            assert_eq!(view["links"][1]["error"], "refused");
+            assert_eq!(view["links"][0]["online"], false);
+            assert_eq!(view["links"][1]["online"], false);
+            assert_eq!(view["links"][2]["error"], "bad reply");
+            assert_eq!(view["links"][2]["online"], false);
+            fcx.cancel();
             Ok(())
-        });
-        let view = next_poll(&fcx, &operator, "").await;
-        assert_eq!(view["links"][0]["error"], "timeout");
-        assert_eq!(view["links"][1]["error"], "refused");
-        assert_eq!(view["links"][0]["online"], false);
-        assert_eq!(view["links"][1]["online"], false);
-        assert_eq!(view["links"][2]["error"], "bad reply");
-        assert_eq!(view["links"][2]["online"], false);
-        fcx.cancel();
-        Ok(())
-    }))
+        },
+    ))
     .unwrap();
 }
 
@@ -850,70 +868,76 @@ fn site_clock_preserves_offsets_and_negative_history_times() {
 
 #[test]
 fn configured_site_clock_reaches_http_and_json() {
-    fictionet::block_on(fictionet::lab(Seed::from_u64(11), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        let site = hmi::Site {
-            epoch: 1_773_475_115,
-            zone: "IST",
-            utc_offset_seconds: 19_800,
-        };
-        let world = start_world_at(&fcx, &driver, hmi::controllers(), site)?;
-        fcx.sleep(Duration::from_millis(1500)).await.unwrap();
-        let response = send_at(&fcx, &world.operator, &get("/api/plant"), site).await;
-        let view = json_body(&response);
-        assert_eq!(view["zone"], "IST");
-        assert_eq!(
-            view["plant_time"],
-            site.timestamp(world.held.lock().clock_ms.unwrap())
-        );
-        assert!(view["plant_time"].as_str().unwrap().ends_with("+05:30"));
-        assert!(
-            view["links"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|link| link["updated_at"].as_str().unwrap().ends_with("+05:30"))
-        );
-        fcx.cancel();
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(11)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let site = hmi::Site {
+                epoch: 1_773_475_115,
+                zone: "IST",
+                utc_offset_seconds: 19_800,
+            };
+            let world = start_world_at(&fcx, &driver, hmi::controllers(), site)?;
+            fcx.sleep(Duration::from_millis(1500)).await.unwrap();
+            let response = send_at(&fcx, &world.operator, &get("/api/plant"), site).await;
+            let view = json_body(&response);
+            assert_eq!(view["zone"], "IST");
+            assert_eq!(
+                view["plant_time"],
+                site.timestamp(world.held.lock().clock_ms.unwrap())
+            );
+            assert!(view["plant_time"].as_str().unwrap().ends_with("+05:30"));
+            assert!(
+                view["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|link| link["updated_at"].as_str().unwrap().ends_with("+05:30"))
+            );
+            fcx.cancel();
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
 #[test]
 fn emergency_posts_write_the_controller_coils() {
-    fictionet::block_on(fictionet::lab(Seed::from_u64(32), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        let world = start_world(&fcx, &driver)?;
-        for (path, body, plc, address) in [
-            ("relief", json!({"open": true}), Plc::Rcs1, 4),
-            ("relief-block", json!({"closed": true}), Plc::Rcs1, 5),
-            (
-                "pump",
-                json!({"name": "safety-injection", "running": true}),
-                Plc::Rcs1,
-                6,
-            ),
-            ("steam-isolation", json!({"closed": true}), Plc::Bop1, 7),
-        ] {
-            let response = send(
-                &fcx,
-                &world.operator,
-                &post(&format!("/api/control/{path}"), &body),
-            )
-            .await;
-            assert_eq!(
-                response.head.status,
-                200,
-                "{path}: {}",
-                String::from_utf8_lossy(&response.body)
-            );
-            driver.advance_to(&(), driver.snapshot().at_ms + 250);
-            assert!(registers::coils(plc, &driver.snapshot())[address]);
-        }
-        fcx.cancel();
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(32)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            let world = start_world(&fcx, &driver)?;
+            for (path, body, plc, address) in [
+                ("relief", json!({"open": true}), Plc::Rcs1, 4),
+                ("relief-block", json!({"closed": true}), Plc::Rcs1, 5),
+                (
+                    "pump",
+                    json!({"name": "safety-injection", "running": true}),
+                    Plc::Rcs1,
+                    6,
+                ),
+                ("steam-isolation", json!({"closed": true}), Plc::Bop1, 7),
+            ] {
+                let response = send(
+                    &fcx,
+                    &world.operator,
+                    &post(&format!("/api/control/{path}"), &body),
+                )
+                .await;
+                assert_eq!(
+                    response.head.status,
+                    200,
+                    "{path}: {}",
+                    String::from_utf8_lossy(&response.body)
+                );
+                driver.advance_to(&(), driver.snapshot().at_ms + 250);
+                assert!(registers::coils(plc, &driver.snapshot())[address]);
+            }
+            fcx.cancel();
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -923,37 +947,40 @@ fn failed_safety_injection_post_returns_the_controller_exception() {
         command::FaultCommand,
         faults::{Fault, FaultChange, ProcessFault},
     };
-    fictionet::block_on(fictionet::lab(Seed::from_u64(33), |fcx| async move {
-        let driver = Driver::new(Config::default());
-        driver
-            .apply_fault(
-                &(),
-                FaultCommand {
-                    change: FaultChange::Inject(Fault::Process(
-                        ProcessFault::SafetyInjectionFailure,
-                    )),
-                    expected_revision: 0,
-                },
+    fictionet::block_on(fictionet::lab(
+        RunOptions::new(Seed::from_u64(33)),
+        |fcx| async move {
+            let driver = Driver::new(Config::default());
+            driver
+                .apply_fault(
+                    &(),
+                    FaultCommand {
+                        change: FaultChange::Inject(Fault::Process(
+                            ProcessFault::SafetyInjectionFailure,
+                        )),
+                        expected_revision: 0,
+                    },
+                )
+                .unwrap();
+            let world = start_world(&fcx, &driver)?;
+            let response = send(
+                &fcx,
+                &world.operator,
+                &post(
+                    "/api/control/pump",
+                    &json!({"name": "safety-injection", "running": true}),
+                ),
             )
-            .unwrap();
-        let world = start_world(&fcx, &driver)?;
-        let response = send(
-            &fcx,
-            &world.operator,
-            &post(
-                "/api/control/pump",
-                &json!({"name": "safety-injection", "running": true}),
-            ),
-        )
-        .await;
-        assert_eq!(response.head.status, 409);
-        let body = json_body(&response);
-        assert_eq!(body["exception"], 4);
-        assert_eq!(body["reason"], "server device failure");
-        assert_eq!(driver.snapshot().operator_actions, 0);
-        fcx.cancel();
-        Ok(())
-    }))
+            .await;
+            assert_eq!(response.head.status, 409);
+            let body = json_body(&response);
+            assert_eq!(body["exception"], 4);
+            assert_eq!(body["reason"], "server device failure");
+            assert_eq!(driver.snapshot().operator_actions, 0);
+            fcx.cancel();
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 
@@ -963,7 +990,7 @@ fn post_accident_api_scales_freezes_and_reports_sensor_faults() {
         command::FaultCommand,
         faults::{Fault, FaultChange, SensorFault},
     };
-    fictionet::block_on(fictionet::lab(Seed::from_u64(35), |fcx| async move {
+    fictionet::block_on(fictionet::lab(RunOptions::new(Seed::from_u64(35)), |fcx| async move {
         let driver = Driver::new(Config::default());
         let world = start_world(&fcx, &driver)?;
         let first = next_poll(&fcx, &world.operator, "").await;

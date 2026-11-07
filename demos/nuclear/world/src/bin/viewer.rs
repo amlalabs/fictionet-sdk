@@ -1,347 +1,328 @@
-//! A loopback control page with typed snapshots, commands, and plant facts.
+//! The control room viewer: the plant on the wall clock, the operator network,
+//! the scripted story, and a control room page on the loopback interface.
 //!
-//! Run `cargo run -p nuclear-world --bin viewer`. The scripted operator starts
-//! immediately; starting a scenario stops it. `--gate` exits after the story,
-//! with a failing exit status if the story fails or is interrupted.
+//! Run `cargo run -p nuclear-world --bin viewer` and open the printed address. Plant time is
+//! initially run time, so one plant second is one second. The scripted story starts at
+//! once. It reads hmi01 and publishes its steps in the first inspector panel.
+//! Page moments mark the plant actions and faults. Ctrl-C stops the viewer.
 //!
-//! The page uses the world's typed command enums as JSON request bodies and
-//! returns their typed results. `/state` streams the latest plant snapshot,
-//! scripted lines, and the last 256 facts. It needs no browser asset download.
-//! The older 3D control-room modules remain in `viewer/` for reuse, but this
-//! page does not mount them or depend on the removed observer asset pipeline.
+//! `--gate` ends the run when the story completes. The exit status is nonzero
+//! when the story fails or stops, so CI and the screenshot runs can wait for it.
+//!
+//! Post a start command to `/api/command/scenario` to start a scenario, or use
+//! the page's Scenarios group once available. A start stops the scripted story.
+//!
+//! The page loads Three.js from the browser libraries in observe/libraries.json,
+//! unpacked into observe/downloads/vendor before building, or the 3D boards
+//! report it.
 
-use std::collections::VecDeque;
+use fictionet::sync::Mutex;
+use nuclear_world::pace::{Pace, Reply as ScenarioReply, ScenarioCommand};
 use std::error::Error as StdError;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::Html,
-    routing::{get, post},
+use fictionet::{Cx, RunOptions, Seed};
+use fictionet_observe::page::{
+    Column, CommandLimits, CommandPort, EventFilter, Format, Page, StateLimits, StateTopic,
 };
-use fictionet::{Cx, Seed};
+use fictionet_observe::{DashboardObserver, DashboardOptions};
 use nuclear_world::command::{Applied, Command, FaultCommand, Rejected};
 use nuclear_world::driver::Driver;
-use nuclear_world::facts::{self, Fact, Source};
-use nuclear_world::pace::{Pace, Reply as ScenarioReply, ScenarioCommand};
+use nuclear_world::facts::{self, Source};
 use nuclear_world::snapshot::PlantSnapshot;
 use nuclear_world::{Config, story};
-use serde::Serialize;
-use tokio::sync::{mpsc, oneshot, watch};
 
+/// The reply to a plant or fault command: what the plant accepted, or why it refused.
 type Reply = Result<Applied, Rejected>;
-type Logs = Arc<Mutex<(VecDeque<Fact>, Vec<story::Line>)>>;
 
-#[derive(Clone, Serialize)]
-struct View {
-    plant: PlantSnapshot,
-    facts: VecDeque<Fact>,
-    story: Vec<story::Line>,
+const JS: &str = "text/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+
+const CONTROL_ROOM: &str = include_str!("../../../viewer/control-room.mjs");
+const CONTROL_BOARD: &str = include_str!("../../../viewer/control-board.mjs");
+const DESK_SCREENS: &str = include_str!("../../../viewer/desk-screens.mjs");
+const BOARD_LAYOUT: &str = include_str!("../../../viewer/board-layout.mjs");
+const ROOM_MOTION: &str = include_str!("../../../viewer/room-motion.mjs");
+const LOOK: &str = include_str!("../../../viewer/look.mjs");
+const METERS: &str = include_str!("../../../viewer/meters.mjs");
+const INSTRUMENTS: &str = include_str!("../../../viewer/instruments.mjs");
+const KNOBS: &str = include_str!("../../../viewer/knobs.mjs");
+const PLANT_SCENE: &str = include_str!("../../../viewer/plant-scene.mjs");
+const VIEWER_CSS: &str = include_str!("../../../viewer/viewer.css");
+const CONTROL_ROOM_CSS: &str = include_str!("../../../viewer/control-room.css");
+
+/// The module the page loads for the control room. A custom panel gets only its
+/// module, state and title, so this entry adds the two command paths the knobs
+/// post to, and the stylesheets the panel needs.
+const ENTRY: &str = r#"import { mount as mountRoom } from '../assets/nuclear/control-room.mjs';
+
+for (const href of ['/assets/nuclear/viewer.css', '/assets/nuclear/control-room.css']) {
+  if (!document.querySelector(`link[href="${href}"]`)) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    document.head.append(link);
+  }
 }
 
-fn publish(state: &watch::Sender<View>, snapshot: &PlantSnapshot, logs: &Logs) {
-    let logs = logs.lock().unwrap();
-    state.send_replace(View {
-        plant: snapshot.clone(),
-        facts: logs.0.clone(),
-        story: logs.1.clone(),
+export function mount(root, services, options) {
+  return mountRoom(root, services, {
+    ...options,
+    command: '/api/command/plant',
+    faults: '/api/command/faults',
+  });
+}
+"#;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn StdError>> {
+    let gate = gate_flag()?;
+    let driver = Driver::new(Config {
+        automatic_protection: false,
+        ..Config::default()
     });
+    let dashboard = DashboardObserver::new(DashboardOptions::default());
+    let state = StateTopic::<PlantSnapshot>::new(StateLimits::default());
+    let lines_topic = StateTopic::<Vec<story::Line>>::new(StateLimits::default());
+    let plant = CommandPort::<Command, Reply>::new(CommandLimits::default());
+    let pace = Arc::new(Mutex::new(Pace::default()));
+    let scenario = CommandPort::<ScenarioCommand, ScenarioReply>::new(CommandLimits::default());
+    let faults = CommandPort::<FaultCommand, Reply>::new(CommandLimits::default());
+    let log = EventFilter {
+        source: Some("plant".into()),
+        ..EventFilter::default()
+    };
+    let server = Page::new("Nuclear unit 1 control room", dashboard.handle())
+        .custom("Control room", ENTRY, state.clone())
+        .workspace("Control room")
+        .command("plant", plant.clone())
+        .command("faults", faults.clone())
+        .command("scenario", scenario.clone())
+        .table(
+            "Scripted operator",
+            lines_topic.clone(),
+            vec![
+                Column::new("Time", "/time"),
+                Column::new("Step", "/step").format(Format::Number),
+                Column::new("Text", "/text"),
+            ],
+        )
+        .inspector_first("Scripted operator")
+        .event_table("Plant log", log, plant_log_columns())
+        .moment(
+            "Maneuver",
+            moment("action", Some(("command", "rod_demand"))),
+        )
+        .moment(
+            "Stuck gauge",
+            moment("fault", Some(("target", "hot_leg_b"))),
+        )
+        .moment("First action", moment("first_action", None))
+        .moment("Reactor trip", moment("trip", None))
+        .moment(
+            "Telemetry quiet",
+            moment("fault", Some(("target", "telemetry_quiet"))),
+        )
+        .asset("nuclear/control-room.mjs", JS, CONTROL_ROOM)
+        .asset("nuclear/control-board.mjs", JS, CONTROL_BOARD)
+        .asset("nuclear/desk-screens.mjs", JS, DESK_SCREENS)
+        .asset("nuclear/board-layout.mjs", JS, BOARD_LAYOUT)
+        .asset("nuclear/room-motion.mjs", JS, ROOM_MOTION)
+        .asset("nuclear/look.mjs", JS, LOOK)
+        .asset("nuclear/meters.mjs", JS, METERS)
+        .asset("nuclear/instruments.mjs", JS, INSTRUMENTS)
+        .asset("nuclear/knobs.mjs", JS, KNOBS)
+        .asset("nuclear/plant-scene.mjs", JS, PLANT_SCENE)
+        .asset("nuclear/viewer.css", CSS, VIEWER_CSS)
+        .asset("nuclear/control-room.css", CSS, CONTROL_ROOM_CSS)
+        .bind_loopback(0)
+        .await?;
+    println!("Control room: {}", server.url());
+    println!("Scripted operator story: automatic protection is off.");
+
+    let (story_done, mut story_result) = tokio::sync::oneshot::channel();
+    let mut run = tokio::spawn(fictionet::run(
+        RunOptions::new(Seed::from_u64(1)).observer(dashboard.observer()),
+        move |cx| async move {
+            let story_generation = driver.generation();
+            let operator = story::start_network(&cx, &driver)?;
+
+            let clock_pace = pace.clone();
+            let clock_driver = driver.clone();
+            let publisher = state.clone();
+            let publish_cx = cx.clone();
+            cx.spawn(move |cx| async move {
+                story::clock(&cx, &clock_driver, &clock_pace, move |snapshot| {
+                    publisher
+                        .publish(publish_cx.now(), snapshot)
+                        .map(|_| ())
+                        .map_err(|error| {
+                            fictionet::Error::msg(format!(
+                                "the control room state did not publish: {error:?}"
+                            ))
+                        })
+                })
+                .await
+            });
+
+            let plant_driver = driver.clone();
+            cx.spawn(move |cx| async move {
+                while let Some(command) = cx.race(None, plant.recv()).await? {
+                    let reply = apply_plant(&cx, &plant_driver, command.command);
+                    command.reply(&cx, reply);
+                }
+                Ok(())
+            });
+
+            let fault_driver = driver.clone();
+            cx.spawn(move |cx| async move {
+                while let Some(command) = cx.race(None, faults.recv()).await? {
+                    let reply = fault_driver.apply_fault(&cx, command.command);
+                    command.reply(&cx, reply);
+                }
+                Ok(())
+            });
+
+            let scenario_driver = driver.clone();
+            cx.spawn(move |cx| async move {
+                while let Some(command) = cx.race(None, scenario.recv()).await? {
+                    let reply = {
+                        let mut pace = pace.lock();
+                        let reply = pace.apply(
+                            command.command,
+                            story::run_ms(&cx),
+                            scenario_driver.snapshot().at_ms,
+                        );
+                        if let Ok(applied) = reply
+                            && let Some(scenario) = applied.scenario
+                        {
+                            scenario_driver.reset(scenario.config());
+                            facts::reset(&cx, scenario, applied.speed);
+                        }
+                        reply
+                    };
+                    command.reply(&cx, reply);
+                }
+                Ok(())
+            });
+
+            let story_driver = driver.clone();
+            cx.spawn(move |cx| async move {
+                if story_driver.generation() != story_generation {
+                    let _ = story_done.send(Ok(None));
+                    return Ok(());
+                }
+                let mut lines = Vec::new();
+                let mut publish_error = None;
+                let report = story::run(&cx, &story_driver, &operator, |line| {
+                    println!(
+                        "scripted: {:>7.1} s  step {}  {}",
+                        line.at_ms as f64 / 1000.0,
+                        line.step,
+                        line.text
+                    );
+                    lines.push(line);
+                    if let Err(error) = lines_topic.publish(cx.now(), &lines) {
+                        publish_error = Some(fictionet::Error::msg(format!(
+                            "the operator lines did not publish: {error:?}"
+                        )));
+                    }
+                })
+                .await
+                .and_then(|report| publish_error.map_or(Ok(report), Err));
+                let _ = story_done.send(report.map_err(|error| error.to_string()));
+                Ok(())
+            });
+            Ok(())
+        },
+    ));
+
+    let finished = tokio::select! {
+        result = &mut story_result => {
+            result.map_err(|_| "the story stopped without a result")?
+        }
+        ended = &mut run => return Err(run_ended(ended)),
+    };
+    match &finished {
+        Ok(Some(report)) => println!(
+            "scripted story complete: fault at {:.1} s, trip at {:.1} s, first action {:.1} s after the fault, telemetry quiet from {:.1} s to {:.1} s",
+            report.fault_at_ms as f64 / 1000.0,
+            report.trip_at_ms as f64 / 1000.0,
+            report.first_action_after_fault_ms as f64 / 1000.0,
+            report.quiet_from_ms as f64 / 1000.0,
+            report.quiet_to_ms as f64 / 1000.0,
+        ),
+        Ok(None) => println!("scripted story stopped: a scenario started"),
+        Err(error) => eprintln!("scripted story failed: {error}"),
+    }
+
+    if gate {
+        server.shutdown(Duration::from_secs(2)).await;
+        run.abort();
+        return finished
+            .and_then(|report| {
+                report.ok_or_else(|| "scripted story stopped: a scenario started".into())
+            })
+            .map(|_| ())
+            .map_err(Into::into);
+    }
+    println!("Serving the control room until Ctrl-C.");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        ended = &mut run => return Err(run_ended(ended)),
+    }
+    server.shutdown(Duration::from_secs(2)).await;
+    run.abort();
+    Ok(())
 }
 
-enum Control {
-    Plant(Command, oneshot::Sender<Reply>),
-    Fault(FaultCommand, oneshot::Sender<Reply>),
-    Scenario(ScenarioCommand, oneshot::Sender<ScenarioReply>),
-}
-
-/// Commands are bounded and applied by the world. A full or closed queue is
-/// unavailable; a dropped world never leaves an HTTP request waiting forever.
-async fn ask<R>(
-    sender: mpsc::Sender<Control>,
-    command: impl FnOnce(oneshot::Sender<R>) -> Control,
-) -> Result<Json<R>, StatusCode> {
-    let (reply, result) = oneshot::channel();
-    sender
-        .try_send(command(reply))
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    result
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
-}
-
-fn router(state: watch::Receiver<View>, commands: mpsc::Sender<Control>) -> Router {
-    Router::new()
-        .route("/", get(|| async { Html(include_str!("../../../viewer/index.html")) }))
-        .route("/viewer.mjs", get(|| async {
-            ([("content-type", "text/javascript; charset=utf-8")], include_str!("../../../viewer/viewer.mjs"))
-        }))
-        .route("/api/command/plant", post(|State(tx): State<mpsc::Sender<Control>>, Json(command): Json<Command>| async move {
-            ask(tx, |reply| Control::Plant(command, reply)).await
-        }))
-        .route("/api/command/faults", post(|State(tx): State<mpsc::Sender<Control>>, Json(command): Json<FaultCommand>| async move {
-            ask(tx, |reply| Control::Fault(command, reply)).await
-        }))
-        .route("/api/command/scenario", post(|State(tx): State<mpsc::Sender<Control>>, Json(command): Json<ScenarioCommand>| async move {
-            ask(tx, |reply| Control::Scenario(command, reply)).await
-        }))
-        .with_state(commands)
-        .merge(fictionet::stdlib::page::state(state))
-}
-
-fn apply_plant(driver: &Driver, command: Command) -> Reply {
-    match driver.apply(&driver.facts(), command) {
+/// Applies a plant command from the control room. An accepted action is logged
+/// with source `panel`, and a refusal is logged with its reason.
+fn apply_plant(cx: &Cx, driver: &Driver, command: Command) -> Reply {
+    match driver.apply(cx, command) {
         Ok(applied) => {
-            facts::action(&driver.facts(), command, Source::Panel, &driver.snapshot());
+            facts::action(cx, command, Source::Panel, &driver.snapshot());
             Ok(applied)
         }
         Err(rejected) => {
-            facts::rejected(
-                &driver.facts(),
-                command,
-                Source::Panel,
-                rejected.reason,
-                driver.snapshot().at_ms,
-            );
+            let at_ms = driver.snapshot().at_ms;
+            facts::rejected(cx, command, Source::Panel, rejected.reason, at_ms);
             Err(rejected)
         }
     }
 }
 
-fn apply_control(cx: &Cx, driver: &Driver, pace: &fictionet::sync::Mutex<Pace>, command: Control) {
-    match command {
-        Control::Plant(command, reply) => {
-            let _ = reply.send(apply_plant(driver, command));
-        }
-        Control::Fault(command, reply) => {
-            let _ = reply.send(driver.apply_fault(&driver.facts(), command));
-        }
-        Control::Scenario(command, reply) => {
-            let applied = pace
-                .lock()
-                .apply(command, story::run_ms(cx), driver.snapshot().at_ms);
-            if let Ok(applied) = applied
-                && let Some(scenario) = applied.scenario
-            {
-                driver.reset(scenario.config());
-                facts::reset(&driver.facts(), scenario, applied.speed);
-            }
-            let _ = reply.send(applied);
-        }
+fn moment(kind: &str, field: Option<(&str, &str)>) -> EventFilter {
+    EventFilter {
+        source: Some("plant".into()),
+        kind: Some(kind.into()),
+        field: field.map(|(key, value)| (key.into(), value.into())),
+        ..EventFilter::default()
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn StdError>> {
-    let gate = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [flag] if flag == "--gate" => true,
-        _ => return Err("usage: cargo run -p nuclear-world --bin viewer -- [--gate]".into()),
-    };
-    let logs: Logs = Arc::default();
-    let fact_log = logs.clone();
-    let driver = Driver::new(Config {
-        automatic_protection: false,
-        ..Config::default()
-    })
-    .observe(move |fact| {
-        let mut logs = fact_log.lock().unwrap();
-        if logs.0.len() == 256 {
-            logs.0.pop_front();
-        }
-        logs.0.push_back(fact);
-    });
-    let (state, snapshots) = watch::channel(View {
-        plant: driver.snapshot(),
-        facts: VecDeque::new(),
-        story: Vec::new(),
-    });
-    let (commands, mut incoming) = mpsc::channel(32);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    println!("Control room: http://{}", listener.local_addr()?);
-    let app = router(snapshots, commands);
-    let (shutdown, stopping) = oneshot::channel();
-    let mut server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = stopping.await;
-            })
-            .await
-    });
-    let (story_done, mut story_result) = oneshot::channel();
-    let mut run = tokio::spawn(fictionet::run(Seed::from_u64(1), move |cx| async move {
-        let pace = Arc::new(fictionet::sync::Mutex::new(Pace::default()));
-        let generation = driver.generation();
-        let operator = story::start_network(&cx, &driver)?;
-        let clock_driver = driver.clone();
-        let clock_pace = pace.clone();
-        let clock_logs = logs.clone();
-        let publisher = state.clone();
-        cx.spawn(move |cx| async move {
-            story::clock(&cx, &clock_driver, &clock_pace, move |snapshot| {
-                publish(&publisher, snapshot, &clock_logs);
-                Ok(())
-            })
-            .await
-        });
-        let control_driver = driver.clone();
-        let control_logs = logs.clone();
-        cx.spawn(move |cx| async move {
-            while let Some(command) = cx.race(None, incoming.recv()).await? {
-                apply_control(&cx, &control_driver, &pace, command);
-                publish(&state, &control_driver.snapshot(), &control_logs);
-            }
-            Ok(())
-        });
-        cx.spawn(move |cx| async move {
-            if driver.generation() != generation {
-                let _ = story_done.send(Ok(None));
-                return Ok(());
-            }
-            let report = story::run(&cx, &driver, &operator, |line| {
-                println!("scripted: {} {}", line.time, line.text);
-                logs.lock().unwrap().1.push(line);
-            })
-            .await;
-            let _ = story_done.send(report.map_err(|error| error.to_string()));
-            Ok(())
-        });
-        Ok(())
-    }));
-
-    let result: Result<(), Box<dyn StdError>> = async {
-        let finished = tokio::select! {
-            result = &mut story_result => result.map_err(|_| "the story stopped without a result")?,
-            ended = &mut run => return Err(format!("the world ended: {ended:?}").into()),
-            ended = &mut server => return Err(format!("the page server ended: {ended:?}").into()),
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                return if gate { Err("the story was interrupted".into()) } else { Ok(()) };
-            }
-        };
-        match &finished {
-            Ok(Some(_)) => println!("Scripted operator story complete."),
-            Ok(None) => println!("Scripted operator stopped: a scenario started."),
-            Err(error) => eprintln!("Scripted operator failed: {error}"),
-        }
-        if gate {
-            return finished
-                .and_then(|report| report.ok_or_else(|| "the story was stopped".into()))
-                .map(|_| ())
-                .map_err(Into::into);
-        }
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            ended = &mut run => return Err(format!("the world ended: {ended:?}").into()),
-            ended = &mut server => return Err(format!("the page server ended: {ended:?}").into()),
-        }
-        Ok(())
-    }
-    .await;
-    run.abort();
-    let _ = shutdown.send(());
-    if !server.is_finished()
-        && tokio::time::timeout(Duration::from_secs(2), &mut server)
-            .await
-            .is_err()
-    {
-        server.abort();
-    }
-    result
+fn plant_log_columns() -> Vec<Column> {
+    vec![
+        Column::new("Time", "/fields/time"),
+        Column::new("Kind", "/kind"),
+        Column::new("Event", "/summary"),
+    ]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use http_body_util::BodyExt;
-    use nuclear_world::faults::FaultChange;
-    use tower_service::Service;
-
-    async fn post_command<R: serde::de::DeserializeOwned>(
-        app: &mut Router,
-        path: &str,
-        command: &impl Serialize,
-    ) -> R {
-        let response = app
-            .call(
-                http::Request::post(path)
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(command).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(response.status().is_success());
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+fn gate_flag() -> Result<bool, Box<dyn StdError>> {
+    match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => Ok(false),
+        [flag] if flag == "--gate" => Ok(true),
+        _ => Err("usage: cargo run -p nuclear-world --bin viewer -- [--gate]".into()),
     }
+}
 
-    #[tokio::test]
-    async fn applied_commands_publish_state_and_stale_faults_leave_it_unchanged() {
-        let driver = Driver::new(Config::default());
-        let original = driver.snapshot();
-        let (state, mut snapshots) = watch::channel(View {
-            plant: original.clone(),
-            facts: VecDeque::new(),
-            story: Vec::new(),
-        });
-        let (commands, mut incoming) = mpsc::channel(2);
-        let mut app = router(snapshots.clone(), commands);
-        let world = tokio::spawn(fictionet::run(Seed::from_u64(1), move |cx| async move {
-            let pace = fictionet::sync::Mutex::new(Pace::default());
-            let logs = Arc::default();
-            while let Some(command) = incoming.recv().await {
-                apply_control(&cx, &driver, &pace, command);
-                publish(&state, &driver.snapshot(), &logs);
-            }
-            Ok(())
-        }));
-        let applied: Reply =
-            post_command(&mut app, "/api/command/plant", &Command::ManualTrip).await;
-        assert!(applied.is_ok());
-        snapshots.changed().await.unwrap();
-        let tripped = snapshots.borrow_and_update().plant.clone();
-        assert!(tripped.truth.reactor.trip.is_some());
-        assert!(tripped.revision > original.revision);
-        let refused: Reply = post_command(
-            &mut app,
-            "/api/command/faults",
-            &FaultCommand {
-                change: FaultChange::ClearAll,
-                expected_revision: original.revision,
-            },
-        )
-        .await;
-        assert!(refused.is_err());
-        snapshots.changed().await.unwrap();
-        assert_eq!(snapshots.borrow().plant, tripped);
-        let reset: ScenarioReply = post_command(
-            &mut app,
-            "/api/command/scenario",
-            &ScenarioCommand::Start {
-                scenario: nuclear_world::scenarios::Scenario::Normal,
-                speed: None,
-            },
-        )
-        .await;
-        assert!(reset.is_ok());
-        snapshots.changed().await.unwrap();
-        assert!(snapshots.borrow().plant.truth.reactor.trip.is_none());
-        drop(app);
-        world.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn commands_to_a_stopped_world_fail_without_waiting() {
-        let (commands, incoming) = mpsc::channel(1);
-        drop(incoming);
-        assert!(
-            ask(commands, |reply| Control::Plant(Command::ManualTrip, reply))
-                .await
-                .is_err()
-        );
+/// The error for a run that ended while the viewer waited on the story.
+fn run_ended(ended: Result<fictionet::Result, tokio::task::JoinError>) -> Box<dyn StdError> {
+    match ended {
+        Ok(Ok(())) => "the run ended before the story finished".into(),
+        Ok(Err(error)) => format!("the run failed: {error}").into(),
+        Err(error) => format!("the run task failed: {error}").into(),
     }
 }

@@ -8,8 +8,6 @@ members = [
     "codegen/tests/golden",
     "codegen/tests/layouts",
     "demos/kit",
-    "demos/artifactory/app",
-    "demos/artifactory/world",
     "demos/search/app",
     "demos/search/world",
     "demos/nuclear/world",
@@ -145,9 +143,6 @@ debug = "line-tables-only"
 opt-level = 1
 
 [profile.release.package.web-world]
-debug = 1
-
-[profile.release.package.artifactory-world]
 debug = 1
 
 [profile.release.package.nuclear-world]
