@@ -1,0 +1,6 @@
+name = "http_verification"
+version = "0.1.0"
+defaultTargets = ["Http"]
+
+[[lean_lib]]
+name = "Http"
