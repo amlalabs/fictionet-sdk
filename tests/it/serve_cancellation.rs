@@ -585,3 +585,80 @@ fn service_error_stays_primary_when_shutdown_is_cancelled() {
 fn successful_shutdown_has_no_secondary_failure() {
     shutdown_outcome(Shutdown::Ready(Ok(())), false, false, None);
 }
+
+/// A connection that hands the driver every byte at once and cancels the
+/// connection's region as it does: a stop that lands between reads.
+struct Feed(Option<Vec<u8>>);
+
+impl Connection for Feed {
+    fn poll_read(
+        &mut self,
+        fcx: &fictionet::Cx,
+        _: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        let Some(bytes) = self.0.take() else {
+            return Poll::Pending;
+        };
+        fcx.cancel();
+        let n = buf.len().min(bytes.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        if n < bytes.len() {
+            self.0 = Some(bytes[n..].to_vec());
+        }
+        Poll::Ready(Ok(n))
+    }
+    fn poll_write(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        Poll::Ready(Ok(data.len()))
+    }
+    fn poll_shutdown(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Once the connection's region is cancelled, the driver hands nothing
+/// on: `connection` returns the cancel, however many items come before
+/// the handoff. The driver yields now and then between items and sees
+/// the cancel there; the range covers a yield.
+#[test]
+fn a_cancelled_region_hands_no_connection_off() {
+    use crate::common::echo_service::Echo;
+    for lines in 0..70 {
+        let mut input = b"x\n".repeat(lines);
+        input.extend_from_slice(b"handoff\n");
+        let served = Arc::new(std::sync::Mutex::new(None));
+        let slot = served.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(0),
+            |fcx| async move {
+                let opts = serve::ServeOptions::default();
+                let result = serve::connection(
+                    &fcx,
+                    Feed(Some(input)),
+                    serve::ConnInfo::default(),
+                    &mut Echo,
+                    &(),
+                    &opts,
+                )
+                .await;
+                *slot.lock().unwrap() = Some(result);
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let served = served.lock().unwrap().take().unwrap();
+        assert!(
+            matches!(served, Err(serve::ServeError::Cancelled)),
+            "{lines} lines before the handoff"
+        );
+    }
+}

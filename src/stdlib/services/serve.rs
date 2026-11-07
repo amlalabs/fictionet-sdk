@@ -1570,14 +1570,17 @@ where
         }
     }
 
-    /// The connection broke, or the world is stopping.
+    /// The connection broke, or the world is stopping. A connection that
+    /// was ending, or about to be handed on, ends at once.
     fn broken(&mut self, end: Ended) {
         self.out.clear();
-        if matches!(self.state, State::Ending { .. }) {
-            self.cancel_all(true);
-            self.end_now(end);
-        } else {
-            self.finish(end);
+        match self.state {
+            State::Running => self.finish(end),
+            State::Ending { .. } | State::Upgrading(_) => {
+                self.cancel_all(true);
+                self.end_now(end);
+            }
+            State::Ended(_) => {}
         }
     }
 
@@ -2099,7 +2102,8 @@ async fn write_all<C: Connection>(
 /// ended, or the connection with its unread bytes after
 /// [`Upgrade::Handoff`]. Returns [`ServeError::Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled, also during a TLS
-/// handshake or final shutdown, unless a failure takes precedence.
+/// handshake, at a handoff or during final shutdown, unless a failure
+/// takes precedence.
 ///
 /// `info` identifies the connection to the service; [`listen`] fills it in. The
 /// connection ends as soon as the client resets it, even while deferred
@@ -2339,6 +2343,11 @@ where
                 }
             }
             Next::Upgrade(how) => {
+                // A cancelled region hands nothing on, as it writes nothing.
+                if fcx.is_cancelled() {
+                    core.broken(Ended::Cancelled);
+                    continue;
+                }
                 let unread = core.unread();
                 // The service goes on after TLS, with the same handle.
                 if how != Upgrade::Tls {
