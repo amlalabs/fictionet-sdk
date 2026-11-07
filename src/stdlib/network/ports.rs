@@ -236,13 +236,14 @@ impl<I: Interface> Ports<I> {
             }
             // Register the task before looking at the queue, so a slot that
             // becomes ready after the queue looked empty still wakes it.
-            {
+            let old = {
                 let mut r = self.lock_ready();
                 match &r.task {
-                    Some(w) if w.will_wake(cx.waker()) => {}
-                    _ => r.task = Some(cx.waker().clone()),
+                    Some(w) if w.will_wake(cx.waker()) => None,
+                    _ => r.task.replace(cx.waker().clone()),
                 }
-            }
+            };
+            drop(old);
             loop {
                 let Some(i) = self.lock_ready().pop() else {
                     break;
@@ -292,6 +293,57 @@ impl<I: Interface> Ports<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_the_task_releases_its_waker_outside_the_queue_lock() {
+        use std::sync::Weak;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CheckDrop(Weak<Ready>, Arc<AtomicBool>);
+        impl Wake for CheckDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("replacing a waiter must not wake it");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert!(self.0.upgrade().unwrap().inner.try_lock().is_some());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(0),
+            |fcx| async move {
+                let (port, peer) = fictionet::pair();
+                let mut ports = Ports::new(vec![port]);
+                let dropped = Arc::new(AtomicBool::new(false));
+                let waker = Waker::from(Arc::new(CheckDrop(
+                    Arc::downgrade(&ports.ready),
+                    dropped.clone(),
+                )));
+                drop(peer);
+                {
+                    let mut next = pin!(ports.next(&fcx, None, |_| Poll::Pending));
+                    assert!(matches!(
+                        next.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Ok(Event::Closed(_)))
+                    ));
+                }
+                drop(waker);
+                assert!(!dropped.load(Ordering::SeqCst));
+                let mut next = pin!(ports.next(&fcx, None, |_| Poll::Pending));
+                assert!(
+                    next.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                assert!(dropped.load(Ordering::SeqCst));
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn concrete_ports_reuse_slots_and_keep_event_priority() {
