@@ -118,6 +118,7 @@ pub fn prepare_endpoint(
         inner: Mutex::new(Box::new(inner)),
         state: Mutex::new(State {
             sockets: BTreeMap::new(),
+            refused: None,
             stopped: false,
             ip_id: fcx.random_u64() as u16,
             groups: Vec::new(),
@@ -153,6 +154,7 @@ struct Shared {
 }
 
 struct State {
+    refused: Option<Arc<dyn Fn(SocketAddr, SocketAddr) + Send + Sync>>,
     sockets: BTreeMap<u16, Queue>,
     /// Multicast groups joined.
     groups: Vec<IpAddr>,
@@ -223,6 +225,7 @@ fn deliver(shared: &Shared, packet: Packet) {
         return;
     }
     let from = SocketAddr::new(ip.src, udp.source_port());
+    let mut refused = None;
     let reply = {
         let mut st = shared.state.lock();
         match st.sockets.get_mut(&udp.destination_port()) {
@@ -239,9 +242,15 @@ fn deliver(shared: &Shared, packet: Packet) {
             }
             // No one answers a group's datagram with an error.
             None if group => None,
-            None => port_unreachable(&packet.0, ip.dst, &st.icmp_options),
+            None => {
+                refused = st.refused.clone();
+                port_unreachable(&packet.0, ip.dst, &st.icmp_options)
+            }
         }
     };
+    if let Some(refused) = refused {
+        refused(from, SocketAddr::new(ip.dst, udp.destination_port()));
+    }
     if let Some(reply) = reply {
         shared.inner.lock().send(reply);
     }
@@ -257,6 +266,11 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    pub(crate) fn on_refused(&self, observe: Arc<dyn Fn(SocketAddr, SocketAddr) + Send + Sync>) {
+        let previous = self.shared.state.lock().refused.replace(observe);
+        drop(previous);
+    }
+
     /// Sets the header choices for this endpoint's ICMP errors.
     pub fn icmp_options(&self, options: icmp::Options) {
         self.shared.state.lock().icmp_options = options;
@@ -452,6 +466,7 @@ fn port_unreachable(packet: &[u8], addr: IpAddr, options: &icmp::Options) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::InterfaceExt;
     use fictionet::{block_on, pair, run};
 
     #[test]
@@ -496,6 +511,34 @@ mod tests {
         let sum = ip::transport_checksum(src, dst, protocol::UDP, &u);
         u[6..8].copy_from_slice(&sum.to_be_bytes());
         ip::packet(src, dst, protocol::UDP, &u)
+    }
+
+    #[test]
+    fn closed_port_observations_follow_validation_and_release_the_lock() {
+        block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let (mut raw, side) = pair();
+                let endpoint = endpoint(&fcx, side, "10.0.0.1".parse()?);
+                let shared = Arc::downgrade(&endpoint.shared);
+                let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let count = observed.clone();
+                endpoint.on_refused(Arc::new(move |_, _| {
+                    assert!(shared.upgrade().unwrap().state.try_lock().is_some());
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }));
+                let valid = datagram(b"query");
+                let mut invalid = valid.clone();
+                *invalid.0.last_mut().unwrap() ^= 1;
+                raw.send(invalid);
+                raw.send(valid);
+                raw.recv(&fcx).await?;
+                assert_eq!(observed.load(std::sync::atomic::Ordering::Relaxed), 1);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 
     /// A socket's queue is bounded by bytes, not by datagrams: before, it

@@ -56,6 +56,8 @@ pub type ConfigFor = Arc<dyn Fn(&Cx) -> ConfigFuture + Send + Sync>;
 /// One connection, accepted on a port of a machine, as a [`PortServer`] gets
 /// it.
 pub struct Arrival {
+    /// The network default for HTTP exchange observations.
+    pub http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
     /// The connection: after the TLS handshake, on a TLS port.
     pub conn: Box<dyn Connection>,
     /// Who it is from, and where it arrived.
@@ -551,6 +553,12 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
+    pub(super) fn observe_dns(&self, event: &fictionet::stdlib::services::dns::Event) {
+        if let Some(observe) = &self.admission.hooks.dns_observe {
+            observe(event);
+        }
+    }
+
     /// The network's limits and timers ([`Net::limits`]), for a program
     /// that serves what the network's own services serve, such as DNS over
     /// TCP with [`Limits::dns_tcp_idle`].
@@ -1445,6 +1453,40 @@ impl Machine {
         let hooks = installation.admission.hooks.clone();
         tcp.limit_isolated_peers(move |addr| hooks.by_addr.lock().contains_key(&addr));
         let (udp, udp_task) = udp::prepare_endpoint(&fcx, udp, addr);
+        if installation.admission.hooks.refused_observe.is_some() {
+            for protocol in [6, 17] {
+                let hooks = installation.admission.hooks.clone();
+                let fcx = fcx.clone();
+                let observe = Arc::new(move |peer: SocketAddr, local: SocketAddr| {
+                    if let Some(observe) = &hooks.refused_observe {
+                        let conn = ConnInfo {
+                            local: Some(local),
+                            peer: Some(peer),
+                            sandbox: hooks.sandbox_of(peer.ip()),
+                            transport: if protocol == 17 {
+                                serve::Transport::Udp
+                            } else {
+                                serve::Transport::Tcp
+                            },
+                            ..Default::default()
+                        };
+                        observe(&super::RefusedPacket {
+                            at: fcx.now(),
+                            conn,
+                            from: peer.ip(),
+                            to: local.ip(),
+                            protocol,
+                            reason: super::Refusal::ClosedPort,
+                        });
+                    }
+                });
+                if protocol == 6 {
+                    tcp.on_refused(observe);
+                } else {
+                    udp.on_refused(observe);
+                }
+            }
+        }
         udp.icmp_options(icmp_options.clone());
         let machine = Arc::new(Machine {
             fcx: fcx.clone(),
@@ -1773,6 +1815,7 @@ async fn connection(
     let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
     let budget = sandbox_id.and_then(|id| hooks.budget(id));
     let arrival = |conn: Box<dyn Connection>, info: ConnInfo| Arrival {
+        http_observe: hooks.http_observe.clone(),
         conn,
         info,
         socket: socket.clone(),
@@ -1797,7 +1840,15 @@ async fn connection(
     let names = port.clone();
     let chosen: Arc<Mutex<Option<Arc<TlsName>>>> = Arc::default();
     let pick = chosen.clone();
+    let requested = hooks
+        .tls_observe
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(None)));
+    let requested_name = requested.clone();
     let select = move |sni: Option<&str>, fcx: &Cx| {
+        if let Some(requested_name) = &requested_name {
+            *requested_name.lock() = sni.map(Arc::<str>::from);
+        }
         let name = {
             let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
             sni.and_then(|n| tls.by_name.get(n))
@@ -1813,8 +1864,31 @@ async fn connection(
         }
     };
     let deadline = accepted + limits.handshake;
-    let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, select, deadline).await else {
-        return;
+    let result = serve::accept_tls(&fcx, conn, &info, select, deadline).await;
+    let (tls, info) = match result {
+        Ok((tls, info)) => {
+            if let Some(observe) = &hooks.tls_observe {
+                observe(&super::TlsObservation {
+                    at: fcx.now(),
+                    conn: info.clone(),
+                    result: Ok(()),
+                });
+            }
+            (tls, info)
+        }
+        Err(error) => {
+            if let Some(observe) = &hooks.tls_observe {
+                let mut info = info;
+                info.tls = true;
+                info.sni = requested.as_ref().and_then(|name| name.lock().take());
+                observe(&super::TlsObservation {
+                    at: fcx.now(),
+                    conn: info,
+                    result: Err(error),
+                });
+            }
+            return;
+        }
     };
     let Some(name) = chosen.lock().take() else {
         return;

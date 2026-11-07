@@ -311,6 +311,75 @@ const TEST_POOLS: Pools = Pools {
     }),
 };
 
+/// Why the network refused a packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// No route leads to the destination.
+    NoRoute,
+    /// The destination port has no listener or socket.
+    ClosedPort,
+    /// The sandbox's egress policy disallows the destination.
+    Policy,
+}
+
+/// A packet the network could not deliver.
+#[derive(Clone, Debug)]
+pub struct RefusedPacket {
+    /// When it was refused.
+    pub at: fictionet::time::Instant,
+    /// The sender, recipient and sandbox, when known.
+    pub conn: fictionet::stdlib::services::serve::ConnInfo,
+    /// Source address, including protocols without ports.
+    pub from: IpAddr,
+    /// Destination address, including protocols without ports.
+    pub to: IpAddr,
+    /// IP protocol number.
+    pub protocol: u8,
+    /// Why delivery failed.
+    pub reason: Refusal,
+}
+
+/// The outcome of a TLS handshake on a host's port.
+#[derive(Debug)]
+pub struct TlsObservation {
+    /// When the handshake ended.
+    pub at: fictionet::time::Instant,
+    /// The connection, including the requested server name when available.
+    pub conn: fictionet::stdlib::services::serve::ConnInfo,
+    /// Whether TLS was established, or why it failed.
+    pub result: Result<(), fictionet::stdlib::services::tls::HandshakeError>,
+}
+
+/// A sandbox attachment's lifecycle change.
+#[derive(Clone, Copy, Debug)]
+pub enum AttachmentChange {
+    /// The attachment joined the network.
+    Attached,
+    /// An address was bound, either by DHCP or from its first packet.
+    Bound {
+        /// Whether DHCP supplied the address.
+        by_dhcp: bool,
+    },
+    /// The attachment left the network.
+    Detached,
+}
+
+/// A sandbox joining, binding an address, or leaving the network.
+#[derive(Clone, Debug)]
+pub struct AttachmentObservation {
+    /// When the change happened.
+    pub at: fictionet::time::Instant,
+    /// The attachment and its addresses at that time.
+    pub sandbox: fictionet::stdlib::services::serve::Sandbox,
+    /// What changed.
+    pub change: AttachmentChange,
+}
+
+type OnRefused = Arc<dyn Fn(&RefusedPacket) + Send + Sync>;
+type OnTls = Arc<dyn Fn(&TlsObservation) + Send + Sync>;
+type OnAttachment = Arc<dyn Fn(&AttachmentObservation) + Send + Sync>;
+type OnDns = Arc<dyn Fn(&fictionet::stdlib::services::dns::Event) + Send + Sync>;
+
 /// A network of hosts and services, and the sandboxes' side of it. See the
 /// [module docs](self).
 pub struct Net {
@@ -321,6 +390,12 @@ pub struct Net {
     hosts: Vec<Host>,
     gateway: Arc<Gateway>,
     unreachable: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
+    http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
+    refused_observe: Option<OnRefused>,
+    tls_observe: Option<OnTls>,
+    attachment_observe: Option<OnAttachment>,
+    dns_observe: Option<OnDns>,
+
     drop_unrouted: bool,
     egress: Option<Arc<Egress>>,
     routes: Vec<(String, Prefix)>,
@@ -348,6 +423,11 @@ impl Net {
             hosts: Vec::new(),
             gateway: Arc::new(default_gateway),
             unreachable: None,
+            http_observe: None,
+            refused_observe: None,
+            tls_observe: None,
+            attachment_observe: None,
+            dns_observe: None,
             drop_unrouted: false,
             egress: None,
             routes: Vec::new(),
@@ -356,6 +436,43 @@ impl Net {
             members: Vec::new(),
             handle: NetHandle::default(),
         }
+    }
+
+    /// Observes closed ports, unrouted packets and egress policy refusals.
+    pub fn on_refused(mut self, observe: impl Fn(&RefusedPacket) + Send + Sync + 'static) -> Self {
+        self.refused_observe = Some(Arc::new(observe));
+        self
+    }
+
+    /// Observes TLS handshakes, including failures before a service runs.
+    pub fn on_tls(mut self, observe: impl Fn(&TlsObservation) + Send + Sync + 'static) -> Self {
+        self.tls_observe = Some(Arc::new(observe));
+        self
+    }
+
+    /// Observes sandbox attachments and address bindings.
+    pub fn on_attachment(
+        mut self,
+        observe: impl Fn(&AttachmentObservation) + Send + Sync + 'static,
+    ) -> Self {
+        self.attachment_observe = Some(Arc::new(observe));
+        self
+    }
+
+    /// Observes the DNS engines on every machine in this network.
+    pub fn on_dns(
+        mut self,
+        observe: impl Fn(&fictionet::stdlib::services::dns::Event) + Send + Sync + 'static,
+    ) -> Self {
+        self.dns_observe = Some(Arc::new(observe));
+        self
+    }
+
+    /// Observes HTTP exchanges served by this network, including hosts added later.
+    /// A server's own observer takes precedence over this network default.
+    pub fn observe_http(mut self, observe: fictionet::stdlib::web::httpd::Observe) -> Self {
+        self.http_observe = Some(observe);
+        self
     }
 
     /// Sets the sandboxes' IPv4 or IPv6 subnet, whichever `subnet` is. The
@@ -547,11 +664,30 @@ impl Net {
             },
             Box::new(router_side),
         );
+        let hooks = Arc::new(Hooks {
+            by_addr: Mutex::default(),
+            routes: Mutex::default(),
+            conns: AtomicU64::new(0),
+            attached: Mutex::default(),
+            http_observe: self.http_observe,
+            refused_observe: self.refused_observe,
+            tls_observe: self.tls_observe,
+            attachment_observe: self.attachment_observe,
+            dns_observe: self.dns_observe,
+        });
         let gateway = subnet.gateway;
         let report = self.unreachable.clone();
         let drop_unrouted = self.drop_unrouted;
+        let report_hooks = hooks.clone();
         fcx.spawn(move |fcx| {
-            unreachable(fcx, unreachable_side, gateway.into(), report, drop_unrouted)
+            unreachable(
+                fcx,
+                unreachable_side,
+                gateway.into(),
+                report,
+                drop_unrouted,
+                report_hooks,
+            )
         });
         if let Some(subnet6) = subnet6 {
             let (router_side, unreachable_side) = link();
@@ -564,16 +700,18 @@ impl Net {
             );
             let gateway = subnet6.gateway;
             let report = self.unreachable.clone();
+            let report_hooks = hooks.clone();
             fcx.spawn(move |fcx| {
-                unreachable(fcx, unreachable_side, gateway.into(), report, drop_unrouted)
+                unreachable(
+                    fcx,
+                    unreachable_side,
+                    gateway.into(),
+                    report,
+                    drop_unrouted,
+                    report_hooks,
+                )
             });
         }
-        let hooks = Arc::new(Hooks {
-            by_addr: Mutex::default(),
-            routes: Mutex::default(),
-            conns: AtomicU64::new(0),
-            attached: Mutex::default(),
-        });
         let lans = make_lans(
             fcx,
             &router,
@@ -621,7 +759,7 @@ impl Net {
                     .map(|(_, p)| *p)
                     .collect();
                 if !prefixes.is_empty() {
-                    let routed = context.routed(sandbox, prefixes.clone());
+                    let routed = context.routed(&fcx, sandbox, prefixes.clone());
                     shared.router.add_prefixes(prefixes, Box::new(routed));
                     continue;
                 }
@@ -957,9 +1095,11 @@ async fn unreachable(
     gateway: IpAddr,
     report: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
     drop_unrouted: bool,
+    hooks: Arc<Hooks>,
 ) -> fictionet::Result {
     let mut run = 0;
     while let Ok(packet) = end.recv(&fcx).await {
+        hooks.refused(&fcx, &packet.0, Refusal::NoRoute);
         if let Some(report) = &report
             && let Some(header) = crate::stdlib::network::ip::Header::parse(&packet.0)
         {
@@ -1008,6 +1148,11 @@ mod tests {
                     routes: Mutex::default(),
                     conns: AtomicU64::new(0),
                     attached: Mutex::default(),
+                    http_observe: None,
+                    refused_observe: None,
+                    tls_observe: None,
+                    attachment_observe: None,
+                    dns_observe: None,
                 });
                 let lans = make_lans(
                     &fcx,

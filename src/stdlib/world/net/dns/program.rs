@@ -775,6 +775,7 @@ impl<E: Engine + Send + 'static> Driver<E> {
                     }
                 }
                 Action::Event(event) => {
+                    self.machine.observe_dns(&event);
                     if let Some(on_event) = &self.on_event {
                         on_event(&event);
                     }

@@ -18,6 +18,12 @@ use std::task::Poll;
 
 /// Sandbox addresses, connection numbering and admission budgets.
 pub(super) struct Hooks {
+    pub(super) refused_observe: Option<super::OnRefused>,
+    pub(super) tls_observe: Option<super::OnTls>,
+    pub(super) attachment_observe: Option<super::OnAttachment>,
+    pub(super) dns_observe: Option<super::OnDns>,
+
+    pub(super) http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
     /// The sandbox that last bound each address. An entry stays after its
     /// sandbox detaches, until another binds the address, so packets and
     /// connections still on their way name the sandbox that sent them.
@@ -36,6 +42,48 @@ pub(super) struct Hooks {
 }
 
 impl Hooks {
+    pub(super) fn refused(&self, fcx: &Cx, packet: &[u8], reason: super::Refusal) {
+        let Some(observe) = &self.refused_observe else {
+            return;
+        };
+        let Some(header) = Header::parse(packet) else {
+            return;
+        };
+        let payload = header.payload(packet);
+        let ports = matches!(header.protocol, 6 | 17)
+            .then(|| payload.get(..4))
+            .flatten();
+        let conn = fictionet::stdlib::services::serve::ConnInfo {
+            sandbox: self.sandbox_of(header.src),
+            peer: ports.map(|p| SocketAddr::new(header.src, u16::from_be_bytes([p[0], p[1]]))),
+            local: ports.map(|p| SocketAddr::new(header.dst, u16::from_be_bytes([p[2], p[3]]))),
+            transport: if header.protocol == 17 {
+                fictionet::stdlib::services::serve::Transport::Udp
+            } else {
+                fictionet::stdlib::services::serve::Transport::Tcp
+            },
+            ..Default::default()
+        };
+        observe(&super::RefusedPacket {
+            at: fcx.now(),
+            conn,
+            from: header.src,
+            to: header.dst,
+            protocol: header.protocol,
+            reason,
+        });
+    }
+
+    fn attachment(&self, fcx: &Cx, sandbox: Sandbox, change: super::AttachmentChange) {
+        if let Some(observe) = &self.attachment_observe {
+            observe(&super::AttachmentObservation {
+                at: fcx.now(),
+                sandbox,
+                change,
+            });
+        }
+    }
+
     /// The sandbox that bound the address, or the route with the longest
     /// prefix that holds it.
     pub(super) fn sandbox_of(&self, addr: IpAddr) -> Option<Sandbox> {
@@ -107,7 +155,12 @@ pub(super) struct Destinations {
 impl Context {
     /// Attributes traffic from a route at `prefixes`, and passes on only
     /// packets from sources the network routes back to it: see [`Routed`].
-    pub(super) fn routed(self: &Arc<Self>, sandbox: Attachment, prefixes: Vec<Prefix>) -> Routed {
+    pub(super) fn routed(
+        self: &Arc<Self>,
+        fcx: &Cx,
+        sandbox: Attachment,
+        prefixes: Vec<Prefix>,
+    ) -> Routed {
         let owner = self.bindings.new_owner();
         self.hooks.attached.lock().insert(owner, None);
         let me = Sandbox {
@@ -124,7 +177,10 @@ impl Context {
             }
         }
         drop(routes);
+        self.hooks
+            .attachment(fcx, me, super::AttachmentChange::Attached);
         Routed {
+            fcx: fcx.clone(),
             sandbox,
             context: self.clone(),
             owner,
@@ -226,6 +282,7 @@ impl Context {
 /// network has elsewhere, such as a sandbox's or a host's, is dropped too:
 /// answers to it would go there.
 pub(super) struct Routed {
+    fcx: Cx,
     sandbox: Attachment,
     context: Arc<Context>,
     owner: u64,
@@ -271,6 +328,16 @@ impl Drop for Routed {
             !bound.contains(&peer)
                 && longest_route(&routes, peer).is_some_and(|(p, _)| prefixes.contains(p))
         });
+        hooks.attachment(
+            &self.fcx,
+            Sandbox {
+                id: self.owner,
+                name: Arc::from(self.sandbox.name()),
+                addr: None,
+                addr_v6: None,
+            },
+            super::AttachmentChange::Detached,
+        );
     }
 }
 /// A UDP packet with correct checksums.
@@ -323,6 +390,7 @@ fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option
 /// and its budget. Dropped when it detaches, which resets its connections,
 /// frees its addresses and its budget, and records `net.detached`.
 struct Attached {
+    fcx: Cx,
     context: Arc<Context>,
     owner: u64,
     name: Arc<str>,
@@ -331,14 +399,37 @@ struct Attached {
 }
 
 impl Attached {
-    fn new(context: &Arc<Context>, _fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
+    fn new(context: &Arc<Context>, fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
         let owner = context.bindings.new_owner();
         context
             .hooks
             .attached
             .lock()
             .insert(owner, Some(Budget::new(context.sandbox_budget)));
+        context.hooks.attachment(
+            fcx,
+            Sandbox {
+                id: owner,
+                name: name.clone(),
+                addr: fixed.and_then(|addr| {
+                    if let IpAddr::V4(addr) = addr {
+                        Some(addr)
+                    } else {
+                        None
+                    }
+                }),
+                addr_v6: fixed.and_then(|addr| {
+                    if let IpAddr::V6(addr) = addr {
+                        Some(addr)
+                    } else {
+                        None
+                    }
+                }),
+            },
+            super::AttachmentChange::Attached,
+        );
         Attached {
+            fcx: fcx.clone(),
             context: context.clone(),
             owner,
             name,
@@ -368,12 +459,15 @@ impl Drop for Attached {
             (context.abort_peers)(&|peer| addrs.contains(&peer));
         }
         context.bindings.release(self.owner);
-        let _sandbox = Sandbox {
+        let sandbox = Sandbox {
             id: self.owner,
             name: self.name.clone(),
             addr: bound,
             addr_v6: bound6,
         };
+        context
+            .hooks
+            .attachment(&self.fcx, sandbox, super::AttachmentChange::Detached);
     }
 }
 
@@ -457,7 +551,7 @@ impl Filter {
         }
     }
 
-    fn bound_now(&mut self, _fcx: &Cx, addr: IpAddr, _by_dhcp: bool) {
+    fn bound_now(&mut self, fcx: &Cx, addr: IpAddr, by_dhcp: bool) {
         let (router_side, mine) = link();
         self.context
             .router
@@ -478,6 +572,9 @@ impl Filter {
             by_addr.insert(a, sandbox.clone());
         }
         drop(by_addr);
+        self.context
+            .hooks
+            .attachment(fcx, sandbox, super::AttachmentChange::Bound { by_dhcp });
     }
 
     fn sent_v4(&mut self, fcx: &Cx, packet: Packet) {
@@ -588,6 +685,9 @@ impl Filter {
                 && let Some(port) = header.dst_port(&packet.0)
                 && !allow(SocketAddr::new(header.dst, port))
             {
+                self.context
+                    .hooks
+                    .refused(fcx, &packet.0, super::Refusal::Policy);
                 return;
             }
         }

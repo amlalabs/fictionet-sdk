@@ -1072,6 +1072,8 @@ pub fn prepare_endpoint(
             next_release: None,
             dev,
             listeners: BTreeMap::new(),
+            refused: None,
+            refusals: Vec::new(),
             conns: BTreeMap::new(),
             by_tuple: HashMap::new(),
             ports: HashMap::new(),
@@ -1168,6 +1170,8 @@ struct Id(u64);
 const COMPACT_SLOTS: usize = 256;
 
 struct State {
+    refused: Option<Arc<dyn Fn(SocketAddr, SocketAddr) + Send + Sync>>,
+    refusals: Vec<(SocketAddr, SocketAddr)>,
     iface: Iface,
     sockets: SocketSet<'static>,
     /// Each socket's slot in `sockets`, ordered by SDK ID for compaction.
@@ -1891,6 +1895,14 @@ impl State {
         let congestion = ip_ecn == 3;
         let ecn = flags & 0xc0 == 0xc0 && (self.settings.ecn_syn)(ip_ecn, t[12] & 15);
         let (syn, rst, ack) = (flags & 6 == 2, flags & 4 != 0, flags & 16 != 0);
+        if syn
+            && !ack
+            && !self.by_tuple.contains_key(&(dst, src))
+            && !self.listeners.contains_key(&dst.port())
+            && self.refused.is_some()
+        {
+            self.refusals.push((src, dst));
+        }
         let new =
             !self.by_tuple.contains_key(&(dst, src)) && self.listeners.contains_key(&dst.port());
         // LISTEN ignores segments without SYN, ACK or RST (RFC 9293).
@@ -2548,7 +2560,7 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
                 Poll::Pending => break,
             }
         }
-        let (next, old_driver) = {
+        let (next, old_driver, refused, refusals) = {
             let mut st = shared.state.lock();
             let old_driver = match &st.driver {
                 Some(w) if w.will_wake(cx.waker()) => None,
@@ -2601,9 +2613,19 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
                 .into_iter()
                 .flatten()
                 .min();
-            (next, old_driver)
+            (
+                next,
+                old_driver,
+                st.refused.clone(),
+                std::mem::take(&mut st.refusals),
+            )
         };
         drop(old_driver);
+        if let Some(refused) = refused {
+            for (peer, local) in refusals {
+                refused(peer, local);
+            }
+        }
         for p in out.drain(..) {
             inner.send(Packet(p));
         }
@@ -2646,6 +2668,11 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    pub(crate) fn on_refused(&self, observe: Arc<dyn Fn(SocketAddr, SocketAddr) + Send + Sync>) {
+        let previous = self.shared.state.lock().refused.replace(observe);
+        drop(previous);
+    }
+
     /// Retains per-source flood limits only where the network prevents spoofing.
     pub(crate) fn limit_isolated_peers(&self, isolated: impl Fn(IpAddr) -> bool + Send + 'static) {
         self.shared.state.lock().isolated_peer = Some(Box::new(isolated));
@@ -3290,6 +3317,33 @@ mod tests {
         packet[tcp_at + 16..tcp_at + 18].copy_from_slice(&[0, 0]);
         let sum = transport_checksum(src, dst, TCP, &packet[tcp_at..]);
         packet[tcp_at + 16..tcp_at + 18].copy_from_slice(&sum.to_be_bytes());
+    }
+
+    #[test]
+    fn closed_port_observations_follow_validation_and_release_the_lock() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (mut raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+            let endpoint = endpoint(&fcx, side, local.ip());
+            let shared = Arc::downgrade(&endpoint.shared);
+            let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = observed.clone();
+            endpoint.on_refused(Arc::new(move |_, _| {
+                assert!(shared.upgrade().unwrap().state.try_lock().is_some());
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }));
+            let valid = segment(peer, local, 7, 0, 2);
+            let mut invalid = valid.clone();
+            invalid.0[36] ^= 1;
+            raw.send(invalid);
+            raw.send(valid);
+            raw.recv(&fcx).await?;
+            assert_eq!(observed.load(std::sync::atomic::Ordering::Relaxed), 1);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
     }
 
     #[test]
