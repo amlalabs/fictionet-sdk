@@ -8,6 +8,185 @@ use fictionet::stdlib::network::tcp;
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::stdlib::services::serve::{self, Flow, Pending, PendingDriver};
 
+#[derive(Default)]
+struct Lifetime {
+    wake: std::sync::Mutex<Option<serve::WakeHandle>>,
+    cancelled: std::sync::atomic::AtomicUsize,
+    dropped: std::sync::atomic::AtomicUsize,
+}
+
+struct RetainedWork(Arc<Lifetime>);
+
+impl Pending for RetainedWork {
+    fn poll_next(
+        &mut self,
+        _: &mut PendingDriver<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, _: &mut PendingDriver<'_>) {
+        self.0
+            .cancelled
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for RetainedWork {
+    fn drop(&mut self) {
+        self.0
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct RetainingSvc;
+service_fixture! {
+    RetainingSvc => (Lines, Arc<Lifetime>, std::convert::Infallible);
+    decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
+    on_open(self; lifetime, driver) -> Flow {
+        *lifetime.wake.lock().unwrap() = Some(driver.wake_handle());
+        driver.defer(RetainedWork(lifetime.clone()));
+        driver.defer_keyed(1, RetainedWork(lifetime.clone()));
+        Ok(Flow::Continue)
+    }
+    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
+        Ok(Flow::Continue)
+    }
+}
+
+impl Lifetime {
+    fn assert_released(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        assert!(self.wake.lock().unwrap().as_ref().unwrap().is_closed());
+        assert!(self.dropped.load(SeqCst) > 0);
+        assert_eq!(self.cancelled.load(SeqCst), self.dropped.load(SeqCst));
+    }
+}
+
+#[test]
+fn dropping_a_harness_releases_the_serving_lifetime() {
+    let lifetime = Arc::new(Lifetime::default());
+    let mut harness =
+        serve::Harness::new(fictionet::Seed::from_u64(0), RetainingSvc, lifetime.clone());
+    harness.open().unwrap();
+    assert!(!harness.wake_handle().is_closed());
+    drop(harness);
+    lifetime.assert_released();
+}
+
+struct Idle;
+impl Connection for Idle {
+    fn poll_read(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+        _: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        Poll::Pending
+    }
+    fn poll_write(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        Poll::Ready(Ok(data.len()))
+    }
+    fn poll_shutdown(
+        &mut self,
+        _: &fictionet::Cx,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn dropping_a_connection_future_releases_the_serving_lifetime() {
+    use std::future::{Future, poll_fn};
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(0),
+        |fcx| async move {
+            let lifetime = Arc::new(Lifetime::default());
+            let mut service = RetainingSvc;
+            let opts = serve::ServeOptions::default();
+            let mut future = Box::pin(serve::connection(
+                &fcx,
+                Idle,
+                serve::ConnInfo::default(),
+                &mut service,
+                &lifetime,
+                &opts,
+            ));
+            poll_fn(|cx| {
+                assert!(future.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(!lifetime.wake.lock().unwrap().as_ref().unwrap().is_closed());
+            drop(future);
+            lifetime.assert_released();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
+impl fictionet::stdlib::network::DatagramSocket for Idle {
+    async fn recv(
+        &mut self,
+        _: &fictionet::Cx,
+    ) -> Result<(Vec<u8>, std::net::SocketAddr), fictionet::RecvError> {
+        std::future::pending().await
+    }
+    fn send_to(&mut self, _: &[u8], _: std::net::SocketAddr) {}
+}
+
+datagram_fixture! {
+    RetainingSvc => (Lines, Arc<Lifetime>, std::convert::Infallible);
+    decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
+    on_open(self; lifetime, driver) -> () {
+        *lifetime.wake.lock().unwrap() = Some(driver.wake_handle());
+        Ok(())
+    }
+    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> serve::DatagramFlow {
+        Ok(serve::DatagramFlow::Continue)
+    }
+}
+
+#[test]
+fn dropping_a_datagram_future_releases_the_serving_lifetime() {
+    use std::future::{Future, poll_fn};
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(0),
+        |fcx| async move {
+            let lifetime = Arc::new(Lifetime::default());
+            let mut service = RetainingSvc;
+            let opts = serve::DatagramOptions::default();
+            let mut future = Box::pin(serve::datagram(
+                &fcx,
+                Idle,
+                "127.0.0.1:7".parse()?,
+                &mut service,
+                &lifetime,
+                &opts,
+            ));
+            poll_fn(|cx| {
+                assert!(future.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(!lifetime.wake.lock().unwrap().as_ref().unwrap().is_closed());
+            drop(future);
+            assert!(lifetime.wake.lock().unwrap().as_ref().unwrap().is_closed());
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
+
 /// Work that never finishes.
 struct Forever(bool);
 impl Pending for Forever {

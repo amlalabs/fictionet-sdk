@@ -125,6 +125,8 @@
 //!   ended. Its reply is written when the connection can still take it: the
 //!   client half-closed ([`Ended::Eof`]), the service closed, the service's
 //!   decoder failed, the connection sat idle or went over its budget.
+//!   Dropping the serving future or harness cancels remaining deferred work
+//!   and closes its wake handle, but does not call `on_end` or write a reply.
 //! - **Stops.** When the world stops, a running service hears [`Ended::Cancelled`].
 //!   [`connection`] returns [`ServeError::Cancelled`], also during a TLS
 //!   handshake or final shutdown, unless it has a failure to return. If
@@ -356,7 +358,8 @@ pub trait Service: Send + 'static {
         Ok(Flow::Upgrade(Upgrade::Handoff))
     }
 
-    /// The connection ended, for the reason in `end`. Called once, last.
+    /// The driver ended the connection, for the reason in `end`. Called once,
+    /// last, when driven to termination, not when the future or harness is dropped.
     fn on_end(
         &mut self,
         _end: Ended,
@@ -555,6 +558,15 @@ struct WakeInner {
     woken: AtomicBool,
     closed: AtomicBool,
     waker: Mutex<Option<Waker>>,
+}
+
+/// Closes the service's handle even if its future is dropped during STARTTLS.
+struct WakeOwner(WakeHandle);
+
+impl Drop for WakeOwner {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 impl std::fmt::Debug for WakeHandle {
@@ -1366,6 +1378,35 @@ struct Core<S: Service> {
     next_work: u64,
 }
 
+impl<S: Service> Core<S> {
+    fn cancel_work(&mut self, mut work: Work) {
+        let mut driver = PendingDriver {
+            fcx: self.fcx.as_ref(),
+            written: work.written,
+            conn: &self.info,
+            close: false,
+        };
+        work.pending.cancel(&mut driver);
+    }
+
+    fn cancel_all(&mut self, ordered: bool) {
+        for (_, work) in std::mem::take(&mut self.keyed) {
+            self.cancel_work(work);
+        }
+        if ordered {
+            for work in std::mem::take(&mut self.ordered) {
+                self.cancel_work(work);
+            }
+        }
+    }
+}
+
+impl<S: Service> Drop for Core<S> {
+    fn drop(&mut self) {
+        self.cancel_all(true);
+    }
+}
+
 impl<S: Service> Core<S>
 where
     <S::Decoder as Decode>::Error: Clone,
@@ -1553,27 +1594,6 @@ where
         if !bytes.is_empty() {
             let credit = work.map(|id| (id, bytes.len() as u64));
             self.out.push_back(Out(bytes, credit));
-        }
-    }
-
-    fn cancel_work(&mut self, mut work: Work) {
-        let mut driver = PendingDriver {
-            fcx: self.fcx.as_ref(),
-            written: work.written,
-            conn: &self.info,
-            close: false,
-        };
-        work.pending.cancel(&mut driver);
-    }
-
-    fn cancel_all(&mut self, ordered: bool) {
-        for (_, work) in std::mem::take(&mut self.keyed) {
-            self.cancel_work(work);
-        }
-        if ordered {
-            for work in std::mem::take(&mut self.ordered) {
-                self.cancel_work(work);
-            }
         }
     }
 
@@ -2168,6 +2188,7 @@ where
         info = i;
     }
     let wake = WakeHandle::new();
+    let _wake_owner = WakeOwner(wake.clone());
     loop {
         let served = run(fcx, conn, info.clone(), service, state, opts, wake.clone()).await?;
         let rest = match served {
@@ -2718,6 +2739,7 @@ where
     };
     let mut timers: Vec<(S::Timer, Instant)> = Vec::new();
     let wake = s.wake.clone();
+    let _wake_owner = WakeOwner(wake.clone());
     let budget = opts.budget.as_ref();
     // An error ends only the call that returned it: serving goes on.
     let _ = service.on_open(
@@ -2732,7 +2754,7 @@ where
     );
     s.send(&mut socket);
     let mut run = 0u32;
-    let ended = loop {
+    loop {
         let now = fcx.now();
         arm(&mut timers, &mut s.timers, now);
         if let Some(i) = due(&timers, now) {
@@ -2857,9 +2879,7 @@ where
         {
             break Err(cancelled);
         }
-    };
-    wake.close();
-    ended
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3251,5 +3271,7 @@ where
 }
 
 impl<S: Service> Drop for Harness<S> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        self.core.s.wake.close();
+    }
 }
