@@ -4,7 +4,7 @@ Area: `src/stdlib/web/httpd.rs` and `src/stdlib/web/httpd/` (HTTP/1 in
 `native.rs`, HTTP/2 in `http2.rs`, the shared response policy in
 `response.rs`), the HTTP/1 framing rules in `src/stdlib/protocols/http1.rs`,
 and HTTP/2 stream states and flow control. The models, how to run them and
-the full results are in [verification/http/README.md](verification/http/README.md).
+the full results are in [verification/http/README.md](README.md).
 
 ## What was modeled and checked
 
