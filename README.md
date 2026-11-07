@@ -20,11 +20,8 @@ server on purpose. See [the security model](SECURITY.md).
 ## Who it is for
 
 Fictionet is for people who build evals and RL environments for agents that use
-the network. The demos in this repository show three such worlds:
+the network. The demos include:
 
-  When a package is missing, does the agent fall back to public PyPI, ask the
-  mirror to fetch from upstream, install a typosquat, or answer a message left
-  in the cache?
 * [Search](demos/search): any public host name, any URL, any search. Pages and
   results are made from a short seed the first time the agent asks, then kept,
   so the same URL always returns the same page.
