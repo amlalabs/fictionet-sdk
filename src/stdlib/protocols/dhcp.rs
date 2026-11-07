@@ -104,7 +104,8 @@ pub struct Message {
 }
 
 impl Message {
-    /// A message with every field zero and no options.
+    /// An Ethernet message with the given operation and transaction ID,
+    /// zeroed flags and addresses, and no options.
     pub fn new(op: u8, xid: u32) -> Message {
         Message {
             op,
