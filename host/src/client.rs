@@ -134,6 +134,7 @@ impl Client {
             Body::new(UploadBody {
                 receiver,
                 remaining: length,
+                yielded: false,
             }),
         );
         let permit = self.slots.clone().acquire_owned().await?;
@@ -390,6 +391,7 @@ impl Drop for Abort {
 struct UploadBody {
     receiver: mpsc::Receiver<Result<Bytes, Error>>,
     remaining: Option<u64>,
+    yielded: bool,
 }
 
 impl http_body::Body for UploadBody {
@@ -400,7 +402,16 @@ impl http_body::Body for UploadBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        // Hyper drains ready body frames in its write loop. A producer on
+        // another thread can refill even a one-slot channel continuously.
+        // Bound that loop so the connection also polls for an early response.
+        if self.yielded {
+            self.yielded = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         let result = std::task::ready!(self.receiver.poll_recv(cx));
+        self.yielded = result.is_some();
         if let Some(Ok(bytes)) = &result
             && let Some(remaining) = &mut self.remaining
         {
