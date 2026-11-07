@@ -1,8 +1,14 @@
 use fictionet::stdlib::network::ip::{self, Header, transport_checksum};
 use fictionet::stdlib::network::tcp::{self, CookieInput, SynCookies, TcpOption};
+use fictionet::stdlib::network::udp;
+use fictionet::stdlib::world::net::{Arrival, Host, Net, PortServer};
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, Seed, block_on, lab, pair};
 use fictionet_extras::linux::{self, Cookies};
-use std::net::SocketAddr;
+use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn ipv4_reply(bytes: &[u8]) -> Option<ip::Ipv4Reply> {
@@ -501,6 +507,108 @@ fn time_wait_expires_after_sixty_seconds() {
         cx.sleep(Duration::from_secs(60)).await?;
         raw.send(fin);
         assert_eq!(receive(&mut raw, &cx).await[13], 4);
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+/// A port that counts the connections it is given and closes each at once.
+struct Counted(Arc<AtomicUsize>);
+
+impl PortServer for Counted {
+    fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {})
+    }
+}
+
+fn udp_packet(from: SocketAddr, to: SocketAddr, data: &[u8]) -> Packet {
+    let mut bytes = vec![0; udp::encoded_len(from.ip(), to.ip(), data.len()).unwrap()];
+    let len = udp::encode(from, to, data, &mut bytes).unwrap();
+    ip::packet(from.ip(), to.ip(), 17, &bytes[..len])
+}
+
+/// What the measurement of Linux 7.2.6 showed, on a host in a network: a
+/// SYN from source port 0 completes its handshake and is then closed with
+/// a FIN before any service sees it; a SYN to port 0 gets the RST|ACK of a
+/// closed port; a datagram to UDP port 0 gets ICMP port unreachable.
+#[test]
+fn a_linux_host_treats_port_zero_as_measured() {
+    block_on(lab(Seed::from_u64(21), |cx| async move {
+        let server = Ipv4Addr::new(203, 0, 113, 8);
+        let served = Arc::new(AtomicUsize::new(0));
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .add_host(
+                Host::new("server")
+                    .at(server)
+                    .tcp_options(linux::tcp())
+                    .icmp_options(linux::icmp(&cx))
+                    .udp_settings(linux::udp())
+                    .port_server(22, Counted(served.clone())),
+            )
+            .start(&cx, attachments)?;
+        let mut raw = attacher.attach("scanner")?;
+        let me = Ipv4Addr::new(10, 0, 0, 2);
+        let ssh = SocketAddr::new(server.into(), 22);
+        // From source port 0: SYN-ACK, then a FIN|ACK right after the
+        // ACK, and the service never runs.
+        let from = SocketAddr::new(me.into(), 0);
+        raw.send(packet(from, ssh, 100, 0, 2, &[]));
+        let syn_ack = receive(&mut raw, &cx).await;
+        assert_eq!(syn_ack[13] & 0x16, 0x12, "SYN|ACK");
+        assert_eq!(&syn_ack[2..4], &[0, 0], "to port 0");
+        let next = sequence(&syn_ack).wrapping_add(1);
+        raw.send(packet(from, ssh, 101, next, 16, &[]));
+        let fin = receive(&mut raw, &cx).await;
+        assert_eq!(fin[13] & 0x15, 0x11, "FIN|ACK, not a RST");
+        assert_eq!(sequence(&fin), next);
+        assert_eq!(served.load(Ordering::SeqCst), 0, "the service never saw it");
+        raw.send(packet(from, ssh, 101, next.wrapping_add(1), 17, &[]));
+        assert_eq!(
+            receive(&mut raw, &cx).await[13] & 0x14,
+            0x10,
+            "the close completes"
+        );
+        // To port 0: the RST|ACK of a closed port, acknowledging the SYN.
+        let from = SocketAddr::new(me.into(), 40000);
+        let zero = SocketAddr::new(server.into(), 0);
+        raw.send(packet(from, zero, 500, 0, 2, &[]));
+        let rst = receive(&mut raw, &cx).await;
+        assert_eq!(rst[13] & 0x16, 0x14, "RST|ACK");
+        assert_eq!(sequence(&rst), 0);
+        assert_eq!(u32::from_be_bytes(rst[8..12].try_into()?), 501);
+        // UDP to port 0: ICMP port unreachable that quotes the datagram.
+        let datagram = udp_packet(from, zero, b"anyone?");
+        raw.send(datagram.clone());
+        let reply = cx
+            .race(Some(cx.now() + Duration::from_secs(1)), raw.recv(&cx))
+            .await
+            .unwrap()?;
+        assert_eq!(reply.0[9], 1, "ICMP");
+        assert_eq!((reply.0[20], reply.0[21]), (3, 3), "port unreachable");
+        assert_eq!(&reply.0[28..], &datagram.0[..]);
+        // From an ordinary port the service is served, and closes.
+        let from = SocketAddr::new(me.into(), 45000);
+        raw.send(packet(from, ssh, 700, 0, 2, &[]));
+        let syn_ack = receive(&mut raw, &cx).await;
+        assert_eq!(syn_ack[13] & 0x16, 0x12);
+        raw.send(packet(
+            from,
+            ssh,
+            701,
+            sequence(&syn_ack).wrapping_add(1),
+            16,
+            &[],
+        ));
+        assert_eq!(
+            receive(&mut raw, &cx).await[13] & 1,
+            1,
+            "the service closed it"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 1);
         cx.cancel();
         Ok(())
     }))
