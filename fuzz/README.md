@@ -1,10 +1,10 @@
 # Fuzzing Fictionet
 
-The agent in the sandbox is the one adversary in Fictionet's trust model.
-Every byte it sends reaches world-side code. The targets here feed the
-parsers and state machines on that path. A panic, a hang or memory that
-grows without end in one of them is a denial of service against the
-world.
+Fictionet treats incoming packets as untrusted, whether they come from an
+agent's sandbox or an external network connected through a world's route.
+The targets here feed the parsers and state machines on those paths. A panic,
+a hang or memory that grows without end in one of them is a denial of service
+against the world. See [the security model](../SECURITY.md).
 
 The targets use [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) and
 libFuzzer, and need a nightly toolchain:
