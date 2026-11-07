@@ -1251,7 +1251,18 @@ impl Pending for Sending {
                 }
                 fields.push(hpack::Field::new(name.as_str(), value.as_bytes()));
             }
-            if let Some(length) = policy.len {
+            // Preserve a valid field that agrees with the response policy. On
+            // 304 it describes the selected representation, not the absent body.
+            let supplied_length = content_length(&parts.headers)
+                .ok()
+                .flatten()
+                .filter(|&length| {
+                    policy.len == Some(length) || parts.status == StatusCode::NOT_MODIFIED
+                })
+                .and_then(|_| parts.headers.get("content-length"));
+            if let Some(length) = supplied_length {
+                fields.push(hpack::Field::new("content-length", length.as_bytes()));
+            } else if let Some(length) = policy.len {
                 fields.push(hpack::Field::new("content-length", length.to_string()));
             }
             if let Some(date) = policy.date {

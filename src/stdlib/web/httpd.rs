@@ -35,6 +35,8 @@
 //! `Content-Length`, or uses the body's known length when none was set.
 //! Native HTTP/1 omits lengths for bodyless statuses and otherwise writes
 //! the body's known length or chooses framing for an unknown length.
+//! HTTP/2 preserves a valid supplied length when it agrees with that policy,
+//! and on `304` preserves the supplied length of the selected representation.
 //! Native HTTP/1 writes its own `Connection` header. It closes the
 //! connection after a response, other than `101`, whose handler's
 //! `Connection` header names `close`, and drops the handler's other tokens.
