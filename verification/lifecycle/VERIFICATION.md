@@ -5,7 +5,7 @@ This pass covers the serving driver in `src/stdlib/services/serve.rs`
 `Connection` contract in `src/stdlib/network/connection.rs`, and one TCP
 connection's life in `src/stdlib/network/tcp.rs` (close, orphan, half-close,
 reset, unread data). The models are under `verification/lifecycle/`, with the
-commands to run them in its [README](verification/lifecycle/README.md).
+commands to run them in its [README](README.md).
 
 Two bugs were found in `serve.rs`, each confirmed by a test that failed on
 the code before its fix, and fixed at the root. The TCP connection's life
@@ -13,7 +13,7 @@ checks clean; no code in `tcp.rs` or `connection.rs` changed.
 
 ## The serving state machine: `Core.tla`
 
-[`Core.tla`](verification/lifecycle/tla/Core.tla) is `Core` as `run` drives
+[`Core.tla`](tla/Core.tla) is `Core` as `run` drives
 it over one connection. The core is a record; each operator is the Rust
 function it stands for, and the actions compose them as the code does:
 
@@ -124,7 +124,7 @@ inside `on_end`, which no service does, so no code changed for it.
 
 ## One TCP connection: `Conn.tla`
 
-[`Conn.tla`](verification/lifecycle/tla/Conn.tla) is one `TcpConnection`
+[`Conn.tla`](tla/Conn.tla) is one `TcpConnection`
 from the moment `accept` or `connect` handed it out until its `Conn` is
 removed: the smoltcp state, whether smoltcp still names the peer (so a RST
 can go out), unread and unacknowledged bytes as booleans, the `Conn` flags
@@ -188,7 +188,7 @@ model keeps the code's behavior.
 
 ## Proofs against the Rust: `kani/ServeProof.rs`
 
-[`ServeProof.rs`](verification/lifecycle/kani/ServeProof.rs) is compiled into
+[`ServeProof.rs`](kani/ServeProof.rs) is compiled into
 `serve` under `cfg(kani)` and calls the production code:
 
 | Harness | Proves |
