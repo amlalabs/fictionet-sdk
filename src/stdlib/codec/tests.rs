@@ -2559,3 +2559,40 @@ fn demux_bounds_input_allocation_growth() {
     assert_eq!(streams.push_with_budget(&2, b"abcdefg", 3), 3);
     assert_eq!(streams.total(), 5);
 }
+
+#[test]
+fn regression_skip_that_raises_capacity_is_not_stuck() {
+    // The first byte is the width of every record, that byte included. The
+    // decoder learns it with a zero-byte skip and raises its capacity to it.
+    struct Widening(usize);
+    impl Decode for Widening {
+        type Item = Vec<u8>;
+        type Error = Infallible;
+        const NAME: &'static str = "widening";
+        fn capacity(&self) -> usize {
+            self.0
+        }
+        fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Vec<u8>>, Infallible> {
+            if self.0 == 1 {
+                let Some(&width) = input.first() else {
+                    return Ok(Step::Need);
+                };
+                self.0 = usize::from(width);
+                return Ok(Step::Skip(0));
+            }
+            Ok(match input.get(..self.0) {
+                Some(record) => Step::Item(record.to_vec(), self.0),
+                None => Step::Need,
+            })
+        }
+    }
+    let mut s = Stream::new(Widening(1));
+    let mut items = Vec::new();
+    assert_eq!(
+        pump(&mut s, &[3, 7, 8, 3, 9, 10], |item| items.push(item)),
+        Ok(6)
+    );
+    assert_eq!(items, [vec![3, 7, 8], vec![3, 9, 10]]);
+    assert_eq!(s.limit(), 3);
+    assert_eq!(finish(&mut s, |_| panic!("no more records")), Ok(()));
+}

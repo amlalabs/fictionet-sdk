@@ -248,9 +248,11 @@ where
         if self.done {
             return None;
         }
-        self.sync_limit();
         let mut zero_budget = None;
         loop {
+            // A step may raise the capacity: the limit follows it before the
+            // next decode, so a full buffer is judged against the new value.
+            self.sync_limit();
             let before = self.dec.held();
             let step = match self.dec.decode(self.buf.unread(), self.eof) {
                 Ok(step) => step,
