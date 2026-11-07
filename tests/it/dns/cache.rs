@@ -209,6 +209,59 @@ fn a_lower_ranked_nxdomain_leaves_data_of_any_type_at_or_below_its_name() {
 }
 
 #[test]
+fn nxdomain_rank_protection_is_independent_of_the_question_type() {
+    for owner in ["x.example.", "y.x.example."] {
+        for rtype in [RecordType::A, RecordType::MX, RecordType::ANY] {
+            for nodata in [false, true] {
+                for rank in [Rank::NonAuthAnswer, Rank::AuthAnswer] {
+                    let mut cache = cache();
+                    let evidence = if nodata {
+                        Offer::Negative {
+                            key: key(owner, RecordType::A),
+                            kind: Negative::NoData,
+                            soa: Some(soa()),
+                            rank,
+                            denial: Vec::new(),
+                            validation: Validation::NotPerformed,
+                            truncated: false,
+                        }
+                    } else {
+                        Offer::Positive {
+                            set: rrset(owner, 300, vec![a("192.0.2.88")]),
+                            rank,
+                            validation: Validation::NotPerformed,
+                            proof: Vec::new(),
+                            truncated: false,
+                        }
+                    };
+                    cache.insert(at(100), evidence);
+                    cache.insert(
+                        at(110),
+                        Offer::Negative {
+                            key: key("x.example.", rtype),
+                            kind: Negative::NxDomain,
+                            soa: Some(soa()),
+                            rank: Rank::NonAuthAnswer,
+                            denial: Vec::new(),
+                            validation: Validation::NotPerformed,
+                            truncated: false,
+                        },
+                    );
+                    let denied = cache
+                        .nxdomain_above(&LowerName::new(&name("x.example.")), DNSClass::IN, at(111))
+                        .is_some();
+                    assert_eq!(
+                        denied,
+                        rank <= Rank::NonAuthAnswer,
+                        "owner {owner}, question {rtype:?}, nodata {nodata}, rank {rank:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn newer_nodata_at_a_name_ends_its_nxdomain() {
     let mut cache = cache();
     cache.insert(at(100), nxdomain("www.example."));

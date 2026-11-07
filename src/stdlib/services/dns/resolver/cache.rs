@@ -442,8 +442,13 @@ impl Cache {
         // Live data or NODATA of higher rank at the name, of any type, or
         // at a name below it shows the name exists, so such an NXDOMAIN
         // is not kept at all.
-        if let Some(asked) = &asked
-            && self.shows_exists(asked, entry.rank(), now)
+        if matches!(
+            entry,
+            Entry::Negative {
+                kind: Negative::NxDomain,
+                ..
+            }
+        ) && self.shows_exists(&key, entry.rank(), now)
         {
             return;
         }
