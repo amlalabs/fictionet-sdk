@@ -90,7 +90,6 @@ where
 }
 
 /// Inspects the response bytes actually delivered to the client.
-#[allow(clippy::too_many_arguments)]
 pub async fn request<C: fictionet::stdlib::network::Connection>(
     fcx: &Cx,
     io: C,
