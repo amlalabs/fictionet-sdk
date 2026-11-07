@@ -139,7 +139,7 @@ fn authority(s: &str, default: Option<u16>) -> Option<(Host, u16)> {
     };
     let port = match port {
         Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-            p.parse::<u16>().ok().filter(|&p| p != 0)?
+            p.parse::<u16>().ok()?
         }
         Some(_) => return None,
         None => default?,
@@ -415,7 +415,6 @@ mod tests {
         for bad in [
             "example.test",
             "example.test:",
-            "example.test:0",
             "example.test:65536",
             "example.test:+1",
             "[fd00::1]",
@@ -424,6 +423,32 @@ mod tests {
         ] {
             let e = parse(&format!("CONNECT {bad} HTTP/1.1\r\n\r\n")).unwrap_err();
             assert_eq!(e.status, 400, "{bad}");
+        }
+    }
+
+    /// Port 0 is a literal wire port, as it is for the world's listeners,
+    /// `ssh-connect` and a TUN sandbox: the door passes it on in both forms.
+    #[test]
+    fn port_zero_targets_are_literal() {
+        let r = parse("CONNECT 203.0.113.30:0 HTTP/1.1\r\nHost: 203.0.113.30:0\r\n\r\n").unwrap();
+        assert_eq!(
+            r.target,
+            Target::Connect {
+                host: Host::V4(Ipv4Addr::new(203, 0, 113, 30)),
+                port: 0
+            }
+        );
+        let r =
+            parse("GET http://zero.test:0/status HTTP/1.1\r\nHost: zero.test:0\r\n\r\n").unwrap();
+        match r.target {
+            Target::Forward {
+                host, port, path, ..
+            } => {
+                assert_eq!(host, Host::Name("zero.test".into()));
+                assert_eq!(port, 0);
+                assert_eq!(path, "/status");
+            }
+            other => panic!("{other:?}"),
         }
     }
 

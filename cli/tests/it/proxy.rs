@@ -31,6 +31,39 @@ const TOKEN: &str = "tok-3f9a2c";
 const BASIC: &str = "Basic cmVsYXk6dG9rLTNmOWEyYw==";
 /// The address `secure.test` has, with TLS on 443.
 const SECURE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+/// The address `zero.test` has, with an HTTP answer on TCP port 0.
+const ZERO: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 30);
+
+/// A service on the literal TCP port 0: reads one request head and answers.
+struct ZeroPort;
+
+impl PortServer for ZeroPort {
+    fn serve(
+        &self,
+        fcx: fictionet::Cx,
+        arrival: Arrival,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        use fictionet::tokio::ConnectionTokioExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        Box::pin(async move {
+            let mut conn = arrival.conn.into_tokio(&fcx);
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                match conn.read_u8().await {
+                    Ok(b) => head.push(b),
+                    Err(_) => return,
+                }
+            }
+            let _ = conn
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nzero\n",
+                )
+                .await;
+            let _ = conn.shutdown().await;
+        })
+    }
+}
 
 /// A world in a thread: `plain.test` (plain HTTP) and `secure.test`
 /// (HTTPS, at 203.0.113.10), every other name NXDOMAIN.
@@ -133,6 +166,12 @@ impl World {
                                 .port_server(80, raw)
                         });
                     }
+                    net = net.host("zero", |h| {
+                        h.at(ZERO)
+                            .dns_name("zero.test")
+                            .port_server(0, ZeroPort)
+                            .port_server(8080, ZeroPort)
+                    });
                     net.start(&fcx, attachments)?;
                     assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));
                     // Ends the run: every attachment closes.
@@ -580,6 +619,60 @@ fn http_door_connects_and_forwards() {
         "{}",
         a.log()
     );
+}
+
+/// A service at TCP port 0 is reachable from a TUN sandbox and through
+/// `ssh-connect`; a sandbox behind the HTTP door must reach it too, by
+/// CONNECT and by absolute URI.
+#[test]
+fn port_zero_through_the_http_door() {
+    let world = World::start();
+    let a = Attach::start(&world, "http-proxy", "zero-http", "10.0.0.2");
+
+    // The same service at 8080: the control.
+    let (mut s, head) = connect(&a, "203.0.113.30:8080", Some(BASIC));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    let answer = http_get(&mut s, "203.0.113.30:8080", "/");
+    assert_eq!(body(&answer), "zero\n", "{answer}");
+    drop(s);
+
+    let (mut s, head) = connect(&a, "203.0.113.30:0", Some(BASIC));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    let answer = http_get(&mut s, "203.0.113.30:0", "/");
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+    assert_eq!(body(&answer), "zero\n");
+    drop(s);
+
+    let mut s = a.connect();
+    write!(
+        s,
+        "GET http://zero.test:0/ HTTP/1.1\r\nHost: zero.test:0\r\nProxy-Authorization: {BASIC}\r\n\r\n"
+    )
+    .unwrap();
+    let answer = String::from_utf8_lossy(&read_all(&mut s)).into_owned();
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+    assert_eq!(body(&answer), "zero\n");
+}
+
+/// The same service through the SOCKS5 door: CONNECT to port 0 must
+/// succeed, as it does for any other listening port.
+#[test]
+fn port_zero_through_the_socks5_door() {
+    let world = World::start();
+    let a = Attach::start(&world, "socks5", "zero-socks", "10.0.0.3");
+
+    // The same service at 8080: the control.
+    let (mut s, reply) = socks_connect(&a, "zero.test", 8080);
+    assert_eq!(reply[..2], [5, 0], "SOCKS5 reply {reply:?}: {}", a.log());
+    let answer = http_get(&mut s, "zero.test:8080", "/");
+    assert_eq!(body(&answer), "zero\n", "{answer}");
+    drop(s);
+
+    let (mut s, reply) = socks_connect(&a, "zero.test", 0);
+    assert_eq!(reply[..2], [5, 0], "SOCKS5 reply {reply:?}: {}", a.log());
+    let answer = http_get(&mut s, "zero.test:0", "/");
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+    assert_eq!(body(&answer), "zero\n");
 }
 
 #[test]
