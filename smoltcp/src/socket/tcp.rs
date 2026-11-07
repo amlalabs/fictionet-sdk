@@ -2974,6 +2974,9 @@ pub(crate) mod test {
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
 
+    #[cfg(kani)]
+    include!("../../../verification/tcp-port-zero/SocketProof.rs");
+
     // =========================================================================================//
     // Constants
     // =========================================================================================//

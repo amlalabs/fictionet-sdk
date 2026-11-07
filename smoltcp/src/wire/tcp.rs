@@ -5,6 +5,10 @@ use super::{Error, Result};
 use crate::wire::ip::checksum;
 use crate::wire::{IpAddress, IpProtocol};
 
+#[cfg(kani)]
+#[path = "../../../verification/tcp-port-zero/Wire.rs"]
+mod port_proofs;
+
 /// A TCP sequence number.
 ///
 /// A sequence number is a monotonically advancing integer modulo 2<sup>32</sup>.

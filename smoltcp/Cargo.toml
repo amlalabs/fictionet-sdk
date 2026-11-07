@@ -11,7 +11,7 @@ publish = false
 autoexamples = false
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [dependencies]
 managed = { version = "0.8", default-features = false, features = ["std"] }
