@@ -147,7 +147,7 @@ pub enum Received {
 }
 
 /// A finished or interrupted response to a dispatched HTTP request.
-/// Rejections before dispatch (including malformed heads and body timeouts)
+/// Rejections before dispatch (including malformed heads and HTTP/1 body timeouts)
 /// are outside this callback. Request and response extensions belong to the
 /// world; the server does not interpret them.
 pub struct Observation {
