@@ -18,7 +18,7 @@
 //! storage API and cache. [`ssrf`] extracts off-site request targets without
 //! fetching them. [`events`] defines the log format and [`log`] writes it.
 //! [`inventory`] is the revisioned package and cache snapshot a dashboard may
-//! show. [`facts`] projects request rows and door attempts from observer events.
+//! show. [`facts`] projects request rows and door attempts from typed service observations.
 //! This module issues certificates and connects the sites to the packet network.
 
 #![warn(missing_docs)]
@@ -186,6 +186,11 @@ pub fn network(
         .collect::<Result<Vec<_>>>()?;
     log.attach(fcx, names);
 
+    let http_log = log.clone();
+    let tls_log = log.clone();
+    let dns_log = log.clone();
+    let refused_log = log.clone();
+    let attachment_log = log.clone();
     let site_for = move |host: &str| {
         let i = NAMES.iter().position(|(name, _)| *name == host)?;
         let site = SITES[i];
@@ -199,6 +204,11 @@ pub fn network(
     };
     let mut net = web::Sites::new(fictionet_extras::network::cdn_pools(), |_| None)
         .into_net()
+        .observe_http(Arc::new(move |e| http_log.http(e)))
+        .on_tls(move |e| tls_log.tls(e))
+        .on_dns(move |e| dns_log.dns(e))
+        .on_refused(move |e| refused_log.refused(e))
+        .on_attachment(move |e| attachment_log.attachment(e))
         .egress(fictionet_extras::network::corporate_egress)
         .subnet(route::Prefix {
             addr: SUBNET.0.into(),
@@ -217,7 +227,7 @@ mod tests {
     #[test]
     fn each_leaf_names_only_its_site() {
         fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
+            fictionet::Seed::from_u64(1),
             |fcx| async move {
                 let identity = Identity::new(&fcx).unwrap();
                 for (i, (leaf, _)) in identity.leaves.iter().enumerate() {

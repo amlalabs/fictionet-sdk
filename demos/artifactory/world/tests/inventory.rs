@@ -67,11 +67,11 @@ fn network_folder_changes_are_ordered_and_refusals_are_silent() {
             }
             assert!(changes.windows(2).all(|c| c[0].0 <= c[1].0));
             assert_eq!(env.contents.inventory().revision, changes.len() as u64);
-            let events = env.memory.checked_of("http", "request").unwrap();
+            let events = env.memory.lock().unwrap();
             assert_eq!(
                 events
                     .iter()
-                    .filter_map(|e| e.u64("folder_revision"))
+                    .filter_map(|e| e.request.as_ref().and_then(|r| r.folder_revision))
                     .collect::<Vec<_>>(),
                 if variant == Variant::Peer {
                     vec![1, 2]

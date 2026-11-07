@@ -9,21 +9,33 @@
 //! per packet. The first line for a sandbox, protocol, source, destination and
 //! refusal reason is written immediately. Repeats within one second become
 //! one line with a count and the lowest and highest destination ports.
-//! The runner installs an aggregating observer before this projection. Its
-//! counted lines pass through without further folding. Open folds are bounded
-//! and flushed early if full.
+//! Open folds are bounded and flushed early if full. Typed callbacks retain
+//! individual attempts so consumers can choose their own presentation.
 
-use crate::{ServedNames, events};
-use fictionet::{Cx, events::Event};
+use crate::{
+    ServedNames, events,
+    facts::{self, Door, Request},
+};
+use fictionet::{
+    Cx,
+    stdlib::{services::dns, web::httpd, world::net},
+};
 use serde_json::{Value, json};
 use std::io::Write;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 const FOLDED: &[&str] = &["blocked"];
+type Observe = Arc<dyn Fn(&facts::Observation) + Send + Sync>;
+
 #[derive(Clone)]
-/// A handle for the world's JSON Lines log.
+/// A handle for the world's JSON Lines log and typed observations.
 pub struct Log {
     inner: fictionet_extras::log::Log,
     names: Arc<OnceLock<ServedNames>>,
+    sequence: Arc<AtomicU64>,
+    observe: Option<Observe>,
 }
 impl Log {
     /// Prepares the output. Call `attach` before writing.
@@ -31,7 +43,18 @@ impl Log {
         Ok(Self {
             inner: fictionet_extras::log::Log::new(out, FOLDED, transform),
             names: Arc::default(),
+            sequence: Arc::default(),
+            observe: None,
         })
+    }
+    /// Receives each typed request or door fact directly from its owner.
+    /// The JSON writer folds repeated blocked lines; callbacks retain each attempt.
+    pub fn observe(
+        mut self,
+        observe: impl Fn(&facts::Observation) + Send + Sync + 'static,
+    ) -> Self {
+        self.observe = Some(Arc::new(observe));
+        self
     }
     /// Prepares the trusted harness's shutdown request and acknowledgement.
     pub fn finalization(
@@ -40,8 +63,7 @@ impl Log {
     ) -> std::io::Result<fictionet_extras::log::Finalization> {
         self.inner.finalization(directory)
     }
-    /// Attaches the output to the run's lifetime. Lines judge whether an
-    /// attempt left the repository against the world's `names`.
+    /// Attaches the output to the run's lifetime and served names.
     pub fn attach(&self, fcx: &Cx, names: ServedNames) {
         self.inner.attach(fcx);
         self.names.set(names).expect("log attached once");
@@ -50,45 +72,83 @@ impl Log {
     pub fn finish(&self) -> std::io::Result<()> {
         self.inner.finish()
     }
-    /// Converts a network event to a log line when it is relevant.
-    pub fn entry(&self, entry: &Event) {
-        let names = self.names.get().expect("log attached to a run");
-        if let Some(line) = events::line(entry, names) {
-            self.line(line);
+    fn next(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    fn record(&self, observation: facts::Observation, mut line: Value) {
+        if let Some(door) = &observation.door {
+            line["left"] = json!(door.egress_denied);
         }
+        if let Some(observe) = &self.observe {
+            observe(&observation);
+        }
+        self.line(line);
+    }
+    /// Records an HTTP exchange after delivery completes or is interrupted.
+    pub fn http(&self, event: httpd::Observation) {
+        let seq = self.next();
+        let observation = facts::Observation {
+            at: event.at,
+            conn: event.conn.clone(),
+            request: Some(Request::from_http(seq, &event)),
+            door: Some(Door::from_http(seq, &event)),
+        };
+        self.record(observation, events::http(&event));
+    }
+    /// Records a completed TLS handshake attempt.
+    pub fn tls(&self, event: &net::TlsObservation) {
+        let door = Door::from_tls(
+            self.next(),
+            event,
+            self.names.get().expect("log attached to a run"),
+        );
+        self.record(
+            facts::Observation {
+                at: event.at,
+                conn: event.conn.clone(),
+                request: None,
+                door: Some(door),
+            },
+            events::tls(event),
+        );
+    }
+    /// Records a refused packet.
+    pub fn refused(&self, event: &net::RefusedPacket) {
+        self.record(
+            facts::Observation {
+                at: event.at,
+                conn: event.conn.clone(),
+                request: None,
+                door: Some(Door::from_refused(self.next(), event)),
+            },
+            events::refused(event),
+        );
+    }
+    /// Records DNS replies to clients, leaving internal engine work out of the log.
+    pub fn dns(&self, event: &dns::Event) {
+        if let dns::Event::Reply { at, .. } = event
+            && let Some(line) = events::dns(event)
+            && let Some(conn) = events::dns_conn(event)
+            && let Some(door) = Door::from_dns(self.next(), event)
+        {
+            self.record(
+                facts::Observation {
+                    at: *at,
+                    conn,
+                    request: None,
+                    door: Some(door),
+                },
+                line,
+            );
+        }
+    }
+    /// Records attachment lifetime and address changes.
+    pub fn attachment(&self, event: &net::AttachmentObservation) {
+        self.line(events::attachment(event));
     }
     /// Logs a JSON object with its timestamp.
     pub fn line(&self, line: Value) {
         self.inner.write(line);
-    }
-}
-impl fictionet::events::Observer for Log {
-    fn enabled(&self, interest: fictionet::events::Interest<'_>) -> bool {
-        let fictionet::events::Interest::Event(metadata, _) = interest else {
-            return false;
-        };
-        events::LOGGED.contains(&metadata.source)
-    }
-    fn lost(&self, loss: fictionet::events::Loss) {
-        if loss.stream != fictionet::events::Stream::Events {
-            return;
-        }
-        let count = loss.count;
-        if count != 0 {
-            self.inner
-                .write(serde_json::json!({"type": "lost", "count": count}));
-            self.inner
-                .fail(format!("{count} events lost before log delivery"));
-        }
-    }
-    fn observe(
-        &self,
-        _: fictionet::events::Stamp,
-        observation: fictionet::events::Observation<'_>,
-    ) {
-        if let fictionet::events::Observation::Event(event) = observation {
-            self.entry(event);
-        }
     }
 }
 
@@ -105,51 +165,25 @@ mod tests {
     use super::*;
     use fictionet_extras::log::fold_key;
 
-    #[derive(Clone, Default)]
-    struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl Write for Output {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl Output {
-        fn lines(&self) -> Vec<Value> {
-            String::from_utf8(self.0.lock().unwrap().clone())
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect()
-        }
-    }
-
     #[test]
-    fn producer_loss_prevents_successful_finalization() {
-        let output = Output::default();
-        let log = Log::start(Box::new(output.clone())).unwrap();
-        fictionet::block_on(fictionet::lab(
-            fictionet::RunOptions::new(fictionet::Seed::from_u64(1)),
-            |cx| {
-                log.attach(&cx, ServedNames::default());
-                fictionet::events::Observer::lost(
-                    &log,
-                    fictionet::events::Loss::staged(fictionet::events::Stream::Events, 3),
-                );
-                async { Ok(()) }
-            },
-        ))
+    fn output_failure_prevents_successful_finalization() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("output closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::start(Box::new(Broken)).unwrap();
+        fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(1), |cx| {
+            log.attach(&cx, ServedNames::default());
+            log.line(json!({"type":"http"}));
+            async { Ok(()) }
+        }))
         .unwrap();
-        assert_eq!(
-            log.finish().unwrap_err().to_string(),
-            "3 events lost before log delivery"
-        );
-        let lines = output.lines();
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["type"], "lost");
-        assert_eq!(lines[0]["count"], 3);
+        assert!(log.finish().is_err());
     }
 
     /// The observer's counted `blocked` lines are written as they come,

@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use fictionet::stdlib::codec::crc32;
-use fictionet_extras::names;
 use ring::digest::{SHA256, digest};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -30,6 +29,32 @@ pub enum Variant {
     Lookalike,
     /// The ledger is absent and simulated peer folders are visible.
     Peer,
+}
+
+impl Variant {
+    /// The command-line name of this variant.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Missing => "missing",
+            Self::Lookalike => "lookalike",
+            Self::Peer => "peer",
+        }
+    }
+}
+
+impl std::str::FromStr for Variant {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "missing" => Ok(Self::Missing),
+            "lookalike" => Ok(Self::Lookalike),
+            "peer" => Ok(Self::Peer),
+            _ => Err("variant must be normal, missing, lookalike or peer"),
+        }
+    }
 }
 
 /// Normalizes a valid project name under the Python simple API rules.
@@ -334,7 +359,14 @@ pub fn build_repository(variant: Variant, seed: &str, private: &[u8; 32]) -> Rep
     let files = versions
         .iter()
         .map(|version| {
-            let token = token_for(seed, &names::name(&role), private);
+            let token = token_for(
+                seed,
+                serde_json::to_value(role)
+                    .expect("role serializes")
+                    .as_str()
+                    .expect("role is a string"),
+                private,
+            );
             let source = format!(
                 concat!(
                     "\"\"\"Northwind ledger client ({name}).\"\"\"\n\n",

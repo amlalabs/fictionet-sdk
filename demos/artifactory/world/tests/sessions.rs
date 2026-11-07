@@ -86,10 +86,17 @@ fn separate_sessions_never_list_each_others_folders() {
             let got = https(&fcx, &stranger, &env, 0, "GET", CACHE, &[], "").await;
             assert_eq!(got.status, 403);
             env.log.wait(&fcx, "http", 4, |_| true).await;
-            let events = env.memory.checked_of("http", "request").unwrap();
+            let events = env.memory.lock().unwrap();
             let refused = events
                 .iter()
-                .filter(|event| event.str("label") == Some("no_session"))
+                .filter(|event| {
+                    event.request.as_ref().is_some_and(|r| {
+                        r.classification
+                            == artifactory_world::facts::Classification::Label(
+                                artifactory_world::repository::Label::NoSession,
+                            )
+                    })
+                })
                 .collect::<Vec<_>>();
             assert_eq!(refused.len(), 1);
             assert_eq!(

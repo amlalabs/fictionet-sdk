@@ -15,8 +15,8 @@ use artifactory_world::{Identity, NAMES, REPOSITORY_NAME};
 use fictionet::prelude::*;
 use fictionet::stdlib::network::ip;
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
-use fictionet::stdlib::world::sandbox::Machine;
 use fictionet::{Attacher, Cx, Interface};
+use fictionet_test_support::sandbox::Machine;
 use rustls::RootCertStore;
 use serde_json::Value;
 
@@ -32,7 +32,7 @@ pub struct Env {
     /// The packages and peer folders served by the world.
     pub contents: Arc<Contents>,
     /// The raw observed events.
-    pub memory: Arc<fictionet_observe::Memory>,
+    pub memory: Arc<std::sync::Mutex<Vec<artifactory_world::facts::Observation>>>,
 }
 
 /// Runs the world until the test client returns.
@@ -61,40 +61,51 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     let buf = Buf::default();
-    let log = Log::start(Box::new(buf.clone())).unwrap();
+    let memory = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = memory.clone();
+    let log = Log::start(Box::new(buf.clone()))
+        .unwrap()
+        .observe(move |event| observed.lock().unwrap().push(event.clone()));
     let output = log.clone();
-    let audit = Arc::new(fictionet_extras::guest_content::Audit::default());
-    let memory = Arc::new(fictionet_observe::Memory::default());
-    fictionet_test_support::harness::run(
-        fictionet::RunOptions::new(fictionet::Seed::from_u64(1)).observer(Arc::new(
-            fictionet_observe::Aggregate::new(Arc::new(fictionet::events::Fanout::new(vec![
-                audit.clone(),
-                memory.clone(),
-                Arc::new(log.clone()),
-            ]))),
-        )),
-        move |fcx| async move {
-            let identity = Identity::new(&fcx)?;
-            let root = identity.ca_der.clone();
-            let mut roots = RootCertStore::empty();
-            roots.add(root)?;
-            let (attacher, attachments) = fictionet::attachments();
-            artifactory_world::start(&fcx, sessions, identity, log, attachments)?;
-            f(
-                fcx,
-                attacher,
-                Env {
-                    roots: Arc::new(roots),
-                    log: buf,
-                    contents,
-                    memory,
-                },
-            )
-            .await
-        },
-    );
+    fictionet_test_support::harness::run(fictionet::Seed::from_u64(1), move |fcx| async move {
+        let identity = Identity::new(&fcx)?;
+        let root = identity.ca_der.clone();
+        let mut roots = RootCertStore::empty();
+        roots.add(root)?;
+        let (attacher, attachments) = fictionet::attachments();
+        artifactory_world::start(&fcx, sessions, identity, log, attachments)?;
+        f(
+            fcx,
+            attacher,
+            Env {
+                roots: Arc::new(roots),
+                log: buf,
+                contents,
+                memory,
+            },
+        )
+        .await
+    });
     output.finish().unwrap();
+}
+
+/// Inspects the response bytes actually delivered to the client.
+#[allow(clippy::too_many_arguments)]
+pub async fn request<C: fictionet::stdlib::network::Connection>(
+    fcx: &Cx,
+    io: C,
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Got {
+    let got =
+        fictionet_test_support::harness::request(fcx, io, method, host, path, headers, body).await;
+    let audit = fictionet_extras::guest_content::Audit::default();
+    audit.inspect(path, &got.body);
     audit.check().unwrap();
+    got
 }
 
 /// One HTTPS request with the world's CA checked.
@@ -114,7 +125,7 @@ pub async fn https(
         m,
         NAMES[site].1,
         NAMES[site].0,
-        fictionet::stdlib::world::sandbox::client_config(
+        fictionet_test_support::sandbox::client_config(
             fcx,
             std::time::SystemTime::now(),
             Some(&env.roots),
@@ -461,7 +472,7 @@ pub async fn script(fcx: Cx, attacher: Attacher, env: Env) -> fictionet::Result 
             &m,
             NAMES[0].1,
             "unserved.test",
-            fictionet::stdlib::world::sandbox::client_config(
+            fictionet_test_support::sandbox::client_config(
                 &fcx,
                 std::time::SystemTime::now(),
                 Some(&env.roots),
