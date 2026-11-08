@@ -205,7 +205,7 @@ pub(crate) use framed::tests as framed_echo;
 #[path = "../../../verification/layer/kani/mod.rs"]
 mod proofs;
 
-pub use budget::{Budget, Charge};
+pub use budget::{Budget, Charge, OwnedWork, WorkOwner};
 pub use carrier::{
     ByteStream, Child, ChildId, Chunk, Credited, Datagram, DatagramCommand, DatagramEvent,
     Datagrams, MessageCommand, MessageEvent, Messages, Mux, MuxCommand, MuxEvent, MuxOp, Slots,

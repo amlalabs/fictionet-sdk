@@ -26,6 +26,11 @@ pub trait Worker<L: Layer>: Send {
     /// How much work is running.
     fn running(&self) -> usize;
 
+    /// Whether job storage could not be reserved. No more work is launched.
+    fn budget_exhausted(&self) -> bool {
+        false
+    }
+
     /// The entropy of the world the work runs in, which the stack then
     /// draws from instead of the harness's seed. `None` keeps the seed.
     fn entropy(&self) -> Option<Arc<dyn Entropy>> {
@@ -110,6 +115,13 @@ impl<L: Layer<Lower = ByteStream>> Harness<L> {
     /// How much of the stack's work the worker is doing.
     pub fn jobs(&self) -> usize {
         self.worker.as_ref().map_or(0, |worker| worker.running())
+    }
+
+    /// Whether the worker stopped because its storage did not fit.
+    pub fn budget_exhausted(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| worker.budget_exhausted())
     }
 
     /// The peer sends `bytes`.

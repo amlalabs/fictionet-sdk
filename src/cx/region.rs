@@ -66,7 +66,7 @@ impl Region {
         })
     }
 
-    pub(super) fn child(self: &Arc<Self>) -> Arc<Region> {
+    pub(crate) fn child(self: &Arc<Self>) -> Arc<Region> {
         let child = Arc::new(Region {
             run: self.run.clone(),
             cancelled: AtomicBool::new(false),
@@ -195,7 +195,7 @@ impl Region {
         }
     }
 
-    pub(super) fn poll_done(&self, cx: &mut Context<'_>) -> Poll<()> {
+    pub(crate) fn poll_done(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.state.lock();
         if state.live == 0 {
             state.completed = true;
