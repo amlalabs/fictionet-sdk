@@ -30,7 +30,9 @@ const LINES_PER_ADVANCE: usize = 64;
 pub(crate) struct Out<'a, T, W, N> {
     now: Instant,
     entropy: &'a dyn Entropy,
-    writes: &'a mut VecDeque<Vec<u8>>,
+    budget: &'a Budget,
+    writes: &'a mut VecDeque<Chunk>,
+    over_budget: &'a mut bool,
     timers: &'a mut Timers<T>,
     work: &'a mut VecDeque<W>,
     close: &'a mut bool,
@@ -39,9 +41,16 @@ pub(crate) struct Out<'a, T, W, N> {
 }
 
 impl<T: Clone + Eq, W, N> Out<'_, T, W, N> {
-    /// Sends `bytes` after what was sent before.
+    /// Sends `bytes` after what was sent before. They are charged to the
+    /// stack's budget until the transport takes them; a write the budget
+    /// has no room for ends the connection.
     pub(crate) fn write(&mut self, bytes: &[u8]) {
-        self.writes.push_back(bytes.to_vec());
+        match self.budget.charge(bytes.len()) {
+            Some(charge) => self
+                .writes
+                .push_back(Chunk::with_charge(bytes.to_vec(), charge)),
+            None => *self.over_budget = true,
+        }
     }
 
     /// Ends the connection once what was written is sent: no more input
@@ -82,11 +91,6 @@ impl<T: Clone + Eq, W, N> Out<'_, T, W, N> {
     /// A number from the stack's entropy.
     pub(crate) fn random_u64(&self) -> u64 {
         self.entropy.random_u64()
-    }
-
-    /// The stack's time.
-    pub(crate) fn now(&self) -> Instant {
-        self.now
     }
 }
 
@@ -150,7 +154,7 @@ pub(crate) trait LineApp: Send + 'static {
 pub(crate) enum LinedError<E> {
     /// The application gave up.
     App(E),
-    /// The budget had no room for the line buffer.
+    /// The budget had no room for the line buffer or a write.
     Budget,
 }
 
@@ -158,7 +162,7 @@ impl<E: fmt::Display> fmt::Display for LinedError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LinedError::App(e) => e.fmt(f),
-            LinedError::Budget => f.write_str("no room for the line buffer"),
+            LinedError::Budget => f.write_str("no room in the budget"),
         }
     }
 }
@@ -180,7 +184,7 @@ pub(crate) struct Lined<A: LineApp> {
     stream: Stream<Lines>,
     charge: Option<Charge>,
     opened: bool,
-    writes: VecDeque<Vec<u8>>,
+    writes: VecDeque<Chunk>,
     timers: Timers<A::Timer>,
     work: VecDeque<A::Work>,
     close: bool,
@@ -231,17 +235,24 @@ impl<A: LineApp> Lined<A> {
         env: &Env<'_, Infallible>,
         f: impl FnOnce(&mut A, &mut LineOut<'_, A>) -> Result<(), A::Error>,
     ) -> Result<(), LinedError<A::Error>> {
+        let mut over_budget = false;
         let mut out = Out {
             now: env.now(),
             entropy: env.entropy(),
+            budget: env.budget(),
             writes: &mut self.writes,
+            over_budget: &mut over_budget,
             timers: &mut self.timers,
             work: &mut self.work,
             close: &mut self.close,
             holding: &mut self.holding,
             next: &mut self.next,
         };
-        f(&mut self.app, &mut out).map_err(LinedError::App)
+        f(&mut self.app, &mut out).map_err(LinedError::App)?;
+        if over_budget {
+            return Err(LinedError::Budget);
+        }
+        Ok(())
     }
 
     /// Whether lines may still go to the application.
@@ -374,8 +385,8 @@ impl<A: LineApp> Layer for Lined<A> {
         if self.reset {
             return None;
         }
-        if let Some(bytes) = self.writes.pop_front() {
-            return Some(StreamCommand::Write(Chunk::new(bytes)));
+        if let Some(chunk) = self.writes.pop_front() {
+            return Some(StreamCommand::Write(chunk));
         }
         if self.close && !self.end_sent {
             self.end_sent = true;

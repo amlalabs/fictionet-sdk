@@ -3,7 +3,7 @@
 //!
 //! `Message` reads and writes complete multicast membership messages through
 //! `Wire`. There is no protocol stream decoder, membership state machine,
-//! querier timer, or `Service`. The caller maintains groups and sends IP
+//! querier timer, or server layer. The caller maintains groups and sends IP
 //! packets.
 //!
 //! IGMP (the Internet Group Management Protocol, IP protocol 2) is how an

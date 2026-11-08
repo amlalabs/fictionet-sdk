@@ -1,7 +1,7 @@
 //! MQTT 3.1.1: reading and writing control packets, with no I/O.
 //!
 //! `Packet` implements `Wire` and supports `codec::Frames<Packet>` stream
-//! decoding. There is no broker session or `Service`, QoS delivery state,
+//! decoding. There is no broker session or server layer, QoS delivery state,
 //! keepalive scheduler, or live transport, and MQTT 5 is unsupported.
 //!
 //! MQTT is the publish and subscribe protocol much of the Internet of
@@ -14,10 +14,9 @@
 //! type. This module follows the OASIS MQTT Version 3.1.1 standard
 //! (Plus Errata 01).
 //!
-//! A broker [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
-//! `codec::Frames<Packet>` to receive [`Packet`]s and writes the bytes of its
-//! replies, from [`Packet::to_bytes`], back to the connection. Which clients
+//! A broker is a [layer](fictionet::stdlib::layer) that reads a byte stream
+//! with `codec::Frames<Packet>` to receive [`Packet`]s and writes the bytes of
+//! its replies, from [`Packet::to_bytes`], back down the stream. Which clients
 //! may connect, which topics exist, and who receives what is up to world code.
 //! [`topic_matches`] says whether a subscription's filter matches a topic name,
 //! as the standard defines it.

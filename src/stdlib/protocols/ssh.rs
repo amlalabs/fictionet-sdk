@@ -20,9 +20,8 @@
 //! SERVICE_REQUEST, SERVICE_ACCEPT, KEXINIT and NEWKEYS. Use [`transport`]
 //! for seeded cryptography, algorithm negotiation, encryption and rekeying.
 //!
-//! A plaintext [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
-//! [`Events`] for the version exchange and numbered packets, or
+//! A plaintext server [layer](fictionet::stdlib::layer) over a byte stream
+//! uses [`Events`] for the version exchange and numbered packets, or
 //! `codec::Frames<Packet>` after the version exchange. It reads payloads with
 //! [`Message::parse`] and builds replies with [`Identification::new`] and
 //! [`Packet::from_message`]. Which algorithms the world offers, and what its

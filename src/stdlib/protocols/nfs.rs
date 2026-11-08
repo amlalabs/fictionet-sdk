@@ -4,7 +4,7 @@
 //! Procedure-specific readers and writers handle NFS and MOUNT arguments and
 //! results. RPC envelopes and TCP stream decoding come from `onc_rpc`. This
 //! module has no `Wire` or `Decode` implementation of its own, file-server
-//! `Service`, or storage backend.
+//! server layer, or storage backend.
 //!
 //! NFS (Network File System) lets a client read and write files that live
 //! on a server as if they were local. Version 3 is the one most servers

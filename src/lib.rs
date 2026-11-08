@@ -154,47 +154,69 @@
 //! Most worlds are a network of hosts, each answering some protocols. Three
 //! stdlib modules make one in a few lines:
 //!
-//! - [`stdlib::services::serve`]: a [`Service`](stdlib::services::serve::Service)
-//!   is the server side of one protocol for one connection, with no I/O: it
-//!   gets decoded items, appends reply bytes, and records facts. One driver
-//!   runs any service over any connection, with timers, TLS, a transcript and
-//!   fault plans.
+//! - [`stdlib::layer`]: a [`Layer`](stdlib::layer::Layer) is one protocol
+//!   between the carrier below it and what it offers above, with no I/O.
+//!   Layers stack on any carrier with the semantics they need: TLS on TCP,
+//!   HTTP on TLS, an application on HTTP/2 streams or SSH channels. A server
+//!   is a stack with nothing above it.
+//! - [`stdlib::services::stack`]: the runners that move bytes, time and work
+//!   between a stack and a live connection or UDP socket, and nothing else.
 //! - [`stdlib::world::net`]: a [`Net`](stdlib::world::net::Net) builds the
 //!   network around the [`Host`](stdlib::world::net::Host)s it is given: the
 //!   sandboxes' subnet with DHCP, a resolver at the gateway that answers
 //!   every host's names, a router, one machine per address, and each host's
-//!   services on their ports.
+//!   stacks on their ports.
 //!
-//! HTTP is a service too ([`stdlib::web::httpd`]): a router whose handlers get
+//! HTTP is a stack too ([`stdlib::web::httpd`]): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
-//! server and a line-echo service run on two hosts:
+//! server and an echo run on two hosts:
 //!
 //! ```
 //! # {
-//! use std::sync::Arc;
+//! use std::convert::Infallible;
 //! use fictionet::{Attachments, Cx, Result};
-//! use fictionet::stdlib::codec::{Ending, LineError, Lines};
+//! use fictionet::stdlib::layer::{Admit, ByteStream, Env, Layer, StreamCommand, StreamEvent, Top};
 //! use fictionet::stdlib::web::httpd::{tower, Server};
 //! use fictionet::stdlib::world::net::Net;
-//! use fictionet::stdlib::services::serve::{Flow, Driver, Service};
 //!
-//! /// Echoes each line back.
-//! struct Echo;
+//! /// Sends back every byte it gets, and ends its side when the client
+//! /// ends theirs.
+//! #[derive(Default)]
+//! struct Echo {
+//!     out: Option<StreamCommand>,
+//! }
 //!
-//! impl Service for Echo {
+//! impl Layer for Echo {
+//!     type Lower = ByteStream;
+//!     type Upper = Top;
+//!     type Report = Infallible;
 //!     type Timer = ();
-//!     type Decoder = Lines;
-//!     type State = ();
-//!     type Error = std::convert::Infallible;
-//!     fn decoder(&self) -> Lines {
-//!         Lines::new(1024, Ending::LfOrCrlf)
-//!     }
-//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> std::result::Result<Flow, Self::Error> {
-//!         let line = line.unwrap_or_default();
+//!     type Work = ();
+//!     type Done = ();
+//!     type Error = Infallible;
 //!
-//!         driver.reply().extend_from_slice(&line);
-//!         driver.reply().push(b'\n');
-//!         Ok(Flow::Continue)
+//!     fn on_event(&mut self, _: &mut Env<'_, Infallible>, event: StreamEvent) -> std::result::Result<Admit<StreamEvent>, Infallible> {
+//!         match event {
+//!             StreamEvent::Written(_) => {}
+//!             StreamEvent::Reset => self.out = None,
+//!             // One reply at a time: the next waits until this one is taken.
+//!             event if self.out.is_some() => return Ok(Admit::Blocked(event)),
+//!             StreamEvent::Data(bytes) => self.out = Some(StreamCommand::Write(bytes)),
+//!             StreamEvent::Ended => self.out = Some(StreamCommand::End),
+//!         }
+//!         Ok(Admit::Taken)
+//!     }
+//!
+//!     fn on_command(&mut self, _: &mut Env<'_, Infallible>, command: Infallible) -> std::result::Result<Admit<Infallible>, Infallible> {
+//!         match command {}
+//!     }
+//!
+//!     fn take_command(&mut self) -> Option<StreamCommand> {
+//!         self.out.take()
+//!     }
+//!
+//!     fn take_event(&mut self) -> Option<Infallible> {
+//!         None
 //!     }
 //! }
 //!
@@ -203,15 +225,14 @@
 //!     // Hosts without a fixed address get one from public CDN space.
 //!     Net::new(fictionet_extras::network::cdn_pools())
 //!         .host("www", |h| h.dns_name("www.example.test").port_server(80, Server::new(site)))
-//!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
+//!         .host("echo", |h| h.dns_name("echo.example.test").tcp_stack(7, |_| Echo::default()))
 //!         .start(&fcx, attachments)
 //! }
 //! # }
 //! ```
 //!
 //! [`stdlib::web::Sites`] is a preset on `Net` for a world of websites. The
-//! guide in `docs/services.md` walks through services and `Net`
-//! step by step.
+//! guide in `docs/services.md` walks through stacks and `Net` step by step.
 //!
 //! # Protocols
 //!
@@ -221,8 +242,8 @@
 //! decoders cut items out of input ([`Decode`](stdlib::codec::Decode)).
 //! HTTP has a ready server, [`stdlib::world::net::Net`] serves DHCP and runs a
 //! DNS resolver ([`stdlib::services::dns`]), and
-//! TLS is built in. For other protocols, a world writes a
-//! [`Service`](stdlib::services::serve::Service) around the module's decoder.
+//! TLS is built in. For other protocols, a world writes a server
+//! [layer](stdlib::layer) around the module's decoder.
 //! The codecs also work in unit tests and fuzz targets. The
 //! [`stdlib::dissect`] adapters use them to inspect caller-supplied packets.
 //! See [Changing a protocol by copying it](stdlib#changing-a-protocol-by-copying-it).
@@ -241,7 +262,7 @@
 //! 2. [`running`](guide::running): the program around a world, and worlds in tests.
 //! 3. [`lowering`](guide::lowering): how each attach type turns what its
 //!    sandbox sends into IP packets, and what the world sees from each.
-//! 4. [`stdlib`], then [`stdlib::world::net`] and [`stdlib::services::serve`]: the
+//! 4. [`stdlib`], then [`stdlib::world::net`] and [`stdlib::layer`]: the
 //!    networking pieces a world is built from, and a network of hosts and
 //!    services in a few lines. [`stdlib::web`] does the same for websites.
 //! 5. [`stdlib::dissect`]: packet inspection built on the protocol decoders.

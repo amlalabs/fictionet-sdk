@@ -3,7 +3,7 @@
 //!
 //! Message readers and writers handle complete packets, with `Vec<u8>` as the
 //! byte representation. There is no protocol stream decoder, neighbor or
-//! multicast-tree state machine, routing `Service`, or live transport.
+//! multicast-tree state machine, routing server layer, or live transport.
 //!
 //! PIM (IP protocol 103) is how routers build the trees that carry
 //! multicast traffic. Neighbors find each other with Hello messages. A

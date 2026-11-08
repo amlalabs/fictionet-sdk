@@ -3,7 +3,7 @@
 //!
 //! `Message` implements `Wire` and supports `codec::Frames<Message>` for
 //! length-prefixed payloads. Header and status helpers do not provide an RPC
-//! session, `Service`, HTTP/2 transport, or protobuf decoding. Compressed
+//! session, server layer, HTTP/2 transport, or protobuf decoding. Compressed
 //! payloads stay as bytes.
 //!
 //! gRPC is how many services call each other: a client names a method,

@@ -3,7 +3,7 @@
 //!
 //! `Record` and complete requests and responses implement `Wire`.
 //! `codec::Frames<Record>` decodes the stream. `Client` and `Server` provide
-//! caller-driven request bookkeeping, but there is no `Service`, process
+//! caller-driven request bookkeeping, but there is no server layer, process
 //! manager, or live transport.
 //!
 //! FastCGI is how a web server hands a request to an application running

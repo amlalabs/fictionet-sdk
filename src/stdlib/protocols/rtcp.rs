@@ -2,7 +2,7 @@
 //!
 //! Packet and compound-datagram types implement `Wire`, and
 //! `codec::Frames<Frame>` decodes RFC 4571 stream envelopes. There is no media
-//! session, report scheduler, `Service`, live transport, or SRTCP cryptography.
+//! session, report scheduler, server layer, live transport, or SRTCP cryptography.
 //!
 //! RTCP travels beside RTP media and says how the media is doing. Senders
 //! and receivers send reports on loss and jitter, name themselves in source

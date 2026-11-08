@@ -6,7 +6,7 @@
 //!
 //! `Packet`, `Message`, and `TokenStream` implement `Wire`. Stream decoders
 //! assemble packets, and `TokenReader` retains column metadata. There is no
-//! login or query session, database `Service`, SQL engine, authentication, or
+//! login or query session, database server layer, SQL engine, authentication, or
 //! TLS transport.
 //!
 //! TDS, the Tabular Data Stream, is how clients talk to Microsoft SQL

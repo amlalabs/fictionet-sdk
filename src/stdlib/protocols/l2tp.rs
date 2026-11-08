@@ -3,7 +3,7 @@
 //!
 //! The packet and control-message types read and write complete values through
 //! `Wire`. There is no stream decoder, tunnel or session state machine,
-//! `Service`, or live transport. Sequencing, retries, and hidden AVP recovery
+//! server layer, or live transport. Sequencing, retries, and hidden AVP recovery
 //! belong to the caller.
 //!
 //! L2TP carries a link layer, such as a PPP session or an Ethernet

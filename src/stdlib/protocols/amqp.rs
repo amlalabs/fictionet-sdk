@@ -2,7 +2,7 @@
 //! content headers, with no I/O.
 //!
 //! Complete frames and payload values use `Wire`, and `Frames` decodes the byte
-//! stream. There is no connection or channel session, broker `Service`, or live
+//! stream. There is no connection or channel session, broker server layer, or live
 //! transport. World code handles negotiation, heartbeats, queues, and delivery.
 //!
 //! AMQP 0-9-1 is the protocol RabbitMQ speaks. A client opens a TCP
@@ -16,11 +16,11 @@
 //! reference for it, including RabbitMQ's field value types and its
 //! extensions to the connection and basic classes.
 //!
-//! A broker [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
-//! [`Frames`] to receive [`Frame`]s. In `on_item`, call
-//! `driver.decoder().set_frame_max()` after negotiation. It reads each method
-//! frame's [`Method`], and writes the reply's bytes back to the connection.
+//! A broker is a [layer](fictionet::stdlib::layer) over a byte stream that
+//! reads it with a [`Stream`](fictionet::stdlib::codec::Stream) of [`Frames`]
+//! to receive [`Frame`]s, calling `stream.decoder().set_frame_max()` after
+//! negotiation. It reads each method frame's [`Method`], and writes the
+//! reply's bytes back down the stream.
 //! Which exchanges and queues exist, and where a message goes, is up to world
 //! code.
 //!

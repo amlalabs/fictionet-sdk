@@ -569,7 +569,7 @@ impl Cx {
 ///   [`ConnError::Cancelled`](crate::stdlib::network::ConnError::Cancelled),
 ///   [`RaceError::Cancelled`], [`JoinError::Cancelled`],
 ///   [`HandshakeError::Cancelled`](crate::stdlib::services::tls::HandshakeError::Cancelled)
-///   and [`ServeError::Cancelled`](crate::stdlib::services::serve::ServeError::Cancelled).
+///   and [`StackError::Cancelled`](crate::stdlib::services::stack::StackError::Cancelled).
 ///
 /// A cancel is never reported as `None`, as `Ok`, or as another error such
 /// as a broken connection. A task passes the error up with `?`, and so

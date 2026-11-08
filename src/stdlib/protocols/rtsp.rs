@@ -3,7 +3,7 @@
 //!
 //! `Message` and `Frame` implement `Wire`, and `Frames` decodes messages and
 //! interleaved data. `Session` represents a header value, not a connection
-//! state machine. This module has no streaming `Service`, media transport, or
+//! state machine. This module has no streaming server layer, media transport, or
 //! playback engine.
 //!
 //! RTSP is how IP cameras, video recorders and media servers are told to
@@ -21,8 +21,7 @@
 //! bytes it reads into [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits the
 //! stream into [`Frame`]s: messages, by their Content-Length, and
 //! interleaved frames, by their length. A camera can also use [`Frames`] as
-//! the decoder of a [`Service`](fictionet::stdlib::services::serve::Service) run by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection).
+//! the reader of a [layer](fictionet::stdlib::layer) over the byte stream.
 //! World code reads the headers it needs with
 //! [`Message::cseq`], [`Message::session`], [`Message::transports`] and
 //! [`Message::range`], builds its answer (often with [`Message::reply`]),

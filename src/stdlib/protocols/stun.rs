@@ -3,7 +3,7 @@
 //!
 //! `Message` and `Frame` implement `Wire`, `codec::Frames<Frame>` yields `Frame` values, and
 //! `answer_binding` builds a stateless Binding reply. There is no ICE or TURN
-//! session, `Service`, live transport, or HMAC computation or verification.
+//! session, server layer, live transport, or HMAC computation or verification.
 //!
 //! STUN is how a host behind a NAT learns the public address and port its
 //! packets leave from. A client sends a Binding request, usually over UDP to

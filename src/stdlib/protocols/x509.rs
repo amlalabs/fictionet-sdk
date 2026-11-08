@@ -3,7 +3,7 @@
 //!
 //! Certificate and CRL values implement `Wire`, while `PemBlocks` decodes a PEM
 //! stream. This module supplies no signing, signature verification, trust-path
-//! validation, TLS session, or certificate `Service`.
+//! validation, TLS session, or certificate server layer.
 //! [`ca`](fictionet::stdlib::services::ca) issues certificates using these types.
 //!
 //! A certificate binds a public key to a name. An issuer signs a

@@ -46,6 +46,7 @@ CONSTANTS NS,          \* the mux's slots
           Readiness,    \* retained buffers and completion traffic
           MayFail,     \* children's layers may fail
           BudgetRefuses, \* the budget may refuse a child's place or inbox
+          RefuseFullInbox, \* a full inbox refuses its child instead of waiting
           Control,     \* the layer above sends control commands
           CheckOverrun, CheckCommandCredit, ReserveForControl,
           MuxChecksGeneration, KeyByWholeId
@@ -107,10 +108,16 @@ MuxSend(s) ==
   LET id == <<s, mgen[s]>>
       kid == kids[id] IN
   /\ ~overrun /\ mlive[s] /\ (mEv[s] >= 1 \/ ~HonestMux)
-  /\ (~Readiness \/ kid.inbox + kid.empty < Q)
+  /\ (~Readiness \/ kid.inbox + kid.empty < Q \/ RefuseFullInbox)
   /\ mEv' = [mEv EXCEPT ![s] = Max0(mEv[s] - 1)]
   /\ IF ~kid.live
        THEN UNCHANGED <<kids, down, overrun, jobs, polledClosed>>   \* a child already gone
+     \* Children::refuse_full_inbox: the child whose inbox is full is
+     \* refused and closed, so the mux goes on with its siblings.
+     ELSE IF Readiness /\ kid.inbox + kid.empty >= Q
+       THEN /\ kids' = [kids EXCEPT ![id] = Dead]
+            /\ down' = Append(down, Cmd("Close", id, 0))
+            /\ UNCHANGED overrun
      ELSE IF kid.granted < 1 /\ CheckOverrun
        THEN overrun' = TRUE /\ UNCHANGED <<kids, down>>
      ELSE \/ /\ kids' = [kids EXCEPT ![id].granted = Max0(kid.granted - 1),

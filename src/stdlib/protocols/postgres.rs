@@ -3,7 +3,7 @@
 //!
 //! `FrontendMessage` and `BackendMessage` implement `Wire`. Directional
 //! decoders track startup and encryption-reply framing. They do not implement a
-//! database session, authentication, SQL execution, a `Service`, or encrypted
+//! database session, authentication, SQL execution, a server layer, or encrypted
 //! transport.
 //!
 //! A PostgreSQL client talks to its server over one TCP connection,
@@ -18,10 +18,10 @@
 //! reads protocols 3.0 and 3.2, which differ only in the length of the
 //! cancel key.
 //!
-//! A database [`Service`](fictionet::stdlib::services::serve::Service) served
-//! by [`serve::connection`](fictionet::stdlib::services::serve::connection)
-//! uses [`FrontendMessages`] to receive each [`FrontendMessage`]. In `on_item`,
-//! call `driver.decoder().refuse_encryption()` after answering an encryption
+//! A database is a [layer](fictionet::stdlib::layer) over a byte stream that
+//! reads it with a [`Stream`](fictionet::stdlib::codec::Stream) of
+//! [`FrontendMessages`] to receive each [`FrontendMessage`], calling
+//! `stream.decoder().refuse_encryption()` after answering an encryption
 //! request with N. It answers with a [`BackendMessage`] for each reply, written
 //! by [`Wire::write`]. Which users exist, which passwords they have, and what a
 //! query returns are up to world code. A world that plays a client does the

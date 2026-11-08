@@ -3,7 +3,7 @@
 //!
 //! `Message` implements `Wire` for complete IPP values, and `Head` decodes
 //! attribute sections while leaving document bytes unread. There is no
-//! print-job session or printer `Service`, HTTP transport, or document
+//! print-job session or printer server layer, HTTP transport, or document
 //! renderer.
 //!
 //! IPP is how computers talk to printers. A client sends a request in the

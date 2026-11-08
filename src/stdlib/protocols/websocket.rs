@@ -3,7 +3,7 @@
 //!
 //! `Frame` implements `Wire`. `Frames` and `Messages` decode frames and
 //! reassemble messages. Handshake helpers do not implement an HTTP Upgrade
-//! transport or a WebSocket session or `Service`. Ping replies, closing, and
+//! transport or a WebSocket session or server layer. Ping replies, closing, and
 //! TLS belong to the caller. Extensions, including compression, are
 //! unsupported.
 //!
@@ -29,9 +29,9 @@
 //! [`Upgrade::response_headers`]. It pushes connection bytes to
 //! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for frames or
 //! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) for whole [`Message`]s.
-//! After the handshake, a [`Service`](fictionet::stdlib::services::serve::Service)
-//! run by [`serve::connection`](fictionet::stdlib::services::serve::connection) can
-//! use [`Frames`] or [`Messages`] to read the WebSocket connection.
+//! After the handshake, a [layer](fictionet::stdlib::layer) over the byte
+//! stream, or code given the upgraded connection, can use [`Frames`] or
+//! [`Messages`] to read the WebSocket connection.
 //! Replies become frames through [`Message::to_frame`] or
 //! [`Message::to_frames`]. Answering pings and deciding when to close
 //! belong to world code.

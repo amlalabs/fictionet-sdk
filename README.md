@@ -55,7 +55,7 @@ networks of websites with `stdlib::web`, and codecs (no I/O) for about a hundred
 protocols and data formats, listed in [the stdlib docs](src/stdlib/mod.rs).
 HTTP has a ready server, `Net` serves DHCP and runs a DNS resolver, and TLS is
 built in.
-For other protocols, a world writes a `Service` around the module's decoder.
+For other protocols, a world writes a server layer around the module's decoder.
 The crate is not on crates.io, so build it from this repository.
 
 A run supplies the world's clock and seeded randomness. With real sandboxes
@@ -139,9 +139,10 @@ bottleneck, a router, a TCP endpoint. The crate docs show each layer.
 | [`fictionet-extras`](extras/src/lib.rs) | Search engine results and reusable site skins with local stylesheets and assets. |
 
 `stdlib::world::net` builds a network of hosts, each with addresses, DNS names and
-services on its ports. A service is the server side of one protocol for one
-connection, written with no I/O: it gets decoded items and appends reply bytes,
-and one driver runs it over any connection. HTTP is a service
+services on its ports. A service is a stack of protocol layers, written with
+no I/O, and any layer stacks on any carrier with the semantics it needs: TLS
+on TCP, HTTP on TLS, an application on HTTP/2 streams. One runner moves bytes,
+time and work between a stack and a live connection. HTTP is a stack
 (`stdlib::web::httpd`), and `web::Sites` is a preset on `Net` for websites.
 
 Each world owns its observation types, views, and page. The stdlib offers
@@ -196,7 +197,7 @@ Start at the crate root, which explains the main ideas, then read in this order:
    sends into IP packets.
 4. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
    protocol modules. Then [`stdlib::world::net`](src/stdlib/world/net.rs) and
-   [`stdlib::services::serve`](src/stdlib/services/serve.rs) for a network of hosts and
+   [`stdlib::layer`](src/stdlib/layer/mod.rs) for a network of hosts and
    services, and [`stdlib::web`](src/stdlib/web/mod.rs) for a network of
    websites.
 5. [Packet dissection](src/stdlib/dissect/mod.rs): opt-in protocol layers and packet summaries.

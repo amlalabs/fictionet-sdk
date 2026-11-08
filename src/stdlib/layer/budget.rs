@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// [`Chunk`](super::Chunk) can carry its charge with it, so the charge moves
 /// with the bytes.
 ///
-/// [`serve`](fictionet::stdlib::services::serve) charges each connection the
-/// larger of its decoder's capacity and its read buffer, the decoder's held
-/// state, the bytes read but not yet decoded, what the service and its
-/// deferred work hold, and the reply bytes not yet written.
+/// The [stack runners](fictionet::stdlib::services::stack) charge each
+/// connection its read buffer, the bytes read but not yet taken, and the
+/// table of the stack's work; each layer charges what it holds, such as a
+/// framer's buffer and the replies not yet written.
 #[derive(Clone)]
 pub struct Budget {
     inner: Arc<BudgetInner>,

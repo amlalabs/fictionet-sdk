@@ -6,7 +6,7 @@ use fictionet::stdlib::protocols::dns::op::{MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit};
 use fictionet::stdlib::protocols::dns::{ProtoError, op::Message};
-use fictionet::stdlib::services::serve::Transport;
+use fictionet::stdlib::network::Transport;
 
 /// Parses `data` as a query over UDP and over TCP. Each gives exactly one
 /// outcome, and the outcome agrees with the bytes: silence only for a
