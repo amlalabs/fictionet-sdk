@@ -236,6 +236,7 @@
 //! | [`network::ports`] | Ready-slot polling for packet interfaces. |
 //! | [`network::route`] | Packet routing and LAN forwarding. |
 //! | [`network::tcp`] | Simulated TCP listeners and connections using smoltcp. |
+//! | [`network::transport`] | What the TCP, UDP and passive TCP observer layers offer above the IP layer: their ports, opening contexts and control messages. |
 //! | [`network::udp`] | UDP sockets, datagram parsing and encoding. |
 //!
 //! [`network`] itself holds the links ([`delay`](network::delay),

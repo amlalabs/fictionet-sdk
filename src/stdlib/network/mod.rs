@@ -12,6 +12,7 @@ pub mod packet;
 pub mod ports;
 pub mod route;
 pub mod tcp;
+pub mod transport;
 pub mod udp;
 
 pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, DatagramSocket};
