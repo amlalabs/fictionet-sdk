@@ -179,6 +179,10 @@ mod timers;
 #[cfg(test)]
 mod tests;
 
+/// A frame echo over [`Framed`], for the runners' tests.
+#[cfg(test)]
+pub(crate) use framed::tests as framed_echo;
+
 pub use budget::{Budget, Charge};
 pub use carrier::{
     ByteStream, Child, ChildId, Chunk, Credited, Datagram, DatagramCommand, DatagramEvent,

@@ -2,7 +2,7 @@ use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_ser
 use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::codec::Decode;
-use fictionet::stdlib::layer::Budget;
+use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Never, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::label_count;
@@ -16,6 +16,7 @@ use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
     self, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
 };
+use fictionet::stdlib::services::stack::{self, StackError, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -199,6 +200,38 @@ where
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
             let _ = serve::connection(&fcx, conn, info, &mut service, &state, &opts).await;
+        })
+    }
+}
+
+/// Serves a layer stack made fresh for each connection.
+struct StackAccept<M> {
+    make: M,
+    max_conns: usize,
+    open: Arc<AtomicUsize>,
+}
+
+impl<L, M> PortServer for StackAccept<M>
+where
+    L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
+    L::Work: Never,
+    L::Report: Never + Send,
+    M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
+{
+    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
+            arrival.socket.reset();
+            return Box::pin(async {});
+        };
+        arrival.socket.hold_until_gone(Box::new(guard));
+        let layer = (self.make)(&arrival.info);
+        let budget = arrival.budget.unwrap_or_else(Budget::unlimited);
+        let (conn, info, socket) = (arrival.conn, arrival.info, arrival.socket);
+        Box::pin(async move {
+            let ended = stack::stream(&fcx, conn, &info, layer, budget, StreamLimits::default());
+            if let Ok(StreamEnd::Reset) = ended.await {
+                socket.reset();
+            }
         })
     }
 }
@@ -506,6 +539,57 @@ impl Host {
             };
             fcx.spawn(move |fcx| async move {
                 Ok(serve::datagram(&fcx, socket, local, &mut service, &state, &opts).await?)
+            });
+        });
+        self.ports.push((port, PortSpec::Udp(start)));
+        self
+    }
+
+    /// Serves the literal TCP `port`, including zero, with a layer stack
+    /// made by `make` for each connection, from the connection's
+    /// [`ConnInfo`]. [`stack::stream`] runs it with the default
+    /// [`StreamLimits`], charging the sandbox's budget, at most
+    /// [`DEFAULT_MAX_CONNS`](serve::DEFAULT_MAX_CONNS) at once. Past that,
+    /// a new connection is reset as soon as it is accepted, and each counts
+    /// until its socket is gone. A connection the stack resets is reset.
+    pub fn tcp_stack<L, M>(self, port: u16, make: M) -> Host
+    where
+        L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
+        L::Work: Never,
+        L::Report: Never + Send,
+        M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
+    {
+        self.port_server(
+            port,
+            StackAccept {
+                make,
+                max_conns: serve::DEFAULT_MAX_CONNS,
+                open: Arc::default(),
+            },
+        )
+    }
+
+    /// Serves UDP `port` with one layer stack made by `make`, which holds
+    /// the conversation for the socket's whole life and gets every
+    /// datagram with its sender's address ([`stack::datagrams`]). Port
+    /// zero asks the endpoint to choose a free port
+    /// ([`udp::Endpoint::bind`]).
+    pub fn udp_stack<L, M>(mut self, port: u16, make: M) -> Host
+    where
+        L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top> + Send + 'static,
+        L::Work: Never,
+        L::Report: Never + Send,
+        L::Error: core::error::Error + Send + Sync + 'static,
+        M: Fn() -> L + Send + Sync + 'static,
+    {
+        let start: UdpStart = Arc::new(move |fcx, socket, local, _sandbox| {
+            let layer = make();
+            fcx.spawn(move |fcx| async move {
+                match stack::datagrams(&fcx, socket, local, layer).await {
+                    Ok(()) => Ok(()),
+                    Err(StackError::Cancelled) => Err(fictionet::Cancelled.into()),
+                    Err(StackError::Layer(e)) => Err(e.into()),
+                }
             });
         });
         self.ports.push((port, PortSpec::Udp(start)));

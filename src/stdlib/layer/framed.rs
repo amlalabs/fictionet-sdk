@@ -249,7 +249,7 @@ impl<O: Wire> core::error::Error for FramedError<O> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! A frame echo on top of [`Framed`], over Modbus/TCP framing. The
     //! tests compare what comes out with what went in, never fixed bytes.
 
@@ -259,12 +259,12 @@ mod tests {
     use fictionet::stdlib::layer::{Budget, Chain, Harness, Side, Top};
     use fictionet::stdlib::protocols::modbus::{self, Frame};
 
-    type Port = Framing<Frames<Frame>, Frame>;
+    pub(crate) type Port = Framing<Frames<Frame>, Frame>;
 
     /// Answers every frame with itself, one at a time, and ends its
     /// direction once its input is over.
     #[derive(Default)]
-    struct Echo {
+    pub(crate) struct Echo {
         reply: Option<Frame>,
         over: bool,
         end_sent: bool,
@@ -325,13 +325,13 @@ mod tests {
         }
     }
 
-    type Stack = Chain<Framed<Frames<Frame>, Frame>, Echo>;
+    pub(crate) type Stack = Chain<Framed<Frames<Frame>, Frame>, Echo>;
 
-    fn stack() -> Stack {
+    pub(crate) fn stack() -> Stack {
         Chain::new(Framed::new(Frames::new()), Echo::default())
     }
 
-    fn frames(count: u16) -> Vec<Frame> {
+    pub(crate) fn frames(count: u16) -> Vec<Frame> {
         (0..count)
             .map(|i| Frame {
                 transaction: i,
@@ -341,7 +341,7 @@ mod tests {
             .collect()
     }
 
-    fn wire(frames: &[Frame]) -> Vec<u8> {
+    pub(crate) fn wire(frames: &[Frame]) -> Vec<u8> {
         frames
             .iter()
             .flat_map(|f| f.to_bytes().expect("a test frame is valid"))
@@ -349,7 +349,7 @@ mod tests {
     }
 
     /// Every frame in `bytes`, which must hold nothing else.
-    fn read(mut bytes: &[u8]) -> Vec<Frame> {
+    pub(crate) fn read(mut bytes: &[u8]) -> Vec<Frame> {
         let mut out = Vec::new();
         while !bytes.is_empty() {
             let (frame, used) = Frame::parse_prefix(bytes)
