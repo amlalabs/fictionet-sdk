@@ -5,9 +5,9 @@
 //! reads a [`Connection`] into a stack's [`ByteStream`] and writes what the
 //! stack gives back, with the write completion, the ends and the resets
 //! between them. [`datagrams`] does the same for a [`DatagramSocket`] and a
-//! stack over [`Datagrams`]. Both drive the stack with a
-//! [`Driver`](fictionet::stdlib::layer::Driver): time from the run's clock,
-//! entropy from the run, and timers when the stack names them.
+//! stack over [`Datagrams`]. Both drive the stack with a [`Driver`]: time
+//! from the run's clock, entropy from the run, and timers when the stack
+//! names them.
 //!
 //! [`Host::tcp_stack`](fictionet::stdlib::world::net::Host::tcp_stack) and
 //! [`Host::udp_stack`](fictionet::stdlib::world::net::Host::udp_stack)
@@ -289,10 +289,11 @@ where
                         Admit::Taken
                     }
                 });
-                if reading && p.failed.is_none() {
-                    if let Poll::Ready(r) = conn.poll_read(fcx, cx, buf) {
-                        p.read = Some(r);
-                    }
+                if reading
+                    && p.failed.is_none()
+                    && let Poll::Ready(r) = conn.poll_read(fcx, cx, buf)
+                {
+                    p.read = Some(r);
                 }
                 if p.failed.is_none() && conn.poll_gone(cx).is_ready() {
                     p.failed = Some(ConnError::Reset);
