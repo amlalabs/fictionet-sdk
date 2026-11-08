@@ -9,8 +9,8 @@ what it leaves out, and what it found is in [VERIFICATION.md](VERIFICATION.md).
 
 Each `.tla` has `*_base.cfg` configs of the code as it is, which must pass,
 and `*_without_<flag>.cfg` configs that break one part of the code and name
-the one property TLC must then violate. `Children_large_command.cfg` is a
-finding: it violates `CommandsGo` on the code as it is.
+the property TLC must then violate. `Children_large_command.cfg` and
+`Children_readiness.cfg` are additional passing configurations.
 
 | Config | Checks |
 | --- | --- |
@@ -33,14 +33,18 @@ finding: it violates `CommandsGo` on the code as it is.
 | `Children_without_reserveforcontrol.cfg` | no reserved places: violates `ControlProgress` |
 | `Children_without_muxchecksgeneration.cfg` | `Slots` ignore the generation: violates `NoStaleDelivery` |
 | `Children_without_keybywholeid.cfg` | `Children` keys children by slot: violates `NoStaleDelivery` |
-| `Children_large_command.cfg` | a command larger than the mux's window: violates `CommandsGo` (finding) |
+| `Children_large_command.cfg` | a command larger than the mux's window drains in legal prefixes: `CommandsGo` holds |
+| `Children_readiness.cfg` | retained receive credit, bounded empty events and jobs, urgent completion, and cancellation |
+| `Children_without_urgent.cfg` | completion stays behind refused data: violates `CompletionProgress` |
+| `Children_without_workownership.cfg` | runtime polls work after its owner closes: violates `NoCancelledPoll` |
+| `Children_without_joblimit.cfg` | reset/reopen launches work past the job limit: violates `BoundedJobs` |
 
 Run one with TLC (JDK 11 or later):
 
 ```sh
 cd verification/layer/tla
-java -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar tlc2.TLC -workers 4 -config Route_base.cfg Route.tla
-java -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar tlc2.TLC -workers 4 -config Children_base.cfg Children.tla
+systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 ~/.cache/adorably-fv/jdk/bin/java -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar tlc2.TLC -workers 4 -metadir ~/.cache/adorably-fv/route-states -config Route_base.cfg Route.tla
+systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 ~/.cache/adorably-fv/jdk/bin/java -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar tlc2.TLC -workers 4 -metadir ~/.cache/adorably-fv/children-states -config Children_base.cfg Children.tla
 ```
 
 `CHECK_DEADLOCK FALSE` is set because a finished run of the owner, or a
@@ -63,7 +67,9 @@ cargo kani -p fictionet --harness timers_in_order_one_name_three_times
 cargo kani -p fictionet --harness timers_cancel_fire_and_retain_touch_one_name
 cargo kani -p fictionet --harness a_chunk_cursor_keeps_the_rest_in_place
 cargo kani -p fictionet --harness a_chunk_cursor_never_passes_the_end
+cargo kani -p fictionet --harness stream_credit_splits_keep_the_allocation_owned
 ```
 
-Run each under a memory cap of about 10 GB; every one finishes in under two
-minutes.
+Run Cargo under `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0`
+with `CARGO_BUILD_JOBS=6` and the worktree's `CARGO_TARGET_DIR`. Measured results
+and proof scope are recorded in [VERIFICATION.md](VERIFICATION.md).
