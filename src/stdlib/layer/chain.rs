@@ -1,0 +1,182 @@
+use fictionet::stdlib::layer::{Admit, CommandOf, Env, EventOf, Layer, Side};
+use fictionet::time::Instant;
+
+/// `B` stacked on `A`: `A`'s upper port is `B`'s lower port.
+///
+/// The chain is itself a layer, from `A`'s lower port to `B`'s upper port,
+/// so chains nest. It keeps both parts' events, timers, work and errors
+/// apart with [`Side`]. Between the parts it holds at most one item each
+/// way: what one part handed over and the other has not taken yet.
+/// [`advance`](Layer::advance) moves those items in a loop, never by one
+/// part calling the other, so a deep stack makes no deep calls.
+pub struct Chain<A: Layer, B: Layer<Lower = A::Upper>> {
+    lower: A,
+    upper: B,
+    /// An event `A` handed up that `B` has not taken.
+    up: Option<EventOf<A::Upper>>,
+    /// A command `B` handed down that `A` has not taken.
+    down: Option<CommandOf<A::Upper>>,
+}
+
+impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
+    /// `upper` on top of `lower`.
+    pub fn new(lower: A, upper: B) -> Chain<A, B> {
+        Chain {
+            lower,
+            upper,
+            up: None,
+            down: None,
+        }
+    }
+
+    /// The lower part.
+    pub fn lower(&self) -> &A {
+        &self.lower
+    }
+
+    /// The upper part.
+    pub fn upper(&self) -> &B {
+        &self.upper
+    }
+
+    /// The lower part.
+    pub fn lower_mut(&mut self) -> &mut A {
+        &mut self.lower
+    }
+
+    /// The upper part.
+    pub fn upper_mut(&mut self) -> &mut B {
+        &mut self.upper
+    }
+}
+
+/// Offers `item` to a part and keeps what it hands back. Returns whether
+/// anything moved. What a closed input refuses is dropped: it will never be
+/// taken.
+fn offer<T>(slot: &mut Option<T>, admit: Admit<T>) -> bool {
+    match admit {
+        Admit::Taken | Admit::Closed(_) => true,
+        Admit::Partial(rest) => {
+            *slot = Some(rest);
+            true
+        }
+        Admit::Blocked(item) => {
+            *slot = Some(item);
+            false
+        }
+    }
+}
+
+impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
+    type Lower = A::Lower;
+    type Upper = B::Upper;
+    type Report = Side<A::Report, B::Report>;
+    type Timer = Side<A::Timer, B::Timer>;
+    type Work = Side<A::Work, B::Work>;
+    type Done = Side<A::Done, B::Done>;
+    type Error = Side<A::Error, B::Error>;
+
+    fn on_event(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        event: EventOf<A::Lower>,
+    ) -> Result<Admit<EventOf<A::Lower>>, Self::Error> {
+        env.scoped(Side::Lower, |env| self.lower.on_event(env, event))
+            .map_err(Side::Lower)
+    }
+
+    fn on_command(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        command: CommandOf<B::Upper>,
+    ) -> Result<Admit<CommandOf<B::Upper>>, Self::Error> {
+        env.scoped(Side::Upper, |env| self.upper.on_command(env, command))
+            .map_err(Side::Upper)
+    }
+
+    fn on_timer(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        timer: Self::Timer,
+    ) -> Result<(), Self::Error> {
+        match timer {
+            Side::Lower(t) => env
+                .scoped(Side::Lower, |env| self.lower.on_timer(env, t))
+                .map_err(Side::Lower),
+            Side::Upper(t) => env
+                .scoped(Side::Upper, |env| self.upper.on_timer(env, t))
+                .map_err(Side::Upper),
+        }
+    }
+
+    fn on_done(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        done: Self::Done,
+    ) -> Result<(), Self::Error> {
+        match done {
+            Side::Lower(d) => env
+                .scoped(Side::Lower, |env| self.lower.on_done(env, d))
+                .map_err(Side::Lower),
+            Side::Upper(d) => env
+                .scoped(Side::Upper, |env| self.upper.on_done(env, d))
+                .map_err(Side::Upper),
+        }
+    }
+
+    fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Self::Error> {
+        let mut moved = env
+            .scoped(Side::Lower, |env| self.lower.advance(env))
+            .map_err(Side::Lower)?;
+        moved |= env
+            .scoped(Side::Upper, |env| self.upper.advance(env))
+            .map_err(Side::Upper)?;
+        if self.up.is_none() {
+            self.up = self.lower.take_event();
+            moved |= self.up.is_some();
+        }
+        if let Some(event) = self.up.take() {
+            let admit = env
+                .scoped(Side::Upper, |env| self.upper.on_event(env, event))
+                .map_err(Side::Upper)?;
+            moved |= offer(&mut self.up, admit);
+        }
+        if self.down.is_none() {
+            self.down = self.upper.take_command();
+            moved |= self.down.is_some();
+        }
+        if let Some(command) = self.down.take() {
+            let admit = env
+                .scoped(Side::Lower, |env| self.lower.on_command(env, command))
+                .map_err(Side::Lower)?;
+            moved |= offer(&mut self.down, admit);
+        }
+        Ok(moved)
+    }
+
+    fn take_command(&mut self) -> Option<CommandOf<A::Lower>> {
+        self.lower.take_command()
+    }
+
+    fn take_event(&mut self) -> Option<EventOf<B::Upper>> {
+        self.upper.take_event()
+    }
+
+    fn take_work(&mut self) -> Option<Self::Work> {
+        if let Some(work) = self.lower.take_work() {
+            return Some(Side::Lower(work));
+        }
+        self.upper.take_work().map(Side::Upper)
+    }
+
+    fn deadline(&self) -> Option<(Instant, Self::Timer)> {
+        let lower = self.lower.deadline();
+        let upper = self.upper.deadline();
+        match (lower, upper) {
+            (Some((a, t)), Some((b, _))) if a <= b => Some((a, Side::Lower(t))),
+            (_, Some((b, t))) => Some((b, Side::Upper(t))),
+            (Some((a, t)), None) => Some((a, Side::Lower(t))),
+            (None, None) => None,
+        }
+    }
+}

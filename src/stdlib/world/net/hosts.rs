@@ -2,6 +2,7 @@ use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_ser
 use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::codec::Decode;
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::label_count;
@@ -13,7 +14,7 @@ use fictionet::stdlib::services::dns::zone::{
 };
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
-    self, Budget, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
+    self, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
 };
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;

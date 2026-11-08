@@ -928,7 +928,7 @@ impl serve::Service for Http2 {
 
 /// Whether `budget` can hold `size` more bytes once the `released` bytes
 /// it counts now are let go.
-fn fits(budget: Option<&serve::Budget>, size: usize, released: usize) -> bool {
+fn fits(budget: Option<&fictionet::stdlib::layer::Budget>, size: usize, released: usize) -> bool {
     budget.is_none_or(|b| size <= b.limit().saturating_sub(b.used().saturating_sub(released)))
 }
 
@@ -1127,7 +1127,7 @@ type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>
 
 struct Sending {
     delivery: Option<super::Delivery>,
-    budget: Option<serve::Budget>,
+    budget: Option<fictionet::stdlib::layer::Budget>,
     id: u32,
     send: Arc<Mutex<Outbound>>,
     work: Option<Later>,

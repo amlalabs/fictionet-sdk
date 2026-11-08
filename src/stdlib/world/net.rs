@@ -158,12 +158,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
+#[cfg(doc)]
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::network::route::{self, Prefix, Router};
 use fictionet::stdlib::network::{icmp, tcp};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::resolver::Config;
 #[cfg(doc)]
-use fictionet::stdlib::services::serve::{Budget, ServeOptions, Service};
+use fictionet::stdlib::services::serve::{ServeOptions, Service};
 use fictionet::{Attachments, Cx, End, Error, Interface, InterfaceExt};
 
 #[cfg(doc)]

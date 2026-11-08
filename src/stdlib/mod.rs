@@ -217,6 +217,7 @@
 //! | Module | Description |
 //! | --- | --- |
 //! | [`codec`] | Wire traits, streaming decoders, combinators, recording and faults. |
+//! | [`layer`] | Protocol layers: carrier ports, stacking, negotiated change, and their driver. |
 //! | [`network`] | IP packets, routing, links, TCP and UDP. |
 //! | [`protocols`] | Message types and framers for each protocol, with no I/O. |
 //! | [`services`] | Service drivers, TLS servers and certificate authorities. |
@@ -390,6 +391,7 @@
 //! | [`world::net::dns`] | DNS servers and resolvers as programs on hosts, their sources, and namespaces. |
 
 pub mod codec;
+pub mod layer;
 pub mod network;
 pub mod protocols;
 pub mod services;
