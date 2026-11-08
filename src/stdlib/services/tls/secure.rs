@@ -1,7 +1,7 @@
 use super::{Handshake, Negotiation, TlsLayer};
 use fictionet::stdlib::layer::{
     Admit, ByteStream, Chain, CommandOf, Env, EventOf, Later, Layer, Side, StreamCommand,
-    StreamEvent,
+    StreamEvent, Successor,
 };
 use fictionet::time::Instant;
 
@@ -19,6 +19,8 @@ use fictionet::time::Instant;
 /// [`Handoff`](fictionet::stdlib::layer::Handoff) names a `Secure` as what
 /// comes next runs in a [`Switch`](fictionet::stdlib::layer::Switch), and
 /// `make` carries the plaintext session's context into the layer above.
+/// As the switch's [`Successor`] it reads none of the bytes that came
+/// before it took over.
 pub struct Secure<U: Layer<Lower = ByteStream>, F, T: Negotiation = TlsLayer> {
     chain: Chain<Driven<T>, Later<U>>,
     make: Option<F>,
@@ -153,6 +155,25 @@ where
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
         self.chain.deadline()
+    }
+}
+
+/// STARTTLS: a plaintext layer names a `Secure` as what comes next. TLS
+/// starts on the carrier when it takes over and reads none of the bytes
+/// that came before, so no plaintext the client pipelined after its request
+/// reaches it, whatever the plaintext layer did with them.
+impl<U, F, T> Successor<Secure<U, F, T>> for Secure<U, F, T>
+where
+    U: Layer<Lower = ByteStream>,
+    T: Negotiation,
+    F: FnOnce(&T) -> U,
+{
+    fn succeed(next: Secure<U, F, T>) -> Secure<U, F, T> {
+        next
+    }
+
+    fn inherits(event: &StreamEvent) -> bool {
+        !matches!(event, StreamEvent::Data(_))
     }
 }
 

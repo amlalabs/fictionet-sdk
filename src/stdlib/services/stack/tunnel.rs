@@ -9,7 +9,7 @@ use super::Job;
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Chunk, CommandOf, Env, EventOf, Layer, StreamCommand, StreamEvent,
-    Top,
+    Successor, Top,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::sync::Mutex;
@@ -115,6 +115,14 @@ impl Drop for Tunnel {
         let mut shared = self.shared.lock();
         shared.reset = true;
         shared.wake_code();
+    }
+}
+
+/// A protocol that negotiates a tunnel names it as what comes next; the
+/// tunnel reads every byte the client sent behind its request.
+impl Successor<Tunnel> for Tunnel {
+    fn succeed(next: Tunnel) -> Tunnel {
+        next
     }
 }
 

@@ -123,7 +123,8 @@
 //! a successful CONNECT or STARTTLS, then runs the `B` that `A` negotiated.
 //! The handover moves the input `A` read past the boundary and the commands
 //! it was given but did not use, once, to `B`. `A`'s timers and work go
-//! with `A`.
+//! with `A`. `B` is a [`Successor`], which says which of the input from
+//! before the switch it reads: TLS after STARTTLS reads none of it.
 //!
 //! Two simpler choices need no handover. A [`Side`]`<A, B>` of two layers
 //! with the same ports is a layer: the choice made when the stack is made.
@@ -232,7 +233,7 @@ pub use framed::{BoundedDecode, BoundedWire, Decoded, Framed, FramedError, Frami
 pub use harness::{Harness, Worker};
 pub use observed::{Direction, ObservedEvent, ObservedStream, Source, Termination};
 pub use packet::{PacketCommand, PacketEvent, Packets, Whole};
-pub use switch::{Handoff, Handover, Switch};
+pub use switch::{Handoff, Handover, Successor, Switch};
 pub use timers::Timers;
 
 use fictionet::time::Instant;

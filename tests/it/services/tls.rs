@@ -177,6 +177,19 @@ struct Mail {
     inbox: Option<Inbox>,
     /// Whether work waits on the inbox.
     waiting: bool,
+    /// What a careless session does with plaintext pipelined after
+    /// STARTTLS, instead of dropping it.
+    careless: Option<Careless>,
+}
+
+/// How a careless STARTTLS session leaves what the client pipelined after
+/// STARTTLS to the switch.
+#[derive(Clone, Copy)]
+enum Careless {
+    /// It hands it over, as a protocol does whose successor is a tunnel.
+    HandsOver,
+    /// It stops taking input at STARTTLS, and the rest waits below.
+    Refuses,
 }
 
 /// Fills waiting for one subscribed session, and the waker of the work
@@ -247,6 +260,7 @@ impl Mail {
             book: Book::default(),
             inbox: None,
             waiting: false,
+            careless: None,
         }
     }
 
@@ -313,9 +327,13 @@ impl Layer for Mail {
     ) -> Result<Admit<StreamEvent>, Infallible> {
         match event {
             StreamEvent::Written(n) => self.written += n,
-            StreamEvent::Data(_) if self.next.is_some() => {}
+            StreamEvent::Data(chunk) if self.next.is_some() => match self.careless {
+                None => {}
+                Some(Careless::HandsOver) => self.below.push(StreamEvent::Data(chunk)),
+                Some(Careless::Refuses) => return Ok(Admit::Blocked(StreamEvent::Data(chunk))),
+            },
             StreamEvent::Data(_) if self.input_over => return Ok(Admit::Closed(event)),
-            StreamEvent::Data(chunk) => {
+            StreamEvent::Data(mut chunk) => {
                 self.input.extend_from_slice(&chunk);
                 while self.next.is_none()
                     && let Some(end) = self.input.iter().position(|b| *b == b'\n')
@@ -326,7 +344,19 @@ impl Layer for Mail {
                     self.answer(env.now(), line);
                 }
                 if self.next.is_some() {
-                    self.input.clear();
+                    // What came after STARTTLS in this chunk.
+                    let rest = std::mem::take(&mut self.input);
+                    match self.careless {
+                        None => {}
+                        Some(Careless::HandsOver) => {
+                            self.below.push(StreamEvent::Data(Chunk::new(rest)))
+                        }
+                        Some(Careless::Refuses) if !rest.is_empty() => {
+                            chunk.advance(chunk.len() - rest.len());
+                            return Ok(Admit::Partial(StreamEvent::Data(chunk)));
+                        }
+                        Some(Careless::Refuses) => {}
+                    }
                 } else if self.input.len() > 512 {
                     self.input_over = true;
                 }
@@ -374,7 +404,8 @@ impl Layer for Mail {
 
     fn on_done(&mut self, _env: &mut Env<'_, Infallible>, fill: String) -> Result<(), Infallible> {
         self.waiting = false;
-        self.out.push_back(format!("250 fill {fill}\r\n").into_bytes());
+        self.out
+            .push_back(format!("250 fill {fill}\r\n").into_bytes());
         Ok(())
     }
 }
@@ -468,10 +499,7 @@ fn a_subscription_made_before_starttls_wakes_the_session_after_it() {
         // The client sends nothing: the fill alone wakes the session.
         fill(&book, "5@99");
         h.settle()?;
-        assert_eq!(
-            decrypt(&mut client, &h.take_output()),
-            b"250 fill 5@99\r\n"
-        );
+        assert_eq!(decrypt(&mut client, &h.take_output()), b"250 fill 5@99\r\n");
         Ok(())
     }))
     .unwrap();
@@ -551,6 +579,52 @@ fn plaintext_pipelined_after_starttls_is_never_read() {
         Ok(())
     }))
     .unwrap();
+}
+
+/// A careless session that keeps what the client pipelined after STARTTLS
+/// still cannot pass it to TLS, whether it hands it over or stops taking
+/// input and leaves it below: the switch drops it. Plaintext reaching TLS
+/// would fail the handshake.
+#[test]
+fn a_careless_session_cannot_pass_pipelined_plaintext_to_tls() {
+    let cases: [(Careless, &[&[u8]]); 3] = [
+        (Careless::HandsOver, &[b"STARTTLS\r\nEHLO\r\n", b"EHLO\r\n"]),
+        // The rest of the chunk handed back, then a chunk refused whole.
+        (Careless::Refuses, &[b"STARTTLS\r\nEHLO\r\n"]),
+        (Careless::Refuses, &[b"STARTTLS\r\n", b"EHLO\r\n"]),
+    ];
+    for (careless, pushes) in cases {
+        block_on(lab(fictionet::Seed::from_u64(5), move |fcx| async move {
+            let (config, client_config) = mail_configs(&fcx);
+            let mut mail = Mail::plain(ConnInfo::default(), config, Duration::from_secs(10));
+            mail.careless = Some(careless);
+            let mut h = Harness::new(fictionet::Seed::from_u64(0), Starttls::new(mail))
+                .with_worker(Polling::new());
+            h.settle()?;
+            h.take_output();
+            h.withhold();
+            for bytes in pushes {
+                h.push(bytes)?;
+            }
+            h.allow_all()?;
+            assert_eq!(h.take_output(), b"220 go ahead\r\n");
+            assert!(h.layer().then().is_some());
+            let mut client = mail_client(client_config);
+            for _ in 0..16 {
+                h.push(&ciphertext(&mut client))?;
+                decrypt(&mut client, &h.take_output());
+            }
+            assert!(!client.is_handshaking());
+            client.writer().write_all(b"EHLO\r\n")?;
+            h.push(&ciphertext(&mut client))?;
+            assert_eq!(
+                decrypt(&mut client, &h.take_output()),
+                b"250 hello tls=true sni=mail.test\r\n"
+            );
+            Ok(())
+        }))
+        .unwrap();
+    }
 }
 
 /// After the go-ahead, bytes that are not a TLS handshake end the
