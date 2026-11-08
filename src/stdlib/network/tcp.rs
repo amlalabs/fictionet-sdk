@@ -1938,6 +1938,24 @@ impl GoneWatch {
     }
 }
 
+impl super::transport::Retirement for GoneWatch {
+    fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.poll_gone(cx)
+    }
+
+    fn reset(&self) {
+        self.reset();
+    }
+
+    fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
+        self.hold_until_gone(item);
+    }
+
+    fn set_keep_alive(&self, interval: Option<Duration>) {
+        self.set_keep_alive(interval);
+    }
+}
+
 /// Ready once the connection of child `id` was reset, or is gone.
 fn poll_gone(shared: &Shared, id: ChildId, cx: &mut Context<'_>) -> Poll<()> {
     let mut host = shared.state.lock();

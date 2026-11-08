@@ -10,6 +10,7 @@
 (*       TcpConnection::poll_read, poll_write, poll_shutdown, Drop,         *)
 (*       TcpConnection::reset, GoneWatch::reset, hold_until_gone, through   *)
 (*       the layer's credit, End, Abort, close and Hold                     *)
+(*       Retirement delegates these same operations for world admission. *)
 (*   Orphan, Abort, CloseIfDrained, Remove                                 *)
 (*       TcpLayer::orphan, abort, close_if_drained, remove_conn             *)
 (*   PeerData, PeerAck, PeerFin, PeerRst                                   *)

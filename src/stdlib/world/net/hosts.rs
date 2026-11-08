@@ -3,6 +3,7 @@ use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
+use fictionet::stdlib::network::transport::Retirement;
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::network::{ConnInfo, Transport};
 use fictionet::stdlib::protocols::dns::label_count;
@@ -63,8 +64,8 @@ pub struct Arrival {
     /// Who it is from, and where it arrived.
     pub info: ConnInfo,
     /// The TCP socket underneath, to keep a count until it is gone
-    /// ([`tcp::GoneWatch::hold_until_gone`]) or to reset it.
-    pub socket: tcp::GoneWatch,
+    /// ([`Retirement::hold_until_gone`]) or to reset it.
+    pub socket: Arc<dyn Retirement>,
     /// The budget of the sandbox it came from. `None` if it came from no
     /// attached sandbox, such as a route ([`Net::route`]).
     pub budget: Option<Budget>,
@@ -84,7 +85,7 @@ pub struct Opening {
     /// settled ([`ConnInfo::sni`], [`ConnInfo::alpn`]).
     pub info: ConnInfo,
     /// The TCP socket underneath.
-    pub socket: tcp::GoneWatch,
+    pub socket: Arc<dyn Retirement>,
     /// The budget of the sandbox it came from, which the whole stack is
     /// charged to.
     pub budget: Option<Budget>,
@@ -653,6 +654,13 @@ impl Endpoints {
     /// it when its peer already has as many open as it may.
     pub fn admit(&self, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
         self.admission.peers.admit(conn)
+    }
+
+    /// Applies the same peer limit to a replacement transport. The transport
+    /// owns the admission count until retirement, including after its
+    /// application ends. A refusal resets the connection.
+    pub fn admit_transport(&self, peer: IpAddr, socket: &dyn Retirement) -> bool {
+        self.admission.peers.admit_transport(peer, socket)
     }
 }
 
@@ -1329,12 +1337,17 @@ impl Peers {
     /// Counts `conn` against its peer until it is gone, or resets it if
     /// its peer already has as many open as it may.
     fn admit(self: &Arc<Self>, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
-        let Some(guard) = self.enter(conn.peer_addr().ip()) else {
-            conn.reset();
-            return None;
+        self.admit_transport(conn.peer_addr().ip(), &conn.gone_watch())
+            .then_some(conn)
+    }
+
+    fn admit_transport(self: &Arc<Self>, peer: IpAddr, socket: &dyn Retirement) -> bool {
+        let Some(guard) = self.enter(peer) else {
+            socket.reset();
+            return false;
         };
-        conn.hold_until_gone(Box::new(guard));
-        Some(conn)
+        socket.hold_until_gone(Box::new(guard));
+        true
     }
 
     pub(super) fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<PeerGuard> {
@@ -1862,7 +1875,7 @@ async fn connection(
     limits: Limits,
 ) {
     let hooks = admission.hooks;
-    let socket = conn.gone_watch();
+    let socket: Arc<dyn Retirement> = Arc::new(conn.gone_watch());
     let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
     let budget = sandbox_id.and_then(|id| hooks.budget(id));
     let has_tls = !port
@@ -2028,6 +2041,58 @@ pub(super) async fn pings(
 mod tests {
     use super::super::{Net, TEST_POOLS};
     use super::*;
+
+    #[test]
+    fn admission_counts_a_custom_transport_until_retirement() {
+        #[derive(Default)]
+        struct Custom {
+            held: Mutex<Vec<Box<dyn Any + Send>>>,
+            retired: std::sync::atomic::AtomicBool,
+        }
+
+        impl Retirement for Custom {
+            fn poll_gone(&self, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+                if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+
+            fn reset(&self) {
+                let mut held = self.held.lock();
+                self.retired
+                    .store(true, std::sync::atomic::Ordering::Release);
+                held.clear();
+            }
+
+            fn hold_until_gone(&self, item: Box<dyn Any + Send>) {
+                let mut held = self.held.lock();
+                if !self.retired.load(std::sync::atomic::Ordering::Acquire) {
+                    held.push(item);
+                }
+            }
+
+            fn set_keep_alive(&self, _: Option<Duration>) {}
+        }
+
+        let peers = Peers::new(1);
+        let peer = "192.0.2.1".parse().unwrap();
+        let closing = Custom::default();
+        assert!(peers.admit_transport(peer, &closing));
+        // No application handle owns the count. Only transport retirement
+        // makes room for the next connection from this peer.
+        let refused = Custom::default();
+        assert!(!peers.admit_transport(peer, &refused));
+        assert!(refused.retired.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(peers.peers(), 1);
+        closing.reset();
+        assert_eq!(peers.peers(), 0);
+        assert!(peers.admit_transport(peer, &Custom::default()));
+        assert_eq!(peers.peers(), 0);
+        assert!(peers.admit_transport(peer, &closing));
+        assert_eq!(peers.peers(), 0);
+    }
 
     #[test]
     fn tls_sharing_uses_the_first_installed_accept() {
