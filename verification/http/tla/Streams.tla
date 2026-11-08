@@ -1,10 +1,14 @@
 ---------------------------- MODULE Streams ----------------------------
-(* The HTTP/2 server's stream states in src/stdlib/web/httpd/http2.rs:  *)
-(* how `Http2::headers`, `Http2::data`, the RST_STREAM arm of            *)
-(* `Http2::frame`, `Http2::dispatch`, `Sending::poll_next` and           *)
-(* `Http2::on_done` move one connection's streams between the states of  *)
-(* RFC 9113 section 5.1, with the server's reset list (`resets`) and     *)
-(* the stream limit (`Limits::streams`).                                 *)
+(* The HTTP/2 server's stream states in src/stdlib/web/httpd/http2.rs   *)
+(* and http2/respond.rs: how the connection layer's `Http2::on_headers`, *)
+(* `Http2::admit`, `Http2::on_data`, the RST_STREAM arm of               *)
+(* `Http2::on_frame`, `Http2::response_head`, `Http2::send_one` and      *)
+(* `Http2::written`, with the exchange child's `Respond` (`dispatch`,    *)
+(* `respond`), move one connection's streams between the states of RFC  *)
+(* 9113 section 5.1, with the server's reset list (`resets`) and the     *)
+(* stream limit (`Limits::streams`). The child's work between them is    *)
+(* one atomic step: the handler is called once, after the request ends  *)
+(* or its body is refused.                                               *)
 EXTENDS Naturals, FiniteSets
 CONSTANTS Ids,          \* the client's stream identifiers, odd
           MaxStreams,   \* Limits::streams
@@ -67,7 +71,7 @@ ResetTo == IF ignored < ResetMax THEN "Ignored" ELSE "Closed"
 Reset(i) == /\ sstate' = [sstate EXCEPT ![i] = ResetTo]
             /\ ignored' = IF ResetTo = "Ignored" THEN ignored + 1 ELSE ignored
 
-\* `Http2::dispatch`: the request reaches the handler; its response has
+\* `Respond` (`dispatch`): the request reaches the handler; its response has
 \* `r` units of body.
 Dispatch(i, r) == /\ dispatched' = [dispatched EXCEPT ![i] = TRUE]
                   /\ pending' = [pending EXCEPT ![i] = r]
@@ -75,7 +79,7 @@ NoDispatch == UNCHANGED <<dispatched, pending>>
 
 Ignored(i) == sstate[i] = "Ignored" /\ IgnoreAfterReset
 
-\* `Http2::headers`, after `Http2::headers_on`: a HEADERS frame on `i`
+\* `Http2::on_headers`, after `Http2::headers_on`: a HEADERS frame on `i`
 \* with END_STREAM `end`. On an open stream it is the trailers.
 Headers(i, end, r) ==
   /\ ~goaway
@@ -105,7 +109,7 @@ Headers(i, end, r) ==
                   /\ UNCHANGED ignored
         /\ UNCHANGED goaway
 
-\* `Http2::data`: a DATA frame on `i` with END_STREAM `end`. Flow control
+\* `Http2::on_data`: a DATA frame on `i` with END_STREAM `end`. Flow control
 \* is Flow.tla's; here every frame fits the windows.
 Data(i, end, r) ==
   /\ ~goaway
@@ -126,7 +130,7 @@ Data(i, end, r) ==
         /\ IF end /\ ~dispatched[i] THEN Dispatch(i, r) ELSE NoDispatch
         /\ UNCHANGED <<ignored, goaway>>
 
-\* The RST_STREAM arm of `Http2::frame`, then `Http2::cancel`: the stream
+\* The RST_STREAM arm of `Http2::on_frame`, then `Http2::end_stream`: the stream
 \* and its response go away. The server's reset list is not consulted or
 \* extended.
 ClientReset(i) ==
@@ -147,20 +151,20 @@ Expire(i) == /\ sstate[i] = "Ignored"
              /\ ignored' = ignored - 1
              /\ UNCHANGED <<last, dispatched, headSent, endSent, pending, goaway, tookAfterEnd>>
 
-\* `Http2::on_timer` with a body deadline, or `Http2::data` with a body
+\* `Respond::on_timer` with a body deadline, or `Http2::on_data` with a body
 \* over its limit: the handler is called before the request ends.
 EarlyAnswer(i, r) == /\ ~goaway
                      /\ sstate[i] = "Open" /\ ~dispatched[i]
                      /\ Dispatch(i, r)
                      /\ UNCHANGED <<sstate, last, headSent, endSent, ignored, goaway, tookAfterEnd>>
 
-\* `Http2::on_done`: the response ended. A request still arriving is
+\* `Http2::written`: the response ended. A request still arriving is
 \* asked to stop with RST_STREAM(NO_ERROR); a finished one closes the stream.
 Done(i) == IF sstate[i] = "HalfRemote"
              THEN sstate' = [sstate EXCEPT ![i] = "Closed"] /\ UNCHANGED ignored
              ELSE Reset(i)
 
-\* `Sending::poll_next`: the response HEADERS frame, with END_STREAM when
+\* `Http2::response_head`: the response HEADERS frame, with END_STREAM when
 \* the body is empty.
 SendHead(i) == /\ ~goaway
                /\ sstate[i] \in Live /\ dispatched[i] /\ ~headSent[i]
@@ -170,13 +174,13 @@ SendHead(i) == /\ ~goaway
                     ELSE UNCHANGED <<endSent, sstate, ignored>>
                /\ UNCHANGED <<last, dispatched, pending, goaway, tookAfterEnd>>
 
-\* `Sending::poll_next`: one DATA frame of the body.
+\* `Http2::send_one`: one DATA frame of the body.
 SendData(i) == /\ ~goaway
                /\ sstate[i] \in Live /\ headSent[i] /\ pending[i] > 0
                /\ pending' = [pending EXCEPT ![i] = pending[i] - 1]
                /\ UNCHANGED <<sstate, last, dispatched, headSent, endSent, ignored, goaway, tookAfterEnd>>
 
-\* `Sending::poll_next`: the empty DATA frame with END_STREAM after the body.
+\* `Http2::send_one`: the empty DATA frame with END_STREAM after the body.
 SendEnd(i) == /\ ~goaway
               /\ sstate[i] \in Live /\ headSent[i] /\ pending[i] = 0 /\ ~endSent[i]
               /\ endSent' = [endSent EXCEPT ![i] = TRUE]

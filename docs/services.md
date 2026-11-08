@@ -701,8 +701,8 @@ or the reverse. The first default at each endpoint keeps the role. Names
 are matched without case or a trailing dot. `Net` itself knows nothing of
 HTTP, so a copy of `httpd` with its own handlers plugs in the same way.
 Copy `src/stdlib/web/httpd.rs` together with `src/stdlib/web/httpd/`, keeping the
-relative paths. Each serving engine has its own file there: `native.rs` for
-HTTP/1 and `http2.rs` for HTTP/2.
+relative paths. Each version has its own file there: `native.rs` for
+HTTP/1, and `http2.rs` with the `http2/` directory for HTTP/2.
 
 Each routed request carries an `httpd::Target`. Its `routing` field is
 `Routing::Exact` when the requested host matches a registered name, or
@@ -723,10 +723,18 @@ also answer with a local rejection.
 `layer::Layer` over a byte stream: test it with `layer::Harness`, and
 `serve_connection` runs it with `services::stack::stream`. On a host's TLS
 port it runs in the same stack as TLS, `Chain<TlsLayer, Http1>`. `Http2`
-serves HTTP/2 on the stdlib's `http2` frames and HPACK, behind the same
-`Handler` trait. Neither needs tokio. Both versions share one set of
-`httpd::Limits`: body size, body and write timers, and 100 streams at once
-on an HTTP/2 connection.
+is the HTTP/2 connection as a layer, on the stdlib's `http2` frames and
+HPACK: a byte stream below, and one `HttpExchange` child per stream above,
+opened with the request's head. `Respond` answers an exchange with the same
+`Handler` trait, and `Responder::http2` composes the server,
+`Chain<Http2, Children<Respond, Top, Opening>>`. `Grpc` serves gRPC calls
+on an exchange instead, each call its own child. On a host's TLS port,
+HTTP/2 runs in the same stack as TLS when ALPN chose `h2`. Without TLS,
+`serve_connection` tells HTTP/2's preface from HTTP/1 by reading no more of
+the first bytes than that takes, and HTTP/1 hands the connection to HTTP/2
+after answering `Upgrade: h2c` with `101`. Neither version needs tokio.
+Both share one set of `httpd::Limits`: body size, body and write timers,
+and 100 streams at once on an HTTP/2 connection.
 Both charge retained request heads and bodies to the sandbox's budget. A pending
 handler keeps its request charge. Heads count method, URI and header bytes and
 header slots. Hidden capacities in `http` types, request extensions, third-party
