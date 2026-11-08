@@ -9,8 +9,9 @@ what it leaves out, and what it found is in [VERIFICATION.md](VERIFICATION.md).
 
 Each `.tla` has `*_base.cfg` configs of the code as it is, which must pass,
 and `*_without_<flag>.cfg` configs that break one part of the code and name
-the property TLC must then violate. `Children_large_command.cfg` and
-`Children_readiness.cfg` are additional passing configurations.
+the property TLC must then violate. `Children_large_command.cfg`,
+`Children_readiness.cfg` and `Children_isolation.cfg` are additional
+passing configurations.
 
 | Config | Checks |
 | --- | --- |
@@ -40,6 +41,8 @@ the property TLC must then violate. `Children_large_command.cfg` and
 | `Children_without_urgent.cfg` | completion stays behind refused data: violates `CompletionProgress` |
 | `Children_without_workownership.cfg` | runtime polls work after its owner closes: violates `NoCancelledPoll` |
 | `Children_without_joblimit.cfg` | reset/reopen launches work past the job limit: violates `BoundedJobs` |
+| `Children_isolation.cfg` | a mux that sends whatever a child's place holds, a child in slot 1 that never takes an event, and connection traffic: `MuxNeverHeld`, `ConnectionProgress`, credit and item bounds |
+| `Children_without_isolate.cfg` | a full place hands the event back to the mux: violates `ConnectionProgress` |
 
 Run one with TLC (JDK 11 or later):
 
