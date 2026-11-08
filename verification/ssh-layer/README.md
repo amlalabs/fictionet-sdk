@@ -58,9 +58,9 @@ the invariant named above. TLC used four workers and a 6 GiB Java heap.
   are assumptions supplied by the standard transport and authentication code,
   with real-client regression coverage. The application factory follows an
   authorized open. The **transport** factory intentionally runs at arrival,
-  before negotiation, with the opening context, budget and deadlines; it is
-  not the application factory. See `Server::with_transport`, `WithTransport::serve`
-  and `tests/ssh_transport.rs`.
+  before negotiation, with a `transport::Opening` (connection, budget and
+  deadlines); it is not the application factory. See `Server::with_transport`,
+  `WithTransport::serve` and `tests/ssh_transport.rs`.
 * **Epoch** checks three data packets separated by two NEWKEYS boundaries.
   Incoming decoding and outgoing queue delivery interleave independently.
   NEWKEYS is decoded using the old key, and installation precedes the next
