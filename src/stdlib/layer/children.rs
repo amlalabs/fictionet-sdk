@@ -91,7 +91,7 @@ type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> B + Send;
 /// The mux never waits for a child. Credit bounds a child's bytes, but not
 /// how many events it holds: many small pieces, completions and ends cost
 /// nothing. Each child holds at most 64 events and one urgent event. When an
-/// event finds its child's place full, the child is visited once at once to
+/// event finds its child's place full, the child is visited at once to
 /// take what waits. A child that still takes nothing is overloaded: it alone
 /// is refused and closed, its work cancelled, and the event is dropped with
 /// it. So any child, however it behaves, holds up neither its siblings nor
@@ -319,7 +319,7 @@ where
         }
     }
 
-    /// Whether child `id`'s place for an event like `event` is full.
+    /// Whether child `id`'s place is full: its urgent place, or its inbox.
     fn full(&self, id: ChildId, urgent: bool) -> bool {
         self.kids
             .iter()
