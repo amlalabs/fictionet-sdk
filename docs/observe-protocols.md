@@ -49,10 +49,15 @@ payload. Supply TLS key log entries when decryption is wanted, or `&[]`.
 The returned `Decoded` exposes layers, fields, tags, and summaries.
 `write_layers` and `write_buffers` encode the result as JSON.
 
-The caller owns capture, retention, TLS keys, and presentation. No observer or
-socket is needed. Call `Dissector::lost` after a capture gap so stream decoders
-cannot join bytes across missing packets. Use `stdlib::pcap` to export the
-same packets to Wireshark, with an optional caller-supplied TLS key log.
+The caller owns capture, retention, TLS keys, and presentation. No socket is
+needed. TCP goes through the passive observer in `stdlib::network::observer`,
+which puts each connection back in order, marks gaps, and says how each
+direction ended. UDP datagrams between two endpoints stay one conversation.
+Call `Dissector::lost` after a capture gap so stream decoders cannot join
+bytes across missing packets. Call `Dissector::finish` when the capture ends:
+what was held past a hole is decoded, and open directions end as incomplete.
+Use `stdlib::pcap` to export the same packets to Wireshark, with an optional
+caller-supplied TLS key log.
 
 `Observed<D>` drives ordered bytes directly. Its [placement contract](../src/stdlib/dissect/present.rs)
 covers exact spans, hop limits, live updates, resets and reassembly buffers.

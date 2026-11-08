@@ -107,7 +107,6 @@ pub mod sse;
 pub mod ssh;
 pub mod stun;
 pub mod syslog;
-pub mod tcp_reassembly;
 pub mod tds;
 pub mod telnet;
 pub mod tftp;
