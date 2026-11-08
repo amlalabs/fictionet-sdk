@@ -1,7 +1,6 @@
 //! The integration tests that run on any machine, one module per area. The
 //! tests that need user namespaces, root or a tun device are in `tests/host`.
 
-#[macro_use]
 mod common;
 
 mod asn1_codec;
