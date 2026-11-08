@@ -885,11 +885,12 @@ impl TcpLayer {
     }
 
     /// Resets the connection and says so, keeping the socket until its RST
-    /// can be sent.
+    /// can be sent. It is gone: what it held is let go.
     fn abort(&mut self, h: Id) {
         let c = self.conns.get_mut(&h).unwrap();
         c.rst = true;
         c.reset = true;
+        c.held.clear();
         let child = c.child;
         let tell = c.open && c.live && !c.reset_sent;
         if tell {
@@ -2020,8 +2021,10 @@ impl TcpLayer {
         };
         let c = self.conns.get_mut(&h).unwrap();
         c.child = None;
+        c.held.clear();
         let request = c.request;
         self.children.remove(id);
+        self.notice(TcpNotice::Gone(id));
         if let Some(request) = request {
             self.notice(TcpNotice::ConnectFailed { request, error });
         }

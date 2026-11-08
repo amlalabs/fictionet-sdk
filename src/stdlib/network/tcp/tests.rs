@@ -3536,4 +3536,16 @@ mod layer {
         assert_eq!(resets, 0, "a connection in TIME-WAIT is not reset");
         assert_eq!(server.layer().upper().get(h).state(), TcpState::TimeWait);
     }
+
+    /// Resetting a connection from above makes it gone at once, so what a
+    /// limit kept for it is let go then, though the child is still open.
+    #[test]
+    fn an_abort_lets_go_of_what_the_connection_held() {
+        let (mut server, _client, (s, _), _) = connected();
+        let token = hold(&mut server, s.id());
+        control(&mut server, TcpControl::Abort(s.id()));
+        let seen = events(&mut server);
+        assert!(said_gone(&seen, s.id()), "an aborted connection is gone");
+        assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
+    }
 }
