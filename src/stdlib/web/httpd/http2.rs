@@ -79,9 +79,11 @@ const LAST_WORDS: usize = wire::HEADER_LEN + 8;
 /// opens a child with the head as its [`Opening`]; its body and end come up
 /// within the credit the child grants, and the child's response goes down
 /// within the credit the connection grants. Receive credit returns to the
-/// client by WINDOW_UPDATE once a batch of input is read and only for bytes
-/// the connection no longer holds, so a child that stops reading stops its
-/// own stream. Response bytes go out within both of the client's windows.
+/// client by WINDOW_UPDATE once a batch of input is read: on the connection
+/// for bytes it no longer holds, and on a stream once its child has read
+/// what it was given, so a child that stops reading stops its own stream
+/// and leaves the others the connection's window. Response bytes go out
+/// within both of the client's windows.
 ///
 /// [`Responder::http2`] puts a [`Respond`] on each stream, answering with a
 /// [`Handler`](super::Handler); [`Grpc`] serves gRPC calls on a stream.
@@ -117,8 +119,8 @@ pub struct Http2 {
     continuations: usize,
     error_resets: usize,
     pending_resets: usize,
-    /// Credit may be due: since it last returned, input arrived, or bytes
-    /// held for a child went up to it or went away with their stream.
+    /// Credit may be due: since it last returned, input arrived, a child
+    /// granted credit, or a stream with held bytes ended.
     batch: bool,
     draining: bool,
     shutdown_ping: Option<[u8; 8]>,
@@ -162,6 +164,9 @@ struct Stream {
     outside: u64,
     /// Credit the child granted for its events.
     credit: u64,
+    /// The most credit the child has held at once: its window. Its credit
+    /// is back at the peak once it has read all it was given.
+    peak: u64,
     credited: bool,
     pending: VecDeque<ExchangeEvent>,
     overflow: bool,
@@ -553,6 +558,7 @@ impl Http2 {
                 held: 0,
                 outside: 0,
                 credit: 0,
+                peak: 0,
                 credited: false,
                 pending: VecDeque::new(),
                 overflow: false,
@@ -600,7 +606,6 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        let held = stream.held;
         while let Some(event) = stream.pending.front_mut() {
             let cost = event.credit();
             let event = if cost <= stream.credit {
@@ -619,8 +624,6 @@ impl Http2 {
             stream.held -= (cost - outside) as u32;
             self.up.push_back(MuxEvent::Child(stream.child, event));
         }
-        // The connection holds less now: their credit may be due.
-        self.batch |= stream.held < held;
     }
 
     /// Stream `id` is over: its child hears why, and its number is free.
@@ -832,10 +835,9 @@ impl Http2 {
             1 => self.encoder.set_settings_limit(setting.value as usize),
             4 => {
                 let initial = setting.value as i32;
-                let delta = initial - self.initial;
                 for stream in self.streams.values_mut() {
-                    stream.send_window =
-                        stream.send_window.checked_add(delta).ok_or_else(|| {
+                    stream.send_window = shifted(stream.send_window, self.initial, initial)
+                        .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "initial window overflow")
                         })?;
                 }
@@ -911,14 +913,12 @@ impl Http2 {
             }
             Frame::WindowUpdate(update) => {
                 if update.stream == 0 {
-                    self.send_window = self
-                        .send_window
-                        .checked_add(update.increment as i32)
-                        .ok_or_else(|| {
+                    self.send_window =
+                        grown(self.send_window, update.increment).ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "connection window overflow")
                         })?;
                 } else if let Some(stream) = self.streams.get_mut(&update.stream) {
-                    if let Some(n) = stream.send_window.checked_add(update.increment as i32) {
+                    if let Some(n) = grown(stream.send_window, update.increment) {
                         stream.send_window = n;
                     } else {
                         self.reset(env, update.stream, ErrorCode::FlowControlError)?;
@@ -1063,30 +1063,37 @@ impl Http2 {
         (moved, false)
     }
 
-    /// The batch of input is read: credit for what the connection no
-    /// longer holds goes back to the client, once it is at least half of
-    /// what the client has left, as h2 does, so many small frames share
-    /// one WINDOW_UPDATE. Streams opened in the batch are taken in.
+    /// The batch of input is read: credit goes back to the client, on the
+    /// connection for what it no longer holds, on each stream for what its
+    /// child can still take, once it is at least half of what the client
+    /// has left, as h2 does, so many small frames share one WINDOW_UPDATE.
+    /// Streams opened in the batch are taken in.
     fn release(&mut self, env: &mut Env<'_, Report>) -> bool {
         let held: i64 = self.streams.values().map(|s| i64::from(s.held)).sum();
-        let used = i64::from(WINDOW - self.recv_window) - held;
-        if used > 0 && used >= i64::from(self.recv_window / 2) {
-            if !self.window_update(env, 0, used as u32) {
+        if let Some(back) = credit_back(self.recv_window, i64::from(WINDOW) - held) {
+            if !self.window_update(env, 0, back) {
                 return true;
             }
-            self.recv_window += used as i32;
+            self.recv_window += back as i32;
         }
         let ids: Vec<u32> = self.streams.keys().copied().collect();
         for id in ids {
             let stream = self.streams.get_mut(&id).expect("an open stream");
             stream.accepted = true;
-            let used = i64::from(WINDOW - stream.recv_window) - i64::from(stream.held);
-            if used > 0 && used >= i64::from(stream.recv_window / 2) {
-                if !self.window_update(env, id, used as u32) {
+            // A stream's window follows its child: once the child has read
+            // all it was given, the client may send what it can take. A
+            // child that stops reading stops its stream, and only its
+            // stream.
+            if stream.credit < stream.peak {
+                continue;
+            }
+            let room = (stream.credit.min(WINDOW as u64) as i64) - i64::from(stream.held);
+            if let Some(back) = credit_back(stream.recv_window, room) {
+                if !self.window_update(env, id, back) {
                     return true;
                 }
                 if let Some(stream) = self.streams.get_mut(&id) {
-                    stream.recv_window += used as i32;
+                    stream.recv_window += back as i32;
                 }
             }
         }
@@ -1240,16 +1247,12 @@ impl Http2 {
     /// one went.
     fn send_one(&mut self, env: &mut Env<'_, Report>, id: u32) -> bool {
         let frame = self.frame.min(wire::DEFAULT_FRAME_SIZE);
-        let window = self.send_window.max(0) as usize;
+        let window = self.send_window;
         let Some(stream) = self.streams.get_mut(&id) else {
             return false;
         };
         if let Some(front) = stream.out.front_mut() {
-            let n = front
-                .len()
-                .min(window)
-                .min(stream.send_window.max(0) as usize)
-                .min(frame);
+            let n = sendable(front.len(), window, stream.send_window, frame);
             if n == 0 {
                 return false;
             }
@@ -1312,7 +1315,7 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        let more = SEND_CREDIT.saturating_sub(stream.granted + stream.out_bytes);
+        let more = more_credit(stream.granted, stream.out_bytes);
         if more > 0 && matches!(stream.reply, Reply::Body) {
             stream.granted += more;
             self.up.push_back(MuxEvent::Credit(stream.child, more));
@@ -1467,9 +1470,12 @@ impl Layer for Http2 {
                 if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child)) {
                     if let Some(stream) = self.streams.get_mut(&id) {
                         stream.credit = stream.credit.saturating_add(units);
+                        stream.peak = stream.peak.max(stream.credit);
                         stream.credited = true;
                     }
                     self.forward(id);
+                    // The child read: credit for its stream may be due.
+                    self.batch = true;
                 }
                 Ok(Admit::Taken)
             }
@@ -1604,6 +1610,43 @@ impl Layer for Http2 {
 
 fn problem(code: ErrorCode, reason: &'static str) -> wire::Error {
     wire::Error { code, reason }
+}
+
+/// The credit `release` returns for a receive window at `window` that may
+/// hold up to `room`: what tops it up to `room`, once that is at least half
+/// of what the client has left, as h2 does, so many small frames share one
+/// WINDOW_UPDATE.
+fn credit_back(window: i32, room: i64) -> Option<u32> {
+    let back = room - i64::from(window);
+    (back > 0 && back >= i64::from(window / 2)).then_some(back as u32)
+}
+
+/// How much of a body piece of `len` bytes one DATA frame carries: the
+/// least of it, the connection's and the stream's send windows, and the
+/// frame size. A window is negative after the client shrinks its initial
+/// window, and then carries nothing.
+fn sendable(len: usize, connection: i32, stream: i32, frame: usize) -> usize {
+    len.min(connection.max(0) as usize)
+        .min(stream.max(0) as usize)
+        .min(frame)
+}
+
+/// A send window after a WINDOW_UPDATE of `increment`, or `None` past
+/// 2^31 - 1 (RFC 9113 section 6.9.1).
+fn grown(window: i32, increment: u32) -> Option<i32> {
+    window.checked_add(i32::try_from(increment).ok()?)
+}
+
+/// A stream's send window after the client moves its initial window from
+/// `old` to `new`, or `None` past 2^31 - 1 (RFC 9113 section 6.9.2).
+fn shifted(window: i32, old: i32, new: i32) -> Option<i32> {
+    window.checked_add(new - old)
+}
+
+/// The body credit a child gets as its bytes go out: what tops its granted
+/// and queued bytes back up to `SEND_CREDIT`.
+fn more_credit(granted: u64, queued: u64) -> u64 {
+    SEND_CREDIT.saturating_sub(granted.saturating_add(queued))
 }
 
 /// The code of a wire value, with unknown codes treated as `INTERNAL_ERROR`
@@ -1779,6 +1822,11 @@ fn request(block: hpack::Block, limits: Limits) -> Option<Request<()>> {
     *request.headers_mut() = headers;
     Some(request)
 }
+
+/// Bounded proofs over the flow-control arithmetic, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../../verification/http2-layer/kani/flow.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {
@@ -2180,13 +2228,84 @@ mod tests {
         bytes
     }
 
+    /// `POST <path>` over HTTP as one HEADERS frame on `stream`, its body to
+    /// come.
+    fn headers_to(stream: u32, path: &str) -> Vec<u8> {
+        let mut block = vec![0x83, 0x86, 0x04, path.len() as u8];
+        block.extend_from_slice(path.as_bytes());
+        let mut bytes = Vec::new();
+        write(
+            &wire::Headers {
+                stream,
+                flags: 4,
+                fragment: block,
+                priority: None,
+                padding: None,
+            },
+            &mut bytes,
+        );
+        bytes
+    }
+
     #[test]
-    fn credit_a_slow_child_frees_after_its_batch_still_returns() {
+    fn a_child_that_stops_reading_stops_only_its_own_stream() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
+                Sink::reading(opening.request.uri().path() != "/stall")
+            }),
+        );
+        let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        harness.push(&headers_to(1, "/stall")).unwrap();
+        // The client sends stream 1 all the credit the server gives it.
+        let (mut connection, mut stream) = (i64::from(WINDOW), i64::from(WINDOW));
+        for _ in 0..64 {
+            let n = connection.min(stream).min(16_384);
+            if n == 0 {
+                break;
+            }
+            let mut data = Vec::new();
+            write(
+                &wire::Data {
+                    stream: 1,
+                    flags: 0,
+                    data: vec![b'y'; n as usize],
+                    padding: None,
+                },
+                &mut data,
+            );
+            harness.push(&data).unwrap();
+            connection -= n;
+            stream -= n;
+            for frame in frames(&harness.take_output()) {
+                if let Frame::WindowUpdate(w) = frame {
+                    match w.stream {
+                        0 => connection += i64::from(w.increment),
+                        1 => stream += i64::from(w.increment),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Its child stopped reading, so stream 1 stopped; the connection
+        // still has room for the other streams.
+        assert_eq!(stream, 0);
+        assert!(connection > 0, "{connection}");
+        let mut input = headers_to(3, "/");
+        input.extend(window_of_data(3));
+        harness.push(&input).unwrap();
+        let output = frames(&harness.take_output());
+        assert!(!output.iter().any(|f| matches!(f, Frame::GoAway(_))));
+        assert!(!harness.ended());
+    }
+
+    #[test]
+    fn credit_returns_once_a_slow_child_reads() {
         use fictionet::stdlib::layer::{Chain, Children};
         use std::sync::atomic::Ordering;
-        // A child that reads late: the bytes the connection held for it are
-        // freed after the batch that brought them was read, and their
-        // credit must still go back to the client.
         let child = Sink::reading(false);
         let reads = child.reads.clone();
         let mut child = Some(child);
@@ -2199,8 +2318,8 @@ mod tests {
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
         harness.push(&client_preface()).unwrap();
         harness.take_output();
-        // The first window goes up to the child, which has not read it: the
-        // connection holds none of it, so its credit comes back.
+        // The window goes up to the child, which does not read it yet: the
+        // connection's credit comes back, the stream's does not.
         let mut input = headers_without_end(1);
         input.extend(window_of_data(1));
         harness.push(&input).unwrap();
@@ -2211,46 +2330,42 @@ mod tests {
                 .any(|f| matches!(f, Frame::WindowUpdate(w) if w.stream == 0)),
             "{output:?}"
         );
-        // The second window waits in the connection for the child's credit.
-        harness.push(&window_of_data(1)).unwrap();
-        let output = frames(&harness.take_output());
         assert!(
-            !output.iter().any(|f| matches!(f, Frame::WindowUpdate(_))),
+            !output
+                .iter()
+                .any(|f| matches!(f, Frame::WindowUpdate(w) if w.stream == 1)),
             "{output:?}"
         );
-        // The child reads: the connection hands the second window up, and
-        // the client gets its credit back.
+        // The child reads, long after the batch: the stream's credit comes
+        // back with no more input.
         reads.store(true, Ordering::Relaxed);
         harness.settle().unwrap();
         let output = frames(&harness.take_output());
-        for stream in [0, 1] {
-            assert!(
-                output
-                    .iter()
-                    .any(|f| matches!(f, Frame::WindowUpdate(w) if w.stream == stream)),
-                "{stream}: {output:?}"
-            );
-        }
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::WindowUpdate(w) if w.stream == 1)),
+            "{output:?}"
+        );
         assert!(!harness.ended());
     }
 
     #[test]
     fn credit_held_for_a_stream_that_ends_returns() {
         use fictionet::stdlib::layer::{Chain, Children};
-        // The connection holds a window of body for a child that never
-        // reads; when the stream ends, those bytes are gone, and the
-        // client's connection credit must come back, or no stream can send
-        // a body again.
+        // With a child window smaller than the stream's, the connection
+        // holds the rest of a window of body for a child that never reads.
+        // When the stream ends, those bytes are gone, and the client's
+        // connection credit must come back.
         let server = Chain::new(
             Http2::new(Limits::default()),
-            Children::new(8, Http2::WINDOW, |_, _, _| Sink::reading(false)),
+            Children::new(8, 16_384, |_, _, _| Sink::reading(false)),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
         harness.push(&client_preface()).unwrap();
         let mut input = headers_without_end(1);
         input.extend(window_of_data(1));
         harness.push(&input).unwrap();
-        harness.push(&window_of_data(1)).unwrap();
         harness.take_output();
         let mut reset = Vec::new();
         write(
