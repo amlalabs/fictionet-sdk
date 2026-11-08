@@ -274,6 +274,45 @@ fn the_idle_clock_restarts_when_the_stack_takes_input_again() {
     );
 }
 
+/// Bytes from the client start the idle time again, even when the stack
+/// writes nothing back: a client that speaks just inside the limit keeps
+/// its connection for a whole limit after it last spoke.
+#[test]
+fn the_idle_clock_restarts_when_the_client_speaks() {
+    let idle = Duration::from_millis(300);
+    let later = Duration::from_millis(250);
+    let limits = StreamLimits {
+        idle: Some(idle),
+        ..StreamLimits::default()
+    };
+    let seen = Arc::new(fictionet::sync::Mutex::new((None, None)));
+    let kept = seen.clone();
+    // No pause: the stack takes every byte and writes none.
+    let quiet = move || Pauses {
+        pause: Duration::ZERO,
+        until: None,
+        seen: kept,
+        end_sent: false,
+    };
+    let client = move |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        conn.write_all(&fcx, b"a").await?;
+        fcx.sleep_until(fcx.now() + later).await?;
+        conn.write_all(&fcx, b"b").await?;
+        read_to_end(&fcx, &mut conn).await?;
+        Ok(())
+    };
+    let ended = serve_one(limits, Budget::unlimited(), quiet, client);
+    assert_eq!(ended, Ok(StreamEnd::Idle));
+    let (first, over) = *seen.lock();
+    let (first, over) = (first.expect("data came"), over.expect("input ended"));
+    assert!(
+        over.since_start() >= first.since_start() + later + idle,
+        "input ended {:?} after the first bytes, within the idle limit of the last",
+        over.since_start().saturating_sub(first.since_start())
+    );
+}
+
 #[test]
 fn a_client_that_stops_reading_times_out() {
     let limits = StreamLimits {

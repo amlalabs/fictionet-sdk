@@ -67,7 +67,11 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     /// Taken by the transport and not yet reported to the stack.
     unreported: u64,
     idled: bool,
+    /// When the peer last read or was written to, or the runner last began
+    /// to wait for it: the idle limit counts from here.
     idle_from: Instant,
+    /// The runner waited for the peer when it last settled.
+    was_waiting: bool,
     stalled_since: Option<Instant>,
     sleep: Option<Sleep>,
     armed: Option<Instant>,
@@ -107,6 +111,7 @@ where
             unreported: 0,
             idled: false,
             idle_from: fcx.now(),
+            was_waiting: false,
             stalled_since: None,
             sleep: None,
             armed: None,
@@ -205,6 +210,7 @@ where
                         };
                         let bytes = self.buf[..n].to_vec();
                         self.input = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
+                        self.idle_from = now;
                     }
                     Poll::Ready(Err(ConnError::Cancelled)) => {
                         return Poll::Ready(Err(StackError::Cancelled));
@@ -311,6 +317,7 @@ where
             if wrote > 0 {
                 self.unreported += wrote;
                 self.stalled_since = None;
+                self.idle_from = now;
             }
             if !self.driver.holds_output() {
                 self.stalled_since = None;
@@ -334,9 +341,13 @@ where
                 && !self.input_over
                 && !self.driver.holds_output()
                 && self.jobs.is_empty();
-            if !waiting {
+            // The idle clock runs only while the runner waits for the peer,
+            // and starts again each time it begins to.
+            if waiting && !self.was_waiting {
                 self.idle_from = now;
-            } else if self.limits.idle.is_some_and(|d| now >= self.idle_from + d) {
+            }
+            self.was_waiting = waiting;
+            if waiting && self.limits.idle.is_some_and(|d| now >= self.idle_from + d) {
                 self.idled = true;
                 self.input = Some(StreamEvent::Ended);
                 continue;
