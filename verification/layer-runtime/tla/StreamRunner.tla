@@ -1,23 +1,38 @@
 ---------------------------- MODULE StreamRunner ----------------------------
-(* `services::stack::stream` in src/stdlib/services/stack.rs: the loop      *)
-(* that reads a live connection into a layer stack's byte stream and       *)
-(* writes what the stack gives back. One iteration of its `loop` is        *)
-(* Settle* (stack.rs:179-204, `settle` at 362-385), Check (205-247),       *)
-(* Poll (the `poll_fn` at 248-318, then 320-355). `EndBroken` is           *)
-(* `end_broken` (388-400). The `Driver` (src/stdlib/layer/driver.rs)       *)
-(* holds at most one command below (`held`), as `Driver::send_below` and   *)
-(* `send` (driver.rs:180-244) do.                                          *)
+(* `services::stack::stream` (src/stdlib/services/stack/mod.rs:163-203)    *)
+(* over `Live` (src/stdlib/services/stack/live.rs): the runner that reads  *)
+(* a live connection into a layer stack's byte stream and writes what the  *)
+(* stack gives back. One round of `Live::step`'s `for _ in 0..ROUNDS`      *)
+(* (live.rs:195-330) is Round: the read (202-221), the write report        *)
+(* (229-239), the held input (240-257), `Driver::run` (258), and          *)
+(* `Driver::send_below` into the transport (264-327). A round that moved   *)
+(* goes round again; one that did not goes to Check, the limits and the    *)
+(* sleep (332-382). When `step` returns Pending, `stream` returns if       *)
+(* `Live::finished` (live.rs:142-150) or the peer is gone (mod.rs:190-196),*)
+(* and otherwise Wait waits. `EndBroken` is `Live::broken`                 *)
+(* (live.rs:392-418). The `Driver` (src/stdlib/layer/driver.rs) holds at   *)
+(* most one command below (`held`), as `send_below` and `send`             *)
+(* (driver.rs:190-195, 246-276) do.                                        *)
 (*                                                                         *)
 (* The stack is abstract: an echo with room for `Room` bytes of input that *)
 (* it moves to its output when it runs, asks to end its direction once it  *)
 (* heard the end of its input, may refuse input for `Pause` ticks on a     *)
 (* timer of its own, and may ask for a reset. That is the shape of         *)
 (* `Chain<Framed, PlcServer>`, plus the timer and the reset that other     *)
-(* stacks have. Bytes are counted, not carried. Time is in ticks.          *)
+(* stacks have. It asks for no work: `jobs` stays empty, so the            *)
+(* `jobs.is_empty()` of `waiting` and `finished` always holds. Bytes are   *)
+(* counted, not carried. Time is in ticks, and passes only while the      *)
+(* runner waits. The ROUNDS bound on one poll (live.rs:195, 384-386) only  *)
+(* yields to the rest of the world, and is left out.                      *)
 (*                                                                         *)
 (* The switches are the rules of the code. TRUE is the code as it is,      *)
-(* including `RestartIdleOnWait`, the fix of commit 1a183c83e; the       *)
-(* `_without_` configs turn one off and name the property that must fail.  *)
+(* with two exceptions. `IdleResetOnRead` and `RestartIdleOnWait` are      *)
+(* comp/v-framed's idle fix, ported to `Live` in commit 6aa68ae5f.         *)
+(* `FinishNeedsInputOver` is FALSE in the code: `Live::finished` returns   *)
+(* once the stack ended its direction, its bytes are written and no work  *)
+(* is left, whether or not its input is over. `StreamRunner_halfclose.cfg` *)
+(* checks that against `FinishNeedsInput`. The `_without_` configs turn    *)
+(* one rule off and name the property that must fail.                      *)
 EXTENDS Integers
 
 CONSTANTS PeerBytes,      \* bytes the peer sends in all
@@ -29,35 +44,37 @@ CONSTANTS PeerBytes,      \* bytes the peer sends in all
           StackMayEndEarly, \* the stack may end its direction before its input is over
           PeerMayReset,   \* the peer may reset the connection
           PeerMayStall,   \* the peer may stop reading: its transport takes no more bytes
-          BudgetMayFail,  \* a read's charge may not fit (stack.rs:333)
-          ReadOnlyWhenTakenRule, \* `reading` needs `input.is_none()` (stack.rs:227)
-          ReportOnceRule,        \* `written = 0` once delivered (stack.rs:185)
-          StallResetOnProgress,  \* `stalled_since = None` on bytes taken (stack.rs:323)
-          IdleResetOnRead,       \* `idle_from = now` on bytes read (stack.rs:340)
-          ResetOnBreak,          \* `end_broken` offers StreamEvent::Reset (stack.rs:394-398)
+          BudgetMayFail,  \* a read's charge may not fit (live.rs:207-210)
+          ReadOnlyWhenTakenRule, \* read only if `input.is_none()` (live.rs:202)
+          ReportOnceRule,        \* `unreported = 0` once delivered (live.rs:237)
+          StallResetOnProgress,  \* `stalled_since = None` on bytes taken (live.rs:319)
+          IdleResetOnRead,       \* `idle_from = now` on bytes read (live.rs:213)
+          ResetOnBreak,          \* `broken` offers StreamEvent::Reset (live.rs:404-408)
           WriteBeforeEnd,        \* the layer hands writes before its End (framed.rs:183-195)
-          KeepPartialRest,       \* `Admit::Partial(rest) => input = Some(rest)` (stack.rs:195)
-          FinishNeedsInputOver,  \* `if shut && input_over` (stack.rs:210)
-          RestartIdleOnWait      \* restart `idle_from` when waiting resumes (stack.rs:229-233, the fix)
+          KeepPartialRest,       \* `Admit::Partial(rest) => input = Some(rest)` (live.rs:247-250)
+          FinishNeedsInputOver,  \* `finished` also needs the input over (FALSE in live.rs:143)
+          RestartIdleOnWait      \* restart `idle_from` when waiting begins (live.rs:346-349)
 
 ASSUME PeerBytes \in Nat /\ Room \in Nat \ {0} /\ Pause \in Nat
 NoLimit == -1  \* stands for `None`; set a limit to it with `<- NoLimit`
 ASSUME Idle \in Nat \cup {NoLimit} /\ WriteTimeout \in Nat \cup {NoLimit}
 
-None == -1
+None == -1  \* also `poll_read` answering Pending
+Skip == -2  \* `poll_read` not called
+Err == -3   \* `poll_read` failed
 
-VARIABLES pc,          \* "settle", "check", "poll" or "done"
+VARIABLES pc,          \* "round", "check", "wait" or "done"
           now,         \* fcx.now()
           inKind, inN, \* `input`: "none", "data" with inN bytes, or "ended"
-          written,     \* `written`: taken by the transport, not yet reported
+          written,     \* `unreported`: taken by the transport, not yet reported
           inputOver,   \* `input_over`
           shut,        \* `shut`
           idled,       \* `idled`
           idleFrom,    \* `idle_from`
           stalledSince,\* `stalled_since`, or None
-          deadline,    \* the deadline the wait sleeps until, or None
+          deadline,    \* `armed`: the deadline the wait sleeps until, or None
           hKind, hN,   \* `Driver::below`: "none", "write" of hN bytes, "end" or "reset"
-          ret,         \* what `stream` returned, once pc = "done"
+          ret,         \* how the run ended, once pc = "done"
           \* the abstract stack
           sbuf,        \* input taken and not yet run
           sout,        \* output queued in the stack, not yet handed down
@@ -82,7 +99,8 @@ VARIABLES pc,          \* "settle", "check", "poll" or "done"
           stackOut,    \* bytes the stack handed down in writes
           offeredReset,\* times the runner offered StreamEvent::Reset
           badRead,     \* a read happened while input was held or over
-          wasWaiting, quietFrom, earlyIdle,
+          wasWaiting,  \* `was_waiting` (live.rs:349), also used by the history
+          quietFrom, earlyIdle,
           wasHolding, stuckFrom, earlyStall
 
 runner == <<pc, now, inKind, inN, written, inputOver, shut, idled, idleFrom, stalledSince,
@@ -97,7 +115,7 @@ Min(a, b) == IF a < b THEN a ELSE b
 MinOf(S) == CHOOSE x \in S : \A y \in S : x <= y
 
 TypeOK ==
-  /\ pc \in {"settle", "check", "poll", "done"}
+  /\ pc \in {"round", "check", "wait", "done"}
   /\ inKind \in {"none", "data", "ended"} /\ inN \in 0..PeerBytes
   /\ hKind \in {"none", "write", "end", "reset"}
   /\ sEnd \in {"no", "asked", "given"} /\ sReset \in {"no", "asked", "given"}
@@ -105,7 +123,7 @@ TypeOK ==
   /\ written \in Nat /\ sbuf \in 0..Room /\ offeredReset \in 0..1
 
 Init ==
-  /\ pc = "settle" /\ now = 0
+  /\ pc = "round" /\ now = 0
   /\ inKind = "none" /\ inN = 0 /\ written = 0
   /\ inputOver = FALSE /\ shut = FALSE /\ idled = FALSE
   /\ idleFrom = 0 /\ stalledSince = None /\ deadline = None
@@ -129,119 +147,27 @@ NextCmd(o, e, r, hr) ==
   ELSE IF e = "asked" THEN "end"
   ELSE "none"
 
-(* `end_broken` (stack.rs:388-400): the stack is offered a reset, which   *)
-(* Framed takes unless its input is over (framed.rs:123, 145-150), and    *)
-(* the runner returns.                                                    *)
-EndBroken(why) ==
+(* `Live::broken` (live.rs:392-418): the stack is offered a reset, which  *)
+(* Framed takes unless its input is over (framed.rs:125, 147-152), and    *)
+(* the run ends. `stream` calls it for a failed read or write             *)
+(* (mod.rs:188, 198) and for a peer that is gone (mod.rs:194); `Live`     *)
+(* calls it itself for the budget (live.rs:207-210) and the write limit   *)
+(* (live.rs:333-338).                                                     *)
+EndBroken(why, over) ==
   /\ offeredReset' = IF ResetOnBreak THEN offeredReset + 1 ELSE offeredReset
-  /\ heardReset' = (heardReset \/ (ResetOnBreak /\ ~sOver))
-  /\ sOver' = (sOver \/ ResetOnBreak)
+  /\ heardReset' = (heardReset \/ (ResetOnBreak /\ ~over))
+  /\ sOver' = (over \/ ResetOnBreak)
   /\ pc' = "done" /\ ret' = why
 
-(* One round of `settle` (stack.rs:362-385) with the offer of stack.rs:   *)
-(* 180-203: the write report, the held input, then `Driver::run`.         *)
-Settle ==
-  /\ pc = "settle"
-  /\ LET m1 == written > 0
-     IN
-     /\ reported' = IF m1 THEN reported + written ELSE reported
-     /\ written' = IF m1 /\ ReportOnceRule THEN 0 ELSE written
-     /\ \E arm \in (IF pausesLeft > 0 THEN BOOLEAN ELSE {FALSE}),
-           askReset \in (IF StackMayReset /\ sReset = "no" /\ ~heardReset THEN BOOLEAN ELSE {FALSE}),
-           early \in (IF StackMayEndEarly /\ sEnd = "no" /\ ~heardReset THEN BOOLEAN ELSE {FALSE}) :
-        \* The offer of the held input.
-        LET blocked == inKind = "data" /\ ~sOver /\ (sTimer # None \/ sbuf = Room)
-            closed == inKind # "none" /\ sOver
-            j == IF inKind = "data" /\ ~sOver /\ ~blocked THEN Min(inN, Room - sbuf) ELSE 0
-            m2 == inKind # "none" /\ ~blocked
-            arms == arm /\ j > 0
-            sbuf1 == sbuf + j
-            sTimer1 == IF arms THEN now + Pause ELSE sTimer
-            ended1 == heardEnded \/ (inKind = "ended" /\ ~sOver)
-            over1 == sOver \/ (inKind = "ended")
-            \* `Driver::run`: due timers first, then the stack's own steps.
-            fires == sTimer1 # None /\ sTimer1 <= now
-            askEnd == (ended1 \/ early) /\ sEnd = "no" /\ ~heardReset
-            runMoved == fires \/ sbuf1 > 0 \/ askEnd \/ askReset
-        IN
-        /\ inKind' = IF closed THEN "none"
-                     ELSE IF inKind = "ended" THEN "none"
-                     ELSE IF inKind = "data" /\ ~blocked /\ j = inN THEN "none"
-                     ELSE IF inKind = "data" /\ ~blocked /\ ~KeepPartialRest THEN "none"
-                     ELSE inKind
-        /\ inN' = IF inKind = "data" /\ ~closed /\ (blocked \/ KeepPartialRest)
-                  THEN inN - j ELSE 0
-        /\ inputOver' = (inputOver \/ closed \/ inKind = "ended")
-        /\ refused' = IF closed /\ inKind = "data" THEN refused + inN ELSE refused
-        /\ took' = took + j
-        /\ heardEnded' = ended1
-        /\ sOver' = over1
-        /\ pausesLeft' = IF arms THEN pausesLeft - 1 ELSE pausesLeft
-        /\ sTimer' = IF fires THEN None ELSE sTimer1
-        \* After its End the stack's output is refused (framed.rs:159-160).
-        /\ sout' = IF sEnd = "no" THEN sout + sbuf1 ELSE sout
-        /\ sbuf' = 0
-        /\ sEnd' = IF askEnd THEN "asked" ELSE sEnd
-        /\ sReset' = IF askReset THEN "asked" ELSE sReset
-        /\ pc' = IF m1 \/ m2 \/ runMoved THEN "settle" ELSE "check"
-  /\ UNCHANGED <<now, shut, idled, idleFrom, stalledSince, deadline, hKind, hN, ret,
-                 heardReset, peer, transportTook, stackOut, offeredReset, badRead, readTotal,
-                 wasWaiting, quietFrom, earlyIdle, wasHolding, stuckFrom, earlyStall>>
-
-(* stack.rs:210-247: the end, the write limit, the idle limit, and the    *)
-(* deadline of the wait.                                                  *)
-Check ==
-  /\ pc = "check"
-  /\ IF shut /\ (inputOver \/ ~FinishNeedsInputOver)
-     THEN /\ pc' = "done" /\ ret' = IF idled THEN "idle" ELSE "finished"
-          /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, idleFrom,
-                         stalledSince, deadline, hKind, hN, stack, peer, hist>>
-     ELSE
-     LET holds == hKind # "none"
-         since == IF holds THEN (IF stalledSince = None THEN now ELSE stalledSince) ELSE None
-         timedOut == holds /\ WriteTimeout # NoLimit /\ now >= since + WriteTimeout
-         reading == ~inputOver /\ (inKind = "none" \/ ~ReadOnlyWhenTakenRule)
-         waiting == reading /\ ~holds
-         resumes == waiting /\ ~wasWaiting
-         from == IF RestartIdleOnWait /\ resumes THEN now ELSE idleFrom
-         idleDue == waiting /\ Idle # NoLimit /\ now >= from + Idle
-         quiet == IF resumes THEN now ELSE quietFrom
-         stuck == IF holds /\ ~wasHolding THEN now ELSE stuckFrom
-         dl == ({sTimer} \ {None})
-               \cup (IF waiting /\ Idle # NoLimit THEN {from + Idle} ELSE {})
-               \cup (IF since # None /\ WriteTimeout # NoLimit THEN {since + WriteTimeout} ELSE {})
-     IN
-     /\ stalledSince' = since /\ idleFrom' = from
-     /\ wasWaiting' = waiting /\ quietFrom' = quiet
-     /\ wasHolding' = holds /\ stuckFrom' = stuck
-     /\ IF timedOut
-        THEN /\ earlyStall' = (now - stuck < WriteTimeout)
-             /\ EndBroken("conn")
-             /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, deadline,
-                            hKind, hN, sbuf, sout, sEnd, sReset, heardEnded, sTimer,
-                            pausesLeft, peer, readTotal, took, refused, transportTook,
-                            reported, stackOut, badRead, earlyIdle>>
-        ELSE IF idleDue
-        THEN /\ idled' = TRUE /\ inKind' = "ended" /\ inN' = 0
-             /\ earlyIdle' = (earlyIdle \/ now - quiet < Idle)
-             /\ pc' = "settle"
-             /\ UNCHANGED <<now, written, inputOver, shut, deadline, hKind, hN, ret, stack,
-                            peer, readTotal, took, refused, transportTook, reported, stackOut,
-                            offeredReset, badRead, earlyStall>>
-        ELSE /\ deadline' = IF dl = {} THEN None ELSE MinOf(dl)
-             /\ pc' = "poll"
-             /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, hKind, hN,
-                            ret, stack, peer, readTotal, took, refused, transportTook,
-                            reported, stackOut, offeredReset, badRead, earlyIdle, earlyStall>>
-
-(* The `poll_fn` of stack.rs:254-316 begins with `Driver::send_below`     *)
-(* (driver.rs:180-185) into the sink of stack.rs:259-297: `send`          *)
-(* (driver.rs:214-244) offers the held command, or takes the next from    *)
-(* the stack, until the sink hands one back. `ws` is what the transport   *)
-(* answers to the first and the second write of this poll (a held write   *)
-(* and then a new one), `sd` what it answers to the shutdown. A write     *)
-(* that is ready takes at least one byte, as `Connection::poll_write`     *)
-(* does for a non-empty buffer.                                           *)
+(* `Driver::send_below` (driver.rs:190-195, `send` at 246-276) into the   *)
+(* sink of live.rs:264-308: `send` offers the held command, or takes the  *)
+(* next from the stack, until the sink hands one back. `ws` is what the   *)
+(* transport answers to the first and the second write of this round (a   *)
+(* held write and then a new one), `sd` what it answers to the shutdown.  *)
+(* A write that is ready takes at least one byte, as                      *)
+(* `Connection::poll_write` does for a non-empty buffer; one that takes   *)
+(* none is the "error" answer (live.rs:272-275). A failed write or        *)
+(* shutdown stays held (live.rs:286-289, 298-301) and `send` stops.       *)
 RECURSIVE SendLoop(_, _, _, _)
 SendLoop(st, ws, sd, fuel) ==
   IF fuel = 0 \/ st.stop THEN st
@@ -268,15 +194,14 @@ SendLoop(st, ws, sd, fuel) ==
                      [s1 EXCEPT !.hk = "write", !.hn = n - 1, !.pw = @ + 1,
                                 !.moved = TRUE, !.stop = TRUE]
                 [] w = "error" ->
-                     SendLoop([s1 EXCEPT !.pfailed = TRUE, !.moved = TRUE, !.wi = @ + 1],
-                              ws, sd, fuel - 1)
+                     [s1 EXCEPT !.hk = "write", !.hn = n, !.pfailed = TRUE, !.stop = TRUE]
                 [] OTHER ->
                      SendLoop([s1 EXCEPT !.pw = @ + n, !.moved = TRUE, !.wi = @ + 1],
                               ws, sd, fuel - 1)
          [] k = "end" ->
               CASE sd = "pending" -> [s1 EXCEPT !.hk = "end", !.stop = TRUE]
                 [] sd = "ok" -> SendLoop([s1 EXCEPT !.pshut = TRUE, !.moved = TRUE], ws, sd, fuel - 1)
-                [] OTHER -> SendLoop([s1 EXCEPT !.pfailed = TRUE, !.moved = TRUE], ws, sd, fuel - 1)
+                [] OTHER -> [s1 EXCEPT !.hk = "end", !.pfailed = TRUE, !.stop = TRUE]
          [] OTHER -> SendLoop([s1 EXCEPT !.preset = TRUE, !.moved = TRUE], ws, sd, fuel - 1)
 
 Send(ws, sd) ==
@@ -284,64 +209,184 @@ Send(ws, sd) ==
                       out |-> stackOut, pw |-> 0, pshut |-> FALSE, preset |-> FALSE,
                       pfailed |-> FALSE, moved |-> FALSE, wi |-> 1, stop |-> FALSE],
                      ws, sd, 5)
-  IN [moved |-> st.moved, pw |-> st.pw, pshut |-> st.pshut, preset |-> st.preset,
-      pfailed |-> st.pfailed, held |-> <<st.hk, st.hn>>, sout |-> st.o, sEnd |-> st.e,
-      sReset |-> st.r, stackOut |-> st.out]
-
+  IN st
 
 Reading == ~inputOver /\ (inKind = "none" \/ ~ReadOnlyWhenTakenRule)
 
-ReadChoices(failed) ==
-  IF ~Reading \/ failed THEN {None - 1}  \* not polled
+(* What `poll_read` answers: not polled, Pending (None), n bytes, the end *)
+(* (0), or a failure (Err) once the peer is gone.                         *)
+ReadChoices ==
+  IF ~Reading THEN {Skip}
+  ELSE IF gone THEN {Err}
   ELSE {None} \cup (IF peerLeft > 0 THEN 1..peerLeft ELSE {})
        \cup (IF peerLeft = 0 /\ peerFin THEN {0} ELSE {})
 
-Poll ==
-  /\ pc = "poll"
-  /\ \E w1, w2 \in (IF peerStalled THEN {"pending"} ELSE {"pending", "partial", "full", "error"}),
+(* One round of `Live::step` (live.rs:196-330). From "wait" a round runs  *)
+(* only if something can move: what woke the runner (live.rs:382).        *)
+Round ==
+  /\ pc \in {"round", "wait"}
+  /\ \E rd \in ReadChoices,
+        budgetFails \in (IF BudgetMayFail THEN BOOLEAN ELSE {FALSE}),
+        w1, w2 \in (IF peerStalled THEN {"pending"} ELSE {"pending", "partial", "full", "error"}),
         sd \in {"pending", "ok", "error"},
-        budgetFails \in (IF BudgetMayFail THEN BOOLEAN ELSE {FALSE}) :
-     LET p == Send(<<w1, w2>>, sd)
-         failed == p.pfailed \/ gone
-     IN \E rd \in ReadChoices(p.pfailed) :
+        arm \in (IF pausesLeft > 0 THEN BOOLEAN ELSE {FALSE}),
+        askReset \in (IF StackMayReset /\ sReset = "no" /\ ~heardReset THEN BOOLEAN ELSE {FALSE}),
+        early \in (IF StackMayEndEarly /\ sEnd = "no" /\ ~heardReset THEN BOOLEAN ELSE {FALSE}) :
      LET got == rd > 0
+         \* the read, live.rs:202-221
+         k0 == IF rd = 0 THEN "ended" ELSE IF got THEN "data" ELSE inKind
+         n0 == IF got THEN rd ELSE IF rd = 0 THEN 0 ELSE inN
+         readMoved == rd >= 0
+         \* the write report, live.rs:229-239
+         m1 == written > 0
+         \* the held input, live.rs:240-257
+         blocked == k0 = "data" /\ ~sOver /\ (sTimer # None \/ sbuf = Room)
+         closed == k0 # "none" /\ sOver
+         j == IF k0 = "data" /\ ~sOver /\ ~blocked THEN Min(n0, Room - sbuf) ELSE 0
+         m2 == k0 # "none" /\ ~blocked
+         arms == arm /\ j > 0
+         sbuf1 == sbuf + j
+         sTimer1 == IF arms THEN now + Pause ELSE sTimer
+         ended1 == heardEnded \/ (k0 = "ended" /\ ~sOver)
+         over1 == sOver \/ (k0 = "ended")
+         \* `Driver::run`: due timers first, then the stack's own steps.
+         fires == sTimer1 # None /\ sTimer1 <= now
+         askEnd == (ended1 \/ early) /\ sEnd = "no" /\ ~heardReset
+         runMoved == fires \/ sbuf1 > 0 \/ askEnd \/ askReset
+         sout1 == IF sEnd = "no" THEN sout + sbuf1 ELSE sout
+         sEnd1 == IF askEnd THEN "asked" ELSE sEnd
+         sReset1 == IF askReset THEN "asked" ELSE sReset
+         \* `send_below`, live.rs:262-308
+         p == SendLoop([hk |-> hKind, hn |-> hN, o |-> sout1, e |-> sEnd1, r |-> sReset1,
+                        out |-> stackOut, pw |-> 0, pshut |-> FALSE, preset |-> FALSE,
+                        pfailed |-> FALSE, moved |-> FALSE, wi |-> 1, stop |-> FALSE],
+                       <<w1, w2>>, sd, 5)
+         moved == readMoved \/ m1 \/ m2 \/ runMoved \/ p.moved
          due == deadline # None /\ now >= deadline
-         ready == p.moved \/ rd >= 0 \/ failed \/ p.preset \/ due
+         stops == (got /\ budgetFails) \/ p.preset \/ p.pfailed \/ rd = Err
      IN
-     /\ ready
-     \* What the poll moved, kept whatever the runner does next.
-     /\ hKind' = p.held[1] /\ hN' = p.held[2]
-     /\ sout' = p.sout /\ sEnd' = p.sEnd /\ sReset' = p.sReset /\ stackOut' = p.stackOut
-     /\ transportTook' = transportTook + p.pw
-     \* stack.rs:320-325
-     /\ written' = written + p.pw
-     /\ shut' = (shut \/ p.pshut)
-     /\ stalledSince' = IF p.pw > 0 /\ StallResetOnProgress THEN None ELSE stalledSince
-     /\ stuckFrom' = IF p.pw > 0 THEN now ELSE stuckFrom
-     \* the read, stack.rs:329-345
-     /\ badRead' = (badRead \/ (rd >= 0 /\ (inKind # "none" \/ inputOver)))
+     /\ pc = "wait" => (moved \/ stops \/ due)
+     /\ badRead' = (badRead \/ (readMoved /\ (inKind # "none" \/ inputOver)))
      /\ readTotal' = IF got THEN readTotal + rd ELSE readTotal
      /\ peerLeft' = IF got THEN peerLeft - rd ELSE peerLeft
-     /\ inKind' = IF rd = 0 THEN "ended" ELSE IF got THEN "data" ELSE inKind
-     /\ inN' = IF got THEN rd ELSE IF rd = 0 THEN 0 ELSE inN
-     /\ idleFrom' = IF (got /\ IdleResetOnRead) \/ p.pw > 0 THEN now ELSE idleFrom
-     /\ quietFrom' = IF got \/ p.pw > 0 THEN now ELSE quietFrom
-     /\ IF p.preset
-        THEN /\ pc' = "done" /\ ret' = "reset"
-             /\ UNCHANGED <<offeredReset, heardReset, sOver>>
-        ELSE IF got /\ budgetFails
-        THEN EndBroken("budget")
-        ELSE IF failed
-        THEN EndBroken("conn")
-        ELSE /\ pc' = "settle" /\ UNCHANGED <<ret, offeredReset, heardReset, sOver>>
-  /\ UNCHANGED <<now, inputOver, idled, deadline, sbuf, heardEnded, sTimer, pausesLeft,
-                 peerFin, gone, peerStalled, took, refused, reported, wasWaiting, earlyIdle, wasHolding,
-                 earlyStall>>
+     /\ IF got /\ budgetFails
+        THEN \* live.rs:207-210: the round ends at the read.
+             /\ EndBroken("budget", sOver)
+             /\ idleFrom' = IF IdleResetOnRead THEN now ELSE idleFrom
+             /\ quietFrom' = now
+             /\ inKind' = "data" /\ inN' = rd
+             /\ UNCHANGED <<now, written, inputOver, shut, idled, stalledSince, deadline,
+                            hKind, hN, sbuf, sout, sEnd, sReset, heardEnded, sTimer,
+                            pausesLeft, peerFin, gone, peerStalled, took, refused,
+                            transportTook, reported, stackOut, wasWaiting, earlyIdle,
+                            wasHolding, stuckFrom, earlyStall>>
+        ELSE
+        /\ reported' = IF m1 THEN reported + written ELSE reported
+        /\ inKind' = IF closed THEN "none"
+                     ELSE IF k0 = "ended" THEN "none"
+                     ELSE IF k0 = "data" /\ ~blocked /\ j = n0 THEN "none"
+                     ELSE IF k0 = "data" /\ ~blocked /\ ~KeepPartialRest THEN "none"
+                     ELSE k0
+        /\ inN' = IF k0 = "data" /\ ~closed /\ (blocked \/ KeepPartialRest)
+                  THEN n0 - j ELSE 0
+        /\ inputOver' = (inputOver \/ closed \/ k0 = "ended")
+        /\ refused' = IF closed /\ k0 = "data" THEN refused + n0 ELSE refused
+        /\ took' = took + j
+        /\ heardEnded' = ended1
+        /\ pausesLeft' = IF arms THEN pausesLeft - 1 ELSE pausesLeft
+        /\ sTimer' = IF fires THEN None ELSE sTimer1
+        \* After its End the stack's output is refused (framed.rs:161-162).
+        /\ sbuf' = 0
+        /\ hKind' = p.hk /\ hN' = p.hn
+        /\ sout' = p.o /\ sEnd' = p.e /\ sReset' = p.r /\ stackOut' = p.out
+        /\ transportTook' = transportTook + p.pw
+        /\ shut' = (shut \/ p.pshut)
+        \* live.rs:312-323: what the transport took is owed to the stack.
+        /\ written' = (IF m1 /\ ReportOnceRule THEN 0 ELSE written) + p.pw
+        /\ stalledSince' = IF (p.pw > 0 /\ StallResetOnProgress) \/ p.hk = "none"
+                           THEN None ELSE stalledSince
+        /\ stuckFrom' = IF p.pw > 0 THEN now ELSE stuckFrom
+        /\ idleFrom' = IF (got /\ IdleResetOnRead) \/ p.pw > 0 THEN now ELSE idleFrom
+        /\ quietFrom' = IF got \/ p.pw > 0 THEN now ELSE quietFrom
+        /\ IF p.preset
+           THEN /\ pc' = "done" /\ ret' = "reset"
+                /\ sOver' = over1 /\ UNCHANGED <<offeredReset, heardReset>>
+           ELSE IF p.pfailed \/ rd = Err
+           THEN /\ EndBroken("conn", over1)
+           ELSE /\ sOver' = over1
+                /\ pc' = IF moved THEN "round" ELSE "check"
+                /\ UNCHANGED <<ret, offeredReset, heardReset>>
+        /\ UNCHANGED <<now, idled, deadline, peerFin, gone, peerStalled, wasWaiting,
+                       earlyIdle, wasHolding, earlyStall>>
 
-(* Time passes while the wait is pending. The wait's first poll takes a   *)
-(* new command from the stack at once, so time does not pass over one.    *)
+(* The limits and the sleep (live.rs:332-382), then, when `step` returns  *)
+(* Pending, what `stream` does with it (mod.rs:190-196).                  *)
+Check ==
+  /\ pc = "check"
+  /\ LET holds == hKind # "none"
+         since == IF holds THEN (IF stalledSince = None THEN now ELSE stalledSince) ELSE None
+         timedOut == holds /\ WriteTimeout # NoLimit /\ now >= since + WriteTimeout
+         waiting == inKind = "none" /\ ~inputOver /\ ~holds
+         resumes == waiting /\ ~wasWaiting
+         from == IF RestartIdleOnWait /\ resumes THEN now ELSE idleFrom
+         idleDue == waiting /\ Idle # NoLimit /\ now >= from + Idle
+         quiet == IF resumes THEN now ELSE quietFrom
+         stuck == IF holds /\ ~wasHolding THEN now ELSE stuckFrom
+         dl == ({sTimer} \ {None})
+               \cup (IF waiting /\ Idle # NoLimit THEN {from + Idle} ELSE {})
+               \cup (IF since # None /\ WriteTimeout # NoLimit THEN {since + WriteTimeout} ELSE {})
+         armed == IF dl = {} THEN None ELSE MinOf(dl)
+         finished == shut /\ ~holds /\ (inputOver \/ ~FinishNeedsInputOver)
+     IN
+     /\ wasHolding' = holds /\ stuckFrom' = stuck
+     /\ IF timedOut
+        THEN /\ stalledSince' = since
+             /\ earlyStall' = (now - stuck < WriteTimeout)
+             /\ EndBroken("conn", sOver)
+             /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, idleFrom,
+                            deadline, hKind, hN, sbuf, sout, sEnd, sReset, heardEnded,
+                            sTimer, pausesLeft, peer, readTotal, took, refused,
+                            transportTook, reported, stackOut, badRead, wasWaiting,
+                            quietFrom, earlyIdle>>
+        ELSE
+        /\ stalledSince' = since /\ idleFrom' = from
+        /\ wasWaiting' = waiting /\ quietFrom' = quiet
+        /\ IF idleDue
+           THEN /\ idled' = TRUE /\ inKind' = "ended" /\ inN' = 0
+                /\ earlyIdle' = (earlyIdle \/ now - quiet < Idle)
+                /\ pc' = "round"
+                /\ UNCHANGED <<now, written, inputOver, shut, deadline, hKind, hN, ret,
+                               stack, peer, readTotal, took, refused, transportTook,
+                               reported, stackOut, offeredReset, badRead, earlyStall>>
+           ELSE IF armed # None /\ now >= armed
+           THEN \* The sleep is due: round again (live.rs:374-380).
+                /\ deadline' = None /\ pc' = "round"
+                /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, hKind,
+                               hN, ret, stack, peer, readTotal, took, refused,
+                               transportTook, reported, stackOut, offeredReset, badRead,
+                               earlyIdle, earlyStall>>
+           ELSE IF finished
+           THEN /\ pc' = "done" /\ ret' = IF idled THEN "idle" ELSE "finished"
+                /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, deadline,
+                               hKind, hN, stack, peer, readTotal, took, refused,
+                               transportTook, reported, stackOut, offeredReset, badRead,
+                               earlyIdle, earlyStall>>
+           ELSE IF gone
+           THEN /\ EndBroken("conn", sOver)
+                /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, deadline,
+                               hKind, hN, sbuf, sout, sEnd, sReset, heardEnded, sTimer,
+                               pausesLeft, peer, readTotal, took, refused, transportTook,
+                               reported, stackOut, badRead, earlyIdle, earlyStall>>
+           ELSE /\ deadline' = armed /\ pc' = "wait"
+                /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, hKind,
+                               hN, ret, stack, peer, readTotal, took, refused,
+                               transportTook, reported, stackOut, offeredReset, badRead,
+                               earlyIdle, earlyStall>>
+
+(* Time passes while the runner waits. A round takes a new command from   *)
+(* the stack at once, so time does not pass over one.                     *)
 Tick ==
-  /\ pc = "poll"
+  /\ pc = "wait"
   /\ deadline # None /\ now < deadline
   /\ ~(hKind = "none" /\ NextCmd(sout, sEnd, sReset, heardReset) # "none")
   /\ now' = now + 1
@@ -349,14 +394,25 @@ Tick ==
                  deadline, hKind, hN, ret, stack, peer, hist>>
 
 PeerReset ==
-  /\ PeerMayReset /\ pc = "poll" /\ ~gone
+  /\ PeerMayReset /\ pc = "wait" /\ ~gone
   /\ gone' = TRUE
   /\ UNCHANGED <<runner, stack, peerLeft, peerFin, peerStalled, hist>>
 
-Next == Settle \/ Check \/ Poll \/ Tick \/ PeerReset
+(* `stream` polls `poll_gone` when the runner waits (mod.rs:194): a peer  *)
+(* that is gone ends the run even if no read or write tries.              *)
+Gone ==
+  /\ pc = "wait" /\ gone
+  /\ EndBroken("conn", sOver)
+  /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, idleFrom, stalledSince,
+                 deadline, hKind, hN, sbuf, sout, sEnd, sReset, heardEnded, sTimer,
+                 pausesLeft, peer, readTotal, took, refused, transportTook, reported,
+                 stackOut, badRead, wasWaiting, quietFrom, earlyIdle, wasHolding,
+                 stuckFrom, earlyStall>>
+
+Next == Round \/ Check \/ Tick \/ PeerReset \/ Gone
 
 Spec == Init /\ [][Next]_vars
-        /\ WF_vars(Settle) /\ WF_vars(Check) /\ WF_vars(Poll) /\ WF_vars(Tick)
+        /\ WF_vars(Round) /\ WF_vars(Check) /\ WF_vars(Tick) /\ WF_vars(Gone)
 
 ----------------------------------------------------------------------------
 (* Properties *)
@@ -389,13 +445,21 @@ ResetHeardOnBreak ==
   pc = "done" => /\ (ret \in {"conn", "budget"} => offeredReset = 1)
                  /\ (ret \in {"finished", "idle", "reset"} => offeredReset = 0)
 
-(* A finished connection has both directions ended; a reset return comes  *)
-(* only from the stack's own reset.                                       *)
+(* A finished connection has the stack's direction ended; a reset return  *)
+(* comes only from the stack's own reset.                                 *)
 EndsAreEarned ==
-  pc = "done" => /\ (ret \in {"finished", "idle"} => shut /\ inputOver)
+  pc = "done" => /\ (ret \in {"finished", "idle"} => shut)
                  /\ (ret = "idle" => idled)
                  /\ (ret = "finished" => ~idled)
                  /\ (ret = "reset" => sReset = "given")
+
+(* A run finishes only once both directions are over: the stack ended its *)
+(* own and its input ended too. `StreamCommand::End` leaves the other     *)
+(* direction open, so a stack that ends its direction first may still be  *)
+(* reading. Together with EndsAreEarned this is the old model's           *)
+(* EndsAreEarned.                                                         *)
+FinishNeedsInput ==
+  pc = "done" => (ret \in {"finished", "idle"} => inputOver)
 
 (* With both limits set, every connection ends.                           *)
 Terminates == <>(pc = "done")
