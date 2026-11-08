@@ -698,8 +698,7 @@ impl<H: Handler> Ssh<H> {
                     SessionLayer::new(handler.clone(), connection.clone(), opening, budget);
                 session.policy_close = Some(policy_close.clone());
                 session
-            })
-            .refuse_full_inbox(),
+            }),
         )
     }
     fn context(&self, now: Instant) -> Context<'_> {

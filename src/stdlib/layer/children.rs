@@ -87,6 +87,15 @@ type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> B + Send;
 /// limit and each inbox up to its bound, and the places go once no child is
 /// left. A child whose storage the budget cannot hold is refused
 /// ([`ChildReport::Refused`]) and its siblings go on.
+///
+/// The mux never waits for a child. Credit bounds a child's bytes, but not
+/// how many events it holds: many small pieces, completions and ends cost
+/// nothing. Each child holds at most 64 events and one urgent event. When an
+/// event finds its child's place full, the child is visited once at once to
+/// take what waits. A child that still takes nothing is overloaded: it alone
+/// is refused and closed, its work cancelled, and the event is dropped with
+/// it. So any child, however it behaves, holds up neither its siblings nor
+/// the connection's own traffic below and above.
 pub struct Children<B, K, O = ()>
 where
     B: Layer<Upper = Top>,
@@ -98,7 +107,6 @@ where
     kids: Vec<(ChildId, Kid<B>)>,
     limit: usize,
     window: u64,
-    refuse_full_inbox: bool,
     down: VecDeque<MuxCommand<B::Lower, K>>,
     up: VecDeque<EventOf<K>>,
     /// The child visited first last time.
@@ -190,7 +198,6 @@ where
             storage: None,
             limit,
             window,
-            refuse_full_inbox: false,
             down: VecDeque::new(),
             up: VecDeque::new(),
             turn: None,
@@ -199,13 +206,6 @@ where
             remaining_visits: 0,
             sweep_first: None,
         }
-    }
-
-    /// Refuse a child whose bounded inbox fills, allowing a wire mux to keep
-    /// parsing traffic for siblings. By default full inboxes apply backpressure.
-    pub fn refuse_full_inbox(mut self) -> Self {
-        self.refuse_full_inbox = true;
-        self
     }
 
     /// The routing storage for `kids` child places: the places themselves,
@@ -310,6 +310,29 @@ where
         }
     }
 
+    /// Closes a child that broke its limits and reports it. Dropping it
+    /// cancels its work.
+    fn refuse(&mut self, env: &mut Env<'_, ChildReport<B::Report, B::Error>>, id: ChildId) {
+        if let Some(kid) = self.remove(id) {
+            self.down.push_back(kid.handle.close());
+            env.report(ChildReport::Refused(id));
+        }
+    }
+
+    /// Whether child `id`'s place for an event like `event` is full.
+    fn full(&self, id: ChildId, urgent: bool) -> bool {
+        self.kids
+            .iter()
+            .find(|(key, _)| *key == id)
+            .is_some_and(|(_, kid)| {
+                if urgent {
+                    kid.urgent.is_some()
+                } else {
+                    kid.inbox.len() >= QUEUE
+                }
+            })
+    }
+
     /// One visit to child `id`: its internal work, one event in, one
     /// command out, and credit granted again. Returns whether anything
     /// moved.
@@ -373,9 +396,7 @@ where
         }
         if let Some(mut command) = kid.outbox.take() {
             if !command.splittable() && command.credit() > kid.max_command {
-                let kid = self.remove(id).expect("live child");
-                self.down.push_back(kid.handle.close());
-                env.report(ChildReport::Refused(id));
+                self.refuse(env, id);
                 return Ok(true);
             }
             if !command.reserve(env.budget()) {
@@ -495,42 +516,39 @@ where
                     return Ok(Admit::Taken);
                 }
                 // A child already gone has nothing to deliver to.
+                let Some(kid) = self.kids.iter().find(|(key, _)| *key == id) else {
+                    return Ok(Admit::Taken);
+                };
+                let cost = event.credit();
+                if cost > kid.1.granted {
+                    return Err(Overrun::Credit(id));
+                }
+                // A full place gets the child one visit to make room. A
+                // child that makes none is overloaded and goes alone: the
+                // event is never handed back to block the mux.
+                let urgent = event.urgent();
+                if self.full(id, urgent) {
+                    self.visit_child(env, id)?;
+                    if self.full(id, urgent) {
+                        self.refuse(env, id);
+                    }
+                }
                 if let Some(kid) = self
                     .kids
                     .iter_mut()
                     .find(|(key, _)| *key == id)
                     .map(|(_, kid)| kid)
                 {
-                    let cost = event.credit();
-                    if cost > kid.granted {
-                        return Err(Overrun::Credit(id));
-                    }
-                    if event.urgent() {
-                        if kid.urgent.is_some() {
-                            return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
-                        }
+                    if urgent {
                         kid.urgent = Some(event);
                     } else {
-                        if kid.inbox.len() >= QUEUE {
-                            if !self.refuse_full_inbox {
-                                return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
-                            }
-                            let kid = self.remove(id).expect("live child");
-                            kid.owner.cancel();
-                            self.down.push_back(kid.handle.close());
-                            env.report(ChildReport::Refused(id));
-                            return Ok(Admit::Taken);
-                        }
                         if kid.inbox.len() == kid.inbox.capacity() {
                             // Charge the inbox's growth before it grows; a
                             // child the budget cannot hold is refused.
                             let places = (kid.inbox.capacity() * 2).clamp(4, QUEUE);
                             let bytes = places * size_of::<(EventOf<B::Lower>, bool)>();
                             if !kid.storage.set(bytes) {
-                                let kid = self.remove(id).expect("live child");
-                                kid.owner.cancel();
-                                self.down.push_back(kid.handle.close());
-                                env.report(ChildReport::Refused(id));
+                                self.refuse(env, id);
                                 return Ok(Admit::Taken);
                             }
                             kid.inbox.reserve_exact(places - kid.inbox.len());
@@ -930,15 +948,8 @@ mod tests {
                     .moved()
             );
         }
-        assert!(matches!(
-            driver
-                .deliver(MuxEvent::Child(
-                    a,
-                    StreamEvent::Data(Chunk::new(Bytes::new()))
-                ))
-                .unwrap(),
-            Admit::Blocked(_)
-        ));
+        // Empty data costs no credit, but holds one of the bounded places.
+        assert_eq!(driver.layer().kids[0].1.inbox.len(), QUEUE);
         let (first, work) = driver.layer_mut().take_work().unwrap();
         let (second, _) = driver.layer_mut().take_work().unwrap();
         assert_ne!(first, second);
@@ -957,7 +968,6 @@ mod tests {
             work: true,
             ..Reader::default()
         });
-        driver.layer_mut().refuse_full_inbox = true;
         let mut slots = Slots::new(2);
         let first = slots.insert(()).unwrap();
         let a = first.id();
@@ -999,6 +1009,114 @@ mod tests {
         );
         driver.run().unwrap();
         assert_eq!(driver.layer_mut().kids[0].1.layer.completions, 9);
+    }
+
+    /// A child that takes every event, or, with `refuse`, never takes one.
+    struct Probe {
+        refuse: bool,
+        taken: usize,
+    }
+
+    impl Layer for Probe {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            if self.refuse {
+                return Ok(Admit::Blocked(event));
+            }
+            self.taken += 1;
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn take_command(&mut self) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_child_that_refuses_everything_holds_up_neither_siblings_nor_control() {
+        use crate::stdlib::layer::{MessageEvent, Messages, MuxOp};
+        let children: Children<Probe, Messages<u8>, bool> =
+            Children::new(3, 8, |_, refuse, _| Probe { refuse, taken: 0 });
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(97))),
+            Budget::new(1 << 20),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(3);
+        let mut ids = Vec::new();
+        for refuse in [true, true, false] {
+            let child = slots.insert(()).unwrap();
+            ids.push(child.id());
+            assert!(
+                driver
+                    .deliver(MuxEvent::Opened(child, refuse, 8))
+                    .unwrap()
+                    .moved()
+            );
+        }
+        let [stuck, stuck_urgent, ready] = ids[..] else {
+            unreachable!()
+        };
+        // The driver never runs in between: only the visits Children makes
+        // when a place is full move anything.
+        let rounds = 4 * QUEUE;
+        for round in 0..rounds {
+            for event in [
+                MuxEvent::Child(stuck, StreamEvent::Data(Chunk::new(Bytes::new()))),
+                MuxEvent::Child(stuck_urgent, StreamEvent::Written(1)),
+                MuxEvent::Child(ready, StreamEvent::Data(Chunk::new(Bytes::new()))),
+                MuxEvent::Child(ready, StreamEvent::Written(1)),
+                MuxEvent::Control(MessageEvent::Message(round as u8)),
+            ] {
+                assert!(matches!(driver.deliver(event), Ok(Admit::Taken)));
+            }
+            assert!(matches!(
+                driver.layer_mut().take_event(),
+                Some(MessageEvent::Message(n)) if n == round as u8
+            ));
+        }
+        driver.run().unwrap();
+        assert!(driver.layer().child(stuck).is_none());
+        assert!(driver.layer().child(stuck_urgent).is_none());
+        assert_eq!(driver.layer().child(ready).unwrap().taken, 2 * rounds);
+        let mut closed = Vec::new();
+        while let Some(command) = driver.layer_mut().take_command() {
+            if let MuxOp::Close(id) = command.into_op() {
+                closed.push(id);
+            }
+        }
+        closed.sort();
+        assert_eq!(closed, [stuck, stuck_urgent]);
+        let refused: Vec<_> = driver
+            .observations()
+            .drain()
+            .filter_map(|report| match report {
+                ChildReport::Refused(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert!(refused.contains(&stuck) && refused.contains(&stuck_urgent));
+        assert!(!refused.contains(&ready));
     }
 
     #[test]
