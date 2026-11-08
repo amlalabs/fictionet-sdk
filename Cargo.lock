@@ -1475,6 +1475,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-copied-tls"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fictionet",
+ "fictionet-extras",
+ "fictionet-rustls",
+ "fictionet-test-support",
+ "http",
+ "http-body-util",
+ "hyper",
+]
+
+[[package]]
 name = "fictionet-demo"
 version = "0.1.0"
 dependencies = [

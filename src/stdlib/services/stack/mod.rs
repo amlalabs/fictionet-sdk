@@ -35,7 +35,7 @@ mod live;
 mod open;
 mod tunnel;
 
-pub use boxed::Boxed;
+pub use boxed::{BoxError, Boxed};
 pub use job::{Job, Polling};
 pub use open::Opened;
 pub use tunnel::{Takeover, Tunnel};
