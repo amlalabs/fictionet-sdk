@@ -896,19 +896,19 @@ impl Http2 {
                     self.settings_deadline = None;
                 } else {
                     self.received_settings = true;
-                    if !self.control(
+                    for setting in settings.entries {
+                        self.peer_setting(setting)?;
+                    }
+                    // Every value is applied: now the acknowledgment (RFC
+                    // 9113 section 6.5.3).
+                    self.control(
                         env,
                         wire::HEADER_LEN,
                         &wire::Settings {
                             flags: 1,
                             entries: Vec::new(),
                         },
-                    ) {
-                        return Ok(());
-                    }
-                    for setting in settings.entries {
-                        self.peer_setting(setting)?;
-                    }
+                    );
                 }
             }
             Frame::WindowUpdate(update) => {
@@ -2385,6 +2385,49 @@ mod tests {
             "{output:?}"
         );
         assert!(!harness.ended());
+    }
+
+    #[test]
+    fn settings_that_fail_are_not_acknowledged() {
+        let mut harness = harness();
+        push(&mut harness, &client_preface());
+        // Stream 1 is open, its send window raised to 2^31 - 1.
+        let mut input = headers_without_end(1);
+        write(
+            &wire::WindowUpdate {
+                stream: 1,
+                flags: 0,
+                increment: wire::MAX_WINDOW - WINDOW as u32,
+            },
+            &mut input,
+        );
+        push(&mut harness, &input);
+        // One more byte of initial window takes it past 2^31 - 1: a
+        // connection error (RFC 9113 section 6.9.2), so the settings were
+        // never applied and get no acknowledgment (section 6.5.3).
+        let mut settings = Vec::new();
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting {
+                    id: 4,
+                    value: WINDOW as u32 + 1,
+                }],
+            },
+            &mut settings,
+        );
+        let output = frames(&push(&mut harness, &settings));
+        assert!(
+            output.iter().any(|f| matches!(f, Frame::GoAway(g)
+                if g.code == ErrorCode::FlowControlError as u32)),
+            "{output:?}"
+        );
+        assert!(
+            !output
+                .iter()
+                .any(|f| matches!(f, Frame::Settings(s) if s.flags & 1 != 0)),
+            "{output:?}"
+        );
     }
 
     #[test]
