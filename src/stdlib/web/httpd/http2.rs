@@ -2037,6 +2037,226 @@ mod tests {
         }
     }
 
+    const BODY: &[u8] = b"hello";
+
+    /// A stream's child installed in place of [`Respond`]: with a request
+    /// for `/stuck` it never takes an event; otherwise it answers with
+    /// [`BODY`] once the request ends.
+    struct Picky {
+        stuck: bool,
+        out: VecDeque<ExchangeCommand>,
+    }
+
+    impl Picky {
+        fn new(opening: Opening) -> Self {
+            let mut picky = Picky {
+                stuck: opening.request.uri().path() == "/stuck",
+                out: VecDeque::new(),
+            };
+            if opening.ended && !picky.stuck {
+                picky.answer();
+            }
+            picky
+        }
+
+        fn answer(&mut self) {
+            self.out.extend([
+                ExchangeCommand::Head(Box::new(ResponseHead {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    end: false,
+                })),
+                ExchangeCommand::Data(Chunk::new(BODY.to_vec())),
+                ExchangeCommand::End,
+            ]);
+        }
+    }
+
+    impl Layer for Picky {
+        type Lower = HttpExchange;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: ExchangeEvent,
+        ) -> Result<Admit<ExchangeEvent>, Infallible> {
+            if self.stuck {
+                return Ok(Admit::Blocked(event));
+            }
+            if matches!(event, ExchangeEvent::End | ExchangeEvent::Trailers(_)) {
+                self.answer();
+            }
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+
+        fn take_command(&mut self) -> Option<ExchangeCommand> {
+            self.out.pop_front()
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    fn request_block(encoder: &mut hpack::Encoder, method: &str, path: &str) -> Vec<u8> {
+        let mut block = Vec::new();
+        encoder
+            .encode_block(
+                &[
+                    hpack::Field::new(":method", method),
+                    hpack::Field::new(":scheme", "http"),
+                    hpack::Field::new(":path", path),
+                ],
+                &mut block,
+            )
+            .unwrap();
+        block
+    }
+
+    #[test]
+    fn a_child_that_never_reads_holds_up_neither_its_siblings_nor_the_connection() {
+        let server = fictionet::stdlib::layer::Chain::new(
+            Http2::new(Limits::default()),
+            fictionet::stdlib::layer::Children::new(16, Http2::WINDOW, |_, opening, _| {
+                Picky::new(opening)
+            }),
+        );
+        let mut harness = Harness::new(fictionet::Seed::from_u64(2), server);
+        // The client's streams start with no window, so a response body
+        // goes out only after the client's WINDOW_UPDATE is read.
+        let mut input = wire::PREFACE.to_vec();
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting { id: 4, value: 0 }],
+            },
+            &mut input,
+        );
+        write(
+            &wire::Settings {
+                flags: 1,
+                entries: Vec::new(),
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        harness.take_output();
+
+        let mut encoder = hpack::Encoder::new(4096);
+        let mut input = Vec::new();
+        // Stream 1's child never reads: its body comes in far more pieces
+        // than a child holds, and past half the connection's window.
+        write(
+            &wire::Headers {
+                stream: 1,
+                flags: 4,
+                fragment: request_block(&mut encoder, "POST", "/stuck"),
+                priority: None,
+                padding: None,
+            },
+            &mut input,
+        );
+        for _ in 0..200 {
+            write(
+                &wire::Data {
+                    stream: 1,
+                    flags: 0,
+                    data: vec![0; 200],
+                    padding: None,
+                },
+                &mut input,
+            );
+        }
+        // Behind it: connection traffic and a sibling request.
+        write(
+            &wire::Ping {
+                flags: 0,
+                opaque: *b"isolated",
+            },
+            &mut input,
+        );
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting { id: 2, value: 0 }],
+            },
+            &mut input,
+        );
+        write(
+            &wire::Headers {
+                stream: 3,
+                flags: 5,
+                fragment: request_block(&mut encoder, "GET", "/"),
+                priority: None,
+                padding: None,
+            },
+            &mut input,
+        );
+        write(
+            &wire::WindowUpdate {
+                stream: 3,
+                flags: 0,
+                increment: BODY.len() as u32,
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        let output = frames(&harness.take_output());
+
+        assert!(
+            output.iter().any(|f| matches!(f, Frame::Ping(p)
+                if p.flags & 1 == 1 && p.opaque == *b"isolated")),
+            "{output:?}"
+        );
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Settings(s) if s.flags & 1 == 1))
+        );
+        // The stuck child alone is reset, and the body it never read gives
+        // the connection's window back.
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1))
+        );
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::WindowUpdate(w) if w.stream == 0))
+        );
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Headers(h) if h.stream == 3))
+        );
+        let body: Vec<u8> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 3 => Some(d.data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(body, BODY);
+        assert!(!output.iter().any(|f| matches!(f, Frame::GoAway(_))));
+        assert!(!harness.ended());
+    }
+
     #[test]
     fn late_frames_on_a_reset_stream_are_ignored() {
         let mut harness = harness();
