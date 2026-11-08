@@ -292,8 +292,8 @@ impl Front {
 /// the resolver leaves a query unanswered.
 const QUERIES: usize = 32;
 
-/// The stack of one DNS over TLS connection over TLS: DNS stream framing,
-/// then [`Queried`].
+/// The stack of one DNS over TLS connection, over TLS or a plain
+/// connection: DNS stream framing, then [`Queried`].
 type DotStack = Chain<Framed<Queries, StreamMessage>, Queried>;
 
 /// DNS over TLS on one port.
