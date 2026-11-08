@@ -2,9 +2,12 @@
 //! included), and name-based virtual hosting.
 //!
 //! [`Http1`] is a [`Layer`](fictionet::stdlib::layer::Layer) over an
-//! ordered byte stream. [`Http2`] is a [`serve`] service on the shared
-//! HTTP/2 frame layer and HPACK. Both servers run with `std` alone.
-//! [`serve_connection`] runs them over a live connection. TLS comes from
+//! ordered byte stream. [`Http2`] is the HTTP/2 connection as a layer, on
+//! the shared HTTP/2 frame layer and HPACK, with one [`HttpExchange`] child
+//! per stream above it: [`Respond`] answers one with a [`Handler`], and
+//! [`Grpc`] serves gRPC calls on one ([`Responder::http2`] composes a
+//! server). Both versions run with `std` alone. [`serve_connection`] runs
+//! them over a live connection. TLS comes from
 //! `fictionet::stdlib::services::tls`. This module supplies no HTTP client.
 //!
 //! A [`Handler`] answers one request. Adapters and virtual hosting:
@@ -27,7 +30,9 @@
 //! keep-alive, pipelining, `Expect: 100-continue`, `HEAD`, chunked
 //! responses for bodies of unknown length, and 30-second limits on each
 //! request's head and on its body. [`serve_connection`] picks the version for a
-//! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
+//! connection in one layer stack ([`http_for`]): HTTP/2 by ALPN, by the
+//! client's preface ([`Detect`]), or by `Upgrade: h2c` ([`Http1::h2c`]), else
+//! HTTP/1.
 //! An unknown-length HTTP/1.1 body ends with a zero-size chunk only at EOF.
 //! Pending polls and empty data frames do not end the response.
 //! All backends suppress response bodies for `HEAD`, informational statuses,
@@ -64,19 +69,20 @@
 //! handler sets itself is sent as it is.
 //!
 //! HTTP/2 uses the same [`Handler`], [`Limits`] and seeded randomness.
-//! The serve driver charges input and output storage, HPACK state, stream
-//! metadata, retained request heads and bodies, and pending responses to the
-//! connection's [`Budget`]. A head that does not fit is refused before its
-//! handler runs, with `answer: budget` and no status. A body that exceeds its
-//! allowance receives `503`. Transport storage belongs to its transport.
-//! After the HTTP/2 server resets a stream, it ignores that stream's late
-//! HEADERS and DATA for one second. It holds at most 50 reset streams at a
-//! time. HEADERS and DATA on any other closed stream are errors. The
-//! one-second hold, body deadlines and SETTINGS acknowledgment deadlines are
-//! all timed on the run's clock.
+//! The connection charges its frame buffer, HPACK state, stream state and
+//! output frames, and each exchange its request head and body and its
+//! response, to the connection's [`Budget`]. A head that does not fit is
+//! refused with `REFUSED_STREAM` before its handler runs. A body that
+//! exceeds its allowance receives `503`. Transport storage belongs to its
+//! transport. After the HTTP/2 server resets a stream, it ignores that
+//! stream's late HEADERS and DATA for one second. It holds at most 50 reset
+//! streams at a time. HEADERS and DATA on any other closed stream are errors.
+//! The one-second hold, body deadlines and SETTINGS acknowledgment deadlines
+//! are all timed on the run's clock.
 //! Stream flow control, reset limits and bounded header assembly apply
-//! independently of the runtime. PING and GOAWAY are handled by the service;
-//! graceful shutdown drains admitted streams.
+//! independently of the runtime. PING and GOAWAY are handled by the
+//! connection; graceful shutdown ([`Http2::graceful_shutdown`]) drains
+//! admitted streams.
 //!
 //! ```
 //! use fictionet::stdlib::layer::Harness;
@@ -113,18 +119,15 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use fictionet::RaceError;
-use fictionet::stdlib::layer::{Budget, Side};
+use fictionet::stdlib::layer::{Budget, Switch};
 use fictionet::stdlib::network::Connection;
-use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::protocols::http1;
-use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::serve::Prefixed;
-use fictionet::stdlib::services::serve::{self, ServeOptions};
+use fictionet::stdlib::services::serve::{self, ConnInfo};
 use fictionet::stdlib::services::stack::{self, StackError, StreamLimits};
 use fictionet::{Cancelled, Cx};
 
 mod body;
+mod detect;
 mod handlers;
 mod http2;
 mod native;
@@ -132,13 +135,18 @@ mod response;
 mod sites;
 
 pub use body::Body;
+pub use detect::{Choice, Detect, Http, Versions};
 pub use handlers::{
     BadGateway, Exchange, Handler, Later, Reply, Reset, Tower, UpgradeHandler, text, tower,
 };
 
-pub use http2::{Http2, Timer as Http2Timer};
+pub use http2::{
+    Ending, ExchangeCommand, ExchangeEvent, Grpc, GrpcCommand, GrpcEvent, Http2, Http2Server,
+    HttpExchange, Opening, Report as Http2Report, Respond, RespondWork, Responder, ResponseHead,
+    Timer as Http2Timer,
+};
 pub use native::{
-    Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer,
+    Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer, Upgraded,
     Work as Http1Work,
 };
 pub use response::{date_header, http_date};
@@ -258,6 +266,19 @@ impl Delivery {
 
     fn finish(&mut self, written: u64, complete: bool) {
         self.update(written);
+        self.end(complete);
+    }
+
+    /// The whole frames of `body` response body bytes were written, all
+    /// told, as a multiplexed connection counts them.
+    fn written(&mut self, body: u64) {
+        if let Some(observation) = &mut self.observation {
+            observation.sent = observation.sent.max(body);
+        }
+    }
+
+    /// Hands the observation over: the response ended, or was cut off.
+    fn end(&mut self, complete: bool) {
         if let Some(mut observation) = self.observation.take() {
             self.held = 0;
             observation.complete = complete;
@@ -349,8 +370,6 @@ pub struct HttpOptions {
     pub date: Option<SystemTime>,
 }
 
-use fictionet::stdlib::protocols::http2::PREFACE;
-
 /// HTTP/1 for the connection `info` names, answering with `handler` as
 /// `opts` says: what [`serve_connection`] runs, and what a site runs over
 /// TLS in the same stack.
@@ -361,9 +380,53 @@ pub(super) fn http1_for(handler: Arc<dyn Handler>, opts: &HttpOptions, info: &Co
     http1
 }
 
+/// HTTP/2 for the connection `info` names, answering with `handler` as
+/// `opts` says.
+pub(super) fn http2_for(
+    handler: Arc<dyn Handler>,
+    opts: &HttpOptions,
+    info: &ConnInfo,
+) -> Http2Server {
+    Responder::shared(handler)
+        .limits(opts.limits)
+        .maybe_observe(opts.observe.clone())
+        .maybe_date(opts.date)
+        .conn(info.clone())
+        .http2()
+}
+
+/// HTTP for one connection, answering with `handler` as `opts` says: the
+/// stack [`serve_connection`] runs. Over TLS the version is ALPN's; without
+/// TLS, [`Detect`] tells HTTP/2's preface from HTTP/1 within the first-bytes
+/// deadline, and HTTP/1 accepts `Upgrade: h2c`.
+pub fn http_for(
+    handler: Arc<dyn Handler>,
+    opts: &HttpOptions,
+    info: &ConnInfo,
+    now: fictionet::time::Instant,
+) -> Http {
+    let mut http1 = http1_for(handler.clone(), opts, info);
+    let http2 = http2_for(handler, opts, info);
+    let detect = if info.tls {
+        let h2 = info.alpn.as_deref() == Some(b"h2".as_slice());
+        Detect::decided(h2, http1.upgradable(), http2)
+    } else {
+        if opts.first_bytes.is_none() {
+            // The head of the first request has the same deadline from
+            // the start, however long telling the versions apart took.
+            http1.first_head_deadline = Some(now + opts.limits.header_timeout);
+        }
+        let first = opts.first_bytes.unwrap_or(opts.limits.header_timeout);
+        Detect::new(first, http1.h2c().upgradable(), http2)
+    };
+    Switch::new(detect)
+}
+
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
-/// when a client without TLS starts with HTTP/2's preface; HTTP/1
-/// otherwise. Both versions work with `std`.
+/// when a client without TLS starts with HTTP/2's preface or upgrades with
+/// `Upgrade: h2c`; HTTP/1 otherwise. Both versions work with `std`, in one
+/// layer stack ([`http_for`]) run by
+/// [`services::stack::stream`](fictionet::stdlib::services::stack::stream).
 /// `info` supplies connection metadata to the handler.
 /// An empty half-close is silent. EOF within an HTTP/2 preface goes through
 /// HTTP/1's truncated-head handling and answers 400.
@@ -371,7 +434,6 @@ pub(super) fn http1_for(handler: Arc<dyn Handler>, opts: &HttpOptions, info: &Co
 /// Returns `Ok(())` when the connection ended, however it ended: a
 /// connection's failure ends that connection. Returns [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled first.
-#[deny(clippy::let_underscore_must_use)]
 pub async fn serve_connection<C: Connection + Unpin>(
     fcx: &Cx,
     conn: C,
@@ -379,65 +441,15 @@ pub async fn serve_connection<C: Connection + Unpin>(
     handler: Arc<dyn Handler>,
     opts: &HttpOptions,
 ) -> Result<(), Cancelled> {
-    let mut conn = conn;
-    let mut first = Vec::new();
-    let head_deadline = fcx.now() + opts.limits.header_timeout;
-    let first_timeout = opts.first_bytes.unwrap_or(opts.limits.header_timeout);
-    let h2 = if info.tls {
-        info.alpn.as_deref() == Some(b"h2".as_slice())
-    } else {
-        // With HTTP/2, read enough to identify its preface. Otherwise,
-        // wait for one byte to enforce the first-byte timeout.
-        let preface = async {
-            let mut buf = [0u8; 24];
-            while first.len() < PREFACE.len() && PREFACE.starts_with(&first) {
-                let room = PREFACE.len() - first.len();
-                match conn.read(fcx, &mut buf[..room]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => first.extend_from_slice(&buf[..n]),
-                }
-            }
-        };
-        match fcx.race(Some(fcx.now() + first_timeout), preface).await {
-            Ok(()) => {}
-            Err(RaceError::Cancelled) => return Err(Cancelled),
-            Err(RaceError::Deadline) => {
-                return Ok(());
-            }
-        }
-        first == PREFACE
-    };
-    let conn = Prefixed::new(first, conn);
-    if h2 {
-        let serve_opts = ServeOptions {
-            idle: None,
-            write_timeout: Some(opts.limits.write_timeout),
-            budget: opts.budget.clone(),
-            ..ServeOptions::default()
-        };
-        let mut service = Http2::with(handler, opts.limits);
-        service.observe = opts.observe.clone();
-        service.date = opts
-            .date
-            .and_then(|date| date.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|date| date.as_secs());
-        return match serve::connection(fcx, conn, info, &mut service, &(), &serve_opts).await {
-            Err(serve::ServeError::Cancelled) => Err(Cancelled),
-            _ => Ok(()),
-        };
-    }
-    let mut http1 = http1_for(handler, opts, &info);
-    if !info.tls && opts.first_bytes.is_none() {
-        http1.first_head_deadline = Some(head_deadline);
-    }
+    let stack = http_for(handler, opts, &info, fcx.now());
     let budget = opts.budget.clone().unwrap_or_else(Budget::unlimited);
     let limits = StreamLimits {
         idle: None,
         write_timeout: Some(opts.limits.write_timeout),
     };
-    match stack::stream(fcx, conn, &info, http1.upgradable(), budget, limits, |_| {}).await {
-        Ok(_) | Err(StackError::Budget) => Ok(()),
+    match stack::stream(fcx, conn, &info, stack, budget, limits, |_| {}).await {
         Err(StackError::Cancelled) => Err(Cancelled),
-        Err(StackError::Layer(Side::Lower(never) | Side::Upper(never))) => match never {},
+        // A layer that gives up ends its connection alone.
+        Ok(_) | Err(StackError::Budget | StackError::Layer(_)) => Ok(()),
     }
 }

@@ -191,8 +191,10 @@ fn serve(
                 .host("site", |host| {
                     host.at(SITE)
                         .tls_accept(443, Sni::Any, move |_| config.clone(), server)
-                        .tcp(80, Arc::new(()), move || {
-                            httpd::Http2::with(handler.clone(), httpd::Limits::default())
+                        .tcp_stack(80, move |info| {
+                            httpd::Responder::shared(handler.clone())
+                                .conn(info.clone())
+                                .http2()
                         })
                 })
                 .start(&fcx, attachments)?;

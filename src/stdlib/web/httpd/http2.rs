@@ -1,77 +1,186 @@
 // Copyright (c) 2017 h2 authors
 // Portions adapted from h2 under the MIT license; see LICENSE-h2 in this directory.
 
+//! HTTP/2 as layers: [`Http2`], the connection, with a byte stream below
+//! and one [`HttpExchange`] child per stream above; [`Respond`], a
+//! [`Handler`](super::Handler) on one exchange; and [`Grpc`], gRPC calls on
+//! one exchange.
+
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
-use http_body::Body as _;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 
-use fictionet::stdlib::codec::{Fail, Wire};
+use fictionet::stdlib::codec::{self, Fail, Wire};
+use fictionet::stdlib::layer::{
+    Admit, ByteStream, Charge, ChildId, Chunk, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Slots,
+    StreamCommand, StreamEvent, Top,
+};
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
-use fictionet::stdlib::services::serve::{self, Done, Driver, Ended, Flow, Pending, PendingDriver};
-use fictionet::sync::Mutex;
 use fictionet::time::Instant;
-use fictionet::{Cx, Error};
 
-use super::response::{Asked, ResponsePolicy, error_response, request_held};
-use super::{Body, Exchange, Handler, Later, Limits, Received, Reply, Reset, text};
+use super::Limits;
+use super::response::request_held;
 
-/// HTTP/2 stream deadline.
+mod exchange;
+mod grpc;
+mod respond;
+
+pub use exchange::{Ending, ExchangeCommand, ExchangeEvent, HttpExchange, Opening, ResponseHead};
+pub use grpc::{Grpc, GrpcCommand, GrpcEvent};
+pub use respond::{Http2Server, Respond, Responder, Work as RespondWork};
+
+/// HTTP/2 connection deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Timer {
-    /// The next stream head or body deadline.
+    /// The SETTINGS acknowledgment deadline, or the end of a reset
+    /// stream's hold.
     Deadline,
 }
+
+/// What [`Http2`] reports about its connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report {
+    /// The connection failed and sent GOAWAY with this error.
+    Failed(wire::Error),
+    /// The connection held more than its budget allows: GOAWAY with
+    /// `ENHANCE_YOUR_CALM`, then the end.
+    Budget,
+}
+
 const RESET_LIFETIME: Duration = Duration::from_secs(1);
 const RESET_MAX: usize = 50;
 const PENDING_RESET_MAX: usize = 20;
 const ERROR_RESET_MAX: usize = 1024;
+/// The receive window of the connection and of each stream, which the
+/// server never changes from the protocol's default.
+const WINDOW: i32 = 65_535;
+/// How many response body bytes the connection takes from one exchange
+/// before it has framed them.
+const SEND_CREDIT: u64 = wire::DEFAULT_FRAME_SIZE as u64;
+/// How many events wait for the children before decoding pauses.
+const UP_LIMIT: usize = 64;
+/// How many output bytes wait for the transport before input pauses.
+const OUT_LIMIT: usize = 64 << 10;
+/// How many frames one advance reads.
+const FRAMES: usize = 16;
+/// The bytes of the last GOAWAY, kept back from the start.
+const LAST_WORDS: usize = wire::HEADER_LEN + 8;
 
-/// HTTP/2 for one connection, driven by bytes and the serve driver's clock.
-/// Uses the shared frame codec and HPACK decoder, with independently scheduled
-/// responses. No runtime is required, including in a [`serve::Harness`].
+/// HTTP/2 for one connection: a [`Layer`] with an ordered byte stream below
+/// and one [`HttpExchange`] child per stream above ([`Mux`]).
+///
+/// The connection owns everything the streams share: the frame decoder,
+/// HPACK in both directions, SETTINGS and their acknowledgment deadline,
+/// the wire's stream numbers and states, both levels of flow control,
+/// resets and their limits, PING and GOAWAY. A request whose head is valid
+/// opens a child with the head as its [`Opening`]; its body and end come up
+/// within the credit the child grants, and the child's response goes down
+/// within the credit the connection grants. Receive credit returns to the
+/// client by WINDOW_UPDATE once a batch of input is read and only for bytes
+/// the connection no longer holds, so a child that stops reading stops its
+/// own stream. Response bytes go out within both of the client's windows.
+///
+/// [`Responder::http2`] puts a [`Respond`] on each stream, answering with a
+/// [`Handler`](super::Handler); [`Grpc`] serves gRPC calls on a stream.
+///
+/// After the server resets a stream, it ignores that stream's late HEADERS
+/// and DATA for one second, and holds at most 50 such streams. A client
+/// that makes the server reset more than 1024 streams for its errors, or
+/// resets more than 20 streams the server has not taken in yet, loses the
+/// connection with `ENHANCE_YOUR_CALM`. Input storage, HPACK state, stream
+/// state, request heads and bodies, and output frames are charged to the
+/// connection's budget before they grow. Past it, the connection sends
+/// GOAWAY with `ENHANCE_YOUR_CALM` and ends.
 pub struct Http2 {
-    pub(super) observe: Option<super::Observe>,
-    handler: Arc<dyn Handler>,
     limits: Limits,
-    pub(super) date: Option<u64>,
+    phase: Phase,
+    /// The chunk of input being read, all of one delivery.
+    input: Option<Chunk>,
+    peer_ended: bool,
+    frames: codec::Stream<Inputs>,
     headers: wire::HeaderBlocks,
+    encoder: hpack::Encoder,
     streams: BTreeMap<u32, Stream>,
-    send: Arc<Mutex<Outbound>>,
+    children: Option<Slots<u32>>,
     resets: VecDeque<(u32, Instant)>,
+    recv_window: i32,
+    send_window: i32,
+    initial: i32,
+    frame: usize,
     last_stream: u32,
     received_settings: bool,
     awaiting_ack: bool,
     settings_deadline: Option<Instant>,
     continuations: usize,
     error_resets: usize,
+    pending_resets: usize,
+    /// Input arrived since credit last returned.
+    batch: bool,
     draining: bool,
     shutdown_ping: Option<[u8; 8]>,
     shutdown_requested: bool,
     goaway_last: Option<u32>,
+    up: VecDeque<MuxEvent<HttpExchange, Top, Opening>>,
+    out: VecDeque<StreamCommand>,
+    out_bytes: usize,
+    /// What was queued, in order, for the transport's completions.
+    sent: VecDeque<Piece>,
+    /// The stream whose frame went out last, so streams take turns.
+    turn: u32,
+    charge: Option<Charge>,
+    last_words: Option<Charge>,
+    /// The request an HTTP/1 `Upgrade: h2c` brought, for stream 1.
+    upgrade: Option<(Opening, Option<Chunk>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Opening,
+    Open,
+    /// The end is queued behind the output.
+    Closing,
+    Closed,
 }
 
 struct Stream {
-    request: Option<Request<Body>>,
-    body: Vec<u8>,
-    deadline: Option<Instant>,
-    remaining: Option<u64>,
+    child: ChildId,
+    _entry: Charge,
+    accepted: bool,
     recv_closed: bool,
+    remaining: Option<u64>,
+    recv_window: i32,
+    /// Received bytes waiting in `pending` for the child's credit.
+    held: u32,
+    /// Credit the child granted for its events.
+    credit: u64,
+    credited: bool,
+    pending: VecDeque<ExchangeEvent>,
+    overflow: bool,
+    send_window: i32,
+    /// Credit the child holds for its body.
+    granted: u64,
+    out: VecDeque<Chunk>,
+    out_bytes: u64,
+    reply: Reply,
+    written: u64,
 }
 
-impl Stream {
-    /// The bytes its request's head and body hold.
-    fn request_held(&self) -> usize {
-        self.request.as_ref().map_or(0, request_held) + self.body.capacity()
-    }
+enum Reply {
+    Waiting,
+    Body,
+    Ending(Option<Box<HeaderMap>>),
+    Ended,
+}
+
+/// Bytes handed to the transport, and what their completion means.
+struct Piece {
+    stream: u32,
+    bytes: u64,
+    body: u64,
+    end: bool,
 }
 
 /// The stream a client HEADERS lands on.
@@ -84,134 +193,298 @@ enum HeadersOn {
     New,
 }
 
-struct Outbound {
-    recv_window: i32,
-    window: i32,
-    initial: i32,
-    frame: usize,
-    streams: BTreeMap<u32, Window>,
-    pending_resets: usize,
-    encoder: hpack::Encoder,
-}
-
-struct Window {
-    recv_window: i32,
-    available: i32,
-    waker: Option<Waker>,
-    accepted: bool,
-}
-
 impl Http2 {
-    /// Answers requests using the default limits.
-    pub fn new(handler: impl Handler) -> Self {
-        Self::with(Arc::new(handler), Limits::default())
-    }
-
-    /// Answers requests using the supplied handler and limits.
-    pub fn with(handler: Arc<dyn Handler>, limits: Limits) -> Self {
+    /// The connection, with these limits.
+    pub fn new(limits: Limits) -> Self {
         Self {
-            observe: None,
-            handler,
             limits,
-            date: None,
+            phase: Phase::Opening,
+            input: None,
+            peer_ended: false,
+            frames: codec::Stream::new(Inputs::client_side(wire::DEFAULT_FRAME_SIZE)),
             headers: wire::HeaderBlocks::with_limits(wire::Limits {
                 header_list: limits.head.head,
                 header_block: limits.head.head,
                 ..wire::Limits::default()
             }),
+            encoder: hpack::Encoder::new(0),
             streams: BTreeMap::new(),
-            send: Arc::new(Mutex::new(Outbound {
-                window: 65_535,
-                recv_window: 65_535,
-                initial: 65_535,
-                frame: wire::DEFAULT_FRAME_SIZE,
-                streams: BTreeMap::new(),
-                pending_resets: 0,
-                encoder: hpack::Encoder::new(0),
-            })),
-            resets: VecDeque::with_capacity(RESET_MAX),
+            children: None,
+            resets: VecDeque::new(),
+            recv_window: WINDOW,
+            send_window: WINDOW,
+            initial: WINDOW,
+            frame: wire::DEFAULT_FRAME_SIZE,
             last_stream: 0,
             received_settings: false,
             awaiting_ack: true,
             settings_deadline: None,
             continuations: 0,
             error_resets: 0,
+            pending_resets: 0,
+            batch: false,
             draining: false,
             shutdown_ping: None,
             shutdown_requested: false,
             goaway_last: None,
+            up: VecDeque::new(),
+            out: VecDeque::new(),
+            out_bytes: 0,
+            sent: VecDeque::new(),
+            turn: 0,
+            charge: None,
+            last_words: None,
+            upgrade: None,
         }
     }
 
-    /// Receives response completion and cancellation observations.
-    pub fn observe(mut self, observe: super::Observe) -> Self {
-        self.observe = Some(observe);
-        self
+    /// The connection an HTTP/1 `Upgrade: h2c` started: the client's
+    /// `HTTP2-Settings` already apply, and its request is stream 1, with
+    /// the whole body that came with it. The client's preface comes next.
+    pub(super) fn upgraded(
+        limits: Limits,
+        settings: &[wire::Setting],
+        opening: Opening,
+        body: Option<Chunk>,
+    ) -> Self {
+        let mut h2 = Self::new(limits);
+        for setting in settings {
+            // HTTP/1 checked them; none can fail here.
+            let _ = h2.peer_setting(*setting);
+        }
+        h2.last_stream = 1;
+        h2.upgrade = Some((opening, body));
+        h2
     }
 
-    /// Begins graceful shutdown on the next driver wake or input.
-    /// A GOAWAY and PING round trip establishes which requests were in flight;
-    /// those requests finish before the connection closes.
+    /// The child credit each exchange should grant: a stream's whole
+    /// receive window, so the connection never holds body bytes for a child
+    /// that reads.
+    pub const WINDOW: u64 = WINDOW as u64;
+
+    /// Begins graceful shutdown: GOAWAY and a PING, then, once the PING
+    /// comes back and the streams in flight are known, a final GOAWAY. The
+    /// connection closes when those streams finish.
     pub fn graceful_shutdown(&mut self) {
         self.shutdown_requested = true;
     }
 
-    fn arm(&self, driver: &mut Driver<'_, Inputs, Timer>) {
-        let deadline = self
-            .streams
-            .values()
-            .filter_map(|s| s.deadline)
-            .chain(self.resets.front().map(|(_, at)| *at))
-            .chain(self.settings_deadline)
-            .min();
-        if let Some(at) = deadline {
-            driver.set_timer(
-                Timer::Deadline,
-                at.since_start().saturating_sub(driver.now().since_start()),
-            );
-        } else {
-            driver.cancel_timer(Timer::Deadline);
+    /// The streams open now.
+    pub fn streams(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// What the connection holds, as charged to its budget. Output frames,
+    /// request bodies and response bodies carry their own charges.
+    fn holding(&self) -> usize {
+        self.frames
+            .limit()
+            .max(self.frames.allocated())
+            .saturating_add(self.headers.allocated())
+            .saturating_add(self.encoder.held())
+            .saturating_add(self.resets.capacity() * size_of::<(u32, Instant)>())
+            .saturating_add(self.up.capacity() * size_of::<MuxEvent<HttpExchange, Top, Opening>>())
+            .saturating_add(self.out.capacity() * size_of::<StreamCommand>())
+            .saturating_add(self.sent.capacity() * size_of::<Piece>())
+    }
+
+    /// Charges what is held now. Returns whether it fits.
+    fn fits(&mut self) -> bool {
+        let need = self.holding();
+        self.charge.as_mut().is_none_or(|charge| charge.set(need))
+    }
+
+    fn open(&mut self, env: &mut Env<'_, Report>) {
+        self.phase = Phase::Open;
+        // The list of recent resets is held at its bound from the start.
+        let resets = RESET_MAX * size_of::<(u32, Instant)>();
+        let Some(charge) = env.budget().charge(self.holding() + resets) else {
+            self.phase = Phase::Closing;
+            self.out.push_back(StreamCommand::End);
+            return;
+        };
+        self.resets.reserve_exact(RESET_MAX);
+        self.charge = Some(charge);
+        self.last_words = env.budget().charge(LAST_WORDS);
+        self.children = Slots::with_budget(self.limits.streams as usize, env.budget());
+        if self.last_words.is_none() || self.children.is_none() {
+            return self.over_budget(env);
+        }
+        let settings = wire::Settings {
+            flags: 0,
+            entries: vec![
+                wire::Setting {
+                    id: 3,
+                    value: self.limits.streams,
+                },
+                wire::Setting {
+                    id: 6,
+                    value: self.limits.head.head.min(u32::MAX as usize) as u32,
+                },
+            ],
+        };
+        if !self.control(env, wire::HEADER_LEN + 12, &settings) {
+            return;
+        }
+        self.settings_deadline = Some(env.now() + self.limits.header_timeout);
+        if let Some((mut opening, body)) = self.upgrade.take() {
+            opening.at = env.now();
+            let ended = body.is_none();
+            let admitted = self.admit(env, 1, opening, None, ended).is_ok();
+            // The request came whole over HTTP/1: stream 1 is half closed
+            // from the client's side (RFC 7540 section 3.2).
+            if let Some(stream) = self.streams.get_mut(&1) {
+                stream.recv_closed = true;
+            }
+            if admitted && let Some(mut chunk) = body {
+                if chunk.reserve(env.budget()) {
+                    self.tell(1, ExchangeEvent::Data(chunk));
+                } else {
+                    self.tell(1, ExchangeEvent::Overflow(chunk.len() as u64));
+                }
+                self.tell(1, ExchangeEvent::End);
+            }
         }
     }
 
-    fn goaway(&mut self, code: ErrorCode, last: u32, driver: &mut Driver<'_, Inputs, Timer>) {
+    // -----------------------------------------------------------------------
+    // Output
+
+    /// Queues output bytes, charged before they were allocated, for
+    /// `stream` (0 for the connection).
+    fn queue(&mut self, chunk: Chunk, stream: u32, body: u64, end: bool) {
+        let bytes = chunk.len();
+        self.out_bytes += bytes;
+        self.sent.push_back(Piece {
+            stream,
+            bytes: bytes as u64,
+            body,
+            end,
+        });
+        self.out.push_back(StreamCommand::Write(chunk));
+    }
+
+    /// Writes a frame of `len` bytes. Past the budget, the connection ends.
+    /// Returns whether it was queued.
+    fn frame_for<W: Wire<WriteError = wire::Error>>(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        len: usize,
+        frame: &W,
+        stream: u32,
+        end: bool,
+    ) -> bool {
+        let Some(charge) = env.budget().charge(len) else {
+            self.over_budget(env);
+            return false;
+        };
+        let mut bytes = Vec::with_capacity(len);
+        frame
+            .write(&mut bytes)
+            .expect("outbound frame has valid fields");
+        debug_assert_eq!(bytes.len(), len);
+        self.queue(Chunk::with_charge(bytes, charge), stream, 0, end);
+        true
+    }
+
+    /// A connection frame.
+    fn control<W: Wire<WriteError = wire::Error>>(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        len: usize,
+        frame: &W,
+    ) -> bool {
+        self.frame_for(env, len, frame, 0, false)
+    }
+
+    fn goaway(&mut self, env: &mut Env<'_, Report>, code: ErrorCode, last: u32) {
         let last = last.min(self.goaway_last.unwrap_or(wire::MAX_WINDOW));
         self.goaway_last = Some(last);
-        write(
+        self.control(
+            env,
+            LAST_WORDS,
             &wire::GoAway {
                 flags: 0,
                 last_stream: last,
                 code: code as u32,
                 debug: Vec::new(),
             },
-            driver.reply(),
         );
     }
 
-    fn fail(&mut self, error: wire::Error, driver: &mut Driver<'_, Inputs, Timer>) -> Flow {
-        self.goaway(error.code, self.last_stream, driver);
-        Flow::Close
+    /// Ends the connection for `error`: GOAWAY, then the end.
+    fn fail(&mut self, env: &mut Env<'_, Report>, error: wire::Error) {
+        env.report(Report::Failed(error));
+        self.goaway(env, error.code, self.last_stream);
+        self.close();
     }
 
-    fn cancel(&mut self, id: u32, driver: &mut Driver<'_, Inputs, Timer>) {
-        driver.cancel_keyed(u64::from(id));
-        self.send.lock().streams.remove(&id);
-        self.streams.remove(&id);
+    /// Ends the connection once what is queued is written. Every exchange
+    /// still open is told the connection is gone.
+    fn close(&mut self) {
+        if matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return;
+        }
+        let ids: Vec<u32> = self.streams.keys().copied().collect();
+        for id in ids {
+            self.end_stream(id, Ending::Gone);
+        }
+        self.resets = VecDeque::new();
+        self.input = None;
+        self.phase = Phase::Closing;
+        self.out.push_back(StreamCommand::End);
     }
 
-    /// Resets stream `id` and ignores its late frames for a while.
-    fn write_reset(&mut self, id: u32, code: ErrorCode, driver: &mut Driver<'_, Inputs, Timer>) {
-        self.cancel(id, driver);
-        write(
+    /// The connection holds more than its budget allows: nothing more is
+    /// written but GOAWAY with `ENHANCE_YOUR_CALM`, which was paid for at
+    /// the start, and it ends.
+    fn over_budget(&mut self, env: &mut Env<'_, Report>) {
+        if matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return;
+        }
+        env.report(Report::Budget);
+        self.out.clear();
+        self.sent.clear();
+        self.out_bytes = 0;
+        if let Some(charge) = self.last_words.take() {
+            let mut bytes = Vec::with_capacity(LAST_WORDS);
+            wire::GoAway {
+                flags: 0,
+                last_stream: self
+                    .last_stream
+                    .min(self.goaway_last.unwrap_or(wire::MAX_WINDOW)),
+                code: ErrorCode::EnhanceYourCalm as u32,
+                debug: Vec::new(),
+            }
+            .write(&mut bytes)
+            .expect("outbound frame has valid fields");
+            self.queue(Chunk::with_charge(bytes, charge), 0, 0, false);
+        }
+        self.close();
+    }
+
+    /// Resets stream `id` and ignores its late frames for a while. Not an
+    /// error of the client's: it does not count toward the reset limit.
+    fn write_reset(&mut self, env: &mut Env<'_, Report>, id: u32, code: ErrorCode) {
+        if self.streams.contains_key(&id) {
+            self.end_stream(id, Ending::Reset(code));
+        }
+        self.frame_for(
+            env,
+            wire::HEADER_LEN + 4,
             &wire::Reset {
                 stream: id,
                 flags: 0,
                 code: code as u32,
             },
-            driver.reply(),
+            id,
+            false,
         );
         if self.resets.len() < RESET_MAX && !self.resets.iter().any(|(s, _)| *s == id) {
-            self.resets.push_back((id, driver.now() + RESET_LIFETIME));
+            if self.resets.capacity() == 0 {
+                self.resets.reserve_exact(RESET_MAX);
+            }
+            self.resets.push_back((id, env.now() + RESET_LIFETIME));
         }
     }
 
@@ -219,11 +492,11 @@ impl Http2 {
     /// the connection.
     fn reset(
         &mut self,
+        env: &mut Env<'_, Report>,
         id: u32,
         code: ErrorCode,
-        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<(), wire::Error> {
-        self.write_reset(id, code, driver);
+        self.write_reset(env, id, code);
         self.error_resets += 1;
         if self.error_resets > ERROR_RESET_MAX {
             return Err(problem(
@@ -238,88 +511,116 @@ impl Http2 {
         self.resets.iter().any(|(s, _)| *s == id)
     }
 
-    /// Answers stream `id`'s request. `charged` is what the budget already
-    /// counts for its head and body. That is nothing for a stream the
-    /// current frame opened, and never the body bytes the current frame added.
-    fn dispatch(
-        &mut self,
-        id: u32,
-        received: Received,
-        charged: usize,
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) {
-        let stream = self.streams.get_mut(&id).expect("an admitted stream");
-        stream.deadline = None;
-        let held = stream.request_held();
-        let mut request = stream.request.take().expect("request dispatched once");
+    // -----------------------------------------------------------------------
+    // Children
 
-        *request.body_mut() = Body::from(std::mem::take(&mut stream.body));
-        let wants = Asked::of(request.method());
-        let delivery = super::Delivery::new(
-            &self.observe,
-            &request,
-            driver.conn(),
-            driver.now(),
-            received,
-        );
-        let reply = match received {
-            Received::Complete => self.handler.call(
-                request,
-                &mut Exchange::new(driver.now(), driver.entropy(), driver.conn()),
-            ),
-            Received::TooLarge => Reply::Now(text(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "The request body is too large.\n",
-            )),
-            Received::Budget => Reply::Now(text(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The server cannot hold this request now.\n",
-            )),
-            Received::Timeout => Reply::Now(text(
-                StatusCode::REQUEST_TIMEOUT,
-                "The request body took too long.\n",
-            )),
-            Received::CutOff => Reply::Now(text(
-                StatusCode::BAD_REQUEST,
-                "The request body was cut off.\n",
-            )),
+    /// Opens stream `id`'s child with `opening`, or refuses the stream
+    /// when its head and state do not fit the budget.
+    fn admit(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        id: u32,
+        mut opening: Opening,
+        remaining: Option<u64>,
+        ended: bool,
+    ) -> Result<(), wire::Error> {
+        let entry = env.budget().charge(size_of::<(u32, Stream)>());
+        let head = env.budget().charge(request_held(&opening.request));
+        let (Some(entry), Some(head)) = (entry, head) else {
+            return self.reset(env, id, ErrorCode::RefusedStream);
         };
-        let (work, response) = match reply {
-            Reply::Now(response) => {
-                // The response replaces the request in the budget. One the
-                // budget cannot hold gets 503 instead, so it does not end
-                // the connection's other streams.
-                let response = if fits(driver.budget(), response_held(&response), charged) {
-                    response
-                } else {
-                    over_budget()
-                };
-                (None, Some(response))
-            }
-            Reply::Later(work) => (Some(work), None),
+        let Some(child) = self.children.as_mut().and_then(|c| c.insert(id).ok()) else {
+            return self.reset(env, id, ErrorCode::RefusedStream);
         };
-        driver.defer_keyed(
-            u64::from(id),
-            Sending {
-                delivery,
-                id,
-                send: self.send.clone(),
-                // Only work still making its response holds the request.
-                request_held: if work.is_some() { held } else { 0 },
-                budget: driver.budget().cloned(),
-                work,
-                making: None,
-                response,
-                body: None,
-                rest: Bytes::new(),
-                rest_held: 0,
-                wants,
-                date: self.date,
-                asked: driver.now(),
-                end_sent: false,
+        let child_id = child.id();
+        opening.charge = Some(head);
+        opening.ended = ended;
+        self.streams.insert(
+            id,
+            Stream {
+                child: child_id,
+                _entry: entry,
+                accepted: false,
+                recv_closed: ended,
+                remaining,
+                recv_window: WINDOW,
+                held: 0,
+                credit: 0,
+                credited: false,
+                pending: VecDeque::new(),
+                overflow: false,
+                send_window: self.initial,
+                granted: SEND_CREDIT,
+                out: VecDeque::new(),
+                out_bytes: 0,
+                reply: Reply::Waiting,
+                written: 0,
             },
         );
+        self.up
+            .push_back(MuxEvent::Opened(child, opening, SEND_CREDIT));
+        self.up.push_back(MuxEvent::Credit(child_id, SEND_CREDIT));
+        Ok(())
     }
+
+    /// Sends stream `id`'s child `event`, in order behind what waits for
+    /// its credit.
+    fn tell(&mut self, id: u32, event: ExchangeEvent) {
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        let cost = match &event {
+            ExchangeEvent::Data(chunk) => chunk.len() as u64,
+            _ => 0,
+        };
+        if !stream.pending.is_empty() || cost > stream.credit {
+            stream.held = stream.held.saturating_add(cost as u32);
+            stream.pending.push_back(event);
+            return;
+        }
+        stream.credit -= cost;
+        self.up.push_back(MuxEvent::Child(stream.child, event));
+    }
+
+    /// Moves what waits for stream `id`'s credit up, as far as it goes.
+    fn forward(&mut self, id: u32) {
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        while let Some(event) = stream.pending.front() {
+            let cost = match event {
+                ExchangeEvent::Data(chunk) => chunk.len() as u64,
+                _ => 0,
+            };
+            if cost > stream.credit {
+                break;
+            }
+            let event = stream.pending.pop_front().expect("a pending event");
+            stream.credit -= cost;
+            stream.held -= cost as u32;
+            self.up.push_back(MuxEvent::Child(stream.child, event));
+        }
+    }
+
+    /// Stream `id` is over: its child hears why, and its number is free.
+    fn end_stream(&mut self, id: u32, why: Ending) {
+        let Some(stream) = self.streams.remove(&id) else {
+            return;
+        };
+        if let Some(children) = &mut self.children {
+            children.remove(stream.child);
+        }
+        self.up.push_back(MuxEvent::Child(
+            stream.child,
+            ExchangeEvent::Closed {
+                why,
+                written: stream.written,
+            },
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Input
 
     /// Finds the stream a client HEADERS on stream `id` lands on. One on an
     /// even stream, a stream that ended, or one below an identifier already
@@ -349,10 +650,10 @@ impl Http2 {
         Ok(HeadersOn::New)
     }
 
-    fn headers(
+    fn on_headers(
         &mut self,
+        env: &mut Env<'_, Report>,
         read: wire::BlockRead,
-        driver: &mut Driver<'_, Inputs, Timer>,
     ) -> Result<(), wire::Error> {
         let Some(block) = read.block else {
             return Ok(());
@@ -367,26 +668,26 @@ impl Http2 {
         }
         if let Some(stream) = self.streams.get(&id) {
             if stream.recv_closed {
-                return self.reset(id, ErrorCode::StreamClosed, driver);
+                return self.reset(env, id, ErrorCode::StreamClosed);
             }
             if !read.end || !valid_trailers(&block) {
-                return self.reset(id, ErrorCode::ProtocolError, driver);
+                return self.reset(env, id, ErrorCode::ProtocolError);
             }
             if stream.remaining.is_some_and(|n| n != 0) {
-                return self.reset(id, ErrorCode::ProtocolError, driver);
+                return self.reset(env, id, ErrorCode::ProtocolError);
             }
-            let stream = self.streams.get_mut(&id).unwrap();
-            stream.recv_closed = true;
-            if stream.request.is_some() {
-                let charged = stream.request_held();
-                self.dispatch(id, Received::Complete, charged, driver);
-            }
+            let trailers = trailer_map(block);
+            self.streams
+                .get_mut(&id)
+                .expect("an open stream")
+                .recv_closed = true;
+            self.tell(id, ExchangeEvent::Trailers(Box::new(trailers)));
             return Ok(());
         }
         if self.draining || self.streams.len() >= self.limits.streams as usize {
             // A client can open streams before it reads our SETTINGS or GOAWAY,
             // so, as in h2, these refusals do not count as errors.
-            self.write_reset(id, ErrorCode::RefusedStream, driver);
+            self.write_reset(env, id, ErrorCode::RefusedStream);
             return Ok(());
         }
         let list_size: usize = block
@@ -399,12 +700,13 @@ impl Http2 {
             || list_size > self.limits.head.head
         {
             let mut fragment = Vec::new();
-            self.send
-                .lock()
-                .encoder
+            self.encoder
                 .encode_block(&[hpack::Field::new(":status", "431")], &mut fragment)
                 .expect("static header");
-            write(
+            let len = wire::HEADER_LEN + fragment.len();
+            if !self.frame_for(
+                env,
+                len,
                 &wire::Headers {
                     stream: id,
                     flags: 5,
@@ -412,138 +714,117 @@ impl Http2 {
                     priority: None,
                     padding: None,
                 },
-                driver.reply(),
-            );
-            return self.reset(id, ErrorCode::RefusedStream, driver);
+                id,
+                false,
+            ) {
+                return Ok(());
+            }
+            return self.reset(env, id, ErrorCode::RefusedStream);
         }
-        let Some(mut request) = request(block, self.limits) else {
-            return self.reset(id, ErrorCode::ProtocolError, driver);
+        let Some(request) = request(block, self.limits) else {
+            return self.reset(env, id, ErrorCode::ProtocolError);
         };
         let remaining = match content_length(request.headers()) {
             Ok(n) => n,
-            Err(()) => return self.reset(id, ErrorCode::ProtocolError, driver),
+            Err(()) => return self.reset(env, id, ErrorCode::ProtocolError),
         };
         if read.end && remaining.is_some_and(|n| n != 0) {
-            return self.reset(id, ErrorCode::ProtocolError, driver);
+            return self.reset(env, id, ErrorCode::ProtocolError);
         }
-        if !fits(
-            driver.budget(),
-            request_held(&request) + std::mem::size_of::<Stream>(),
-            0,
-        ) {
-            return self.reset(id, ErrorCode::RefusedStream, driver);
-        }
-        request.extensions_mut().insert(driver.conn().clone());
-
-        self.streams.insert(
-            id,
-            Stream {
-                request: Some(request),
-                body: Vec::new(),
-                deadline: (!read.end).then_some(driver.now() + self.limits.body_timeout),
-                remaining,
-                recv_closed: read.end,
-            },
-        );
-        let mut send = self.send.lock();
-        let initial = send.initial;
-        send.streams.insert(
-            id,
-            Window {
-                recv_window: 65_535,
-                available: initial,
-                waker: None,
-                accepted: false,
-            },
-        );
-        drop(send);
-        // Acceptance runs after the current input batch so a reset burst cannot
-        // accumulate abandoned requests faster than the application drains them.
-        driver.defer_keyed(0, Accept(self.send.clone()));
-        if read.end {
-            self.dispatch(id, Received::Complete, 0, driver);
-        }
-        Ok(())
+        self.batch = true;
+        let opening = Opening {
+            request: Box::new(request),
+            ended: read.end,
+            at: env.now(),
+            charge: None,
+        };
+        self.admit(env, id, opening, remaining, read.end)
     }
 
-    fn data(
-        &mut self,
-        data: wire::Data,
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<(), wire::Error> {
+    fn on_data(&mut self, env: &mut Env<'_, Report>, data: wire::Data) -> Result<(), wire::Error> {
         let id = data.stream;
         let size = data.data.len() + data.padding.as_ref().map_or(0, |p| p.len() + 1);
-        let mut send = self.send.lock();
-        send.recv_window -= size as i32;
-        if send.recv_window < 0 {
+        self.recv_window -= size as i32;
+        if self.recv_window < 0 {
             return Err(problem(
                 ErrorCode::FlowControlError,
                 "connection receive window exceeded",
             ));
         }
-        drop(send);
         // The connection window counts every DATA frame, padding and frames for
         // reset streams included. Credit returns after the input batch, so DATA
         // sent before the client saw a WINDOW_UPDATE must fit the old window.
-        driver.defer_keyed(0, Accept(self.send.clone()));
+        self.batch = true;
         if self.ignored(id) {
             return Ok(());
         }
-        let Some(stream) = self.streams.get(&id) else {
+        let Some(stream) = self.streams.get_mut(&id) else {
             if id > self.last_stream || id & 1 == 0 {
                 return Err(problem(ErrorCode::ProtocolError, "data on an idle stream"));
             }
-            return self.reset(id, ErrorCode::StreamClosed, driver);
+            return self.reset(env, id, ErrorCode::StreamClosed);
         };
         if stream.recv_closed {
-            return self.reset(id, ErrorCode::StreamClosed, driver);
+            return self.reset(env, id, ErrorCode::StreamClosed);
         }
-        let mut send = self.send.lock();
-        let window = send.streams.get_mut(&id).expect("an admitted stream");
-        window.recv_window -= size as i32;
-        if window.recv_window < 0 {
-            drop(send);
-            return self.reset(id, ErrorCode::FlowControlError, driver);
+        stream.recv_window -= size as i32;
+        if stream.recv_window < 0 {
+            return self.reset(env, id, ErrorCode::FlowControlError);
         }
-        drop(send);
-        let charged = stream.request_held();
-        let growth = stream
-            .body
-            .len()
-            .saturating_add(data.data.len())
-            .saturating_sub(stream.body.capacity());
-        let room = fits(driver.budget(), growth, 0);
-        let stream = self.streams.get_mut(&id).unwrap();
         if let Some(remaining) = &mut stream.remaining {
             let Some(n) = remaining.checked_sub(data.data.len() as u64) else {
-                return self.reset(id, ErrorCode::ProtocolError, driver);
+                return self.reset(env, id, ErrorCode::ProtocolError);
             };
             *remaining = n;
             if data.flags & 1 != 0 && n != 0 {
-                return self.reset(id, ErrorCode::ProtocolError, driver);
+                return self.reset(env, id, ErrorCode::ProtocolError);
             }
         }
-        stream.recv_closed = data.flags & 1 != 0;
-        if stream.request.is_some() {
-            if stream.body.len().saturating_add(data.data.len()) > self.limits.body {
-                self.dispatch(id, Received::TooLarge, charged, driver);
-            } else if !room || stream.body.try_reserve_exact(data.data.len()).is_err() {
-                self.dispatch(id, Received::Budget, charged, driver);
-            } else {
-                stream.body.extend_from_slice(&data.data);
-                if stream.recv_closed {
-                    self.dispatch(id, Received::Complete, charged, driver);
+        let end = data.flags & 1 != 0;
+        stream.recv_closed = end;
+        if !data.data.is_empty() && !stream.overflow {
+            match env.budget().charge(data.data.capacity()) {
+                Some(charge) => {
+                    let chunk = Chunk::with_charge(data.data, charge);
+                    self.tell(id, ExchangeEvent::Data(chunk));
+                }
+                None => {
+                    // The body is the stream's alone to lose: its child
+                    // answers, and the other streams go on.
+                    let dropped = data.data.len() as u64;
+                    self.streams.get_mut(&id).expect("an open stream").overflow = true;
+                    self.tell(id, ExchangeEvent::Overflow(dropped));
                 }
             }
+        }
+        if end {
+            self.tell(id, ExchangeEvent::End);
         }
         Ok(())
     }
 
-    fn frame(
-        &mut self,
-        frame: Frame,
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<(), wire::Error> {
+    /// Applies one of the client's settings.
+    fn peer_setting(&mut self, setting: wire::Setting) -> Result<(), wire::Error> {
+        match setting.id {
+            1 => self.encoder.set_settings_limit(setting.value as usize),
+            4 => {
+                let initial = setting.value as i32;
+                let delta = initial - self.initial;
+                for stream in self.streams.values_mut() {
+                    stream.send_window =
+                        stream.send_window.checked_add(delta).ok_or_else(|| {
+                            problem(ErrorCode::FlowControlError, "initial window overflow")
+                        })?;
+                }
+                self.initial = initial;
+            }
+            5 => self.frame = setting.value as usize,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_frame(&mut self, env: &mut Env<'_, Report>, frame: Frame) -> Result<(), wire::Error> {
         if !self.received_settings && !matches!(&frame, Frame::Settings(s) if s.flags & 1 == 0) {
             return Err(problem(
                 ErrorCode::ProtocolError,
@@ -569,15 +850,15 @@ impl Http2 {
             Frame::Headers(h) if h.priority.is_some_and(|p| p.stream == h.stream) => {
                 match self.headers_on(h.stream)? {
                     HeadersOn::Reset => {}
-                    HeadersOn::Open => self.reset(h.stream, ErrorCode::ProtocolError, driver)?,
+                    HeadersOn::Open => self.reset(env, h.stream, ErrorCode::ProtocolError)?,
                     HeadersOn::New => {
                         self.last_stream = h.stream;
-                        self.reset(h.stream, ErrorCode::ProtocolError, driver)?;
+                        self.reset(env, h.stream, ErrorCode::ProtocolError)?;
                     }
                 }
             }
-            Frame::Headers(_) | Frame::Continuation(_) => self.headers(headers, driver)?,
-            Frame::Data(data) => self.data(data, driver)?,
+            Frame::Headers(_) | Frame::Continuation(_) => self.on_headers(env, headers)?,
+            Frame::Data(data) => self.on_data(env, data)?,
             Frame::Settings(settings) => {
                 if settings.flags & 1 != 0 {
                     if !self.awaiting_ack {
@@ -590,63 +871,34 @@ impl Http2 {
                     self.settings_deadline = None;
                 } else {
                     self.received_settings = true;
-                    write(
+                    if !self.control(
+                        env,
+                        wire::HEADER_LEN,
                         &wire::Settings {
                             flags: 1,
                             entries: Vec::new(),
                         },
-                        driver.reply(),
-                    );
-                    let mut send = self.send.lock();
+                    ) {
+                        return Ok(());
+                    }
                     for setting in settings.entries {
-                        match setting.id {
-                            1 => send.encoder.set_settings_limit(setting.value as usize),
-                            4 => {
-                                let initial = setting.value as i32;
-                                let delta = initial - send.initial;
-                                for window in send.streams.values_mut() {
-                                    window.available =
-                                        window.available.checked_add(delta).ok_or_else(|| {
-                                            problem(
-                                                ErrorCode::FlowControlError,
-                                                "initial window overflow",
-                                            )
-                                        })?;
-                                    if let Some(waker) = window.waker.take() {
-                                        waker.wake();
-                                    }
-                                }
-                                send.initial = initial;
-                            }
-                            5 => send.frame = setting.value as usize,
-                            _ => {}
-                        }
+                        self.peer_setting(setting)?;
                     }
                 }
             }
             Frame::WindowUpdate(update) => {
-                let mut send = self.send.lock();
                 if update.stream == 0 {
-                    send.window = send
-                        .window
+                    self.send_window = self
+                        .send_window
                         .checked_add(update.increment as i32)
                         .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "connection window overflow")
                         })?;
-                    for window in send.streams.values_mut() {
-                        if let Some(waker) = window.waker.take() {
-                            waker.wake();
-                        }
-                    }
-                } else if let Some(window) = send.streams.get_mut(&update.stream) {
-                    if let Some(n) = window.available.checked_add(update.increment as i32) {
-                        window.available = n;
-                        if let Some(waker) = window.waker.take() {
-                            waker.wake();
-                        }
+                } else if let Some(stream) = self.streams.get_mut(&update.stream) {
+                    if let Some(n) = stream.send_window.checked_add(update.increment as i32) {
+                        stream.send_window = n;
                     } else {
-                        drop(send);
-                        self.reset(update.stream, ErrorCode::FlowControlError, driver)?;
+                        self.reset(env, update.stream, ErrorCode::FlowControlError)?;
                     }
                 } else if update.stream > self.last_stream || update.stream & 1 == 0 {
                     return Err(problem(
@@ -659,38 +911,38 @@ impl Http2 {
                 if reset.stream > self.last_stream || reset.stream & 1 == 0 {
                     return Err(problem(ErrorCode::ProtocolError, "reset on idle stream"));
                 }
-                let mut send = self.send.lock();
-                if send.streams.get(&reset.stream).is_some_and(|s| !s.accepted) {
-                    send.pending_resets += 1;
-                    if send.pending_resets > PENDING_RESET_MAX {
+                if self.streams.get(&reset.stream).is_some_and(|s| !s.accepted) {
+                    self.pending_resets += 1;
+                    if self.pending_resets > PENDING_RESET_MAX {
                         return Err(problem(
                             ErrorCode::EnhanceYourCalm,
                             "too many pending request resets",
                         ));
                     }
                 }
-                drop(send);
-                self.cancel(reset.stream, driver);
+                let code = code_of(reset.code);
+                self.end_stream(reset.stream, Ending::Reset(code));
             }
             Frame::Ping(ping) if ping.flags & 1 == 0 => {
-                write(
+                self.control(
+                    env,
+                    wire::HEADER_LEN + 8,
                     &wire::Ping {
                         flags: 1,
                         opaque: ping.opaque,
                     },
-                    driver.reply(),
                 );
             }
             Frame::Ping(ping) => {
                 if self.shutdown_ping == Some(ping.opaque) {
                     self.shutdown_ping = None;
                     self.draining = true;
-                    self.goaway(ErrorCode::NoError, self.last_stream, driver);
+                    self.goaway(env, ErrorCode::NoError, self.last_stream);
                 }
             }
             Frame::GoAway(_) => {
                 self.draining = true;
-                self.goaway(ErrorCode::NoError, self.last_stream, driver);
+                self.goaway(env, ErrorCode::NoError, self.last_stream);
             }
             Frame::PushPromise(_) => {
                 return Err(problem(
@@ -703,66 +955,9 @@ impl Http2 {
         Ok(())
     }
 
-    fn flow(&mut self, driver: &mut Driver<'_, Inputs, Timer>) -> Flow {
-        if self.shutdown_requested && self.shutdown_ping.is_none() && !self.draining {
-            self.shutdown_requested = false;
-            let opaque = driver.random_u64().to_be_bytes();
-            self.shutdown_ping = Some(opaque);
-            self.goaway(ErrorCode::NoError, wire::MAX_WINDOW, driver);
-            write(&wire::Ping { flags: 0, opaque }, driver.reply());
-        }
-        self.arm(driver);
-        if self.draining && self.streams.is_empty() {
-            Flow::Close
-        } else {
-            Flow::Continue
-        }
-    }
-}
-
-impl serve::Service for Http2 {
-    type Timer = Timer;
-    type Decoder = Inputs;
-    type State = ();
-    type Error = Infallible;
-
-    fn decoder(&self) -> Inputs {
-        Inputs::client_side(wire::DEFAULT_FRAME_SIZE)
-    }
-
-    fn on_open(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<Flow, Infallible> {
-        write(
-            &wire::Settings {
-                flags: 0,
-                entries: vec![
-                    wire::Setting {
-                        id: 3,
-                        value: self.limits.streams,
-                    },
-                    wire::Setting {
-                        id: 6,
-                        value: self.limits.head.head.min(u32::MAX as usize) as u32,
-                    },
-                ],
-            },
-            driver.reply(),
-        );
-        self.settings_deadline = Some(driver.now() + self.limits.header_timeout);
-        Ok(self.flow(driver))
-    }
-
-    fn on_item(
-        &mut self,
-        item: Input,
-        _: &(),
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<Flow, Infallible> {
-        let result = match item {
-            Input::Frame(frame) => self.frame(frame, driver),
+    fn on_input(&mut self, env: &mut Env<'_, Report>, item: Input) -> Result<(), wire::Error> {
+        match item {
+            Input::Frame(frame) => self.on_frame(env, frame),
             Input::Refused {
                 scope: wire::ErrorScope::Connection,
                 error,
@@ -792,166 +987,643 @@ impl serve::Service for Http2 {
                     // ignores the stream's late frames (section 5.1).
                     Ok(())
                 } else if priority || self.streams.contains_key(&header.stream) {
-                    self.reset(header.stream, error.code, driver)
+                    self.reset(env, header.stream, error.code)
                 } else {
                     Ok(())
                 }
             }
             Input::Preface => Ok(()),
-        };
-        if let Err(error) = result {
-            return Ok(self.fail(error, driver));
         }
-        Ok(self.flow(driver))
     }
 
-    fn on_timer(
+    /// Reads input until a bounded number of frames is read, the children
+    /// or the transport fall behind, or no whole frame is left. Returns
+    /// whether anything moved, and whether all the input is read.
+    fn read(&mut self, env: &mut Env<'_, Report>) -> (bool, bool) {
+        let mut moved = false;
+        for _ in 0..FRAMES {
+            if self.phase != Phase::Open || self.up.len() >= UP_LIMIT || self.out_bytes >= OUT_LIMIT
+            {
+                return (moved, false);
+            }
+            if let Some(chunk) = &mut self.input {
+                let n = self.frames.push(chunk);
+                chunk.advance(n);
+                if chunk.is_empty() {
+                    self.input = None;
+                }
+                moved |= n > 0;
+            }
+            if self.input.is_none() && self.peer_ended && !self.frames.is_eof() {
+                self.frames.end();
+            }
+            match self.frames.next() {
+                Some(Ok(item)) => {
+                    moved = true;
+                    if let Err(error) = self.on_input(env, item) {
+                        self.fail(env, error);
+                        return (true, false);
+                    }
+                }
+                Some(Err(fail)) => {
+                    let error = match fail {
+                        Fail::Protocol(error) => error,
+                        _ => problem(ErrorCode::ProtocolError, "truncated HTTP/2 frame"),
+                    };
+                    self.fail(env, error);
+                    return (true, false);
+                }
+                None if self.input.is_some() => {}
+                None => return (moved, true),
+            }
+        }
+        (moved, false)
+    }
+
+    /// The batch of input is read: credit for what the connection no
+    /// longer holds goes back to the client, once it is at least half of
+    /// what the client has left, as h2 does, so many small frames share
+    /// one WINDOW_UPDATE. Streams opened in the batch are taken in.
+    fn release(&mut self, env: &mut Env<'_, Report>) -> bool {
+        let held: i64 = self.streams.values().map(|s| i64::from(s.held)).sum();
+        let used = i64::from(WINDOW - self.recv_window) - held;
+        if used > 0 && used >= i64::from(self.recv_window / 2) {
+            if !self.window_update(env, 0, used as u32) {
+                return true;
+            }
+            self.recv_window += used as i32;
+        }
+        let ids: Vec<u32> = self.streams.keys().copied().collect();
+        for id in ids {
+            let stream = self.streams.get_mut(&id).expect("an open stream");
+            stream.accepted = true;
+            let used = i64::from(WINDOW - stream.recv_window) - i64::from(stream.held);
+            if used > 0 && used >= i64::from(stream.recv_window / 2) {
+                if !self.window_update(env, id, used as u32) {
+                    return true;
+                }
+                if let Some(stream) = self.streams.get_mut(&id) {
+                    stream.recv_window += used as i32;
+                }
+            }
+        }
+        self.pending_resets = 0;
+        self.batch = false;
+        true
+    }
+
+    fn window_update(&mut self, env: &mut Env<'_, Report>, stream: u32, increment: u32) -> bool {
+        self.control(
+            env,
+            wire::HEADER_LEN + 4,
+            &wire::WindowUpdate {
+                stream,
+                flags: 0,
+                increment,
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Responses
+
+    fn on_child(&mut self, env: &mut Env<'_, Report>, child: ChildId, command: ExchangeCommand) {
+        let Some(&id) = self.children.as_ref().and_then(|c| c.get(child)) else {
+            return;
+        };
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        let body = matches!(stream.reply, Reply::Body);
+        match command {
+            ExchangeCommand::Reset(code) => self.write_reset(env, id, code),
+            ExchangeCommand::Head(head) if matches!(stream.reply, Reply::Waiting) => {
+                self.response_head(env, id, *head);
+            }
+            ExchangeCommand::Data(chunk) if body && chunk.len() as u64 <= stream.granted => {
+                stream.granted -= chunk.len() as u64;
+                stream.out_bytes += chunk.len() as u64;
+                stream.out.push_back(chunk);
+            }
+            ExchangeCommand::Trailers(trailers) if body => {
+                stream.reply = Reply::Ending(Some(trailers));
+            }
+            ExchangeCommand::End if body => stream.reply = Reply::Ending(None),
+            // A child that answers out of order, or past its credit, broke
+            // its exchange: the stream alone is reset.
+            _ => self.write_reset(env, id, ErrorCode::InternalError),
+        }
+    }
+
+    /// Encodes a response head as HEADERS and CONTINUATION frames, which go
+    /// out together.
+    fn response_head(&mut self, env: &mut Env<'_, Report>, id: u32, head: ResponseHead) {
+        let mut fields = vec![hpack::Field::new(":status", head.status.as_str())];
+        fields.extend(fields_of(&head.headers));
+        if self.header_block(env, id, &fields, head.end)
+            && let Some(stream) = self.streams.get_mut(&id)
+        {
+            stream.reply = if head.end { Reply::Ended } else { Reply::Body };
+        }
+    }
+
+    /// Writes a header block on stream `id`. Returns whether it went out;
+    /// one that cannot be encoded resets the stream.
+    fn header_block(
         &mut self,
-        _: Timer,
-        _: &(),
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<Flow, Infallible> {
-        let now = driver.now();
+        env: &mut Env<'_, Report>,
+        id: u32,
+        fields: &[hpack::Field],
+        end: bool,
+    ) -> bool {
+        let mut block = Vec::new();
+        // A zero-capacity table keeps response storage bounded while still
+        // honoring the peer's required table-size updates.
+        if self.encoder.encode_block(fields, &mut block).is_err() {
+            self.write_reset(env, id, ErrorCode::InternalError);
+            return false;
+        }
+        let max = self.frame.max(1);
+        let first = block.len().min(max);
+        let frames = 1 + (block.len() - first).div_ceil(max);
+        let len = block.len() + frames * wire::HEADER_LEN;
+        let Some(charge) = env.budget().charge(len) else {
+            self.over_budget(env);
+            return false;
+        };
+        let mut out = Vec::with_capacity(len);
+        let write = |out: &mut Vec<u8>| -> Result<(), wire::Error> {
+            wire::Headers {
+                stream: id,
+                flags: u8::from(end) | if first == block.len() { 4 } else { 0 },
+                fragment: block[..first].to_vec(),
+                padding: None,
+                priority: None,
+            }
+            .write(out)?;
+            let rest = &block[first..];
+            for (index, fragment) in rest.chunks(max).enumerate() {
+                wire::Continuation {
+                    stream: id,
+                    flags: if (index + 1) * max >= rest.len() {
+                        4
+                    } else {
+                        0
+                    },
+                    fragment: fragment.to_vec(),
+                }
+                .write(out)?;
+            }
+            Ok(())
+        };
+        if write(&mut out).is_err() {
+            drop(charge);
+            self.write_reset(env, id, ErrorCode::InternalError);
+            return false;
+        }
+        self.queue(Chunk::with_charge(out, charge), id, 0, end);
+        true
+    }
+
+    /// Frames response bodies within both windows, a frame per stream in
+    /// turn, and the ends of bodies whose bytes are all out.
+    fn send(&mut self, env: &mut Env<'_, Report>) -> bool {
+        let mut moved = false;
+        loop {
+            let mut any = false;
+            let ids: Vec<u32> = self
+                .streams
+                .range(self.turn.saturating_add(1)..)
+                .chain(self.streams.range(..=self.turn))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                if self.out_bytes >= OUT_LIMIT || self.phase != Phase::Open {
+                    return moved;
+                }
+                if self.send_one(env, id) {
+                    self.turn = id;
+                    any = true;
+                    moved = true;
+                }
+            }
+            if !any {
+                return moved;
+            }
+        }
+    }
+
+    /// One frame of stream `id`'s response, if it can go. Returns whether
+    /// one went.
+    fn send_one(&mut self, env: &mut Env<'_, Report>, id: u32) -> bool {
+        let frame = self.frame.min(wire::DEFAULT_FRAME_SIZE);
+        let window = self.send_window.max(0) as usize;
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return false;
+        };
+        if let Some(front) = stream.out.front_mut() {
+            let n = front
+                .len()
+                .min(window)
+                .min(stream.send_window.max(0) as usize)
+                .min(frame);
+            if n == 0 {
+                return false;
+            }
+            let payload = front.split_to(n);
+            if front.is_empty() {
+                stream.out.pop_front();
+            }
+            stream.send_window -= n as i32;
+            stream.out_bytes -= n as u64;
+            self.send_window -= n as i32;
+            let Some(charge) = env.budget().charge(wire::HEADER_LEN) else {
+                self.over_budget(env);
+                return true;
+            };
+            let mut header = Vec::with_capacity(wire::HEADER_LEN);
+            wire::FrameHeader {
+                length: n,
+                kind: 0,
+                flags: 0,
+                stream: id,
+            }
+            .write(&mut header)
+            .expect("outbound frame has valid fields");
+            self.queue(Chunk::with_charge(header, charge), id, 0, false);
+            self.queue(payload, id, n as u64, false);
+            self.grant(id);
+            return true;
+        }
+        match std::mem::replace(&mut stream.reply, Reply::Ended) {
+            Reply::Ending(None) => {
+                self.frame_for(
+                    env,
+                    wire::HEADER_LEN,
+                    &wire::Data {
+                        stream: id,
+                        flags: 1,
+                        data: Vec::new(),
+                        padding: None,
+                    },
+                    id,
+                    true,
+                );
+                true
+            }
+            Reply::Ending(Some(trailers)) => {
+                let fields = fields_of(&trailers);
+                self.header_block(env, id, &fields, true);
+                true
+            }
+            other => {
+                stream.reply = other;
+                false
+            }
+        }
+    }
+
+    /// Gives stream `id`'s child more credit for its body, as the bytes it
+    /// sent go out.
+    fn grant(&mut self, id: u32) {
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        let more = SEND_CREDIT.saturating_sub(stream.granted + stream.out_bytes);
+        if more > 0 && matches!(stream.reply, Reply::Body) {
+            stream.granted += more;
+            self.up.push_back(MuxEvent::Credit(stream.child, more));
+        }
+    }
+
+    /// The transport took `n` more bytes: the frames they finish count for
+    /// their streams, and a stream whose response's end went out is over.
+    fn written(&mut self, env: &mut Env<'_, Report>, mut n: u64) {
+        let mut touched: Vec<u32> = Vec::new();
+        let mut finished: Vec<u32> = Vec::new();
+        while n > 0 {
+            let Some(piece) = self.sent.front_mut() else {
+                break;
+            };
+            let step = n.min(piece.bytes);
+            piece.bytes -= step;
+            n -= step;
+            self.out_bytes = self.out_bytes.saturating_sub(step as usize);
+            if piece.bytes > 0 {
+                break;
+            }
+            let piece = self.sent.pop_front().expect("a piece");
+            if self.sent.is_empty() {
+                self.sent = VecDeque::new();
+            }
+            if piece.stream == 0 {
+                continue;
+            }
+            if let Some(stream) = self.streams.get_mut(&piece.stream) {
+                if piece.body > 0 {
+                    stream.written += piece.body;
+                    if !touched.contains(&piece.stream) {
+                        touched.push(piece.stream);
+                    }
+                }
+                if piece.end {
+                    finished.push(piece.stream);
+                }
+            }
+        }
+        for id in touched {
+            if let Some(stream) = self.streams.get(&id)
+                && !finished.contains(&id)
+            {
+                self.up.push_back(MuxEvent::Child(
+                    stream.child,
+                    ExchangeEvent::Written(stream.written),
+                ));
+            }
+        }
+        for id in finished {
+            let open = self.streams.get(&id).is_some_and(|s| !s.recv_closed);
+            self.end_stream(id, Ending::Done);
+            if open {
+                // The response is complete but the request is not: ask the
+                // client to stop sending it, without an error (RFC 9113
+                // section 8.1). Not the client's error, so not counted.
+                self.write_reset(env, id, ErrorCode::NoError);
+            }
+        }
+    }
+}
+
+impl Layer for Http2 {
+    type Lower = ByteStream;
+    type Upper = Mux<HttpExchange, Top, Opening>;
+    type Report = Report;
+    type Timer = Timer;
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn report_bytes(_: &Report) -> Option<usize> {
+        Some(0)
+    }
+
+    fn on_event(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        event: StreamEvent,
+    ) -> Result<Admit<StreamEvent>, Infallible> {
+        if self.phase == Phase::Opening {
+            self.open(env);
+        }
+        match event {
+            StreamEvent::Data(chunk) => {
+                if matches!(self.phase, Phase::Closing | Phase::Closed) || self.peer_ended {
+                    return Ok(Admit::Closed(StreamEvent::Data(chunk)));
+                }
+                if chunk.is_empty() {
+                    return Ok(Admit::Taken);
+                }
+                // One delivery at a time, read whole before the next, and
+                // none while the transport falls behind. The delivery keeps
+                // whatever charge it came with: the bytes are read from it
+                // into the frame buffer, which is held at its bound.
+                if self.input.is_some() || self.out_bytes >= OUT_LIMIT {
+                    return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
+                }
+                self.input = Some(chunk);
+                Ok(Admit::Taken)
+            }
+            StreamEvent::Written(n) => {
+                self.written(env, n);
+                Ok(Admit::Taken)
+            }
+            StreamEvent::Ended => {
+                self.peer_ended = true;
+                Ok(Admit::Taken)
+            }
+            StreamEvent::Reset => {
+                let ids: Vec<u32> = self.streams.keys().copied().collect();
+                for id in ids {
+                    self.end_stream(id, Ending::Gone);
+                }
+                self.out.clear();
+                self.sent.clear();
+                self.out_bytes = 0;
+                self.input = None;
+                self.resets = VecDeque::new();
+                self.phase = Phase::Closed;
+                Ok(Admit::Taken)
+            }
+        }
+    }
+
+    fn on_command(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        command: MuxCommand<HttpExchange, Top>,
+    ) -> Result<Admit<MuxCommand<HttpExchange, Top>>, Infallible> {
+        if self.phase == Phase::Opening {
+            self.open(env);
+        }
+        if matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return Ok(Admit::Taken);
+        }
+        // A response head is framed at once: it waits while the transport
+        // falls behind.
+        if matches!(command.op(), MuxOp::Child(_, ExchangeCommand::Head(_)))
+            && self.out_bytes >= OUT_LIMIT
+        {
+            return Ok(Admit::Blocked(command));
+        }
+        match command.into_op() {
+            MuxOp::Child(child, command) => {
+                self.on_child(env, child, command);
+                Ok(Admit::Taken)
+            }
+            MuxOp::Credit(child, units) => {
+                if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child)) {
+                    if let Some(stream) = self.streams.get_mut(&id) {
+                        stream.credit = stream.credit.saturating_add(units);
+                        stream.credited = true;
+                    }
+                    self.forward(id);
+                }
+                Ok(Admit::Taken)
+            }
+            MuxOp::Close(child) => {
+                // The children refused or dropped this exchange: its stream
+                // is refused, or reset if its response had begun.
+                if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child))
+                    && let Some(stream) = self.streams.get(&id)
+                {
+                    let code = if matches!(stream.reply, Reply::Waiting) {
+                        ErrorCode::RefusedStream
+                    } else {
+                        ErrorCode::InternalError
+                    };
+                    self.write_reset(env, id, code);
+                }
+                Ok(Admit::Taken)
+            }
+            MuxOp::Control(never) => match never {},
+        }
+    }
+
+    fn on_timer(&mut self, env: &mut Env<'_, Report>, _: Timer) -> Result<(), Infallible> {
+        let now = env.now();
+        if self.phase != Phase::Open {
+            return Ok(());
+        }
         if self.settings_deadline.is_some_and(|at| at <= now) {
-            return Ok(self.fail(
+            self.settings_deadline = None;
+            self.fail(
+                env,
                 problem(
                     ErrorCode::SettingsTimeout,
                     "SETTINGS acknowledgment timed out",
                 ),
-                driver,
-            ));
+            );
+            return Ok(());
         }
         while self.resets.front().is_some_and(|(_, at)| *at <= now) {
             self.resets.pop_front();
         }
-        let expired: Vec<_> = self
-            .streams
-            .iter()
-            .filter(|(_, s)| s.deadline.is_some_and(|at| at <= now))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            let charged = self.streams[&id].request_held();
-            self.dispatch(id, Received::Timeout, charged, driver);
-        }
-        Ok(self.flow(driver))
-    }
-
-    fn on_wake(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<Flow, Infallible> {
-        Ok(self.flow(driver))
-    }
-
-    fn on_done(
-        &mut self,
-        key: u64,
-        done: Done,
-        _: &(),
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<Flow, Infallible> {
-        let id = key as u32;
-        if id == 0 {
-            return Ok(self.flow(driver));
-        }
-        let code = match done {
-            Done::Failed(_) => Some(ErrorCode::InternalError),
-            // The response is complete but the request is not: ask the client
-            // to stop sending it, without an error (RFC 9113 section 8.1).
-            Done::Finished if self.streams.get(&id).is_some_and(|s| !s.recv_closed) => {
-                Some(ErrorCode::NoError)
-            }
-            Done::Finished => None,
-        };
-        if let Some(code) = code {
-            // These resets are not for the client's errors, so, as in h2,
-            // they do not count toward the limit on error resets.
-            self.write_reset(id, code, driver);
-        } else {
-            self.streams.remove(&id);
-            self.send.lock().streams.remove(&id);
-        }
-        Ok(self.flow(driver))
-    }
-
-    fn on_fail(
-        &mut self,
-        error: &Fail<wire::Error>,
-        _: &(),
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<(), Infallible> {
-        let error = match error {
-            Fail::Protocol(error) => *error,
-            _ => problem(ErrorCode::ProtocolError, "truncated HTTP/2 frame"),
-        };
-        self.fail(error, driver);
         Ok(())
     }
 
-    fn on_end(
-        &mut self,
-        end: Ended,
-        _: &(),
-        driver: &mut Driver<'_, Inputs, Timer>,
-    ) -> Result<(), Infallible> {
-        if end == Ended::Budget {
-            // Tell the client why its streams stop, rather than just closing.
-            self.goaway(ErrorCode::EnhanceYourCalm, self.last_stream, driver);
+    fn advance(&mut self, env: &mut Env<'_, Report>) -> Result<bool, Infallible> {
+        let mut moved = false;
+        if self.phase == Phase::Opening {
+            self.open(env);
+            moved = true;
         }
-        self.streams.clear();
-        self.send.lock().streams.clear();
-        self.resets = VecDeque::new();
-
-        Ok(())
+        if self.phase != Phase::Open {
+            return Ok(moved);
+        }
+        if self.shutdown_requested && self.shutdown_ping.is_none() && !self.draining {
+            self.shutdown_requested = false;
+            let opaque = env.entropy().random_u64().to_be_bytes();
+            self.shutdown_ping = Some(opaque);
+            self.goaway(env, ErrorCode::NoError, wire::MAX_WINDOW);
+            self.control(env, wire::HEADER_LEN + 8, &wire::Ping { flags: 0, opaque });
+            moved = true;
+        }
+        let (read, drained) = self.read(env);
+        moved |= read;
+        // The batch is over once every byte of it is read and handed up,
+        // and every child it opened has granted its first credit.
+        if drained
+            && self.batch
+            && self.up.is_empty()
+            && self.streams.values().all(|s| s.credited)
+            && self.phase == Phase::Open
+        {
+            moved |= self.release(env);
+        }
+        if self.phase == Phase::Open {
+            moved |= self.send(env);
+        }
+        if self.phase == Phase::Open && self.draining && self.streams.is_empty() {
+            self.close();
+            moved = true;
+        }
+        if self.phase == Phase::Open && drained && self.peer_ended && self.input.is_none() {
+            // The client sent everything: what is queued goes out, and the
+            // connection ends with no GOAWAY.
+            self.close();
+            moved = true;
+        }
+        if matches!(self.phase, Phase::Open) && !self.fits() {
+            self.over_budget(env);
+            moved = true;
+        }
+        Ok(moved)
     }
 
-    fn held(&self) -> usize {
-        self.headers.allocated()
-            + self.resets.capacity() * std::mem::size_of::<(u32, Instant)>()
-            + self
-                .streams
-                .values()
-                .map(|s| {
-                    std::mem::size_of::<Stream>()
-                        + s.body.capacity()
-                        + s.request.as_ref().map_or(0, request_held)
-                })
-                .sum::<usize>()
-            + {
-                let send = self.send.lock();
-                send.streams.len() * std::mem::size_of::<(u32, Window)>() + send.encoder.held()
-            }
+    fn take_command(&mut self) -> Option<StreamCommand> {
+        let command = self.out.pop_front()?;
+        if matches!(command, StreamCommand::End | StreamCommand::Reset) {
+            self.phase = Phase::Closed;
+        }
+        if self.out.is_empty() {
+            // Queues hold nothing while the connection is idle; the next
+            // advance charges what is left.
+            self.out = VecDeque::new();
+        }
+        Some(command)
     }
-}
 
-/// Whether `budget` can hold `size` more bytes once the `released` bytes
-/// it counts now are let go.
-fn fits(budget: Option<&fictionet::stdlib::layer::Budget>, size: usize, released: usize) -> bool {
-    budget.is_none_or(|b| size <= b.limit().saturating_sub(b.used().saturating_sub(released)))
+    fn take_event(&mut self) -> Option<MuxEvent<HttpExchange, Top, Opening>> {
+        let event = self.up.pop_front()?;
+        if self.up.is_empty() {
+            self.up = VecDeque::new();
+        }
+        Some(event)
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.phase == Phase::Closed
+    }
+
+    fn deadline(&self) -> Option<(Instant, Timer)> {
+        if self.phase != Phase::Open {
+            return None;
+        }
+        self.resets
+            .front()
+            .map(|(_, at)| *at)
+            .into_iter()
+            .chain(self.settings_deadline)
+            .min()
+            .map(|at| (at, Timer::Deadline))
+    }
 }
 
 fn problem(code: ErrorCode, reason: &'static str) -> wire::Error {
     wire::Error { code, reason }
 }
 
-fn write<W: Wire<WriteError = wire::Error>>(frame: &W, out: &mut Vec<u8>) {
-    frame.write(out).expect("outbound frame has valid fields");
+/// The code of a wire value, with unknown codes treated as `INTERNAL_ERROR`
+/// (RFC 9113 section 7).
+fn code_of(code: u32) -> ErrorCode {
+    use ErrorCode::*;
+    [
+        NoError,
+        ProtocolError,
+        InternalError,
+        FlowControlError,
+        SettingsTimeout,
+        StreamClosed,
+        FrameSizeError,
+        RefusedStream,
+        Cancel,
+        CompressionError,
+        ConnectError,
+        EnhanceYourCalm,
+        InadequateSecurity,
+        Http11Required,
+    ]
+    .get(code as usize)
+    .copied()
+    .unwrap_or(InternalError)
 }
 
-fn window_update(stream: u32, increment: usize, out: &mut Vec<u8>) {
-    write(
-        &wire::WindowUpdate {
-            stream,
-            flags: 0,
-            increment: increment as u32,
-        },
-        out,
-    );
+/// Fields HTTP/2 carries of `headers`: never the connection-specific ones
+/// (RFC 9113 section 8.2.2).
+fn fields_of(headers: &HeaderMap) -> Vec<hpack::Field> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+            )
+        })
+        .map(|(name, value)| hpack::Field::new(name.as_str(), value.as_bytes()))
+        .collect()
 }
 
-fn content_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
+pub(super) fn content_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
     let mut length = None;
     for value in headers.get_all("content-length") {
         let value = value.to_str().map_err(|_| ())?;
@@ -976,6 +1648,20 @@ fn valid_trailers(block: &hpack::Block) -> bool {
         })
 }
 
+/// A checked trailer block as a map.
+fn trailer_map(block: hpack::Block) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for h in block.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(&h.name),
+            HeaderValue::from_bytes(&h.value),
+        ) {
+            map.append(name, value);
+        }
+    }
+    map
+}
+
 fn valid_name(name: &[u8]) -> bool {
     !name.iter().any(u8::is_ascii_uppercase)
         && HeaderName::from_bytes(name).is_ok()
@@ -985,7 +1671,7 @@ fn valid_name(name: &[u8]) -> bool {
         )
 }
 
-fn request(block: hpack::Block, limits: Limits) -> Option<Request<Body>> {
+fn request(block: hpack::Block, limits: Limits) -> Option<Request<()>> {
     if block.more != 0 || block.headers.len() > limits.head.headers {
         return None;
     }
@@ -1065,335 +1751,30 @@ fn request(block: hpack::Block, limits: Limits) -> Option<Request<Body>> {
         .method(method)
         .uri(http::Uri::from_parts(uri).ok()?)
         .version(Version::HTTP_2)
-        .body(Body::empty())
+        .body(())
         .ok()?;
     *request.headers_mut() = headers;
     Some(request)
 }
 
-struct Accept(Arc<Mutex<Outbound>>);
-
-impl Pending for Accept {
-    fn poll_next(
-        &mut self,
-        _: &mut PendingDriver<'_>,
-        _: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, Error>>> {
-        let mut send = self.0.lock();
-        let mut out = Vec::new();
-        release_window(0, &mut send.recv_window, &mut out);
-        for (&id, stream) in &mut send.streams {
-            stream.accepted = true;
-            release_window(id, &mut stream.recv_window, &mut out);
-        }
-        send.pending_resets = 0;
-        if out.is_empty() {
-            Poll::Ready(None)
-        } else {
-            Poll::Ready(Some(Ok(out)))
-        }
-    }
-}
-
-/// Returns the credit DATA used once it is at least half of what the client
-/// has left, as h2 does, so many small frames share one WINDOW_UPDATE.
-fn release_window(id: u32, window: &mut i32, out: &mut Vec<u8>) {
-    let used = 65_535 - *window;
-    if used > 0 && used >= *window / 2 {
-        window_update(id, used as usize, out);
-        *window = 65_535;
-    }
-}
-
-fn response_held(response: &Response<Body>) -> usize {
-    let headers = response.headers();
-    let slots = headers.capacity() + headers.len() - headers.keys_len();
-    response.body().full_len()
-        + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
-        + headers
-            .iter()
-            .map(|(n, v)| n.as_str().len() + v.as_bytes().len())
-            .sum::<usize>()
-}
-
-fn over_budget() -> Response<Body> {
-    text(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "The server cannot hold this response now.\n",
-    )
-}
-
-type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
-
-struct Sending {
-    delivery: Option<super::Delivery>,
-    budget: Option<fictionet::stdlib::layer::Budget>,
-    id: u32,
-    send: Arc<Mutex<Outbound>>,
-    work: Option<Later>,
-    making: Option<Making>,
-    response: Option<Response<Body>>,
-    body: Option<Body>,
-    rest: Bytes,
-    rest_held: usize,
-    request_held: usize,
-    /// What the request's method asks of the response's body.
-    wants: Asked,
-    date: Option<u64>,
-    asked: Instant,
-    end_sent: bool,
-}
-
-impl Sending {
-    fn headers(&mut self, fields: &[hpack::Field], end: bool) -> Result<Vec<u8>, Error> {
-        let mut block = Vec::new();
-        // A zero-capacity table keeps response storage bounded while still
-        // honoring the peer's required table-size updates.
-        self.send.lock().encoder.encode_block(fields, &mut block)?;
-        let mut out = Vec::new();
-        let max = self.send.lock().frame;
-        let first = block.len().min(max);
-        wire::Headers {
-            stream: self.id,
-            flags: u8::from(end) | if first == block.len() { 4 } else { 0 },
-            fragment: block[..first].to_vec(),
-            padding: None,
-            priority: None,
-        }
-        .write(&mut out)?;
-        let rest = &block[first..];
-        for (index, fragment) in rest.chunks(max).enumerate() {
-            wire::Continuation {
-                stream: self.id,
-                flags: if (index + 1) * max >= rest.len() {
-                    4
-                } else {
-                    0
-                },
-                fragment: fragment.to_vec(),
-            }
-            .write(&mut out)?;
-        }
-        if let Some(delivery) = &mut self.delivery {
-            delivery.piece(out.len(), 0);
-        }
-        Ok(out)
-    }
-}
-
-impl Pending for Sending {
-    fn poll_next(
-        &mut self,
-        driver: &mut PendingDriver<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, Error>>> {
-        if let Some(delivery) = &mut self.delivery {
-            delivery.update(driver.written());
-        }
-        if let Some(work) = self.work.take() {
-            self.making = Some(match driver.fcx() {
-                Some(fcx) => work(fcx.clone()),
-                None => Box::pin(std::future::ready(Err(Error::msg(
-                    "this answer needs a Cx: use Harness::with_fcx",
-                )))),
-            });
-        }
-        if let Some(making) = &mut self.making {
-            let response = match making.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(response)) => response,
-                // An error on the stream's work resets it unanswered.
-                Poll::Ready(Err(error)) if error.is::<Reset>() => {
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Ready(Err(error)) => error_response(&error),
-            };
-            self.making = None;
-            // The response replaces the request in the budget. One it cannot
-            // hold gets 503, so the other streams go on.
-            let room = fits(
-                self.budget.as_ref(),
-                response_held(&response),
-                self.request_held,
-            );
-            self.request_held = 0;
-            self.response = Some(if room { response } else { over_budget() });
-        }
-        if let Some(response) = self.response.take() {
-            let (parts, body) = response.into_parts();
-            if let Some(delivery) = &mut self.delivery {
-                delivery.response(&parts);
-            }
-            let now = driver.fcx().map_or(self.asked, Cx::now);
-            let date = self.date.and_then(|date| {
-                HeaderValue::from_str(&super::http_date(
-                    date.saturating_add(now.since_start().as_secs()),
-                ))
-                .ok()
-            });
-            let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), self.wants, date);
-            let mut fields = vec![hpack::Field::new(":status", parts.status.as_str())];
-            for (name, value) in &parts.headers {
-                if matches!(
-                    name.as_str(),
-                    "connection"
-                        | "content-length"
-                        | "proxy-connection"
-                        | "keep-alive"
-                        | "transfer-encoding"
-                        | "upgrade"
-                ) {
-                    continue;
-                }
-                fields.push(hpack::Field::new(name.as_str(), value.as_bytes()));
-            }
-            // Preserve a valid field that agrees with the response policy. On
-            // 304 it describes the selected representation, not the absent body.
-            let supplied_length = content_length(&parts.headers)
-                .ok()
-                .flatten()
-                .filter(|&length| {
-                    policy.len == Some(length) || parts.status == StatusCode::NOT_MODIFIED
-                })
-                .and_then(|_| parts.headers.get("content-length"));
-            if let Some(length) = supplied_length {
-                fields.push(hpack::Field::new("content-length", length.as_bytes()));
-            } else if let Some(length) = policy.len {
-                fields.push(hpack::Field::new("content-length", length.to_string()));
-            }
-            if let Some(date) = policy.date {
-                fields.push(hpack::Field::new("date", date.as_bytes()));
-            }
-            self.end_sent = policy.bodiless || body.is_end_stream();
-            if !self.end_sent {
-                self.body = Some(body);
-            }
-            return Poll::Ready(Some(self.headers(&fields, self.end_sent)));
-        }
-        loop {
-            if !self.rest.is_empty() {
-                let mut send = self.send.lock();
-                let capacity = send.window.max(0) as usize;
-                let frame = send.frame.min(wire::DEFAULT_FRAME_SIZE);
-                let Some(window) = send.streams.get_mut(&self.id) else {
-                    return Poll::Ready(None);
-                };
-                let n = self
-                    .rest
-                    .len()
-                    .min(capacity)
-                    .min(window.available.max(0) as usize)
-                    .min(frame);
-                if n == 0 {
-                    let old = window.waker.replace(cx.waker().clone());
-                    drop(send);
-                    drop(old);
-                    return Poll::Pending;
-                }
-                window.available -= n as i32;
-                send.window -= n as i32;
-                drop(send);
-                let data = self.rest.split_to(n).to_vec();
-                if self.rest.is_empty() {
-                    self.rest = Bytes::new();
-                    self.rest_held = 0;
-                }
-                if let Some(delivery) = &mut self.delivery {
-                    delivery.piece(9 + data.len(), data.len());
-                }
-                return Poll::Ready(Some(
-                    wire::Data {
-                        stream: self.id,
-                        flags: 0,
-                        data,
-                        padding: None,
-                    }
-                    .to_bytes()
-                    .map_err(Into::into),
-                ));
-            }
-            if self.end_sent {
-                if let Some(delivery) = &mut self.delivery {
-                    delivery.finish(driver.written(), true);
-                }
-                return Poll::Ready(None);
-            }
-            let Some(body) = &mut self.body else {
-                self.end_sent = true;
-                if let Some(delivery) = &mut self.delivery {
-                    delivery.piece(9, 0);
-                }
-                return Poll::Ready(Some(
-                    wire::Data {
-                        stream: self.id,
-                        flags: 1,
-                        data: Vec::new(),
-                        padding: None,
-                    }
-                    .to_bytes()
-                    .map_err(Into::into),
-                ));
-            };
-            let held = body.full_len();
-            match Pin::new(body).poll_frame(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => self.body = None,
-                Poll::Ready(Some(Err(error))) => {
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(data) => {
-                        // The headers are out, so a chunk the budget cannot
-                        // hold resets this stream alone.
-                        if !fits(self.budget.as_ref(), data.len(), held) {
-                            return Poll::Ready(Some(Err(Error::msg(
-                                "response body exceeds budget",
-                            ))));
-                        }
-                        self.rest_held = data.len();
-                        self.rest = data;
-                    }
-                    Err(frame) => {
-                        if let Ok(trailers) = frame.into_trailers() {
-                            let fields: Vec<_> = trailers
-                                .iter()
-                                .map(|(n, v)| hpack::Field::new(n.as_str(), v.as_bytes()))
-                                .collect();
-                            self.end_sent = true;
-                            self.body = None;
-                            return Poll::Ready(Some(self.headers(&fields, true)));
-                        }
-                    }
-                },
-            }
-        }
-    }
-
-    fn cancel(&mut self, driver: &mut PendingDriver<'_>) {
-        if let Some(delivery) = &mut self.delivery {
-            delivery.finish(driver.written(), false);
-        }
-    }
-
-    fn held(&self) -> usize {
-        self.delivery.as_ref().map_or(0, |delivery| delivery.held)
-            + self.request_held
-            + self.rest_held
-            + self.body.as_ref().map_or(0, Body::full_len)
-            + self.response.as_ref().map_or(0, response_held)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{HttpOptions, PREFACE};
+    use super::super::{Body, Exchange, Handler, HttpOptions, Reply, text};
     use super::*;
+    use fictionet::Cx;
+    use fictionet::stdlib::layer::Harness;
     use fictionet::stdlib::network::{ConnError, Connection};
     use fictionet::stdlib::services::serve::ConnInfo;
-    use std::future::poll_fn;
+    use fictionet::stdlib::services::stack::Polling;
+    use fictionet::sync::Mutex;
+    use http::StatusCode;
+    use std::future::{Future, poll_fn};
     use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
     struct StalledBody {
-        input: Bytes,
+        input: bytes::Bytes,
         output: Arc<Mutex<Vec<u8>>>,
     }
 
@@ -1432,7 +1813,7 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(1),
             |fcx| async move {
-                let mut input = PREFACE.to_vec();
+                let mut input = wire::PREFACE.to_vec();
                 input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
                 // POST / over HTTP, with no END_STREAM on the headers.
                 let block = b"\x83\x86\x84\x01\x01a";
@@ -1441,7 +1822,7 @@ mod tests {
                 let output = Arc::new(Mutex::new(Vec::new()));
                 let conn = StalledBody {
                     output: output.clone(),
-                    input: Bytes::from(input),
+                    input: bytes::Bytes::from(input),
                 };
                 let duration = Duration::from_millis(40);
                 let opts = HttpOptions {
@@ -1507,9 +1888,27 @@ mod tests {
         }
     }
 
+    fn harness() -> Harness<Http2Server> {
+        Harness::new(
+            fictionet::Seed::from_u64(1),
+            Responder::new(NotFound).http2(),
+        )
+        .with_worker(Polling::new())
+    }
+
+    /// The client sends `bytes`; what the server wrote back.
+    fn push(harness: &mut Harness<Http2Server>, bytes: &[u8]) -> Vec<u8> {
+        harness.push(bytes).unwrap();
+        harness.take_output()
+    }
+
+    fn write<W: Wire<WriteError = wire::Error>>(frame: &W, out: &mut Vec<u8>) {
+        frame.write(out).expect("outbound frame has valid fields");
+    }
+
     /// The client preface, its SETTINGS, and its acknowledgment of the server's.
     fn client_preface() -> Vec<u8> {
-        let mut bytes = PREFACE.to_vec();
+        let mut bytes = wire::PREFACE.to_vec();
         for flags in [0, 1] {
             write(
                 &wire::Settings {
@@ -1553,9 +1952,8 @@ mod tests {
     #[test]
     fn self_dependent_headers_preserve_compression_across_continuations() {
         for fragmented in [false, true] {
-            let mut harness =
-                serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
-            harness.push(&client_preface()).unwrap();
+            let mut harness = harness();
+            push(&mut harness, &client_preface());
             let mut encoder = hpack::Encoder::new(4096);
             let fields = [
                 hpack::Field::new(":method", "GET"),
@@ -1601,7 +1999,7 @@ mod tests {
             }
             .write(&mut input)
             .unwrap();
-            let output = frames(&harness.push(&input).unwrap());
+            let output = frames(&push(&mut harness, &input));
             assert!(output.iter().any(|f| matches!(f, Frame::Reset(r)
                 if r.stream == 1 && r.code == ErrorCode::ProtocolError as u32)));
             assert!(
@@ -1610,7 +2008,7 @@ mod tests {
                     .any(|f| matches!(f, Frame::Headers(h) if h.stream == 3))
             );
             assert!(!output.iter().any(|f| matches!(f, Frame::GoAway(_))));
-            assert!(!harness.closed());
+            assert!(!harness.ended());
         }
     }
 
@@ -1620,32 +2018,30 @@ mod tests {
         // ends the connection (RFC 9113 sections 5.1 and 5.1.1), whatever
         // priority the frame carries.
         for (open, again) in [(1, 1), (5, 3)] {
-            let mut harness =
-                serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
-            harness.push(&client_preface()).unwrap();
-            let output = frames(&harness.push(&post(open, false)).unwrap());
+            let mut harness = harness();
+            push(&mut harness, &client_preface());
+            let output = frames(&push(&mut harness, &post(open, false)));
             assert!(
                 output
                     .iter()
                     .any(|f| matches!(f, Frame::Headers(h) if h.stream == open))
             );
-            let output = frames(&harness.push(&post(again, true)).unwrap());
+            let output = frames(&push(&mut harness, &post(again, true)));
             assert!(
                 output.iter().any(|f| matches!(f, Frame::GoAway(g)
                     if g.last_stream == open && g.code == ErrorCode::ProtocolError as u32)),
                 "{output:?}"
             );
             assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
-            assert!(harness.closed());
+            assert!(harness.ended());
         }
     }
 
     #[test]
     fn late_frames_on_a_reset_stream_are_ignored() {
-        let mut harness =
-            serve::Harness::new(fictionet::Seed::from_u64(1), Http2::new(NotFound), ());
-        harness.push(&client_preface()).unwrap();
-        let output = frames(&harness.push(&post(1, true)).unwrap());
+        let mut harness = harness();
+        push(&mut harness, &client_preface());
+        let output = frames(&push(&mut harness, &post(1, true)));
         assert!(output.iter().any(|f| matches!(f, Frame::Reset(r)
             if r.stream == 1 && r.code == ErrorCode::ProtocolError as u32)));
         // The server reset stream 1, so it ignores the stream's late frames
@@ -1657,8 +2053,8 @@ mod tests {
             // PRIORITY with a 4-byte payload.
             vec![0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0],
         ] {
-            assert_eq!(frames(&harness.push(&late).unwrap()), [], "{late:?}");
+            assert_eq!(frames(&push(&mut harness, &late)), [], "{late:?}");
         }
-        assert!(!harness.closed());
+        assert!(!harness.ended());
     }
 }
