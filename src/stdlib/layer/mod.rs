@@ -150,7 +150,9 @@
 //! 5. **Limits apply before growth.** Charge first, then allocate.
 //! 6. **Progress is bounded and fair.** [`Layer::advance`] moves a bounded
 //!    amount of work per call, and children are visited in a stable,
-//!    rotating order. A stalled child holds only its own credit.
+//!    rotating order. A stalled child holds only its own credit. A
+//!    refused event never holds up a write completion behind it
+//!    ([`Layer::take_urgent`]).
 //! 7. **Timers belong to owners.** A layer keeps its own timers
 //!    ([`Timers`]); they go when the layer goes. A child's timers are keyed
 //!    by its [`ChildId`], generation included.
@@ -372,6 +374,18 @@ pub trait Layer: Sized {
 
     /// Hands over the next event for the port above, if one is ready.
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>>;
+
+    /// Hands over the next event for the port above that must not wait
+    /// behind one the port above has refused, if one is ready: a write
+    /// completion ([`StreamEvent::Written`]) is the one a byte stream has.
+    /// Whoever holds an event the port above refused asks for these, so a
+    /// layer that waits for its writes to complete before it takes more
+    /// input never waits for ever. A layer hands each such event once, from
+    /// this or from [`take_event`](Self::take_event), whichever asks first.
+    /// The port above takes every one it is offered.
+    fn take_urgent(&mut self) -> Option<EventOf<Self::Upper>> {
+        None
+    }
 
     /// Hands over the next piece of work for the world, if there is one.
     fn take_work(&mut self) -> Option<Self::Work> {

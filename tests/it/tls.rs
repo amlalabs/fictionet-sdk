@@ -18,6 +18,8 @@ use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
 #[path = "tls_layer.rs"]
 mod layer;
+#[path = "tls_stack.rs"]
+mod stack;
 
 // ---------------------------------------------------------------------------
 // An in-memory connection pair.

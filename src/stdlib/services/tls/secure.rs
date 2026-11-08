@@ -110,6 +110,10 @@ where
         self.chain.take_event()
     }
 
+    fn take_urgent(&mut self) -> Option<EventOf<U::Upper>> {
+        self.chain.take_urgent()
+    }
+
     fn take_work(&mut self) -> Option<Self::Work> {
         self.chain.take_work()
     }

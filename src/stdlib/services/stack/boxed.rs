@@ -61,6 +61,7 @@ trait Erased<Lo: Port, Up: Port>: Send {
     fn advance(&mut self, env: &mut Env<'_, BoxReport>) -> Result<bool, BoxError>;
     fn take_command(&mut self) -> Option<CommandOf<Lo>>;
     fn take_event(&mut self) -> Option<EventOf<Up>>;
+    fn take_urgent(&mut self) -> Option<EventOf<Up>>;
     fn take_work(&mut self) -> Option<BoxWork>;
     fn deadline(&self) -> Option<Instant>;
 }
@@ -127,6 +128,10 @@ where
 
     fn take_event(&mut self) -> Option<EventOf<Up>> {
         Layer::take_event(self)
+    }
+
+    fn take_urgent(&mut self) -> Option<EventOf<Up>> {
+        Layer::take_urgent(self)
     }
 
     fn take_work(&mut self) -> Option<BoxWork> {
@@ -203,6 +208,10 @@ impl<Lo: Port, Up: Port> Layer for Boxed<Lo, Up> {
 
     fn take_event(&mut self) -> Option<EventOf<Up>> {
         self.inner.take_event()
+    }
+
+    fn take_urgent(&mut self) -> Option<EventOf<Up>> {
+        self.inner.take_urgent()
     }
 
     fn take_work(&mut self) -> Option<BoxWork> {

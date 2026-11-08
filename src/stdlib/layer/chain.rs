@@ -6,7 +6,9 @@ use fictionet::time::Instant;
 /// The chain is itself a layer, from `A`'s lower port to `B`'s upper port,
 /// so chains nest. It keeps both parts' events, timers, work and errors
 /// apart with [`Side`]. Between the parts it holds at most one item each
-/// way: what one part handed over and the other has not taken yet.
+/// way: what one part handed over and the other has not taken yet. While
+/// `B` refuses the event it holds, `A`'s urgent events
+/// ([`take_urgent`](Layer::take_urgent)) go past it, one at a time.
 /// [`advance`](Layer::advance) moves those items in a loop, never by one
 /// part calling the other, so a deep stack makes no deep calls.
 pub struct Chain<A: Layer, B: Layer<Lower = A::Upper>> {
@@ -14,6 +16,9 @@ pub struct Chain<A: Layer, B: Layer<Lower = A::Upper>> {
     upper: B,
     /// An event `A` handed up that `B` has not taken.
     up: Option<EventOf<A::Upper>>,
+    /// An urgent event `A` handed up past a refused one, that `B` has not
+    /// taken yet.
+    urgent: Option<EventOf<A::Upper>>,
     /// A command `B` handed down that `A` has not taken.
     down: Option<CommandOf<A::Upper>>,
 }
@@ -25,6 +30,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
             lower,
             upper,
             up: None,
+            urgent: None,
             down: None,
         }
     }
@@ -131,6 +137,16 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         moved |= env
             .scoped(Side::Upper, |env| self.upper.advance(env))
             .map_err(Side::Upper)?;
+        // An urgent event goes first, then whatever `A` has.
+        if self.urgent.is_none() && self.up.is_some() {
+            self.urgent = self.lower.take_urgent();
+        }
+        if let Some(event) = self.urgent.take() {
+            let admit = env
+                .scoped(Side::Upper, |env| self.upper.on_event(env, event))
+                .map_err(Side::Upper)?;
+            moved |= offer(&mut self.urgent, admit);
+        }
         if self.up.is_none() {
             self.up = self.lower.take_event();
             moved |= self.up.is_some();
@@ -160,6 +176,10 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
 
     fn take_event(&mut self) -> Option<EventOf<B::Upper>> {
         self.upper.take_event()
+    }
+
+    fn take_urgent(&mut self) -> Option<EventOf<B::Upper>> {
+        self.upper.take_urgent()
     }
 
     fn take_work(&mut self) -> Option<Self::Work> {

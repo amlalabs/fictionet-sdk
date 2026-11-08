@@ -239,6 +239,13 @@ where
         }
     }
 
+    fn take_urgent(&mut self) -> Option<EventOf<A::Upper>> {
+        match &mut self.phase {
+            Phase::First(a) => a.take_urgent(),
+            Phase::Then(b) => b.take_urgent(),
+        }
+    }
+
     fn take_work(&mut self) -> Option<Self::Work> {
         match &mut self.phase {
             Phase::First(a) => a.take_work().map(Side::Lower),

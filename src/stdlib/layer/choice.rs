@@ -108,6 +108,13 @@ where
         }
     }
 
+    fn take_urgent(&mut self) -> Option<EventOf<A::Upper>> {
+        match self {
+            Side::Lower(a) => a.take_urgent(),
+            Side::Upper(b) => b.take_urgent(),
+        }
+    }
+
     fn take_work(&mut self) -> Option<Self::Work> {
         match self {
             Side::Lower(a) => a.take_work().map(Side::Lower),
@@ -224,6 +231,10 @@ impl<U: Layer> Layer for Later<U> {
 
     fn take_event(&mut self) -> Option<EventOf<U::Upper>> {
         self.layer.as_mut()?.take_event()
+    }
+
+    fn take_urgent(&mut self) -> Option<EventOf<U::Upper>> {
+        self.layer.as_mut()?.take_urgent()
     }
 
     fn take_work(&mut self) -> Option<U::Work> {

@@ -627,6 +627,10 @@ impl Layer for TlsLayer {
         self.above.take()
     }
 
+    fn take_urgent(&mut self) -> Option<StreamEvent> {
+        (self.credit != 0).then(|| StreamEvent::Written(std::mem::take(&mut self.credit)))
+    }
+
     fn take_work(&mut self) -> Option<Pick> {
         if !std::mem::take(&mut self.work) {
             return None;

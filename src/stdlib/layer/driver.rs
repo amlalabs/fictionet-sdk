@@ -74,6 +74,8 @@ pub struct Driver<L: Layer> {
     observed: Observations<L::Report>,
     below: Option<CommandOf<L::Lower>>,
     above: Option<EventOf<L::Upper>>,
+    /// An urgent event that went past the refused one above, refused too.
+    urgent: Option<EventOf<L::Upper>>,
     steps: usize,
 }
 
@@ -89,6 +91,7 @@ impl<L: Layer> Driver<L> {
             observed: Observations::new(KEPT),
             below: None,
             above: None,
+            urgent: None,
             steps: STEPS,
         }
     }
@@ -191,13 +194,35 @@ impl<L: Layer> Driver<L> {
         send(&mut self.below, || self.layer.take_command(), sink)
     }
 
-    /// Offers the stack's output for what is above it to `sink`. Returns
-    /// whether anything moved.
+    /// Offers the stack's output for what is above it to `sink`. While the
+    /// sink refuses an event, the stack's urgent events
+    /// ([`Layer::take_urgent`]) still go to it. Returns whether anything
+    /// moved.
     pub fn send_above(
         &mut self,
-        sink: impl FnMut(EventOf<L::Upper>) -> Admit<EventOf<L::Upper>>,
+        mut sink: impl FnMut(EventOf<L::Upper>) -> Admit<EventOf<L::Upper>>,
     ) -> bool {
-        send(&mut self.above, || self.layer.take_event(), sink)
+        let mut moved = false;
+        if let Some(event) = self.urgent.take() {
+            match sink(event) {
+                Admit::Taken | Admit::Closed(_) => moved = true,
+                Admit::Partial(event) | Admit::Blocked(event) => {
+                    self.urgent = Some(event);
+                    return false;
+                }
+            }
+        }
+        moved |= send(&mut self.above, || self.layer.take_event(), &mut sink);
+        while self.above.is_some()
+            && let Some(event) = self.layer.take_urgent()
+        {
+            moved = true;
+            if let Admit::Partial(event) | Admit::Blocked(event) = sink(event) {
+                self.urgent = Some(event);
+                break;
+            }
+        }
+        moved
     }
 
     /// Whether the driver holds output the carrier below has not taken.
