@@ -128,19 +128,8 @@ impl Layer for Detect {
                     }
                     self.first.reserve_exact(PREFACE.len());
                 }
-                let mut taken = 0;
-                for &byte in chunk.iter() {
-                    self.first.push(byte);
-                    taken += 1;
-                    if !PREFACE.starts_with(&self.first) {
-                        self.chosen = Some(false);
-                        break;
-                    }
-                    if self.first.len() == PREFACE.len() {
-                        self.chosen = Some(true);
-                        break;
-                    }
-                }
+                let (taken, chosen) = scan(&mut self.first, &chunk);
+                self.chosen = chosen;
                 chunk.advance(taken);
                 Ok(if chunk.is_empty() {
                     Admit::Taken
@@ -205,6 +194,28 @@ impl Layer for Detect {
             .map(|at| (at, ()))
     }
 }
+
+/// Reads `bytes` into `first`, the bytes read so far, until they tell the
+/// versions apart: how many it took, and HTTP/2 (`true`) or HTTP/1 once
+/// known. The byte that differs from the preface is taken, so HTTP/1 reads
+/// it from `first`; what is not taken comes after.
+fn scan(first: &mut Vec<u8>, bytes: &[u8]) -> (usize, Option<bool>) {
+    for (taken, &byte) in bytes.iter().enumerate() {
+        first.push(byte);
+        if !PREFACE.starts_with(first) {
+            return (taken + 1, Some(false));
+        }
+        if first.len() == PREFACE.len() {
+            return (taken + 1, Some(true));
+        }
+    }
+    (bytes.len(), None)
+}
+
+/// Bounded proofs over [`scan`], run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../../verification/http2-layer/kani/detect.rs"]
+mod proofs;
 
 impl Handoff for Detect {
     type Next = Choice;
