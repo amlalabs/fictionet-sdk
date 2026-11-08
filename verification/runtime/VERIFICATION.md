@@ -219,3 +219,6 @@ response succeeds, as does a 130-frame response exceeding the 64 job slots.
 Focused tests check last-borrow wakeup and parent retention by a nested lease.
 The existing Kani compiler limitation above also prevents a direct proof
 over the mutex-backed context lease; no Kani success is claimed for it.
+
+On the completed implementation, all 19 context and region unit tests pass;
+the combined stack and TLS unit selection passes all 24 tests.

@@ -396,3 +396,8 @@ ambient randomness that happens to repeat within one process, would not
 show. ECH (which also keeps its random source in an `Arc` in the fork) is
 not exercised. That `CryptoProvider` holds its parts in `Arc`s rather than
 `&'static` is checked by the compiler, not here.
+
+After clearing the completed TLS selection future so its private context is
+released, all three Kani harnesses were rerun successfully under the 12 GiB
+systemd limit with six Cargo build jobs. The final log is
+`/home/souvik/.cache/adorably-fv/foundation-tls-kani-last.log`.
