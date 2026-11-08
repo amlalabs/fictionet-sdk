@@ -45,15 +45,17 @@
 //! }
 //! ```
 
+use core::any::Any;
 use core::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 use fictionet::stdlib::layer::{
-    ByteStream, Datagrams, Direction, Messages, Mux, ObservedStream, Top,
+    ByteStream, ChildId, Datagrams, Direction, Messages, Mux, ObservedStream, Top,
 };
 use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::network::packet::Scope;
 use fictionet::stdlib::network::tcp::{Answer, Handshake};
+use fictionet::time::Duration;
 
 /// The port a TCP layer offers: one [`ByteStream`] child per connection,
 /// opened as a [`TcpOpening`], and [`TcpControl`] for the endpoint.
@@ -103,8 +105,9 @@ pub enum TcpOrigin {
 pub enum TcpControl {
     /// Listen on the literal wire `port`, zero included. Fails
     /// ([`TcpNotice::ListenFailed`]) if something listens there already or
-    /// an outgoing connection uses the port. Each connection it accepts
-    /// opens a child.
+    /// an outgoing connection uses the port. Connections whose handshake
+    /// finished wait in the listener's backlog until [`TcpControl::Accept`]
+    /// lets them open a child.
     Listen {
         /// The port.
         port: u16,
@@ -122,9 +125,12 @@ pub enum TcpControl {
         /// The port.
         port: u16,
     },
-    /// Open a connection to `remote` from an ephemeral port. It opens a
-    /// child with [`TcpOrigin::Connected`], or fails with
-    /// [`TcpNotice::ConnectFailed`].
+    /// Open a connection to `remote` from an ephemeral port. Its child
+    /// opens at once with [`TcpOrigin::Connected`], so closing the child
+    /// gives the attempt up; it gets credit to write once the handshake is
+    /// done. A connection that cannot be tried, or whose handshake fails,
+    /// is reported with [`TcpNotice::ConnectFailed`], and a child it had
+    /// is closed.
     Connect {
         /// The number the answer names.
         request: Request,
@@ -135,6 +141,52 @@ pub enum TcpControl {
     /// once, discarding what was still to be sent, as a reset does: for
     /// peers that are gone for good.
     AbortPeers(Box<dyn Fn(IpAddr) -> bool + Send>),
+    /// Let `count` more connections from `port`'s backlog open a child, as
+    /// many calls of `accept(2)` would. Until one is accepted it counts
+    /// against the backlog.
+    Accept {
+        /// The listening port.
+        port: u16,
+        /// How many more.
+        count: usize,
+    },
+    /// Hold at most `backlog` connections on `port` that are not accepted
+    /// yet, from now on. Those already held stay.
+    Backlog {
+        /// The listening port.
+        port: u16,
+        /// The new backlog.
+        backlog: usize,
+    },
+    /// Answer `port`'s handshakes with `answer` from now on.
+    Answer {
+        /// The listening port.
+        port: u16,
+        /// How it answers.
+        answer: Box<dyn Answer>,
+    },
+    /// Reset the connection of this child at once, whether the child is
+    /// open or was closed and its connection is still closing. Nothing once
+    /// the connection is [gone](TcpNotice::Gone) into TIME-WAIT or forgotten.
+    Abort(ChildId),
+    /// Send a keepalive after this long idle, and as often after that, on
+    /// the connection of an open child; `None` sends none.
+    KeepAlive {
+        /// The child.
+        child: ChildId,
+        /// The interval.
+        interval: Option<Duration>,
+    },
+    /// Keep `item` until the connection of this child is gone: reset,
+    /// retired into TIME-WAIT, or forgotten, which may be after the child
+    /// is closed. Dropped at once if it is gone already. Limits that count
+    /// connections hold their count here.
+    Hold {
+        /// The child.
+        child: ChildId,
+        /// What to keep.
+        item: Box<dyn Any + Send>,
+    },
 }
 
 impl fmt::Debug for TcpControl {
@@ -159,6 +211,26 @@ impl fmt::Debug for TcpControl {
                 .field("remote", remote)
                 .finish(),
             TcpControl::AbortPeers(_) => f.write_str("AbortPeers"),
+            TcpControl::Accept { port, count } => f
+                .debug_struct("Accept")
+                .field("port", port)
+                .field("count", count)
+                .finish(),
+            TcpControl::Backlog { port, backlog } => f
+                .debug_struct("Backlog")
+                .field("port", port)
+                .field("backlog", backlog)
+                .finish(),
+            TcpControl::Answer { port, .. } => {
+                f.debug_struct("Answer").field("port", port).finish()
+            }
+            TcpControl::Abort(child) => f.debug_tuple("Abort").field(child).finish(),
+            TcpControl::KeepAlive { child, interval } => f
+                .debug_struct("KeepAlive")
+                .field("child", child)
+                .field("interval", interval)
+                .finish(),
+            TcpControl::Hold { child, .. } => f.debug_struct("Hold").field("child", child).finish(),
         }
     }
 }
@@ -191,6 +263,11 @@ pub enum TcpNotice {
         /// Where it was going.
         local: SocketAddr,
     },
+    /// The connection of this child is gone: reset by either side, retired
+    /// into TIME-WAIT, or forgotten. What [`TcpControl::Hold`] kept for it
+    /// is released, now or when the connection is forgotten. It may be
+    /// said more than once.
+    Gone(ChildId),
 }
 
 // ---------------------------------------------------------------------------
