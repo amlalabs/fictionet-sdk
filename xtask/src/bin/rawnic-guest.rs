@@ -2,6 +2,8 @@
 use std::{ffi::CString, fs, io};
 #[path = "../egress.rs"]
 mod egress;
+#[path = "../port_zero.rs"]
+mod port_zero;
 #[path = "../rawnic_frames.rs"]
 mod rawnic_frames;
 #[path = "../rawnic_world.rs"]

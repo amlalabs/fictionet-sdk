@@ -18,7 +18,7 @@ const TCP_BYTES: usize = 4096;
 const UDP_BYTES: usize = 1024;
 
 #[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Capture(pub(super) Arc<Mutex<Vec<u8>>>);
 
 impl Write for Capture {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -30,7 +30,7 @@ impl Write for Capture {
     }
 }
 
-fn config(address: Ipv4Addr, gateway: Ipv4Addr) -> Config {
+pub(super) fn config(address: Ipv4Addr, gateway: Ipv4Addr) -> Config {
     Config {
         address,
         gateway,
@@ -45,7 +45,9 @@ fn sinks(capture: &Capture) -> Sinks {
     }
 }
 
-fn endpoints(honeypot: &Honeypot) -> fictionet::Result<tokio::sync::oneshot::Receiver<Endpoints>> {
+pub(super) fn endpoints(
+    honeypot: &Honeypot,
+) -> fictionet::Result<tokio::sync::oneshot::Receiver<Endpoints>> {
     let (send, receive) = tokio::sync::oneshot::channel();
     let send = Mutex::new(Some(send));
     honeypot.program(move |_fcx: fictionet::Cx, endpoints: Endpoints| {
@@ -266,7 +268,7 @@ async fn world() -> fictionet::Result {
     evidence(&capture)
 }
 
-fn prepare_device(device: &str) -> fictionet::Result<fictionet_host::VirtioNet> {
+pub(super) fn prepare_device(device: &str) -> fictionet::Result<fictionet_host::VirtioNet> {
     let path = format!("/sys/bus/pci/devices/{device}");
     if std::path::Path::new(&format!("{path}/driver")).exists() {
         std::fs::write(format!("{path}/driver/unbind"), device)?;
@@ -312,12 +314,12 @@ async fn vfio() -> fictionet::Result {
     evidence(&capture)
 }
 
-async fn tun() -> fictionet::Result {
+pub(super) fn prepare_tun(peer: Ipv4Addr) -> fictionet::Result<fictionet_host::tun::Tun> {
     use fictionet_host::tun::{Mode, Tun};
     let device = Tun::open("egress", Mode::Create)?;
     let control = std::net::UdpSocket::bind("0.0.0.0:0")?;
     for (operation, address) in [
-        (libc::SIOCSIFADDR, PEER),
+        (libc::SIOCSIFADDR, peer),
         (libc::SIOCSIFNETMASK, Ipv4Addr::new(255, 255, 255, 0)),
     ] {
         // SAFETY: the initialized request holds a complete IPv4 sockaddr and a terminated interface name.
@@ -341,6 +343,11 @@ async fn tun() -> fictionet::Result {
             return Err(io::Error::last_os_error().into());
         }
     }
+    Ok(device)
+}
+
+async fn tun() -> fictionet::Result {
+    let device = prepare_tun(PEER)?;
     let listener = tokio::net::TcpListener::bind((PEER, PORT)).await?;
     let udp = tokio::net::UdpSocket::bind((PEER, PORT)).await?;
     let capture = Capture::default();
@@ -416,6 +423,7 @@ pub fn run() -> fictionet::Result {
         .block_on(async {
             exercise("world attachment", world()).await?;
             exercise("TUN", tun()).await?;
-            exercise("VFIO virtio-net through an isolated QEMU hub", vfio()).await
+            exercise("VFIO virtio-net through an isolated QEMU hub", vfio()).await?;
+            super::port_zero::run().await
         })
 }
