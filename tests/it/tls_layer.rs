@@ -359,3 +359,80 @@ fn rejection_drains_its_alert_before_reporting_failure() {
     }))
     .unwrap();
 }
+
+#[test]
+fn a_bad_record_after_close_notify_writes_nothing_after_the_end() {
+    block_on(lab(Seed::from_u64(22), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let (mut server, mut client) = handshake(config, client_config, 0);
+        assert!(matches!(
+            server.driver().command(StreamCommand::End)?,
+            Admit::Taken
+        ));
+        server.push(&[])?;
+        assert!(server.ended());
+        receive(&mut client, &server.take_output());
+        // The client may still send after the server's close_notify.
+        client.writer().write_all(b"still talking")?;
+        let mut record = client_output(&mut client);
+        let last = record.len() - 1;
+        record[last] ^= 1;
+        let mut event = StreamEvent::Data(Chunk::new(record));
+        let mut after_end = Vec::new();
+        for _ in 0..8 {
+            if let Admit::Partial(rest) | Admit::Blocked(rest) = server.driver().deliver(event)? {
+                event = rest;
+            } else {
+                event = StreamEvent::Data(Chunk::new(Vec::new()));
+            }
+            let _ = server.driver().run();
+            server.driver().send_below(|command| {
+                after_end.push(format!("{command:?}"));
+                Admit::Taken
+            });
+        }
+        assert!(after_end.is_empty(), "commands after End: {after_end:?}");
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn hello_work_finished_after_the_client_left_sends_nothing() {
+    block_on(lab(Seed::from_u64(23), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        for answer in [Some(config), None] {
+            let mut client = rustls::ClientConnection::new(
+                client_config(&fcx, &ca, &[b"http/1.1"]),
+                rustls::pki_types::ServerName::try_from("example.test").unwrap(),
+            )?;
+            let mut server = Harness::new(Seed::from_u64(24), tls::TlsLayer::new());
+            server.push(&client_output(&mut client))?;
+            assert!(server.work().is_some());
+            // The client closes while the world is still choosing a config.
+            assert!(matches!(
+                server.driver().deliver(StreamEvent::Ended)?,
+                Admit::Taken
+            ));
+            let mut commands = Vec::new();
+            let mut drive = |server: &mut Server| {
+                for _ in 0..4 {
+                    let _ = server.driver().run();
+                    server.driver().send_below(|command| {
+                        commands.push(format!("{command:?}"));
+                        Admit::Taken
+                    });
+                }
+            };
+            drive(&mut server);
+            server.driver().complete(answer)?;
+            drive(&mut server);
+            assert_eq!(commands, ["End"], "after the client left");
+        }
+        Ok(())
+    }))
+    .unwrap();
+}

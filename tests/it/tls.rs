@@ -21,6 +21,10 @@ mod layer;
 #[path = "tls_stack.rs"]
 mod stack;
 
+/// The provider's entropy checks, kept with the other TLS proofs.
+#[path = "../../verification/tls/entropy.rs"]
+mod entropy;
+
 // ---------------------------------------------------------------------------
 // An in-memory connection pair.
 
