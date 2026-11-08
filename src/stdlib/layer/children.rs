@@ -255,18 +255,22 @@ where
 
     fn remove(&mut self, id: ChildId) -> Option<Kid<B>> {
         let index = self.kids.iter().position(|(key, _)| *key == id)?;
-        let kid = self.kids.remove(index).1;
-        if self.kids.is_empty() {
-            // With no children the places go, so an idle connection holds
-            // the same whatever it held before.
-            self.kids = Vec::new();
-            self.down.shrink_to(QUEUE.max(self.down.len()));
-            let places = self.down.capacity().saturating_sub(QUEUE);
-            if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
-                storage.set(bytes);
-            }
+        Some(self.kids.remove(index).1)
+    }
+
+    /// With no children the places go, so an idle connection holds the same
+    /// whatever it held before. Closing commands still queued keep their
+    /// places until the mux takes them.
+    fn release_places(&mut self) {
+        if !self.kids.is_empty() || self.storage.is_none() {
+            return;
         }
-        Some(kid)
+        self.kids = Vec::new();
+        self.down.shrink_to(QUEUE.max(self.down.len()));
+        let places = self.down.capacity().saturating_sub(QUEUE);
+        if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
+            storage.set(bytes);
+        }
     }
 
     /// The layer of child `id`, while it is open.
@@ -643,6 +647,7 @@ where
         if self.remaining_visits == 0 {
             self.turn = self.sweep_first;
         }
+        self.release_places();
         Ok(moved || self.remaining_visits > 0)
     }
 
