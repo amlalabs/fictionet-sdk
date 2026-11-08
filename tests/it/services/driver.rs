@@ -1,5 +1,6 @@
 use super::*;
 use fictionet::Seed;
+use fictionet::stdlib::services::stack::Polling;
 
 // ---------------------------------------------------------------------------
 // The harness
@@ -76,14 +77,14 @@ fn replies_do_not_depend_on_chunk_boundaries() {
     };
     let input = b"POST /e HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabcPOST /e HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nxy\r\n0\r\n\r\n";
     let whole = {
-        let mut h =
-            layer::Harness::new(fictionet::Seed::from_u64(0), Http1::new(router())).running_work();
+        let mut h = layer::Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()))
+            .with_worker(Polling::new());
         h.push(input).unwrap();
         h.output().to_vec()
     };
     for a in 0..input.len() {
-        let mut h =
-            layer::Harness::new(fictionet::Seed::from_u64(0), Http1::new(router())).running_work();
+        let mut h = layer::Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()))
+            .with_worker(Polling::new());
         h.push(&input[..a]).unwrap();
         h.push(&input[a..]).unwrap();
         assert_eq!(h.output(), whole, "split at {a}");
@@ -1138,8 +1139,8 @@ fn harness_service_and_http_share_the_context_stream() {
                 http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
             },
         );
-        let mut http =
-            layer::Harness::new(Seed::from_u64(999), Http1::new(router)).in_world(fcx.clone());
+        let mut http = layer::Harness::new(Seed::from_u64(999), Http1::new(router))
+            .with_worker(Polling::in_world(fcx.clone()));
         fcx.sleep(Duration::from_millis(1)).await?;
         let before = fcx.now();
         http.push(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();

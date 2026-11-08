@@ -1,19 +1,44 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Wake, Waker};
 use std::time::Duration;
 
-use fictionet::stdlib::layer::job::Jobs;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Chunk, Driver, Job, Layer, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Chunk, Driver, Layer, StreamCommand, StreamEvent,
 };
 use fictionet::time::Instant;
-use fictionet::{Cx, Seed, SeededEntropy};
+use fictionet::{Entropy, Seed, SeededEntropy};
 
 /// How many rounds a harness call makes before it calls the stack stuck:
 /// a stack that keeps moving with no new input never settles.
 const ROUNDS: usize = 1 << 20;
+
+/// Does a stack's work for a [`Harness`]: whatever polls the futures that
+/// a layer's [`Work`](Layer::Work) carries, which neither a layer nor the
+/// harness ever does.
+///
+/// [`services::stack::Polling`](fictionet::stdlib::services::stack::Polling)
+/// is the one the live runners use, with or without a world.
+pub trait Worker<L: Layer>: Send {
+    /// Takes the stack's new work from `driver`, moves all of it on once,
+    /// and gives the stack what finished. Returns whether anything moved.
+    fn work(&mut self, driver: &mut Driver<L>) -> Result<bool, L::Error>;
+
+    /// How much work is running.
+    fn running(&self) -> usize;
+
+    /// The entropy of the world the work runs in, which the stack then
+    /// draws from instead of the harness's seed. `None` keeps the seed.
+    fn entropy(&self) -> Option<Arc<dyn Entropy>> {
+        None
+    }
+
+    /// The time of the world the work runs in, which the harness's clock
+    /// then follows. `None` for a clock that moves only when the test
+    /// moves it.
+    fn now(&self) -> Option<Instant> {
+        None
+    }
+}
 
 /// Runs a stack over a byte stream with no runtime, for tests and fuzz
 /// targets.
@@ -28,9 +53,9 @@ const ROUNDS: usize = 1 << 20;
 /// seeded stream. Every call runs the stack until nothing more moves.
 ///
 /// The stack's work waits for the test ([`work`](Self::work),
-/// [`complete`](Self::complete)), unless the harness is
-/// [`running_work`](Self::running_work): then it polls the work itself, as
-/// the live runner does.
+/// [`complete`](Self::complete)), unless the harness has a
+/// [`Worker`] ([`with_worker`](Self::with_worker)): then the worker does it
+/// each time the harness runs the stack.
 pub struct Harness<L: Layer<Lower = ByteStream>> {
     driver: Driver<L>,
     /// What the peer sent that the stack has not taken.
@@ -44,63 +69,7 @@ pub struct Harness<L: Layer<Lower = ByteStream>> {
     reset: bool,
     /// Whether the stack refused input as closed.
     input_closed: bool,
-    /// The world whose clock the stack runs on, if it runs in one.
-    world: Option<Cx>,
-    work: Option<Box<dyn RunWork<L> + Send>>,
-}
-
-/// Polls a stack's work for a harness.
-trait RunWork<L: Layer> {
-    /// Takes the stack's new work and polls all of it once, giving the
-    /// stack what finished. Returns whether anything moved.
-    fn run(&mut self, driver: &mut Driver<L>) -> Result<bool, L::Error>;
-    /// How much work is running.
-    fn len(&self) -> usize;
-}
-
-/// Set when polled work asks to be polled again.
-struct Flag(AtomicBool);
-
-impl Wake for Flag {
-    fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
-struct Running<W> {
-    jobs: Jobs<W>,
-    fcx: Option<Cx>,
-    woken: Arc<Flag>,
-}
-
-impl<L> RunWork<L> for Running<L::Work>
-where
-    L: Layer,
-    L::Work: Job<Done = L::Done>,
-{
-    fn run(&mut self, driver: &mut Driver<L>) -> Result<bool, L::Error> {
-        let mut moved = false;
-        while let Some(work) = driver.take_work() {
-            self.jobs.push(work);
-            moved = true;
-        }
-        self.woken.0.store(false, Ordering::Relaxed);
-        let waker = Waker::from(self.woken.clone());
-        let mut cx = Context::from_waker(&waker);
-        moved |= self
-            .jobs
-            .poll(self.fcx.as_ref(), &mut cx, |done| driver.complete(done))?;
-        // Work that woke itself while it was polled has more to do.
-        Ok(moved || self.woken.0.load(Ordering::Relaxed))
-    }
-
-    fn len(&self) -> usize {
-        self.jobs.len()
-    }
+    worker: Option<Box<dyn Worker<L>>>,
 }
 
 impl<L: Layer<Lower = ByteStream>> Harness<L> {
@@ -122,51 +91,25 @@ impl<L: Layer<Lower = ByteStream>> Harness<L> {
             ended: false,
             reset: false,
             input_closed: false,
-            world: None,
-            work: None,
+            worker: None,
         }
     }
 
-    /// From now on the harness polls the stack's work itself, with no
-    /// world, each time it runs the stack. Work that is not ready waits for
-    /// the next call; work that wakes itself while polled is polled again
-    /// at once.
-    pub fn running_work(self) -> Harness<L>
-    where
-        L::Work: Job<Done = L::Done>,
-    {
-        self.polling(None)
-    }
-
-    /// Runs the stack in the world of `fcx`: its clock, read each time the
-    /// harness runs the stack, its entropy, and its context for the work,
-    /// which the harness polls as [`running_work`](Self::running_work)
-    /// does. Bind it before anything runs. Only the world moves the clock
-    /// then: [`advance`](Self::advance) panics.
-    pub fn in_world(mut self, fcx: Cx) -> Harness<L>
-    where
-        L::Work: Job<Done = L::Done>,
-    {
-        self.driver.rebind(Arc::new(fcx.clone()), fcx.now());
-        self.world = Some(fcx.clone());
-        self.polling(Some(fcx))
-    }
-
-    fn polling(mut self, fcx: Option<Cx>) -> Harness<L>
-    where
-        L::Work: Job<Done = L::Done>,
-    {
-        self.work = Some(Box::new(Running {
-            jobs: Jobs::new(),
-            fcx,
-            woken: Arc::new(Flag(AtomicBool::new(false))),
-        }));
+    /// From now on `worker` does the stack's work, each time the harness
+    /// runs the stack. A worker in a world gives the stack that world's
+    /// entropy and clock: give it before anything runs.
+    pub fn with_worker(mut self, worker: impl Worker<L> + 'static) -> Harness<L> {
+        if let Some(entropy) = worker.entropy() {
+            let now = worker.now().unwrap_or(self.driver.now());
+            self.driver.rebind(entropy, now);
+        }
+        self.worker = Some(Box::new(worker));
         self
     }
 
-    /// How much of the stack's work the harness is polling.
+    /// How much of the stack's work the worker is doing.
     pub fn jobs(&self) -> usize {
-        self.work.as_ref().map_or(0, |work| work.len())
+        self.worker.as_ref().map_or(0, |worker| worker.running())
     }
 
     /// The peer sends `bytes`.
@@ -207,7 +150,10 @@ impl<L: Layer<Lower = ByteStream>> Harness<L> {
     /// at its own time.
     pub fn advance(&mut self, d: Duration) -> Result<(), L::Error> {
         assert!(
-            self.world.is_none(),
+            self.worker
+                .as_ref()
+                .and_then(|worker| worker.now())
+                .is_none(),
             "the world moves the clock of a harness in a world"
         );
         let until = self.driver.now() + d;
@@ -283,8 +229,8 @@ impl<L: Layer<Lower = ByteStream>> Harness<L> {
 
     /// Runs the stack until nothing more moves.
     pub fn settle(&mut self) -> Result<(), L::Error> {
-        if let Some(fcx) = &self.world {
-            self.driver.set_now(fcx.now());
+        if let Some(now) = self.worker.as_ref().and_then(|worker| worker.now()) {
+            self.driver.set_now(now);
         }
         for _ in 0..ROUNDS {
             let mut moved = false;
@@ -297,8 +243,8 @@ impl<L: Layer<Lower = ByteStream>> Harness<L> {
                     }
                 }
             }
-            if let Some(work) = &mut self.work {
-                moved |= work.run(&mut self.driver)?;
+            if let Some(worker) = &mut self.worker {
+                moved |= worker.work(&mut self.driver)?;
             }
             while let Some(event) = self.input.pop_front() {
                 match self.driver.deliver(event)? {

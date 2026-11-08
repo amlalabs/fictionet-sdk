@@ -163,14 +163,15 @@
 //! input and takes output, with no I/O of its own. [`Harness`] is a driver
 //! with a seeded entropy source, a clock that moves only when told, and a
 //! byte-stream peer that takes output only as fast as the test allows, so
-//! backpressure can be tested. [`live::run`] is a driver over a live
-//! connection: it only translates the connection's readiness and the
-//! world's clock.
+//! backpressure can be tested.
 //!
-//! A layer's [`Work`](Layer::Work) is the one place async code runs: the
-//! layer hands it over, and whatever drives the stack polls it as a [`Job`]
-//! and gives the result back. A [`Tunnel`] hands the rest of a byte stream
-//! to async code written against a connection, such as what runs after a
+//! Nothing in this module does I/O, reads a clock or polls a future. A
+//! layer's [`Work`](Layer::Work) is the one place async code runs: the
+//! layer hands it over, and whatever runs the stack polls it and gives the
+//! result back. [`services::stack`](fictionet::stdlib::services::stack)
+//! runs stacks over live connections and sockets, polls their work, and
+//! does the work for a harness ([`Worker`]); it also hands a byte stream to
+//! async code written against a connection, such as what runs after a
 //! CONNECT.
 
 mod budget;
@@ -181,11 +182,8 @@ mod driver;
 mod env;
 mod framed;
 mod harness;
-mod job;
-pub mod live;
 mod switch;
 mod timers;
-mod tunnel;
 
 #[cfg(test)]
 mod tests;
@@ -205,11 +203,9 @@ pub use children::{ChildReport, Children, Overrun};
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
 pub use framed::{Decoded, Framed, FramedError, Framing};
-pub use harness::Harness;
-pub use job::Job;
+pub use harness::{Harness, Worker};
 pub use switch::{Handoff, Handover, Switch};
 pub use timers::Timers;
-pub use tunnel::{Takeover, Tunnel};
 
 use fictionet::time::Instant;
 
@@ -292,30 +288,6 @@ impl<L: core::fmt::Display, U: core::fmt::Display> core::fmt::Display for Side<L
 }
 
 impl<L: core::error::Error, U: core::error::Error> core::error::Error for Side<L, U> {}
-
-/// A type with no values: the work of a stack that asks for none, or the
-/// reports of one that makes none. Whatever cannot carry work or reports
-/// requires them to be `Never`, so a stack that would need it does not
-/// compile.
-pub trait Never {
-    /// There is no value to call this on.
-    fn never(self) -> !;
-}
-
-impl Never for core::convert::Infallible {
-    fn never(self) -> ! {
-        match self {}
-    }
-}
-
-impl<L: Never, U: Never> Never for Side<L, U> {
-    fn never(self) -> ! {
-        match self {
-            Side::Lower(l) => l.never(),
-            Side::Upper(u) => u.never(),
-        }
-    }
-}
 
 /// One protocol between a lower port and an upper port, with no I/O.
 ///

@@ -9,6 +9,7 @@ use fictionet::stdlib::codec::Fail;
 use fictionet::stdlib::layer::Harness;
 use fictionet::stdlib::protocols::http1::{RejectedRequest, RequestError};
 use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::web::httpd::{self, Closing, Http1, Http1Report};
 
 use fictionet_test_support::world;
@@ -21,12 +22,12 @@ pub(crate) type H = Harness<Http1>;
 
 /// Serves with `http1`, polling its work with no world.
 pub(crate) fn serve(http1: Http1) -> H {
-    Harness::new(fictionet::Seed::from_u64(0), http1).running_work()
+    Harness::new(fictionet::Seed::from_u64(0), http1).with_worker(Polling::new())
 }
 
 /// Serves with `http1`, polling its work in the world of `fcx`.
 pub(crate) fn serve_in(fcx: fictionet::Cx, http1: Http1) -> H {
-    Harness::new(fictionet::Seed::from_u64(0), http1).in_world(fcx)
+    Harness::new(fictionet::Seed::from_u64(0), http1).with_worker(Polling::in_world(fcx))
 }
 
 /// What the client gets after sending `bytes`.
@@ -1191,8 +1192,9 @@ mod live {
 
     use fictionet::Cx;
     use fictionet::stdlib::layer::Budget;
-    use fictionet::stdlib::layer::live::{self, Live, Outcome};
+    use fictionet::stdlib::network::ConnError;
     use fictionet::stdlib::network::{Connection, ConnectionExt, ip, tcp};
+    use fictionet::stdlib::services::stack::{self, StreamEnd, StreamLimits};
 
     const SERVER: Ipv4Addr = Ipv4Addr::new(10, 9, 1, 1);
 
@@ -1381,11 +1383,14 @@ mod live {
             let (finish, finished) = tokio::sync::oneshot::channel();
             fcx.spawn(move |fcx| async move {
                 let conn = listener.accept(&fcx).await?;
-                let live = Live {
-                    budget: Budget::unlimited(),
+                let limits = StreamLimits {
+                    idle: None,
                     write_timeout: Some(Duration::from_millis(300)),
                 };
-                let outcome = live::run(&fcx, conn, Http1::new(page(16 << 20)), &live).await;
+                let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+                let http1 = Http1::new(page(16 << 20));
+                let budget = Budget::unlimited();
+                let outcome = stack::stream(&fcx, conn, &info, http1, budget, limits, |_| {}).await;
                 let _ = finish.send(outcome);
                 Ok(())
             });
@@ -1395,7 +1400,10 @@ mod live {
             conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
                 .await?;
             let outcome = finished.await.unwrap();
-            assert!(matches!(outcome, Ok(Outcome::Stalled)), "{outcome:?}");
+            assert!(
+                matches!(outcome, Ok(StreamEnd::Conn(ConnError::TimedOut))),
+                "{outcome:?}"
+            );
             drop(conn);
             Ok(())
         });

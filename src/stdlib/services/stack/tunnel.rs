@@ -7,10 +7,11 @@ use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
 
+use super::Job;
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Chunk, CommandOf, Env, EventOf, Job, Layer, StreamCommand,
-    StreamEvent, Top,
+    Admit, Budget, ByteStream, Chunk, CommandOf, Env, EventOf, Layer, StreamCommand, StreamEvent,
+    Top,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::sync::Mutex;

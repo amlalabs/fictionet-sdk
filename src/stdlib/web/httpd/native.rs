@@ -12,11 +12,12 @@ use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::codec::{Fail, Stream};
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, CommandOf, Env, Handoff, Handover, Job, Layer, StreamCommand,
-    StreamEvent, Switch, Timers, Top, Tunnel,
+    Admit, ByteStream, Charge, Chunk, CommandOf, Env, Handoff, Handover, Layer, StreamCommand,
+    StreamEvent, Switch, Timers, Top,
 };
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError, RequestHead};
 use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::services::stack::{Job, Tunnel};
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
@@ -1111,6 +1112,7 @@ mod router_tests {
     use super::*;
 
     use fictionet::stdlib::layer::{Budget, Harness};
+    use fictionet::stdlib::services::stack::Polling;
     use fictionet::sync::Mutex;
 
     #[test]
@@ -1135,7 +1137,7 @@ mod router_tests {
                     collect.lock().push(observation)
                 })),
             )
-            .running_work();
+            .with_worker(Polling::new());
             let mut request = format!(
                 "POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: {length}\r\n\r\n"
             )
@@ -1191,7 +1193,7 @@ mod router_tests {
                 collect.lock().push(observation)
             })),
         )
-        .running_work();
+        .with_worker(Polling::new());
         harness
             .push(b"GET /slow HTTP/1.1\r\nHost: example.test\r\n\r\n")
             .unwrap();
@@ -1221,7 +1223,7 @@ mod router_tests {
             Http1::new(Big),
             budget.clone(),
         )
-        .running_work();
+        .with_worker(Polling::new());
         h.settle().unwrap();
         let base = budget.used();
         h.withhold();
@@ -1250,6 +1252,7 @@ mod tests {
     use std::time::Duration;
 
     use fictionet::stdlib::layer::Harness;
+    use fictionet::stdlib::services::stack::Polling;
     use fictionet::sync::Mutex;
 
     /// Records the data frames of each request body until it ends or fails.
@@ -1284,7 +1287,7 @@ mod tests {
                 fictionet::Seed::from_u64(0),
                 Http1::new(Frames(seen.clone())),
             )
-            .running_work();
+            .with_worker(Polling::new());
             let mut request =
                 b"POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
             request.extend_from_slice(rest);
@@ -1336,7 +1339,7 @@ mod tests {
     fn a_pipelined_request_survives_a_response_slower_than_the_head_timeout() {
         let open = Arc::new(AtomicBool::new(false));
         let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Slow(open.clone())))
-            .running_work();
+            .with_worker(Polling::new());
         h.push(b"GET /slow HTTP/1.1\r\nHost: a\r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n")
             .unwrap();
         // The first response takes longer than the 30-second head timeout,
@@ -1360,7 +1363,8 @@ mod tests {
 
     #[test]
     fn a_successful_connect_answer_has_no_body_framing() {
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Hello)).running_work();
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Hello))
+            .with_worker(Polling::new());
         h.push(b"CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\n")
             .unwrap();
         // After a 2xx to CONNECT every byte is tunnel data, so the answer
@@ -1394,8 +1398,8 @@ mod tests {
         let input = b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n";
         let whole = {
             let calls = Arc::new(AtomicUsize::new(0));
-            let mut h =
-                Harness::new(fictionet::Seed::from_u64(0), Http1::new(Count(calls))).running_work();
+            let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Count(calls)))
+                .with_worker(Polling::new());
             h.push(input).unwrap();
             h.output().to_vec()
         };
@@ -1405,7 +1409,7 @@ mod tests {
                 fictionet::Seed::from_u64(0),
                 Http1::new(Count(calls.clone())),
             )
-            .running_work();
+            .with_worker(Polling::new());
             h.withhold();
             h.push(input).unwrap();
             assert_eq!(calls.load(Ordering::Relaxed), 1);

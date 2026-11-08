@@ -7,6 +7,7 @@
 
 use bytes::Bytes;
 use fictionet::stdlib::layer::Harness;
+use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
 use libfuzzer_sys::fuzz_target;
 
@@ -49,7 +50,7 @@ fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
         fictionet::Seed::from_u64(0),
         Http1::new(Pages(calls.clone())),
     )
-    .running_work();
+    .with_worker(Polling::new());
     for chunk in chunks {
         h.push(chunk).unwrap();
     }

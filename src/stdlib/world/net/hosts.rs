@@ -2,7 +2,7 @@ use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_ser
 use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::codec::Decode;
-use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Never, Top};
+use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::label_count;
@@ -16,7 +16,7 @@ use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
     self, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
 };
-use fictionet::stdlib::services::stack::{self, StackError, StreamEnd, StreamLimits};
+use fictionet::stdlib::services::stack::{self, Job, StackError, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -214,8 +214,10 @@ struct StackAccept<M> {
 impl<L, M> PortServer for StackAccept<M>
 where
     L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
-    L::Work: Never,
-    L::Report: Never + Send,
+    L::Work: Job<Done = L::Done>,
+    L::Report: Send,
+    L::Done: Send,
+    L::Error: Send,
     M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
 {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -228,7 +230,8 @@ where
         let budget = arrival.budget.unwrap_or_else(Budget::unlimited);
         let (conn, info, socket) = (arrival.conn, arrival.info, arrival.socket);
         Box::pin(async move {
-            let ended = stack::stream(&fcx, conn, &info, layer, budget, StreamLimits::default());
+            let limits = StreamLimits::default();
+            let ended = stack::stream(&fcx, conn, &info, layer, budget, limits, |_| {});
             if let Ok(StreamEnd::Reset) = ended.await {
                 socket.reset();
             }
@@ -555,8 +558,10 @@ impl Host {
     pub fn tcp_stack<L, M>(self, port: u16, make: M) -> Host
     where
         L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
-        L::Work: Never,
-        L::Report: Never + Send,
+        L::Work: Job<Done = L::Done>,
+        L::Report: Send,
+        L::Done: Send,
+        L::Error: Send,
         M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
         self.port_server(
@@ -577,15 +582,16 @@ impl Host {
     pub fn udp_stack<L, M>(mut self, port: u16, make: M) -> Host
     where
         L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top> + Send + 'static,
-        L::Work: Never,
-        L::Report: Never + Send,
+        L::Work: Job<Done = L::Done>,
+        L::Report: Send,
+        L::Done: Send,
         L::Error: core::error::Error + Send + Sync + 'static,
         M: Fn() -> L + Send + Sync + 'static,
     {
         let start: UdpStart = Arc::new(move |fcx, socket, local, _sandbox| {
             let layer = make();
             fcx.spawn(move |fcx| async move {
-                match stack::datagrams(&fcx, socket, local, layer).await {
+                match stack::datagrams(&fcx, socket, local, layer, |_| {}).await {
                     Ok(()) => Ok(()),
                     Err(StackError::Cancelled) => Err(fictionet::Cancelled.into()),
                     Err(StackError::Layer(e)) => Err(e.into()),

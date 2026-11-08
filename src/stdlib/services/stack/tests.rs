@@ -6,9 +6,13 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 
+use std::sync::Arc;
+
+use super::live::READ;
 use super::*;
-use fictionet::stdlib::layer::Env;
 use fictionet::stdlib::layer::framed_echo::{frames, read, stack, wire};
+use fictionet::stdlib::layer::{Env, StreamCommand, StreamEvent};
+use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::network::{ConnectionExt, ip, tcp, udp};
 use fictionet::{Seed, block_on, lab, pair};
 
@@ -61,9 +65,9 @@ fn serve_one<L, F, Fut>(
 ) -> Result<StreamEnd, String>
 where
     L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
-    L::Work: Never,
-    L::Report: Never + Send,
-    L::Error: core::fmt::Debug,
+    L::Work: Job<Done = L::Done>,
+    L::Report: Send,
+    L::Error: core::fmt::Debug + Send,
     F: FnOnce(Cx, tcp::Endpoint) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
@@ -75,7 +79,7 @@ where
         let client = fcx.spawn(move |fcx| client(fcx, client_machine.tcp));
         let conn = listener.accept(&fcx).await?;
         let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
-        let ended = stream(&fcx, conn, &info, make(), budget, limits).await;
+        let ended = stream(&fcx, conn, &info, make(), budget, limits, |_| {}).await;
         *slot.lock() = Some(ended.map_err(|e| format!("{e:?}")));
         client.join(&fcx).await?;
         // The machines run until the world stops.
@@ -285,7 +289,7 @@ fn datagrams_reach_one_conversation_and_answers_go_to_each_sender() {
         let (server, client) = machines(&fcx);
         let socket = server.udp.bind(PORT)?;
         fcx.spawn(move |fcx| async move {
-            Ok(datagrams(&fcx, socket, server_addr(), Counter::default()).await?)
+            Ok(datagrams(&fcx, socket, server_addr(), Counter::default(), |_| {}).await?)
         });
         let mut a = client.udp.bind(0)?;
         let mut b = client.udp.bind(0)?;

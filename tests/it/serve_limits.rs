@@ -24,6 +24,7 @@ use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::layer::{self, Budget};
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{self, Ended, Flow, Harness, ServeOptions};
+use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::web::httpd::{
     self, Body, Closing, Exchange, Handler, Http1, HttpOptions, Limits, Reply,
 };
@@ -145,7 +146,7 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
         Http1::new(page(1 << 20)),
         Budget::new(512 << 10),
     )
-    .running_work();
+    .with_worker(Polling::new());
     assert_eq!(send(&mut h, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n"), b"");
     assert_eq!(closing(&mut h), Some(Closing::Budget));
 }
@@ -597,7 +598,7 @@ fn pending_http1_requests_keep_their_body_charge() {
             Http1::new(router),
             budget.clone(),
         )
-        .in_world(fcx.clone());
+        .with_worker(Polling::in_world(fcx.clone()));
         h.settle().unwrap();
         let base = budget.used();
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 8192\r\n\r\n")
@@ -636,7 +637,7 @@ fn truncated_http1_requests_keep_their_body_charge() {
             Http1::new(Partial),
             budget.clone(),
         )
-        .in_world(fcx.clone());
+        .with_worker(Polling::in_world(fcx.clone()));
         h.settle().unwrap();
         let base = budget.used();
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 16384\r\n\r\n")
@@ -667,7 +668,7 @@ fn http1_charges_heads_while_reading_and_metadata_while_waiting() {
             Http1::new(router),
             budget.clone(),
         )
-        .in_world(fcx.clone());
+        .with_worker(Polling::in_world(fcx.clone()));
         h.settle().unwrap();
         let base = budget.used();
         let head = format!(
@@ -904,7 +905,7 @@ fn streaming_responses_release_request_metadata() {
             Http1::new(StreamingMetadata),
             budget.clone(),
         )
-        .running_work();
+        .with_worker(Polling::new());
         h.settle().unwrap();
         let base = budget.used();
         let head = format!(

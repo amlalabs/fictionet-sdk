@@ -113,7 +113,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fictionet::RaceError;
-use fictionet::stdlib::layer::live::{self, Live, Outcome};
 use fictionet::stdlib::layer::{Budget, Side};
 use fictionet::stdlib::network::Connection;
 use fictionet::stdlib::network::ConnectionExt;
@@ -121,6 +120,7 @@ use fictionet::stdlib::protocols::http1;
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::Prefixed;
 use fictionet::stdlib::services::serve::{self, ServeOptions};
+use fictionet::stdlib::services::stack::{self, StackError, StreamLimits};
 use fictionet::{Cancelled, Cx};
 
 mod body;
@@ -421,14 +421,14 @@ pub async fn serve_connection<C: Connection + Unpin>(
     if !info.tls && opts.first_bytes.is_none() {
         http1.first_head_deadline = Some(head_deadline);
     }
-    let live = Live {
-        budget: opts.budget.clone().unwrap_or_else(Budget::unlimited),
+    let budget = opts.budget.clone().unwrap_or_else(Budget::unlimited);
+    let limits = StreamLimits {
+        idle: None,
         write_timeout: Some(opts.limits.write_timeout),
     };
-    let _note = serve::PanicNote::new(std::any::type_name::<Http1>(), &info);
-    match live::run(fcx, conn, http1.upgradable(), &live).await {
-        Ok(Outcome::Cancelled) => Err(Cancelled),
+    match stack::stream(fcx, conn, &info, http1.upgradable(), budget, limits, |_| {}).await {
         Ok(_) => Ok(()),
-        Err(Side::Lower(never) | Side::Upper(never)) => match never {},
+        Err(StackError::Cancelled) => Err(Cancelled),
+        Err(StackError::Layer(Side::Lower(never) | Side::Upper(never))) => match never {},
     }
 }
