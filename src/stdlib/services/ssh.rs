@@ -418,7 +418,6 @@ impl<H: Handler> PortServer for Server<H> {
         if options.budget.is_none() {
             options.budget = arrival.budget;
         }
-        options.handshake = arrival.limits.handshake;
         Box::pin(async move {
             let _ = serve::connection(
                 &fcx,

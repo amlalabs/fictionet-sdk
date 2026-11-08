@@ -1,7 +1,8 @@
 //! DNS message framing: one message per datagram, or each message after a
 //! two-octet length on a stream (RFC 1035 §4.2.2, RFC 7766 §8).
 
-use fictionet::stdlib::codec::{Collect, CollectError, Decode, Step};
+use fictionet::stdlib::codec::{Collect, CollectError, Decode, Step, Wire};
+use fictionet::stdlib::layer::{BoundedDecode, BoundedWire};
 
 /// How a transport frames DNS messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,6 +68,66 @@ impl Decode for Queries {
     }
 }
 
+/// Each message is one allocation of at most 65535 octets.
+impl BoundedDecode for Queries {
+    fn allocation_bound(&self) -> usize {
+        usize::from(u16::MAX)
+    }
+}
+
+/// A DNS message as a stream carries it: after its length as two octets
+/// in network order (RFC 1035 §4.2.2). The value is the message alone;
+/// writing it adds the length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamMessage(pub Vec<u8>);
+
+/// Why bytes are not a [`StreamMessage`], or a message cannot be one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamMessageError {
+    /// The length does not count the octets that follow it.
+    Length,
+    /// The message is longer than the 65535 octets the length counts.
+    TooLong,
+}
+
+impl core::fmt::Display for StreamMessageError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            StreamMessageError::Length => "the length does not count the message",
+            StreamMessageError::TooLong => "a DNS message longer than a stream carries",
+        })
+    }
+}
+
+impl core::error::Error for StreamMessageError {}
+
+impl Wire for StreamMessage {
+    type ParseError = StreamMessageError;
+    type WriteError = StreamMessageError;
+
+    fn parse(b: &[u8]) -> Result<StreamMessage, StreamMessageError> {
+        let (prefix, message) = b.split_at_checked(2).ok_or(StreamMessageError::Length)?;
+        if usize::from(u16::from_be_bytes([prefix[0], prefix[1]])) != message.len() {
+            return Err(StreamMessageError::Length);
+        }
+        Ok(StreamMessage(message.to_vec()))
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), StreamMessageError> {
+        let len = u16::try_from(self.0.len()).map_err(|_| StreamMessageError::TooLong)?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+impl BoundedWire for StreamMessage {
+    fn write_bound(&self) -> Result<usize, StreamMessageError> {
+        u16::try_from(self.0.len()).map_err(|_| StreamMessageError::TooLong)?;
+        Ok(2 + self.0.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +170,32 @@ mod tests {
         );
         assert!(stream_framed(&vec![0; 65535]).is_some());
         assert_eq!(stream_framed(&vec![0; 65536]), None);
+    }
+
+    #[test]
+    fn a_stream_message_reads_back_as_the_queries_reader_reads_it() {
+        for len in [0, 1, 12, 512, 65535] {
+            let message = StreamMessage((0..len).map(|i| i as u8).collect());
+            let bytes = message.to_bytes().unwrap();
+            assert_eq!(bytes.len(), message.write_bound().unwrap());
+            assert_eq!(StreamMessage::parse(&bytes).unwrap(), message);
+            let mut queries = Queries::new(Framing::Stream);
+            assert_eq!(
+                queries.decode(&bytes, false).unwrap(),
+                Step::Item(message.0.clone(), bytes.len())
+            );
+            // Cut short or with more after it, the length no longer counts it.
+            if let Some((_, short)) = bytes.split_last() {
+                assert!(StreamMessage::parse(short).is_err());
+            }
+            let mut long = bytes.clone();
+            long.push(0);
+            assert!(StreamMessage::parse(&long).is_err());
+        }
+        let too_long = StreamMessage(vec![0; 65536]);
+        let mut out = Vec::new();
+        assert!(too_long.write(&mut out).is_err());
+        assert!(out.is_empty());
+        assert!(too_long.write_bound().is_err());
     }
 }

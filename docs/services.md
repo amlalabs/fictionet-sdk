@@ -179,11 +179,13 @@ A service can also:
   service). `driver.defer_keyed(key, work)` runs work beside the reads and
   the other keyed work, each writing whole frames, and `on_done` hears
   when one ends: concurrent responses, as HTTP/2 streams need.
-- **Upgrade the connection.** `Flow::Upgrade(Upgrade::Tls)` shakes hands
-  as a TLS server with `ServeOptions::starttls` and calls `on_open` again
-  over TLS (`driver.conn().tls` is then true): STARTTLS in SMTP, IMAP and
-  LDAP, and Postgres's `SSLRequest`. `Upgrade::Decoder` goes on with a
-  fresh decoder. `Upgrade::Handoff` hands the connection and its unread
+- **Upgrade the connection.** `Upgrade::Decoder` goes on with a fresh
+  decoder. STARTTLS (SMTP, IMAP, LDAP, Postgres's `SSLRequest`) is a
+  layer stack instead: a plaintext layer whose `layer::Handoff` names a
+  `tls::Secure` as what comes next, in a `layer::Switch`, served with
+  `Host::tcp_stack`. The plaintext layer hands over once its go-ahead is
+  written, and decides what becomes of plaintext the client pipelined
+  after its request. `Upgrade::Handoff` hands the connection and its unread
   bytes back to whoever called `serve::connection`. A port served with `Host::tcp`
   or `tcp_with` closes such a connection. To go on with it, serve the port
   with a `PortServer` of your own, as `httpd::Server` does.
@@ -542,7 +544,7 @@ body framing, so a clean FIN short of Content-Length is not detected.
 Other kinds of port:
 
 - `tcp_with(port, world, make, opts, max_conns)`: the same, with
-  `ServeOptions` for an idle limit or a STARTTLS config, and a cap on the
+  `ServeOptions` for an idle limit or a budget, and a cap on the
   connections served at once (`tcp` uses `DEFAULT_MAX_CONNS`, 64).
 - `udp(port, world, make)`: one `DatagramService` for the port, which
   gets every datagram, each decoded on its own as DNS and Modbus over UDP
@@ -592,7 +594,7 @@ whichever is larger, the input its decoder has not used yet, queued
 replies, and what the service and its deferred work report holding.
 Memory outside those counts, such as hyper's own buffers, is not charged.
 `Net::limits` changes these limits and the TLS handshake and DNS timers.
-Its handshake timer also applies to STARTTLS. Tests set small ones.
+Tests set small ones.
 `fictionet::run(seed, world)` gives TCP, UDP, services, HTTP exchanges one ChaCha20 byte stream through `Cx`. The same seed and
 ordered draws produce the same numbers. HTTP/2 handlers also draw from
 this run stream, so their execution order matters.

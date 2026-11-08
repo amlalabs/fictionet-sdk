@@ -129,13 +129,11 @@
 //!   Dropping the serving future or harness cancels remaining deferred work
 //!   and closes its wake handle, but does not call `on_end` or write a reply.
 //! - **Stops.** When the world stops, a running service hears [`Ended::Cancelled`].
-//!   [`connection`] returns [`ServeError::Cancelled`], also during a TLS
-//!   handshake or final shutdown, unless it has a failure to return. If
+//!   [`connection`] returns [`ServeError::Cancelled`], also during final
+//!   shutdown, unless it has a failure to return. If
 //!   [`Service::on_end`] already ran, it is not called again.
 //! - **Upgrades.** A call that returns [`Flow::Upgrade`] says what comes
-//!   next: [`Upgrade::Tls`] shakes hands as a TLS server with
-//!   [`ServeOptions::starttls`] and calls [`Service::on_open`] again over
-//!   TLS (STARTTLS in SMTP, LDAP and Postgres); [`Upgrade::Decoder`] goes
+//!   next: [`Upgrade::Decoder`] goes
 //!   on with a fresh decoder; [`Upgrade::Handoff`] hands the connection
 //!   and its unread bytes back in [`Served::Upgraded`], for a CONNECT
 //!   tunnel. A decoder that ends ([`Step::End`](fictionet::stdlib::codec::Step::End))
@@ -252,7 +250,6 @@ use fictionet::stdlib::layer::{Budget, Charge};
 use fictionet::stdlib::network::tcp::Handshake;
 use fictionet::stdlib::network::{Accept, Accepted, DatagramSocket};
 use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
-use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, RaceError, RecvError, Task};
 
@@ -282,13 +279,11 @@ pub trait Service: Send + 'static {
     type Error: core::error::Error + Send + Sync + 'static;
 
     /// A fresh decoder for a new connection, and after
-    /// [`Upgrade::Decoder`] or a TLS upgrade.
+    /// [`Upgrade::Decoder`].
     fn decoder(&self) -> Self::Decoder;
 
     /// The connection is open and nothing is read yet. A protocol whose
-    /// server speaks first (SSH, SMTP, FTP banners) writes here. Called
-    /// again after [`Upgrade::Tls`], once the handshake is done:
-    /// `driver.conn().tls` is then true.
+    /// server speaks first (SSH, SMTP, FTP banners) writes here.
     fn on_open(
         &mut self,
         _state: &Self::State,
@@ -393,11 +388,6 @@ pub enum Flow {
 /// What comes after [`Flow::Upgrade`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upgrade {
-    /// Shake hands as a TLS server on the connection, with the config
-    /// [`ServeOptions::starttls`] picks, then go on with the same service
-    /// over TLS: a fresh decoder, and [`Service::on_open`] again. STARTTLS
-    /// in SMTP, IMAP and LDAP, and Postgres's `SSLRequest`.
-    Tls,
     /// Go on with the same service and a fresh decoder from
     /// [`Service::decoder`], which reads the bytes not yet decoded. For a
     /// protocol whose framing changes after a handshake.
@@ -409,10 +399,9 @@ pub enum Upgrade {
 }
 
 impl Upgrade {
-    /// `tls`, `decoder` or `handoff`.
+    /// `decoder` or `handoff`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Upgrade::Tls => "tls",
             Upgrade::Decoder => "decoder",
             Upgrade::Handoff => "handoff",
         }
@@ -925,10 +914,6 @@ impl Drop for PanicNote {
 /// [`listen`] accepts or a datagram [`datagram`] receives.
 pub type SandboxOf = Arc<dyn Fn(std::net::IpAddr) -> Option<Sandbox> + Send + Sync>;
 
-/// Chooses the TLS config for a handshake from the client's SNI. `None`
-/// rejects the handshake with `unrecognized_name`.
-pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> + Send + Sync>;
-
 /// The connections a listener serves at once unless told otherwise: what
 /// [`Host::tcp`](fictionet::stdlib::world::net::Host::tcp) and
 /// [`Host::tls`](fictionet::stdlib::world::net::Host::tls) use. See
@@ -947,14 +932,6 @@ pub struct ServeOptions {
     /// that stops reading. Default 10 seconds. `None` waits forever; a
     /// reset or the world stopping still ends the wait.
     pub write_timeout: Option<Duration>,
-    /// Shake hands first, with the config this picks.
-    pub tls: Option<TlsSelect>,
-    /// The config for [`Upgrade::Tls`]. Without one, a service that asks
-    /// for TLS is closed.
-    pub starttls: Option<TlsSelect>,
-    /// How long a client has from connecting (or from STARTTLS) to finish
-    /// its TLS handshake. Default 10 seconds.
-    pub handshake: Duration,
     /// The read buffer's limit, at least the decoder's capacity. Larger
     /// lets the decoder see more at once. Default 0: the capacity.
     pub read_buffer: usize,
@@ -967,9 +944,6 @@ impl Default for ServeOptions {
         ServeOptions {
             idle: Some(Duration::from_secs(10)),
             write_timeout: Some(Duration::from_secs(10)),
-            tls: None,
-            starttls: None,
-            handshake: Duration::from_secs(10),
             read_buffer: 0,
             budget: None,
         }
@@ -981,42 +955,12 @@ impl std::fmt::Debug for ServeOptions {
         f.debug_struct("ServeOptions")
             .field("idle", &self.idle)
             .field("write_timeout", &self.write_timeout)
-            .field("tls", &self.tls.is_some())
-            .field("starttls", &self.starttls.is_some())
             .field("budget", &self.budget)
             .finish()
     }
 }
 
 impl ServeOptions {
-    /// Shakes hands with `config` for every name.
-    pub fn tls(self, config: Arc<ServerConfig>) -> ServeOptions {
-        ServeOptions {
-            tls: Some(Arc::new(move |_, _| Some(config.clone()))),
-            ..self
-        }
-    }
-
-    /// Shakes hands with the config `select` picks for the client's SNI.
-    pub fn tls_by_name(
-        self,
-        select: impl Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> + Send + Sync + 'static,
-    ) -> ServeOptions {
-        ServeOptions {
-            tls: Some(Arc::new(select)),
-            ..self
-        }
-    }
-
-    /// Shakes hands with `config` when the service asks for
-    /// [`Upgrade::Tls`].
-    pub fn starttls(self, config: Arc<ServerConfig>) -> ServeOptions {
-        ServeOptions {
-            starttls: Some(Arc::new(move |_, _| Some(config.clone()))),
-            ..self
-        }
-    }
-
     /// Sets the idle limit.
     pub fn idle(self, idle: Option<Duration>) -> ServeOptions {
         ServeOptions { idle, ..self }
@@ -1092,8 +1036,8 @@ pub enum Served<C> {
     /// cancel is [`ServeError::Cancelled`].
     Closed(Ended),
     /// The service asked for an upgrade the caller performs: the
-    /// connection with its unread bytes. [`connection`] performs
-    /// [`Upgrade::Tls`] itself and returns only [`Upgrade::Handoff`].
+    /// connection with its unread bytes. [`connection`] returns only
+    /// [`Upgrade::Handoff`].
     Upgraded(Upgrade, Prefixed<C>),
 }
 
@@ -1979,14 +1923,11 @@ async fn write_all<C: Connection>(
     .await
 }
 
-/// Serves one connection with `service` until it ends: TLS first with
-/// [`ServeOptions::tls`], then the service, with every [`Upgrade::Tls`]
-/// it asks for performed with [`ServeOptions::starttls`]. Returns how it
+/// Serves one connection with `service` until it ends. Returns how it
 /// ended, or the connection with its unread bytes after
 /// [`Upgrade::Handoff`]. Returns [`ServeError::Cancelled`] if `fcx`'s
-/// [region](fictionet::Cx#regions) is cancelled, also during a TLS
-/// handshake, at a handoff or during final shutdown, unless a failure
-/// takes precedence.
+/// [region](fictionet::Cx#regions) is cancelled, also at a handoff or
+/// during final shutdown, unless a failure takes precedence.
 ///
 /// `info` identifies the connection to the service; [`listen`] fills it in. The
 /// connection ends as soon as the client resets it, even while deferred
@@ -2067,53 +2008,10 @@ where
     C: Connection,
     <S::Decoder as Decode>::Error: Clone + Send,
 {
-    let mut conn: Box<dyn Connection> = Box::new(conn);
-    let mut info = info;
-    if let Some(select) = &opts.tls {
-        let (tls, i) = match accept_tls(
-            fcx,
-            conn,
-            &info,
-            |sni, fcx| std::future::ready(select(sni, fcx)),
-            fcx.now() + opts.handshake,
-        )
-        .await
-        {
-            Ok(done) => done,
-            Err(e) => return tls_failed(e),
-        };
-        conn = Box::new(tls);
-        info = i;
-    }
+    let conn: Box<dyn Connection> = Box::new(conn);
     let wake = WakeHandle::new();
     let _wake_owner = WakeOwner(wake.clone());
-    loop {
-        let served = run(fcx, conn, info.clone(), service, state, opts, wake.clone()).await?;
-        let rest = match served {
-            Served::Upgraded(Upgrade::Tls, rest) => rest,
-            other => return Ok(other),
-        };
-        let Some(select) = &opts.starttls else {
-            return Ok(Served::Closed(Ended::Failed));
-        };
-        let deadline = fcx.now() + opts.handshake;
-        let ready = |sni: Option<&str>, fcx: &Cx| std::future::ready(select(sni, fcx));
-        let (tls, i) = match accept_tls(fcx, rest, &info, ready, deadline).await {
-            Ok(done) => done,
-            Err(e) => return tls_failed(e),
-        };
-        conn = Box::new(tls);
-        info = i;
-    }
-}
-
-/// How [`connection`] ends when its TLS handshake fails: cancelled if the
-/// handshake was, else with the connection closed as broken.
-fn tls_failed<E>(e: HandshakeError) -> Result<Served<Box<dyn Connection>>, ServeError<E>> {
-    match e {
-        HandshakeError::Cancelled => Err(ServeError::Cancelled),
-        _ => Ok(Served::Closed(Ended::Conn(ConnError::Broken))),
-    }
+    run(fcx, conn, info, service, state, opts, wake).await
 }
 
 #[deny(clippy::let_underscore_must_use)]
@@ -2232,10 +2130,7 @@ where
                     continue;
                 }
                 let unread = core.unread();
-                // The service goes on after TLS, with the same handle.
-                if how != Upgrade::Tls {
-                    core.s.wake.close();
-                }
+                core.s.wake.close();
                 return Ok(Served::Upgraded(how, Prefixed::new(unread, conn)));
             }
             Next::Closed(end) => {
@@ -2268,55 +2163,11 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// TLS
-
-/// Shakes hands as a TLS server on `conn`, with the config `select` picks
-/// for the client's SNI, by `deadline`. The config may take time to pick
-/// (a world that checks the real host first, say): only this handshake
-/// waits for it, and the wait counts toward `deadline`.
-///
-/// Returns the TLS connection and `info` with its SNI and ALPN, or how the
-/// handshake failed: [`HandshakeError::Rejected`] when `select` has no
-/// config for the name, [`HandshakeError::TimedOut`] past `deadline`, and
-/// [`HandshakeError::Cancelled`] if `fcx`'s [region](fictionet::Cx#regions)
-/// is cancelled.
-pub async fn accept_tls<C: Connection, F: Future<Output = Option<Arc<ServerConfig>>>>(
-    fcx: &Cx,
-    conn: C,
-    info: &ConnInfo,
-    select: impl FnOnce(Option<&str>, &Cx) -> F,
-    deadline: Instant,
-) -> Result<(TlsConnection<C>, ConnInfo), HandshakeError> {
-    let mut sni: Option<String> = None;
-    let handshake = async {
-        let hello = tls::server_detailed(fcx, conn).await?;
-        sni = hello
-            .server_name()
-            .map(|n| n.trim_end_matches('.').to_ascii_lowercase());
-        let Some(config) = select(sni.as_deref(), fcx).await else {
-            let _ = hello.reject(fcx).await;
-            return Err(HandshakeError::Rejected);
-        };
-        hello.finish_detailed(fcx, config).await
-    };
-    let done = match fcx.race(Some(deadline), handshake).await {
-        Ok(done) => done,
-        Err(RaceError::Deadline) => Err(HandshakeError::TimedOut),
-        Err(RaceError::Cancelled) => Err(HandshakeError::Cancelled),
-    };
-
-    let conn = done?;
-    let info = info.clone().over_tls(sni.as_deref(), conn.alpn());
-    Ok((conn, info))
-}
-
-// ---------------------------------------------------------------------------
 // Listening
 
 /// Accepts connections on `listener` and serves each with a fresh service
 /// from `make`, in a task of its own, until the listener closes or the
-/// region is cancelled. With [`ServeOptions::tls`], each connection shakes
-/// hands first. At most `max_conns` connections are served at once
+/// region is cancelled. At most `max_conns` connections are served at once
 /// ([`DEFAULT_MAX_CONNS`] is the usual choice); past that, a new one is
 /// reset as soon as it is accepted. Each counts until its socket is gone,
 /// so a client that never finishes closing cannot open more. Connections
@@ -2800,7 +2651,8 @@ pub enum HarnessError<D, S> {
     Pending(fictionet::Error),
     /// The connection is closed: no more bytes are taken.
     Closed,
-    /// The service asked for this upgrade; see [`Harness::resume`].
+    /// The service asked for this upgrade, which hands the connection on:
+    /// the harness runs nothing more.
     Upgraded(Upgrade),
 }
 
@@ -2857,7 +2709,6 @@ pub struct Harness<S: Service> {
     service: S,
     state: S::State,
     core: Core<S>,
-    opts: ServeOptions,
     now: Instant,
     opened: bool,
     output: Vec<u8>,
@@ -2902,7 +2753,6 @@ where
             service,
             state,
             core,
-            opts,
             now: Instant::ZERO,
             opened: false,
             output: Vec::new(),
@@ -3081,37 +2931,6 @@ where
         if self.closed() || self.upgraded.is_some() {
             return Ok(Vec::new());
         }
-        self.run()
-    }
-
-    /// After [`HarnessError::Upgraded`]: goes on as [`connection`] does once the
-    /// upgrade is done, as the connection `conn` (for TLS, with `tls` set).
-    /// The service gets a fresh decoder that reads the unread bytes, and
-    /// [`Service::on_open`] again. Returns what it sends.
-    pub fn resume(&mut self, conn: ConnInfo) -> HarnessResult<S> {
-        if self.upgraded.take().is_none() {
-            return Ok(Vec::new());
-        }
-        self.read_clock();
-        self.reported = false;
-        let unread = self.core.unread();
-        let wake = self.core.s.wake.clone();
-        let fcx = self.core.fcx.take();
-        let mut core = Core::new(
-            fcx,
-            self.core.s.entropy.clone(),
-            &self.service,
-            conn,
-            &self.opts,
-            Some(wake),
-            self.now,
-        );
-        core.s.bytes_in = self.core.s.bytes_in;
-        if !unread.is_empty() {
-            core.queue.push_back((unread, 0));
-        }
-        self.core = core;
-        self.core.open(&mut self.service, &self.state, self.now);
         self.run()
     }
 
