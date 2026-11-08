@@ -551,6 +551,10 @@ impl Layer for IpLayer {
     }
 }
 
+#[cfg(kani)]
+#[path = "../../../verification/packet-udp/kani/packet.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

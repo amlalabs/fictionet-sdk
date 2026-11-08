@@ -126,3 +126,7 @@ pub fn encode(
     bytes[6..8].copy_from_slice(&if sum == 0 { 0xffff } else { sum }.to_be_bytes());
     Ok(len)
 }
+
+#[cfg(kani)]
+#[path = "../../../../verification/packet-udp/kani/udp_wire.rs"]
+mod proofs;

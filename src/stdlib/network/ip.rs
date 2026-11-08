@@ -1786,6 +1786,10 @@ pub fn hop(packet: &mut [u8]) -> Hop {
     }
 }
 
+#[cfg(kani)]
+#[path = "../../../verification/packet-udp/kani/ip_header.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
