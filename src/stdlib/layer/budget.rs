@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// A [`Charge`] holds part of it and gives it back when dropped. Charge
 /// before growing: [`Budget::charge`] and [`Charge::set`] refuse, changing
 /// nothing, when the total would pass the limit, so the limit holds at every
-/// moment and not only when someone checks.
+/// moment and not only when someone checks. A layer reaches its
+/// connection's budget through [`Env::budget`](super::Env::budget); a
+/// [`Chunk`](super::Chunk) can carry its charge with it, so the charge moves
+/// with the bytes.
 ///
 /// [`serve`](fictionet::stdlib::services::serve) charges each connection the
 /// larger of its decoder's capacity and its read buffer, the decoder's held
@@ -42,6 +45,11 @@ impl Budget {
                 limit,
             }),
         }
+    }
+
+    /// A budget that never refuses, for code that is not limited.
+    pub fn unlimited() -> Budget {
+        Budget::new(usize::MAX)
     }
 
     /// Bytes charged now.
@@ -110,6 +118,20 @@ impl Charge {
         } else {
             false
         }
+    }
+
+    /// Moves `bytes` of this charge into a new one, as when part of what it
+    /// pays for changes owner. The budget's total does not change. `None`,
+    /// changing nothing, if this charge holds less.
+    pub fn split(&mut self, bytes: usize) -> Option<Charge> {
+        if bytes > self.now {
+            return None;
+        }
+        self.now -= bytes;
+        Some(Charge {
+            budget: self.budget.clone(),
+            now: bytes,
+        })
     }
 }
 
