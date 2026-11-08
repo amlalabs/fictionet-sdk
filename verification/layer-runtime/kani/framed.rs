@@ -14,7 +14,6 @@
 extern crate alloc;
 
 use super::super::{BoundedDecode, BoundedWire, Framed, FramedError, Owned};
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -159,19 +158,10 @@ fn seen<T, E>(event: &MessageEvent<Result<T, E>>) -> Seen {
     }
 }
 
-/// A chunk of exactly `N` bytes the solver chooses. The length is fixed so
-/// that the solver's allocations have fixed sizes; the harnesses cover
-/// every length up to their bound one case each. The bytes are leaked to a
-/// static slice, so `Bytes` takes its static form; `Framed` reads only the
-/// slice.
+/// A chunk of exactly `N` symbolic bytes. Separate fixed lengths keep
+/// allocation sizes concrete while covering every byte value.
 fn fixed<const N: usize>() -> Chunk {
-    let leaked: &'static [u8; N] = Box::leak(Box::new(kani::any::<[u8; N]>()));
-    Chunk::new(&leaked[..])
-}
-
-/// `N` bytes the solver chooses, as a static slice.
-fn fixed_bytes<const N: usize>() -> &'static [u8] {
-    Box::leak(Box::new(kani::any::<[u8; N]>()))
+    Chunk::new(kani::any::<[u8; N]>().to_vec())
 }
 
 /// What a push of `offered` hands back is exactly the bytes it did not take.
@@ -201,10 +191,11 @@ fn charged_across<const A: usize, const B: usize>() {
         );
         assert_eq!(budget.used(), buffer_charge(f));
     };
-    let first = fixed_bytes::<A>();
+    let first = kani::any::<[u8; A]>();
     suffix_kept(
-        first,
-        d.deliver(StreamEvent::Data(Chunk::new(first))).unwrap(),
+        &first,
+        d.deliver(StreamEvent::Data(Chunk::new(first.to_vec())))
+            .unwrap(),
     );
     check(&d);
     let takes: u8 = kani::any();
@@ -212,10 +203,11 @@ fn charged_across<const A: usize, const B: usize>() {
     for _ in 0..takes {
         let _ = d.layer_mut().take_event();
     }
-    let second = fixed_bytes::<B>();
+    let second = kani::any::<[u8; B]>();
     suffix_kept(
-        second,
-        d.deliver(StreamEvent::Data(Chunk::new(second))).unwrap(),
+        &second,
+        d.deliver(StreamEvent::Data(Chunk::new(second.to_vec())))
+            .unwrap(),
     );
     check(&d);
 }
@@ -257,9 +249,9 @@ fn accounted(budget: &Budget, d: &Driver<Framed<Units, Blob>>, flying: &Option<C
 /// and `S2`: 0 the peer ends, 1 the peer resets, 2 the layer above ends, 3
 /// an event is taken, 4 the transport takes the write it holds, 5 the
 /// transport takes the next write.
-/// The limits: none, room for the buffer's charge only (six),
-/// for the written value's only (eight, a `Vec`'s first allocation), for
-/// either but not both, and for both.
+/// The fixed limits exercise refusal, the input reservation alone, and
+/// combined input and output with several amounts of spare capacity.
+/// Output now reserves its declared encoded bound before allocation.
 fn charges_come_back<const LIMIT: usize, const S1: u8, const S2: u8>() {
     let budget = Budget::new(LIMIT);
     let mut d = driver(Units, &budget);
@@ -343,11 +335,9 @@ fn in_order<const ODD_FIRST: bool, const CUT: usize>() {
     // The first byte of each unit says its length, so it is fixed by the
     // shape; the other bytes of a three-byte unit are the solver's.
     let (p, q): (u8, u8) = (kani::any(), kani::any());
-    let wire: &'static [u8] = if ODD_FIRST {
-        Box::leak(Box::new([5, p, q, 2]))
-    } else {
-        Box::leak(Box::new([2, 5, p, q, 7]))
-    };
+    let odd = [5, p, q, 2];
+    let even = [2, 5, p, q, 7];
+    let wire: &[u8] = if ODD_FIRST { &odd } else { &even };
     let units = if ODD_FIRST { [5, 2] } else { [2, 5] };
     let partial = !ODD_FIRST;
     let budget = Budget::unlimited();
@@ -423,6 +413,7 @@ in_order! {
 
 #[kani::proof]
 #[kani::unwind(7)]
+#[kani::solver(minisat)]
 fn a_decoder_failure_comes_up_once_then_ended() {
     let budget = Budget::unlimited();
     let mut d = driver(Steps, &budget);

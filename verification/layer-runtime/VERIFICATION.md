@@ -373,6 +373,19 @@ the item, and checks that the reservation remains until the item is dropped.
 The PLC proof setup now supplies and receives owned frames with reservations;
 its request ordering and identity assertions are unchanged.
 
+The readiness pass reran all 23 Framed harnesses after moving Chunk to
+owned vector backing: all verified under the 12 GiB memory cap. The nine
+buffer harnesses took 58 to 82 seconds each, the ten charge-release
+harnesses 2 to 10 seconds, the ordering harness 4 seconds, and the two new
+ownership/reservation harnesses 1 to 3 seconds. The symbolic decoder
+failure harness verified in 277 seconds using MiniSat, with its original
+three symbolic operations, unwind bound and assertions unchanged. Input
+fixtures now use fixed-size symbolic arrays copied into the production
+chunk rather than leaking an extra allocation for a static slice. Earlier
+runs against the intermediate shared backing implementation were stopped
+or exceeded the available resources; only the completed vector-backed run
+is counted here.
+
 ## Kani over the PLC server and the time server
 
 ### The PLC server: `kani/plc.rs`
@@ -415,6 +428,13 @@ controller serves, which read and change the plant, are not covered.
 | --- | --- | --- |
 | a frame that arrives while an answer waits is taken and dropped instead of refused | `a_pipelined_request_waits_for_the_answer_before_it_unserved` | FAILED: "the second request waits for the first answer" (26 s) |
 | the end of the client's frames is ignored | `each_request_gets_one_answer_in_order_unserved_pdu_2` | FAILED: "the server ends its side once the client's frames are over" (31 s) |
+
+The readiness pass also reran all 18 PLC harnesses with owned request and
+response reservations and the existing plant unwind set. All verified in
+44 to 82 seconds each under the 12 GiB cap. The one- and two-byte input
+domains, function cases, pipeline choices and identity/order assertions
+are unchanged. These proofs exercise the application and ownership API;
+the real framed PLC stack additionally passed all 24 PLC unit tests.
 
 ### The time server: `kani/ntp.rs`
 
