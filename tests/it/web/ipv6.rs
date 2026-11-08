@@ -369,28 +369,21 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
 
 #[test]
 fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
-    use fictionet::stdlib::codec::{Ending, LineError, Lines};
-    use fictionet::stdlib::services::serve::{DatagramDriver, DatagramFlow, DatagramService};
+    use crate::common::line_stack::{DatagramApp, Datagrammed, Sends};
+    use fictionet::stdlib::codec::LineError;
+    use fictionet::stdlib::layer::Budget;
+    use fictionet::stdlib::network::ConnInfo;
     use fictionet::stdlib::web::httpd;
     use fictionet::stdlib::world::net::{Host, Net};
 
+    /// Answers nothing.
     struct Quiet;
-    impl DatagramService for Quiet {
+    impl DatagramApp for Quiet {
         type Timer = ();
-        type Decoder = Lines;
-        type State = ();
-        type Error = Infallible;
-        fn decoder(&self) -> Lines {
-            Lines::new(64, Ending::LfOrCrlf)
-        }
-        fn on_item(
-            &mut self,
-            _: Result<Vec<u8>, LineError>,
-            _: &(),
-            _: &mut DatagramDriver<'_, Lines>,
-        ) -> Result<DatagramFlow, Infallible> {
-            Ok(DatagramFlow::Continue)
-        }
+        fn line(&mut self, _: Result<Vec<u8>, LineError>, _: SocketAddr, _: &mut Sends<'_, ()>) {}
+    }
+    fn quiet(info: &ConnInfo) -> Datagrammed<Quiet> {
+        Datagrammed::new(Quiet, info.local)
     }
 
     run_world::world(Duration::from_secs(60), |fcx| async move {
@@ -425,13 +418,14 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
             site("first", false).served_by(Host::new("first").dns_name("first.test").at(v4).at(v6));
         // Only IPv6 has an ephemeral socket at 49152. IPv4 preparation
         // succeeds before the rejected declaration reaches that conflict.
-        let occupied = Host::new("occupied")
-            .at(v6)
-            .ipv6_only()
-            .udp(0, Arc::new(()), || Quiet);
+        let occupied =
+            Host::new("occupied")
+                .at(v6)
+                .ipv6_only()
+                .udp_stack(0, Budget::unlimited(), quiet);
         let bad = site("bad", true)
             .served_by(Host::new("bad").at(v4).at(v6))
-            .udp(49152, Arc::new(()), || Quiet);
+            .udp_stack(49152, Budget::unlimited(), quiet);
         let good = site("good", false).served_by(Host::new("good").at(v4).at(v6));
         let (attacher, attachments) = fictionet::attachments();
         let net = Net::new(fictionet_extras::network::cdn_pools())
