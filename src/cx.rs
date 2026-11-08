@@ -379,8 +379,8 @@ impl Cx {
     }
 
     /// Runs `f` in a new region inside this one, and waits for that region
-    /// to end: until `f` has returned and all the work it spawned has
-    /// ended.
+    /// to end: until `f` has returned and all tasks in that region and its
+    /// descendants have ended.
     ///
     /// `f` runs inside the task that awaits this. Its work is cancelled when
     /// this region is. For work that is allowed to fail as a whole, such as
@@ -401,8 +401,8 @@ impl Cx {
     /// cancel the region.
     ///
     /// Dropping the returned future before it finishes cancels the new
-    /// region. Its work then ends on its own, as after any cancel, but
-    /// nothing waits for it and its errors are lost.
+    /// region without blocking. Its tasks remain counted in the enclosing
+    /// region until they end; their errors have no dropped owner to return to.
     pub async fn region<F, Fut>(&self, f: F) -> crate::Result
     where
         F: FnOnce(Cx) -> Fut,

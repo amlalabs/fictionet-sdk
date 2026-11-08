@@ -31,6 +31,7 @@ impl Drop for CancelWait {
 /// A region: a group of work that is cancelled together and ends together.
 pub(crate) struct Region {
     run: Weak<RunShared>,
+    parent: Option<Weak<Region>>,
     cancelled: AtomicBool,
     /// Cancelled by [`Cx::cancel`](crate::Cx::cancel): errors from then on are not kept.
     pub(super) stopped: AtomicBool,
@@ -48,8 +49,10 @@ struct RegionState {
     error: Option<crate::Error>,
     /// Some of its work ended with a cancel instead of finishing.
     cancel_ended: bool,
-    /// Spawned work that has not ended yet.
+    /// Spawned work here or below that has not ended yet.
     live: usize,
+    /// Keeps the ancestor accounting alive while descendants have tasks.
+    active_parent: Option<Arc<Region>>,
     /// The owner observed completion; no more tasks may enter.
     completed: bool,
     /// Woken when `live` drops to zero.
@@ -60,6 +63,7 @@ impl Region {
     pub(crate) fn root(run: Weak<RunShared>) -> Arc<Region> {
         Arc::new(Region {
             run,
+            parent: None,
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             state: Mutex::default(),
@@ -69,6 +73,7 @@ impl Region {
     pub(crate) fn child(self: &Arc<Self>) -> Arc<Region> {
         let child = Arc::new(Region {
             run: self.run.clone(),
+            parent: Some(Arc::downgrade(self)),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             state: Mutex::default(),
@@ -156,9 +161,23 @@ impl Region {
     }
 
     pub(crate) fn try_start_task(&self) -> bool {
+        let parent = match &self.parent {
+            Some(parent) => match parent.upgrade() {
+                Some(parent) if parent.try_start_task() => Some(parent),
+                _ => return false,
+            },
+            None => None,
+        };
         let mut state = self.state.lock();
         if state.completed {
+            drop(state);
+            if let Some(parent) = parent {
+                parent.task_done(false);
+            }
             return false;
+        }
+        if state.live == 0 {
+            state.active_parent = parent;
         }
         state.live += 1;
         true
@@ -178,13 +197,13 @@ impl Region {
     /// Counts one task as ended. `failed` cancels the region: the task's
     /// error was already kept with [`record_error`](Region::record_error).
     pub(crate) fn task_done(&self, failed: bool) {
-        let done = {
+        let (done, parent) = {
             let mut state = self.state.lock();
             state.live -= 1;
             if state.live == 0 {
-                state.done.take()
+                (state.done.take(), state.active_parent.take())
             } else {
-                None
+                (None, state.active_parent.clone())
             }
         };
         if failed {
@@ -192,6 +211,10 @@ impl Region {
         }
         if let Some(w) = done {
             w.wake();
+        }
+        if let Some(parent) = parent {
+            // Descendant completion releases accounting, not its local error.
+            parent.task_done(false);
         }
     }
 
@@ -220,6 +243,65 @@ mod tests {
     use crate::{Cancelled, Cx, JoinError, block_on, run};
     use std::future::{Future, poll_fn};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn completion_waits_for_descendants_and_preserves_error_isolation() {
+        let root = Region::root(Weak::new());
+        let child = root.child();
+        let grandchild = child.child();
+        let sibling = root.child();
+        assert!(grandchild.try_start_task());
+        assert!(sibling.try_start_task());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(root.poll_done(&mut cx).is_pending());
+        assert!(child.poll_done(&mut cx).is_pending());
+        assert_eq!(root.state.lock().live, 2);
+        grandchild.task_done(true);
+        assert!(grandchild.is_cancelled());
+        assert!(!child.is_cancelled());
+        assert!(!root.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        assert!(child.poll_done(&mut cx).is_ready());
+        assert!(root.poll_done(&mut cx).is_pending());
+        sibling.task_done(false);
+        assert!(root.poll_done(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn descendants_keep_accounting_alive_without_retaining_idle_regions() {
+        let root = Region::root(Weak::new());
+        let middle = root.child();
+        let child = middle.child();
+        let weak = Arc::downgrade(&middle);
+        assert!(child.try_start_task());
+        drop(middle);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(root.state.lock().live, 1);
+        child.task_done(false);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(root.state.lock().live, 0);
+        assert!(
+            !child.try_start_task(),
+            "an expired ancestor cannot be reopened"
+        );
+    }
+
+    #[test]
+    fn closed_admission_rolls_back_every_ancestor_reservation() {
+        let root = Region::root(Weak::new());
+        let middle = root.child();
+        let child = middle.child();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(child.poll_done(&mut cx).is_ready());
+        assert!(!child.try_start_task());
+        assert_eq!(middle.state.lock().live, 0);
+        assert_eq!(root.state.lock().live, 0);
+        assert!(middle.poll_done(&mut cx).is_ready());
+        assert!(!middle.child().try_start_task());
+        assert_eq!(root.state.lock().live, 0);
+        assert!(root.poll_done(&mut cx).is_ready());
+        assert!(!root.child().child().try_start_task());
+    }
 
     #[test]
     fn completion_waiter_replacement_releases_wakers_outside_the_lock() {
