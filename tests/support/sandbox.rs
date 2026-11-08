@@ -3,7 +3,6 @@
 //! [`machine`] splits a cable into TCP, UDP, and ICMP. DNS queries and
 //! TLS handshakes use the run's clock and randomness.
 
-#[path = "../../src/stdlib/services/tls/output.rs"]
 mod output;
 use output::Output;
 

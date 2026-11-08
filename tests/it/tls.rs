@@ -16,6 +16,9 @@ use fictionet::{Cx, Seed, block_on, lab};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
+#[path = "tls_layer.rs"]
+mod layer;
+
 // ---------------------------------------------------------------------------
 // An in-memory connection pair.
 
