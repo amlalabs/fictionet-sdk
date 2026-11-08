@@ -91,7 +91,7 @@ impl Default for StreamLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamEnd {
     /// The stack ended its direction, every byte of it was written, and no
-    /// work is left.
+    /// work is left, and input ended or the stack declared itself terminal.
     Finished,
     /// The same, after the runner ended the input of an idle connection
     /// ([`StreamLimits::idle`]).
@@ -99,7 +99,8 @@ pub enum StreamEnd {
     /// The stack reset the connection. Whoever owns the socket resets it.
     Reset,
     /// The budget had no room for the connection's read buffer, so the
-    /// stack never ran, or for bytes it read, and the stack heard
+    /// stack never ran, for its work slots, or for bytes it read.
+    /// When input allocation fails the stack hears
     /// [`StreamEvent::Reset`](fictionet::stdlib::layer::StreamEvent::Reset).
     Budget,
     /// Reading or writing failed: the peer reset the connection, or it
@@ -115,6 +116,8 @@ pub enum StreamEnd {
 pub enum StackError<E> {
     /// The stack gave up on its connection with this error.
     Layer(E),
+    /// The runner could not retain input or work within its memory budget.
+    Budget,
     /// The run's [region](fictionet::Cx#regions) was cancelled.
     Cancelled,
 }
@@ -123,6 +126,7 @@ impl<E: core::fmt::Display> core::fmt::Display for StackError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             StackError::Layer(e) => e.fmt(f),
+            StackError::Budget => f.write_str("stack memory budget exhausted"),
             StackError::Cancelled => f.write_str("cancelled"),
         }
     }
@@ -132,6 +136,7 @@ impl<E: core::error::Error + 'static> core::error::Error for StackError<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             StackError::Layer(e) => Some(e),
+            StackError::Budget => None,
             StackError::Cancelled => Some(&Cancelled),
         }
     }
@@ -156,7 +161,8 @@ impl<E> From<Cancelled> for StackError<E> {
 /// that work, not the run.
 ///
 /// It returns once the stack has ended its direction with every byte
-/// written and no work left, or when the connection fails, the stack
+/// written and no work left, and input has ended or the stack declares
+/// itself terminal, or when the connection fails, the stack
 /// resets it or gives up on it, or `limits` give up on it. A panic in the
 /// stack names it and `info` on standard error as it unwinds
 /// ([`PanicNote`]). Dropping the run drops the stack and its work.
@@ -204,7 +210,10 @@ where
 
 /// Runs `stack` over every datagram of `socket`, which is bound at
 /// `local`, until the socket closes or the stack ends it, handing its
-/// reports to `report`.
+/// reports to `report`, charging retained input and layer state to `budget`.
+/// The socket owns its receive allocation until it returns; that transport
+/// storage is outside this budget. Before retaining a returned datagram the
+/// runner charges its full capacity, or drops it and returns a budget error.
 ///
 /// The stack is one conversation for the socket's whole life: it keeps
 /// whatever state it likes between datagrams, and its timers run between
@@ -220,6 +229,7 @@ pub async fn datagrams<L, D>(
     socket: D,
     local: SocketAddr,
     stack: L,
+    budget: Budget,
     mut report: impl FnMut(L::Report) + Send,
 ) -> Result<(), StackError<L::Error>>
 where
@@ -234,7 +244,7 @@ where
     };
     let _note = PanicNote::new(std::any::type_name::<L>(), &info);
     in_region(fcx, move |fcx| async move {
-        run_datagrams(&fcx, socket, stack, &mut report).await
+        run_datagrams(&fcx, socket, stack, budget, &mut report).await
     })
     .await
 }
@@ -243,6 +253,7 @@ async fn run_datagrams<L, D>(
     fcx: &Cx,
     mut socket: D,
     stack: L,
+    budget: Budget,
     report: &mut (impl FnMut(L::Report) + Send),
 ) -> Result<(), StackError<L::Error>>
 where
@@ -250,28 +261,28 @@ where
     L::Work: Job<Done = L::Done>,
     D: DatagramSocket,
 {
-    let mut driver = Driver::new(
-        stack,
-        std::sync::Arc::new(fcx.clone()),
-        Budget::unlimited(),
-        fcx.now(),
-    );
+    let mut driver = Driver::new(stack, std::sync::Arc::new(fcx.clone()), budget, fcx.now());
     let mut jobs = Jobs::new();
-    let mut finished: Vec<L::Done> = Vec::new();
     let mut input: Option<DatagramEvent<SocketAddr>> = None;
     let mut socket_closed = false;
     let mut rounds = 0u32;
     loop {
         driver.set_now(fcx.now());
+        // Poll work even while a productive layer keeps the runner busy.
+        poll_fn(|cx| {
+            Poll::Ready(jobs.poll(Some(fcx), cx, |done| {
+                driver.complete(done).map_err(StackError::Layer)
+            }))
+        })
+        .await?;
         let mut ended = false;
         let mut settled = false;
         for _ in 0..FAIR {
             let mut moved = false;
-            for done in finished.drain(..) {
-                driver.complete(done).map_err(StackError::Layer)?;
-                moved = true;
-            }
             moved |= jobs.take(&mut driver);
+            if jobs.budget_exhausted() {
+                return Err(StackError::Budget);
+            }
             if let Some(event) = input.take() {
                 match driver.deliver(event).map_err(StackError::Layer)? {
                     Admit::Taken | Admit::Closed(_) => moved = true,
@@ -314,14 +325,12 @@ where
             let mut recv = pin!(socket.recv(fcx));
             let mut sleep = pin!(deadline.map(|t| fcx.sleep_until(t)));
             let mut cancelled = pin!(fcx.cancelled());
-            let (jobs, finished) = (&mut jobs, &mut finished);
             poll_fn(|cx| {
                 if cancelled.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(Err(StackError::Cancelled));
                 }
                 let done = jobs.poll(Some(fcx), cx, |done| {
-                    finished.push(done);
-                    Ok::<(), StackError<L::Error>>(())
+                    driver.complete(done).map_err(StackError::Layer)
                 })?;
                 if receive && let Poll::Ready(r) = recv.as_mut().poll(cx) {
                     return Poll::Ready(Ok(Some(r)));
@@ -339,8 +348,12 @@ where
         };
         match got {
             Some(Ok((bytes, from))) => {
+                let charge = driver
+                    .budget()
+                    .charge(bytes.capacity())
+                    .ok_or(StackError::Budget)?;
                 input = Some(DatagramEvent::Datagram(Datagram::new(
-                    Chunk::new(bytes),
+                    Chunk::with_charge(bytes, charge),
                     from,
                 )));
             }

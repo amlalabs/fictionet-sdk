@@ -5,8 +5,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use bytes::Bytes;
-
 use super::Job;
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
@@ -52,6 +50,8 @@ struct Shared {
     outbound_len: usize,
     /// The code will write nothing more.
     finished: bool,
+    /// The application released its connection.
+    released: bool,
     /// `End` went down.
     end_sent: bool,
     budget: Option<Budget>,
@@ -97,6 +97,7 @@ impl Tunnel {
                 outbound: VecDeque::new(),
                 outbound_len: 0,
                 finished: false,
+                released: false,
                 end_sent: false,
                 budget: None,
                 reader: None,
@@ -125,6 +126,10 @@ impl Layer for Tunnel {
     type Work = Takeover;
     type Done = ();
     type Error = Infallible;
+
+    fn is_terminal(&self) -> bool {
+        self.shared.lock().released
+    }
 
     fn on_event(
         &mut self,
@@ -218,6 +223,7 @@ impl Job for Takeover {
                 // Nothing can take the stream over without a world.
                 let mut shared = self.shared.lock();
                 shared.finished = true;
+                shared.released = true;
                 return Poll::Ready(());
             };
             let conn = Box::new(TunnelConn {
@@ -296,7 +302,7 @@ impl Connection for TunnelConn {
             },
             None => None,
         };
-        let bytes = Bytes::copy_from_slice(&data[..n]);
+        let bytes = data[..n].to_vec();
         let chunk = match charge {
             Some(charge) => Chunk::with_charge(bytes, charge),
             None => Chunk::new(bytes),
@@ -328,6 +334,7 @@ impl Drop for TunnelConn {
     fn drop(&mut self) {
         let mut shared = self.shared.lock();
         shared.finished = true;
+        shared.released = true;
         shared.wake_runner();
     }
 }

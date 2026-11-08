@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::layer::{
-    Admit, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Env, Layer, Top,
+    Admit, Budget, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Env, Layer, Top,
 };
 use fictionet::stdlib::protocols::ntp::{self, Leap, Packet, ServerInfo, Timestamp};
 use fictionet::stdlib::world::net::Host;
@@ -27,7 +27,9 @@ pub(crate) fn host(pages: Arc<Pages>) -> Host {
 
 /// Serves NTP on `host`'s UDP port 123 with the time `clock` reads.
 fn serve(host: Host, clock: impl Fn() -> SystemTime + Clone + Send + Sync + 'static) -> Host {
-    host.udp_stack(ntp::PORT, move || TimeServer::new(clock.clone()))
+    host.udp_stack(ntp::PORT, Budget::new(128 * 1024), move || {
+        TimeServer::new(clock.clone())
+    })
 }
 
 /// An NTP server over UDP: one conversation for the socket's whole life,
@@ -62,10 +64,10 @@ impl<C: Fn() -> SystemTime> TimeServer<C> {
         };
         // A packet that is not a request, such as a server's reply, gets
         // no answer, as from a real server.
-        ntp::server_reply(&request, &server, now, now)
-            .ok()?
-            .to_bytes()
-            .ok()
+        let reply = ntp::server_reply(&request, &server, now, now).ok()?;
+        let mut bytes = Vec::with_capacity(ntp::HEADER_LEN);
+        reply.write(&mut bytes).ok()?;
+        Some(bytes)
     }
 }
 
@@ -93,9 +95,16 @@ impl<C: Fn() -> SystemTime> Layer for TimeServer<C> {
         let client = *datagram.meta();
         // An answer the budget has no room for is not sent, as a busy
         // server drops a request.
-        if let Some(bytes) = self.answer(datagram.payload())
-            && let Some(charge) = env.budget().charge(bytes.capacity())
+        // Parsing copies the trailer; the transactional writer uses one
+        // temporary header alongside the final reply allocation.
+        let temporary = datagram.payload().len().saturating_sub(ntp::HEADER_LEN);
+        let Some(reservation) = temporary.checked_add(2 * ntp::HEADER_LEN) else {
+            return Ok(Admit::Taken);
+        };
+        if let Some(mut charge) = env.budget().charge(reservation)
+            && let Some(bytes) = self.answer(datagram.payload())
         {
+            charge.set(ntp::HEADER_LEN);
             let payload = Chunk::with_charge(bytes, charge);
             self.reply = Some(Datagram::new(payload, client));
         }
@@ -182,6 +191,47 @@ mod tests {
 
     fn client(port: u16) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, 2], port))
+    }
+
+    #[test]
+    fn reply_memory_is_reserved_before_parsing_and_encoding() {
+        let mut request = Packet::client_request(Timestamp::from_unix(1_000, 7));
+        request.trailer = vec![0; 4];
+        let bytes = request.to_bytes().unwrap();
+        for limit in [99, 100] {
+            let budget = Budget::new(limit);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let mut driver = Driver::new(
+                TimeServer::new(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    session()
+                }),
+                Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+                budget.clone(),
+                Instant::ZERO,
+            );
+            let event =
+                DatagramEvent::Datagram(Datagram::new(Chunk::new(bytes.clone()), client(1)));
+            assert!(matches!(driver.deliver(event).unwrap(), Admit::Taken));
+            let command = driver.layer_mut().take_command();
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::Relaxed),
+                usize::from(limit == 100)
+            );
+            assert_eq!(command.is_some(), limit == 100);
+            assert_eq!(
+                budget.used(),
+                if limit == 100 { ntp::HEADER_LEN } else { 0 }
+            );
+            drop(driver);
+            assert_eq!(
+                budget.used(),
+                if limit == 100 { ntp::HEADER_LEN } else { 0 }
+            );
+            drop(command);
+            assert_eq!(budget.used(), 0);
+        }
     }
 
     #[test]

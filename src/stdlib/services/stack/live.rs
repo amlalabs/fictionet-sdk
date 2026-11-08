@@ -137,16 +137,19 @@ where
     }
 
     /// How the run finished, once the stack has ended its direction, every
-    /// byte of it is written, and no work is left. A stack that ends its
-    /// direction is done with the connection.
+    /// byte of it is written, no work is left, and input has ended or the
+    /// stack explicitly declares its whole lifetime terminal.
     pub(super) fn finished(&self) -> Option<StreamEnd> {
-        (self.shut && !self.driver.holds_output() && self.jobs.is_empty()).then_some(
-            if self.idled {
-                StreamEnd::Idle
-            } else {
-                StreamEnd::Finished
-            },
-        )
+        (self.shut
+            && (self.input_over || self.driver.layer().is_terminal())
+            && !self.driver.holds_output()
+            && self.unreported == 0
+            && self.jobs.is_empty())
+        .then_some(if self.idled {
+            StreamEnd::Idle
+        } else {
+            StreamEnd::Finished
+        })
     }
 
     /// Moves the stack and its connection on until nothing more can move
@@ -226,6 +229,9 @@ where
                 .poll(Some(fcx), cx, |done| driver.complete(done))
                 .map_err(StackError::Layer)?;
             moved |= self.jobs.take(&mut self.driver);
+            if self.jobs.budget_exhausted() {
+                return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
+            }
             if self.unreported > 0
                 && !matches!(
                     self.driver
@@ -382,6 +388,8 @@ where
             return Poll::Pending;
         }
         // Busy for a while: let the rest of the world run, then go on.
+        // This pause is internal work, not time spent waiting for the peer.
+        self.was_waiting = false;
         cx.waker().wake_by_ref();
         Poll::Pending
     }

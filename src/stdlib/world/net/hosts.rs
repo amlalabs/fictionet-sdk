@@ -619,8 +619,9 @@ impl Host {
     /// the conversation for the socket's whole life and gets every
     /// datagram with its sender's address ([`stack::datagrams`]). Port
     /// zero asks the endpoint to choose a free port
-    /// ([`udp::Endpoint::bind`]).
-    pub fn udp_stack<L, M>(mut self, port: u16, make: M) -> Host
+    /// ([`udp::Endpoint::bind`]). Retained datagrams and layer state share
+    /// `budget` across every sender and every instance of this host.
+    pub fn udp_stack<L, M>(mut self, port: u16, budget: Budget, make: M) -> Host
     where
         L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top> + Send + 'static,
         L::Work: Job<Done = L::Done>,
@@ -630,12 +631,16 @@ impl Host {
         M: Fn() -> L + Send + Sync + 'static,
     {
         let start: UdpStart = Arc::new(move |fcx, socket, local, _sandbox| {
+            let budget = budget.clone();
             let layer = make();
             fcx.spawn(move |fcx| async move {
-                match stack::datagrams(&fcx, socket, local, layer, |_| {}).await {
+                match stack::datagrams(&fcx, socket, local, layer, budget, |_| {}).await {
                     Ok(()) => Ok(()),
                     Err(StackError::Cancelled) => Err(fictionet::Cancelled.into()),
                     Err(StackError::Layer(e)) => Err(e.into()),
+                    Err(StackError::Budget) => {
+                        Err(std::io::Error::other("datagram memory budget exhausted").into())
+                    }
                 }
             });
         });
@@ -2044,7 +2049,9 @@ async fn connection(
         Err(StackError::Cancelled) => HandshakeError::Cancelled,
         Ok(StreamEnd::Conn(e)) => e.into(),
         Ok(StreamEnd::Budget) => HandshakeError::Failed("no budget for the handshake".into()),
-        Ok(_) | Err(StackError::Layer(Side::Upper(_))) => HandshakeError::Closed,
+        Ok(_) | Err(StackError::Budget | StackError::Layer(Side::Upper(_))) => {
+            HandshakeError::Closed
+        }
     };
     if let Some(observe) = &hooks.tls_observe {
         let mut info = info;

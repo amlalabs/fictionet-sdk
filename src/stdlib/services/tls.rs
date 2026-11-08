@@ -217,6 +217,7 @@ impl From<StackError<HandshakeError>> for HandshakeError {
     fn from(e: StackError<HandshakeError>) -> HandshakeError {
         match e {
             StackError::Layer(e) => e,
+            StackError::Budget => HandshakeError::Failed("input memory budget exhausted".into()),
             StackError::Cancelled => HandshakeError::Cancelled,
         }
     }

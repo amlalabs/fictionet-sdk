@@ -58,6 +58,21 @@ where
     type Done = Side<Option<Arc<ServerConfig>>, U::Done>;
     type Error = Side<HandshakeError, U::Error>;
 
+    fn report_bytes(report: &Self::Report) -> Option<usize> {
+        match report {
+            Side::Lower(()) => Some(0),
+            Side::Upper(report) => U::report_bytes(report),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.chain.depth()
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.chain.is_terminal()
+    }
+
     fn on_event(
         &mut self,
         env: &mut Env<'_, Self::Report>,

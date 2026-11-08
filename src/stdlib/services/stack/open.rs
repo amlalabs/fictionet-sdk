@@ -135,6 +135,7 @@ where
             Poll::Ready(Ok(Halt::End(StreamEnd::Conn(e)))) => Err(e),
             Poll::Ready(Ok(Halt::End(StreamEnd::Reset))) => Err(ConnError::Reset),
             Poll::Ready(Ok(Halt::End(_))) => Err(ConnError::Broken),
+            Poll::Ready(Err(StackError::Budget)) => Err(ConnError::Broken),
             Poll::Ready(Err(StackError::Cancelled)) => Err(ConnError::Cancelled),
             Poll::Ready(Err(StackError::Layer(e))) => Err(e.into()),
         }

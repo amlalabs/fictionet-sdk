@@ -436,7 +436,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
         write_timeout: Some(opts.limits.write_timeout),
     };
     match stack::stream(fcx, conn, &info, http1.upgradable(), budget, limits, |_| {}).await {
-        Ok(_) => Ok(()),
+        Ok(_) | Err(StackError::Budget) => Ok(()),
         Err(StackError::Cancelled) => Err(Cancelled),
         Err(StackError::Layer(Side::Lower(never) | Side::Upper(never))) => match never {},
     }

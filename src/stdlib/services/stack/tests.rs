@@ -437,7 +437,15 @@ fn datagrams_reach_one_conversation_and_answers_go_to_each_sender() {
         let (server, client) = machines(&fcx);
         let socket = server.udp.bind(PORT)?;
         fcx.spawn(move |fcx| async move {
-            Ok(datagrams(&fcx, socket, server_addr(), Counter::default(), |_| {}).await?)
+            Ok(datagrams(
+                &fcx,
+                socket,
+                server_addr(),
+                Counter::default(),
+                Budget::unlimited(),
+                |_| {},
+            )
+            .await?)
         });
         let mut a = client.udp.bind(0)?;
         let mut b = client.udp.bind(0)?;
@@ -545,9 +553,409 @@ fn a_closed_socket_gets_everything_the_stack_still_has() {
             closing: false,
             slot: None,
         };
-        datagrams(&fcx, socket, server_addr(), goodbyes, |_| {}).await?;
+        datagrams(
+            &fcx,
+            socket,
+            server_addr(),
+            goodbyes,
+            Budget::unlimited(),
+            |_| {},
+        )
+        .await?;
         Ok(())
     }))
     .expect("the run finishes");
     assert_eq!(*sent.lock(), 200);
+}
+
+/// Ends its writes immediately, but receives the peer's response afterward.
+struct HalfClosed {
+    end: bool,
+    received: Arc<fictionet::sync::Mutex<Vec<u8>>>,
+}
+
+impl Layer for HalfClosed {
+    type Lower = ByteStream;
+    type Upper = Top;
+    type Report = Infallible;
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn on_event(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        event: StreamEvent,
+    ) -> Result<Admit<StreamEvent>, Infallible> {
+        if let StreamEvent::Data(bytes) = event {
+            self.received.lock().extend_from_slice(&bytes);
+        }
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn take_command(&mut self) -> Option<StreamCommand> {
+        std::mem::take(&mut self.end).then_some(StreamCommand::End)
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+}
+
+#[test]
+fn ending_writes_keeps_reading_the_peers_response() {
+    let received = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
+    let output = received.clone();
+    let response = frames(3);
+    let expected = wire(&response);
+    let sent = expected.clone();
+    let client = move |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        assert!(read_to_end(&fcx, &mut conn).await?.is_empty());
+        conn.write_all(&fcx, &sent).await?;
+        conn.shutdown(&fcx).await?;
+        Ok(())
+    };
+    let ended = serve_one(
+        StreamLimits::default(),
+        Budget::unlimited(),
+        move || HalfClosed {
+            end: true,
+            received: output,
+        },
+        client,
+    );
+    assert_eq!(ended, Ok(StreamEnd::Finished));
+    assert_eq!(*received.lock(), expected);
+}
+
+struct OneDatagram(Option<Vec<u8>>);
+
+impl DatagramSocket for OneDatagram {
+    async fn recv(&mut self, _: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
+        self.0
+            .take()
+            .map(|bytes| (bytes, server_addr()))
+            .ok_or(RecvError::Closed)
+    }
+
+    fn send_to(&mut self, _: &[u8], _: SocketAddr) {}
+}
+
+#[test]
+fn datagram_input_requires_its_backing_capacity_in_the_budget() {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.push(1);
+    let budget = Budget::new(bytes.capacity() - 1);
+    let retained = budget.clone();
+    block_on(lab(Seed::from_u64(4), move |fcx| async move {
+        let result = datagrams(
+            &fcx,
+            OneDatagram(Some(bytes)),
+            server_addr(),
+            Counter::default(),
+            budget,
+            |_| {},
+        )
+        .await;
+        assert!(matches!(result, Err(StackError::Budget)));
+        Ok(())
+    }))
+    .expect("the run finishes");
+    assert_eq!(retained.used(), 0);
+}
+
+struct BusyDatagram {
+    work: bool,
+    done: bool,
+    end_sent: bool,
+    visits: usize,
+}
+
+struct TwoPolls(bool);
+
+impl Job for TwoPolls {
+    type Done = ();
+
+    fn poll(&mut self, _: Option<&Cx>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        if std::mem::replace(&mut self.0, true) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+impl Layer for BusyDatagram {
+    type Lower = Datagrams<SocketAddr>;
+    type Upper = Top;
+    type Report = Infallible;
+    type Timer = ();
+    type Work = TwoPolls;
+    type Done = ();
+    type Error = Infallible;
+
+    fn on_event(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        _: DatagramEvent<SocketAddr>,
+    ) -> Result<Admit<DatagramEvent<SocketAddr>>, Infallible> {
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn advance(&mut self, _: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+        self.visits += 1;
+        assert!(
+            self.visits < 512,
+            "productive layers must allow pending work to run"
+        );
+        Ok(false)
+    }
+
+    fn take_work(&mut self) -> Option<TwoPolls> {
+        std::mem::take(&mut self.work).then_some(TwoPolls(false))
+    }
+
+    fn on_done(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+        self.done = true;
+        Ok(())
+    }
+
+    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+        if self.end_sent {
+            return None;
+        }
+        Some(if self.done {
+            self.end_sent = true;
+            DatagramCommand::End
+        } else {
+            DatagramCommand::Send(Datagram::new(Chunk::new(Vec::new()), server_addr()))
+        })
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+}
+
+#[test]
+fn a_productive_datagram_layer_does_not_starve_its_pending_work() {
+    block_on(lab(Seed::from_u64(5), move |fcx| async move {
+        datagrams(
+            &fcx,
+            OneDatagram(None),
+            server_addr(),
+            BusyDatagram {
+                work: true,
+                done: false,
+                end_sent: false,
+                visits: 0,
+            },
+            Budget::unlimited(),
+            |_| {},
+        )
+        .await?;
+        Ok(())
+    }))
+    .expect("the work completes");
+}
+
+/// Carries one child over TCP, with a two-byte send window replenished
+/// only by actual transport completions.
+struct StreamChild {
+    slots: fictionet::stdlib::layer::Slots<()>,
+    child: fictionet::stdlib::layer::ChildId,
+    opening: Option<fictionet::stdlib::layer::Child>,
+    incoming: Option<StreamEvent>,
+    outgoing: Option<StreamCommand>,
+    receive_credit: u64,
+    grant: u64,
+    written: u64,
+}
+
+impl StreamChild {
+    fn new() -> Self {
+        let mut slots = fictionet::stdlib::layer::Slots::new(1);
+        let handle = slots.insert(()).unwrap();
+        Self {
+            child: handle.id(),
+            slots,
+            opening: Some(handle),
+            incoming: None,
+            outgoing: None,
+            receive_credit: 0,
+            grant: 2,
+            written: 0,
+        }
+    }
+}
+
+impl Layer for StreamChild {
+    type Lower = ByteStream;
+    type Upper = fictionet::stdlib::layer::Mux<ByteStream, Top, &'static str>;
+    type Report = Infallible;
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn on_event(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        event: StreamEvent,
+    ) -> Result<Admit<StreamEvent>, Infallible> {
+        if let StreamEvent::Written(n) = event {
+            self.written += n;
+            self.grant += n;
+            return Ok(Admit::Taken);
+        }
+        if self.incoming.is_some() {
+            return Ok(Admit::Blocked(event));
+        }
+        if let StreamEvent::Data(mut bytes) = event {
+            if self.receive_credit == 0 {
+                return Ok(Admit::Blocked(StreamEvent::Data(bytes)));
+            }
+            let n = bytes.len().min(self.receive_credit as usize);
+            self.receive_credit -= n as u64;
+            let prefix = bytes.split_to(n);
+            self.incoming = Some(StreamEvent::Data(prefix));
+            return Ok(if bytes.is_empty() {
+                Admit::Taken
+            } else {
+                Admit::Partial(StreamEvent::Data(bytes))
+            });
+        }
+        self.incoming = Some(event);
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        command: fictionet::stdlib::layer::MuxCommand<ByteStream, Top>,
+    ) -> Result<Admit<fictionet::stdlib::layer::MuxCommand<ByteStream, Top>>, Infallible> {
+        use fictionet::stdlib::layer::MuxOp;
+        if matches!(command.op(), MuxOp::Child(..)) && self.outgoing.is_some() {
+            return Ok(Admit::Blocked(command));
+        }
+        match command.into_op() {
+            MuxOp::Child(child, command) => {
+                assert!(self.slots.contains(child));
+                self.outgoing = Some(command);
+            }
+            MuxOp::Credit(child, n) => {
+                assert_eq!(child, self.child);
+                self.receive_credit += n;
+            }
+            MuxOp::Close(child) => {
+                self.slots.remove(child);
+                self.outgoing = Some(StreamCommand::Reset);
+            }
+            MuxOp::Control(never) => match never {},
+        }
+        Ok(Admit::Taken)
+    }
+
+    fn take_command(&mut self) -> Option<StreamCommand> {
+        self.outgoing.take()
+    }
+
+    fn take_event(
+        &mut self,
+    ) -> Option<fictionet::stdlib::layer::MuxEvent<ByteStream, Top, &'static str>> {
+        use fictionet::stdlib::layer::MuxEvent;
+        if let Some(child) = self.opening.take() {
+            return Some(MuxEvent::Opened(child, "http", u64::MAX));
+        }
+        if let Some(completion) = self.take_urgent() {
+            return Some(completion);
+        }
+        if self.grant > 0 {
+            return Some(MuxEvent::Credit(
+                self.child,
+                std::mem::take(&mut self.grant),
+            ));
+        }
+        self.incoming
+            .take()
+            .map(|event| MuxEvent::Child(self.child, event))
+    }
+
+    fn take_urgent(
+        &mut self,
+    ) -> Option<fictionet::stdlib::layer::MuxEvent<ByteStream, Top, &'static str>> {
+        (self.written > 0).then(|| {
+            fictionet::stdlib::layer::MuxEvent::Child(
+                self.child,
+                StreamEvent::Written(std::mem::take(&mut self.written)),
+            )
+        })
+    }
+}
+
+#[test]
+fn an_async_http_child_runs_over_the_live_stream_with_a_small_window() {
+    use fictionet::stdlib::layer::{Chain, Children};
+    use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Http1, Reply};
+    struct Deferred;
+    impl Handler for Deferred {
+        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            let path = request.uri().path().to_owned();
+            Reply::Later(Box::new(move |fcx| {
+                Box::pin(async move {
+                    fcx.yield_now().await?;
+                    Ok(httpd::text(http::StatusCode::OK, &path))
+                })
+            }))
+        }
+    }
+    let client = |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        conn.write_all(
+            &fcx,
+            b"GET /child-response HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+        conn.shutdown(&fcx).await?;
+        let bytes = read_to_end(&fcx, &mut conn).await?;
+        let response =
+            fictionet::stdlib::protocols::http1::Response::parse_for(&bytes, "GET").unwrap();
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.body, b"/child-response");
+        Ok(())
+    };
+    let result = serve_one(
+        StreamLimits::default(),
+        Budget::new(1024 * 1024),
+        || {
+            Chain::new(
+                StreamChild::new(),
+                Children::new(1, 65536, |_, context, _| {
+                    assert_eq!(context, "http");
+                    Http1::new(Deferred)
+                }),
+            )
+        },
+        client,
+    );
+    assert_eq!(result, Ok(StreamEnd::Finished));
 }
