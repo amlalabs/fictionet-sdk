@@ -247,7 +247,7 @@ impl UdpLayer {
             queue: VecDeque::new(),
             bytes: 0,
             granted: 0,
-            credit: SEND_WINDOW,
+            credit: 0,
             owed: SEND_WINDOW,
             ending: self.input_ended,
             ended: false,
@@ -533,3 +533,6 @@ fn port_unreachable(
         IpAddr::V6(_) => options.error(packet, addr, 1, 4, 0),
     }
 }
+
+#[cfg(test)]
+mod tests;
