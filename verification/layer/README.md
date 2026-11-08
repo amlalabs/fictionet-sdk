@@ -10,8 +10,8 @@ what it leaves out, and what it found is in [VERIFICATION.md](VERIFICATION.md).
 Each `.tla` has `*_base.cfg` configs of the code as it is, which must pass,
 and `*_without_<flag>.cfg` configs that break one part of the code and name
 the property TLC must then violate. `Children_large_command.cfg`,
-`Children_readiness.cfg` and `Children_isolation.cfg` are additional
-passing configurations.
+`Children_readiness.cfg`, `Children_refuse_full.cfg` and
+`Children_isolation.cfg` are additional passing configurations.
 
 | Config | Checks |
 | --- | --- |
@@ -30,6 +30,7 @@ passing configurations.
 | `Children_stalled_base.cfg` | the invariants and `ControlProgress`, with children that never read |
 | `Children_budget.cfg` | the base invariants with `BudgetRefuses`: the budget may refuse a child's place at `Opened` or its inbox's growth at `MuxSend`, closing that child |
 | `Children_budget_stalled.cfg` | the stalled configuration with `BudgetRefuses` |
+| `Children_refuse_full.cfg` | with `Overload`: a child that never reads, and its successor in the same slot, each refused and closed when its place is full instead of holding up the mux; the readiness invariants, `MuxNeverHeld` and `CancelledWorkLeaves` |
 | `Children_commands_base.cfg` | `CommandsGo` when every command fits the mux's window |
 | `Children_without_checkoverrun.cfg` | no Overrun check: violates `EventCredit` |
 | `Children_without_checkcommandcredit.cfg` | commands sent without credit: violates `CommandCredit` |
@@ -63,6 +64,7 @@ cargo kani -p fictionet --harness slots_refuse_past_the_limit
 cargo kani -p fictionet --harness slots_never_answer_a_stale_id
 cargo kani -p fictionet --harness slots_never_answer_another_connections_id
 cargo kani -p fictionet --harness charges_split_and_drop_within_the_limit
+cargo kani -p fictionet --harness charges_sum_to_the_budget_and_never_pass_its_limit
 cargo kani -p fictionet --harness timers_in_order_three_names
 cargo kani -p fictionet --harness timers_get_three_names
 cargo kani -p fictionet --harness timers_in_order_first_armed_again
