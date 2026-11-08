@@ -201,6 +201,10 @@ mod tests;
 #[cfg(test)]
 pub(crate) use framed::tests as framed_echo;
 
+#[cfg(kani)]
+#[path = "../../../verification/layer/kani/mod.rs"]
+mod proofs;
+
 pub use budget::{Budget, Charge};
 pub use carrier::{
     ByteStream, Child, ChildId, Chunk, Credited, Datagram, DatagramCommand, DatagramEvent,
