@@ -408,7 +408,7 @@ impl Ledger {
 #[derive(Clone)]
 pub struct Model {
     cx: Cx,
-    connection: fictionet::stdlib::services::serve::ConnInfo,
+    connection: fictionet::stdlib::network::ConnInfo,
     provider: Provider,
     credential: Option<Credential>,
     forward: web::Forward,

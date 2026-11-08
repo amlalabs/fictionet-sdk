@@ -477,7 +477,7 @@ fn dimensions_fields<M: SerializeMap>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::services::serve::ConnInfo;
+    use fictionet::stdlib::network::ConnInfo;
 
     #[test]
     fn redacted_evidence_omits_credentials_and_nested_application_bytes() {

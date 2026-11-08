@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::EdeCode;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
@@ -22,7 +23,6 @@ use fictionet::stdlib::protocols::dns::{Parsed, Request, read_message};
 use fictionet::stdlib::services::dns::zone::{
     Answered, AnyResponse, ChainProblem, Denial, Signed, Zone, ZoneData, answer, check_chain, dname,
 };
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::{Seed, SeededEntropy};
 
 fn name(text: &str) -> Name {

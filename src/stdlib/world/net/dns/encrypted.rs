@@ -77,6 +77,7 @@ use fictionet::stdlib::layer::{
     Admit, Budget, Chain, Charge, Decoded, Env, Framed, Framing, Layer, MessageCommand,
     MessageEvent, Owned, OwnedWork, Timers, Top, WorkOwner,
 };
+use fictionet::stdlib::network::{ConnInfo, Transport};
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
 use fictionet::stdlib::protocols::dns::{
@@ -84,7 +85,6 @@ use fictionet::stdlib::protocols::dns::{
 };
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::Client;
-use fictionet::stdlib::services::serve::{ConnInfo, Transport};
 use fictionet::stdlib::services::stack::{self, Boxed, Job, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
@@ -276,8 +276,8 @@ impl Front {
             local,
             transport: Transport::Tcp,
             connection: None,
-            // The serve layer reports a peer no sandbox has with id 0
-            // (`ServeOptions::sandbox`).
+            // A peer that is no sandbox comes with id 0
+            // (`Hooks::sandbox_at`).
             sandbox: conn.sandbox.clone().filter(|sandbox| sandbox.id != 0),
         })
     }

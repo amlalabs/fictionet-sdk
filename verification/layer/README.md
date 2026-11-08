@@ -27,6 +27,8 @@ the property TLC must then violate. `Children_large_command.cfg` and
 | `Children_base.cfg` | `NoStaleDelivery`, `EventCredit`, `MuxEventCredit`, `CommandCredit`, `SendsLeaveReserve`, with two children at once |
 | `Children_refuse_base.cfg` | the same but `MuxEventCredit`, with a limit of one child (so `Opened` is refused) and a mux that may send past credit |
 | `Children_stalled_base.cfg` | the invariants and `ControlProgress`, with children that never read |
+| `Children_budget.cfg` | the base invariants with `BudgetRefuses`: the budget may refuse a child's place at `Opened` or its inbox's growth at `MuxSend`, closing that child |
+| `Children_budget_stalled.cfg` | the stalled configuration with `BudgetRefuses` |
 | `Children_commands_base.cfg` | `CommandsGo` when every command fits the mux's window |
 | `Children_without_checkoverrun.cfg` | no Overrun check: violates `EventCredit` |
 | `Children_without_checkcommandcredit.cfg` | commands sent without credit: violates `CommandCredit` |

@@ -1800,36 +1800,6 @@ impl Listener {
     }
 }
 
-impl fictionet::stdlib::network::Accept for Listener {
-    type Conn = TcpConnection;
-
-    async fn accept(&mut self, fcx: &Cx) -> Result<Self::Conn, ConnError> {
-        Listener::accept(self, fcx).await
-    }
-}
-
-impl fictionet::stdlib::network::Accepted for TcpConnection {
-    fn local_addr(&self) -> SocketAddr {
-        TcpConnection::local_addr(self)
-    }
-
-    fn peer_addr(&self) -> SocketAddr {
-        TcpConnection::peer_addr(self)
-    }
-
-    fn handshake(&self) -> Option<Handshake> {
-        TcpConnection::handshake(self).cloned()
-    }
-
-    fn reset(self) {
-        TcpConnection::reset(self);
-    }
-
-    fn hold_until_gone<T: Send + 'static>(&self, item: T) {
-        TcpConnection::hold_until_gone(self, Box::new(item));
-    }
-}
-
 impl Drop for Listener {
     fn drop(&mut self) {
         let mut host = self.shared.state.lock();

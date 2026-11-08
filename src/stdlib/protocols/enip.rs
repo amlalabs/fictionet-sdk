@@ -3,7 +3,7 @@
 //!
 //! `Packet` and typed CIP bodies implement `Wire`, and `codec::Frames<Packet>`
 //! decodes encapsulation packets. There is no registration or I/O connection
-//! state machine, device `Service`, or live transport. CIP object behavior
+//! state machine, device server layer, or live transport. CIP object behavior
 //! belongs to the caller.
 //!
 //! EtherNet/IP carries the Common Industrial Protocol (CIP) over ordinary

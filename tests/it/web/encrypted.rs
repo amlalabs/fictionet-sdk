@@ -12,6 +12,7 @@ use bytes::Bytes;
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64;
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::{ConnectionExt, tcp};
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, AlgorithmPolicy, Anchors, DigestType, KeyFlags, KeySet, Sign, Validation, Window,
@@ -27,7 +28,6 @@ use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Denial, Node, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{Event, WallClock};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
 use fictionet::stdlib::world::net::dns::{Authoritative, Recursive};

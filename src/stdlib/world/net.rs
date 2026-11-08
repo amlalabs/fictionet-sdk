@@ -4,37 +4,40 @@
 //!
 //! [`Net`] builds the whole network around the [`Host`]s a world declares.
 //! Each host has addresses, DNS names, and services on its ports: any
-//! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and any
-//! [`PortServer`] of the world's own, such as [`httpd::Server`] for HTTP with
-//! name-based virtual hosting. Every sandbox that attaches is put on the
-//! sandboxes' subnet, given an address by DHCP or by its first packet, and
-//! kept from reaching the other sandboxes. A world then writes only its
-//! services. Each world reports its own typed observations from its services.
+//! [layer](fictionet::stdlib::layer) stack over TCP or UDP
+//! ([`Host::tcp_stack`], [`Host::udp_stack`]), the same over TLS chosen by
+//! SNI ([`Host::tls_stack`]), and any [`PortServer`] of the world's own, such
+//! as [`httpd::Server`] for HTTP with name-based virtual hosting. Every
+//! sandbox that attaches is put on the sandboxes' subnet, given an address by
+//! DHCP or by its first packet, and kept from reaching the other sandboxes. A
+//! world then writes only its services. Each world reports its own typed
+//! observations from its services.
 //!
-//! An office: a domain controller that answers LDAP and Kerberos, a web
-//! server, and a PLC, with DNS names for each:
+//! An office: a domain controller that answers LDAP, a web server, and a
+//! PLC, with DNS names for each:
 //!
 //! ```
-//! # use std::sync::Arc;
+//! # use std::convert::Infallible;
 //! # use fictionet::{Attachments, Cx, Result};
-//! # use fictionet::stdlib::{web::httpd, world::net::{Host, Net}, services::serve};
-//! # struct Ldap; struct Plc; struct Directory; struct Plant;
-//! # macro_rules! svc { ($t:ty, $w:ty) => {
-//! # impl serve::Service for $t {
-//!     type Timer = ();
-//! #     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
-//! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
-//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder, Self::Timer>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
+//! # use fictionet::stdlib::layer::{Admit, ByteStream, Env, Layer, StreamCommand, StreamEvent, Top};
+//! # use fictionet::stdlib::{web::httpd, world::net::{Host, Net}};
+//! # struct Ldap; struct Plc;
+//! # macro_rules! stack { ($t:ty) => {
+//! # impl Layer for $t {
+//! #     type Lower = ByteStream; type Upper = Top; type Report = Infallible; type Timer = ();
+//! #     type Work = (); type Done = (); type Error = Infallible;
+//! #     fn on_event(&mut self, _: &mut Env<'_, Infallible>, e: StreamEvent) -> std::result::Result<Admit<StreamEvent>, Infallible> { Ok(Admit::Closed(e)) }
+//! #     fn on_command(&mut self, _: &mut Env<'_, Infallible>, c: Infallible) -> std::result::Result<Admit<Infallible>, Infallible> { match c {} }
+//! #     fn take_command(&mut self) -> Option<StreamCommand> { None }
+//! #     fn take_event(&mut self) -> Option<Infallible> { None }
 //! # } } }
-//! # svc!(Ldap, Directory); svc!(Plc, Plant);
+//! # stack!(Ldap); stack!(Plc);
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let directory = Arc::new(Directory);
-//! let plant = Arc::new(Plant);
 //! let intranet = httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "intranet\n" })));
 //! Net::new(fictionet_extras::network::cdn_pools())
-//!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
+//!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp_stack(389, |_| Ldap))
 //!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
-//!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
+//!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp_stack(502, |_| Plc))
 //!     .start(&fcx, attachments)?;
 //! # Ok(())
 //! # }
@@ -128,12 +131,13 @@
 //!   trailing IP payload bytes are ignored when checking the checksum.
 //!   A peer address may have 256 connections open at once across the
 //!   network ([`Limits::connections_per_peer`]); past that, new ones are
-//!   reset. Each service has its own cap too ([`Host::tcp_with`]).
+//!   reset. Each port has its own cap too ([`Host::tcp_stack_with`]).
 //! - **Budgets.** Service-layer holdings for one sandbox are charged to
 //!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
-//!   says otherwise. A connection that would pass it is closed. The service
-//!   driver charges its buffers and what the service reports holding, and
-//!   HTTP/2 charges retained request heads and bodies (see [`httpd`]).
+//!   says otherwise. A connection that would pass it is closed. The stack
+//!   runner charges its read buffer and the bytes the stack has not taken,
+//!   each layer charges what it holds, and HTTP/2 charges retained request
+//!   heads and bodies (see [`httpd`]).
 //!   A [`PortServer`] of your own charges what it chooses. A sandbox has one
 //!   budget for both its addresses, from when it attaches until it
 //!   detaches. A route ([`Net::route`]) has none.
@@ -164,8 +168,6 @@ use fictionet::stdlib::network::route::{self, Prefix, Router};
 use fictionet::stdlib::network::{icmp, tcp};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::resolver::Config;
-#[cfg(doc)]
-use fictionet::stdlib::services::serve::{ServeOptions, Service};
 use fictionet::{Attachments, Cx, End, Error, Interface, InterfaceExt};
 
 #[cfg(doc)]
@@ -179,12 +181,13 @@ mod names;
 
 pub use addresses::Placed;
 use addresses::{Leases, Subnet, Subnet6, check_pools};
+pub use attachments::Sandbox;
 use attachments::{Destinations, Hooks, filter, udp_packet};
 use dns::Recursive;
 use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};
 pub use hosts::{
-    Arrival, ConfigFor, ConfigFuture, Declared, Endpoints, Host, Opening, PortServer,
-    PreparedShare, Program, Sni,
+    Arrival, ConfigFor, ConfigFuture, DEFAULT_MAX_CONNS, Declared, Endpoints, Host, Opening,
+    PortServer, PreparedShare, Program, Sni,
 };
 pub use names::normalize;
 
@@ -335,7 +338,7 @@ pub struct RefusedPacket {
     /// When it was refused.
     pub at: fictionet::time::Instant,
     /// The sender, recipient and sandbox, when known.
-    pub conn: fictionet::stdlib::services::serve::ConnInfo,
+    pub conn: fictionet::stdlib::network::ConnInfo,
     /// Source address, including protocols without ports.
     pub from: IpAddr,
     /// Destination address, including protocols without ports.
@@ -352,7 +355,7 @@ pub struct TlsObservation {
     /// When the handshake ended.
     pub at: fictionet::time::Instant,
     /// The connection, including the requested server name when available.
-    pub conn: fictionet::stdlib::services::serve::ConnInfo,
+    pub conn: fictionet::stdlib::network::ConnInfo,
     /// Whether TLS was established, or why it failed.
     pub result: Result<(), fictionet::stdlib::services::tls::HandshakeError>,
 }
@@ -377,7 +380,7 @@ pub struct AttachmentObservation {
     /// When the change happened.
     pub at: fictionet::time::Instant,
     /// The attachment and its addresses at that time.
-    pub sandbox: fictionet::stdlib::services::serve::Sandbox,
+    pub sandbox: Sandbox,
     /// What changed.
     pub change: AttachmentChange,
 }
@@ -507,7 +510,7 @@ impl Net {
     }
 
     /// Adds a host called `label`, built by `build`:
-    /// `net.host("dc01", |h| h.at(addr).tcp(389, directory, || Ldap))`.
+    /// `net.host("dc01", |h| h.at(addr).tcp_stack(389, |_| Ldap::new()))`.
     pub fn host(mut self, label: &str, build: impl FnOnce(Host) -> Host) -> Net {
         self.hosts.push(build(Host::new(label)));
         self
@@ -1135,7 +1138,7 @@ async fn unreachable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::services::serve::ConnInfo;
+    use crate::stdlib::network::ConnInfo;
     use fictionet::stdlib::network::ConnectionExt;
     use fictionet::stdlib::network::ip;
     use std::net::SocketAddr;

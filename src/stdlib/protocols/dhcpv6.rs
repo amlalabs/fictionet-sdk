@@ -2,7 +2,7 @@
 //! options, with no I/O.
 //!
 //! `Message` reads and writes datagrams, and `codec::Frames<Message>` decodes
-//! length-prefixed TCP messages. There is no lease or relay session, `Service`,
+//! length-prefixed TCP messages. There is no lease or relay session, server layer,
 //! or live transport. The caller owns addresses, lease lifetimes, and
 //! retransmissions.
 //!

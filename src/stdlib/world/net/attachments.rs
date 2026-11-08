@@ -8,7 +8,6 @@ use fictionet::stdlib::network::ports::{self, Ports};
 use fictionet::stdlib::network::route::{Lan, Prefix, Router};
 use fictionet::stdlib::network::{ip, udp};
 use fictionet::stdlib::protocols::dhcp;
-use fictionet::stdlib::services::serve::Sandbox;
 use fictionet::sync::Mutex;
 use fictionet::{Attachment, Cx, Interface, Packet};
 use std::collections::HashMap;
@@ -16,6 +15,21 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
+
+/// A sandbox attached to a network.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Sandbox {
+    /// The attachment, numbered from 1 in the order sandboxes attached. A
+    /// name and an address can be used again after a sandbox detaches; the
+    /// id never is.
+    pub id: u64,
+    /// Its attachment's name.
+    pub name: Arc<str>,
+    /// Its IPv4 address, once bound.
+    pub addr: Option<Ipv4Addr>,
+    /// Its IPv6 address, once bound.
+    pub addr_v6: Option<Ipv6Addr>,
+}
 
 /// Sandbox addresses, connection numbering and admission budgets.
 pub(super) struct Hooks {
@@ -57,14 +71,14 @@ impl Hooks {
         let ports = matches!(header.protocol, 6 | 17)
             .then(|| payload.get(..4))
             .flatten();
-        let conn = fictionet::stdlib::services::serve::ConnInfo {
+        let conn = fictionet::stdlib::network::ConnInfo {
             sandbox: self.sandbox_of(header.src),
             peer: ports.map(|p| SocketAddr::new(header.src, u16::from_be_bytes([p[0], p[1]]))),
             local: ports.map(|p| SocketAddr::new(header.dst, u16::from_be_bytes([p[2], p[3]]))),
             transport: if header.protocol == 17 {
-                fictionet::stdlib::services::serve::Transport::Udp
+                fictionet::stdlib::network::Transport::Udp
             } else {
-                fictionet::stdlib::services::serve::Transport::Tcp
+                fictionet::stdlib::network::Transport::Tcp
             },
             ..Default::default()
         };

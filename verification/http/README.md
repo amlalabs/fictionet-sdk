@@ -46,7 +46,7 @@ proves the RFC rules about them.
 | `policy` | `ResponsePolicy::new` in `response.rs` | `bodiless` and the length for a status, an `Asked` (`Body`, `Head`, `Tunnel`), a body length hint and a handler-supplied `Content-Length` |
 | `encode1` | `native::encode` and `Http1::start` | HTTP/1 head: `Content-Length`, `Transfer-Encoding: chunked` for an unknown length on HTTP/1.1, `Connection: close` for one on HTTP/1.0 |
 | `readerFraming`, `readerClose` | `http1::response_framing` in `protocols/http1.rs` | The reader's body boundary for a head and the request method (RFC 9112 section 6.3) |
-| `headers2`, `contentLength2` | `Sending::poll_next` in `http2.rs` | HTTP/2 HEADERS: `content-length` and END_STREAM |
+| `headers2`, `contentLength2` | `Respond`'s `start` in `http2/respond.rs` (once `Sending::poll_next` in `http2.rs`) | HTTP/2 HEADERS: `content-length` and END_STREAM |
 | `askedBeforeFix` | the `head_only: bool` that `Sending` carried before the fix | The negative control: the mapping that lost CONNECT |
 
 Theorems, each over every status class, method, hint and supplied length:
@@ -92,11 +92,14 @@ of every theorem above.
 
 ## TLA+: HTTP/2 stream states
 
-`tla/Streams.tla` is `Http2::headers`, `headers_on`, `data`, the RST_STREAM
-arm of `Http2::frame`, `cancel`, `write_reset`, `on_timer` (reset expiry and
-the body deadline), `on_done` and `Sending::poll_next`, over a few client
-stream identifiers, with the stream limit, the reset list and response body
-sizes as constants. Flags turn parts of the code off:
+`tla/Streams.tla` is the HTTP/2 connection layer's `Http2::on_headers`,
+`headers_on`, `admit`, `on_data`, the RST_STREAM arm of `Http2::on_frame`,
+`end_stream`, `write_reset`, `on_timer` (reset expiry), `response_head`,
+`send_one` and `written` (the stream ends once its END_STREAM is written),
+with the exchange child's `Respond` (`dispatch`, the body deadline in
+`Respond::on_timer`, and `respond`) as atomic steps between them, over a few
+client stream identifiers, with the stream limit, the reset list and
+response body sizes as constants. Flags turn parts of the code off:
 `IgnoreAfterReset`, `RefuseOverLimit`, `HalfClosedIsStreamError`,
 `CheckBelowLast`.
 
@@ -119,13 +122,18 @@ Results with `Ids = {1, 3, 5}`, `MaxStreams = 2`, `ResetMax = 1`,
 
 ## TLA+: HTTP/2 flow control
 
-`tla/Flow.tla` is the receive side of `Http2::data` (the connection window
-first, then the stream's, padding and its length byte included), `Accept`
-with `release_window` (credit returns by WINDOW_UPDATE once the client used
-at least half of what it has left), the send side of `Sending::poll_next`
-(the least of the body left, both windows and the frame size; a stored waker
-when that is zero), and the WINDOW_UPDATE and SETTINGS_INITIAL_WINDOW_SIZE
-arms of `Http2::frame` with their 2^31 - 1 checks and wakes. Bytes are
+`tla/Flow.tla` is the receive side of `Http2::on_data` (the connection
+window first, then the stream's, padding and its length byte included),
+`Http2::release` once a batch of input is read (credit returns by
+WINDOW_UPDATE once the client used at least half of what it has left), the
+send side of `Http2::send_one` (the least of the body left, both windows and
+the frame size; a wait for a retry when that is zero), and the WINDOW_UPDATE
+and SETTINGS_INITIAL_WINDOW_SIZE arms of `Http2::on_frame` with their
+2^31 - 1 checks. The `Wake*` flags are the retry: `Http2::advance` tries
+every stream's `send_one` again after each batch of frames it reads, so all
+three are on in the code. The model's exchange takes each body unit as it
+comes, as `Respond` does, so the bytes `release` holds back for a child
+that has not granted credit (`Stream::held`) are zero in it. Bytes are
 units; the windows hold a few units. The client is any client: it may send
 beyond its credit, update any window at any time and move its initial window
 up and down. Flags: `CountPadding`, `CheckConnectionWindow`,
@@ -159,7 +167,12 @@ violates `ServerSpendsWithinWindows`, and `without_wakeonconnectionupdate`,
 
 `tla/Pipeline.tla` is `Http1` (`web/httpd/native.rs`) inside
 `Switch<Http1, Tunnel>` (`layer/switch.rs`), with the `Tunnel`
-(`services/stack/tunnel.rs`) it switches to. The header of the file maps each action
+(`services/stack/tunnel.rs`) it switches to. The successor is now
+`Upgraded`, a `Side<Tunnel, Http2Server>`: an `Upgrade: h2c` request that
+`Http1::h2c` accepts is answered by the service's own 101, which sets the
+successor in `dispatch` and then takes the same `start`, `finish`,
+`hand_on` and `handover` path as the model's `U` token, so the model does
+not tell the two successors apart. The header of the file maps each action
 to its functions with line numbers (at commit 50b69c60d, the code this pass
 checked; the fix below moves `native.rs` lines after 575 down by four):
 `on_event` for data, the end and

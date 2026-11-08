@@ -244,30 +244,37 @@ mod http {
         use fictionet::stdlib::{
             codec::{Side, Stream, Wire},
             protocols::websocket::{self, Message, Messages},
-            services::serve,
         };
-        struct Echo;
-        service_fixture! {
-            Echo => (Messages, (), websocket::Error);
-            decoder(self) {
-                Messages::for_receiver(Side::Server)
-            }
-            on_item(self, message: Message; _, driver) -> serve::Flow {
-                message.to_frame(None)?.write(driver.reply())?;
-                Ok(serve::Flow::Continue)
+        /// Answers each message with itself, over the upgraded connection.
+        async fn echo(
+            fcx: &fictionet::Cx,
+            mut conn: Box<dyn fictionet::stdlib::network::Connection>,
+        ) -> fictionet::Result {
+            let mut stream = Stream::new(Messages::for_receiver(Side::Server));
+            loop {
+                while let Some(message) = stream.next() {
+                    let message = message.map_err(|e| fictionet::Error::msg(e.to_string()))?;
+                    conn.write_all(fcx, &message.to_frame(None)?.to_bytes()?)
+                        .await?;
+                }
+                let mut buf = [0; 1024];
+                let n = conn.read(fcx, &mut buf).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                let _ = stream.push(&buf[..n]);
             }
         }
         fictionet::block_on(fictionet::lab(Seed::from_u64(3), |fcx| async move {
             let router = fictionet_test_support::handler(|_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, request: http::Request<bytes::Bytes>| {
                 let headers: Vec<_> = request.headers().iter().map(|(n, v)| (n.as_str(), v.to_str().unwrap())).collect();
                 let upgrade = websocket::check_request(&headers).unwrap();
-                let info = request.extensions().get::<fictionet::stdlib::services::serve::ConnInfo>().unwrap().clone();
+                assert!(request.extensions().get::<fictionet::stdlib::network::ConnInfo>().is_some());
                 let mut response = ::http::Response::builder().status(101);
                 for (name, value) in upgrade.response_headers(None).unwrap() { response = response.header(name, value); }
                 let mut response = response.body(bytes::Bytes::new()).unwrap();
                 response.extensions_mut().insert(httpd::UpgradeHandler::new(move |fcx, conn| async move {
-                    let result = serve::connection(&fcx, conn, info, &mut Echo, &(), &serve::ServeOptions::default()).await;
-                    assert!(matches!(result, Ok(_) | Err(serve::ServeError::Cancelled)));
+                    let _ = echo(&fcx, conn).await;
                 }));
                 response
             });

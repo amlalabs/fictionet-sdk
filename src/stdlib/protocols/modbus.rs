@@ -2,7 +2,7 @@
 //! I/O.
 //!
 //! `Frame` implements `Wire` and supports `codec::Frames<Frame>`. Request and
-//! response helpers interpret its PDU. There is no device session, `Service`,
+//! response helpers interpret its PDU. There is no device session, server layer,
 //! register store, or live transport. The observe presenter is separate from
 //! this wire layer.
 //!

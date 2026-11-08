@@ -1,39 +1,104 @@
-//! Contracts for byte connections, accepted streams, and datagram sockets.
+//! Contracts for byte connections and datagram sockets, and what is known
+//! about a connection when it arrives.
 //!
-//! These traits let transports supply reads, writes, acceptance, and address
-//! information to the serving driver. They provide no protocol parser,
-//! session, service implementation, or encryption of their own.
+//! These traits let transports supply reads, writes and address
+//! information to whatever runs a protocol over them, such as the
+//! [stack runners](fictionet::stdlib::services::stack). They provide no
+//! protocol parser, session or encryption of their own.
 
 use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use fictionet::stdlib::network::tcp::Handshake;
+use fictionet::stdlib::world::net::Sandbox;
 use fictionet::{Cancelled, Cx};
 
-/// Accepts byte streams for the serving driver.
-pub trait Accept: Send + 'static {
-    /// The accepted connection and its transport lifetime.
-    type Conn: Accepted;
-
-    /// Waits for a connection, or returns cancellation or a transport error.
-    fn accept(&mut self, fcx: &Cx) -> impl Future<Output = Result<Self::Conn, ConnError>> + Send;
+/// How a connection's bytes travel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Transport {
+    /// A byte stream: TCP, or TLS over it.
+    #[default]
+    Tcp,
+    /// Datagrams: UDP.
+    Udp,
 }
 
-/// An accepted stream with addresses and a transport lifetime.
-pub trait Accepted: Connection {
-    /// The local address of the connection.
-    fn local_addr(&self) -> std::net::SocketAddr;
-    /// The peer's address.
-    fn peer_addr(&self) -> std::net::SocketAddr;
-    /// What the TCP handshake that opened it carried.
-    fn handshake(&self) -> Option<super::tcp::Handshake>;
-    /// Resets the connection without waiting for a graceful close.
-    fn reset(self);
-    /// Retains `item` until the transport is gone, including after this
-    /// handle is dropped. This keeps closing sockets in the serving limit.
-    fn hold_until_gone<T: Send + 'static>(&self, item: T);
+impl Transport {
+    /// `tcp` or `udp`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        }
+    }
 }
 
-/// A datagram socket for the serving driver.
+/// What is known about a connection, or a UDP port's socket, when it
+/// arrives: who it is between, how its bytes travel, and what its
+/// handshakes settled. A stack factory such as
+/// [`Host::tcp_stack`](fictionet::stdlib::world::net::Host::tcp_stack)'s
+/// gets one, and handlers read it through their exchange.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ConnInfo {
+    /// The connection's number, from whoever accepted it. [`Net`]
+    /// numbers its connections from 1, on every port.
+    ///
+    /// [`Net`]: fictionet::stdlib::world::net::Net
+    pub id: Option<u64>,
+    /// The sandbox the connection came from, as it was when it arrived.
+    pub sandbox: Option<Sandbox>,
+    /// The world's side: the address and port the connection arrived on.
+    pub local: Option<SocketAddr>,
+    /// The other side.
+    pub peer: Option<SocketAddr>,
+    /// What the TCP handshake carried, for a TCP connection: the options
+    /// of the peer's SYN, those the listener added to its SYN-ACK, and
+    /// those of the ACK that completed it, including the SYN and SYN-ACK's
+    /// typed IPv4 options. `None` for datagrams or a
+    /// connection this side opened.
+    pub handshake: Option<Handshake>,
+    /// Whether the bytes arrived over TLS.
+    pub tls: bool,
+    /// The name the client sent in its TLS hello, in lowercase.
+    pub sni: Option<Arc<str>>,
+    /// The protocol the TLS handshake agreed on, such as `h2`.
+    pub alpn: Option<Arc<[u8]>>,
+    /// TCP or UDP. A service served both ways, such as a Kerberos KDC,
+    /// answers by it: a reply too big for a datagram asks the client to
+    /// use TCP.
+    pub transport: Transport,
+}
+
+impl ConnInfo {
+    /// A connection with this number between `local` and `peer`.
+    pub fn new(id: u64, local: SocketAddr, peer: SocketAddr) -> ConnInfo {
+        ConnInfo {
+            id: Some(id),
+            local: Some(local),
+            peer: Some(peer),
+            ..ConnInfo::default()
+        }
+    }
+
+    /// The same, from `sandbox`.
+    pub fn from_sandbox(mut self, sandbox: Option<Sandbox>) -> ConnInfo {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// The same, over TLS with this SNI and ALPN.
+    pub fn over_tls(mut self, sni: Option<&str>, alpn: Option<&[u8]>) -> ConnInfo {
+        self.tls = true;
+        self.sni = sni.map(Arc::from);
+        self.alpn = alpn.map(Arc::from);
+        self
+    }
+}
+
+/// A datagram socket, as the [datagram runner](fictionet::stdlib::services::stack::datagrams)
+/// uses it.
 pub trait DatagramSocket: Send + 'static {
     /// Waits for bytes and their sender. Drains queued datagrams before
     /// returning [`fictionet::RecvError::Closed`]. Cancellation ends the wait.

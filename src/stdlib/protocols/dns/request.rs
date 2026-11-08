@@ -16,7 +16,7 @@ use super::rr::rdata::tsig::TsigError;
 use super::rr::rdata::{NULL, TSIG};
 use super::rr::{DNSClass, Name, RData, Record, RecordType};
 use super::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
-use fictionet::stdlib::services::serve::Transport;
+use fictionet::stdlib::network::Transport;
 
 /// A query that passed every check of [`Request::parse`]: a QUERY with
 /// one question a server can answer.

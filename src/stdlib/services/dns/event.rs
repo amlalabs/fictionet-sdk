@@ -6,11 +6,11 @@
 
 use std::net::SocketAddr;
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::op::{Metadata, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::RecordSet;
 use fictionet::stdlib::protocols::dns::{EdeCode, EdnsIn};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
 use super::exchange::{Client, ExchangeFailure, Token};

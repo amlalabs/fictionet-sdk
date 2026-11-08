@@ -11,7 +11,7 @@ use super::request::Request;
 use super::rr::{DNSClass, Name, RData, Record, RecordType};
 use super::serialize::binary::{BinEncodable, BinEncoder};
 use super::{ProtoError, dnssec::rdata::DNSSECRData};
-use fictionet::stdlib::services::serve::Transport;
+use fictionet::stdlib::network::Transport;
 
 /// A reply to write with [`fit`].
 #[derive(Clone, Debug, PartialEq)]

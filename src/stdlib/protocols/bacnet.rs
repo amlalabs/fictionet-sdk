@@ -4,7 +4,7 @@
 //! Complete datagrams and their layers use `Wire`. `codec::Frames<Tag>` and
 //! `codec::Frames<Value>` decode tagged values, not BACnet connections. Who-Is
 //! and I-Am have typed bodies. Other service bodies stay as bytes. There is no
-//! device session, `Service`, or live UDP transport.
+//! device session, server layer, or live UDP transport.
 //!
 //! BACnet is how building automation talks: thermostats, air handlers,
 //! chillers, lighting panels and door controllers report their readings and

@@ -2,12 +2,10 @@
 //! features of the modules that use it. Helpers that other test binaries
 //! share are in the fictionet-test-support crate.
 
-#[macro_use]
-mod service_fixture;
-
 pub mod alloc;
-pub mod echo_service;
+pub mod echo_stack;
 pub mod io;
+pub mod line_stack;
 pub mod rustls_client;
 pub mod threads;
 

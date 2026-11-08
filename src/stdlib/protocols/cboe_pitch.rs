@@ -6,7 +6,7 @@
 //!
 //! `Unit` supplies complete-value reading and writing and TCP stream framing.
 //! `GapDetector` and `Book` track feed state. This module has no GRP or Spin
-//! Server session, `Service`, or live transport. Callers request gaps and
+//! Server session, server layer, or live transport. Callers request gaps and
 //! coordinate recovery.
 //!
 //! PITCH is Cboe's depth-of-book market data feed for its BYX, BZX, EDGA

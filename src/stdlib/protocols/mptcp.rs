@@ -7,7 +7,7 @@
 //! and [`dss_checksum`] the checksum of a mapping. [`DataLevel`] gives the
 //! DSS for each segment of a connection that has one subflow. There is no
 //! data sequence reassembly over several subflows, path manager,
-//! `Service`, or live transport.
+//! server layer, or live transport.
 //!
 //! Multipath TCP lets one connection use several paths at once, such as
 //! Wi-Fi and a mobile network. The first TCP connection, the first

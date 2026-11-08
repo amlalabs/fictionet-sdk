@@ -31,7 +31,7 @@
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr};
 
-use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::network::ConnInfo;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -835,7 +835,7 @@ pub(crate) mod tests {
         assert_eq!(source_of(&ConnInfo::default()), Source::Modbus);
 
         let sandboxed = ConnInfo {
-            sandbox: Some(fictionet::stdlib::services::serve::Sandbox {
+            sandbox: Some(fictionet::stdlib::world::net::Sandbox {
                 id: 1,
                 name: "hmi".into(),
                 addr: Some(HMI_ADDRESS),

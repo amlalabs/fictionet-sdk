@@ -3,7 +3,7 @@
 //!
 //! `Document` and `Message` implement `Wire`, and `codec::Frames<Message>`
 //! decodes the stream. There is no database session, authentication, query
-//! engine, or `Service`. OP_COMPRESSED payloads are kept without decompression.
+//! engine, or server layer. OP_COMPRESSED payloads are kept without decompression.
 //!
 //! A MongoDB client talks to a server over TCP, usually on port 27017. Each
 //! message starts with a 16-byte header that gives its length, its request

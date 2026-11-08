@@ -43,6 +43,8 @@ pub use tunnel::{Takeover, Tunnel};
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -50,8 +52,7 @@ use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Driver,
     Layer, Top,
 };
-use fictionet::stdlib::network::{ConnError, Connection, DatagramSocket};
-use fictionet::stdlib::services::serve::{ConnInfo, PanicNote, Transport};
+use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket, Transport};
 use fictionet::sync::Mutex;
 use fictionet::{Cancelled, Cx, RecvError};
 
@@ -148,6 +149,85 @@ impl<E> From<Cancelled> for StackError<E> {
     }
 }
 
+/// A panic in world code is the world's bug. Fictionet does not catch it:
+/// it ends the run. The panic's own message says where in the code it
+/// happened; a `PanicNote` alive while it unwinds adds which stack and
+/// connection, on standard error. [`stream`] and [`datagrams`] keep one
+/// while they run a stack.
+pub struct PanicNote {
+    service: &'static str,
+    conn: ConnInfo,
+}
+
+impl PanicNote {
+    /// A note for `service` (such as `std::any::type_name` of it) serving
+    /// `conn`.
+    pub fn new(service: &'static str, conn: &ConnInfo) -> PanicNote {
+        PanicNote {
+            service,
+            conn: conn.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for PanicNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the panic came from {}", self.service)?;
+        let c = &self.conn;
+        if let Some(id) = c.id {
+            write!(f, ", serving connection {id}")?;
+        }
+        if let Some(peer) = c.peer {
+            write!(f, " from {peer}")?;
+        }
+        if let Some(local) = c.local {
+            write!(f, " to {local} ({})", c.transport.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PanicNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PanicNote({self})")
+    }
+}
+
+impl Drop for PanicNote {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            use std::io::Write as _;
+            // Never a second panic while unwinding.
+            let _ = writeln!(std::io::stderr(), "fictionet: {self}");
+        }
+    }
+}
+
+/// Counts one open connection of a listener until dropped, so a listener
+/// can refuse connections past its cap. A port server keeps it with the
+/// accepted socket ([`TcpConnection::hold_until_gone`]), so a connection
+/// counts until its socket is gone, not only while its stack runs.
+///
+/// [`TcpConnection::hold_until_gone`]: fictionet::stdlib::network::tcp::TcpConnection::hold_until_gone
+pub struct Counted(Arc<AtomicUsize>);
+
+impl Counted {
+    /// Counts one more in `open`, unless it already counts `max`.
+    pub fn enter(open: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
+        open.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < max).then_some(n + 1)
+        })
+        .ok()?;
+        Some(Counted(open.clone()))
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Runs `stack` over `conn` until the stack is done with it, charging
 /// what it holds to `budget` and handing its reports to `report`.
 ///
@@ -157,13 +237,16 @@ impl<E> From<Cancelled> for StackError<E> {
 /// as [`StreamEvent::Written`](fictionet::stdlib::layer::StreamEvent::Written).
 /// Due timers go off before more input is offered. The stack's work runs
 /// with the world's context in a [region](fictionet::Cx#regions) of its
-/// own: what it spawns is cancelled when the run ends, and its failures end
-/// that work, not the run.
+/// own: what it spawns is cancelled when the run ends. A task of the work
+/// that fails ends that work and cancels the run, never the caller's
+/// region.
 ///
 /// It returns once the stack has ended its direction with every byte
 /// written and no work left, and input has ended or the stack declares
 /// itself terminal, or when the connection fails, the stack
-/// resets it or gives up on it, or `limits` give up on it. A panic in the
+/// resets it or gives up on it, or `limits` give up on it. A cancel of the
+/// run's region wins over any of these but the stack giving up
+/// ([`StackError::Cancelled`]). A panic in the
 /// stack names it and `info` on standard error as it unwinds
 /// ([`PanicNote`]). Dropping the run drops the stack and its work.
 pub async fn stream<L, C>(
@@ -189,7 +272,13 @@ where
                 return Poll::Ready(Err(StackError::Cancelled));
             }
             let above = &mut |event| match event {};
-            let failed = match live.poll(&fcx, cx, above, &mut report) {
+            let polled = live.poll(&fcx, cx, above, &mut report);
+            // A cancel that landed while the stack ran, as a read or the
+            // stack's work did something, wins over how the stack ended.
+            if fcx.is_cancelled() && !matches!(polled, Poll::Ready(Err(StackError::Layer(_)))) {
+                return Poll::Ready(Err(StackError::Cancelled));
+            }
+            let failed = match polled {
                 Poll::Ready(Ok(Halt::End(end))) => return Poll::Ready(Ok(end)),
                 Poll::Ready(Ok(Halt::Conn(e))) => e,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -315,6 +404,10 @@ where
         // settled stack is done with it.
         if ended || (settled && socket_closed && input.is_none() && jobs.is_empty()) {
             jobs.close_completed();
+            // As the stream runner does, a cancel that landed meanwhile wins.
+            if fcx.is_cancelled() {
+                return Err(StackError::Cancelled);
+            }
             return Ok(());
         }
         if !settled {
@@ -415,3 +508,7 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(kani)]
+#[path = "../../../../verification/layer-runtime/kani/admission.rs"]
+mod proofs;

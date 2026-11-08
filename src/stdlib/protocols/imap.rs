@@ -2,7 +2,7 @@
 //!
 //! `Command` and `Response` implement `Wire`. `Inputs` and `Responses` decode
 //! commands, literals, and replies. Their framing modes do not implement an
-//! authenticated mailbox session, a `Service`, storage, or TLS.
+//! authenticated mailbox session, a server layer, storage, or TLS.
 //!
 //! IMAP is how mail clients read mail kept on a server, usually over TCP
 //! port 143. A client sends commands. Each is a line that starts with a
@@ -21,10 +21,10 @@
 //! it sends the bytes. For a non-synchronizing one, `{n+}`, it does not
 //! wait. A binary literal, `~{n}`, may also hold NUL bytes.
 //!
-//! A mailbox [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
-//! [`Inputs`]; in `on_item`, call `driver.decoder().refuse_literal()` to refuse
-//! a pending literal or `driver.decoder().expect_line()` for AUTHENTICATE and
+//! A mailbox is a [layer](fictionet::stdlib::layer) over a byte stream that
+//! reads it with a [`Stream`](fictionet::stdlib::codec::Stream) of [`Inputs`];
+//! between items it calls `stream.decoder().refuse_literal()` to refuse a
+//! pending literal or `stream.decoder().expect_line()` for AUTHENTICATE and
 //! IDLE. Each item is a [`Command`], a literal continuation, or a syntax error.
 //! Send a [`Response`] for each command. Clients read
 //! [`Stream<Responses>`](fictionet::stdlib::codec::Stream). Mailboxes,

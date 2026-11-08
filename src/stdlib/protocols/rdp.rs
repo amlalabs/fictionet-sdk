@@ -1,7 +1,6 @@
 //! RDP connection messages from MS-RDPBCGR, with no I/O.
 //!
-//! A [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! A server [layer](fictionet::stdlib::layer) over a byte stream uses
 //! `codec::Frames<Frame>` to separate TPKT slow-path packets from fast-path
 //! packets. [`Connection`] reads X.224 connection requests and confirms,
 //! including cookies, routing tokens and security negotiation. [`McsConnect`]

@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use fictionet::stdlib::codec::Fail;
 use fictionet::stdlib::layer::Harness;
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http1::{RejectedRequest, RequestError};
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::web::httpd::{self, Closing, Http1, Http1Report};
 

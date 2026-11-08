@@ -26,6 +26,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::SystemTime;
 
 use fictionet::stdlib::codec::{Decode, Step};
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::{ConnError, ConnectionExt, tcp, udp};
 use fictionet::stdlib::protocols::dns::dnssec::Ring;
 use fictionet::stdlib::protocols::dns::{Framing, Parsed, Queries, Request, stream_framed};
@@ -35,7 +36,6 @@ use fictionet::stdlib::services::dns::{
     Action, Client, Engine, Event, ExchangeFailure, Generation, Input, Lookup, Session, Token,
     Transmit, WallClock,
 };
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy, RaceError};
@@ -899,7 +899,7 @@ impl<E: Engine + Send + 'static> Driver<E> {
     async fn serve_stream(self: &Arc<Self>, fcx: &Cx, mut conn: tcp::TcpConnection) {
         let mut buf = vec![0; READ_BUFFER];
         // The connection's read buffer and the bytes read but not yet
-        // framed are charged to its sandbox's budget, as the service driver
+        // framed are charged to its sandbox's budget, as the stack runner
         // charges them; one that does not fit is closed.
         let mut charge = match self.machine.budget_of(conn.peer_addr().ip()) {
             Some(budget) => match budget.charge(buf.len()) {

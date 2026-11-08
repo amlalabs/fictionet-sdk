@@ -7,7 +7,7 @@
 //!
 //! `Packet` and message envelopes implement `Wire`, and `codec::Frames<Frame>`
 //! decodes TCP framing. These are wire messages only, with no client or server
-//! session or file-server `Service`. Signing, encryption, decompression,
+//! session or file-server server layer. Signing, encryption, decompression,
 //! authentication, and file storage belong to the caller.
 //!
 //! SMB is how Windows shares files, printers and named pipes. A client opens

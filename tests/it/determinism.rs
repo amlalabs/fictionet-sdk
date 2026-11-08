@@ -10,12 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::common::line_stack::{LineApp, LineOut, Lined};
 use bytes::Bytes;
 use fictionet::prelude::*;
-use fictionet::stdlib::codec::{Ending, LineError, Lines};
+use fictionet::stdlib::codec::LineError;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::services::serve::{DEFAULT_MAX_CONNS, Flow, ServeOptions};
+use fictionet::stdlib::services::stack::StreamLimits;
+use fictionet::stdlib::world::net::DEFAULT_MAX_CONNS;
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::{
     network::{Connection, delay, filter},
@@ -38,18 +40,28 @@ struct Trace {
     packets: Vec<(bool, Vec<u8>)>,
     losses: [usize; 2],
 }
-
+/// Echoes each line.
 struct Echo;
-service_fixture! {
-    Echo => (Lines, (), Infallible);
-    decoder(self) {
-        Lines::new(4096, Ending::LfOrCrlf)
+
+impl LineApp for Echo {
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn max_line(&self) -> usize {
+        4096
     }
-    on_item(self, line: Result<Vec<u8>, LineError>; _, d) -> Flow {
-        let line = line.unwrap();
-        d.reply().extend_from_slice(&line);
-        d.reply().push(b'\n');
-        Ok(Flow::Continue)
+
+    fn line(
+        &mut self,
+        line: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
+        out.write(&line.unwrap());
+        out.write(b"\n");
+        Ok(())
     }
 }
 
@@ -143,12 +155,15 @@ async fn episode(
         .lan(&office)
         .lan(&web_lan)
         .host("echo", |h| {
-            h.on(&office).at(ECHO).dns_name("echo.test").tcp_with(
+            let limits = StreamLimits {
+                idle: Some(Duration::from_secs(120)),
+                ..StreamLimits::default()
+            };
+            h.on(&office).at(ECHO).dns_name("echo.test").tcp_stack_with(
                 7,
-                Arc::new(()),
-                || Echo,
-                ServeOptions::default().idle(Some(Duration::from_secs(120))),
+                limits,
                 DEFAULT_MAX_CONNS,
+                |_| Lined::new(Echo),
             )
         })
         .host("https", |h| {

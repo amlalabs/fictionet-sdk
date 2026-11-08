@@ -3,7 +3,7 @@
 //!
 //! `Packet` implements `Wire` and supports `codec::Frames<Packet>` stream
 //! decoding. Despite the protocol name, this module has no session state
-//! machine or `Service`. The caller handles session acceptance, SMB payloads,
+//! machine or server layer. The caller handles session acceptance, SMB payloads,
 //! and TCP.
 //!
 //! Before SMB ran straight over TCP port 445, Windows file sharing ran over

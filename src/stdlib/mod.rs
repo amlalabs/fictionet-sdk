@@ -31,12 +31,13 @@
 //! - **Protocols.** Each protocol is a module written with no I/O: types
 //!   for its messages and a framer for its byte stream, built on the tools
 //!   in [`codec`]. [Protocols](#protocols) explains the shape they share.
-//! - **Services.** A [`serve::Service`](services::serve::Service) is the server
-//!   side of one protocol for one connection, written with no I/O.
-//!   [`serve::connection`](services::serve::connection) and
-//!   [`serve::listen`](services::serve::listen) run it over a connection or a
-//!   listener. HTTP is one ([`httpd`](web::httpd)). Worlds report typed facts
-//!   through their own service state.
+//! - **Layers.** A [`Layer`](layer::Layer) is one protocol between the
+//!   carrier below it and what it offers above, written with no I/O, and
+//!   layers stack on any carrier with the semantics they need. A server is a
+//!   stack with nothing above it. [`stack::stream`](services::stack::stream)
+//!   and [`stack::datagrams`](services::stack::datagrams) run a stack over a
+//!   connection or a UDP socket. HTTP is one ([`httpd`](web::httpd)). Worlds
+//!   report typed facts through their own state.
 //! - **Networks.** [`net::Net`](world::net::Net) builds all of the above for
 //!   you: the sandboxes' subnet, a resolver at the gateway, addresses, a
 //!   router, one machine per address, and each host's services.
@@ -92,7 +93,7 @@
 //! | [`udp::endpoint`](network::udp::endpoint) | UDP packets and an address | sockets |
 //! | [`net::Net::start`](world::net::Net::start) | the attachments, and the hosts with their services | nothing: it builds DNS, routing, machines and every service |
 //! | [`web::Sites::start`] | the attachments, and a callback that gives the site for a hostname | nothing: it builds DNS, routing, machines, TLS and HTTP |
-//! | [`serve::listen`](services::serve::listen) | a listener, and a function that makes a service | the accepting task |
+//! | [`stack::stream`](services::stack::stream) | a connection and a stack | how the run ended, once the stack is done |
 //!
 //! **Functions you await.** These are `async`. They take `&Cx`, as every wait
 //! in Fictionet does, and run inside the task that awaits them. They start no
@@ -155,12 +156,12 @@
 //! a conversation (a session, an exchange, an order book), driven by the
 //! caller the same way: items in, bytes and events out.
 //!
-//! Three layers put a protocol on the network. A
-//! [`serve::Service`](services::serve::Service) joins a framer to a server's
-//! replies and the facts it records, and
-//! [`serve::connection`](services::serve::connection) runs it over a
-//! connection. A [`net::Host`](world::net::Host) puts the service on a port of
-//! a machine with a name and an address. Capture presentation belongs to
+//! Three pieces put a protocol on the network. A server
+//! [`Layer`](layer::Layer) joins a framer to a server's replies and the facts
+//! it records, on whatever carrier it needs ([`layer::Framed`] frames a byte
+//! stream with a codec), and [`stack::stream`](services::stack::stream) runs
+//! it over a connection. A [`net::Host`](world::net::Host) puts the stack on a
+//! port of a machine with a name and an address. Capture presentation belongs to
 //! [`dissect`]. Its `Present` adapters use these codecs, and its `Registry`
 //! selects adapters for traffic.
 //! Wire parsing, serving and capture presentation are
@@ -186,9 +187,11 @@
 //!    one-line description to the [module table](#protocol-modules).
 //! 3. Add `fuzz/fuzz_targets/<name>.rs` and a `[[bin]]` entry in `fuzz/Cargo.toml`.
 //!
-//! A service and a presenter are optional additions. A service owns replies,
-//! connection state and events; install it on a [`net::Host`](world::net::Host)
-//! port. Capture adapters and protocol selection live in [`dissect`]. Create a
+//! A server layer and a presenter are optional additions. A server layer owns
+//! replies, connection state and events; install it on a
+//! [`net::Host`](world::net::Host) port with
+//! [`Host::tcp_stack`](world::net::Host::tcp_stack) or
+//! [`Host::udp_stack`](world::net::Host::udp_stack). Capture adapters and protocol selection live in [`dissect`]. Create a
 //! [`dissect::Dissector::with_registry`] to inspect packets with custom adapters.
 //!
 //! ## Changing a protocol by copying it
@@ -200,11 +203,11 @@
 //!
 //! For a Modbus gateway that accepts a nonzero protocol identifier, copy
 //! `src/stdlib/protocols/modbus.rs` into your crate and remove the two
-//! protocol-identifier checks in `Frame::parse_prefix`. Implement a
-//! [`serve::Service`](services::serve::Service) whose decoder is
+//! protocol-identifier checks in `Frame::parse_prefix`. Write a server
+//! [`Layer`](layer::Layer) over [`layer::Framed`] with
 //! `codec::Frames<modbus::Frame>` from that copy, and install it with
-//! [`net::Host::tcp`](world::net::Host::tcp). Fault plans and transcripts use
-//! the same service driver. A [`dissect::Present`] adapter can use the copied
+//! [`net::Host::tcp_stack`](world::net::Host::tcp_stack). A
+//! [`dissect::Present`] adapter can use the copied
 //! parser. Register it in [`dissect::Registry`] and pass it to your dissector.
 //!
 //! A module can also be generated from a schema; see
@@ -220,7 +223,7 @@
 //! | [`layer`] | Protocol layers: carrier ports, stacking, negotiated change, and their driver. |
 //! | [`network`] | IP packets, routing, links, TCP and UDP. |
 //! | [`protocols`] | Message types and framers for each protocol, with no I/O. |
-//! | [`services`] | Service drivers, TLS servers and certificate authorities. |
+//! | [`services`] | Stack runners, TLS servers and certificate authorities. |
 //! | [`test_support`] | Test data, scripted decoders and behavior assertions. |
 //! | [`web`] | Websites by hostname, and HTTP serving. |
 //! | [`world`] | Networks of hosts, and simulated clients. |
@@ -374,7 +377,6 @@
 //! | [`services::ca`] | Seeded certificate authorities and server certificates. |
 //! | [`services::dns`] | DNS engines with no I/O: zones, authoritative servers, and a validating recursive resolver. |
 //! | [`services::keys`] | Seeded private keys: P-256, P-384, RSA, and Ed25519. |
-//! | [`services::serve`] | Service drivers, listeners, transcripts and fault plans. |
 //! | [`services::ssh`] | SSH servers with typed authentication and raw session streams. |
 //! | [`services::stack`] | Runners for layer stacks over live connections and UDP sockets. |
 //! | [`services::tls`] | Simulated TLS servers using rustls. |

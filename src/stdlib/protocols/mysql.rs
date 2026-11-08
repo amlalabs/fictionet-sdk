@@ -5,7 +5,7 @@
 //!
 //! `Packet` and `Message` implement `Wire`. Stream decoders join packets and
 //! `ResultReader` tracks result-set parsing. That state is not a login or query
-//! session. Authentication, SQL execution, a database `Service`, and TLS
+//! session. Authentication, SQL execution, a database server layer, and TLS
 //! transport are outside this module.
 //!
 //! MySQL clients talk to a server over TCP, usually on port 3306. Every
@@ -20,9 +20,8 @@
 //! protocol chapter of the MySQL source documentation.
 //!
 //! Nothing here reads a socket. A world that plays a database server sends a
-//! [`Handshake`] inside a [`Message`]. A
-//! [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
+//! [`Handshake`] inside a [`Message`]. A server
+//! [layer](fictionet::stdlib::layer) over the byte stream reads it with
 //! `codec::Frames<Packet>` for packets or [`Messages`] to join split packets
 //! and check their sequence IDs. It reads each payload as a
 //! [`HandshakeResponse`] or [`Command`], then builds reply messages from

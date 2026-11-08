@@ -4,7 +4,7 @@
 //! `Part`, `Body`, and `Entity` read and write complete values through `Wire`,
 //! and `Parts` decodes complete parts from a stream. The caller supplies body
 //! boundaries. This module does not implement HTTP or mail sessions, a
-//! `Service`, or upload storage.
+//! server layer, or upload storage.
 //!
 //! A multipart body carries several parts in one message. HTML forms send
 //! their fields and uploaded files this way (`multipart/form-data`), and

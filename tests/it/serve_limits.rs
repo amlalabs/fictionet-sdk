@@ -3,7 +3,6 @@
 //! same limits, budget and seed as HTTP/1.
 
 use crate::common::io;
-use crate::http2_server::H2_INPUT;
 use fictionet_test_support::world;
 
 use fictionet_extras::hyper_io;
@@ -18,13 +17,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::common::line_stack::{LineApp, LineOut, Lined, LinedError};
 use crate::httpd::{closing, poll, send, serve};
 use bytes::Bytes;
-use fictionet::stdlib::codec::{Ending, LineError, Lines};
+use fictionet::stdlib::codec::LineError;
 use fictionet::stdlib::layer::{self, Budget};
-use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::serve::{self, Ended, Flow, Harness, ServeOptions};
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::services::stack::Polling;
+use fictionet::stdlib::services::stack::{self, StreamEnd, StreamLimits};
 use fictionet::stdlib::web::httpd::{
     self, Body, Closing, Exchange, Handler, Http1, HttpOptions, Limits, Reply,
 };
@@ -36,8 +36,56 @@ use fictionet::{Cx, pair};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 
-fn idle_http2_budget(budget: &Budget) {
-    assert_eq!(budget.used(), H2_INPUT);
+fn idle_http2_budget(budget: &Budget, idle: usize) {
+    assert_eq!(budget.used(), idle);
+}
+
+/// What an idle HTTP/2 connection over TCP holds, measured in a world of
+/// its own, so it draws nothing from a test's world: the runner's read
+/// buffer and the stack's fixed state.
+fn h2_input() -> usize {
+    let idle = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let measured = idle.clone();
+    world(Duration::from_secs(60), move |fcx| async move {
+        measured.store(
+            h2_idle_over_tcp(&fcx).await?,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    });
+    idle.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn h2_idle_over_tcp(fcx: &Cx) -> fictionet::Result<usize> {
+    let (server, client) = two_machines(fcx);
+    let budget = Budget::unlimited();
+    serve_http(
+        fcx,
+        &server,
+        80,
+        Arc::new(page(0)),
+        HttpOptions {
+            budget: Some(budget.clone()),
+            ..HttpOptions::default()
+        },
+    )?;
+    let conn = client
+        .connect(fcx, SocketAddr::new(SERVER.into(), 80))
+        .await?;
+    let (_send, driving) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+        Exec(fcx.clone()),
+        Io {
+            fcx: fcx.clone(),
+            conn,
+        },
+    )
+    .await?;
+    fcx.spawn(move |_| async move {
+        let _ = driving.await;
+        Ok(())
+    });
+    fcx.idle().await?;
+    Ok(budget.used())
 }
 
 const SERVER: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
@@ -83,14 +131,20 @@ struct Loud {
     size: usize,
 }
 
-service_fixture! {
-    Loud => (Lines, (), Infallible);
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
-    }
-    on_item(self, _: Result<Vec<u8>, LineError>; _, driver) -> Flow {
-        driver.reply().resize(self.size, b'x');
-        Ok(Flow::Continue)
+impl LineApp for Loud {
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn line(
+        &mut self,
+        _: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
+        out.write(&vec![b'x'; self.size]);
+        Ok(())
     }
 }
 
@@ -104,37 +158,29 @@ fn page(size: usize) -> impl Handler {
 }
 
 // ---------------------------------------------------------------------------
-// The write side of serve
+// The write side of a stack
 
-/// A reply not yet written counts against the budget. Before, only what
-/// was read did, so a client that asked for big replies and never read
-/// them held them outside the budget.
+/// A reply not yet written counts against the budget, so a client that
+/// asks for big replies and never reads them cannot hold them outside it.
 #[test]
 fn reply_bytes_count_against_the_budget() {
-    let opts = ServeOptions::default()
-        .idle(None)
-        .budget(Budget::new(256 << 10));
-    let mut h = Harness::with_options(
+    let mut h = layer::Harness::with_budget(
         fictionet::Seed::from_u64(0),
-        Loud { size: 1 << 20 },
-        (),
-        opts,
+        Lined::new(Loud { size: 1 << 20 }),
+        Budget::new(256 << 10),
     );
-    assert_eq!(h.push(b"go\n").unwrap(), b"");
-    assert_eq!(h.end_reason(), Some(Ended::Budget));
+    assert!(matches!(h.push(b"go\n"), Err(LinedError::Budget)));
+    assert_eq!(h.output(), b"");
 
     // A reply that fits goes out.
-    let opts = ServeOptions::default()
-        .idle(None)
-        .budget(Budget::new(256 << 10));
-    let mut h = Harness::with_options(
+    let mut h = layer::Harness::with_budget(
         fictionet::Seed::from_u64(0),
-        Loud { size: 64 << 10 },
-        (),
-        opts,
+        Lined::new(Loud { size: 64 << 10 }),
+        Budget::new(256 << 10),
     );
-    assert_eq!(h.push(b"go\n").unwrap().len(), 64 << 10);
-    assert_eq!(h.end_reason(), None);
+    h.push(b"go\n").unwrap();
+    assert_eq!(h.output().len(), 64 << 10);
+    assert!(!h.ended());
 }
 
 /// What deferred work holds counts too: an HTTP/1 response body waiting
@@ -151,29 +197,25 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     assert_eq!(closing(&mut h), Some(Closing::Budget));
 }
 
-/// A write that takes no bytes for the write timeout ends the connection.
-/// Before, the driver waited for ever on a client that stopped reading.
+/// A write that takes no bytes for the write timeout ends the connection:
+/// the runner does not wait for ever on a client that stopped reading.
 #[test]
 fn a_client_that_stops_reading_times_out() {
     fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
-        let opts = ServeOptions::default()
-            .idle(None)
-            .write_timeout(Some(Duration::from_millis(300)));
+        let limits = StreamLimits {
+            idle: None,
+            write_timeout: Some(Duration::from_millis(300)),
+        };
         let mut listener = server.listen(7)?;
         let (finish, finished) = tokio::sync::oneshot::channel();
         fcx.spawn(move |fcx| async move {
             let conn = listener.accept(&fcx).await?;
-            let outcome = serve::connection(
-                &fcx,
-                conn,
-                ConnInfo::default(),
-                &mut Loud { size: 16 << 20 },
-                &(),
-                &opts,
-            )
-            .await;
-            let _ = finish.send(outcome);
+            let stack = Lined::new(Loud { size: 16 << 20 });
+            let info = ConnInfo::default();
+            let budget = Budget::unlimited();
+            let outcome = stack::stream(&fcx, conn, &info, stack, budget, limits, |_| {}).await;
+            let _ = finish.send(outcome.map_err(|e| format!("{e:?}")));
             Ok(())
         });
         let mut conn = client
@@ -181,12 +223,12 @@ fn a_client_that_stops_reading_times_out() {
             .await?;
         conn.write_all(&fcx, b"go\n").await?;
         let outcome = finished.await.unwrap();
-        assert!(matches!(
+        assert_eq!(
             outcome,
-            Ok(serve::Served::Closed(Ended::Conn(
+            Ok(StreamEnd::Conn(
                 fictionet::stdlib::network::ConnError::TimedOut
-            )))
-        ));
+            ))
+        );
         drop(conn);
         Ok(())
     });
@@ -482,6 +524,7 @@ fn http2_caps_the_streams_a_connection_opens() {
 /// a handler's randomness from the run's stream, as HTTP/1 does.
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
+    let idle = h2_input();
     world::seeded_world(
         fictionet::Seed::from_u64(7),
         Duration::from_secs(60),
@@ -523,7 +566,10 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
                     body: 9000,
                     ..Limits::default()
                 },
-                budget: Some(Budget::new(H2_INPUT + 8000)),
+                // Room for one read of the largest request and for a
+                // 7500-byte body once, but not for it twice: the body comes
+                // up charged and is copied into the request.
+                budget: Some(Budget::new(idle + 16_000)),
                 ..HttpOptions::default()
             };
             serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
@@ -727,9 +773,12 @@ impl Handler for WaitingMetadata {
 
 #[test]
 fn http2_rejects_metadata_before_calling_the_handler() {
-    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
+    let idle = h2_input();
+    fictionet_test_support::world::world(Duration::from_secs(10), move |fcx| async move {
         let (server, client) = two_machines(&fcx);
-        let budget = Budget::new(H2_INPUT + 1024);
+        // Room for the request's bytes to arrive, which the runner charges as
+        // it reads them, but not for its 4096-byte header to be held.
+        let budget = Budget::new(idle + 4096);
         let router = fictionet_test_support::handler(
             |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
              _: http::Request<bytes::Bytes>| panic!("metadata was not admitted"),
@@ -760,15 +809,18 @@ fn http2_rejects_metadata_before_calling_the_handler() {
             Ok(())
         });
         assert!(send.send_request(metadata_request()).await.is_err());
-        idle_http2_budget(&budget);
+        idle_http2_budget(&budget, idle);
         Ok(())
     });
 }
 
 #[test]
 fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
-    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
-        let budget = Budget::new(64 << 10);
+    let idle = h2_input();
+    fictionet_test_support::world::world(Duration::from_secs(10), move |fcx| async move {
+        // Room for the idle connection, which holds the runner's read
+        // buffer and job table, and two retained request heads.
+        let budget = Budget::new(128 << 10);
         let shared = budget.clone();
         fcx.region(move |fcx| async move {
             let budget = shared;
@@ -803,14 +855,15 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             fcx.idle().await?;
             assert_eq!(waiting.load(std::sync::atomic::Ordering::SeqCst), 1);
             let one = budget.used();
-            assert!(one >= 4096, "the retained request headers count");
-            // Reserve enough for one more request head.
-            let other = budget
-                .charge(budget.limit() - one - (one - H2_INPUT) - 1024)
-                .unwrap();
+            assert!(one >= idle + 4096, "the retained request headers count");
             let second = send.send_request(metadata_request());
             fcx.idle().await?;
             assert_eq!(waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
+            // Leave room for the next request's bytes to arrive, but not for
+            // its head to be held.
+            let other = budget
+                .charge(budget.limit() - budget.used() - 4096)
+                .unwrap();
             let two = budget.used();
             assert!(two >= other.bytes() + 2 * 4096);
             assert!(send.send_request(metadata_request()).await.is_err());
@@ -897,7 +950,8 @@ impl Handler for StreamingMetadata {
 
 #[test]
 fn streaming_responses_release_request_metadata() {
-    fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
+    let idle = h2_input();
+    fictionet_test_support::world::world(Duration::from_secs(10), move |fcx| async move {
         let budget = Budget::new(1 << 20);
 
         let mut h = layer::Harness::with_budget(
@@ -954,7 +1008,7 @@ fn streaming_responses_release_request_metadata() {
         let streaming = budget.used();
         drop(response);
         fcx.idle().await?;
-        idle_http2_budget(&budget);
+        idle_http2_budget(&budget, idle);
 
         let response = send.send_request(metadata_request()).await?;
         assert_eq!(response.status(), 200);
@@ -965,7 +1019,7 @@ fn streaming_responses_release_request_metadata() {
         );
         drop(response);
         fcx.idle().await?;
-        idle_http2_budget(&budget);
+        idle_http2_budget(&budget, idle);
         Ok(())
     });
 }
@@ -1141,11 +1195,11 @@ fn peer_admission_is_shared_by_machines_and_dns() {
             })
             .host("one", |h| {
                 h.at(Ipv4Addr::new(104, 18, 0, 2))
-                    .tcp(7, Arc::new(()), || Loud { size: 1 })
+                    .tcp_stack(7, |_| Lined::new(Loud { size: 1 }))
             })
             .host("two", |h| {
                 h.at(Ipv4Addr::new(104, 18, 0, 3))
-                    .tcp(7, Arc::new(()), || Loud { size: 1 })
+                    .tcp_stack(7, |_| Lined::new(Loud { size: 1 }))
             })
             .start(&fcx, attachments)?;
         let m = fictionet_test_support::sandbox::machine(

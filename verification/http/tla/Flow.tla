@@ -1,11 +1,16 @@
 ------------------------------ MODULE Flow ------------------------------
 (* HTTP/2 flow control in src/stdlib/web/httpd/http2.rs: the receive      *)
-(* windows `Http2::data` debits and `Accept` with `release_window`        *)
-(* refills by WINDOW_UPDATE; the send windows `Sending::poll_next` spends  *)
-(* and the WINDOW_UPDATE and SETTINGS arms of `Http2::frame` refill; and   *)
-(* the wakers that restart a response waiting for credit. Bytes are in    *)
+(* windows `Http2::on_data` debits and `Http2::release` refills by        *)
+(* WINDOW_UPDATE once a batch of input is read; the send windows          *)
+(* `Http2::send_one` spends and the WINDOW_UPDATE and SETTINGS arms of     *)
+(* `Http2::on_frame` refill; and the retry that restarts a response       *)
+(* waiting for credit, which `Http2::advance` makes for every stream     *)
+(* after each batch of frames it reads (the `Wake*` flags). Bytes are in *)
 (* units: a DATA frame carries one unit of payload and `extra` units of   *)
 (* padding, and the windows hold a few units instead of 65,535 bytes.     *)
+(* The exchange child takes each body unit as it comes, as `Respond`     *)
+(* does, so the bytes `Http2::release` holds back for a child that has   *)
+(* not granted credit (`Stream::held`) are zero here.                     *)
 EXTENDS Integers, FiniteSets
 CONSTANTS Ids,        \* the client's stream identifiers, odd
           RecvWindow, \* 65_535: the server's initial receive windows, connection and stream
@@ -16,11 +21,11 @@ CONSTANTS Ids,        \* the client's stream identifiers, odd
           Requests,   \* request body sizes
           Initials,   \* values the client's SETTINGS_INITIAL_WINDOW_SIZE takes
           Extras,     \* padding per DATA frame the client sends
-          CountPadding,           \* `Http2::data` debits padding and its length byte
+          CountPadding,           \* `Http2::on_data` debits padding and its length byte
           CheckConnectionWindow,  \* a negative connection window ends the connection
           CheckStreamWindow,      \* a negative stream window resets the stream
-          ReleaseCredit,          \* `Accept` returns credit by WINDOW_UPDATE
-          SpendWithinWindows,     \* `Sending::poll_next` sends no more than both windows allow
+          ReleaseCredit,          \* `Http2::release` returns credit by WINDOW_UPDATE
+          SpendWithinWindows,     \* `Http2::send_one` sends no more than both windows allow
           WakeOnConnectionUpdate, \* a connection WINDOW_UPDATE wakes every waiting response
           WakeOnStreamUpdate,     \* a stream WINDOW_UPDATE wakes its response
           WakeOnSettings          \* SETTINGS_INITIAL_WINDOW_SIZE wakes every waiting response
@@ -33,19 +38,19 @@ ASSUME Extras \subseteq Nat
 
 VARIABLES sstate,       \* per stream: Idle, Open, HalfRemote or Closed
           last,         \* Http2::last_stream
-          recvConn,     \* Outbound::recv_window
-          recvStream,   \* Window::recv_window
+          recvConn,     \* Http2::recv_window
+          recvStream,   \* Stream::recv_window
           creditConn,   \* what the client may still send on the connection
           creditStream, \* what the client may still send on each stream
-          sendConn,     \* Outbound::window
-          sendStream,   \* Window::available
-          initial,      \* Outbound::initial
+          sendConn,     \* Http2::send_window
+          sendStream,   \* Stream::send_window
+          initial,      \* Http2::initial
           reqLeft,      \* request body units the client still has to send
           dispatched,   \* the handler was called
           pending,      \* response body units left to send
           headSent,     \* the response HEADERS frame is out
           endSent,      \* the response's END_STREAM is out
-          waiting,      \* Sending stored its waker: it is not polled until woken
+          waiting,      \* `Http2::send_one` found no credit: it waits for a retry
           goaway,       \* a connection error ended the connection
           overspent     \* history: the server sent DATA beyond a window
 vars == <<sstate, last, recvConn, recvStream, creditConn, creditStream, sendConn, sendStream,
@@ -81,7 +86,7 @@ Dispatch(i, r) == /\ dispatched' = [dispatched EXCEPT ![i] = TRUE]
                   /\ pending' = [pending EXCEPT ![i] = r]
 NoDispatch == UNCHANGED <<dispatched, pending>>
 
-\* `Http2::headers` on a new stream: the request has `q` units of body to
+\* `Http2::on_headers` on a new stream: the request has `q` units of body to
 \* come, and its response `r` units. The stream's windows start at the
 \* receive default and the client's initial window.
 Open(i, q, r) ==
@@ -96,13 +101,13 @@ Open(i, q, r) ==
   /\ UNCHANGED <<recvConn, creditConn, sendConn, initial, headSent, endSent, waiting, goaway,
                  overspent>>
 
-\* The `size` of a DATA frame in `Http2::data`: payload, padding and the
+\* The `size` of a DATA frame in `Http2::on_data`: payload, padding and the
 \* padding length byte.
 Size(extra) == 1 + (IF CountPadding /\ extra > 0 THEN extra ELSE 0)
 \* What the frame costs the client under RFC 9113 section 6.9.
 Charge(extra) == 1 + extra
 
-\* `Http2::data` on an open stream: the client sends one unit of its body,
+\* `Http2::on_data` on an open stream: the client sends one unit of its body,
 \* with `extra` padding, within the credit it has. The connection window
 \* is debited first, for every stream; then the stream's window.
 ClientData(i, extra, r) ==
@@ -117,7 +122,7 @@ ClientData(i, extra, r) ==
   /\ IF reqLeft[i] = 1 /\ ~dispatched[i] THEN Dispatch(i, r) ELSE NoDispatch
   /\ UNCHANGED <<last, sendConn, sendStream, initial, headSent, endSent, waiting, goaway, overspent>>
 
-\* `Http2::data` from a client that sends beyond its credit: the connection
+\* `Http2::on_data` from a client that sends beyond its credit: the connection
 \* window check ends the connection; the stream window check resets the
 \* stream. The frame still counts against the client's connection credit.
 ClientOverData(i, extra) ==
@@ -135,7 +140,7 @@ ClientOverData(i, extra) ==
                            IF recvStream'[i] < 0 /\ CheckStreamWindow THEN "Closed" ELSE "Open"]
             /\ UNCHANGED goaway
 
-\* `Accept::poll_next` with `release_window`: once the client used at
+\* `Http2::release`, once a batch of input is read: once the client used at
 \* least half of what it has left, the server returns that credit by
 \* WINDOW_UPDATE, on the connection and on each live stream.
 Due(window) == RecvWindow - window > 0 /\ RecvWindow - window >= window \div 2
@@ -152,7 +157,7 @@ Release ==
   /\ UNCHANGED <<sstate, last, sendConn, sendStream, initial, reqLeft, dispatched, pending,
                  headSent, endSent, waiting, goaway, overspent>>
 
-\* The WINDOW_UPDATE arm of `Http2::frame` for stream zero: the client
+\* The WINDOW_UPDATE arm of `Http2::on_frame` for stream zero: the client
 \* adds `inc` to the connection window. Past the maximum, the connection
 \* ends; otherwise every waiting response wakes.
 ConnectionUpdate(inc) ==
@@ -165,7 +170,7 @@ ConnectionUpdate(inc) ==
             /\ waiting' = IF WakeOnConnectionUpdate THEN [i \in Ids |-> FALSE] ELSE waiting
             /\ UNCHANGED goaway
 
-\* The WINDOW_UPDATE arm of `Http2::frame` for a live stream: the client
+\* The WINDOW_UPDATE arm of `Http2::on_frame` for a live stream: the client
 \* adds `inc` to the stream's window. Past the maximum, the stream is
 \* reset; otherwise its response wakes.
 StreamUpdate(i, inc) ==
@@ -179,7 +184,7 @@ StreamUpdate(i, inc) ==
             /\ waiting' = IF WakeOnStreamUpdate THEN [waiting EXCEPT ![i] = FALSE] ELSE waiting
             /\ UNCHANGED sstate
 
-\* The SETTINGS arm of `Http2::frame` with SETTINGS_INITIAL_WINDOW_SIZE `v`:
+\* The SETTINGS arm of `Http2::on_frame` with SETTINGS_INITIAL_WINDOW_SIZE `v`:
 \* every live stream's window moves by the difference. Past the maximum,
 \* the connection ends; otherwise every waiting response wakes.
 Settings(v) ==
@@ -194,7 +199,7 @@ Settings(v) ==
             /\ waiting' = IF WakeOnSettings THEN [i \in Ids |-> FALSE] ELSE waiting
             /\ UNCHANGED goaway
 
-\* The RST_STREAM arm of `Http2::frame`: the stream and its response go away.
+\* The RST_STREAM arm of `Http2::on_frame`: the stream and its response go away.
 ClientReset(i) ==
   /\ ~goaway /\ sstate[i] \in Live
   /\ sstate' = [sstate EXCEPT ![i] = "Closed"]
@@ -202,7 +207,7 @@ ClientReset(i) ==
                  initial, reqLeft, dispatched, pending, headSent, endSent, waiting, goaway,
                  overspent>>
 
-\* `Http2::on_timer` with a body deadline: the handler is called before
+\* `Respond::on_timer` with a body deadline: the handler is called before
 \* the request ends.
 EarlyAnswer(i, r) ==
   /\ ~goaway /\ sstate[i] = "Open" /\ ~dispatched[i]
@@ -210,11 +215,11 @@ EarlyAnswer(i, r) ==
   /\ UNCHANGED <<sstate, last, recvConn, recvStream, creditConn, creditStream, sendConn,
                  sendStream, initial, reqLeft, headSent, endSent, waiting, goaway, overspent>>
 
-\* `Http2::on_done`: the stream closes, with RST_STREAM(NO_ERROR) if the
+\* `Http2::written`: the stream closes, with RST_STREAM(NO_ERROR) if the
 \* request is still arriving.
 Done(i) == sstate' = [sstate EXCEPT ![i] = "Closed"]
 
-\* `Sending::poll_next`: the response HEADERS frame.
+\* `Http2::response_head`: the response HEADERS frame.
 SendHead(i) ==
   /\ ~goaway /\ sstate[i] \in Live /\ dispatched[i] /\ ~headSent[i]
   /\ headSent' = [headSent EXCEPT ![i] = TRUE]
@@ -223,10 +228,10 @@ SendHead(i) ==
   /\ UNCHANGED <<last, recvConn, recvStream, creditConn, creditStream, sendConn, sendStream,
                  initial, reqLeft, dispatched, pending, waiting, goaway, overspent>>
 
-\* `Sending::poll_next` with body left: `n` is the least of what is left,
+\* `Http2::send_one` with body left: `n` is the least of what is left,
 \* the connection window, the stream window and the frame size. With
-\* nothing to send it stores its waker and waits; otherwise it spends `n`
-\* from both windows.
+\* nothing to send it waits for a retry; otherwise it spends `n` from both
+\* windows.
 Allowed(i) == IF SpendWithinWindows
                 THEN Min(Min(pending[i], Max(sendConn, 0)), Min(Max(sendStream[i], 0), Frame))
                 ELSE Min(pending[i], Frame)
@@ -243,7 +248,7 @@ SendData(i) ==
             /\ overspent' = (overspent \/ Allowed(i) > sendConn \/ Allowed(i) > sendStream[i])
             /\ UNCHANGED waiting
 
-\* `Sending::poll_next`: the empty DATA frame with END_STREAM after the body.
+\* `Http2::send_one`: the empty DATA frame with END_STREAM after the body.
 SendEnd(i) ==
   /\ ~goaway /\ sstate[i] \in Live /\ headSent[i] /\ pending[i] = 0 /\ ~endSent[i]
   /\ endSent' = [endSent EXCEPT ![i] = TRUE]
@@ -268,8 +273,9 @@ Server == \/ Release
           \/ \E i \in Ids : Respond(i) \/ \E r \in Responses : EarlyAnswer(i, r)
 Next == Client \/ Server
 
-\* The serve driver polls a response whenever it is woken and runs `Accept`
-\* after every input batch. The client sends the body it declared and
+\* `Http2::advance` retries a waiting response after every batch of frames
+\* and runs `Http2::release` once a batch is read. The client sends the
+\* body it declared and
 \* grants credit when the server runs out. A client that keeps moving its
 \* initial window can hold every response back forever, so the liveness
 \* properties are for one that settles on a value.

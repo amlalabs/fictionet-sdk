@@ -8,14 +8,14 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use fictionet::stdlib::layer::{Budget, Chain, Harness, Switch};
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::{ip, tcp};
-use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::stack::{self, Polling, StreamEnd, StreamLimits, Tunnel};
+use fictionet::stdlib::services::stack::{self, Polling, StreamEnd, StreamLimits};
 use fictionet::stdlib::web::httpd::{self, Http1};
 use fictionet::{Entropy, SeededEntropy};
 
 /// TLS with HTTP/1 on top, the HTTP/1 able to hand its stream on.
-type Https = Chain<tls::TlsLayer, Switch<Http1, Tunnel>>;
+type Https = Chain<tls::TlsLayer, Switch<Http1, httpd::Upgraded>>;
 
 fn https(config: Arc<ServerConfig>, handler: impl httpd::Handler) -> Https {
     Chain::new(tls::TlsLayer::new(config), Http1::new(handler).upgradable())

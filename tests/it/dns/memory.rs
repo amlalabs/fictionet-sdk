@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::SOA;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, RecordType};
@@ -14,7 +15,6 @@ use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, Zone, answer
 use fictionet::stdlib::services::dns::{
     ExchangeFailure, Input, Looked, Lookup, Token, Tokens, Transmit,
 };
-use fictionet::stdlib::services::serve::Transport;
 use fictionet_test_support::lookup_authority::LookupAuthority;
 
 use super::resolver::{

@@ -1,16 +1,17 @@
 # Services and networks
 
-This guide builds a small world step by step: a service, a test for it,
-a network of hosts that serve it, and a log a grader reads. Every piece is
+This guide builds a small world step by step: a server stack, a test for
+it, a network of hosts that serve it, and a log a grader reads. Every piece is
 a public module of `fictionet::stdlib`, so each file can be copied into a world's crate and
 changed there. Every world defines its own typed observations and decides
 where to send them.
 
 | Module | What it gives |
 |---|---|
-| `serve` | The `Service` trait and the driver that runs it over a connection (`connection`, `listen`), a `Harness` for tests, and `DatagramService` with its runner for a UDP socket (`datagram`) |
-| `net` | `Net`: the sandboxes' subnet, a resolver at the gateway, routing, one machine per address, and each `Host`'s services |
-| `httpd` | HTTP as a service: `Handler`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
+| `layer` | The `Layer` trait: one protocol between the carrier below it and what it offers above, stacked with `Chain`, `Switch` and `Children`, and a `Harness` for tests |
+| `services::stack` | The runners that run a stack over a connection (`stream`) or a UDP socket (`datagrams`), and `Polling` to do a stack's work in a harness |
+| `net` | `Net`: the sandboxes' subnet, a resolver at the gateway, routing, one machine per address, and each `Host`'s stacks on its ports |
+| `httpd` | HTTP as a stack: `Handler`, the `tower` adapter for axum, `VirtualHosts`, `Http1`, `Http2` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
 
 UDP sockets and Net's DHCP server read only the declared UDP datagram.
@@ -120,107 +121,169 @@ the only scan bound, so callers limit it before parsing. JSON keeps its size,
 depth, value-count and number-length limits, value trees and public errors.
 The helper does not check surrounding delimiters or choose output escapes.
 
-## 1. A service
+## 1. A server stack
 
-A service is the server side of one protocol, for one connection. It
-reads nothing and writes nothing itself. The driver decodes the client's
-bytes with the service's decoder and calls the service once per item. The
-service appends its reply and records what it saw:
+A protocol is a layer: it sits between the carrier below it, such as a
+byte stream, and what it offers above, and it reads nothing and writes
+nothing itself. Events come up from below and commands come down, all
+synchronously, with the time, the entropy and the budget in an `Env`. A
+server is a stack with nothing above it (`Top`). Here a login prompt reads
+lines with a codec stream it owns, answers one password and closes:
 
 ```rust
-use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::services::serve::{Flow, Driver, Service};
+use std::collections::VecDeque;
+use std::convert::Infallible;
+use std::sync::Arc;
+use fictionet::stdlib::codec::{Ending, Lines, Stream};
+use fictionet::stdlib::layer::{Admit, ByteStream, Chunk, Env, Layer, StreamCommand, StreamEvent, Top};
 
 /// A login prompt that takes one password and closes.
-struct Prompt;
+struct Prompt {
+    password: Arc<str>, // the right password, shared by every connection
+    lines: Stream<Lines>,
+    out: VecDeque<StreamCommand>,
+    asked: bool,
+    done: bool,
+}
 
-impl Service for Prompt {
+impl Prompt {
+    fn new(password: Arc<str>) -> Prompt {
+        let lines = Stream::new(Lines::new(256, Ending::LfOrCrlf));
+        Prompt { password, lines, out: VecDeque::new(), asked: false, done: false }
+    }
+}
+
+impl Layer for Prompt {
+    type Lower = ByteStream;
+    type Upper = Top;
+    type Report = Infallible;
     type Timer = ();
-    type Decoder = Lines;
-    type State = String; // the right password, shared by every connection
-    type Error = std::convert::Infallible;
+    type Work = ();
+    type Done = ();
+    type Error = Infallible;
 
-    fn decoder(&self) -> Lines {
-        Lines::new(256, Ending::LfOrCrlf)
+    fn on_event(&mut self, _: &mut Env<'_, Infallible>, event: StreamEvent) -> Result<Admit<StreamEvent>, Infallible> {
+        match event {
+            StreamEvent::Written(_) => Ok(Admit::Taken),
+            event if self.done => Ok(Admit::Closed(event)),
+            StreamEvent::Data(mut bytes) => {
+                // Take what the line buffer has room for, and hand back the rest.
+                let took = self.lines.push(&bytes);
+                if took == bytes.len() {
+                    return Ok(Admit::Taken);
+                }
+                bytes.advance(took);
+                let rest = StreamEvent::Data(bytes);
+                Ok(if took == 0 { Admit::Blocked(rest) } else { Admit::Partial(rest) })
+            }
+            StreamEvent::Ended | StreamEvent::Reset => {
+                self.done = true;
+                self.out.push_back(StreamCommand::End);
+                Ok(Admit::Taken)
+            }
+        }
     }
 
-    fn on_open(&mut self, _: &String, driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> Result<Flow, Self::Error> {
-        driver.reply().extend_from_slice(b"password: ");
-        Ok(Flow::Continue)
+    fn advance(&mut self, _: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+        if !self.asked {
+            self.asked = true;
+            self.out.push_back(StreamCommand::Write(Chunk::new(b"password: ".to_vec())));
+            return Ok(true);
+        }
+        if self.done {
+            return Ok(false);
+        }
+        let Some(Ok(line)) = self.lines.next() else {
+            return Ok(false);
+        };
+        let right = line.unwrap_or_default() == self.password.as_bytes();
+        let answer: &[u8] = if right { b"welcome\n" } else { b"no\n" };
+        self.out.push_back(StreamCommand::Write(Chunk::new(answer.to_vec())));
+        self.out.push_back(StreamCommand::End);
+        self.done = true;
+        Ok(true)
     }
 
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_, Self::Decoder, Self::Timer>) -> Result<Flow, Self::Error> {
-        let line = line.unwrap_or_default();
-        let right = line == password.as_bytes();
-        driver.reply().extend_from_slice(if right { b"welcome\n" } else { b"no\n" });
-        Ok(Flow::Close)
+    fn is_terminal(&self) -> bool {
+        self.done
+    }
+
+    fn on_command(&mut self, _: &mut Env<'_, Infallible>, command: Infallible) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn take_command(&mut self) -> Option<StreamCommand> {
+        self.out.pop_front()
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
     }
 }
 ```
 
-`State` is what every connection shares: here a password, in a real
-world a directory, a process model or an order book. The service itself
-is made fresh for each connection.
+What every connection shares, here a password and in a real world a
+directory, a process model or an order book, goes into the layer when it
+is made, fresh for each connection. A layer refuses what it cannot take
+yet, and the caller keeps it: the rules every layer keeps are in the
+`layer` module docs.
 
-A service can also:
+Layers compose by type. `Chain<A, B>` puts `B` on `A` when `B`'s lower port
+is `A`'s upper port, so TLS (`tls::TlsLayer`) goes under HTTP or under the
+prompt above, `layer::Framed` turns a byte stream into whole frames with a
+codec for a protocol that never handles bytes, and `Children` gives each
+stream of a multiplexed connection, such as an HTTP/2 stream or an SSH
+channel, a layer of its own. A layer can also:
 
-- **Run timers.** `driver.set_timer(Timer::Heartbeat, d)` arms a timer from the service's `type Timer` enum and
-  `on_timer` hears which one went off. A FIX session has four (heartbeat,
-  TestRequest, logon, logout), each armed and cancelled on its own. A due
-  timer is handled before more input is read, so a client that never
-  stops sending cannot starve it.
-- **Be woken.** `driver.wake_handle()` gives a handle the world keeps, such
-  as next to an order in the book. When another trader's order fills it,
-  that connection calls `handle.wake()`, and this connection's `on_wake`
-  writes the execution report. SMB2 oplock breaks, LDAP persistent search
-  and MCP notifications work the same way.
-- **Hand over async work.** `driver.defer(work)` runs work whose bytes are
-  written in order before the next item (an HTTP/1 response from a tower
-  service). `driver.defer_keyed(key, work)` runs work beside the reads and
-  the other keyed work, each writing whole frames, and `on_done` hears
-  when one ends: concurrent responses, as HTTP/2 streams need.
-- **Upgrade the connection.** `Upgrade::Decoder` goes on with a fresh
-  decoder. STARTTLS (SMTP, IMAP, LDAP, Postgres's `SSLRequest`) is a
-  layer stack instead: a plaintext layer whose `layer::Handoff` names a
-  `tls::Secure` as what comes next, in a `layer::Switch`, served with
-  `Host::tcp_stack`. The plaintext layer hands over once its go-ahead is
-  written, and decides what becomes of plaintext the client pipelined
-  after its request. `Upgrade::Handoff` hands the connection and its unread
-  bytes back to whoever called `serve::connection`. A port served with `Host::tcp`
-  or `tcp_with` closes such a connection. To go on with it, serve the port
-  with a `PortServer` of your own, as `httpd::Server` does.
-- **Say what it holds.** `Service::held` reports bytes the service keeps
-  for the connection, such as a request body, and `Pending::held` what
-  deferred work keeps, such as a response body not yet written. They
-  count against the sandbox's budget with the decoder's own and the reply
-  bytes waiting to be written.
+- **Run timers.** It keeps them in a `layer::Timers` and answers
+  `deadline` with the next; `on_timer` hears which one went off. A FIX
+  session has four (heartbeat, TestRequest, logon, logout), each armed and
+  cancelled on its own. A due timer is handled before more input is
+  offered, so a client that never stops sending cannot starve it.
+- **Hand over async work.** `take_work` gives the runner work that is a
+  `services::stack::Job`, such as an HTTP handler's answer, the next frame
+  of a streamed body, or a wait for something another connection sends,
+  and `on_done` hears what it brought back. Work runs beside the reads, so
+  concurrent responses interleave as HTTP/2 streams need. When another
+  trader's order fills, that connection sends the fill to this one's work
+  over a channel, and the layer writes the execution report. SMB2 oplock
+  breaks, LDAP persistent search and MCP notifications work the same way.
+- **Change protocol.** `layer::Switch<A, B>` runs `A` until it reaches a
+  protocol boundary, then the `B` it negotiated, with the input `A` read
+  past the boundary. STARTTLS (SMTP, IMAP, LDAP, Postgres's `SSLRequest`)
+  is a plaintext layer whose `layer::Handoff` names a `tls::Secure` as what
+  comes next, served with `Host::tcp_stack`. The plaintext layer hands over
+  once its go-ahead is written, and decides what becomes of plaintext the
+  client pipelined after its request. `services::stack::Tunnel` hands the
+  rest of a stream to async code written against a connection, as what
+  runs after a CONNECT or a WebSocket upgrade does.
+- **Charge what it holds.** Each layer charges its own storage, such as a
+  line buffer or a reply not yet written, to the connection's budget before
+  it grows, and a `Chunk` carries its charge down the stack with the bytes.
+  The runner charges its read buffer and the bytes the stack has not taken.
 
-An error the service returns closes its connection and records
-`conn.error`. A panic is a bug in the world, and Fictionet does not catch
-it: it ends the run, wherever in the world it happens. As it unwinds,
-the driver names the service and the connection on standard error after
-the panic's own message, so the failed run says where to look.
+A stack error ends its connection. A panic is a bug in the world, and
+Fictionet does not catch it: it ends the run, wherever in the world it
+happens. As it unwinds, the runner names the stack and the connection on
+standard error after the panic's own message, so the failed run says where
+to look.
 
-When the world stops, a running service hears `Ended::Cancelled` in `on_end`.
-`serve::connection` returns `Err(ServeError::Cancelled)`, also during the TLS
-handshake or the final shutdown, unless it has a failure to return. If the
-service was already ending, `on_end` has heard the original cause and is not
-called again. `datagram` returns `Err(Cancelled)`.
+`services::stack::stream` runs a stack over a connection until the stack
+has ended its direction with every byte written and no work left, and the
+input has ended or the stack is terminal. When the world stops, or the
+run's region is otherwise cancelled, it returns
+`Err(StackError::Cancelled)`, unless the stack itself gave up. A task of
+the stack's work that fails ends that work and cancels the run, never the
+caller's region. `services::stack::datagrams` runs a stack over a UDP
+socket the same way, one conversation for the socket's whole life.
 
-The final shutdown waits at most five seconds. A shutdown cancellation returns
-`ServeError::Cancelled`; other shutdown failures keep `Served::Closed(end)`.
-An earlier service or deferred-work failure stays primary.
-
-A task spawned in the connection's child region can fail and cancel that
-region. Its original error returns as `ServeError::Pending` unless the
-driver already has a failure to return. Cancellation itself is not a task
-failure. `listen` and `Net` serve each connection in a task of its own; a
-connection's failure does not end the world.
-
-A write that takes no bytes for `ServeOptions::write_timeout` (10
-seconds) ends the connection: a client that stops reading cannot hold a
-reply, or a service's timers, for ever. A client that resets the
-connection ends it at once, also while a write waits.
+The runner ends the input of a connection that sends nothing for
+`StreamLimits::idle` (10 seconds) while it waits with nothing to write and
+no work running: the stack hears it as an end of input. A write that takes
+no bytes for `StreamLimits::write_timeout` (10 seconds) ends the
+connection: a client that stops reading cannot hold a reply, or a stack's
+timers, for ever. A client that resets the connection ends it at once,
+also while a write waits.
 
 TCP disappearance watches wake when either side resets the connection or
 the endpoint stops, even while a handler keeps the connection without
@@ -259,11 +322,12 @@ result for its HTTP and SOCKS error replies.
 ### One protocol, two framings
 
 Kerberos frames a message with a four-byte length over TCP, and sends one
-message per datagram over UDP. Write a thin `Service` for TCP and a thin
-`DatagramService` for UDP over one core of your own: each picks its
-decoder and hands the message to the shared code, and the UDP side can
-answer `KRB_ERR_RESPONSE_TOO_BIG`. Serve them with `Host::tcp(88, ..)` and
-`Host::udp(88, ..)` and the same `State`.
+message per datagram over UDP. Write a thin layer over a byte stream for
+TCP and a thin layer over datagrams for UDP around one core of your own:
+each picks its framing and hands the message to the shared code, and the
+UDP side can answer `KRB_ERR_RESPONSE_TOO_BIG`. Serve them with
+`Host::tcp_stack(88, ..)` and `Host::udp_stack(88, ..)`, each made with
+the same shared state. The `ConnInfo` each factory gets says which.
 
 ### FTP control framing
 
@@ -415,40 +479,45 @@ Exhaustive matches on `tftp::Error` must handle the new
 
 ### Dates belong to the world
 
-`driver.now()` is the run's clock: time since the run started, with no
-date. A service that needs a date, such as for ticket lifetimes,
-certificate validity or a FIX `SendingTime`, takes it from its `State`,
-which decides what day it is in the world. Include that date in the world's
+`Env::now` is the run's clock: time since the run started, with no
+date. A layer that needs a date, such as for ticket lifetimes,
+certificate validity or a FIX `SendingTime`, takes it from the shared
+state it is made with, which decides what day it is in the world. Include that date in the world's
 own typed state when readers need to place its observations on a calendar.
 
 HTTP follows the same rule. `httpd` sends a `Date` header only when the
 world gave its date at the start of the run (`Sites::date`, `Server::date`,
 `Http1::date` or `HttpOptions::date`), and the header is
-that date plus `driver.now()`. With no world date, responses carry no `Date`
+that date plus `Env::now`. With no world date, responses carry no `Date`
 header at all, as RFC 9110 allows for a server without a clock: a world
 that never says what day it is never leaks the host's. A `Date` a handler
 sets itself goes out as it is.
 
 ## 2. A test with no runtime
 
-`Harness` runs a service with no I/O: push the client's bytes, get the
-reply.
+`layer::Harness` runs a stack with no I/O: push the client's bytes, take
+the reply.
 
 ```rust
-use fictionet::stdlib::services::serve::Harness;
+use fictionet::stdlib::layer::Harness;
 
-let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned());
-assert_eq!(h.open()?, b"password: ");
-assert_eq!(h.push(b"hunter2\n")?, b"welcome\n");
-assert!(h.closed());
+let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt::new("hunter2".into()));
+h.settle()?;
+assert_eq!(h.take_output(), b"password: ");
+h.push(b"hunter2\n")?;
+assert_eq!(h.take_output(), b"welcome\n");
+assert!(h.ended());
 ```
 
-The harness runs the same state machine as the driver: `advance` moves
-its clock and fires timers in order, `poll` runs deferred work and wakes,
-and `resume` goes on after an upgrade. Its standalone entropy stream starts
-from the supplied `Seed`. Calling `with_fcx` before opening it binds both
-its clock and randomness to that run; use the run's sleeps and `poll` then,
-because manual `advance` is only available to standalone harnesses.
+The harness plays the peer and the transport, and takes the stack's output
+only as fast as the test allows (`withhold`, `allow`, `allow_all`), so
+backpressure can be tested. `advance` moves its clock and fires timers in
+order. The stack's work waits for the test (`work`, `complete`) unless the
+harness has a worker: `with_worker(services::stack::Polling::new())` polls
+it as the live runners do. Its standalone entropy stream starts from the
+supplied `Seed`. `Polling::in_world(fcx)` binds both its clock and
+randomness to that run; use the run's sleeps then, because manual
+`advance` is only available to standalone harnesses.
 
 For decoder tests with caller decisions, `stdlib::test_support::Scripted`
 holds a decoder and caller state. Its hooks run before each decode call and
@@ -461,16 +530,18 @@ it on the next call. Drive it with `test_support::decode_chunks` to check chunki
 with `at`, or picked from the `Pools` the world passes to `Net::new`), DNS
 names, and services on its ports. `fictionet_extras::network::cdn_pools`
 gives public CDN space; `Pools::NONE` gives no automatic addresses, so every
-host needs `at`:
+host needs `at`. `tcp_stack(port, make)` serves a TCP port with a stack made
+for each connection from its `ConnInfo`, which numbers it and names its
+sandbox:
 
 ```rust
 use std::sync::Arc;
 use fictionet::stdlib::world::net::{Net, Pools};
 
-let password = Arc::new("hunter2".to_owned());
+let password: Arc<str> = "hunter2".into();
 let at: std::net::Ipv4Addr = "10.20.0.5".parse()?;
 Net::new(Pools::NONE)
-    .host("vault", |h| h.at(at).dns_name("vault.corp.test").tcp(2323, password.clone(), || Prompt))
+    .host("vault", |h| h.at(at).dns_name("vault.corp.test").tcp_stack(2323, move |_| Prompt::new(password.clone())))
     .start(&fcx, attachments)?;
 ```
 
@@ -543,20 +614,20 @@ body framing, so a clean FIN short of Content-Length is not detected.
 
 Other kinds of port:
 
-- `tcp_with(port, world, make, opts, max_conns)`: the same, with
-  `ServeOptions` for an idle limit or a budget, and a cap on the
-  connections served at once (`tcp` uses `DEFAULT_MAX_CONNS`, 64).
-- `udp(port, world, make)`: one `DatagramService` for the port, which
-  gets every datagram, each decoded on its own as DNS and Modbus over UDP
-  frame their messages. Its `on_item` replies to the datagram's sender and
-  says whether to go on with the rest of the datagram (`DatagramFlow`).
-  Any call can send datagrams to anyone (`send_to`) and run timers, as a
-  MoldUDP64 server does for retransmissions and heartbeats. A datagram
-  service has no deferred work, upgrades or connection ends. `udp_with`
-  adds a budget its calls can check.
-- `tls(port, sni, config, world, make)`: TLS first, picked by the name the
+- `tcp_stack_with(port, limits, max_conns, make)`: the same, with
+  `StreamLimits` for the idle and write limits, and a cap on the
+  connections served at once (`tcp_stack` uses `DEFAULT_MAX_CONNS`, 64).
+- `udp_stack(port, budget, make)`: one stack for the port, a layer over
+  `Datagrams`, which gets every datagram whole with its sender's address
+  and sends each datagram it gives to the address it names, so it can
+  send to anyone and run timers, as a MoldUDP64 server does for
+  retransmissions and heartbeats. It is one conversation for the socket's
+  whole life, and its factory gets the socket's address. What it retains
+  is charged to `budget`.
+- `tls_stack(port, sni, config, make)`: TLS first, picked by the name the
   client sends (`Sni::Any`, `Sni::Names` for the host's DNS names, or one
-  name); several calls on one port route by SNI.
+  name), then a stack over the decrypted stream; several calls on one port
+  route by SNI.
 - `port_server(port, server)` and `tls_accept(port, sni, config, server)`: a
   `PortServer` of the world's own. HTTP is one: `httpd::Server`, below.
 
@@ -586,13 +657,13 @@ limits. [`httpd.rs`](../src/stdlib/web/httpd.rs) says how the native HTTP/2
 server keeps time.
 
 Each peer address may hold 256 connections at once across all machines
-and gateway DNS listeners in the network. Bytes held by the service layer
-are charged to one budget per sandbox, 256 MiB by default. TCP socket
-buffers and TLS handshakes are outside this budget.
-The driver counts each connection's read buffer or its decoder's capacity,
-whichever is larger, the input its decoder has not used yet, queued
-replies, and what the service and its deferred work report holding.
-Memory outside those counts, such as hyper's own buffers, is not charged.
+and gateway DNS listeners in the network. Bytes held by the stacks are
+charged to one budget per sandbox, 256 MiB by default. TCP socket
+buffers and TLS handshakes are outside this budget. The runner counts
+each connection's read buffer and the input the stack has not taken yet,
+and each layer counts what it holds, such as a framer's buffer and the
+replies not yet written. Memory outside those counts, such as hyper's
+own buffers, is not charged.
 `Net::limits` changes these limits and the TLS handshake and DNS timers.
 Tests set small ones.
 `fictionet::run(seed, world)` gives TCP, UDP, services, HTTP exchanges one ChaCha20 byte stream through `Cx`. The same seed and
@@ -620,7 +691,7 @@ members, and the LAN's drops are recorded as `net.blocked` repeats with
 ```rust
 Net::new(Pools::NONE)
     .lan("corp", "192.168.56.0/24".parse()?)
-    .host("dc01", |h| h.on("corp").at(dc01).dns_name("dc01.corp.test").tcp(389, directory, || Ldap))
+    .host("dc01", |h| h.on("corp").at(dc01).dns_name("dc01.corp.test").tcp_stack(389, move |_| Ldap::new(directory.clone())))
     .member("ws01", "corp", "192.168.56.31".parse()?)
     .start(&fcx, attachments)?;
 ```
@@ -640,7 +711,7 @@ A write with different starting bytes reports only its own bytes.
 
 ## 4. HTTP
 
-HTTP is a service like the others. Implement `httpd::Handler` for a
+HTTP is a stack like the others. Implement `httpd::Handler` for a
 custom handler, or use axum through the tower adapter:
 
 ```rust
@@ -703,8 +774,8 @@ or the reverse. The first default at each endpoint keeps the role. Names
 are matched without case or a trailing dot. `Net` itself knows nothing of
 HTTP, so a copy of `httpd` with its own handlers plugs in the same way.
 Copy `src/stdlib/web/httpd.rs` together with `src/stdlib/web/httpd/`, keeping the
-relative paths. Each serving engine has its own file there: `native.rs` for
-HTTP/1 and `http2.rs` for HTTP/2.
+relative paths. Each version has its own file there: `native.rs` for
+HTTP/1, and `http2.rs` with the `http2/` directory for HTTP/2.
 
 Each routed request carries an `httpd::Target`. Its `routing` field is
 `Routing::Exact` when the requested host matches a registered name, or
@@ -725,10 +796,18 @@ also answer with a local rejection.
 `layer::Layer` over a byte stream: test it with `layer::Harness`, and
 `serve_connection` runs it with `services::stack::stream`. On a host's TLS
 port it runs in the same stack as TLS, `Chain<TlsLayer, Http1>`. `Http2`
-serves HTTP/2 on the stdlib's `http2` frames and HPACK, behind the same
-`Handler` trait. Neither needs tokio. Both versions share one set of
-`httpd::Limits`: body size, body and write timers, and 100 streams at once
-on an HTTP/2 connection.
+is the HTTP/2 connection as a layer, on the stdlib's `http2` frames and
+HPACK: a byte stream below, and one `HttpExchange` child per stream above,
+opened with the request's head. `Respond` answers an exchange with the same
+`Handler` trait, and `Responder::http2` composes the server,
+`Chain<Http2, Children<Respond, Top, Opening>>`. `Grpc` serves gRPC calls
+on an exchange instead, each call its own child. On a host's TLS port,
+HTTP/2 runs in the same stack as TLS when ALPN chose `h2`. Without TLS,
+`serve_connection` tells HTTP/2's preface from HTTP/1 by reading no more of
+the first bytes than that takes, and HTTP/1 hands the connection to HTTP/2
+after answering `Upgrade: h2c` with `101`. Neither version needs tokio.
+Both share one set of `httpd::Limits`: body size, body and write timers,
+and 100 streams at once on an HTTP/2 connection.
 Both charge retained request heads and bodies to the sandbox's budget. A pending
 handler keeps its request charge. Heads count method, URI and header bytes and
 header slots. Hidden capacities in `http` types, request extensions, third-party
@@ -769,7 +848,7 @@ at the next header block.
 
 ## 5. Observation
 
-A service reports facts through its own typed state, and an HTTP handler can
+A stack reports facts through the typed state it was made with, and an HTTP handler can
 report directly when it answers a request. Nothing is emitted by default.
 The optional `network::tap` copies packets to a caller-owned bounded channel.
 `Net::on_unreachable` supplies typed source and destination addresses when a
@@ -790,50 +869,55 @@ caller-supplied sockets and browser libraries.
 
 ## Changing framing between items
 
-A service can use a protocol module's decoder directly. `Driver::decoder()` returns the active decoder, so a mode change applies before the next item, including bytes already buffered from the same read. For SMTP, accept `DATA`, send `354`, and call `start_data()`:
+A layer over a byte stream can own a protocol module's decoder in a
+`codec::Stream`, as the prompt above owns its line reader. `Stream::decoder`
+returns the active decoder, so a mode change applies before the next item,
+including bytes already buffered from the same read. For SMTP, accept
+`DATA`, send `354`, and call `start_data()`. The part of a mail layer that
+answers what it has read:
 
 ```rust
-use fictionet::stdlib::{protocols::smtp, services::serve::{Driver, Flow, Service}};
+use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::layer::{Chunk, StreamCommand};
+use fictionet::stdlib::protocols::smtp;
 
-#[derive(Default)]
 struct Mailbox {
+    input: Stream<smtp::Inputs>,
+    out: std::collections::VecDeque<StreamCommand>,
     messages: Vec<Vec<u8>>,
 }
 
-impl Service for Mailbox {
-    type Timer = ();
-    type Decoder = smtp::Inputs;
-    type State = ();
-    type Error = smtp::Error;
-
-    fn decoder(&self) -> Self::Decoder {
-        smtp::Inputs::new()
-    }
-
-    fn on_item(
-        &mut self,
-        item: Result<smtp::Input, smtp::Error>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder, Self::Timer>,
-    ) -> Result<Flow, Self::Error> {
-        match item? {
-            smtp::Input::Command(command) if command.verb == "DATA" => {
-                driver.decoder().start_data().map_err(smtp::Error::Framing)?;
-                driver.reply().extend_from_slice(b"354 Send data\r\n");
-            }
-            smtp::Input::Message(bytes) => {
-                self.messages.push(bytes);
-                driver.reply().extend_from_slice(b"250 Queued\r\n");
-            }
-            smtp::Input::Command(_) => driver.reply().extend_from_slice(b"250 OK\r\n"),
-            smtp::Input::Line(_) => driver.reply().extend_from_slice(b"503 Unexpected response\r\n"),
+impl Mailbox {
+    /// Answers every item the stream holds; the layer's `advance` calls it.
+    fn answer(&mut self) -> Result<(), smtp::Error> {
+        while let Some(item) = self.input.next() {
+            // A stream cut short inside a command, or whose framing failed.
+            let Ok(item) = item else {
+                return Err(smtp::Error::Incomplete);
+            };
+            let reply: &[u8] = match item? {
+                smtp::Input::Command(command) if command.verb == "DATA" => {
+                    self.input.decoder().start_data().map_err(smtp::Error::Framing)?;
+                    b"354 Send data\r\n"
+                }
+                smtp::Input::Message(bytes) => {
+                    self.messages.push(bytes);
+                    b"250 Queued\r\n"
+                }
+                smtp::Input::Command(_) => b"250 OK\r\n",
+                smtp::Input::Line(_) => b"503 Unexpected response\r\n",
+            };
+            self.out.push_back(StreamCommand::Write(Chunk::new(reply.to_vec())));
         }
-        Ok(Flow::Continue)
+        Ok(())
     }
 }
 ```
 
-Install it with `host.tcp(smtp::PORT, Arc::new(()), Mailbox::default)`. The SMTP decoder removes transparency dots and returns to commands after the DATA terminator. The same access lets an IMAP service refuse a literal or a Postgres service resume startup after replying `N` to an SSL request.
+Serve it with `host.tcp_stack(smtp::PORT, |_| Mailbox::new())`. The SMTP
+decoder removes transparency dots and returns to commands after the DATA
+terminator. The same access lets an IMAP layer refuse a literal or a
+Postgres layer resume startup after replying `N` to an SSL request.
 
 IMAP status responses always write a space after the status word, even with
 empty text. The space counts toward `imap::MAX_TEXT`. Readers accept an
@@ -843,11 +927,11 @@ yields that error as an item before reading the next response. Writing a
 response that cannot fit returns `imap::Error::Unwritable` and leaves the
 output unchanged.
 
-For SMTP AUTH, send a `334` challenge and call `driver.decoder().expect_line()`.
+For SMTP AUTH, send a `334` challenge and call `stream.decoder().expect_line()`.
 The next item is `smtp::Input::Line(Vec<u8>)`. It preserves the response bytes
 without CRLF, including an empty response or `*` cancellation. Call
 `expect_line()` again for each further challenge. SASL validation,
-cancellation replies and authentication results belong to the service.
+cancellation replies and authentication results belong to the mail layer.
 
 Raw responses allow `smtp::MAX_AUTH_LINE` (16,384) content bytes. Command
 lines still allow 512 bytes including CRLF. Input capacity is now 16,386
@@ -862,14 +946,17 @@ Source compatibility: exhaustive matches on `smtp::Input` must handle the
 new `Line` variant. Raw responses are emitted only when the caller selects
 them. Existing command and DATA parsing keeps its grammar and limits.
 
-`Driver::decoder()` changes the active decoder between items.
-`Driver::peek_decoder()` reads its state. `DatagramDriver::decoder()` does
-the same for the current datagram; each new datagram starts with a fresh
-decoder.
+`Stream::decoder()` changes the active decoder between items. A layer
+over datagrams reads each datagram with a stream of its own, so each new
+datagram starts with a fresh decoder.
 
 ## SSH sessions
 
-`stdlib::services::ssh::Server` runs the SSH transport through `serve::connection`.
+`stdlib::services::ssh::Ssh` is the SSH connection as a layer: a byte stream
+below, and one child per channel above, each opened with its typed request.
+Authentication and connection requests stay with the parent, and
+`Ssh::sessions` puts a session layer on every channel. `ssh::Server` is the
+`PortServer` that runs it with `services::stack::stream`.
 Its `Handler` chooses each authentication result and creates a `Session` for a
 shell, exec command or subsystem. `SessionRequest` carries the authenticated
 user, accepted environment and optional terminal settings. The session receives

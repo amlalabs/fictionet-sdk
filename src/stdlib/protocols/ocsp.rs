@@ -2,7 +2,7 @@
 //! with no I/O.
 //!
 //! DER request and response types implement `Wire`, and `codec::Frames<Frame>` decodes
-//! successive DER values. There is no responder `Service`, HTTP transport,
+//! successive DER values. There is no responder server layer, HTTP transport,
 //! signature generation, or signature verification.
 //!
 //! The Online Certificate Status Protocol is how a client asks a

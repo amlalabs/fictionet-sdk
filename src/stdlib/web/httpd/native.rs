@@ -11,19 +11,21 @@ use http::header::HOST;
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
-use fictionet::stdlib::codec::{Fail, Stream};
+use fictionet::stdlib::codec::{Fail, Stream, base64};
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, Chunk, CommandOf, Env, Handoff, Handover, Layer, Owned,
-    OwnedWork, StreamCommand, StreamEvent, Switch, Timers, Top, WorkOwner,
+    OwnedWork, Side, StreamCommand, StreamEvent, Switch, Timers, Top, WorkOwner,
 };
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError, RequestHead};
-use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::protocols::http2::{DEFAULT_FRAME_SIZE, MAX_WINDOW, Setting};
 use fictionet::stdlib::services::stack::{Job, Tunnel};
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
 use super::body::Inner;
 use super::handlers::status_only;
+use super::http2::{Http2Server, Responder};
 use super::response::{Asked, ResponsePolicy, head_held, request_held};
 use super::sites::no_host;
 use super::{
@@ -77,20 +79,31 @@ pub enum Closing {
     Reset,
 }
 
-/// What runs on an HTTP/1 connection once HTTP is over: the code a
-/// response handed the connection to with an [`UpgradeHandler`].
+/// What runs on an HTTP/1 connection once HTTP/1 is over: the code a
+/// response handed the connection to with an [`UpgradeHandler`], or HTTP/2.
 pub enum Next {
     /// A `101 Switching Protocols` answer to an upgrade, such as to
     /// WebSocket.
     Upgrade(UpgradeHandler),
     /// A 2xx answer to CONNECT: a tunnel.
     Connect(UpgradeHandler),
+    /// A `101` answer to `Upgrade: h2c`: HTTP/2, with the request that
+    /// asked as its stream 1.
+    H2c(Box<Http2Server>),
 }
 
-impl From<Next> for Tunnel {
-    fn from(next: Next) -> Tunnel {
-        let (Next::Upgrade(handler) | Next::Connect(handler)) = next;
-        Tunnel::new(move |fcx, conn| handler.run(fcx, conn))
+/// What runs after HTTP/1 hands its connection on: a tunnel to code
+/// written against a connection, or HTTP/2.
+pub type Upgraded = Side<Tunnel, Http2Server>;
+
+impl From<Next> for Upgraded {
+    fn from(next: Next) -> Upgraded {
+        match next {
+            Next::Upgrade(handler) | Next::Connect(handler) => {
+                Side::Lower(Tunnel::new(move |fcx, conn| handler.run(fcx, conn)))
+            }
+            Next::H2c(server) => Side::Upper(*server),
+        }
     }
 }
 
@@ -139,6 +152,8 @@ pub struct Http1 {
     /// The world's date at the start of the run, for `Date` headers.
     pub(super) date: Option<SystemTime>,
     conn: ConnInfo,
+    /// Whether `Upgrade: h2c` hands the connection to HTTP/2.
+    h2c: bool,
     pub(super) first_head_deadline: Option<Instant>,
     stream: Stream<http1::RequestEvents>,
     /// Bytes past the end of HTTP, kept for what comes next.
@@ -182,6 +197,7 @@ impl Http1 {
             opts,
             date: None,
             conn: ConnInfo::default(),
+            h2c: false,
             first_head_deadline: None,
             stream: Stream::new(http1::RequestEvents::with_limits(opts.head)),
             after: Vec::new(),
@@ -227,10 +243,31 @@ impl Http1 {
         self
     }
 
+    /// Accepts HTTP/2 by `Upgrade: h2c` (RFC 7540 section 3.2), as a
+    /// server without TLS may: an HTTP/1.1 request that asks for it, with
+    /// valid `HTTP2-Settings`, gets `101 Switching Protocols` instead of
+    /// the handler, and once that is written the connection is HTTP/2 with
+    /// the request as stream 1, answered by the same handler. A request
+    /// whose upgrade headers or settings are not valid stays on HTTP/1.
+    pub fn h2c(mut self) -> Http1 {
+        self.h2c = true;
+        self
+    }
+
     /// This connection, with what a response hands it on to running after
-    /// HTTP.
-    pub fn upgradable(self) -> Switch<Http1, Tunnel> {
+    /// HTTP/1.
+    pub fn upgradable(self) -> Switch<Http1, Upgraded> {
         Switch::new(self)
+    }
+
+    /// HTTP/2 for this connection after `Upgrade: h2c`.
+    fn http2(&self, settings: &[Setting], request: Request<Body>) -> Http2Server {
+        Responder::shared(self.handler.clone())
+            .limits(self.opts)
+            .maybe_observe(self.observe.clone())
+            .maybe_date(self.date)
+            .conn(self.conn.clone())
+            .upgraded(settings, request)
     }
 
     /// The bytes held, as charged to the budget. Output carries its own
@@ -452,7 +489,10 @@ impl Http1 {
         } else {
             Received::Complete
         };
-        let delivery = Delivery::new(&self.observe, &request, &self.conn, now, received);
+        let mut delivery = Delivery::new(&self.observe, &request, &self.conn, now, received);
+        let h2c = (self.h2c && keep_alive && !self.too_big && !lacks_host)
+            .then(|| h2c_settings(&request))
+            .flatten();
         let reply = if self.too_big {
             Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
         } else if lacks_host {
@@ -461,6 +501,16 @@ impl Http1 {
             && matches!(&request.body().0, Inner::Stream(_))
         {
             Reply::Now(status_only(StatusCode::BAD_REQUEST))
+        } else if let Some(settings) = h2c {
+            // The request is HTTP/2's stream 1, observed there: the 101
+            // is not its answer.
+            delivery = None;
+            self.next = Some(Next::H2c(Box::new(self.http2(&settings, request))));
+            let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
+            switching
+                .headers_mut()
+                .insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
+            Reply::Now(switching)
         } else {
             self.handler
                 .call(request, &mut Exchange::new(now, env.entropy(), &self.conn))
@@ -639,7 +689,10 @@ impl Http1 {
         }
         let hands_on = parts.status == StatusCode::SWITCHING_PROTOCOLS
             || (r.wants == Asked::Tunnel && parts.status.is_success());
-        if hands_on && let Some(handler) = parts.extensions.get::<UpgradeHandler>() {
+        if matches!(self.next, Some(Next::H2c(_))) {
+            // The service's own 101 to `Upgrade: h2c`.
+            r.close = false;
+        } else if hands_on && let Some(handler) = parts.extensions.get::<UpgradeHandler>() {
             self.next = Some(if parts.status == StatusCode::SWITCHING_PROTOCOLS {
                 Next::Upgrade(handler.clone())
             } else {
@@ -1166,6 +1219,62 @@ impl Job for Work {
             answer,
         })
     }
+}
+
+/// The client's settings, if `request` asks to upgrade to HTTP/2 the way
+/// RFC 7540 section 3.2 says: HTTP/1.1, `Upgrade` naming `h2c`, a
+/// `Connection` naming `Upgrade` and `HTTP2-Settings`, and one
+/// `HTTP2-Settings` whose base64url holds valid SETTINGS. `None` keeps the
+/// request on HTTP/1.
+fn h2c_settings(request: &Request<Body>) -> Option<Vec<Setting>> {
+    fn tokens<'a>(request: &'a Request<Body>, name: &str) -> impl Iterator<Item = &'a [u8]> {
+        request
+            .headers()
+            .get_all(name)
+            .iter()
+            .flat_map(|value| value.as_bytes().split(|b| *b == b','))
+            .map(<[u8]>::trim_ascii)
+    }
+    if request.version() != Version::HTTP_11
+        || !matches!(&request.body().0, Inner::Full(_))
+        || !tokens(request, "upgrade").any(|t| t.eq_ignore_ascii_case(b"h2c"))
+        || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"upgrade"))
+        || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"http2-settings"))
+    {
+        return None;
+    }
+    let mut values = request.headers().get_all("http2-settings").iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    // base64url (RFC 4648 section 5), its padding left off.
+    let standard: Vec<u8> = value
+        .as_bytes()
+        .iter()
+        .map(|b| match b {
+            b'-' => b'+',
+            b'_' => b'/',
+            b => *b,
+        })
+        .collect();
+    let payload = base64::decode(&standard, base64::Padding::Optional)?;
+    if !payload.len().is_multiple_of(6) {
+        return None;
+    }
+    let settings: Vec<Setting> = payload
+        .chunks(6)
+        .map(|s| Setting {
+            id: u16::from_be_bytes([s[0], s[1]]),
+            value: u32::from_be_bytes([s[2], s[3], s[4], s[5]]),
+        })
+        .collect();
+    let valid = settings.iter().all(|s| match s.id {
+        2 => s.value <= 1,
+        4 => s.value <= MAX_WINDOW,
+        5 => (DEFAULT_FRAME_SIZE as u32..=0xff_ffff).contains(&s.value),
+        _ => true,
+    });
+    valid.then_some(settings)
 }
 
 /// A request body that ends early: `bytes`, then an error saying `why`.

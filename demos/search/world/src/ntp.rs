@@ -27,7 +27,7 @@ pub(crate) fn host(pages: Arc<Pages>) -> Host {
 
 /// Serves NTP on `host`'s UDP port 123 with the time `clock` reads.
 fn serve(host: Host, clock: impl Fn() -> SystemTime + Clone + Send + Sync + 'static) -> Host {
-    host.udp_stack(ntp::PORT, Budget::new(128 * 1024), move || {
+    host.udp_stack(ntp::PORT, Budget::new(128 * 1024), move |_| {
         TimeServer::new(clock.clone())
     })
 }

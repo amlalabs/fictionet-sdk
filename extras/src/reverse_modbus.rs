@@ -20,9 +20,9 @@
 
 use fictionet::Cx;
 use fictionet::stdlib::codec::{Fail, Frames, Stream, Wire};
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
 use fictionet::stdlib::protocols::modbus::{self, Frame, Request, Response};
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::world::net::{Arrival, PortServer};
 use std::future::Future;
 use std::pin::Pin;

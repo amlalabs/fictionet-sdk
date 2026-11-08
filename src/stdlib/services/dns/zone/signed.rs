@@ -529,6 +529,7 @@ pub(super) mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::stdlib::network::Transport;
     use crate::stdlib::protocols::dns::dnssec::{
         Algorithm, AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, Insecure, Link, Ring,
         Validation, ZoneKey, validate_denial, validate_rrset,
@@ -537,7 +538,6 @@ pub(super) mod tests {
     use crate::stdlib::protocols::dns::rr::rdata::{A, NS, SOA};
     use crate::stdlib::protocols::dns::{Parsed, Request};
     use crate::stdlib::services::dns::zone::{Answered, answer};
-    use crate::stdlib::services::serve::Transport;
     use fictionet::{Seed, SeededEntropy};
 
     /// A fully qualified name from text, where `\DDD` is the octet DDD

@@ -6,13 +6,13 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, Query, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::protocols::dns::{Parsed, Request};
 use fictionet::stdlib::services::dns::Generation;
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Answered, AnyResponse, ZoneData, answer};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns;
 use fictionet::stdlib::world::net::dns::internet::{self, NameServer, ROOT_SERVERS};
 use fictionet::stdlib::world::net::{Host, Net};

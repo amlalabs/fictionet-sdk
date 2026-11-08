@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fictionet::stdlib::network::ConnectionExt;
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSKEY;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Insecure, KeyFlags, KeySet, PublicKeyBuf, Ring, Sign, Validation,
@@ -35,7 +36,6 @@ use fictionet::stdlib::services::dns::zone::{
 use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Event, Generation, Input, Session,
 };
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::Recursive;
 use fictionet::stdlib::world::net::{Host, Net};
 use fictionet::time::Instant;

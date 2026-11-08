@@ -95,6 +95,66 @@ The Lean proofs (`lake build` in `verification/http/lean`) build: the
 bare-101 close sets the request's close decision, which `Framing.lean`
 already takes as any value, so its theorems cover it.
 
+## After the HTTP/2 layer port
+
+HTTP/2 moved from a `serve::Service` with deferred work (`Accept`,
+`Sending`) to layers: the connection `Http2` in `http2.rs`, with one
+exchange child per stream (`Respond` in `http2/respond.rs`). The stream and
+flow-control rules kept their code; what moved is who runs it.
+`Streams.tla` and `Flow.tla` keep their actions and their flags, with the
+source correspondence moved to the new functions:
+
+- `Http2::headers`, `data`, `frame`, `cancel` and `on_done` are now
+  `on_headers` (with `admit`), `on_data`, `on_frame`, `end_stream` and
+  `written`: a stream ends once the frame carrying its response's
+  END_STREAM is written, as `Sending` finishing after its last write did,
+  with RST_STREAM(NO_ERROR) for a request still arriving.
+- `Http2::dispatch` and the body deadline are the child's `dispatch` and
+  `Respond::on_timer`. The child's step between the connection's actions is
+  atomic in the models, as the deferred work was.
+- `Sending::poll_next` is `Respond`'s `start` and `respond` for the head
+  and body, and the connection's `response_head` and `send_one` for the
+  frames within both windows.
+- `Accept` with `release_window` is `Http2::release`, run once a batch of
+  input is read and handed to the children. It returns credit only for
+  bytes the connection no longer holds: `Stream::held` counts body bytes
+  waiting for a child's credit. `Respond` takes every byte as it comes, as
+  the model's server does, so `held` is zero in `Flow.tla`; a model of a
+  child that stops reading is not part of this pass.
+- The wakers are gone. `Http2::advance` tries every stream's `send_one`
+  after each batch of frames, so the three `Wake*` flags are all on in the
+  code.
+
+`Pipeline.tla` is unchanged: `Http1`'s new `Upgrade: h2c` branch sets its
+successor in `dispatch` and then takes the `start`, `finish`, `hand_on`
+and `handover` path the model's `U` token takes.
+
+Rerun with TLC 2.19, `-Xmx6g`, an 8 GiB systemd memory cap and state
+directories on the home volume, at the port's revision:
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Streams_base.cfg` | 210,019 | 13,277 | every property holds, depth 14 |
+| `Streams_without_ignoreafterreset.cfg` | 141 | 50 | `LateFramesIgnored` violated |
+| `Streams_without_refuseoverlimit.cfg` | 439 | 112 | `Concurrency` violated |
+| `Streams_without_halfclosedisstreamerror.cfg` | 115 | 39 | `NoBodyAfterEnd` violated |
+| `Streams_without_checkbelowlast.cfg` | 170 | 56 | `ClosedHeadersEndConnection` violated |
+| `Flow_base.cfg` | 4,581,219 | 1,145,490 | every property holds, depth 22, 1 min 43 s |
+| `Flow_without_countpadding.cfg` | 59 | 43 | `CreditMatchesWindow` violated |
+| `Flow_without_checkconnectionwindow.cfg` | 587 | 323 | `OverflowRejected` violated |
+| `Flow_without_checkstreamwindow.cfg` | 29,171 | 10,561 | `OverflowRejected` violated |
+| `Flow_without_releasecredit.cfg` | 423,815 | 130,334 | temporal property violated (`RequestsEnd`) |
+| `Flow_without_spendwithinwindows.cfg` | 10,133 | 4,059 | `ServerSpendsWithinWindows` violated |
+| `Flow_without_wakeonconnectionupdate.cfg` | 4,872,579 | 1,230,106 | temporal property violated (`NoLostWake`) |
+| `Flow_without_wakeonstreamupdate.cfg` | 388,175 | 119,824 | temporal property violated (`NoLostWake`) |
+| `Flow_without_wakeonsettings.cfg` | 390,771 | 119,969 | temporal property violated (`NoLostWake`) |
+
+Workers race to a violation, so ablation counts differ from earlier runs.
+The table tests `http2_framing_follows_the_rfcs_for_every_case` and
+`http1_framing_follows_the_rfcs_for_every_case` pass on the ported code,
+and h2spec v2.6.0 in strict mode passes 147 of 147 cases over TLS and over
+h2c with prior knowledge.
+
 ## Bugs
 
 ### A 101 without an UpgradeHandler kept the connection reading HTTP

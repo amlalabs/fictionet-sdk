@@ -2,7 +2,7 @@
 //!
 //! `SessionDescription` implements `Wire`, and `SessionDescriptions` decodes a
 //! body ending at EOF. These are descriptions only. There is no offer/answer
-//! state machine, ICE connectivity checking, media transport, or `Service`.
+//! state machine, ICE connectivity checking, media transport, or server layer.
 //!
 //! The Session Description Protocol says what a media session carries and
 //! where: which streams (audio, video, data), on which ports, with which

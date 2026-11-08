@@ -5,11 +5,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::ssh::{
     auth, connection,
     transport::{HostKey, Transport},
 };
-use fictionet::stdlib::services::{serve, ssh};
+use fictionet::stdlib::services::ssh;
 use fictionet::sync::Mutex;
 use fictionet_extras::ssh::{
     Profile, authentication_delay, honeypot, password_failure_delay, terminal,
@@ -65,11 +67,11 @@ pub fn server(
             },
             observer: Log(observer),
         }),
-        options: serve::ServeOptions {
+        budget: Some(fictionet::stdlib::layer::Budget::new(32 << 20)),
+        limits: fictionet::stdlib::services::stack::StreamLimits {
             idle: Some(Duration::from_secs(300)),
-            ..serve::ServeOptions::default()
-        }
-        .budget(fictionet::stdlib::layer::Budget::new(32 << 20)),
+            ..Default::default()
+        },
     }
 }
 
@@ -268,7 +270,7 @@ mod tests {
 
     #[test]
     fn shell_accepts_editing_but_closes_on_submission() {
-        let connection = serve::ConnInfo::new(
+        let connection = ConnInfo::new(
             1,
             "127.0.0.1:22".parse().unwrap(),
             "127.0.0.2:30000".parse().unwrap(),
@@ -301,7 +303,7 @@ mod tests {
 
     #[test]
     fn empty_and_erased_lines_allow_another_command() {
-        let connection = serve::ConnInfo::new(
+        let connection = ConnInfo::new(
             1,
             "127.0.0.1:22".parse().unwrap(),
             "127.0.0.2:30000".parse().unwrap(),
@@ -329,7 +331,7 @@ mod tests {
             profile: Profile::ubuntu_24_04(),
             delay_secret: 0,
         };
-        let connection = serve::ConnInfo::new(
+        let connection = ConnInfo::new(
             1,
             "127.0.0.1:22".parse().unwrap(),
             "127.0.0.2:30000".parse().unwrap(),

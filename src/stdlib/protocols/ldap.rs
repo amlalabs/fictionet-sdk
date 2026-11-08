@@ -3,7 +3,7 @@
 //!
 //! `Message` implements `Wire` and supports `codec::Frames<Message>` stream
 //! decoding. These are wire messages only, with no bind session, directory
-//! `Service`, authentication, or TLS transport.
+//! server layer, authentication, or TLS transport.
 //!
 //! LDAP is how most directories are read and changed: Active Directory,
 //! OpenLDAP and the address books behind mail servers. A client binds (logs
