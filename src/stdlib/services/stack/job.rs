@@ -196,15 +196,15 @@ impl<W: Job> Jobs<W> {
                     region: parent.region.child(),
                 });
             }
-            if let Some(work) = &mut running.work {
-                if let Poll::Ready(result) = work.poll(running.region.as_ref(), cx) {
-                    running.work = None;
-                    if let Some(region) = &running.region {
-                        region.cancel();
-                    }
-                    finished = true;
-                    done(result)?;
+            if let Some(work) = &mut running.work
+                && let Poll::Ready(result) = work.poll(running.region.as_ref(), cx)
+            {
+                running.work = None;
+                if let Some(region) = &running.region {
+                    region.cancel();
                 }
+                finished = true;
+                done(result)?;
             }
             let drained = running.work.is_none()
                 && running
@@ -324,14 +324,41 @@ mod tests {
     use fictionet::{Seed, SeededEntropy};
     use std::sync::atomic::AtomicUsize;
 
+    type Start = Arc<fictionet::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+
     struct PendingJob {
         polls: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
+        tasks: Arc<AtomicUsize>,
+        stopped: Arc<AtomicUsize>,
+        start: Start,
+    }
+    struct TaskDrop(Arc<AtomicUsize>);
+    impl Drop for TaskDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
     impl Job for PendingJob {
         type Done = ();
-        fn poll(&mut self, _: Option<&Cx>, _: &mut Context<'_>) -> Poll<()> {
-            self.polls.fetch_add(1, Ordering::Relaxed);
+        fn poll(&mut self, fcx: Option<&Cx>, _: &mut Context<'_>) -> Poll<()> {
+            let polls = self.polls.fetch_add(1, Ordering::Relaxed);
+            if let Some(fcx) = fcx
+                && polls == 0
+            {
+                let tasks = self.tasks.clone();
+                let guard = TaskDrop(self.stopped.clone());
+                let start = self.start.lock().take();
+                fcx.spawn(move |fcx| async move {
+                    let _guard = guard;
+                    tasks.fetch_add(1, Ordering::Relaxed);
+                    if let Some(start) = start {
+                        start.send(()).expect("the setup awaits task start");
+                    }
+                    fcx.cancelled().await;
+                    Ok(())
+                });
+            }
             Poll::Pending
         }
     }
@@ -345,6 +372,9 @@ mod tests {
         owner: WorkOwner,
         polls: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
+        tasks: Arc<AtomicUsize>,
+        stopped: Arc<AtomicUsize>,
+        start: Start,
         extracted: usize,
     }
     impl Source {
@@ -353,6 +383,9 @@ mod tests {
                 owner: WorkOwner::new(),
                 polls: Arc::default(),
                 drops: Arc::default(),
+                tasks: Arc::default(),
+                stopped: Arc::default(),
+                start: Arc::default(),
                 extracted: 0,
             }
         }
@@ -390,6 +423,9 @@ mod tests {
             Some(self.owner.own(PendingJob {
                 polls: self.polls.clone(),
                 drops: self.drops.clone(),
+                tasks: self.tasks.clone(),
+                stopped: self.stopped.clone(),
+                start: self.start.clone(),
             }))
         }
     }
@@ -455,5 +491,66 @@ mod tests {
         assert_eq!(driver.layer().extracted, 1);
         assert_eq!(driver.layer().polls.load(Ordering::Relaxed), 0);
         assert_eq!(driver.layer().drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn closing_work_cancels_its_tasks_while_sibling_work_continues() {
+        fictionet::block_on(fictionet::lab(Seed::from_u64(13), |fcx| async move {
+            let mut closing = driver(Budget::unlimited());
+            let mut sibling = driver(Budget::unlimited());
+            let (closing_start, closing_started) = tokio::sync::oneshot::channel();
+            let (sibling_start, sibling_started) = tokio::sync::oneshot::channel();
+            *closing.layer().start.lock() = Some(closing_start);
+            *sibling.layer().start.lock() = Some(sibling_start);
+            let mut jobs = Jobs::new();
+            jobs.take(&mut closing);
+            jobs.take(&mut sibling);
+            std::future::poll_fn(|cx| {
+                Poll::Ready(jobs.poll(Some(&fcx), cx, |_| Ok::<_, Infallible>(())))
+            })
+            .await
+            .unwrap();
+            // Establish that both child tasks entered before closing either owner.
+            closing_started
+                .await
+                .expect("the closing owner's task started");
+            sibling_started.await.expect("the sibling's task started");
+            assert_eq!(closing.layer().tasks.load(Ordering::Relaxed), 1);
+            assert_eq!(sibling.layer().tasks.load(Ordering::Relaxed), 1);
+            let sibling_polls = sibling.layer().polls.load(Ordering::Relaxed);
+            let closing_polls = closing.layer().polls.load(Ordering::Relaxed);
+            closing.layer().owner.cancel();
+            std::future::poll_fn(|cx| {
+                jobs.poll(Some(&fcx), cx, |_| -> Result<(), Infallible> {
+                    panic!("pending work must not complete")
+                })
+                .unwrap();
+                if jobs.len() == INTAKE {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(closing.layer().stopped.load(Ordering::Relaxed), 1);
+            assert_eq!(closing.layer().drops.load(Ordering::Relaxed), INTAKE);
+            assert_eq!(closing.layer().polls.load(Ordering::Relaxed), closing_polls);
+            assert_eq!(sibling.layer().stopped.load(Ordering::Relaxed), 0);
+            assert!(sibling.layer().polls.load(Ordering::Relaxed) > sibling_polls);
+            sibling.layer().owner.cancel();
+            std::future::poll_fn(|cx| {
+                jobs.poll(Some(&fcx), cx, |_| Ok::<_, Infallible>(()))
+                    .unwrap();
+                if jobs.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(sibling.layer().stopped.load(Ordering::Relaxed), 1);
+            Ok(())
+        }))
+        .expect("all owned tasks drain");
     }
 }
