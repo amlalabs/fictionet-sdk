@@ -19,6 +19,10 @@ use rustls::{AlertDescription, ClientConfig, RootCertStore};
 #[path = "tls_layer.rs"]
 mod layer;
 
+/// The provider's entropy checks, kept with the other TLS proofs.
+#[path = "../../verification/tls/entropy.rs"]
+mod entropy;
+
 // ---------------------------------------------------------------------------
 // An in-memory connection pair.
 
