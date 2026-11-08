@@ -221,8 +221,8 @@ pub struct Limits {
     /// Default 30 seconds.
     pub write_timeout: Duration,
     /// Bytes held by the service layer for one sandbox, all services
-    /// together: see [`Budget`]. Excludes TCP buffers and TLS handshakes.
-    /// Default 256 MiB.
+    /// together: see [`Budget`]. Excludes TCP buffers and the state rustls
+    /// keeps itself; TLS's own buffers count. Default 256 MiB.
     pub sandbox_budget: usize,
 }
 
