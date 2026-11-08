@@ -23,6 +23,7 @@ pub struct Chain<A: Layer, B: Layer<Lower = A::Upper>> {
     /// A command `B` handed down that `A` has not taken.
     down: Option<CommandOf<A::Upper>>,
     work_upper: bool,
+    timer_upper: bool,
 }
 
 impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
@@ -39,6 +40,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
             urgent: None,
             down: None,
             work_upper: false,
+            timer_upper: false,
         }
     }
 
@@ -112,6 +114,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
     ) -> Result<(), Self::Error> {
+        self.timer_upper = matches!(timer, Side::Lower(_));
         match timer {
             Side::Lower(t) => env
                 .scoped(Side::Lower, |env| self.lower.on_timer(env, t))
@@ -226,10 +229,75 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         let lower = self.lower.deadline();
         let upper = self.upper.deadline();
         match (lower, upper) {
-            (Some((a, t)), Some((b, _))) if a <= b => Some((a, Side::Lower(t))),
+            (Some((a, t)), Some((b, _))) if a < b || (a == b && !self.timer_upper) => {
+                Some((a, Side::Lower(t)))
+            }
             (_, Some((b, t))) => Some((b, Side::Upper(t))),
             (Some((a, t)), None) => Some((a, Side::Lower(t))),
             (None, None) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::layer::{Budget, ByteStream, Driver, StreamCommand, StreamEvent};
+    use crate::{Seed, SeededEntropy};
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    struct Clock(usize);
+    impl Layer for Clock {
+        type Lower = ByteStream;
+        type Upper = ByteStream;
+        type Report = ();
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(Admit::Blocked(event))
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            command: StreamCommand,
+        ) -> Result<Admit<StreamCommand>, Infallible> {
+            Ok(Admit::Blocked(command))
+        }
+        fn take_command(&mut self) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<StreamEvent> {
+            None
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            Some((Instant::ZERO, ()))
+        }
+        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn equally_due_timers_rotate_between_permanently_ready_layers() {
+        let mut driver = Driver::new(
+            Chain::new(Clock(0), Clock(0)),
+            Arc::new(SeededEntropy::new(Seed::from_u64(95))),
+            Budget::new(1000),
+            Instant::ZERO,
+        );
+        driver.run().unwrap();
+        let a = driver.layer().lower().0;
+        let b = driver.layer().upper().0;
+        assert!(a > 0 && b > 0);
+        assert!(a.abs_diff(b) <= 1);
+        assert!(driver.exhausted());
     }
 }

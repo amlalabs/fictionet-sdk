@@ -90,7 +90,6 @@ where
 {
     make: Box<ChildFactory<B, O>>,
     kids: Vec<(ChildId, Kid<B>)>,
-    storage: Option<Charge>,
     limit: usize,
     window: u64,
     down: VecDeque<MuxCommand<B::Lower, K>>,
@@ -98,8 +97,11 @@ where
     /// The child visited first last time.
     turn: Option<ChildId>,
     work_turn: Option<ChildId>,
+    timer_turn: Option<ChildId>,
     remaining_visits: usize,
     sweep_first: Option<ChildId>,
+    // Reservations outlive every allocation they cover during destruction.
+    storage: Option<Charge>,
 }
 
 struct Kid<B: Layer> {
@@ -184,6 +186,7 @@ where
             up: VecDeque::new(),
             turn: None,
             work_turn: None,
+            timer_turn: None,
             remaining_visits: 0,
             sweep_first: None,
         }
@@ -511,6 +514,7 @@ where
         else {
             return Ok(());
         };
+        self.timer_turn = Some(id);
         if let Err(e) = env.scoped(
             move |e| ChildReport::Event(id, e),
             |env| kid.layer.on_timer(env, timer),
@@ -620,7 +624,7 @@ where
         self.kids
             .iter()
             .filter_map(|(id, kid)| kid.layer.deadline().map(|(at, t)| (at, (*id, t))))
-            .min_by_key(|(at, _)| *at)
+            .min_by_key(|(at, (id, _))| (*at, !self.timer_turn.is_none_or(|last| *id > last), *id))
     }
 }
 
@@ -642,6 +646,8 @@ mod tests {
         completions: u64,
         work: bool,
         productive: bool,
+        timer: bool,
+        fired: usize,
     }
 
     impl Layer for Reader {
@@ -689,6 +695,13 @@ mod tests {
         }
         fn take_work(&mut self) -> Option<()> {
             self.work.then_some(())
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            self.timer.then_some((Instant::ZERO, ()))
+        }
+        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
+            self.fired += 1;
+            Ok(())
         }
     }
 
@@ -882,6 +895,29 @@ mod tests {
             70,
             "every productive child gets output capacity"
         );
+    }
+
+    #[test]
+    fn equally_due_child_timers_rotate_even_when_they_rearm_immediately() {
+        let mut driver = driver(|_, _, _| Reader {
+            timer: true,
+            ..Reader::default()
+        });
+        let mut slots = Slots::new(3);
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let child = slots.insert(()).unwrap();
+            ids.push(child.id());
+            let _ = driver.deliver(MuxEvent::Opened(child, "timer", 8)).unwrap();
+        }
+        driver.run().unwrap();
+        let counts: Vec<_> = ids
+            .into_iter()
+            .map(|id| driver.layer().child(id).unwrap().fired)
+            .collect();
+        assert!(counts.iter().all(|n| *n > 0));
+        assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1);
+        assert!(driver.exhausted());
     }
 
     #[test]
