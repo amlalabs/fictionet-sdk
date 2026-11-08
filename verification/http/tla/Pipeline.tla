@@ -37,6 +37,9 @@
 (*   FeedBelow            Switch::advance in Then (switch.rs:207-224)      *)
 (*   TunnelRead           TunnelConn::poll_read (tunnel.rs:241-268)        *)
 (*                                                                         *)
+(* After HTTP framing ends, retained input is admitted only up to the    *)
+(* remaining stream capacity. Allocation refusal closes via Abort; this  *)
+(* model abstracts byte allocations, whose reservation precedes encoding. *)
 (* Each flag is a rule of the code; a *_without_<flag>.cfg turns one off   *)
 (* and names the property TLC must then find violated.                     *)
 (***************************************************************************)
@@ -169,6 +172,7 @@ HttpData ==
        /\ cur' = <<>>
        /\ UNCHANGED <<http>>
     \/ /\ phase = "Switching" /\ ~peerEnded
+       /\ Len(leftover) < 4
        /\ cur' = <<>>
        /\ IF LeftoverInSwitching
           THEN /\ leftover' = Append(leftover, [t |-> "data", d |-> cur])
@@ -180,8 +184,9 @@ HttpData ==
                       next, out, queued, handed, written, pos>>
     \/ /\ phase \in {"Reading", "Answering"} /\ ~peerEnded /\ sdone
        /\ AfterLen < StreamCap
-       /\ after' = Append(after, cur)
-       /\ cur' = <<>>
+       /\ LET n == Min(Len(cur), StreamCap - AfterLen)
+          IN /\ after' = Append(after, SubSeq(cur, 1, n))
+             /\ cur' = SubSeq(cur, n + 1, Len(cur))
        /\ UNCHANGED <<phase, buf, eof, sdone, closeNext, peerEnded, resp, next,
                       out, queued, handed, written, leftover, pos>>
     \/ /\ phase \in {"Reading", "Answering"} /\ ~peerEnded /\ ~sdone
@@ -270,7 +275,10 @@ Make ==
 (* hand_on (native.rs:637-655): the unread bytes, the bytes past the end *)
 (* of HTTP, then the peer's end. *)
 Unread == IF KeepUnread /\ buf # <<>> THEN <<[t |-> "data", d |-> buf]>> ELSE <<>>
-Afters == [i \in 1..Len(after) |-> [t |-> "data", d |-> after[i]]]
+AfterData == LET F[i \in 0..Len(after)] ==
+                    IF i = 0 THEN <<>> ELSE F[i - 1] \o after[i]
+             IN F[Len(after)]
+Afters == IF after = <<>> THEN <<>> ELSE <<[t |-> "data", d |-> AfterData]>>
 Ends == IF peerEnded THEN <<[t |-> "end"]>> ELSE <<>>
 HandOn ==
     /\ leftover' = IF EndLast THEN Unread \o Afters \o Ends
@@ -387,6 +395,7 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 TypeOK ==
     /\ phase \in {"Reading", "Answering", "Switching", "Closing", "Closed"}
     /\ Len(buf) <= StreamCap + MaxChunk
+    /\ AfterLen <= StreamCap
     /\ Range(buf) \subseteq Tokens /\ Range(tIn) \subseteq Tokens
     /\ written <= handed /\ handed <= queued
 

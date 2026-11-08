@@ -8,10 +8,10 @@ use fictionet::stdlib::layer::{
 };
 
 /// A wire writer whose maximum output allocation is known before writing.
-/// The writer must not reserve beyond this bound or allocate temporary
-/// heap storage.
+/// The writer must not reserve beyond this bound or allocate outside its
+/// destination, including on error.
 pub trait BoundedWire: Wire {
-    /// Maximum output capacity needed by `write`.
+    /// Maximum output capacity needed by `write`, computed without allocating.
     fn write_bound(&self) -> Result<usize, Self::WriteError>;
 }
 
@@ -45,6 +45,12 @@ impl<T> Owned<T> {
     /// Reserved allocation bytes.
     pub fn charged(&self) -> usize {
         self.charge.bytes()
+    }
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for Owned<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.value.as_ref()
     }
 }
 
