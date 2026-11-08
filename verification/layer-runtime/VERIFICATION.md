@@ -298,6 +298,12 @@ real `Stream`, `Buffer`, `Budget`, `Charge`, `Chunk` and `Driver`.
 
 Before Bug 1's fix, the charge harnesses fail (see the mutations below).
 
+On the merged foundation all 21 were rerun in one `cargo kani -p fictionet
+-Z stubbing` under a 12 GB memory cap, and all verified: the nine charge
+harnesses in 47 to 80 s each, the ten `every_charge_comes_back_*` in 4 to
+16 s, the ordering harness in 5 s and the decoder-failure harness in
+303 s.
+
 Each harness fails when the rule it checks is broken. These manual
 mutations of `framed.rs` were applied one at a time, the named harness
 run, and the file restored:

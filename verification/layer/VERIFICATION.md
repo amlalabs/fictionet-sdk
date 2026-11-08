@@ -12,6 +12,48 @@ on the code as it is: a child command whose credit cost is larger than the
 mux's whole window for that child never goes out (below, "Finding"). No
 code in `src/` changed apart from the line that includes the Kani proofs.
 
+## On the merged foundation
+
+The pass was written on `comp/v-layer` and merged into `comp/foundation`
+(commit `e68a070d3`); everything was rerun at code revision `6aa68ae5f`.
+`children.rs`, `carrier.rs`, `budget.rs` and `timers.rs` did not change,
+so `Children.tla` and the Kani proofs describe the same code. `chain.rs`,
+`driver.rs` and `switch.rs` gained an urgent path: while the next layer
+refuses an event, a layer's `take_urgent` events (TLS's write credit) go
+past it, one at a time, through a slot of their own in `Chain`
+(`chain.rs:140-149`) and in the `Driver` (`driver.rs:206-224`).
+`Route.tla` has no layer with urgent events: with `take_urgent` answering
+None, the trait's default, the code runs exactly the statements the model
+does, and the line numbers above are the merged ones. The order in which
+an urgent event passes a refused one, and that it still arrives once, are
+not modeled; that is open.
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Route_base.cfg` | 1,569,747 | 1,058,166 | all four properties hold |
+| `Route_wide_base.cfg` | 8,718,455 | 5,653,462 | all four properties hold |
+| `Route_without_keepblocked.cfg` | 2,948 | 2,236 | `UpConserved` violated |
+| `Route_without_keeprest.cfg` | 3,086 | 2,373 | `UpConserved` violated |
+| `Route_without_blockedisstill.cfg` | 412,883 | 303,862 | `RunEnds` violated |
+| `Route_without_leftoversfirst.cfg` | 28,572 | 27,317 | `UpConserved` violated |
+| `Route_without_restfirst.cfg` | 115,023 | 97,468 | `UpConserved` violated |
+| `Route_without_moveabove.cfg` | 1,981 | 1,280 | `DownConserved` violated |
+| `Route_without_switchonce.cfg` | 10,908 | 10,042 | `HandoverOnce` violated |
+| `Route_without_driverkeepsrest.cfg` | 261,078 | 209,874 | `UpConserved` violated |
+| `Children_base.cfg` | 12,789,594 | 1,857,160 | all five invariants hold |
+| `Children_refuse_base.cfg` | 14,398,126 | 2,645,648 | all four invariants hold |
+| `Children_stalled_base.cfg` | 1,561,917 | 219,760 | the invariants and `ControlProgress` hold |
+| `Children_commands_base.cfg` | 2,040 | 504 | `CommandCredit`, `CommandsGo` hold |
+| `Children_without_checkoverrun.cfg` | 36 | 28 | `EventCredit` violated |
+| `Children_without_checkcommandcredit.cfg` | 31 | 25 | `CommandCredit` violated |
+| `Children_without_reserveforcontrol.cfg` | 1,270,241 | 213,928 | `ControlProgress` violated |
+| `Children_without_muxchecksgeneration.cfg` | 2,313 | 1,010 | `NoStaleDelivery` violated |
+| `Children_without_keybywholeid.cfg` | 1,009 | 502 | `NoStaleDelivery` violated |
+| `Children_large_command.cfg` | 742 | 191 | `CommandsGo` violated: the finding below, still open on the code as it is |
+
+Each was run with `-workers 4 -Xmx6g` under an 8 GB memory cap. The Kani
+results on the merged code are in the Kani section below.
+
 ## Routing through Chain and Switch: `Route.tla`
 
 [`Route.tla`](tla/Route.tla) is the stack `Chain<L, Switch<A, B>>` run by a
@@ -243,6 +285,11 @@ under `cfg(kani)` and calls the production code through its public API.
 | `timers_cancel_fire_and_retain_touch_one_name` | 4 | CaDiCaL | 714 | all pass, 26 s |
 | `a_chunk_cursor_keeps_the_rest_in_place` | 6 | CaDiCaL | 1,327 | all pass, 3.7 s |
 | `a_chunk_cursor_never_passes_the_end` | 6 | CaDiCaL | 1,143 | the one expected panic, 81 s |
+
+On the merged foundation all thirteen were rerun in one
+`cargo kani -p fictionet -Z stubbing --harness stdlib::layer::proofs`
+under a 12 GB memory cap: each gave the same number of checks and the same
+result as above, in 0.8 to 66 s of verification each.
 
 Each run was `cargo kani -p fictionet --harness <name>` under a 10 GB memory
 cap. The checks are CBMC's, the unwinding assertions among them, so every

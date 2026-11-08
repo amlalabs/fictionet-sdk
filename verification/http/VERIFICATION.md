@@ -27,6 +27,55 @@ The existing `httpd` library tests and the `httpd` and `http2_server`
 integration test modules pass; `cargo fmt` and `cargo clippy -- -D warnings`
 are clean on the library and the `it` tests.
 
+## On the merged foundation
+
+`comp/v-http1` was merged into `comp/foundation` (commit `61ef74c2f`) and
+every TLA+ config and Kani harness here was rerun at code revision
+`6aa68ae5f`. Since `Pipeline.tla` and `Tunnel.tla` were written,
+`native.rs` changed only in its imports and in the bare-101 close below,
+and the tunnel moved from `layer/tunnel.rs` to
+`services/stack/tunnel.rs`, unchanged but for its imports; the line
+numbers in the models and the README are the merged ones. The bare-101
+test now runs its work with `Harness::with_worker(Polling::new())`, the
+foundation's way, and passes.
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Streams_base.cfg` | 210,019 | 13,277 | every property holds |
+| `Streams_without_checkbelowlast.cfg` | 436 | 117 | `ClosedHeadersEndConnection` violated |
+| `Streams_without_halfclosedisstreamerror.cfg` | 148 | 50 | `NoBodyAfterEnd` violated |
+| `Streams_without_ignoreafterreset.cfg` | 114 | 43 | `LateFramesIgnored` violated |
+| `Streams_without_refuseoverlimit.cfg` | 312 | 87 | `Concurrency` violated |
+| `Flow_base.cfg` | 4,581,219 | 1,145,490 | every property holds |
+| `Flow_without_checkconnectionwindow.cfg` | 661 | 349 | `OverflowRejected` violated |
+| `Flow_without_checkstreamwindow.cfg` | 39,116 | 13,799 | `OverflowRejected` violated |
+| `Flow_without_countpadding.cfg` | 73 | 52 | `CreditMatchesWindow` violated |
+| `Flow_without_releasecredit.cfg` | 558,533 | 169,566 | `RequestsEnd` violated |
+| `Flow_without_spendwithinwindows.cfg` | 7,433 | 3,076 | `ServerSpendsWithinWindows` violated |
+| `Flow_without_wakeonconnectionupdate.cfg` | 4,872,579 | 1,230,106 | `NoLostWake` violated |
+| `Flow_without_wakeonsettings.cfg` | 276,877 | 87,180 | `NoLostWake` violated |
+| `Flow_without_wakeonstreamupdate.cfg` | 264,463 | 81,949 | `NoLostWake` violated |
+| `Pipeline_base.cfg` | 1,493,826 | 660,798 | every property holds |
+| `Pipeline_without_waitwritten.cfg` | 255,903 | 107,199 | `ReadAfterWritten` violated |
+| `Pipeline_without_readonlyinreading.cfg` | 23,315 | 17,661 | `OneInFlight` violated |
+| `Pipeline_without_keepunread.cfg` | 578,355 | 258,971 | `TunnelGetsTheRest` violated |
+| `Pipeline_without_leftoverinswitching.cfg` | 806,714 | 365,039 | `TunnelGetsTheRest` violated |
+| `Pipeline_without_endlast.cfg` | 1,236,442 | 549,135 | `TunnelEndsLast` violated |
+| `Pipeline_without_handoverafterwritten.cfg` | 106,739 | 51,707 | `HandoverAfterWritten` violated |
+| `Pipeline_without_leftoverfirst.cfg` | 578,723 | 258,776 | `TunnelGetsTheRest` violated |
+| `Pipeline_without_feedleftovers.cfg` | 1,471,808 | 648,360 | `TunnelGetsAll` violated |
+| `Pipeline_without_closeafterbare101.cfg` | 391,817 | 172,027 | `NoHttpAfter101` violated |
+| `Tunnel_base.cfg` | 30,275 | 5,644 | every invariant holds |
+| `Tunnel_without_checkroom.cfg` | 26 | 23 | `OutboundWithinRoom` violated |
+| `Tunnel_without_chargewrites.cfg` | 22 | 19 | `ChargesMatch` violated |
+| `Tunnel_without_admitbelowroom.cfg` | 33 | 27 | `InboundBelowRoomAndAChunk` violated |
+| `Tunnel_doc_room.cfg` | 70 | 46 | `InboundWithinRoom` violated: the finding below |
+| `Tunnel_empty_chunks.cfg` | 59 | 52 | `NoEofWhileOpen` violated: the finding below |
+
+Each was run with `-workers 4 -Xmx6g` under an 8 GB memory cap; where
+several workers race to a violation the counts differ a little from the
+branch's. KANI_RESULTS
+
 ## Bugs
 
 ### A 101 without an UpgradeHandler kept the connection reading HTTP

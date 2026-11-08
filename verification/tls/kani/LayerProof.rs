@@ -113,7 +113,7 @@ fn a_completion_credits_the_pending_write_once_at_its_fence() {
 
 /// One accepted write of `p` bytes whose ciphertext, `c` bytes in any
 /// number of chunks, the driver has taken, with the fence where the output
-/// arm of `advance` puts it (`layer.rs:482-488`: at `produced` once rustls
+/// arm of `advance` puts it (`layer.rs:565-571`: at `produced` once rustls
 /// has nothing more to write); then any schedule of six steps: the
 /// carrier completing any part of what is out, or the application taking
 /// events. At every step the accepted bytes are acknowledged, owed, or
@@ -137,7 +137,7 @@ fn a_write_is_acknowledged_once_after_its_ciphertext_completes() {
     layer.produced = end;
     let p: usize = kani::any();
     kani::assume(p != 0 && p <= CHUNK);
-    // on_command accepted p bytes (layer.rs:374); advance fenced them.
+    // on_command accepted p bytes (layer.rs:457); advance fenced them.
     layer.pending_plaintext = p;
     layer.fence = Some(end);
 
