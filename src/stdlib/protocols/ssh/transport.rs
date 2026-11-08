@@ -223,11 +223,17 @@ pub enum TransportEvent {
     },
 }
 
-struct Negotiated {
-    kex: String,
-    host: String,
-    incoming: String,
-    outgoing: String,
+/// Algorithms selected by the latest completed key exchange.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Negotiated {
+    /// Key exchange algorithm.
+    pub kex: String,
+    /// Host signature algorithm.
+    pub host: String,
+    /// Client to server authenticated cipher.
+    pub incoming: String,
+    /// Server to client authenticated cipher.
+    pub outgoing: String,
 }
 
 enum Exchange {
@@ -252,6 +258,7 @@ pub struct Transport {
     proposal: KexInit,
     client_kex: Option<KexInit>,
     exchange: Exchange,
+    negotiated: Option<Negotiated>,
     incoming: Direction,
     outgoing: Direction,
     session_id: Vec<u8>,
@@ -286,6 +293,7 @@ impl Transport {
             proposal,
             client_kex: None,
             exchange: Exchange::Idle,
+            negotiated: None,
             incoming: Direction::plain(),
             outgoing: Direction::plain(),
             session_id: Vec::new(),
@@ -360,6 +368,11 @@ impl Transport {
     /// The most recently received client proposal, for world observations.
     pub fn client_kex(&self) -> Option<&KexInit> {
         self.client_kex.as_ref()
+    }
+    /// Algorithms installed by the latest exchange. Available once the server
+    /// has sent NEWKEYS; use `is_established` and `is_rekeying` to check completion.
+    pub fn negotiated(&self) -> Option<&Negotiated> {
+        self.negotiated.as_ref()
     }
     /// The first exchange hash, retained across rekeys for user authentication.
     pub fn session_id(&self) -> Option<&[u8]> {
@@ -648,6 +661,7 @@ impl Transport {
             put_string(&mut extension, b"ssh-ed25519,rsa-sha2-512,rsa-sha2-256");
             self.send(&extension, out)?;
         }
+        self.negotiated = Some(algorithms);
         self.exchange = Exchange::NewKeys(Box::new(incoming));
         Ok(())
     }
@@ -723,6 +737,12 @@ impl Decode for Transport {
             + self.peer.as_ref().map_or(0, identification)
             + proposal(&self.proposal)
             + self.client_kex.as_ref().map_or(0, proposal)
+            + self.negotiated.as_ref().map_or(0, |algorithms| {
+                algorithms.kex.capacity()
+                    + algorithms.host.capacity()
+                    + algorithms.incoming.capacity()
+                    + algorithms.outgoing.capacity()
+            })
             + self.session_id.capacity()
             + direction(&self.incoming)
             + direction(&self.outgoing)
