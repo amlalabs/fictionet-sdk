@@ -2,7 +2,7 @@
 //! both its versions, with no I/O.
 //!
 //! `Value`, `Resp2`, and `Command` implement `Wire`. `Values` and `Commands`
-//! decode streams. There is no Redis session or `Service`, command execution,
+//! decode streams. There is no Redis session or server layer, command execution,
 //! data store, or live transport.
 //!
 //! Redis, and the servers that copy it, speak RESP over TCP, usually on

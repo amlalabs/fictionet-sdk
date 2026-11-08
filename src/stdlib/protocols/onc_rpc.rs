@@ -3,7 +3,7 @@
 //!
 //! `Message`, `Fragment`, and `Record` implement `Wire`. `Fragments`,
 //! `records`, and `messages` decode and assemble TCP records. There is no
-//! client or server call session, `Service`, authentication verification, or
+//! client or server call session, server layer, authentication verification, or
 //! live transport. Procedure dispatch belongs to the caller.
 //!
 //! ONC RPC (Open Network Computing Remote Procedure Call, first Sun RPC)

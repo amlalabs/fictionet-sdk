@@ -237,13 +237,16 @@ impl Drop for Counted {
 /// as [`StreamEvent::Written`](fictionet::stdlib::layer::StreamEvent::Written).
 /// Due timers go off before more input is offered. The stack's work runs
 /// with the world's context in a [region](fictionet::Cx#regions) of its
-/// own: what it spawns is cancelled when the run ends, and its failures end
-/// that work, not the run.
+/// own: what it spawns is cancelled when the run ends. A task of the work
+/// that fails ends that work and cancels the run, never the caller's
+/// region.
 ///
 /// It returns once the stack has ended its direction with every byte
 /// written and no work left, and input has ended or the stack declares
 /// itself terminal, or when the connection fails, the stack
-/// resets it or gives up on it, or `limits` give up on it. A panic in the
+/// resets it or gives up on it, or `limits` give up on it. A cancel of the
+/// run's region wins over any of these but the stack giving up
+/// ([`StackError::Cancelled`]). A panic in the
 /// stack names it and `info` on standard error as it unwinds
 /// ([`PanicNote`]). Dropping the run drops the stack and its work.
 pub async fn stream<L, C>(
@@ -269,7 +272,13 @@ where
                 return Poll::Ready(Err(StackError::Cancelled));
             }
             let above = &mut |event| match event {};
-            let failed = match live.poll(&fcx, cx, above, &mut report) {
+            let polled = live.poll(&fcx, cx, above, &mut report);
+            // A cancel that landed while the stack ran, as a read or the
+            // stack's work did something, wins over how the stack ended.
+            if fcx.is_cancelled() && !matches!(polled, Poll::Ready(Err(StackError::Layer(_)))) {
+                return Poll::Ready(Err(StackError::Cancelled));
+            }
+            let failed = match polled {
                 Poll::Ready(Ok(Halt::End(end))) => return Poll::Ready(Ok(end)),
                 Poll::Ready(Ok(Halt::Conn(e))) => e,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -395,6 +404,10 @@ where
         // settled stack is done with it.
         if ended || (settled && socket_closed && input.is_none() && jobs.is_empty()) {
             jobs.close_completed();
+            // As the stream runner does, a cancel that landed meanwhile wins.
+            if fcx.is_cancelled() {
+                return Err(StackError::Cancelled);
+            }
             return Ok(());
         }
         if !settled {
@@ -495,3 +508,7 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(kani)]
+#[path = "../../../../verification/layer-runtime/kani/admission.rs"]
+mod proofs;

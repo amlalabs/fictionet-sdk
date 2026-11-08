@@ -3,7 +3,7 @@
 //!
 //! `EncodedMessage` and `Frame` implement `Wire`. `EncodedMessages` and
 //! `codec::Frames<Frame>` decode unframed and framed streams. Values are
-//! schema-free, with no IDL compiler, RPC session, `Service`, or live
+//! schema-free, with no IDL compiler, RPC session, server layer, or live
 //! transport.
 //!
 //! Thrift is a remote procedure call system. A client calls a method on a

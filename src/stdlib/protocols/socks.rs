@@ -3,7 +3,7 @@
 //!
 //! Complete handshake values use `Wire`. `ClientMessages` and `ServerMessages`
 //! decode each direction with caller-selected phases. These are handshake
-//! readers, not a proxy session or `Service`. Connection establishment,
+//! readers, not a proxy session or server layer. Connection establishment,
 //! authentication decisions, and TCP or UDP relaying belong to the caller.
 //!
 //! SOCKS is how a client asks a proxy to open a connection for it. The
@@ -15,11 +15,10 @@
 //! 1929 (the username and password login), the SOCKS4 protocol document,
 //! and its SOCKS4a extension, which lets the client send a domain name.
 //!
-//! A proxy [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
-//! [`ClientMessages`]. In `on_item`, it answers each [`ClientMessage`] and
-//! chooses the next phase with `driver.decoder().select()` or
-//! `driver.decoder().verified()`. A client uses
+//! A proxy is a [layer](fictionet::stdlib::layer) over a byte stream that
+//! reads it with a [`Stream`](fictionet::stdlib::codec::Stream) of
+//! [`ClientMessages`]. It answers each [`ClientMessage`] and chooses the next
+//! phase with `stream.decoder().select()` or `stream.decoder().verified()`. A client uses
 //! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). After the last
 //! handshake item, `swap` or `into_parts` hands unread bytes to the tunnel
 //! protocol. While a decision is pending, input stays buffered up to the unit

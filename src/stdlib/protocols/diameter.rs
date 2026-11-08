@@ -1,7 +1,7 @@
 //! Diameter: reading and writing messages and AVPs, with no I/O.
 //!
 //! `Message` and `Avp` implement `Wire`, and `codec::Frames<Message>` decodes
-//! the message stream. There is no peer session or `Service`. Capability
+//! the message stream. There is no peer session or server layer. Capability
 //! exchange, watchdog timing, request correlation, and transport belong to
 //! world code.
 //!

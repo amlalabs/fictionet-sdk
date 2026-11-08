@@ -3,7 +3,7 @@
 //!
 //! Packet and LSA readers and writers handle complete values. `Vec<u8>`
 //! carries complete packet bytes. There is no protocol stream decoder,
-//! neighbor state machine, routing database, route calculation, or `Service`.
+//! neighbor state machine, routing database, route calculation, or server layer.
 //!
 //! OSPF (Open Shortest Path First, IP protocol 89) is a link-state routing
 //! protocol that many enterprise and campus networks run inside. Routers on

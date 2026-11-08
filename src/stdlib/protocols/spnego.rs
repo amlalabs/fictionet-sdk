@@ -2,7 +2,7 @@
 //! Negotiate, SMB and LDAP carry, with no I/O.
 //!
 //! `NegotiationToken` implements `Wire`, and `codec::Frames<Frame>` decodes successive
-//! tokens. There is no negotiation session or `Service`, mechanism
+//! tokens. There is no negotiation session or server layer, mechanism
 //! authentication, cryptography, or live transport. Inner tokens remain bytes.
 //!
 //! SPNEGO lets a client and a server agree on how to authenticate, usually

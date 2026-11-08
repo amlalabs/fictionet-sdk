@@ -2,7 +2,7 @@
 //!
 //! `Command`, `Request`, and `Reply` implement `Wire`. `Inputs` and `Outputs`
 //! decode the two directions. Reply expectations are framing state, not an
-//! authenticated mail session. There is no mailbox `Service` or TLS transport.
+//! authenticated mail session. There is no mailbox server layer or TLS transport.
 //!
 //! POP3 is how a mail client downloads mail from its server. The client
 //! connects over TCP, usually to port 110, and sends commands one per
@@ -16,10 +16,10 @@
 //! `[IN-USE]`), RFC 2595 (`STLS`) and RFC 3206 (the `SYS` and `AUTH`
 //! response codes).
 //!
-//! A mail [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
-//! [`Inputs`] to interpret each [`Request`] and write a [`Reply`]; in
-//! `on_item`, call `driver.decoder().expect_line()` to read an AUTH answer.
+//! A mail server is a [layer](fictionet::stdlib::layer) over a byte stream
+//! that reads it with a [`Stream`](fictionet::stdlib::codec::Stream) of
+//! [`Inputs`] to interpret each [`Request`] and write a [`Reply`]; it calls
+//! `stream.decoder().expect_line()` to read an AUTH answer.
 //! Clients use [`Stream<Outputs>`](fictionet::stdlib::codec::Stream) and queue
 //! whether each reply has a body with [`Outputs::expect`]. CRLF is required.
 //! Bad or overlong commands are error items. Overlong command remainders are

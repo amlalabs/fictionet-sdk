@@ -9,11 +9,11 @@
 //! Command lines use the base 512-byte limit; extension-specific increases
 //! and BDAT binary chunk framing are not implemented.
 //!
-//! A mail [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) uses
-//! [`Inputs`]. After accepting DATA and sending a 354 reply in `on_item`, call
-//! `driver.decoder().start_data()`. See the SMTP DATA section in
-//! `docs/services.md` for a service example. The next item is the complete
+//! A mail server is a [layer](fictionet::stdlib::layer) over a byte stream
+//! that reads it with a [`Stream`](fictionet::stdlib::codec::Stream) of
+//! [`Inputs`]. After accepting DATA and sending a 354 reply, it calls
+//! `stream.decoder().start_data()` before it reads the next item, which may
+//! already be in the stream's buffer. The next item is the complete
 //! unstuffed message. Its terminating dot returns the reader to commands. Use
 //! [`Stream<Replies>`](fictionet::stdlib::codec::Stream) on the client. Bad
 //! commands are error items; overlong lines are skipped. After sending an AUTH

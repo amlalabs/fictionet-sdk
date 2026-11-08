@@ -4,7 +4,7 @@
 //! `Packet` implements `Wire` and supports `codec::Frames<Packet>`. `Bands`
 //! decodes side-band payloads. Request and advertisement helpers do not
 //! implement a fetch or push session, repository storage, packfile processing,
-//! or a `Service`.
+//! or a server layer.
 //!
 //! Git clients fetch and push over TCP port 9418 (`git://`), over SSH and
 //! over smart HTTP. All three carry the same messages, split into

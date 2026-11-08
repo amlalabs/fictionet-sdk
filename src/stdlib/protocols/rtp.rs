@@ -2,7 +2,7 @@
 //! packets, with no I/O.
 //!
 //! `Packet` and `Demux` implement `Wire`. TCP envelope decoding comes from
-//! `rtcp::Frame`. There is no media session, codec, jitter buffer, `Service`,
+//! `rtcp::Frame`. There is no media session, codec, jitter buffer, server layer,
 //! live transport, or SRTP cryptography.
 //!
 //! RTP carries audio and video in real time: voice calls, video calls,

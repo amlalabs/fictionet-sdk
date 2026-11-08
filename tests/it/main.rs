@@ -1,7 +1,6 @@
 //! The integration tests that run on any machine, one module per area. The
 //! tests that need user namespaces, root or a tun device are in `tests/host`.
 
-#[macro_use]
 mod common;
 
 mod asn1_codec;
@@ -49,10 +48,10 @@ mod rpc_nfs_codec;
 mod rtp_rtcp_rules;
 mod sandbox;
 mod sbe_codegen;
-mod serve_cancellation;
 mod serve_limits;
 mod services;
 mod sse_codec;
+mod stack_cancellation;
 mod stack_harness;
 mod streams_codec;
 mod stress;

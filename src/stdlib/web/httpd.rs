@@ -355,8 +355,8 @@ pub struct HttpOptions {
     /// if no bytes arrived. `None` waits as long as
     /// the HTTP/1 head limit allows.
     pub first_bytes: Option<Duration>,
-    /// What connections are charged to ([`ServeOptions::budget`]): over
-    /// HTTP/1 and HTTP/2 what the driver and service hold, including each request's head and body,
+    /// What connections are charged to: over
+    /// HTTP/1 and HTTP/2 what the runner and the stack hold, including each request's head and body,
     /// and each response frame until its last slice is
     /// dropped. Heads count method, URI and header bytes, plus header slots;
     /// hidden capacities, extensions and third-party overhead are excluded.

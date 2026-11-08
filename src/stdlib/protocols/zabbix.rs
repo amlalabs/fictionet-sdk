@@ -2,7 +2,7 @@
 //! agents, senders and servers exchange, with no I/O.
 //!
 //! `Packet` and `Message` implement `Wire`, and `codec::Frames<Packet>` decodes
-//! packet framing. There is no agent or server session, monitoring `Service`,
+//! packet framing. There is no agent or server session, monitoring server layer,
 //! live transport, or decompression. Message bodies retain their JSON text.
 //!
 //! Zabbix monitors servers and network gear. An agent on each host answers

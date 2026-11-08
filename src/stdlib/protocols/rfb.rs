@@ -4,7 +4,7 @@
 //! Complete wire values, directional decoders, and caller-driven `Client` and
 //! `Server` sessions cover the handshake and supported framebuffer messages.
 //! Updates support Raw, CopyRect, Cursor, and DesktopSize only. There is no DES
-//! authentication computation, encrypted transport, or VNC `Service`.
+//! authentication computation, encrypted transport, or VNC server layer.
 //!
 //! RFB lets a client see and drive a remote screen. The server sends
 //! pictures of its framebuffer, and the client sends key presses and
@@ -26,11 +26,10 @@
 //! [`Client`]. Each session tracks both directions, since the next peer unit
 //! depends on what was sent. The byte layers are
 //! [`Stream<ClientMessages>`](fictionet::stdlib::codec::Stream) and
-//! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). A
-//! [`Service`](fictionet::stdlib::services::serve::Service) served by
-//! [`serve::connection`](fictionet::stdlib::services::serve::connection) can
-//! instead use [`ClientMessages`] directly, calling
-//! `driver.decoder().set_phase()` in `on_item` as the handshake advances.
+//! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). A server
+//! [layer](fictionet::stdlib::layer) over a byte stream can instead read it
+//! with a stream of [`ClientMessages`], calling
+//! `stream.decoder().set_phase()` between items as the handshake advances.
 //! Unsupported security and closed sessions preserve the unread suffix for
 //! `into_parts` or `swap`.
 //!

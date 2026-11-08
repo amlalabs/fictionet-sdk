@@ -3,7 +3,7 @@
 //!
 //! `Header` implements `Wire`, and `Headers` decodes one initial header before
 //! handing off the remaining bytes. This module supplies no proxy session,
-//! `Service`, forwarding loop, or TLS termination.
+//! server layer, forwarding loop, or TLS termination.
 //!
 //! A load balancer or TLS terminator that passes a connection on loses the
 //! client's address: the server sees the proxy's. The PROXY protocol fixes

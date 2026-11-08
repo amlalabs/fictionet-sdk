@@ -3,7 +3,7 @@
 //!
 //! `Header` reads and writes complete header sections through `Wire`, and
 //! `Head` decodes a header from a stream. This module does not decode mail
-//! bodies or provide an SMTP session, mail `Service`, or live transport.
+//! bodies or provide an SMTP session, mail server layer, or live transport.
 //!
 //! Mail messages start with a header: lines of `Name: value`, then a blank
 //! line, then the body. HTTP borrows the same layout for its own headers.

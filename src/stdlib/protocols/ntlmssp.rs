@@ -6,7 +6,7 @@
 //!
 //! The message and response types read and write complete values through
 //! `Wire`. There is no stream decoder, authentication state machine, or
-//! `Service`. Hashes, response verification, signing, and sealing belong to the
+//! server layer. Hashes, response verification, signing, and sealing belong to the
 //! caller.
 //!
 //! NTLM is how Windows machines prove who a user is without a domain

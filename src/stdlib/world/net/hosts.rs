@@ -1,7 +1,6 @@
 use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_serve_v6};
 use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, link, normalize};
-use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Side, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
@@ -12,9 +11,6 @@ use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{
     Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, additional_targets,
-};
-use fictionet::stdlib::services::serve::{
-    self, DatagramOptions, DatagramService, ServeOptions, Service,
 };
 use fictionet::stdlib::services::stack::{
     self, Boxed, Counted, Job, StackError, StreamEnd, StreamLimits,
@@ -110,8 +106,8 @@ impl Opening {
     }
 }
 
-/// Serves connections on one port of a host. [`Host::tcp`] and
-/// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`] is HTTP's.
+/// Serves connections on one port of a host. [`Host::tcp_stack`] makes one
+/// for a layer stack; [`httpd::Server`] is HTTP's.
 /// A world writes its own for anything else.
 pub trait PortServer: Any + Send + Sync {
     /// Serves one connection.
@@ -195,59 +191,7 @@ impl PreparedShare {
     }
 }
 
-/// Serves a [`Service`] made fresh for each connection.
-struct ServiceAccept<S: Service, M> {
-    state: Arc<S::State>,
-    make: M,
-    opts: ServeOptions,
-    max_conns: usize,
-    open: Arc<AtomicUsize>,
-}
-
-impl<S: Service, M> ServiceAccept<S, M> {
-    fn new(
-        state: Arc<S::State>,
-        make: M,
-        opts: ServeOptions,
-        max_conns: usize,
-    ) -> ServiceAccept<S, M> {
-        ServiceAccept {
-            state,
-            make,
-            opts,
-            max_conns,
-            open: Arc::default(),
-        }
-    }
-}
-
-impl<S, M> PortServer for ServiceAccept<S, M>
-where
-    S: Service,
-    M: Fn() -> S + Send + Sync + 'static,
-    <S::Decoder as Decode>::Error: Clone + Send,
-{
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
-            arrival.socket.reset();
-            return Box::pin(async {});
-        };
-        arrival.socket.hold_until_gone(Box::new(guard));
-        let mut service = (self.make)();
-        let state = self.state.clone();
-        let mut opts = self.opts.clone();
-        if opts.budget.is_none() {
-            opts.budget = arrival.budget;
-        }
-        let (conn, info) = (arrival.conn, arrival.info);
-        Box::pin(async move {
-            let _ = serve::connection(&fcx, conn, info, &mut service, &state, &opts).await;
-        })
-    }
-}
-
-/// The connections a port served with [`Host::tcp_stack`] or [`Host::tcp`]
-/// serves at once.
+/// The connections a port served with [`Host::tcp_stack`] serves at once.
 pub const DEFAULT_MAX_CONNS: usize = 64;
 
 /// Serves a layer stack made fresh for each connection.
@@ -286,10 +230,8 @@ where
     }
 }
 
-/// Starts serving a UDP port of a machine: the socket, its address,
-/// and who the sandboxes are.
-pub(super) type UdpStart =
-    Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, serve::SandboxOf) + Send + Sync>;
+/// Starts serving a UDP port of a machine: the socket and its address.
+pub(super) type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr) + Send + Sync>;
 
 /// Which names a TLS service on a port answers to, by the SNI the client
 /// sends.
@@ -433,67 +375,6 @@ impl Host {
         self
     }
 
-    /// Serves the literal TCP `port`, including zero, with a [`Service`]
-    /// made by `make` for each connection, sharing `world`, with the default
-    /// [`ServeOptions`], at most [`DEFAULT_MAX_CONNS`](DEFAULT_MAX_CONNS)
-    /// at once.
-    /// Connections are numbered and identify their sandbox in [`ConnInfo`].
-    pub fn tcp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
-    where
-        S: Service,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decoder as Decode>::Error: Clone + Send,
-    {
-        self.tcp_with(
-            port,
-            state,
-            make,
-            ServeOptions::default(),
-            DEFAULT_MAX_CONNS,
-        )
-    }
-
-    /// The same with these options (an idle limit, a budget) and at most
-    /// `max_conns` connections at once. Past that, a new one is reset as
-    /// soon as it is accepted, and each counts until its socket is gone.
-    /// The sandbox's budget applies when `opts` has none.
-    pub fn tcp_with<S, M>(
-        self,
-        port: u16,
-        state: Arc<S::State>,
-        make: M,
-        opts: ServeOptions,
-        max_conns: usize,
-    ) -> Host
-    where
-        S: Service,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decoder as Decode>::Error: Clone + Send,
-    {
-        self.port_server(port, ServiceAccept::new(state, make, opts, max_conns))
-    }
-
-    /// Serves TCP `port` with TLS for the names `sni` gives, then a
-    /// [`Service`] made by `make`, with the default [`ServeOptions`], as
-    /// [`tcp`](Self::tcp). Several `tls` calls on one port route by SNI; a
-    /// name with no entry is rejected with `unrecognized_name`.
-    pub fn tls<S, M>(
-        self,
-        port: u16,
-        sni: impl Into<Sni>,
-        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-        state: Arc<S::State>,
-        make: M,
-    ) -> Host
-    where
-        S: Service,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decoder as Decode>::Error: Clone + Send,
-    {
-        let accept = ServiceAccept::new(state, make, ServeOptions::default(), DEFAULT_MAX_CONNS);
-        self.tls_accept(port, sni, config_for, accept)
-    }
-
     /// Serves TCP `port` with `accept`.
     pub fn port_server(mut self, port: u16, accept: impl PortServer) -> Host {
         self.ports.push((port, PortSpec::Tcp(Arc::new(accept))));
@@ -535,57 +416,6 @@ impl Host {
             accept: Arc::new(accept),
         };
         self.ports.push((port, spec));
-        self
-    }
-
-    /// Serves UDP `port` with one [`DatagramService`] made by `make`, which
-    /// gets every datagram ([`serve::datagram`]). The network names each
-    /// datagram's sandbox.
-    /// Port zero asks the endpoint to choose a free port ([`udp::Endpoint::bind`]).
-    pub fn udp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
-    where
-        S: DatagramService,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decoder as Decode>::Error: Clone + Send,
-    {
-        self.udp_port(port, state, make, None)
-    }
-
-    /// The same, with a budget the service's calls can check
-    /// ([`DatagramOptions::budget`]).
-    pub fn udp_with<S, M>(self, port: u16, state: Arc<S::State>, make: M, budget: Budget) -> Host
-    where
-        S: DatagramService,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decoder as Decode>::Error: Clone + Send,
-    {
-        self.udp_port(port, state, make, Some(budget))
-    }
-
-    fn udp_port<S, M>(
-        mut self,
-        port: u16,
-        state: Arc<S::State>,
-        make: M,
-        budget: Option<Budget>,
-    ) -> Host
-    where
-        S: DatagramService,
-        M: Fn() -> S + Send + Sync + 'static,
-        <S::Decoder as Decode>::Error: Clone + Send,
-    {
-        let start: UdpStart = Arc::new(move |fcx, socket, local, sandbox| {
-            let mut service = make();
-            let state = state.clone();
-            let opts = DatagramOptions {
-                budget: budget.clone(),
-                sandbox: Some(sandbox),
-            };
-            fcx.spawn(move |fcx| async move {
-                Ok(serve::datagram(&fcx, socket, local, &mut service, &state, &opts).await?)
-            });
-        });
-        self.ports.push((port, PortSpec::Udp(start)));
         self
     }
 
@@ -685,7 +515,7 @@ impl Host {
         L::Error: core::error::Error + Send + Sync + 'static,
         M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
-        let start: UdpStart = Arc::new(move |fcx, socket, local, _sandbox| {
+        let start: UdpStart = Arc::new(move |fcx, socket, local| {
             let budget = budget.clone();
             let layer = make(&ConnInfo {
                 local: Some(local),
@@ -1444,11 +1274,6 @@ impl Admission {
     pub(super) fn admit(&self, _fcx: &Cx, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
         self.peers.admit(conn)
     }
-
-    pub(super) fn sandbox(&self) -> serve::SandboxOf {
-        let hooks = self.hooks.clone();
-        Arc::new(move |addr| Some(hooks.sandbox_at(addr)))
-    }
 }
 
 /// Open connections by peer address, for
@@ -1886,12 +1711,11 @@ impl Machine {
 
     /// Installs the prepared services in declaration order without failure.
     fn add(self: &Arc<Self>, prepared: Vec<PreparedPort>) {
-        let sandbox = self.admission.sandbox();
         for prepared in prepared {
             match prepared {
                 PreparedPort::Udp { socket, start } => {
                     let local = socket.local_addr();
-                    start(&self.fcx, socket, local, sandbox.clone());
+                    start(&self.fcx, socket, local);
                 }
                 PreparedPort::Tcp {
                     number,
