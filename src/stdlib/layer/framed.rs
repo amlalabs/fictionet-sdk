@@ -250,6 +250,10 @@ impl<O: Wire> core::error::Error for FramedError<O> {
     }
 }
 
+#[cfg(kani)]
+#[path = "../../../verification/layer-runtime/kani/mod.rs"]
+mod proofs;
+
 #[cfg(test)]
 pub(crate) mod tests {
     //! A frame echo on top of [`Framed`], over Modbus/TCP framing. The

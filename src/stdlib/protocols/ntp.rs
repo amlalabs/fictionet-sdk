@@ -734,6 +734,10 @@ impl Wire for Timestamp {
     }
 }
 
+#[cfg(kani)]
+#[path = "../../../verification/layer-runtime/kani/ntp_reply.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
