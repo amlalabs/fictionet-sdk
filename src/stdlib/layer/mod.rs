@@ -171,6 +171,9 @@ mod harness;
 mod switch;
 mod timers;
 
+#[cfg(test)]
+mod tests;
+
 pub use budget::{Budget, Charge};
 pub use carrier::{
     ByteStream, Child, ChildId, Chunk, Credited, Datagram, DatagramCommand, DatagramEvent,
