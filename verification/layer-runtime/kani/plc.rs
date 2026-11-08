@@ -59,7 +59,7 @@ fn take(d: &mut Driver<PlcServer>, answers: &mut Vec<Frame>, ended: &mut bool) {
     match d.layer_mut().take_command() {
         Some(MessageCommand::Send(frame)) => {
             assert!(!*ended, "nothing is sent after the end");
-            answers.push(frame);
+            answers.push(frame.into_parts().0);
         }
         Some(MessageCommand::End) => {
             assert!(!*ended, "the end is sent once");
@@ -81,9 +81,14 @@ fn server() -> Driver<PlcServer> {
 }
 
 fn offer(d: &mut Driver<PlcServer>, frame: &Frame) -> Admit<MessageEvent<Decoded<Frames<Frame>>>> {
-    d.deliver(MessageEvent::Message(Ok(frame.clone())))
-        .ok()
-        .expect("the server never fails")
+    d.deliver(MessageEvent::Message(Ok(
+        fictionet::stdlib::layer::Owned::new(
+            frame.clone(),
+            Budget::unlimited().charge(frame.pdu.capacity()).unwrap(),
+        ),
+    )))
+    .ok()
+    .expect("the server never fails")
 }
 
 /// Two requests. With `PIPELINED` the second comes before the frame layer
@@ -97,7 +102,7 @@ fn answers_in_order<const LEN: usize, const FUNCTION: u8, const PIPELINED: bool>
     assert!(matches!(offer(&mut d, &requests[0]), Admit::Taken));
     if PIPELINED {
         match offer(&mut d, &requests[1]) {
-            Admit::Blocked(MessageEvent::Message(Ok(back))) => assert_eq!(back, requests[1]),
+            Admit::Blocked(MessageEvent::Message(Ok(back))) => assert_eq!(*back, requests[1]),
             _ => panic!("the second request waits for the first answer"),
         }
     }

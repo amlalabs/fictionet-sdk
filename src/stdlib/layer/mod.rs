@@ -219,7 +219,7 @@ pub use children::{ChildReport, Children, Overrun};
 pub use choice::Later;
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
-pub use framed::{Decoded, Framed, FramedError, Framing};
+pub use framed::{BoundedDecode, BoundedWire, Decoded, Framed, FramedError, Framing, Owned};
 pub use harness::{Harness, Worker};
 pub use switch::{Handoff, Handover, Switch};
 pub use timers::Timers;

@@ -13,7 +13,7 @@
 
 extern crate alloc;
 
-use super::super::{Framed, FramedError};
+use super::super::{BoundedDecode, BoundedWire, Framed, FramedError, Owned};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -102,6 +102,23 @@ impl Decode for Units {
     }
 }
 
+impl BoundedDecode for Units {
+    fn allocation_bound(&self) -> usize {
+        0
+    }
+}
+impl BoundedDecode for Steps {
+    fn allocation_bound(&self) -> usize {
+        0
+    }
+}
+impl BoundedWire for Blob {
+    fn write_bound(&self) -> Result<usize, Bad> {
+        u8::try_from(self.0.len()).map_err(|_| Bad)?;
+        Ok(1 + self.0.len())
+    }
+}
+
 struct NoEntropy;
 impl Entropy for NoEntropy {
     fn fill_random(&self, out: &mut [u8]) {
@@ -109,7 +126,7 @@ impl Entropy for NoEntropy {
     }
 }
 
-fn driver<D: Decode>(decoder: D, budget: &Budget) -> Driver<Framed<D, Blob>>
+fn driver<D: BoundedDecode>(decoder: D, budget: &Budget) -> Driver<Framed<D, Blob>>
 where
     D::Error: Clone,
 {
@@ -254,7 +271,10 @@ fn charges_come_back<const LIMIT: usize, const S1: u8, const S2: u8>() {
         assert_eq!(d.layer().stream.buffered(), 0);
     }
     accounted(&budget, &d, &flying);
-    let _ = d.command(MessageCommand::Send(Blob(alloc::vec![kani::any()])));
+    let _ = d.command(MessageCommand::Send(Owned::new(
+        Blob(alloc::vec![kani::any()]),
+        Budget::unlimited().charge(1).unwrap(),
+    )));
     accounted(&budget, &d, &flying);
     for step in [S1, S2] {
         match step {
@@ -347,7 +367,7 @@ fn in_order<const ODD_FIRST: bool, const CUT: usize>() {
                 MessageEvent::Message(Ok(unit)) => {
                     assert!(failures == 0);
                     assert!(items < 2);
-                    assert!(unit == units[items], "in order, each once");
+                    assert!(*unit == units[items], "in order, each once");
                     items += 1;
                 }
                 MessageEvent::Message(Err(fail)) => {
@@ -475,4 +495,80 @@ fn a_decoder_failure_comes_up_once_then_ended() {
             Some(MessageEvent::Ended)
         ));
     }
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn encoding_is_not_called_without_its_reservation() {
+    struct Large;
+    impl Wire for Large {
+        type ParseError = Bad;
+        type WriteError = Bad;
+        fn parse(_: &[u8]) -> Result<Self, Bad> {
+            Ok(Self)
+        }
+        fn write(&self, _: &mut Vec<u8>) -> Result<(), Bad> {
+            panic!("an unreserved writer must not run")
+        }
+    }
+    impl BoundedWire for Large {
+        fn write_bound(&self) -> Result<usize, Bad> {
+            Ok(64)
+        }
+    }
+    let limit: u8 = kani::any();
+    kani::assume(limit < 64);
+    let budget = Budget::new(usize::from(limit));
+    let mut d = Driver::new(
+        Framed::<_, Large>::new(Units),
+        Arc::new(NoEntropy),
+        budget.clone(),
+        Instant::ZERO,
+    );
+    let value = Owned::new(Large, budget.charge(0).unwrap());
+    assert!(matches!(
+        d.command(MessageCommand::Send(value)),
+        Err(FramedError::Budget)
+    ));
+    assert_eq!(budget.used(), 0);
+}
+
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_decoded_allocation_keeps_its_charge_outside_the_layer() {
+    struct Allocates;
+    impl Decode for Allocates {
+        type Item = Vec<u8>;
+        type Error = Bad;
+        const NAME: &'static str = "owned";
+        fn capacity(&self) -> usize {
+            1
+        }
+        fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Vec<u8>>, Bad> {
+            Ok(if input.is_empty() {
+                Step::Need
+            } else {
+                Step::Item(input[..1].to_vec(), 1)
+            })
+        }
+    }
+    impl BoundedDecode for Allocates {
+        fn allocation_bound(&self) -> usize {
+            1
+        }
+    }
+    let budget = Budget::new(8);
+    let mut d = driver(Allocates, &budget);
+    assert!(matches!(
+        d.deliver(StreamEvent::Data(fixed::<1>())).unwrap(),
+        Admit::Taken
+    ));
+    let MessageEvent::Message(Ok(value)) = d.layer_mut().take_event().unwrap() else {
+        panic!("one item")
+    };
+    assert!(value.charged() >= value.capacity());
+    drop(d);
+    assert_eq!(budget.used(), value.charged());
+    drop(value);
+    assert_eq!(budget.used(), 0);
 }

@@ -3,17 +3,65 @@ use core::marker::PhantomData;
 
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Env, Layer, MessageCommand, MessageEvent, Messages,
+    Admit, Budget, ByteStream, Charge, Chunk, Env, Layer, MessageCommand, MessageEvent, Messages,
     StreamCommand, StreamEvent,
 };
 
+/// A wire writer whose maximum output allocation is known before writing.
+/// The writer must not reserve beyond this bound or allocate temporary
+/// heap storage.
+pub trait BoundedWire: Wire {
+    /// Maximum output capacity needed by `write`.
+    fn write_bound(&self) -> Result<usize, Self::WriteError>;
+}
+
+/// A decoder with a bound on allocations produced by its next step.
+/// The bound covers owned items. Errors must not allocate, and decoding
+/// must not grow retained state; use a layer with explicit reservations
+/// for stateful decoding that allocates.
+pub trait BoundedDecode: Decode {
+    /// Maximum additional allocated bytes while decoding the next item.
+    fn allocation_bound(&self) -> usize;
+}
+
+/// An owned value and the reservation that follows its allocation.
+#[derive(Debug)]
+pub struct Owned<T> {
+    value: T,
+    charge: Charge,
+}
+
+impl<T> Owned<T> {
+    /// Attaches a reservation acquired before constructing the value.
+    pub fn new(value: T, charge: Charge) -> Self {
+        Self { value, charge }
+    }
+
+    /// Transfers both the value and its reservation to another owner.
+    pub fn into_parts(self) -> (T, Charge) {
+        (self.value, self.charge)
+    }
+
+    /// Reserved allocation bytes.
+    pub fn charged(&self) -> usize {
+        self.charge.bytes()
+    }
+}
+
+impl<T> core::ops::Deref for Owned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
 /// What a framed byte stream hands up: the next item, or why framing
 /// stopped.
-pub type Decoded<D> = Result<<D as Decode>::Item, Fail<<D as Decode>::Error>>;
+pub type Decoded<D> = Result<Owned<<D as Decode>::Item>, Fail<<D as Decode>::Error>>;
 
 /// The message port [`Framed`] offers: items of `D` up, values of `O`
 /// down.
-pub type Framing<D, O> = Messages<Decoded<D>, O>;
+pub type Framing<D, O> = Messages<Decoded<D>, Owned<O>>;
 
 /// A byte stream framed into messages: decoded with `D` coming up, written
 /// as [`Wire`] values of `O` going down. Modbus/TCP, a length-prefixed
@@ -41,6 +89,7 @@ pub type Framing<D, O> = Messages<Decoded<D>, O>;
 pub struct Framed<D: Decode, O> {
     stream: Stream<D>,
     charge: Option<Charge>,
+    budget: Option<Budget>,
     out: Option<Chunk>,
     /// The upper side asked to end the direction.
     end: bool,
@@ -59,6 +108,7 @@ impl<D: Decode, O> Framed<D, O> {
         Framed {
             stream: Stream::new(decoder),
             charge: None,
+            budget: None,
             out: None,
             end: false,
             end_sent: false,
@@ -78,6 +128,7 @@ impl<D: Decode, O> Framed<D, O> {
     where
         O: Wire,
     {
+        self.budget = Some(env.budget().clone());
         let limit = self.stream.limit().max(self.stream.decoder().capacity());
         let need = limit
             .saturating_mul(2)
@@ -100,9 +151,9 @@ impl<D: Decode, O> Framed<D, O> {
 
 impl<D, O> Layer for Framed<D, O>
 where
-    D: Decode,
+    D: BoundedDecode,
     D::Error: Clone,
-    O: Wire,
+    O: BoundedWire,
 {
     type Lower = ByteStream;
     type Upper = Framing<D, O>;
@@ -154,8 +205,8 @@ where
     fn on_command(
         &mut self,
         env: &mut Env<'_, Infallible>,
-        command: MessageCommand<O>,
-    ) -> Result<Admit<MessageCommand<O>>, FramedError<O>> {
+        command: MessageCommand<Owned<O>>,
+    ) -> Result<Admit<MessageCommand<Owned<O>>>, FramedError<O>> {
         if self.reset || self.end {
             return Ok(Admit::Closed(command));
         }
@@ -164,12 +215,10 @@ where
                 if self.out.is_some() {
                     return Ok(Admit::Blocked(MessageCommand::Send(value)));
                 }
-                let mut bytes = Vec::new();
+                let bound = value.write_bound().map_err(FramedError::Write)?;
+                let charge = env.budget().charge(bound).ok_or(FramedError::Budget)?;
+                let mut bytes = Vec::with_capacity(bound);
                 value.write(&mut bytes).map_err(FramedError::Write)?;
-                let charge = env
-                    .budget()
-                    .charge(bytes.capacity())
-                    .ok_or(FramedError::Budget)?;
                 self.out = Some(Chunk::with_charge(bytes, charge));
                 Ok(Admit::Taken)
             }
@@ -178,6 +227,13 @@ where
                 Ok(Admit::Taken)
             }
         }
+    }
+
+    fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Self::Error> {
+        if self.budget.is_none() {
+            self.charge(env)?;
+        }
+        Ok(false)
     }
 
     fn take_command(&mut self) -> Option<StreamCommand> {
@@ -199,8 +255,17 @@ where
             return None;
         }
         if !self.input_over {
+            let budget = self.budget.as_ref()?;
+            let bound = self.stream.decoder().allocation_bound();
+            let Some(charge) = budget.charge(bound) else {
+                self.input_over = true;
+                return Some(MessageEvent::Message(Err(Fail::Refused {
+                    unread: self.stream.buffered(),
+                    limit: budget.limit(),
+                })));
+            };
             match self.stream.next() {
-                Some(Ok(item)) => return Some(MessageEvent::Message(Ok(item))),
+                Some(Ok(item)) => return Some(MessageEvent::Message(Ok(Owned::new(item, charge)))),
                 Some(Err(fail)) => {
                     self.input_over = true;
                     return Some(MessageEvent::Message(Err(fail)));
@@ -271,7 +336,7 @@ pub(crate) mod tests {
     /// direction once its input is over.
     #[derive(Default)]
     pub(crate) struct Echo {
-        reply: Option<Frame>,
+        reply: Option<Owned<Frame>>,
         over: bool,
         end_sent: bool,
         failures: usize,
@@ -315,7 +380,7 @@ pub(crate) mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<MessageCommand<Frame>> {
+        fn take_command(&mut self) -> Option<MessageCommand<Owned<Frame>>> {
             if let Some(frame) = self.reply.take() {
                 return Some(MessageCommand::Send(frame));
             }
@@ -365,6 +430,68 @@ pub(crate) mod tests {
             bytes = &bytes[used..];
         }
         out
+    }
+
+    #[test]
+    fn output_is_reserved_before_the_writer_runs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WROTE: AtomicBool = AtomicBool::new(false);
+        struct Large;
+        impl Wire for Large {
+            type ParseError = NoError;
+            type WriteError = NoError;
+            fn parse(_: &[u8]) -> Result<Self, NoError> {
+                Ok(Self)
+            }
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), NoError> {
+                WROTE.store(true, Ordering::Relaxed);
+                out.extend_from_slice(&[0; 64]);
+                Ok(())
+            }
+        }
+        impl BoundedWire for Large {
+            fn write_bound(&self) -> Result<usize, NoError> {
+                Ok(64)
+            }
+        }
+        let budget = Budget::new(63);
+        let mut d = super::super::Driver::new(
+            Framed::<_, Large>::new(Widens { widened: false }),
+            std::sync::Arc::new(fictionet::SeededEntropy::new(Seed::from_u64(8))),
+            budget.clone(),
+            fictionet::time::Instant::ZERO,
+        );
+        let value = Owned::new(Large, budget.charge(0).unwrap());
+        assert!(matches!(
+            d.command(MessageCommand::Send(value)),
+            Err(FramedError::Budget)
+        ));
+        assert!(!WROTE.load(Ordering::Relaxed));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_decoded_value_keeps_its_reservation_after_the_decoder_is_dropped() {
+        let budget = Budget::new(4096);
+        let mut d = super::super::Driver::new(
+            Framed::<_, Frame>::new(Frames::<Frame>::new()),
+            std::sync::Arc::new(fictionet::SeededEntropy::new(Seed::from_u64(9))),
+            budget.clone(),
+            fictionet::time::Instant::ZERO,
+        );
+        assert!(matches!(
+            d.deliver(StreamEvent::Data(Chunk::new(wire(&frames(1)))))
+                .unwrap(),
+            Admit::Taken
+        ));
+        let MessageEvent::Message(Ok(value)) = d.layer_mut().take_event().unwrap() else {
+            panic!("a frame")
+        };
+        assert!(value.charged() >= value.pdu.capacity());
+        drop(d);
+        assert_eq!(budget.used(), value.charged());
+        drop(value);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
@@ -475,6 +602,12 @@ pub(crate) mod tests {
         widened: bool,
     }
 
+    impl BoundedDecode for Widens {
+        fn allocation_bound(&self) -> usize {
+            0
+        }
+    }
+
     impl Decode for Widens {
         type Item = u8;
         type Error = NoError;
@@ -516,7 +649,7 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             d.layer_mut().take_event(),
-            Some(MessageEvent::Message(Ok(1)))
+            Some(MessageEvent::Message(Ok(value))) if *value == 1
         ));
         let _ = d
             .deliver(StreamEvent::Data(Chunk::new(vec![2; 16])))

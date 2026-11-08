@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::layer::{
-    Admit, Chain, Decoded, Env, Framed, Framing, Layer, MessageCommand, MessageEvent, Top,
+    Admit, Chain, Decoded, Env, Framed, Framing, Layer, MessageCommand, MessageEvent, Owned, Top,
 };
 use fictionet::stdlib::protocols::modbus::{Exception, Frame, Request, Response};
 use fictionet::stdlib::services::serve::ConnInfo;
@@ -70,7 +70,7 @@ pub struct PlcServer {
     facts: facts::Observer,
     source: Source,
     /// The answer the frame layer has not taken yet.
-    reply: Option<Frame>,
+    reply: Option<Owned<Frame>>,
     /// The client's frames are over.
     over: bool,
     end_sent: bool,
@@ -103,7 +103,7 @@ impl Layer for PlcServer {
 
     fn on_event(
         &mut self,
-        _env: &mut Env<'_, Infallible>,
+        env: &mut Env<'_, Infallible>,
         event: MessageEvent<Decoded<Frames<Frame>>>,
     ) -> Result<Admit<MessageEvent<Decoded<Frames<Frame>>>>, Infallible> {
         if self.over {
@@ -114,8 +114,16 @@ impl Layer for PlcServer {
                 if self.reply.is_some() {
                     return Ok(Admit::Blocked(MessageEvent::Message(Ok(frame))));
                 }
+                // PDU encoders grow their byte vectors geometrically.
+                let Some(charge) = env
+                    .budget()
+                    .charge(fictionet::stdlib::protocols::modbus::MAX_PDU.saturating_mul(2))
+                else {
+                    self.over = true;
+                    return Ok(Admit::Closed(MessageEvent::Message(Ok(frame))));
+                };
                 let pdu = self.answer(&frame, &self.plant, self.source, &self.facts);
-                self.reply = Some(frame.reply(pdu));
+                self.reply = Some(Owned::new(frame.reply(pdu), charge));
             }
             // After a framing error no reader can find the next frame, and
             // a real server closes the connection.
@@ -132,7 +140,7 @@ impl Layer for PlcServer {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<MessageCommand<Frame>> {
+    fn take_command(&mut self) -> Option<MessageCommand<Owned<Frame>>> {
         if let Some(reply) = self.reply.take() {
             return Some(MessageCommand::Send(reply));
         }
