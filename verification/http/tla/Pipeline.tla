@@ -4,7 +4,7 @@
 (* tunnel after a CONNECT or an upgrade: `Http1` in                        *)
 (* src/stdlib/web/httpd/native.rs inside `Switch<Http1, Tunnel>`           *)
 (* (src/stdlib/layer/switch.rs), with the `Tunnel` it switches to          *)
-(* (src/stdlib/layer/tunnel.rs).                                           *)
+(* (src/stdlib/services/stack/tunnel.rs).                                 *)
 (*                                                                         *)
 (* The client's bytes are a sequence of tokens chosen at the start: a      *)
 (* whole request ("P" keep-alive, "Q" with Connection: close, "C" CONNECT, *)
@@ -14,27 +14,28 @@
 (* Sizes are in tokens: the request decoder's buffer holds StreamCap of    *)
 (* them, the tunnel takes a chunk while it holds fewer than TunnelRoom.    *)
 (*                                                                         *)
-(* Source, by action (line numbers at commit 50b69c60d):                   *)
-(*   Chunk, ClientEnd     the peer and the driver below (live.rs:227-240)  *)
-(*   OfferData, OfferEnd  Http1::on_event (native.rs:731-788); after the   *)
+(* Source, by action (written at 50b69c60d; line numbers of the merged    *)
+(* foundation, where only imports and the bare-101 close changed):        *)
+(*   Chunk, ClientEnd     the peer and the driver below (stack/live.rs:202-221)*)
+(*   OfferData, OfferEnd  Http1::on_event (native.rs:732-789); after the   *)
 (*                        switch Switch::on_event (switch.rs:128-143) and  *)
-(*                        Tunnel::on_event (tunnel.rs:128-152)             *)
-(*   Read                 Http1::advance in Reading (native.rs:871) ->     *)
-(*                        Http1::read (native.rs:309-373), dispatch        *)
-(*                        (native.rs:377-457), fail (native.rs:460-507)    *)
-(*   Make                 Work::poll and Http1::on_done (native.rs:820-863)*)
-(*   Respond              Http1::respond (native.rs:510-558), start        *)
-(*                        (native.rs:562-604), piece (native.rs:607-615),  *)
-(*                        finish (native.rs:619-632), hand_on              *)
-(*                        (native.rs:636-654), all_written (native.rs:275) *)
+(*                        Tunnel::on_event (tunnel.rs:129-153)             *)
+(*   Read                 Http1::advance in Reading (native.rs:872) ->     *)
+(*                        Http1::read (native.rs:310-374), dispatch        *)
+(*                        (native.rs:378-458), fail (native.rs:461-508)    *)
+(*   Make                 Work::poll and Http1::on_done (native.rs:821-864)*)
+(*   Respond              Http1::respond (native.rs:511-559), start        *)
+(*                        (native.rs:563-605), piece (native.rs:608-616),  *)
+(*                        finish (native.rs:620-633), hand_on              *)
+(*                        (native.rs:637-655), all_written (native.rs:276) *)
 (*   Abort                on_timer, over_budget and a failed work: close   *)
-(*                        (native.rs:280-306, 813-818, 858-861)            *)
-(*   TakeCommand          Http1::take_command (native.rs:881-888)          *)
-(*   Written              StreamEvent::Written (native.rs:774-777)         *)
+(*                        (native.rs:281-307, 814-819, 859-862)            *)
+(*   TakeCommand          Http1::take_command (native.rs:882-889)          *)
+(*   Written              StreamEvent::Written (native.rs:775-778)         *)
 (*   Handover             Switch::advance in First (switch.rs:195-205) ->  *)
-(*                        Http1::handover (native.rs:906-917)              *)
+(*                        Http1::handover (native.rs:907-918)              *)
 (*   FeedBelow            Switch::advance in Then (switch.rs:207-224)      *)
-(*   TunnelRead           TunnelConn::poll_read (tunnel.rs:240-267)        *)
+(*   TunnelRead           TunnelConn::poll_read (tunnel.rs:241-268)        *)
 (*                                                                         *)
 (* Each flag is a rule of the code; a *_without_<flag>.cfg turns one off   *)
 (* and names the property TLC must then find violated.                     *)
@@ -48,15 +49,15 @@ CONSTANTS
     TunnelRoom,   \* the tunnel takes a chunk while it holds fewer
     MaxChunk,     \* the most tokens in one chunk from below
     Bodies,       \* response sizes after the head, in pieces
-    WaitWritten,          \* all_written waits for Written (native.rs:276)
-    ReadOnlyInReading,    \* advance reads only in Reading (native.rs:871)
-    KeepUnread,           \* hand_on passes the unread bytes (native.rs:638-646)
-    LeftoverInSwitching,  \* Data while Switching joins the leftover (native.rs:747-749)
-    EndLast,              \* hand_on puts the peer's end last (native.rs:650-652)
-    HandOverAfterWritten, \* handover only once Switching (native.rs:907)
+    WaitWritten,          \* all_written waits for Written (native.rs:277)
+    ReadOnlyInReading,    \* advance reads only in Reading (native.rs:872)
+    KeepUnread,           \* hand_on passes the unread bytes (native.rs:639-647)
+    LeftoverInSwitching,  \* Data while Switching joins the leftover (native.rs:748-750)
+    EndLast,              \* hand_on puts the peer's end last (native.rs:651-653)
+    HandOverAfterWritten, \* handover only once Switching (native.rs:908)
     LeftoverFirst,        \* Switch blocks new input behind leftovers (switch.rs:138)
     FeedLeftovers,        \* Switch feeds a leftover on each advance (switch.rs:211-216)
-    CloseAfterBare101     \* a 101 without an UpgradeHandler closes (native.rs:576-580, b69a3806f)
+    CloseAfterBare101     \* a 101 without an UpgradeHandler closes (native.rs:577-581, b69a3806f)
 
 Tokens == 1..L
 None == "none"
@@ -68,7 +69,7 @@ Run(a, n) == [j \in 1..n |-> a + j]
 (* A response as the handler gives it. `hands`: a 101, or a 2xx to       *)
 (* CONNECT, carrying an UpgradeHandler, which sets `next` in start.      *)
 (* `close`: what dispatch and encode decide; CONNECT never keeps the     *)
-(* connection alive (native.rs:389) unless it hands on (native.rs:575).  *)
+(* connection alive (native.rs:390) unless it hands on (native.rs:576).  *)
 (* `s101`: the status is 101.                                            *)
 Resp(body, making, hands, close, s101) ==
     [left |-> 1 + body, making |-> making, hands |-> hands,
@@ -112,7 +113,7 @@ AfterLen == LET F[i \in 0..Len(after)] ==
                     IF i = 0 THEN 0 ELSE F[i - 1] + Len(after[i])
             IN F[Len(after)]
 
-(* native.rs:275-277 *)
+(* native.rs:276-278 *)
 AllWritten == out = <<>> /\ (~WaitWritten \/ written >= handed)
 
 Init ==
@@ -128,7 +129,7 @@ Init ==
     /\ badRead = FALSE /\ badHandover = FALSE /\ handPos = 0
     /\ head101 = FALSE /\ readAfter101 = FALSE
 
-(* close (native.rs:280-299): what is queued is written, then End. *)
+(* close (native.rs:281-300): what is queued is written, then End. *)
 Close ==
     IF phase \in {"Closing", "Closed"}
     THEN UNCHANGED <<phase, out, resp, next>>
@@ -153,7 +154,7 @@ ClientEnd ==
     /\ clientEnd' = TRUE /\ endSent' = TRUE
     /\ UNCHANGED <<wire, sent, cur, http, tunnel, history>>
 
-(* Tunnel::on_event, Data (tunnel.rs:136-145): taken whole while it holds *)
+(* Tunnel::on_event, Data (tunnel.rs:137-146): taken whole while it holds *)
 (* less than its room; refused once the stream ended.                     *)
 TunnelTakes(d) ==
     /\ Len(inbound) < TunnelRoom \/ tEnded
@@ -162,7 +163,7 @@ TunnelTakes(d) ==
        ELSE /\ inbound' = inbound \o d
             /\ tIn' = tIn \o d
 
-(* Http1::on_event, Data (native.rs:740-773). *)
+(* Http1::on_event, Data (native.rs:741-774). *)
 HttpData ==
     \/ /\ phase \in {"Closing", "Closed"} \/ peerEnded
        /\ cur' = <<>>
@@ -203,7 +204,7 @@ OfferData ==
             /\ UNCHANGED <<http, switched, below, tEnded>>
     /\ UNCHANGED <<wire, sent, clientEnd, endSent, history>>
 
-(* Http1::on_event, Ended (native.rs:778-787); Tunnel::on_event, Ended. *)
+(* Http1::on_event, Ended (native.rs:779-788); Tunnel::on_event, Ended. *)
 OfferEnd ==
     /\ clientEnd /\ cur = <<>>
     /\ clientEnd' = FALSE
@@ -224,7 +225,7 @@ OfferEnd ==
 -----------------------------------------------------------------------------
 (* Http1 *)
 
-(* Http1::read (native.rs:309-373), one request at a time. A request is *)
+(* Http1::read (native.rs:310-374), one request at a time. A request is *)
 (* read whole: Head, Body and Done. *)
 Read ==
     /\ ~switched
@@ -238,7 +239,7 @@ Read ==
        \/ /\ ~closeNext /\ buf # <<>>
           /\ LET t == Head(buf) IN
              IF wire[t] = "X"
-             THEN \* fail (native.rs:491-506): a 400, then close.
+             THEN \* fail (native.rs:492-507): a 400, then close.
                   /\ sdone' = TRUE
                   /\ queued' = queued + 1
                   /\ phase' = "Closing"
@@ -258,7 +259,7 @@ Read ==
     /\ UNCHANGED <<client, eof, after, peerEnded, handed, written, leftover,
                    tunnel, respsDone, badHandover, handPos, head101>>
 
-(* The handler's later answer arrives (on_done, native.rs:828-831). *)
+(* The handler's later answer arrives (on_done, native.rs:829-832). *)
 Make ==
     /\ ~switched /\ phase = "Answering" /\ resp.on /\ resp.making
     /\ resp' = [resp EXCEPT !.making = FALSE]
@@ -266,7 +267,7 @@ Make ==
                    next, out, queued, handed, written, leftover, pos, tunnel,
                    history>>
 
-(* hand_on (native.rs:636-654): the unread bytes, the bytes past the end *)
+(* hand_on (native.rs:637-655): the unread bytes, the bytes past the end *)
 (* of HTTP, then the peer's end. *)
 Unread == IF KeepUnread /\ buf # <<>> THEN <<[t |-> "data", d |-> buf]>> ELSE <<>>
 Afters == [i \in 1..Len(after) |-> [t |-> "data", d |-> after[i]]]
@@ -278,19 +279,19 @@ HandOn ==
     /\ phase' = "Switching"
     /\ handPos' = pos
 
-(* Http1::respond (native.rs:510-558): one piece once the last is written. *)
+(* Http1::respond (native.rs:511-559): one piece once the last is written. *)
 Respond ==
     /\ ~switched /\ phase = "Answering" /\ resp.on /\ ~resp.making
     /\ AllWritten
     /\ IF resp.left > 0
-       THEN \* start (native.rs:567-576) sets `next` with the head; piece.
+       THEN \* start (native.rs:568-577) sets `next` with the head; piece.
             /\ out' = Append(out, "R")
             /\ queued' = queued + 1
             /\ resp' = [resp EXCEPT !.left = @ - 1, !.started = TRUE]
             /\ next' = IF ~resp.started /\ resp.hands THEN "tunnel" ELSE next
             /\ head101' = (head101 \/ (~resp.started /\ resp.s101 /\ ~resp.hands))
             /\ UNCHANGED <<phase, buf, after, leftover, respsDone, handPos>>
-       ELSE \* finish (native.rs:619-632).
+       ELSE \* finish (native.rs:620-633).
             /\ respsDone' = respsDone + 1
             /\ resp' = NoResp
             /\ IF next # None
@@ -309,7 +310,7 @@ Respond ==
 Abort ==
     /\ ~switched /\ phase \in {"Reading", "Answering"}
     /\ \/ Close
-       \/ \* over_budget (native.rs:303-306): nothing more is written.
+       \/ \* over_budget (native.rs:304-307): nothing more is written.
           /\ phase' = "Closing" /\ out' = <<"End">>
           /\ resp' = NoResp /\ next' = None
     /\ UNCHANGED <<client, buf, eof, sdone, closeNext, after, peerEnded,

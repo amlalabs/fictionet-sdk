@@ -1,23 +1,25 @@
 ------------------------------- MODULE Tunnel -------------------------------
 (***************************************************************************)
-(* The room and the charges of `layer::Tunnel` (src/stdlib/layer/tunnel.rs *)
-(* at commit 50b69c60d): the bytes it holds each way, what the code's      *)
+(* The room and the charges of `services::stack::Tunnel`                   *)
+(* (src/stdlib/services/stack/tunnel.rs; written at commit 50b69c60d, when *)
+(* it was layer/tunnel.rs, and unchanged but for its imports since): the   *)
+(* bytes it holds each way, what the code's                                *)
 (* writes are charged to the stack's budget, and what the code's reads     *)
 (* return. Sizes are units; `Room` stands for `ROOM` (64 KiB).             *)
 (*                                                                         *)
-(*   Deliver      Tunnel::on_event, Data (tunnel.rs:136-145)               *)
-(*   End, Reset   Tunnel::on_event, Ended and Reset (tunnel.rs:147-148)    *)
-(*   Read         TunnelConn::poll_read (tunnel.rs:240-267)                *)
-(*   Write        TunnelConn::poll_write (tunnel.rs:269-307), with         *)
+(*   Deliver      Tunnel::on_event, Data (tunnel.rs:137-146)               *)
+(*   End, Reset   Tunnel::on_event, Ended and Reset (tunnel.rs:148-149)    *)
+(*   Read         TunnelConn::poll_read (tunnel.rs:241-268)                *)
+(*   Write        TunnelConn::poll_write (tunnel.rs:270-308), with         *)
 (*                Budget::charge (layer/budget.rs:82-88)                   *)
-(*   Take         Tunnel::take_command (tunnel.rs:171-185)                 *)
+(*   Take         Tunnel::take_command (tunnel.rs:172-186)                 *)
 (*   Release      the layer below drops a chunk it took: Charge's drop     *)
 (*                (layer/budget.rs:138-142)                                *)
-(*   Shutdown     TunnelConn::poll_shutdown and its drop (tunnel.rs:309,   *)
-(*                326-331)                                                 *)
+(*   Shutdown     TunnelConn::poll_shutdown and its drop (tunnel.rs:310,   *)
+(*                327-333)                                                 *)
 (*                                                                         *)
 (* The code starts only once the budget is known (take_work,               *)
-(* tunnel.rs:191-200), so every write here is charged. Kani could not run  *)
+(* tunnel.rs:192-201), so every write here is charged. Kani could not run  *)
 (* on this code: see verification/http/README.md.                          *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
@@ -29,9 +31,9 @@ CONSTANTS
     WriteSizes,   \* sizes the code writes
     ReadSizes,    \* sizes of the code's read buffers
     MaxEvents,    \* chunks from below, and writes, in one behavior
-    CheckRoom,        \* a write takes at most the room left (tunnel.rs:285-290)
-    ChargeWrites,     \* a write is charged before it is queued (tunnel.rs:291-302)
-    AdmitBelowRoom    \* a chunk is taken only below the room (tunnel.rs:140-142)
+    CheckRoom,        \* a write takes at most the room left (tunnel.rs:286-291)
+    ChargeWrites,     \* a write is charged before it is queued (tunnel.rs:292-303)
+    AdmitBelowRoom    \* a chunk is taken only below the room (tunnel.rs:141-143)
 
 Sum(s) == LET F[i \in 0..Len(s)] == IF i = 0 THEN 0 ELSE F[i - 1] + s[i]
           IN F[Len(s)]
