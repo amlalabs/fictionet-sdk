@@ -138,11 +138,13 @@ impl Flow {
     /// they are known.
     pub fn opened(seq: u32, payload: Option<usize>) -> Flow {
         let isn = TcpSeqNumber::new(seq);
-        let payload = payload.filter(|len| *len <= i32::MAX as usize);
+        // Payload the capture does not hold, or too long to place, counts
+        // for nothing: an ACK of the SYN alone still answers it.
+        let payload = payload.filter(|len| *len <= i32::MAX as usize).unwrap_or(0);
         Flow {
             next: Some(isn + 1),
             position: 1,
-            opened: payload.map(|len| (isn + 1, isn + 1 + len)),
+            opened: Some((isn + 1, isn + 1 + payload)),
             ..Flow::midstream(seq)
         }
     }

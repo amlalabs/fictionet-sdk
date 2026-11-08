@@ -83,6 +83,8 @@ struct Watch {
     tcp: Driver<Observer>,
     number: u64,
     grant: bool,
+    /// Bytes the capture leaves off the end of the next packet.
+    cut: usize,
     handles: Vec<Child>,
     delivered: BTreeMap<(ChildId, Direction), u64>,
 }
@@ -98,6 +100,7 @@ impl Watch {
             ),
             number: 0,
             grant: true,
+            cut: 0,
             handles: Vec::new(),
             delivered: BTreeMap::new(),
         }
@@ -154,6 +157,8 @@ impl Watch {
                 original_len: packet.len(),
             }),
         };
+        let mut packet = packet;
+        packet.truncate(packet.len() - std::mem::take(&mut self.cut));
         let packet = IpPacket::observed(Chunk::new(packet), ingress);
         assert!(matches!(
             self.tcp.deliver(PacketEvent::Packet(packet)),
@@ -1040,4 +1045,26 @@ fn random_segments_keep_the_stream_rules() {
             assert_eq!(tcp.observer().buffered(), 0);
         }
     }
+}
+
+/// A packet the capture cut short gives none of its payload, so nothing
+/// is made up from the part that is there. Its SYN still opens the
+/// direction, and the SYN sent again whole is a repeat of it.
+#[test]
+fn a_packet_cut_short_gives_no_payload() {
+    let mut tcp = watch();
+    tcp.cut = 1;
+    let syn = tcp.up(100, 2, b"ab");
+    assert_eq!(syn.opened.len(), 1);
+    assert!(syn.events.is_empty());
+    let again = tcp.up(100, 2, b"ab");
+    assert!(again.opened.is_empty() && again.closed.is_empty());
+    assert_eq!(again.evs(), [&data(0, b"ab", Some(0))]);
+    tcp.cut = 2;
+    assert!(tcp.up(103, 0x18, b"cdef").events.is_empty());
+    // The same segment captured whole follows on.
+    assert_eq!(
+        tcp.up(103, 0x18, b"cdef").evs(),
+        [&data(2, b"cdef", Some(0))]
+    );
 }
