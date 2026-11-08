@@ -331,6 +331,42 @@ mod h2c {
     }
 
     #[test]
+    fn an_upgrading_body_larger_than_the_streams_window_reaches_the_handler() {
+        // The body came whole over HTTP/1, so it is larger than the credit
+        // the exchange grants at once: it must still reach the handler, in
+        // pieces, without waiting for the body deadline.
+        let body = "x".repeat(100_000);
+        let mut h = server();
+        let mut input = upgrade(&settings(&[(4, (1 << 31) - 1)]), &body);
+        input.extend(preface());
+        h.push(&input).unwrap();
+        let (head, output) = split(&h.take_output());
+        assert!(
+            head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+            "{head}"
+        );
+        let streams = per_stream(&output);
+        let stream = streams.get(&1).expect("an answer on stream 1");
+        assert_eq!(field(&stream.blocks[0], ":status"), Some(&b"200"[..]));
+        let mut echoed = stream.data.clone();
+        // The connection's send window holds back the rest of the echo.
+        h.push(
+            &http2::WindowUpdate {
+                stream: 0,
+                flags: 0,
+                increment: 1 << 20,
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .unwrap();
+        let streams = per_stream(&frames(&h.take_output()));
+        echoed.extend_from_slice(&streams[&1].data);
+        assert!(streams[&1].ended);
+        assert_eq!(echoed, body.as_bytes());
+    }
+
+    #[test]
     fn invalid_settings_keep_the_request_on_http1() {
         for settings in [
             // Not base64url.
