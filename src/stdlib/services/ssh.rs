@@ -15,20 +15,20 @@ use std::time::Duration;
 
 use super::stack;
 use crate::Cx;
-use crate::stdlib::codec::{Stream, Wire};
+use crate::stdlib::codec::Wire;
 use crate::stdlib::layer::{
     Admit, Budget, ByteStream, Chain, Charge, ChildId, Children, Chunk as Bytes, Env, Layer, Mux,
     MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand, StreamEvent, Timers, Top,
 };
-use crate::stdlib::protocols::ssh::transport::{
-    HostKey, Transport, TransportError, TransportEvent,
-};
+use crate::stdlib::protocols::ssh::transport::{HostKey, TransportError};
 use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
 use crate::stdlib::world::net::{Arrival, PortServer};
 use crate::time::Instant;
 use fictionet::stdlib::network::ConnInfo;
 
 pub mod channel;
+pub mod transport;
+use transport::{PacketTransport, StandardTransport, State as TransportState};
 mod session;
 use channel::{ChannelCommand, ChannelEvent, ChannelPort, Opening};
 pub use session::SessionLayer;
@@ -503,13 +503,45 @@ pub struct Server<H: Handler> {
     /// Optional listener backlog.
     pub backlog: Option<usize>,
 }
-impl<H: Handler> PortServer for Server<H> {
-    fn backlog(&self) -> Option<usize> {
-        self.backlog
+/// Construction context for one transport, before any input is admitted.
+pub struct TransportOpening<'a> {
+    /// Shared defaults; a replacement may supply its own transport policy.
+    pub config: &'a Config,
+    /// Identity and addresses of the accepted connection.
+    pub connection: &'a ConnInfo,
+    /// Shared connection allocation budget.
+    pub budget: &'a Budget,
+    /// Carrier idle and write deadlines.
+    pub limits: stack::StreamLimits,
+    /// Simulation time at arrival.
+    pub now: Instant,
+    /// Absolute authentication deadline.
+    pub login_deadline: Instant,
+}
+
+/// A server with a caller-supplied transport factory and standard sessions.
+pub struct WithTransport<H: Handler, F> {
+    server: Server<H>,
+    factory: F,
+}
+impl<H: Handler> Server<H> {
+    /// Install a fresh transport per arrival, retaining Handler and Children.
+    pub fn with_transport<T: PacketTransport, F>(self, factory: F) -> WithTransport<H, F>
+    where
+        F: Fn(&TransportOpening<'_>) -> T + Send + Sync + 'static,
+    {
+        WithTransport {
+            server: self,
+            factory,
+        }
     }
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_with<T: PacketTransport>(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+        factory: impl FnOnce(&TransportOpening<'_>) -> T,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let info = Arc::new(arrival.info);
-        let layer = Ssh::new(self.config.clone(), self.handler.clone(), info.clone()).sessions();
         let handler = self.handler.clone();
         let budget = self
             .budget
@@ -517,6 +549,22 @@ impl<H: Handler> PortServer for Server<H> {
             .or(arrival.budget)
             .unwrap_or_else(Budget::unlimited);
         let limits = self.limits;
+        let now = fcx.now();
+        let transport = factory(&TransportOpening {
+            config: &self.config,
+            connection: &info,
+            budget: &budget,
+            limits,
+            now,
+            login_deadline: now + self.config.login_grace,
+        });
+        let layer = Ssh::with_transport(
+            self.config.clone(),
+            handler.clone(),
+            info.clone(),
+            transport,
+        )
+        .sessions();
         Box::pin(async move {
             let mut protocol_end = Ended::Eof;
             let result =
@@ -548,6 +596,28 @@ impl<H: Handler> PortServer for Server<H> {
                 &Event::End(end),
             );
         })
+    }
+}
+
+impl<H: Handler> PortServer for Server<H> {
+    fn backlog(&self) -> Option<usize> {
+        self.backlog
+    }
+    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.serve_with(fcx, arrival, |opening| {
+            StandardTransport::new(opening.config)
+        })
+    }
+}
+impl<H: Handler, T: PacketTransport, F> PortServer for WithTransport<H, F>
+where
+    F: Fn(&TransportOpening<'_>) -> T + Send + Sync + 'static,
+{
+    fn backlog(&self) -> Option<usize> {
+        self.server.backlog
+    }
+    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.server.serve_with(fcx, arrival, &self.factory)
     }
 }
 
@@ -612,11 +682,11 @@ struct Flight {
 /// [`Children`] directly for another channel application, or use [`Self::sessions`].
 /// Host configuration and synchronous policy callback allocations belong to the
 /// caller. Bounded transport parsing storage is reserved before decoding.
-pub struct Ssh<H: Handler> {
+pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     config: Arc<Config>,
     handler: Arc<H>,
     connection: Arc<ConnInfo>,
-    stream: Stream<Transport>,
+    transport: T,
     timers: Timers<Timer>,
     started: bool,
     ended: bool,
@@ -644,21 +714,31 @@ pub struct Ssh<H: Handler> {
 }
 
 /// SSH with one synchronous application adapter on every scoped channel.
-pub type Sessions<H> = Chain<Ssh<H>, Children<SessionLayer<H>, Top, Owned<Opening>>>;
+pub type Sessions<H, T = StandardTransport> =
+    Chain<Ssh<H, T>, Children<SessionLayer<H>, Top, Owned<Opening>>>;
 
 impl<H: Handler> Ssh<H> {
     /// A fresh SSH layer with explicit connection identity.
     pub fn new(config: Arc<Config>, handler: Arc<H>, connection: Arc<ConnInfo>) -> Self {
-        let stream = Stream::new(Transport::new(
-            config.host_key.clone(),
-            config.identification.clone(),
-        ));
+        let transport = StandardTransport::new(&config);
+        Self::with_transport(config, handler, connection, transport)
+    }
+}
+impl<H: Handler, T: PacketTransport> Ssh<H, T> {
+    /// Compose a transport with the standard authentication and channel layer.
+    /// With sessions the stack is `Chain<Ssh<H, T>, Children<SessionLayer<H>, Top, Owned<Opening>>>`.
+    pub fn with_transport(
+        config: Arc<Config>,
+        handler: Arc<H>,
+        connection: Arc<ConnInfo>,
+        transport: T,
+    ) -> Self {
         let limit = config.max_channels;
         Self {
             config,
             handler,
             connection,
-            stream,
+            transport,
             timers: Timers::new(),
             started: false,
             ended: false,
@@ -686,7 +766,7 @@ impl<H: Handler> Ssh<H> {
         }
     }
     /// Run the configured Handler and Session policy on each channel.
-    pub fn sessions(self) -> Sessions<H> {
+    pub fn sessions(self) -> Sessions<H, T> {
         let handler = self.handler.clone();
         let connection = self.connection.clone();
         let limit = self.config.max_channels;
@@ -709,7 +789,7 @@ impl<H: Handler> Ssh<H> {
         }
     }
     fn resident_bytes(&self) -> usize {
-        self.stream.limit() + self.stream.held() + 6 * ssh::MAX_PAYLOAD
+        self.transport.resident_bytes() + 6 * ssh::MAX_PAYLOAD
     }
     fn scratch(&mut self) -> Result<(), Error> {
         // A name list may expand a two-byte wire name into a String and its
@@ -752,8 +832,7 @@ impl<H: Handler> Ssh<H> {
         if self.out.len() + ssh::MAX_PACKET > self.out.capacity() {
             return Err(TransportError::State.into());
         }
-        self.stream
-            .decoder()
+        self.transport
             .write_packet(payload, &mut self.out)
             .map_err(Error::Protocol)
     }
@@ -778,8 +857,7 @@ impl<H: Handler> Ssh<H> {
         description: &str,
     ) -> Result<(), Error> {
         self.output(env)?;
-        self.stream
-            .decoder()
+        self.transport
             .disconnect(reason, description, &mut self.out)?;
         self.close(env, Ended::Closed);
         Ok(())
@@ -839,10 +917,12 @@ impl<H: Handler> Ssh<H> {
         }
         let verified = request
             .verify_public_key(
-                self.stream
-                    .decoder()
-                    .session_id()
-                    .ok_or(TransportError::State)?,
+                match self.transport.state() {
+                    TransportState::Established { session_id, .. }
+                    | TransportState::Rekeying { session_id } => Some(session_id),
+                    TransportState::Pending => None,
+                }
+                .ok_or(TransportError::State)?,
                 payload,
             )
             .unwrap_or(false);
@@ -1218,17 +1298,13 @@ impl<H: Handler> Ssh<H> {
             self.output(env)?;
             let mut seed = [0; 32];
             env.entropy().fill_random(&mut seed);
-            self.stream.decoder().seed(seed)?;
-            if let Some(proposal) = &self.config.proposal {
-                self.stream.decoder().set_proposal(proposal.clone())?;
-            }
-            self.stream.decoder().start_identification(&mut self.out)?;
+            self.transport.start(seed, &mut self.out)?;
             self.timers
                 .set(Timer::Login, env.now() + self.config.login_grace);
             self.started = true;
             return Ok(true);
         }
-        if !self.stream.decoder().is_rekeying() {
+        if matches!(self.transport.state(), TransportState::Established { .. }) {
             if self.failure_ready {
                 if let Some(failure) = self.failure.take() {
                     self.write(env, &failure)?;
@@ -1306,27 +1382,19 @@ impl<H: Handler> Ssh<H> {
                 }
                 return Ok(true);
             }
-            if self.stream.decoder().needs_rekey() {
+            if self.transport.needs_rekey() {
                 self.output(env)?;
-                self.stream.decoder().rekey(&mut self.out)?;
+                self.transport.rekey(&mut self.out)?;
                 return Ok(true);
             }
         }
-        if self.stream.buffered() > 0 {
-            self.scratch()?;
-        }
-        let Some(event) = self.stream.next() else {
-            if self.stream.is_done() {
-                self.close(env, Ended::Eof);
-                return Ok(true);
-            }
-            return Ok(false);
-        };
-        let event = match event {
-            Ok(event) => event,
+        self.scratch()?;
+        self.output(env)?;
+        let event = match self.transport.poll(&mut self.out) {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(false),
             Err(_) => {
-                self.output(env)?;
-                self.stream.decoder().disconnect(
+                self.transport.disconnect(
                     ssh::DisconnectReason::ProtocolError,
                     "Invalid SSH packet",
                     &mut self.out,
@@ -1336,23 +1404,19 @@ impl<H: Handler> Ssh<H> {
             }
         };
         match &event {
-            TransportEvent::Version(version) => self
+            transport::Event::Version(version) => self
                 .handler
                 .observe(&self.context(env.now()), &Event::Version(version.clone())),
-            TransportEvent::Packet { payload, .. } if payload.first() == Some(&20) => {
-                if let ssh::Message::KexInit(proposal) = ssh::Message::parse(payload)? {
-                    self.handler
-                        .observe(&self.context(env.now()), &Event::KexInit(proposal));
-                }
+            transport::Event::Proposal(proposal) => self
+                .handler
+                .observe(&self.context(env.now()), &Event::KexInit(proposal.clone())),
+            transport::Event::End => {
+                self.close(env, Ended::Eof);
+                return Ok(true);
             }
             _ => {}
         }
-        let sequence = match &event {
-            TransportEvent::Packet { sequence, .. } => *sequence,
-            _ => 0,
-        };
-        self.output(env)?;
-        if let Some(payload) = self.stream.decoder().handle(event, &mut self.out)? {
+        if let transport::Event::Packet { sequence, payload } = event {
             if payload.first() == Some(&1) {
                 self.close(env, Ended::Closed);
                 return Ok(true);
@@ -1376,7 +1440,7 @@ impl<H: Handler> Ssh<H> {
     }
 }
 
-impl<H: Handler> Layer for Ssh<H> {
+impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
     fn report_bytes(_: &Ended) -> Option<usize> {
         Some(0)
     }
@@ -1414,7 +1478,7 @@ impl<H: Handler> Layer for Ssh<H> {
                     return Ok(Admit::Closed(StreamEvent::Data(data)));
                 }
                 self.reserve(env)?;
-                let n = self.stream.push(&data);
+                let n = self.transport.push(&data);
                 data.advance(n);
                 if !data.is_empty() {
                     return Ok(if n == 0 {
@@ -1424,7 +1488,7 @@ impl<H: Handler> Layer for Ssh<H> {
                     });
                 }
             }
-            StreamEvent::Ended => self.stream.end(),
+            StreamEvent::Ended => self.transport.end(),
             StreamEvent::Reset => {
                 self.close(env, Ended::Conn(crate::stdlib::network::ConnError::Reset))
             }
@@ -1466,7 +1530,7 @@ impl<H: Handler> Layer for Ssh<H> {
         }
         if !self.out.is_empty()
             || self.up.len() >= 4
-            || self.stream.decoder().is_rekeying()
+            || !matches!(self.transport.state(), TransportState::Established { .. })
             || self.flights.len() >= 120
         {
             return Ok(Admit::Blocked(command));
@@ -1645,7 +1709,7 @@ impl<H: Handler> Layer for Ssh<H> {
         Ok(())
     }
 }
-impl<H: Handler> Ssh<H> {
+impl<H: Handler, T: PacketTransport> Ssh<H, T> {
     fn channel_write(
         &mut self,
         env: &Env<'_, Ended>,

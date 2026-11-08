@@ -174,6 +174,10 @@ impl<D: Decode> Stream<D> {
     pub fn failed(&self) -> Option<&Fail<D::Error>> {
         self.failed.as_ref()
     }
+    /// Inspect decoder state without changing the input boundary.
+    pub fn get_ref(&self) -> &D {
+        &self.dec
+    }
     /// Access to mode changes between items. A raised capacity raises the
     /// buffer limit before the next push, spare offer, or decode.
     pub fn decoder(&mut self) -> &mut D {
