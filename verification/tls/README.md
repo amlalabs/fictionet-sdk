@@ -2,8 +2,8 @@
 
 The TLA+ models of the server TLS layer (`tla/Layer.tla`, for
 `src/stdlib/services/tls/layer.rs` as `Driver` and `Harness` drive it) and
-of write cancellation in the live adapter (`tla/Write.tla`, for
-`TlsConnection::poll_write` in `src/stdlib/services/tls.rs`), the Kani
+of write cancellation in the live connection (`tla/Write.tla`, for
+`Opened::poll_write` in `src/stdlib/services/stack/open.rs`), the Kani
 proofs over the layer's write accounting (`kani/LayerProof.rs`), and the
 tests that the crypto provider draws only from the entropy it was given
 (`entropy.rs`). What each covers, what it leaves out, and the two bugs it
@@ -39,7 +39,7 @@ that drop one rule and name the one property TLC must then violate
 | `Write_without_matchcontent.cfg` | a retry credited whatever its bytes: violates `ConfirmedIsTheCallers` |
 | `Write_without_takepending.cfg` | the earlier write kept after it is settled: violates `ConfirmedOnce` |
 | `Write_without_rememberwrite.cfg` | no `pending_write`: violates `NoDuplicate` |
-| `Write_without_flushcredits.cfg` | a Ready flush that has not credited: violates `NoHang` |
+| `Write_without_pumpfirst.cfg` | `poll_write` looks at the earlier write before it runs the stack: violates `NoHang` |
 
 Run one with TLC (Java 11 or later and `tla2tools.jar`):
 

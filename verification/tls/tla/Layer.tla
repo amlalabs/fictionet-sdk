@@ -12,10 +12,18 @@
 (* with the peer's next bytes in each phase. Bytes are units: a record of  *)
 (* m plaintext units is m + Overhead ciphertext units, and one CHUNK is    *)
 (* Chunk units, so a record can span two chunks as a 16 KiB record does.   *)
+(*                                                                         *)
+(* The hello work is the layer's `Pick` job (layer.rs:61-90): the world    *)
+(* takes it and answers with a config or a refusal, whenever it likes.     *)
+(* The handshake deadline is a timer that may go off at any moment before  *)
+(* the handshake is done (Timeout). The credit `take_event` hands up is    *)
+(* also what `take_urgent` (layer.rs:630-632) hands up when a `Chain` or   *)
+(* the `Driver` takes it past a refused event: both take the same counter  *)
+(* whole, so UpperTakes is either.                                         *)
 EXTENDS Integers
 
 CONSTANTS
-  Chunk,      \* CHUNK (layer.rs:14) in units
+  Chunk,      \* CHUNK (layer.rs:20) in units
   Overhead,   \* ciphertext units a record adds to its plaintext
   MaxWrite,   \* the largest Write the application offers, in units
   MaxPlain,   \* the most plaintext one record from the peer carries
@@ -24,21 +32,22 @@ CONSTANTS
   \* Each flag is the code as it is when TRUE. A config that sets one to
   \* FALSE names the property TLC must then violate.
   QuietAfterClose, \* rustls queues nothing once close_notify is sent (fix 1, rustls common_state.rs)
-  DropLateDone,    \* on_done of a failed layer sends nothing (fix 2, layer.rs:394)
-  CheckWritten,    \* on_event refuses a Written larger than what is out (layer.rs:225)
+  DropLateDone,    \* on_done of a failed layer sends nothing (fix 2, layer.rs:473-476)
+  CheckWritten,    \* on_event refuses a Written larger than what is out (layer.rs:308)
   CarrierRepeats,  \* the carrier may report a byte it never took (a broken carrier)
-  CountProduced,   \* advance counts every chunk it hands below in `produced` (layer.rs:479)
-  Fence,           \* credit waits until `delivered` reaches the fence (layer.rs:200)
-  TakeCredit,      \* take_event takes the credit it hands up (layer.rs:542)
-  CheckHandshake,  \* on_command blocks a Write while handshaking (layer.rs:355)
-  CheckClosing,    \* on_command refuses everything once closing (layer.rs:341)
-  EndAfterDrain,   \* advance sends End only when no output is pending (layer.rs:522)
-  EndOnce,         \* advance sends End once (`end_sent`, layer.rs:522)
-  AbortClears,     \* abort drops the queued output (layer.rs:177, 180)
-  CreditOnWritten, \* a Written calls credit_written (layer.rs:231)
-  ClearAlert,      \* advance drops a fully written alert (layer.rs:476)
-  ReadAfterClose,  \* advance still reads plaintext after close_notify is queued (layer.rs:491)
-  RustlsHoldsEarlyData \* rustls's reader yields nothing before the handshake ends (an assumption)
+  CountProduced,   \* advance counts every chunk it hands below in `produced` (layer.rs:562)
+  Fence,           \* credit waits until `delivered` reaches the fence (layer.rs:283)
+  TakeCredit,      \* take_event takes the credit it hands up (layer.rs:625, 631)
+  CheckHandshake,  \* on_command blocks a Write while handshaking (layer.rs:438)
+  CheckClosing,    \* on_command refuses everything once closing (layer.rs:424)
+  EndAfterDrain,   \* advance sends End only when no output is pending (layer.rs:605)
+  EndOnce,         \* advance sends End once (`end_sent`, layer.rs:605-606)
+  AbortClears,     \* abort drops the queued output (layer.rs:260, 263)
+  CreditOnWritten, \* a Written calls credit_written (layer.rs:314)
+  ClearAlert,      \* advance drops a fully written alert (layer.rs:559)
+  ReadAfterClose,  \* advance still reads plaintext after close_notify is queued (layer.rs:574)
+  RustlsHoldsEarlyData, \* rustls's reader yields nothing before the handshake ends (an assumption)
+  HandshakeDeadline \* the layer has a handshake deadline (handshake_by, layer.rs:159-162) that may pass
 
 ASSUME Chunk \in Nat \ {0} /\ Overhead \in Nat \ {0} /\ MaxWrite \in Nat \ {0}
 ASSUME MaxPlain \in Nat \ {0} /\ MaxInputs \in Nat /\ MaxCmds \in Nat
@@ -58,7 +67,7 @@ Phases == {"init", "acceptor", "accepted", "hs", "open", "none"}
 (*   none      all None again: after an error, a rejection or abort     *)
 
 Init ==
-  s = [ \* TlsLayer (layer.rs:48-74)
+  s = [ \* TlsLayer (layer.rs:108-136)
         ph |-> "init", hello |-> FALSE, work |-> FALSE,
         alert |-> "no",          \* None, or Some before ("pending") and after ("written") its bytes
         reject |-> FALSE, fb |-> "unset", failure |-> FALSE, failed |-> FALSE,
@@ -116,25 +125,25 @@ CloseNotify(t) == IF t.sentFatal THEN t ELSE [Append(t, 1) EXCEPT !.sentFatal = 
 -----------------------------------------------------------------------------
 (* TlsLayer *)
 
-Handshaking(t) == t.ph # "open"                           \* is_handshaking, layer.rs:120
+Handshaking(t) == t.ph # "open"                           \* is_handshaking, layer.rs:202
 
-OutputPending(t) ==                                       \* output_pending, layer.rs:140
+OutputPending(t) ==                                       \* output_pending, layer.rs:222
   \/ t.below.k # "none"
   \/ t.produced # t.delivered
   \/ t.alert # "no"
   \/ t.reject
   \/ WantsWrite(t)
 
-Fail(t) ==                                                \* fail, layer.rs:148
+Fail(t) ==                                                \* fail, layer.rs:230
   IF t.failed THEN t ELSE [t EXCEPT !.failure = TRUE, !.failed = TRUE, !.closing = TRUE]
 
-CreditWritten(t) ==                                       \* credit_written, layer.rs:199
+CreditWritten(t) ==                                       \* credit_written, layer.rs:282
   IF (IF Fence THEN t.fence # -1 /\ t.delivered >= t.fence ELSE t.pend # 0)
   THEN [t EXCEPT !.credit = @ + t.pend, !.pend = 0, !.fence = -1, !.gEnd = -1,
                  !.early = @ \/ (t.pend > 0 /\ ~(t.gEnd # -1 /\ t.delivered >= t.gEnd))]
   ELSE t
 
-Abort(t) ==                                               \* abort, layer.rs:171
+Abort(t) ==                                               \* abort, layer.rs:253
   [t EXCEPT !.reset = TRUE, !.inEnded = TRUE, !.closing = TRUE, !.work = FALSE,
             !.above = None,
             !.below = IF AbortClears THEN None ELSE @,
@@ -147,7 +156,7 @@ Abort(t) ==                                               \* abort, layer.rs:171
             !.delivered = t.produced, !.pend = 0, !.fence = -1, !.credit = 0,
             !.lost = @ + t.pend + t.credit, !.gEnd = -1]
 
-\* The output arm of advance, layer.rs:455-490.
+\* The output arm of advance, layer.rs:538-573.
 Produce(t) ==
   LET n  == IF t.reject THEN 1                          \* UNRECOGNIZED_NAME
             ELSE IF t.alert = "pending" THEN 1          \* AcceptedAlert::write
@@ -175,7 +184,7 @@ Produce(t) ==
 
 Readable(t) == t.plain > 0 \/ t.peerClose \/ t.eof
 
-\* The plaintext arm of advance, layer.rs:496-518: reader().into_first_chunk()
+\* The plaintext arm of advance, layer.rs:579-601: reader().into_first_chunk()
 Read(t) ==
   IF t.plain > 0
   THEN [t EXCEPT !.above = Cmd("data", Min(t.plain, Chunk)), !.plain = @ - Min(t.plain, Chunk),
@@ -184,7 +193,7 @@ Read(t) ==
   THEN [t EXCEPT !.ended = TRUE, !.inEnded = TRUE, !.above = Cmd("ended", 0)]
   ELSE [t EXCEPT !.ended = TRUE, !.above = Cmd("ended", 0)]   \* UnexpectedEof
 
-\* One call of advance (layer.rs:416-534) that returns Ok(true) or an Err.
+\* One call of advance (layer.rs:499-617) that returns Ok(true) or an Err.
 \* A call that returns Ok(false) changes nothing and is not a step.
 AdvanceNext(t) ==
   IF t.reset
@@ -211,7 +220,7 @@ Advance ==
   /\ s' = AdvanceNext(s)
 
 -----------------------------------------------------------------------------
-(* The peer's bytes and the carrier's reports: on_event, layer.rs:217-330 *)
+(* The peer's bytes and the carrier's reports: on_event, layer.rs:300-413 *)
 
 PeerSends ==
   /\ ~s.stopped /\ s.inp = "none" /\ ~s.peerDone /\ s.ins < MaxInputs
@@ -219,18 +228,18 @@ PeerSends ==
        s' = [s EXCEPT !.inp = k, !.ins = @ + 1, !.peerDone = (k # "data"),
                       !.cReset = @ \/ k = "reset"]   \* a peer reset resets the carrier too
 
-DataBlocked(t) ==                                         \* layer.rs:265-274
+DataBlocked(t) ==                                         \* layer.rs:348-357
   \/ t.ph = "accepted" \/ t.above.k # "none" \/ t.below.k # "none"
   \/ (t.ph \in {"hs", "open"} /\ (WantsWrite(t) \/ ~WantsRead(t)))
 
 \* What the acceptor or process_new_packets makes of the next bytes.
-Accept(t, o) ==                                           \* layer.rs:305-319
+Accept(t, o) ==                                           \* layer.rs:388-402
   CASE o = "partial" -> t
     [] o = "hello"   -> [t EXCEPT !.ph = "accepted"]
     [] o = "bad"     -> Fail([t EXCEPT !.ph = "none",
                                        !.alert = IF t.fb = "hs" THEN "pending" ELSE "no"])
 
-Process(t, o) ==                                          \* layer.rs:321, process
+Process(t, o) ==                                          \* layer.rs:404, process
   CASE o = "progress"   -> t
     [] o = "done"       -> [t EXCEPT !.ph = "open"]
     [] o = "ticket"     -> Append([t EXCEPT !.ph = "open"], 1)   \* done, with a NewSessionTicket
@@ -259,9 +268,9 @@ DeliverData ==
                 s' = [Accept(t1, o) EXCEPT !.inp = rest]
        ELSE IF t0.ph \in {"hs", "open"}
        THEN \E o \in Outcomes(t0) : s' = [Process(t0, o) EXCEPT !.inp = rest]
-       ELSE s' = [t0 EXCEPT !.inp = "none"]                     \* Closed, layer.rs:291
+       ELSE s' = [t0 EXCEPT !.inp = "none"]                     \* Closed, layer.rs:374
 
-DeliverEnded ==                                           \* layer.rs:241-259
+DeliverEnded ==                                           \* layer.rs:324-342
   /\ s.inp = "ended"
   /\ ~(s.ph \in {"hs", "open"} /\ s.plain > 0)                    \* Blocked
   /\ s' = LET t == [s EXCEPT !.inEnded = TRUE, !.inp = "none"] IN
@@ -270,13 +279,13 @@ DeliverEnded ==                                           \* layer.rs:241-259
 DeliverInput ==
   /\ ~s.stopped /\ s.inp # "none"
   /\ IF s.reset \/ (s.inp # "reset" /\ (s.inEnded \/ s.failed))
-     THEN s' = [s EXCEPT !.inp = "none"]                         \* Closed, layer.rs:223, 240
+     THEN s' = [s EXCEPT !.inp = "none"]                         \* Closed, layer.rs:306, 323
      ELSE IF s.inp = "reset"
      THEN s' = [Abort(s) EXCEPT !.resetSent = TRUE, !.above = Cmd("reset", 0), !.inp = "none"]
      ELSE IF s.inp = "ended" THEN DeliverEnded
      ELSE DeliverData
 
-DeliverWritten ==                                         \* layer.rs:223-233
+DeliverWritten ==                                         \* layer.rs:306-316
   /\ ~s.stopped /\ s.unrep > 0
   /\ IF s.reset
      THEN s' = [s EXCEPT !.unrep = 0]                            \* Closed: the harness drops it
@@ -286,7 +295,7 @@ DeliverWritten ==                                         \* layer.rs:223-233
           s' = IF CreditOnWritten THEN CreditWritten(t) ELSE t
 
 -----------------------------------------------------------------------------
-(* The application above: on_command, layer.rs:332-383, and take_event *)
+(* The application above: on_command, layer.rs:415-466, and take_event *)
 
 Writes == {Cmd("write", n) : n \in 1..MaxWrite}
 
@@ -300,7 +309,7 @@ UpperCancels ==
   /\ ~s.stopped /\ s.cmd.k = "write"
   /\ s' = [s EXCEPT !.cmd = None]
 
-WriteBlocked(t) ==                                        \* layer.rs:355
+WriteBlocked(t) ==                                        \* layer.rs:438
   \/ (CheckHandshake /\ Handshaking(t))
   \/ t.pend # 0
   \/ OutputPending(t)
@@ -308,9 +317,9 @@ WriteBlocked(t) ==                                        \* layer.rs:355
 UpperCommand ==
   /\ ~s.stopped /\ s.cmd.k # "none"
   /\ IF s.cmd.k = "reset" /\ ~s.reset
-     THEN s' = [Abort(s) EXCEPT !.cmd = None]                    \* layer.rs:337
+     THEN s' = [Abort(s) EXCEPT !.cmd = None]                    \* layer.rs:420
      ELSE IF s.failed \/ s.reset \/ (s.closing /\ (CheckClosing \/ s.cmd.k # "write"))
-     THEN s' = [s EXCEPT !.cmd = None]                           \* Closed, layer.rs:341
+     THEN s' = [s EXCEPT !.cmd = None]                           \* Closed, layer.rs:424
      ELSE IF s.cmd.k = "end"
      THEN /\ ~Handshaking(s)                                     \* else Blocked
           /\ s' = [CloseNotify([s EXCEPT !.closing = TRUE]) EXCEPT !.cmd = None]
@@ -323,7 +332,7 @@ UpperCommand ==
                      !.afterClose = @ \/ s.closing,
                      !.cmd = IF s.cmd.n > m THEN Cmd("write", s.cmd.n - m) ELSE None]
 
-UpperTakes ==                                             \* take_event, layer.rs:540-545
+UpperTakes ==                                             \* take_event, layer.rs:623-628, and take_urgent, 630-632
   /\ ~s.stopped
   /\ IF s.credit # 0
      THEN s' = [s EXCEPT !.acked = @ + s.credit, !.credit = IF TakeCredit THEN 0 ELSE @]
@@ -331,7 +340,7 @@ UpperTakes ==                                             \* take_event, layer.r
           /\ s' = [s EXCEPT !.above = None]
 
 -----------------------------------------------------------------------------
-(* The world: take_work (layer.rs:547) and on_done (layer.rs:385-414) *)
+(* The world: take_work (layer.rs:634-643) and on_done (layer.rs:468-497) *)
 
 TakeWork ==
   /\ ~s.stopped /\ s.work
@@ -340,14 +349,22 @@ TakeWork ==
 Done ==
   /\ ~s.stopped /\ s.workTaken /\ ~s.doneGiven
   /\ LET t == [s EXCEPT !.doneGiven = TRUE] IN
-     IF t.ph # "accepted"
+     IF (t.failed \/ t.reset) /\ DropLateDone
+     THEN s' = t                                                 \* the fix: nothing more to send
+     ELSE IF t.ph # "accepted"
      THEN s' = [t EXCEPT !.stopped = TRUE]                       \* Err: no client hello
-     ELSE IF t.failed /\ DropLateDone
-     THEN s' = [t EXCEPT !.work = FALSE, !.ph = "none"]          \* the fix: nothing more to send
      ELSE \E o \in {"reject", "ok", "err"} :
             s' = CASE o = "reject" -> Fail([t EXCEPT !.work = FALSE, !.ph = "none", !.reject = TRUE])
                    [] o = "ok"     -> Append([t EXCEPT !.work = FALSE, !.ph = "hs"], 1)
                    [] o = "err"    -> Fail([t EXCEPT !.work = FALSE, !.ph = "none", !.alert = "pending"])
+
+\* The handshake deadline goes off (on_timer, layer.rs:645-653; `deadline`
+\* at 655-659 names it only while handshaking and not failed): the hello
+\* work is dropped and the handshake fails with no alert of its own.
+Timeout ==
+  /\ HandshakeDeadline /\ ~s.stopped
+  /\ Handshaking(s) /\ ~s.failed /\ ~s.reset
+  /\ s' = Fail([s EXCEPT !.work = FALSE, !.ph = IF s.ph = "accepted" THEN "none" ELSE @])
 
 -----------------------------------------------------------------------------
 (* The driver's held command and the carrier below *)
@@ -384,7 +401,7 @@ CarrierLies ==
 Next ==
   \/ Advance \/ PeerSends \/ DeliverInput \/ DeliverWritten
   \/ UpperOffers \/ UpperCancels \/ UpperCommand \/ UpperTakes
-  \/ TakeWork \/ Done \/ TakeCommand \/ CarrierTakes \/ CarrierLies
+  \/ TakeWork \/ Done \/ Timeout \/ TakeCommand \/ CarrierTakes \/ CarrierLies
 
 \* The driver keeps running the layer, moving its output and offering the
 \* peer's input (which may stay blocked), the carrier
@@ -448,11 +465,12 @@ OneEnd == s.ends <= 1
 \* After a reset, nothing more is written and nothing more is credited.
 ResetStops == s.reset => (s.below.k \in {"none", "reset"} /\ s.credit = 0 /\ s.pend = 0)
 
-\* When Io::poll_flush (services/tls.rs:165) returns Ready(Ok) the driver
-\* holds nothing, every completion was delivered, and the layer has no
-\* output pending. Then no accepted write is still waiting for credit.
-\* TlsConnection::poll_write returns Pending without a waker in three
-\* places (tls.rs:587, 614, 623) that this makes unreachable.
+\* Once the driver holds nothing, every completion was delivered, and the
+\* layer has no output pending, no accepted write is still waiting for
+\* credit: a write waits for credit only while its ciphertext is out, so a
+\* runner that keeps moving output and completions credits it. The
+\* replaced TlsConnection relied on this at a Ready flush; `Opened`
+\* (services/stack/open.rs) waits for the credit itself (Write.tla).
 FlushedMeansCredited ==
   (s.dbelow.k = "none" /\ s.unrep = 0 /\ ~OutputPending(s) /\ ~s.reset)
     => s.pend = 0
