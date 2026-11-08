@@ -1,11 +1,13 @@
 use super::*;
 use fictionet::Seed;
-use fictionet::stdlib::services::stack::Polling;
+use fictionet::stdlib::layer::{Harness, Switch};
+use fictionet::stdlib::services::stack::{StackError, Tunnel};
+use fictionet::time::Instant;
 
 // ---------------------------------------------------------------------------
 // The harness
 
-/// A service's replies must not depend on how the client's bytes were cut
+/// A stack's replies must not depend on how the client's bytes were cut
 /// into chunks: every split of the input gives the same output.
 #[test]
 fn replies_do_not_depend_on_chunk_boundaries() {
@@ -38,29 +40,21 @@ fn replies_do_not_depend_on_chunk_boundaries() {
             value: true,
         },
     ));
+    let plant = || {
+        Arc::new(Plant {
+            limit: 1000,
+            ..Plant::default()
+        })
+    };
     let whole = {
-        let mut h = Harness::new(
-            fictionet::Seed::from_u64(0),
-            Plc,
-            Plant {
-                limit: 1000,
-                ..Plant::default()
-            },
-        );
+        let mut h = Harness::new(Seed::from_u64(0), Plc::stack(plant()));
         h.push(&input).unwrap();
         h.output().to_vec()
     };
     assert!(!whole.is_empty());
     for a in 0..input.len() {
         for b in a..input.len() {
-            let mut h = Harness::new(
-                fictionet::Seed::from_u64(0),
-                Plc,
-                Plant {
-                    limit: 1000,
-                    ..Plant::default()
-                },
-            );
+            let mut h = Harness::new(Seed::from_u64(0), Plc::stack(plant()));
             for chunk in [&input[..a], &input[a..b], &input[b..]] {
                 h.push(chunk).unwrap();
             }
@@ -77,13 +71,13 @@ fn replies_do_not_depend_on_chunk_boundaries() {
     };
     let input = b"POST /e HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabcPOST /e HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nxy\r\n0\r\n\r\n";
     let whole = {
-        let mut h = layer::Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()))
+        let mut h = layer::Harness::new(Seed::from_u64(0), Http1::new(router()))
             .with_worker(Polling::new());
         h.push(input).unwrap();
         h.output().to_vec()
     };
     for a in 0..input.len() {
-        let mut h = layer::Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()))
+        let mut h = layer::Harness::new(Seed::from_u64(0), Http1::new(router()))
             .with_worker(Polling::new());
         h.push(&input[..a]).unwrap();
         h.push(&input[a..]).unwrap();
@@ -92,28 +86,24 @@ fn replies_do_not_depend_on_chunk_boundaries() {
 }
 
 // ---------------------------------------------------------------------------
-// The driver, over TCP
+// The runner, over TCP
 
 #[test]
-fn listen_serves_each_connection() {
-    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
+fn a_listener_serves_each_connection() {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        let opts = ServeOptions::default();
-        serve::listen(
+        line_stack::listen(
             &fcx,
             server.listen(7)?,
-            Arc::new(()),
-            || Echo,
-            opts,
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
+            StreamLimits::default(),
+            Echo::stack,
         );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
             .await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
         conn.write_all(&fcx, b"one\nlater\ntwo\n").await?;
-        // The deferred answer comes in order, between the two echoes.
+        // The answer from work comes in order, between the two echoes.
         assert_eq!(read_some(&fcx, &mut conn, 14).await, b"one\nlater\ntwo\n");
         conn.write_all(&fcx, b"quit\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 100).await, b"bye\n");
@@ -123,17 +113,11 @@ fn listen_serves_each_connection() {
 
 #[test]
 fn timers_tick_and_idle_connections_close() {
-    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
+    world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        serve::listen(
-            &fcx,
-            server.listen(1)?,
-            Arc::new(()),
-            || Ticker { ticks: 0 },
-            ServeOptions::default(),
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
-        );
+        line_stack::listen(&fcx, server.listen(1)?, StreamLimits::default(), || {
+            Lined::new(Ticker::default())
+        });
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 1))
             .await?;
@@ -141,54 +125,63 @@ fn timers_tick_and_idle_connections_close() {
         assert_eq!(read_some(&fcx, &mut conn, 100).await, b"tick\ntick\ntick\n");
         assert!(fcx.now().since_start() - started.since_start() >= Duration::from_millis(90));
 
-        let opts = ServeOptions::default().idle(Some(Duration::from_millis(100)));
-        serve::listen(
-            &fcx,
-            server.listen(2)?,
-            Arc::new(()),
-            || Echo,
-            opts,
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
-        );
+        let limits = StreamLimits {
+            idle: Some(Duration::from_millis(100)),
+            ..StreamLimits::default()
+        };
+        line_stack::listen(&fcx, server.listen(2)?, limits, Echo::stack);
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 2))
             .await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
         let started = fcx.now();
-        assert_eq!(conn.read(&fcx, &mut [0; 1]).await?, 0);
+        // The stack hears an idle client as one that ended its direction,
+        // answers that, and the connection closes.
+        assert_eq!(read_some(&fcx, &mut conn, 4).await, b"eof\n");
         assert_eq!(
             fcx.now().since_start() - started.since_start(),
             Duration::from_millis(100)
         );
+        assert_eq!(conn.read(&fcx, &mut [0; 1]).await?, 0);
         Ok(())
     });
 }
 
+/// The echo, switching to `then` on `handoff`.
+type Switching = Switch<Lined<Echo>, Tunnel>;
+
+fn switching(then: echo_stack::Then) -> Switching {
+    Switch::new(Lined::new(Echo { then: Some(then) }))
+}
+
 #[test]
-fn a_handoff_returns_the_connection_with_its_unread_bytes() {
+fn a_handover_gives_the_next_protocol_the_unread_bytes() {
     world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        let mut listener = server.listen(25)?;
         let (tx, rx) = mpsc::channel();
-        fcx.spawn(move |fcx| async move {
-            let conn = listener.accept(&fcx).await?;
-            let served = serve::connection(
-                &fcx,
-                conn,
-                ConnInfo::default(),
-                &mut Echo,
-                &(),
-                &ServeOptions::default(),
-            )
-            .await;
-            if let Ok(Served::Upgraded(Upgrade::Handoff, mut rest)) = served {
-                let _ = tx.send(rest.unread().to_vec());
+        let tx = Arc::new(Mutex::new(tx));
+        let then: echo_stack::Then = Arc::new(move || {
+            let tx = tx.clone();
+            Tunnel::new(move |fcx, mut rest| async move {
+                let mut unread = [0; 3];
+                let mut got = 0;
+                while got < unread.len() {
+                    match rest.read(&fcx, &mut unread[got..]).await {
+                        Ok(n) if n > 0 => got += n,
+                        _ => return,
+                    }
+                }
+                let _ = tx.lock().unwrap().send(unread.to_vec());
                 // What follows is the next protocol's: here, raw bytes.
-                rest.write_all(&fcx, b"upgraded\n").await?;
-            }
-            Ok(())
+                let _ = rest.write_all(&fcx, b"upgraded\n").await;
+            })
         });
+        line_stack::listen(
+            &fcx,
+            server.listen(25)?,
+            StreamLimits::default(),
+            move || switching(then.clone()),
+        );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 25))
             .await?;
@@ -204,23 +197,23 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
 
 #[test]
 fn a_connection_cap_resets_connections_past_it() {
-    fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
-        let (server, _su, client, _cu) = two_machines(&fcx);
-        serve::listen(
-            &fcx,
-            server.listen(7)?,
-            Arc::new(()),
-            || Echo,
-            ServeOptions::default(),
-            2,
-            None,
-        );
-        let to = SocketAddr::new(SERVER.into(), 7);
-        let mut a = client.connect(&fcx, to).await?;
-        let mut b = client.connect(&fcx, to).await?;
+    let addr = Ipv4Addr::new(10, 40, 0, 9);
+    world(Duration::from_secs(60), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("svc", |h| {
+                h.at(addr)
+                    .tcp_stack_with(7, StreamLimits::default(), 2, |_| Echo::stack())
+            })
+            .start(&fcx, attachments)?;
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
+        let to = SocketAddr::new(addr.into(), 7);
+        let mut a = s.tcp.connect(&fcx, to).await?;
+        let mut b = s.tcp.connect(&fcx, to).await?;
         assert_eq!(read_some(&fcx, &mut a, 6).await, b"hello\n");
         assert_eq!(read_some(&fcx, &mut b, 6).await, b"hello\n");
-        let mut c = client.connect(&fcx, to).await?;
+        let mut c = s.tcp.connect(&fcx, to).await?;
         let mut buf = [0u8; 16];
         let r = timeout(&fcx, Duration::from_secs(2), c.read(&fcx, &mut buf))
             .await
@@ -230,37 +223,40 @@ fn a_connection_cap_resets_connections_past_it() {
     });
 }
 
-#[test]
-fn datagram_answers_each_datagram() {
-    /// Answers a datagram of lines with their count.
-    struct Count;
-    datagram_fixture! {
-        Count => (Lines, AtomicUsize, Infallible);
-        decoder(self) {
-            Lines::new(64, Ending::LfOrCrlf)
-        }
-        on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> DatagramFlow {
-            let total = n.fetch_add(1, Ordering::SeqCst) + 1;
-            driver
-                .reply()
-                .extend_from_slice(format!("{total};").as_bytes());
-            Ok(DatagramFlow::Continue)
-        }
+/// Answers a datagram of lines with their count so far, in one datagram.
+struct Count {
+    seen: usize,
+    answer: Vec<u8>,
+}
+
+impl DatagramApp for Count {
+    type Timer = ();
+
+    fn line(&mut self, _: Result<Vec<u8>, LineError>, _: SocketAddr, _: &mut Sends<'_, ()>) {
+        self.seen += 1;
+        self.answer
+            .extend_from_slice(format!("{};", self.seen).as_bytes());
     }
+
+    fn finished(&mut self, from: SocketAddr, sends: &mut Sends<'_, ()>) {
+        sends.send_to(from, std::mem::take(&mut self.answer));
+    }
+}
+
+#[test]
+fn the_datagram_runner_answers_each_datagram() {
     world(Duration::from_secs(60), |fcx| async move {
         let (_s, server, _c, client) = two_machines(&fcx);
         let socket = server.bind(9)?;
         fcx.spawn(move |fcx| async move {
             let local = SocketAddr::new(SERVER.into(), 9);
-            let _ = serve::datagram(
-                &fcx,
-                socket,
-                local,
-                &mut Count,
-                &AtomicUsize::new(0),
-                &DatagramOptions::default(),
-            )
-            .await;
+            let count = Count {
+                seen: 0,
+                answer: Vec::new(),
+            };
+            let stack = Datagrammed::new(count, Some(local));
+            let budget = Budget::unlimited();
+            let _ = stack::datagrams(&fcx, socket, local, stack, budget, |_| {}).await;
             Ok(())
         });
         let mut s = client.bind(4000)?;
@@ -317,45 +313,48 @@ fn a_tower_service_runs_as_a_handler() {
     });
 }
 
-/// A decoder that skips a long run of bytes is making progress: the
-/// connection stays open, as in the harness. Before, the driver took a
-/// pass with no item for a stuck decoder and closed the connection as
-/// failed.
-#[test]
-fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
-    /// Echo on 16-byte lines.
-    struct Short;
-    service_fixture! {
-        Short => (Lines, (), Infallible);
-        decoder(self) {
-            Lines::new(16, Ending::LfOrCrlf)
-        }
-        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
-            match line {
-                Ok(line) => driver
-                    .reply()
-                    .extend_from_slice(&[line.as_slice(), b"\n"].concat()),
-                Err(_) => driver.reply().extend_from_slice(b"long\n"),
-            }
-            Ok(Flow::Continue)
-        }
+/// Echo on 16-byte lines.
+struct Short;
+
+impl LineApp for Short {
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn max_line(&self) -> usize {
+        16
     }
+
+    fn line(
+        &mut self,
+        line: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
+        match line {
+            Ok(line) => out.write(&[line.as_slice(), b"\n"].concat()),
+            Err(_) => out.write(b"long\n"),
+        }
+        Ok(())
+    }
+}
+
+/// A reader that skips a long run of bytes is making progress: the
+/// connection stays open, in the harness and over TCP.
+#[test]
+fn a_reader_that_skips_a_long_line_keeps_the_connection_open() {
     let mut input = vec![b'x'; 100];
     input.extend_from_slice(b"\nok\n");
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Short, ());
-    assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
-    assert!(!h.closed());
-    fictionet_test_support::world::world(Duration::from_secs(60), move |fcx| async move {
+    let mut h = Harness::new(Seed::from_u64(0), Lined::new(Short));
+    h.push(&input).unwrap();
+    assert_eq!(h.output(), b"long\nok\n");
+    assert!(!h.ended() && !h.input_closed());
+    world(Duration::from_secs(60), move |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        serve::listen(
-            &fcx,
-            server.listen(7)?,
-            Arc::new(()),
-            || Short,
-            ServeOptions::default(),
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
-        );
+        line_stack::listen(&fcx, server.listen(7)?, StreamLimits::default(), || {
+            Lined::new(Short)
+        });
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
             .await?;
@@ -365,101 +364,113 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     });
 }
 
-/// The harness runs deferred work and reports an upgrade, as the driver
-/// does. Before, it dropped the work and took an upgrade for a close.
+/// The harness runs a stack's work, and a switch runs the protocol the
+/// stack handed over to, with the bytes read past the handover.
 #[test]
-fn the_harness_runs_deferred_work_and_reports_upgrades() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
-    let got = h.push(b"one\nlater\ntwo\n");
-    assert_eq!(
-        got.as_deref().map(String::from_utf8_lossy).unwrap(),
-        "hello\none\nlater\ntwo\n"
-    );
-    assert!(matches!(
-        h.push(b"handoff\nrest"),
-        Err(HarnessError::Upgraded(Upgrade::Handoff))
-    ));
-    assert_eq!(h.upgraded(), Some(Upgrade::Handoff));
-    assert!(!h.closed());
+fn the_harness_runs_work_and_switches_protocols() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let then: echo_stack::Then = Arc::new(|| {
+            Tunnel::new(|fcx, rest| async move {
+                // The next protocol keeps the connection.
+                let _ = fcx.cancelled().await;
+                drop(rest);
+            })
+        });
+        let mut h = Harness::new(Seed::from_u64(0), switching(then))
+            .with_worker(Polling::in_world(fcx.clone()));
+        h.push(b"one\nlater\ntwo\n").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&h.take_output()),
+            "hello\none\nlater\ntwo\n"
+        );
+        h.push(b"handoff\nrest").unwrap();
+        assert!(h.layer().then().is_some(), "the tunnel runs");
+        assert!(h.layer().first().is_none(), "the echo is gone");
+        assert_eq!(h.unread(), 0, "the tunnel took the rest");
+        assert!(!h.ended(), "a handover is not a close");
+        Ok(())
+    });
 }
 
-/// Fills waiting for one connection.
-type Inbox = Arc<Mutex<Vec<String>>>;
+/// Subscribers to fills, each with where to send its fills.
+type Book = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<String>>>>;
 
-/// An exchange's order book: each subscriber's wake handle, and the fills
-/// waiting for it.
-#[derive(Default)]
-struct Book {
-    subscribers: Mutex<Vec<(serve::WakeHandle, Inbox)>>,
+/// Waits for the next fill sent to one subscriber.
+struct NextFill(tokio::sync::mpsc::UnboundedReceiver<String>);
+
+impl Job for NextFill {
+    type Done = (Option<String>, tokio::sync::mpsc::UnboundedReceiver<String>);
+
+    fn poll(&mut self, _: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Self::Done> {
+        match self.0.poll_recv(cx) {
+            Poll::Ready(fill) => {
+                let (_, empty) = tokio::sync::mpsc::unbounded_channel();
+                Poll::Ready((fill, std::mem::replace(&mut self.0, empty)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// `sub` subscribes the connection to fills; `fill X` sends X to every
-/// subscriber, from this connection, through the others' wake handles.
-struct Trader {
-    inbox: Inbox,
-}
+/// subscriber, from this connection, and the others' work wakes for it.
+struct Trader(Book);
 
-service_fixture! {
-    Trader => (Lines, Book, Infallible);
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
-    }
-    on_item(self, line: Result<Vec<u8>, LineError>; book, driver) -> Flow {
+impl LineApp for Trader {
+    type Timer = ();
+    type Work = NextFill;
+    type Done = (Option<String>, tokio::sync::mpsc::UnboundedReceiver<String>);
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn line(
+        &mut self,
+        line: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
         let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
         if line == "sub" {
-            book.subscribers
-                .lock()
-                .unwrap()
-                .push((driver.wake_handle(), self.inbox.clone()));
-            driver.reply().extend_from_slice(b"subscribed\n");
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            self.0.lock().unwrap().push(tx);
+            out.start(NextFill(rx));
+            out.write(b"subscribed\n");
         } else if let Some(fill) = line.strip_prefix("fill ") {
-            let mut subscribers = book.subscribers.lock().unwrap();
-            subscribers.retain(|(w, _)| !w.is_closed());
-            for (wake, inbox) in subscribers.iter() {
-                inbox.lock().unwrap().push(fill.to_owned());
-                wake.wake();
-            }
-            driver.reply().extend_from_slice(b"ok\n");
+            let mut subscribers = self.0.lock().unwrap();
+            subscribers.retain(|tx| tx.send(fill.to_owned()).is_ok());
+            out.write(b"ok\n");
         }
-        Ok(Flow::Continue)
+        Ok(())
     }
-    on_wake(self; _, driver) -> Flow {
-        for fill in self.inbox.lock().unwrap().drain(..) {
-            driver
-                .reply()
-                .extend_from_slice(format!("execution {fill}\n").as_bytes());
+
+    fn done(&mut self, done: Self::Done, out: &mut LineOut<'_, Self>) -> Result<(), Infallible> {
+        let (fill, rx) = done;
+        if let Some(fill) = fill {
+            out.write(format!("execution {fill}\n").as_bytes());
+            out.start(NextFill(rx));
         }
-        Ok(Flow::Continue)
+        Ok(())
     }
 }
 
 #[test]
-fn another_connection_wakes_a_service_to_push_a_fill() {
-    let mut h = Harness::new(
-        fictionet::Seed::from_u64(0),
-        Trader {
-            inbox: Arc::default(),
-        },
-        Book::default(),
-    );
-    assert_eq!(h.push(b"sub\n").unwrap(), b"subscribed\n");
-    let inbox = h.state().subscribers.lock().unwrap()[0].1.clone();
-    inbox.lock().unwrap().push("7@100".into());
-    h.wake_handle().wake();
-    assert_eq!(h.poll().unwrap(), b"execution 7@100\n");
+fn another_connection_wakes_a_stack_to_push_a_fill() {
+    let book = Book::default();
+    let mut h = Harness::new(Seed::from_u64(0), Lined::new(Trader(book.clone())))
+        .with_worker(Polling::new());
+    h.push(b"sub\n").unwrap();
+    assert_eq!(h.take_output(), b"subscribed\n");
+    book.lock().unwrap()[0].send("7@100".into()).unwrap();
+    h.settle().unwrap();
+    assert_eq!(h.take_output(), b"execution 7@100\n");
 
     world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        serve::listen(
+        let book = Book::default();
+        line_stack::listen(
             &fcx,
             server.listen(9000)?,
-            Arc::new(Book::default()),
-            || Trader {
-                inbox: Arc::default(),
-            },
-            ServeOptions::default(),
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
+            StreamLimits::default(),
+            move || Lined::new(Trader(book.clone())),
         );
         let to = SocketAddr::new(SERVER.into(), 9000);
         let mut a = client.connect(&fcx, to).await?;
@@ -487,99 +498,104 @@ struct Session {
     beats: u64,
 }
 
-service_fixture! {
-    Session => (Lines, (), Infallible);
-    timer(SessionTimer);
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
+impl Session {
+    fn stack() -> Lined<Session> {
+        Lined::new(Session { lines: 0, beats: 0 })
     }
-    on_open(self; _, driver) -> Flow {
-        driver.set_timer(SessionTimer::Heartbeat, Duration::from_millis(10));
-        driver.set_timer(SessionTimer::Logon, Duration::from_millis(25));
-        Ok(Flow::Continue)
+}
+
+impl LineApp for Session {
+    type Timer = SessionTimer;
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn open(&mut self, out: &mut LineOut<'_, Self>) -> Result<(), Infallible> {
+        out.set_timer(SessionTimer::Heartbeat, Duration::from_millis(10));
+        out.set_timer(SessionTimer::Logon, Duration::from_millis(25));
+        Ok(())
     }
-    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+
+    fn line(
+        &mut self,
+        line: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
         self.lines += 1;
         if line.as_deref() == Ok(b"step") {
-            assert_eq!(self.beats, self.lines - 2, "due heartbeat before the next line");
-            driver.set_timer(SessionTimer::Heartbeat, Duration::ZERO);
+            assert_eq!(
+                self.beats,
+                self.lines - 2,
+                "due heartbeat before the next line"
+            );
+            out.set_timer(SessionTimer::Heartbeat, Duration::ZERO);
         }
         if line.as_deref() == Ok(b"logon") {
-            driver.cancel_timer(SessionTimer::Logon);
-            driver.reply().extend_from_slice(b"logged on\n");
+            out.cancel_timer(SessionTimer::Logon);
+            out.write(b"logged on\n");
         }
         if line.as_deref() == Ok(b"end") {
-            driver.reply().extend_from_slice(
-                format!("end lines={} beats={}\n", self.lines, self.beats).as_bytes(),
-            );
-            return Ok(Flow::Close);
+            out.write(format!("end lines={} beats={}\n", self.lines, self.beats).as_bytes());
+            out.close();
         }
-        Ok(Flow::Continue)
+        Ok(())
     }
-    on_timer(self, timer: SessionTimer; _, driver) -> Flow {
+
+    fn timer(
+        &mut self,
+        timer: SessionTimer,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
         match timer {
             SessionTimer::Heartbeat => {
                 self.beats += 1;
-                driver.set_timer(SessionTimer::Heartbeat, Duration::from_millis(10));
-                Ok(Flow::Continue)
+                out.set_timer(SessionTimer::Heartbeat, Duration::from_millis(10));
             }
             SessionTimer::Logon => {
-                driver.reply().extend_from_slice(b"logon timed out\n");
-                Ok(Flow::Close)
+                out.write(b"logon timed out\n");
+                out.close();
             }
         }
+        Ok(())
     }
 }
 
 #[test]
 fn named_timers_run_side_by_side() {
-    let mut h = Harness::new(
-        fictionet::Seed::from_u64(0),
-        Session { lines: 0, beats: 0 },
-        (),
-    );
-    h.open().unwrap();
+    let mut h = Harness::new(Seed::from_u64(0), Session::stack());
+    h.settle().unwrap();
     assert_eq!(
-        h.timer(SessionTimer::Logon),
-        Some(fictionet::time::Instant::ZERO + Duration::from_millis(25))
+        h.layer().timer(&SessionTimer::Logon),
+        Some(Instant::ZERO + Duration::from_millis(25))
     );
     h.advance(Duration::from_millis(20)).unwrap();
-    assert_eq!(h.service().beats, 2);
+    assert_eq!(h.layer().app().beats, 2);
     h.push(b"logon\n").unwrap();
-    assert_eq!(h.timer(SessionTimer::Logon), None);
+    assert_eq!(h.layer().timer(&SessionTimer::Logon), None);
     h.advance(Duration::from_millis(30)).unwrap();
-    assert!(!h.closed());
-    assert_eq!(h.service().beats, 5);
+    assert!(!h.ended());
+    assert_eq!(h.layer().app().beats, 5);
 
     // Without a logon, the logon timer closes the session, heartbeats or not.
-    let mut h = Harness::new(
-        fictionet::Seed::from_u64(0),
-        Session { lines: 0, beats: 0 },
-        (),
-    );
-    h.open().unwrap();
-    assert_eq!(
-        h.advance(Duration::from_millis(30)).unwrap(),
-        b"logon timed out\n"
-    );
-    assert!(h.closed());
+    let mut h = Harness::new(Seed::from_u64(0), Session::stack());
+    h.settle().unwrap();
+    h.advance(Duration::from_millis(30)).unwrap();
+    assert_eq!(h.take_output(), b"logon timed out\n");
+    assert!(h.ended());
 }
 
 /// A client that never stops sending cannot starve the heartbeat: due
-/// timers go before more input. Before, the driver read whenever bytes
-/// were there and only then looked at its one timer.
+/// timers go before more input.
 #[test]
 fn continuous_input_cannot_starve_a_timer() {
     world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
-        serve::listen(
+        line_stack::listen(
             &fcx,
             server.listen(7)?,
-            Arc::new(()),
-            || Session { lines: 0, beats: 0 },
-            ServeOptions::default(),
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
+            StreamLimits::default(),
+            Session::stack,
         );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
@@ -604,7 +620,7 @@ fn continuous_input_cannot_starve_a_timer() {
                 Ok::<_, ConnError>(reply)
             })
             .await
-            .expect("the service did not finish")
+            .expect("the stack did not finish")
             .unwrap(),
         )
         .unwrap();
@@ -613,7 +629,8 @@ fn continuous_input_cannot_starve_a_timer() {
     });
 }
 
-/// Whose turn it is among keyed works, and the wakers of those waiting.
+/// Whose turn it is among the streams' frames, and the wakers of those
+/// waiting.
 #[derive(Default)]
 struct Baton {
     turn: usize,
@@ -621,25 +638,21 @@ struct Baton {
     waiting: Vec<std::task::Waker>,
 }
 
-/// One stream's response: `frames` frames, each written on its turn, so
-/// two of them interleave frame by frame.
-struct Frames {
+/// One stream's next frame, written on its turn, so two streams' frames
+/// interleave frame by frame.
+struct NextFrame {
     stream: usize,
     of: usize,
-    sent: usize,
+    frame: usize,
     frames: usize,
     baton: Arc<Mutex<Baton>>,
 }
 
-impl Pending for Frames {
-    fn poll_next(
-        &mut self,
-        _ctx: &mut PendingDriver<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
-        if self.sent == self.frames {
-            return Poll::Ready(None);
-        }
+impl Job for NextFrame {
+    /// The frame, and the work for the stream's next frame, if any.
+    type Done = (Vec<u8>, Option<NextFrame>, usize);
+
+    fn poll(&mut self, _: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Self::Done> {
         let mut baton = self.baton.lock().unwrap();
         if !baton.open || baton.turn % self.of != self.stream {
             baton.waiting.push(cx.waker().clone());
@@ -649,49 +662,63 @@ impl Pending for Frames {
         for w in baton.waiting.drain(..) {
             w.wake();
         }
-        self.sent += 1;
-        Poll::Ready(Some(Ok(
-            format!("[{} {}]", self.stream, self.sent).into_bytes()
-        )))
+        let frame = format!("[{} {}]", self.stream, self.frame).into_bytes();
+        let next = (self.frame < self.frames).then(|| NextFrame {
+            stream: self.stream,
+            of: self.of,
+            frame: self.frame + 1,
+            frames: self.frames,
+            baton: self.baton.clone(),
+        });
+        Poll::Ready((frame, next, self.stream))
     }
 }
 
-/// HTTP/2 in miniature: `get` opens a stream whose response is keyed work;
-/// `ping` is answered at once, while responses are still on their way.
+/// HTTP/2 in miniature: `get` opens a stream whose response comes a frame
+/// at a time from work; `ping` is answered at once, while responses are
+/// still on their way.
 struct Mux {
     streams: usize,
     baton: Arc<Mutex<Baton>>,
 }
 
-service_fixture! {
-    Mux => (Lines, (), Infallible);
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
-    }
-    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+impl LineApp for Mux {
+    type Timer = ();
+    type Work = NextFrame;
+    type Done = (Vec<u8>, Option<NextFrame>, usize);
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn line(
+        &mut self,
+        line: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
         match line.as_deref() {
             Ok(b"get") => {
-                let work = Frames {
+                out.start(NextFrame {
                     stream: self.streams,
                     of: 2,
-                    sent: 0,
+                    frame: 1,
                     frames: 3,
                     baton: self.baton.clone(),
-                };
-                driver.defer_keyed(self.streams as u64, work);
+                });
                 self.streams += 1;
             }
-            Ok(b"ping") => driver.reply().extend_from_slice(b"(pong)"),
+            Ok(b"ping") => out.write(b"(pong)"),
             _ => {}
         }
-        Ok(Flow::Continue)
+        Ok(())
     }
-    on_done(self, key: u64, done: serve::Done; _, driver) -> Flow {
-        assert!(matches!(done, serve::Done::Finished), "{done:?}");
-        driver
-            .reply()
-            .extend_from_slice(format!("(done {key})").as_bytes());
-        Ok(Flow::Continue)
+
+    fn done(&mut self, done: Self::Done, out: &mut LineOut<'_, Self>) -> Result<(), Infallible> {
+        let (frame, next, stream) = done;
+        out.write(&frame);
+        match next {
+            Some(next) => out.start(next),
+            None => out.write(format!("(done {stream})").as_bytes()),
+        }
+        Ok(())
     }
 }
 
@@ -705,31 +732,31 @@ fn interleaved(out: &str) {
 }
 
 #[test]
-fn keyed_work_interleaves_two_responses_while_reads_go_on() {
+fn work_interleaves_two_responses_while_reads_go_on() {
     let baton = Arc::new(Mutex::new(Baton {
         open: true,
         ..Baton::default()
     }));
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Mux { streams: 0, baton }, ());
-    let out = String::from_utf8(h.push(b"get\nget\n").unwrap()).unwrap();
-    interleaved(&out);
-    assert_eq!(h.pending(), (0, 0));
+    let mut h = Harness::new(Seed::from_u64(0), Lined::new(Mux { streams: 0, baton }))
+        .with_worker(Polling::new());
+    h.push(b"get\nget\n").unwrap();
+    interleaved(&String::from_utf8(h.take_output()).unwrap());
+    assert_eq!(h.jobs(), 0);
 
     world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         let baton = Arc::new(Mutex::new(Baton::default()));
         let shared = baton.clone();
-        serve::listen(
+        line_stack::listen(
             &fcx,
             server.listen(7)?,
-            Arc::new(()),
-            move || Mux {
-                streams: 0,
-                baton: shared.clone(),
+            StreamLimits::default(),
+            move || {
+                Lined::new(Mux {
+                    streams: 0,
+                    baton: shared.clone(),
+                })
             },
-            ServeOptions::default(),
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
         );
         let mut conn = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
@@ -749,65 +776,69 @@ fn keyed_work_interleaves_two_responses_while_reads_go_on() {
     });
 }
 
-#[test]
-fn datagram_services_send_several_datagrams_and_tick() {
-    /// MoldUDP64 in miniature: `req N` is answered with N datagrams, and a
-    /// heartbeat goes to the world's subscriber every 20 ms.
-    struct Mold;
-    datagram_fixture! {
-        Mold => (Lines, SocketAddr, Infallible);
-        decoder(self) {
-            Lines::new(64, Ending::LfOrCrlf)
-        }
-        on_open(self; _, cx) -> () {
-            cx.set_timer((), Duration::from_millis(20));
-            Ok(())
-        }
-        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> DatagramFlow {
-            let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
-            let n: u32 = line
-                .strip_prefix("req ")
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-            let to = driver.conn().peer.unwrap();
-            let transport = driver.conn().transport;
-            for i in 1..=n {
-                driver.send_to(
-                    to,
-                    format!("packet {i} over {}", transport.as_str()).into_bytes(),
-                );
-            }
-            Ok(DatagramFlow::Continue)
-        }
-        on_timer(self, _: (); subscriber, cx) -> () {
-            cx.send_to(*subscriber, b"heartbeat".to_vec());
-            cx.set_timer((), Duration::from_millis(20));
-            Ok(())
+/// MoldUDP64 in miniature: `req N` is answered with N datagrams, and a
+/// heartbeat goes to the world's subscriber every 20 ms.
+struct Mold {
+    subscriber: SocketAddr,
+    transport: &'static str,
+}
+
+impl DatagramApp for Mold {
+    type Timer = ();
+
+    fn open(&mut self, sends: &mut Sends<'_, ()>) {
+        sends.set_timer((), Duration::from_millis(20));
+    }
+
+    fn line(
+        &mut self,
+        line: Result<Vec<u8>, LineError>,
+        from: SocketAddr,
+        sends: &mut Sends<'_, ()>,
+    ) {
+        let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
+        let n: u32 = line
+            .strip_prefix("req ")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        for i in 1..=n {
+            let packet = format!("packet {i} over {}", self.transport);
+            sends.send_to(from, packet.into_bytes());
         }
     }
-    world(Duration::from_secs(60), |fcx| async move {
-        let (_s, server, _c, client) = two_machines(&fcx);
-        let socket = server.bind(9)?;
-        let subscriber = SocketAddr::new(Ipv4Addr::new(10, 9, 0, 2).into(), 4001);
-        let mut feed = client.bind(4001)?;
-        fcx.spawn(move |fcx| async move {
-            let local = SocketAddr::new(SERVER.into(), 9);
-            let _ = serve::datagram(
-                &fcx,
-                socket,
-                local,
-                &mut Mold,
-                &subscriber,
-                &DatagramOptions::default(),
-            )
-            .await;
-            Ok(())
-        });
-        let mut s = client.bind(4000)?;
-        s.send_to(b"req 3\n", SocketAddr::new(SERVER.into(), 9));
+
+    fn timer(&mut self, _: (), sends: &mut Sends<'_, ()>) {
+        sends.send_to(self.subscriber, b"heartbeat".to_vec());
+        sends.set_timer((), Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_datagram_stack_sends_several_datagrams_and_ticks() {
+    let addr = Ipv4Addr::new(10, 40, 0, 9);
+    world(Duration::from_secs(60), move |fcx| async move {
+        let subscriber = SocketAddr::new(ME.into(), 4001);
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("mold", |h| {
+                h.at(addr)
+                    .udp_stack(9, Budget::unlimited(), move |info: &ConnInfo| {
+                        let mold = Mold {
+                            subscriber,
+                            transport: info.transport.as_str(),
+                        };
+                        Datagrammed::new(mold, info.local)
+                    })
+            })
+            .start(&fcx, attachments)?;
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
+        let mut feed = s.udp.bind(4001)?;
+        let mut u = s.udp.bind(4000)?;
+        u.send_to(b"req 3\n", SocketAddr::new(addr.into(), 9));
         for i in 1..=3 {
             assert_eq!(
-                s.recv(&fcx).await?.0,
+                u.recv(&fcx).await?.0,
                 format!("packet {i} over udp").into_bytes()
             );
         }
@@ -817,56 +848,65 @@ fn datagram_services_send_several_datagrams_and_tick() {
     });
 }
 
-/// Panics on `boom`.
+/// Panics on `boom`, gives up on `fail`.
 struct Fragile;
 
-service_fixture! {
-    Fragile => (Lines, (), std::io::Error);
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
-    }
-    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+impl LineApp for Fragile {
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = std::io::Error;
+
+    fn line(
+        &mut self,
+        line: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), std::io::Error> {
         match line.as_deref() {
-            Ok(b"boom") => panic!("the service fell over"),
-            Ok(b"fail") => Err(std::io::Error::other("the service gave up")),
+            Ok(b"boom") => panic!("the stack fell over"),
+            Ok(b"fail") => Err(std::io::Error::other("the stack gave up")),
             _ => {
-                driver.reply().extend_from_slice(b"fine\n");
-                Ok(Flow::Continue)
+                out.write(b"fine\n");
+                Ok(())
             }
         }
     }
 }
 
-/// A service error closes only its connection and is recorded. A panic
-/// is not caught: it ends the run, as a panic anywhere in a world does.
-/// Before, the driver caught it and the world went on.
+/// A stack error closes only its connection. A panic is not caught: it
+/// ends the run, as a panic anywhere in a world does.
 #[test]
 fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Fragile, ());
+    let mut h = Harness::new(Seed::from_u64(0), Lined::new(Fragile));
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.push(b"boom\n")));
     assert!(caught.is_err());
 
     let addr = Ipv4Addr::new(10, 40, 0, 9);
     let to = SocketAddr::new(addr.into(), 7);
-    fictionet_test_support::world::world(Duration::from_secs(60), move |fcx| async move {
+    world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
-            .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
+            .host("svc", |h| h.at(addr).tcp_stack(7, |_| Lined::new(Fragile)))
             .start(&fcx, attachments)?;
         let s = machine(&fcx, attacher.attach("agent")?, ME);
         let mut b = s.tcp.connect(&fcx, to).await?;
         b.write_all(&fcx, b"hi\nfail\n").await?;
         assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
+        // The world goes on: another connection is served.
+        let mut c = s.tcp.connect(&fcx, to).await?;
+        c.write_all(&fcx, b"hi\n").await?;
+        assert_eq!(read_some(&fcx, &mut c, 5).await, b"fine\n");
         Ok(())
     });
 
     let ran = std::thread::spawn(move || {
-        block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             Net::new(fictionet_extras::network::cdn_pools())
                 .ipv4_only()
-                .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
+                .host("svc", |h| h.at(addr).tcp_stack(7, |_| Lined::new(Fragile)))
                 .start(&fcx, attachments)?;
             let s = machine(&fcx, attacher.attach("agent")?, ME);
             let mut a = s.tcp.connect(&fcx, to).await?;
@@ -877,26 +917,32 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     })
     .join();
     let panic = ran.expect_err("the run should end with the panic");
-    assert_eq!(panic.downcast_ref::<&str>(), Some(&"the service fell over"));
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"the stack fell over"));
 }
 
 /// Draws one number per connection.
 struct Dice;
 
-service_fixture! {
-    Dice => (Lines, (), Infallible);
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
+impl LineApp for Dice {
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn open(&mut self, out: &mut LineOut<'_, Self>) -> Result<(), Infallible> {
+        let n = out.random_u64();
+        out.write(format!("{n}\n").as_bytes());
+        out.close();
+        Ok(())
     }
-    on_open(self; _, driver) -> Flow {
-        let n = driver.random_u64();
-        driver
-            .reply()
-            .extend_from_slice(format!("{n}\n").as_bytes());
-        Ok(Flow::Close)
-    }
-    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
-        Ok(Flow::Continue)
+
+    fn line(
+        &mut self,
+        _: Result<Vec<u8>, LineError>,
+        _: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
+        Ok(())
     }
 }
 
@@ -906,31 +952,22 @@ service_fixture! {
 fn a_seeded_run_repeats_its_randomness() {
     let draws = |seed: u64| {
         let (tx, rx) = mpsc::channel();
-        fictionet::block_on(fictionet::lab(
-            fictionet::Seed::from_u64(seed),
-            move |fcx| async move {
-                let (server, _su, client, _cu) = two_machines(&fcx);
-                serve::listen(
-                    &fcx,
-                    server.listen(7)?,
-                    Arc::new(()),
-                    || Dice,
-                    ServeOptions::default(),
-                    fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-                    None,
-                );
-                let mut got = Vec::new();
-                for _ in 0..2 {
-                    let mut conn = client
-                        .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
-                        .await?;
-                    got.push(String::from_utf8(read_some(&fcx, &mut conn, 64).await).unwrap());
-                }
-                tx.send(got).unwrap();
-                fcx.cancel();
-                Ok(())
-            },
-        ))
+        block_on(lab(Seed::from_u64(seed), move |fcx| async move {
+            let (server, _su, client, _cu) = two_machines(&fcx);
+            line_stack::listen(&fcx, server.listen(7)?, StreamLimits::default(), || {
+                Lined::new(Dice)
+            });
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                let mut conn = client
+                    .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
+                    .await?;
+                got.push(String::from_utf8(read_some(&fcx, &mut conn, 64).await).unwrap());
+            }
+            tx.send(got).unwrap();
+            fcx.cancel();
+            Ok(())
+        }))
         .unwrap();
         rx.recv().unwrap()
     };
@@ -941,27 +978,26 @@ fn a_seeded_run_repeats_its_randomness() {
 }
 
 /// A closed connection counts against the cap until its socket is gone, so
-/// a client that never finishes closing cannot open more. Before, the
-/// count dropped when the service ended.
+/// a client that never finishes closing cannot open more.
 #[test]
 fn a_connection_counts_until_its_socket_is_gone() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let (server, _su, client, _cu) = two_machines(&fcx);
-        serve::listen(
-            &fcx,
-            server.listen(7)?,
-            Arc::new(()),
-            || Echo,
-            ServeOptions::default(),
-            1,
-            None,
-        );
-        let to = SocketAddr::new(SERVER.into(), 7);
-        let mut a = client.connect(&fcx, to).await?;
+    let addr = Ipv4Addr::new(10, 40, 0, 9);
+    world(Duration::from_secs(60), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("svc", |h| {
+                h.at(addr)
+                    .tcp_stack_with(7, StreamLimits::default(), 1, |_| Echo::stack())
+            })
+            .start(&fcx, attachments)?;
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
+        let to = SocketAddr::new(addr.into(), 7);
+        let mut a = s.tcp.connect(&fcx, to).await?;
         a.write_all(&fcx, b"quit\n").await?;
         assert_eq!(read_some(&fcx, &mut a, 10).await, b"hello\nbye\n");
         // The server closed its side; `a` keeps its own open.
-        let mut b = client.connect(&fcx, to).await?;
+        let mut b = s.tcp.connect(&fcx, to).await?;
         let mut buf = [0u8; 16];
         let r = timeout(&fcx, Duration::from_secs(2), b.read(&fcx, &mut buf))
             .await
@@ -997,53 +1033,58 @@ where
     out.lock().unwrap().clone()
 }
 
+/// Answers nothing.
+struct Quiet;
+
+impl DatagramApp for Quiet {
+    type Timer = ();
+
+    fn line(&mut self, _: Result<Vec<u8>, LineError>, _: SocketAddr, _: &mut Sends<'_, ()>) {}
+}
+
 /// Every wait of the serving stack reports a cancel the one way: an
-/// accept, `serve`, `datagram`, `httpd::serve_connection`, and, with the
-/// `tokio` feature, a connection read through tokio's traits.
+/// accept, the stream runner, `httpd::serve_connection`, the datagram
+/// runner, and, with the `tokio` feature, a connection read through
+/// tokio's traits.
 #[test]
 fn every_serving_wait_reports_a_cancel() {
-    /// Answers nothing.
-    struct Quiet;
-    datagram_fixture! {
-        Quiet => (Lines, (), Infallible);
-        decoder(self) {
-            Lines::new(64, Ending::LfOrCrlf)
-        }
-        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> DatagramFlow {
-            Ok(DatagramFlow::Continue)
-        }
-    }
     world(Duration::from_secs(60), |fcx| async move {
         let (server, server_udp, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(7)?;
 
-        // Nobody connects: the accept is cancelled.
+        // Nothing connects: the accept is cancelled.
         let got = after_a_cancel(&fcx, |region_fcx| async move {
             listener.accept(&region_fcx).await.map(|_| ())
         })
         .await;
         assert_eq!(got, "Err(Cancelled)");
 
-        // A client that connects and sends nothing, served by `serve`.
+        // A client that connects and sends nothing, served by the stream
+        // runner.
         let mut listener = server.listen(8)?;
         let _c1 = client
             .connect(&fcx, SocketAddr::new(SERVER.into(), 8))
             .await?;
         let conn = listener.accept(&fcx).await?;
+        let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
         let got = after_a_cancel(&fcx, |region_fcx| async move {
-            serve::connection(
+            let limits = StreamLimits::default();
+            let budget = Budget::unlimited();
+            stack::stream(
                 &region_fcx,
                 conn,
-                ConnInfo::default(),
-                &mut Echo,
-                &(),
-                &ServeOptions::default(),
+                &info,
+                Echo::stack(),
+                budget,
+                limits,
+                |_| {},
             )
             .await
             .map(|_| ())
+            .map_err(|e| matches!(e, StackError::Cancelled).then_some(fictionet::Cancelled))
         })
         .await;
-        assert_eq!(got, "Err(Cancelled)");
+        assert_eq!(got, "Err(Some(Cancelled))");
 
         // The same, by httpd.
         let mut listener = server.listen(80)?;
@@ -1071,22 +1112,25 @@ fn every_serving_wait_reports_a_cancel() {
         .await;
         assert_eq!(got, "Err(Cancelled)");
 
-        // A socket that receives no datagrams, served by `datagram`.
+        // A socket that receives no datagrams, served by the datagram
+        // runner.
         let socket = server_udp.bind(9)?;
         let local = SocketAddr::new(SERVER.into(), 9);
         let got = after_a_cancel(&fcx, |region_fcx| async move {
-            serve::datagram(
+            let stack = Datagrammed::new(Quiet, Some(local));
+            stack::datagrams(
                 &region_fcx,
                 socket,
                 local,
-                &mut Quiet,
-                &(),
-                &DatagramOptions::default(),
+                stack,
+                Budget::unlimited(),
+                |_| {},
             )
             .await
+            .map_err(|e| matches!(e, StackError::Cancelled).then_some(fictionet::Cancelled))
         })
         .await;
-        assert_eq!(got, "Err(Cancelled)");
+        assert_eq!(got, "Err(Some(Cancelled))");
 
         // A read through tokio's traits fails with an I/O error whose
         // source is the connection's cancel, of a kind std does not retry.
@@ -1118,15 +1162,17 @@ fn every_serving_wait_reports_a_cancel() {
 }
 
 #[test]
-fn harness_service_and_http_share_the_context_stream() {
+fn a_harness_stack_and_http_share_the_world_s_entropy() {
     use fictionet::{Entropy, SeededEntropy};
     let seed = Seed::from_u64(42);
     world::seeded_world(seed, Duration::from_secs(10), move |fcx| async move {
         let oracle = SeededEntropy::new(seed);
         assert_eq!(fcx.random_u64(), oracle.random_u64());
-        let mut dice = Harness::new(Seed::from_u64(999), Dice, ()).with_fcx(fcx.clone());
+        let mut dice = Harness::new(Seed::from_u64(999), Lined::new(Dice))
+            .with_worker(Polling::in_world(fcx.clone()));
+        dice.settle().unwrap();
         assert_eq!(
-            dice.open().unwrap(),
+            dice.take_output(),
             format!("{}\n", oracle.random_u64()).as_bytes()
         );
 

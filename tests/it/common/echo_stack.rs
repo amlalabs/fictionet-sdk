@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use fictionet::Cx;
 use fictionet::stdlib::codec::LineError;
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::services::stack::{Job, Tunnel};
 
-use super::line_stack::{DatagramApp, LineApp, LineOut, Lined, Sends};
+use super::line_stack::{DatagramApp, Datagrammed, LineApp, LineOut, Lined, Sends};
 
 /// Makes what a handover hands the rest of the stream to.
 pub(crate) type Then = Arc<dyn Fn() -> Tunnel + Send + Sync>;
@@ -99,21 +100,27 @@ impl Job for Later {
     }
 }
 
-/// Echoes each line of a datagram back to its sender.
-pub(crate) struct EchoDatagrams;
+/// A datagram echo for a host's UDP port.
+pub(crate) fn echo_datagrams(info: &ConnInfo) -> Datagrammed<EchoDatagrams> {
+    Datagrammed::new(EchoDatagrams::default(), info.local)
+}
+
+/// Echoes the lines of each datagram back to its sender, in one datagram.
+#[derive(Default)]
+pub(crate) struct EchoDatagrams {
+    answer: Vec<u8>,
+}
 
 impl DatagramApp for EchoDatagrams {
     type Timer = ();
 
-    fn line(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        from: SocketAddr,
-        sends: &mut Sends<'_, ()>,
-    ) {
-        let mut answer = line.unwrap_or_default();
-        answer.push(b'\n');
-        sends.send_to(from, answer);
+    fn line(&mut self, line: Result<Vec<u8>, LineError>, _: SocketAddr, _: &mut Sends<'_, ()>) {
+        self.answer.extend_from_slice(&line.unwrap_or_default());
+        self.answer.push(b'\n');
+    }
+
+    fn finished(&mut self, from: SocketAddr, sends: &mut Sends<'_, ()>) {
+        sends.send_to(from, std::mem::take(&mut self.answer));
     }
 }
 

@@ -182,7 +182,7 @@ fn zero_port_host_serves_a_conversation() {
         let (attacher, attachments) = fictionet::attachments();
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
-            .host("console", |h| h.at(addr).tcp(0, Arc::new(()), || Echo))
+            .host("console", |h| h.at(addr).tcp_stack(0, |_| Echo::stack()))
             .start(&fcx, attachments)?;
         let machine = machine(&fcx, attacher.attach("client")?, ME);
         let target = SocketAddr::new(addr.into(), 0);
@@ -218,25 +218,24 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                 .ipv4_only()
                 .at(addr)
                 .port_server(80, server.clone())
-                .udp(9, Arc::new(()), move || {
+                .udp_stack(9, Budget::unlimited(), move |info| {
                     count.fetch_add(1, Ordering::SeqCst);
-                    EchoDatagrams
+                    echo_datagrams(info)
                 });
             let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::ServerConfig> {
                 panic!("no handshake for a rejected host")
             };
             let bad = match failure {
-                "bind" => {
-                    bad.udp(0, Arc::new(()), || EchoDatagrams)
-                        .udp(49152, Arc::new(()), || EchoDatagrams)
-                }
+                "bind" => bad
+                    .udp_stack(0, Budget::unlimited(), echo_datagrams)
+                    .udp_stack(49152, Budget::unlimited(), echo_datagrams),
                 "zero-duplicate" => bad
-                    .tcp(0, Arc::new(()), || Echo)
-                    .tcp(0, Arc::new(()), || Echo),
-                "udp-duplicate" => bad.udp(9, Arc::new(()), || EchoDatagrams),
+                    .tcp_stack(0, |_| Echo::stack())
+                    .tcp_stack(0, |_| Echo::stack()),
+                "udp-duplicate" => bad.udp_stack(9, Budget::unlimited(), echo_datagrams),
                 "tcp-duplicate" => bad
-                    .tcp(81, Arc::new(()), || Echo)
-                    .tcp(81, Arc::new(()), || Echo),
+                    .tcp_stack(81, |_| Echo::stack())
+                    .tcp_stack(81, |_| Echo::stack()),
                 "tls-plain" => bad.tls_accept(80, Sni::Any, config, Spy::default()),
                 "sni-duplicate" => bad
                     .tls_accept(443, Sni::Any, config, Spy::default())
@@ -247,9 +246,9 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                 .dns_name("good.test")
                 .ipv4_only()
                 .at(addr)
-                .tcp(80, Arc::new(()), || Echo)
-                .udp(9, Arc::new(()), || EchoDatagrams)
-                .udp(49152, Arc::new(()), || EchoDatagrams);
+                .tcp_stack(80, |_| Echo::stack())
+                .udp_stack(9, Budget::unlimited(), echo_datagrams)
+                .udp_stack(49152, Budget::unlimited(), echo_datagrams);
             let (attacher, attachments) = fictionet::attachments();
             let net = Net::new(fictionet_extras::network::cdn_pools());
             let handle = net.handle();
@@ -282,13 +281,14 @@ fn failed_lan_join_or_missing_tls_names_does_not_commit_services() {
             let server = Sharing::default();
             let started = Arc::new(AtomicUsize::new(0));
             let count = started.clone();
-            let host =
-                Host::new("bad")
-                    .port_server(80, server.clone())
-                    .udp(9, Arc::new(()), move || {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        EchoDatagrams
-                    });
+            let host = Host::new("bad").port_server(80, server.clone()).udp_stack(
+                9,
+                Budget::unlimited(),
+                move |info| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    echo_datagrams(info)
+                },
+            );
             let net = if lan {
                 let corp = Lan::new("corp", "192.168.56.0/24".parse()?);
                 Net::new(fictionet_extras::network::cdn_pools())
@@ -323,7 +323,7 @@ fn a_second_family_bind_failure_preserves_existing_services() {
                 .at(v6)
                 .ipv6_only()
                 .port_server(80, server.clone())
-                .udp(0, Arc::new(()), || EchoDatagrams);
+                .udp_stack(0, Budget::unlimited(), echo_datagrams);
             let mut net = Net::new(fictionet_extras::network::cdn_pools()).add_host(first);
             if existing_v4 {
                 net = net.add_host(
@@ -332,22 +332,22 @@ fn a_second_family_bind_failure_preserves_existing_services() {
                         .at(v4)
                         .ipv4_only()
                         .port_server(80, server.clone())
-                        .tcp(7, Arc::new(()), || Echo),
+                        .tcp_stack(7, |_| Echo::stack()),
                 );
             }
             let bad = Host::new("bad")
                 .at(v4)
                 .at(v6)
                 .port_server(80, server.clone())
-                .tcp(81, Arc::new(()), || Echo)
-                .udp(9, Arc::new(()), || EchoDatagrams)
-                .udp(49152, Arc::new(()), || EchoDatagrams);
+                .tcp_stack(81, |_| Echo::stack())
+                .udp_stack(9, Budget::unlimited(), echo_datagrams)
+                .udp_stack(49152, Budget::unlimited(), echo_datagrams);
             let good = Host::new("good")
                 .at(v4)
                 .at(v6)
                 .port_server(80, server.clone())
-                .tcp(81, Arc::new(()), || Echo)
-                .udp(9, Arc::new(()), || EchoDatagrams);
+                .tcp_stack(81, |_| Echo::stack())
+                .udp_stack(9, Budget::unlimited(), echo_datagrams);
             let (attacher, attachments) = fictionet::attachments();
             let handle = net.handle();
             net.start(&fcx, attachments)?;
@@ -458,9 +458,10 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("plc", |h| {
+                let plant = plant.clone();
                 h.at(PLC_ADDR)
                     .dns_name("plc1.plant.test")
-                    .tcp(modbus::PORT, plant.clone(), || Plc)
+                    .tcp_stack(modbus::PORT, move |_| Plc::stack(plant.clone()))
             })
             .host("hmi", |h| {
                 h.dns_name("hmi.plant.test")
@@ -577,17 +578,17 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
     fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
-        struct Udp;
-        datagram_fixture! {
-            Udp => (Lines, AtomicUsize, Infallible);
-            decoder(self) {
-                Lines::new(64, Ending::LfOrCrlf)
-            }
-            on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> DatagramFlow {
-                driver.reply().extend_from_slice(
-                    format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes(),
-                );
-                Ok(DatagramFlow::Continue)
+        struct Udp(Arc<AtomicUsize>);
+        impl DatagramApp for Udp {
+            type Timer = ();
+            fn line(
+                &mut self,
+                _: Result<Vec<u8>, LineError>,
+                from: SocketAddr,
+                sends: &mut Sends<'_, ()>,
+            ) {
+                let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+                sends.send_to(from, format!("{n}\n").into_bytes());
             }
         }
         let (attacher, attachments) = fictionet::attachments();
@@ -595,8 +596,10 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
             .ipv4_only()
             .host("svc", |h| {
                 h.at(Ipv4Addr::new(10, 40, 0, 1))
-                    .tcp(7, Arc::new(()), || Echo)
-                    .udp(9, counter.clone(), || Udp)
+                    .tcp_stack(7, |_| Echo::stack())
+                    .udp_stack(9, Budget::unlimited(), move |info| {
+                        Datagrammed::new(Udp(counter.clone()), info.local)
+                    })
             })
             .route(
                 "box",
@@ -645,20 +648,15 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
 fn ephemeral_udp_service_reports_its_wire_endpoint() {
     struct Announce {
         to: SocketAddr,
+        reported: Arc<Mutex<Option<SocketAddr>>>,
     }
-    datagram_fixture! {
-        Announce => (Lines, Mutex<Option<SocketAddr>>, Infallible);
-        decoder(self) {
-            Lines::new(64, Ending::LfOrCrlf)
+    impl DatagramApp for Announce {
+        type Timer = ();
+        fn open(&mut self, sends: &mut Sends<'_, ()>) {
+            *self.reported.lock().unwrap() = sends.local();
+            sends.send_to(self.to, vec![1]);
         }
-        on_open(self; reported, driver) -> () {
-            *reported.lock().unwrap() = driver.conn().local;
-            driver.send_to(self.to, vec![1]);
-            Ok(())
-        }
-        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> DatagramFlow {
-            Ok(DatagramFlow::Continue)
-        }
+        fn line(&mut self, _: Result<Vec<u8>, LineError>, _: SocketAddr, _: &mut Sends<'_, ()>) {}
     }
     world(Duration::from_secs(60), |fcx| async move {
         let reported = Arc::new(Mutex::new(None));
@@ -683,11 +681,15 @@ fn ephemeral_udp_service_reports_its_wire_endpoint() {
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let to = rx.recv().await.expect("the receiving socket opened");
-        handle.add_host(Host::new("announcer").at(Ipv4Addr::new(10, 40, 0, 1)).udp(
-            0,
-            reported.clone(),
-            move || Announce { to },
-        ))?;
+        let shared = reported.clone();
+        handle.add_host(
+            Host::new("announcer")
+                .at(Ipv4Addr::new(10, 40, 0, 1))
+                .udp_stack(0, Budget::unlimited(), move |info| {
+                    let reported = shared.clone();
+                    Datagrammed::new(Announce { to, reported }, info.local)
+                }),
+        )?;
         let wire_source = rx.recv().await.expect("the datagram arrived");
         let observed = reported.lock().unwrap().expect("the service opened");
         assert_eq!(
@@ -706,13 +708,13 @@ fn two_ephemeral_udp_services_fit_on_one_machine() {
         let net = Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
             .host("first", move |h| {
-                h.at(addr).udp(0, Arc::new(()), || EchoDatagrams)
+                h.at(addr).udp_stack(0, Budget::unlimited(), echo_datagrams)
             });
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let second = Host::new("second")
             .at(addr)
-            .udp(0, Arc::new(()), || EchoDatagrams);
+            .udp_stack(0, Budget::unlimited(), echo_datagrams);
         handle
             .add_host(second)
             .map_err(|e| fictionet::Error::msg(format!("second ephemeral UDP service: {e}")))?;
@@ -720,21 +722,36 @@ fn two_ephemeral_udp_services_fit_on_one_machine() {
     });
 }
 
-/// Says hello, then takes lines up to 40 KiB: a decoder that holds up to
-/// that much, charged to the connection's budget.
+/// The longest line [`Wide`] reads.
+const WIDE_LINE: usize = 10 << 10;
+
+/// Says hello, then takes lines up to [`WIDE_LINE`]: a line buffer that
+/// may grow to twice that, charged to the connection's budget with the
+/// runner's read buffer.
 struct Wide;
 
-service_fixture! {
-    Wide => (Lines, (), Infallible);
-    decoder(self) {
-        Lines::new(40 << 10, Ending::LfOrCrlf)
+impl LineApp for Wide {
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn max_line(&self) -> usize {
+        WIDE_LINE
     }
-    on_open(self; _, driver) -> Flow {
-        driver.reply().extend_from_slice(b"hello\n");
-        Ok(Flow::Continue)
+
+    fn open(&mut self, out: &mut LineOut<'_, Self>) -> Result<(), Infallible> {
+        out.write(b"hello\n");
+        Ok(())
     }
-    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
-        Ok(Flow::Continue)
+
+    fn line(
+        &mut self,
+        _: Result<Vec<u8>, LineError>,
+        _: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
+        Ok(())
     }
 }
 
@@ -755,8 +772,8 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
             .limits(limits)
             .host("svc", |h| {
                 h.at(addr)
-                    .tcp_with(7, Arc::new(()), || Echo, ServeOptions::default(), 1)
-                    .tcp(8, Arc::new(()), || Wide)
+                    .tcp_stack_with(7, StreamLimits::default(), 1, |_| Echo::stack())
+                    .tcp_stack(8, |_| Lined::new(Wide))
             })
             .start(&fcx, attachments)?;
         let s = machine(&fcx, attacher.attach("agent")?, ME);
@@ -768,7 +785,8 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
             .await
             .expect("an answer");
         assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
-        // Two 40 KiB decoders fit the 100 KiB budget; a third does not.
+        // With the echo above, two wide connections fit the 100 KiB budget;
+        // a third does not.
         let to = SocketAddr::new(addr.into(), 8);
         let mut c = s.tcp.connect(&fcx, to).await?;
         let mut d = s.tcp.connect(&fcx, to).await?;
@@ -789,7 +807,7 @@ fn net_serves_the_default_cap_of_connections_on_a_tcp_port() {
         let addr = Ipv4Addr::new(10, 40, 0, 3);
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
-            .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Echo))
+            .host("svc", |h| h.at(addr).tcp_stack(7, |_| Echo::stack()))
             .start(&fcx, attachments)?;
         let s = machine(&fcx, attacher.attach("agent")?, ME);
         let to = SocketAddr::new(addr.into(), 7);
@@ -825,8 +843,8 @@ fn net_refuses_a_host_it_cannot_serve() {
         let twice = fail(
             Net::new(fictionet_extras::network::cdn_pools()).host("a", |h| {
                 h.at(Ipv4Addr::new(10, 40, 0, 1))
-                    .tcp(7, Arc::new(()), || Echo)
-                    .tcp(7, Arc::new(()), || Echo)
+                    .tcp_stack(7, |_| Echo::stack())
+                    .tcp_stack(7, |_| Echo::stack())
             }),
         );
         assert!(
@@ -838,7 +856,7 @@ fn net_refuses_a_host_it_cannot_serve() {
         let bad = fail(
             Net::new(fictionet_extras::network::cdn_pools()).host("b", |h| {
                 h.at(Ipv4Addr::new(224, 0, 0, 1))
-                    .tcp(7, Arc::new(()), || Echo)
+                    .tcp_stack(7, |_| Echo::stack())
             }),
         );
         assert!(
@@ -848,8 +866,8 @@ fn net_refuses_a_host_it_cannot_serve() {
         let udp = fail(
             Net::new(fictionet_extras::network::cdn_pools()).host("c", |h| {
                 h.at(Ipv4Addr::new(10, 40, 0, 2))
-                    .udp(9, Arc::new(()), || EchoDatagrams)
-                    .udp(9, Arc::new(()), || EchoDatagrams)
+                    .udp_stack(9, Budget::unlimited(), echo_datagrams)
+                    .udp_stack(9, Budget::unlimited(), echo_datagrams)
             }),
         );
         assert!(udp.is_some(), "{udp:?}");
@@ -863,7 +881,7 @@ fn net_refuses_a_host_it_cannot_serve() {
             Net::new(fictionet_extras::network::cdn_pools()).host("d", |h| {
                 h.at(at)
                     .tls_accept(443, Sni::Any, config, Spy::default())
-                    .tcp(443, Arc::new(()), || Echo)
+                    .tcp_stack(443, |_| Echo::stack())
             }),
         );
         assert!(
@@ -874,7 +892,7 @@ fn net_refuses_a_host_it_cannot_serve() {
         );
         let plain_first = fail(
             Net::new(fictionet_extras::network::cdn_pools()).host("e", |h| {
-                h.at(at).tcp(443, Arc::new(()), || Echo).tls_accept(
+                h.at(at).tcp_stack(443, |_| Echo::stack()).tls_accept(
                     443,
                     Sni::Any,
                     config,
@@ -898,23 +916,16 @@ fn net_refuses_a_host_it_cannot_serve() {
 #[test]
 fn hosts_and_members_share_a_lan_on_the_net() {
     /// Sends `tick` to a multicast group every 20 ms.
-    struct Feed;
-    datagram_fixture! {
-        Feed => (Lines, SocketAddr, Infallible);
-        decoder(self) {
-            Lines::new(64, Ending::LfOrCrlf)
+    struct Feed(SocketAddr);
+    impl DatagramApp for Feed {
+        type Timer = ();
+        fn open(&mut self, sends: &mut Sends<'_, ()>) {
+            sends.set_timer((), Duration::from_millis(20));
         }
-        on_open(self; _, cx) -> () {
-            cx.set_timer((), Duration::from_millis(20));
-            Ok(())
-        }
-        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> DatagramFlow {
-            Ok(DatagramFlow::Continue)
-        }
-        on_timer(self, _: (); group, cx) -> () {
-            cx.send_to(*group, b"tick".to_vec());
-            cx.set_timer((), Duration::from_millis(20));
-            Ok(())
+        fn line(&mut self, _: Result<Vec<u8>, LineError>, _: SocketAddr, _: &mut Sends<'_, ()>) {}
+        fn timer(&mut self, _: (), sends: &mut Sends<'_, ()>) {
+            sends.send_to(self.0, b"tick".to_vec());
+            sends.set_timer((), Duration::from_millis(20));
         }
     }
     fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
@@ -930,12 +941,14 @@ fn hosts_and_members_share_a_lan_on_the_net() {
                 h.on(&corp)
                     .at(dc)
                     .dns_name("dc01.corp.test")
-                    .tcp(389, Arc::new(()), || Echo)
+                    .tcp_stack(389, |_| Echo::stack())
             })
             .host("feed", |h| {
-                h.on(&corp)
-                    .dns_name("feed.corp.test")
-                    .udp(30000, Arc::new(group), || Feed)
+                h.on(&corp).dns_name("feed.corp.test").udp_stack(
+                    30000,
+                    Budget::unlimited(),
+                    move |info| Datagrammed::new(Feed(group), info.local),
+                )
             })
             .member("ws01", &corp, ws.into())
             .start(&fcx, attachments)?;
@@ -1144,7 +1157,7 @@ fn net_keeps_one_budget_per_attachment() {
             .host("svc", |h| {
                 h.at(addr)
                     .at(addr6)
-                    .tcp(8, Arc::new(()), || Wide)
+                    .tcp_stack(8, |_| Lined::new(Wide))
                     .port_server(9, spy)
             })
             .start(&fcx, attachments)?;
@@ -1175,7 +1188,7 @@ fn net_keeps_one_budget_per_attachment() {
                     got[0].clone().expect("a budget"),
                     got[1].clone().expect("a budget"),
                 );
-                assert!(b4.used() >= 40 << 10, "{b4:?}");
+                assert!(b4.used() >= 2 * WIDE_LINE, "{b4:?}");
                 assert_eq!(b6.used(), b4.used(), "IPv6 has its own budget");
                 // Leaving the region detaches the sandbox.
                 Err(fictionet::Error::from(Done))
@@ -1191,7 +1204,7 @@ fn net_keeps_one_budget_per_attachment() {
         let _spied = b.tcp.connect(&fcx, SocketAddr::new(addr.into(), 9)).await?;
         let got = spied(&fcx, &budgets, 3).await;
         let b_budget = got[2].clone().expect("a budget");
-        assert!(b_budget.used() >= 40 << 10, "{b_budget:?}");
+        assert!(b_budget.used() >= 2 * WIDE_LINE, "{b_budget:?}");
         fcx.idle().await?;
         assert_eq!(
             a.used(),
@@ -1217,7 +1230,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
                 .ipv4_only()
                 .lan(&corp)
                 .host("dc01", |h| {
-                    h.on(&corp).at(dc).tcp(389, Arc::new(()), || Echo)
+                    h.on(&corp).at(dc).tcp_stack(389, |_| Echo::stack())
                 })
                 .member("ws01", &corp, ws.into())
                 .start(&fcx, attachments)?;
@@ -1289,10 +1302,10 @@ fn hosts_and_lans_follow_the_supplied_pools() {
             Net::new(pools)
                 .ipv4_only()
                 .host("www", |h| {
-                    h.dns_name("www.test").tcp(7, Arc::new(()), || Echo)
+                    h.dns_name("www.test").tcp_stack(7, |_| Echo::stack())
                 })
                 .host("plc", |h| {
-                    h.dns_name("plc.test").tcp(7, Arc::new(()), || Echo)
+                    h.dns_name("plc.test").tcp_stack(7, |_| Echo::stack())
                 })
                 .start(&fcx, attachments)?;
             let m = machine(&fcx, attacher.attach("client")?, ME);
@@ -1331,7 +1344,7 @@ fn without_pools_a_host_needs_an_address() {
         let (_, attachments) = fictionet::attachments();
         let error = Net::new(Pools::NONE)
             .host("www", |h| {
-                h.dns_name("www.test").tcp(7, Arc::new(()), || Echo)
+                h.dns_name("www.test").tcp_stack(7, |_| Echo::stack())
             })
             .start(&fcx, attachments)
             .expect_err("a host with no address is refused");

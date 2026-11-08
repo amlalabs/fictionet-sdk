@@ -11,7 +11,7 @@ const LATE_AT: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 30);
 
 /// A host at `addr` that serves the echo service on TCP port 7.
 fn echo_host(label: &str, addr: Ipv4Addr) -> Host {
-    Host::new(label).at(addr).tcp(7, Arc::new(()), || Echo)
+    Host::new(label).at(addr).tcp_stack(7, |_| Echo::stack())
 }
 
 /// Waits up to ten seconds of world time for what a program sends.

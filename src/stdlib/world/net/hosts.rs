@@ -637,6 +637,37 @@ impl Host {
         )
     }
 
+    /// Serves TCP `port` with TLS for the names `sni` gives, with the
+    /// config `config_for` returns for each handshake, then a layer stack
+    /// made by `make` for each connection over the decrypted stream, as
+    /// [`tcp_stack`](Self::tcp_stack) does over TCP. Its [`ConnInfo`] has
+    /// the name and protocol TLS settled. Several TLS servers on one port
+    /// route by SNI; a name with no entry is rejected with
+    /// `unrecognized_name`.
+    pub fn tls_stack<L, M>(
+        self,
+        port: u16,
+        sni: impl Into<Sni>,
+        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+        make: M,
+    ) -> Host
+    where
+        L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
+        L::Work: Job<Done = L::Done>,
+        L::Report: Send,
+        L::Done: Send,
+        L::Error: Send,
+        M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
+    {
+        let accept = StackAccept {
+            make,
+            max_conns: DEFAULT_MAX_CONNS,
+            limits: StreamLimits::default(),
+            open: Arc::default(),
+        };
+        self.tls_accept(port, sni, config_for, accept)
+    }
+
     /// Serves UDP `port` with one layer stack made by `make` from the
     /// socket's [`ConnInfo`]: its address, which says the port the
     /// endpoint chose for port zero, and [`Transport::Udp`]. The stack
