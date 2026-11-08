@@ -85,7 +85,7 @@ mod options;
 mod request;
 
 pub use fit::{Fitted, Limit, Response, fit};
-pub use framing::{Framing, Queries, stream_framed};
+pub use framing::{Framing, Queries, StreamMessage, StreamMessageError, stream_framed};
 pub use names::{dname_substitute, label_count};
 pub use options::{Ede, EdeCode, Nsid, Padding};
 pub use request::{EdnsIn, Parsed, Request, read_message};

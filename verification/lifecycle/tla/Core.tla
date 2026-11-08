@@ -20,8 +20,8 @@
 (* or keyed work, arm the timer, and hand back any Flow or an error.       *)
 (* Bytes are counted, not carried.  Writes to the connection take no time  *)
 (* (the write limit is the connection's affair); a write may still fail.  *)
-(* The budget blows up nondeterministically.  The TLS handshake and        *)
-(* `connection`'s region wrapper are outside this module.                  *)
+(* The budget blows up nondeterministically.  `connection`'s region        *)
+(* wrapper is outside this module.                                         *)
 (*                                                                         *)
 (* IdleLimit is ServeOptions::idle in ticks; 0 means none.  SuspendIdle    *)
 (* FALSE is the code before the fix: the idle clock restarts only on the   *)
@@ -40,7 +40,7 @@ Min(a, b) == IF a < b THEN a ELSE b
 Ends == {"Eof", "Closed", "Failed", "Idle", "Budget", "Conn", "Cancelled"}
 Writable(e) == e \in {"Eof", "Closed", "Failed", "Idle", "Budget"}
 \* `Flow`, with `Err` for a call that returns the service's error.
-Flows == {"Continue", "Close", "Tls", "Handoff", "Decoder", "Err"}
+Flows == {"Continue", "Close", "Handoff", "Decoder", "Err"}
 Defers == {"none", "ordered", "keyed"}
 
 VARIABLES
@@ -66,8 +66,8 @@ CoreRecords == [
   state: {"Running", "Ending", "Upgrading", "Ended"},
   end: Ends \cup {"None"},
   called: BOOLEAN,              \* Ending: on_end ran
-  how: {"None", "Tls", "Handoff"},
-  heldFlow: {"None", "Close", "Tls", "Handoff", "Decoder"},
+  how: {"None", "Handoff"},
+  heldFlow: {"None", "Close", "Handoff", "Decoder"},
   ordered: 0..MaxWork,
   keyed: 0..MaxWork,
   out: 0..MaxOut,
@@ -223,7 +223,7 @@ UpgradeReturn ==
   /\ Ready /\ c.state = "Upgrading" /\ (~TotalBroken \/ ~cancelled)
   /\ pc' = "Done"
   /\ returned' = "Upgraded"
-  /\ c' = [c EXCEPT !.wakeClosed = c.wakeClosed \/ c.how = "Handoff"]
+  /\ c' = [c EXCEPT !.wakeClosed = TRUE]
   /\ UNCHANGED <<waitKind, input, eof, timer, woken, cancelled, observed,
                  elapsed, quiet, suspended>>
   /\ charged' = Holding(c, input)
@@ -505,12 +505,12 @@ TypeOK ==
 OnEndOnce == c.onEnd <= 1
 NoLateCalls == c.late = 0
 
-\* The wake handle is open exactly while the service runs, and after a
-\* STARTTLS handoff, which goes on with the same handle.
+\* The wake handle is open exactly while the service runs: a handoff
+\* closes it with the rest.
 WakeHandle ==
   /\ c.state \in {"Ending", "Ended"} => c.wakeClosed
   /\ c.state = "Running" => ~c.wakeClosed
-  /\ returned = "Upgraded" => (c.wakeClosed <=> c.how = "Handoff")
+  /\ returned = "Upgraded" => c.wakeClosed
 
 \* No deferred work outlives the connection; keyed work ends with Running.
 WorkAtEnd ==

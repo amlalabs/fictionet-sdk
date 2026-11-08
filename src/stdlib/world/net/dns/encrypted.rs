@@ -57,6 +57,7 @@
 //! # }
 //! ```
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -64,26 +65,32 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use http::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE};
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 
+use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64::{self, Padding};
+use fictionet::stdlib::layer::{
+    Admit, Budget, Chain, Charge, Decoded, Env, Framed, Framing, Layer, MessageCommand,
+    MessageEvent, Owned, OwnedWork, Timers, Top, WorkOwner,
+};
 use fictionet::stdlib::protocols::dns::op::Message;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RData};
-use fictionet::stdlib::protocols::dns::{Framing, Queries, read_message, stream_framed};
+use fictionet::stdlib::protocols::dns::{
+    Framing as DnsFraming, Queries, StreamMessage, read_message,
+};
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::Client;
-use fictionet::stdlib::services::serve::{
-    self, ConnInfo, Driver, Flow, Pending, PendingDriver, ServeOptions, Service, Transport,
-};
+use fictionet::stdlib::services::serve::{ConnInfo, Transport};
+use fictionet::stdlib::services::stack::{self, Boxed, Job, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
-use fictionet::{Cx, Error};
+use fictionet::time::Instant;
 
-use super::super::{Arrival, Host, PortServer, Sni};
+use super::super::{Arrival, Host, Limits, Opening, PortServer, Sni};
 use super::ResolverHandle;
 
 /// The port of DNS over TLS (RFC 7858 §3.1).
@@ -279,31 +286,53 @@ impl Front {
 // ---------------------------------------------------------------------------
 // DNS over TLS
 
+/// How many queries one DNS over TLS connection may have with the resolver
+/// and answered but not yet written, together. A client that pipelines
+/// more waits: its next query is read once an answer is written, or once
+/// the resolver leaves a query unanswered.
+const QUERIES: usize = 32;
+
+/// The stack of one DNS over TLS connection, over TLS or a plain
+/// connection: DNS stream framing, then [`Queried`].
+type DotStack = Chain<Framed<Queries, StreamMessage>, Queried>;
+
 /// DNS over TLS on one port.
 struct Dot {
     front: Arc<Front>,
 }
 
+impl Dot {
+    /// The stack for the connection `conn`, under the network's `limits`.
+    fn stack(&self, conn: &ConnInfo, limits: &Limits) -> DotStack {
+        Chain::new(
+            Framed::new(Queries::new(DnsFraming::Stream)),
+            Queried::new(self.front.clone(), conn, limits.dns_tcp_idle),
+        )
+    }
+}
+
 impl PortServer for Dot {
+    /// The same stack over a connection with no TLS in front.
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let mut service = Queried {
-            front: self.front.clone(),
-            next: 0,
+        let stack = self.stack(&arrival.info, &arrival.limits);
+        let budget = arrival.budget.unwrap_or_else(Budget::unlimited);
+        // The stack keeps its own idle time.
+        let limits = StreamLimits {
+            idle: None,
+            write_timeout: Some(arrival.limits.write_timeout),
         };
-        // The connection's buffers and the queries it waits on are charged
-        // to its sandbox. It closes once it has been quiet for the network's
-        // idle time for DNS over TCP with no query waiting (RFC 7766
-        // §6.2.3, RFC 7858 §3.4).
-        let opts = ServeOptions {
-            budget: arrival.budget,
-            handshake: arrival.limits.handshake,
-            idle: Some(arrival.limits.dns_tcp_idle),
-            ..ServeOptions::default()
-        };
+        let (conn, info, socket) = (arrival.conn, arrival.info, arrival.socket);
         Box::pin(async move {
-            let _ =
-                serve::connection(&fcx, arrival.conn, arrival.info, &mut service, &(), &opts).await;
+            let ended = stack::stream(&fcx, conn, &info, stack, budget, limits, |_| {});
+            if let Ok(StreamEnd::Reset) = ended.await {
+                socket.reset();
+            }
         })
+    }
+
+    /// Queries and answers in the same stack as TLS.
+    fn over_tls(&self, _fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+        Some(Boxed::new(self.stack(&opening.info, &opening.limits)))
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {
@@ -311,93 +340,268 @@ impl PortServer for Dot {
     }
 }
 
-/// One DNS over TLS connection: each query goes to the resolver as it
-/// arrives, and each answer is written whole as soon as it is ready, so
-/// answers may come out of order (RFC 7766 §6.2.1.1).
+/// The port [`Queried`] runs on: whole queries up, answers down.
+type QueryPort = Framing<Queries, StreamMessage>;
+
+/// The timer of a DNS over TLS connection with no query waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Quiet;
+
+/// One DNS over TLS connection's queries: each goes to the resolver as it
+/// arrives, as [work](Ask), and each answer is written whole as soon as it
+/// is ready, so answers may come out of order (RFC 7766 §6.2.1.1). A query
+/// the resolver leaves unanswered writes nothing.
+///
+/// A query keeps its charge to the connection's budget while the resolver
+/// has it, and its answer is charged before it is kept. An answer that
+/// does not fit closes the connection, as the queries still with the
+/// resolver are dropped.
+///
+/// The connection closes once it has been quiet for the network's idle
+/// time for DNS over TCP with no query waiting (RFC 7766 §6.2.3, RFC 7858
+/// §3.4), or once the client has ended its direction and every answer is
+/// written.
 struct Queried {
     front: Arc<Front>,
+    /// Who the queries are from. `None` for a connection with no
+    /// addresses, which no network made: its queries go nowhere.
+    client: Option<Client>,
+    idle: Duration,
+    owner: WorkOwner,
+    /// The next query's number. The work of a query is known by it, since
+    /// two queries on a connection may carry the same DNS ID.
     next: u64,
+    /// The numbers of the queries with the resolver, or waiting in `work`
+    /// to go to it.
+    asking: Vec<u64>,
+    work: VecDeque<OwnedWork<Ask>>,
+    /// Answers the framing below has not taken yet, in the order they came.
+    answers: VecDeque<Owned<StreamMessage>>,
+    timers: Timers<Quiet>,
+    /// No more queries are read: the client's input is over, the
+    /// connection was quiet too long, or an answer did not fit.
+    over: bool,
+    end_sent: bool,
 }
 
-impl Service for Queried {
-    type Timer = ();
-    type Decoder = Queries;
-    type State = ();
+impl Queried {
+    /// The queries of the connection `conn` to the resolver `front` puts
+    /// them to, closed after `idle` with none waiting.
+    fn new(front: Arc<Front>, conn: &ConnInfo, idle: Duration) -> Queried {
+        Queried {
+            client: front.client(conn),
+            front,
+            idle,
+            owner: WorkOwner::new(),
+            next: 0,
+            asking: Vec::new(),
+            work: VecDeque::new(),
+            answers: VecDeque::new(),
+            timers: Timers::new(),
+            over: false,
+            end_sent: false,
+        }
+    }
+
+    /// Reads no more queries.
+    fn stop(&mut self) {
+        self.over = true;
+        self.timers.cancel(&Quiet);
+    }
+
+    /// Whether no query is waiting: none with the resolver, and no answer
+    /// left to hand below.
+    fn quiet(&self) -> bool {
+        self.asking.is_empty() && self.answers.is_empty()
+    }
+}
+
+impl Layer for Queried {
+    type Lower = QueryPort;
+    type Upper = Top;
+    type Report = Infallible;
+    type Timer = Quiet;
+    type Work = OwnedWork<Ask>;
+    type Done = Answered;
     type Error = Infallible;
 
-    fn decoder(&self) -> Queries {
-        Queries::new(Framing::Stream)
+    fn is_terminal(&self) -> bool {
+        self.end_sent
     }
 
-    fn on_item(
+    fn on_event(
         &mut self,
-        query: Vec<u8>,
-        _state: &(),
-        driver: &mut Driver<'_, Queries, ()>,
-    ) -> Result<Flow, Infallible> {
-        if let Some(client) = self.front.client(driver.conn()) {
-            let answer = Answering::new(self.front.resolver.clone(), client, query);
-            driver.defer_keyed(self.next, answer);
-            self.next += 1;
+        _env: &mut Env<'_, Infallible>,
+        event: MessageEvent<Decoded<Queries>>,
+    ) -> Result<Admit<MessageEvent<Decoded<Queries>>>, Infallible> {
+        if self.over {
+            return Ok(Admit::Closed(event));
         }
-        Ok(Flow::Continue)
+        match event {
+            MessageEvent::Message(Ok(query)) => {
+                if self.asking.len() + self.answers.len() >= QUERIES {
+                    return Ok(Admit::Blocked(MessageEvent::Message(Ok(query))));
+                }
+                self.timers.cancel(&Quiet);
+                let Some(client) = self.client.clone() else {
+                    return Ok(Admit::Taken);
+                };
+                // The framing charged it as the longest message; it keeps
+                // only what it holds, and less always fits.
+                let (query, mut charge) = query.into_parts();
+                charge.set(query.capacity());
+                let generation = self.next;
+                self.next += 1;
+                self.asking.push(generation);
+                self.work.push_back(self.owner.own(Ask {
+                    generation,
+                    resolver: self.front.resolver.clone(),
+                    query: Some((client, query)),
+                    charge: Some(charge),
+                    asking: None,
+                }));
+            }
+            // A stream of DNS messages fails only cut short: what came
+            // whole is still answered.
+            MessageEvent::Message(Err(_)) | MessageEvent::Ended => self.stop(),
+        }
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _env: &mut Env<'_, Infallible>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn on_timer(&mut self, _env: &mut Env<'_, Infallible>, timer: Quiet) -> Result<(), Infallible> {
+        self.timers.cancel(&timer);
+        if !self.over && self.quiet() {
+            self.stop();
+        }
+        Ok(())
+    }
+
+    fn on_done(
+        &mut self,
+        _env: &mut Env<'_, Infallible>,
+        done: Answered,
+    ) -> Result<(), Infallible> {
+        let Some(at) = self.asking.iter().position(|g| *g == done.generation) else {
+            return Ok(());
+        };
+        self.asking.swap_remove(at);
+        match done.outcome {
+            Outcome::Answer(answer) => self.answers.push_back(answer),
+            Outcome::Unanswered => {}
+            Outcome::Budget => {
+                self.stop();
+                self.owner.cancel();
+                self.owner = WorkOwner::new();
+                self.work.clear();
+                self.asking.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the idle time once no query is waiting.
+    fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+        if !self.over && self.quiet() && self.timers.get(&Quiet).is_none() {
+            self.timers.set(Quiet, env.now() + self.idle);
+        }
+        Ok(false)
+    }
+
+    fn take_command(&mut self) -> Option<MessageCommand<Owned<StreamMessage>>> {
+        if let Some(answer) = self.answers.pop_front() {
+            return Some(MessageCommand::Send(answer));
+        }
+        if self.over && self.asking.is_empty() && !self.end_sent {
+            self.end_sent = true;
+            return Some(MessageCommand::End);
+        }
+        None
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+
+    fn take_work(&mut self) -> Option<OwnedWork<Ask>> {
+        self.work.pop_front()
+    }
+
+    fn deadline(&self) -> Option<(Instant, Quiet)> {
+        self.timers.next()
     }
 }
 
-/// The resolver's answer to one query.
-type Answer = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>>;
+/// The resolver's answer to one query, on its way.
+type Asking = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>>;
 
-/// One query of a DNS over TLS connection, waiting for its answer, which
-/// it writes after its two-octet length (RFC 7858 §3.3, RFC 1035 §4.2.2).
-/// A query the resolver leaves unanswered writes nothing.
-struct Answering {
+/// One query of a DNS over TLS connection, with the resolver until it
+/// answers. Run with no world, it is unanswered.
+struct Ask {
+    generation: u64,
     resolver: ResolverHandle,
     query: Option<(Client, Vec<u8>)>,
-    answer: Option<Answer>,
-    held: usize,
+    /// What the query holds while the resolver has it, then what its
+    /// answer holds.
+    charge: Option<Charge>,
+    asking: Option<Asking>,
 }
 
-impl Answering {
-    fn new(resolver: ResolverHandle, client: Client, query: Vec<u8>) -> Answering {
-        Answering {
-            resolver,
-            held: query.len(),
-            query: Some((client, query)),
-            answer: None,
-        }
-    }
+/// What became of one query.
+struct Answered {
+    generation: u64,
+    outcome: Outcome,
 }
 
-impl Pending for Answering {
-    fn poll_next(
-        &mut self,
-        driver: &mut PendingDriver<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, Error>>> {
-        if let Some((client, query)) = self.query.take() {
-            let Some(fcx) = driver.fcx().cloned() else {
-                return Poll::Ready(None);
-            };
+enum Outcome {
+    /// The resolver answered with this message.
+    Answer(Owned<StreamMessage>),
+    /// The resolver dropped the query.
+    Unanswered,
+    /// The resolver answered, and the connection's budget has no room for
+    /// the answer.
+    Budget,
+}
+
+impl Job for Ask {
+    type Done = Answered;
+
+    fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Answered> {
+        if let Some((client, query)) = self.query.take()
+            && let Some(fcx) = fcx.cloned()
+        {
             let resolver = self.resolver.clone();
-            self.answer = Some(Box::pin(async move {
+            self.asking = Some(Box::pin(async move {
                 resolver.query(&fcx, client, query).await
             }));
         }
-        let Some(answer) = &mut self.answer else {
-            return Poll::Ready(None);
+        let answer = match &mut self.asking {
+            Some(asking) => ready!(asking.as_mut().poll(cx)),
+            None => None,
         };
-        let answer = ready!(answer.as_mut().poll(cx));
-        self.answer = None;
-        self.held = 0;
-        Poll::Ready(answer.map(|answer| {
-            // The resolver fits stream answers to 65535 octets.
-            stream_framed(&answer)
-                .ok_or_else(|| Error::msg("a DNS answer longer than a stream carries"))
-        }))
-    }
-
-    fn held(&self) -> usize {
-        self.held
+        self.asking = None;
+        let outcome = match (answer, self.charge.take()) {
+            (Some(answer), Some(mut charge)) => {
+                if charge.set(answer.capacity()) {
+                    Outcome::Answer(Owned::new(StreamMessage(answer), charge))
+                } else {
+                    Outcome::Budget
+                }
+            }
+            (Some(_), None) => Outcome::Budget,
+            (None, _) => Outcome::Unanswered,
+        };
+        Poll::Ready(Answered {
+            generation: self.generation,
+            outcome,
+        })
     }
 }
 
@@ -625,4 +829,311 @@ pub fn freshness(message: &Message) -> Option<u32> {
             _ => None,
         })
         .min()
+}
+
+#[cfg(test)]
+mod tests {
+    //! DNS over TLS's queries over its framing, in a harness: the test does
+    //! the resolver's part, so it decides when each query is answered and
+    //! with what. The tests compare what the client reads with what the
+    //! resolver answered, never fixed bytes.
+
+    use std::task::Waker;
+
+    use super::super::Recursive;
+    use super::*;
+    use fictionet::stdlib::codec::{Decode, Step};
+    use fictionet::stdlib::layer::{Harness, Side};
+    use fictionet::stdlib::services::dns::WallClock;
+    use fictionet::stdlib::services::dns::resolver::Config;
+    use fictionet::{Entropy, Seed, SeededEntropy};
+
+    const IDLE: Duration = Duration::from_secs(10);
+
+    fn harness(budget: Budget) -> Harness<DotStack> {
+        let clock = WallClock {
+            start: SystemTime::UNIX_EPOCH,
+        };
+        let front = Arc::new(Front {
+            resolver: Recursive::new(Config::new(), clock).handle(),
+            at: None,
+        });
+        let local = "192.0.2.1:853".parse().unwrap();
+        let peer = "198.51.100.7:40000".parse().unwrap();
+        let conn = ConnInfo::new(1, local, peer);
+        let stack = Chain::new(
+            Framed::new(Queries::new(DnsFraming::Stream)),
+            Queried::new(front, &conn, IDLE),
+        );
+        Harness::with_budget(Seed::from_u64(7), stack, budget)
+    }
+
+    /// A message of `len` octets, different for each `seed`. The layer
+    /// does not read messages, so it need not be DNS.
+    fn message(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+    }
+
+    /// `messages` as a client writes them, each after its length.
+    fn framed(messages: &[Vec<u8>]) -> Vec<u8> {
+        messages
+            .iter()
+            .flat_map(|m| StreamMessage(m.clone()).to_bytes().unwrap())
+            .collect()
+    }
+
+    /// The client sends `bytes` in pieces of 1 to 7 octets.
+    fn push_cut(h: &mut Harness<DotStack>, bytes: &[u8], seed: u64) {
+        let cuts = SeededEntropy::new(Seed::from_u64(seed));
+        let mut at = 0;
+        while at < bytes.len() {
+            let end = (at + 1 + cuts.random_below(7) as usize).min(bytes.len());
+            h.push(&bytes[at..end]).unwrap();
+            at = end;
+        }
+    }
+
+    /// The messages a client reads from `bytes`, which must hold only
+    /// whole ones.
+    fn read(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut queries = Queries::new(DnsFraming::Stream);
+        let mut at = 0;
+        let mut messages = Vec::new();
+        while at < bytes.len() {
+            let Step::Item(message, used) = queries.decode(&bytes[at..], false).unwrap() else {
+                panic!("a message cut short");
+            };
+            messages.push(message);
+            at += used;
+        }
+        messages
+    }
+
+    /// The queries the stack has handed the resolver since last asked.
+    fn asks(h: &mut Harness<DotStack>) -> Vec<OwnedWork<Ask>> {
+        let mut asks = Vec::new();
+        while let Some(work) = h.work() {
+            // The framing asks for no work.
+            let Side::Upper(ask) = work;
+            asks.push(ask);
+        }
+        asks
+    }
+
+    fn query_of(ask: &OwnedWork<Ask>) -> &[u8] {
+        &ask.work.query.as_ref().expect("not yet polled").1
+    }
+
+    fn answered(ask: &OwnedWork<Ask>, answer: Vec<u8>) -> Side<Infallible, Answered> {
+        let charge = Budget::unlimited().charge(answer.len()).unwrap();
+        Side::Upper(Answered {
+            generation: ask.work.generation,
+            outcome: Outcome::Answer(Owned::new(StreamMessage(answer), charge)),
+        })
+    }
+
+    fn unanswered(ask: &OwnedWork<Ask>) -> Side<Infallible, Answered> {
+        Side::Upper(Answered {
+            generation: ask.work.generation,
+            outcome: Outcome::Unanswered,
+        })
+    }
+
+    /// Polls `ask` once, with no world, as the runner would, its resolver
+    /// answering at once with `answer`.
+    fn poll_answering(ask: &mut OwnedWork<Ask>, answer: Option<Vec<u8>>) -> Answered {
+        ask.work.query = None;
+        ask.work.asking = Some(Box::pin(std::future::ready(answer)));
+        let mut cx = Context::from_waker(Waker::noop());
+        match Job::poll(ask, None, &mut cx) {
+            Poll::Ready(done) => done,
+            Poll::Pending => panic!("a ready answer is pending"),
+        }
+    }
+
+    #[test]
+    fn each_answer_goes_out_whole_as_soon_as_it_is_ready() {
+        for seed in 0..8 {
+            let mut h = harness(Budget::unlimited());
+            let queries: Vec<_> = (0..3).map(|i| message(i * 40, 12 + i as usize)).collect();
+            push_cut(&mut h, &framed(&queries), seed);
+            let asks = asks(&mut h);
+            let asked: Vec<_> = asks.iter().map(|a| query_of(a).to_vec()).collect();
+            assert_eq!(asked, queries);
+            assert!(h.output().is_empty());
+            // The last is answered first, the first next, and the middle
+            // one never.
+            let (last, first) = (message(200, 30), message(100, 20));
+            h.complete(answered(&asks[2], last.clone())).unwrap();
+            h.complete(answered(&asks[0], first.clone())).unwrap();
+            h.complete(unanswered(&asks[1])).unwrap();
+            assert_eq!(read(h.output()), [last, first.clone()]);
+            // The connection goes on.
+            push_cut(&mut h, &framed(&[message(7, 17)]), seed);
+            let more = self::asks(&mut h);
+            assert_eq!(more.len(), 1);
+            h.complete(answered(&more[0], message(9, 40))).unwrap();
+            assert_eq!(read(h.output()).len(), 3);
+            assert!(!h.ended());
+        }
+    }
+
+    #[test]
+    fn two_queries_with_the_same_id_are_two_queries() {
+        let mut h = harness(Budget::unlimited());
+        let query = message(1, 20);
+        h.push(&framed(&[query.clone(), query.clone()])).unwrap();
+        let asks = asks(&mut h);
+        assert_eq!(asks.len(), 2);
+        let (one, two) = (message(50, 25), message(90, 25));
+        h.complete(answered(&asks[1], two.clone())).unwrap();
+        // A result for a query already answered changes nothing.
+        h.complete(answered(&asks[1], message(3, 10))).unwrap();
+        h.complete(answered(&asks[0], one.clone())).unwrap();
+        assert_eq!(read(h.output()), [two, one]);
+    }
+
+    #[test]
+    fn a_client_that_pipelines_past_the_limit_waits_for_its_answers() {
+        let extra = 10;
+        let mut h = harness(Budget::unlimited());
+        let queries: Vec<_> = (0..QUERIES + extra).map(|i| message(i as u8, 12)).collect();
+        h.push(&framed(&queries)).unwrap();
+        let first = asks(&mut h);
+        assert_eq!(first.len(), QUERIES);
+        // Answers the client does not read hold their places.
+        h.withhold();
+        for ask in &first {
+            h.complete(answered(ask, query_of(ask).to_vec())).unwrap();
+        }
+        let mut pending = asks(&mut h);
+        assert!(pending.len() < extra, "{} more read", pending.len());
+        // Once it reads, the rest go to the resolver.
+        h.allow_all().unwrap();
+        let mut total = first.len();
+        while !pending.is_empty() {
+            for ask in &pending {
+                h.complete(answered(ask, query_of(ask).to_vec())).unwrap();
+            }
+            total += pending.len();
+            pending = asks(&mut h);
+        }
+        assert_eq!(total, queries.len());
+        let mut out = read(h.output());
+        out.sort();
+        let mut sent = queries.clone();
+        sent.sort();
+        assert_eq!(out, sent);
+    }
+
+    #[test]
+    fn a_quiet_connection_closes_after_the_idle_time_and_a_waiting_query_keeps_it_open() {
+        let tick = Duration::from_millis(1);
+        let mut quiet = harness(Budget::unlimited());
+        quiet.settle().unwrap();
+        quiet.advance(IDLE - tick).unwrap();
+        assert!(!quiet.ended());
+        quiet.advance(tick).unwrap();
+        assert!(quiet.ended());
+
+        let mut h = harness(Budget::unlimited());
+        h.settle().unwrap();
+        h.advance(IDLE / 2).unwrap();
+        h.push(&framed(&[message(1, 12)])).unwrap();
+        let asks = asks(&mut h);
+        // The resolver takes three idle times to answer.
+        h.advance(IDLE * 3).unwrap();
+        assert!(!h.ended());
+        let answer = message(2, 30);
+        h.complete(answered(&asks[0], answer.clone())).unwrap();
+        assert_eq!(read(h.output()), [answer]);
+        // The idle time starts again from the answer.
+        h.advance(IDLE - tick).unwrap();
+        assert!(!h.ended());
+        h.advance(tick).unwrap();
+        assert!(h.ended());
+    }
+
+    #[test]
+    fn a_client_that_ends_its_direction_still_gets_its_answers() {
+        let mut h = harness(Budget::unlimited());
+        h.push(&framed(&[message(1, 12), message(2, 12)])).unwrap();
+        // Half a third query, then the end.
+        h.push(&framed(&[message(3, 12)])[..5]).unwrap();
+        h.end().unwrap();
+        let asks = asks(&mut h);
+        assert_eq!(asks.len(), 2);
+        assert!(!h.ended());
+        let answer = message(4, 30);
+        h.complete(answered(&asks[1], answer.clone())).unwrap();
+        assert!(!h.ended());
+        h.complete(unanswered(&asks[0])).unwrap();
+        assert!(h.ended());
+        assert_eq!(read(h.output()), [answer]);
+        assert!(h.layer().is_terminal());
+    }
+
+    #[test]
+    fn a_query_stays_charged_while_the_resolver_has_it() {
+        let budget = Budget::unlimited();
+        let mut h = harness(budget.clone());
+        h.settle().unwrap();
+        let before = budget.used();
+        let query = message(1, 300);
+        h.push(&framed(std::slice::from_ref(&query))).unwrap();
+        let mut asks = asks(&mut h);
+        assert!(budget.used() >= before + query.len());
+        // The answer takes the query's place in the budget until it is
+        // written.
+        let answer = message(2, 900);
+        let done = poll_answering(&mut asks[0], Some(answer.clone()));
+        drop(asks);
+        assert!(budget.used() >= before + answer.len());
+        h.complete(Side::Upper(done)).unwrap();
+        assert_eq!(read(h.output()), [answer]);
+        assert_eq!(budget.used(), before);
+    }
+
+    #[test]
+    fn an_answer_with_no_room_closes_the_connection_and_drops_the_other_queries() {
+        let budget = Budget::new(1 << 20);
+        let mut h = harness(budget.clone());
+        h.push(&framed(&[message(1, 12), message(2, 12)])).unwrap();
+        let mut asks = asks(&mut h);
+        // More than the budget has left once the query gives back its charge.
+        let room = budget.limit() - budget.used() + query_of(&asks[0]).len();
+        let done = poll_answering(&mut asks[0], Some(message(3, room + 1)));
+        assert!(matches!(done.outcome, Outcome::Budget));
+        h.complete(Side::Upper(done)).unwrap();
+        assert!(asks[1].cancelled());
+        // The other query's answer, had it come, writes nothing.
+        h.complete(answered(&asks[1], message(4, 12))).unwrap();
+        assert!(h.output().is_empty());
+        assert!(h.ended());
+    }
+
+    #[test]
+    fn a_closed_connection_cancels_its_queries() {
+        let mut h = harness(Budget::unlimited());
+        h.push(&framed(&[message(1, 12)])).unwrap();
+        let asks = asks(&mut h);
+        assert!(!asks[0].cancelled());
+        drop(h);
+        assert!(asks[0].cancelled());
+    }
+
+    #[test]
+    fn a_query_with_no_world_is_unanswered() {
+        let mut h = harness(Budget::unlimited());
+        h.push(&framed(&[message(1, 12)])).unwrap();
+        let mut asks = asks(&mut h);
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(done) = Job::poll(&mut asks[0], None, &mut cx) else {
+            panic!("a query with no world waits");
+        };
+        assert!(matches!(done.outcome, Outcome::Unanswered));
+        h.complete(Side::Upper(done)).unwrap();
+        assert!(h.output().is_empty());
+        assert!(!h.ended());
+    }
 }

@@ -15,6 +15,11 @@ use fictionet::time::Instant;
 /// It is [`Chain`]`<TlsLayer, `[`Later`]`<U>>`: the plaintext the client sends
 /// right after its handshake waits in order until `make` has made the layer
 /// above, then reaches it first. A handshake that fails never makes it.
+///
+/// It is also what STARTTLS switches to: a plaintext layer whose
+/// [`Handoff`](fictionet::stdlib::layer::Handoff) names a `Secure` as what
+/// comes next runs in a [`Switch`](fictionet::stdlib::layer::Switch), and
+/// `make` carries the plaintext session's context into the layer above.
 pub struct Secure<U: Layer<Lower = ByteStream>, F> {
     chain: Chain<TlsLayer, Later<U>>,
     make: Option<F>,

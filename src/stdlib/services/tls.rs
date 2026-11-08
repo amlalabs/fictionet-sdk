@@ -128,9 +128,8 @@ pub fn alert_name(code: u8) -> &'static str {
 }
 
 /// How a handshake failed, in more detail than [`ConnError`]: what
-/// [`server_detailed`], [`ClientHello::finish_detailed`] and
-/// [`serve::accept_tls`](fictionet::stdlib::services::serve::accept_tls) return, for a
-/// world that logs how each handshake ended.
+/// [`server_detailed`], [`ClientHello::finish_detailed`] and [`TlsLayer`]
+/// return, for a world that logs how each handshake ended.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HandshakeError {
@@ -142,10 +141,10 @@ pub enum HandshakeError {
     Failed(String),
     /// There was no config for the name the client asked for, and the
     /// handshake was refused with `unrecognized_name`. Returned by
-    /// [`TlsLayer`] and `accept_tls`.
+    /// [`TlsLayer`].
     Rejected,
-    /// The handshake did not finish by its deadline: from `accept_tls`, and
-    /// from a [`TlsLayer`] given one ([`TlsLayer::handshake_by`]).
+    /// The handshake did not finish by its deadline: from a [`TlsLayer`]
+    /// given one ([`TlsLayer::handshake_by`]).
     TimedOut,
     /// The connection underneath failed. Never [`ConnError::Cancelled`]:
     /// a cancel is [`HandshakeError::Cancelled`].
