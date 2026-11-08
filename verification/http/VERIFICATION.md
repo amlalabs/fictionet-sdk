@@ -4,7 +4,7 @@ Area: `src/stdlib/web/httpd.rs` and `src/stdlib/web/httpd/` (HTTP/1 in
 `native.rs`, HTTP/2 in `http2.rs`, the shared response policy in
 `response.rs`), the HTTP/1 framing rules in `src/stdlib/protocols/http1.rs`,
 HTTP/2 stream states and flow control, the HTTP/1 layer (`Http1`) with its
-handoff through `Switch` to `layer::Tunnel`, and the HTTP/1 body framing
+handoff through `Switch` to `stack::Tunnel`, and the HTTP/1 body framing
 (`http1::BodyEvents`) shared by serving, capture and the WARC reader. The
 models, how to run them and the full results are in
 [verification/http/README.md](README.md).
@@ -47,7 +47,7 @@ with the 101 followed by a second `HTTP/1.1` response on the same
 connection.
 
 Fix: `Http1::start` closes the connection after a 101 that carries no
-`UpgradeHandler` (native.rs:576-580). After it the test passes and
+`UpgradeHandler` (native.rs:577-581). After it the test passes and
 `Pipeline_base.cfg`, which checks `NoHttpAfter101`, passes. The rule
 predates B2: the server before the layer had the same one. Commit
 b69a3806f: "Model the HTTP/1 pipeline and handoff; close after a bare 101".

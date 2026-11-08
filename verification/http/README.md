@@ -159,7 +159,7 @@ violates `ServerSpendsWithinWindows`, and `without_wakeonconnectionupdate`,
 
 `tla/Pipeline.tla` is `Http1` (`web/httpd/native.rs`) inside
 `Switch<Http1, Tunnel>` (`layer/switch.rs`), with the `Tunnel`
-(`layer/tunnel.rs`) it switches to. The header of the file maps each action
+(`services/stack/tunnel.rs`) it switches to. The header of the file maps each action
 to its functions with line numbers (at commit 50b69c60d, the code this pass
 checked; the fix below moves `native.rs` lines after 575 down by four):
 `on_event` for data, the end and
@@ -199,15 +199,15 @@ turns one off and violates the property it names:
 
 | Config | The rule turned off | Violates | States to the violation |
 |---|---|---|---|
-| `without_waitwritten` | `all_written` waits for `Written` (native.rs:275-277) | `ReadAfterWritten` | 255,857 generated, depth 8 |
-| `without_readonlyinreading` | `advance` reads only in `Reading` (native.rs:871) | `OneInFlight` | 23,412, depth 5 |
-| `without_keepunread` | `hand_on` passes the unread bytes (native.rs:638-646) | `TunnelGetsTheRest` | 578,788, depth 11 |
-| `without_leftoverinswitching` | data while `Switching` joins the leftovers (native.rs:747-749) | `TunnelGetsTheRest` | 806,786, depth 13 |
-| `without_endlast` | `hand_on` puts the client's end last (native.rs:650-652) | `TunnelEndsLast` | 1,236,115, depth 19 |
-| `without_handoverafterwritten` | `handover` only once `Switching` (native.rs:907) | `HandoverAfterWritten` | 106,530, depth 6 |
+| `without_waitwritten` | `all_written` waits for `Written` (native.rs:276-278) | `ReadAfterWritten` | 255,857 generated, depth 8 |
+| `without_readonlyinreading` | `advance` reads only in `Reading` (native.rs:872) | `OneInFlight` | 23,412, depth 5 |
+| `without_keepunread` | `hand_on` passes the unread bytes (native.rs:639-647) | `TunnelGetsTheRest` | 578,788, depth 11 |
+| `without_leftoverinswitching` | data while `Switching` joins the leftovers (native.rs:748-750) | `TunnelGetsTheRest` | 806,786, depth 13 |
+| `without_endlast` | `hand_on` puts the client's end last (native.rs:651-653) | `TunnelEndsLast` | 1,236,115, depth 19 |
+| `without_handoverafterwritten` | `handover` only once `Switching` (native.rs:908) | `HandoverAfterWritten` | 106,530, depth 6 |
 | `without_leftoverfirst` | `Switch` blocks new input behind leftovers (switch.rs:138) | `TunnelGetsTheRest` | 578,870, depth 11 |
 | `without_feedleftovers` | `Switch::advance` feeds a leftover (switch.rs:211-216) | `TunnelGetsAll` | 1,471,808 generated, the whole graph |
-| `without_closeafterbare101` | a 101 without an `UpgradeHandler` closes (native.rs:576-580) | `NoHttpAfter101` | 391,698, depth 9 |
+| `without_closeafterbare101` | a 101 without an `UpgradeHandler` closes (native.rs:577-581) | `NoHttpAfter101` | 391,698, depth 9 |
 
 The last is the code before commit b69a3806f: see the bugs below.
 
@@ -310,7 +310,7 @@ in `http1.rs` (the edit, the harness, the result):
 ## TLA+: the tunnel's room and charges
 
 `tla/Tunnel.tla` is `Tunnel::on_event`, `take_command`, and the
-`TunnelConn` reads and writes the code gets (`layer/tunnel.rs`), with the
+`TunnelConn` reads and writes the code gets (`services/stack/tunnel.rs`), with the
 budget's `charge` and a charge's drop, in units with `Room` for the 64 KiB
 `ROOM`. Kani could not check this code: every harness that calls
 `TunnelConn`'s `poll_read` or `poll_write` needs a `Cx`, and building one
@@ -331,9 +331,9 @@ With `Room = 2`, `Limit = 3`, chunks from below of 1 or 3 units, writes of
 1 or 3, reads of 1 or 2 and three of each: `Tunnel_base.cfg` passes,
 30,275 states generated, 5,644 distinct, depth 15. Each ablation violates
 its property: `without_checkroom` (a write takes `min(room, len)`,
-tunnel.rs:285-290) violates `OutboundWithinRoom`; `without_chargewrites`
-(the charge before the queue, tunnel.rs:291-302) violates `ChargesMatch`;
-`without_admitbelowroom` (`Blocked` at the room, tunnel.rs:140-142)
+tunnel.rs:286-291) violates `OutboundWithinRoom`; `without_chargewrites`
+(the charge before the queue, tunnel.rs:292-303) violates `ChargesMatch`;
+`without_admitbelowroom` (`Blocked` at the room, tunnel.rs:141-143)
 violates `InboundBelowRoomAndAChunk`.
 
 Two configs check the code against what it promises and find it does not
@@ -344,9 +344,9 @@ violates it in 6 steps: a chunk that arrives below the room is taken whole.
 `NoEofWhileOpen` in 4 steps: an empty chunk at the front makes `poll_read`
 return `Ok(0)`, end of input, to a stream that has not ended. The base
 config sends no empty chunks because no producer in this tree does:
-`Http1::on_event` takes an empty chunk and drops it (native.rs:744-746),
-the live driver turns a zero-byte read into `Ended` (live.rs:229-233) and
-`Harness::push` skips empty input (harness.rs:174-177).
+`Http1::on_event` takes an empty chunk and drops it (native.rs:745-747),
+the stack runner turns a zero-byte read into `Ended` (stack/live.rs:204) and
+`Harness::push` skips empty input (harness.rs:117-120).
 
 ## Rust
 
@@ -403,7 +403,7 @@ could not run on the code, so they are reported for the owner rather than
 fixed here.
 
 - **An empty chunk from below reads as end of input.** `TunnelConn::poll_read`
-  (tunnel.rs:247-257) copies `min(chunk.len(), buf.len())` bytes from the
+  (tunnel.rs:248-258) copies `min(chunk.len(), buf.len())` bytes from the
   first chunk and pops it when it is empty, so an empty `Data` chunk at the
   front returns `Ok(0)` to a read with room, which every `Connection` user
   takes as the peer's end, while the stream is still open
@@ -413,13 +413,13 @@ fixed here.
   `Http1::on_event` already has: take an empty chunk and drop it in
   `Tunnel::on_event`.
 - **The inbound room is a soft limit.** `Tunnel::on_event` takes a chunk
-  whole whenever it holds less than `ROOM` (tunnel.rs:140-144), so it can
+  whole whenever it holds less than `ROOM` (tunnel.rs:141-145), so it can
   hold up to `ROOM - 1` plus the largest chunk from below, not the "at most
   64 KiB" its doc comment says (`Tunnel_doc_room.cfg`). The tunnel charges
   nothing for what it holds from below: a chunk carries whatever charge its
-  producer gave it, and the live driver's carry none (live.rs:235). Taking
-  a prefix up to the room and answering `Admit::Partial` would make the doc
-  true.
+  producer gave it; the stack runner's carry the charge of the bytes read
+  (stack/live.rs:207-212). Taking a prefix up to the room and answering
+  `Admit::Partial` would make the doc true.
 
 ## What the models leave out
 

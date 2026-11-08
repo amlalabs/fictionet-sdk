@@ -29,15 +29,15 @@ does, and `Driver::run` advances until nothing moves.
 
 | Model | Rust (`src/stdlib/layer/`) |
 | --- | --- |
-| `OfferSlot`, `OfferMoved` | `chain.rs:56` `offer` |
-| `StepL`, `StepS`, `StepTU`, `StepOU`, `StepTD`, `StepOD` | `chain.rs:127-155` `Chain::advance` |
+| `OfferSlot`, `OfferMoved` | `chain.rs:62` `offer` |
+| `StepL`, `StepS`, `StepTU`, `StepOU`, `StepTD`, `StepOD` | `chain.rs:133-171` `Chain::advance` |
 | `StepS`, `StepH` (first phase) | `switch.rs:195-205` |
 | `StepS`, `StepSB`, `StepSA` (second phase), `FeedQueue` | `switch.rs:207-223`, `feed` at `switch.rs:101` |
 | `EventAnswers`, `CommandAnswers` | `switch.rs:128-159` `Switch::on_event`, `on_command` |
-| `StartRun`, `StepE` | `driver.rs:158` `Driver::run` |
-| `SendBelow`, `SendAbove` | `driver.rs:180-194` and `send` at `driver.rs:214` |
-| `Deliver`, `OwnerQueue` | `driver.rs:132`, `harness.rs:513-525` |
-| `Command` | `driver.rs:141` |
+| `StartRun`, `StepE` | `driver.rs:168` `Driver::run` |
+| `SendBelow`, `SendAbove` | `driver.rs:190-226` and `send` at `driver.rs:246` |
+| `Deliver`, `OwnerQueue` | `driver.rs:142`, `harness.rs:249-263` |
+| `Command` | `driver.rs:151` |
 
 What is checked:
 
@@ -295,7 +295,7 @@ it.
 ## Smaller observations, no change made
 
 - `Layer::deadline` says "of two due at the same moment, the one armed
-  first". `Chain::deadline` (`chain.rs:172-181`) gives the lower part's timer
+  first". `Chain::deadline` (`chain.rs:192-201`) gives the lower part's timer
   on a tie, and `Children::deadline` (`children.rs:389-394`) the child with
   the smallest id, whichever was armed first. Both are deterministic, so
   runs repeat, but they do not keep the trait's wording. `Timers::next`

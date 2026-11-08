@@ -3,7 +3,7 @@
 The code that runs layer stacks on live sockets, and the first stacks
 ported onto it: `layer::Framed` (`src/stdlib/layer/framed.rs`), the
 runners `services::stack::stream` and `services::stack::datagrams`
-(`src/stdlib/services/stack.rs`) that `Host::tcp_stack` and
+(`src/stdlib/services/stack/`, the stream runner in `live.rs`) that `Host::tcp_stack` and
 `Host::udp_stack` serve ports with, the Nuclear controllers' Modbus/TCP
 stack (`demos/nuclear/world/src/plc.rs`) and the Search time server
 (`demos/search/world/src/ntp.rs`).
@@ -18,7 +18,8 @@ what it leaves out, the results, and the three bugs found.
 
 ```sh
 # TLC. Every *_base.cfg must pass; every *_without_<flag>.cfg must violate
-# the one property it names.
+# the one property it names. StreamRunner_halfclose.cfg violates
+# FinishNeedsInput on the code as it is: a known gap (VERIFICATION.md).
 cd verification/layer-runtime/tla
 java -XX:+UseParallelGC -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar \
   tlc2.TLC -workers 4 -config StreamRunner_base.cfg StreamRunner.tla
