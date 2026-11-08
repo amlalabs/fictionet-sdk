@@ -3549,6 +3549,35 @@ mod layer {
         assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
     }
 
+    /// Closing a child does not let go of what a limit kept for its
+    /// connection while the connection is still closing: it counts until
+    /// the transport retires it into TIME-WAIT.
+    #[test]
+    fn a_closed_childs_connection_counts_until_it_retires() {
+        let (mut server, mut client, (s, _), (c, _)) = connected();
+        let id = s.id();
+        let token = hold(&mut server, id);
+        let close: Command = s.close();
+        assert!(matches!(server.command(close), Ok(Admit::Taken)));
+        let (at_server, _) = exchange(&mut server, &mut client, |_| true);
+        let h = server.layer().upper().socket_of(id);
+        assert_eq!(server.layer().upper().get(h).state(), TcpState::FinWait2);
+        assert!(
+            !said_gone(&at_server, id),
+            "a closing connection is not gone"
+        );
+        assert_eq!(
+            Arc::strong_count(&token),
+            2,
+            "a closing connection still counts"
+        );
+        let close: Command = c.close();
+        assert!(matches!(client.command(close), Ok(Admit::Taken)));
+        let (at_server, _) = exchange(&mut server, &mut client, |_| true);
+        assert!(said_gone(&at_server, id), "TIME-WAIT is gone");
+        assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
+    }
+
     /// A connection the peer resets while it waits in the backlog still
     /// opens a child when it is accepted, and that child is told at once
     /// that its connection is gone, not only once it is closed.
