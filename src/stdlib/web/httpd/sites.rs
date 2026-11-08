@@ -13,14 +13,13 @@ use http::{Request, StatusCode};
 use fictionet::Cx;
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::services::stack::Boxed;
-use fictionet::stdlib::services::tls::ServerConfig;
+use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::stdlib::world::net::{
     Arrival, ConfigFor, ConfigFuture, Host, Opening, PortServer, PreparedShare, Sni,
 };
 
 use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, Reply, http1_for, http2_for, serve_connection,
-    text,
+    Body, Exchange, Handler, HttpOptions, Limits, Reply, http_for, serve_connection, text,
 };
 
 pub use fictionet::stdlib::world::net::normalize;
@@ -283,7 +282,13 @@ pub struct Server {
     date: Option<SystemTime>,
     vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
     tls: Option<ConfigFor>,
+    tls_layer: tls::Factory,
+    application: ApplicationFor,
+    protocols: Vec<Vec<u8>>,
 }
+
+type ApplicationFor =
+    Arc<dyn Fn(&Cx, &Opening, Arc<dyn Handler>, &HttpOptions) -> Boxed + Send + Sync>;
 
 impl Server {
     /// A site served by `handler`, over plain HTTP.
@@ -305,6 +310,11 @@ impl Server {
             date: None,
             vhosts: Arc::default(),
             tls: None,
+            tls_layer: tls::Factory::default(),
+            application: Arc::new(|cx, opening, handler, opts| {
+                Boxed::new(http_for(handler, opts, &opening.info, cx.now()))
+            }),
+            protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         }
     }
 
@@ -354,6 +364,36 @@ impl Server {
     /// use the first one's.
     pub fn date(mut self, start: SystemTime) -> Server {
         self.date = Some(start);
+        self
+    }
+
+    /// Replaces TLS for this listener. The first TLS site installed at an
+    /// address and port selects the factory for every site sharing it;
+    /// later sites still select their own certificates. Sites sharing this
+    /// HTTP server also use its application factory and advertised protocols.
+    /// The default is `Chain<TlsLayer, Later<Http>>` through `Secure`, with
+    /// `Http = Switch<Detect>` choosing HTTP/1 or HTTP/2 with `Children`.
+    pub fn tls_layer(mut self, factory: tls::Factory) -> Self {
+        self.tls_layer = factory;
+        self
+    }
+
+    /// Selects an application from `opening.info.alpn`, advertising
+    /// `protocols` in the handshake. The factory receives the routed site
+    /// handler, connection budget, limits and runtime context. Use
+    /// [`http_for`] for the standard HTTP/1 and HTTP/2 choices, or return
+    /// another byte-stream application for another negotiated protocol.
+    /// Sites sharing a listener use the first server's application factory
+    /// and protocol list, like its limits and response observer.
+    /// The default is `Switch<Detect>`; HTTP/2 composes its multiplexed
+    /// streams with `Children` and the request handler.
+    pub fn applications(
+        mut self,
+        protocols: Vec<Vec<u8>>,
+        make: impl Fn(&Cx, &Opening, Arc<dyn Handler>, &HttpOptions) -> Boxed + Send + Sync + 'static,
+    ) -> Self {
+        self.protocols = protocols;
+        self.application = Arc::new(make);
         self
     }
 
@@ -436,7 +476,7 @@ impl PortServer for Server {
     /// TLS. The network's
     /// [`write_timeout`](fictionet::stdlib::world::net::Limits::write_timeout)
     /// gives up on a client that stops reading.
-    fn over_tls(&self, _fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+    fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
         let opts = HttpOptions {
             observe: self.observe.clone().or(opening.http_observe.clone()),
             limits: self.limits,
@@ -445,15 +485,15 @@ impl PortServer for Server {
             date: self.date,
         };
         let handler = self.handler_for(&opening.info);
-        Some(if opening.info.alpn.as_deref() == Some(b"h2".as_slice()) {
-            Boxed::new(http2_for(handler, &opts, &opening.info))
-        } else {
-            Boxed::new(http1_for(handler, &opts, &opening.info).upgradable())
-        })
+        Some((self.application)(fcx, opening, handler, &opts))
+    }
+
+    fn tls_factory(&self) -> tls::Factory {
+        self.tls_layer.clone()
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        self.protocols.clone()
     }
 
     fn prepare_share(

@@ -62,12 +62,14 @@
 //! can run rustls, OpenSSL, or anything else over a connection itself,
 //! since [`Connection`] is an open trait.
 
+mod factory;
 mod layer;
 mod provider;
 mod secure;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
+pub use factory::{Build, Factory, Handshake, Negotiation, Selection};
 pub use layer::{Hello, Pick, Picking, TlsLayer};
 pub use secure::Secure;
 

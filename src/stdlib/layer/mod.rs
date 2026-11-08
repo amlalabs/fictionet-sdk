@@ -309,7 +309,10 @@ impl<L: core::fmt::Display, U: core::fmt::Display> core::fmt::Display for Side<L
     }
 }
 
-impl<L: core::error::Error, U: core::error::Error> core::error::Error for Side<L, U> {}
+impl<L: core::fmt::Debug + core::fmt::Display, U: core::fmt::Debug + core::fmt::Display>
+    core::error::Error for Side<L, U>
+{
+}
 
 /// One protocol between a lower port and an upper port, with no I/O.
 ///

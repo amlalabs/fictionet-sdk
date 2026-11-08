@@ -2,7 +2,7 @@ use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_ser
 use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::codec::Decode;
-use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Side, Top};
+use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::network::{ConnInfo, Transport};
@@ -19,7 +19,7 @@ use fictionet::stdlib::services::serve::{
 use fictionet::stdlib::services::stack::{
     self, Boxed, Counted, Job, StackError, StreamEnd, StreamLimits,
 };
-use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig, TlsLayer};
+use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, End, Interface, InterfaceExt};
@@ -124,6 +124,14 @@ pub trait PortServer: Any + Send + Sync {
     fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
         let _ = (fcx, opening);
         None
+    }
+
+    /// TLS implementation for this listener. The first TLS server installed
+    /// at an address and port chooses it for every name sharing that listener.
+    /// Certificates remain per name; application selection uses each name's
+    /// server (which may be shared through `prepare_share`).
+    fn tls_factory(&self) -> tls::Factory {
+        tls::Factory::default()
     }
 
     /// Pending connection limit for this port. The first server opening
@@ -2035,9 +2043,9 @@ async fn connection(
     let chosen: Arc<Mutex<Option<Arc<TlsName>>>> = Arc::default();
     let select = {
         let (names, requested, chosen) = (port.clone(), requested.clone(), chosen.clone());
-        move |fcx: Cx, hello: Arc<tls::Hello>| {
-            let sni = hello
-                .server_name()
+        move |fcx: Cx, server_name: Option<String>| {
+            let sni = server_name
+                .as_deref()
                 .map(|n| Arc::<str>::from(n.trim_end_matches('.').to_ascii_lowercase()));
             let name = {
                 let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
@@ -2048,23 +2056,25 @@ async fn connection(
             };
             *requested.lock() = sni;
             let chosen = chosen.clone();
-            async move {
+            Box::pin(async move {
                 let name = name?;
                 let config = name.config(&fcx).await;
                 *chosen.lock() = Some(name);
                 Some(config)
-            }
+            }) as tls::Picking
         }
     };
     let handshook = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let serve = {
         let (fcx, info, budget) = (fcx.clone(), info.clone(), budget.clone());
-        let (requested, handshook) = (requested.clone(), handshook.clone());
+        let handshook = handshook.clone();
         let (http_observe, tls_observe) = (hooks.http_observe.clone(), hooks.tls_observe.clone());
-        move |tls: &TlsLayer| -> Boxed {
+        move |state: tls::Handshake<'_>| -> Boxed {
             handshook.store(true, std::sync::atomic::Ordering::Relaxed);
-            let sni = requested.lock().clone();
-            let info = info.over_tls(sni.as_deref(), tls.alpn());
+            let tls::Handshake::Established { server_name, alpn } = state else {
+                unreachable!("Secure constructs applications only after negotiation")
+            };
+            let info = info.over_tls(server_name, alpn);
             if let Some(observe) = &tls_observe {
                 observe(&super::TlsObservation {
                     at: fcx.now(),
@@ -2092,25 +2102,39 @@ async fn connection(
             }))
         }
     };
-    let layer = TlsLayer::selecting(select).handshake_by(accepted + limits.handshake);
+    let factory = port
+        .tls
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .first
+        .as_ref()
+        .expect("TLS listener has a server")
+        .tls_factory();
     let stream = StreamLimits {
         idle: None,
         write_timeout: Some(limits.write_timeout),
     };
     let budget = budget.unwrap_or_else(Budget::unlimited);
-    let secure = tls::Secure::new(layer, serve);
+    let secure = factory.build(
+        tls::Build {
+            cx: fcx.clone(),
+            info: info.clone(),
+            budget: budget.clone(),
+            deadline: accepted + limits.handshake,
+            select: Arc::new(select),
+        },
+        serve,
+    );
     let ended = stack::stream(&fcx, conn, &info, secure, budget, stream, |_| {}).await;
     if handshook.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let error = match ended {
-        Err(StackError::Layer(Side::Lower(e))) => e,
+        Err(StackError::Layer(e)) => HandshakeError::Failed(e.to_string()),
         Err(StackError::Cancelled) => HandshakeError::Cancelled,
         Ok(StreamEnd::Conn(e)) => e.into(),
         Ok(StreamEnd::Budget) => HandshakeError::Failed("no budget for the handshake".into()),
-        Ok(_) | Err(StackError::Budget | StackError::Layer(Side::Upper(_))) => {
-            HandshakeError::Closed
-        }
+        Ok(_) | Err(StackError::Budget) => HandshakeError::Closed,
     };
     if let Some(observe) = &hooks.tls_observe {
         let mut info = info;

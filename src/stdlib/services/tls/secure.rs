@@ -1,18 +1,14 @@
-use std::sync::Arc;
-
-use rustls::ServerConfig;
-
-use super::{HandshakeError, Pick, TlsLayer};
+use super::{Handshake, Negotiation, TlsLayer};
 use fictionet::stdlib::layer::{
     Admit, ByteStream, Chain, CommandOf, Env, EventOf, Later, Layer, Side, StreamEvent,
 };
 use fictionet::time::Instant;
 
-/// [`TlsLayer`] with the layer above it made once the handshake is done,
+/// A TLS negotiation layer with the layer above it made once the handshake is done,
 /// from what the handshake settled: the name in the client's hello and the
 /// protocol both sides agreed on with ALPN.
 ///
-/// It is [`Chain`]`<TlsLayer, `[`Later`]`<U>>`: the plaintext the client sends
+/// The default is [`Chain`]`<TlsLayer, `[`Later`]`<U>>`: the plaintext the client sends
 /// right after its handshake waits in order until `make` has made the layer
 /// above, then reaches it first. A handshake that fails never makes it.
 ///
@@ -20,19 +16,20 @@ use fictionet::time::Instant;
 /// [`Handoff`](fictionet::stdlib::layer::Handoff) names a `Secure` as what
 /// comes next runs in a [`Switch`](fictionet::stdlib::layer::Switch), and
 /// `make` carries the plaintext session's context into the layer above.
-pub struct Secure<U: Layer<Lower = ByteStream>, F> {
-    chain: Chain<TlsLayer, Later<U>>,
+pub struct Secure<U: Layer<Lower = ByteStream>, F, T: Negotiation = TlsLayer> {
+    chain: Chain<T, Later<U>>,
     make: Option<F>,
 }
 
-impl<U, F> Secure<U, F>
+impl<U, F, T> Secure<U, F, T>
 where
     U: Layer<Lower = ByteStream>,
-    F: FnOnce(&TlsLayer) -> U,
+    T: Negotiation,
+    F: FnOnce(&T) -> U,
 {
     /// `tls`, with what `make` makes from it above, once its handshake is
     /// done.
-    pub fn new(tls: TlsLayer, make: F) -> Secure<U, F> {
+    pub fn new(tls: T, make: F) -> Secure<U, F, T> {
         Secure {
             chain: Chain::new(tls, Later::new()),
             make: Some(make),
@@ -40,7 +37,7 @@ where
     }
 
     /// The TLS layer.
-    pub fn tls(&self) -> &TlsLayer {
+    pub fn tls(&self) -> &T {
         self.chain.lower()
     }
 
@@ -50,22 +47,23 @@ where
     }
 }
 
-impl<U, F> Layer for Secure<U, F>
+impl<U, F, T> Layer for Secure<U, F, T>
 where
     U: Layer<Lower = ByteStream>,
-    F: FnOnce(&TlsLayer) -> U,
+    T: Negotiation,
+    F: FnOnce(&T) -> U,
 {
     type Lower = ByteStream;
     type Upper = U::Upper;
-    type Report = Side<(), U::Report>;
-    type Timer = Side<(), U::Timer>;
-    type Work = Side<Pick, U::Work>;
-    type Done = Side<Option<Arc<ServerConfig>>, U::Done>;
-    type Error = Side<HandshakeError, U::Error>;
+    type Report = Side<T::Report, U::Report>;
+    type Timer = Side<T::Timer, U::Timer>;
+    type Work = Side<T::Work, U::Work>;
+    type Done = Side<T::Done, U::Done>;
+    type Error = Side<T::Error, U::Error>;
 
     fn report_bytes(report: &Self::Report) -> Option<usize> {
         match report {
-            Side::Lower(()) => Some(0),
+            Side::Lower(report) => T::report_bytes(report),
             Side::Upper(report) => U::report_bytes(report),
         }
     }
@@ -112,7 +110,7 @@ where
 
     fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Self::Error> {
         let tls = self.chain.lower();
-        let settled = !tls.is_handshaking() && tls.failure().is_none();
+        let settled = matches!(tls.handshake(), Handshake::Established { .. });
         let mut moved = false;
         if settled && let Some(make) = self.make.take() {
             let upper = make(self.chain.lower());

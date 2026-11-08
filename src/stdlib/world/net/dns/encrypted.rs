@@ -86,7 +86,7 @@ use fictionet::stdlib::protocols::dns::{
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::stack::{self, Boxed, Job, StreamEnd, StreamLimits};
-use fictionet::stdlib::services::tls::ServerConfig;
+use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
 use fictionet::time::Instant;
 
@@ -112,33 +112,106 @@ const MAX_MESSAGE: usize = u16::MAX as usize;
 /// What a TLS port's handshake gets its config from.
 type TlsFor = Arc<dyn Fn(&Cx) -> Arc<ServerConfig> + Send + Sync>;
 
+/// A query's answer, or `None` when the service leaves it unanswered.
+/// Dropping this future cancels the query. Services must keep any work they
+/// start owned by the future, so a closed connection cannot leave it running.
+pub type QueryFuture = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>>;
+
+/// The DNS application shared by DNS over TLS and DNS over HTTPS.
+///
+/// `query` receives a whole DNS message without stream framing, and the
+/// connection's client identity. It returns a whole response without framing.
+/// The fronts retain framing, connection limits, cancellation and delivery:
+/// DoT sends each completed answer as a whole message, while DoH answers the
+/// corresponding HTTP request. The default service is [`ResolverHandle`].
+/// Async closures with these arguments also implement this trait.
+pub trait QueryService: Send + Sync + 'static {
+    /// Answer one query in the connection's world context.
+    fn query(&self, fcx: Cx, client: Client, message: Vec<u8>) -> QueryFuture;
+}
+
+impl QueryService for ResolverHandle {
+    fn query(&self, fcx: Cx, client: Client, message: Vec<u8>) -> QueryFuture {
+        let resolver = self.clone();
+        Box::pin(async move { resolver.query(&fcx, client, message).await })
+    }
+}
+
+impl<F, Fut> QueryService for F
+where
+    F: Fn(Cx, Client, Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<Vec<u8>>> + Send + 'static,
+{
+    fn query(&self, fcx: Cx, client: Client, message: Vec<u8>) -> QueryFuture {
+        Box::pin(self(fcx, client, message))
+    }
+}
+
 /// DNS over TLS and over HTTPS in front of a [`Recursive`](super::Recursive),
 /// added to a host with [`dot`](Self::dot) and [`doh`](Self::doh). See the
 /// [module docs](self).
-#[derive(Clone)]
-pub struct Fronts {
-    resolver: ResolverHandle,
+pub struct Fronts<Q = ResolverHandle> {
+    resolver: Arc<Q>,
     tls: TlsFor,
+    tls_layer: tls::Factory,
     names: Vec<LowerName>,
     at: Option<IpAddr>,
     date: Option<SystemTime>,
     fallback: Option<Arc<dyn Handler>>,
 }
 
-impl Fronts {
+impl<Q> Clone for Fronts<Q> {
+    fn clone(&self) -> Self {
+        Self {
+            resolver: self.resolver.clone(),
+            tls: self.tls.clone(),
+            tls_layer: self.tls_layer.clone(),
+            names: self.names.clone(),
+            at: self.at,
+            date: self.date,
+            fallback: self.fallback.clone(),
+        }
+    }
+}
+
+impl<Q: QueryService> Fronts<Q> {
     /// Fronts for the resolver `resolver` reaches, whose TLS handshakes
-    /// use the config `tls` returns for each.
+    /// use the config `tls` returns for each. Pass a [`ResolverHandle`] for
+    /// the default recursive service, or any [`QueryService`] to replace it.
     pub fn new(
-        resolver: ResolverHandle,
+        resolver: Q,
         tls: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-    ) -> Fronts {
+    ) -> Self {
         Fronts {
-            resolver,
+            resolver: Arc::new(resolver),
             tls: Arc::new(tls),
+            tls_layer: tls::Factory::default(),
             names: Vec::new(),
             at: None,
             date: None,
             fallback: None,
+        }
+    }
+
+    /// Replaces TLS for both encrypted fronts. The first server installed
+    /// on an address and port supplies the TLS factory for every name on
+    /// that listener; certificate selection remains per name.
+    pub fn tls_layer(mut self, factory: tls::Factory) -> Self {
+        self.tls_layer = factory;
+        self
+    }
+
+    /// Replaces the DNS application while keeping both fronts' configuration.
+    /// Framing and client identity still belong to the fronts.
+    pub fn query_service<S: QueryService>(self, service: S) -> Fronts<S> {
+        Fronts {
+            resolver: Arc::new(service),
+            tls: self.tls,
+            tls_layer: self.tls_layer,
+            names: self.names,
+            at: self.at,
+            date: self.date,
+            fallback: self.fallback,
         }
     }
 
@@ -150,7 +223,7 @@ impl Fronts {
     /// [`client`](Self::client) and [`resolver`](Self::resolver) of the
     /// fronts it answers for, so it is made after
     /// [`resolver_at`](Self::resolver_at).
-    pub fn fallback(self, handler: Arc<dyn Handler>) -> Fronts {
+    pub fn fallback(self, handler: Arc<dyn Handler>) -> Self {
         Fronts {
             fallback: Some(handler),
             ..self
@@ -161,7 +234,7 @@ impl Fronts {
     /// request over TLS for another name, by SNI or by its host, gets
     /// `421 Misdirected Request`; a request for the address it arrived
     /// at, with no name, is answered.
-    pub fn names(self, names: impl IntoIterator<Item = Name>) -> Fronts {
+    pub fn names(self, names: impl IntoIterator<Item = Name>) -> Self {
         Fronts {
             names: names
                 .into_iter()
@@ -179,7 +252,7 @@ impl Fronts {
     /// needs it, such as DNS over HTTPS at the addresses of a name of its
     /// own that are not the resolver's. The resolver then sees each query
     /// as asked of `addr`.
-    pub fn resolver_at(self, addr: IpAddr) -> Fronts {
+    pub fn resolver_at(self, addr: IpAddr) -> Self {
         Fronts {
             at: Some(addr),
             ..self
@@ -189,7 +262,7 @@ impl Fronts {
     /// Sends `Date` headers on DNS over HTTPS answers, `start` being the
     /// world's date at the start of the run
     /// ([`httpd::Server::date`]).
-    pub fn date(self, start: SystemTime) -> Fronts {
+    pub fn date(self, start: SystemTime) -> Self {
         Fronts {
             date: Some(start),
             ..self
@@ -205,17 +278,22 @@ impl Fronts {
         self.front().client(conn)
     }
 
-    /// The resolver the fronts put queries to.
-    pub fn resolver(&self) -> &ResolverHandle {
+    /// The query service the fronts put queries to, by default a resolver handle.
+    pub fn resolver(&self) -> &Q {
         &self.resolver
     }
 
     /// `host` serving DNS over TLS on TCP port 853, for any name a client
     /// sends, offering `dot`, the ALPN identifier IANA registers for it.
+    ///
+    /// The default composition is `Secure<Chain<Framed<Queries,
+    /// StreamMessage>, Queried>, _>`: `Secure` builds
+    /// `Chain<TlsLayer, Later<_>>`, and `Queried` invokes this query service.
     pub fn dot(&self, host: Host) -> Host {
         let tls = self.tls.clone();
         let port = Dot {
             front: Arc::new(self.front()),
+            tls_layer: self.tls_layer.clone(),
         };
         host.tls_accept(DOT_PORT, Sni::Any, move |fcx| tls(fcx), port)
     }
@@ -225,6 +303,11 @@ impl Fronts {
     /// to the address sends none; its requests are answered only for
     /// [`names`](Self::names) and the address. Those names are its own on
     /// the port, so no other host at the address can serve them there.
+    ///
+    /// The default composition is `Secure<Http, _>`, with
+    /// `Chain<TlsLayer, Later<Http>>` deferring HTTP until negotiation.
+    /// `Http` chooses HTTP/1's `Switch` or HTTP/2's
+    /// `Chain<Http2, Children<Respond, Top, Opening>>`; their handlers invoke this service.
     pub fn doh(&self, host: Host) -> Host {
         let server = || {
             let server = httpd::Server::new(Doh {
@@ -233,6 +316,7 @@ impl Fronts {
                 fallback: self.fallback.clone(),
             })
             .https()
+            .tls_layer(self.tls_layer.clone())
             .default_host();
             match self.date {
                 Some(start) => server.date(start),
@@ -259,7 +343,7 @@ impl Fronts {
 
 /// What both fronts put queries to.
 struct Front {
-    resolver: ResolverHandle,
+    resolver: Arc<dyn QueryService>,
     at: Option<IpAddr>,
 }
 
@@ -299,6 +383,7 @@ type DotStack = Chain<Framed<Queries, StreamMessage>, Queried>;
 /// DNS over TLS on one port.
 struct Dot {
     front: Arc<Front>,
+    tls_layer: tls::Factory,
 }
 
 impl Dot {
@@ -312,6 +397,10 @@ impl Dot {
 }
 
 impl PortServer for Dot {
+    fn tls_factory(&self) -> tls::Factory {
+        self.tls_layer.clone()
+    }
+
     /// The same stack over a connection with no TLS in front.
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let stack = self.stack(&arrival.info, &arrival.limits);
@@ -540,13 +629,13 @@ impl Layer for Queried {
 }
 
 /// The resolver's answer to one query, on its way.
-type Asking = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>>;
+type Asking = QueryFuture;
 
 /// One query of a DNS over TLS connection, with the resolver until it
 /// answers. Run with no world, it is unanswered.
 struct Ask {
     generation: u64,
-    resolver: ResolverHandle,
+    resolver: Arc<dyn QueryService>,
     query: Option<(Client, Vec<u8>)>,
     /// What the query holds while the resolver has it, then what its
     /// answer holds.
@@ -577,10 +666,7 @@ impl Job for Ask {
         if let Some((client, query)) = self.query.take()
             && let Some(fcx) = fcx.cloned()
         {
-            let resolver = self.resolver.clone();
-            self.asking = Some(Box::pin(async move {
-                resolver.query(&fcx, client, query).await
-            }));
+            self.asking = Some(self.resolver.query(fcx, client, query));
         }
         let answer = match &mut self.asking {
             Some(asking) => ready!(asking.as_mut().poll(cx)),
@@ -643,7 +729,7 @@ impl Handler for Doh {
         let resolver = self.front.resolver.clone();
         Reply::Later(Box::new(move |fcx| {
             Box::pin(async move {
-                let Some(answer) = resolver.query(&fcx, client, query).await else {
+                let Some(answer) = resolver.query(fcx, client, query).await else {
                     let refusal =
                         Refusal::Text(StatusCode::BAD_REQUEST, "The query is not a DNS query.\n");
                     return Ok(refusal.response());
@@ -855,7 +941,7 @@ mod tests {
             start: SystemTime::UNIX_EPOCH,
         };
         let front = Arc::new(Front {
-            resolver: Recursive::new(Config::new(), clock).handle(),
+            resolver: Arc::new(Recursive::new(Config::new(), clock).handle()),
             at: None,
         });
         let local = "192.0.2.1:853".parse().unwrap();
@@ -949,6 +1035,52 @@ mod tests {
             Poll::Ready(done) => done,
             Poll::Pending => panic!("a ready answer is pending"),
         }
+    }
+
+    #[test]
+    fn replacement_service_receives_whole_queries_and_connection_identity() {
+        fictionet::block_on(fictionet::lab(Seed::from_u64(19), |fcx| async move {
+            let local: SocketAddr = "192.0.2.1:853".parse().unwrap();
+            let peer: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+            let resolver_ip: IpAddr = "192.0.2.53".parse().unwrap();
+            let service = move |_: Cx, client: Client, mut query: Vec<u8>| async move {
+                assert_eq!(client.peer, peer);
+                assert_eq!(client.local, SocketAddr::new(resolver_ip, local.port()));
+                assert_eq!(client.transport, Transport::Tcp);
+                query.reverse();
+                Some(query)
+            };
+            let fronts = Fronts::new(service, |_| panic!("no handshake in this harness"))
+                .resolver_at(resolver_ip);
+            let conn = ConnInfo::new(1, local, peer);
+            let dot = Dot {
+                front: Arc::new(fronts.front()),
+                tls_layer: fronts.tls_layer.clone(),
+            };
+            let mut h = Harness::with_budget(
+                Seed::from_u64(20),
+                dot.stack(&conn, &Limits::default()),
+                Budget::unlimited(),
+            );
+            let queries = [message(1, 20), message(2, 25)];
+            push_cut(&mut h, &framed(&queries), 21);
+            let mut work = asks(&mut h);
+            assert_eq!(work.len(), queries.len());
+            let mut expected = Vec::new();
+            for ask in work.iter_mut().rev() {
+                let mut answer = query_of(ask).to_vec();
+                answer.reverse();
+                expected.push(answer);
+                let mut cx = Context::from_waker(Waker::noop());
+                let Poll::Ready(done) = Job::poll(ask, Some(&fcx), &mut cx) else {
+                    panic!("the service answers immediately");
+                };
+                h.complete(Side::Upper(done)).unwrap();
+            }
+            assert_eq!(read(h.output()), expected);
+            Ok(())
+        }))
+        .unwrap();
     }
 
     #[test]

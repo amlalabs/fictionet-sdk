@@ -667,3 +667,18 @@ impl Layer for TlsLayer {
 #[cfg(kani)]
 #[path = "../../../../verification/tls/kani/LayerProof.rs"]
 mod proofs;
+
+impl super::Negotiation for TlsLayer {
+    fn handshake(&self) -> super::Handshake<'_> {
+        if self.failed {
+            super::Handshake::Failed
+        } else if self.is_handshaking() {
+            super::Handshake::Pending
+        } else {
+            super::Handshake::Established {
+                server_name: self.hello().and_then(Hello::server_name),
+                alpn: self.alpn(),
+            }
+        }
+    }
+}
