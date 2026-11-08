@@ -249,6 +249,50 @@ refused child, its sibling going on, and the router's charge returning to
 its idle value once no child is left. The Kani harnesses cover `Slots`,
 `Charge`, `Timers`, `Chunk` and `WorkOwner`, none of which changed.
 
+### Refusing a child whose inbox is full
+
+The SSH port added `Children::refuse_full_inbox`: a wire mux such as SSH
+must keep reading traffic for every channel, so a child whose bounded inbox
+is full is refused and closed, its work cancelled and `Refused` reported,
+instead of holding up the event for its siblings. The default still holds
+the event back. The model gains `RefuseFullInbox`: with readiness on,
+`MuxSend` to a child whose inbox and empty events fill `Q` closes that
+child instead of waiting. Every existing configuration sets it false and
+keeps its behavior. `Children_refuse_full.cfg` sets it true, with a child
+that never reads and its successor in the same slot; the same configuration
+without it reaches 6,915 distinct states, so the refusal path is reached.
+The model was rerun in full after the change, with the same JDK, memory cap
+and state directories on the home volume:
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Children_base.cfg` | 13,067,962 | 1,857,160 | all safety properties pass |
+| `Children_budget.cfg` | 13,657,794 | 1,857,160 | all safety properties pass |
+| `Children_budget_stalled.cfg` | 1,713,569 | 219,760 | safety and control progress pass |
+| `Children_refuse_base.cfg` | 16,775,230 | 2,645,648 | all safety properties pass |
+| `Children_refuse_full.cfg` | 59,704 | 8,594 | readiness invariants, `NoStaleDelivery` and `CancelledWorkLeaves` pass |
+| `Children_stalled_base.cfg` | 1,639,585 | 219,760 | safety and control progress pass |
+| `Children_commands_base.cfg` | 2,082 | 504 | command credit and delivery pass |
+| `Children_large_command.cfg` | 760 | 191 | command credit and delivery pass |
+| `Children_readiness.cfg` | 71,116 | 10,066 | readiness invariants and progress pass |
+| `Children_without_checkoverrun.cfg` | 36 | 28 | expected `EventCredit` violation |
+| `Children_without_checkcommandcredit.cfg` | 26 | 22 | expected `CommandCredit` violation |
+| `Children_without_reserveforcontrol.cfg` | 1,098,207 | 183,419 | expected `ControlProgress` violation |
+| `Children_without_muxchecksgeneration.cfg` | 2,373 | 1,042 | expected `NoStaleDelivery` violation |
+| `Children_without_keybywholeid.cfg` | 1,256 | 592 | expected `NoStaleDelivery` violation |
+| `Children_without_urgent.cfg` | 6,780 | 1,670 | expected `CompletionProgress` violation |
+| `Children_without_workownership.cfg` | 317 | 134 | expected `NoCancelledPoll` violation |
+| `Children_without_joblimit.cfg` | 745 | 250 | expected `BoundedJobs` violation |
+
+A configuration that must fail stops at its first violation, so its counts
+depend on the order four workers find states in. The Rust test
+`refusing_a_full_inbox_keeps_siblings_and_cancels_its_work` checks the
+refused child's work cancelled and its sibling's completion delivered.
+
+The budget proof the serving engine kept over `Charge::set` moved here as
+`charges_sum_to_the_budget_and_never_pass_its_limit` when the engine was
+deleted: unwind 4, 429 checks, all pass in 2.6 s with Kani 0.68.
+
 ### Scope and limitations
 
 The model covers partial stream output; atomic-message rejection above the

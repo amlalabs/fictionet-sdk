@@ -21,13 +21,17 @@ tables below now record a subsequent rerun with explicit whole-layer
 completion and bounded datagram input retention in `090aba987`. The historical
 reproductions remain below. The buffer fix merged as it was.
 
-Three bugs were found, each confirmed by a test that failed on the code
+Five bugs were found, each confirmed by a test that failed on the code
 before its fix:
 
 1. `Framed` charged its decoder buffer less than the buffer grows to.
 2. `stream` ended idle input at once after a time it was not reading.
 3. `datagrams` dropped what a stack still had to send when its socket
    closed, if the stack needed more than 64 rounds to send it.
+4. `Jobs::poll` polled work whose region failed for ever (found later,
+   below).
+5. A cancel that landed while the stack ran lost to how it ended (found
+   later, below).
 
 ## Bug 1: `Framed` charged half its buffer
 
@@ -300,6 +304,48 @@ by the datagram numbers here. Work is polled even while continuous output
 prevents settling; `a_productive_datagram_layer_does_not_starve_its_pending_work`
 checks this in bounded visits. Results go directly to the driver rather
 than through an additional completion vector.
+
+## Bugs 4 and 5: found by porting the serving engine's tests
+
+When the serving engine was deleted, its cancellation tests were ported to
+these runners (`tests/it/stack_cancellation.rs`). Two of them failed on the
+runners as they were, and both were fixed at the root:
+
+4. **Work whose region failed was polled for ever.** A task that work
+   spawned and that failed cancelled the work's own region, but
+   `Jobs::poll` kept polling the work, which never finished, so the run
+   never ended (`a_background_failure_ends_the_run_and_spares_the_caller`
+   deadlocked the lab). `Jobs::poll` now treats work whose region is
+   cancelled like work whose owner ended: it is never polled again, and its
+   failure goes to the run's region as before, which ends the run without
+   touching the caller's. The job region is made before that check, so work
+   of a run that is already cancelled is never polled at all.
+5. **A cancel that landed while the stack ran lost to how it ended.** The
+   stream runner looked at its region's cancel only at the top of each
+   poll. A connection whose read cancelled the region, then handed over all
+   its bytes, let the stack reach a handover and the code after it run, and
+   the run returned `Ok` (`a_cancelled_region_hands_no_connection_off`).
+   This is the bug the serving engine had and fixed
+   (`verification/lifecycle/VERIFICATION.md`, Bug 2). The stream and datagram
+   runners now return `StackError::Cancelled` for a cancel that landed while
+   the stack ran, unless the stack itself gave up.
+
+Neither runner model covers region cancellation or the work's own region
+(see what each leaves out below), so these are covered by the ported tests,
+not by TLC. The runner code changed for them, so both runner models were
+rerun on it: `StreamRunner_base.cfg`, `StreamRunner_halfclose.cfg` and
+`DatagramRunner_base.cfg` pass with the state counts recorded in their
+tables below.
+
+## Kani over the connection count: `kani/admission.rs`
+
+`Counted` is the count a port server keeps of its open connections, held
+with the socket so a closed connection counts until its socket is gone.
+It moved here from the serving engine with its proof:
+
+| Harness | Proves | Unwind | Checks | Result |
+| --- | --- | ---: | ---: | --- |
+| `connections_are_counted_up_to_the_maximum` | `Counted::enter` never counts past the maximum, and a dropped count makes room for one more, for maxima up to three | 5 | 451 | all pass, 2.1 s |
 
 ## Kani over `Framed`
 
