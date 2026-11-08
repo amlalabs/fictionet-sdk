@@ -211,3 +211,24 @@ fn one_conversation_answers_each_request_in_turn() {
     ));
     assert_eq!(replies(&mut d).1, 0);
 }
+
+#[kani::proof]
+#[kani::unwind(54)]
+fn the_time_server_reserves_reply_memory_before_reading_the_clock() {
+    let limit: u8 = kani::any();
+    kani::assume(limit < 96);
+    let budget = Budget::new(limit as usize);
+    let mut driver = Driver::new(
+        TimeServer::new(|| panic!("no reply work without its reservation")),
+        Arc::new(NoEntropy),
+        budget.clone(),
+        Instant::ZERO,
+    );
+    let (bytes, _) = request();
+    assert!(matches!(
+        driver.deliver(datagram(bytes, client(1))).unwrap(),
+        Admit::Taken
+    ));
+    assert!(driver.layer_mut().take_command().is_none());
+    assert_eq!(budget.used(), 0);
+}

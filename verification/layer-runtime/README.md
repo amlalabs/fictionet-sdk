@@ -18,13 +18,17 @@ what it leaves out, the results, and the three bugs found.
 
 ```sh
 # TLC. Every *_base.cfg must pass; every *_without_<flag>.cfg must violate
-# the one property it names. StreamRunner_halfclose.cfg violates
-# FinishNeedsInput on the code as it is: a known gap (VERIFICATION.md).
+# the one property it names. StreamRunner_halfclose.cfg must pass;
+# StreamRunner_without_finishinput.cfg preserves its old counterexample.
 cd verification/layer-runtime/tla
-java -XX:+UseParallelGC -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar \
-  tlc2.TLC -workers 4 -config StreamRunner_base.cfg StreamRunner.tla
-java -XX:+UseParallelGC -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar \
-  tlc2.TLC -workers 4 -config DatagramRunner_base.cfg DatagramRunner.tla
+systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
+  ~/.cache/adorably-fv/jdk/bin/java -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar \
+  tlc2.TLC -workers 4 -metadir ~/.cache/adorably-fv/states/stream \
+  -config StreamRunner_base.cfg StreamRunner.tla
+systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
+  ~/.cache/adorably-fv/jdk/bin/java -Xmx6g -cp ~/.cache/adorably-fv/tla2tools.jar \
+  tlc2.TLC -workers 4 -metadir ~/.cache/adorably-fv/states/datagrams \
+  -config DatagramRunner_base.cfg DatagramRunner.tla
 
 # Kani, from the root of the repository. A --harness filter matches by
 # substring and runs the harnesses one after another; none needs more

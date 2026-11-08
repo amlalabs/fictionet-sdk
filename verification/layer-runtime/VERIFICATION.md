@@ -16,8 +16,10 @@ and `stack/mod.rs` (`stream`, `datagrams`). The split had lost the fixes
 of Bugs 2 and 3, and the stream runner also no longer restarted its idle
 clock on a read; they were ported to the new code, not copied from the
 old (commits `33fd898e0` and `6aa68ae5f`), and both models were updated
-to the new loops and rerun at code revision `6aa68ae5f`. What each model
-now describes is in its section below. Bug 1's fix merged as it was.
+to the new loops and rerun at code revision `6aa68ae5f`. The runner
+tables below now record a subsequent rerun with explicit whole-layer
+completion and bounded datagram input retention in `090aba987`. The historical
+reproductions remain below. The buffer fix merged as it was.
 
 Three bugs were found, each confirmed by a test that failed on the code
 before its fix:
@@ -127,7 +129,7 @@ The port (commit `33fd898e0`) adds `settled` to that condition
 ## The stream runner: `StreamRunner.tla`
 
 [`tla/StreamRunner.tla`](tla/StreamRunner.tla) is one connection under
-`stream` (`src/stdlib/services/stack/mod.rs:163-203`) and `Live`
+`stream` (`src/stdlib/services/stack/mod.rs`) and `Live`
 (`src/stdlib/services/stack/live.rs`), one round at a time. It was
 rewritten for the split runner: `Live::step` reads first, offers the
 stack its input, runs it and writes in the same round, and checks the
@@ -136,11 +138,11 @@ and the run is finished, or the peer is gone.
 
 | Model | Rust (`src/stdlib/services/stack/live.rs` unless named) |
 | --- | --- |
-| `Round` | one round of `step` (196-330): the read (202-221), the `Written` report (229-239), the held input (240-257), `Driver::run` (258), `send_below` into the transport (262-308), then a reset, a failed write or a failed read ends the run (309-327) |
-| `SendLoop` | the sink of 264-308 under `Driver::send_below` and `send` (`layer/driver.rs:190-195`, `246-276`): a write that fails, or takes nothing, stays held |
-| `Check` | 332-382: the write limit, the idle limit with `was_waiting` (346-349), the sleep; then `stream` on `Pending` (`mod.rs:190-196`): `Live::finished` (142-150), else `poll_gone` |
-| `EndBroken` | `Live::broken` (392-418) |
-| `Tick`, `PeerReset`, `Gone` | time passing while the runner waits; the peer's reset; `stream` noticing it with `poll_gone` |
+| `Round` | one round of `Live::step`: read, deliver `Written`, offer held input, call `Driver::run`, and send output; reset or transport failure ends the run |
+| `SendLoop` | `Live::step`'s `send_below` sink: failed or partial writes retain their suffix; shutdown follows prior writes |
+| `Check` | the settled part of `Live::step`: write timeout, idle timing and sleep; `stream` then checks `Live::finished` and `poll_gone` |
+| `EndBroken` | `Live::broken` offers a reset and drains remaining upward events |
+| `Tick`, `PeerReset`, `Gone` | time passing while the runner waits; peer reset; `stream` noticing `poll_gone` |
 
 A round from the wait runs only if something can move then: the peer
 sent, the transport takes a write, the peer is gone, or the sleep is due.
@@ -175,47 +177,61 @@ Properties:
 - `EndsAreEarned`: `Finished` and `Idle` mean the stack ended its
   direction, `Idle` only after the idle limit fired, `Reset` only after
   the stack's reset.
-- `FinishNeedsInput`: `Finished` and `Idle` also mean the input ended. On
-  the branch this was part of `EndsAreEarned`; it is apart now because the
-  code does not keep it (below).
+- `FinishNeedsInput`: for the modeled layer, which does not declare its
+  whole lifetime terminal, `Finished` and `Idle` also mean input ended.
 - `Terminates`: with both limits set, every connection ends.
 
 | Config | Rule turned off | Generated | Distinct | Result |
 | --- | --- | ---: | ---: | --- |
-| `StreamRunner_base.cfg` | none (the code as it is) | 18,410,091 | 122,879 | every property but `FinishNeedsInput` holds (6 min 31 s) |
-| `StreamRunner_halfclose.cfg` | none (the code as it is) | 70,986 | 1,023 | `FinishNeedsInput` violated: a design gap, below |
-| `StreamRunner_finish_after_input.cfg` | none, plus `finished` needing the input over (not the code) | 27,865,057 | 185,569 | `FinishNeedsInput` holds |
-| `_without_readonlywhentaken` | read without `input.is_none()` | 44,828 | 805 | `ReadOnlyWhenTaken` violated |
+| `StreamRunner_base.cfg` | none | 27,865,057 | 185,569 | all invariants and `Terminates` hold, 7 min 6 s |
+| `StreamRunner_halfclose.cfg` | none | 27,865,057 | 185,569 | `FinishNeedsInput` holds, 4 min 18 s |
+| `StreamRunner_without_finishinput.cfg` | finish after write shutdown alone | 55,335 | 898 | `FinishNeedsInput` violated |
+| `_without_readonlywhentaken` | read without `input.is_none()` | 53,515 | 885 | `ReadOnlyWhenTaken` violated |
 | `_without_keeppartialrest` | a `Partial` rest dropped | 5,736 | 156 | `InputKept` violated |
-| `_without_reportonce` | `unreported` not cleared once reported | 14,536 | 388 | `WrittenOnce` violated |
+| `_without_reportonce` | `unreported` not cleared once reported | 15,304 | 393 | `WrittenOnce` violated |
 | `_without_writebeforeend` | the stack's End before its writes | 3,416 | 78 | `EndAfterWrites` violated |
-| `_without_idleresetonread` | no `idle_from = now` on a read | 2,584,842 | 19,315 | `IdleNeedsQuiet` violated |
-| `_without_restartidleonwait` | no restart when waiting begins | 2,360,916 | 17,914 | `IdleNeedsQuiet` violated |
-| `_without_stallresetonprogress` | no `stalled_since = None` on bytes written | 3,396,792 | 25,095 | `StallNeedsNoProgress` violated |
+| `_without_idleresetonread` | no `idle_from = now` on a read | 2,789,495 | 19,980 | `IdleNeedsQuiet` violated |
+| `_without_restartidleonwait` | no restart when waiting begins | 2,549,268 | 18,646 | `IdleNeedsQuiet` violated |
+| `_without_stallresetonprogress` | no `stalled_since = None` on bytes written | 3,806,460 | 27,185 | `StallNeedsNoProgress` violated |
 | `_without_resetonbreak` | `broken` offers no reset | 528 | 26 | `ResetHeardOnBreak` violated |
-| `_without_writetimeout` | `write_timeout: None` | 2,647,837 | 21,169 | `Terminates` violated: a peer that stopped reading holds the runner forever |
+| `_without_writetimeout` | `write_timeout: None` | 3,032,080 | 23,081 | `Terminates` violated: a peer that stopped reading holds the runner forever |
 
-Each was run with `-workers 4 -Xmx6g` under an 8 GB memory cap; TLC
+Each was rerun with `-workers 4 -Xmx6g` using the JDK in
+`~/.cache/adorably-fv/jdk`, under an 8 GiB systemd memory cap and no
+swap. State directories were on the home volume. TLC
 stops at the first violation. The `_without_restartidleonwait` trace is
 the one of Bug 2: the stack ends its direction at once, the shutdown pends
 for two ticks while the runner holds the End, it completes with no byte
 written, and the next check ends the input with `idle_from` still at zero.
 
-The half-close gap. `Live::finished` returns `Finished` once the stack
-ended its direction, every byte of it is written and no work is left,
-whether or not its input is over, and `stream` then drops the stack. The
-old runner also waited for the input to end (`FinishNeedsInputOver` in
-the model). `StreamCommand::End` closes one direction, so a stack that
-ends its own and then waits for the peer's answer is dropped before the
-answer comes. TLC's trace is four states: the stack ends its direction
-early, the shutdown completes, the next check finds the run finished with
-the input still open. The review of the foundation lists this
-(`crm/ideas/protocol-foundation-astra-review-20261108.md`, "the live
-runner treats a write half-close as completion of the whole stack"), and
-the fix belongs to the next step of the plan; `StreamRunner_finish_after_input.cfg`
-shows that waiting for the input as well keeps the property in this
-model. Whatever terminal state the fix adds should make that config the
-code, and this one pass.
+The former half-close counterexample is now a passing base configuration.
+`Live::finished` requires input to finish or the layer to declare its whole
+lifetime terminal, in addition to write shutdown, drained output, delivered
+write completions and no running jobs. Ending writes by itself is not a
+terminal declaration. The model's abstract stack never declares itself
+terminal, so `FinishNeedsInputOver = TRUE` corresponds to production.
+`StreamRunner_without_finishinput.cfg` keeps the old failing behavior as
+a mutation, replacing the former proposed-fix configuration.
+
+`ending_writes_keeps_reading_the_peers_response` exercises the actual
+runner over simulated TCP: the peer waits for EOF, then sends its response
+and ends input; the layer must receive that complete response. HTTP's
+closed phase and a tunnel application's released connection explicitly
+mark the whole application terminal. Those application-specific states
+are not modeled here. TLS and composition wrappers forward terminal
+state while the runner still requires their output to drain.
+
+At `f51fa312c`, completed jobs retain their ownership lease while spawned
+producer tasks remain active; returning a streamed response must not cancel
+its producer. Whole-stack termination or owner invalidation cancels them.
+`b0fb45ee2` makes enclosing regions count descendant tasks, so dropping an
+opened stack initiates cancellation without blocking its destructor and the
+enclosing region joins the work before returning. The 19 stack tests pass,
+including pending-job cancellation with a live sibling, producer survival
+after job completion, dropped-opened-stack joining, and a real async HTTP
+child over TCP with a two-byte command window. Region interleavings and the
+unsupported direct Mutex Kani attempt are recorded in
+[`verification/runtime/VERIFICATION.md`](../runtime/VERIFICATION.md).
 
 What it leaves out: bytes are counts and the stack's room is one byte, so
 chunk boundaries and data values are not modeled (`Framed`'s Kani proofs
@@ -233,16 +249,16 @@ writes, not here.
 ## The datagram runner: `DatagramRunner.tla`
 
 [`tla/DatagramRunner.tla`](tla/DatagramRunner.tla) is one socket under
-`datagrams` (`run_datagrams` in `src/stdlib/services/stack/mod.rs:242-359`).
+`datagrams` (`run_datagrams` in `src/stdlib/services/stack/mod.rs`).
 On the merged foundation a round runs the stack before it sends, where the
 old `settle` sent first; the model's round follows the new order.
 
 | Model | Rust (`src/stdlib/services/stack/mod.rs`) |
 | --- | --- |
-| `SettleRound` | one round of the `for _ in 0..FAIR` at 268-299: the held input, `Driver::run`, then `send_below` into `send_to` |
-| `Drain` | the sink of 283-294: send each datagram, take End, refuse the rest as closed |
-| `AfterSettle` | 300-309: return on End or on a closed socket once settled, yield when not settled |
-| `Wait` | the `poll_fn` of 318-337 and 340-357: receive only with no input held, sleep until the stack's deadline |
+| `SettleRound` | one `run_datagrams` round: offer held input, call `Driver::run`, then `send_below` |
+| `Drain` | the `send_below` sink: send complete datagrams, accept End, refuse later output |
+| `AfterSettle` | return on End or on a closed socket only after settling; otherwise yield and continue |
+| `Wait` | receive only with no held input; wake for the next layer deadline |
 | `Arrive`, `Close`, `Tick` | the environment |
 
 The stack has the shape of `TimeServer`: at most one reply per datagram it
@@ -264,18 +280,26 @@ closed socket ends the run).
 | Config | Rule turned off | Generated | Distinct | Result |
 | --- | --- | ---: | ---: | --- |
 | `DatagramRunner_base.cfg` | none | 32,196 | 5,787 | every property holds |
-| `_without_receiveonlywhentaken` | receive while a datagram is held | 4,120 | 822 | `InOrderOnce` violated |
-| `_without_oneconversation` | a fresh stack per datagram | 1,365 | 283 | `InOrderOnce` violated |
-| `_without_sendeachdatagram` | a send taken without `send_to` | 71 | 33 | `SentInOrder` violated |
-| `_without_endclosesoutput` | output after End still sent | 160 | 53 | `NothingAfterEnd` violated |
-| `_without_settlebeforeclose` | the code before Bug 3's port | 1,002 | 183 | `CloseFlushes` violated |
+| `_without_receiveonlywhentaken` | receive while a datagram is held | 4,136 | 828 | `InOrderOnce` violated |
+| `_without_oneconversation` | a fresh stack per datagram | 1,362 | 282 | `InOrderOnce` violated |
+| `_without_sendeachdatagram` | a send taken without `send_to` | 53 | 32 | `SentInOrder` violated |
+| `_without_endclosesoutput` | output after End still sent | 198 | 58 | `NothingAfterEnd` violated |
+| `_without_settlebeforeclose` | returning before settling | 488 | 113 | `CloseFlushes` violated |
 | `_without_deadlineinwait` | the wait ignores the stack's deadline | 25,674 | 4,957 | `TimerFires` violated |
 | `_without_returnonclose` | no return on a closed socket | 33,678 | 6,053 | `CloseEnds` violated |
 
 What it leaves out: datagram contents and addresses (each datagram is its
 number; that answers go to the address the stack names is a Kani property
 of the time server below), the socket dropping datagrams it cannot queue,
-the stack's work, and cancellation.
+the stack's work, and cancellation. The runner now takes an explicit
+budget and charges the full capacity of each transport-owned receive
+allocation before retaining it; socket allocations themselves remain the
+transport's responsibility. This memory boundary is exercised by
+`datagram_input_requires_its_backing_capacity_in_the_budget`, not modeled
+by the datagram numbers here. Work is polled even while continuous output
+prevents settling; `a_productive_datagram_layer_does_not_starve_its_pending_work`
+checks this in bounded visits. Results go directly to the driver rather
+than through an additional completion vector.
 
 ## Kani over `Framed`
 
@@ -332,8 +356,22 @@ three Modbus frames, by execution) and the byte counting of
 `StreamRunner.tla` (`InputKept`), not a proof. The capacity term of Bug
 1's fix is shown by its unit test only: `Units` has a fixed capacity, and
 `Steps` (whose capacity is fixed too) does not exercise the charge.
-Decoder state that grows in `take_event` is charged only at the next push;
-no decoder in use holds state, and this is not proved either way.
+The framing adapter now requires `BoundedDecode`: decoding cannot grow
+retained state or allocate errors, and the owned item's allocation has a
+stated bound reserved before decoding. `Owned` carries that reservation
+beyond the adapter. `BoundedWire` states an output-capacity bound without
+temporary heap allocations, so the adapter reserves before invoking the
+writer. These are implementer contracts, not inferred bounds for arbitrary
+`Decode` or `Wire` implementations. The real Modbus implementation and the
+small proof decoders implement these contracts; ordinary codec consumers
+keep their existing interfaces.
+
+The new refusal harness makes its writer panic if entered and proves that
+no budget below its output bound invokes it. The new owned-allocation
+harness decodes an allocated byte vector, drops its layer while retaining
+the item, and checks that the reservation remains until the item is dropped.
+The PLC proof setup now supplies and receives owned frames with reservations;
+its request ordering and identity assertions are unchanged.
 
 ## Kani over the PLC server and the time server
 
@@ -398,6 +436,14 @@ RFC 5905 and RFC 4330 on the bytes, not taken from the code: at least the
 On the merged foundation all 26 `TimeServer` harnesses were rerun under a
 12 GB memory cap and verified, in 0.8 to 34 s each.
 
+After the reply reservation change in `090aba987`, all 27 harnesses,
+including the new reservation proof, passed under the requested 12 GiB
+systemd cap, no swap, six build jobs and `target-int`. Verification took
+1.65 to 28.88 seconds per harness; the new refusal proof took 2.51 seconds.
+The command was `cargo kani -p web-world -Z stubbing --harness the_time_server
+--harness one_conversation_answers_each_request_in_turn`. The four NTP tests
+also passed, including the actual sandbox clock exchange over the network.
+
 [`kani/ntp_reply.rs`](kani/ntp_reply.rs), included from
 `src/stdlib/protocols/ntp.rs`, proves on `ntp::server_reply` itself, for
 every mode, every version 0 to 7 and any other field: a reply comes only
@@ -427,5 +473,12 @@ for those headers is shown by the test
 `one_conversation_answers_each_request_and_nothing_else` (a server's
 reply, an empty datagram, bytes that are not NTP), not by a proof. The
 answered headers have their fields other than the first byte, the poll,
-the transmit time and the trailer set to zero. A budget with no room for
-the answer (the server then drops the request) is not covered.
+the transmit time and the trailer set to zero. The reply path now reserves the copied request trailer plus two reply
+headers before parsing or consulting the clock: the transactional packet
+writer temporarily holds one header alongside its destination. After
+encoding, only the final header reservation travels with the reply. The
+unit test `reply_memory_is_reserved_before_parsing_and_encoding` exercises
+both sides of this peak bound and retention after the server is dropped.
+`the_time_server_reserves_reply_memory_before_reading_the_clock` proves
+that every budget below the header-only peak rejects before consulting
+the clock and leaves no reply or reservation.

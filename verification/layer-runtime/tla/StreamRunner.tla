@@ -1,19 +1,12 @@
 ---------------------------- MODULE StreamRunner ----------------------------
-(* `services::stack::stream` (src/stdlib/services/stack/mod.rs:163-203)    *)
-(* over `Live` (src/stdlib/services/stack/live.rs): the runner that reads  *)
-(* a live connection into a layer stack's byte stream and writes what the  *)
-(* stack gives back. One round of `Live::step`'s `for _ in 0..ROUNDS`      *)
-(* (live.rs:195-330) is Round: the read (202-221), the write report        *)
-(* (229-239), the held input (240-257), `Driver::run` (258), and          *)
-(* `Driver::send_below` into the transport (264-327). A round that moved   *)
-(* goes round again; one that did not goes to Check, the limits and the    *)
-(* sleep (332-382). When `step` returns Pending, `stream` returns if       *)
-(* `Live::finished` (live.rs:142-150) or the peer is gone (mod.rs:190-196),*)
-(* and otherwise Wait waits. `EndBroken` is `Live::broken`                 *)
-(* (live.rs:392-418). The `Driver` (src/stdlib/layer/driver.rs) holds at   *)
-(* most one command below (`held`), as `send_below` and `send`             *)
-(* (driver.rs:190-195, 246-276) do.                                        *)
-(*                                                                         *)
+(* `services::stack::stream` in src/stdlib/services/stack/mod.rs drives   *)
+(* Live::step in src/stdlib/services/stack/live.rs. Round reads, reports   *)
+(* writes, offers held input, calls Driver::run and sends output. A round *)
+(* with progress repeats; a settled round checks deadlines and sleeps.   *)
+(* After Pending, stream checks Live::finished and transport poll_gone.   *)
+(* EndBroken corresponds to Live::broken. Driver holds one refused       *)
+(* command below, retaining partial output until the transport takes it. *)
+(*                                                                     *)
 (* The stack is abstract: an echo with room for `Room` bytes of input that *)
 (* it moves to its output when it runs, asks to end its direction once it  *)
 (* heard the end of its input, may refuse input for `Pause` ticks on a     *)
@@ -22,17 +15,15 @@
 (* stacks have. It asks for no work: `jobs` stays empty, so the            *)
 (* `jobs.is_empty()` of `waiting` and `finished` always holds. Bytes are   *)
 (* counted, not carried. Time is in ticks, and passes only while the      *)
-(* runner waits. The ROUNDS bound on one poll (live.rs:195, 384-386) only  *)
+(* runner waits. The ROUNDS bound on one poll  only  *)
 (* yields to the rest of the world, and is left out.                      *)
 (*                                                                         *)
-(* The switches are the rules of the code. TRUE is the code as it is,      *)
-(* with two exceptions. `IdleResetOnRead` and `RestartIdleOnWait` are      *)
-(* comp/v-framed's idle fix, ported to `Live` in commit 6aa68ae5f.         *)
-(* `FinishNeedsInputOver` is FALSE in the code: `Live::finished` returns   *)
-(* once the stack ended its direction, its bytes are written and no work  *)
-(* is left, whether or not its input is over. `StreamRunner_halfclose.cfg` *)
-(* checks that against `FinishNeedsInput`. The `_without_` configs turn    *)
-(* one rule off and name the property that must fail.                      *)
+(* The switches are the rules of the code. TRUE is the production rule.  *)
+(* This abstract stack never declares its whole lifetime terminal: ending *)
+(* writes alone leaves input live. The runner must therefore wait for     *)
+(* inputOver as well. Terminal application layers, such as HTTP closing   *)
+(* after its final response, are covered by the executable stack tests.   *)
+(* The _without_ configs turn one rule off and must violate its property. *)
 EXTENDS Integers
 
 CONSTANTS PeerBytes,      \* bytes the peer sends in all
@@ -44,16 +35,16 @@ CONSTANTS PeerBytes,      \* bytes the peer sends in all
           StackMayEndEarly, \* the stack may end its direction before its input is over
           PeerMayReset,   \* the peer may reset the connection
           PeerMayStall,   \* the peer may stop reading: its transport takes no more bytes
-          BudgetMayFail,  \* a read's charge may not fit (live.rs:207-210)
-          ReadOnlyWhenTakenRule, \* read only if `input.is_none()` (live.rs:202)
-          ReportOnceRule,        \* `unreported = 0` once delivered (live.rs:237)
-          StallResetOnProgress,  \* `stalled_since = None` on bytes taken (live.rs:319)
-          IdleResetOnRead,       \* `idle_from = now` on bytes read (live.rs:213)
-          ResetOnBreak,          \* `broken` offers StreamEvent::Reset (live.rs:404-408)
+          BudgetMayFail,  \* a read's charge may not fit
+          ReadOnlyWhenTakenRule, \* read only if `input.is_none()`
+          ReportOnceRule,        \* `unreported = 0` once delivered
+          StallResetOnProgress,  \* `stalled_since = None` on bytes taken
+          IdleResetOnRead,       \* `idle_from = now` on bytes read
+          ResetOnBreak,          \* `broken` offers StreamEvent::Reset
           WriteBeforeEnd,        \* the layer hands writes before its End (framed.rs:183-195)
-          KeepPartialRest,       \* `Admit::Partial(rest) => input = Some(rest)` (live.rs:247-250)
-          FinishNeedsInputOver,  \* `finished` also needs the input over (FALSE in live.rs:143)
-          RestartIdleOnWait      \* restart `idle_from` when waiting begins (live.rs:346-349)
+          KeepPartialRest,       \* `Admit::Partial(rest) => input = Some(rest)`
+          FinishNeedsInputOver,  \* `finished` needs input over for a nonterminal layer
+          RestartIdleOnWait      \* restart `idle_from` when waiting begins
 
 ASSUME PeerBytes \in Nat /\ Room \in Nat \ {0} /\ Pause \in Nat
 NoLimit == -1  \* stands for `None`; set a limit to it with `<- NoLimit`
@@ -99,7 +90,7 @@ VARIABLES pc,          \* "round", "check", "wait" or "done"
           stackOut,    \* bytes the stack handed down in writes
           offeredReset,\* times the runner offered StreamEvent::Reset
           badRead,     \* a read happened while input was held or over
-          wasWaiting,  \* `was_waiting` (live.rs:349), also used by the history
+          wasWaiting,  \* `was_waiting` , also used by the history
           quietFrom, earlyIdle,
           wasHolding, stuckFrom, earlyStall
 
@@ -147,12 +138,12 @@ NextCmd(o, e, r, hr) ==
   ELSE IF e = "asked" THEN "end"
   ELSE "none"
 
-(* `Live::broken` (live.rs:392-418): the stack is offered a reset, which  *)
+(* `Live::broken` : the stack is offered a reset, which  *)
 (* Framed takes unless its input is over (framed.rs:125, 147-152), and    *)
 (* the run ends. `stream` calls it for a failed read or write             *)
 (* (mod.rs:188, 198) and for a peer that is gone (mod.rs:194); `Live`     *)
-(* calls it itself for the budget (live.rs:207-210) and the write limit   *)
-(* (live.rs:333-338).                                                     *)
+(* calls it itself for the budget  and the write limit   *)
+(* .                                                     *)
 EndBroken(why, over) ==
   /\ offeredReset' = IF ResetOnBreak THEN offeredReset + 1 ELSE offeredReset
   /\ heardReset' = (heardReset \/ (ResetOnBreak /\ ~over))
@@ -166,8 +157,8 @@ EndBroken(why, over) ==
 (* held write and then a new one), `sd` what it answers to the shutdown.  *)
 (* A write that is ready takes at least one byte, as                      *)
 (* `Connection::poll_write` does for a non-empty buffer; one that takes   *)
-(* none is the "error" answer (live.rs:272-275). A failed write or        *)
-(* shutdown stays held (live.rs:286-289, 298-301) and `send` stops.       *)
+(* none is the "error" answer . A failed write or        *)
+(* shutdown stays held  and `send` stops.       *)
 RECURSIVE SendLoop(_, _, _, _)
 SendLoop(st, ws, sd, fuel) ==
   IF fuel = 0 \/ st.stop THEN st
@@ -221,8 +212,8 @@ ReadChoices ==
   ELSE {None} \cup (IF peerLeft > 0 THEN 1..peerLeft ELSE {})
        \cup (IF peerLeft = 0 /\ peerFin THEN {0} ELSE {})
 
-(* One round of `Live::step` (live.rs:196-330). From "wait" a round runs  *)
-(* only if something can move: what woke the runner (live.rs:382).        *)
+(* One round of `Live::step` . From "wait" a round runs  *)
+(* only if something can move: what woke the runner .        *)
 Round ==
   /\ pc \in {"round", "wait"}
   /\ \E rd \in ReadChoices,
@@ -319,7 +310,7 @@ Round ==
         /\ UNCHANGED <<now, idled, deadline, peerFin, gone, peerStalled, wasWaiting,
                        earlyIdle, wasHolding, earlyStall>>
 
-(* The limits and the sleep (live.rs:332-382), then, when `step` returns  *)
+(* The limits and the sleep , then, when `step` returns  *)
 (* Pending, what `stream` does with it (mod.rs:190-196).                  *)
 Check ==
   /\ pc = "check"
@@ -359,7 +350,7 @@ Check ==
                                stack, peer, readTotal, took, refused, transportTook,
                                reported, stackOut, offeredReset, badRead, earlyStall>>
            ELSE IF armed # None /\ now >= armed
-           THEN \* The sleep is due: round again (live.rs:374-380).
+           THEN \* The sleep is due: round again .
                 /\ deadline' = None /\ pc' = "round"
                 /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, hKind,
                                hN, ret, stack, peer, readTotal, took, refused,

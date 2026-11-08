@@ -21,6 +21,11 @@
 (* The switches are the rules of the code. TRUE is the code as it is,      *)
 (* including `SettleBeforeClose`, the fix of comp/v-framed's commit        *)
 (* 1a183c83e, ported to the split runner in 33fd898e0.                    *)
+(* The explicit allocation budget and per-job cancellable regions are   *)
+(* outside this model. Datagrams are atomic numbered items here. The     *)
+(* production runner polls jobs during busy visits as well as waits, and *)
+(* gives completions directly to the driver without an intermediate     *)
+(* result vector. Runtime tests cover those resource and work paths.     *)
 EXTENDS Integers, Sequences
 
 CONSTANTS Datagrams,      \* datagrams that reach the socket in all
