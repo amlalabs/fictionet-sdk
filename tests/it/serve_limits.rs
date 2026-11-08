@@ -17,13 +17,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::common::line_stack::{LineApp, LineOut, Lined, LinedError};
 use crate::httpd::{closing, poll, send, serve};
 use bytes::Bytes;
-use fictionet::stdlib::codec::{Ending, LineError, Lines};
+use fictionet::stdlib::codec::LineError;
 use fictionet::stdlib::layer::{self, Budget};
 use fictionet::stdlib::network::ConnInfo;
-use fictionet::stdlib::services::serve::{self, Ended, Flow, Harness, ServeOptions};
 use fictionet::stdlib::services::stack::Polling;
+use fictionet::stdlib::services::stack::{self, StreamEnd, StreamLimits};
 use fictionet::stdlib::web::httpd::{
     self, Body, Closing, Exchange, Handler, Http1, HttpOptions, Limits, Reply,
 };
@@ -130,14 +131,20 @@ struct Loud {
     size: usize,
 }
 
-service_fixture! {
-    Loud => (Lines, (), Infallible);
-    decoder(self) {
-        Lines::new(64, Ending::LfOrCrlf)
-    }
-    on_item(self, _: Result<Vec<u8>, LineError>; _, driver) -> Flow {
-        driver.reply().resize(self.size, b'x');
-        Ok(Flow::Continue)
+impl LineApp for Loud {
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Next = Infallible;
+    type Error = Infallible;
+
+    fn line(
+        &mut self,
+        _: Result<Vec<u8>, LineError>,
+        out: &mut LineOut<'_, Self>,
+    ) -> Result<(), Infallible> {
+        out.write(&vec![b'x'; self.size]);
+        Ok(())
     }
 }
 
@@ -151,37 +158,29 @@ fn page(size: usize) -> impl Handler {
 }
 
 // ---------------------------------------------------------------------------
-// The write side of serve
+// The write side of a stack
 
-/// A reply not yet written counts against the budget. Before, only what
-/// was read did, so a client that asked for big replies and never read
-/// them held them outside the budget.
+/// A reply not yet written counts against the budget, so a client that
+/// asks for big replies and never reads them cannot hold them outside it.
 #[test]
 fn reply_bytes_count_against_the_budget() {
-    let opts = ServeOptions::default()
-        .idle(None)
-        .budget(Budget::new(256 << 10));
-    let mut h = Harness::with_options(
+    let mut h = layer::Harness::with_budget(
         fictionet::Seed::from_u64(0),
-        Loud { size: 1 << 20 },
-        (),
-        opts,
+        Lined::new(Loud { size: 1 << 20 }),
+        Budget::new(256 << 10),
     );
-    assert_eq!(h.push(b"go\n").unwrap(), b"");
-    assert_eq!(h.end_reason(), Some(Ended::Budget));
+    assert!(matches!(h.push(b"go\n"), Err(LinedError::Budget)));
+    assert_eq!(h.output(), b"");
 
     // A reply that fits goes out.
-    let opts = ServeOptions::default()
-        .idle(None)
-        .budget(Budget::new(256 << 10));
-    let mut h = Harness::with_options(
+    let mut h = layer::Harness::with_budget(
         fictionet::Seed::from_u64(0),
-        Loud { size: 64 << 10 },
-        (),
-        opts,
+        Lined::new(Loud { size: 64 << 10 }),
+        Budget::new(256 << 10),
     );
-    assert_eq!(h.push(b"go\n").unwrap().len(), 64 << 10);
-    assert_eq!(h.end_reason(), None);
+    h.push(b"go\n").unwrap();
+    assert_eq!(h.output().len(), 64 << 10);
+    assert!(!h.ended());
 }
 
 /// What deferred work holds counts too: an HTTP/1 response body waiting
@@ -198,29 +197,25 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     assert_eq!(closing(&mut h), Some(Closing::Budget));
 }
 
-/// A write that takes no bytes for the write timeout ends the connection.
-/// Before, the driver waited for ever on a client that stopped reading.
+/// A write that takes no bytes for the write timeout ends the connection:
+/// the runner does not wait for ever on a client that stopped reading.
 #[test]
 fn a_client_that_stops_reading_times_out() {
     fictionet_test_support::world::world(Duration::from_secs(60), |fcx| async move {
         let (server, client) = two_machines(&fcx);
-        let opts = ServeOptions::default()
-            .idle(None)
-            .write_timeout(Some(Duration::from_millis(300)));
+        let limits = StreamLimits {
+            idle: None,
+            write_timeout: Some(Duration::from_millis(300)),
+        };
         let mut listener = server.listen(7)?;
         let (finish, finished) = tokio::sync::oneshot::channel();
         fcx.spawn(move |fcx| async move {
             let conn = listener.accept(&fcx).await?;
-            let outcome = serve::connection(
-                &fcx,
-                conn,
-                ConnInfo::default(),
-                &mut Loud { size: 16 << 20 },
-                &(),
-                &opts,
-            )
-            .await;
-            let _ = finish.send(outcome);
+            let stack = Lined::new(Loud { size: 16 << 20 });
+            let info = ConnInfo::default();
+            let budget = Budget::unlimited();
+            let outcome = stack::stream(&fcx, conn, &info, stack, budget, limits, |_| {}).await;
+            let _ = finish.send(outcome.map_err(|e| format!("{e:?}")));
             Ok(())
         });
         let mut conn = client
@@ -228,12 +223,12 @@ fn a_client_that_stops_reading_times_out() {
             .await?;
         conn.write_all(&fcx, b"go\n").await?;
         let outcome = finished.await.unwrap();
-        assert!(matches!(
+        assert_eq!(
             outcome,
-            Ok(serve::Served::Closed(Ended::Conn(
+            Ok(StreamEnd::Conn(
                 fictionet::stdlib::network::ConnError::TimedOut
-            )))
-        ));
+            ))
+        );
         drop(conn);
         Ok(())
     });
@@ -1200,11 +1195,11 @@ fn peer_admission_is_shared_by_machines_and_dns() {
             })
             .host("one", |h| {
                 h.at(Ipv4Addr::new(104, 18, 0, 2))
-                    .tcp(7, Arc::new(()), || Loud { size: 1 })
+                    .tcp_stack(7, |_| Lined::new(Loud { size: 1 }))
             })
             .host("two", |h| {
                 h.at(Ipv4Addr::new(104, 18, 0, 3))
-                    .tcp(7, Arc::new(()), || Loud { size: 1 })
+                    .tcp_stack(7, |_| Lined::new(Loud { size: 1 }))
             })
             .start(&fcx, attachments)?;
         let m = fictionet_test_support::sandbox::machine(
