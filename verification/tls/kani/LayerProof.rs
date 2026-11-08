@@ -11,6 +11,7 @@ use super::*;
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{Budget, Observations};
 use fictionet::time::Instant;
+use std::mem::ManuallyDrop;
 
 /// The layer never draws entropy itself; any draw is a failure.
 struct NoEntropy;
@@ -22,9 +23,14 @@ impl Entropy for NoEntropy {
 }
 
 /// A layer before any hello. It picks its config as work, which no
-/// harness runs, so no `ServerConfig` is built.
-fn fresh() -> TlsLayer {
-    TlsLayer::selecting(|_, _| async { None })
+/// harness runs, so no `ServerConfig` is built. It is never dropped:
+/// dropping its picker is a call through a vtable, which CBMC expands to
+/// every function of that shape, and dropping is not what these proofs
+/// are about.
+fn fresh() -> ManuallyDrop<TlsLayer> {
+    ManuallyDrop::new(TlsLayer::with(Select::With(Arc::new(|_, _| {
+        unreachable!("no harness picks a config")
+    }))))
 }
 
 /// Cumulative byte counts stay below 2^62: a connection does not move
@@ -35,7 +41,7 @@ const LIMIT: u64 = 1 << 62;
 /// write was accepted: `delivered <= produced`, at most one CHUNK of
 /// plaintext pending, and a fence only while that plaintext is pending
 /// and its ciphertext not yet all delivered.
-fn accounting() -> TlsLayer {
+fn accounting() -> ManuallyDrop<TlsLayer> {
     let mut layer = fresh();
     layer.produced = kani::any();
     layer.delivered = kani::any();
