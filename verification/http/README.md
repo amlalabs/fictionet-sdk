@@ -35,7 +35,7 @@ proves the RFC rules about them.
 | Lean | Rust | Rule |
 |---|---|---|
 | `policy` | `ResponsePolicy::new` in `response.rs` | `bodiless` and the length for a status, an `Asked` (`Body`, `Head`, `Tunnel`), a body length hint and a handler-supplied `Content-Length` |
-| `encode1` | `native::encode` and `Streaming::poll_next` | HTTP/1 head: `Content-Length`, `Transfer-Encoding: chunked` for an unknown length on HTTP/1.1, `Connection: close` for one on HTTP/1.0 |
+| `encode1` | `native::encode` and `Http1::start` | HTTP/1 head: `Content-Length`, `Transfer-Encoding: chunked` for an unknown length on HTTP/1.1, `Connection: close` for one on HTTP/1.0 |
 | `readerFraming`, `readerClose` | `http1::response_framing` in `protocols/http1.rs` | The reader's body boundary for a head and the request method (RFC 9112 section 6.3) |
 | `headers2`, `contentLength2` | `Sending::poll_next` in `http2.rs` | HTTP/2 HEADERS: `content-length` and END_STREAM |
 | `askedBeforeFix` | the `head_only: bool` that `Sending` carried before the fix | The negative control: the mapping that lost CONNECT |

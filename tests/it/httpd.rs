@@ -1153,7 +1153,10 @@ fn http1_pipelined_partial_head_timeout_closes_the_connection() {
     );
 
     let mut h = serve(Http1::new(router));
-    let reply = send(&mut h, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\nGET / HTTP/1.1\r\n");
+    let reply = send(
+        &mut h,
+        b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\nGET / HTTP/1.1\r\n",
+    );
     assert!(reply.starts_with(b"HTTP/1.1 200"));
     assert!(!h.ended());
     h.advance(Duration::from_secs(31)).unwrap();
@@ -1175,4 +1178,226 @@ fn http1_body_timeout_closes_the_connection() {
         .unwrap();
     h.advance(Duration::from_secs(61)).unwrap();
     assert!(h.ended());
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/1 over a live connection
+
+mod live {
+    use super::*;
+
+    use std::future::Future;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use fictionet::Cx;
+    use fictionet::stdlib::layer::Budget;
+    use fictionet::stdlib::layer::live::{self, Live, Outcome};
+    use fictionet::stdlib::network::{Connection, ConnectionExt, ip, tcp};
+
+    const SERVER: Ipv4Addr = Ipv4Addr::new(10, 9, 1, 1);
+
+    fn two_machines(fcx: &Cx) -> (tcp::Endpoint, tcp::Endpoint) {
+        let (a, b) = fictionet::pair();
+        let (at, _au, _ai, _ao) = ip::split_protocols(fcx, a);
+        let (bt, _bu, _bi, _bo) = ip::split_protocols(fcx, b);
+        let client: IpAddr = Ipv4Addr::new(10, 9, 1, 2).into();
+        (
+            tcp::endpoint(fcx, at, SERVER.into()),
+            tcp::endpoint(fcx, bt, client),
+        )
+    }
+
+    /// Answers CONNECT with 200 and an echo of the tunnel, and anything
+    /// else with 404.
+    fn tunnels() -> impl httpd::Handler {
+        fictionet_test_support::reply_handler(|_, request| {
+            if request.method() != http::Method::CONNECT {
+                return httpd::Reply::Now(
+                    http::Response::builder()
+                        .status(404)
+                        .body(httpd::Body::empty())
+                        .unwrap(),
+                );
+            }
+            let mut response = http::Response::new(httpd::Body::empty());
+            response.extensions_mut().insert(httpd::UpgradeHandler::new(
+                |fcx, mut conn| async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = conn.read(&fcx, &mut buf).await {
+                        if n == 0 || conn.write_all(&fcx, &buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                },
+            ));
+            httpd::Reply::Now(response)
+        })
+    }
+
+    /// Serves `handler` on port 80 of `server`.
+    fn serve_on(fcx: &Cx, server: &tcp::Endpoint, handler: Arc<dyn httpd::Handler>) {
+        let mut listener = server.listen(80).unwrap();
+        fcx.spawn(move |fcx| async move {
+            loop {
+                let conn = listener.accept(&fcx).await?;
+                let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+                let handler = handler.clone();
+                fcx.spawn(move |fcx| async move {
+                    Ok(httpd::serve_connection(
+                        &fcx,
+                        conn,
+                        info,
+                        handler,
+                        &httpd::HttpOptions::default(),
+                    )
+                    .await?)
+                });
+            }
+        });
+    }
+
+    /// Reads from `conn` until `want` bytes have come.
+    async fn read_exactly(
+        fcx: &Cx,
+        conn: &mut impl Connection,
+        want: usize,
+    ) -> fictionet::Result<Vec<u8>> {
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 16 * 1024];
+        while got.len() < want {
+            let n = conn.read(fcx, &mut buf).await?;
+            assert!(n > 0, "the server closed after {} bytes", got.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        Ok(got)
+    }
+
+    const ANSWER: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
+
+    /// The bytes a client sends right after its CONNECT, in the same
+    /// segment, reach the tunnel once and first, and the tunnel's own
+    /// bytes follow the answer with nothing between.
+    #[test]
+    fn a_connect_tunnel_gets_the_bytes_sent_with_its_request_once() {
+        world(Duration::from_secs(30), |fcx| async move {
+            let (server, client) = two_machines(&fcx);
+            serve_on(&fcx, &server, Arc::new(tunnels()));
+            let mut conn = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+                .await?;
+            conn.write_all(
+                &fcx,
+                b"CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\nping",
+            )
+            .await?;
+            let got = read_exactly(&fcx, &mut conn, ANSWER.len() + 4).await?;
+            assert_eq!(&got[..ANSWER.len()], ANSWER);
+            assert_eq!(&got[ANSWER.len()..], b"ping");
+            conn.write_all(&fcx, b"pong").await?;
+            assert_eq!(read_exactly(&fcx, &mut conn, 4).await?, b"pong");
+            conn.shutdown(&fcx).await?;
+            let mut rest = [0u8; 16];
+            assert_eq!(conn.read(&fcx, &mut rest).await?, 0);
+            Ok(())
+        });
+    }
+
+    /// A tunnel whose client sends far more than any buffer holds, and
+    /// reads nothing for a while, still gets every byte back in order:
+    /// each buffer on the way waits instead of dropping or reordering.
+    #[test]
+    fn a_connect_tunnel_under_backpressure_keeps_every_byte_in_order() {
+        world(Duration::from_secs(60), |fcx| async move {
+            let (server, client) = two_machines(&fcx);
+            serve_on(&fcx, &server, Arc::new(tunnels()));
+            let mut conn = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+                .await?;
+            let payload: Vec<u8> = (0..(512u32 << 10)).map(|n| (n % 251) as u8).collect();
+            let mut sent = b"CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\n".to_vec();
+            sent.extend_from_slice(&payload);
+            let want = ANSWER.len() + payload.len();
+            // Write all along, but read nothing until every buffer on the
+            // way has had time to fill.
+            let quiet = std::pin::pin!(fcx.sleep(Duration::from_secs(2)));
+            let mut quiet = Some(quiet);
+            let mut unsent = &sent[..];
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 16 * 1024];
+            std::future::poll_fn(|cx| {
+                while !unsent.is_empty() {
+                    match conn.poll_write(&fcx, cx, unsent) {
+                        Poll::Ready(Ok(n)) => unsent = &unsent[n..],
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => break,
+                    }
+                }
+                if let Some(waiting) = &mut quiet {
+                    if waiting.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    quiet = None;
+                }
+                while got.len() < want {
+                    match conn.poll_read(&fcx, cx, &mut buf) {
+                        Poll::Ready(Ok(0)) => {
+                            return Poll::Ready(Err(fictionet::stdlib::network::ConnError::Closed));
+                        }
+                        Poll::Ready(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                if unsent.is_empty() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await?;
+            assert_eq!(&got[..ANSWER.len()], ANSWER);
+            assert!(
+                got[ANSWER.len()..] == payload[..],
+                "the tunnel changed the bytes"
+            );
+            Ok(())
+        });
+    }
+
+    /// Answers every request with `size` bytes.
+    fn page(size: usize) -> impl httpd::Handler {
+        fictionet_test_support::handler(move |_, _| {
+            http::Response::new(Bytes::from(vec![b'x'; size]))
+        })
+    }
+
+    /// A client that stops reading an answer ends the run once a write has
+    /// taken nothing for the write timeout.
+    #[test]
+    fn a_client_that_stops_reading_an_answer_stalls_the_run() {
+        world(Duration::from_secs(60), |fcx| async move {
+            let (server, client) = two_machines(&fcx);
+            let mut listener = server.listen(80)?;
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            fcx.spawn(move |fcx| async move {
+                let conn = listener.accept(&fcx).await?;
+                let live = Live {
+                    budget: Budget::unlimited(),
+                    write_timeout: Some(Duration::from_millis(300)),
+                };
+                let outcome = live::run(&fcx, conn, Http1::new(page(16 << 20)), &live).await;
+                let _ = finish.send(outcome);
+                Ok(())
+            });
+            let mut conn = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+                .await?;
+            conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n")
+                .await?;
+            let outcome = finished.await.unwrap();
+            assert!(matches!(outcome, Ok(Outcome::Stalled)), "{outcome:?}");
+            drop(conn);
+            Ok(())
+        });
+    }
 }

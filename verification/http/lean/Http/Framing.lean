@@ -80,7 +80,7 @@ def policy (st : Status) (hint : Hint) (asked : Asked) (supplied : Supplied) : P
     len := if noBody st asked then none else policyLen hint asked supplied }
 
 /-- The body bytes the server writes after the head: none when the policy
-says bodiless, else what the body yields (`Streaming::poll_next` and
+says bodiless, else what the body yields (`Http1::start` and
 `Sending::poll_next` both drop the body when `policy.bodiless`). -/
 def written (p : Policy) (actual : Nat) : Nat :=
   if p.bodiless then 0 else actual
