@@ -51,7 +51,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fictionet::stdlib::network::ip::{self, Intake, Reassembly};
 use fictionet::stdlib::network::ports::{Event, Ports};
 use fictionet::stdlib::services::serve::Counted;
-use fictionet::stdlib::world::net::{Arrival, Host, Net, Pools, PortServer};
+use fictionet::stdlib::world::net::{Arrival, Host, Net, NetHandle, Pools, PortServer, Program};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Attachment, Attachments, Cx, End, Interface};
@@ -217,14 +217,33 @@ impl PortServer for Bounded {
 /// IPv6 alike.
 pub const INTERNET: &str = "internet";
 
-/// A running honeypot, for looking at what it holds.
+/// A running honeypot, its observations, and trusted machine programs.
 #[derive(Clone)]
 pub struct Honeypot {
+    network: NetHandle,
+    address: Ipv4Addr,
+    address_v6: Option<Ipv6Addr>,
     tokens: Arc<Tokens>,
     observer: Arc<Mutex<Observer>>,
 }
 
 impl Honeypot {
+    /// Runs trusted application code on the existing honeypot machines.
+    ///
+    /// Its TCP and UDP endpoints share the server's addresses and ports.
+    /// Initiated packets leave through the same routed attachment as replies;
+    /// this does not open host operating system sockets. With IPv6 configured,
+    /// the program runs once per address family. Errors fail the world region.
+    pub fn program(&self, program: impl Program) -> fictionet::Result {
+        let host = Host::new("server").at(self.address).program(program);
+        let host = match self.address_v6 {
+            Some(address) => host.at(address),
+            None => host.ipv4_only(),
+        };
+        self.network.add_host(host)?;
+        Ok(())
+    }
+
     /// How many open connections negotiated MPTCP.
     pub fn mptcp_connections(&self) -> usize {
         self.tokens.len()
@@ -251,12 +270,16 @@ pub fn start(
     let mut observer = Observer::new(sinks, clock, config.burst, tokens.clone())?;
     observer.restricted_evidence(config.restricted_evidence);
     let observer = Arc::new(Mutex::new(observer));
+    let network = network(fcx, config, clock, &tokens, observer.clone());
     let honeypot = Honeypot {
+        network: network.handle(),
+        address: config.address,
+        address_v6: config.address_v6,
         tokens: tokens.clone(),
         observer: observer.clone(),
     };
     let (attacher, inner) = fictionet::attachments();
-    network(fcx, config, clock, &tokens, observer.clone()).start(fcx, inner)?;
+    network.start(fcx, inner)?;
     let expiring = observer.clone();
     fcx.spawn(move |fcx| async move {
         let mut timer = fictionet::Timer::new(&fcx);

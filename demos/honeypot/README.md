@@ -264,3 +264,27 @@ copy-mode transport, ownership and crash guards, and qualification on the
 actual guest NIC/driver/kernel combination. Native/generic and copy/zero-copy
 are separate capabilities. No current startup message claims those capabilities,
 a direct ENA driver, or a validated advisory-specific SSH classifier.
+
+## Initiated traffic spike
+
+An embedding application can call `Honeypot::program` with a Fictionet
+`Program`. It receives the existing server machine's TCP and UDP endpoints;
+`machine.tcp.connect` and a bound UDP socket's `send_to` initiate traffic
+through the same `internet` attachment used for incoming traffic and replies.
+The backend's routes and, for Ethernet, gateway resolution still apply. This
+hook runs trusted application code; SSH input is never used to initiate traffic.
+The deployed CLI does not start an outbound program.
+
+`cargo xtask egress /path/to/guest-artifacts` builds and boots a disposable QEMU
+guest. It checks IPv4 TCP and UDP request/response exchanges through the
+in-process world attachment, TUN with a guest Linux peer, and two VFIO
+virtio-net devices connected by an internal QEMU hub. All peers run inside the
+guest. There is no host networking backend or external network connection.
+The guest verifies randomized payload responses, capture directions and
+checksums, and that the existing incoming HTTP service still works. Its result
+reaches the harness through QEMU's exit device, independently of printed text.
+
+Run this task only where QEMU and the existing raw NIC guest prerequisites are
+available. Choose an artifact directory outside temporary storage. This spike
+does not qualify the Unix world socket transport, IPv6, performance, cloud NICs,
+or the planned XDP/AF_XDP backend.

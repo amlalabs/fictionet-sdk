@@ -1,5 +1,7 @@
 //! Guest-only entry point for the isolated raw Ethernet exercise.
 use std::{ffi::CString, fs, io};
+#[path = "../egress.rs"]
+mod egress;
 #[path = "../rawnic_frames.rs"]
 mod rawnic_frames;
 #[path = "../rawnic_world.rs"]
@@ -89,6 +91,12 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
             return Err("guest tests failed".into());
         }
     }
+    if cmdline
+        .split_whitespace()
+        .any(|arg| arg == "fictionet.egress=1")
+    {
+        return egress::run().map_err(|error| io::Error::other(error.to_string()).into());
+    }
     rawnic_world::tun().map_err(|error| io::Error::other(error.to_string()))?;
     let device = "0000:00:03.0";
     let path = format!("/sys/bus/pci/devices/{device}");
@@ -121,8 +129,22 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     let mut guest = false;
-    if let Err(error) = run(&mut guest) {
+    let result = run(&mut guest);
+    if let Err(error) = &result {
         eprintln!("RAWNIC FAIL: {error}");
+    }
+    if guest
+        && fs::read_to_string("/proc/cmdline")
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|arg| arg == "fictionet.egress=1")
+    {
+        // SAFETY: this marked QEMU guest exposes only the exit device at this port.
+        unsafe {
+            if libc::ioperm(0xf4, 4, 1) == 0 {
+                std::arch::asm!("out dx, eax", in("dx") 0xf4u16, in("eax") 42 + u32::from(result.is_err()));
+            }
+        }
     }
     if guest {
         unsafe {
