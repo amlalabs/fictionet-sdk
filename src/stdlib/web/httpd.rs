@@ -1,15 +1,16 @@
 //! HTTP as a service: plain handlers, an adapter for tower services (axum
-//! included), and name-based virtual hosting, all on [`serve`].
+//! included), and name-based virtual hosting.
 //!
-//! `Http1` is a caller-driven `Service` on the `http1` decoder.
-//! [`Http2`] uses the shared HTTP/2 frame layer and HPACK. Both servers run
-//! with `std` alone. `serve_connection` runs them over a live connection. TLS comes from
+//! [`Http1`] is a [`Layer`](fictionet::stdlib::layer::Layer) over an
+//! ordered byte stream. [`Http2`] is a [`serve`] service on the shared
+//! HTTP/2 frame layer and HPACK. Both servers run with `std` alone.
+//! [`serve_connection`] runs them over a live connection. TLS comes from
 //! `fictionet::stdlib::services::tls`. This module supplies no HTTP client.
 //!
 //! A [`Handler`] answers one request. Adapters and virtual hosting:
 //!
 //! - [`tower`]: any `tower_service::Service<http::Request<Body>>`, such as an
-//!   `axum::Router`, run as deferred work of the connection.
+//!   `axum::Router`, run as the connection's work.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
 //!   with several sites at one address does, with the redirect to https and
 //!   the `421 Misdirected Request` of [`web::Sites`](fictionet::stdlib::web::Sites).
@@ -22,9 +23,8 @@
 //! component with its own handlers plugs in the same way. Copy `httpd.rs`
 //! together with the `httpd/` directory, keeping the relative paths.
 //!
-//! [`Http1`] is the [`Service`](fictionet::stdlib::services::serve::Service) that speaks
-//! HTTP/1.0 and 1.1 to a client, on [`http1`]'s
-//! decoder: keep-alive, pipelining, `Expect: 100-continue`, `HEAD`, chunked
+//! [`Http1`] speaks HTTP/1.0 and 1.1 to a client, on [`http1`]'s decoder:
+//! keep-alive, pipelining, `Expect: 100-continue`, `HEAD`, chunked
 //! responses for bodies of unknown length, and 30-second limits on each
 //! request's head and on its body. [`serve_connection`] picks the version for a
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
@@ -44,10 +44,14 @@
 //! most HTTP/1 servers do. HTTP/2 names stay lowercase, as that protocol
 //! requires.
 //!
-//! An upgrade request reaches the native HTTP/1 handler. A synchronous handler
-//! returns `101` with an [`UpgradeHandler`] extension to receive the connection
-//! after the response is written, including unread bytes. The stdlib's
-//! [`websocket`](fictionet::stdlib::protocols::websocket) codec can serve it directly.
+//! An upgrade request reaches the native HTTP/1 handler. A handler hands
+//! the connection on by putting an [`UpgradeHandler`] in the extensions of
+//! a `101` answer, or of a 2xx answer to CONNECT: once the answer is
+//! written, HTTP is over, and [`Http1::upgradable`] runs the upgrade
+//! handler on the rest of the stream, with the bytes the client sent past
+//! the request first. The stdlib's
+//! [`websocket`](fictionet::stdlib::protocols::websocket) codec can serve it
+//! directly.
 //! # Dates
 //!
 //! The world owns its dates. A response carries a `Date` header only when
@@ -75,8 +79,8 @@
 //! graceful shutdown drains admitted streams.
 //!
 //! ```
+//! use fictionet::stdlib::layer::Harness;
 //! use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
-//! use fictionet::stdlib::services::serve::Harness;
 //!
 //! struct Pages;
 //! impl Handler for Pages {
@@ -88,12 +92,13 @@
 //!         Reply::Now(http::Response::new(body))
 //!     }
 //! }
-//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages), ());
-//! let reply = h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages)).running_work();
+//! h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
+//! let reply = h.take_output();
 //! assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
 //! assert!(reply.ends_with(b"\r\n\r\nhi\n"));
-//! let reply = h.push(b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nok")?;
-//! assert!(reply.ends_with(b"\r\n\r\nok"));
+//! h.push(b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nok")?;
+//! assert!(h.take_output().ends_with(b"\r\n\r\nok"));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -108,7 +113,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fictionet::RaceError;
-use fictionet::stdlib::layer::Budget;
+use fictionet::stdlib::layer::live::{self, Live, Outcome};
+use fictionet::stdlib::layer::{Budget, Side};
 use fictionet::stdlib::network::Connection;
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::protocols::http1;
@@ -130,7 +136,10 @@ pub use handlers::{
 };
 
 pub use http2::{Http2, Timer as Http2Timer};
-pub use native::{Http1, Timer as Http1Timer};
+pub use native::{
+    Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer,
+    Work as Http1Work,
+};
 pub use response::{date_header, http_date};
 pub use sites::{Answer, Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
 
@@ -388,13 +397,13 @@ pub async fn serve_connection<C: Connection + Unpin>(
         first == PREFACE
     };
     let conn = Prefixed::new(first, conn);
-    let serve_opts = ServeOptions {
-        idle: None,
-        write_timeout: Some(opts.limits.write_timeout),
-        budget: opts.budget.clone(),
-        ..ServeOptions::default()
-    };
     if h2 {
+        let serve_opts = ServeOptions {
+            idle: None,
+            write_timeout: Some(opts.limits.write_timeout),
+            budget: opts.budget.clone(),
+            ..ServeOptions::default()
+        };
         let mut service = Http2::with(handler, opts.limits);
         service.observe = opts.observe.clone();
         service.date = opts
@@ -406,25 +415,20 @@ pub async fn serve_connection<C: Connection + Unpin>(
             _ => Ok(()),
         };
     }
-    let mut service = Http1::with(handler.clone(), opts.limits);
-    service.date = opts.date;
-    service.observe = opts.observe.clone();
+    let mut http1 = Http1::with(handler, opts.limits).conn(info.clone());
+    http1.date = opts.date;
+    http1.observe = opts.observe.clone();
     if !info.tls && opts.first_bytes.is_none() {
-        service.first_head_deadline = Some(head_deadline);
+        http1.first_head_deadline = Some(head_deadline);
     }
-    match serve::connection(fcx, conn, info.clone(), &mut service, &(), &serve_opts).await {
-        Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => {
-            if let Some(upgrade) = service.upgrade.take() {
-                upgrade.run(fcx.clone(), Box::new(rest)).await;
-                return if fcx.is_cancelled() {
-                    Err(Cancelled)
-                } else {
-                    Ok(())
-                };
-            }
-            Ok(())
-        }
-        Err(serve::ServeError::Cancelled) => Err(Cancelled),
-        Ok(_) | Err(_) => Ok(()),
+    let live = Live {
+        budget: opts.budget.clone().unwrap_or_else(Budget::unlimited),
+        write_timeout: Some(opts.limits.write_timeout),
+    };
+    let _note = serve::PanicNote::new(std::any::type_name::<Http1>(), &info);
+    match live::run(fcx, conn, http1.upgradable(), &live).await {
+        Ok(Outcome::Cancelled) => Err(Cancelled),
+        Ok(_) => Ok(()),
+        Err(Side::Lower(never) | Side::Upper(never)) => match never {},
     }
 }

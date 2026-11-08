@@ -93,6 +93,13 @@ impl<L: Layer> Driver<L> {
         }
     }
 
+    /// Draws from `entropy` and reads `now` from here on, as a harness that
+    /// joins a world does before anything runs.
+    pub(super) fn rebind(&mut self, entropy: Arc<dyn Entropy>, now: Instant) {
+        self.entropy = entropy;
+        self.now = now;
+    }
+
     /// Keeps at most `limit` reports from now on.
     pub fn keep_observations(&mut self, limit: usize) {
         self.observed.limit = limit;

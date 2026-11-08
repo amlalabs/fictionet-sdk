@@ -34,7 +34,7 @@ use bytes::Bytes;
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
 use fictionet::stdlib::dissect::{Dissector, Registry};
-use fictionet::stdlib::layer::Budget;
+use fictionet::stdlib::layer::{self, Budget};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::{Message, Query};

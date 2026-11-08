@@ -130,7 +130,7 @@ pub struct Tower<S> {
 
 /// Runs any tower service, such as an `axum::Router`, as a [`Handler`].
 /// Each request gets its own clone of the service, as tower expects, and
-/// runs as deferred work of its connection. The response's body streams
+/// runs as work of its connection. The response's body streams
 /// to the client as it comes.
 pub fn tower<S, B>(service: S) -> Tower<S>
 where
@@ -169,11 +169,14 @@ where
     }
 }
 
-/// Runs a protocol after an HTTP/1 switching-protocols response is written.
+/// Runs a protocol after an HTTP/1 response that hands the connection on is
+/// written.
 ///
-/// Insert this in the extensions of a `101 Switching Protocols` response
-/// returned as [`Reply::Now`]. [`serve_connection`](super::serve_connection) calls it with the
-/// connection and its unread bytes. It runs once, even if the response is cloned.
+/// Insert this in the extensions of a `101 Switching Protocols` response,
+/// or of a 2xx response to CONNECT. Once the response is written,
+/// [`Http1::upgradable`](super::Http1::upgradable) calls it with the rest of
+/// the stream as a connection, whose first bytes are those the client sent
+/// past the request. It runs once, even if the response is cloned.
 #[derive(Clone)]
 pub struct UpgradeHandler(Arc<Mutex<Option<UpgradeWork>>>);
 
