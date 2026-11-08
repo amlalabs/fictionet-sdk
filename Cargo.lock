@@ -5902,6 +5902,7 @@ dependencies = [
  "fictionet",
  "fictionet-extras",
  "fictionet-host",
+ "fictionet-test-support",
  "form_urlencoded",
  "futures-util",
  "http",
