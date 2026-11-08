@@ -237,7 +237,6 @@ where
         if opts.budget.is_none() {
             opts.budget = arrival.budget;
         }
-        opts.handshake = arrival.limits.handshake;
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
             let _ = serve::connection(&fcx, conn, info, &mut service, &state, &opts).await;
@@ -447,11 +446,10 @@ impl Host {
         )
     }
 
-    /// The same with these options (an idle limit, a STARTTLS config) and
-    /// at most `max_conns` connections at once. Past that, a new one is
-    /// reset as soon as it is accepted, and each counts until its socket is
-    /// gone. The sandbox's budget applies when `opts` has none. A STARTTLS
-    /// handshake has [`Limits::handshake`], whatever `opts` says.
+    /// The same with these options (an idle limit, a budget) and at most
+    /// `max_conns` connections at once. Past that, a new one is reset as
+    /// soon as it is accepted, and each counts until its socket is gone.
+    /// The sandbox's budget applies when `opts` has none.
     pub fn tcp_with<S, M>(
         self,
         port: u16,

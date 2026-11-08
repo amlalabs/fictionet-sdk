@@ -1,7 +1,7 @@
 # Service and connection lifecycle: what was modeled and found
 
 This pass covers the serving driver in `src/stdlib/services/serve.rs`
-(serving state, cancellation on drop, wake handles, STARTTLS upgrades), the
+(serving state, cancellation on drop, wake handles, handoffs), the
 `Connection` contract in `src/stdlib/network/connection.rs`, and one TCP
 connection's life in `src/stdlib/network/tcp.rs` (close, orphan, half-close,
 reset, unread data). The models are under `verification/lifecycle/`, with the
@@ -39,7 +39,7 @@ What is checked:
 - `OnEndOnce`, `NoLateCalls`: `on_end` runs at most once, and no call reaches
   the service after `Ended`.
 - `WakeHandle`: the handle is open exactly while the service runs, closed
-  from `Ending` on, and after a handoff; open across a STARTTLS upgrade.
+  from `Ending` on, and after a handoff.
 - `WorkAtEnd`, `Unwritable`: no deferred work outlives the connection, keyed
   work ends with `Running`, and an end the connection cannot take a reply
   for writes nothing and runs no ordered work.
@@ -54,10 +54,10 @@ What is checked:
 
 | Config | Generated | Distinct | Depth | Result |
 | --- | ---: | ---: | ---: | --- |
-| `Core_fixed.cfg` (idle of two ticks, one of each work and input) | 593,496 | 111,078 | 21 | all eight invariants and three properties hold |
-| `Core_wide.cfg` (no idle, two of each work and input) | 181,600 | 27,192 | 16 | all hold |
-| `Core_original_idle.cfg` (`SuspendIdle = FALSE`) | 41,258 | 11,768 | 9 | `IdleNeedsQuiet` violated: a wake whose call defers ordered work, two ticks, the work ends, `Ended::Idle` |
-| `Core_original_broken.cfg` (`TotalBroken = FALSE`) | 15,534 | 4,332 | 8 | `ObservedCancel` violated: a cancel, a wake whose call asks for a handoff, `apply`, the yield sees the cancel and `broken` does nothing, the connection is handed on |
+| `Core_fixed.cfg` (idle of two ticks, one of each work and input) | 508,676 | 101,130 | 21 | all eight invariants and three properties hold |
+| `Core_wide.cfg` (no idle, two of each work and input) | 149,792 | 24,000 | 16 | all hold |
+| `Core_original_idle.cfg` (`SuspendIdle = FALSE`) | 26,466 | 8,271 | 9 | `IdleNeedsQuiet` violated: a wake whose call defers ordered work, two ticks, the work ends, `Ended::Idle` |
+| `Core_original_broken.cfg` (`TotalBroken = FALSE`) | 13,081 | 4,090 | 8 | `ObservedCancel` violated: a cancel, a wake whose call asks for a handoff, `apply`, the yield sees the cancel and `broken` does nothing, the connection is handed on |
 
 The two passing runs explored their whole space with an empty queue; TLC
 stops at the first violation in the other two.
@@ -113,8 +113,7 @@ of `run` observes the cancel as the other exits do.
 
 Writes take no time in the model: a write that stalls is the write limit's
 affair (`ServeOptions::write_timeout`), and the idle clock keeps running
-through it. The TLS handshake (`accept_tls`), the STARTTLS loop of
-`serve_in_region`, and the region wrapper of `connection` are outside it.
+through it. The region wrapper of `connection` is outside it.
 The decoder is abstract: `Upgrade::Decoder` and the `fresh` rule are a
 stutter, `Fail::Stuck` and `Fail::Refused` are one failure. `on_end`'s own
 timers are not modeled. The budget's first charge at `open` is not modeled.

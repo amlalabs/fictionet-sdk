@@ -210,8 +210,8 @@ pub struct Limits {
     /// closing. Default 256.
     pub connections_per_peer: usize,
     /// How long a client has, from connecting, to finish its TLS handshake,
-    /// or on an HTTP port without TLS to send its first bytes; and from a
-    /// service's STARTTLS, to finish that handshake. Default 10 seconds.
+    /// or on an HTTP port without TLS to send its first bytes. Default 10
+    /// seconds.
     pub handshake: Duration,
     /// How long a DNS-over-TCP connection may sit idle between queries (RFC
     /// 7766, section 6.2.3). Default 10 seconds.
