@@ -2327,6 +2327,10 @@ impl Wire for Chunk {
 #[path = "../../../verification/http/kani/body.rs"]
 mod proofs;
 
+#[cfg(kani)]
+#[path = "../../../verification/http/kani/smuggling.rs"]
+mod smuggling_proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
