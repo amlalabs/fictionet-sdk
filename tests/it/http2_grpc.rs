@@ -1,18 +1,25 @@
+use std::net::SocketAddr;
+
+use crate::tcp_observer::Capture;
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::layer::{Direction, ObservedEvent};
+use fictionet::stdlib::network::observer::Limits;
 use fictionet::stdlib::{
     codec::{Demux, Wire},
-    protocols::{grpc, hpack, http2, tcp_reassembly},
+    protocols::{grpc, hpack, http2},
 };
-use tcp_reassembly::{Chunk, FlowKey, Segment};
 
-fn key(direction: usize) -> FlowKey {
-    let a = "192.0.2.1".parse().unwrap();
-    let b = "192.0.2.2".parse().unwrap();
-    if direction == 0 {
-        (a, 40000, b, 50051)
-    } else {
-        (b, 50051, a, 40000)
-    }
+/// The sender and receiver of direction 0, the client's, or 1.
+fn ends(direction: usize) -> (SocketAddr, SocketAddr) {
+    let a = "192.0.2.1:40000".parse().unwrap();
+    let b = "192.0.2.2:50051".parse().unwrap();
+    if direction == 0 { (a, b) } else { (b, a) }
+}
+
+/// The client's direction is the observer's forward one: the client sent
+/// the first segment.
+fn index(direction: Direction) -> usize {
+    usize::from(direction == Direction::Reverse)
 }
 fn headers(
     encoder: &mut hpack::Encoder,
@@ -57,7 +64,7 @@ fn data(stream: u32, payload: &[u8], end: bool) -> Vec<u8> {
     out
 }
 struct Stack {
-    tcp: tcp_reassembly::Reassembler,
+    tcp: Capture,
     h2: [http2::Session; 2],
     calls: Demux<(usize, u32), Frames<grpc::Message>>,
     messages: Vec<(usize, u32, Vec<u8>)>,
@@ -69,7 +76,7 @@ struct Stack {
 impl Stack {
     fn new() -> Self {
         Self {
-            tcp: tcp_reassembly::Reassembler::new(tcp_reassembly::Limits {
+            tcp: Capture::new(Limits {
                 buffered: 128,
                 ..Default::default()
             }),
@@ -142,21 +149,15 @@ impl Stack {
         }
     }
     fn segment(&mut self, dir: usize, seq: u32, flags: u8, payload: &[u8]) {
-        for event in self
-            .tcp
-            .push(Segment {
-                key: key(dir),
-                seq,
-                ack: if dir == 1 { 101 } else { 0 },
-                flags,
-                payload,
-            })
-            .events
-        {
+        let (from, to) = ends(dir);
+        let ack = if dir == 1 { 101 } else { 0 };
+        for event in self.tcp.segment(from, to, seq, ack, flags, payload) {
             match event {
-                Chunk::Bytes { dir, bytes, .. } => {
-                    let dir = usize::from(dir == key(1));
-                    let mut rest = bytes.as_slice();
+                ObservedEvent::Data {
+                    direction, bytes, ..
+                } => {
+                    let dir = index(direction);
+                    let mut rest = &bytes[..];
                     while !rest.is_empty() {
                         let n = self.h2[dir].push(rest);
                         rest = &rest[n..];
@@ -166,8 +167,8 @@ impl Stack {
                         assert!(n > 0);
                     }
                 }
-                Chunk::Gap { dir, .. } => {
-                    let dir = usize::from(dir == key(1));
+                ObservedEvent::Gap { direction, .. } => {
+                    let dir = index(direction);
                     self.h2[dir].lost();
                     // This test uses streams 1 and 5. A world keeps its active
                     // call keys and removes all keys of the affected direction.
@@ -176,8 +177,8 @@ impl Stack {
                     }
                     self.gaps += 1;
                 }
-                Chunk::End { dir, .. } => {
-                    let dir = usize::from(dir == key(1));
+                ObservedEvent::End { direction, .. } => {
+                    let dir = index(direction);
                     self.h2[dir].end();
                     while let Some(event) = self.h2[dir].next() {
                         self.event(dir, event.unwrap());
@@ -413,7 +414,11 @@ fn tcp_to_http2_to_grpc_with_reordering_fragments_trailers_and_a_gap() {
     client_seq = stack.reordered(0, client_seq, &pending);
     assert!(stack.h2[0].held() > 0);
     assert_eq!(stack.calls.total(), 2);
-    stack.segment(0, client_seq + 100, 0x18, &[0; 256]);
+    // Bytes after a hole are held. A segment past the bound makes the
+    // observer give up on the hole and skip to them.
+    stack.segment(0, client_seq + 100, 0x18, &[0; 8]);
+    assert_eq!(stack.gaps, 0);
+    stack.segment(0, client_seq + 200, 0x18, &[0; 256]);
     assert_eq!(stack.gaps, 1);
     assert!(stack.h2[0].is_done());
     assert_eq!(stack.h2[0].held(), 0);

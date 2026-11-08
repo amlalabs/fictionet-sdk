@@ -1,10 +1,10 @@
 # Connection lifecycle
 
 The TLA+ model of one TCP connection's life (`tla/Conn.tla`, for
-`src/stdlib/network/tcp.rs`). What it models, what it leaves out, and what
-it found is in [VERIFICATION.md](VERIFICATION.md), which also says where the
-obligations of the serving engine's model and proofs went when the engine
-was deleted.
+`src/stdlib/network/tcp/engine.rs` and the handles in `tcp.rs`). What it
+models, what it leaves out, and what it found is in
+[VERIFICATION.md](VERIFICATION.md), which also says where the obligations of
+the serving engine's model and proofs went when the engine was deleted.
 
 The model has a config of the code as it is, and configs that keep an
 earlier or weakened rule and name the property TLC must then violate:

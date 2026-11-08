@@ -235,9 +235,12 @@
 //! | [`network::ethernet`] | Ethernet frames to IP packets and back for a VM's network card or a host on a segment, with ARP, neighbor discovery and the frame stream. |
 //! | [`network::icmp`] | ICMP echo replies and error messages. |
 //! | [`network::ip`] | IP packets, checksums, fragment reassembly and protocol splitting. |
+//! | [`network::observer`] | The passive TCP observer: captured packets in, one observed stream per connection out, with gaps and typed ends. |
+//! | [`network::packet`] | The IP layer: whole packets taken in as a host takes them, checked, reassembled and sorted for their transports. |
 //! | [`network::ports`] | Ready-slot polling for packet interfaces. |
 //! | [`network::route`] | Packet routing and LAN forwarding. |
 //! | [`network::tcp`] | Simulated TCP listeners and connections using smoltcp. |
+//! | [`network::transport`] | What the TCP, UDP and passive TCP observer layers offer above the IP layer: their ports, opening contexts and control messages. |
 //! | [`network::udp`] | UDP sockets, datagram parsing and encoding. |
 //!
 //! [`network`] itself holds the links ([`delay`](network::delay),
@@ -351,7 +354,6 @@
 //! | [`protocols::ssh`] | SSH transport encryption, authentication and connection messages. |
 //! | [`protocols::stun`] | STUN messages, attributes and binding replies. |
 //! | [`protocols::syslog`] | Syslog messages and stream framing. |
-//! | [`protocols::tcp_reassembly`] | TCP capture reassembly, gaps and end signals. |
 //! | [`protocols::tds`] | SQL Server packets, logins, batches and response tokens. |
 //! | [`protocols::telnet`] | Telnet data, commands and option negotiation. |
 //! | [`protocols::tftp`] | TFTP packets, options and read transfers. |

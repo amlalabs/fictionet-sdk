@@ -67,8 +67,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "tcp_reassembly"
-path = "fuzz_targets/tcp_reassembly.rs"
+name = "tcp_observer"
+path = "fuzz_targets/tcp_observer.rs"
 test = false
 doc = false
 bench = false
