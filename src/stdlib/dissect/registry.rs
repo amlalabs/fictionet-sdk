@@ -1,5 +1,6 @@
 use super::{Decoded, KeyLine, Observed, Place, Present};
 use fictionet::stdlib::dissect::Transport;
+use fictionet::stdlib::layer::Termination;
 use std::sync::Arc;
 
 /// Inputs to a protocol matcher. Ports are in conversation order.
@@ -52,9 +53,16 @@ pub trait Protocol: Send {
     fn waiting(&self, reverse: bool) -> bool;
     /// Discards state invalidated by missing bytes in this direction.
     fn lost(&mut self, reverse: bool);
-    /// Finishes a stream direction that ended cleanly. The default has no
-    /// final output.
-    fn end(&mut self, _reverse: bool, _packet: &mut Decoded) {}
+    /// Ends a stream direction: nothing more comes this way. A clean end
+    /// ([`Termination::Fin`]) finishes what the direction held, so a
+    /// message read to the end of the stream completes and a message cut
+    /// short is reported. Any other end means what the direction waited
+    /// for will never come. The default discards it, as for missing bytes.
+    fn end(&mut self, reverse: bool, how: Termination, _packet: &mut Decoded) {
+        if !how.is_clean() {
+            self.lost(reverse);
+        }
+    }
     /// Processes one whole datagram in one direction, empty ones included.
     /// A datagram's end is not the end of the conversation: the
     /// conversation's later datagrams, both ways, come to the same
@@ -72,7 +80,7 @@ pub trait Protocol: Send {
         keys: &[KeyLine],
     ) {
         self.data(reverse, bytes, at, packet, keys);
-        self.end(reverse, packet);
+        self.end(reverse, Termination::Fin, packet);
     }
 }
 
@@ -286,7 +294,10 @@ where
             *slot = slot.take().map(Observed::reset);
         }
     }
-    fn end(&mut self, reverse: bool, packet: &mut Decoded) {
+    fn end(&mut self, reverse: bool, how: Termination, packet: &mut Decoded) {
+        if !how.is_clean() {
+            return self.lost(reverse);
+        }
         if let Some(dir) = self
             .dirs
             .get_mut(usize::from(reverse))

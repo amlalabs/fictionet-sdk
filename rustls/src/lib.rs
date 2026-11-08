@@ -467,7 +467,9 @@ pub mod internal {
         }
     }
 
-    pub use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
+    pub use crate::tls13::key_schedule::{
+        derive_next_traffic_secret, derive_traffic_iv, derive_traffic_key,
+    };
 
     pub mod fuzzing {
         pub use crate::msgs::deframer::fuzz_deframer;

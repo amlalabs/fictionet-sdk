@@ -7,6 +7,8 @@
 //! follow TCP streams across packets.
 
 mod app;
+#[cfg(test)]
+mod capture_tests;
 mod json;
 
 /// The byte transport supplied to a dissector.
@@ -39,6 +41,7 @@ use std::sync::Arc;
 use fictionet::stdlib::codec::{be16, be32};
 use fictionet::stdlib::layer::{
     Admit, Budget, Child, ChildId, Chunk, Direction, Driver, MuxEvent, ObservedEvent, PacketEvent,
+    Termination,
 };
 use fictionet::stdlib::network::ip::Header;
 use fictionet::stdlib::network::observer::{self, Observer, ObserverReport};
@@ -330,6 +333,15 @@ impl Decoded {
         }
     }
 
+    /// Adds a note to the layer at `layer`, unless the detail is full or
+    /// that layer was not kept.
+    fn note(&mut self, layer: usize, name: &str, value: String) {
+        let size = name.len().saturating_add(value.len()).saturating_add(32);
+        if layer < self.layers.len() && self.take(size) {
+            self.layers[layer].note(name, value);
+        }
+    }
+
     /// Counts `n` more bytes toward [`MAX_DETAIL`], if they fit and nothing
     /// was cut before.
     fn take(&mut self, n: usize) -> bool {
@@ -397,6 +409,9 @@ struct Watched {
     _child: Child,
     /// The ports, the lower endpoint's first.
     ports: (u16, u16),
+    /// The observer's endpoints: its forward direction runs from the first
+    /// to the second.
+    endpoints: (SocketAddr, SocketAddr),
     /// Whether the observer's forward direction, from the endpoint it saw
     /// first, runs from the higher endpoint to the lower.
     flip: bool,
@@ -486,13 +501,18 @@ impl Dissector {
     /// held past a hole is decoded after its gap, and the direction ends
     /// as incomplete, since a capture ending without a FIN does not show
     /// that the sender finished. Returns what that completes, as one more
-    /// entry. The dissector then starts over, as for a new capture.
+    /// entry, whose first layer notes how each stream ended and what was
+    /// missing. The dissector then starts over, as for a new capture.
     pub fn finish(&mut self, keys: &[KeyLine]) -> Decoded {
         let mut d = Decoded {
             info: "End of capture".into(),
             ..Decoded::default()
         };
-        self.watch(PacketEvent::Ended, &mut d, keys, None);
+        let mut end = Layer::new("End of capture", 0, (0, 0));
+        end.summary = format!("{} TCP connections were open", self.connections.len());
+        d.push(end);
+        let (_, seen) = self.observe(PacketEvent::Ended);
+        self.apply(seen, &mut d, keys, None, 0);
         self.lost();
         d.cap_info();
         d
@@ -807,6 +827,7 @@ impl Dissector {
             l.field("Options", opts.join(", "), r(20, off));
         }
         l.note("Payload", format!("{} bytes", payload.1 - payload.0));
+        let notes = d.layers.len();
         d.push(l);
         d.src = sock(&d.src, sport);
         d.dst = sock(&d.dst, dport);
@@ -847,7 +868,7 @@ impl Dissector {
             d.tag("late");
         }
         let layers = d.layers.len().checked_add(d.cut);
-        let last = self.apply(seen, d, keys, context.protocol);
+        let last = self.apply(seen, d, keys, context.protocol, notes);
         if let Some((id, reverse)) = last
             && d.layers.len().checked_add(d.cut) == layers
             && self
@@ -892,6 +913,7 @@ impl Dissector {
                             Watched {
                                 _child: child,
                                 ports: (low.port(), high.port()),
+                                endpoints: (connection.first, connection.second),
                                 flip: connection.first != low,
                                 conversation: None,
                                 delivered: [0; 2],
@@ -910,15 +932,21 @@ impl Dissector {
 
     /// Feeds what the observer's connections carried to their decoders, in
     /// order, and returns the connection and direction that last got bytes.
-    /// A gap resets a direction's decoders. A clean end finishes them; any
-    /// other end discards what they held, since what they waited for will
-    /// not come.
+    /// A gap resets a direction's decoders. An end goes to them with its
+    /// cause: a clean end finishes them; any other end discards what they
+    /// held, since what they waited for will not come.
+    ///
+    /// Each gap, and each end that is not clean, is noted on the layer at
+    /// `notes`: which way, how many bytes are missing, and why the stream
+    /// ended. A gap tags the packet `missing`. An end that cuts short a
+    /// message the decoders were holding tags it `incomplete`.
     fn apply(
         &mut self,
         seen: Vec<Observation>,
         d: &mut Decoded,
         keys: &[KeyLine],
         protocol: Option<&str>,
+        notes: usize,
     ) -> Option<(ChildId, bool)> {
         let mut last = None;
         for observation in seen {
@@ -937,6 +965,11 @@ impl Dissector {
                 Direction::Reverse => !watched.flip,
             };
             let (low, high) = watched.ports;
+            let ((from, to), direction) = (watched.endpoints, event.direction());
+            let way = move || match direction {
+                Direction::Forward => format!("{from} → {to}"),
+                Direction::Reverse => format!("{to} → {from}"),
+            };
             let registry = &self.registry;
             let open =
                 || Conversation::with_registry(low, high, registry.clone()).with_protocol(protocol);
@@ -956,33 +989,43 @@ impl Dissector {
                     conversation.data(reverse, &bytes, place, d, keys);
                     last = Some((id, reverse));
                 }
-                ObservedEvent::Gap { .. } => {
+                ObservedEvent::Gap { missing, .. } => {
                     watched.conversation.get_or_insert_with(open).lost(reverse);
+                    let missing = match missing {
+                        Some(n) => format!("{}: {n} bytes were not captured", way()),
+                        None => format!("{}: bytes were not captured", way()),
+                    };
+                    d.tag("missing");
+                    d.note(notes, "Missing bytes", missing);
                 }
                 ObservedEvent::End { cause, .. } => {
+                    let cut = watched
+                        .conversation
+                        .as_ref()
+                        .is_some_and(|c| c.waiting(reverse));
                     if let Some(conversation) = &mut watched.conversation {
-                        if cause.is_clean() {
-                            conversation.end(reverse, d);
-                        } else {
-                            conversation.lost(reverse);
-                        }
+                        conversation.end(reverse, cause, d);
                     }
+                    let why = match cause {
+                        Termination::Fin => continue,
+                        Termination::Reset => "reset",
+                        Termination::Truncated => "the capture ended with bytes missing",
+                        Termination::Evicted => {
+                            "no longer followed, to stay within the observer's bounds"
+                        }
+                        Termination::Replaced => "a new connection on the same endpoints began",
+                        Termination::Finalized => "the capture ended before the sender closed it",
+                    };
+                    let mut end = format!("{}: {why}", way());
+                    if cut {
+                        end.push_str(", cutting a message short");
+                        d.tag("incomplete");
+                    }
+                    d.note(notes, "Stream end", end);
                 }
             }
         }
         last
-    }
-
-    /// Hands the observer `event` and applies what comes up.
-    fn watch(
-        &mut self,
-        event: PacketEvent<IpPacket>,
-        d: &mut Decoded,
-        keys: &[KeyLine],
-        protocol: Option<&str>,
-    ) {
-        let (_, seen) = self.observe(event);
-        self.apply(seen, d, keys, protocol);
     }
 
     /// Decodes a UDP datagram, and gives its payload to its conversation.

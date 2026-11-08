@@ -769,7 +769,7 @@ impl KeyScheduleSuite {
     /// Derive the next application traffic secret, returning it.
     fn derive_next(&self, base_key: &OkmBlock) -> OkmBlock {
         let expander = self.suite.hkdf_provider.expander_for_okm(base_key);
-        hkdf_expand_label_block(expander.as_ref(), b"traffic upd", &[])
+        derive_next_traffic_secret(expander.as_ref())
     }
 
     /// Derive the PSK to use given a resumption_master_secret and
@@ -825,6 +825,16 @@ pub fn derive_traffic_key(
 /// [HKDF-Expand-Label]: <https://www.rfc-editor.org/rfc/rfc8446#section-7.1>
 pub fn derive_traffic_iv(expander: &dyn HkdfExpander) -> Iv {
     hkdf_expand_label(expander, b"iv", &[])
+}
+
+/// [HKDF-Expand-Label] with the label "traffic upd": the application traffic
+/// secret that follows a KeyUpdate, from the expander of the current one
+/// ([RFC 8446, section 7.2]).
+///
+/// [HKDF-Expand-Label]: <https://www.rfc-editor.org/rfc/rfc8446#section-7.1>
+/// [RFC 8446, section 7.2]: <https://www.rfc-editor.org/rfc/rfc8446#section-7.2>
+pub fn derive_next_traffic_secret(expander: &dyn HkdfExpander) -> OkmBlock {
+    hkdf_expand_label_block(expander, b"traffic upd", &[])
 }
 
 /// [HKDF-Expand-Label] where the output length is a compile-time constant, and therefore

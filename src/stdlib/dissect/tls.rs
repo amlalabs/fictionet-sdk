@@ -4,6 +4,11 @@ use fictionet::stdlib::dissect::{
     Conversation, Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol,
     Registry, protocols,
 };
+use fictionet::stdlib::layer::Termination;
+use rustls::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter};
+use rustls::crypto::tls13::OkmBlock;
+use rustls::internal::{derive_next_traffic_secret, derive_traffic_iv, derive_traffic_key};
+use rustls::{ContentType, ProtocolVersion, SupportedCipherSuite, Tls13CipherSuite};
 
 /// One TLS connection: what its hellos said, and its keys.
 struct Tls {
@@ -34,6 +39,9 @@ struct Tls {
 /// The supplied registry also selects protocols in the decrypted stream.
 pub struct TlsSession {
     tls: Tls,
+    /// Each direction's records, until bytes go missing in it. Past a gap,
+    /// where the next record starts and which sequence number it has are
+    /// unknown, so that direction's records are not read again.
     dirs: [Option<Observed<protocols::TlsRecords>>; 2],
 }
 impl TlsSession {
@@ -68,21 +76,45 @@ impl TlsSession {
 impl Protocol for TlsSession {
     fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, keys: &[KeyLine]) {
         let i = usize::from(reverse);
-        if let Some(dir) = &mut self.dirs[i] {
-            dir.data_with(bytes, at, d, |item, raw, start, place, d| {
+        match &mut self.dirs[i] {
+            Some(dir) => dir.data_with(bytes, at, d, |item, raw, start, place, d| {
                 self.tls.present_record(i, item, raw, start, place, d, keys)
-            });
+            }),
+            None => d.application(1, "TLS", "Not decoded: earlier bytes were not captured"),
         }
     }
+    /// Whether this direction holds part of a record, or the decrypted
+    /// stream holds part of a message.
     fn waiting(&self, reverse: bool) -> bool {
         self.dirs[usize::from(reverse)]
             .as_ref()
             .is_some_and(Observed::waiting)
+            || self
+                .tls
+                .inner
+                .as_ref()
+                .is_some_and(|inner| inner.waiting(reverse))
     }
+    /// Ends the records of this direction, then the decrypted stream they
+    /// carried, the same way: a clean end finishes both, so a message
+    /// read to the end of the stream completes; any other end discards
+    /// what both held.
+    fn end(&mut self, reverse: bool, how: Termination, d: &mut Decoded) {
+        if !how.is_clean() {
+            return self.lost(reverse);
+        }
+        if let Some(dir) = &mut self.dirs[usize::from(reverse)] {
+            dir.end(d);
+        }
+        if let Some(inner) = &mut self.tls.inner {
+            inner.end(reverse, how, d);
+        }
+    }
+    /// Stops reading this direction's records, and tells the decrypted
+    /// stream its bytes are missing.
     fn lost(&mut self, reverse: bool) {
         let i = usize::from(reverse);
-        let slot = &mut self.dirs[i];
-        *slot = slot.take().map(Observed::reset);
+        self.dirs[i] = None;
         if let Some(inner) = &mut self.tls.inner {
             inner.lost(reverse);
         }
@@ -111,42 +143,103 @@ fn whole_messages(b: &[u8]) -> usize {
     at
 }
 
-/// An AEAD key and its IV.
-type Key = (ring::aead::LessSafeKey, [u8; 12]);
-
 /// The keys of one direction. It holds two keys at most, whatever the
 /// peer sends: the handshake key until the application key takes over,
 /// and the application key, which each KeyUpdate replaces.
+///
+/// The key schedule and record protection are the ones the world's TLS
+/// endpoints run: rustls derives each key and IV from its traffic secret
+/// and opens each record, so a record the dissector opens is one an
+/// endpoint with the same secret would accept.
 struct DirKeys {
+    suite: &'static Tls13CipherSuite,
     /// The handshake key, until a record opens with the application key.
-    handshake: Option<Key>,
-    app: Key,
+    handshake: Option<Box<dyn MessageDecrypter>>,
+    app: Box<dyn MessageDecrypter>,
     /// The sequence number of the next record, under the key in use.
     seq: u64,
-    cipher: u16,
     /// The secret `app` was made from, from which a KeyUpdate derives the
     /// next.
-    secret: Vec<u8>,
+    secret: OkmBlock,
+}
+
+/// The TLS 1.3 cipher suite numbered `cipher`, if rustls has it.
+fn suite(cipher: u16) -> Option<&'static Tls13CipherSuite> {
+    rustls::crypto::ring::ALL_CIPHER_SUITES
+        .iter()
+        .filter_map(SupportedCipherSuite::tls13)
+        .find(|suite| u16::from(suite.common.suite) == cipher)
+}
+
+/// Opens records protected with the key and IV of traffic secret
+/// `secret`.
+fn decrypter(suite: &'static Tls13CipherSuite, secret: &OkmBlock) -> Box<dyn MessageDecrypter> {
+    let expander = suite.hkdf_provider.expander_for_okm(secret);
+    suite.aead_alg.decrypter(
+        derive_traffic_key(expander.as_ref(), suite.aead_alg),
+        derive_traffic_iv(expander.as_ref()),
+    )
+}
+
+/// Decrypts one TLS 1.3 record body at sequence number `seq`: the inner
+/// content type and the plaintext.
+fn open_with(key: &mut dyn MessageDecrypter, seq: u64, body: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let mut buf = body.to_vec();
+    let message = InboundOpaqueMessage::new(
+        ContentType::ApplicationData,
+        ProtocolVersion::TLSv1_2,
+        &mut buf,
+    );
+    let plain = key.decrypt(message, seq).ok()?;
+    Some((u8::from(plain.typ), plain.payload.to_vec()))
 }
 
 impl DirKeys {
+    /// Both keys of one direction, from its traffic secrets in the key
+    /// log. A secret that is not as long as the suite's hash is no key.
+    fn new(suite: &'static Tls13CipherSuite, handshake: &[u8], app: &[u8]) -> Option<DirKeys> {
+        let len = suite.common.hash_provider.output_len();
+        if handshake.len() != len || app.len() != len {
+            return None;
+        }
+        let secret = OkmBlock::new(app);
+        Some(DirKeys {
+            suite,
+            handshake: Some(decrypter(suite, &OkmBlock::new(handshake))),
+            app: decrypter(suite, &secret),
+            seq: 0,
+            secret,
+        })
+    }
+
     /// Moves to the key that follows a KeyUpdate (RFC 8446, 4.6.3 and
     /// 7.2). Every later record of this direction uses it, from sequence
     /// number 0, and the old key opens nothing more.
     fn update(&mut self) {
-        let (hash, len) = if self.cipher == 0x1302 {
-            (ring::hkdf::HKDF_SHA384, 48)
-        } else {
-            (ring::hkdf::HKDF_SHA256, 32)
-        };
-        let prk = ring::hkdf::Prk::new_less_safe(hash, &self.secret);
-        if let Some(next) = expand_label(&prk, "traffic upd", len)
-            && let Some(key) = traffic_key(self.cipher, &next)
-        {
-            self.app = key;
-            self.secret = next;
-            self.seq = 0;
+        let expander = self.suite.hkdf_provider.expander_for_okm(&self.secret);
+        self.secret = derive_next_traffic_secret(expander.as_ref());
+        self.app = decrypter(self.suite, &self.secret);
+        self.seq = 0;
+    }
+
+    /// Decrypts one TLS 1.3 record body. During the handshake it tries the
+    /// handshake key, then the application key from sequence number 0,
+    /// since the one gives way to the other after the Finished message.
+    /// The flag says whether the application key opened it.
+    fn open(&mut self, body: &[u8]) -> Option<(u8, Vec<u8>, bool)> {
+        if let Some(hs) = &mut self.handshake {
+            if let Some((kind, plain)) = open_with(hs.as_mut(), self.seq, body) {
+                self.seq = self.seq.checked_add(1)?;
+                return Some((kind, plain, false));
+            }
+            let (kind, plain) = open_with(self.app.as_mut(), 0, body)?;
+            self.handshake = None;
+            self.seq = 1;
+            return Some((kind, plain, true));
         }
+        let (kind, plain) = open_with(self.app.as_mut(), self.seq, body)?;
+        self.seq = self.seq.checked_add(1)?;
+        Some((kind, plain, true))
     }
 }
 
@@ -176,93 +269,6 @@ fn handshake_name(t: u8) -> &'static str {
         20 => "Finished",
         24 => "Key Update",
         _ => "Handshake",
-    }
-}
-
-/// HKDF-Expand-Label from TLS 1.3, with an empty context.
-fn expand_label(prk: &ring::hkdf::Prk, label: &str, len: usize) -> Option<Vec<u8>> {
-    struct Len(usize);
-    impl ring::hkdf::KeyType for Len {
-        fn len(&self) -> usize {
-            self.0
-        }
-    }
-    let full = format!("tls13 {label}");
-    let info = [
-        &(len as u16).to_be_bytes()[..],
-        &[full.len() as u8],
-        full.as_bytes(),
-        &[0u8],
-    ];
-    let okm = prk.expand(&info, Len(len)).ok()?;
-    let mut out = vec![0u8; len];
-    okm.fill(&mut out).ok()?;
-    Some(out)
-}
-
-/// The key and IV for `secret` with TLS 1.3 cipher suite `cipher`.
-fn traffic_key(cipher: u16, secret: &[u8]) -> Option<(ring::aead::LessSafeKey, [u8; 12])> {
-    use ring::{aead, hkdf};
-    let (alg, hash, key_len): (&aead::Algorithm, hkdf::Algorithm, usize) = match cipher {
-        0x1301 => (&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16),
-        0x1302 => (&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32),
-        0x1303 => (&aead::CHACHA20_POLY1305, hkdf::HKDF_SHA256, 32),
-        _ => return None,
-    };
-    let prk = hkdf::Prk::new_less_safe(hash, secret);
-    let key = expand_label(&prk, "key", key_len)?;
-    let iv: [u8; 12] = expand_label(&prk, "iv", 12)?.try_into().ok()?;
-    Some((
-        aead::LessSafeKey::new(aead::UnboundKey::new(alg, &key).ok()?),
-        iv,
-    ))
-}
-
-/// Decrypts one TLS 1.3 record, its 5-byte header and its body, with
-/// `key` at sequence number `seq`: the inner content type and the
-/// plaintext.
-fn open_with(key: &Key, seq: u64, header: &[u8], body: &[u8]) -> Option<(u8, Vec<u8>)> {
-    use ring::aead::{Aad, Nonce};
-    let (key, iv) = key;
-    let mut nonce = *iv;
-    for (n, b) in nonce[4..].iter_mut().zip(seq.to_be_bytes()) {
-        *n ^= b;
-    }
-    let mut buf = body.to_vec();
-    let plain = key
-        .open_in_place(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(header),
-            &mut buf,
-        )
-        .ok()?;
-    let mut plain = plain.to_vec();
-    while plain.last() == Some(&0) {
-        plain.pop();
-    }
-    let kind = plain.pop()?;
-    Some((kind, plain))
-}
-
-impl DirKeys {
-    /// Decrypts one TLS 1.3 record. During the handshake it tries the
-    /// handshake key, then the application key from sequence number 0,
-    /// since the one gives way to the other after the Finished message.
-    /// The flag says whether the application key opened it.
-    fn open(&mut self, header: &[u8], body: &[u8]) -> Option<(u8, Vec<u8>, bool)> {
-        if let Some(hs) = &self.handshake {
-            if let Some((kind, plain)) = open_with(hs, self.seq, header, body) {
-                self.seq = self.seq.checked_add(1)?;
-                return Some((kind, plain, false));
-            }
-            let (kind, plain) = open_with(&self.app, 0, header, body)?;
-            self.handshake = None;
-            self.seq = 1;
-            return Some((kind, plain, true));
-        }
-        let (kind, plain) = open_with(&self.app, self.seq, header, body)?;
-        self.seq = self.seq.checked_add(1)?;
-        Some((kind, plain, true))
     }
 }
 
@@ -297,27 +303,22 @@ impl Tls {
         if !self.tls13 || self.keys.iter().all(Option::is_some) {
             return;
         }
+        let Some(suite) = suite(cipher) else {
+            return;
+        };
         let secret = |label: &str| {
             keys.iter()
                 .find(|k| k.label == label && &k.client_random == random)
-                .map(|k| k.secret.clone())
+                .map(|k| k.secret.as_slice())
         };
         for (dir, side) in [(client, "CLIENT"), (1 - client, "SERVER")] {
             if self.keys[dir].is_some() {
                 continue;
             }
-            let hs = secret(&format!("{side}_HANDSHAKE_TRAFFIC_SECRET"))
-                .and_then(|s| traffic_key(cipher, &s));
-            let app_secret = secret(&format!("{side}_TRAFFIC_SECRET_0"));
-            let app = app_secret.as_ref().and_then(|s| traffic_key(cipher, s));
-            if let (Some(hs), Some(app), Some(app_secret)) = (hs, app, app_secret) {
-                self.keys[dir] = Some(DirKeys {
-                    handshake: Some(hs),
-                    app,
-                    seq: 0,
-                    cipher,
-                    secret: app_secret,
-                });
+            let hs = secret(&format!("{side}_HANDSHAKE_TRAFFIC_SECRET"));
+            let app = secret(&format!("{side}_TRAFFIC_SECRET_0"));
+            if let (Some(hs), Some(app)) = (hs, app) {
+                self.keys[dir] = DirKeys::new(suite, hs, app);
             }
         }
     }
@@ -406,9 +407,7 @@ impl Tls {
             23 => {
                 let version = version(self);
                 self.find_keys(keys);
-                let opened = self.keys[i]
-                    .as_mut()
-                    .and_then(|k| k.open(&record[..5], body));
+                let opened = self.keys[i].as_mut().and_then(|k| k.open(body));
                 match opened {
                     None => {
                         l.summary = format!("{version} Application Data, encrypted");
@@ -703,7 +702,7 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use fictionet::stdlib::dissect::Match;
 
@@ -814,10 +813,36 @@ mod tests {
             assert_eq!(held.capacity(), 0);
         }
     }
-    /// Seals one TLS 1.3 record with the key from `secret`.
-    fn seal(secret: &[u8], seq: u64, kind: u8, plain: &[u8]) -> Vec<u8> {
-        use ring::aead::{Aad, Nonce};
-        let (key, iv) = traffic_key(0x1301, secret).unwrap();
+    /// HKDF-Expand-Label from TLS 1.3 (RFC 8446, 7.1), with an empty
+    /// context, written here from the RFC with ring, apart from the
+    /// rustls key schedule the reader uses.
+    fn expand_label(secret: &[u8], label: &str, len: usize) -> Vec<u8> {
+        struct Len(usize);
+        impl ring::hkdf::KeyType for Len {
+            fn len(&self) -> usize {
+                self.0
+            }
+        }
+        let prk = ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, secret);
+        let full = format!("tls13 {label}");
+        let info = [
+            &(len as u16).to_be_bytes()[..],
+            &[full.len() as u8],
+            full.as_bytes(),
+            &[0u8],
+        ];
+        let mut out = vec![0u8; len];
+        prk.expand(&info, Len(len)).unwrap().fill(&mut out).unwrap();
+        out
+    }
+
+    /// Seals one TLS_AES_128_GCM_SHA256 record with the key from `secret`.
+    pub(in super::super) fn seal(secret: &[u8], seq: u64, kind: u8, plain: &[u8]) -> Vec<u8> {
+        use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+        let key = LessSafeKey::new(
+            UnboundKey::new(&AES_128_GCM, &expand_label(secret, "key", 16)).unwrap(),
+        );
+        let iv: [u8; 12] = expand_label(secret, "iv", 12).try_into().unwrap();
         let mut inner = plain.to_vec();
         inner.push(kind);
         let len = inner.len() + 16;
@@ -866,7 +891,7 @@ mod tests {
         fn fields(_: &Vec<u8>, _: &[u8], _: &mut Layer) {}
     }
 
-    fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
+    pub(in super::super) fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
         let mut message = vec![kind, 0, (body.len() >> 8) as u8, body.len() as u8];
         message.extend_from_slice(body);
         message
@@ -1054,12 +1079,7 @@ mod tests {
     }
 
     fn next_secret(secret: &[u8]) -> Vec<u8> {
-        expand_label(
-            &ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, secret),
-            "traffic upd",
-            32,
-        )
-        .unwrap()
+        expand_label(secret, "traffic upd", 32)
     }
 
     /// After a KeyUpdate, the next records use the new key from sequence
@@ -1068,13 +1088,7 @@ mod tests {
     #[test]
     fn a_key_update_replaces_the_key() {
         let (hs, app) = ([2u8; 32], [1u8; 32]);
-        let keys = DirKeys {
-            handshake: traffic_key(0x1301, &hs),
-            app: traffic_key(0x1301, &app).unwrap(),
-            seq: 0,
-            cipher: 0x1301,
-            secret: app.to_vec(),
-        };
+        let keys = DirKeys::new(suite(0x1301).unwrap(), &hs, &app).unwrap();
         let mut tls = Tls {
             tls13: true,
             cipher: Some(0x1301),

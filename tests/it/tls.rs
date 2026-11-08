@@ -16,6 +16,8 @@ use fictionet::{Cx, Seed, block_on, lab};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
+#[path = "tls_capture.rs"]
+mod capture;
 #[path = "tls_layer.rs"]
 mod layer;
 #[path = "tls_stack.rs"]
@@ -45,7 +47,14 @@ struct Pipe {
 struct MemConn {
     rx: Arc<Mutex<Pipe>>,
     tx: Arc<Mutex<Pipe>>,
+    /// Where this end's writes are recorded, and whether it is the second
+    /// end of its pair.
+    tap: Option<(Tap, bool)>,
 }
+
+/// What both ends of a pair wrote, in order: whether the second end wrote
+/// it, and the bytes.
+type Tap = Arc<Mutex<Vec<(bool, Vec<u8>)>>>;
 
 fn mem_pair() -> (MemConn, MemConn) {
     let a = Arc::new(Mutex::new(Pipe::default()));
@@ -54,9 +63,22 @@ fn mem_pair() -> (MemConn, MemConn) {
         MemConn {
             rx: a.clone(),
             tx: b.clone(),
+            tap: None,
         },
-        MemConn { rx: b, tx: a },
+        MemConn {
+            rx: b,
+            tx: a,
+            tap: None,
+        },
     )
+}
+
+/// A pair whose writes, both ways, are recorded in `tap`.
+fn tapped_pair(tap: &Tap) -> (MemConn, MemConn) {
+    let (mut first, mut second) = mem_pair();
+    first.tap = Some((tap.clone(), false));
+    second.tap = Some((tap.clone(), true));
+    (first, second)
 }
 
 impl Connection for MemConn {
@@ -110,6 +132,9 @@ impl Connection for MemConn {
         }
         let n = room.min(data.len());
         p.buf.extend(&data[..n]);
+        if let Some((tap, second)) = &self.tap {
+            tap.lock().unwrap().push((*second, data[..n].to_vec()));
+        }
         if let Some(w) = p.reader.take() {
             w.wake();
         }

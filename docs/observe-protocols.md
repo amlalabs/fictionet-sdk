@@ -53,9 +53,15 @@ The caller owns capture, retention, TLS keys, and presentation. No socket is
 needed. TCP goes through the passive observer in `stdlib::network::observer`,
 which puts each connection back in order, marks gaps, and says how each
 direction ended. UDP datagrams between two endpoints stay one conversation.
+Each gap is noted on the packet's TCP layer with its direction and size,
+and tags the packet `missing`. Each end other than a FIN is noted with its
+cause, and tags the packet `incomplete` when it cuts short a message the
+decoders held. A protocol gets each end through `Protocol::end` with its
+`Termination`: a FIN finishes what it held, any other end discards it.
 Call `Dissector::lost` after a capture gap so stream decoders cannot join
 bytes across missing packets. Call `Dissector::finish` when the capture ends:
-what was held past a hole is decoded, and open directions end as incomplete.
+what was held past a hole is decoded, open directions end, and the entry's
+first layer notes how each ended.
 Use `stdlib::pcap` to export the same packets to Wireshark, with an optional
 caller-supplied TLS key log.
 
@@ -76,7 +82,10 @@ that name is registered. Other cases use the registry matchers, including
 across split plaintext prefixes. Eight unmatched bytes permanently reject
 plaintext selection in both directions, as in the outer conversation.
 Selection is not retried at each record. User replacements apply inside TLS
-too. HTTP/1 capture reads each head with `stdlib::protocols::http1`'s lenient reader
+too. TLS 1.3 records are opened with the key schedule and record protection
+of rustls, which the world's TLS endpoints use. Past missing bytes, TLS stops
+reading that direction, since where its next record starts and which
+sequence number it has are unknown. HTTP/1 capture reads each head with `stdlib::protocols::http1`'s lenient reader
 (`RequestHead::parse_lenient`), which checks syntax but not the framing
 rules an endpoint applies, and frames bodies itself. Chunked bodies end after
 the empty line that terminates all trailers. Trailer bytes do not enter the
