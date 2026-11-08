@@ -350,6 +350,16 @@ pub struct HttpOptions {
 
 use fictionet::stdlib::protocols::http2::PREFACE;
 
+/// HTTP/1 for the connection `info` names, answering with `handler` as
+/// `opts` says: what [`serve_connection`] runs, and what a site runs over
+/// TLS in the same stack.
+pub(super) fn http1_for(handler: Arc<dyn Handler>, opts: &HttpOptions, info: &ConnInfo) -> Http1 {
+    let mut http1 = Http1::with(handler, opts.limits).conn(info.clone());
+    http1.date = opts.date;
+    http1.observe = opts.observe.clone();
+    http1
+}
+
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
 /// otherwise. Both versions work with `std`.
@@ -415,9 +425,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
             _ => Ok(()),
         };
     }
-    let mut http1 = Http1::with(handler, opts.limits).conn(info.clone());
-    http1.date = opts.date;
-    http1.observe = opts.observe.clone();
+    let mut http1 = http1_for(handler, opts, &info);
     if !info.tls && opts.first_bytes.is_none() {
         http1.first_head_deadline = Some(head_deadline);
     }

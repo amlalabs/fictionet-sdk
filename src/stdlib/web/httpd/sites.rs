@@ -11,12 +11,16 @@ use http::uri::{Authority, Scheme};
 use http::{Request, StatusCode};
 
 use fictionet::Cx;
+use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::services::stack::Boxed;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::world::net::{
-    Arrival, ConfigFor, ConfigFuture, Host, PortServer, PreparedShare, Sni,
+    Arrival, ConfigFor, ConfigFuture, Host, Opening, PortServer, PreparedShare, Sni,
 };
 
-use super::{Body, Exchange, Handler, HttpOptions, Limits, Reply, serve_connection, text};
+use super::{
+    Body, Exchange, Handler, HttpOptions, Limits, Reply, http1_for, serve_connection, text,
+};
 
 pub use fictionet::stdlib::world::net::normalize;
 
@@ -397,16 +401,23 @@ impl Server {
     }
 }
 
-impl PortServer for Server {
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let vhosts = arrival.info.local.and_then(|local| {
+impl Server {
+    /// The sites of the address `info` arrived at, as one handler.
+    fn handler_for(&self, info: &ConnInfo) -> Arc<dyn Handler> {
+        let vhosts = info.local.and_then(|local| {
             self.vhosts
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&local)
                 .cloned()
         });
-        let handler: Arc<dyn Handler> = Arc::new(vhosts.unwrap_or_default());
+        Arc::new(vhosts.unwrap_or_default())
+    }
+}
+
+impl PortServer for Server {
+    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let handler = self.handler_for(&arrival.info);
         let opts = HttpOptions {
             observe: self.observe.clone().or(arrival.http_observe.clone()),
             limits: self.limits,
@@ -418,6 +429,27 @@ impl PortServer for Server {
         Box::pin(async move {
             let _ = serve_connection(&fcx, conn, info, handler, &opts).await;
         })
+    }
+
+    /// HTTP/1 in the same stack as TLS, unless TLS agreed on `h2`: HTTP/2
+    /// is served as a connection. The network's
+    /// [`write_timeout`](fictionet::stdlib::world::net::Limits::write_timeout)
+    /// gives up on a client that stops reading.
+    fn over_tls(&self, _fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+        if opening.info.alpn.as_deref() == Some(b"h2".as_slice()) {
+            return None;
+        }
+        let opts = HttpOptions {
+            observe: self.observe.clone().or(opening.http_observe.clone()),
+            limits: self.limits,
+            first_bytes: None,
+            budget: opening.budget.clone(),
+            date: self.date,
+        };
+        let handler = self.handler_for(&opening.info);
+        Some(Boxed::new(
+            http1_for(handler, &opts, &opening.info).upgradable(),
+        ))
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {

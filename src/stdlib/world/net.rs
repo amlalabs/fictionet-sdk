@@ -183,8 +183,8 @@ use attachments::{Destinations, Hooks, filter, udp_packet};
 use dns::Recursive;
 use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};
 pub use hosts::{
-    Arrival, ConfigFor, ConfigFuture, Declared, Endpoints, Host, PortServer, PreparedShare,
-    Program, Sni,
+    Arrival, ConfigFor, ConfigFuture, Declared, Endpoints, Host, Opening, PortServer,
+    PreparedShare, Program, Sni,
 };
 pub use names::normalize;
 
@@ -216,6 +216,10 @@ pub struct Limits {
     /// How long a DNS-over-TCP connection may sit idle between queries (RFC
     /// 7766, section 6.2.3). Default 10 seconds.
     pub dns_tcp_idle: Duration,
+    /// How long a write may take no bytes on a connection to a TLS port, a
+    /// client that stopped reading, before the network gives up on it.
+    /// Default 30 seconds.
+    pub write_timeout: Duration,
     /// Bytes held by the service layer for one sandbox, all services
     /// together: see [`Budget`]. Excludes TCP buffers and TLS handshakes.
     /// Default 256 MiB.
@@ -228,6 +232,7 @@ impl Default for Limits {
             connections_per_peer: 256,
             handshake: Duration::from_secs(10),
             dns_tcp_idle: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(30),
             sandbox_budget: 256 << 20,
         }
     }

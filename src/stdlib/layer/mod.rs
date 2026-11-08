@@ -123,6 +123,12 @@
 //! it was given but did not use, once, to `B`. `A`'s timers and work go
 //! with `A`.
 //!
+//! Two simpler choices need no handover. A [`Side`]`<A, B>` of two layers
+//! with the same ports is a layer: the choice made when the stack is made.
+//! [`Later`]`<U>` is a layer made once the layer below it has settled what it
+//! should be, such as what runs over TLS once the handshake chose a name
+//! and a protocol; until then it takes nothing and what is offered waits.
+//!
 //! # The rules every layer and driver keeps
 //!
 //! 1. **Refusal keeps ownership.** An entry point takes an owned value and
@@ -178,6 +184,7 @@ mod budget;
 mod carrier;
 mod chain;
 mod children;
+mod choice;
 mod driver;
 mod env;
 mod framed;
@@ -200,6 +207,7 @@ pub use carrier::{
 };
 pub use chain::Chain;
 pub use children::{ChildReport, Children, Overrun};
+pub use choice::Later;
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
 pub use framed::{Decoded, Framed, FramedError, Framing};

@@ -59,10 +59,12 @@
 
 mod layer;
 mod provider;
+mod secure;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
 pub use layer::{Hello, Pick, Picking, TlsLayer};
+pub use secure::Secure;
 
 use std::future::poll_fn;
 use std::sync::Arc;

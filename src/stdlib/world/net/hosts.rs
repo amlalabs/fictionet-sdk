@@ -2,7 +2,7 @@ use super::addresses::{Allocator, Placed, Subnet, Subnet6, may_serve_v4, may_ser
 use super::dns::HOST_TTL;
 use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::codec::Decode;
-use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Top};
+use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Side, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::label_count;
@@ -16,8 +16,8 @@ use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
     self, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
 };
-use fictionet::stdlib::services::stack::{self, Job, StackError, StreamEnd, StreamLimits};
-use fictionet::stdlib::services::tls::ServerConfig;
+use fictionet::stdlib::services::stack::{self, Boxed, Job, StackError, StreamEnd, StreamLimits};
+use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig, TlsLayer};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, End, Interface, InterfaceExt};
@@ -76,12 +76,53 @@ pub struct Arrival {
     pub limits: Limits,
 }
 
+/// A connection on a TLS port whose handshake is done, before anything
+/// serves it: what an [`Arrival`] holds but the connection, which is the
+/// TLS layer's to carry. [`PortServer::over_tls`] gets one.
+pub struct Opening {
+    /// The network default for HTTP exchange observations.
+    pub http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
+    /// Who it is from, where it arrived, and the name and protocol TLS
+    /// settled ([`ConnInfo::sni`], [`ConnInfo::alpn`]).
+    pub info: ConnInfo,
+    /// The TCP socket underneath.
+    pub socket: tcp::GoneWatch,
+    /// The budget of the sandbox it came from, which the whole stack is
+    /// charged to.
+    pub budget: Option<Budget>,
+    /// The network's limits and timers.
+    pub limits: Limits,
+}
+
+impl Opening {
+    /// The arrival of `conn`, which carries the decrypted bytes.
+    pub fn arrive(self, conn: Box<dyn Connection>) -> Arrival {
+        Arrival {
+            http_observe: self.http_observe,
+            conn,
+            info: self.info,
+            socket: self.socket,
+            budget: self.budget,
+            limits: self.limits,
+        }
+    }
+}
+
 /// Serves connections on one port of a host. [`Host::tcp`] and
 /// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`] is HTTP's.
 /// A world writes its own for anything else.
 pub trait PortServer: Any + Send + Sync {
     /// Serves one connection.
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// The layer that serves one connection on a TLS port once its
+    /// handshake is done, over the decrypted stream, in the same stack as
+    /// TLS. Default `None`: [`serve`](Self::serve) gets the decrypted stream
+    /// as a connection, through a [`Tunnel`](stack::Tunnel).
+    fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+        let _ = (fcx, opening);
+        None
+    }
 
     /// Pending connection limit for this port. The first server opening
     /// a shared port chooses its limit; `None` uses the host's TCP default.
@@ -1887,8 +1928,9 @@ async fn accept(
     }
 }
 
-/// Serves one connection: TLS by SNI first if the port has TLS names, then
-/// the name's accept.
+/// Serves one connection: on a port with TLS names, one stack of TLS and,
+/// once its handshake is done, what the name's accept serves over it;
+/// otherwise the port's accept.
 async fn connection(
     fcx: Cx,
     conn: tcp::TcpConnection,
@@ -1902,14 +1944,6 @@ async fn connection(
     let socket = conn.gone_watch();
     let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
     let budget = sandbox_id.and_then(|id| hooks.budget(id));
-    let arrival = |conn: Box<dyn Connection>, info: ConnInfo| Arrival {
-        http_observe: hooks.http_observe.clone(),
-        conn,
-        info,
-        socket: socket.clone(),
-        budget: budget.clone(),
-        limits,
-    };
     let has_tls = !port
         .tls
         .read()
@@ -1919,71 +1953,109 @@ async fn connection(
     if !has_tls {
         let plain = port.plain.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(accept) = plain {
-            accept
-                .serve(fcx.clone(), arrival(Box::new(conn), info))
-                .await;
+            let arrival = Arrival {
+                http_observe: hooks.http_observe.clone(),
+                conn: Box::new(conn),
+                info,
+                socket,
+                budget,
+                limits,
+            };
+            accept.serve(fcx.clone(), arrival).await;
         }
         return;
     }
-    let names = port.clone();
+
+    // The name the client asked for, as the port knows its names.
+    let requested: Arc<Mutex<Option<Arc<str>>>> = Arc::default();
     let chosen: Arc<Mutex<Option<Arc<TlsName>>>> = Arc::default();
-    let pick = chosen.clone();
-    let requested = hooks
-        .tls_observe
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(None)));
-    let requested_name = requested.clone();
-    let select = move |sni: Option<&str>, fcx: &Cx| {
-        if let Some(requested_name) = &requested_name {
-            *requested_name.lock() = sni.map(Arc::<str>::from);
-        }
-        let name = {
-            let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
-            sni.and_then(|n| tls.by_name.get(n))
-                .or_else(|| tls.by_name.get(""))
-                .cloned()
-        };
-        let fcx = fcx.clone();
-        async move {
-            let name = name?;
-            let config = name.config(&fcx).await;
-            *pick.lock() = Some(name);
-            Some(config)
+    let select = {
+        let (names, requested, chosen) = (port.clone(), requested.clone(), chosen.clone());
+        move |fcx: Cx, hello: Arc<tls::Hello>| {
+            let sni = hello
+                .server_name()
+                .map(|n| Arc::<str>::from(n.trim_end_matches('.').to_ascii_lowercase()));
+            let name = {
+                let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
+                sni.as_deref()
+                    .and_then(|n| tls.by_name.get(n))
+                    .or_else(|| tls.by_name.get(""))
+                    .cloned()
+            };
+            *requested.lock() = sni;
+            let chosen = chosen.clone();
+            async move {
+                let name = name?;
+                let config = name.config(&fcx).await;
+                *chosen.lock() = Some(name);
+                Some(config)
+            }
         }
     };
-    let deadline = accepted + limits.handshake;
-    let result = serve::accept_tls(&fcx, conn, &info, select, deadline).await;
-    let (tls, info) = match result {
-        Ok((tls, info)) => {
-            if let Some(observe) = &hooks.tls_observe {
+    let handshook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serve = {
+        let (fcx, info, budget) = (fcx.clone(), info.clone(), budget.clone());
+        let (requested, handshook) = (requested.clone(), handshook.clone());
+        let (http_observe, tls_observe) = (hooks.http_observe.clone(), hooks.tls_observe.clone());
+        move |tls: &TlsLayer| -> Boxed {
+            handshook.store(true, std::sync::atomic::Ordering::Relaxed);
+            let sni = requested.lock().clone();
+            let info = info.over_tls(sni.as_deref(), tls.alpn());
+            if let Some(observe) = &tls_observe {
                 observe(&super::TlsObservation {
                     at: fcx.now(),
                     conn: info.clone(),
                     result: Ok(()),
                 });
             }
-            (tls, info)
-        }
-        Err(error) => {
-            if let Some(observe) = &hooks.tls_observe {
-                let mut info = info;
-                info.tls = true;
-                info.sni = requested.as_ref().and_then(|name| name.lock().take());
-                observe(&super::TlsObservation {
-                    at: fcx.now(),
-                    conn: info,
-                    result: Err(error),
-                });
+            let opening = Opening {
+                http_observe,
+                info,
+                socket,
+                budget,
+                limits,
+            };
+            // The config came from the name the pick chose.
+            let Some(name) = chosen.lock().take() else {
+                return Boxed::new(stack::Tunnel::new(|_, _| async {}));
+            };
+            if let Some(stack) = name.accept.over_tls(&fcx, &opening) {
+                return stack;
             }
-            return;
+            let accept = name.accept.clone();
+            Boxed::new(stack::Tunnel::new(move |fcx, conn| {
+                accept.serve(fcx, opening.arrive(conn))
+            }))
         }
     };
-    let Some(name) = chosen.lock().take() else {
-        return;
+    let layer = TlsLayer::selecting(select).handshake_by(accepted + limits.handshake);
+    let stream = StreamLimits {
+        idle: None,
+        write_timeout: Some(limits.write_timeout),
     };
-    name.accept
-        .serve(fcx.clone(), arrival(Box::new(tls), info))
-        .await;
+    let budget = budget.unwrap_or_else(Budget::unlimited);
+    let secure = tls::Secure::new(layer, serve);
+    let ended = stack::stream(&fcx, conn, &info, secure, budget, stream, |_| {}).await;
+    if handshook.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let error = match ended {
+        Err(StackError::Layer(Side::Lower(e))) => e,
+        Err(StackError::Cancelled) => HandshakeError::Cancelled,
+        Ok(StreamEnd::Conn(e)) => e.into(),
+        Ok(StreamEnd::Budget) => HandshakeError::Failed("no budget for the handshake".into()),
+        Ok(_) | Err(StackError::Layer(Side::Upper(_))) => HandshakeError::Closed,
+    };
+    if let Some(observe) = &hooks.tls_observe {
+        let mut info = info;
+        info.tls = true;
+        info.sni = requested.lock().take();
+        observe(&super::TlsObservation {
+            at: fcx.now(),
+            conn: info,
+            result: Err(error),
+        });
+    }
 }
 
 /// Answers pings to `addr`.
