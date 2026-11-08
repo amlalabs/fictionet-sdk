@@ -2322,6 +2322,11 @@ impl Wire for Chunk {
     }
 }
 
+/// Bounded proofs over the body framing, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/http/kani/body.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
