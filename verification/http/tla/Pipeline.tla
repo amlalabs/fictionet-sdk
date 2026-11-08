@@ -56,7 +56,7 @@ CONSTANTS
     HandOverAfterWritten, \* handover only once Switching (native.rs:907)
     LeftoverFirst,        \* Switch blocks new input behind leftovers (switch.rs:138)
     FeedLeftovers,        \* Switch feeds a leftover on each advance (switch.rs:211-216)
-    CloseAfterBare101     \* a 101 without an UpgradeHandler closes (start, native.rs)
+    CloseAfterBare101     \* a 101 without an UpgradeHandler closes (native.rs:576-580, b69a3806f)
 
 Tokens == 1..L
 None == "none"

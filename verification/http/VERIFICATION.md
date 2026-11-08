@@ -3,8 +3,11 @@
 Area: `src/stdlib/web/httpd.rs` and `src/stdlib/web/httpd/` (HTTP/1 in
 `native.rs`, HTTP/2 in `http2.rs`, the shared response policy in
 `response.rs`), the HTTP/1 framing rules in `src/stdlib/protocols/http1.rs`,
-and HTTP/2 stream states and flow control. The models, how to run them and
-the full results are in [verification/http/README.md](README.md).
+HTTP/2 stream states and flow control, the HTTP/1 layer (`Http1`) with its
+handoff through `Switch` to `layer::Tunnel`, and the HTTP/1 body framing
+(`http1::BodyEvents`) shared by serving, capture and the WARC reader. The
+models, how to run them and the full results are in
+[verification/http/README.md](README.md).
 
 ## What was modeled and checked
 
@@ -15,12 +18,39 @@ the full results are in [verification/http/README.md](README.md).
 | `verification/http/tla/Streams.tla` | `Http2::headers`, `headers_on`, `data`, RST_STREAM handling, `cancel`, `write_reset`, `on_timer`, `on_done`, `Sending::poll_next` | TLC 2.19 | Base: 210,019 states generated, 13,277 distinct, depth 14; six invariants and six properties hold, including the liveness `ResponsesEnd`. Four ablations each violate the one property named for them. |
 | `verification/http/tla/Flow.tla` | The receive side of `Http2::data`, `Accept` with `release_window`, the send side of `Sending::poll_next`, the WINDOW_UPDATE and SETTINGS_INITIAL_WINDOW_SIZE arms of `Http2::frame` | TLC 2.19 | Base: 4,581,219 states generated, 1,145,490 distinct, depth 22; four invariants and four properties hold, including the liveness `NoLostWake`, `ResponsesEnd` and `RequestsEnd`. Eight ablations each violate the one property named for them. |
 | `tests/it/httpd.rs::http1_framing_follows_the_rfcs_for_every_case`, `tests/it/http2_server.rs::http2_framing_follows_the_rfcs_for_every_case` | The server itself, over the Lean domain | `cargo test` | Pass. Every method, status class, supplied length and body kind (and both HTTP/1 request versions) satisfies the rules the theorems state, on the bytes and frames the server writes. |
+| `verification/http/tla/Pipeline.tla` | `Http1::on_event`, `advance`, `read`, `dispatch`, `fail`, `on_done`, `respond`, `start`, `piece`, `finish`, `hand_on`, `close`, `take_command`, `handover`; `Switch::on_event` and `advance`; `Tunnel::on_event` | TLC 2.19 | Base: 1,493,826 states generated, 660,798 distinct, depth 41; six invariants and the liveness `TunnelGetsAll` hold: one request in flight, the next read only after the last response is written, the handover only with nothing of HTTP left to write, the bytes after the request reach the tunnel first, in order, once and all, the end last, and no request after a 101. Nine ablations each violate the one property named for them; one of them is the code before the fix below. |
+| `verification/http/kani/body.rs` | `BodyEvents::decode` (`Reader::body`, `chunk_step`, `chunk_framing`, `chunk_size`, `chunk_size_skipping_extensions`, `number`) | Kani 0.68.0 | 18 harnesses verified: one step from every state, in both chunk modes, does what an independent statement of the RFC 9112 grammar says, never waits while it holds its capacity, and (for every state but the lenient size and trailer lines) gives the same result at every split; chunk-size parsing gives the hex value exactly when it fits in a `u64`, without overflow. Five mutations of `http1.rs` each fail the harness run against them. |
+| `verification/http/tla/Tunnel.tla` | `Tunnel::on_event`, `take_command`, `TunnelConn::poll_read` and `poll_write` with the budget's charges | TLC 2.19 | Base: 30,275 states generated, 5,644 distinct, depth 15: the code's writes stay within the room and are charged exactly, and input stays under the room plus one chunk. Three ablations each violate their property; two configs find the code does not keep its doc's 64 KiB inbound bound, and that an empty chunk from below reads as end of input. Kani could not run on this code (a compiler panic on `Region`, and 10 GiB). |
+| `native.rs::tests::a_101_without_an_upgrade_handler_closes` | `Http1` over the layer harness | `cargo test` | Fails before the fix (a 101, then a second response), passes after. The `httpd`, `serve_limits` and `services` integration tests (119) and the `httpd::native` and `layer` library tests pass. |
 
 The existing `httpd` library tests and the `httpd` and `http2_server`
 integration test modules pass; `cargo fmt` and `cargo clippy -- -D warnings`
 are clean on the library and the `it` tests.
 
 ## Bugs
+
+### A 101 without an UpgradeHandler kept the connection reading HTTP
+
+A handler that answered an upgrade request with a 101 but no
+`UpgradeHandler` left `Http1` with no successor, and a keep-alive request
+sent `finish` back to `Reading`: the server wrote `101 Switching Protocols`
+with `Connection: upgrade`, then read the client's next bytes as a new
+request and answered it. RFC 9110 section 15.2.2 says the connection
+switches right after the 101. `Pipeline_without_closeafterbare101.cfg`
+violates `NoHttpAfter101` (client tokens `U, P, P, C`: the second request is
+read after the 101, 391,698 states, depth 9).
+
+Reproduction: `a_101_without_an_upgrade_handler_closes` in
+`src/stdlib/web/httpd/native.rs` sends an upgrade request and a second
+request to a handler that answers with a bare 101. Before the fix it failed
+with the 101 followed by a second `HTTP/1.1` response on the same
+connection.
+
+Fix: `Http1::start` closes the connection after a 101 that carries no
+`UpgradeHandler` (native.rs:576-580). After it the test passes and
+`Pipeline_base.cfg`, which checks `NoHttpAfter101`, passes. The rule
+predates B2: the server before the layer had the same one. Commit
+b69a3806f: "Model the HTTP/1 pipeline and handoff; close after a bare 101".
 
 ### A 2xx to CONNECT over HTTP/2 carried a length and a body
 
@@ -47,6 +77,21 @@ the fix the test passes, the HTTP/2 table test passes for CONNECT, and the
 Lean theorem `connect_success_has_no_length_h2` is the fixed behaviour.
 Commit 70ed52764: "Answer a CONNECT over HTTP/2 with a bare head".
 
+## Found in the tunnel, not changed
+
+From `Tunnel.tla` and the code; Kani could not run on `tunnel.rs`, so these
+are left to the owner (README, "Findings in the tunnel").
+
+- An empty `Data` chunk at the front of the tunnel's input makes
+  `TunnelConn::poll_read` return `Ok(0)`, end of input, while the stream is
+  open (`Tunnel_empty_chunks.cfg`, 4 steps). No producer in this tree sends
+  an empty chunk today; `Http1::on_event` already drops them, and the same
+  check in `Tunnel::on_event` would close it.
+- The tunnel takes a chunk whole while it holds less than 64 KiB, so it can
+  hold up to 64 KiB less one byte plus the largest chunk from below, not the
+  "at most 64 KiB" its doc says (`Tunnel_doc_room.cfg`), and it charges
+  nothing for those bytes.
+
 ## Judged correct, not changed
 
 - HTTP/2 keeps a valid handler-supplied `content-length` on a 304, where
@@ -72,9 +117,16 @@ HPACK, CONTINUATION, PRIORITY, PUSH_PROMISE, trailers, GOAWAY draining,
 PING and the SETTINGS acknowledgment; the wire parser's own validation of
 SETTINGS values, zero window increments and frame sizes (in
 `protocols/http2.rs`); body size limits, the connection budget, the head and
-body timeouts, the error-reset limit and TLS; HTTP/1 request pipelining and
-the 101 that hands the connection on; WINDOW_UPDATE on a closed stream. The
-flow-control liveness properties assume a client that eventually settles
-on one SETTINGS_INITIAL_WINDOW_SIZE, since one that keeps moving it can hold
-every response back by design. No Kani harnesses: the crate's dependency
-graph does not build under the memory cap this machine allows.
+body timeouts, the error-reset limit and TLS; WINDOW_UPDATE on a closed
+stream. The flow-control liveness properties assume a client that
+eventually settles on one SETTINGS_INITIAL_WINDOW_SIZE, since one that
+keeps moving it can hold every response back by design.
+
+`Pipeline.tla` treats a request as one token and the conditions of
+deadlines, the budget and failed work as one `Abort` that may close the
+connection at any point; resets from below and the tunnel's output are left
+out. The Kani body proofs are per step on inputs of up to six bytes, with
+whole bodies following by induction on the steps; the lenient size and
+trailer lines are not proved split-independent, and the strict 128-byte
+chunk-line limit is not reached. `Tunnel.tla` is a model of `tunnel.rs`,
+not a proof over it. The README lists each gap.

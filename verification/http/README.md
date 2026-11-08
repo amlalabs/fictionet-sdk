@@ -3,10 +3,11 @@
 The HTTP server in `src/stdlib/web/httpd.rs` and `src/stdlib/web/httpd/`
 answers over HTTP/1 (`native.rs`) and HTTP/2 (`http2.rs`) from one response
 policy (`response.rs`). This directory models that policy and both wire
-framings in Lean, the HTTP/1 request framing rules in Lean, and the HTTP/2
-stream states and flow control in TLA+. Two table tests run the Lean
-framing domain through the real server and check the same rules on the
-bytes it writes.
+framings in Lean, the HTTP/1 request framing rules in Lean, the HTTP/2
+stream states and flow control in TLA+, the HTTP/1 layer's pipeline and its
+handoff to a tunnel in TLA+, and the HTTP/1 body framing (`http1::BodyEvents`)
+with Kani. Two table tests run the Lean framing domain through the real
+server and check the same rules on the bytes it writes.
 
 ```sh
 # Lean: the theorems, then the axiom audit (only propext, Quot.sound and
@@ -20,12 +21,20 @@ java -XX:+UseParallelGC -Xmx6g -cp /home/souvik/.cache/adorably-fv/tla2tools.jar
   tlc2.TLC -workers 3 -config Streams_base.cfg Streams.tla
 java -XX:+UseParallelGC -Xmx6g -cp /home/souvik/.cache/adorably-fv/tla2tools.jar \
   tlc2.TLC -workers 3 -config Flow_base.cfg Flow.tla
+java -XX:+UseParallelGC -Xmx6g -cp /home/souvik/.cache/adorably-fv/tla2tools.jar \
+  tlc2.TLC -workers 4 -config Pipeline_base.cfg Pipeline.tla
 
-# Rust: the table tests and the regression for the bug the model found.
+# Kani: one harness at a time (each holds up to 10 GiB). The harnesses
+# stub `memchr` (see below), so stubbing must be on.
+cargo kani -p fictionet -Z stubbing --harness length_steps_follow_the_grammar
+
+# Rust: the table tests and the regressions for the bugs the models found.
 cargo test -p fictionet --test it -- framing_follows connect_success
+cargo test -p fictionet --lib -- a_101_without_an_upgrade_handler_closes
 ```
 
-Lean 4 v4.35.0 with no Mathlib; TLC 2.19 on JDK 21.
+Lean 4 v4.35.0 with no Mathlib; TLC 2.19 on JDK 21; Kani 0.68.0 with
+CBMC 6.11.0.
 
 ## Lean: the response policy and both framings
 
@@ -146,6 +155,199 @@ violates `ServerSpendsWithinWindows`, and `without_wakeonconnectionupdate`,
 `without_wakeonstreamupdate` and `without_wakeonsettings` violate
 `NoLostWake`.
 
+## TLA+: the HTTP/1 pipeline and the handoff to a tunnel
+
+`tla/Pipeline.tla` is `Http1` (`web/httpd/native.rs`) inside
+`Switch<Http1, Tunnel>` (`layer/switch.rs`), with the `Tunnel`
+(`layer/tunnel.rs`) it switches to. The header of the file maps each action
+to its functions with line numbers (at commit 50b69c60d, the code this pass
+checked; the fix below moves `native.rs` lines after 575 down by four):
+`on_event` for data, the end and
+`Written`; `advance` with `read`, `dispatch` and `fail`; `on_done`;
+`respond`, `start`, `piece`, `finish` and `hand_on`; `close` and
+`over_budget`; `take_command`; `handover`; `Switch::on_event` and
+`Switch::advance`; `Tunnel::on_event` and `TunnelConn::poll_read`.
+
+The client sends `L` tokens chosen at the start from `P` (a keep-alive
+request), `Q` (a request with `Connection: close`), `C` (CONNECT), `U` (an
+upgrade request) and `X` (bytes that are not HTTP), in chunks of one or two
+tokens, then ends. A token is its index, so a lost, repeated or reordered
+byte shows. The request decoder's buffer holds `StreamCap` tokens (pushes
+past it are partial or blocked, as `Stream::push` is), and the tunnel takes
+a chunk whole while it holds fewer than `TunnelRoom`. The handler answers
+each request with any response its kind allows: a head with or without a
+body piece, at once or later (`Reply::Later`), and for `U` and `C` a 101 or
+2xx with an `UpgradeHandler`, without one, or a plain answer. A deadline,
+the budget or a failed work may close the connection at any point
+(`Abort`). The transport takes and writes each command when it likes.
+
+| Property | States |
+|---|---|
+| `OneInFlight` | at most one request read and not yet answered |
+| `ReadAfterWritten` | a request is read only once every byte of the response before it has been written (`Written`), not only handed below |
+| `HandoverAfterWritten` | the handover happens only with nothing of HTTP left to write: no response byte can follow it |
+| `TunnelGetsTheRest` | the tunnel's input is the tokens after the handed-over request, from the first, in order, each once |
+| `TunnelEndsLast` | the client's end reaches the tunnel only after every token did |
+| `NoHttpAfter101` | after a 101 is queued, no further request is read |
+| `TunnelGetsAll` (liveness) | every token after the request reaches the tunnel, under fairness of everything that moves bytes (not of `Abort`) |
+
+Results with `L = 4`, `StreamCap = 2`, `TunnelRoom = 1`, chunks of 1 or 2
+tokens and responses of one or two pieces: `Pipeline_base.cfg` passes,
+1,493,826 states generated, 660,798 distinct, depth 41, 15 s with four
+workers. Each flag is a rule of the code; each `Pipeline_without_<flag>.cfg`
+turns one off and violates the property it names:
+
+| Config | The rule turned off | Violates | States to the violation |
+|---|---|---|---|
+| `without_waitwritten` | `all_written` waits for `Written` (native.rs:275-277) | `ReadAfterWritten` | 255,857 generated, depth 8 |
+| `without_readonlyinreading` | `advance` reads only in `Reading` (native.rs:871) | `OneInFlight` | 23,412, depth 5 |
+| `without_keepunread` | `hand_on` passes the unread bytes (native.rs:638-646) | `TunnelGetsTheRest` | 578,788, depth 11 |
+| `without_leftoverinswitching` | data while `Switching` joins the leftovers (native.rs:747-749) | `TunnelGetsTheRest` | 806,786, depth 13 |
+| `without_endlast` | `hand_on` puts the client's end last (native.rs:650-652) | `TunnelEndsLast` | 1,236,115, depth 19 |
+| `without_handoverafterwritten` | `handover` only once `Switching` (native.rs:907) | `HandoverAfterWritten` | 106,530, depth 6 |
+| `without_leftoverfirst` | `Switch` blocks new input behind leftovers (switch.rs:138) | `TunnelGetsTheRest` | 578,870, depth 11 |
+| `without_feedleftovers` | `Switch::advance` feeds a leftover (switch.rs:211-216) | `TunnelGetsAll` | 1,471,808 generated, the whole graph |
+| `without_closeafterbare101` | a 101 without an `UpgradeHandler` closes (native.rs:576-580) | `NoHttpAfter101` | 391,698, depth 9 |
+
+The last is the code before commit b69a3806f: see the bugs below.
+
+## Kani: HTTP/1 body framing
+
+`kani/body.rs` is compiled into `protocols/http1.rs` under `cfg(kani)` and
+calls the real decoder: `BodyEvents::decode`, which is `Reader::body`,
+`Reader::chunk_step`, `chunk_framing`, `chunk_size`,
+`chunk_size_skipping_extensions` and `number`, the body framing that
+`RequestEvents` and `ResponseEvents` (serving), the capture parser
+(`dissect/protocols/http1.rs`) and the WARC reader (`extras/src/warc.rs`)
+share. The serving decoders reach the same `Reader::body` after a head;
+the capture parser and the WARC reader use `BodyEvents` itself in the
+lenient mode (`skip_chunk_extras`).
+
+The proofs are per step. From each state the decoder can be in, a harness
+sets up a decoder through the public constructors, puts it in that state
+with any count (so lengths and chunk sizes up to `u64::MAX` are in), and
+calls `decode` once. A body is a run of such steps from the state `begin`
+sets for its framing, so a property that holds for every step from every
+state holds for the whole body by induction on the steps. Whole-body
+harnesses, which unroll several calls with the state symbolic between
+them, did not fit in 10 GiB at any input length that reaches a chunk.
+
+`one_step_follows_the_grammar` writes the grammar out independently
+(`spec_front_line`, `spec_hex`, `spec_trim`, `spec_field_byte`; the
+lenient trailer line uses the crate's `header_line_ok` as the definition of
+a field line) and checks, for any line, head, field and block limits up to
+3, 6, 2 and 3, any head and field counts so far, every input of up to six
+bytes, with and without the end of input:
+
+- a size line is consumed exactly when it is a complete CRLF line within
+  the line limit whose size is valid hex, with no extension in strict
+  mode, or with whitespace around the size and an extension of field bytes
+  in lenient mode, and the next state holds that size (or is the trailers
+  for 0); a bare LF, an overlong line or a bad size is refused;
+- inside a length or a chunk, a block of exactly `min(left, block)` bytes
+  goes up once that many are there, its bytes are the input's, and the
+  count drops by exactly that, to `Done` or the chunk's CRLF at zero;
+- a chunk's CRLF and the strict empty trailer section are required byte
+  for byte; a lenient trailer line passes the head limit, the field limit
+  and the field syntax, or is refused;
+- a close-delimited body goes up in full blocks, then the rest and `Done`
+  at the end of input; after a body come `Done` and the end;
+- no step consumes more than its input; `Need` changes no state; the end
+  of input with nothing buffered in an unfinished body is a failure;
+- the decoder never answers `Need` while it holds its capacity, so the
+  stream's buffer, whose limit is that capacity, never has to grow past
+  it (the bounded-buffer rule `Stream` reports as `Fail::Stuck`).
+
+`one_step_is_independent_of_the_split` checks that a call on the bytes up
+to any cut either asks for more, after which the call on all of them gives
+what one call on all of them gives (with whatever `Lines` remembered of
+its scan), or already gives that same result. With `Need` changing no
+state, this extends to any number of cuts.
+
+| Harness | State, mode | Verification time | Outcomes reached (`kani::cover!`) |
+|---|---|---|---|
+| `length_steps_follow_the_grammar` | `Length(n)`, any `n` | 1.4 s | waits, refuses (empty at the end), yields a block |
+| `data_steps_follow_the_grammar` | `Data(n)`, any `n` | 1.3 s | waits, refuses, yields a block |
+| `close_steps_follow_the_grammar` | `Close` | 1.3 s | waits, yields a block, yields `Done` |
+| `steps_after_a_body_follow_the_grammar` | `Done`, `Boundary`, `End` | 0.8 s | yields `Done`, ends |
+| `strict_size_steps_follow_the_grammar` | `Size`, strict | 14.6 s | waits, refuses, consumes the line |
+| `lenient_size_steps_follow_the_grammar` | `Size`, lenient | 37.6 s | waits, refuses, consumes the line |
+| `strict_data_end_steps_follow_the_grammar` | `DataEnd`, strict | 1.5 s | waits, refuses, consumes the CRLF |
+| `lenient_data_end_steps_follow_the_grammar` | `DataEnd`, lenient | 1.2 s | waits, refuses, consumes the CRLF |
+| `strict_trailer_steps_follow_the_grammar` | `Trailers`, strict | 1.5 s | waits, refuses, consumes the CRLF |
+| `lenient_trailer_steps_follow_the_grammar` | `Trailers`, lenient | 56.1 s | waits, refuses, consumes a line |
+| `length_steps_are_independent_of_the_split` | `Length(n)` | 7.7 s | a cut before the result |
+| `data_steps_are_independent_of_the_split` | `Data(n)` | 8.9 s | a cut before the result |
+| `close_steps_are_independent_of_the_split` | `Close` | 3.3 s | a cut before the result |
+| `steps_after_a_body_are_independent_of_the_split` | `Done`, `Boundary`, `End` | 1.0 s | a cut before the result |
+| `strict_size_steps_are_independent_of_the_split` | `Size`, strict | 30.1 s | a cut before the result |
+| `data_end_steps_are_independent_of_the_split` | `DataEnd`, both modes | 81.4 s | a cut before the result |
+| `strict_trailer_steps_are_independent_of_the_split` | `Trailers`, strict | 6.7 s | a cut before the result |
+| `chunk_size_is_the_hex_value_or_refused` | `chunk_size`, `chunk_size_skipping_extensions` on any line of up to 20 bytes | 443 s | |
+
+Each harness reports `VERIFICATION:- SUCCESSFUL` with every unwinding
+assertion holding; the times are CBMC's, with compilation about 20 s more.
+The covers a state cannot reach (a block from a size line, say) are
+`UNSATISFIABLE`, as they should be. The last harness proves the size
+parsers return a value exactly when the input is non-empty hex whose value
+fits in a `u64` (leading zeros allowed), and that value, with Kani's
+overflow checks on every operation: chunk-size arithmetic cannot overflow.
+
+Every harness stubs `core::slice::memchr::memchr` with `find_byte`, a
+byte-by-byte search with the same result: CBMC cannot rule out memchr's
+word-at-a-time path at a symbolic length, and with it the formulas do not
+fit in memory. Each harness was also run against a broken copy of one rule
+in `http1.rs` (the edit, the harness, the result):
+
+| Broken rule (`http1.rs` at 50b69c60d) | Harness | Result |
+|---|---|---|
+| `chunk_framing` accepts any byte after the CR of a chunk's CRLF (line 1598, `if false && *second != b'\n'`) | `strict_data_end_steps_follow_the_grammar` | fails: `got == expect` |
+| a lenient trailer line ignores the head limit (line 1542, `if false && self.scanned > self.limits.head`) | `lenient_trailer_steps_follow_the_grammar` | fails: `got == expect` |
+| a length's block ignores the block size (line 1471, `.min(self.limits.body_chunk)` removed) | `length_steps_follow_the_grammar` | fails: `got == expect` |
+| a close-delimited body sends whatever it has (line 1487, `if n != 0`) | `close_steps_are_independent_of_the_split` | fails: `later == direct` |
+| `number` wraps instead of refusing on overflow (line 1637, `Some(n.wrapping_mul(..))`) | `chunk_size_is_the_hex_value_or_refused` | fails: `strict == spec_hex(line)` and `skipping == expected` |
+
+## TLA+: the tunnel's room and charges
+
+`tla/Tunnel.tla` is `Tunnel::on_event`, `take_command`, and the
+`TunnelConn` reads and writes the code gets (`layer/tunnel.rs`), with the
+budget's `charge` and a charge's drop, in units with `Room` for the 64 KiB
+`ROOM`. Kani could not check this code: every harness that calls
+`TunnelConn`'s `poll_read` or `poll_write` needs a `Cx`, and building one
+reaches `Region`, on which Kani 0.68's compiler panics
+(`kani-compiler/src/intrinsics.rs:243`, as `verification/runtime` records);
+the one harness that needs no `Cx`, the start of the code only once the
+budget is known, ran out of 10 GiB in CBMC (the boxed takeover, its future
+and `std::sync::Mutex`).
+
+| Property | States |
+|---|---|
+| `OutboundWithinRoom` | the code's writes waiting below never pass the room |
+| `ChargesMatch` | the budget's count is exactly the bytes waiting and the bytes the layer below took and still holds |
+| `InboundBelowRoomAndAChunk` | what came from below and was not read stays under the room plus one chunk |
+| `NoEofWhileOpen` | a read returns end of input (`Ok(0)` to a buffer with room) only after the stream ended |
+
+With `Room = 2`, `Limit = 3`, chunks from below of 1 or 3 units, writes of
+1 or 3, reads of 1 or 2 and three of each: `Tunnel_base.cfg` passes,
+30,275 states generated, 5,644 distinct, depth 15. Each ablation violates
+its property: `without_checkroom` (a write takes `min(room, len)`,
+tunnel.rs:285-290) violates `OutboundWithinRoom`; `without_chargewrites`
+(the charge before the queue, tunnel.rs:291-302) violates `ChargesMatch`;
+`without_admitbelowroom` (`Blocked` at the room, tunnel.rs:140-142)
+violates `InboundBelowRoomAndAChunk`.
+
+Two configs check the code against what it promises and find it does not
+keep it; both are findings below. `Tunnel_doc_room.cfg` checks the doc
+comment's "each way holds at most 64 KiB" (`InboundWithinRoom`) and
+violates it in 6 steps: a chunk that arrives below the room is taken whole.
+`Tunnel_empty_chunks.cfg` lets a chunk from below be empty and violates
+`NoEofWhileOpen` in 4 steps: an empty chunk at the front makes `poll_read`
+return `Ok(0)`, end of input, to a stream that has not ended. The base
+config sends no empty chunks because no producer in this tree does:
+`Http1::on_event` takes an empty chunk and drops it (native.rs:744-746),
+the live driver turns a zero-byte read into `Ended` (live.rs:229-233) and
+`Harness::push` skips empty input (harness.rs:174-177).
+
 ## Rust
 
 `tests/it/httpd.rs::http1_framing_follows_the_rfcs_for_every_case` and
@@ -157,7 +359,31 @@ without a length), and for HTTP/1 both request versions. They check the
 rules above on the frames and bytes the server writes, and that the HTTP/1
 reply reads back under its request's method as the body the handler wrote.
 
-## The bug
+`src/stdlib/web/httpd/native.rs::tests::a_101_without_an_upgrade_handler_closes`
+is the regression for the 101 bug below.
+
+## The bugs
+
+### A 101 without an UpgradeHandler kept reading HTTP
+
+`Pipeline_without_closeafterbare101.cfg` (the code at 50b69c60d) violates
+`NoHttpAfter101`: with the client's tokens `U, P, P, C`, the handler answers
+the upgrade request with a 101 that carries no `UpgradeHandler`; `start`
+sets no successor, the request kept the connection alive, so `finish` went
+back to `Reading` and the next request was read and answered on a
+connection whose 101 had said HTTP was over. RFC 9110 section 15.2.2 says
+the server switches immediately after the 101's empty line. A client that
+believed the 101 sends WebSocket frames, which the server then read as HTTP
+and answered with a 400. The test `a_101_without_an_upgrade_handler_closes`
+sends an upgrade request and a second request to a handler that answers
+with a bare 101; before the fix the output was the 101 (with `Connection:
+upgrade`) followed by a second response. A 2xx to CONNECT without a handler
+was already safe: CONNECT never keeps the connection alive. The fix
+(commit b69a3806f, `Http1::start`): a 101 with nothing to take the
+connection over closes it after the head. The behaviour predates B2: the
+code before the layer had the same rule.
+
+### The HTTP/2 CONNECT length
 
 `Sending` in `http2.rs` carried `head_only: bool` and rebuilt `Asked` from it
 as `Head` or `Body`, so a 2xx response to CONNECT over HTTP/2 took the `Body`
@@ -170,6 +396,31 @@ test `connect_success_has_no_length_and_ends_the_stream` in
 `Asked` through `Sending` (`wants: Asked`, from `Asked::of(request.method())`
 in `dispatch`), so both backends ask the one policy the same question.
 
+## Findings in the tunnel, not changed
+
+Both come from `Tunnel.tla`, a model, and from reading `tunnel.rs`; Kani
+could not run on the code, so they are reported for the owner rather than
+fixed here.
+
+- **An empty chunk from below reads as end of input.** `TunnelConn::poll_read`
+  (tunnel.rs:247-257) copies `min(chunk.len(), buf.len())` bytes from the
+  first chunk and pops it when it is empty, so an empty `Data` chunk at the
+  front returns `Ok(0)` to a read with room, which every `Connection` user
+  takes as the peer's end, while the stream is still open
+  (`Tunnel_empty_chunks.cfg`). `ByteStream` says chunk boundaries mean
+  nothing, so an empty chunk is allowed; no producer in this tree sends one
+  (see above), so it cannot happen today. The smallest fix is the one
+  `Http1::on_event` already has: take an empty chunk and drop it in
+  `Tunnel::on_event`.
+- **The inbound room is a soft limit.** `Tunnel::on_event` takes a chunk
+  whole whenever it holds less than `ROOM` (tunnel.rs:140-144), so it can
+  hold up to `ROOM - 1` plus the largest chunk from below, not the "at most
+  64 KiB" its doc comment says (`Tunnel_doc_room.cfg`). The tunnel charges
+  nothing for what it holds from below: a chunk carries whatever charge its
+  producer gave it, and the live driver's carry none (live.rs:235). Taking
+  a prefix up to the room and answering `Admit::Partial` would make the doc
+  true.
+
 ## What the models leave out
 
 - HPACK, CONTINUATION, PRIORITY, PUSH_PROMISE, trailers, GOAWAY draining and
@@ -177,8 +428,25 @@ in `dispatch`), so both backends ask the one policy the same question.
   frame sizes) are in `protocols/http2.rs` and its tests, not here.
 - Body size limits, the connection budget, the head and body timeouts, the
   error-reset limit and TLS.
-- HTTP/1 request pipelining and the 101 that hands the connection on.
 - WINDOW_UPDATE on a closed stream (ignored by the server, not modeled) and
   the SETTINGS acknowledgment.
-- Kani harnesses: the crate's dependency graph does not build under the
-  memory cap the verification machine allows, so no Kani proofs are included.
+- `Pipeline.tla` treats a request as one token: the head, body, 100-continue
+  and the decoder's failures inside a request are the Lean request framing
+  and the Kani body proofs, not this model. Timers, the budget and failed
+  work appear only as `Abort`, which may close the connection at any point;
+  their exact conditions are not modeled. Resets from below, `Report`s,
+  `Delivery` observations and the tunnel's own output are left out. Four
+  client tokens, a two-token decoder buffer and a one-token tunnel room.
+- The Kani body proofs are per step with inputs of up to six bytes (four
+  hex digits of chunk size), limits of up to three bytes per line, six per
+  head and two fields; whole bodies follow by induction on the steps, which
+  is an argument, not a harness. The lenient size line and the lenient
+  trailer line are not proved split-independent (those two harnesses did
+  not fit in 10 GiB); the strict ones are, and the line reader (`Lines`) is
+  the same. The strict 128-byte chunk-line limit is not reached (the
+  lenient mode's limit, the header line limit, is, up to three). `Stream`
+  itself, the serving decoders' head parsing and the capture parser's and
+  the WARC reader's handling of what `BodyEvents` returns are not covered.
+- `Tunnel.tla` is a model of `tunnel.rs`, not a proof over the code (see
+  above): wakers, the takeover's start and drop, `poll_gone` and the stack's
+  `Written` events are left out.
