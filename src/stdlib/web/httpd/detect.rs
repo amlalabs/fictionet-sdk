@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use fictionet::stdlib::layer::{
     Admit, ByteStream, Charge, Chunk, Env, Handoff, Handover, Layer, Side, StreamCommand,
-    StreamEvent, Switch, Top,
+    StreamEvent, Successor, Switch, Top,
 };
 use fictionet::stdlib::protocols::http2::PREFACE;
 use fictionet::time::Instant;
@@ -30,8 +30,8 @@ pub enum Choice {
     Http2(Box<Http2Server>),
 }
 
-impl From<Choice> for Versions {
-    fn from(choice: Choice) -> Versions {
+impl Successor<Choice> for Versions {
+    fn succeed(choice: Choice) -> Versions {
         match choice {
             Choice::Http1(http1) => Side::Lower(*http1),
             Choice::Http2(http2) => Side::Upper(*http2),

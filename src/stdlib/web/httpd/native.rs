@@ -14,7 +14,7 @@ use http_body::{Body as _, Frame};
 use fictionet::stdlib::codec::{Fail, Stream, base64};
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, Chunk, CommandOf, Env, Handoff, Handover, Layer, Owned,
-    OwnedWork, Side, StreamCommand, StreamEvent, Switch, Timers, Top, WorkOwner,
+    OwnedWork, Side, StreamCommand, StreamEvent, Successor, Switch, Timers, Top, WorkOwner,
 };
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError, RequestHead};
@@ -96,8 +96,8 @@ pub enum Next {
 /// written against a connection, or HTTP/2.
 pub type Upgraded = Side<Tunnel, Http2Server>;
 
-impl From<Next> for Upgraded {
-    fn from(next: Next) -> Upgraded {
+impl Successor<Next> for Upgraded {
+    fn succeed(next: Next) -> Upgraded {
         match next {
             Next::Upgrade(handler) | Next::Connect(handler) => {
                 Side::Lower(Tunnel::new(move |fcx, conn| handler.run(fcx, conn)))

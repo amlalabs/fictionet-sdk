@@ -24,9 +24,35 @@ pub trait Handoff: Layer {
     /// it has been handed over; until then `None`. After it returns `Some`
     /// the layer is finished and is dropped.
     ///
-    /// The protocol decides what the successor may read: STARTTLS does not
-    /// pass on plaintext a client pipelined after its request.
+    /// What the successor reads of it is the successor's choice
+    /// ([`Successor::inherits`]): the successor of STARTTLS reads none of
+    /// the plaintext a client pipelined after its request, however the
+    /// old layer hands it over.
     fn handover(&mut self) -> Option<Handover<Self::Next, Self::Lower, Self::Upper>>;
+}
+
+/// A layer that can run after a [`Handoff`] layer whose
+/// [`Next`](Handoff::Next) is `N`, in a [`Switch`].
+pub trait Successor<N>: Layer + Sized {
+    /// The successor made from what the old protocol negotiated.
+    fn succeed(next: N) -> Self;
+
+    /// Whether the successor reads `event`, which came from below before
+    /// it took over, under the old protocol. The switch drops each event it
+    /// does not read: what the old layer handed over, and what the old
+    /// layer refused and the layer below still holds. By default it reads
+    /// every one, as a tunnel after CONNECT reads the bytes the client sent
+    /// behind its request.
+    ///
+    /// TLS after STARTTLS reads no data that came before it. Events it
+    /// declines must come from below in one order, as data on a byte
+    /// stream does. Write completions are counted apart from the data, so
+    /// a successor reads them; the old layer hands over only once its
+    /// writes are complete, so none of its own are left.
+    fn inherits(event: &EventOf<Self::Lower>) -> bool {
+        let _ = event;
+        true
+    }
 }
 
 /// What a finished layer hands its successor.
@@ -56,22 +82,29 @@ enum Phase<A, B> {
 ///
 /// The switch moves the handover's leftovers to `B` once each, before
 /// anything newer, and drops `A` with its timers and work. A timer or a
-/// result of `A`'s that arrives after the switch is ignored.
+/// result of `A`'s that arrives after the switch is ignored. Events from
+/// below that came before the switch and that `B` does not
+/// [inherit](Successor::inherits) never reach it, whether `A` handed them
+/// over or refused them.
 pub struct Switch<A, B>
 where
     A: Handoff,
-    B: Layer<Lower = A::Lower, Upper = A::Upper> + From<A::Next>,
+    B: Successor<A::Next, Lower = A::Lower, Upper = A::Upper>,
 {
     phase: Phase<A, B>,
     owner: WorkOwner,
     below: VecDeque<EventOf<A::Lower>>,
     above: VecDeque<CommandOf<A::Upper>>,
+    /// The layer below holds an event from before the switch that `A`
+    /// refused and `B` does not inherit. It offers that event again before
+    /// any newer one.
+    owed: bool,
 }
 
 impl<A, B> Switch<A, B>
 where
     A: Handoff,
-    B: Layer<Lower = A::Lower, Upper = A::Upper> + From<A::Next>,
+    B: Successor<A::Next, Lower = A::Lower, Upper = A::Upper>,
 {
     /// Starts with `first`.
     pub fn new(first: A) -> Switch<A, B> {
@@ -81,6 +114,7 @@ where
             phase: Phase::First(first),
             below: VecDeque::new(),
             above: VecDeque::new(),
+            owed: false,
         }
     }
 
@@ -120,7 +154,7 @@ fn feed<T>(queue: &mut VecDeque<T>, admit: Admit<T>) -> bool {
 impl<A, B> Layer for Switch<A, B>
 where
     A: Handoff,
-    B: Layer<Lower = A::Lower, Upper = A::Upper> + From<A::Next>,
+    B: Successor<A::Next, Lower = A::Lower, Upper = A::Upper>,
 {
     type Lower = A::Lower;
     type Upper = A::Upper;
@@ -136,9 +170,22 @@ where
         event: EventOf<A::Lower>,
     ) -> Result<Admit<EventOf<A::Lower>>, Self::Error> {
         match &mut self.phase {
-            Phase::First(a) => env
-                .scoped(Side::Lower, |env| a.on_event(env, event))
-                .map_err(Side::Lower),
+            Phase::First(a) => {
+                let declined = !B::inherits(&event);
+                let admit = env
+                    .scoped(Side::Lower, |env| a.on_event(env, event))
+                    .map_err(Side::Lower)?;
+                if declined {
+                    self.owed = matches!(admit, Admit::Blocked(_) | Admit::Partial(_));
+                }
+                Ok(admit)
+            }
+            // What `A` refused before the switch comes again first, and
+            // `B` does not read it.
+            Phase::Then(_) if self.owed && !B::inherits(&event) => {
+                self.owed = false;
+                Ok(Admit::Taken)
+            }
             // The old layer's leftovers go first.
             Phase::Then(_) if !self.below.is_empty() => Ok(Admit::Blocked(event)),
             Phase::Then(b) => env
@@ -204,9 +251,14 @@ where
                 let Some(handover) = a.handover() else {
                     return Ok(moved);
                 };
-                self.below.extend(handover.below);
+                self.below.extend(
+                    handover
+                        .below
+                        .into_iter()
+                        .filter(|event| B::inherits(event)),
+                );
                 self.above.extend(handover.above);
-                let next = B::from(handover.next);
+                let next = B::succeed(handover.next);
                 assert!(next.depth() < super::MAX_DEPTH, "composition is too deep");
                 self.owner = WorkOwner::new();
                 self.phase = Phase::Then(next);

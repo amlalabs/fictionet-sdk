@@ -398,8 +398,8 @@ impl Tunnel {
     }
 }
 
-impl From<Upgraded> for Tunnel {
-    fn from(_: Upgraded) -> Tunnel {
+impl Successor<Upgraded> for Tunnel {
+    fn succeed(_: Upgraded) -> Tunnel {
         Tunnel {
             out: Vec::new(),
             taken: 0,

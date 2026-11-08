@@ -253,10 +253,12 @@ channel, a layer of its own. A layer can also:
   past the boundary. STARTTLS (SMTP, IMAP, LDAP, Postgres's `SSLRequest`)
   is a plaintext layer whose `layer::Handoff` names a `tls::Secure` as what
   comes next, served with `Host::tcp_stack`. The plaintext layer hands over
-  once its go-ahead is written, and decides what becomes of plaintext the
-  client pipelined after its request. `services::stack::Tunnel` hands the
-  rest of a stream to async code written against a connection, as what
-  runs after a CONNECT or a WebSocket upgrade does.
+  once its go-ahead is written. Plaintext the client pipelined after its
+  request never reaches TLS: `B` is a `layer::Successor`, which says which
+  of the input from before the switch it reads, and TLS reads none of it,
+  however the plaintext layer handed it over. `services::stack::Tunnel`
+  hands the rest of a stream to async code written against a connection,
+  as what runs after a CONNECT or a WebSocket upgrade does.
 - **Charge what it holds.** Each layer charges its own storage, such as a
   line buffer or a reply not yet written, to the connection's budget before
   it grows, and a `Chunk` carries its charge down the stack with the bytes.
