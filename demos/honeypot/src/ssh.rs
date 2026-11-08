@@ -65,11 +65,12 @@ pub fn server(
             },
             observer: Log(observer),
         }),
-        options: serve::ServeOptions {
+        budget: Some(fictionet::stdlib::layer::Budget::new(32 << 20)),
+        backlog: None,
+        limits: fictionet::stdlib::services::stack::StreamLimits {
             idle: Some(Duration::from_secs(300)),
-            ..serve::ServeOptions::default()
-        }
-        .budget(fictionet::stdlib::layer::Budget::new(32 << 20)),
+            ..Default::default()
+        },
     }
 }
 
