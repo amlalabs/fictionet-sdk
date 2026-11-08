@@ -205,15 +205,21 @@ impl<W: Job> Jobs<W> {
         let mut i = 0;
         while i < self.running.len() {
             let running = &mut self.running[i];
-            if running.work.as_ref().is_some_and(Job::cancelled) {
+            if running.work.is_some() && running.region.is_none() {
+                running.region = fcx.map(Cx::job_context);
+            }
+            // Work whose owner ended, or whose own region was cancelled or
+            // failed, is never polled again: a task of its that failed
+            // ends that work, and the failure goes to the parent below.
+            let ended = running.work.as_ref().is_some_and(Job::cancelled)
+                || (running.work.is_some()
+                    && running.region.as_ref().is_some_and(Cx::is_cancelled));
+            if ended {
                 running.work = None;
                 if let Some(region) = &running.region {
                     region.cancel();
                 }
                 finished = true;
-            }
-            if running.work.is_some() && running.region.is_none() {
-                running.region = fcx.map(Cx::job_context);
             }
             if !running.completed
                 && let Some(work) = &mut running.work

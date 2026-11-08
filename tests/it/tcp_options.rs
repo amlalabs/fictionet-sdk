@@ -13,7 +13,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
+use crate::common::line_stack::{LineApp, LineOut, Lined};
+use fictionet::stdlib::codec::{LineError, Wire};
+use fictionet::stdlib::layer::Budget;
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
 use fictionet::stdlib::network::tcp::{
     self, AckAnswer, Answer, Handshake, SYN_OPTIONS_ROOM, SynAnswer, TcpOption,
@@ -22,7 +25,7 @@ use fictionet::stdlib::network::{Accepted, ConnectionExt};
 use fictionet::stdlib::protocols::mptcp::{
     self, Capable, Join, Keys, MptcpOption, algorithm, reason,
 };
-use fictionet::stdlib::services::serve::{self, Flow};
+use fictionet::stdlib::services::stack::{self, StreamLimits};
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet, pair};
 use fictionet_test_support::timeout;
 
@@ -499,60 +502,59 @@ fn configured_cookies_decline_timestamps_and_ecn_without_retaining_state() {
     });
 }
 
-/// Records the SYN options of each connection it serves, then closes it.
-struct RecordSyn;
+/// Closes the connection as soon as it opens.
+struct Closes;
 
-impl serve::Service for RecordSyn {
+impl LineApp for Closes {
     type Timer = ();
-    type Decoder = Lines;
-    type State = Mutex<Vec<Option<Arc<[TcpOption]>>>>;
+    type Work = std::convert::Infallible;
+    type Done = std::convert::Infallible;
+    type Next = std::convert::Infallible;
     type Error = std::convert::Infallible;
 
-    fn decoder(&self) -> Lines {
-        Lines::new(64, Ending::LfOrCrlf)
+    fn open(&mut self, out: &mut LineOut<'_, Self>) -> Result<(), Self::Error> {
+        out.close();
+        Ok(())
     }
 
-    fn on_open(
-        &mut self,
-        seen: &Self::State,
-        driver: &mut serve::Driver<'_, Lines, ()>,
-    ) -> Result<Flow, Self::Error> {
-        seen.lock()
-            .unwrap()
-            .push(driver.conn().handshake.as_ref().unwrap().syn.clone());
-        Ok(Flow::Close)
-    }
-
-    fn on_item(
+    fn line(
         &mut self,
         _: Result<Vec<u8>, LineError>,
-        _: &Self::State,
-        _: &mut serve::Driver<'_, Lines, ()>,
-    ) -> Result<Flow, Self::Error> {
-        Ok(Flow::Close)
+        _: &mut LineOut<'_, Self>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
 #[test]
-fn a_service_sees_the_syn_options_in_its_conn_info() {
+fn a_stack_factory_sees_the_syn_options_in_its_conn_info() {
     world(Duration::from_secs(10), |fcx| async move {
         let (mut raw, side) = pair();
         let server = tcp::endpoint(&fcx, side, ip(SERVER));
         let seen = Arc::new(Mutex::new(Vec::new()));
-        serve::listen(
-            &fcx,
-            server.listen(80)?,
-            seen.clone(),
-            || RecordSyn,
-            serve::ServeOptions::default(),
-            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
-            None,
-        );
+        let mut listener = server.listen(80)?;
+        let record = seen.clone();
+        fcx.spawn(move |fcx| async move {
+            let conn = listener.accept(&fcx).await?;
+            let info = ConnInfo {
+                handshake: conn.handshake().cloned(),
+                ..ConnInfo::new(1, conn.local_addr(), conn.peer_addr())
+            };
+            // What the factory of the connection's stack is given.
+            record
+                .lock()
+                .unwrap()
+                .push(info.handshake.as_ref().unwrap().syn.clone());
+            let (limits, budget) = (StreamLimits::default(), Budget::unlimited());
+            let stack = Lined::new(Closes);
+            let _ = stack::stream(&fcx, conn, &info, stack, budget, limits, |_| {}).await;
+            Ok(())
+        });
         raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));
         let syn_ack = next(&fcx, &mut raw).await.expect("a SYN-ACK");
         let iss = seq_of(tcp_of(&syn_ack));
         raw.send(segment(4000, 1001, iss.wrapping_add(1), ACK, &[]));
-        // The service closes the connection once it has looked.
+        // The stack closes the connection once it opens.
         let fin = next(&fcx, &mut raw).await.expect("a FIN");
         assert_eq!(tcp_of(&fin)[13] & 1, 1);
         let seen = seen.lock().unwrap();
