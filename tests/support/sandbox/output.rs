@@ -1,4 +1,4 @@
-//! Ciphertext delivery and plaintext credit shared by the TLS adapters.
+//! Ciphertext delivery and plaintext credit for the sandbox TLS client.
 
 use super::ConnectionCommon;
 use fictionet::Cx;

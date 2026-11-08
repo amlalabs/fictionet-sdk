@@ -4,7 +4,12 @@
 //! protocol over TLS, by hand. If the world is a set of websites,
 //! [`web::Sites`](fictionet::stdlib::web::Sites) does TLS for you.
 //!
-//! TLS here is middleware. It takes a [`Connection`], usually a
+//! [`TlsLayer`] is a synchronous protocol layer with ordered byte streams
+//! below and above it. Compose it with [`Chain`](fictionet::stdlib::layer::Chain)
+//! or drive it without a runtime using [`Harness`](fictionet::stdlib::layer::Harness).
+//! The functions here adapt connection readiness to that same layer.
+//!
+//! The live adapter takes a [`Connection`], usually a
 //! [`TcpConnection`](fictionet::stdlib::network::tcp::TcpConnection), and gives back a
 //! `Connection` that carries the decrypted bytes.
 //!
@@ -52,21 +57,20 @@
 //! can run rustls, OpenSSL, or anything else over a connection itself,
 //! since [`Connection`] is an open trait.
 
-mod output;
+mod layer;
 mod provider;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
-use output::Output;
+pub use layer::{Hello, TlsLayer};
+
+use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, StreamCommand, StreamEvent};
+use std::collections::VecDeque;
 use std::future::poll_fn;
-use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rustls::ConnectionCommon;
 pub use rustls::ServerConfig;
-
-use rustls::server::{Acceptor, ServerConnection};
 
 use fictionet::Cx;
 use fictionet::stdlib::network::{ConnError, Connection};
@@ -116,84 +120,193 @@ pub fn alert_name(code: u8) -> &'static str {
 
 /// How much to read from the connection underneath in one read.
 const READ_CHUNK: usize = 16 * 1024;
-/// The most plaintext one `poll_write` encrypts.
-const WRITE_CHUNK: usize = 64 * 1024;
-
-/// The byte plumbing between rustls and the connection underneath.
+/// Socket readiness translated into the layer driver's owned inputs and outputs.
 struct Io<C> {
     conn: C,
-    /// Bytes read from `conn` that rustls has not taken yet.
-    inbuf: fictionet::stdlib::codec::Buffer,
-    output: Output,
-    /// `conn` said it will send nothing more.
+    driver: Driver<TlsLayer>,
+    input: Option<StreamEvent>,
+    plaintext: VecDeque<Chunk>,
+    ended: bool,
     eof: bool,
+    credited: u64,
+    pending_write: Option<Chunk>,
 }
 
 impl<C: Connection> Io<C> {
-    fn new(conn: C) -> Self {
-        Io {
+    fn new(fcx: &Cx, conn: C) -> Self {
+        Self {
             conn,
-            inbuf: fictionet::stdlib::codec::Buffer::new(READ_CHUNK),
-            output: Output::default(),
+            driver: Driver::new(
+                TlsLayer::new(),
+                Arc::new(fcx.clone()),
+                Budget::unlimited(),
+                fcx.now(),
+            ),
+            input: None,
+            plaintext: VecDeque::new(),
+            ended: false,
             eof: false,
+            credited: 0,
+            pending_write: None,
         }
     }
 
-    /// Hands all queued output to `conn`.
-    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        self.output.poll_flush(&mut self.conn, fcx, cx)
-    }
-
-    /// Reads more bytes from `conn` into `inbuf`, or sets `eof`.
-    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        let spare = self.inbuf.spare();
-        if spare.is_empty() {
-            std::alloc::handle_alloc_error(std::alloc::Layout::array::<u8>(READ_CHUNK).unwrap());
-        }
-        let result = self.conn.poll_read(fcx, cx, spare);
-        let n = match &result {
-            Poll::Ready(Ok(n)) => *n,
-            _ => 0,
-        };
-        self.inbuf.commit(n);
-        match result {
-            Poll::Ready(Ok(0)) => {
-                self.eof = true;
-                Poll::Ready(Ok(()))
+    fn collect(&mut self) {
+        self.driver.send_above(|event| {
+            match event {
+                StreamEvent::Data(bytes) => self.plaintext.push_back(bytes),
+                StreamEvent::Written(n) => self.credited += n,
+                StreamEvent::Ended | StreamEvent::Reset => self.ended = true,
             }
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+            Admit::Taken
+        });
     }
 
-    /// Feeds `inbuf` (or the end of input) to rustls and processes it. On a
-    /// TLS error, queues the alert rustls made and fails with what went
-    /// wrong.
-    fn feed(&mut self, tls: &mut ServerConnection) -> Result<(), HandshakeError> {
-        if self.inbuf.is_empty() {
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), HandshakeError>> {
+        self.driver.set_now(fcx.now());
+        for _ in 0..1024 {
+            self.driver.run()?;
+            let mut written = 0;
+            let mut error = None;
+            let mut blocked = false;
+            let conn = &mut self.conn;
+            let moved = self.driver.send_below(|command| match command {
+                StreamCommand::Write(mut bytes) => match conn.poll_write(fcx, cx, &bytes) {
+                    Poll::Ready(Ok(0)) => {
+                        error = Some(ConnError::Closed);
+                        Admit::Blocked(StreamCommand::Write(bytes))
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        written += n as u64;
+                        bytes.advance(n);
+                        if bytes.is_empty() {
+                            Admit::Taken
+                        } else {
+                            Admit::Partial(StreamCommand::Write(bytes))
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        Admit::Blocked(StreamCommand::Write(bytes))
+                    }
+                    Poll::Pending => {
+                        blocked = true;
+                        Admit::Blocked(StreamCommand::Write(bytes))
+                    }
+                },
+                StreamCommand::End | StreamCommand::Reset => match conn.poll_shutdown(fcx, cx) {
+                    Poll::Ready(Ok(())) => Admit::Taken,
+                    Poll::Ready(Err(e)) => {
+                        error = Some(e);
+                        Admit::Blocked(command)
+                    }
+                    Poll::Pending => {
+                        blocked = true;
+                        Admit::Blocked(command)
+                    }
+                },
+            });
+            if written != 0 {
+                match self.driver.deliver(StreamEvent::Written(written))? {
+                    Admit::Taken => {}
+                    _ => {
+                        return Poll::Ready(Err(HandshakeError::Failed(
+                            "TLS refused write completion".into(),
+                        )));
+                    }
+                }
+            }
+            self.collect();
+            if let Some(e) = error {
+                return Poll::Ready(Err(e.into()));
+            }
+            if blocked {
+                return Poll::Pending;
+            }
+            if !moved && !self.driver.holds_output() && !self.driver.layer().output_pending() {
+                return Poll::Ready(Ok(()));
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), HandshakeError>> {
+        self.driver.set_now(fcx.now());
+        if self.input.is_none() {
             if self.eof {
-                // Tells rustls the input ended.
-                let _ = tls.read_tls(&mut &[][..]);
+                return Poll::Ready(Ok(()));
             }
-        } else {
-            let n = tls
-                .read_tls(&mut self.inbuf.unread())
-                .map_err(|e| HandshakeError::Failed(e.to_string()))?;
-            if n == 0 {
-                return Err(HandshakeError::Failed("rustls took no bytes".into()));
-            }
-            self.inbuf.consume(n);
-        }
-        let result = tls.process_new_packets().map(|_| ());
-        if let Err(e) = result {
-            self.output.take_output(tls)?;
-            return Err(match e {
-                rustls::Error::AlertReceived(alert) => HandshakeError::Alert(u8::from(alert)),
-                e => HandshakeError::Failed(e.to_string()),
+            let charge = self
+                .driver
+                .budget()
+                .charge(READ_CHUNK)
+                .ok_or_else(|| HandshakeError::Failed("TLS input budget exhausted".into()))?;
+            let mut bytes = vec![0; READ_CHUNK];
+            let n = match self.conn.poll_read(fcx, cx, &mut bytes) {
+                Poll::Ready(result) => result?,
+                Poll::Pending => return Poll::Pending,
+            };
+            self.input = Some(if n == 0 {
+                self.eof = true;
+                StreamEvent::Ended
+            } else {
+                bytes.truncate(n);
+                StreamEvent::Data(Chunk::with_charge(bytes, charge))
             });
         }
-        Ok(())
+        let event = self.input.take().unwrap();
+        match self.driver.deliver(event)? {
+            Admit::Taken | Admit::Closed(_) => {}
+            Admit::Partial(rest) => self.input = Some(rest),
+            Admit::Blocked(rest) => {
+                self.input = Some(rest);
+                return Poll::Pending;
+            }
+        }
+        self.driver.run()?;
+        self.collect();
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_handshake(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        hello: bool,
+    ) -> Poll<Result<(), HandshakeError>> {
+        if fcx.is_cancelled() {
+            return Poll::Ready(Err(HandshakeError::Cancelled));
+        }
+        for _ in 0..1024 {
+            let flushed = self.poll_flush(fcx, cx);
+            if self.driver.layer().failure().is_some() {
+                if flushed.is_pending() {
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Err(self.driver.layer_mut().take_failure().unwrap()));
+            }
+            match flushed {
+                Poll::Ready(result) => result?,
+                Poll::Pending => return Poll::Pending,
+            }
+            if if hello {
+                self.driver.layer().hello().is_some()
+            } else {
+                !self.driver.layer().is_handshaking()
+            } {
+                return Poll::Ready(Ok(()));
+            }
+            if self.eof {
+                return Poll::Ready(Err(HandshakeError::Closed));
+            }
+            match self.poll_fill(fcx, cx) {
+                Poll::Ready(result) => result?,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -211,8 +324,8 @@ pub enum HandshakeError {
     /// The bytes were not TLS, or broke the protocol.
     Failed(String),
     /// There was no config for the name the client asked for, and the
-    /// handshake was refused with `unrecognized_name`. Only from
-    /// `accept_tls`.
+    /// handshake was refused with `unrecognized_name`. Returned by
+    /// [`TlsLayer`] and `accept_tls`.
     Rejected,
     /// The handshake did not finish by its deadline. Only from
     /// `accept_tls`.
@@ -304,113 +417,52 @@ pub async fn server_detailed<C: Connection>(
     fcx: &Cx,
     conn: C,
 ) -> Result<ClientHello<C>, HandshakeError> {
-    let mut io = Io::new(conn);
-    let mut acceptor = Acceptor::default();
-    let mut first_byte = None;
-    let mut alert = None;
-    let accepted = poll_fn(|cx| {
-        loop {
-            if !io.inbuf.is_empty() {
-                first_byte.get_or_insert(io.inbuf.unread()[0]);
-                let n = acceptor
-                    .read_tls(&mut io.inbuf.unread())
-                    .map_err(|e| HandshakeError::Failed(e.to_string()))?;
-                io.inbuf.consume(n);
-                match acceptor.accept() {
-                    Ok(Some(accepted)) => return Poll::Ready(Ok(accepted)),
-                    Ok(None) if n == 0 => {
-                        return Poll::Ready(Err(HandshakeError::Failed(
-                            "the hello is too large".into(),
-                        )));
-                    }
-                    Ok(None) => continue,
-                    // Send rustls' fatal alert for a malformed hello, but
-                    // send nothing for input that did not start as a TLS
-                    // handshake record (content type 22).
-                    Err((e, fatal)) => {
-                        if first_byte == Some(22) {
-                            alert = Some(fatal);
-                        }
-                        return Poll::Ready(Err(HandshakeError::Failed(e.to_string())));
-                    }
-                }
-            }
-            if io.eof {
-                return Poll::Ready(Err(HandshakeError::Closed));
-            }
-            match io.poll_fill(fcx, cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    })
-    .await;
-    if let Some(mut alert) = alert {
-        use fictionet::stdlib::network::ConnectionExt;
-        // Best effort: tell the client why, then close. The hello already
-        // failed, and that is the error returned.
-        let _ = alert.write_all(&mut io.output.bytes);
-        let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
-        let _ = io.conn.shutdown(fcx).await;
-    }
-    let accepted = accepted?;
-    let hello = accepted.client_hello();
-    let server_name = hello.server_name().map(str::to_owned);
-    let alpn = hello
-        .alpn()
-        .map(|protocols| protocols.map(<[u8]>::to_vec).collect())
-        .unwrap_or_default();
-    Ok(ClientHello {
-        conn: io.conn,
-        inbuf: io.inbuf,
-        accepted,
-        server_name,
-        alpn,
-    })
+    let mut io = Io::new(fcx, conn);
+    poll_fn(|cx| io.poll_handshake(fcx, cx, true)).await?;
+    Ok(ClientHello { io })
 }
 
 /// What the client asked for, before the server has answered.
 pub struct ClientHello<C> {
-    conn: C,
-    /// Bytes the client sent after its hello, not yet read by rustls.
-    inbuf: fictionet::stdlib::codec::Buffer,
-    accepted: rustls::server::Accepted,
-    server_name: Option<String>,
-    alpn: Vec<Vec<u8>>,
+    io: Io<C>,
 }
-
-/// The `unrecognized_name` alert (112) as a fatal alert record, unencrypted,
-/// as it is sent before the server's hello.
-const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 
 impl<C: Connection> ClientHello<C> {
     /// The name the client asked for (SNI), such as `api.stripe.com`. `None`
     /// if the client sent no name, for example when it connected to a bare
     /// IP address.
     pub fn server_name(&self) -> Option<&str> {
-        self.server_name.as_deref()
+        self.io.driver.layer().hello().and_then(Hello::server_name)
     }
 
     /// The application protocols the client offers (ALPN), such as `h2` and
     /// `http/1.1`, in the client's order of preference.
     pub fn alpn(&self) -> Vec<&[u8]> {
-        self.alpn.iter().map(Vec::as_slice).collect()
+        self.io
+            .driver
+            .layer()
+            .hello()
+            .map(Hello::alpn)
+            .unwrap_or_default()
     }
 
     /// The connection underneath, for example to see who connected.
     pub fn inner(&self) -> &C {
-        &self.conn
+        &self.io.conn
     }
 
     /// Refuses the name the client asked for: sends the `unrecognized_name`
     /// alert and closes the connection. Dropping the hello instead closes the
     /// connection with no alert.
-    pub async fn reject(self, fcx: &Cx) -> Result<(), ConnError> {
-        use fictionet::stdlib::network::ConnectionExt;
-        let mut conn = self.conn;
-        conn.write_all(fcx, &UNRECOGNIZED_NAME).await?;
-        conn.shutdown(fcx).await
+    pub async fn reject(mut self, fcx: &Cx) -> Result<(), ConnError> {
+        self.io
+            .driver
+            .complete(None)
+            .map_err(HandshakeError::into_conn)?;
+        match poll_fn(|cx| self.io.poll_flush(fcx, cx)).await {
+            Ok(()) | Err(HandshakeError::Rejected) => Ok(()),
+            Err(error) => Err(error.into_conn()),
+        }
     }
 
     /// Finishes the handshake with `config`.
@@ -435,61 +487,10 @@ impl<C: Connection> ClientHello<C> {
         fcx: &Cx,
         config: Arc<ServerConfig>,
     ) -> Result<TlsConnection<C>, HandshakeError> {
-        let mut io = Io {
-            conn: self.conn,
-            inbuf: self.inbuf,
-            output: Output::default(),
-            eof: false,
-        };
-        let mut tls = match self.accepted.into_connection(config) {
-            Ok(tls) => tls,
-            Err((e, mut alert)) => {
-                // Best effort: tell the client why, then close.
-                let _ = alert.write_all(&mut io.output.bytes);
-                let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
-                return Err(HandshakeError::Failed(e.to_string()));
-            }
-        };
-        let result = poll_fn(|cx| {
-            loop {
-                io.output.take_output(&mut tls)?;
-                match io.poll_flush(fcx, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-                    Poll::Pending => return Poll::Pending,
-                }
-                if !tls.is_handshaking() {
-                    return Poll::Ready(Ok(()));
-                }
-                if !io.inbuf.is_empty() {
-                    io.feed(&mut tls)?;
-                    continue;
-                }
-                if io.eof {
-                    return Poll::Ready(Err(HandshakeError::Closed));
-                }
-                match io.poll_fill(fcx, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        })
-        .await;
-        match result {
-            Ok(()) => Ok(TlsConnection {
-                io,
-                tls,
-                closing: false,
-            }),
-            Err(e) => {
-                // Send the alert rustls made, if there is one.
-                if !io.output.bytes.is_empty() {
-                    let _ = poll_fn(|cx| io.poll_flush(fcx, cx)).await;
-                }
-                Err(e)
-            }
-        }
+        let mut io = self.io;
+        io.driver.complete(Some(config))?;
+        poll_fn(|cx| io.poll_handshake(fcx, cx, false)).await?;
+        Ok(TlsConnection { io, closing: false })
     }
 }
 
@@ -501,7 +502,6 @@ impl<C: Connection> ClientHello<C> {
 /// only when the connection has no room for it.
 pub struct TlsConnection<C> {
     io: Io<C>,
-    tls: ServerConnection,
     /// `close_notify` is queued.
     closing: bool,
 }
@@ -514,7 +514,7 @@ impl<C: Connection> TlsConnection<C> {
 
     /// The application protocol both sides agreed on (ALPN), if any.
     pub fn alpn(&self) -> Option<&[u8]> {
-        self.tls.alpn_protocol()
+        self.io.driver.layer().alpn()
     }
 }
 
@@ -525,64 +525,46 @@ impl<C: Connection> Connection for TlsConnection<C> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ConnError>> {
-        // A cancel comes first, before plaintext already decrypted.
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        loop {
-            match self.tls.reader().read(buf) {
-                // Ok(0) is the client's close_notify.
-                Ok(n) => return Poll::Ready(Ok(n)),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                // The client closed the connection without close_notify.
-                // A server reads that as the end of input, like most do.
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(0)),
-                Err(_) => return Poll::Ready(Err(ConnError::Broken)),
+        for _ in 0..1024 {
+            self.io.collect();
+            if let Some(bytes) = self.io.plaintext.front_mut() {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                bytes.advance(n);
+                if bytes.is_empty() {
+                    self.io.plaintext.pop_front();
+                }
+                return Poll::Ready(Ok(n));
             }
-            if !self.io.inbuf.is_empty() || self.io.eof {
-                let eof_seen = self.io.inbuf.is_empty();
-                let fed = self.io.feed(&mut self.tls);
-                // rustls may have something to send: a key update, a ticket
-                // or an alert. Only a lack of room defers it to the next read
-                // or write; a transport failure must reach this reader.
-                let flushed = self
-                    .io
-                    .output
-                    .take_output(&mut self.tls)
-                    .and_then(|()| self.io.output.flush_for_read(&mut self.io.conn, fcx, cx));
-                if fed.is_err() {
-                    return Poll::Ready(Err(ConnError::Broken));
-                }
-                flushed?;
-                if eof_seen {
-                    // The end of input was fed; the reader now says how it
-                    // ended. Never loop on it twice.
-                    return match self.tls.reader().read(buf) {
-                        Ok(n) => Poll::Ready(Ok(n)),
-                        Err(e)
-                            if e.kind() == ErrorKind::WouldBlock
-                                || e.kind() == ErrorKind::UnexpectedEof =>
-                        {
-                            Poll::Ready(Ok(0))
-                        }
-                        Err(_) => Poll::Ready(Err(ConnError::Broken)),
-                    };
-                }
+            if self.io.ended {
+                return Poll::Ready(Ok(0));
+            }
+            let filled = self.io.poll_fill(fcx, cx);
+            let flushed = self.io.poll_flush(fcx, cx);
+            if self.io.driver.layer().failure().is_some() {
+                return Poll::Ready(Err(ConnError::Broken));
+            }
+            if let Poll::Ready(Err(e)) = flushed {
+                return Poll::Ready(Err(e.into_conn()));
+            }
+            if !self.io.plaintext.is_empty() || self.io.ended {
                 continue;
             }
-            match self.io.poll_fill(fcx, cx) {
+            match filled {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    // Output queued by an earlier read still goes out.
-                    self.io.output.flush_for_read(&mut self.io.conn, fcx, cx)?;
-                    return Poll::Pending;
-                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into_conn())),
+                Poll::Pending if self.io.input.is_some() && flushed.is_ready() => continue,
+                Poll::Pending => return Poll::Pending,
             }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     fn poll_write(
@@ -591,44 +573,88 @@ impl<C: Connection> Connection for TlsConnection<C> {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
-        match self.io.output.poll_credit(&mut self.io.conn, fcx, cx, data) {
-            Poll::Ready(Ok(Some(n))) => return Poll::Ready(Ok(n)),
-            Poll::Ready(Ok(None)) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+        if fcx.is_cancelled() {
+            return Poll::Ready(Err(ConnError::Cancelled));
+        }
+        match self.io.poll_flush(fcx, cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into_conn())),
             Poll::Pending => return Poll::Pending,
+        }
+        if let Some(previous) = self.io.pending_write.take() {
+            if self.io.credited < previous.len() as u64 {
+                self.io.pending_write = Some(previous);
+                return Poll::Pending;
+            }
+            self.io.credited -= previous.len() as u64;
+            if data.starts_with(&previous) {
+                return Poll::Ready(Ok(previous.len()));
+            }
         }
         if self.closing {
             return Poll::Ready(Err(ConnError::Closed));
         }
-        match self.io.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => {}
-            other => return other.map(|r| r.map(|()| 0)),
-        }
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let chunk = &data[..data.len().min(WRITE_CHUNK)];
-        let n = match self.tls.writer().write(chunk) {
-            Ok(0) | Err(_) => return Poll::Ready(Err(ConnError::Closed)),
-            Ok(n) => n,
+        let n = data.len().min(16 * 1024);
+        let budget = self.io.driver.budget();
+        let charge = budget.charge(n).ok_or(ConnError::Broken)?;
+        let retry_charge = budget.charge(n).ok_or(ConnError::Broken)?;
+        let command = StreamCommand::Write(Chunk::with_charge(data[..n].to_vec(), charge));
+        let accepted = match self
+            .io
+            .driver
+            .command(command)
+            .map_err(HandshakeError::into_conn)?
+        {
+            Admit::Taken => n,
+            Admit::Partial(StreamCommand::Write(rest)) => n - rest.len(),
+            Admit::Closed(_) => return Poll::Ready(Err(ConnError::Closed)),
+            Admit::Blocked(_) => return Poll::Pending,
+            _ => return Poll::Ready(Err(ConnError::Broken)),
         };
-        self.io.output.take_output(&mut self.tls)?;
-        self.io
-            .output
-            .poll_written(&mut self.io.conn, fcx, cx, &chunk[..n])
+        // A retry is matched by content because Connection's borrowed write
+        // interface has no identity that survives dropping its future.
+        let n = accepted;
+        self.io.pending_write = Some(Chunk::with_charge(data[..n].to_vec(), retry_charge));
+        match self.io.poll_flush(fcx, cx) {
+            Poll::Ready(Ok(())) => {
+                if self.io.credited < n as u64 {
+                    return Poll::Pending;
+                }
+                self.io.credited -= n as u64;
+                self.io.pending_write = None;
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into_conn())),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
-    /// Sends `close_notify`, then shuts down the connection underneath.
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        if !self.closing {
-            self.closing = true;
-            self.tls.send_close_notify();
-            self.io.output.take_output(&mut self.tls)?;
+        if fcx.is_cancelled() {
+            return Poll::Ready(Err(ConnError::Cancelled));
         }
         match self.io.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => self.io.conn.poll_shutdown(fcx, cx),
-            other => other,
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into_conn())),
+            Poll::Pending => return Poll::Pending,
         }
+        if !self.closing {
+            match self
+                .io
+                .driver
+                .command(StreamCommand::End)
+                .map_err(HandshakeError::into_conn)?
+            {
+                Admit::Taken | Admit::Closed(_) => self.closing = true,
+                _ => return Poll::Pending,
+            }
+        }
+        self.io
+            .poll_flush(fcx, cx)
+            .map(|r| r.map_err(HandshakeError::into_conn))
     }
 
     fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
