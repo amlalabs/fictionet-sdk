@@ -3,7 +3,7 @@
 This pass covers the serving driver in `src/stdlib/services/serve.rs`
 (serving state, cancellation on drop, wake handles, handoffs), the
 `Connection` contract in `src/stdlib/network/connection.rs`, and one TCP
-connection's life in `src/stdlib/network/tcp.rs` (close, orphan, half-close,
+connection's life in `src/stdlib/network/tcp/engine.rs` (close, orphan, half-close,
 reset, unread data). The models are under `verification/lifecycle/`, with the
 commands to run them in its [README](README.md).
 
@@ -131,15 +131,21 @@ can go out), unread and unacknowledged bytes as booleans, the `Conn` flags
 `conns`, `orphans` and `time_wait`, what `hold_until_gone` keeps, the
 FIN-WAIT-2 orphan timer, and `stopped`.
 
+The connection's state now lives in `TcpLayer`
+(`src/stdlib/network/tcp/engine.rs`), and the handles in `tcp.rs` reach it
+only through the layer's commands and events. The model's actions map onto
+both:
+
 | Model | Rust |
 | --- | --- |
-| `Read`, `Write`, `Shutdown`, `Drop`, `ResetHandle`, `WatchReset`, `Hold` | `TcpConnection::poll_read`, `poll_write`, `poll_shutdown`, `Drop`, `reset`; `GoneWatch::reset`, `hold_until_gone` |
-| `Orphan`, `AbortSocket`, `CloseIfDrained`, `Remove` | `State::orphan`, `abort`, `close_if_drained`, `remove_conn` |
-| `PeerData`, `PeerAck`, `PeerFin`, `PeerRst` | `State::ingress` after smoltcp's `process`: the flags it sets, `held.clear()` and the wake on a RST, `close_if_drained` after every segment |
+| `Read`, `Write`, `Shutdown` | `TcpConnection::poll_read` (credit for the child, then its data), `poll_write` (a write within the send buffer's credit), `poll_shutdown` (the child's `End`) |
+| `Drop`, `ResetHandle`, `WatchReset`, `Hold` | `TcpConnection`'s `Drop` (`TcpControl::Abort` first if bytes that came up are unread, then closing the child), `reset` (`Abort`, then the drop); `GoneWatch::reset` (`Abort`) and `hold_until_gone` (`TcpControl::Hold`) |
+| `Orphan`, `AbortSocket`, `CloseIfDrained`, `Remove` | `TcpLayer::orphan` (closing a child), `abort`, `close_if_drained`, `remove_conn` |
+| `PeerData`, `PeerAck`, `PeerFin`, `PeerRst` | `TcpLayer::ingress` after smoltcp's `process`: the flags it sets, `held.clear()` and `TcpNotice::Gone` on a RST, `close_if_drained` after every segment |
 | `Timeout`, `Egress`, `TimeWaitExpires` | smoltcp's timeout (an abort), the RST going out, TIME-WAIT's expiry |
-| `Housekeeping`, `ExpireOrphans`, `GivesUpDue`, `EvictTimeWait` | the orphan loop and TIME-WAIT cap of `State::housekeeping`; `State::expire_orphans` and `gives_up` |
-| `Stop` | `Shared::stop` |
-| `Gone` | `poll_gone` ready: stopped, removed, `rst`, or `retired` |
+| `Housekeeping`, `ExpireOrphans`, `GivesUpDue`, `EvictTimeWait` | the orphan loop and TIME-WAIT cap of `TcpLayer::housekeeping`; `TcpLayer::expire_orphans` and `gives_up` |
+| `Stop` | `Shared::stop`, which stops the layer (`TcpLayer::stop`) |
+| `Gone` | `poll_gone` ready: stopped, removed, `rst`, or `retired`, as `TcpLayer::gone` reads it; `TcpNotice::Gone` wakes the watches |
 
 What is checked:
 
