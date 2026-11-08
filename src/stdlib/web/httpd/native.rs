@@ -143,7 +143,6 @@ pub struct Http1 {
     stream: Stream<http1::RequestEvents>,
     /// Bytes past the end of HTTP, kept for what comes next.
     after: Vec<u8>,
-    charge: Option<Charge>,
     phase: Phase,
     timers: Timers<Timer>,
     head: Option<RequestHead>,
@@ -164,6 +163,7 @@ pub struct Http1 {
     next: Option<Next>,
     /// What the successor gets, once HTTP is over.
     leftover: Vec<StreamEvent>,
+    charge: Option<Charge>,
 }
 
 impl Http1 {
@@ -766,12 +766,12 @@ struct Responding {
     /// Why the connection closes after it, if it does.
     then: Closing,
     chunked: bool,
-    body_charge: Option<Charge>,
     stage: Stage,
     /// Body bytes not yet written, covered by `body_charge` until the last piece.
     rest: Bytes,
     /// Where the response starts among the bytes queued.
     base: u64,
+    body_charge: Option<Charge>,
 }
 
 enum Stage {
