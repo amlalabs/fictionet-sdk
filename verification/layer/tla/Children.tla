@@ -45,6 +45,7 @@ CONSTANTS NS,          \* the mux's slots
           CheckWorkOwnership, CheckUrgent, CheckJobLimit, JobLimit,
           Readiness,    \* retained buffers and completion traffic
           MayFail,     \* children's layers may fail
+          BudgetRefuses, \* the budget may refuse a child's place or inbox
           Control,     \* the layer above sends control commands
           CheckOverrun, CheckCommandCredit, ReserveForControl,
           MuxChecksGeneration, KeyByWholeId
@@ -88,15 +89,17 @@ Init == /\ mlive = [s \in Slots |-> FALSE]
 (* The mux: events up to Children.                                         *)
 
 \* The mux opens a child in a free slot (Slots::insert) and hands up its
-\* handle; Children makes its layer, or closes it at once at the limit.
+\* handle; Children makes its layer, or closes it at once at the limit or
+\* when the budget cannot hold its place (Children::make_room).
 Opened(s) ==
   LET id == <<s, mgen[s]>> IN
   /\ ~overrun /\ ~mlive[s] /\ mgen[s] <= G
   /\ mlive' = [mlive EXCEPT ![s] = TRUE]
   /\ mEv' = [mEv EXCEPT ![s] = 0] /\ mCmd' = [mCmd EXCEPT ![s] = 0]
-  /\ IF Cardinality(Live(kids)) >= Limit
-       THEN down' = Append(down, Cmd("Close", id, 0)) /\ UNCHANGED kids
-       ELSE kids' = [kids EXCEPT ![id] = Fresh] /\ UNCHANGED down
+  /\ \E refused \in (IF BudgetRefuses THEN BOOLEAN ELSE {FALSE}) :
+       IF Cardinality(Live(kids)) >= Limit \/ refused
+         THEN down' = Append(down, Cmd("Close", id, 0)) /\ UNCHANGED kids
+         ELSE kids' = [kids EXCEPT ![id] = Fresh] /\ UNCHANGED down
   /\ UNCHANGED <<mgen, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
 
 \* The mux sends a child an event of one credit unit.
@@ -107,13 +110,19 @@ MuxSend(s) ==
   /\ (~Readiness \/ kid.inbox + kid.empty < Q)
   /\ mEv' = [mEv EXCEPT ![s] = Max0(mEv[s] - 1)]
   /\ IF ~kid.live
-       THEN UNCHANGED <<kids, overrun, jobs, polledClosed>>   \* a child already gone
+       THEN UNCHANGED <<kids, down, overrun, jobs, polledClosed>>   \* a child already gone
      ELSE IF kid.granted < 1 /\ CheckOverrun
-       THEN overrun' = TRUE /\ UNCHANGED kids
-     ELSE /\ kids' = [kids EXCEPT ![id].granted = Max0(kid.granted - 1),
-                                  ![id].inbox = kid.inbox + 1]
-          /\ UNCHANGED overrun
-  /\ UNCHANGED <<mlive, mgen, mCmd, down, turn, ctrlPending, misdelivered, overspent, jobs, polledClosed>>
+       THEN overrun' = TRUE /\ UNCHANGED <<kids, down>>
+     ELSE \/ /\ kids' = [kids EXCEPT ![id].granted = Max0(kid.granted - 1),
+                                     ![id].inbox = kid.inbox + 1]
+             /\ UNCHANGED <<overrun, down>>
+          \* The budget cannot hold the inbox's growth: the child is
+          \* refused and closed, and its siblings go on.
+          \/ /\ BudgetRefuses
+             /\ kids' = [kids EXCEPT ![id] = Dead]
+             /\ down' = Append(down, Cmd("Close", id, 0))
+             /\ UNCHANGED overrun
+  /\ UNCHANGED <<mlive, mgen, mCmd, turn, ctrlPending, misdelivered, overspent, jobs, polledClosed>>
 
 \* The mux lets a child send one more credit unit, within its window.
 MuxCredit(s) ==

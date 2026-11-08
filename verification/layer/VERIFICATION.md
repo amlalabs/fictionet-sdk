@@ -208,6 +208,47 @@ The two original long-running mutation/liveness scenarios retain their
 original fairness and assertions. No test or property was weakened to
 turn the formerly failing large-command scenario into a success.
 
+### Results after storage is charged as children open
+
+`Children` no longer reserves every child place, closing slot and inbox up
+to its limit before the first child. Its queues are charged from its first
+step; child places grow geometrically up to the limit, charged before they
+grow, and go once no child is left (`make_room`, `release_places`); each
+inbox grows on demand up to its bound, charged before it grows. A child
+whose place or inbox growth the budget refuses is closed and reported
+`Refused`, as one past the limit is, instead of failing the connection.
+The model gains `BudgetRefuses`: `Opened` may refuse a child below the
+limit, and `MuxSend` may close a live child instead of queuing its event.
+Every existing configuration sets it false and keeps its behavior; two new
+configurations set it true. Rerun with the same JDK, memory cap and state
+directories:
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Children_base.cfg` | 13,067,962 | 1,857,160 | all safety properties pass |
+| `Children_budget.cfg` | 13,657,794 | 1,857,160 | all safety properties pass |
+| `Children_budget_stalled.cfg` | 1,713,569 | 219,760 | safety and control progress pass |
+| `Children_refuse_base.cfg` | 16,775,230 | 2,645,648 | all safety properties pass |
+| `Children_stalled_base.cfg` | 1,639,585 | 219,760 | safety and control progress pass |
+| `Children_commands_base.cfg` | 2,082 | 504 | command credit and delivery pass |
+| `Children_large_command.cfg` | 760 | 191 | command credit and delivery pass |
+| `Children_readiness.cfg` | 71,116 | 10,066 | readiness invariants and progress pass |
+| `Children_without_checkoverrun.cfg` | 36 | 28 | expected `EventCredit` violation |
+| `Children_without_checkcommandcredit.cfg` | 36 | 28 | expected `CommandCredit` violation |
+| `Children_without_reserveforcontrol.cfg` | 875,147 | 153,455 | expected `ControlProgress` violation |
+| `Children_without_muxchecksgeneration.cfg` | 2,336 | 1,011 | expected `NoStaleDelivery` violation |
+| `Children_without_keybywholeid.cfg` | 1,121 | 548 | expected `NoStaleDelivery` violation |
+| `Children_without_urgent.cfg` | 8,250 | 1,972 | expected `CompletionProgress` violation |
+| `Children_without_workownership.cfg` | 225 | 97 | expected `NoCancelledPoll` violation |
+| `Children_without_joblimit.cfg` | 753 | 254 | expected `BoundedJobs` violation |
+
+The model does not count bytes, so it does not show that the charges match
+the allocations; the Rust test
+`a_child_the_budget_cannot_hold_is_refused_and_its_siblings_go_on` checks a
+refused child, its sibling going on, and the router's charge returning to
+its idle value once no child is left. The Kani harnesses cover `Slots`,
+`Charge`, `Timers`, `Chunk` and `WorkOwner`, none of which changed.
+
 ### Scope and limitations
 
 The model covers partial stream output; atomic-message rejection above the
