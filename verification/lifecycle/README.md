@@ -2,7 +2,8 @@
 
 The TLA+ models of the serving state machine (`tla/Core.tla`, for
 `src/stdlib/services/serve.rs`) and of one TCP connection's life
-(`tla/Conn.tla`, for `src/stdlib/network/tcp.rs`), and the Kani proofs over
+(`tla/Conn.tla`, for `src/stdlib/network/tcp/engine.rs` and the handles in
+`tcp.rs`), and the Kani proofs over
 the pure parts of `serve` (`kani/ServeProof.rs`). What each models, what it
 leaves out, and what it found is in [VERIFICATION.md](../../VERIFICATION.md)
 at the root of the repository.

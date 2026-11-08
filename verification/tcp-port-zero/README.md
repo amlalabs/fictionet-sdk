@@ -60,9 +60,12 @@ completed, and leave `accepts` and `process` as modeled.
 ## Binding and host preparation
 
 [Binding.tla](Binding.tla) checks two separate
-state spaces. Allocation models `Endpoint::listen`, the cyclic allocator in
-`Endpoint::connect`, `take_port`, `free_port`, `remove_conn`, and listener
-drop in [network TCP](../../src/stdlib/network/tcp.rs). The model checks reservation
+state spaces. Allocation models what the TCP layer in
+[`tcp/engine.rs`](../../src/stdlib/network/tcp/engine.rs) does for
+`TcpControl::Listen`, the cyclic allocator of its `connect` (for
+`TcpControl::Connect`), `take_port`, `free_port`, `remove_conn`, and
+`TcpControl::Unlisten`. `Endpoint::listen`, `Endpoint::connect` and a
+listener's drop send those commands. The model checks reservation
 conservation, exclusion between listeners and outgoing connections, ephemeral
 source selection, availability, and preservation of the requested destination.
 Connection removal represents actual resource release, not handle drop.
