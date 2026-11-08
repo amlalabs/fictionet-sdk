@@ -1,6 +1,8 @@
 //! Bounded proofs call the production channel window operations. All u32
 //! windows and usize packet lengths are symbolic; there is no small-window
 //! assumption. Buffer admission is proved independently of allocation.
+//! Source: src/stdlib/services/ssh.rs:357-383 (buffer admission),
+//! :680-708 (receive and send debits), :1235-1251 and :1754-1763 (callers).
 use super::*;
 
 fn channel() -> Channel {
@@ -115,4 +117,23 @@ fn ssh_output_without_count() {
         let broken = next - n;
         assert_eq!(broken - out.bytes, n);
     }
+}
+
+#[kani::proof]
+fn ssh_output_without_limit() {
+    let current: usize = kani::any();
+    kani::assume(current <= OUTPUT_LIMIT);
+    let n: usize = kani::any();
+    // Remove the length gate before the production addition.
+    let next = current.wrapping_add(n);
+    assert!(next <= OUTPUT_LIMIT && next as u128 == current as u128 + n as u128);
+}
+
+#[kani::proof]
+fn ssh_output_without_exit() {
+    let mut out = std::mem::ManuallyDrop::new(Output::default());
+    out.exited = true;
+    // Mutate away the closed-output gate, even for an empty write.
+    out.exited = false;
+    assert!(out.next_bytes(0).is_err());
 }
