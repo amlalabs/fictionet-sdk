@@ -1,6 +1,6 @@
 use super::{Decoded, KeyLine, Observed, Place, Present};
-use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::layer::Termination;
+use fictionet::stdlib::network::Transport;
 use std::sync::Arc;
 
 /// Inputs to a protocol matcher. Ports are in conversation order.

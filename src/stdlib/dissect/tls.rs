@@ -1,10 +1,10 @@
 use fictionet::stdlib::codec::{be16, be24};
-use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::dissect::{
     Conversation, Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol,
     Registry, protocols,
 };
 use fictionet::stdlib::layer::Termination;
+use fictionet::stdlib::network::Transport;
 use rustls::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter};
 use rustls::crypto::tls13::OkmBlock;
 use rustls::internal::{derive_next_traffic_secret, derive_traffic_iv, derive_traffic_key};

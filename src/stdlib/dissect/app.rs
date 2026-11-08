@@ -356,8 +356,8 @@ mod tests {
 
     #[test]
     fn capture_registrations_keep_inventory_and_matching_precedence() {
-        use fictionet::stdlib::dissect::Transport::{Tcp, Udp};
         use fictionet::stdlib::dissect::{Match, Registry, Selection};
+        use fictionet::stdlib::network::Transport::{Tcp, Udp};
 
         let mut registered = Registry::new();
         fictionet::stdlib::dissect::protocols::Http1::register(&mut registered);

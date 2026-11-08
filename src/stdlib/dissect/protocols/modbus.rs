@@ -1,9 +1,9 @@
 use super::Display;
 use fictionet::stdlib::codec::{Decode, Fail, Frames, Step};
-use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::dissect::{
     Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol, Registry,
 };
+use fictionet::stdlib::network::Transport;
 
 /// Modbus/TCP capture frames. Framing is provided by the stdlib decoder.
 pub struct Modbus {

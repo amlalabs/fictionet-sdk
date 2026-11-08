@@ -9,19 +9,10 @@
 mod app;
 #[cfg(test)]
 mod capture_tests;
-mod json;
-
-/// The byte transport supplied to a dissector.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Transport {
-    /// An ordered byte stream.
-    Tcp,
-    /// One datagram at a time.
-    Udp,
-}
 mod conversation;
 /// Copyable HTTP/2 and gRPC presentation.
 pub mod http2;
+mod json;
 mod present;
 /// Copyable capture decoders and presenters for the built-in protocols.
 pub mod protocols;
@@ -1108,7 +1099,7 @@ impl Dissector {
             conversation.protocol = self
                 .registry
                 .open(Selection {
-                    transport: fictionet::stdlib::dissect::Transport::Udp,
+                    transport: fictionet::stdlib::network::Transport::Udp,
                     ports: conversation.ports,
                     protocol: context.protocol,
                     alpn: None,
@@ -2025,7 +2016,7 @@ mod tests {
         registry.register_protocol(
             "count",
             |s| {
-                if s.transport == Transport::Udp {
+                if s.transport == fictionet::stdlib::network::Transport::Udp {
                     Match::Yes
                 } else {
                     Match::No

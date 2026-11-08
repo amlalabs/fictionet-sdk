@@ -345,10 +345,10 @@ mod tests {
 
     #[test]
     fn presenters_plug_into_observe_and_construct_display_items() {
-        use fictionet::stdlib::dissect::Transport;
         use fictionet::stdlib::dissect::{
             Decoded, Layer, Match, Observed, Place, Present, Registry, Selection,
         };
+        use fictionet::stdlib::network::Transport;
         let mut registry = Registry::new();
         registry.register(
             "modbus",

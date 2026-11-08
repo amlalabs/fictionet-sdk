@@ -1,6 +1,6 @@
-use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::dissect::{Decoded, KeyLine, Match, Place, Protocol, Registry, Selection};
 use fictionet::stdlib::layer::Termination;
+use fictionet::stdlib::network::Transport;
 
 /// Selects and drives one ordered byte conversation in both directions.
 /// Direction zero sends from the first port to the second. TCP callers use

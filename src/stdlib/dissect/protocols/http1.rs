@@ -1,7 +1,7 @@
 use super::{Display, MAX_BUFFER};
 use fictionet::stdlib::codec::{Decode, Step};
-use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::dissect::{Decoded, Layer, Match, Placement, Present, Registry};
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::http1;
 use fictionet::sync::Mutex;
 use std::collections::VecDeque;

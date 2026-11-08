@@ -10,7 +10,7 @@ use fictionet::stdlib::codec::{Decode, Fail, Spans, Stream};
 /// The stream retains a terminal error while reporting it once to the caller.
 ///
 /// ```
-/// use fictionet::stdlib::dissect::Transport;
+/// use fictionet::stdlib::network::Transport;
 /// use fictionet::stdlib::dissect::{Layer, Present, Registry, Selection, Match};
 /// use fictionet::stdlib::codec::{Decode, Step};
 /// use std::convert::Infallible;

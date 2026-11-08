@@ -8,10 +8,10 @@
 //! replace the built-in, registered the same way.
 
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire, be32};
-use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::dissect::{
     Decoded, Layer, Match, Placement, Present, Registry, SummaryPriority,
 };
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::http2::{
     Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderPayload, MAX_WINDOW, PREFACE, Setting,
 };
