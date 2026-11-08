@@ -1,6 +1,11 @@
-//! The Modbus/TCP server for one controller, as a [`serve::Service`].
+//! The Modbus/TCP server for one controller, as a
+//! [layer](fictionet::stdlib::layer).
 //!
-//! [`PlcService`] answers the controller's register map from [`registers`].
+//! [`PlcServer`] reads whole frames: [`stack`] puts it on
+//! [`Framed`], which turns the connection's bytes into frames and its
+//! replies back into bytes.
+//!
+//! [`PlcServer`] answers the controller's register map from [`registers`].
 //! Reads take their values from a snapshot of the shared plant. Writes decode
 //! to plant commands. An accepted write echoes the request, and a rejected one
 //! answers with the exception that its reason maps to.
@@ -26,9 +31,12 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use fictionet::stdlib::codec::{Frames, Wire};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::layer::{
+    Admit, Chain, Decoded, Env, Framed, Framing, Layer, MessageCommand, MessageEvent, Top,
+};
 use fictionet::stdlib::protocols::modbus::{Exception, Frame, Request, Response};
-use fictionet::stdlib::services::serve::{self, Flow};
+use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::sync::Mutex;
 
 use crate::Plant;
@@ -39,37 +47,104 @@ use crate::registers::{self, Plc};
 /// One plant, shared by the connections of every controller.
 pub type Shared = Arc<Mutex<Plant>>;
 
-/// The Modbus/TCP server for one controller.
-pub struct PlcService {
-    /// Receives accepted changes from this controller.
-    pub facts: facts::Observer,
-    /// The controller whose register map this connection serves.
-    pub plc: Plc,
+/// One controller's connection: Modbus/TCP frames over the byte stream,
+/// and the controller on top.
+pub type Stack = Chain<Framed<Frames<Frame>, Frame>, PlcServer>;
+
+/// The stack for one connection to `plc`, described by `conn`, serving the
+/// shared `plant` and sending the facts its writes make to `facts`.
+pub fn stack(plc: Plc, plant: Shared, facts: facts::Observer, conn: &ConnInfo) -> Stack {
+    let source = facts::source_of(conn);
+    Chain::new(
+        Framed::new(Frames::new()),
+        PlcServer::new(plc, plant, facts, source),
+    )
 }
 
-impl serve::Service for PlcService {
-    type Decoder = Frames<Frame>;
-    type State = Shared;
-    type Error = Infallible;
-    type Timer = ();
+/// The Modbus/TCP server for one controller, on one connection. It answers
+/// each frame with one frame, in order, and ends its side of the
+/// connection once the client's frames are over.
+pub struct PlcServer {
+    plc: Plc,
+    plant: Shared,
+    facts: facts::Observer,
+    source: Source,
+    /// The answer the frame layer has not taken yet.
+    reply: Option<Frame>,
+    /// The client's frames are over.
+    over: bool,
+    end_sent: bool,
+}
 
-    fn decoder(&self) -> Self::Decoder {
-        Frames::new()
+impl PlcServer {
+    /// Serves `plc`'s register map from `plant` to a client whose writes
+    /// come from `source`, sending the facts they make to `facts`.
+    pub fn new(plc: Plc, plant: Shared, facts: facts::Observer, source: Source) -> PlcServer {
+        PlcServer {
+            plc,
+            plant,
+            facts,
+            source,
+            reply: None,
+            over: false,
+            end_sent: false,
+        }
+    }
+}
+
+impl Layer for PlcServer {
+    type Lower = Framing<Frames<Frame>, Frame>;
+    type Upper = Top;
+    type Report = Infallible;
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn on_event(
+        &mut self,
+        _env: &mut Env<'_, Infallible>,
+        event: MessageEvent<Decoded<Frames<Frame>>>,
+    ) -> Result<Admit<MessageEvent<Decoded<Frames<Frame>>>>, Infallible> {
+        if self.over {
+            return Ok(Admit::Closed(event));
+        }
+        match event {
+            MessageEvent::Message(Ok(frame)) => {
+                if self.reply.is_some() {
+                    return Ok(Admit::Blocked(MessageEvent::Message(Ok(frame))));
+                }
+                let pdu = self.answer(&frame, &self.plant, self.source, &self.facts);
+                self.reply = Some(frame.reply(pdu));
+            }
+            // After a framing error no reader can find the next frame, and
+            // a real server closes the connection.
+            MessageEvent::Message(Err(_)) | MessageEvent::Ended => self.over = true,
+        }
+        Ok(Admit::Taken)
     }
 
-    fn on_item(
+    fn on_command(
         &mut self,
-        frame: Frame,
-        state: &Shared,
-        driver: &mut serve::Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
-        let source = facts::source_of(driver.conn());
-        let pdu = self.answer(&frame, state, source, &self.facts);
-        frame
-            .reply(pdu)
-            .write(driver.reply())
-            .expect("a reply PDU is never empty and never longer than one Modbus PDU");
-        Ok(Flow::Continue)
+        _env: &mut Env<'_, Infallible>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn take_command(&mut self) -> Option<MessageCommand<Frame>> {
+        if let Some(reply) = self.reply.take() {
+            return Some(MessageCommand::Send(reply));
+        }
+        if self.over && !self.end_sent {
+            self.end_sent = true;
+            return Some(MessageCommand::End);
+        }
+        None
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
     }
 }
 
@@ -106,7 +181,7 @@ fn device_identification(data: &[u8]) -> Vec<u8> {
     reply
 }
 
-impl PlcService {
+impl PlcServer {
     /// The reply PDU for one request frame. `source` names the sender of any
     /// write, and `sink` receives the facts the write makes.
     fn answer(&self, frame: &Frame, plant: &Shared, source: Source, sink: &impl Sink) -> Vec<u8> {
@@ -332,8 +407,8 @@ mod tests {
     use crate::faults::{Fault, FaultChange, SensorFault};
     use crate::protection::TripCause;
     use crate::sensors::Sensor;
-    use fictionet::stdlib::services::serve::ConnInfo;
-    use fictionet::stdlib::services::serve::Harness;
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::layer::Harness;
     use std::error::Error;
 
     const TRANSACTION: u16 = 7;
@@ -342,15 +417,15 @@ mod tests {
         Arc::new(Mutex::new(Plant::new(Config::default())))
     }
 
-    fn harness(plc: Plc, plant: &Shared) -> serve::Harness<PlcService> {
-        serve::Harness::new(
-            fictionet::Seed::from_u64(0),
-            PlcService {
-                plc,
-                facts: facts::Observer::default(),
-            },
+    /// A harness whose connection says nothing of where it is from.
+    fn harness(plc: Plc, plant: &Shared) -> Harness<Stack> {
+        let stack = stack(
+            plc,
             plant.clone(),
-        )
+            facts::Observer::default(),
+            &ConnInfo::default(),
+        );
+        Harness::new(fictionet::Seed::from_u64(0), stack)
     }
 
     /// A connection from `peer`, as the event log sees it.
@@ -363,23 +438,13 @@ mod tests {
     }
 
     /// A harness whose connection comes from `peer`, with its facts kept in `memory`.
-    fn observed(plc: Plc, plant: &Shared, peer: &str, memory: &Arc<Memory>) -> Harness<PlcService> {
-        serve::Harness::new(
-            fictionet::Seed::from_u64(0),
-            PlcService {
-                plc,
-                facts: observer(memory),
-            },
-            plant.clone(),
-        )
-        .with_conn(from(peer))
+    fn observed(plc: Plc, plant: &Shared, peer: &str, memory: &Arc<Memory>) -> Harness<Stack> {
+        let stack = stack(plc, plant.clone(), observer(memory), &from(peer));
+        Harness::new(fictionet::Seed::from_u64(0), stack)
     }
 
     /// Sends one request frame through the harness and reads back the reply.
-    fn exchange(
-        h: &mut serve::Harness<PlcService>,
-        request: &Request,
-    ) -> Result<Response, Box<dyn Error>> {
+    fn exchange(h: &mut Harness<Stack>, request: &Request) -> Result<Response, Box<dyn Error>> {
         let pdu = request.to_pdu()?;
         let bytes = Frame {
             transaction: TRANSACTION,
@@ -387,7 +452,8 @@ mod tests {
             pdu,
         }
         .to_bytes()?;
-        let reply = h.push(&bytes)?;
+        h.push(&bytes)?;
+        let reply = h.take_output();
         let (frame, used) = Frame::parse_prefix(&reply)?.ok_or("the reply is not a whole frame")?;
         assert_eq!(used, reply.len(), "one request, one reply");
         assert_eq!(frame.transaction, TRANSACTION);
@@ -741,7 +807,7 @@ mod tests {
         Ok(())
     }
 
-    fn identify(h: &mut Harness<PlcService>, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn identify(h: &mut Harness<Stack>, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         let bytes = Frame {
             transaction: TRANSACTION,
             unit: 1,
@@ -752,7 +818,8 @@ mod tests {
             .to_pdu()?,
         }
         .to_bytes()?;
-        let reply = h.push(&bytes)?;
+        h.push(&bytes)?;
+        let reply = h.take_output();
         let (frame, used) = Frame::parse_prefix(&reply)?.ok_or("incomplete reply")?;
         assert_eq!(used, reply.len());
         assert_eq!(frame.transaction, TRANSACTION);
@@ -1101,6 +1168,106 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    /// Pipelined reads of every input register, one frame each, numbered
+    /// from 1.
+    fn pipelined_reads(count: u16) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut bytes = Vec::new();
+        for i in 0..count {
+            Frame {
+                transaction: i + 1,
+                unit: 1,
+                pdu: Request::ReadInputRegisters {
+                    address: i % 8,
+                    quantity: 1,
+                }
+                .to_pdu()?,
+            }
+            .write(&mut bytes)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Every frame in `bytes`, which must hold whole frames only.
+    fn frames_in(mut bytes: &[u8]) -> Result<Vec<Frame>, Box<dyn Error>> {
+        let mut frames = Vec::new();
+        while !bytes.is_empty() {
+            let (frame, used) = Frame::parse_prefix(bytes)?.ok_or("a frame is cut short")?;
+            frames.push(frame);
+            bytes = &bytes[used..];
+        }
+        Ok(frames)
+    }
+
+    #[test]
+    fn pipelined_requests_cut_anywhere_get_the_same_answers_in_order() -> Result<(), Box<dyn Error>>
+    {
+        let plant = plant();
+        let input = pipelined_reads(3)?;
+        let mut whole = harness(Plc::Rcs1, &plant);
+        whole.push(&input)?;
+        let answers = frames_in(whole.output())?;
+        let numbers: Vec<u16> = answers.iter().map(|f| f.transaction).collect();
+        assert_eq!(numbers, [1, 2, 3], "one answer per request, in order");
+        for cut in 0..=input.len() {
+            let mut h = harness(Plc::Rcs1, &plant);
+            h.push(&input[..cut])?;
+            h.push(&input[cut..])?;
+            assert_eq!(frames_in(h.output())?, answers, "cut at {cut}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_gets_every_answer_once_it_reads() -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let input = pipelined_reads(200)?;
+        let mut h = harness(Plc::Rcs1, &plant);
+        h.withhold();
+        h.push(&input)?;
+        assert!(h.output().is_empty());
+        assert!(h.unread() > 0, "requests wait with the client");
+        h.allow_all()?;
+        let numbers: Vec<u16> = frames_in(h.output())?
+            .iter()
+            .map(|f| f.transaction)
+            .collect();
+        assert_eq!(numbers, (1..=200).collect::<Vec<u16>>());
+        assert_eq!(h.unread(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn the_server_closes_its_side_after_the_answers_when_the_client_ends()
+    -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let mut h = harness(Plc::Rcs1, &plant);
+        h.push(&pipelined_reads(2)?)?;
+        assert!(!h.ended(), "the connection stays open between requests");
+        h.end()?;
+        assert_eq!(frames_in(h.output())?.len(), 2);
+        assert!(h.ended());
+        Ok(())
+    }
+
+    #[test]
+    fn bytes_that_are_not_modbus_close_the_connection_after_the_answers_before_them()
+    -> Result<(), Box<dyn Error>> {
+        let plant = plant();
+        let mut h = harness(Plc::Rcs1, &plant);
+        let mut input = pipelined_reads(2)?;
+        // A protocol identifier of 1: not Modbus.
+        input.extend_from_slice(&[0, 3, 0, 1, 0, 6, 1, 4, 0, 0, 0, 1]);
+        input.extend_from_slice(&pipelined_reads(1)?);
+        h.push(&input)?;
+        let numbers: Vec<u16> = frames_in(h.output())?
+            .iter()
+            .map(|f| f.transaction)
+            .collect();
+        assert_eq!(numbers, [1, 2], "nothing after the bad frame is answered");
+        assert!(h.ended());
         Ok(())
     }
 }

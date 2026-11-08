@@ -85,6 +85,10 @@
 //! | [`Messages`] | Whole typed protocol units. A message boundary is never turned into an end of input. |
 //! | [`Mux`] | Connection control plus children, each owned through a [`Child`] handle and each with its own port, closing and credit. |
 //!
+//! [`Framed`] turns a byte stream into [`Messages`] with a codec, so a
+//! protocol that reads whole frames, such as Modbus/TCP, sits on top of it
+//! and never handles bytes.
+//!
 //! A child handle cannot be used once it has been closed, because closing
 //! consumes it:
 //!
@@ -175,6 +179,7 @@ mod chain;
 mod children;
 mod driver;
 mod env;
+mod framed;
 mod harness;
 mod job;
 pub mod live;
@@ -184,6 +189,10 @@ mod tunnel;
 
 #[cfg(test)]
 mod tests;
+
+/// A frame echo over [`Framed`], for the runners' tests.
+#[cfg(test)]
+pub(crate) use framed::tests as framed_echo;
 
 pub use budget::{Budget, Charge};
 pub use carrier::{
@@ -195,6 +204,7 @@ pub use chain::Chain;
 pub use children::{ChildReport, Children, Overrun};
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
+pub use framed::{Decoded, Framed, FramedError, Framing};
 pub use harness::Harness;
 pub use job::Job;
 pub use switch::{Handoff, Handover, Switch};
@@ -282,6 +292,30 @@ impl<L: core::fmt::Display, U: core::fmt::Display> core::fmt::Display for Side<L
 }
 
 impl<L: core::error::Error, U: core::error::Error> core::error::Error for Side<L, U> {}
+
+/// A type with no values: the work of a stack that asks for none, or the
+/// reports of one that makes none. Whatever cannot carry work or reports
+/// requires them to be `Never`, so a stack that would need it does not
+/// compile.
+pub trait Never {
+    /// There is no value to call this on.
+    fn never(self) -> !;
+}
+
+impl Never for core::convert::Infallible {
+    fn never(self) -> ! {
+        match self {}
+    }
+}
+
+impl<L: Never, U: Never> Never for Side<L, U> {
+    fn never(self) -> ! {
+        match self {
+            Side::Lower(l) => l.never(),
+            Side::Upper(u) => u.never(),
+        }
+    }
+}
 
 /// One protocol between a lower port and an upper port, with no I/O.
 ///

@@ -374,6 +374,7 @@
 //! | [`services::keys`] | Seeded private keys: P-256, P-384, RSA, and Ed25519. |
 //! | [`services::serve`] | Service drivers, listeners, transcripts and fault plans. |
 //! | [`services::ssh`] | SSH servers with typed authentication and raw session streams. |
+//! | [`services::stack`] | Runners for layer stacks over live connections and UDP sockets. |
 //! | [`services::tls`] | Simulated TLS servers using rustls. |
 //!
 //! ## Web modules

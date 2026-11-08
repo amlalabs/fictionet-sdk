@@ -23,7 +23,6 @@
 //! hosts or trusted sandboxes to it, then calls [`Net::start`].
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
 
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::protocols::modbus;
@@ -31,7 +30,7 @@ use fictionet::stdlib::world::net::{Net, Pools};
 use fictionet::{Attachments, Cx, Error};
 
 use crate::driver::Driver;
-use crate::plc::PlcService;
+use crate::plc;
 use crate::registers::Plc;
 
 /// The network where ordinary sandboxes attach.
@@ -66,14 +65,10 @@ pub fn builder(driver: &Driver) -> Net {
     for (label, plc, addr) in CONTROLLERS {
         let plant = plant.clone();
         let facts = driver.facts();
-        // `Host::tcp` takes an `Arc` of the service's state. The state is the
-        // shared plant's `Arc`, so each host passes an `Arc` of that.
         net = net.host(label, move |h| {
-            h.at(addr)
-                .tcp(modbus::PORT, Arc::new(plant), move || PlcService {
-                    plc,
-                    facts: facts.clone(),
-                })
+            h.at(addr).tcp_stack(modbus::PORT, move |conn| {
+                plc::stack(plc, plant.clone(), facts.clone(), conn)
+            })
         });
     }
     net
