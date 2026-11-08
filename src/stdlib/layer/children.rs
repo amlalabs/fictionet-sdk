@@ -98,6 +98,7 @@ where
     kids: Vec<(ChildId, Kid<B>)>,
     limit: usize,
     window: u64,
+    refuse_full_inbox: bool,
     down: VecDeque<MuxCommand<B::Lower, K>>,
     up: VecDeque<EventOf<K>>,
     /// The child visited first last time.
@@ -189,6 +190,7 @@ where
             storage: None,
             limit,
             window,
+            refuse_full_inbox: false,
             down: VecDeque::new(),
             up: VecDeque::new(),
             turn: None,
@@ -197,6 +199,13 @@ where
             remaining_visits: 0,
             sweep_first: None,
         }
+    }
+
+    /// Refuse a child whose bounded inbox fills, allowing a wire mux to keep
+    /// parsing traffic for siblings. By default full inboxes apply backpressure.
+    pub fn refuse_full_inbox(mut self) -> Self {
+        self.refuse_full_inbox = true;
+        self
     }
 
     /// The routing storage for `kids` child places: the places themselves,
@@ -503,7 +512,14 @@ where
                         kid.urgent = Some(event);
                     } else {
                         if kid.inbox.len() >= QUEUE {
-                            return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
+                            if !self.refuse_full_inbox {
+                                return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
+                            }
+                            let kid = self.remove(id).expect("live child");
+                            kid.owner.cancel();
+                            self.down.push_back(kid.handle.close());
+                            env.report(ChildReport::Refused(id));
+                            return Ok(Admit::Taken);
                         }
                         if kid.inbox.len() == kid.inbox.capacity() {
                             // Charge the inbox's growth before it grows; a
@@ -934,6 +950,57 @@ mod tests {
         assert!(work.cancelled());
         assert_eq!(driver.layer_mut().take_work().unwrap().0, b);
     }
+    #[test]
+    fn refusing_a_full_inbox_keeps_siblings_and_cancels_its_work() {
+        let mut driver = driver(|_, _, _| Reader {
+            waiting: true,
+            work: true,
+            ..Reader::default()
+        });
+        driver.layer_mut().refuse_full_inbox = true;
+        let mut slots = Slots::new(2);
+        let first = slots.insert(()).unwrap();
+        let a = first.id();
+        let second = slots.insert(()).unwrap();
+        let b = second.id();
+        assert!(
+            driver
+                .deliver(MuxEvent::Opened(first, "a", 8))
+                .unwrap()
+                .moved()
+        );
+        assert!(
+            driver
+                .deliver(MuxEvent::Opened(second, "b", 8))
+                .unwrap()
+                .moved()
+        );
+        let (owner, work) = driver.layer_mut().take_work().unwrap();
+        assert_eq!(owner, a);
+        for _ in 0..=QUEUE {
+            assert!(
+                driver
+                    .deliver(MuxEvent::Child(
+                        a,
+                        StreamEvent::Data(Chunk::new(Vec::new()))
+                    ))
+                    .unwrap()
+                    .moved()
+            );
+        }
+        assert!(work.cancelled());
+        assert_eq!(driver.layer_mut().kids.len(), 1);
+        assert_eq!(driver.layer_mut().take_work().unwrap().0, b);
+        assert!(
+            driver
+                .deliver(MuxEvent::Child(b, StreamEvent::Written(9)))
+                .unwrap()
+                .moved()
+        );
+        driver.run().unwrap();
+        assert_eq!(driver.layer_mut().kids[0].1.layer.completions, 9);
+    }
+
     #[test]
     fn continuously_ready_children_rotate_across_bounded_sweeps() {
         let children: Children<Reader, Top> = Children::new(70, 8, |_, (), _| Reader {

@@ -9,7 +9,9 @@ use fictionet::stdlib::protocols::ssh::{
     auth, connection,
     transport::{HostKey, Transport},
 };
-use fictionet::stdlib::services::{serve, ssh};
+#[cfg(test)]
+use fictionet::stdlib::services::serve;
+use fictionet::stdlib::services::ssh;
 use fictionet::sync::Mutex;
 use fictionet_extras::ssh::{
     Profile, authentication_delay, honeypot, password_failure_delay, terminal,
@@ -65,11 +67,11 @@ pub fn server(
             },
             observer: Log(observer),
         }),
-        options: serve::ServeOptions {
+        budget: Some(fictionet::stdlib::layer::Budget::new(32 << 20)),
+        limits: fictionet::stdlib::services::stack::StreamLimits {
             idle: Some(Duration::from_secs(300)),
-            ..serve::ServeOptions::default()
-        }
-        .budget(fictionet::stdlib::layer::Budget::new(32 << 20)),
+            ..Default::default()
+        },
     }
 }
 
