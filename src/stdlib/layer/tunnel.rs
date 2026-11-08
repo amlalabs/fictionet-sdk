@@ -189,6 +189,8 @@ impl Layer for Tunnel {
     }
 
     fn take_work(&mut self) -> Option<Takeover> {
+        // The code starts once the tunnel knows what to charge its writes to.
+        self.shared.lock().budget.as_ref()?;
         let takeover = self.takeover.take()?;
         Some(Takeover {
             takeover: Some(takeover),
