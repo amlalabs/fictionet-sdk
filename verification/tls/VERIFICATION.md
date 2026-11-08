@@ -3,8 +3,9 @@
 The three accounting Kani harnesses were rerun after the child-readiness
 changes to shared stream backing and work ownership, with the existing
 symbolic schedules and assertions. All passed under the 12 GiB memory cap:
-reset checked 18,239 properties (10.70 seconds), write completion 16,855
-(81.13 seconds), and completion credit 17,027 (21.56 seconds). These remain
+reset checked 18,239 properties (12.42 seconds), write completion 16,855
+(98.33 seconds), and completion credit 17,027 (18.34 seconds). This final run
+includes releasing the completed TLS selection future. These remain
 accounting proofs with the assumptions below, not a proof of rustls internals
 or executor scheduling.
 

@@ -402,3 +402,34 @@ joining. The live worker tests exercise those runtime obligations. Child
 budget-refusal, slot-storage reservation, exhausted-generation retirement,
 atomic output rejection and the 70-child scheduling case are Rust regression
 tests; they are not represented as additional symbolic proof coverage here.
+
+## Child-readiness integration gate
+
+The final production revision is `04ff2b09d` on `comp/foundation`. The
+prerequisite includes typed child opening, separate retained receive credit,
+bounded urgent routing and work ownership, and async HTTP children through
+both the deterministic harness and the live stream runner. It does not port
+HTTP/2, SSH or the remaining services or claim the later deletion milestone.
+
+The final library run passed 3,865 tests and the integration binary passed
+all 1,331 tests, including the unchanged request-budget regressions. Clippy
+passed with warnings denied for fictionet, nuclear-world and web-world,
+including all targets. Formatting passed. Both browser checks (without
+default features, with and without tokio) and browser clippy passed. Cargo
+doc passed with rustdoc warnings denied.
+
+All 298 doctests passed in a serial run. The combined test invocation had
+already passed its unit and integration suites, but its doctest phase failed
+to compile because the shared-target library artifact was missing while
+other Cargo invocations were active. After those exited, the unchanged
+doctests compiled and passed. No assertion was weakened or test skipped.
+
+The HTTP runtime benchmark completed on the final implementation: the last
+HTTP/1 run reported 90,728 requests/second and the HTTP/2 run 72,116. These
+are smoke-run measurements, not a before/after performance comparison.
+
+All Cargo commands used the integration target directory, six build jobs,
+and the requested 12 GiB systemd limit with swap disabled. TLC used the
+cached JDK and jar, a 6 GiB heap under an 8 GiB limit, and state directories
+on the home volume. Model assumptions and exclusions remain in the
+individual verification reports.
