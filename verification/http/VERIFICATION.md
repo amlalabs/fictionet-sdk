@@ -66,6 +66,13 @@ foundation's way, and passes.
 | `Pipeline_without_feedleftovers.cfg` | 1,471,808 | 648,360 | `TunnelGetsAll` violated |
 | `Pipeline_without_closeafterbare101.cfg` | 391,817 | 172,027 | `NoHttpAfter101` violated |
 
+| `Tunnel_base.cfg` | 30,275 | 5,644 | every invariant holds |
+| `Tunnel_without_checkroom.cfg` | 26 | 23 | `OutboundWithinRoom` violated |
+| `Tunnel_without_chargewrites.cfg` | 22 | 19 | `ChargesMatch` violated |
+| `Tunnel_without_admitbelowroom.cfg` | 33 | 27 | `InboundBelowRoomAndAChunk` violated |
+| `Tunnel_doc_room.cfg` | 70 | 46 | `InboundWithinRoom` violated: the finding below |
+| `Tunnel_empty_chunks.cfg` | 59 | 52 | `NoEofWhileOpen` violated: the finding below |
+
 The foundation readiness pass reran the base configuration and all nine
 mutations after bounding post-framing input admission to the remaining
 stream capacity. The base checked 1,493,826 generated and 660,798 distinct
@@ -76,12 +83,7 @@ volume. The model abstracts allocation: production reserves decoded-head
 storage and wire output before growth, and copied handover bytes carry a
 separate reservation until the old input buffer is released. Allocation
 refusal follows `Abort`; the state counts do not prove heap bounds.
-| `Tunnel_base.cfg` | 30,275 | 5,644 | every invariant holds |
-| `Tunnel_without_checkroom.cfg` | 26 | 23 | `OutboundWithinRoom` violated |
-| `Tunnel_without_chargewrites.cfg` | 22 | 19 | `ChargesMatch` violated |
-| `Tunnel_without_admitbelowroom.cfg` | 33 | 27 | `InboundBelowRoomAndAChunk` violated |
-| `Tunnel_doc_room.cfg` | 70 | 46 | `InboundWithinRoom` violated: the finding below |
-| `Tunnel_empty_chunks.cfg` | 59 | 52 | `NoEofWhileOpen` violated: the finding below |
+
 
 Each was run with `-workers 4 -Xmx6g` under an 8 GB memory cap; where
 several workers race to a violation the counts differ a little from the
