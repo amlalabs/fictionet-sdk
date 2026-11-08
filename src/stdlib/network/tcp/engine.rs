@@ -1916,7 +1916,15 @@ impl TcpLayer {
             let (remote, handshake) = (c.remote, c.handshake.clone());
             l.left(remote.ip());
             self.open_child(h, TcpOrigin::Accepted(handshake));
-            self.conns.get_mut(&h).unwrap().live = true;
+            let c = self.conns.get_mut(&h).unwrap();
+            c.live = true;
+            // The peer may have reset it while it waited: its child opens
+            // gone, and is told so now rather than when it is closed.
+            if let Some(id) = c.child
+                && self.gone(id)
+            {
+                self.notice(TcpNotice::Gone(id));
+            }
             self.grant(h);
         }
     }

@@ -3548,4 +3548,50 @@ mod layer {
         assert!(said_gone(&seen, s.id()), "an aborted connection is gone");
         assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
     }
+
+    /// A connection the peer resets while it waits in the backlog still
+    /// opens a child when it is accepted, and that child is told at once
+    /// that its connection is gone, not only once it is closed.
+    #[test]
+    fn a_connection_reset_before_it_is_accepted_opens_gone() {
+        let mut server = stack(SERVER, 1, Budget::unlimited());
+        let mut client = stack(CLIENT, 2, Budget::unlimited());
+        control(
+            &mut server,
+            TcpControl::Listen {
+                port: 80,
+                backlog: None,
+                answer: None,
+            },
+        );
+        let remote: SocketAddr = format!("{SERVER}:80").parse().unwrap();
+        control(
+            &mut client,
+            TcpControl::Connect {
+                request: Request(1),
+                remote,
+            },
+        );
+        let mut at_client = events(&mut client);
+        let (at_server, more) = exchange(&mut server, &mut client, |_| true);
+        at_client.extend(more);
+        assert!(at_server.iter().all(|e| !matches!(e, MuxEvent::Opened(..))));
+        let (c, _) = opened(&mut at_client);
+        let reset: Command = c.send(StreamCommand::Reset);
+        assert!(matches!(client.command(reset), Ok(Admit::Taken)));
+        let mut resets = 0;
+        let _ = exchange(&mut server, &mut client, |p| {
+            resets += usize::from(tcp_flags(p).is_some_and(|f| f & 4 != 0));
+            true
+        });
+        assert!(resets >= 1, "the client's RST reached the server");
+        control(&mut server, TcpControl::Accept { port: 80, count: 1 });
+        let _ = sent(&mut server);
+        let mut seen = events(&mut server);
+        let (s, _) = opened(&mut seen);
+        assert!(
+            said_gone(&seen, s.id()),
+            "a connection reset before accept is gone when its child opens"
+        );
+    }
 }
