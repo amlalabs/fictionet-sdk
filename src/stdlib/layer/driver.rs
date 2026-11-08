@@ -23,7 +23,8 @@ pub struct Observations<E> {
 }
 
 impl<E> Observations<E> {
-    /// Room for `limit` reports.
+    /// An empty store with an item limit. Unmeasured reports are omitted;
+    /// use [`bounded`](Self::bounded) to supply their allocation bound.
     pub fn new(limit: usize) -> Observations<E> {
         Observations {
             kept: VecDeque::new(),
@@ -192,6 +193,10 @@ impl<L: Layer> Driver<L> {
         &mut self,
         event: EventOf<L::Lower>,
     ) -> Result<Admit<EventOf<L::Lower>>, L::Error> {
+        assert!(
+            self.layer.depth() <= super::MAX_DEPTH,
+            "composition is too deep"
+        );
         let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
         self.layer.on_event(&mut env, event)
     }
@@ -201,19 +206,27 @@ impl<L: Layer> Driver<L> {
         &mut self,
         command: CommandOf<L::Upper>,
     ) -> Result<Admit<CommandOf<L::Upper>>, L::Error> {
+        assert!(
+            self.layer.depth() <= super::MAX_DEPTH,
+            "composition is too deep"
+        );
         let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
         self.layer.on_command(&mut env, command)
     }
 
     /// Gives the stack the result of work it asked for.
     pub fn complete(&mut self, done: L::Done) -> Result<(), L::Error> {
+        assert!(
+            self.layer.depth() <= super::MAX_DEPTH,
+            "composition is too deep"
+        );
         let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
         self.layer.on_done(&mut env, done)
     }
 
     /// Fires due timers and advances the stack until nothing moves or the
     /// step limit is reached. Returns whether anything moved; call it again
-    /// after input or output has moved.
+    /// after input or output has moved, or whenever [`exhausted`](Self::exhausted) is true.
     pub fn run(&mut self) -> Result<bool, L::Error> {
         assert!(
             self.layer.depth() <= super::MAX_DEPTH,
@@ -222,6 +235,10 @@ impl<L: Layer> Driver<L> {
         self.exhausted = true;
         let mut moved = false;
         for _ in 0..self.steps {
+            assert!(
+                self.layer.depth() <= super::MAX_DEPTH,
+                "composition is too deep"
+            );
             let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
             let mut step = false;
@@ -230,6 +247,10 @@ impl<L: Layer> Driver<L> {
                 step = true;
             }
             step |= self.layer.advance(&mut env)?;
+            assert!(
+                self.layer.depth() <= super::MAX_DEPTH,
+                "composition is too deep"
+            );
             if !step {
                 self.exhausted = false;
                 break;
@@ -391,6 +412,41 @@ mod tests {
             Some((Instant::ZERO, ()))
         }
     }
+    #[test]
+    fn report_retention_counts_backing_capacity_and_omits_unknown_sizes() {
+        let mut reports = Observations::bounded(2, 512, |bytes: &Vec<u8>| Some(bytes.capacity()));
+        let mut oversized = Vec::with_capacity(4096);
+        oversized.push(1);
+        reports.observe(oversized);
+        assert_eq!(reports.iter().count(), 0);
+        assert_eq!(reports.omitted(), 1);
+        reports.observe(vec![1, 2]);
+        assert_eq!(reports.iter().count(), 1);
+        assert!(reports.used() <= 512);
+        let held = reports.used();
+        drop(reports.drain().collect::<Vec<_>>());
+        assert!(reports.used() < held);
+        let mut unknown = Observations::new(2);
+        unknown.observe(vec![1]);
+        assert_eq!(unknown.iter().count(), 0);
+        assert_eq!(unknown.omitted(), 1);
+    }
+
+    #[test]
+    fn erased_composition_cannot_hide_unbounded_depth() {
+        use crate::stdlib::services::stack::Boxed;
+        let mut stack = Boxed::new(Productive {
+            timers: 0,
+            advances: 0,
+        });
+        while stack.depth() < crate::stdlib::layer::MAX_DEPTH {
+            stack = Boxed::new(stack);
+        }
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Boxed::new(stack))).is_err()
+        );
+    }
+
     #[test]
     fn continuous_output_and_timers_yield_without_starving_advance() {
         let mut driver = Driver::new(

@@ -852,6 +852,24 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
     out
 }
 
+impl fictionet::stdlib::layer::BoundedWire for Frame {
+    fn write_bound(&self) -> Result<usize, Error> {
+        if self.pdu.is_empty() {
+            return Err(Error::EmptyPdu);
+        }
+        if self.pdu.len() > MAX_PDU {
+            return Err(Error::TooLong);
+        }
+        Ok(HEADER_LEN + self.pdu.len())
+    }
+}
+
+impl fictionet::stdlib::layer::BoundedDecode for fictionet::stdlib::codec::Frames<Frame> {
+    fn allocation_bound(&self) -> usize {
+        MAX_PDU
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1883,23 +1901,5 @@ mod tests {
         finish(&mut stream, |item| requests.push(item)).unwrap();
         assert_eq!(requests, [Ok(request)]);
         assert!(stream.is_done());
-    }
-}
-
-impl fictionet::stdlib::layer::BoundedWire for Frame {
-    fn write_bound(&self) -> Result<usize, Error> {
-        if self.pdu.is_empty() {
-            return Err(Error::EmptyPdu);
-        }
-        if self.pdu.len() > MAX_PDU {
-            return Err(Error::TooLong);
-        }
-        Ok(HEADER_LEN + self.pdu.len())
-    }
-}
-
-impl fictionet::stdlib::layer::BoundedDecode for fictionet::stdlib::codec::Frames<Frame> {
-    fn allocation_bound(&self) -> usize {
-        MAX_PDU
     }
 }

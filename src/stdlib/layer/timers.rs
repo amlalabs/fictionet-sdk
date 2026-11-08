@@ -19,7 +19,7 @@ pub struct Timers<T> {
 impl<T> Default for Timers<T> {
     fn default() -> Self {
         Timers {
-            armed: std::array::from_fn(|_| None),
+            armed: [const { None }; 8],
             len: 0,
         }
     }
@@ -50,10 +50,16 @@ impl<T: Clone + Eq> Timers<T> {
         else {
             return false;
         };
-        self.armed[index..self.len].rotate_left(1);
+        self.remove_at(index);
+        true
+    }
+
+    fn remove_at(&mut self, index: usize) {
+        for at in index..self.len - 1 {
+            self.armed[at] = self.armed[at + 1].take();
+        }
         self.len -= 1;
         self.armed[self.len] = None;
-        true
     }
 
     /// When `timer` goes off, if it is armed.
@@ -90,9 +96,7 @@ impl<T: Clone + Eq> Timers<T> {
             if keep(&self.armed[at].as_ref().unwrap().1) {
                 at += 1;
             } else {
-                self.armed[at..self.len].rotate_left(1);
-                self.len -= 1;
-                self.armed[self.len] = None;
+                self.remove_at(at);
             }
         }
     }

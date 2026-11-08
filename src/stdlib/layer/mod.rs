@@ -145,8 +145,11 @@
 //! 3. **Admission is not delivery.** Taking bytes, handing them below, and
 //!    their write completion ([`StreamEvent::Written`]) are three different
 //!    facts.
-//! 4. **Every retained allocation is charged** to the connection's
+//! 4. **Owned payload and queue storage are charged** to the connection's
 //!    [`Budget`], and the charge moves with what it pays for ([`Chunk`]).
+//!    Fixed engine state has explicit count limits; reports have their own
+//!    byte budget. Each adapter documents external configuration and callback
+//!    allocations it cannot measure.
 //! 5. **Limits apply before growth.** Charge first, then allocate.
 //! 6. **Progress is bounded and fair.** [`Layer::advance`] moves a bounded
 //!    amount of work per call, and children are visited in a stable,
@@ -162,8 +165,10 @@
 //! Every entry point is synchronous: it never awaits, reads a socket, reads
 //! a clock, or starts a task. The time, the entropy and the budget come in
 //! an [`Env`]. Layers do not call each other back: [`Chain`] and [`Switch`]
-//! move items between their parts in a loop, so the depth of calls is the
-//! depth of the stack's type, whatever the traffic.
+//! move items between their parts. Dispatch through nested composites is
+//! recursive and limited to [`MAX_DEPTH`], including boxed layers. Each
+//! driver visit and output drain has a finite allowance; an exhausted visit
+//! requests continuation rather than sleeping for external input.
 //!
 //! # Driving a stack
 //!
@@ -419,8 +424,8 @@ pub trait Layer: Sized {
         None
     }
 
-    /// The earliest armed timer and when it is due. Of two due at the same
-    /// moment, the one armed first.
+    /// The earliest armed timer and when it is due. `Timers` breaks ties by
+    /// arming order; composites rotate ties deterministically among owners.
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
         None
     }

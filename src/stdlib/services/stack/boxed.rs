@@ -45,7 +45,7 @@ impl<Lo: Port, Up: Port> Boxed<Lo, Up> {
         L::Report: core::fmt::Debug + Send + 'static,
         L::Work: Job<Done = L::Done>,
         L::Done: Send + 'static,
-        L::Error: core::error::Error + Send + Sync + 'static,
+        L::Error: Into<BoxError> + Send + Sync + 'static,
     {
         assert!(
             stack.depth() < fictionet::stdlib::layer::MAX_DEPTH,
@@ -93,8 +93,8 @@ where
     }
 }
 
-fn error<E: core::error::Error + Send + Sync + 'static>(e: E) -> BoxError {
-    Box::new(e)
+fn error<E: Into<BoxError>>(e: E) -> BoxError {
+    e.into()
 }
 
 impl<L, Lo: Port, Up: Port> Erased<Lo, Up> for L
@@ -103,7 +103,7 @@ where
     L::Report: core::fmt::Debug + Send + 'static,
     L::Work: Job<Done = L::Done>,
     L::Done: Send + 'static,
-    L::Error: core::error::Error + Send + Sync + 'static,
+    L::Error: Into<BoxError> + Send + Sync + 'static,
 {
     fn depth(&self) -> usize {
         Layer::depth(self)
