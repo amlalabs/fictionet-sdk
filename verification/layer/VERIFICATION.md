@@ -7,12 +7,13 @@ mux whose children live in `Slots` (`carrier.rs`); and the state of
 `Slots`, `Budget` and `Charge` (`budget.rs`), `Timers` (`timers.rs`) and
 `Chunk` (`carrier.rs`). The commands are in the [README](README.md).
 
-No property failed on the code's safety rules. One liveness property fails
-on the code as it is: a child command whose credit cost is larger than the
-mux's whole window for that child never goes out (below, "Finding"). No
-code in `src/` changed apart from the line that includes the Kani proofs.
+The original pass exposed a child-write liveness failure. The child-readiness
+implementation now splits byte-stream commands within available credit; the
+unchanged large-command scenario passes. The updated child model also covers
+bounded empty events, retained receive credit, urgent completion and cancelled
+work. Historical merged-branch results below remain identified separately.
 
-## On the merged foundation
+## Historical run on the merged foundation
 
 The pass was written on `comp/v-layer` and merged into `comp/foundation`
 (commit `e68a070d3`); everything was rerun at code revision `6aa68ae5f`.
@@ -26,7 +27,8 @@ past it, one at a time, through a slot of their own in `Chain`
 None, the trait's default, the code runs exactly the statements the model
 does, and the line numbers above are the merged ones. The order in which
 an urgent event passes a refused one, and that it still arrives once, are
-not modeled; that is open.
+were not modeled in that run. The current urgent projection and rerun are
+recorded under bounded dispatch and urgent completion below.
 
 | Config | Generated | Distinct | Result |
 | --- | ---: | ---: | --- |
@@ -49,7 +51,7 @@ not modeled; that is open.
 | `Children_without_reserveforcontrol.cfg` | 1,270,241 | 213,928 | `ControlProgress` violated |
 | `Children_without_muxchecksgeneration.cfg` | 2,313 | 1,010 | `NoStaleDelivery` violated |
 | `Children_without_keybywholeid.cfg` | 1,009 | 502 | `NoStaleDelivery` violated |
-| `Children_large_command.cfg` | 742 | 191 | `CommandsGo` violated: the finding below, still open on the code as it is |
+| `Children_large_command.cfg` | 742 | 191 | historical `CommandsGo` counterexample before the child-readiness fix; current result below |
 
 Each was run with `-workers 4 -Xmx6g` under an 8 GB memory cap. The Kani
 results on the merged code are in the Kani section below.
@@ -134,124 +136,100 @@ its queue.
 
 ## Children over a mux: `Children.tla`
 
-[`Children.tla`](tla/Children.tla) is `Children` with the mux below it. A
-child id is `<<slot, generation>>`. The mux is any mux that keeps its
-children in `Slots`: it opens a child in any free slot, sends a child's
-events, grants a child command credit within a window (`MaxCredit`), closes
-a child when its peer resets it, and takes `Children`'s commands one at a
-time, applying each to the child its id names if `Slots` finds one. Each
-child's layer is abstract: on a visit it may take its next event or not,
-hand over a command of any cost in `Costs`, or fail; on a late timer or
-work result it may fail. Every `Children` entry point is one atomic action.
-`Q` and `R` stand for `QUEUE` and `RESERVE`; the configs use 3 and 1.
+The model follows `Children` over a mux whose scoped, generation-checked
+handles come from `Slots`. `Opened`, `MuxSend`, `MuxCredit` and
+`MuxPeerClose` correspond to child admission, events, grants and immediate
+reset/close. `Visit` offers ordinary input, passes urgent completion,
+splits stream output at available credit and returns released credit.
+`MuxTake` checks the target generation before applying each queued command.
+The constants use one or two slots and generations, queue size three and
+one reserved control slot; production uses a queue size of 64 with eight
+reserved places and at most 4096 configured children. Closing commands
+have additional bounded space, one per admitted child.
 
-| Model | Rust |
-| --- | --- |
-| `Opened` | `children.rs:262-279` (`on_event`, `Opened`, the limit and `Refused`) |
-| `MuxSend` | `children.rs:280-290` (`on_event`, `Child`, the `Overrun` check) |
-| `MuxCredit` | `children.rs:291-295` (`on_event`, `Credit`) |
-| `MuxPeerClose` | `children.rs:296-298` (`on_event`, `Closed`) |
-| `OfferControl` | `children.rs:309-319` (`on_command`) |
-| `LateResult` | `children.rs:321-353` (`on_timer`, `on_done`) |
-| `Advance`, `Visit`, `VisitOrder` | `children.rs:355-373` (`advance`), `:182-238` (`visit_child`), `:165-177` (`fail`) |
-| `MuxTake` | `children.rs:375` (`take_command`) and the mux's lookups, `carrier.rs:458-496` (`Slots::entry`, `contains`, `get_mut`, `remove`) |
+`Readiness` enables retained buffers, zero-credit empty events, a reserved
+completion slot, and owned work. Taking data moves its credit from the
+inbox to `held`; only `Release` makes it available for a new grant. This
+matches the receive reservation carried by `Chunk` until its last backing
+owner drops. `MuxWritten` can arrive while ordinary input is refused and
+`Visit` consumes it through the urgent slot. EOF remains ordinary input in
+the Rust; reset removes the child, invalidates work and drops queued data.
 
-What is checked:
+`ExtractWork` reserves a bounded runtime job entry. Closing a child leaves
+that entry invalid until `PollWork` removes it; the owner check prevents
+polling invalid work. Weak fairness of runtime polling establishes release
+of cancelled jobs. The model allows one outstanding job per child identity;
+the readiness configuration sets a separate job limit of one, so reset
+and reopen can exhaust it before the stale job is drained. Production
+allows several within its separate limit of 64 jobs and bounds
+intake to eight per visit. Delayed completion still goes through the scoped
+child identity check.
 
-- `NoStaleDelivery`: a command (send, grant, close), timer or work result
-  for a child that is gone never reaches the child that has its slot now,
-  or any other.
-- `EventCredit`: each child's event credit is in exactly one place, granted
-  to the mux, in its inbox, or owed back; their sum is the window `W`. A
-  child that stops reading holds at most `W`, even under a mux that sends
-  past its credit (`Children_refuse_base.cfg` has such a mux; `Overrun`
-  stops the connection first).
-- `MuxEventCredit`: with a mux that keeps to its credit, its credit for a
-  child is what `Children` granted less the grants still queued.
-- `CommandCredit`: the mux never receives a send larger than the credit it
-  has out, and its credit for a child is the child's credit plus its queued
-  sends.
-- `SendsLeaveReserve`: children's sends never take the `R` places kept for
-  control and credit.
-- `ControlProgress`: a control command from above is taken eventually,
-  with children whose layers never read, under weak fairness of `Advance`,
-  `MuxTake` and `OfferControl`. A child may still send as fast as its peer
-  grants credit.
-- `CommandsGo` (finding below): a child's command reaches the mux
-  eventually while the child lives, when the peer keeps reading (weak
-  fairness of `MuxCredit`).
+The checked properties are byte-credit conservation (`EventCredit`,
+`MuxEventCredit`, `CommandCredit`), generation isolation (`NoStaleDelivery`),
+reserved control capacity (`SendsLeaveReserve`), queue and job item bounds
+(`BoundedItems`, `BoundedJobs`), and absence of cancelled-owner polling
+(`NoCancelledPoll`). `CommandsGo` assumes a peer continues granting credit;
+`ControlProgress` does not assume stalled children begin reading.
+`CompletionProgress` concerns an already queued completion and assumes only
+continued child visits. `CancelledWorkLeaves` assumes continued common
+runtime polling, not completion of the cancelled operation.
 
-| Config | Generated | Distinct | Depth | Result |
-| --- | ---: | ---: | ---: | --- |
-| `Children_base.cfg` (2 slots, 2 generations each, 2 children at once) | 12,789,594 | 1,857,160 | 25 | all five invariants hold, 16 s |
-| `Children_refuse_base.cfg` (limit 1, a mux that may overrun) | 14,398,126 | 2,645,648 | 42 | all four invariants hold, 19 s |
-| `Children_stalled_base.cfg` (children that never read, a mux window of 2, one generation) | 1,561,917 | 219,760 | 22 | all five invariants and `ControlProgress` hold, 216 s |
-| `Children_commands_base.cfg` (one slot, a mux window of 2, costs 1 and 2) | 2,040 | 504 | 15 | `CommandCredit` and `CommandsGo` hold |
-| `Children_without_checkoverrun.cfg` | 41 | 31 | 5 | `EventCredit` violated: a mux sends past credit and the inbox holds `W + 1` |
-| `Children_without_checkcommandcredit.cfg` | 31 | 25 | 5 | `CommandCredit` violated: a send with no credit reaches the mux |
-| `Children_without_reserveforcontrol.cfg` | 900,110 | 162,151 | | `ControlProgress` violated: two children's sends refill the queue each time the mux takes one, and the control command never finds room |
-| `Children_without_muxchecksgeneration.cfg` | 2,497 | 1,091 | 8 | `NoStaleDelivery` violated: a queued command for a closed child reaches the successor in its slot |
-| `Children_without_keybywholeid.cfg` | 1,157 | 567 | 7 | `NoStaleDelivery` violated: a late result for a closed child reaches the successor in its slot |
-| `Children_large_command.cfg` (a mux window of 1, costs 1 and 2) | 742 | 191 | | `CommandsGo` violated on the code as it is (finding) |
+### Results after the child-readiness changes
 
-The liveness configs use one generation per slot and a mux window of 2: with a
-window of 1, two children can never have three sends queued, so the
-mutation without the reserve could not fail.
+Every command uses the supplied JDK with `java -Xmx6g`, an 8 GiB systemd
+memory cap with swap disabled, and TLC state directories on the home volume.
+The original positive configs and intentional mutations were rerun alongside
+the readiness config. The readiness configurations were then rerun
+with cancellation fairness restricted to stale owners and an independently
+exhaustible job limit: a live operation may remain pending forever. Generated counts can vary for early-stopping
+mutations with four workers.
 
-### Finding: a command larger than the mux's window never goes out
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Children_base.cfg` | 13,067,962 | 1,857,160 | all safety properties pass |
+| `Children_refuse_base.cfg` | 16,775,230 | 2,645,648 | all safety properties pass |
+| `Children_stalled_base.cfg` | 1,639,585 | 219,760 | safety and control progress pass |
+| `Children_commands_base.cfg` | 2,082 | 504 | command credit and delivery pass |
+| `Children_large_command.cfg` | 760 | 191 | command credit and delivery pass with a one-byte window |
+| `Children_readiness.cfg` | 71,116 | 10,066 | credit/item/job invariants, delivery, completion and cancellation progress pass |
+| `Children_without_checkoverrun.cfg` | 41 | 31 | expected `EventCredit` violation |
+| `Children_without_checkcommandcredit.cfg` | 31 | 25 | expected `CommandCredit` violation |
+| `Children_without_reserveforcontrol.cfg` | 945,883 | 164,063 | expected `ControlProgress` violation |
+| `Children_without_muxchecksgeneration.cfg` | 2,356 | 1,020 | expected `NoStaleDelivery` violation |
+| `Children_without_keybywholeid.cfg` | 1,179 | 563 | expected `NoStaleDelivery` violation |
+| `Children_without_urgent.cfg` | 8,120 | 1,927 | expected `CompletionProgress` violation |
+| `Children_without_workownership.cfg` | 309 | 135 | expected `NoCancelledPoll` violation |
+| `Children_without_joblimit.cfg` | 883 | 297 | expected `BoundedJobs` violation |
 
-`visit_child` (`children.rs:221-230`) sends a child's command only when its
-whole cost fits the child's credit (`cost <= kid.credit`); otherwise it
-keeps the command in the child's outbox and tries again on the next visit.
-It never splits a command, and `Credited` gives it no way to. So a command
-whose cost is larger than all the credit the mux will ever have out for that
-child waits forever, and the child sends nothing after it.
+The readiness pass completed in 25 seconds; the stalled-child pass in
+3 minutes 45 seconds. The large-command pass completed in under a second.
+The two original long-running mutation/liveness scenarios retain their
+original fairness and assertions. No test or property was weakened to
+turn the formerly failing large-command scenario into a success.
 
-Counterexample (`Children_large_command.cfg`, a mux window of 1): the mux opens a
-child; `Children` grants it its event credit; the mux grants one unit of
-command credit, which fills its window; the child's layer hands over a
-command of cost 2. From there every visit keeps the command, the mux grants
-nothing more because its window is full, and the command never reaches the
-mux. With a window of 2 (`Children_commands_base.cfg`) the same property
-holds.
+### Scope and limitations
 
-On a byte-stream child the cost of `StreamCommand::Write` is the chunk's
-length (`carrier.rs:140-147`). A mux that grants credit up to its peer's
-flow-control window (an HTTP/2 stream's send window starts at 65,535 bytes)
-would hold back for good any single write larger than that window. Whether
-this happens depends on the mux's credit policy, and no mux on the layer
-foundation exists yet to say. Two ways out, both a design change rather
-than a local fix: let `Children` split a command to the credit it has (a
-`split` on `Credited`, meaningful for byte-stream writes), or document that
-a mux must always grant at least the cost of the largest command a child
-may send. No code changed.
+The model covers partial stream output; atomic-message rejection above the
+mux's declared maximum is checked by the Rust regression test. Input data
+uses one credit unit at a time. The item-bound case adds empty data with no
+byte credit. It does not model protocol-specific headers, trailers or their
+payload sizes. Its job actions abstract polling and release, not the runtime
+region's task-joining internals. Fixed byte reservations and shared backing
+ownership are exercised against Rust; credit conservation alone does not
+prove all allocations have charges.
 
-### What `Children.tla` leaves out
-
-- Events and commands of more than one credit unit on the event side, and
-  partial admission of a child's event (`Admit::Partial`,
-  `children.rs:205-209`); events cost one unit each.
-- Zero-cost events (`StreamEvent::Written`, `Ended`, `Reset`) pass
-  `cost > kid.granted` and are queued without bound. A mux that sent them
-  without end would grow a child's inbox; the mux is trusted code, so the
-  model leaves them out.
-- Control events going up (`MuxEvent::Control`, `children.rs:299-304`), and
-  `take_work`, `deadline`, and reports.
-- Closes pushed by `fail` and by a refused child skip the queue limit
-  (`children.rs:174`, `:265`). The code bounds them by the mux's own limit on
-  children; the model lets the queue grow past `Q` for them and checks
-  nothing about its length.
-- Fairness among children. `VisitOrder` keeps the rotation, but no property
-  says a busy child cannot starve a sibling.
-- Control progress with children that read. Their credit grants may use the
-  reserved places, as control does, so `ControlProgress` is checked only
-  with children that never read. The model also runs the entry points in
-  any order, not the order a `Chain` calls them in.
-- The `ChildId` scope across connections (that is the Kani proof below),
-  and generation overflow (a `u64` per slot).
-- Sizes: one or two slots, one or two generations, a limit of one or two,
-  `W` of 1, a mux window of 1 or 2, `Q` of 3 and `R` of 1. The real
-  `QUEUE` is 64 and `RESERVE` 8.
+A model `Advance` visits its finite set of children. Rust divides a sweep
+into at most 64 child visits and explicitly continues until the sweep ends;
+work selection rotates after its last successful extraction. A regression
+with 70 continuously productive children exercises full output queues and
+multiple bounded visit groups. Small model
+sizes do not prove a throughput bound for 4096 children. Cross-connection
+scope, generation exhaustion, byte-cursor bounds and backing retention are
+covered by the production-code tests and Kani harnesses rather than this
+finite interleaving model. Atomic opening context and factory semantics
+are tested with real async HTTP children, including a stalled response,
+a cancelled pending handler, a completing sibling and parent control.
 
 ## Proofs against the Rust: `kani/mod.rs`
 
@@ -339,11 +317,88 @@ it.
   `charges_sum_to_the_budget_and_never_pass_its_limit` covers for the same
   `Budget`.
 
-## Smaller observations, no change made
+## Equal-deadline scheduling
 
-- `Layer::deadline` says "of two due at the same moment, the one armed
-  first". `Chain::deadline` (`chain.rs:192-201`) gives the lower part's timer
-  on a tie, and `Children::deadline` (`children.rs:389-394`) the child with
-  the smallest id, whichever was armed first. Both are deterministic, so
-  runs repeat, but they do not keep the trait's wording. `Timers::next`
-  keeps it (proved above).
+Local `Timers` retain their deterministic arming order. Across composed
+owners, `Chain` rotates equal-deadline delivery between its two sides and
+`Children` rotates it among child identities. Earlier deadlines still win.
+This prevents an owner that continually rearms a timer for the current time
+from starving another owner at that same deadline. Rust regressions keep
+both sides, and separately three children, permanently due: each fires
+within a bounded driver visit and their delivery counts differ by at most
+one. Timer selection is not part of the child interleaving model; its
+unconstrained `LateResult` action still checks stale-generation isolation
+for every possible target.
+
+## Bounded dispatch and urgent completion
+
+The driver now caps both ordinary output draining and urgent output draining
+at 1024 visits per call. It reports an exhausted internal visit explicitly,
+and services a due timer and ordinary layer progress in the same iteration.
+The runner continues after exhaustion. Composition still dispatches recursively;
+constructors and the driver enforce a depth of at most 32, including erased
+layers. Tests cover a permanently productive output source, a permanently due
+timer, and repeated boxing. This is an explicit depth bound, not an iterative
+routing proof.
+
+The byte-routing configurations were rerun after these changes. Their finite
+sources do not reach the new drain allowance, so their conservation properties
+are unchanged. Route_base explored 1,058,166 distinct states and Route_wide_base
+5,653,462; both passed all invariants and RunEnds. Each existing deliberate
+mutation still produced its named conservation or progress counterexample.
+
+Route_urgent checks a separate projection in the same model: normal data at
+both a Chain edge and a Driver edge is refused until Written arrives. The
+completion traverses the lower layer, Chain's urgent slot, the upper layer,
+and Driver's urgent slot exactly once. UrgentConserved and UrgentProgress pass
+in 10 distinct states, depth seven. Route_without_urgent disables the bypass
+and produces the intended liveness counterexample in its initial state.
+Only urgent acceptance and fair visits are assumed. There is no assumption
+that a peer eventually accepts ordinary blocked data. This projection covers
+the bypass mechanism; it does not prove arbitrary protocol-specific completion
+semantics or arbitrary nesting together with the byte-routing model.
+
+Reports now have separate item and byte limits. Report sizes must include all
+retained backing allocations; unmeasurable payloads are omitted and counted.
+Tests check a short vector retaining a large capacity, unknown-size omission,
+and payload charge release on drain. Observation storage never draws from the
+connection's protocol budget. Eight inline timer slots replace the timer vector
+and arming counter; stable slot order preserves local tie ordering without an
+overflowing arming sequence. These engine bounds do not account for arbitrary
+application callback allocations.
+
+## Shared stream backing and cancellation harnesses
+
+All fifteen layer harnesses passed on the child-readiness implementation.
+After the final inline-array initialization change, all seven timer harnesses
+were rerun and passed again. Their unwind bound is twelve to cover the eight
+inline slots; their symbolic inputs and assertions are unchanged. MiniSat
+handles these array formulas within the requested memory cap. The combined
+cancel/fire/retain harness took 195.63 seconds on the final run; the other six
+took at most 1.70 seconds each. Earlier solver attempts that exceeded the cap
+are not counted as verification results.
+
+`Chunk` now shares an owned vector plus checked byte cursors. Its reservation
+covers the vector capacity, and `split_to` only clones the shared owner and
+moves a cursor: splitting for child credit cannot allocate or release the
+backing early. A normalized receive buffer also carries its credit-return
+lease until its last piece is released. Cursor/lease metadata remains
+bounded engine storage rather than a claim about allocator overhead.
+
+The following production harnesses were rerun with the unchanged symbolic
+four-byte inputs, cursor choices and both release orders. No `Bytes` storage
+or allocator behavior is stubbed in these proofs. Each run used the requested
+12 GiB systemd cap with swap disabled.
+
+| Harness | Checks | Result | Solver time |
+| --- | ---: | --- | ---: |
+| `stream_credit_splits_keep_the_allocation_owned` | 854 | all pass; concatenated prefix/suffix equals the input and the charge survives either first drop | 8.64 s |
+| `a_chunk_cursor_keeps_the_rest_in_place` | 867 | all pass; two advances preserve the unread suffix and charge | 4.19 s |
+| `a_chunk_cursor_never_passes_the_end` | 632 | the one required panic when advancing past the end | 0.50 s |
+| `work_cancellation_stays_with_its_owner` | 243 | all pass; closing one owner invalidates its leases and leaves another owner live | 0.28 s |
+
+The cancellation harness checks the lease, not executor scheduling or task
+joining. The live worker tests exercise those runtime obligations. Child
+budget-refusal, slot-storage reservation, exhausted-generation retirement,
+atomic output rejection and the 70-child scheduling case are Rust regression
+tests; they are not represented as additional symbolic proof coverage here.

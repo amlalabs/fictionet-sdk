@@ -51,7 +51,7 @@ EXTENDS Integers, Sequences, FiniteSets
 CONSTANTS NU,   \* bytes the peer sends from below
           ND,   \* bytes the application sends from above
           KeepBlocked, KeepRest, BlockedIsStill, LeftoversFirst,
-          RestFirst, MoveAbove, SwitchOnce, DriverKeepsRest
+          RestFirst, MoveAbove, SwitchOnce, DriverKeepsRest, UrgentBypass
 
 VARIABLES
   \* from below, upward
@@ -386,7 +386,6 @@ RunStep == running /\ (StepL \/ StepS \/ StepH \/ StepSB \/ StepSA \/ StepTU
                        \/ StepOU \/ StepTD \/ StepOD \/ StepE)
 
 Next == Owner \/ RunStep
-Spec == Init /\ [][Next]_vars /\ WF_vars(RunStep)
 
 ---------------------------------------------------------------------------
 (* Properties.                                                           *)
@@ -420,4 +419,57 @@ HandoverOnce == handovers <= 1
 \* A run of the driver ends with nothing moving: the routing loop needs no
 \* step limit to stop.
 RunEnds == running ~> ~running
+
+---------------------------------------------------------------------------
+(* Checked separately: both normal edges hold data until Written arrives. *)
+(* Only urgent acceptance and fair runner visits are assumed. No eventual *)
+(* acceptance of normal data by a stalled peer is assumed. *)
+VARIABLES urgentLower, urgentChain, urgentUpper, urgentDriver, delivered,
+          childWaiting, topWaiting, childData, topData
+urgentVars == <<urgentLower, urgentChain, urgentUpper, urgentDriver,
+                delivered, childWaiting, topWaiting, childData, topData>>
+UrgentInit ==
+  /\ urgentLower = 1 /\ urgentChain = 0 /\ urgentUpper = 0
+  /\ urgentDriver = 0 /\ delivered = 0
+  /\ childWaiting = TRUE /\ topWaiting = TRUE
+  /\ childData = TRUE /\ topData = TRUE
+TakeChainUrgent ==
+  /\ urgentLower = 1 /\ urgentChain = 0
+  /\ UrgentBypass \/ ~childData
+  /\ urgentLower' = 0 /\ urgentChain' = 1
+  /\ UNCHANGED <<urgentUpper, urgentDriver, delivered, childWaiting,
+                  topWaiting, childData, topData>>
+OfferChainUrgent ==
+  /\ urgentChain = 1 /\ urgentUpper = 0
+  /\ urgentChain' = 0 /\ urgentUpper' = 1 /\ childWaiting' = FALSE
+  /\ UNCHANGED <<urgentLower, urgentDriver, delivered, topWaiting,
+                  childData, topData>>
+TakeDriverUrgent ==
+  /\ urgentUpper = 1 /\ urgentDriver = 0
+  /\ UrgentBypass \/ ~topData
+  /\ urgentUpper' = 0 /\ urgentDriver' = 1
+  /\ UNCHANGED <<urgentLower, urgentChain, delivered, childWaiting,
+                  topWaiting, childData, topData>>
+OfferDriverUrgent ==
+  /\ urgentDriver = 1
+  /\ urgentDriver' = 0 /\ delivered' = delivered + 1 /\ topWaiting' = FALSE
+  /\ UNCHANGED <<urgentLower, urgentChain, urgentUpper, childWaiting,
+                  childData, topData>>
+OfferChildData ==
+  /\ childData /\ ~childWaiting /\ childData' = FALSE
+  /\ UNCHANGED <<urgentLower, urgentChain, urgentUpper, urgentDriver,
+                  delivered, childWaiting, topWaiting, topData>>
+OfferTopData ==
+  /\ topData /\ ~topWaiting /\ topData' = FALSE
+  /\ UNCHANGED <<urgentLower, urgentChain, urgentUpper, urgentDriver,
+                  delivered, childWaiting, topWaiting, childData>>
+UrgentNext == TakeChainUrgent \/ OfferChainUrgent \/ TakeDriverUrgent
+              \/ OfferDriverUrgent \/ OfferChildData \/ OfferTopData
+UrgentSpec == Init /\ UrgentInit /\ [][UrgentNext /\ UNCHANGED vars]_<<vars, urgentVars>>
+  /\ WF_urgentVars(TakeChainUrgent) /\ WF_urgentVars(OfferChainUrgent)
+  /\ WF_urgentVars(TakeDriverUrgent) /\ WF_urgentVars(OfferDriverUrgent)
+  /\ WF_urgentVars(OfferChildData) /\ WF_urgentVars(OfferTopData)
+UrgentConserved == urgentLower + urgentChain + urgentUpper + urgentDriver + delivered = 1
+UrgentProgress == <> (delivered = 1 /\ ~childData /\ ~topData)
+Spec == Init /\ UrgentInit /\ [][Next /\ UNCHANGED urgentVars]_<<vars, urgentVars>> /\ WF_vars(RunStep)
 =============================================================================

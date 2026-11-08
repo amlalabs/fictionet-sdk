@@ -227,7 +227,7 @@ fn at(t: u8) -> Instant {
 
 /// Three different names: `next` and `len`.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(12)]
 #[kani::solver(minisat)]
 fn timers_in_order_three_names() {
     come_due_in_order([0, 1, 2], false);
@@ -235,7 +235,7 @@ fn timers_in_order_three_names() {
 
 /// Three different names: `get`.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(12)]
 #[kani::solver(minisat)]
 fn timers_get_three_names() {
     let times: [u8; 3] = [kani::any(), kani::any(), kani::any()];
@@ -251,7 +251,7 @@ fn timers_get_three_names() {
 
 /// The first name armed again last.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(12)]
 #[kani::solver(minisat)]
 fn timers_in_order_first_armed_again() {
     come_due_in_order([0, 1, 0], true);
@@ -259,7 +259,7 @@ fn timers_in_order_first_armed_again() {
 
 /// The second name armed again.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(12)]
 #[kani::solver(minisat)]
 fn timers_in_order_second_armed_again() {
     come_due_in_order([0, 1, 1], true);
@@ -267,7 +267,7 @@ fn timers_in_order_second_armed_again() {
 
 /// The first name armed twice, then another.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(12)]
 #[kani::solver(minisat)]
 fn timers_in_order_first_armed_twice() {
     come_due_in_order([0, 0, 1], true);
@@ -275,7 +275,7 @@ fn timers_in_order_first_armed_twice() {
 
 /// One name armed three times.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(12)]
 #[kani::solver(minisat)]
 fn timers_in_order_one_name_three_times() {
     come_due_in_order([0, 0, 0], true);
@@ -318,7 +318,8 @@ fn come_due_in_order(names: [u8; 3], check_get: bool) {
 /// it did; `retain` disarms what it is told to. The other timer is left
 /// alone, and `next` is then the one left, if any.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(12)]
+#[kani::solver(minisat)]
 fn timers_cancel_fire_and_retain_touch_one_name() {
     let (t0, t1): (u8, u8) = (kani::any(), kani::any());
     let mut timers: Timers<u8> = Timers::new();
@@ -371,6 +372,7 @@ const CHUNK: usize = 4;
 /// solver past the memory cap.
 #[kani::proof]
 #[kani::unwind(6)]
+#[kani::solver(minisat)]
 fn a_chunk_cursor_keeps_the_rest_in_place() {
     let bytes: [u8; CHUNK] = kani::any();
     let length = CHUNK;
@@ -410,6 +412,7 @@ fn a_chunk_cursor_keeps_the_rest_in_place() {
 #[kani::proof]
 #[kani::should_panic]
 #[kani::unwind(6)]
+#[kani::solver(minisat)]
 fn a_chunk_cursor_never_passes_the_end() {
     let length: usize = kani::any();
     kani::assume(length <= CHUNK);
@@ -417,4 +420,70 @@ fn a_chunk_cursor_never_passes_the_end() {
     let n: usize = kani::any();
     kani::assume(n > length && n <= CHUNK + 1);
     chunk.advance(n);
+}
+
+/// Splitting for a peer window preserves both byte order and the backing
+/// reservation, whichever half is released first.
+#[kani::proof]
+#[kani::unwind(6)]
+#[kani::solver(minisat)]
+fn stream_credit_splits_keep_the_allocation_owned() {
+    use super::{Credited, StreamCommand};
+    let bytes: [u8; CHUNK] = kani::any();
+    let units: usize = kani::any();
+    kani::assume(units > 0 && units < CHUNK);
+    let budget = Budget::new(CHUNK);
+    let command = StreamCommand::Write(Chunk::with_charge(
+        bytes.to_vec(),
+        budget.charge(CHUNK).unwrap(),
+    ));
+    let (StreamCommand::Write(prefix), Some(StreamCommand::Write(suffix))) =
+        command.admit_credit(units as u64).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(prefix.len(), units);
+    assert_eq!(suffix.len(), CHUNK - units);
+    for i in 0..CHUNK {
+        assert_eq!(
+            if i < units {
+                prefix[i]
+            } else {
+                suffix[i - units]
+            },
+            bytes[i]
+        );
+    }
+    assert_eq!(budget.used(), CHUNK);
+    if kani::any() {
+        drop(prefix);
+        assert_eq!(budget.used(), CHUNK);
+        drop(suffix);
+    } else {
+        drop(suffix);
+        assert_eq!(budget.used(), CHUNK);
+        drop(prefix);
+    }
+    assert_eq!(budget.used(), 0);
+}
+
+/// Invalidating an owner invalidates all its work, including leases retained
+/// after the owner is dropped; a successor has an independent lifetime.
+#[kani::proof]
+#[kani::unwind(3)]
+fn work_cancellation_stays_with_its_owner() {
+    let owner = WorkOwner::new();
+    let first = owner.own(kani::any::<u8>());
+    let second = owner.own(kani::any::<u8>());
+    assert!(!first.cancelled());
+    assert!(!second.cancelled());
+    if kani::any() {
+        owner.cancel();
+    }
+    drop(owner);
+    let successor = WorkOwner::new();
+    let next = successor.own(());
+    assert!(first.cancelled());
+    assert!(second.cancelled());
+    assert!(!next.cancelled());
 }
