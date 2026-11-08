@@ -297,7 +297,9 @@ where
                 break;
             }
         }
-        if ended || (socket_closed && input.is_none() && jobs.is_empty()) {
+        // A closed socket still gets what the stack has left, so only a
+        // settled stack is done with it.
+        if ended || (settled && socket_closed && input.is_none() && jobs.is_empty()) {
             return Ok(());
         }
         if !settled {
