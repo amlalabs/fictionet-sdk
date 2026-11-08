@@ -7,9 +7,69 @@ clock, regions and joins, and `block_on`. The models are TLA+ specifications in
 has the table of specs, their correspondence to the Rust, the bounds, and the
 ablations.
 
-No bug was confirmed. Every passing configuration completed with an empty queue
-and no violation, and every ablation violated exactly the property its config
-names, so the properties have teeth. No production code is changed.
+In the original pass, no bug was confirmed and no production code changed.
+Every passing configuration completed with an empty queue and no violation,
+and every ablation violated exactly the property its config names. The later
+descendant-ownership change and its new evidence are recorded next.
+
+## Descendant task ownership
+
+The original pass below modeled one region's own task count. The layer job
+runner also creates nested regions directly, so returning or dropping an
+opened stack exposed a missing obligation: the enclosing region must join
+those descendant tasks, even when their intermediate context was dropped.
+
+At `b0fb45ee2`, `Region::try_start_task` reserves every ancestor from root to leaf,
+refusing a completed or expired ancestor. A rejected local admission rolls
+all successful reservations back. `task_done` releases leaf-to-root and
+wakes each region whose subtree count reaches zero. Failure remains local:
+ancestor releases pass no error or cancellation. The structural parent is
+weak; an active region retains its parent only while tasks are counted, so
+dropping an intermediate context cannot lose accounting, and retaining an
+idle context cannot keep a region waiting.
+
+`RegionTree.tla` models two admissions into a fixed four-region tree, with
+one step per ancestor reservation/release and independent completion
+checks between them. It checks exact count conservation, closed admission,
+no task outliving any joined ancestor, no leaked rejected reservations and
+failure isolation. Its progress property assumes weak fairness of each
+task's transitions, including that running tasks eventually finish; it
+proves neither termination of arbitrary user futures nor cancellation of
+code that ignores cancellation. Retention of the intermediate parent Arc
+is tested in production Rust, not represented as a heap in the model.
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `RegionTree_base` | 70,485 | 23,984 | all five invariants and `Settles` hold, depth 23 |
+| `RegionTree_without_ancestorcounts` | 2,489 | 1,278 | `NoTaskOutlives` violated |
+| `RegionTree_without_ancestoradmission` | 233 | 190 | `ClosedCounts` violated |
+| `RegionTree_without_rollback` | 820 | 497 | `NoLeakedReservations` violated |
+| `RegionTree_without_errorisolation` | 2,181 | 1,089 | `ErrorIsolation` violated |
+
+The existing `Region.tla` was rerun unchanged as the single-region case:
+124,050 generated states, 30,395 distinct, depth 17, all properties pass.
+Its mutations still violate their named properties: missing completion
+wake has 24,507 distinct states; finishing after the count decrement has
+1,006; cancelling the run after decrementing its tasks has 1,122.
+
+The production tests cover descendant completion, intermediate-context
+release, rejected admission rollback, task failure isolation, a completed
+job whose producer must remain live, and dropping an `Opened` while its
+spawned task is active. Task-start acknowledgements establish the setup
+ordering without sleeps or timing assumptions.
+
+A direct Kani attempt over `Region` methods could not reach verification:
+Kani 0.68.0 internally panicked at `kani-compiler/src/intrinsics.rs:243`,
+`assertion failed: matches!(output.kind(), TyKind::RigidTy(RigidTy::Int(IntTy::I32)))`,
+while compiling the real mutex/futex path. No lock stub or altered runtime
+semantics was substituted. The newly attempted harness was removed because
+it prevents Kani compilation; there was no preexisting runtime Kani harness
+to disable. This property has TLC and executable-test evidence, not a
+successful Kani proof.
+
+All region TLC reruns used `~/.cache/adorably-fv/jdk/bin/java -Xmx6g`,
+`tlc2.TLC -workers 4`, an 8 GiB systemd scope with no swap, and state
+directories under `~/.cache/adorably-fv/states` on the home volume.
 
 ## What was modeled and checked
 

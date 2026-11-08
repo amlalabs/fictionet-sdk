@@ -59,3 +59,13 @@ their release order), `Region::child`'s list of children, the heap rebuild in
 reads. Panics, memory and the `Waker` contract are assumed. Tasks in the
 models end, sleep, idle or wait as they choose; the models do not say what
 world code does, only what the runtime does with it.
+
+
+The child-readiness pass adds `RegionTree.tla` for ancestor task accounting.
+Run `RegionTree_base.cfg` expecting count conservation, closed admission,
+joining and error isolation to hold. Each `RegionTree_without_*.cfg` must
+violate its named invariant. There are two task admissions and four fixed
+regions; the model exposes every ancestor reservation and release to
+interleaving. The original `Region` configurations remain the single-region
+checks. See `VERIFICATION.md` for scope and the unavailable direct Kani
+attempt over the real mutex path.
