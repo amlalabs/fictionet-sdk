@@ -55,7 +55,7 @@
 mod output;
 mod provider;
 
-pub use provider::{client_config_builder, config_builder, crypto_provider, with_context};
+pub use provider::{client_config_builder, config_builder, crypto_provider};
 
 use output::Output;
 use std::future::poll_fn;
@@ -63,6 +63,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use rustls::ConnectionCommon;
 pub use rustls::ServerConfig;
 
 use rustls::server::{Acceptor, ServerConnection};
@@ -169,7 +170,7 @@ impl<C: Connection> Io<C> {
     /// Feeds `inbuf` (or the end of input) to rustls and processes it. On a
     /// TLS error, queues the alert rustls made and fails with what went
     /// wrong.
-    fn feed(&mut self, fcx: &Cx, tls: &mut ServerConnection) -> Result<(), HandshakeError> {
+    fn feed(&mut self, tls: &mut ServerConnection) -> Result<(), HandshakeError> {
         if self.inbuf.is_empty() {
             if self.eof {
                 // Tells rustls the input ended.
@@ -184,7 +185,7 @@ impl<C: Connection> Io<C> {
             }
             self.inbuf.consume(n);
         }
-        let result = with_context(fcx, || tls.process_new_packets().map(|_| ()));
+        let result = tls.process_new_packets().map(|_| ());
         if let Err(e) = result {
             self.output.take_output(tls)?;
             return Err(match e {
@@ -440,7 +441,7 @@ impl<C: Connection> ClientHello<C> {
             output: Output::default(),
             eof: false,
         };
-        let mut tls = match with_context(fcx, || self.accepted.into_connection(config)) {
+        let mut tls = match self.accepted.into_connection(config) {
             Ok(tls) => tls,
             Err((e, mut alert)) => {
                 // Best effort: tell the client why, then close.
@@ -461,7 +462,7 @@ impl<C: Connection> ClientHello<C> {
                     return Poll::Ready(Ok(()));
                 }
                 if !io.inbuf.is_empty() {
-                    io.feed(fcx, &mut tls)?;
+                    io.feed(&mut tls)?;
                     continue;
                 }
                 if io.eof {
@@ -543,7 +544,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
             }
             if !self.io.inbuf.is_empty() || self.io.eof {
                 let eof_seen = self.io.inbuf.is_empty();
-                let fed = self.io.feed(fcx, &mut self.tls);
+                let fed = self.io.feed(&mut self.tls);
                 // rustls may have something to send: a key update, a ticket
                 // or an alert. Only a lack of room defers it to the next read
                 // or write; a transport failure must reach this reader.
@@ -607,7 +608,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
             return Poll::Ready(Ok(0));
         }
         let chunk = &data[..data.len().min(WRITE_CHUNK)];
-        let n = match with_context(fcx, || self.tls.writer().write(chunk)) {
+        let n = match self.tls.writer().write(chunk) {
             Ok(0) | Err(_) => return Poll::Ready(Err(ConnError::Closed)),
             Ok(n) => n,
         };
@@ -621,7 +622,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         if !self.closing {
             self.closing = true;
-            with_context(fcx, || self.tls.send_close_notify());
+            self.tls.send_close_notify();
             self.io.output.take_output(&mut self.tls)?;
         }
         match self.io.poll_flush(fcx, cx) {

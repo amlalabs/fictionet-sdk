@@ -25,7 +25,7 @@ use rustls::ClientConfig;
 // Shared rustls client and payload pattern.
 
 use crate::common::rustls_client;
-type Client<C> = rustls_client::Client<C, false>;
+type Client<C> = rustls_client::Client<C>;
 
 use fictionet_test_support::pattern;
 

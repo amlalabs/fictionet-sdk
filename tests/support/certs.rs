@@ -7,6 +7,7 @@ use fictionet::{
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use simulated_rustls as rustls;
 
 /// A server certificate and the roots that trust it.
 pub struct Certs {

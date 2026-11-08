@@ -13,6 +13,7 @@ members = [
     "demos/nuclear/world",
     "demos/honeypot",
     "smoltcp",
+    "rustls",
     "xtask",
 ]
 default-members = [".", "cli", "codegen", "codegen/tests/golden", "codegen/tests/layouts", "xtask"]
@@ -69,7 +70,7 @@ x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 p384 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 rsa = { version = "0.9.10", features = ["sha2"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls = { package = "fictionet-rustls", path = "rustls", default-features = false, features = ["std", "ring", "tls12"] }
 smoltcp = { path = "smoltcp", default-features = false }
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
 tower-service = { version = "0.3.3" }

@@ -15,6 +15,7 @@ use fictionet::{Attacher, Cx};
 use http::{HeaderMap, StatusCode};
 use rustls::ClientConfig;
 use serde_json::Value;
+use simulated_rustls as rustls;
 
 use crate::{Done, timeout};
 

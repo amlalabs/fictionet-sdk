@@ -1,10 +1,7 @@
 //! A rustls client over a simulated connection.
 
 use fictionet::Cx;
-use fictionet::stdlib::{
-    network::{ConnError, Connection, ConnectionExt},
-    services::tls,
-};
+use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use std::io::{ErrorKind, Read, Write};
@@ -32,12 +29,12 @@ impl std::fmt::Display for ClientError {
 }
 impl std::error::Error for ClientError {}
 
-pub struct Client<C, const WORLD_CONTEXT: bool> {
+pub struct Client<C> {
     conn: C,
     pub tls: ClientConnection,
 }
 
-impl<C: Connection, const WORLD_CONTEXT: bool> Client<C, WORLD_CONTEXT> {
+impl<C: Connection> Client<C> {
     pub async fn connect(
         fcx: &Cx,
         conn: C,
@@ -45,13 +42,7 @@ impl<C: Connection, const WORLD_CONTEXT: bool> Client<C, WORLD_CONTEXT> {
         name: &str,
     ) -> Result<Self, ClientError> {
         let name = ServerName::try_from(name.to_owned()).unwrap();
-        let make = || ClientConnection::new(config, name);
-        let tls = if WORLD_CONTEXT {
-            tls::with_context(fcx, make)
-        } else {
-            make()
-        }
-        .unwrap();
+        let tls = ClientConnection::new(config, name).unwrap();
         let mut c = Client { conn, tls };
         while c.tls.is_handshaking() {
             c.flush(fcx).await?;
@@ -83,11 +74,7 @@ impl<C: Connection, const WORLD_CONTEXT: bool> Client<C, WORLD_CONTEXT> {
         let mut data = &buf[..n];
         loop {
             self.tls.read_tls(&mut data).unwrap();
-            let r = if WORLD_CONTEXT {
-                tls::with_context(fcx, || self.tls.process_new_packets())
-            } else {
-                self.tls.process_new_packets()
-            };
+            let r = self.tls.process_new_packets();
             // Send any alert or reply before reporting.
             let _ = self.flush(fcx).await;
             r.map_err(ClientError::Tls)?;

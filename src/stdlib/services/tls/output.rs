@@ -1,8 +1,8 @@
 //! Ciphertext delivery and plaintext credit shared by the TLS adapters.
 
+use super::ConnectionCommon;
 use fictionet::Cx;
 use fictionet::stdlib::network::{ConnError, Connection};
-use rustls::ConnectionCommon;
 use std::task::{Context, Poll};
 
 /// Ciphertext waiting for the connection underneath, and the write it completes.

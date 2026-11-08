@@ -138,7 +138,7 @@ impl Drop for MemConn {
 
 use crate::common::rustls_client;
 use rustls_client::ClientError;
-type Client = rustls_client::Client<MemConn, true>;
+type Client = rustls_client::Client<MemConn>;
 
 // ---------------------------------------------------------------------------
 // Certificates.
@@ -202,10 +202,6 @@ fn issue(
         leaf.chain[0] = ca.sign(tbs).unwrap().to_bytes().unwrap().into();
     }
     (leaf.chain, leaf.key)
-}
-
-fn provider() -> rustls::crypto::CryptoProvider {
-    tls::crypto_provider()
 }
 
 /// A server config for `name`, issued by `ca`, offering `alpn`.
@@ -488,7 +484,7 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
             let (chain, key) = issue(&fcx, &ca, &["example.test"], 2000, 2100, false);
             let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                 Arc::new(roots(&ca)),
-                Arc::new(provider()),
+                Arc::new(tls::crypto_provider(Arc::new(fcx.clone()))),
             )
             .build()
             .unwrap();
@@ -503,7 +499,7 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
             // The client's clock says mid-2019, so it accepts the server.
             let client_config = Arc::new(
                 ClientConfig::builder_with_details(
-                    Arc::new(provider()),
+                    Arc::new(tls::crypto_provider(Arc::new(fcx.clone()))),
                     Arc::new(FixedTime(date(2019, 6, 1))),
                 )
                 .with_safe_default_protocol_versions()
@@ -700,7 +696,7 @@ fn tls12_clients_work_too() {
                 "CxRandom"
             );
             let mut client_config = ClientConfig::builder_with_details(
-                Arc::new(provider()),
+                Arc::new(tls::crypto_provider(Arc::new(fcx.clone()))),
                 Arc::new(FixedTime(date(2030, 1, 1))),
             )
             .with_protocol_versions(&[&rustls::version::TLS12])

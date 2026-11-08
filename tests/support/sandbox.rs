@@ -19,8 +19,10 @@ use fictionet::{Cx, End, Error, Interface};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    ClientConfig, ClientConnection, ConnectionCommon, DigitallySignedStruct, RootCertStore,
+    SignatureScheme,
 };
+use simulated_rustls as rustls;
 use std::future::poll_fn;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -104,7 +106,7 @@ impl Machine {
     ) -> Result<TlsClient<tcp::TcpConnection>, Error> {
         let conn = self.tcp.connect(fcx, to).await?;
         let name = ServerName::try_from(name.to_owned())?;
-        let session = tls::with_context(fcx, || ClientConnection::new(config, name))?;
+        let session = ClientConnection::new(config, name)?;
         let mut client = TlsClient::with(conn, session);
         client.handshake(fcx).await?;
         Ok(client)
@@ -143,7 +145,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
     ) -> Result<Self, Error> {
         let config = client_config(fcx, start, Some(roots), alpn)?;
         let name = ServerName::try_from(name.to_owned())?;
-        let tls = tls::with_context(fcx, || ClientConnection::new(config, name))?;
+        let tls = ClientConnection::new(config, name)?;
         Ok(TlsClient::with(conn, tls))
     }
 
@@ -189,7 +191,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
                 self.pending = data.to_vec();
                 return Poll::Ready(Ok(true));
             }
-            let r = tls::with_context(fcx, || self.tls.process_new_packets());
+            let r = self.tls.process_new_packets();
             if let Err(e) = r {
                 // Send our alert, best effort.
                 let _ = self.poll_flush(fcx, cx);

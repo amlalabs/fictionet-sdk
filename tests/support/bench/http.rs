@@ -10,6 +10,7 @@ use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use simulated_rustls as rustls;
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -21,6 +21,7 @@ http = "1.5.0"
 http-body-util = "0.1"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 libc = "0.2.189"
+simulated-rustls = { package = "fictionet-rustls", path = "../../rustls", default-features = false, features = ["std", "ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

@@ -220,7 +220,7 @@ mod contract {
 
         fn poll_write(
             &mut self,
-            fcx: &Cx,
+            _: &Cx,
             _: &mut Context<'_>,
             data: &[u8],
         ) -> Poll<Result<usize, ConnError>> {
@@ -234,7 +234,7 @@ mod contract {
             let limit = data.len().min(peer.budget);
             let n = peer.tls.read_tls(&mut &data[..limit]).unwrap();
             peer.budget -= n;
-            tls::with_context(fcx, || peer.tls.process_new_packets()).unwrap();
+            peer.tls.process_new_packets().unwrap();
             let Peer { tls, received, .. } = &mut *peer;
             let result = tls.reader().read_to_end(received);
             assert_eq!(result.unwrap_err().kind(), ErrorKind::WouldBlock);
@@ -256,18 +256,14 @@ mod contract {
             fictionet_test_support::sandbox::client_config(fcx, start, Some(&Arc::new(roots)), &[])
                 .unwrap();
         let session = if server {
-            let client = tls::with_context(fcx, || {
-                ClientConnection::new(
-                    client_config.clone(),
-                    ServerName::try_from("secret.test").unwrap(),
-                )
-            })
+            let client = ClientConnection::new(
+                client_config.clone(),
+                ServerName::try_from("secret.test").unwrap(),
+            )
             .unwrap();
             rustls::Connection::Client(client)
         } else {
-            rustls::Connection::Server(
-                tls::with_context(fcx, || rustls::ServerConnection::new(config.clone())).unwrap(),
-            )
+            rustls::Connection::Server(rustls::ServerConnection::new(config.clone()).unwrap())
         };
         let peer = Arc::new(Mutex::new(Peer {
             tls: session,
@@ -287,10 +283,9 @@ mod contract {
             assert!(!conn.inner().0.lock().unwrap().tls.is_handshaking());
             Box::new(conn)
         } else {
-            let session = tls::with_context(fcx, || {
+            let session =
                 ClientConnection::new(client_config, ServerName::try_from("secret.test").unwrap())
-            })
-            .unwrap();
+                    .unwrap();
             let mut conn = TlsClient::with(transport, session);
             conn.handshake(fcx).await.unwrap();
             assert!(!conn.tls.is_handshaking());
@@ -428,7 +423,7 @@ mod contract {
                 assert!(conn.poll_write(&fcx, &mut cx, b"queued").is_pending());
                 if incoming {
                     let mut peer = peer.lock().unwrap();
-                    tls::with_context(&fcx, || peer.tls.refresh_traffic_keys()).unwrap();
+                    peer.tls.refresh_traffic_keys().unwrap();
                     peer.tls.writer().write_all(b"hello").unwrap();
                 }
                 peer.lock().unwrap().terminal = Some(result);

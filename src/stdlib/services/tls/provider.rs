@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,7 +14,7 @@ use rustls::sign::{Signer, SigningKey};
 use rustls::time_provider::TimeProvider;
 use rustls::{ConfigBuilder, NamedGroup, SignatureAlgorithm, SignatureScheme, WantsVersions};
 
-use fictionet::Cx;
+use fictionet::{Cx, Entropy};
 
 /// Starts a rustls server config whose time and randomness come from `fcx`.
 ///
@@ -38,15 +37,9 @@ use fictionet::Cx;
 /// uses the same random stream, but real peers determine handshake timing
 /// and the order in which their inputs arrive.
 ///
-/// Random values are drawn while [`server`](super::server),
-/// [`ClientHello::finish`](super::ClientHello::finish) or a
-/// [`TlsConnection`](super::TlsConnection) is working, and come from the `Cx`
-/// passed to that call.
-/// Code driving rustls directly must bind a `Cx` with [`with_context`];
-/// otherwise random draws fail.
-///
-/// Continue as with `ServerConfig::builder()`. Key loading does not draw
-/// randomness. Keep configs within their run because the clock holds `fcx`:
+/// The provider retains the run's entropy, including when a connection is
+/// driven directly or moved between threads. Keep configs within their run:
+/// both the clock and entropy retain the run's capabilities.
 ///
 /// ```
 /// # use fictionet::{Cx, Result, stdlib::services::tls};
@@ -61,7 +54,7 @@ use fictionet::Cx;
 /// # }
 /// ```
 pub fn config_builder(fcx: &Cx, start: SystemTime) -> ConfigBuilder<ServerConfig, WantsVersions> {
-    let provider = crypto_provider();
+    let provider = crypto_provider(Arc::new(fcx.clone()));
     let clock = CxClock {
         fcx: fcx.clone(),
         start,
@@ -70,13 +63,13 @@ pub fn config_builder(fcx: &Cx, start: SystemTime) -> ConfigBuilder<ServerConfig
 }
 
 /// Starts a rustls client config using the same clock and randomness as [`config_builder`].
-/// Keep the config within its run and bind direct rustls calls with [`with_context`].
+/// Keep the config within its run.
 pub fn client_config_builder(
     fcx: &Cx,
     start: SystemTime,
 ) -> ConfigBuilder<rustls::ClientConfig, WantsVersions> {
     rustls::ClientConfig::builder_with_details(
-        Arc::new(crypto_provider()),
+        Arc::new(crypto_provider(Arc::new(fcx.clone()))),
         Arc::new(CxClock {
             fcx: fcx.clone(),
             start,
@@ -107,54 +100,26 @@ impl TimeProvider for CxClock {
     }
 }
 
-thread_local! {
-    /// The `Cx` of the TLS work running on this thread now, if any.
-    static CURRENT: RefCell<Option<Cx>> = const { RefCell::new(None) };
-}
+/// rustls randomness backed by an owned run capability.
+struct CxRandom(Arc<dyn Entropy>);
 
-/// Runs synchronous TLS work with `fcx` as its source of randomness.
-///
-/// Bind each call that constructs or drives a rustls connection using
-/// [`crypto_provider`]. The binding lasts only until `f` returns, including
-/// during unwinding. Nested calls restore the previous context. Do not
-/// return a future expecting the binding to remain active when it is polled.
-pub fn with_context<T>(fcx: &Cx, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Cx>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let previous = self.0.take();
-            CURRENT.with(|c| *c.borrow_mut() = previous);
-        }
+impl std::fmt::Debug for CxRandom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CxRandom")
     }
-    let previous = CURRENT.with(|c| c.borrow_mut().replace(fcx.clone()));
-    let _restore = Restore(previous);
-    f()
 }
-
-/// rustls's `SecureRandom`, from the `Cx` of the TLS work that draws it.
-///
-/// rustls keeps it as a `&'static`, so it cannot hold a `Cx` itself: it
-/// reads the one [`with_context`] set for this thread.
-#[derive(Debug)]
-struct CxRandom;
 
 impl SecureRandom for CxRandom {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-        CURRENT.with(|c| match &*c.borrow() {
-            Some(fcx) => {
-                fcx.fill_random(buf);
-                Ok(())
-            }
-            None => Err(GetRandomFailed),
-        })
+        self.0.fill_random(buf);
+        Ok(())
     }
 }
 
 /// Builds the run-aware TLS crypto provider.
 ///
 /// Cipher suites, verification algorithms and their preference order are
-/// ring's. Key exchange and signing use the run's entropy through
-/// [`with_context`]; without a context, operations needing entropy fail.
+/// ring's. Key exchange and signing retain the supplied entropy capability.
 /// X25519, P-256 and P-384 secrets are zeroized when dropped. The provider
 /// does not install a stateless ticketer; rustls's stateful cache remains
 /// available. Custom resolvers and signers must honor the same contract.
@@ -162,40 +127,42 @@ impl SecureRandom for CxRandom {
 /// The provider supplies cryptography, not the certificate clock. For a
 /// client config, use `rustls::ClientConfig::builder_with_details` with a
 /// `TimeProvider` derived from [`Cx::now`] and the world's date.
-pub fn crypto_provider() -> CryptoProvider {
+pub fn crypto_provider(entropy: Arc<dyn Entropy>) -> CryptoProvider {
     CryptoProvider {
-        secure_random: &CxRandom,
+        secure_random: Arc::new(CxRandom(entropy.clone())),
         kx_groups: vec![
-            &CxGroup(rustls::NamedGroup::X25519),
-            &CxGroup(rustls::NamedGroup::secp256r1),
-            &CxGroup(rustls::NamedGroup::secp384r1),
+            Arc::new(CxGroup(NamedGroup::X25519, CxRandom(entropy.clone()))),
+            Arc::new(CxGroup(NamedGroup::secp256r1, CxRandom(entropy.clone()))),
+            Arc::new(CxGroup(NamedGroup::secp384r1, CxRandom(entropy.clone()))),
         ],
-        key_provider: &CxKeyProvider,
+        key_provider: Arc::new(CxKeyProvider {
+            random: CxRandom(entropy),
+        }),
         ..rustls::crypto::ring::default_provider()
     }
 }
 
 #[derive(Debug)]
-struct CxGroup(NamedGroup);
+struct CxGroup(NamedGroup, CxRandom);
 
 impl SupportedKxGroup for CxGroup {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
         let secret = match self.0 {
             NamedGroup::X25519 => {
                 let mut bytes = Zeroizing::new([0; 32]);
-                CxRandom.fill(bytes.as_mut())?;
+                self.1.fill(bytes.as_mut())?;
                 ExchangeSecret::X25519(x25519_dalek::StaticSecret::from(*bytes))
             }
             NamedGroup::secp256r1 => loop {
                 let mut bytes = Zeroizing::new([0; 32]);
-                CxRandom.fill(bytes.as_mut())?;
+                self.1.fill(bytes.as_mut())?;
                 if let Ok(secret) = p256::SecretKey::from_slice(bytes.as_ref()) {
                     break ExchangeSecret::P256(secret);
                 }
             },
             NamedGroup::secp384r1 => loop {
                 let mut bytes = Zeroizing::new([0; 48]);
-                CxRandom.fill(bytes.as_mut())?;
+                self.1.fill(bytes.as_mut())?;
                 if let Ok(secret) = p384::SecretKey::from_slice(bytes.as_ref()) {
                     break ExchangeSecret::P384(secret);
                 }
@@ -281,7 +248,9 @@ impl ActiveKeyExchange for Exchange {
 }
 
 #[derive(Debug)]
-struct CxKeyProvider;
+struct CxKeyProvider {
+    random: CxRandom,
+}
 
 // Debug deliberately excludes private key material.
 enum KeyMaterial {
@@ -291,6 +260,7 @@ enum KeyMaterial {
 }
 
 struct RunSigningKey {
+    entropy: Arc<dyn Entropy>,
     material: Arc<KeyMaterial>,
     public: Vec<u8>,
 }
@@ -343,6 +313,7 @@ impl KeyProvider for CxKeyProvider {
                 .as_bytes()
                 .to_vec();
             return Ok(Arc::new(RunSigningKey {
+                entropy: self.random.0.clone(),
                 material: Arc::new(KeyMaterial::Rsa(Box::new(key))),
                 public,
             }));
@@ -360,6 +331,7 @@ impl KeyProvider for CxKeyProvider {
                 .as_bytes()
                 .to_vec();
             return Ok(Arc::new(RunSigningKey {
+                entropy: self.random.0.clone(),
                 material: Arc::new(KeyMaterial::P256(key.into())),
                 public,
             }));
@@ -377,6 +349,7 @@ impl KeyProvider for CxKeyProvider {
                 .as_bytes()
                 .to_vec();
             return Ok(Arc::new(RunSigningKey {
+                entropy: self.random.0.clone(),
                 material: Arc::new(KeyMaterial::P384(key.into())),
                 public,
             }));
@@ -407,6 +380,7 @@ impl SigningKey for RunSigningKey {
         };
         let scheme = *supported.iter().find(|s| offered.contains(s))?;
         Some(Box::new(RunSigner {
+            entropy: self.entropy.clone(),
             material: self.material.clone(),
             scheme,
         }))
@@ -423,6 +397,7 @@ impl SigningKey for RunSigningKey {
 }
 
 struct RunSigner {
+    entropy: Arc<dyn Entropy>,
     material: Arc<KeyMaterial>,
     scheme: SignatureScheme,
 }
@@ -435,18 +410,7 @@ impl std::fmt::Debug for RunSigner {
     }
 }
 
-// Own the capability for the duration of the primitive's synchronous call.
-// rand_core's infallible methods cannot report missing context, so construction
-// checks it before passing this adapter to RSA.
-struct CxRng(Cx);
-impl CxRng {
-    fn current() -> Result<Self, rustls::Error> {
-        CURRENT
-            .with(|c| c.borrow().clone())
-            .map(Self)
-            .ok_or_else(|| GetRandomFailed.into())
-    }
-}
+struct CxRng(Arc<dyn Entropy>);
 impl rsa::rand_core::CryptoRng for CxRng {}
 impl rsa::rand_core::RngCore for CxRng {
     fn next_u32(&mut self) -> u32 {
@@ -486,7 +450,7 @@ impl Signer for RunSigner {
                 Ok(signature.to_der().as_bytes().to_vec())
             }
             KeyMaterial::Rsa(key) => {
-                let mut rng = CxRng::current()?;
+                let mut rng = CxRng(self.entropy.clone());
                 let hash = match self.scheme {
                     SignatureScheme::RSA_PSS_SHA256 | SignatureScheme::RSA_PKCS1_SHA256 => {
                         &ring::digest::SHA256
@@ -543,25 +507,25 @@ impl Signer for RunSigner {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn randomness_requires_context_and_preserves_partial_fills() {
+    fn randomness_preserves_partial_fills() {
         use fictionet::{Entropy, SeededEntropy};
         use rustls::crypto::SecureRandom;
         let mut byte = [0; 1];
-        assert!(super::CxRandom.fill(&mut byte).is_err());
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(42),
             |fcx| async move {
                 let oracle = SeededEntropy::new(fictionet::Seed::from_u64(42));
                 let mut expected = [0; 1];
                 oracle.fill_random(&mut expected);
-                super::with_context(&fcx, || super::CxRandom.fill(&mut byte)).unwrap();
+                super::CxRandom(std::sync::Arc::new(fcx.clone()))
+                    .fill(&mut byte)
+                    .unwrap();
                 assert_eq!(byte, expected);
                 assert_eq!(fcx.random_u64(), oracle.random_u64());
                 Ok(())
             },
         ))
         .unwrap();
-        assert!(super::CxRandom.fill(&mut byte).is_err());
     }
 
     #[test]
@@ -608,8 +572,7 @@ mod tests {
             let result = Arc::new(Mutex::new(Vec::new()));
             let output = result.clone();
             block_on(lab(Seed::from_u64(seed), move |cx| async move {
-                *output.lock().unwrap() =
-                    super::with_context(&cx, || draw(super::crypto_provider()));
+                *output.lock().unwrap() = draw(super::crypto_provider(Arc::new(cx.clone())));
                 Ok(())
             }))
             .unwrap();

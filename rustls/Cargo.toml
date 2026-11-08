@@ -1,0 +1,128 @@
+[package]
+edition = "2021"
+rust-version = "1.71"
+name = "fictionet-rustls"
+version = "0.23.46"
+publish = false
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Rustls is a modern TLS library written in Rust."
+homepage = "https://github.com/rustls/rustls"
+readme = "README.md"
+categories = [
+    "network-programming",
+    "cryptography",
+]
+license = "Apache-2.0 OR ISC OR MIT"
+repository = "https://github.com/rustls/rustls"
+
+[package.metadata.docs.rs]
+features = [
+    "read_buf",
+    "ring",
+]
+rustdoc-args = [
+    "--cfg",
+    "rustls_docsrs",
+]
+
+[features]
+default = ["ring", "logging", "std", "tls12"]
+custom-provider = []
+logging = ["log"]
+read_buf = ["rustversion", "std"]
+ring = ["dep:ring", "webpki/ring"]
+std = ["webpki/std", "pki-types/std", "once_cell/std"]
+tls12 = []
+
+[lib]
+name = "rustls"
+path = "src/lib.rs"
+
+[[bench]]
+name = "benchmarks"
+path = "benches/benchmarks.rs"
+harness = false
+required-features = ["ring"]
+
+[dependencies.hashbrown]
+version = "0.15"
+features = [
+    "default-hasher",
+    "inline-more",
+]
+optional = true
+default-features = false
+
+[dependencies.log]
+version = "0.4.8"
+optional = true
+
+[dependencies.once_cell]
+version = "1.16"
+features = [
+    "alloc",
+    "race",
+]
+default-features = false
+
+[dependencies.pki-types]
+version = "1.12"
+features = ["alloc"]
+package = "rustls-pki-types"
+
+[dependencies.ring]
+version = "0.17"
+optional = true
+
+[dependencies.subtle]
+version = "2.5.0"
+default-features = false
+
+[dependencies.webpki]
+version = "0.103.14"
+features = ["alloc"]
+default-features = false
+package = "rustls-webpki"
+
+[dependencies.zeroize]
+version = "1.8"
+
+[dev-dependencies.bencher]
+version = "0.1.5"
+
+[dev-dependencies.env_logger]
+version = "0.11"
+
+[dev-dependencies.hex]
+version = "0.4"
+
+[dev-dependencies.log]
+version = "0.4.8"
+
+[dev-dependencies.macro_rules_attribute]
+version = "0.2"
+
+[dev-dependencies.webpki-roots]
+version = "1"
+
+[dev-dependencies.x509-parser]
+version = "0.17"
+
+[build-dependencies.rustversion]
+version = "1.0.6"
+optional = true
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(bench)",
+    "cfg(coverage_nightly)",
+    "cfg(read_buf)",
+    "cfg(rustls_docsrs)",
+]
