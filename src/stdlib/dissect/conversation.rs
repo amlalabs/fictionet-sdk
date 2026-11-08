@@ -1,5 +1,6 @@
 use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::dissect::{Decoded, KeyLine, Match, Place, Protocol, Registry, Selection};
+use fictionet::stdlib::layer::Termination;
 
 /// Selects and drives one ordered byte conversation in both directions.
 /// Direction zero sends from the first port to the second. TCP callers use
@@ -71,12 +72,15 @@ impl Conversation {
         }
     }
 
-    /// Tells the selected protocol that this direction ended cleanly, and
-    /// appends what that completes to `d`. Before selection there is
-    /// nothing to finish.
-    pub fn end(&mut self, dir: bool, d: &mut Decoded) {
-        if let Some(protocol) = &mut self.protocol {
-            protocol.end(dir, d);
+    /// Tells the selected protocol how this direction ended, and appends
+    /// what that completes to `d`. Before selection there is nothing to
+    /// finish, and an end that is not clean discards the prefix, as
+    /// [`lost`](Self::lost) does.
+    pub fn end(&mut self, dir: bool, how: Termination, d: &mut Decoded) {
+        match &mut self.protocol {
+            Some(protocol) => protocol.end(dir, how, d),
+            None if !how.is_clean() => self.lost(dir),
+            None => {}
         }
     }
 

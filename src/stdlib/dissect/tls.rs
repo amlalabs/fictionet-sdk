@@ -4,6 +4,7 @@ use fictionet::stdlib::dissect::{
     Conversation, Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol,
     Registry, protocols,
 };
+use fictionet::stdlib::layer::Termination;
 
 /// One TLS connection: what its hellos said, and its keys.
 struct Tls {
@@ -74,10 +75,32 @@ impl Protocol for TlsSession {
             });
         }
     }
+    /// Whether this direction holds part of a record, or the decrypted
+    /// stream holds part of a message.
     fn waiting(&self, reverse: bool) -> bool {
         self.dirs[usize::from(reverse)]
             .as_ref()
             .is_some_and(Observed::waiting)
+            || self
+                .tls
+                .inner
+                .as_ref()
+                .is_some_and(|inner| inner.waiting(reverse))
+    }
+    /// Ends the records of this direction, then the decrypted stream they
+    /// carried, the same way: a clean end finishes both, so a message
+    /// read to the end of the stream completes; any other end discards
+    /// what both held.
+    fn end(&mut self, reverse: bool, how: Termination, d: &mut Decoded) {
+        if !how.is_clean() {
+            return self.lost(reverse);
+        }
+        if let Some(dir) = &mut self.dirs[usize::from(reverse)] {
+            dir.end(d);
+        }
+        if let Some(inner) = &mut self.tls.inner {
+            inner.end(reverse, how, d);
+        }
     }
     fn lost(&mut self, reverse: bool) {
         let i = usize::from(reverse);
