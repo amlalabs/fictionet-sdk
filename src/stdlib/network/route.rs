@@ -37,6 +37,13 @@ pub struct Prefix {
     pub len: u8,
 }
 
+impl std::fmt::Display for Prefix {
+    /// `10.0.0.0/8` or `::/0`, the form [`Prefix::from_str`] reads.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.len)
+    }
+}
+
 impl FromStr for Prefix {
     type Err = Error;
 

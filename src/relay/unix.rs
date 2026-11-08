@@ -40,10 +40,23 @@ pub fn address(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::s
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let bytes = path.as_os_str().as_bytes();
-    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+    let problem = if bytes.is_empty() {
+        Some("is empty".to_owned())
+    } else if bytes.len() >= addr.sun_path.len() {
+        Some(format!(
+            "is {} bytes; Unix socket paths must be shorter than {}",
+            bytes.len(),
+            addr.sun_path.len()
+        ))
+    } else if bytes.contains(&0) {
+        Some("contains a NUL byte".to_owned())
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "bad Unix socket path",
+            format!("Unix socket path {} {problem}", path.display()),
         ));
     }
     for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {

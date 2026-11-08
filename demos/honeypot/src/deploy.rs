@@ -255,7 +255,7 @@ impl Options {
             "persona": "Ubuntu 24.04 / Linux 6.8", "http_profile": format!("{:?}", self.args.config.http_profile),
             "listeners": self.args.config.ports.iter().map(|port| json!({"port": port.number, "service": format!("{:?}", port.service).to_lowercase()})).collect::<Vec<_>>(),
             "ssh_auth": match self.args.config.ssh_auth { SshAuth::Reject => "reject", SshAuth::AnyCredentials => "accept", SshAuth::PasswordOrPublicKey(_) => "configured_password_or_signed_public_key" },
-            "internet_ipv4": format!("{:?}", self.args.config.internet.ipv4), "internet_ipv6": format!("{:?}", self.args.config.internet.ipv6),
+            "internet_ipv4": self.args.config.internet.ipv4.to_string(), "internet_ipv6": self.args.config.internet.ipv6.to_string(),
             "burst_window_ms": self.args.config.burst.window.as_millis(), "burst_syns": self.args.config.burst.syns,
             "capture_boundary": if matches!(self.backend, Backend::Vfio { .. }) { "ethernet_and_derived_ip" } else { "ip" },
             "observations": ["mptcp", "ipv4_options", "ssh", "port_zero"],

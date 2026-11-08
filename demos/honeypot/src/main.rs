@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn main() -> fictionet::Result {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
-    if matches!(arguments.as_slice(), [arg] if arg == "--help" || arg == "-h") {
+    if arguments.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{}", deploy::HELP);
         return Ok(());
     }
