@@ -7,6 +7,8 @@
 //! follow TCP streams across packets.
 
 mod app;
+#[cfg(test)]
+mod capture_tests;
 mod json;
 
 /// The byte transport supplied to a dissector.

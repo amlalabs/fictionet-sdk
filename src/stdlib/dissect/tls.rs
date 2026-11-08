@@ -35,6 +35,9 @@ struct Tls {
 /// The supplied registry also selects protocols in the decrypted stream.
 pub struct TlsSession {
     tls: Tls,
+    /// Each direction's records, until bytes go missing in it. Past a gap,
+    /// where the next record starts and which sequence number it has are
+    /// unknown, so that direction's records are not read again.
     dirs: [Option<Observed<protocols::TlsRecords>>; 2],
 }
 impl TlsSession {
@@ -69,10 +72,11 @@ impl TlsSession {
 impl Protocol for TlsSession {
     fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, keys: &[KeyLine]) {
         let i = usize::from(reverse);
-        if let Some(dir) = &mut self.dirs[i] {
-            dir.data_with(bytes, at, d, |item, raw, start, place, d| {
+        match &mut self.dirs[i] {
+            Some(dir) => dir.data_with(bytes, at, d, |item, raw, start, place, d| {
                 self.tls.present_record(i, item, raw, start, place, d, keys)
-            });
+            }),
+            None => d.application(1, "TLS", "Not decoded: earlier bytes were not captured"),
         }
     }
     /// Whether this direction holds part of a record, or the decrypted
@@ -102,10 +106,11 @@ impl Protocol for TlsSession {
             inner.end(reverse, how, d);
         }
     }
+    /// Stops reading this direction's records, and tells the decrypted
+    /// stream its bytes are missing.
     fn lost(&mut self, reverse: bool) {
         let i = usize::from(reverse);
-        let slot = &mut self.dirs[i];
-        *slot = slot.take().map(Observed::reset);
+        self.dirs[i] = None;
         if let Some(inner) = &mut self.tls.inner {
             inner.lost(reverse);
         }
@@ -726,7 +731,7 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use fictionet::stdlib::dissect::Match;
 
@@ -838,7 +843,7 @@ mod tests {
         }
     }
     /// Seals one TLS 1.3 record with the key from `secret`.
-    fn seal(secret: &[u8], seq: u64, kind: u8, plain: &[u8]) -> Vec<u8> {
+    pub(in super::super) fn seal(secret: &[u8], seq: u64, kind: u8, plain: &[u8]) -> Vec<u8> {
         use ring::aead::{Aad, Nonce};
         let (key, iv) = traffic_key(0x1301, secret).unwrap();
         let mut inner = plain.to_vec();
@@ -889,7 +894,7 @@ mod tests {
         fn fields(_: &Vec<u8>, _: &[u8], _: &mut Layer) {}
     }
 
-    fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
+    pub(in super::super) fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
         let mut message = vec![kind, 0, (body.len() >> 8) as u8, body.len() as u8];
         message.extend_from_slice(body);
         message
