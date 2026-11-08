@@ -3,7 +3,8 @@
 //! part of the API.
 
 use crate::Packet;
-use crate::stdlib::network::ip::{Intake, Reassembly, protocol_end};
+use crate::stdlib::network::ip::{Intake, Reassembly};
+use crate::stdlib::network::packet::Transport;
 use crate::time::{Duration, Instant};
 
 /// Feeds packets to fragment reassembly, as `split_protocols` takes them in
@@ -35,8 +36,7 @@ pub fn reassemble(packets: impl IntoIterator<Item = (u64, Vec<u8>)>) -> Vec<Pack
     out
 }
 
-/// Which end of `ip::split_protocols` a whole packet goes to, as a
-/// protocol number.
-pub fn sort(packet: &[u8]) -> u8 {
-    protocol_end(packet)
+/// Which end of `ip::split_protocols` a whole packet goes to.
+pub fn sort(packet: &[u8]) -> Transport {
+    Transport::of(packet)
 }

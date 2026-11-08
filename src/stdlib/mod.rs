@@ -232,6 +232,7 @@
 //! | [`network::ethernet`] | Ethernet frames to IP packets and back for a VM's network card or a host on a segment, with ARP, neighbor discovery and the frame stream. |
 //! | [`network::icmp`] | ICMP echo replies and error messages. |
 //! | [`network::ip`] | IP packets, checksums, fragment reassembly and protocol splitting. |
+//! | [`network::packet`] | The IP layer: whole packets taken in as a host takes them, checked, reassembled and sorted for their transports. |
 //! | [`network::ports`] | Ready-slot polling for packet interfaces. |
 //! | [`network::route`] | Packet routing and LAN forwarding. |
 //! | [`network::tcp`] | Simulated TCP listeners and connections using smoltcp. |

@@ -102,6 +102,21 @@ impl Chunk {
         true
     }
 
+    /// The bytes not yet taken, as a vector. Reuses the allocation when
+    /// this chunk alone owns uncharged backing that holds exactly these
+    /// bytes, and copies them otherwise. Any charge goes back when the
+    /// chunk's backing is dropped: the vector carries none.
+    pub fn into_vec(self) -> Vec<u8> {
+        let whole = self.start == 0 && self.end == self.backing.bytes.len();
+        if whole && self.backing.charge.is_none() && self.backing.credit.is_none() {
+            match Arc::try_unwrap(self.backing) {
+                Ok(backing) => return backing.bytes,
+                Err(backing) => return backing.bytes[self.start..self.end].to_vec(),
+            }
+        }
+        self.to_vec()
+    }
+
     /// The shared backing allocation's charge. Split pieces name the same
     /// charge; their charged values must not be added together.
     pub fn charged(&self) -> usize {

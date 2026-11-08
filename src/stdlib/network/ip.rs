@@ -83,14 +83,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
+use std::sync::Arc;
 use std::task::Poll;
 
+use fictionet::stdlib::layer::{
+    Admit, Budget, Chunk, Datagram, Driver, PacketCommand, PacketEvent,
+};
+use fictionet::stdlib::network::packet::{Ingress, IpLayer, Transport};
 use fictionet::stdlib::network::{
     icmp,
     ports::{Event, Ports},
 };
 use fictionet::time::{Duration, Instant};
-use fictionet::{Cx, End, Interface, Packet};
+use fictionet::{Cx, End, Entropy, Interface, Packet};
 
 /// Typed IPv4 options and their standards-level wire codec.
 pub use smoltcp::wire::{
@@ -303,7 +308,7 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
             Box::new(v6_mine),
             Box::new(other_mine),
         ]);
-        split(fcx, ports, None, |packet| match version(&packet.0) {
+        split(fcx, ports, |packet| match version(&packet.0) {
             Some(4) => 1,
             Some(6) => 2,
             _ => 3,
@@ -313,45 +318,25 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
     (v4, v6, other)
 }
 
-/// The loop behind both splits. Port 0 is the interface being split. Each
-/// packet from it goes to the port `sort` names. Packets from every other
-/// port go out on port 0. With `reassembly`, packets from port 0 go through
-/// [`Reassembly::push`] before they are sorted.
+/// The loop behind [`split_versions`]. Port 0 is the interface being split.
+/// Each packet from it goes to the port `sort` names. Packets from every
+/// other port go out on port 0.
 ///
 /// It ends when the region is cancelled, when port 0 closes, or when every
 /// other port has closed.
 async fn split(
     fcx: Cx,
     mut ports: Ports<Box<dyn Interface>>,
-    mut reassembly: Option<Reassembly>,
     sort: impl Fn(&Packet) -> usize,
 ) -> fictionet::Result {
     loop {
-        let deadline = reassembly.as_ref().and_then(|r| r.next_expiry());
-        match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
+        match ports.next(&fcx, None, |_| Poll::Pending).await? {
             Event::Packet(0, packet) => {
-                let packet = match reassembly.as_mut() {
-                    Some(r) => match r.push(packet, fcx.now()) {
-                        Intake::Whole(p) => p,
-                        Intake::Waiting => continue,
-                        Intake::Refused { answer, .. } => {
-                            if let Some(answer) = answer {
-                                ports.send(0, answer);
-                            }
-                            continue;
-                        }
-                    },
-                    None => packet,
-                };
                 let to = sort(&packet);
                 ports.send(to, packet);
             }
             Event::Packet(_, packet) => ports.send(0, packet),
-            Event::Timer => {
-                if let Some(r) = reassembly.as_mut() {
-                    r.expire(fcx.now());
-                }
-            }
+            Event::Timer => {}
             Event::Closed(0) | Event::Extra => return Ok(()),
             Event::Closed(_) => {
                 if ports.open() <= 1 {
@@ -359,6 +344,68 @@ async fn split(
                 }
             }
         }
+    }
+}
+
+/// The loop behind [`split_protocols`]: the interfaces around an
+/// [`IpLayer`]. Port 0 is the interface being split; ports 1 to 4 take TCP,
+/// UDP, ICMP and everything else. Each packet from port 0 goes into the
+/// layer, and each one the layer hands up goes to the port of its
+/// [`Transport`]. Packets from every other port, and the layer's answers,
+/// go out on port 0. The layer's deadline is the loop's.
+///
+/// The layer is drained after every step, so it always has room for the
+/// next packet. What waits is bounded by the interfaces' own caps and by
+/// the reassembly's, so the layer runs with no budget of its own.
+///
+/// It ends when the region is cancelled, when port 0 closes, or when every
+/// other port has closed.
+async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fictionet::Result {
+    let entropy: Arc<dyn Entropy> = Arc::new(fcx.clone());
+    let mut ip = Driver::new(IpLayer::host(), entropy, Budget::unlimited(), fcx.now());
+    ip.keep_observations(0);
+    loop {
+        let admit = match ports.next(&fcx, ip.deadline(), |_| Poll::Pending).await? {
+            Event::Packet(0, Packet(bytes)) => {
+                ip.set_now(fcx.now());
+                let raw = Datagram::new(Chunk::new(bytes), Ingress::default());
+                ip.deliver(PacketEvent::Packet(raw))?.map(drop)
+            }
+            Event::Packet(_, Packet(bytes)) => ip
+                .command(PacketCommand::Send(Chunk::new(bytes)))?
+                .map(drop),
+            Event::Timer => {
+                ip.set_now(fcx.now());
+                Admit::Taken
+            }
+            Event::Closed(0) | Event::Extra => return Ok(()),
+            Event::Closed(_) => {
+                if ports.open() <= 1 {
+                    return Ok(());
+                }
+                Admit::Taken
+            }
+        };
+        assert_eq!(admit, Admit::Taken, "a drained IP layer has room");
+        ip.run()?;
+        ip.send_below(|command| {
+            if let PacketCommand::Send(bytes) = command {
+                ports.send(0, Packet(bytes.into_vec()));
+            }
+            Admit::Taken
+        });
+        ip.send_above(|event| {
+            if let PacketEvent::Packet(packet) = event {
+                let to = match packet.transport() {
+                    Transport::Tcp => 1,
+                    Transport::Udp => 2,
+                    Transport::Icmp => 3,
+                    Transport::Other(_) => 4,
+                };
+                ports.send(to, Packet(packet.into_bytes().into_vec()));
+            }
+            Admit::Taken
+        });
     }
 }
 
@@ -473,65 +520,9 @@ pub fn prepare_split_protocols(
             Box::new(icmp_mine),
             Box::new(other_mine),
         ]);
-        split(
-            fcx,
-            ports,
-            Some(Reassembly::default()),
-            |packet| match protocol_end(&packet.0) {
-                protocol::TCP => 1,
-                protocol::UDP => 2,
-                protocol::ICMP | protocol::ICMPV6 => 3,
-                _ => 4,
-            },
-        )
-        .await
+        split_transports(fcx, ports).await
     };
     ((tcp, udp, icmp, other), Prepared { task })
-}
-
-/// Which end of [`split_protocols`] a whole (not fragmented) packet belongs
-/// to, as a protocol number: TCP, UDP, ICMP (1 for both versions' ICMP), or
-/// anything else for the last end. ICMP errors are sorted by the protocol
-/// of the packet they quote.
-pub fn protocol_end(packet: &[u8]) -> u8 {
-    let Some(h) = Header::parse_whole(packet) else {
-        return protocol::NONE;
-    };
-    let icmp = h.payload(packet);
-    match h.protocol {
-        // Destination unreachable (including "fragmentation needed"),
-        // source quench, time exceeded, parameter problem.
-        protocol::ICMP if h.src.is_ipv4() => {
-            if icmp.len() >= 8
-                && matches!(icmp[0], 3 | 4 | 11 | 12)
-                && let Some(p) = quoted_protocol(&icmp[8..])
-            {
-                return p;
-            }
-            protocol::ICMP
-        }
-        // Types below 128 are errors: destination unreachable, packet too
-        // big, time exceeded, parameter problem.
-        protocol::ICMPV6 if h.src.is_ipv6() => {
-            if icmp.len() >= 8
-                && icmp[0] < 128
-                && let Some(p) = quoted_protocol(&icmp[8..])
-            {
-                return p;
-            }
-            protocol::ICMP
-        }
-        p => p,
-    }
-}
-
-/// The protocol of the packet quoted in an ICMP error, if it is TCP or UDP.
-fn quoted_protocol(quoted: &[u8]) -> Option<u8> {
-    let h = Header::parse_truncated(quoted)?;
-    if h.fragment.is_some_and(|f| f.offset != 0) {
-        return None;
-    }
-    matches!(h.protocol, protocol::TCP | protocol::UDP).then_some(h.protocol)
 }
 
 /// How long an unfinished IPv4 packet waits for its fragments, as Linux's
@@ -587,8 +578,9 @@ struct Partial {
     expires: Instant,
 }
 
-/// Fragment reassembly, for [`split_protocols`] and for each sandbox's
-/// filter in [`net::Net`](fictionet::stdlib::world::net::Net).
+/// Fragment reassembly, for the [`IpLayer`] that [`split_protocols`] runs on
+/// and for each sandbox's filter in
+/// [`net::Net`](fictionet::stdlib::world::net::Net).
 ///
 /// Every step costs at most a logarithm of the number of unfinished
 /// packets, since the agent decides how many there are. At most 4 MiB of
@@ -2461,7 +2453,11 @@ mod tests {
                 Some((next, 40)),
                 "parse_whole, next header {next}"
             );
-            assert_eq!(protocol_end(&p), next, "the split, next header {next}");
+            assert_eq!(
+                Transport::of(&p),
+                Transport::Other(next),
+                "the split, next header {next}"
+            );
         }
         // A chain cut short reads as "no next header" only to the reader
         // that allows it.
