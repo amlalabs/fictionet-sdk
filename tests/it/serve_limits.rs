@@ -18,13 +18,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::httpd::{closing, poll, send, serve};
 use bytes::Bytes;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::layer::Budget;
+use fictionet::stdlib::layer::{self, Budget};
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{self, Ended, Flow, Harness, ServeOptions};
 use fictionet::stdlib::web::httpd::{
-    self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply,
+    self, Body, Closing, Exchange, Handler, Http1, HttpOptions, Limits, Reply,
 };
 use fictionet::stdlib::{
     network::{Connection, ConnectionExt, ip, tcp},
@@ -139,21 +140,14 @@ fn reply_bytes_count_against_the_budget() {
 /// to be written. Before, it did not.
 #[test]
 fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
-    let opts = ServeOptions::default()
-        .idle(None)
-        .budget(Budget::new(512 << 10));
-
-    let mut h = Harness::with_options(
+    let mut h = layer::Harness::with_budget(
         fictionet::Seed::from_u64(0),
         Http1::new(page(1 << 20)),
-        (),
-        opts,
-    );
-    assert_eq!(
-        h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap(),
-        b""
-    );
-    assert_eq!(h.end_reason(), Some(Ended::Budget));
+        Budget::new(512 << 10),
+    )
+    .running_work();
+    assert_eq!(send(&mut h, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n"), b"");
+    assert_eq!(closing(&mut h), Some(Closing::Budget));
 }
 
 /// A write that takes no bytes for the write timeout ends the connection.
@@ -376,10 +370,8 @@ fn response_policy_agrees_across_http_versions() {
 /// fired.
 #[test]
 fn an_http10_body_of_unknown_length_closes_the_connection() {
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Streams), ());
-    let reply = h
-        .push(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
-        .unwrap();
+    let mut h = serve(Http1::new(Streams));
+    let reply = send(&mut h, b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
     let text = String::from_utf8(reply).unwrap();
     assert!(text.starts_with("HTTP/1.0 200 OK\r\n"), "{text}");
     assert!(
@@ -387,19 +379,17 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
         "{text}"
     );
     assert!(text.ends_with("\r\n\r\nstreamed\n"), "{text}");
-    assert_eq!(h.end_reason(), Some(Ended::Closed));
+    assert_eq!(closing(&mut h), Some(Closing::Done));
 
     // With a known length, the connection stays open.
-    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(page(3)), ());
-    let reply = h
-        .push(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
-        .unwrap();
+    let mut h = serve(Http1::new(page(3)));
+    let reply = send(&mut h, b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
     assert!(
         String::from_utf8(reply)
             .unwrap()
             .contains("Connection: keep-alive")
     );
-    assert_eq!(h.end_reason(), None);
+    assert_eq!(closing(&mut h), None);
 }
 
 /// A request's event is made once its bytes are written, and says what
@@ -602,23 +592,22 @@ fn pending_http1_requests_keep_their_body_charge() {
                 http::Response::new(Bytes::new())
             },
         );
-        let mut h = Harness::with_options(
+        let mut h = layer::Harness::with_budget(
             fictionet::Seed::from_u64(0),
             Http1::new(router),
-            (),
-            ServeOptions::default().budget(budget.clone()),
+            budget.clone(),
         )
-        .with_fcx(fcx.clone());
-        h.open().unwrap();
+        .in_world(fcx.clone());
+        h.settle().unwrap();
         let base = budget.used();
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 8192\r\n\r\n")
             .unwrap();
         h.push(&[b'x'; 8192]).unwrap();
-        assert_eq!(h.pending(), (1, 0));
+        assert_eq!(h.jobs(), 1);
         assert!(budget.used() >= base + 8192);
         fcx.sleep(Duration::from_secs(1)).await?;
-        assert!(!h.poll().unwrap().is_empty());
-        assert_eq!(h.pending(), (0, 0));
+        assert!(!poll(&mut h).is_empty());
+        assert_eq!(h.jobs(), 0);
         assert_eq!(budget.used(), base);
         drop(h);
         assert_eq!(budget.used(), 0);
@@ -642,20 +631,19 @@ fn truncated_http1_requests_keep_their_body_charge() {
     }
     world(Duration::from_secs(10), |fcx| async move {
         let budget = Budget::new(1 << 20);
-        let mut h = Harness::with_options(
+        let mut h = layer::Harness::with_budget(
             fictionet::Seed::from_u64(0),
             Http1::new(Partial),
-            (),
-            ServeOptions::default().budget(budget.clone()),
+            budget.clone(),
         )
-        .with_fcx(fcx.clone());
-        h.open().unwrap();
+        .in_world(fcx.clone());
+        h.settle().unwrap();
         let base = budget.used();
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 16384\r\n\r\n")
             .unwrap();
         h.push(&[b'x'; 8192]).unwrap();
         let _ = h.end();
-        assert_eq!(h.pending(), (1, 0));
+        assert_eq!(h.jobs(), 1);
         assert!(budget.used() >= base + 8192);
         drop(h);
         assert_eq!(budget.used(), 0);
@@ -674,14 +662,13 @@ fn http1_charges_heads_while_reading_and_metadata_while_waiting() {
                 http::Response::new(Bytes::new())
             },
         );
-        let mut h = Harness::with_options(
+        let mut h = layer::Harness::with_budget(
             fictionet::Seed::from_u64(0),
             Http1::new(router),
-            (),
-            ServeOptions::default().budget(budget.clone()),
+            budget.clone(),
         )
-        .with_fcx(fcx.clone());
-        h.open().unwrap();
+        .in_world(fcx.clone());
+        h.settle().unwrap();
         let base = budget.used();
         let head = format!(
             "POST / HTTP/1.1\r\nHost: a.test\r\nX-Large: {}\r\nContent-Length: 1\r\n\r\n",
@@ -690,21 +677,22 @@ fn http1_charges_heads_while_reading_and_metadata_while_waiting() {
         h.push(head.as_bytes()).unwrap();
         assert!(budget.used() >= base + 4096, "the head waits for the body");
         h.push(b"x").unwrap();
-        assert_eq!(h.pending(), (1, 0));
+        assert_eq!(h.jobs(), 1);
         assert!(
             budget.used() >= base + 4096 && budget.used() < base + 8192,
             "only the handler retains the request headers"
         );
         fcx.sleep(Duration::from_secs(1)).await?;
-        assert!(!h.poll().unwrap().is_empty());
+        assert!(!poll(&mut h).is_empty());
         assert_eq!(budget.used(), base);
 
         // Leave too little room for the request head.
         let other = budget.charge(budget.limit() - base - 3000).unwrap();
-        assert!(h.push(head.as_bytes()).unwrap().is_empty());
-        assert_eq!(h.end_reason(), Some(Ended::Budget));
-        assert!(matches!(h.push(b"x"), Err(serve::HarnessError::Closed)));
-        assert_eq!(h.pending(), (0, 0));
+        assert!(send(&mut h, head.as_bytes()).is_empty());
+        assert_eq!(closing(&mut h), Some(Closing::Budget));
+        h.push(b"x").unwrap();
+        assert!(h.input_closed());
+        assert_eq!(h.jobs(), 0);
         drop(h);
         drop(other);
         assert_eq!(budget.used(), 0);
@@ -911,24 +899,20 @@ fn streaming_responses_release_request_metadata() {
     fictionet_test_support::world::world(Duration::from_secs(10), |fcx| async move {
         let budget = Budget::new(1 << 20);
 
-        let mut h = Harness::with_options(
+        let mut h = layer::Harness::with_budget(
             fictionet::Seed::from_u64(0),
             Http1::new(StreamingMetadata),
-            (),
-            ServeOptions::default().budget(budget.clone()),
-        );
-        h.open().unwrap();
+            budget.clone(),
+        )
+        .running_work();
+        h.settle().unwrap();
         let base = budget.used();
         let head = format!(
             "GET / HTTP/1.1\r\nHost: a.test\r\nX-Large: {}\r\n\r\n",
             "x".repeat(4096)
         );
-        assert!(
-            h.push(head.as_bytes())
-                .unwrap()
-                .starts_with(b"HTTP/1.1 200")
-        );
-        assert_eq!(h.pending(), (1, 0));
+        assert!(send(&mut h, head.as_bytes()).starts_with(b"HTTP/1.1 200"));
+        assert_eq!(h.jobs(), 1);
         assert_eq!(budget.used(), base);
         drop(h);
         assert_eq!(budget.used(), 0);

@@ -194,11 +194,12 @@
 //! an endpoint would refuse, so its adapter can use an explicit observation
 //! policy while sharing the wire parser's building blocks.
 //!
-//! [`http1`](super::protocols::http1) supplies wire values and decoders. With
-//! `std`, `httpd::Http1` supplies the service and `httpd::serve_connection`
-//! drives it. With `tokio`, that driver hands tower HTTP/1 upgrades to hyper.
-//! The service also supports explicit `httpd::UpgradeHandler` continuations
-//! without `tokio`; see the `httpd` module docs.
+//! [`http1`](super::protocols::http1) supplies wire values and decoders,
+//! including the body framing that serving, capture and archives share.
+//! `httpd::Http1` serves HTTP/1 as a layer, and `httpd::serve_connection`
+//! runs it over a live connection, handing the connection on after a `101`
+//! or a CONNECT with an `httpd::UpgradeHandler`; see the `httpd` module
+//! docs.
 //!
 //! HTTP/1 capture uses
 //! [`RequestHead::parse_lenient`](super::protocols::http1::RequestHead::parse_lenient)

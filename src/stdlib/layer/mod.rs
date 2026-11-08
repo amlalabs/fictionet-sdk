@@ -159,7 +159,15 @@
 //! input and takes output, with no I/O of its own. [`Harness`] is a driver
 //! with a seeded entropy source, a clock that moves only when told, and a
 //! byte-stream peer that takes output only as fast as the test allows, so
-//! backpressure can be tested.
+//! backpressure can be tested. [`live::run`] is a driver over a live
+//! connection: it only translates the connection's readiness and the
+//! world's clock.
+//!
+//! A layer's [`Work`](Layer::Work) is the one place async code runs: the
+//! layer hands it over, and whatever drives the stack polls it as a [`Job`]
+//! and gives the result back. A [`Tunnel`] hands the rest of a byte stream
+//! to async code written against a connection, such as what runs after a
+//! CONNECT.
 
 mod budget;
 mod carrier;
@@ -168,8 +176,11 @@ mod children;
 mod driver;
 mod env;
 mod harness;
+mod job;
+pub mod live;
 mod switch;
 mod timers;
+mod tunnel;
 
 #[cfg(test)]
 mod tests;
@@ -185,8 +196,10 @@ pub use children::{ChildReport, Children, Overrun};
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
 pub use harness::Harness;
+pub use job::Job;
 pub use switch::{Handoff, Handover, Switch};
 pub use timers::Timers;
+pub use tunnel::{Takeover, Tunnel};
 
 use fictionet::time::Instant;
 

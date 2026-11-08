@@ -1,5 +1,4 @@
 use super::{Display, MAX_BUFFER};
-use fictionet::stdlib::codec::ascii::{hex_value, trim_ows};
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::dissect::Transport;
 use fictionet::stdlib::dissect::{Decoded, Layer, Match, Placement, Present, Registry};
@@ -29,13 +28,14 @@ fn looks_like_http1(b: &[u8]) -> bool {
 
 /// HTTP/1 capture parser. It shares a bounded request-method queue with
 /// the other direction so HEAD and CONNECT responses retain their framing.
-/// Chunked bodies finish after the empty line ending the complete trailer
-/// section. Trailers are scanned incrementally within the capture buffer
-/// limit and are not included in body previews.
-/// Chunk sizes must be nonempty hexadecimal values that fit in `u64`.
-/// Surrounding spaces and tabs and `;extensions` are tolerated. Invalid or
-/// overflowing sizes emit a `malformed` item with the raw size line and the
-/// body preview so far, then skip bytes until close because framing is lost.
+/// Bodies are read by [`http1::BodyEvents`], the body framing the server
+/// uses, told to skip chunk extensions and trailers as a passive observer
+/// must. Chunked bodies finish after the empty line ending the trailer
+/// section; trailers are not included in body previews. Spaces and tabs
+/// around a chunk size are tolerated. Framing the body reader refuses, such
+/// as an invalid or overflowing chunk size, emits a `malformed` item with
+/// the raw line and the body preview so far, then skips bytes until close
+/// because framing is lost.
 #[derive(Default)]
 pub struct Http1 {
     state: Http1State,
@@ -43,7 +43,6 @@ pub struct Http1 {
     // The other decoder in a pair accounts for this shared queue.
     shared_methods: bool,
     scanned: usize,
-    final_chunk: Option<usize>,
 }
 impl Http1 {
     /// Registers `http1` for TCP method or response prefixes, or `http/1.1` ALPN.
@@ -75,14 +74,12 @@ impl Http1 {
                 methods: Arc::clone(&methods),
                 shared_methods: false,
                 scanned: 0,
-                final_chunk: None,
             },
             Self {
                 state: Http1State::default(),
                 methods,
                 shared_methods: true,
                 scanned: 0,
-                final_chunk: None,
             },
         ]
     }
@@ -108,7 +105,7 @@ impl Decode for Http1 {
     }
     fn held(&self) -> usize {
         let preview = match &self.state {
-            Http1State::Body { seen, .. } | Http1State::Chunked { seen, .. } => seen.len(),
+            Http1State::Body { seen, .. } => seen.len(),
             _ => 0,
         };
         if self.shared_methods {
@@ -170,104 +167,8 @@ impl Decode for Http1 {
                 head.len(),
             ));
         }
-        // Cache each line boundary. Size and trailer lines are scanned
-        // once even when every byte arrives in its own segment.
-        if let Http1State::Chunked { left: 0, total, .. } = self.state {
-            if self.final_chunk.is_none() {
-                let skip = if total != 0 && input.starts_with(b"\r\n") {
-                    2usize
-                } else {
-                    0
-                };
-                let tail = input.get(skip..).unwrap_or_default();
-                let Some(end) = self.find(tail, b"\r\n") else {
-                    if input.len() >= self.capacity() {
-                        self.reset();
-                        return Ok(Step::Skip(input.len()));
-                    }
-                    return Ok(Step::Need);
-                };
-                let line = &tail[..end];
-                let used = skip.saturating_add(end).saturating_add(2);
-                let Some(size) = chunk_size(line) else {
-                    let mut d = Decoded::default();
-                    if let Http1State::Chunked { seen, .. } = &self.state {
-                        body_layer(&mut d, total, seen);
-                    }
-                    let mut layer = Layer::new("Hypertext Transfer Protocol", 0, (skip, used));
-                    layer.summary = "Malformed HTTP chunk size".into();
-                    layer.field(
-                        "Chunk size",
-                        String::from_utf8_lossy(line).escape_debug().to_string(),
-                        (skip, skip + end),
-                    );
-                    // Display retains one layer, including the body preview here.
-                    for body in d.layers.drain(..) {
-                        layer.note("Body received", body.summary);
-                        layer.fields.extend(body.fields);
-                    }
-                    d.application(2, "HTTP", &layer.summary);
-                    d.push(layer);
-                    d.tag("malformed");
-                    self.state = Http1State::ToClose;
-                    self.final_chunk = None;
-                    self.scanned = 0;
-                    return Ok(Step::Item(
-                        Display::from_packet(d, "Malformed HTTP chunk size"),
-                        used,
-                    ));
-                };
-                if size == 0 {
-                    self.final_chunk = Some(used);
-                } else if let Http1State::Chunked { left, total, .. } = &mut self.state {
-                    *left = size;
-                    *total = total.saturating_add(size);
-                    return Ok(Step::Skip(used));
-                }
-            }
-            while let Some(used) = self.final_chunk {
-                let after = input.get(used..).unwrap_or_default();
-                let Some(rest) = self.find(after, b"\r\n") else {
-                    if input.len() >= self.capacity() {
-                        self.reset();
-                        return Ok(Step::Skip(input.len()));
-                    }
-                    return Ok(Step::Need);
-                };
-                let end = used.saturating_add(rest).saturating_add(2);
-                if rest != 0 {
-                    self.final_chunk = Some(end);
-                    continue;
-                }
-                self.final_chunk = None;
-                let state = std::mem::take(&mut self.state);
-                if let Http1State::Chunked { total, seen, .. } = state {
-                    return Ok(Step::Item(body_item(total, &seen), end));
-                }
-            }
-        }
-        let fixed_body = matches!(self.state, Http1State::Body { .. });
-        match &mut self.state {
-            Http1State::Body { left, seen, total } | Http1State::Chunked { left, seen, total } => {
-                if input.is_empty() {
-                    return Ok(Step::Need);
-                }
-                let n = usize::try_from(*left)
-                    .unwrap_or(usize::MAX)
-                    .min(input.len());
-                let take = n.min(4096usize.saturating_sub(seen.len()));
-                seen.extend_from_slice(input.get(..take).unwrap_or_default());
-                *left = left.saturating_sub(n as u64);
-                if *left == 0 && fixed_body {
-                    let Http1State::Body { total, seen, .. } = std::mem::take(&mut self.state)
-                    else {
-                        return Ok(Step::End);
-                    };
-                    return Ok(Step::Item(body_item(total, &seen), n));
-                }
-                let _ = total;
-                Ok(Step::Skip(n))
-            }
+        match &self.state {
+            Http1State::Body { .. } => Ok(self.body(input)),
             Http1State::ToClose | Http1State::Tunnel => Ok(if input.is_empty() {
                 Step::Need
             } else {
@@ -277,12 +178,96 @@ impl Decode for Http1 {
         }
     }
 }
+impl Http1 {
+    /// One step through a body, by the shared body framing. Framing steps
+    /// in a row are taken together, so a body block or the body's end
+    /// carries the framing bytes before it. The end of a capture is not
+    /// the end of a body: one it cuts off stays incomplete.
+    fn body(&mut self, input: &[u8]) -> Step<Display> {
+        let capacity = self.capacity();
+        let mut used = 0usize;
+        loop {
+            let rest = input.get(used..).unwrap_or_default();
+            let Http1State::Body { body, seen, total } = &mut self.state else {
+                return Step::Skip(used);
+            };
+            let Ok(step) = body.decode(rest, false) else {
+                return self.malformed(rest, used);
+            };
+            match step {
+                Step::Item(http1::Event::Body(data), n) => {
+                    let take = data.len().min(PREVIEW.saturating_sub(seen.len()));
+                    seen.extend_from_slice(&data[..take]);
+                    *total = total.saturating_add(data.len() as u64);
+                    used = used.saturating_add(n);
+                }
+                Step::Skip(n) if n > 0 => used = used.saturating_add(n),
+                Step::Item(http1::Event::Done, n) => {
+                    used = used.saturating_add(n);
+                    let Http1State::Body { total, seen, .. } = std::mem::take(&mut self.state)
+                    else {
+                        return Step::Skip(used);
+                    };
+                    return Step::Item(body_item(total, &seen), used);
+                }
+                Step::Item(http1::Event::Head(never), _) => match never {},
+                _ if used > 0 => return Step::Skip(used),
+                _ if input.len() >= capacity => {
+                    self.reset();
+                    return Step::Skip(input.len());
+                }
+                _ => return Step::Need,
+            }
+        }
+    }
+
+    /// The body's framing was refused at the start of `rest`, `start`
+    /// bytes into the input: a `malformed` item naming the refused line,
+    /// with the body so far. Nothing after it can be framed.
+    fn malformed(&mut self, rest: &[u8], start: usize) -> Step<Display> {
+        let Http1State::Body { body, seen, total } = std::mem::take(&mut self.state) else {
+            return Step::Skip(start);
+        };
+        let (what, field) = if body.in_trailers() {
+            ("Malformed HTTP trailer", "Trailer")
+        } else {
+            ("Malformed HTTP chunk size", "Chunk size")
+        };
+        let end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(rest.len());
+        let line = &rest[..end];
+        let used = start
+            .saturating_add(end)
+            .saturating_add(if end < rest.len() { 2 } else { 0 });
+        let mut d = Decoded::default();
+        body_layer(&mut d, total, &seen);
+        let mut layer = Layer::new("Hypertext Transfer Protocol", 0, (start, used));
+        layer.summary = what.into();
+        layer.field(
+            field,
+            String::from_utf8_lossy(line).escape_debug().to_string(),
+            (start, start + end),
+        );
+        // Display retains one layer, including the body preview here.
+        for body in d.layers.drain(..) {
+            layer.note("Body received", body.summary);
+            layer.fields.extend(body.fields);
+        }
+        d.application(2, "HTTP", &layer.summary);
+        d.push(layer);
+        d.tag("malformed");
+        self.state = Http1State::ToClose;
+        self.scanned = 0;
+        Step::Item(Display::from_packet(d, what), used)
+    }
+}
 impl Present for Http1 {
     display_presenter!();
     fn reset(&mut self) {
         self.state = Http1State::default();
         self.scanned = 0;
-        self.final_chunk = None;
     }
 }
 fn body_item(total: u64, seen: &[u8]) -> Display {
@@ -293,14 +278,19 @@ fn body_item(total: u64, seen: &[u8]) -> Display {
     item
 }
 
-fn chunk_size(line: &[u8]) -> Option<u64> {
-    let digits = trim_ows(line.split(|b| *b == b';').next()?);
-    if digits.is_empty() {
-        return None;
+/// The most of a body kept for its preview.
+const PREVIEW: usize = 4096;
+
+/// The limits the body reader keeps within a capture's buffer: a chunk
+/// line or a trailer line, with its line ending, may fill the buffer, and
+/// a trailer section may hold any number of fields.
+fn body_limits() -> http1::Limits {
+    http1::Limits {
+        header_line: MAX_BUFFER - 1,
+        head: MAX_BUFFER,
+        headers: usize::MAX,
+        ..http1::Limits::default()
     }
-    digits.iter().try_fold(0u64, |size, b| {
-        size.checked_mul(16)?.checked_add(u64::from(hex_value(*b)?))
-    })
 }
 
 /// HTTP/1.1 request methods waiting for their responses.
@@ -335,16 +325,10 @@ enum Http1State {
     /// Waiting for a request or status line and headers.
     #[default]
     Head,
-    /// In a body of known length: bytes left, and the start of it.
+    /// In a body framed by its length or by chunks: its reader, the start
+    /// of it, and how many bytes it has had.
     Body {
-        left: u64,
-        seen: Vec<u8>,
-        total: u64,
-    },
-    /// In a chunked body: bytes left of the current chunk (0 between
-    /// chunks), and the start of it.
-    Chunked {
-        left: u64,
+        body: http1::BodyEvents,
         seen: Vec<u8>,
         total: u64,
     },
@@ -364,22 +348,21 @@ fn body_kind(headers: &[http1::Header], none: bool, response: bool) -> Http1Stat
             .find(|h| h.name.eq_ignore_ascii_case(name))
             .map(|h| String::from_utf8_lossy(&h.value).to_string())
     };
-    if get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
-        return Http1State::Chunked {
-            left: 0,
-            seen: Vec::new(),
-            total: 0,
+    let framing =
+        if get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+            http1::Framing::Chunked
+        } else {
+            match get("content-length").and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(0) => return Http1State::Head,
+                Some(n) => http1::Framing::Length(n),
+                None if response => return Http1State::ToClose,
+                None => return Http1State::Head,
+            }
         };
-    }
-    match get("content-length").and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(0) => Http1State::Head,
-        Some(n) => Http1State::Body {
-            left: n,
-            seen: Vec::new(),
-            total: n,
-        },
-        None if response => Http1State::ToClose,
-        None => Http1State::Head,
+    Http1State::Body {
+        body: http1::BodyEvents::with_limits(framing, body_limits()).skip_chunk_extras(),
+        seen: Vec::new(),
+        total: 0,
     }
 }
 
@@ -527,7 +510,6 @@ mod tests {
                 .unwrap();
             assert_eq!(received.value, if body { "3 bytes" } else { "0 bytes" });
             assert!(matches!(http.state, Http1State::ToClose));
-            assert_eq!(http.final_chunk, None);
             assert_eq!(http.scanned, 0);
             assert_eq!(http.held(), 0);
             assert!(matches!(
@@ -555,18 +537,27 @@ mod tests {
 
     #[test]
     fn chunk_sizes_allow_ows_extensions_and_u64_max() {
-        for (line, size) in [(" \tA \t;ext", 10), ("ffffffffFFFFFFFF", u64::MAX)] {
-            let mut http = Http1::default();
-            let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-            assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
-            let bytes = format!("{line}\r\n");
-            assert!(
-                matches!(http.decode(bytes.as_bytes(), false), Ok(Step::Skip(n)) if n == bytes.len())
-            );
-            assert!(
-                matches!(http.state, Http1State::Chunked { left, total, .. } if left == size && total == size)
-            );
-        }
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        // A size with whitespace around it and an extension frames its
+        // chunk: the body that follows completes with that many bytes.
+        let mut http = Http1::default();
+        assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
+        let line = b" \tA \t;ext\r\n";
+        assert!(matches!(http.decode(line, false), Ok(Step::Skip(n)) if n == line.len()));
+        let rest = b"0123456789\r\n0\r\n\r\n";
+        let Ok(Step::Item(item, used)) = http.decode(rest, false) else {
+            panic!("the chunk did not complete the body");
+        };
+        assert_eq!(used, rest.len());
+        assert_eq!(item.summary(), "10 bytes");
+        assert!(!item.tags.contains(&"malformed"));
+        // The largest size is a chunk too: its data is taken as body.
+        let mut http = Http1::default();
+        assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
+        let line = b"ffffffffFFFFFFFF\r\n";
+        assert!(matches!(http.decode(line, false), Ok(Step::Skip(n)) if n == line.len()));
+        let data = vec![b'x'; 8192];
+        assert!(matches!(http.decode(&data, false), Ok(Step::Skip(n)) if n == data.len()));
     }
 
     #[test]
@@ -637,19 +628,38 @@ mod tests {
         }
     }
 
+    /// What a stream of `bytes`, ended or not, decodes to.
+    fn items(bytes: &[u8], end: bool) -> Vec<Display> {
+        let mut stream = Stream::new(Http1::default());
+        assert_eq!(stream.push(bytes), bytes.len());
+        if end {
+            stream.end();
+        }
+        let mut items = Vec::new();
+        while let Some(Ok(item)) = stream.next() {
+            items.push(item);
+        }
+        items
+    }
+
     #[test]
     fn http_truncated_trailers_do_not_complete_the_body() {
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         let ending = b"0\r\nX-Test: yes\r\nX-Other: two\r\n\r\n";
         for end in 0..ending.len() {
-            let mut http = Http1::default();
-            assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
-            for n in 0..=end {
-                assert!(matches!(http.decode(&ending[..n], false), Ok(Step::Need)));
+            let mut bytes = head.to_vec();
+            bytes.extend_from_slice(&ending[..end]);
+            for eof in [false, true] {
+                let items = items(&bytes, eof);
+                assert_eq!(items.len(), 1, "{end} {eof}");
+                assert_eq!(items[0].summary(), "HTTP/1.1 200 OK");
             }
-            assert!(matches!(http.decode(&ending[..end], true), Ok(Step::Need)));
-            assert!(matches!(http.state, Http1State::Chunked { .. }));
         }
+        let mut bytes = head.to_vec();
+        bytes.extend_from_slice(ending);
+        let items = items(&bytes, true);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].summary(), "0 bytes");
     }
 
     #[test]
@@ -657,41 +667,48 @@ mod tests {
         let mut http = Http1::default();
         let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert!(matches!(http.decode(head, false), Ok(Step::Item(_, _))));
-        let mut bytes = b"0\r\nX-Test: ".to_vec();
-        bytes.resize(http.capacity() - 1, b'x');
-        assert!(matches!(http.decode(&bytes, false), Ok(Step::Need)));
-        bytes.push(b'x');
-        assert!(matches!(http.decode(&bytes, false), Ok(Step::Skip(n)) if n == bytes.len()));
-        assert!(matches!(http.state, Http1State::Head));
-        assert_eq!(http.scanned, 0);
-        assert_eq!(http.final_chunk, None);
+        assert!(matches!(http.decode(b"0\r\n", false), Ok(Step::Skip(3))));
+        // A trailer line may fill the buffer, short of its last byte.
+        let mut line = b"X-Test: ".to_vec();
+        line.resize(http.capacity() - 1, b'x');
+        assert!(matches!(http.decode(&line, false), Ok(Step::Need)));
+        // One more byte and the framing is given up, not the bound.
+        line.push(b'x');
+        let Ok(Step::Item(item, used)) = http.decode(&line, false) else {
+            panic!("the decoder kept waiting past its buffer");
+        };
+        assert_eq!(used, line.len());
+        assert!(item.tags.contains(&"malformed"));
+        assert_eq!(item.summary(), "Malformed HTTP trailer");
+        assert_eq!(http.held(), 0);
+        let next = b"HTTP/1.1 204 No Content\r\n\r\n";
+        assert!(matches!(http.decode(next, false), Ok(Step::Skip(n)) if n == next.len()));
     }
 
     #[test]
-    fn http_size_and_trailer_scans_resume_without_rescanning() {
-        let mut http = Http1 {
-            state: Http1State::Chunked {
-                left: 0,
-                seen: Vec::new(),
-                total: 0,
-            },
-            ..Http1::default()
-        };
-        let mut bytes = b"0\r\n".to_vec();
-        for _ in 0..3 {
-            let start = bytes.len();
-            for _ in 0..1000 {
-                bytes.push(b'x');
-                assert!(matches!(http.decode(&bytes, false), Ok(Step::Need)));
-                assert_eq!(http.final_chunk, Some(start));
-                assert_eq!(http.scanned, bytes.len() - start);
-            }
+    fn http_size_and_trailer_lines_fed_a_byte_at_a_time_complete_the_body_once() {
+        let mut bytes = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let head = bytes.len();
+        bytes.extend_from_slice(b"0\r\n");
+        for n in 0..3 {
+            bytes.extend_from_slice(format!("X-{n}: ").as_bytes());
+            bytes.resize(bytes.len() + 1000, b'x');
             bytes.extend_from_slice(b"\r\n");
-            assert!(matches!(http.decode(&bytes, false), Ok(Step::Need)));
-            assert_eq!(http.final_chunk, Some(bytes.len()));
-            assert_eq!(http.scanned, 0);
         }
         bytes.extend_from_slice(b"\r\n");
-        assert!(matches!(http.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len()));
+        let mut stream = Stream::new(Http1::default());
+        let mut items = Vec::new();
+        for (at, byte) in bytes.iter().enumerate() {
+            assert_eq!(stream.push(std::slice::from_ref(byte)), 1);
+            while let Some(item) = stream.next_span() {
+                items.push((at, item.unwrap()));
+            }
+        }
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, head - 1);
+        let (at, (body, span)) = &items[1];
+        assert_eq!(*at, bytes.len() - 1);
+        assert_eq!(body.summary(), "0 bytes");
+        assert_eq!(span.end, bytes.len() as u64);
     }
 }

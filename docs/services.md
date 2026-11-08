@@ -719,7 +719,9 @@ threads handle upstream HTTP/1.1 and rustls, reusing completed connections.
 Both tower services return streaming `httpd::Body` responses. `Proxy` can
 also answer with a local rejection.
 
-`Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. `Http2`
+`Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder, as a
+`layer::Layer` over a byte stream: test it with `layer::Harness`, and
+`serve_connection` runs it with `layer::live::run`. `Http2`
 serves HTTP/2 on the stdlib's `http2` frames and HPACK, behind the same
 `Handler` trait. Neither needs tokio. Both versions share one set of
 `httpd::Limits`: body size, body and write timers, and 100 streams at once

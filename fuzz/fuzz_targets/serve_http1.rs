@@ -1,12 +1,12 @@
-//! HTTP/1 as a service (`httpd::Http1` with a handler), driven by
-//! `serve::Harness` with no runtime. The fuzzer's bytes are the client's,
+//! HTTP/1 serving (`httpd::Http1` with a handler), driven by the layer
+//! `Harness` with no runtime. The fuzzer's bytes are the client's,
 //! cut into two chunks at a point the first byte picks; the replies must
 //! not depend on where the cut falls, the service must never panic, and
 //! handler calls do not depend on chunk boundaries.
 #![no_main]
 
 use bytes::Bytes;
-use fictionet::stdlib::services::serve::Harness;
+use fictionet::stdlib::layer::Harness;
 use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
 use libfuzzer_sys::fuzz_target;
 
@@ -48,18 +48,16 @@ fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
     let mut h = Harness::new(
         fictionet::Seed::from_u64(0),
         Http1::new(Pages(calls.clone())),
-        (),
-    );
+    )
+    .running_work();
     for chunk in chunks {
-        if h.push(chunk).is_err() {
-            break;
-        }
+        h.push(chunk).unwrap();
     }
-    let _ = h.end();
+    h.end().unwrap();
     (
         h.output().to_vec(),
         calls.load(std::sync::atomic::Ordering::Relaxed),
-        h.closed(),
+        h.ended(),
     )
 }
 
