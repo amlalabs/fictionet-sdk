@@ -213,6 +213,13 @@ volume. This model projects lifecycle transitions, not the implementation of
 atomic references, mutexes or waker registration. RegionTree continues to
 cover descendant task accounting separately.
 
+When the serving engine was deleted, `Jobs::poll` gained a rule: work whose
+own region was cancelled, as when a task it spawned failed, is never polled
+again, as work whose owner ended is not, and its region is made before that
+check. That is the model's `Cancel` followed by `Reap`, which the code had
+not done for a cancel from inside the job. Both configurations were rerun on
+the new code and gave the results above.
+
 The real HTTP regressions return a body that captures its handler context
 and starts its first clock wait only when a frame is polled. The one-frame
 response succeeds, as does a 130-frame response exceeding the 64 job slots.
