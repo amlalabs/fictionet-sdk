@@ -206,6 +206,9 @@ pub(crate) use framed::tests as framed_echo;
 mod proofs;
 
 pub use budget::{Budget, Charge, OwnedWork, WorkOwner};
+
+/// Maximum supported composition depth, including erased layers.
+pub const MAX_DEPTH: usize = 32;
 pub use carrier::{
     ByteStream, Child, ChildId, Chunk, Credited, Datagram, DatagramCommand, DatagramEvent,
     Datagrams, MessageCommand, MessageEvent, Messages, Mux, MuxCommand, MuxEvent, MuxOp, Slots,
@@ -316,6 +319,26 @@ impl<L: core::error::Error, U: core::error::Error> core::error::Error for Side<L
 /// Read [the rules](self#the-rules-every-layer-and-driver-keeps) before
 /// writing one.
 pub trait Layer: Sized {
+    /// Heap bytes retained by a report, excluding the report value itself.
+    /// Return `None` for opaque allocations: observers omit those reports
+    /// rather than retain memory with no known bound. Observation storage
+    /// has a separate budget and never consumes protocol capacity.
+    fn report_bytes(_report: &Self::Report) -> Option<usize> {
+        None
+    }
+
+    /// Maximum number of nested layer calls, including this layer.
+    /// Composites include their children even when hidden by type erasure.
+    fn depth(&self) -> usize {
+        1
+    }
+
+    /// Whether both application directions are finished. A write half-close
+    /// alone does not imply this; the runner still drains pending output.
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
     /// The port this layer runs over.
     type Lower: Port;
     /// The port this layer offers.

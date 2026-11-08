@@ -21,6 +21,27 @@ where
     type Done = Side<A::Done, B::Done>;
     type Error = Side<A::Error, B::Error>;
 
+    fn report_bytes(report: &Self::Report) -> Option<usize> {
+        match report {
+            Side::Lower(a) => A::report_bytes(a),
+            Side::Upper(b) => B::report_bytes(b),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        1 + match self {
+            Side::Lower(a) => a.depth(),
+            Side::Upper(b) => b.depth(),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        match self {
+            Side::Lower(a) => a.is_terminal(),
+            Side::Upper(b) => b.is_terminal(),
+        }
+    }
+
     fn on_event(
         &mut self,
         env: &mut Env<'_, Self::Report>,
@@ -157,7 +178,11 @@ impl<U> Later<U> {
 
     /// The layer, once it is made. Panics if it was made before: a layer
     /// is made once.
-    pub fn set(&mut self, layer: U) {
+    pub fn set(&mut self, layer: U)
+    where
+        U: Layer,
+    {
+        assert!(layer.depth() < super::MAX_DEPTH, "composition is too deep");
         assert!(self.layer.is_none(), "a later layer is made once");
         self.layer = Some(layer);
     }
@@ -181,6 +206,18 @@ impl<U: Layer> Layer for Later<U> {
     type Work = U::Work;
     type Done = U::Done;
     type Error = U::Error;
+
+    fn report_bytes(report: &Self::Report) -> Option<usize> {
+        U::report_bytes(report)
+    }
+
+    fn depth(&self) -> usize {
+        1 + self.layer.as_ref().map_or(0, Layer::depth)
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.layer.as_ref().is_some_and(Layer::is_terminal)
+    }
 
     fn on_event(
         &mut self,

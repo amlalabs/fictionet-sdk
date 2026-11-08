@@ -8,7 +8,16 @@ use fictionet::time::Instant;
 use super::Job;
 
 /// A report of a boxed stack.
-pub type BoxReport = Box<dyn core::fmt::Debug + Send>;
+pub struct BoxReport {
+    inner: Box<dyn core::fmt::Debug + Send>,
+    bytes: Option<usize>,
+}
+
+impl core::fmt::Debug for BoxReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
 /// Why a boxed stack gave up.
 pub type BoxError = Box<dyn core::error::Error + Send + Sync>;
 /// The result of a boxed stack's work.
@@ -38,6 +47,10 @@ impl<Lo: Port, Up: Port> Boxed<Lo, Up> {
         L::Done: Send + 'static,
         L::Error: core::error::Error + Send + Sync + 'static,
     {
+        assert!(
+            stack.depth() < fictionet::stdlib::layer::MAX_DEPTH,
+            "composition is too deep"
+        );
         Boxed {
             inner: Box::new(stack),
         }
@@ -46,6 +59,8 @@ impl<Lo: Port, Up: Port> Boxed<Lo, Up> {
 
 /// What [`Boxed`] needs of a stack, with its types boxed.
 trait Erased<Lo: Port, Up: Port>: Send {
+    fn depth(&self) -> usize;
+    fn is_terminal(&self) -> bool;
     fn on_event(
         &mut self,
         env: &mut Env<'_, BoxReport>,
@@ -66,8 +81,16 @@ trait Erased<Lo: Port, Up: Port>: Send {
     fn deadline(&self) -> Option<Instant>;
 }
 
-fn boxed<R: core::fmt::Debug + Send + 'static>(report: R) -> BoxReport {
-    Box::new(report)
+fn boxed<L: Layer>(report: L::Report) -> BoxReport
+where
+    L::Report: core::fmt::Debug + Send + 'static,
+{
+    let bytes =
+        L::report_bytes(&report).and_then(|n| n.checked_add(std::mem::size_of::<L::Report>()));
+    BoxReport {
+        inner: Box::new(report),
+        bytes,
+    }
 }
 
 fn error<E: core::error::Error + Send + Sync + 'static>(e: E) -> BoxError {
@@ -82,12 +105,19 @@ where
     L::Done: Send + 'static,
     L::Error: core::error::Error + Send + Sync + 'static,
 {
+    fn depth(&self) -> usize {
+        Layer::depth(self)
+    }
+    fn is_terminal(&self) -> bool {
+        Layer::is_terminal(self)
+    }
+
     fn on_event(
         &mut self,
         env: &mut Env<'_, BoxReport>,
         event: EventOf<Lo>,
     ) -> Result<Admit<EventOf<Lo>>, BoxError> {
-        env.scoped(boxed, |env| Layer::on_event(self, env, event))
+        env.scoped(boxed::<L>, |env| Layer::on_event(self, env, event))
             .map_err(error)
     }
 
@@ -96,7 +126,7 @@ where
         env: &mut Env<'_, BoxReport>,
         command: CommandOf<Up>,
     ) -> Result<Admit<CommandOf<Up>>, BoxError> {
-        env.scoped(boxed, |env| Layer::on_command(self, env, command))
+        env.scoped(boxed::<L>, |env| Layer::on_command(self, env, command))
             .map_err(error)
     }
 
@@ -104,7 +134,7 @@ where
         let Some((_, timer)) = Layer::deadline(self) else {
             return Ok(());
         };
-        env.scoped(boxed, |env| Layer::on_timer(self, env, timer))
+        env.scoped(boxed::<L>, |env| Layer::on_timer(self, env, timer))
             .map_err(error)
     }
 
@@ -113,12 +143,12 @@ where
         let Ok(done) = done.downcast::<L::Done>() else {
             return Ok(());
         };
-        env.scoped(boxed, |env| Layer::on_done(self, env, *done))
+        env.scoped(boxed::<L>, |env| Layer::on_done(self, env, *done))
             .map_err(error)
     }
 
     fn advance(&mut self, env: &mut Env<'_, BoxReport>) -> Result<bool, BoxError> {
-        env.scoped(boxed, |env| Layer::advance(self, env))
+        env.scoped(boxed::<L>, |env| Layer::advance(self, env))
             .map_err(error)
     }
 
@@ -152,6 +182,10 @@ where
 {
     type Done = BoxDone;
 
+    fn cancelled(&self) -> bool {
+        self.0.cancelled()
+    }
+
     fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<BoxDone> {
         self.0.poll(fcx, cx).map(|done| Box::new(done) as BoxDone)
     }
@@ -159,6 +193,10 @@ where
 
 impl<J: Job + ?Sized> Job for Box<J> {
     type Done = J::Done;
+
+    fn cancelled(&self) -> bool {
+        (**self).cancelled()
+    }
 
     fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<J::Done> {
         (**self).poll(fcx, cx)
@@ -169,10 +207,20 @@ impl<Lo: Port, Up: Port> Layer for Boxed<Lo, Up> {
     type Lower = Lo;
     type Upper = Up;
     type Report = BoxReport;
+    fn report_bytes(report: &BoxReport) -> Option<usize> {
+        report.bytes
+    }
     type Timer = ();
     type Work = BoxWork;
     type Done = BoxDone;
     type Error = BoxError;
+
+    fn depth(&self) -> usize {
+        1 + self.inner.depth()
+    }
+    fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
 
     fn on_event(
         &mut self,

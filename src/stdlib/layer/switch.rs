@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use fictionet::stdlib::layer::{Admit, CommandOf, Env, EventOf, Layer, Port, Side};
+use fictionet::stdlib::layer::{
+    Admit, CommandOf, Env, EventOf, Layer, OwnedWork, Port, Side, WorkOwner,
+};
 use fictionet::time::Instant;
 
 /// A layer that can reach a protocol boundary after which something else
@@ -61,6 +63,7 @@ where
     B: Layer<Lower = A::Lower, Upper = A::Upper> + From<A::Next>,
 {
     phase: Phase<A, B>,
+    owner: WorkOwner,
     below: VecDeque<EventOf<A::Lower>>,
     above: VecDeque<CommandOf<A::Upper>>,
 }
@@ -72,7 +75,9 @@ where
 {
     /// Starts with `first`.
     pub fn new(first: A) -> Switch<A, B> {
+        assert!(first.depth() < super::MAX_DEPTH, "composition is too deep");
         Switch {
+            owner: WorkOwner::new(),
             phase: Phase::First(first),
             below: VecDeque::new(),
             above: VecDeque::new(),
@@ -121,7 +126,7 @@ where
     type Upper = A::Upper;
     type Report = Side<A::Report, B::Report>;
     type Timer = Side<A::Timer, B::Timer>;
-    type Work = Side<A::Work, B::Work>;
+    type Work = OwnedWork<Side<A::Work, B::Work>>;
     type Done = Side<A::Done, B::Done>;
     type Error = Side<A::Error, B::Error>;
 
@@ -201,7 +206,10 @@ where
                 };
                 self.below.extend(handover.below);
                 self.above.extend(handover.above);
-                self.phase = Phase::Then(B::from(handover.next));
+                let next = B::from(handover.next);
+                assert!(next.depth() < super::MAX_DEPTH, "composition is too deep");
+                self.owner = WorkOwner::new();
+                self.phase = Phase::Then(next);
                 Ok(true)
             }
             Phase::Then(b) => {
@@ -247,9 +255,31 @@ where
     }
 
     fn take_work(&mut self) -> Option<Self::Work> {
-        match &mut self.phase {
+        let work = match &mut self.phase {
             Phase::First(a) => a.take_work().map(Side::Lower),
             Phase::Then(b) => b.take_work().map(Side::Upper),
+        }?;
+        Some(self.owner.own(work))
+    }
+
+    fn report_bytes(report: &Self::Report) -> Option<usize> {
+        match report {
+            Side::Lower(a) => A::report_bytes(a),
+            Side::Upper(b) => B::report_bytes(b),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        1 + match &self.phase {
+            Phase::First(a) => a.depth(),
+            Phase::Then(b) => b.depth(),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        match &self.phase {
+            Phase::First(a) => a.is_terminal(),
+            Phase::Then(b) => b.is_terminal(),
         }
     }
 

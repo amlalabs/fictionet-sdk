@@ -1,4 +1,4 @@
-use fictionet::stdlib::layer::{Admit, CommandOf, Env, EventOf, Layer, Side};
+use fictionet::stdlib::layer::{Admit, CommandOf, Env, EventOf, Layer, MAX_DEPTH, Side};
 use fictionet::time::Instant;
 
 /// `B` stacked on `A`: `A`'s upper port is `B`'s lower port.
@@ -10,7 +10,8 @@ use fictionet::time::Instant;
 /// `B` refuses the event it holds, `A`'s urgent events
 /// ([`take_urgent`](Layer::take_urgent)) go past it, one at a time.
 /// [`advance`](Layer::advance) moves those items in a loop, never by one
-/// part calling the other, so a deep stack makes no deep calls.
+/// part calling the other. Dispatch recurses through the composition, whose
+/// depth is bounded by [`MAX_DEPTH`].
 pub struct Chain<A: Layer, B: Layer<Lower = A::Upper>> {
     lower: A,
     upper: B,
@@ -21,17 +22,23 @@ pub struct Chain<A: Layer, B: Layer<Lower = A::Upper>> {
     urgent: Option<EventOf<A::Upper>>,
     /// A command `B` handed down that `A` has not taken.
     down: Option<CommandOf<A::Upper>>,
+    work_upper: bool,
 }
 
 impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
     /// `upper` on top of `lower`.
     pub fn new(lower: A, upper: B) -> Chain<A, B> {
+        assert!(
+            1 + lower.depth().max(upper.depth()) <= MAX_DEPTH,
+            "composition depth exceeded"
+        );
         Chain {
             lower,
             upper,
             up: None,
             urgent: None,
             down: None,
+            work_upper: false,
         }
     }
 
@@ -183,10 +190,36 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
     }
 
     fn take_work(&mut self) -> Option<Self::Work> {
-        if let Some(work) = self.lower.take_work() {
-            return Some(Side::Lower(work));
+        let work = if self.work_upper {
+            self.upper
+                .take_work()
+                .map(Side::Upper)
+                .or_else(|| self.lower.take_work().map(Side::Lower))
+        } else {
+            self.lower
+                .take_work()
+                .map(Side::Lower)
+                .or_else(|| self.upper.take_work().map(Side::Upper))
+        };
+        if let Some(ref work) = work {
+            self.work_upper = matches!(work, Side::Lower(_));
         }
-        self.upper.take_work().map(Side::Upper)
+        work
+    }
+
+    fn report_bytes(report: &Self::Report) -> Option<usize> {
+        match report {
+            Side::Lower(report) => A::report_bytes(report),
+            Side::Upper(report) => B::report_bytes(report),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        1 + self.lower.depth().max(self.upper.depth())
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.upper.is_terminal()
     }
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {

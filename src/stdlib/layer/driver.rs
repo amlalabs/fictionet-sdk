@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use fictionet::Entropy;
-use fictionet::stdlib::layer::{Admit, Budget, CommandOf, Env, EventOf, Layer, Observe};
+use fictionet::stdlib::layer::{Admit, Budget, Charge, CommandOf, Env, EventOf, Layer, Observe};
 use fictionet::time::Instant;
 
 /// How many timers and internal steps one [`Driver::run`] takes at most.
@@ -14,7 +14,10 @@ const KEPT: usize = 1024;
 /// ones there was no room for. Reports never hold up the protocol.
 #[derive(Debug)]
 pub struct Observations<E> {
-    kept: VecDeque<E>,
+    kept: VecDeque<(E, Charge)>,
+    budget: Budget,
+    storage: Option<Charge>,
+    heap_bytes: fn(&E) -> Option<usize>,
     limit: usize,
     omitted: u64,
 }
@@ -24,19 +27,37 @@ impl<E> Observations<E> {
     pub fn new(limit: usize) -> Observations<E> {
         Observations {
             kept: VecDeque::new(),
+            budget: Budget::new(256 * 1024),
+            storage: None,
+            heap_bytes: |_| None,
             limit,
             omitted: 0,
         }
     }
 
+    /// Bound report retention with a separate byte budget and an allocation
+    /// size function. The function must include all retained backing storage.
+    pub fn bounded(limit: usize, bytes: usize, heap_bytes: fn(&E) -> Option<usize>) -> Self {
+        Self {
+            budget: Budget::new(bytes),
+            heap_bytes,
+            ..Self::new(limit)
+        }
+    }
+
+    /// Bytes reserved for report slots and retained payloads.
+    pub fn used(&self) -> usize {
+        self.budget.used()
+    }
+
     /// Takes the kept reports, oldest first, making room for more.
     pub fn drain(&mut self) -> impl Iterator<Item = E> + '_ {
-        self.kept.drain(..)
+        self.kept.drain(..).map(|(event, _charge)| event)
     }
 
     /// The kept reports, oldest first.
     pub fn iter(&self) -> impl Iterator<Item = &E> + '_ {
-        self.kept.iter()
+        self.kept.iter().map(|(event, _)| event)
     }
 
     /// How many reports came while there was no room.
@@ -47,11 +68,33 @@ impl<E> Observations<E> {
 
 impl<E> Observe<E> for Observations<E> {
     fn observe(&mut self, event: E) {
-        if self.kept.len() < self.limit {
-            self.kept.push_back(event);
-        } else {
-            self.omitted += 1;
+        let bytes = (self.heap_bytes)(&event);
+        let room = self.kept.len() < self.limit;
+        if room && let Some(bytes) = bytes {
+            if self.kept.len() == self.kept.capacity() {
+                let capacity = self
+                    .limit
+                    .min(self.budget.limit() / std::mem::size_of::<(E, Charge)>().max(1));
+                let wanted = capacity.saturating_mul(std::mem::size_of::<(E, Charge)>());
+                let reserved = match &mut self.storage {
+                    Some(charge) => charge.set(wanted),
+                    None => {
+                        self.storage = self.budget.charge(wanted);
+                        self.storage.is_some()
+                    }
+                };
+                if !reserved || capacity <= self.kept.len() {
+                    self.omitted = self.omitted.saturating_add(1);
+                    return;
+                }
+                self.kept.reserve_exact(capacity - self.kept.len());
+            }
+            if let Some(charge) = self.budget.charge(bytes) {
+                self.kept.push_back((event, charge));
+                return;
+            }
         }
+        self.omitted = self.omitted.saturating_add(1);
     }
 }
 
@@ -77,22 +120,28 @@ pub struct Driver<L: Layer> {
     /// An urgent event that went past the refused one above, refused too.
     urgent: Option<EventOf<L::Upper>>,
     steps: usize,
+    exhausted: bool,
 }
 
 impl<L: Layer> Driver<L> {
     /// Drives `layer` at time `now`, drawing from `entropy` and charging
     /// `budget`.
     pub fn new(layer: L, entropy: Arc<dyn Entropy>, budget: Budget, now: Instant) -> Driver<L> {
+        assert!(layer.depth() <= super::MAX_DEPTH, "composition is too deep");
         Driver {
             layer,
             entropy,
             budget,
             now,
-            observed: Observations::new(KEPT),
+            observed: Observations {
+                heap_bytes: L::report_bytes,
+                ..Observations::new(KEPT)
+            },
             below: None,
             above: None,
             urgent: None,
             steps: STEPS,
+            exhausted: false,
         }
     }
 
@@ -166,23 +215,33 @@ impl<L: Layer> Driver<L> {
     /// step limit is reached. Returns whether anything moved; call it again
     /// after input or output has moved.
     pub fn run(&mut self) -> Result<bool, L::Error> {
+        assert!(
+            self.layer.depth() <= super::MAX_DEPTH,
+            "composition is too deep"
+        );
+        self.exhausted = true;
         let mut moved = false;
         for _ in 0..self.steps {
             let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
-            let step = match due {
-                Some((_, timer)) => {
-                    self.layer.on_timer(&mut env, timer)?;
-                    true
-                }
-                None => self.layer.advance(&mut env)?,
-            };
+            let mut step = false;
+            if let Some((_, timer)) = due {
+                self.layer.on_timer(&mut env, timer)?;
+                step = true;
+            }
+            step |= self.layer.advance(&mut env)?;
             if !step {
+                self.exhausted = false;
                 break;
             }
             moved = true;
         }
         Ok(moved)
+    }
+
+    /// Whether the last run used its whole allowance and needs another visit.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// Offers the stack's output for the carrier below to `sink`, which
@@ -213,9 +272,13 @@ impl<L: Layer> Driver<L> {
             }
         }
         moved |= send(&mut self.above, || self.layer.take_event(), &mut sink);
-        while self.above.is_some()
-            && let Some(event) = self.layer.take_urgent()
-        {
+        for _ in 0..STEPS {
+            if self.above.is_none() {
+                break;
+            }
+            let Some(event) = self.layer.take_urgent() else {
+                break;
+            };
             moved = true;
             if let Admit::Partial(event) | Admit::Blocked(event) = sink(event) {
                 self.urgent = Some(event);
@@ -249,7 +312,7 @@ fn send<T>(
     mut sink: impl FnMut(T) -> Admit<T>,
 ) -> bool {
     let mut moved = false;
-    loop {
+    for _ in 0..STEPS {
         let item = match held.take() {
             Some(item) => item,
             None => match next() {
@@ -272,5 +335,85 @@ fn send<T>(
                 return moved;
             }
         }
+    }
+    moved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::layer::{Port, Top};
+    use crate::{Seed, SeededEntropy};
+    use std::convert::Infallible;
+
+    struct Units;
+    impl Port for Units {
+        type Event = ();
+        type Command = ();
+    }
+    struct Productive {
+        timers: usize,
+        advances: usize,
+    }
+    impl Layer for Productive {
+        type Lower = Units;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<Admit<()>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
+            self.timers += 1;
+            Ok(())
+        }
+        fn advance(&mut self, _: &mut Env<'_, ()>) -> Result<bool, Infallible> {
+            self.advances += 1;
+            Ok(true)
+        }
+        fn take_command(&mut self) -> Option<()> {
+            Some(())
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            Some((Instant::ZERO, ()))
+        }
+    }
+    #[test]
+    fn continuous_output_and_timers_yield_without_starving_advance() {
+        let mut driver = Driver::new(
+            Productive {
+                timers: 0,
+                advances: 0,
+            },
+            Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        assert!(driver.run().unwrap());
+        assert!(driver.exhausted());
+        assert!(driver.layer().timers > 0);
+        assert!(driver.layer().advances > 0);
+        assert!(driver.layer().timers + driver.layer().advances <= STEPS * 2);
+        let mut accepted = 0;
+        assert!(driver.send_below(|()| {
+            accepted += 1;
+            Admit::Taken
+        }));
+        assert!(accepted > 0 && accepted <= STEPS);
+        assert!(driver.run().unwrap());
+        assert!(driver.layer().advances > STEPS);
     }
 }

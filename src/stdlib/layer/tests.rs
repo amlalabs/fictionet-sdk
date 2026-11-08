@@ -240,6 +240,7 @@ impl Layer for Echo {
     type Upper = Top;
     /// The length of each line answered.
     type Report = usize;
+    fn report_bytes(_: &usize) -> Option<usize> { Some(0) }
     type Timer = ();
     type Work = ();
     type Done = ();
