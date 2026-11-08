@@ -22,6 +22,8 @@ use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
 use crate::stdlib::world::net::{Arrival, PortServer};
 use crate::time::Instant;
 
+pub mod channel;
+
 const WINDOW: u32 = 65536;
 const PACKET: u32 = 32000;
 const OUTPUT_LIMIT: usize = 256 * 1024;
