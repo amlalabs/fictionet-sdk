@@ -1060,9 +1060,9 @@ type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>
 pub struct Work {
     generation: u64,
     lease: OwnedWork<()>,
+    op: Op,
     charge: Option<Charge>,
     budget: Budget,
-    op: Op,
 }
 
 enum Op {
@@ -1076,8 +1076,8 @@ enum Op {
 /// The result of [`Work`].
 pub struct Done {
     generation: u64,
-    charge: Option<Charge>,
     answer: Answer,
+    charge: Option<Charge>,
 }
 
 enum Answer {
