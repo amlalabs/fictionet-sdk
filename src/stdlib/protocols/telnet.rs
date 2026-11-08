@@ -3,7 +3,7 @@
 //!
 //! `Event` and `BinaryEvent` implement `Wire`, `Events` decodes the stream, and
 //! `Negotiation` tracks option state with the Q method. There is no login
-//! session, terminal emulator, `Service`, or live transport.
+//! session, terminal emulator, server layer, or live transport.
 //!
 //! Telnet is the oldest remote login protocol, and many routers, switches,
 //! PLCs and embedded boards still offer it on TCP port 23. Both ends send
@@ -15,11 +15,11 @@
 //! (terminal type) and RFC 1073 (window size), and negotiates options with
 //! the Q method of RFC 1143, which never loops.
 //!
-//! A terminal [`Service`](fictionet::stdlib::services::serve::Service) served
-//! by [`serve::connection`](fictionet::stdlib::services::serve::connection)
-//! uses [`Events`] and hands each negotiation to [`Negotiation`]. In `on_item`,
-//! it writes each returned reply event and calls
-//! `driver.decoder().set_binary()` when binary mode changes. The default
+//! A terminal is a [layer](fictionet::stdlib::layer) over a byte stream that
+//! reads it with a [`Stream`](fictionet::stdlib::codec::Stream) of [`Events`]
+//! and hands each negotiation to [`Negotiation`]. It writes each returned
+//! reply event and calls `stream.decoder().set_binary()` when binary mode
+//! changes. The default
 //! delivers each data byte immediately. Batch readers can use
 //! [`Events::with_limit`] to wait for larger runs. [`Event`] uses NVT encoding;
 //! [`BinaryEvent`] carries an event in binary mode. [`ControlScanner`] exposes

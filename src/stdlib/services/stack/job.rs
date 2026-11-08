@@ -746,3 +746,7 @@ mod tests {
         .expect("the enclosing region drains dropped stack work");
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../../verification/layer-runtime/kani/jobs.rs"]
+mod proofs;

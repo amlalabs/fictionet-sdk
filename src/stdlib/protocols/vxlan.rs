@@ -3,7 +3,7 @@
 //!
 //! `Packet` and `GpePacket` read and write complete datagrams through `Wire`,
 //! leaving the inner frame as bytes. There is no stream decoder, tunnel
-//! endpoint state, learning bridge, `Service`, or live transport.
+//! endpoint state, learning bridge, server layer, or live transport.
 //!
 //! VXLAN stretches a layer 2 network across a layer 3 one. A tunnel
 //! endpoint (a VTEP: a hypervisor, a switch, a container host) takes an

@@ -2,7 +2,7 @@
 //!
 //! `Frame` implements `Wire`, `Inputs` decodes the stream, and `Session` tracks
 //! one direction rather than a whole client or server. This module has no
-//! `Service` or live transport. The native server in
+//! server layer or live transport. The native server in
 //! `fictionet::stdlib::web::httpd` and the observe presenter share this frame layer.
 //!
 //! Use [`Session`] for endpoint decoding. [`Inputs`] reports frame errors

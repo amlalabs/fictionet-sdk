@@ -749,7 +749,7 @@ mod tests {
                 let shared = network(&fcx, "10.0.0.0/24", Some("2001:db8::/64"));
                 let bind = || {
                     let mut host = Host::new("bind.test").dns_name("bind.test");
-                    let start: UdpStart = Arc::new(|_, _, _, _| panic!("not committed"));
+                    let start: UdpStart = Arc::new(|_, _, _| panic!("not committed"));
                     host.ports.push((0, PortSpec::Udp(start.clone())));
                     host.ports.push((49152, PortSpec::Udp(start)));
                     host

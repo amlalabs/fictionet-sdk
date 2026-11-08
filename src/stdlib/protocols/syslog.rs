@@ -2,7 +2,7 @@
 //! RFC 3164, and splitting a TCP stream of them per RFC 6587, with no I/O.
 //!
 //! `Message`, `BsdMessage`, and `Entry` implement `Wire`, and `Frames` decodes
-//! RFC 6587 stream envelopes. There is no collector session or `Service`, log
+//! RFC 6587 stream envelopes. There is no collector session or server layer, log
 //! storage, or TLS transport.
 //!
 //! Syslog is how Unix machines, routers, firewalls and most appliances send

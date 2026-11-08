@@ -899,7 +899,7 @@ impl<E: Engine + Send + 'static> Driver<E> {
     async fn serve_stream(self: &Arc<Self>, fcx: &Cx, mut conn: tcp::TcpConnection) {
         let mut buf = vec![0; READ_BUFFER];
         // The connection's read buffer and the bytes read but not yet
-        // framed are charged to its sandbox's budget, as the service driver
+        // framed are charged to its sandbox's budget, as the stack runner
         // charges them; one that does not fit is closed.
         let mut charge = match self.machine.budget_of(conn.peer_addr().ip()) {
             Some(budget) => match budget.charge(buf.len()) {

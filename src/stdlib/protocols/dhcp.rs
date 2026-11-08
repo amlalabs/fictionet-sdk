@@ -4,7 +4,7 @@
 //! for a VM.
 //!
 //! `Message` reads and writes complete datagrams through `Wire`. This file
-//! supplies no stream decoder, lease state machine, or `Service`. Address
+//! supplies no stream decoder, lease state machine, or server layer. Address
 //! assignment and socket handling belong to its callers. [`ReplyConfig::build`]
 //! forms a reply and selects its IPv4 destination after the caller has
 //! admitted the request and chosen a [`Reply`]. It keeps no lease state.

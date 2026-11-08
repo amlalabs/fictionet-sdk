@@ -3,7 +3,7 @@
 //!
 //! `Frame` implements `Wire` and supports `codec::Frames<Frame>` stream
 //! decoding. `Context` holds negotiated parsing options. There is no peer
-//! session or routing `Service`. Timers, message ordering, route selection, and
+//! session or routing server layer. Timers, message ordering, route selection, and
 //! TCP belong to the caller.
 //!
 //! BGP is how networks on the Internet tell each other which addresses

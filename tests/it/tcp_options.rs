@@ -17,11 +17,11 @@ use crate::common::line_stack::{LineApp, LineOut, Lined};
 use fictionet::stdlib::codec::{LineError, Wire};
 use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::network::ConnInfo;
+use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
 use fictionet::stdlib::network::tcp::{
     self, AckAnswer, Answer, Handshake, SYN_OPTIONS_ROOM, SynAnswer, TcpOption,
 };
-use fictionet::stdlib::network::{Accepted, ConnectionExt};
 use fictionet::stdlib::protocols::mptcp::{
     self, Capable, Join, Keys, MptcpOption, algorithm, reason,
 };
@@ -281,7 +281,6 @@ fn syn_options_reach_the_connection_and_the_syn_ack_answers_mptcp() {
             iss,
         };
         assert_eq!(*conn.handshake().unwrap(), handshake);
-        assert_eq!(Accepted::handshake(&conn), Some(handshake));
         Ok(())
     });
 }

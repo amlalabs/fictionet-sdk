@@ -276,8 +276,8 @@ impl Front {
             local,
             transport: Transport::Tcp,
             connection: None,
-            // The serve layer reports a peer no sandbox has with id 0
-            // (`ServeOptions::sandbox`).
+            // A peer that is no sandbox comes with id 0
+            // (`Hooks::sandbox_at`).
             sandbox: conn.sandbox.clone().filter(|sandbox| sandbox.id != 0),
         })
     }

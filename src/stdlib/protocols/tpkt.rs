@@ -3,7 +3,7 @@
 //!
 //! `Packet` implements `Wire` and supports `codec::Frames<Packet>` stream
 //! decoding. It keeps the TPDU as bytes and supplies no COTP session,
-//! `Service`, or live TCP transport.
+//! server layer, or live TCP transport.
 //!
 //! ISO transport was made for networks other than TCP. RFC 1006 carries it
 //! over TCP anyway, usually on port 102, by putting each transport message

@@ -206,6 +206,39 @@ fn charges_split_and_drop_within_the_limit() {
     assert_eq!(budget.used(), 0);
 }
 
+/// `Charge::set` on a charge taken from the budget keeps the budget's
+/// count equal to the sum of its charges and never past the limit: a change
+/// that would pass it is refused and changes nothing, less always fits, and
+/// dropping a charge gives it back. Moved here from the serving engine's
+/// proofs, which checked the budget its connections were charged to.
+#[kani::proof]
+#[kani::unwind(4)]
+fn charges_sum_to_the_budget_and_never_pass_its_limit() {
+    let limit: u8 = kani::any();
+    let budget = Budget::new(limit as usize);
+    let first: u8 = kani::any();
+    let second: u8 = kani::any();
+    let a = budget.charge(first as usize);
+    assert_eq!(a.is_some(), first <= limit);
+    let b = budget.charge(second as usize);
+    let held = a.as_ref().map_or(0, Charge::bytes) + b.as_ref().map_or(0, Charge::bytes);
+    assert_eq!(budget.used(), held);
+    assert!(budget.used() <= budget.limit());
+    if let Some(mut a) = a {
+        let was = a.bytes();
+        let to: u8 = kani::any();
+        let fits = a.set(to as usize);
+        assert_eq!(fits, held - was + to as usize <= limit as usize);
+        assert_eq!(a.bytes(), if fits { to as usize } else { was });
+        assert_eq!(budget.used(), held - was + a.bytes());
+        assert!(budget.used() <= budget.limit());
+        drop(a);
+        assert_eq!(budget.used(), b.as_ref().map_or(0, Charge::bytes));
+    }
+    drop(b);
+    assert_eq!(budget.used(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Timers (src/stdlib/layer/timers.rs)
 

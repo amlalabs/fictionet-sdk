@@ -2,7 +2,7 @@
 //! I/O.
 //!
 //! `Header` and `Packet` read and write complete values through `Wire`. There
-//! is no protocol stream decoder, tunnel state machine, `Service`, or live
+//! is no protocol stream decoder, tunnel state machine, server layer, or live
 //! transport. The caller supplies datagram boundaries and handles the inner
 //! payload.
 //!

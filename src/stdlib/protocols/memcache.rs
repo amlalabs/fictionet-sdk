@@ -3,7 +3,7 @@
 //!
 //! `Command`, `Response`, `Packet`, and `UdpFrame` implement `Wire`. Text
 //! decoders and `codec::Frames<Packet>` handle streams. There is no cache
-//! session or `Service`, storage engine, expiration scheduler, or live
+//! session or server layer, storage engine, expiration scheduler, or live
 //! transport.
 //!
 //! memcached is a cache that keeps values under keys in memory. Web

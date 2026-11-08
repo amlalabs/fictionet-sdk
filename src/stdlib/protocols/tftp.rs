@@ -3,7 +3,7 @@
 //!
 //! `Packet` implements `Wire`, and `ReadTransfer` is a caller-driven state
 //! machine for one read. `NetasciiBytes` decodes text payloads. There is no
-//! write-transfer state machine, client session, `Service`, live UDP transport,
+//! write-transfer state machine, client session, server layer, live UDP transport,
 //! or retry scheduler.
 //!
 //! TFTP (the Trivial File Transfer Protocol) moves files over UDP with

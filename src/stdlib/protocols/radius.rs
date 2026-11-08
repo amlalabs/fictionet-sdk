@@ -1,7 +1,7 @@
 //! RADIUS: reading and writing packets and attributes, with no I/O.
 //!
 //! `Packet` implements `Wire` and supports `codec::Frames<Packet>` for TCP
-//! framing. There is no authentication session, `Service`, or cryptography.
+//! framing. There is no authentication session, server layer, or cryptography.
 //! Authenticators and hidden passwords remain the caller's responsibility.
 //!
 //! RADIUS is how network equipment asks a central server whether a user

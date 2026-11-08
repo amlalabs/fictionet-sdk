@@ -9,7 +9,7 @@ repeating groups, and its variable data. Readers skip the extra bytes
 of longer blocks from newer senders and refuse acting versions below
 13. Constants, such as a price's exponent, are associated constants.
 
-There is no feed session, recovery engine, order book, `Service` or
+There is no feed session, recovery engine, order book, server layer or
 live transport. The generated part is checked against the generator in CI.
 A copy in your crate has no such check. See
 [code generation](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md)

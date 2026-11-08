@@ -97,30 +97,6 @@ impl ConnInfo {
     }
 }
 
-/// Accepts byte streams for the serving driver.
-pub trait Accept: Send + 'static {
-    /// The accepted connection and its transport lifetime.
-    type Conn: Accepted;
-
-    /// Waits for a connection, or returns cancellation or a transport error.
-    fn accept(&mut self, fcx: &Cx) -> impl Future<Output = Result<Self::Conn, ConnError>> + Send;
-}
-
-/// An accepted stream with addresses and a transport lifetime.
-pub trait Accepted: Connection {
-    /// The local address of the connection.
-    fn local_addr(&self) -> std::net::SocketAddr;
-    /// The peer's address.
-    fn peer_addr(&self) -> std::net::SocketAddr;
-    /// What the TCP handshake that opened it carried.
-    fn handshake(&self) -> Option<super::tcp::Handshake>;
-    /// Resets the connection without waiting for a graceful close.
-    fn reset(self);
-    /// Retains `item` until the transport is gone, including after this
-    /// handle is dropped. This keeps closing sockets in the serving limit.
-    fn hold_until_gone<T: Send + 'static>(&self, item: T);
-}
-
 /// A datagram socket, as the [datagram runner](fictionet::stdlib::services::stack::datagrams)
 /// uses it.
 pub trait DatagramSocket: Send + 'static {

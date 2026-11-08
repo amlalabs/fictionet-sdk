@@ -2,7 +2,7 @@
 //!
 //! `Message` and `NgMessage` read and write complete routing messages through
 //! `Wire`. There is no protocol stream decoder, routing-table state machine,
-//! update timer, authentication verification, or `Service`.
+//! update timer, authentication verification, or server layer.
 //!
 //! RIP (the Routing Information Protocol) is the oldest routing protocol
 //! still in use. Each router sends its neighbors the routes it knows, each

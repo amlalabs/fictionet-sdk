@@ -508,3 +508,7 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(kani)]
+#[path = "../../../../verification/layer-runtime/kani/admission.rs"]
+mod proofs;

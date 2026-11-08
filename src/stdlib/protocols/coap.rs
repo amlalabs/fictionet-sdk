@@ -3,7 +3,7 @@
 //!
 //! `Message` and `Frame` implement `Wire`, `codec::Frames<Frame>` decodes TCP
 //! framing, and `Reassembler` joins block-wise payloads. There is no client or
-//! server session, `Service`, retransmission scheduler, or DTLS transport.
+//! server session, server layer, retransmission scheduler, or DTLS transport.
 //!
 //! CoAP, the Constrained Application Protocol, is a small web protocol for
 //! sensors, meters and other small devices. A client sends a request with

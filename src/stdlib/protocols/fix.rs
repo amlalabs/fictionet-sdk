@@ -1,7 +1,7 @@
 //! FIX tag=value messages, repeating-group views, and caller-driven sessions.
 //!
 //! `Message` implements `Wire`, `Messages` decodes the stream, and `Session` is
-//! a caller-driven state machine for either side. There is no `Service` or live
+//! a caller-driven state machine for either side. There is no server layer or live
 //! transport. The caller supplies time, authentication decisions, and
 //! application behavior.
 //!

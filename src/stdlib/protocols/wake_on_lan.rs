@@ -2,7 +2,7 @@
 //!
 //! `MagicPacket` implements `Wire`, and `MagicPackets` searches a bounded
 //! payload ending at EOF. These helpers do not send packets, change host power
-//! state, or provide a `Service`. World code acts on a match.
+//! state, or provide a server layer. World code acts on a match.
 //!
 //! A machine that is asleep or switched off can keep its network card
 //! powered and listening. When the card sees a "magic packet" for its own
