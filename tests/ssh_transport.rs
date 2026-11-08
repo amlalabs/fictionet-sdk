@@ -57,6 +57,9 @@ impl PacketTransport for RestrictedTransport {
     ) -> Result<(), TransportError> {
         self.inner.disconnect(reason, description, out)
     }
+    fn poll_ready(&self) -> bool {
+        self.inner.poll_ready()
+    }
     fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure> {
         let event = self.inner.poll(out)?;
         if let Some(Event::Observed(Observation::Proposal(proposal))) = &event

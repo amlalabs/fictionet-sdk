@@ -117,6 +117,9 @@ pub trait PacketTransport: Send + 'static {
     fn push(&mut self, bytes: &[u8]) -> usize;
     /// Mark EOF; poll must still process buffered packets or report truncation.
     fn end(&mut self);
+    /// Whether polling can consume input, emit an event, or finish after EOF.
+    /// False lets the caller avoid reserving packet scratch space while idle.
+    fn poll_ready(&self) -> bool;
     /// None means more input is required. Output belongs exclusively to caller.
     fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure>;
     /// Current negotiation state and stable session identity.
@@ -211,6 +214,9 @@ impl PacketTransport for StandardTransport {
         out: &mut Vec<u8>,
     ) -> Result<(), TransportError> {
         self.stream.decoder().disconnect(reason, description, out)
+    }
+    fn poll_ready(&self) -> bool {
+        self.stream.buffered() > 0 || self.stream.is_eof()
     }
     fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure> {
         let Some(event) = self.stream.next() else {

@@ -1395,6 +1395,9 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 return Ok(true);
             }
         }
+        if !self.transport.poll_ready() {
+            return Ok(false);
+        }
         self.scratch()?;
         self.output(env)?;
         let event = match self.transport.poll(&mut self.out) {
@@ -2006,6 +2009,29 @@ mod tests {
                 .iter()
                 .any(|end| matches!(end, Ended::Failed))
         );
+        drop(harness);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn idle_transport_does_not_reserve_packet_scratch() {
+        let budget = Budget::new(1 << 20);
+        let config = Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        ));
+        let mut harness = crate::stdlib::layer::Harness::with_budget(
+            crate::Seed::from_u64(3),
+            Ssh::new(
+                config,
+                Arc::new(Observed(Mutex::new(Vec::new()))),
+                Arc::new(ConnInfo::default()),
+            ),
+            budget.clone(),
+        );
+        harness.settle().unwrap();
+        assert!(!harness.take_output().is_empty());
+        harness.settle().unwrap();
         drop(harness);
         assert_eq!(budget.used(), 0);
     }
