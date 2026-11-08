@@ -5,12 +5,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::op::{Edns, Message, MessageType, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{
     Ede, EdeCode, Fitted, Limit, Nsid, Request, Response, fit,
 };
-use fictionet::stdlib::services::serve::Transport;
 
 use super::super::zone::AnyResponse;
 

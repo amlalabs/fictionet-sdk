@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::op::{Edns, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Record, RecordSet};
@@ -7,7 +8,6 @@ use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::Zone;
 use fictionet::stdlib::services::dns::{Client, Event, Looked, Lookup, WallClock};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::stdlib::world::net::dns::{
     Authoritative, Namespace, Only, Recursive, ResolverHandle, Upstream,
 };
@@ -794,7 +794,7 @@ fn net_serves_the_default_cap_of_connections_on_a_tcp_port() {
         let s = machine(&fcx, attacher.attach("agent")?, ME);
         let to = SocketAddr::new(addr.into(), 7);
         let mut open = Vec::new();
-        for _ in 0..serve::DEFAULT_MAX_CONNS {
+        for _ in 0..fictionet::stdlib::world::net::DEFAULT_MAX_CONNS {
             let mut conn = s.tcp.connect(&fcx, to).await?;
             assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
             open.push(conn);

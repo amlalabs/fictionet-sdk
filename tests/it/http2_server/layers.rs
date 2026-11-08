@@ -380,7 +380,7 @@ mod h2c {
 
 mod detection {
     use super::*;
-    use fictionet::stdlib::services::serve::ConnInfo;
+    use fictionet::stdlib::network::ConnInfo;
     use fictionet::stdlib::web::httpd::{Http, HttpOptions};
 
     fn http(opts: &HttpOptions) -> Harness<Http> {

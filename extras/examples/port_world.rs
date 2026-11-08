@@ -8,8 +8,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::ConnectionExt;
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
 use fictionet::stdlib::world::net::{Arrival, Net, Pools, PortServer};
 use fictionet::{Attachments, Cx};

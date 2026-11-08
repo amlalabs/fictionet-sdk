@@ -5,6 +5,7 @@ use fictionet::stdlib::codec::Decode;
 use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Side, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
+use fictionet::stdlib::network::{ConnInfo, Transport};
 use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::Query;
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Name, RecordSet};
@@ -12,11 +13,12 @@ use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{
     Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, additional_targets,
 };
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
-    self, Counted, DatagramOptions, DatagramService, ServeOptions, Service,
+    self, DatagramOptions, DatagramService, ServeOptions, Service,
 };
-use fictionet::stdlib::services::stack::{self, Boxed, Job, StackError, StreamEnd, StreamLimits};
+use fictionet::stdlib::services::stack::{
+    self, Boxed, Counted, Job, StackError, StreamEnd, StreamLimits,
+};
 use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig, TlsLayer};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -244,10 +246,15 @@ where
     }
 }
 
+/// The connections a port served with [`Host::tcp_stack`] or [`Host::tcp`]
+/// serves at once.
+pub const DEFAULT_MAX_CONNS: usize = 64;
+
 /// Serves a layer stack made fresh for each connection.
 struct StackAccept<M> {
     make: M,
     max_conns: usize,
+    limits: StreamLimits,
     open: Arc<AtomicUsize>,
 }
 
@@ -268,9 +275,9 @@ where
         arrival.socket.hold_until_gone(Box::new(guard));
         let layer = (self.make)(&arrival.info);
         let budget = arrival.budget.unwrap_or_else(Budget::unlimited);
-        let (conn, info, socket) = (arrival.conn, arrival.info, arrival.socket);
+        let (conn, info, socket, limits) =
+            (arrival.conn, arrival.info, arrival.socket, self.limits);
         Box::pin(async move {
-            let limits = StreamLimits::default();
             let ended = stack::stream(&fcx, conn, &info, layer, budget, limits, |_| {});
             if let Ok(StreamEnd::Reset) = ended.await {
                 socket.reset();
@@ -428,7 +435,7 @@ impl Host {
 
     /// Serves the literal TCP `port`, including zero, with a [`Service`]
     /// made by `make` for each connection, sharing `world`, with the default
-    /// [`ServeOptions`], at most [`DEFAULT_MAX_CONNS`](serve::DEFAULT_MAX_CONNS)
+    /// [`ServeOptions`], at most [`DEFAULT_MAX_CONNS`](DEFAULT_MAX_CONNS)
     /// at once.
     /// Connections are numbered and identify their sandbox in [`ConnInfo`].
     pub fn tcp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
@@ -442,7 +449,7 @@ impl Host {
             state,
             make,
             ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
+            DEFAULT_MAX_CONNS,
         )
     }
 
@@ -483,12 +490,7 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
-        let accept = ServiceAccept::new(
-            state,
-            make,
-            ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
-        );
+        let accept = ServiceAccept::new(state, make, ServeOptions::default(), DEFAULT_MAX_CONNS);
         self.tls_accept(port, sni, config_for, accept)
     }
 
@@ -589,12 +591,33 @@ impl Host {
 
     /// Serves the literal TCP `port`, including zero, with a layer stack
     /// made by `make` for each connection, from the connection's
-    /// [`ConnInfo`]. [`stack::stream`] runs it with the default
-    /// [`StreamLimits`], charging the sandbox's budget, at most
-    /// [`DEFAULT_MAX_CONNS`](serve::DEFAULT_MAX_CONNS) at once. Past that,
-    /// a new connection is reset as soon as it is accepted, and each counts
-    /// until its socket is gone. A connection the stack resets is reset.
+    /// [`ConnInfo`], which numbers it and names its sandbox.
+    /// [`stack::stream`] runs it with the default [`StreamLimits`],
+    /// charging the sandbox's budget, at most [`DEFAULT_MAX_CONNS`] at
+    /// once. Past that, a new connection is reset as soon as it is
+    /// accepted, and each counts until its socket is gone. A connection the
+    /// stack resets is reset.
     pub fn tcp_stack<L, M>(self, port: u16, make: M) -> Host
+    where
+        L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
+        L::Work: Job<Done = L::Done>,
+        L::Report: Send,
+        L::Done: Send,
+        L::Error: Send,
+        M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
+    {
+        self.tcp_stack_with(port, StreamLimits::default(), DEFAULT_MAX_CONNS, make)
+    }
+
+    /// The same with these limits and at most `max_conns` connections at
+    /// once.
+    pub fn tcp_stack_with<L, M>(
+        self,
+        port: u16,
+        limits: StreamLimits,
+        max_conns: usize,
+        make: M,
+    ) -> Host
     where
         L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
         L::Work: Job<Done = L::Done>,
@@ -607,14 +630,17 @@ impl Host {
             port,
             StackAccept {
                 make,
-                max_conns: serve::DEFAULT_MAX_CONNS,
+                max_conns,
+                limits,
                 open: Arc::default(),
             },
         )
     }
 
-    /// Serves UDP `port` with one layer stack made by `make`, which holds
-    /// the conversation for the socket's whole life and gets every
+    /// Serves UDP `port` with one layer stack made by `make` from the
+    /// socket's [`ConnInfo`]: its address, which says the port the
+    /// endpoint chose for port zero, and [`Transport::Udp`]. The stack
+    /// holds the conversation for the socket's whole life and gets every
     /// datagram with its sender's address ([`stack::datagrams`]). Port
     /// zero asks the endpoint to choose a free port
     /// ([`udp::Endpoint::bind`]). Retained datagrams and layer state share
@@ -626,11 +652,15 @@ impl Host {
         L::Report: Send,
         L::Done: Send,
         L::Error: core::error::Error + Send + Sync + 'static,
-        M: Fn() -> L + Send + Sync + 'static,
+        M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
         let start: UdpStart = Arc::new(move |fcx, socket, local, _sandbox| {
             let budget = budget.clone();
-            let layer = make();
+            let layer = make(&ConnInfo {
+                local: Some(local),
+                transport: Transport::Udp,
+                ..ConnInfo::default()
+            });
             fcx.spawn(move |fcx| async move {
                 match stack::datagrams(&fcx, socket, local, layer, budget, |_| {}).await {
                     Ok(()) => Ok(()),
@@ -712,7 +742,7 @@ impl Endpoints {
 
     /// The sandbox that `peer` belongs to, or `None` for a peer that is no
     /// sandbox.
-    pub fn sandbox_of(&self, peer: IpAddr) -> Option<serve::Sandbox> {
+    pub fn sandbox_of(&self, peer: IpAddr) -> Option<super::Sandbox> {
         self.admission.hooks.sandbox_of(peer)
     }
 
@@ -1615,9 +1645,9 @@ impl Machine {
                             peer: Some(peer),
                             sandbox: hooks.sandbox_of(peer.ip()),
                             transport: if protocol == 17 {
-                                serve::Transport::Udp
+                                Transport::Udp
                             } else {
-                                serve::Transport::Tcp
+                                Transport::Tcp
                             },
                             ..Default::default()
                         };

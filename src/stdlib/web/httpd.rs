@@ -120,9 +120,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fictionet::stdlib::layer::{Budget, Switch};
-use fictionet::stdlib::network::Connection;
+use fictionet::stdlib::network::{ConnInfo, Connection};
 use fictionet::stdlib::protocols::http1;
-use fictionet::stdlib::services::serve::{self, ConnInfo};
 use fictionet::stdlib::services::stack::{self, StackError, StreamLimits};
 use fictionet::{Cancelled, Cx};
 
@@ -175,7 +174,7 @@ pub struct Observation {
     /// When the request was dispatched.
     pub at: fictionet::time::Instant,
     /// The connection carrying the request.
-    pub conn: serve::ConnInfo,
+    pub conn: ConnInfo,
     /// The parsed request head, without its body.
     pub request: http::request::Parts,
     /// The response selected for transmission, if one was produced.
@@ -205,7 +204,7 @@ impl Delivery {
     fn new(
         observe: &Option<Observe>,
         request: &http::Request<Body>,
-        conn: &serve::ConnInfo,
+        conn: &ConnInfo,
         at: fictionet::time::Instant,
         received: Received,
     ) -> Option<Self> {

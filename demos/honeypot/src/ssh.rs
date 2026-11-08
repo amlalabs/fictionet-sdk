@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::ssh::{
     auth, connection,
     transport::{HostKey, Transport},
 };
-#[cfg(test)]
-use fictionet::stdlib::services::serve;
 use fictionet::stdlib::services::ssh;
 use fictionet::sync::Mutex;
 use fictionet_extras::ssh::{
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn shell_accepts_editing_but_closes_on_submission() {
-        let connection = serve::ConnInfo::new(
+        let connection = ConnInfo::new(
             1,
             "127.0.0.1:22".parse().unwrap(),
             "127.0.0.2:30000".parse().unwrap(),
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn empty_and_erased_lines_allow_another_command() {
-        let connection = serve::ConnInfo::new(
+        let connection = ConnInfo::new(
             1,
             "127.0.0.1:22".parse().unwrap(),
             "127.0.0.2:30000".parse().unwrap(),
@@ -331,7 +331,7 @@ mod tests {
             profile: Profile::ubuntu_24_04(),
             delay_secret: 0,
         };
-        let connection = serve::ConnInfo::new(
+        let connection = ConnInfo::new(
             1,
             "127.0.0.1:22".parse().unwrap(),
             "127.0.0.2:30000".parse().unwrap(),

@@ -261,7 +261,7 @@ mod http {
             let router = fictionet_test_support::handler(|_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, request: http::Request<bytes::Bytes>| {
                 let headers: Vec<_> = request.headers().iter().map(|(n, v)| (n.as_str(), v.to_str().unwrap())).collect();
                 let upgrade = websocket::check_request(&headers).unwrap();
-                let info = request.extensions().get::<fictionet::stdlib::services::serve::ConnInfo>().unwrap().clone();
+                let info = request.extensions().get::<fictionet::stdlib::network::ConnInfo>().unwrap().clone();
                 let mut response = ::http::Response::builder().status(101);
                 for (name, value) in upgrade.response_headers(None).unwrap() { response = response.header(name, value); }
                 let mut response = response.body(bytes::Bytes::new()).unwrap();

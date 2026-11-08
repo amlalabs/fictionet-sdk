@@ -7,9 +7,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use fictionet::Entropy;
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, Query};
 use fictionet::stdlib::protocols::dns::read_message;
-use fictionet::stdlib::services::serve::{Sandbox, Transport};
+use fictionet::stdlib::world::net::Sandbox;
 use fictionet::time::Instant;
 
 use super::clock::WallClock;

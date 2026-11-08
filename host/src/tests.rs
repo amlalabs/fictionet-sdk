@@ -718,7 +718,7 @@ async fn serve_one(fcx: &Cx, forward: fictionet::stdlib::web::Forward) -> String
         httpd::serve_connection(
             fcx,
             conn,
-            fictionet::stdlib::services::serve::ConnInfo::default(),
+            fictionet::stdlib::network::ConnInfo::default(),
             Arc::new(forward),
             &httpd::HttpOptions::default(),
         ),
@@ -935,7 +935,7 @@ fn a_client_reset_stops_the_pending_upstream_response() {
         httpd::serve_connection(
             &fcx,
             conn,
-            fictionet::stdlib::services::serve::ConnInfo::default(),
+            fictionet::stdlib::network::ConnInfo::default(),
             Arc::new(forward),
             &httpd::HttpOptions::default(),
         )

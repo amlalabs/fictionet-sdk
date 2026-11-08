@@ -1763,8 +1763,8 @@ mod tests {
     use super::*;
     use fictionet::Cx;
     use fictionet::stdlib::layer::Harness;
+    use fictionet::stdlib::network::ConnInfo;
     use fictionet::stdlib::network::{ConnError, Connection};
-    use fictionet::stdlib::services::serve::ConnInfo;
     use fictionet::stdlib::services::stack::Polling;
     use fictionet::sync::Mutex;
     use http::StatusCode;

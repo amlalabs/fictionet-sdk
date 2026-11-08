@@ -115,7 +115,7 @@ fn dropping_a_connection_future_releases_the_serving_lifetime() {
             let mut future = Box::pin(serve::connection(
                 &fcx,
                 Idle,
-                serve::ConnInfo::default(),
+                fictionet::stdlib::network::ConnInfo::default(),
                 &mut service,
                 &lifetime,
                 &opts,
@@ -239,7 +239,7 @@ fn cancelling_deferred_end_work_keeps_the_world_running() {
                     Arc::new(()),
                     || Svc,
                     serve::ServeOptions::default(),
-                    serve::DEFAULT_MAX_CONNS,
+                    fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
                     None,
                 );
                 let mut conn = client.connect(&fcx, "10.0.0.1:7".parse()?).await?;
@@ -303,11 +303,8 @@ fn finishing_a_connection_cancels_and_joins_its_spawned_work() {
                 Ok(())
             });
             let conn = listener.accept(&fcx).await?;
-            let info = fictionet::stdlib::services::serve::ConnInfo::new(
-                1,
-                conn.local_addr(),
-                conn.peer_addr(),
-            );
+            let info =
+                fictionet::stdlib::network::ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
             let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             serve::connection(
                 &fcx,
@@ -442,7 +439,7 @@ fn background_failure(fail: bool) {
                 fail,
                 ..TerminalSvc::default()
             };
-            let info = fictionet::stdlib::services::serve::ConnInfo::new(
+            let info = fictionet::stdlib::network::ConnInfo::new(
                 42,
                 "10.0.0.1:7".parse()?,
                 "10.0.0.2:1234".parse()?,
@@ -502,7 +499,7 @@ fn shutdown_outcome(shutdown: Shutdown, cancel: bool, fail: bool, secondary: Opt
                         shutdown,
                         polled: polled.clone(),
                     },
-                    fictionet::stdlib::services::serve::ConnInfo::default(),
+                    fictionet::stdlib::network::ConnInfo::default(),
                     &mut service,
                     &(),
                     &opts,
@@ -644,7 +641,7 @@ fn a_cancelled_region_hands_no_connection_off() {
                 let result = serve::connection(
                     &fcx,
                     Feed(Some(input)),
-                    serve::ConnInfo::default(),
+                    fictionet::stdlib::network::ConnInfo::default(),
                     &mut Echo,
                     &(),
                     &opts,

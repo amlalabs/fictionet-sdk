@@ -21,7 +21,7 @@ use crate::httpd::{closing, poll, send, serve};
 use bytes::Bytes;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::layer::{self, Budget};
-use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::services::serve::{self, Ended, Flow, Harness, ServeOptions};
 use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::web::httpd::{

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC3};
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, DigestType, KeyFlags, Nsec3HashAlgorithm, Sign, Validation, Window, ZoneKey, ds,
@@ -31,7 +32,6 @@ use fictionet::stdlib::services::dns::{
     Action, Client, ClientQuery, Engine, Event, ExchangeFailure, Generation, Input, Looked, Lookup,
     Session, Token, Unmatched, WallClock,
 };
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 use fictionet_extras::dns::place::Place;

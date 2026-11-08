@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG};
 use fictionet::stdlib::protocols::dns::dnssec::{
     AlgorithmPolicy, Anchors, Chain, DigestType, Fetched, Insecure, KeyFlags, KeySet, Link,
@@ -65,7 +66,6 @@ use fictionet::stdlib::services::dns::zone::{
     answer, check_chain,
 };
 use fictionet::stdlib::services::dns::{Client, ClientQuery, WallClock};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 use fictionet_extras::dns::unbound;

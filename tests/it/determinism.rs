@@ -15,7 +15,8 @@ use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::protocols::dns::op::{Message, MessageType, OpCode, Query};
 use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::services::serve::{DEFAULT_MAX_CONNS, Flow, ServeOptions};
+use fictionet::stdlib::services::serve::{Flow, ServeOptions};
+use fictionet::stdlib::world::net::DEFAULT_MAX_CONNS;
 use fictionet::stdlib::world::net::Net;
 use fictionet::stdlib::{
     network::{Connection, delay, filter},

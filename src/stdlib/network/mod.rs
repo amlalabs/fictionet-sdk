@@ -13,5 +13,7 @@ pub mod route;
 pub mod tcp;
 pub mod udp;
 
-pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, DatagramSocket};
+pub use connection::{
+    Accept, Accepted, ConnError, ConnInfo, Connection, ConnectionExt, DatagramSocket, Transport,
+};
 pub use link::{Direction, bottleneck, delay, filter, tap};

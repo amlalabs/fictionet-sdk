@@ -67,7 +67,7 @@
 //! # fn start(fcx: &Cx, side: fictionet::End) -> Result {
 //! let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, side);
 //! let machine = tcp::endpoint(fcx, tcp, "10.0.0.10".parse()?);
-//! serve::listen(fcx, machine.listen(7)?, Arc::new(()), || Echo, serve::ServeOptions::default(), serve::DEFAULT_MAX_CONNS, None);
+//! serve::listen(fcx, machine.listen(7)?, Arc::new(()), || Echo, serve::ServeOptions::default(), fictionet::stdlib::world::net::DEFAULT_MAX_CONNS, None);
 //! # Ok(())
 //! # }
 //! ```
@@ -150,106 +150,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use std::net::{Ipv4Addr, Ipv6Addr};
-
-/// A sandbox attached to a network.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Sandbox {
-    /// The attachment, numbered from 1 in the order sandboxes attached. A
-    /// name and an address can be used again after a sandbox detaches; the
-    /// id never is.
-    pub id: u64,
-    /// Its attachment's name.
-    pub name: Arc<str>,
-    /// Its IPv4 address, once bound.
-    pub addr: Option<Ipv4Addr>,
-    /// Its IPv6 address, once bound.
-    pub addr_v6: Option<Ipv6Addr>,
-}
-
-/// How a connection's bytes travel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Transport {
-    /// A byte stream: TCP, or TLS over it.
-    #[default]
-    Tcp,
-    /// Datagrams: UDP.
-    Udp,
-}
-
-impl Transport {
-    /// `tcp` or `udp`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Transport::Tcp => "tcp",
-            Transport::Udp => "udp",
-        }
-    }
-}
-
-/// Connection metadata supplied to a service or handler.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ConnInfo {
-    /// The connection's number, from whoever accepted it. [`Net`]
-    /// numbers its connections from 1, on every port.
-    ///
-    /// [`Net`]: crate::stdlib::world::net::Net
-    pub id: Option<u64>,
-    /// The sandbox the connection came from, as it was when it arrived.
-    pub sandbox: Option<Sandbox>,
-    /// The world's side: the address and port the connection arrived on.
-    pub local: Option<SocketAddr>,
-    /// The other side.
-    pub peer: Option<SocketAddr>,
-    /// What the TCP handshake carried, for a TCP connection: the options
-    /// of the peer's SYN, those the listener added to its SYN-ACK, and
-    /// those of the ACK that completed it, including the SYN and SYN-ACK's
-    /// typed IPv4 options. `None` for datagrams or a
-    /// connection this side opened.
-    pub handshake: Option<Handshake>,
-    /// Whether the bytes arrived over TLS.
-    pub tls: bool,
-    /// The name the client sent in its TLS hello, in lowercase.
-    pub sni: Option<Arc<str>>,
-    /// The protocol the TLS handshake agreed on, such as `h2`.
-    pub alpn: Option<Arc<[u8]>>,
-    /// TCP or UDP. A service served both ways, such as a Kerberos KDC,
-    /// answers by it: a reply too big for a datagram asks the client to
-    /// use TCP.
-    pub transport: Transport,
-}
-
-impl ConnInfo {
-    /// A connection with this number between `local` and `peer`.
-    pub fn new(id: u64, local: SocketAddr, peer: SocketAddr) -> ConnInfo {
-        ConnInfo {
-            id: Some(id),
-            local: Some(local),
-            peer: Some(peer),
-            ..ConnInfo::default()
-        }
-    }
-
-    /// The same, from `sandbox`.
-    pub fn from_sandbox(mut self, sandbox: Option<Sandbox>) -> ConnInfo {
-        self.sandbox = sandbox;
-        self
-    }
-
-    /// The same, over TLS with this SNI and ALPN.
-    pub fn over_tls(mut self, sni: Option<&str>, alpn: Option<&[u8]>) -> ConnInfo {
-        self.tls = true;
-        self.sni = sni.map(Arc::from);
-        self.alpn = alpn.map(Arc::from);
-        self
-    }
-}
-
 use fictionet::stdlib::codec::{Decode, Fail, Stream};
 use fictionet::stdlib::layer::{Budget, Charge};
-use fictionet::stdlib::network::tcp::Handshake;
 use fictionet::stdlib::network::{Accept, Accepted, DatagramSocket};
 use fictionet::stdlib::network::{ConnError, Connection, ConnectionExt};
+use fictionet::stdlib::network::{ConnInfo, Transport};
+use fictionet::stdlib::services::stack::{Counted, PanicNote};
+use fictionet::stdlib::world::net::Sandbox;
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, RaceError, RecvError, Task};
 
@@ -850,75 +757,12 @@ fn due<T>(timers: &[(T, Instant)], now: Instant) -> Option<usize> {
     (*at <= now).then_some(i)
 }
 
-/// Names a service and its connection in a panic that unwinds past it.
-///
-/// A panic in world code is the world's bug. Fictionet does not catch it:
-/// it ends the run. The panic's own message says where in the code it
-/// happened; a `PanicNote` alive while it unwinds adds which service and
-/// connection, on standard error. [`connection`], [`datagram`] and
-/// HTTP/2 in [`httpd`](fictionet::stdlib::web::httpd) keep one while they call
-/// world code.
-pub struct PanicNote {
-    service: &'static str,
-    conn: ConnInfo,
-}
-
-impl PanicNote {
-    /// A note for `service` (such as `std::any::type_name` of it) serving
-    /// `conn`.
-    pub fn new(service: &'static str, conn: &ConnInfo) -> PanicNote {
-        PanicNote {
-            service,
-            conn: conn.clone(),
-        }
-    }
-}
-
-impl std::fmt::Display for PanicNote {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the panic came from {}", self.service)?;
-        let c = &self.conn;
-        if let Some(id) = c.id {
-            write!(f, ", serving connection {id}")?;
-        }
-        if let Some(peer) = c.peer {
-            write!(f, " from {peer}")?;
-        }
-        if let Some(local) = c.local {
-            write!(f, " to {local} ({})", c.transport.as_str())?;
-        }
-        Ok(())
-    }
-}
-
-impl std::fmt::Debug for PanicNote {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PanicNote({self})")
-    }
-}
-
-impl Drop for PanicNote {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            use std::io::Write as _;
-            // Never a second panic while unwinding.
-            let _ = writeln!(std::io::stderr(), "fictionet: {self}");
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Options
 
 /// Names the sandbox at an address, for the [`ConnInfo`] of a connection
 /// [`listen`] accepts or a datagram [`datagram`] receives.
 pub type SandboxOf = Arc<dyn Fn(std::net::IpAddr) -> Option<Sandbox> + Send + Sync>;
-
-/// The connections a listener serves at once unless told otherwise: what
-/// [`Host::tcp`](fictionet::stdlib::world::net::Host::tcp) and
-/// [`Host::tls`](fictionet::stdlib::world::net::Host::tls) use. See
-/// [`listen`].
-pub const DEFAULT_MAX_CONNS: usize = 64;
 
 /// How [`connection`] serves one stream connection, for itself or for a
 /// listener.
@@ -2168,7 +2012,7 @@ where
 /// Accepts connections on `listener` and serves each with a fresh service
 /// from `make`, in a task of its own, until the listener closes or the
 /// region is cancelled. At most `max_conns` connections are served at once
-/// ([`DEFAULT_MAX_CONNS`] is the usual choice); past that, a new one is
+/// ([`DEFAULT_MAX_CONNS`](fictionet::stdlib::world::net::DEFAULT_MAX_CONNS) is the usual choice); past that, a new one is
 /// reset as soon as it is accepted. Each counts until its socket is gone,
 /// so a client that never finishes closing cannot open more. Connections
 /// are numbered from 1, in the order they are accepted. `sandbox` names
@@ -2219,26 +2063,6 @@ where
             });
         }
     })
-}
-
-/// Counts one open connection until dropped.
-pub struct Counted(Arc<AtomicUsize>);
-
-impl Counted {
-    /// Counts one more in `open`, unless it already counts `max`.
-    pub fn enter(open: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
-        open.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < max).then_some(n + 1)
-        })
-        .ok()?;
-        Some(Counted(open.clone()))
-    }
-}
-
-impl Drop for Counted {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 // ---------------------------------------------------------------------------

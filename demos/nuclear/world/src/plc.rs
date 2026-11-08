@@ -35,8 +35,8 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::layer::{
     Admit, Chain, Decoded, Env, Framed, Framing, Layer, MessageCommand, MessageEvent, Owned, Top,
 };
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::modbus::{Exception, Frame, Request, Response};
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::sync::Mutex;
 
 use crate::Plant;

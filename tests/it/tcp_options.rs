@@ -545,7 +545,7 @@ fn a_service_sees_the_syn_options_in_its_conn_info() {
             seen.clone(),
             || RecordSyn,
             serve::ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         raw.send(segment(4000, 1000, 0, SYN, &LINUX_SYN));

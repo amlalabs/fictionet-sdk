@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
 use fictionet::Entropy;
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Anchors, Chain, Fetched, Insecure, Link, Validation, Verified, Verify, proof, validate_denial,
@@ -39,7 +40,6 @@ use fictionet::stdlib::protocols::dns::rr::{
     DNSClass, LowerName, Name, RData, RecordSet, RecordType, SerialNumber,
 };
 use fictionet::stdlib::protocols::dns::{Parsed, Request, Response, dname_substitute, label_count};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
 use super::super::event::{Event, Unmatched, UpstreamOutcome};

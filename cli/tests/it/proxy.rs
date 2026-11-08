@@ -1452,7 +1452,7 @@ mod routing {
     }
 
     pub(super) fn route(vhosts: &VirtualHosts, request: Request<Body>, port: u16) -> httpd::Reply {
-        let conn = fictionet::stdlib::services::serve::ConnInfo::new(
+        let conn = fictionet::stdlib::network::ConnInfo::new(
             1,
             SocketAddr::from(([203, 0, 113, 1], port)),
             "10.0.0.2:5000".parse().unwrap(),

@@ -13,9 +13,9 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::Entropy;
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::op::{Message, Query};
 use fictionet::stdlib::protocols::dns::{Parsed, Request, read_message};
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 
 use super::exchange::{

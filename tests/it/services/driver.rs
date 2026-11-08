@@ -105,7 +105,7 @@ fn listen_serves_each_connection() {
             Arc::new(()),
             || Echo,
             opts,
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -131,7 +131,7 @@ fn timers_tick_and_idle_connections_close() {
             Arc::new(()),
             || Ticker { ticks: 0 },
             ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -148,7 +148,7 @@ fn timers_tick_and_idle_connections_close() {
             Arc::new(()),
             || Echo,
             opts,
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -353,7 +353,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
             Arc::new(()),
             || Short,
             ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -458,7 +458,7 @@ fn another_connection_wakes_a_service_to_push_a_fill() {
                 inbox: Arc::default(),
             },
             ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         let to = SocketAddr::new(SERVER.into(), 9000);
@@ -578,7 +578,7 @@ fn continuous_input_cannot_starve_a_timer() {
             Arc::new(()),
             || Session { lines: 0, beats: 0 },
             ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -728,7 +728,7 @@ fn keyed_work_interleaves_two_responses_while_reads_go_on() {
                 baton: shared.clone(),
             },
             ServeOptions::default(),
-            serve::DEFAULT_MAX_CONNS,
+            fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
             None,
         );
         let mut conn = client
@@ -916,7 +916,7 @@ fn a_seeded_run_repeats_its_randomness() {
                     Arc::new(()),
                     || Dice,
                     ServeOptions::default(),
-                    serve::DEFAULT_MAX_CONNS,
+                    fictionet::stdlib::world::net::DEFAULT_MAX_CONNS,
                     None,
                 );
                 let mut got = Vec::new();

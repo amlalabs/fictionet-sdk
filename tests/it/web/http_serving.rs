@@ -342,8 +342,7 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
                 std::sync::Arc::new(fictionet_host::Client::new()),
             )?)),
         );
-        let conn =
-            fictionet::stdlib::services::serve::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
+        let conn = fictionet::stdlib::network::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
         let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
         let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
         let reply = vhosts.call(

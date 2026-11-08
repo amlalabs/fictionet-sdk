@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use super::serve::ConnInfo;
 use super::stack;
 use crate::Cx;
 use crate::stdlib::codec::{Stream, Wire};
@@ -27,6 +26,7 @@ use crate::stdlib::protocols::ssh::transport::{
 use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
 use crate::stdlib::world::net::{Arrival, PortServer};
 use crate::time::Instant;
+use fictionet::stdlib::network::ConnInfo;
 
 pub mod channel;
 mod session;

@@ -16,9 +16,9 @@ use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, Chunk, CommandOf, Env, Handoff, Handover, Layer, Owned,
     OwnedWork, Side, StreamCommand, StreamEvent, Switch, Timers, Top, WorkOwner,
 };
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError, RequestHead};
 use fictionet::stdlib::protocols::http2::{DEFAULT_FRAME_SIZE, MAX_WINDOW, Setting};
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::stack::{Job, Tunnel};
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};

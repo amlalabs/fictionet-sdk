@@ -12,8 +12,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::layer::{Chain, Charge, Children, Chunk, Env, Layer, Top};
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http2::{ErrorCode, Setting};
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};

@@ -35,6 +35,7 @@ use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines, Wire};
 use fictionet::stdlib::dissect::{Dissector, Registry};
 use fictionet::stdlib::layer::{self, Budget};
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ip, tcp, udp};
 use fictionet::stdlib::protocols::dns::op::{Message, Query};
@@ -42,7 +43,6 @@ use fictionet::stdlib::protocols::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::protocols::modbus::{
     self, Exception, Frame, Request as MbRequest, Response as MbResponse,
 };
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::{
     self, DatagramFlow, DatagramOptions, Flow, Harness, HarnessError, Pending, PendingDriver,
     ServeOptions, Served, Upgrade,

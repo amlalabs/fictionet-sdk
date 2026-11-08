@@ -8,6 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC};
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, AlgorithmPolicy, Anchors, DigestType, KeyFlags, KeySet, Ring, Sign, Validation,
@@ -35,7 +36,6 @@ use fictionet::stdlib::services::dns::{
     Action, Answer, Client, ClientQuery, Engine, Event, Generation, Input, Session, Unmatched,
     WallClock,
 };
-use fictionet::stdlib::services::serve::Transport;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 use fictionet_extras::dns::{public, unbound};

@@ -11,7 +11,7 @@ use http::uri::{Authority, Scheme};
 use http::{Request, StatusCode};
 
 use fictionet::Cx;
-use fictionet::stdlib::services::serve::ConnInfo;
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::services::stack::Boxed;
 use fictionet::stdlib::services::tls::ServerConfig;
 use fictionet::stdlib::world::net::{

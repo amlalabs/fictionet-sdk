@@ -46,11 +46,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::tcp::{self, TcpConnection};
 use fictionet::stdlib::network::{ConnError, ConnectionExt};
 use fictionet::stdlib::protocols::modbus::{self, Exception, Frame};
-use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::web::httpd::{self, Handler, HttpOptions};
 use fictionet::stdlib::world::net::Net;
 use fictionet::sync::Mutex;

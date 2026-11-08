@@ -164,8 +164,6 @@ use fictionet::stdlib::network::route::{self, Prefix, Router};
 use fictionet::stdlib::network::{icmp, tcp};
 use fictionet::stdlib::services::dns::WallClock;
 use fictionet::stdlib::services::dns::resolver::Config;
-#[cfg(doc)]
-use fictionet::stdlib::services::serve::{ServeOptions, Service};
 use fictionet::{Attachments, Cx, End, Error, Interface, InterfaceExt};
 
 #[cfg(doc)]
@@ -179,12 +177,13 @@ mod names;
 
 pub use addresses::Placed;
 use addresses::{Leases, Subnet, Subnet6, check_pools};
+pub use attachments::Sandbox;
 use attachments::{Destinations, Hooks, filter, udp_packet};
 use dns::Recursive;
 use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};
 pub use hosts::{
-    Arrival, ConfigFor, ConfigFuture, Declared, Endpoints, Host, Opening, PortServer,
-    PreparedShare, Program, Sni,
+    Arrival, ConfigFor, ConfigFuture, DEFAULT_MAX_CONNS, Declared, Endpoints, Host, Opening,
+    PortServer, PreparedShare, Program, Sni,
 };
 pub use names::normalize;
 
@@ -335,7 +334,7 @@ pub struct RefusedPacket {
     /// When it was refused.
     pub at: fictionet::time::Instant,
     /// The sender, recipient and sandbox, when known.
-    pub conn: fictionet::stdlib::services::serve::ConnInfo,
+    pub conn: fictionet::stdlib::network::ConnInfo,
     /// Source address, including protocols without ports.
     pub from: IpAddr,
     /// Destination address, including protocols without ports.
@@ -352,7 +351,7 @@ pub struct TlsObservation {
     /// When the handshake ended.
     pub at: fictionet::time::Instant,
     /// The connection, including the requested server name when available.
-    pub conn: fictionet::stdlib::services::serve::ConnInfo,
+    pub conn: fictionet::stdlib::network::ConnInfo,
     /// Whether TLS was established, or why it failed.
     pub result: Result<(), fictionet::stdlib::services::tls::HandshakeError>,
 }
@@ -377,7 +376,7 @@ pub struct AttachmentObservation {
     /// When the change happened.
     pub at: fictionet::time::Instant,
     /// The attachment and its addresses at that time.
-    pub sandbox: fictionet::stdlib::services::serve::Sandbox,
+    pub sandbox: Sandbox,
     /// What changed.
     pub change: AttachmentChange,
 }
@@ -1135,7 +1134,7 @@ async fn unreachable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::services::serve::ConnInfo;
+    use crate::stdlib::network::ConnInfo;
     use fictionet::stdlib::network::ConnectionExt;
     use fictionet::stdlib::network::ip;
     use std::net::SocketAddr;

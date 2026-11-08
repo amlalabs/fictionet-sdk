@@ -43,6 +43,8 @@ pub use tunnel::{Takeover, Tunnel};
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -50,8 +52,7 @@ use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Driver,
     Layer, Top,
 };
-use fictionet::stdlib::network::{ConnError, Connection, DatagramSocket};
-use fictionet::stdlib::services::serve::{ConnInfo, PanicNote, Transport};
+use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket, Transport};
 use fictionet::sync::Mutex;
 use fictionet::{Cancelled, Cx, RecvError};
 
@@ -145,6 +146,85 @@ impl<E: core::error::Error + 'static> core::error::Error for StackError<E> {
 impl<E> From<Cancelled> for StackError<E> {
     fn from(_: Cancelled) -> StackError<E> {
         StackError::Cancelled
+    }
+}
+
+/// A panic in world code is the world's bug. Fictionet does not catch it:
+/// it ends the run. The panic's own message says where in the code it
+/// happened; a `PanicNote` alive while it unwinds adds which stack and
+/// connection, on standard error. [`stream`] and [`datagrams`] keep one
+/// while they run a stack.
+pub struct PanicNote {
+    service: &'static str,
+    conn: ConnInfo,
+}
+
+impl PanicNote {
+    /// A note for `service` (such as `std::any::type_name` of it) serving
+    /// `conn`.
+    pub fn new(service: &'static str, conn: &ConnInfo) -> PanicNote {
+        PanicNote {
+            service,
+            conn: conn.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for PanicNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the panic came from {}", self.service)?;
+        let c = &self.conn;
+        if let Some(id) = c.id {
+            write!(f, ", serving connection {id}")?;
+        }
+        if let Some(peer) = c.peer {
+            write!(f, " from {peer}")?;
+        }
+        if let Some(local) = c.local {
+            write!(f, " to {local} ({})", c.transport.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PanicNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PanicNote({self})")
+    }
+}
+
+impl Drop for PanicNote {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            use std::io::Write as _;
+            // Never a second panic while unwinding.
+            let _ = writeln!(std::io::stderr(), "fictionet: {self}");
+        }
+    }
+}
+
+/// Counts one open connection of a listener until dropped, so a listener
+/// can refuse connections past its cap. A port server keeps it with the
+/// accepted socket ([`TcpConnection::hold_until_gone`]), so a connection
+/// counts until its socket is gone, not only while its stack runs.
+///
+/// [`TcpConnection::hold_until_gone`]: fictionet::stdlib::network::tcp::TcpConnection::hold_until_gone
+pub struct Counted(Arc<AtomicUsize>);
+
+impl Counted {
+    /// Counts one more in `open`, unless it already counts `max`.
+    pub fn enter(open: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
+        open.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < max).then_some(n + 1)
+        })
+        .ok()?;
+        Some(Counted(open.clone()))
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
