@@ -266,6 +266,11 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 /// Names and defaults belong to the local address and port where `Net`
 /// installed them. Sharing one address does not add sites at another.
 /// Over TLS, ALPN offers `h2` and `http/1.1` with `std` alone.
+/// The default stack is `Chain<TlsLayer, Later<Boxed>>`; its application
+/// is `Http = Switch<Detect, Versions>`. HTTP/2 in turn composes
+/// `Chain<Http2, Children<Respond, Top, Opening>>`. Replace the TLS factory
+/// with [`tls_layer`](Self::tls_layer), or negotiated applications with
+/// [`applications`](Self::applications).
 ///
 /// ```
 /// # use fictionet::stdlib::{web::httpd, world::net::Host};
@@ -369,10 +374,10 @@ impl Server {
 
     /// Replaces TLS for this listener. The first TLS site installed at an
     /// address and port selects the factory for every site sharing it;
-    /// later sites still select their own certificates. Sites sharing this
-    /// HTTP server also use its application factory and advertised protocols.
-    /// The default is `Chain<TlsLayer, Later<Http>>` through `Secure`, with
-    /// `Http = Switch<Detect>` choosing HTTP/1 or HTTP/2 with `Children`.
+    /// later sites still select their own certificates and applications.
+    /// The default is `Chain<TlsLayer, Later<Boxed>>` through `Secure`.
+    /// The application box contains `Http = Switch<Detect, Versions>`;
+    /// HTTP/2 is `Chain<Http2, Children<Respond, Top, Opening>>`.
     pub fn tls_layer(mut self, factory: tls::Factory) -> Self {
         self.tls_layer = factory;
         self
@@ -383,9 +388,9 @@ impl Server {
     /// handler, connection budget, limits and runtime context. Use
     /// [`http_for`] for the standard HTTP/1 and HTTP/2 choices, or return
     /// another byte-stream application for another negotiated protocol.
-    /// Sites sharing a listener use the first server's application factory
-    /// and protocol list, like its limits and response observer.
-    /// The default is `Switch<Detect>`; HTTP/2 composes its multiplexed
+    /// Each TLS site selects its own protocols and application, even when
+    /// it shares routing, limits and the response observer with other sites.
+    /// The default is `Switch<Detect, Versions>`; HTTP/2 composes its multiplexed
     /// streams with `Children` and the request handler.
     pub fn applications(
         mut self,
@@ -507,15 +512,21 @@ impl PortServer for Server {
         let (vhost, default_host) = (site.vhost.clone(), site.default_host);
         let names = names.to_vec();
         let endpoints = self.vhosts.clone();
-        Some(PreparedShare::new(move || {
-            let mut endpoints = endpoints.write().unwrap_or_else(|e| e.into_inner());
-            let vhosts = endpoints.entry(local).or_default();
-            for name in names {
-                vhosts.insert(&name, vhost.clone());
-            }
-            if default_host {
-                vhosts.set_default(vhost);
-            }
-        }))
+        let mut application = self.clone();
+        application.application = site.application.clone();
+        application.protocols = site.protocols.clone();
+        Some(
+            PreparedShare::new(move || {
+                let mut endpoints = endpoints.write().unwrap_or_else(|e| e.into_inner());
+                let vhosts = endpoints.entry(local).or_default();
+                for name in names {
+                    vhosts.insert(&name, vhost.clone());
+                }
+                if default_host {
+                    vhosts.set_default(vhost);
+                }
+            })
+            .tls_server(Arc::new(application)),
+        )
     }
 }

@@ -670,7 +670,7 @@ mod proofs;
 
 impl super::Negotiation for TlsLayer {
     fn handshake(&self) -> super::Handshake<'_> {
-        if self.failed {
+        if self.failed || self.reset {
             super::Handshake::Failed
         } else if self.is_handshaking() {
             super::Handshake::Pending

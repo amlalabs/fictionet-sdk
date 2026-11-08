@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use fictionet::Cx;
-use fictionet::stdlib::layer::{Budget, ByteStream, Layer};
+use fictionet::stdlib::layer::{Budget, ByteStream, Layer, Side};
 use fictionet::stdlib::network::ConnInfo;
-use fictionet::stdlib::services::stack::{Boxed, Job};
+use fictionet::stdlib::services::stack::{BoxError, Boxed, Job};
 use fictionet::time::Instant;
 
-use super::{Picking, Secure, TlsLayer};
+use super::{HandshakeError, Picking, Secure, TlsLayer};
 
 /// Authoritative negotiation state. Failure must remain failure even after
 /// an implementation has handed its error to the driver.
@@ -47,7 +47,9 @@ pub struct Build {
     pub budget: Budget,
     /// Absolute deadline, including asynchronous certificate selection.
     pub deadline: Instant,
-    /// The listener's per-name certificate selection.
+    /// The listener's per-name certificate selection. Invoke this with the
+    /// client's requested name to use the world's certificates; application
+    /// routing follows the name reported in `Handshake::Established`.
     pub select: Selection,
 }
 
@@ -58,7 +60,10 @@ type Make = dyn Fn(Build, Application) -> Boxed + Send + Sync;
 /// `Chain<TlsLayer, Later<Boxed>>`, through [`Secure`]. Applications are
 /// constructed only after successful negotiation, before plaintext delivery.
 #[derive(Clone)]
-pub struct Factory(Arc<Make>);
+pub struct Factory {
+    make: Arc<Make>,
+    error: fn(BoxError) -> HandshakeError,
+}
 
 impl Factory {
     /// Uses `make` to construct a fresh replacement layer per connection.
@@ -68,13 +73,35 @@ impl Factory {
         T::Report: core::fmt::Debug + Send + 'static,
         T::Work: Job<Done = T::Done>,
         T::Done: Send + 'static,
-        T::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
+        T::Error: Into<BoxError> + core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
     {
-        Self(Arc::new(move |opening, application| {
-            Boxed::new(Secure::new(make(opening), move |tls: &T| {
-                application(tls.handshake())
-            }))
-        }))
+        Self {
+            make: Arc::new(move |opening, application| {
+                Boxed::new(Secure::new(make(opening), move |tls: &T| {
+                    application(tls.handshake())
+                }))
+            }),
+            error: |error| {
+                let error = match error.downcast::<Side<T::Error, BoxError>>() {
+                    Ok(error) => match *error {
+                        Side::Lower(error) => error.into(),
+                        Side::Upper(error) => error,
+                    },
+                    Err(error) => error,
+                };
+                match error.downcast::<HandshakeError>() {
+                    Ok(error) => *error,
+                    Err(error) => HandshakeError::Failed(error.to_string()),
+                }
+            },
+        }
+    }
+
+    /// Converts an error from this factory's boxed stack for TLS observers.
+    /// Standard handshake errors retain their classification; replacement
+    /// errors of another type are reported as `HandshakeError::Failed`.
+    pub fn handshake_error(&self, error: BoxError) -> HandshakeError {
+        (self.error)(error)
     }
 
     /// Composes this listener's TLS with the negotiated application.
@@ -83,7 +110,7 @@ impl Factory {
         opening: Build,
         application: impl FnOnce(Handshake<'_>) -> Boxed + Send + 'static,
     ) -> Boxed {
-        (self.0)(opening, Box::new(application))
+        (self.make)(opening, Box::new(application))
     }
 }
 

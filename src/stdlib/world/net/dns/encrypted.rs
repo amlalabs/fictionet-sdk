@@ -286,9 +286,9 @@ impl<Q: QueryService> Fronts<Q> {
     /// `host` serving DNS over TLS on TCP port 853, for any name a client
     /// sends, offering `dot`, the ALPN identifier IANA registers for it.
     ///
-    /// The default composition is `Secure<Chain<Framed<Queries,
-    /// StreamMessage>, Queried>, _>`: `Secure` builds
-    /// `Chain<TlsLayer, Later<_>>`, and `Queried` invokes this query service.
+    /// The default is `Chain<TlsLayer, Later<Boxed>>` through `Secure`.
+    /// The application box contains `Chain<Framed<Queries, StreamMessage>,
+    /// Queried>`; `Queried` invokes this query service.
     pub fn dot(&self, host: Host) -> Host {
         let tls = self.tls.clone();
         let port = Dot {
@@ -304,8 +304,8 @@ impl<Q: QueryService> Fronts<Q> {
     /// [`names`](Self::names) and the address. Those names are its own on
     /// the port, so no other host at the address can serve them there.
     ///
-    /// The default composition is `Secure<Http, _>`, with
-    /// `Chain<TlsLayer, Later<Http>>` deferring HTTP until negotiation.
+    /// The default is `Chain<TlsLayer, Later<Boxed>>` through `Secure`,
+    /// with the application box containing `Http = Switch<Detect, Versions>`.
     /// `Http` chooses HTTP/1's `Switch` or HTTP/2's
     /// `Chain<Http2, Children<Respond, Top, Opening>>`; their handlers invoke this service.
     pub fn doh(&self, host: Host) -> Host {

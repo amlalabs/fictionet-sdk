@@ -1,5 +1,6 @@
 use super::*;
 use fictionet::stdlib::layer::{Admit, Budget, Chunk, Harness, StreamCommand, StreamEvent};
+use fictionet::stdlib::services::tls::{Handshake, Negotiation};
 use std::io::{ErrorKind, Read, Write};
 
 type Server = Harness<tls::TlsLayer>;
@@ -280,6 +281,7 @@ fn reset_aborts_a_queued_close_and_cancels_hello_work() {
         ));
         assert!(server.work().is_none());
         assert!(server.layer().hello().is_none());
+        assert_eq!(server.layer().handshake(), Handshake::Failed);
         Ok(())
     }))
     .unwrap();
@@ -348,6 +350,8 @@ fn rejection_drains_its_alert_before_reporting_failure() {
             server.allow_all(),
             Err(tls::HandshakeError::Rejected)
         ));
+        assert_eq!(server.layer().handshake(), Handshake::Failed);
+        assert!(server.layer().failure().is_none());
         client.read_tls(&mut &server.take_output()[..])?;
         assert!(matches!(
             client.process_new_packets(),

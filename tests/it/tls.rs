@@ -906,3 +906,88 @@ fn a_lab_tls_handshake_uses_the_worlds_key_log() {
             .any(|(label, _, _)| label == "SERVER_TRAFFIC_SECRET_0")
     );
 }
+
+fn observed_world_handshake_failure(rejected_name: bool) {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use fictionet::stdlib::web::httpd;
+    use fictionet::stdlib::world::net::{Host, Limits, Net};
+    use fictionet_test_support::sandbox::{TlsClient, machine};
+
+    fictionet_test_support::world::world(Duration::from_secs(20), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "accepted.test", &[b"http/1.1"]);
+        let address = Ipv4Addr::new(192, 0, 2, 10);
+        let (observed, observation) = tokio::sync::oneshot::channel();
+        let observed = Mutex::new(Some(observed));
+        let host = Host::new("tls")
+            .at(address)
+            .dns_name("accepted.test")
+            .tls_accept(
+                443,
+                "accepted.test",
+                move |_| config.clone(),
+                httpd::Server::new(httpd::tower(axum::Router::new())),
+            );
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .limits(Limits {
+                handshake: Duration::from_millis(100),
+                ..Limits::default()
+            })
+            .on_tls(move |event| {
+                if rejected_name {
+                    assert!(
+                        matches!(event.result, Err(tls::HandshakeError::Rejected)),
+                        "{:?}",
+                        event.result
+                    );
+                    assert_eq!(event.conn.sni.as_deref(), Some("rejected.test"));
+                } else {
+                    assert!(
+                        matches!(event.result, Err(tls::HandshakeError::TimedOut)),
+                        "{:?}",
+                        event.result
+                    );
+                    assert!(event.conn.sni.is_none());
+                }
+                observed.lock().unwrap().take().unwrap().send(()).unwrap();
+            })
+            .hosts([host])
+            .start(&fcx, attachments)?;
+        let machine = machine(&fcx, attacher.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
+        let conn = machine
+            .tcp
+            .connect(&fcx, SocketAddr::new(address.into(), 443))
+            .await?;
+        if rejected_name {
+            let mut client = TlsClient::new(
+                &fcx,
+                conn,
+                &Arc::new(roots(&ca)),
+                "rejected.test",
+                &[b"http/1.1"],
+                date(2030, 1, 1),
+            )?;
+            assert!(client.handshake(&fcx).await.is_err());
+            observation.await?;
+        } else {
+            // Keep the TCP connection open without a ClientHello. The
+            // listener's own handshake deadline must end the attempt.
+            observation.await?;
+            drop(conn);
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn world_observer_preserves_handshake_timeout() {
+    observed_world_handshake_failure(false);
+}
+
+#[test]
+fn world_observer_preserves_rejected_server_name() {
+    observed_world_handshake_failure(true);
+}
