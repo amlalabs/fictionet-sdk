@@ -10,6 +10,66 @@
 //! connection has a byte stream below and [multiplexed children](Mux)
 //! above.
 //!
+//! Layers compose by type. [`Chain`]`<A, B>` puts `B` on top of `A`, and it
+//! exists only when `B`'s lower port is `A`'s upper port, so a stream
+//! protocol cannot be stacked on datagrams, and a protocol that needs
+//! exchanges cannot be stacked on bare bytes:
+//!
+//! ```compile_fail,E0271
+//! # use fictionet::stdlib::layer::*;
+//! # use core::marker::PhantomData;
+//! # struct Probe<L, U>(PhantomData<(L, U)>);
+//! # impl<L: Port, U: Port> Layer for Probe<L, U> {
+//! #     type Lower = L; type Upper = U; type Report = (); type Timer = ();
+//! #     type Work = (); type Done = (); type Error = ();
+//! #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
+//! #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
+//! #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+//! #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
+//! # }
+//! // A datagram carrier under a stream protocol.
+//! type Wrong = Chain<Probe<Top, Datagrams<()>>, Probe<ByteStream, Top>>;
+//! fn build(stack: Wrong) {}
+//! ```
+//!
+//! ```compile_fail,E0271
+//! # use fictionet::stdlib::layer::*;
+//! # use core::marker::PhantomData;
+//! # struct Probe<L, U>(PhantomData<(L, U)>);
+//! # impl<L: Port, U: Port> Layer for Probe<L, U> {
+//! #     type Lower = L; type Upper = U; type Report = (); type Timer = ();
+//! #     type Work = (); type Done = (); type Error = ();
+//! #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
+//! #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
+//! #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+//! #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
+//! # }
+//! # struct Request; struct Response;
+//! // A protocol that reads typed requests, put on a bare byte stream.
+//! type Wrong = Chain<Probe<Top, ByteStream>, Probe<Messages<Request, Response>, Top>>;
+//! fn build(stack: Wrong) {}
+//! ```
+//!
+//! The same stacks with matching ports compile:
+//!
+//! ```
+//! # use fictionet::stdlib::layer::*;
+//! # use core::marker::PhantomData;
+//! # struct Probe<L, U>(PhantomData<(L, U)>);
+//! # impl<L: Port, U: Port> Layer for Probe<L, U> {
+//! #     type Lower = L; type Upper = U; type Report = (); type Timer = ();
+//! #     type Work = (); type Done = (); type Error = ();
+//! #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
+//! #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
+//! #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+//! #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
+//! # }
+//! # struct Request; struct Response;
+//! type Stream = Chain<Probe<Top, ByteStream>, Probe<ByteStream, Top>>;
+//! type Typed = Chain<Probe<Top, Messages<Request, Response>>, Probe<Messages<Request, Response>, Top>>;
+//! fn build(stream: Stream, typed: Typed) {}
+//! ```
+//!
 //! Type equality proves only that the carrier fits. Whether a handshake
 //! succeeded, a stream may be opened, or peer input is valid is still
 //! decided at run time by each layer's state machine.
@@ -51,6 +111,14 @@
 //! its slot and the identity of its connection, so a successor in the same
 //! slot, or a child of another connection, never answers to it.
 //!
+//! # Negotiated change
+//!
+//! [`Switch`]`<A, B>` runs `A` until it reaches a protocol boundary, such as
+//! a successful CONNECT or STARTTLS, then runs the `B` that `A` negotiated.
+//! The handover moves the input `A` read past the boundary and the commands
+//! it was given but did not use, once, to `B`. `A`'s timers and work go
+//! with `A`.
+//!
 //! # The rules every layer and driver keeps
 //!
 //! 1. **Refusal keeps ownership.** An entry point takes an owned value and
@@ -79,10 +147,18 @@
 //! 8. **Closed input is explicit.** A layer whose input has ended says
 //!    [`Admit::Closed`] instead of taking and dropping.
 //!
+//! Every entry point is synchronous: it never awaits, reads a socket, reads
+//! a clock, or starts a task. The time, the entropy and the budget come in
+//! an [`Env`]. Layers do not call each other back: [`Chain`] and [`Switch`]
+//! move items between their parts in a loop, so the depth of calls is the
+//! depth of the stack's type, whatever the traffic.
 
 mod budget;
 mod carrier;
+mod chain;
+mod children;
 mod env;
+mod switch;
 mod timers;
 
 pub use budget::{Budget, Charge};
@@ -91,7 +167,10 @@ pub use carrier::{
     Datagrams, MessageCommand, MessageEvent, Messages, Mux, MuxCommand, MuxEvent, MuxOp, Slots,
     StreamCommand, StreamEvent,
 };
+pub use chain::Chain;
+pub use children::{ChildReport, Children, Overrun};
 pub use env::{Env, Observe};
+pub use switch::{Handoff, Handover, Switch};
 pub use timers::Timers;
 
 use fictionet::time::Instant;
@@ -155,7 +234,7 @@ impl<T> Admit<T> {
 }
 
 /// Which part of a composed layer something belongs to: the lower part or
-/// the upper one. A composed layer keeps both parts' events,
+/// the upper one. A [`Chain`] or a [`Switch`] keeps both parts' events,
 /// timers, work and errors apart with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Side<L, U> {
