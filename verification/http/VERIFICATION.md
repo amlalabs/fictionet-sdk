@@ -74,7 +74,15 @@ foundation's way, and passes.
 
 Each was run with `-workers 4 -Xmx6g` under an 8 GB memory cap; where
 several workers race to a violation the counts differ a little from the
-branch's. KANI_RESULTS
+branch's.
+
+The 18 body-framing harnesses of `kani/body.rs` were rerun in one
+`cargo kani -p fictionet -Z stubbing --harness stdlib::protocols::http1::proofs`
+under a 12 GB memory cap and all verified, with 533 to 1,661 checks each,
+in 0.7 s to 459 s (`chunk_size_is_the_hex_value_or_refused` the longest).
+The Lean proofs (`lake build` in `verification/http/lean`) build: the
+bare-101 close sets the request's close decision, which `Framing.lean`
+already takes as any value, so its theorems cover it.
 
 ## Bugs
 

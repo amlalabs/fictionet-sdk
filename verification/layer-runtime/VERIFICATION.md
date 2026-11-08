@@ -362,6 +362,10 @@ The loop ids carry the crate's hash; if a rebuild changes it, an
 unwinding failure names the loop, and its id is in the harness's
 `*.pretty_name_map.json` under `target/kani`.
 
+On the merged foundation all 18 were rerun with the command in the
+README, the same `plant.unwindset` (the crate's hash had not changed)
+and a 12 GB memory cap, and all verified, in 45 to 57 s each.
+
 What it leaves out: Modbus bytes. Driving `Chain<Framed, PlcServer>` from
 bytes in one harness ran out of 10 GiB, as did one symbolic function code
 over every branch of `Request::parse`; the composition rests on the
@@ -391,6 +395,9 @@ RFC 5905 and RFC 4330 on the bytes, not taken from the code: at least the
 | `the_time_server_refuses_version_0_mode_<m>`, every mode | a header of version 0, which `Packet::parse` refuses, gets no answer | all 8 verified, about 1 s each |
 | `one_conversation_answers_each_request_in_turn` | two client requests from any two ports, any transmit times: the second is refused as `Blocked` and handed back whole while the first answer waits, each answer goes to its own sender with its own transmit time as origin, and the socket's end sends nothing | verified, 31 s |
 
+On the merged foundation all 26 `TimeServer` harnesses were rerun under a
+12 GB memory cap and verified, in 0.8 to 34 s each.
+
 [`kani/ntp_reply.rs`](kani/ntp_reply.rs), included from
 `src/stdlib/protocols/ntp.rs`, proves on `ntp::server_reply` itself, for
 every mode, every version 0 to 7 and any other field: a reply comes only
@@ -399,7 +406,8 @@ origin, its version, and mode 4 to a client and 2 to a symmetric peer
 (`a_reply_comes_only_for_a_request_and_carries_its_transmit_time`,
 verified, under 1 s), and that a header whose mode bits are 0, 6 or 7
 does not parse whatever its other bytes (`a_header_of_mode_0_6_or_7_does_not_parse`,
-verified, 1 s); `TimeServer` answers nothing it cannot parse.
+verified, 1 s); `TimeServer` answers nothing it cannot parse. Both
+verified again on the merged foundation.
 
 | Mutation | Harness | Result |
 | --- | --- | --- |
