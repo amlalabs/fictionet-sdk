@@ -551,3 +551,8 @@ impl Layer for TlsLayer {
         self.hello.clone()
     }
 }
+
+/// Bounded proofs over the write accounting, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../../verification/tls/kani/LayerProof.rs"]
+mod proofs;
