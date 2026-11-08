@@ -80,6 +80,7 @@
 //!
 //! ```
 //! use fictionet::stdlib::layer::Harness;
+//! use fictionet::stdlib::services::stack::Polling;
 //! use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
 //!
 //! struct Pages;
@@ -92,7 +93,7 @@
 //!         Reply::Now(http::Response::new(body))
 //!     }
 //! }
-//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages)).running_work();
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages)).with_worker(Polling::new());
 //! h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
 //! let reply = h.take_output();
 //! assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));

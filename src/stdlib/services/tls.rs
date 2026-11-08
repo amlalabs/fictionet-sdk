@@ -4,14 +4,19 @@
 //! protocol over TLS, by hand. If the world is a set of websites,
 //! [`web::Sites`](fictionet::stdlib::web::Sites) does TLS for you.
 //!
-//! [`TlsLayer`] is a synchronous protocol layer with ordered byte streams
-//! below and above it. Compose it with [`Chain`](fictionet::stdlib::layer::Chain)
-//! or drive it without a runtime using [`Harness`](fictionet::stdlib::layer::Harness).
-//! The functions here adapt connection readiness to that same layer.
+//! [`TlsLayer`] is TLS as a [layer](fictionet::stdlib::layer), with ordered
+//! byte streams below and above it and no I/O. Put a protocol on top of it
+//! with [`Chain`](fictionet::stdlib::layer::Chain), as
+//! `Chain<TlsLayer, Http1>` serves HTTPS, or with [`Secure`] when what runs
+//! on top depends on the name and protocol the handshake settles. Run the
+//! stack over a TCP connection with
+//! [`stack::stream`](fictionet::stdlib::services::stack::stream), or without
+//! a runtime in a [`Harness`](fictionet::stdlib::layer::Harness).
 //!
-//! The live adapter takes a [`Connection`], usually a
-//! [`TcpConnection`](fictionet::stdlib::network::tcp::TcpConnection), and gives back a
-//! `Connection` that carries the decrypted bytes.
+//! For code written against a [`Connection`], [`server`] runs the same
+//! layer over one, usually a
+//! [`TcpConnection`](fictionet::stdlib::network::tcp::TcpConnection), and
+//! gives back a `Connection` that carries the decrypted bytes.
 //!
 //! The world supplies a rustls [`ServerConfig`], using certificate files
 //! or certificates issued by [`ca`](fictionet::stdlib::services::ca). This module
@@ -139,8 +144,8 @@ pub enum HandshakeError {
     /// handshake was refused with `unrecognized_name`. Returned by
     /// [`TlsLayer`] and `accept_tls`.
     Rejected,
-    /// The handshake did not finish by its deadline. Only from
-    /// `accept_tls`.
+    /// The handshake did not finish by its deadline: from `accept_tls`, and
+    /// from a [`TlsLayer`] given one ([`TlsLayer::handshake_by`]).
     TimedOut,
     /// The connection underneath failed. Never [`ConnError::Cancelled`]:
     /// a cancel is [`HandshakeError::Cancelled`].
