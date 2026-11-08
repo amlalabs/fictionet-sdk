@@ -67,6 +67,10 @@ mod layer;
 mod provider;
 mod secure;
 
+#[cfg(kani)]
+#[path = "../../../verification/tls-contract/kani/Buffers.rs"]
+mod contract_buffers;
+
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
 pub use factory::{Build, Factory, Handshake, Negotiation, Selection};

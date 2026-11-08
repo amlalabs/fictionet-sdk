@@ -1,6 +1,7 @@
 use super::{Handshake, Negotiation, TlsLayer};
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Chain, CommandOf, Env, EventOf, Later, Layer, Side, StreamEvent,
+    Admit, ByteStream, Chain, CommandOf, Env, EventOf, Later, Layer, Side, StreamCommand,
+    StreamEvent,
 };
 use fictionet::time::Instant;
 
@@ -11,13 +12,15 @@ use fictionet::time::Instant;
 /// The default is [`Chain`]`<TlsLayer, `[`Later`]`<U>>`: the plaintext the client sends
 /// right after its handshake waits in order until `make` has made the layer
 /// above, then reaches it first. A handshake that fails never makes it.
+/// Once negotiation reports failure, no more input reaches the application,
+/// including plaintext it previously refused. TLS still drains its alerts.
 ///
 /// It is also what STARTTLS switches to: a plaintext layer whose
 /// [`Handoff`](fictionet::stdlib::layer::Handoff) names a `Secure` as what
 /// comes next runs in a [`Switch`](fictionet::stdlib::layer::Switch), and
 /// `make` carries the plaintext session's context into the layer above.
 pub struct Secure<U: Layer<Lower = ByteStream>, F, T: Negotiation = TlsLayer> {
-    chain: Chain<T, Later<U>>,
+    chain: Chain<Driven<T>, Later<U>>,
     make: Option<F>,
 }
 
@@ -31,14 +34,21 @@ where
     /// done.
     pub fn new(tls: T, make: F) -> Secure<U, F, T> {
         Secure {
-            chain: Chain::new(tls, Later::new()),
+            chain: Chain::new(
+                Driven {
+                    tls,
+                    event: None,
+                    urgent: None,
+                },
+                Later::new(),
+            ),
             make: Some(make),
         }
     }
 
     /// The TLS layer.
     pub fn tls(&self) -> &T {
-        self.chain.lower()
+        &self.chain.lower().tls
     }
 
     /// The layer above, once it is made.
@@ -109,13 +119,18 @@ where
     }
 
     fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Self::Error> {
-        let tls = self.chain.lower();
-        let settled = matches!(tls.handshake(), Handshake::Established { .. });
-        let mut moved = false;
-        if settled && let Some(make) = self.make.take() {
-            let upper = make(self.chain.lower());
-            self.chain.upper_mut().set(upper);
-            moved = true;
+        let mut moved = env
+            .scoped(Side::Lower, |env| self.chain.lower_mut().step(env))
+            .map_err(Side::Lower)?;
+        match self.tls().handshake() {
+            Handshake::Pending | Handshake::Failed => return Ok(moved),
+            Handshake::Established { .. } => {
+                if let Some(make) = self.make.take() {
+                    let upper = make(self.tls());
+                    self.chain.upper_mut().set(upper);
+                    moved = true;
+                }
+            }
         }
         Ok(self.chain.advance(env)? || moved)
     }
@@ -141,6 +156,103 @@ where
     }
 }
 
+// Stage the lower step and its output before checking negotiation. Chain
+// must not call into TLS between that check and application delivery.
+struct Driven<T> {
+    tls: T,
+    event: Option<StreamEvent>,
+    urgent: Option<StreamEvent>,
+}
+
+impl<T: Negotiation> Driven<T> {
+    fn step(&mut self, env: &mut Env<'_, T::Report>) -> Result<bool, T::Error> {
+        let mut moved = self.tls.advance(env)?;
+        if self.urgent.is_none() {
+            self.urgent = self.tls.take_urgent();
+            moved |= self.urgent.is_some();
+        }
+        if self.event.is_none() {
+            self.event = self.tls.take_event();
+            moved |= self.event.is_some();
+        }
+        Ok(moved)
+    }
+}
+
+impl<T: Negotiation> Layer for Driven<T> {
+    type Lower = ByteStream;
+    type Upper = ByteStream;
+    type Report = T::Report;
+    type Timer = T::Timer;
+    type Work = T::Work;
+    type Done = T::Done;
+    type Error = T::Error;
+
+    fn report_bytes(report: &Self::Report) -> Option<usize> {
+        T::report_bytes(report)
+    }
+
+    fn depth(&self) -> usize {
+        self.tls.depth()
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.tls.is_terminal()
+    }
+
+    fn on_event(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        event: StreamEvent,
+    ) -> Result<Admit<StreamEvent>, Self::Error> {
+        self.tls.on_event(env, event)
+    }
+
+    fn on_command(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        command: StreamCommand,
+    ) -> Result<Admit<StreamCommand>, Self::Error> {
+        self.tls.on_command(env, command)
+    }
+
+    fn on_timer(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        timer: Self::Timer,
+    ) -> Result<(), Self::Error> {
+        self.tls.on_timer(env, timer)
+    }
+
+    fn on_done(
+        &mut self,
+        env: &mut Env<'_, Self::Report>,
+        done: Self::Done,
+    ) -> Result<(), Self::Error> {
+        self.tls.on_done(env, done)
+    }
+
+    fn take_command(&mut self) -> Option<StreamCommand> {
+        self.tls.take_command()
+    }
+
+    fn take_event(&mut self) -> Option<StreamEvent> {
+        self.urgent.take().or_else(|| self.event.take())
+    }
+
+    fn take_urgent(&mut self) -> Option<StreamEvent> {
+        self.urgent.take()
+    }
+
+    fn take_work(&mut self) -> Option<Self::Work> {
+        self.tls.take_work()
+    }
+
+    fn deadline(&self) -> Option<(Instant, Self::Timer)> {
+        self.tls.deadline()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
@@ -159,6 +271,8 @@ mod tests {
     enum Selected {
         Accept,
         Refuse,
+        FailWhenAdvanced,
+        FailWhenTaken,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +287,8 @@ mod tests {
         state: Handshake<'static>,
         event: Option<StreamEvent>,
         select: Option<Select>,
+        fail_on_advance: bool,
+        fail_on_take: bool,
     }
 
     impl Replacement {
@@ -181,6 +297,8 @@ mod tests {
                 state: Handshake::Pending,
                 event: None,
                 select: Some(Select),
+                fail_on_advance: false,
+                fail_on_take: false,
             }
         }
     }
@@ -235,9 +353,26 @@ mod tests {
                     alpn: Some(b"example"),
                 },
                 Selected::Refuse => Handshake::Failed,
+                Selected::FailWhenTaken => {
+                    self.fail_on_take = true;
+                    self.state
+                }
+                Selected::FailWhenAdvanced => {
+                    self.fail_on_advance = true;
+                    self.state
+                }
             };
             env.report(selected);
             Ok(())
+        }
+
+        fn advance(&mut self, _: &mut Env<'_, Selected>) -> Result<bool, Expired> {
+            if std::mem::take(&mut self.fail_on_advance) {
+                self.state = Handshake::Failed;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
 
         fn on_timer(&mut self, _: &mut Env<'_, Selected>, _: Deadline) -> Result<(), Expired> {
@@ -253,6 +388,13 @@ mod tests {
             self.event.take()
         }
 
+        fn take_urgent(&mut self) -> Option<StreamEvent> {
+            if std::mem::take(&mut self.fail_on_take) {
+                self.state = Handshake::Failed;
+            }
+            None
+        }
+
         fn take_work(&mut self) -> Option<Select> {
             self.select.take()
         }
@@ -266,6 +408,7 @@ mod tests {
     struct Application {
         ready: Arc<AtomicBool>,
         received: Vec<u8>,
+        received_count: Arc<AtomicUsize>,
         ended: bool,
     }
 
@@ -287,7 +430,11 @@ mod tests {
                 return Ok(Admit::Blocked(event));
             }
             match event {
-                StreamEvent::Data(chunk) => self.received.extend_from_slice(&chunk),
+                StreamEvent::Data(chunk) => {
+                    self.received_count
+                        .fetch_add(chunk.len(), Ordering::Relaxed);
+                    self.received.extend_from_slice(&chunk);
+                }
                 StreamEvent::Ended => self.ended = true,
                 StreamEvent::Written(_) | StreamEvent::Reset => {}
             }
@@ -327,6 +474,7 @@ mod tests {
             Application {
                 ready,
                 received: Vec::new(),
+                received_count: Arc::new(AtomicUsize::new(0)),
                 ended: false,
             }
         }
@@ -361,6 +509,32 @@ mod tests {
         let reports: Vec<_> = h.driver().observations().drain().collect();
         assert_eq!(reports, [Side::Lower(Selected::Accept)]);
         assert!(h.layer().deadline().is_none());
+    }
+
+    #[test]
+    fn failure_stops_plaintext_waiting_for_the_application() {
+        for failure in [
+            Selected::Refuse,
+            Selected::FailWhenAdvanced,
+            Selected::FailWhenTaken,
+        ] {
+            let builds = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(AtomicBool::new(false));
+            let secure = Secure::new(
+                Replacement::new(),
+                application(builds.clone(), ready.clone()),
+            );
+            let mut h = Harness::new(Seed::from_u64(45), secure);
+            h.complete(Side::Lower(Selected::Accept)).unwrap();
+            let received = h.layer().upper().unwrap().received_count.clone();
+            h.push(b"authenticated but not yet delivered").unwrap();
+            ready.store(true, Ordering::Relaxed);
+            h.complete(Side::Lower(failure)).unwrap();
+            h.settle().unwrap();
+            assert_eq!(received.load(Ordering::Relaxed), 0);
+            assert_eq!(builds.load(Ordering::Relaxed), 1);
+            assert!(h.layer().upper().unwrap().received.is_empty());
+        }
     }
 
     #[test]
