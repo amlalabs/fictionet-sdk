@@ -55,7 +55,11 @@ CONSTANTS
   CountAccepts,         \* offer uses up one Accept per child
   LiveAfterHandshake,   \* a connecting child carries bytes only once open
   CountUntilGone,       \* closing a child leaves what it held alone
-  ResetReleases         \* abort and connect_failed release what was held
+  ResetReleases,        \* abort and connect_failed release what was held
+  OfferReady,           \* offer takes only what finished its handshake
+  BoundBacklog,         \* a SYN past the backlog starts no connection
+  SayGone,              \* Release says TcpNotice::Gone
+  OfferSaysGone         \* a child opened for a reset connection is told
 
 Conns == Accepted \cup Connected
 
@@ -129,11 +133,13 @@ Fin(s) == CASE s = "Est" -> "FinWait1" [] s = "CloseWait" -> "LastAck"
                [] s = "SynSent" -> "Closed" [] OTHER -> s
 
 -----------------------------------------------------------------------------
-\* The listener.
+\* The listener.  With BoundBacklog FALSE a SYN starts a connection
+\* however many wait.
 Syn(c) ==
   /\ ~stopped /\ c \in Accepted /\ conn[c].sock = "None"
-  /\ Cardinality(InQueue("ready")) < Backlog
-  /\ Cardinality(InQueue("embryonic")) + Cardinality(InQueue("ready")) < Backlog
+  /\ BoundBacklog =>
+       /\ Cardinality(InQueue("ready")) < Backlog
+       /\ Cardinality(InQueue("embryonic")) + Cardinality(InQueue("ready")) < Backlog
   /\ Set(c, [conn[c] EXCEPT !.sock = "SynRcvd", !.at = "embryonic"])
   /\ UNCHANGED <<granted, credits, stopped>>
 
@@ -160,12 +166,17 @@ HandshakeExpires(c) ==
   /\ UNCHANGED <<granted, credits, stopped>>
 
 \* offer: a connection from the ready queue opens a child, using up one
-\* Accept, and the child may write at once.
+\* Accept, and the child may write at once.  One the peer reset while it
+\* waited opens gone, and Gone goes up with it.  With OfferReady FALSE it
+\* also takes one still waiting for the final ACK.
 Offer(c) ==
-  /\ ~stopped /\ conn[c].at = "ready" /\ credits > 0
+  /\ ~stopped /\ credits > 0
+  /\ \/ conn[c].at = "ready"
+     \/ ~OfferReady /\ conn[c].at = "embryonic"
   /\ Set(c, [conn[c] EXCEPT !.at = "conn", !.child = "open", !.mapped = TRUE,
                             !.live = TRUE,
-                            !.credited = conn[c].sock \in Writable])
+                            !.credited = conn[c].sock \in Writable,
+                            !.said = OfferSaysGone /\ conn[c].rst])
   /\ credits' = IF CountAccepts THEN credits - 1 ELSE credits
   /\ UNCHANGED <<granted, stopped>>
 
@@ -325,14 +336,15 @@ TimeWaitExpires(c) ==
   /\ UNCHANGED <<granted, credits, stopped>>
 
 \* refresh, for an open, live child: a socket that reached TIME-WAIT or
-\* closed on its own lets go of what it held and is gone.
+\* closed on its own lets go of what it held and is gone.  With SayGone
+\* FALSE it lets go without telling the host.
 Release(c) ==
   /\ ReleaseOpen /\ ~stopped
   /\ conn[c].child = "open" /\ conn[c].live
   /\ conn[c].sock \in {"TimeWait", "Closed"}
   /\ ~conn[c].rst /\ ~conn[c].released
   /\ Set(c, [conn[c] EXCEPT !.released = TRUE, !.held = FALSE,
-                            !.said = conn[c].said \/ conn[c].mapped])
+                            !.said = conn[c].said \/ (SayGone /\ conn[c].mapped)])
   /\ UNCHANGED <<granted, credits, stopped>>
 
 \* housekeeping's orphan loop: closed and its RST gone, it is removed; in
@@ -453,6 +465,10 @@ CountedUntilGone ==
 ReleaseSaid ==
   [][\A c \in Conns : (conn[c].held /\ ~conn'[c].held) => conn'[c].said]_vars
 SaidMeansReleased == \A c \in Conns : conn[c].said => ~conn[c].held
+\* Every child whose connection is gone was told so: a host that reads only
+\* TcpNotice::Gone knows exactly what gone() knows.
+GoneIsSaid ==
+  \A c \in Conns : (conn[c].child # "none" /\ Gone(c)) => conn[c].said
 
 \* Abort on a connection that is gone changes nothing.
 AbortAfterGoneIsNothing ==
