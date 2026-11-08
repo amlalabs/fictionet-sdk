@@ -37,8 +37,9 @@ pub trait Negotiation: Layer<Lower = ByteStream, Upper = ByteStream> {
 /// `None` refuses the name. Dropping the future cancels selection.
 pub type Selection = Arc<dyn Fn(Cx, Option<String>) -> Picking + Send + Sync>;
 
-/// Context for constructing a fresh TLS layer for an accepted connection.
-pub struct Build {
+/// What a TLS factory receives for one accepted connection, before
+/// negotiation.
+pub struct Opening {
     /// Runtime context, including deterministic entropy.
     pub cx: Cx,
     /// Connection identity before negotiation.
@@ -54,7 +55,7 @@ pub struct Build {
 }
 
 type Application = Box<dyn FnOnce(Handshake<'_>) -> Boxed + Send>;
-type Make = dyn Fn(Build, Application) -> Boxed + Send + Sync;
+type Make = dyn Fn(Opening, Application) -> Boxed + Send + Sync;
 
 /// A listener's TLS implementation. The default composition is
 /// `Chain<TlsLayer, Later<Boxed>>`, through [`Secure`]. Applications are
@@ -67,7 +68,7 @@ pub struct Factory {
 
 impl Factory {
     /// Uses `make` to construct a fresh replacement layer per connection.
-    pub fn new<T>(make: impl Fn(Build) -> T + Send + Sync + 'static) -> Self
+    pub fn new<T>(make: impl Fn(Opening) -> T + Send + Sync + 'static) -> Self
     where
         T: Negotiation + Send + 'static,
         T::Report: core::fmt::Debug + Send + 'static,
@@ -107,7 +108,7 @@ impl Factory {
     /// Composes this listener's TLS with the negotiated application.
     pub fn build(
         &self,
-        opening: Build,
+        opening: Opening,
         application: impl FnOnce(Handshake<'_>) -> Boxed + Send + 'static,
     ) -> Boxed {
         (self.make)(opening, Box::new(application))

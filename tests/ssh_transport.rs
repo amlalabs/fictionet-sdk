@@ -179,7 +179,7 @@ async fn custom_transport_keeps_standard_public_key_authentication_channels_and_
                         backlog: None,
                     }
                     .with_transport(move |opening| {
-                        assert_eq!(opening.connection.local.unwrap().port(), 22);
+                        assert_eq!(opening.info.local.unwrap().port(), 22);
                         assert!(opening.login_deadline > opening.now);
                         RestrictedTransport {
                             inner: StandardTransport::new(opening.config),

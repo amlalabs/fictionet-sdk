@@ -10,9 +10,30 @@
 
 use super::Config;
 use crate::stdlib::codec::{Stream, Wire};
+use crate::stdlib::layer::Budget;
+use crate::stdlib::network::ConnInfo;
 use crate::stdlib::protocols::ssh::transport::Transport;
 pub use crate::stdlib::protocols::ssh::transport::{Negotiated, TransportError};
 use crate::stdlib::protocols::ssh::{self, transport::TransportEvent};
+use crate::stdlib::services::stack;
+use crate::time::Instant;
+
+/// What a transport factory receives for one accepted connection, before any
+/// input is admitted.
+pub struct Opening<'a> {
+    /// Shared defaults; a replacement may supply its own transport policy.
+    pub config: &'a Config,
+    /// Identity and addresses of the accepted connection.
+    pub info: &'a ConnInfo,
+    /// Shared connection allocation budget.
+    pub budget: &'a Budget,
+    /// Carrier idle and write deadlines.
+    pub limits: stack::StreamLimits,
+    /// Simulation time at arrival.
+    pub now: Instant,
+    /// Absolute authentication deadline.
+    pub login_deadline: Instant,
+}
 
 /// Peer metadata observed before transport negotiation accepts or rejects it.
 #[derive(Clone, Debug)]

@@ -73,7 +73,7 @@ mod contract_buffers;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
-pub use factory::{Build, Factory, Handshake, Negotiation, Selection};
+pub use factory::{Factory, Handshake, Negotiation, Opening, Selection};
 pub use layer::{Hello, Pick, Picking, TlsLayer};
 pub use secure::Secure;
 

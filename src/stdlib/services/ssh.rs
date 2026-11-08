@@ -507,22 +507,6 @@ pub struct Server<H: Handler> {
     /// Optional listener backlog.
     pub backlog: Option<usize>,
 }
-/// Construction context for one transport, before any input is admitted.
-pub struct TransportOpening<'a> {
-    /// Shared defaults; a replacement may supply its own transport policy.
-    pub config: &'a Config,
-    /// Identity and addresses of the accepted connection.
-    pub connection: &'a ConnInfo,
-    /// Shared connection allocation budget.
-    pub budget: &'a Budget,
-    /// Carrier idle and write deadlines.
-    pub limits: stack::StreamLimits,
-    /// Simulation time at arrival.
-    pub now: Instant,
-    /// Absolute authentication deadline.
-    pub login_deadline: Instant,
-}
-
 /// A server with a caller-supplied transport factory and standard sessions.
 pub struct WithTransport<H: Handler, F> {
     server: Server<H>,
@@ -532,7 +516,7 @@ impl<H: Handler> Server<H> {
     /// Install a fresh transport per arrival, retaining Handler and Children.
     pub fn with_transport<T: PacketTransport, F>(self, factory: F) -> WithTransport<H, F>
     where
-        F: Fn(&TransportOpening<'_>) -> T + Send + Sync + 'static,
+        F: Fn(&transport::Opening<'_>) -> T + Send + Sync + 'static,
     {
         WithTransport {
             server: self,
@@ -543,7 +527,7 @@ impl<H: Handler> Server<H> {
         &self,
         fcx: Cx,
         arrival: Arrival,
-        factory: impl FnOnce(&TransportOpening<'_>) -> T,
+        factory: impl FnOnce(&transport::Opening<'_>) -> T,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let info = Arc::new(arrival.info);
         let handler = self.handler.clone();
@@ -554,9 +538,9 @@ impl<H: Handler> Server<H> {
             .unwrap_or_else(Budget::unlimited);
         let limits = self.limits;
         let now = fcx.now();
-        let transport = factory(&TransportOpening {
+        let transport = factory(&transport::Opening {
             config: &self.config,
-            connection: &info,
+            info: &info,
             budget: &budget,
             limits,
             now,
@@ -615,7 +599,7 @@ impl<H: Handler> PortServer for Server<H> {
 }
 impl<H: Handler, T: PacketTransport, F> PortServer for WithTransport<H, F>
 where
-    F: Fn(&TransportOpening<'_>) -> T + Send + Sync + 'static,
+    F: Fn(&transport::Opening<'_>) -> T + Send + Sync + 'static,
 {
     fn backlog(&self) -> Option<usize> {
         self.server.backlog

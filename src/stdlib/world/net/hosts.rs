@@ -1972,7 +1972,7 @@ async fn connection(
     };
     let budget = budget.unwrap_or_else(Budget::unlimited);
     let secure = factory.build(
-        tls::Build {
+        tls::Opening {
             cx: fcx.clone(),
             info: info.clone(),
             budget: budget.clone(),
