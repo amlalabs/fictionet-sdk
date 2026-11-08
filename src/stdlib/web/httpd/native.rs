@@ -1399,7 +1399,8 @@ mod tests {
     /// `verification/http/tla/Pipeline.tla` (`NoHttpAfter101`).
     #[test]
     fn a_101_without_an_upgrade_handler_closes() {
-        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Bare101)).running_work();
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Bare101))
+            .with_worker(Polling::new());
         h.push(
             b"GET /a HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n\
               GET /b HTTP/1.1\r\nHost: a\r\n\r\n",

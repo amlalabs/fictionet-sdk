@@ -126,6 +126,10 @@ fn timestamp(time: SystemTime) -> Timestamp {
     Timestamp::from_unix(since.as_secs() as i64, since.subsec_nanos())
 }
 
+#[cfg(kani)]
+#[path = "../../../../verification/layer-runtime/kani/ntp.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

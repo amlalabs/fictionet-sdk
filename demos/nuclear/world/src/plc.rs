@@ -397,6 +397,10 @@ fn reply_pdu(response: Response, function: u8) -> Vec<u8> {
         .unwrap_or_else(|_| Exception::ServerDeviceFailure.to_pdu(function))
 }
 
+#[cfg(kani)]
+#[path = "../../../../verification/layer-runtime/kani/plc.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

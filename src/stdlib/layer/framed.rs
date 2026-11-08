@@ -70,15 +70,17 @@ impl<D: Decode, O> Framed<D, O> {
     }
 
     /// Charges the buffer as it may grow and the decoder's state. The
-    /// buffer never grows past its limit, so charging the limit is enough
-    /// before taking bytes.
+    /// buffer's limit follows the decoder's capacity on the next push, and
+    /// the buffer keeps a consumed prefix until it is as long as what is
+    /// left, so it grows to at most twice that limit: charging that is
+    /// enough before taking bytes.
     fn charge(&mut self, env: &Env<'_, Infallible>) -> Result<(), FramedError<O>>
     where
         O: Wire,
     {
-        let need = self
-            .stream
-            .limit()
+        let limit = self.stream.limit().max(self.stream.decoder().capacity());
+        let need = limit
+            .saturating_mul(2)
             .max(self.stream.allocated())
             .saturating_add(self.stream.held());
         let fits = match &mut self.charge {
@@ -247,6 +249,10 @@ impl<O: Wire> core::error::Error for FramedError<O> {
         }
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/layer-runtime/kani/mod.rs"]
+mod proofs;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -426,6 +432,101 @@ pub(crate) mod tests {
         assert_eq!(read(h.output()), sent);
         assert_eq!(h.layer().upper().failures, 1);
         assert!(h.ended());
+    }
+
+    /// The decoder's buffer keeps a consumed prefix until it is as long as
+    /// what is left, so it can grow to twice its limit. Here a small frame
+    /// and most of a big one fill the limit; the small frame is answered,
+    /// and the rest of the big one makes the buffer grow past the limit.
+    #[test]
+    fn the_budget_covers_everything_the_buffer_grows_to() {
+        let budget = Budget::new(1 << 16);
+        let mut h = Harness::with_budget(Seed::from_u64(6), stack(), budget.clone());
+        let mut sent = frames(1);
+        sent.push(Frame {
+            transaction: 9,
+            unit: 1,
+            pdu: vec![0x10; modbus::MAX_PDU],
+        });
+        let input = wire(&sent);
+        h.push(&input[..modbus::MAX_FRAME]).unwrap();
+        h.push(&input[modbus::MAX_FRAME..]).unwrap();
+        assert_eq!(read(h.output()), sent);
+        let framed = h.layer().lower();
+        let holds = framed.stream.allocated() + framed.stream.held();
+        assert!(
+            budget.used() >= holds,
+            "the budget is charged {} for a buffer of {holds}",
+            budget.used()
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct NoError;
+    impl core::fmt::Display for NoError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("no error")
+        }
+    }
+    impl core::error::Error for NoError {}
+
+    /// One-byte items. After the first, it needs room for sixteen bytes.
+    struct Widens {
+        widened: bool,
+    }
+
+    impl Decode for Widens {
+        type Item = u8;
+        type Error = NoError;
+        const NAME: &'static str = "widens";
+        fn capacity(&self) -> usize {
+            if self.widened { 16 } else { 4 }
+        }
+        fn decode(
+            &mut self,
+            input: &[u8],
+            _eof: bool,
+        ) -> Result<fictionet::stdlib::codec::Step<u8>, NoError> {
+            use fictionet::stdlib::codec::Step;
+            Ok(match input.first() {
+                Some(&b) => {
+                    self.widened = true;
+                    Step::Item(b, 1)
+                }
+                None => Step::Need,
+            })
+        }
+    }
+
+    /// A decoder may raise its capacity as it reads; the buffer follows it
+    /// on the next push, so the charge before that push must too.
+    #[test]
+    fn the_budget_covers_a_capacity_the_decoder_raised() {
+        use fictionet::SeededEntropy;
+        use fictionet::stdlib::layer::Driver;
+        use fictionet::time::Instant;
+        use std::sync::Arc;
+        let budget = Budget::new(1 << 16);
+        let framed: Framed<Widens, Frame> = Framed::new(Widens { widened: false });
+        let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
+        let mut d = Driver::new(framed, entropy, budget.clone(), Instant::ZERO);
+        assert!(matches!(
+            d.deliver(StreamEvent::Data(Chunk::new(vec![1]))),
+            Ok(Admit::Taken)
+        ));
+        assert!(matches!(
+            d.layer_mut().take_event(),
+            Some(MessageEvent::Message(Ok(1)))
+        ));
+        let _ = d
+            .deliver(StreamEvent::Data(Chunk::new(vec![2; 16])))
+            .unwrap();
+        let holds = d.layer().stream.allocated() + d.layer().stream.held();
+        assert!(
+            budget.used() >= holds,
+            "the budget is charged {} for a buffer of {holds}",
+            budget.used()
+        );
     }
 
     #[test]
