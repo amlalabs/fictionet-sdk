@@ -616,6 +616,22 @@ async fn websockets_work_through_sites() {
                 reply,
                 fictionet::stdlib::protocols::websocket::Message::Text("echo: hello".into())
             );
+            use fictionet::stdlib::{
+                codec::Wire,
+                protocols::websocket::{Close, Message},
+            };
+            let close = Message::Close(Some(Close::new(1000)));
+            let mut frames = Vec::new();
+            for message in [&close, &close, &Message::Text("after close".into())] {
+                message
+                    .to_frame(Some([1, 2, 3, 4]))
+                    .unwrap()
+                    .write(&mut frames)
+                    .unwrap();
+            }
+            conn.write_all(&fcx, &frames).await.unwrap();
+            let response = read_all(&fcx, &mut conn).await.unwrap();
+            assert_eq!(response, close.to_frame(None).unwrap().to_bytes().unwrap());
             Err(fictionet::Error::from(Done))
         }),
     )
