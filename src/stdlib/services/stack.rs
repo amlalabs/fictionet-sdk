@@ -170,6 +170,7 @@ where
     let mut shut = false;
     let mut idled = false;
     let mut idle_from = fcx.now();
+    let mut was_waiting = false;
     let mut stalled_since: Option<Instant> = None;
     let mut rounds = 0u32;
     loop {
@@ -225,6 +226,11 @@ where
         }
         let reading = !input_over && input.is_none();
         let waiting = reading && !driver.holds_output();
+        // The idle clock runs only while the runner waits for the peer.
+        if waiting && !was_waiting {
+            idle_from = now;
+        }
+        was_waiting = waiting;
         if waiting && limits.idle.is_some_and(|d| now >= idle_from + d) {
             idled = true;
             input = Some(StreamEvent::Ended);
@@ -453,7 +459,9 @@ where
             });
             Ok(moved)
         })?;
-        if ended || (socket_closed && input.is_none()) {
+        // A closed socket still gets what the stack has left, so only a
+        // settled stack is done with it.
+        if ended || (settled && socket_closed && input.is_none()) {
             return Ok(());
         }
         if !settled {
