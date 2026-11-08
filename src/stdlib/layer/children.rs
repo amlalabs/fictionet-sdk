@@ -72,10 +72,10 @@ type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> B + Send;
 /// a new child has its slot. A child that fails is closed and reported
 /// ([`ChildReport::Failed`]); its siblings go on.
 ///
-/// Every child gets `window` credit units for its events, granted again as
-/// its layer takes them, so a child that stops reading holds at most
-/// `window` units plus bounded item and completion slots. A child's commands wait in a place of
-/// their own until the mux grants credit for them, so a child the peer does
+/// Every child gets `window` credit units for its events. A child that stops
+/// reading holds at most `window` units plus bounded item and completion
+/// slots. A child's commands wait in a place of their own until the mux
+/// grants credit for them, so a child the peer does
 /// not read holds up nothing but itself. Children are visited in a stable
 /// order, at most 64 per advance, continuing after the last visited child.
 /// At most 4096 children can be configured; work and deadline scans share
@@ -99,6 +99,7 @@ where
     turn: Option<ChildId>,
     work_turn: Option<ChildId>,
     remaining_visits: usize,
+    sweep_first: Option<ChildId>,
 }
 
 struct Kid<B: Layer> {
@@ -129,7 +130,8 @@ pub enum ChildReport<E, X> {
     Event(ChildId, E),
     /// A child's layer failed. The child was closed; its siblings go on.
     Failed(ChildId, X),
-    /// A child opened when the limit was reached. It was closed at once.
+    /// A child exceeded admission limits or produced an impossible atomic
+    /// command. It was closed at once.
     Refused(ChildId),
 }
 
@@ -183,6 +185,7 @@ where
             turn: None,
             work_turn: None,
             remaining_visits: 0,
+            sweep_first: None,
         }
     }
 
@@ -542,6 +545,7 @@ where
     fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Overrun> {
         if self.remaining_visits == 0 {
             self.remaining_visits = self.kids.len();
+            self.sweep_first = None;
         }
         let count = self.remaining_visits.min(QUEUE);
         let mut last = self.turn;
@@ -556,6 +560,7 @@ where
             let Some(id) = next else {
                 break;
             };
+            self.sweep_first.get_or_insert(id);
             last = Some(id);
             moved |= self.visit_child(env, id)?;
         }
@@ -563,6 +568,9 @@ where
         self.remaining_visits = self.remaining_visits.saturating_sub(count);
         if self.kids.is_empty() {
             self.remaining_visits = 0;
+        }
+        if self.remaining_visits == 0 {
+            self.turn = self.sweep_first;
         }
         Ok(moved || self.remaining_visits > 0)
     }
@@ -633,6 +641,7 @@ mod tests {
         ended: bool,
         completions: u64,
         work: bool,
+        productive: bool,
     }
 
     impl Layer for Reader {
@@ -670,7 +679,10 @@ mod tests {
             match c {}
         }
         fn take_command(&mut self) -> Option<StreamCommand> {
-            self.writes.pop_front()
+            self.writes.pop_front().or_else(|| {
+                self.productive
+                    .then(|| StreamCommand::Write(Chunk::new(vec![1])))
+            })
         }
         fn take_event(&mut self) -> Option<Infallible> {
             None
@@ -836,6 +848,116 @@ mod tests {
             .unwrap();
         assert!(work.cancelled());
         assert_eq!(driver.layer_mut().take_work().unwrap().0, b);
+    }
+    #[test]
+    fn continuously_ready_children_rotate_across_bounded_sweeps() {
+        let children: Children<Reader, Top> = Children::new(70, 8, |_, (), _| Reader {
+            productive: true,
+            ..Reader::default()
+        });
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(94))),
+            Budget::new(16 << 20),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(70);
+        for _ in 0..70 {
+            let child = slots.insert(()).unwrap();
+            let id = child.id();
+            let _ = driver.deliver(MuxEvent::Opened(child, (), 1)).unwrap();
+            let _ = driver.deliver(MuxEvent::Credit(id, 1000)).unwrap();
+        }
+        let mut sent = std::collections::BTreeSet::new();
+        for _ in 0..70 {
+            driver.run().unwrap();
+            while let Some(command) = driver.layer_mut().take_command() {
+                if let super::super::MuxOp::Child(id, StreamCommand::Write(_)) = command.into_op() {
+                    sent.insert(id);
+                }
+            }
+        }
+        assert_eq!(
+            sent.len(),
+            70,
+            "every productive child gets output capacity"
+        );
+    }
+
+    #[test]
+    fn a_refused_reservation_never_constructs_a_child() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = called.clone();
+        let children: Children<Reader, Top, ()> = Children::new(1, 8, move |_, (), _| {
+            flag.store(true, Ordering::Relaxed);
+            Reader::default()
+        });
+        let budget = Budget::new(0);
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(92))),
+            budget.clone(),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(1);
+        let child = slots.insert(()).unwrap();
+        assert!(matches!(
+            driver.deliver(MuxEvent::Opened(child, (), 8)),
+            Err(Overrun::Budget)
+        ));
+        assert!(!called.load(Ordering::Relaxed));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn an_atomic_command_larger_than_the_declared_limit_closes_the_child() {
+        use crate::stdlib::layer::{MessageCommand, MessageEvent, Messages, MuxOp};
+        struct Atomic(bool);
+        impl Layer for Atomic {
+            type Lower = Messages<u8>;
+            type Upper = Top;
+            type Report = ();
+            type Timer = ();
+            type Work = Infallible;
+            type Done = Infallible;
+            type Error = Infallible;
+            fn on_event(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                _: MessageEvent<u8>,
+            ) -> Result<Admit<MessageEvent<u8>>, Infallible> {
+                Ok(Admit::Taken)
+            }
+            fn on_command(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                c: Infallible,
+            ) -> Result<Admit<Infallible>, Infallible> {
+                match c {}
+            }
+            fn take_command(&mut self) -> Option<MessageCommand<u8>> {
+                std::mem::take(&mut self.0).then_some(MessageCommand::Send(7))
+            }
+            fn take_event(&mut self) -> Option<Infallible> {
+                None
+            }
+        }
+        let children: Children<Atomic, Top> = Children::new(1, 1, |_, (), _| Atomic(true));
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(93))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(1);
+        let child = slots.insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
+        driver.run().unwrap();
+        assert!(driver.layer().child(id).is_none());
+        assert!(
+            matches!(driver.layer_mut().take_command().unwrap().into_op(), MuxOp::Close(actual) if actual == id)
+        );
     }
 }
 

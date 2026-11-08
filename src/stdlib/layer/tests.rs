@@ -779,14 +779,14 @@ impl Layer for Toy {
         }
         let child = match command.op() {
             MuxOp::Child(id, _) | MuxOp::Credit(id, _) | MuxOp::Close(id) => Some(*id),
-            MuxOp::Open | MuxOp::Control(_) => None,
+            MuxOp::Control(_) => None,
         };
         // A child that is gone takes nothing, and never will.
         if child.is_some_and(|id| !self.lanes.contains(id)) {
             return Ok(Admit::Closed(command));
         }
         match command.into_op() {
-            MuxOp::Open | MuxOp::Child(_, Part::Head(_)) => return Err(ToyError::Unsupported),
+            MuxOp::Child(_, Part::Head(_)) => return Err(ToyError::Unsupported),
             MuxOp::Child(id, Part::Body(bytes)) => {
                 let lane = self.lanes.get_mut(id).expect("checked above");
                 let len = bytes.len() as u64;

@@ -4,8 +4,6 @@ use core::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::{Buf, Bytes};
-
 use fictionet::stdlib::layer::{Budget, Charge, CommandOf, EventOf, Port};
 
 // ---------------------------------------------------------------------------
@@ -16,84 +14,108 @@ use fictionet::stdlib::layer::{Budget, Charge, CommandOf, EventOf, Port};
 /// A receiver that takes only part of a chunk [`advance`](Self::advance)s
 /// past what it took and hands the chunk back, so the rest keeps its place.
 /// The [`Charge`] that paid for the whole allocation goes wherever the chunk
-/// goes and is given back when the chunk is dropped.
+/// goes and is given back when the last piece of that backing is dropped.
+/// The reservation covers the vector's capacity. Shared cursor and lease
+/// metadata are bounded engine storage: routers and layers must also enforce
+/// item limits, including for empty chunks.
 pub struct Chunk {
-    bytes: Bytes,
+    backing: Arc<ChunkBacking>,
+    start: usize,
+    end: usize,
+}
+
+struct ChunkBacking {
+    bytes: Vec<u8>,
     charge: Option<Arc<Charge>>,
-    credit: Option<Arc<CreditReturn>>,
+    credit: Option<CreditReturn>,
 }
 
 impl Chunk {
     /// Bytes nothing has been charged for, such as input whose owner
     /// accounts for it.
-    pub fn new(bytes: impl Into<Bytes>) -> Chunk {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Chunk {
+        Self::backed(bytes.into(), None)
+    }
+
+    fn backed(bytes: Vec<u8>, charge: Option<Arc<Charge>>) -> Chunk {
+        let end = bytes.len();
         Chunk {
-            bytes: bytes.into(),
-            charge: None,
-            credit: None,
+            backing: Arc::new(ChunkBacking {
+                bytes,
+                charge,
+                credit: None,
+            }),
+            start: 0,
+            end,
         }
     }
 
     /// Bytes paid for by `charge`, which should cover their whole
     /// allocation. Take the charge before allocating.
-    pub fn with_charge(bytes: impl Into<Bytes>, charge: Charge) -> Chunk {
-        Chunk {
-            bytes: bytes.into(),
-            charge: Some(Arc::new(charge)),
-            credit: None,
-        }
+    pub fn with_charge(bytes: Vec<u8>, charge: Charge) -> Chunk {
+        assert!(
+            charge.bytes() >= bytes.capacity(),
+            "chunk backing exceeds its reservation"
+        );
+        Self::backed(bytes, Some(Arc::new(charge)))
     }
 
     /// The bytes not yet taken.
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.end - self.start
     }
 
     /// Whether every byte has been taken.
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.start == self.end
     }
 
     /// Marks the first `n` bytes as taken. Panics if fewer remain.
     pub fn advance(&mut self, n: usize) {
-        self.bytes.advance(n);
+        assert!(n <= self.len(), "chunk cursor exceeds its remaining bytes");
+        self.start += n;
     }
 
-    /// Splits off a prefix, retaining the backing allocation charge until
-    /// both pieces have been released.
+    /// Splits off a prefix without allocating. Both pieces retain the same
+    /// backing reservation until their last owner releases it.
     pub fn split_to(&mut self, n: usize) -> Chunk {
-        Chunk {
-            bytes: self.bytes.split_to(n),
-            charge: self.charge.clone(),
-            credit: self.credit.clone(),
-        }
+        assert!(n <= self.len(), "chunk prefix exceeds its remaining bytes");
+        let prefix = Chunk {
+            backing: self.backing.clone(),
+            start: self.start,
+            end: self.start + n,
+        };
+        self.start += n;
+        prefix
     }
 
     /// Copies unaccounted bytes into a reserved allocation. Already charged
     /// backing storage keeps its charge, including any unread suffix.
     pub fn reserve(&mut self, budget: &Budget) -> bool {
-        if self.charge.is_some() {
+        if self.backing.charge.is_some() {
             return true;
         }
         let Some(charge) = budget.charge(self.len()) else {
             return false;
         };
-        self.bytes = Bytes::copy_from_slice(&self.bytes);
-        self.charge = Some(Arc::new(charge));
+        *self = Self::with_charge(self.to_vec(), charge);
         true
     }
 
-    /// The bytes charged for this chunk.
+    /// The shared backing allocation's charge. Split pieces name the same
+    /// charge; their charged values must not be added together.
     pub fn charged(&self) -> usize {
-        self.charge.as_ref().map_or(0, |charge| charge.bytes())
+        self.backing
+            .charge
+            .as_ref()
+            .map_or(0, |charge| charge.bytes())
     }
 }
 
 impl core::ops::Deref for Chunk {
     type Target = [u8];
-
     fn deref(&self) -> &[u8] {
-        &self.bytes
+        &self.backing.bytes[self.start..self.end]
     }
 }
 
@@ -239,11 +261,9 @@ impl Credited for StreamEvent {
 
     fn reserve_receive(&mut self, _: &Budget, backing: &Arc<Charge>) -> bool {
         if let Self::Data(chunk) = self {
-            // Normalize arbitrary input slices while the advertised window
-            // already pays for the new backing allocation.
-            chunk.bytes = Bytes::copy_from_slice(&chunk.bytes);
-            chunk.charge = Some(backing.clone());
-            chunk.credit = None;
+            // Normalize arbitrary slices while the receive window already
+            // pays for the new allocation. The old backing may now release.
+            *chunk = Chunk::backed(chunk.to_vec(), Some(backing.clone()));
         }
         true
     }
@@ -257,7 +277,9 @@ impl Credited for StreamEvent {
 
     fn retain_credit(&mut self, credit: CreditReturn) -> bool {
         if let Self::Data(chunk) = self {
-            chunk.credit = Some(Arc::new(credit));
+            Arc::get_mut(&mut chunk.backing)
+                .expect("receive backing was reserved uniquely")
+                .credit = Some(credit);
             true
         } else {
             false
@@ -435,7 +457,7 @@ impl<O> Credited for MessageCommand<O> {
 /// number of children, each speaking port `C`. HTTP/2 streams, SSH
 /// channels, QUIC streams.
 ///
-/// A child is opened by the peer or by asking ([`MuxCommand::open`]), and
+/// A child is opened by the peer or through typed connection control, and
 /// the upper side receives its [`Child`] handle in [`MuxEvent::Opened`].
 /// Commands for a child can only be made from its handle, and closing
 /// consumes the handle.
@@ -480,8 +502,6 @@ pub struct MuxCommand<C: Port, K: Port>(MuxOp<C, K>);
 
 /// What a [`MuxCommand`] asks for.
 pub enum MuxOp<C: Port, K: Port> {
-    /// Open a child; the answer is [`MuxEvent::Opened`].
-    Open,
     /// A command for one child, within the credit the mux granted.
     Child(ChildId, CommandOf<C>),
     /// The child's events may use this many more credit units.
@@ -493,11 +513,6 @@ pub enum MuxOp<C: Port, K: Port> {
 }
 
 impl<C: Port, K: Port> MuxCommand<C, K> {
-    /// Asks the connection to open a child.
-    pub fn open() -> MuxCommand<C, K> {
-        MuxCommand(MuxOp::Open)
-    }
-
     /// A connection control command.
     pub fn control(command: CommandOf<K>) -> MuxCommand<C, K> {
         MuxCommand(MuxOp::Control(command))
@@ -517,7 +532,6 @@ impl<C: Port, K: Port> MuxCommand<C, K> {
 impl<C: Port, K: Port> core::fmt::Debug for MuxCommand<C, K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match &self.0 {
-            MuxOp::Open => "Open",
             MuxOp::Child(..) => "Child",
             MuxOp::Credit(..) => "Credit",
             MuxOp::Close(_) => "Close",
@@ -716,5 +730,40 @@ impl<T> Slots<T> {
     /// The most children at once.
     pub fn limit(&self) -> usize {
         self.limit
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    #[test]
+    fn an_exhausted_generation_retires_its_slot() {
+        let mut slots = Slots::new(1);
+        let first = slots.insert(()).unwrap();
+        slots.entries[0].0 = u64::MAX;
+        let last = ChildId {
+            generation: u64::MAX,
+            ..first.id()
+        };
+        assert_eq!(slots.remove(last), Some(()));
+        assert!(!slots.contains(last));
+        assert!(slots.insert(()).is_err());
+    }
+
+    #[test]
+    fn slot_storage_is_reserved_before_it_grows() {
+        assert!(Slots::<u8>::with_budget(1, &Budget::new(0)).is_none());
+        let budget = Budget::new(1000);
+        let mut slots = Slots::with_budget(2, &budget).unwrap();
+        let charged = budget.used();
+        let a = slots.insert(1u8).unwrap();
+        let _b = slots.insert(2).unwrap();
+        assert!(slots.insert(3).is_err());
+        slots.remove(a.id());
+        let _c = slots.insert(3).unwrap();
+        assert_eq!(budget.used(), charged);
+        drop(slots);
+        assert_eq!(budget.used(), 0);
     }
 }
