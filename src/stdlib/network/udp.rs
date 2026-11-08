@@ -1,11 +1,10 @@
 //! UDP: sockets for a machine on the simulated network.
 //!
-//! [`UdpLayer`] is a machine's UDP as a [layer](fictionet::stdlib::layer):
-//! whole IP packets below, from the [IP layer](super::packet::IpLayer), and
-//! one child per bound socket above, carrying datagrams with the peer's
-//! address ([`Udp`](super::transport::Udp)). It owns the sockets, their
-//! queues, the choice of ephemeral ports, multicast membership and the
-//! answers to datagrams for closed ports.
+//! [`UdpLayer`] is a machine's UDP as a [layer]: whole IP packets below,
+//! from the [IP layer](super::packet::IpLayer), and one child per bound
+//! socket above, carrying datagrams with the peer's address ([`Udp`]). It
+//! owns the sockets, their queues, the choice of ephemeral ports, multicast
+//! membership and the answers to datagrams for closed ports.
 //!
 //! Use this module to give a machine UDP, for example to run a DNS server
 //! (see [`dns`](fictionet::stdlib::protocols::dns)). [`endpoint`] takes an [`Interface`]
