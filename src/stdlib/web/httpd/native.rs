@@ -164,6 +164,8 @@ pub struct Http1 {
     /// What the successor gets, once HTTP is over.
     leftover: Vec<StreamEvent>,
     charge: Option<Charge>,
+    /// One body-result allowance, transferred through Work and Done while polling.
+    frame_charge: Option<Charge>,
 }
 
 impl Http1 {
@@ -184,6 +186,7 @@ impl Http1 {
             stream: Stream::new(http1::RequestEvents::with_limits(opts.head)),
             after: Vec::new(),
             charge: None,
+            frame_charge: None,
             phase: Phase::Opening,
             timers: Timers::new(),
             head: None,
@@ -274,8 +277,11 @@ impl Http1 {
     /// Takes the first charge and starts waiting for the first head.
     fn open(&mut self, env: &mut Env<'_, Report>) {
         self.phase = Phase::Reading;
-        match env.budget().charge(self.holding()) {
-            Some(charge) => self.charge = Some(charge),
+        match env.budget().charge(self.holding().saturating_add(PIECE)) {
+            Some(mut charge) => {
+                self.frame_charge = charge.split(PIECE);
+                self.charge = Some(charge);
+            }
             None => return self.over_budget(env),
         }
         let at = self
@@ -593,10 +599,7 @@ impl Http1 {
                 true
             }
             Stage::Body(Some(body)) => {
-                let Some(charge) = env.budget().charge(PIECE) else {
-                    self.over_budget(env);
-                    return true;
-                };
+                let charge = self.frame_charge.take().expect("one body frame at a time");
                 self.generation += 1;
                 self.work = Some(Work {
                     generation: self.generation,
@@ -698,7 +701,14 @@ impl Http1 {
             delivery.piece(bytes.len(), body);
         }
         if r.rest.is_empty() {
-            r.body_charge = None;
+            if self.frame_charge.is_none() {
+                self.frame_charge = r.body_charge.take();
+                if let Some(charge) = &mut self.frame_charge {
+                    charge.set(PIECE);
+                }
+            } else {
+                r.body_charge = None;
+            }
         }
         self.responding = Some(r);
         if !self.fits(0) {
@@ -975,16 +985,22 @@ impl Layer for Http1 {
                 {
                     r.rest = data;
                     r.body_charge = done.charge;
+                } else {
+                    self.frame_charge = done.charge;
                 }
                 r.stage = Stage::Body(Some(body));
                 None
             }
             Answer::Frame(_, None) => {
+                self.frame_charge = done.charge;
                 r.stage = Stage::Body(None);
                 None
             }
             // The bytes so far may have broken the framing: close.
-            Answer::Frame(_, Some(Err(e))) => Some(e),
+            Answer::Frame(_, Some(Err(e))) => {
+                self.frame_charge = done.charge;
+                Some(e)
+            }
         };
         if let Some(e) = failed {
             env.report(Report::Work(e));
@@ -1134,7 +1150,7 @@ impl Job for Work {
                         if !self
                             .charge
                             .as_mut()
-                            .is_some_and(|charge| charge.set(data.len()))
+                            .is_some_and(|charge| charge.set(PIECE.max(data.len())))
                         {
                             return Err(Error::msg("the body frame exceeds the connection budget"));
                         }

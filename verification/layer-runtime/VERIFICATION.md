@@ -382,9 +382,8 @@ failure harness verified in 277 seconds using MiniSat, with its original
 three symbolic operations, unwind bound and assertions unchanged. Input
 fixtures now use fixed-size symbolic arrays copied into the production
 chunk rather than leaking an extra allocation for a static slice. Earlier
-runs against the intermediate shared backing implementation were stopped
-or exceeded the available resources; only the completed vector-backed run
-is counted here.
+runs against the intermediate shared backing implementation did not
+complete; only the completed vector-backed run is counted here.
 
 ## Kani over the PLC server and the time server
 
