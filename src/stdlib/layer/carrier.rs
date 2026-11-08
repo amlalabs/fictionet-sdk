@@ -1,11 +1,12 @@
 //! The four carrier contracts and the handles of multiplexed children.
 
 use core::marker::PhantomData;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Buf, Bytes};
 
-use fictionet::stdlib::layer::{Charge, CommandOf, EventOf, Port};
+use fictionet::stdlib::layer::{Budget, Charge, CommandOf, EventOf, Port};
 
 // ---------------------------------------------------------------------------
 // Bytes
@@ -18,7 +19,8 @@ use fictionet::stdlib::layer::{Charge, CommandOf, EventOf, Port};
 /// goes and is given back when the chunk is dropped.
 pub struct Chunk {
     bytes: Bytes,
-    charge: Option<Charge>,
+    charge: Option<Arc<Charge>>,
+    credit: Option<Arc<CreditReturn>>,
 }
 
 impl Chunk {
@@ -28,6 +30,7 @@ impl Chunk {
         Chunk {
             bytes: bytes.into(),
             charge: None,
+            credit: None,
         }
     }
 
@@ -36,7 +39,8 @@ impl Chunk {
     pub fn with_charge(bytes: impl Into<Bytes>, charge: Charge) -> Chunk {
         Chunk {
             bytes: bytes.into(),
-            charge: Some(charge),
+            charge: Some(Arc::new(charge)),
+            credit: None,
         }
     }
 
@@ -55,9 +59,33 @@ impl Chunk {
         self.bytes.advance(n);
     }
 
+    /// Splits off a prefix, retaining the backing allocation charge until
+    /// both pieces have been released.
+    pub fn split_to(&mut self, n: usize) -> Chunk {
+        Chunk {
+            bytes: self.bytes.split_to(n),
+            charge: self.charge.clone(),
+            credit: self.credit.clone(),
+        }
+    }
+
+    /// Copies unaccounted bytes into a reserved allocation. Already charged
+    /// backing storage keeps its charge, including any unread suffix.
+    pub fn reserve(&mut self, budget: &Budget) -> bool {
+        if self.charge.is_some() {
+            return true;
+        }
+        let Some(charge) = budget.charge(self.len()) else {
+            return false;
+        };
+        self.bytes = Bytes::copy_from_slice(&self.bytes);
+        self.charge = Some(Arc::new(charge));
+        true
+    }
+
     /// The bytes charged for this chunk.
     pub fn charged(&self) -> usize {
-        self.charge.as_ref().map_or(0, Charge::bytes)
+        self.charge.as_ref().map_or(0, |charge| charge.bytes())
     }
 }
 
@@ -78,10 +106,83 @@ impl core::fmt::Debug for Chunk {
     }
 }
 
+/// Receive credit returned when the owning payload is released. A carrier
+/// with retained data attaches this token to its backing storage.
+pub struct CreditReturn {
+    released: Arc<AtomicU64>,
+    units: u64,
+}
+
+impl CreditReturn {
+    pub(crate) fn new(released: Arc<AtomicU64>, units: u64) -> Self {
+        Self { released, units }
+    }
+}
+
+impl Drop for CreditReturn {
+    fn drop(&mut self) {
+        self.released.fetch_add(self.units, Ordering::Relaxed);
+    }
+}
+
 /// What a value uses of a child's credit (see [`Mux`]).
 pub trait Credited {
     /// The credit units this value uses.
     fn credit(&self) -> u64;
+
+    /// Takes a legal prefix within `units`, returning the untouched item
+    /// when this carrier is atomic or no prefix fits.
+    fn admit_credit(self, units: u64) -> Result<(Self, Option<Self>), Self>
+    where
+        Self: Sized,
+    {
+        if self.credit() <= units {
+            Ok((self, None))
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Backing bytes to reserve before advertising a receive window. This
+    /// is independent of item slots and peer command credit. Carriers whose
+    /// credit counts messages must supply a bounded payload policy separately.
+    fn receive_bytes(_window: u64) -> Option<usize> {
+        Some(0)
+    }
+
+    /// Admits a payload against the already reserved receive backing, or
+    /// reserves its own separately accounted payload for an atomic carrier.
+    fn reserve_receive(&mut self, budget: &Budget, _backing: &Arc<Charge>) -> bool {
+        self.reserve(budget)
+    }
+
+    /// Reserves any retained payload before admission. Carrier implementations
+    /// with owned storage must override this or carry a reservation already.
+    fn reserve(&mut self, _budget: &Budget) -> bool {
+        true
+    }
+
+    /// Attaches receive credit to the retained payload. Atomic messages use
+    /// admission credit; byte and body carriers override this to retain it.
+    fn retain_credit(&mut self, mut credit: CreditReturn) -> bool {
+        credit.units = 0;
+        false
+    }
+
+    /// Whether credit can split this value at legal byte boundaries.
+    fn splittable(&self) -> bool {
+        false
+    }
+
+    /// Whether this event terminates the child and invalidates queued data.
+    fn terminal_reset(&self) -> bool {
+        false
+    }
+
+    /// Whether this event may pass refused input. EOF never may.
+    fn urgent(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +230,44 @@ pub enum StreamCommand {
 }
 
 impl Credited for StreamEvent {
+    fn terminal_reset(&self) -> bool {
+        matches!(self, Self::Reset)
+    }
+    fn receive_bytes(window: u64) -> Option<usize> {
+        usize::try_from(window).ok()
+    }
+
+    fn reserve_receive(&mut self, _: &Budget, backing: &Arc<Charge>) -> bool {
+        if let Self::Data(chunk) = self {
+            // Normalize arbitrary input slices while the advertised window
+            // already pays for the new backing allocation.
+            chunk.bytes = Bytes::copy_from_slice(&chunk.bytes);
+            chunk.charge = Some(backing.clone());
+            chunk.credit = None;
+        }
+        true
+    }
+
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        match self {
+            Self::Data(chunk) => chunk.reserve(budget),
+            _ => true,
+        }
+    }
+
+    fn retain_credit(&mut self, credit: CreditReturn) -> bool {
+        if let Self::Data(chunk) = self {
+            chunk.credit = Some(Arc::new(credit));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn urgent(&self) -> bool {
+        matches!(self, StreamEvent::Written(_) | StreamEvent::Reset)
+    }
+
     fn credit(&self) -> u64 {
         match self {
             StreamEvent::Data(chunk) => chunk.len() as u64,
@@ -138,6 +277,31 @@ impl Credited for StreamEvent {
 }
 
 impl Credited for StreamCommand {
+    fn splittable(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        match self {
+            Self::Write(chunk) => chunk.reserve(budget),
+            _ => true,
+        }
+    }
+    fn admit_credit(self, units: u64) -> Result<(Self, Option<Self>), Self> {
+        if self.credit() <= units {
+            return Ok((self, None));
+        }
+        match self {
+            StreamCommand::Write(mut chunk) if units > 0 => {
+                let prefix = chunk.split_to(units as usize);
+                Ok((
+                    StreamCommand::Write(prefix),
+                    Some(StreamCommand::Write(chunk)),
+                ))
+            }
+            command => Err(command),
+        }
+    }
+
     fn credit(&self) -> u64 {
         match self {
             StreamCommand::Write(chunk) => chunk.len() as u64,
@@ -285,18 +449,20 @@ impl<O> Credited for MessageCommand<O> {
 /// its siblings and the connection's control traffic go on. Refusing a
 /// whole item ([`Admit::Blocked`](super::Admit::Blocked)) is left for the
 /// connection as a whole.
-pub struct Mux<C, K>(PhantomData<fn() -> (C, K)>);
+pub struct Mux<C, K, O = ()>(PhantomData<fn(C, K, O)>);
 
-impl<C: Port, K: Port> Port for Mux<C, K> {
-    type Event = MuxEvent<C, K>;
+impl<C: Port, K: Port, O> Port for Mux<C, K, O> {
+    type Event = MuxEvent<C, K, O>;
     type Command = MuxCommand<C, K>;
 }
 
 /// What comes up from a multiplexed connection.
-pub enum MuxEvent<C: Port, K: Port> {
+pub enum MuxEvent<C: Port, K: Port, O = ()> {
     /// A new child, opened by the peer or because the upper side asked.
-    /// The handle is the only way to address it.
-    Opened(Child),
+    /// The handle is the only way to address it. The final value is the
+    /// largest atomic command cost this child can ever admit, independent
+    /// of its currently granted credit.
+    Opened(Child, O, u64),
     /// An event of one child, within the credit granted for it.
     Child(ChildId, EventOf<C>),
     /// The child may send this many more credit units.
@@ -417,18 +583,36 @@ pub struct Slots<T> {
     free: Vec<u32>,
     live: usize,
     limit: usize,
+    _storage: Option<Charge>,
 }
 
 impl<T> Slots<T> {
-    /// Room for at most `limit` children at once.
+    /// Room for at most `limit` children at once. This constructor uses
+    /// bounded engine storage; connection-owned muxes use [`Self::with_budget`].
     pub fn new(limit: usize) -> Slots<T> {
         Slots {
-            scope: SCOPES.fetch_add(1, Ordering::Relaxed),
+            scope: SCOPES
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .expect("child scopes exhausted"),
             entries: Vec::new(),
             free: Vec::new(),
             live: 0,
             limit: limit.min(u32::MAX as usize),
+            _storage: None,
         }
+    }
+
+    /// Reserves all slot and free-list storage against a connection budget
+    /// before allocating. Values stored in a slot own their payload charges.
+    pub fn with_budget(limit: usize, budget: &Budget) -> Option<Slots<T>> {
+        let limit = limit.min(u32::MAX as usize);
+        let bytes = limit.checked_mul(size_of::<(u64, Option<T>)>() + size_of::<u32>())?;
+        let charge = budget.charge(bytes)?;
+        let mut slots = Slots::new(limit);
+        slots.entries = Vec::with_capacity(limit);
+        slots.free = Vec::with_capacity(limit);
+        slots._storage = Some(charge);
+        Some(slots)
     }
 
     /// Adds a child, or hands `value` back when the limit is reached.
@@ -439,6 +623,12 @@ impl<T> Slots<T> {
         let slot = match self.free.pop() {
             Some(slot) => slot,
             None => {
+                if self.entries.len() >= self.limit {
+                    return Err(value);
+                }
+                if self.entries.len() == self.entries.capacity() {
+                    self.entries.reserve_exact(1);
+                }
                 self.entries.push((0, None));
                 (self.entries.len() - 1) as u32
             }
@@ -488,9 +678,14 @@ impl<T> Slots<T> {
             return None;
         }
         let entry = &mut self.entries[id.slot as usize];
-        entry.0 += 1;
         let value = entry.1.take();
-        self.free.push(id.slot);
+        if let Some(next) = entry.0.checked_add(1) {
+            entry.0 = next;
+            if self.free.len() == self.free.capacity() {
+                self.free.reserve_exact(1);
+            }
+            self.free.push(id.slot);
+        }
         self.live -= 1;
         value
     }

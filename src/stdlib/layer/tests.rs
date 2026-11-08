@@ -240,7 +240,9 @@ impl Layer for Echo {
     type Upper = Top;
     /// The length of each line answered.
     type Report = usize;
-    fn report_bytes(_: &usize) -> Option<usize> { Some(0) }
+    fn report_bytes(_: &usize) -> Option<usize> {
+        Some(0)
+    }
     type Timer = ();
     type Work = ();
     type Done = ();
@@ -679,7 +681,7 @@ impl Toy {
                 };
                 let child = self.lanes.insert(lane).map_err(|_| ToyError::Full)?;
                 self.by_peer.insert(peer, child.id());
-                self.up.push_back(MuxEvent::Opened(child));
+                self.up.push_back(MuxEvent::Opened(child, (), u64::MAX));
             }
             DATA => {
                 let (_, lane) = self.lane(peer)?;
@@ -1010,7 +1012,10 @@ fn masked(room: usize) -> Masked {
 
 fn muxed() -> Muxed {
     Chain::new(
-        Chain::new(Toy::new(8), Children::new(8, 64, Answer::default)),
+        Chain::new(
+            Toy::new(8),
+            Children::new(8, 64, |_, (), _| Answer::default()),
+        ),
         Pong::default(),
     )
 }
@@ -1020,9 +1025,9 @@ fn gated() -> Gated {
 }
 
 /// The work a muxed stack asks for, as the child it is for.
-fn work_child(work: Side<Side<(), (ChildId, ())>, ()>) -> ChildId {
+fn work_child(work: Side<Side<(), (ChildId, OwnedWork<()>)>, ()>) -> ChildId {
     match work {
-        Side::Lower(Side::Upper((id, ()))) => id,
+        Side::Lower(Side::Upper((id, _))) => id,
         _ => panic!("only children ask for work"),
     }
 }
@@ -1452,7 +1457,7 @@ fn a_mux_refuses_commands_for_a_child_that_is_gone() {
     let open = frame(OPEN, 5, b"head");
     let _ = driver.deliver(StreamEvent::Data(Chunk::new(open))).unwrap();
     driver.run().unwrap();
-    let Some(MuxEvent::Opened(child)) = driver.layer_mut().take_event() else {
+    let Some(MuxEvent::Opened(child, (), u64::MAX)) = driver.layer_mut().take_event() else {
         panic!("the child opened");
     };
     let close = frame(CLOSE, 5, &[]);

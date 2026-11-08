@@ -210,9 +210,9 @@ pub use budget::{Budget, Charge, OwnedWork, WorkOwner};
 /// Maximum supported composition depth, including erased layers.
 pub const MAX_DEPTH: usize = 32;
 pub use carrier::{
-    ByteStream, Child, ChildId, Chunk, Credited, Datagram, DatagramCommand, DatagramEvent,
-    Datagrams, MessageCommand, MessageEvent, Messages, Mux, MuxCommand, MuxEvent, MuxOp, Slots,
-    StreamCommand, StreamEvent,
+    ByteStream, Child, ChildId, Chunk, CreditReturn, Credited, Datagram, DatagramCommand,
+    DatagramEvent, Datagrams, MessageCommand, MessageEvent, Messages, Mux, MuxCommand, MuxEvent,
+    MuxOp, Slots, StreamCommand, StreamEvent,
 };
 pub use chain::Chain;
 pub use children::{ChildReport, Children, Overrun};

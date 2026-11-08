@@ -29,7 +29,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
     /// `upper` on top of `lower`.
     pub fn new(lower: A, upper: B) -> Chain<A, B> {
         assert!(
-            1 + lower.depth().max(upper.depth()) <= MAX_DEPTH,
+            lower.depth().max(upper.depth()) < MAX_DEPTH,
             "composition depth exceeded"
         );
         Chain {
