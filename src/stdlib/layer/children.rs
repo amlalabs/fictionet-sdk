@@ -81,6 +81,12 @@ type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> B + Send;
 /// At most 4096 children can be configured; work and deadline scans share
 /// that hard bound. Byte receive credit returns when its backing is released;
 /// atomic message credit returns on admission, independently of memory.
+///
+/// The router's queues are charged to the budget from its first step. Each
+/// child's place and its inbox are charged as they grow, the places up to the
+/// limit and each inbox up to its bound, and the places go once no child is
+/// left. A child whose storage the budget cannot hold is refused
+/// ([`ChildReport::Refused`]) and its siblings go on.
 pub struct Children<B, K, O = ()>
 where
     B: Layer<Upper = Top>,
@@ -111,7 +117,8 @@ struct Kid<B: Layer> {
     layer: B,
     /// Events the mux sent within credit that the layer has not taken.
     inbox: VecDeque<(EventOf<B::Lower>, bool)>,
-    _storage: Charge,
+    /// What the inbox is charged: its places, grown as events wait.
+    storage: Charge,
     released: Arc<AtomicU64>,
     backing: Arc<Charge>,
     max_command: u64,
@@ -192,32 +199,78 @@ where
         }
     }
 
+    /// The routing storage for `kids` child places: the places themselves,
+    /// the command queue with one closing place per child, and the control
+    /// queue.
+    fn routing_bytes(kids: usize) -> Option<usize> {
+        kids.checked_mul(size_of::<(ChildId, Kid<B>)>())?
+            .checked_add(
+                (QUEUE.checked_add(kids)?)
+                    .checked_mul(size_of::<MuxCommand<B::Lower, K>>())?
+                    .checked_add(QUEUE.checked_mul(size_of::<EventOf<K>>())?)?,
+            )
+    }
+
+    /// Reserves the queues the first time anything arrives. Child places
+    /// are reserved as children open ([`Self::make_room`]).
     fn reserve(&mut self, budget: &Budget) -> Result<(), Overrun> {
         if self.storage.is_some() {
             return Ok(());
         }
-        let bytes = self
-            .limit
-            .checked_mul(size_of::<(ChildId, Kid<B>)>())
-            .and_then(|n| {
-                n.checked_add(
-                    (QUEUE.checked_add(self.limit)?)
-                        .checked_mul(size_of::<MuxCommand<B::Lower, K>>())?
-                        .checked_add(QUEUE.checked_mul(size_of::<EventOf<K>>())?)?,
-                )
-            })
-            .ok_or(Overrun::Budget)?;
+        let bytes = Self::routing_bytes(0).ok_or(Overrun::Budget)?;
         let charge = budget.charge(bytes).ok_or(Overrun::Budget)?;
-        self.kids = Vec::with_capacity(self.limit);
-        self.down = VecDeque::with_capacity(QUEUE + self.limit);
+        self.kids = Vec::new();
+        self.down = VecDeque::with_capacity(QUEUE);
         self.up = VecDeque::with_capacity(QUEUE);
         self.storage = Some(charge);
         Ok(())
     }
 
+    /// Makes a place for one more child, charging its routing storage
+    /// before growing. Places grow geometrically up to the limit and are
+    /// kept once made. Returns whether there is room.
+    fn make_room(&mut self) -> bool {
+        if self.kids.len() < self.kids.capacity() {
+            return true;
+        }
+        let places = self
+            .kids
+            .capacity()
+            .saturating_mul(2)
+            .max(4)
+            .min(self.limit.max(1));
+        let Some(bytes) = Self::routing_bytes(places) else {
+            return false;
+        };
+        let Some(storage) = &mut self.storage else {
+            return false;
+        };
+        if !storage.set(bytes) {
+            return false;
+        }
+        self.kids.reserve_exact(places - self.kids.len());
+        self.down.reserve_exact(QUEUE + places - self.down.len());
+        true
+    }
+
     fn remove(&mut self, id: ChildId) -> Option<Kid<B>> {
         let index = self.kids.iter().position(|(key, _)| *key == id)?;
         Some(self.kids.remove(index).1)
+    }
+
+    /// With no children the places go, so an idle connection holds the same
+    /// whatever it held before. Closing commands still queued keep their
+    /// places until the mux takes them.
+    fn release_places(&mut self) {
+        if !self.kids.is_empty() || self.storage.is_none() {
+            return;
+        }
+        self.kids = Vec::new();
+        self.down.shrink_to(QUEUE.max(self.down.len()));
+        let places = self.down.capacity().saturating_sub(QUEUE);
+        if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
+            storage.set(bytes);
+        }
     }
 
     /// The layer of child `id`, while it is open.
@@ -375,23 +428,24 @@ where
                         max_command,
                     )));
                 }
-                if self.kids.len() >= self.limit {
+                // A child past the limit, or one whose storage the budget
+                // cannot hold, is refused: closed at once, its siblings
+                // and the connection untouched.
+                let reserved = (self.kids.len() < self.limit && self.make_room())
+                    .then(|| {
+                        // The inbox grows as events wait in it (`admit`).
+                        let storage = env.budget().charge(0)?;
+                        let backing = env
+                            .budget()
+                            .charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
+                        Some((storage, Arc::new(backing)))
+                    })
+                    .flatten();
+                let Some((storage, backing)) = reserved else {
                     self.down.push_back(child.close());
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
-                }
-                let bytes = QUEUE
-                    .checked_mul(size_of::<(EventOf<B::Lower>, bool)>())
-                    .ok_or(Overrun::Budget)?;
-                let storage = env.budget().charge(bytes).ok_or(Overrun::Budget)?;
-                let backing = Arc::new(
-                    env.budget()
-                        .charge(
-                            EventOf::<B::Lower>::receive_bytes(self.window)
-                                .ok_or(Overrun::Budget)?,
-                        )
-                        .ok_or(Overrun::Budget)?,
-                );
+                };
                 let layer = (self.make)(id, opening, env.budget());
                 assert!(layer.depth() < MAX_DEPTH, "composition depth exceeded");
                 let kid = Kid {
@@ -399,8 +453,8 @@ where
                     layer,
                     owner: WorkOwner::new(),
                     urgent: None,
-                    inbox: VecDeque::with_capacity(QUEUE),
-                    _storage: storage,
+                    inbox: VecDeque::new(),
+                    storage,
                     released: Arc::new(AtomicU64::new(0)),
                     backing,
                     max_command,
@@ -450,6 +504,20 @@ where
                     } else {
                         if kid.inbox.len() >= QUEUE {
                             return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
+                        }
+                        if kid.inbox.len() == kid.inbox.capacity() {
+                            // Charge the inbox's growth before it grows; a
+                            // child the budget cannot hold is refused.
+                            let places = (kid.inbox.capacity() * 2).clamp(4, QUEUE);
+                            let bytes = places * size_of::<(EventOf<B::Lower>, bool)>();
+                            if !kid.storage.set(bytes) {
+                                let kid = self.remove(id).expect("live child");
+                                kid.owner.cancel();
+                                self.down.push_back(kid.handle.close());
+                                env.report(ChildReport::Refused(id));
+                                return Ok(Admit::Taken);
+                            }
+                            kid.inbox.reserve_exact(places - kid.inbox.len());
                         }
                         if !event.reserve_receive(env.budget(), &kid.backing) {
                             return Err(Overrun::Budget);
@@ -547,6 +615,9 @@ where
     }
 
     fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Overrun> {
+        // The queues are the router's fixed state: an idle connection holds
+        // them from its first step.
+        self.reserve(env.budget())?;
         if self.remaining_visits == 0 {
             self.remaining_visits = self.kids.len();
             self.sweep_first = None;
@@ -576,6 +647,7 @@ where
         if self.remaining_visits == 0 {
             self.turn = self.sweep_first;
         }
+        self.release_places();
         Ok(moved || self.remaining_visits > 0)
     }
 
@@ -918,6 +990,62 @@ mod tests {
         assert!(counts.iter().all(|n| *n > 0));
         assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1);
         assert!(driver.exhausted());
+    }
+
+    #[test]
+    fn a_child_the_budget_cannot_hold_is_refused_and_its_siblings_go_on() {
+        let made = Arc::new(AtomicU64::new(0));
+        let count = made.clone();
+        let children: Children<Reader, Top, ()> = Children::new(8, 8, move |_, (), _| {
+            count.fetch_add(1, Ordering::Relaxed);
+            Reader::default()
+        });
+        let budget = Budget::new(100_000);
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(96))),
+            budget.clone(),
+            Instant::ZERO,
+        );
+        driver.run().unwrap();
+        let idle = budget.used();
+        let mut slots = Slots::new(8);
+        let first = slots.insert(()).unwrap();
+        let a = first.id();
+        let _ = driver.deliver(MuxEvent::Opened(first, (), 8)).unwrap();
+        driver.run().unwrap();
+        while driver.layer_mut().take_command().is_some() {}
+        // Nothing is left for a second child's places.
+        let other = budget.charge(budget.limit() - budget.used()).unwrap();
+        let second = slots.insert(()).unwrap();
+        let b = second.id();
+        assert!(matches!(
+            driver.deliver(MuxEvent::Opened(second, (), 8)),
+            Ok(Admit::Taken)
+        ));
+        assert!(driver.layer().child(b).is_none());
+        assert!(
+            matches!(driver.layer_mut().take_command().unwrap().into_op(), crate::stdlib::layer::MuxOp::Close(id) if id == b)
+        );
+        assert_eq!(made.load(Ordering::Relaxed), 1);
+        drop(other);
+        // The first child still takes its events.
+        let _ = driver
+            .deliver(MuxEvent::Child(
+                a,
+                StreamEvent::Data(Chunk::new(Bytes::from_static(b"ab"))),
+            ))
+            .unwrap();
+        driver.run().unwrap();
+        assert_eq!(
+            driver.layer().child(a).unwrap().held.as_deref(),
+            Some(&b"ab"[..])
+        );
+        // With no children, the router holds what it held idle.
+        let _ = driver.deliver(MuxEvent::Closed(a)).unwrap();
+        driver.run().unwrap();
+        while driver.layer_mut().take_command().is_some() {}
+        assert_eq!(budget.used(), idle);
     }
 
     #[test]

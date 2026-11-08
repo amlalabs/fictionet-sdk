@@ -196,10 +196,11 @@
 //!
 //! [`http1`](super::protocols::http1) supplies wire values and decoders,
 //! including the body framing that serving, capture and archives share.
-//! `httpd::Http1` serves HTTP/1 as a layer, and `httpd::serve_connection`
-//! runs it over a live connection, handing the connection on after a `101`
-//! or a CONNECT with an `httpd::UpgradeHandler`; see the `httpd` module
-//! docs.
+//! `httpd::Http1` serves HTTP/1 as a layer, `httpd::Http2` serves HTTP/2 as
+//! one with a child per stream, and `httpd::serve_connection` runs them over
+//! a live connection. HTTP/1 hands the connection on after a `101` or a
+//! CONNECT with an `httpd::UpgradeHandler`, or to HTTP/2 after
+//! `Upgrade: h2c`; see the `httpd` module docs.
 //!
 //! HTTP/1 capture uses
 //! [`RequestHead::parse_lenient`](super::protocols::http1::RequestHead::parse_lenient)

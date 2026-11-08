@@ -357,8 +357,10 @@
 //!   Over TLS, the version is agreed in the handshake (ALPN): `start` sets
 //!   each config's ALPN list to `h2` and `http/1.1`, so a browser gets HTTP/2 and
 //!   `curl` gets what it asks for. Without TLS, the version is read from the
-//!   first bytes the client sends. HTTP/2 streams run as tasks in the
-//!   connection's [region](fictionet::Cx#regions).
+//!   first bytes the client sends, or a client upgrades with `Upgrade: h2c`.
+//!   Each HTTP/2 stream is a child of the connection's layer, and its
+//!   handler's async work runs in the connection's
+//!   [region](fictionet::Cx#regions).
 //! - **Routing by host.** Each request goes to the site for its host: the
 //!   authority of its URI if it has one (the `:authority` in HTTP/2, or an
 //!   absolute URI in HTTP/1.1), else its `Host` header. A host with no site

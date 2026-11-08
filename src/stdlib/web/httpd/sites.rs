@@ -19,7 +19,8 @@ use fictionet::stdlib::world::net::{
 };
 
 use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, Reply, http1_for, serve_connection, text,
+    Body, Exchange, Handler, HttpOptions, Limits, Reply, http1_for, http2_for, serve_connection,
+    text,
 };
 
 pub use fictionet::stdlib::world::net::normalize;
@@ -431,14 +432,11 @@ impl PortServer for Server {
         })
     }
 
-    /// HTTP/1 in the same stack as TLS, unless TLS agreed on `h2`: HTTP/2
-    /// is served as a connection. The network's
+    /// HTTP/2 when TLS agreed on `h2`, else HTTP/1, in the same stack as
+    /// TLS. The network's
     /// [`write_timeout`](fictionet::stdlib::world::net::Limits::write_timeout)
     /// gives up on a client that stops reading.
     fn over_tls(&self, _fcx: &Cx, opening: &Opening) -> Option<Boxed> {
-        if opening.info.alpn.as_deref() == Some(b"h2".as_slice()) {
-            return None;
-        }
         let opts = HttpOptions {
             observe: self.observe.clone().or(opening.http_observe.clone()),
             limits: self.limits,
@@ -447,9 +445,11 @@ impl PortServer for Server {
             date: self.date,
         };
         let handler = self.handler_for(&opening.info);
-        Some(Boxed::new(
-            http1_for(handler, &opts, &opening.info).upgradable(),
-        ))
+        Some(if opening.info.alpn.as_deref() == Some(b"h2".as_slice()) {
+            Boxed::new(http2_for(handler, &opts, &opening.info))
+        } else {
+            Boxed::new(http1_for(handler, &opts, &opening.info).upgradable())
+        })
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {
