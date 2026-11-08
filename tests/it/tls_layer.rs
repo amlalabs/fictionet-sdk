@@ -404,12 +404,12 @@ fn hello_work_finished_after_the_client_left_sends_nothing() {
     block_on(lab(Seed::from_u64(23), |fcx| async move {
         let ca = Ca::new(&fcx, "Test CA")?;
         let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
-        for answer in [Some(config), None] {
+        for answer in [Some(config.clone()), None] {
             let mut client = rustls::ClientConnection::new(
                 client_config(&fcx, &ca, &[b"http/1.1"]),
                 rustls::pki_types::ServerName::try_from("example.test").unwrap(),
             )?;
-            let mut server = Harness::new(Seed::from_u64(24), tls::TlsLayer::new());
+            let mut server = Harness::new(Seed::from_u64(24), tls::TlsLayer::new(config.clone()));
             server.push(&client_output(&mut client))?;
             assert!(server.work().is_some());
             // The client closes while the world is still choosing a config.

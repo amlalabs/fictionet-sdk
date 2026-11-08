@@ -21,6 +21,12 @@ impl Entropy for NoEntropy {
     }
 }
 
+/// A layer before any hello. It picks its config as work, which no
+/// harness runs, so no `ServerConfig` is built.
+fn fresh() -> TlsLayer {
+    TlsLayer::selecting(|_, _| async { None })
+}
+
 /// Cumulative byte counts stay below 2^62: a connection does not move
 /// 4 EiB, and the bound leaves room for every addition the code makes.
 const LIMIT: u64 = 1 << 62;
@@ -30,7 +36,7 @@ const LIMIT: u64 = 1 << 62;
 /// plaintext pending, and a fence only while that plaintext is pending
 /// and its ciphertext not yet all delivered.
 fn accounting() -> TlsLayer {
-    let mut layer = TlsLayer::new();
+    let mut layer = fresh();
     layer.produced = kani::any();
     layer.delivered = kani::any();
     kani::assume(layer.delivered <= layer.produced && layer.produced <= LIMIT);
@@ -116,7 +122,7 @@ fn a_write_is_acknowledged_once_after_its_ciphertext_completes() {
     let budget = Budget::unlimited();
     let mut observed = Observations::new(0);
     let mut env = Env::new(Instant::ZERO, &NoEntropy, &budget, &mut observed);
-    let mut layer = TlsLayer::new();
+    let mut layer = fresh();
     let start: u64 = kani::any();
     let c: u64 = kani::any();
     kani::assume(start <= LIMIT && c != 0 && c <= LIMIT);
