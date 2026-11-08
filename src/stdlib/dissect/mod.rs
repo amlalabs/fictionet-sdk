@@ -31,15 +31,20 @@ pub use conversation::Conversation;
 pub use present::{Observed, Place, Placement, Present};
 pub use registry::{Match, Protocol, Registry, Selection};
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::{self, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use fictionet::stdlib::codec::{be16, be32};
-use fictionet::stdlib::network::ip::Header;
-use fictionet::stdlib::protocols::tcp_reassembly::{
-    Chunk, FlowKey, Reassembler, Segment, conversation_key,
+use fictionet::stdlib::layer::{
+    Admit, Budget, Child, ChildId, Chunk, Direction, Driver, MuxEvent, ObservedEvent, PacketEvent,
 };
+use fictionet::stdlib::network::ip::Header;
+use fictionet::stdlib::network::observer::{self, Observer, ObserverReport};
+use fictionet::stdlib::network::packet::{Capture, Ingress, IpPacket, Scope};
+use fictionet::time::Instant;
+use fictionet::{Seed, SeededEntropy};
 
 /// One line of an `SSLKEYLOGFILE`: a TLS secret and the client random it
 /// belongs to. Debug output excludes the secret.
@@ -367,11 +372,72 @@ impl Decoded {
 }
 
 /// Decodes the packets of one link, in order.
-#[derive(Default)]
+///
+/// TCP goes through a passive [`Observer`], which puts each connection
+/// back in order and says where bytes are missing and how each direction
+/// ended; the dissector decodes what each connection carries. UDP
+/// datagrams between the same two endpoints are one conversation, kept
+/// across datagrams, for at most 256 conversations at once; past that, the
+/// one seen longest ago is forgotten.
 pub struct Dissector {
-    tcp: Reassembler,
-    conversations: HashMap<FlowKey, Conversation>,
+    observer: Driver<Observer>,
+    connections: BTreeMap<ChildId, Watched>,
+    udp: BTreeMap<(Scope, SocketAddr, SocketAddr), Datagrams>,
     registry: Registry,
+    /// Packets decoded so far: the number of the last one.
+    packets: u64,
+}
+
+/// UDP conversations kept at once.
+const UDP_CONVERSATIONS: usize = 256;
+
+/// One TCP connection the observer follows.
+struct Watched {
+    /// The observer's handle, held while the connection lasts.
+    _child: Child,
+    /// The ports, the lower endpoint's first.
+    ports: (u16, u16),
+    /// Whether the observer's forward direction, from the endpoint it saw
+    /// first, runs from the higher endpoint to the lower.
+    flip: bool,
+    /// The decoders, from the first byte or gap on.
+    conversation: Option<Conversation>,
+    /// Bytes delivered each way.
+    delivered: [u64; 2],
+}
+
+/// One UDP conversation: datagrams between two endpoints, both ways.
+struct Datagrams {
+    /// The sender of the first datagram.
+    first: SocketAddr,
+    /// The ports, the first sender's first.
+    ports: (u16, u16),
+    protocol: Option<Box<dyn Protocol>>,
+    /// The number of the packet that last carried a datagram of it.
+    last: u64,
+}
+
+/// A TCP observer within `limits`, driven with no clock or entropy of its
+/// own: an observer reads neither.
+fn tcp_observer(limits: observer::Limits) -> Driver<Observer> {
+    Driver::new(
+        Observer::new(limits),
+        Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+        Budget::unlimited(),
+        Instant::ZERO,
+    )
+}
+
+impl Default for Dissector {
+    fn default() -> Dissector {
+        Dissector {
+            observer: tcp_observer(observer::Limits::default()),
+            connections: BTreeMap::new(),
+            udp: BTreeMap::new(),
+            registry: Registry::default(),
+            packets: 0,
+        }
+    }
 }
 
 impl std::fmt::Debug for Dissector {
@@ -411,8 +477,25 @@ impl Dissector {
     /// capture sampled or evicted some. No decoder joins bytes across the
     /// gap. Reassembly limits and the registry stay as they are.
     pub fn lost(&mut self) {
-        self.tcp = Reassembler::new(self.tcp.limits());
-        self.conversations.clear();
+        self.observer = tcp_observer(self.observer.layer().limits());
+        self.connections.clear();
+        self.udp.clear();
+    }
+
+    /// Finishes the capture. Each TCP direction still open ends: what was
+    /// held past a hole is decoded after its gap, and the direction ends
+    /// as incomplete, since a capture ending without a FIN does not show
+    /// that the sender finished. Returns what that completes, as one more
+    /// entry. The dissector then starts over, as for a new capture.
+    pub fn finish(&mut self, keys: &[KeyLine]) -> Decoded {
+        let mut d = Decoded {
+            info: "End of capture".into(),
+            ..Decoded::default()
+        };
+        self.watch(PacketEvent::Ended, &mut d, keys, None);
+        self.lost();
+        d.cap_info();
+        d
     }
 
     /// Decodes one raw IPv4 or IPv6 packet. Pass TLS key log entries when
@@ -429,6 +512,7 @@ impl Dissector {
         protocol: Option<&str>,
         complete: bool,
     ) -> Decoded {
+        self.packets += 1;
         let context = DecodeContext { protocol, complete };
         let mut d = Decoded::default();
         match p.first().map(|b| b >> 4) {
@@ -608,8 +692,8 @@ impl Dissector {
             context.complete = false;
         }
         match proto {
-            6 => self.tcp(p, at, end, header.src, header.dst, d, keys, context),
-            17 => udp(p, at, end, d, &self.registry, context),
+            6 => self.tcp(p, at, end, d, keys, context),
+            17 => self.udp(p, header, d, context),
             1 => icmp(p, at, end, d, false),
             58 => icmp(p, at, end, d, true),
             other => {
@@ -619,14 +703,13 @@ impl Dissector {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Decodes a TCP segment and gives it to the observer, whose
+    /// connections' bytes go to their decoders.
     fn tcp(
         &mut self,
         p: &[u8],
         at: usize,
         end: usize,
-        src: IpAddr,
-        dst: IpAddr,
         d: &mut Decoded,
         keys: &[KeyLine],
         context: DecodeContext<'_>,
@@ -657,44 +740,51 @@ impl Dissector {
         };
         let (seq, ack, flags, win) = (sequence, acknowledgment, t[13], window);
         let payload = (at + off, end);
-        let key = (src, sport, dst, dport);
-        let flow = self.tcp.push(Segment {
-            key,
-            seq,
-            ack,
-            flags,
-            payload: if context.complete {
-                &p[payload.0..payload.1]
-            } else {
-                &[]
+        // The observer gets what the copy holds of the packet: the headers
+        // alone when the payload is not all here. The dissector is given no
+        // capture times, and the observer reads none.
+        let held = if context.complete { p } else { &p[..at + off] };
+        let packet = IpPacket::observed(
+            Chunk::new(held.to_vec()),
+            Ingress {
+                scope: Scope::ROOT,
+                link: 0,
+                capture: Some(Capture {
+                    number: self.packets,
+                    at: Instant::ZERO,
+                    original_len: p.len(),
+                }),
             },
-        });
-        let (ckey, reversed) = conversation_key(key);
-        if flow.cleared {
-            self.conversations.clear();
-        }
-        if flow.restarted {
-            self.conversations.remove(&ckey);
+        );
+        let (reports, seen) = self.observe(PacketEvent::Packet(packet));
+        let (mut rel_seq, mut rel_ack, mut retransmission) = (0, 0, false);
+        let (mut dropped, mut late) = (false, false);
+        for report in reports {
+            match report {
+                ObserverReport::Segment {
+                    sequence,
+                    acknowledgment,
+                    retransmission: again,
+                    ..
+                } => (rel_seq, rel_ack, retransmission) = (sequence, acknowledgment, again),
+                ObserverReport::Dropped { .. } => dropped = true,
+                ObserverReport::Late { .. } => late = true,
+                ObserverReport::Unwatched { .. } => {}
+            }
         }
         let names = flag_names(flags);
         let mut l = Layer::new("Transmission Control Protocol", 0, (at, at + off));
         let r = |a: usize, b: usize| (at + a, at + b);
         l.summary = format!(
-            "Src Port: {sport}, Dst Port: {dport}, Seq: {}, Ack: {}, Len: {}",
-            flow.rel_seq,
-            flow.rel_ack,
+            "Src Port: {sport}, Dst Port: {dport}, Seq: {rel_seq}, Ack: {rel_ack}, Len: {}",
             payload.1 - payload.0
         );
         l.field("Source port", sport.to_string(), r(0, 2));
         l.field("Destination port", dport.to_string(), r(2, 4));
-        l.field(
-            "Sequence number",
-            format!("{} (raw {seq})", flow.rel_seq),
-            r(4, 8),
-        );
+        l.field("Sequence number", format!("{rel_seq} (raw {seq})"), r(4, 8));
         l.field(
             "Acknowledgment number",
-            format!("{} (raw {ack})", flow.rel_ack),
+            format!("{rel_ack} (raw {ack})"),
             r(8, 12),
         );
         l.field("Header length", format!("{off} bytes"), r(12, 13));
@@ -721,17 +811,13 @@ impl Dissector {
         d.src = sock(&d.src, sport);
         d.dst = sock(&d.dst, dport);
         d.proto = "TCP".into();
-        let mut info = format!(
-            "{sport} → {dport} [{}] Seq={} ",
-            names.join(", "),
-            flow.rel_seq
-        );
+        let mut info = format!("{sport} → {dport} [{}] Seq={rel_seq} ", names.join(", "));
         if flags & 0x10 != 0 {
             #[expect(
                 clippy::let_underscore_must_use,
                 reason = "fmt::Write for String never returns Err"
             )]
-            let _ = write!(info, "Ack={} ", flow.rel_ack);
+            let _ = write!(info, "Ack={rel_ack} ");
         }
         #[expect(
             clippy::let_underscore_must_use,
@@ -745,7 +831,7 @@ impl Dissector {
             )]
             let _ = write!(info, " {}", opts.join(" "));
         }
-        if flow.retransmission {
+        if retransmission {
             d.tag("retransmission");
             info.push_str(" [retransmission]");
         }
@@ -753,61 +839,258 @@ impl Dissector {
             d.tag("reset");
         }
         d.info = info;
-        if !context.complete {
-            self.conversations.remove(&ckey);
-            return;
-        }
-        let mut gap = false;
-        let layers = d.layers.len().checked_add(d.cut);
-        let mut delivered = false;
-        for event in flow.events {
-            match event {
-                Chunk::Bytes {
-                    offset,
-                    bytes,
-                    input_offset,
-                    ..
-                } => {
-                    let conversation = self.conversations.entry(ckey).or_insert_with(|| {
-                        Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
-                            .with_protocol(context.protocol)
-                    });
-                    let place = Place {
-                        stream_start: offset,
-                        buf: 0,
-                        offset: input_offset.and_then(|at| payload.0.checked_add(at)),
-                        len: bytes.len(),
-                    };
-                    conversation.data(reversed, &bytes, place, d, keys);
-                    delivered = true;
-                }
-                Chunk::Gap { resumed: true, .. } => {
-                    let conversation = self.conversations.entry(ckey).or_insert_with(|| {
-                        Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
-                            .with_protocol(context.protocol)
-                    });
-                    conversation.lost(reversed);
-                }
-                Chunk::Gap { resumed: false, .. } => gap = true,
-                // Forwarding Protocol::end would end Observed streams, but
-                // reassembly still delivers captured payload after FIN or RST.
-                // Keep the conversation until a SYN replaces it.
-                Chunk::End { .. } => {}
-            }
-        }
-        if gap {
+        if dropped {
             d.tag("gap");
         }
-        if delivered
+        if late {
+            // Payload after its direction ended: shown, never decoded.
+            d.tag("late");
+        }
+        let layers = d.layers.len().checked_add(d.cut);
+        let last = self.apply(seen, d, keys, context.protocol);
+        if let Some((id, reverse)) = last
             && d.layers.len().checked_add(d.cut) == layers
             && self
-                .conversations
-                .get(&ckey)
-                .is_some_and(|c| c.waiting(reversed))
+                .connections
+                .get(&id)
+                .and_then(|watched| watched.conversation.as_ref())
+                .is_some_and(|c| c.waiting(reverse))
         {
             d.info.push_str(" [part of a longer message]");
         }
     }
+
+    /// Hands the TCP observer `event`, and takes what comes up: its
+    /// reports, and what its connections carry, for [`apply`](Self::apply).
+    /// A connection the observer opens gets credit for all it sends.
+    fn observe(&mut self, event: PacketEvent<IpPacket>) -> (Vec<ObserverReport>, Vec<Observation>) {
+        match self.observer.deliver(event) {
+            Ok(_) => {}
+            Err(never) => match never {},
+        }
+        let reports = self.observer.observations().drain().collect();
+        let mut seen = Vec::new();
+        loop {
+            let mut batch = Vec::new();
+            self.observer.send_above(|event| {
+                batch.push(event);
+                Admit::Taken
+            });
+            if batch.is_empty() {
+                break;
+            }
+            for event in batch {
+                match event {
+                    MuxEvent::Opened(child, connection, _) => {
+                        match self.observer.command(child.grant(u64::MAX)) {
+                            Ok(_) => {}
+                            Err(never) => match never {},
+                        }
+                        let (_, low, high, _) = connection.key();
+                        self.connections.insert(
+                            child.id(),
+                            Watched {
+                                _child: child,
+                                ports: (low.port(), high.port()),
+                                flip: connection.first != low,
+                                conversation: None,
+                                delivered: [0; 2],
+                            },
+                        );
+                    }
+                    MuxEvent::Child(id, event) => seen.push(Observation::Event(id, event)),
+                    MuxEvent::Closed(id) => seen.push(Observation::Closed(id)),
+                    MuxEvent::Credit(..) => {}
+                    MuxEvent::Control(never) => match never {},
+                }
+            }
+        }
+        (reports, seen)
+    }
+
+    /// Feeds what the observer's connections carried to their decoders, in
+    /// order, and returns the connection and direction that last got bytes.
+    /// A gap resets a direction's decoders. A clean end finishes them; any
+    /// other end discards what they held, since what they waited for will
+    /// not come.
+    fn apply(
+        &mut self,
+        seen: Vec<Observation>,
+        d: &mut Decoded,
+        keys: &[KeyLine],
+        protocol: Option<&str>,
+    ) -> Option<(ChildId, bool)> {
+        let mut last = None;
+        for observation in seen {
+            let (id, event) = match observation {
+                Observation::Closed(id) => {
+                    self.connections.remove(&id);
+                    continue;
+                }
+                Observation::Event(id, event) => (id, event),
+            };
+            let Some(watched) = self.connections.get_mut(&id) else {
+                continue;
+            };
+            let reverse = match event.direction() {
+                Direction::Forward => watched.flip,
+                Direction::Reverse => !watched.flip,
+            };
+            let (low, high) = watched.ports;
+            let registry = &self.registry;
+            let open =
+                || Conversation::with_registry(low, high, registry.clone()).with_protocol(protocol);
+            match event {
+                ObservedEvent::Data { bytes, source, .. } => {
+                    let i = usize::from(reverse);
+                    let place = Place {
+                        stream_start: watched.delivered[i],
+                        buf: 0,
+                        offset: source
+                            .filter(|source| source.packet == self.packets)
+                            .map(|source| source.offset),
+                        len: bytes.len(),
+                    };
+                    watched.delivered[i] = watched.delivered[i].saturating_add(bytes.len() as u64);
+                    let conversation = watched.conversation.get_or_insert_with(open);
+                    conversation.data(reverse, &bytes, place, d, keys);
+                    last = Some((id, reverse));
+                }
+                ObservedEvent::Gap { .. } => {
+                    watched.conversation.get_or_insert_with(open).lost(reverse);
+                }
+                ObservedEvent::End { cause, .. } => {
+                    if let Some(conversation) = &mut watched.conversation {
+                        if cause.is_clean() {
+                            conversation.end(reverse, d);
+                        } else {
+                            conversation.lost(reverse);
+                        }
+                    }
+                }
+            }
+        }
+        last
+    }
+
+    /// Hands the observer `event` and applies what comes up.
+    fn watch(
+        &mut self,
+        event: PacketEvent<IpPacket>,
+        d: &mut Decoded,
+        keys: &[KeyLine],
+        protocol: Option<&str>,
+    ) {
+        let (_, seen) = self.observe(event);
+        self.apply(seen, d, keys, protocol);
+    }
+
+    /// Decodes a UDP datagram, and gives its payload to its conversation.
+    fn udp(&mut self, p: &[u8], header: &Header, d: &mut Decoded, context: DecodeContext<'_>) {
+        let (at, end) = (header.payload.start, header.payload.end);
+        let u = &p[at..end];
+        if u.len() < 8 {
+            return truncated(d, "UDP", u.len());
+        }
+        let Some(source_port) = be16(u, 0) else {
+            return truncated(d, "UDP", u.len());
+        };
+        let Some(destination_port) = be16(u, 2) else {
+            return truncated(d, "UDP", u.len());
+        };
+        let Some(length) = be16(u, 4) else {
+            return truncated(d, "UDP", u.len());
+        };
+        let (sport, dport, len) = (source_port, destination_port, length);
+        // The datagram is as long as its header says, if the packet holds that
+        // much: bytes after it are not part of it. A copy that does not hold
+        // the whole packet, such as a first fragment, cannot be held to the
+        // length its header says.
+        let datagram = fictionet::stdlib::network::udp::Datagram::parse(u);
+        let short = context.complete && datagram.is_none();
+        let end = datagram.map_or(end, |datagram| at + 8 + datagram.payload().len());
+        let u = &p[at..end];
+        let mut l = Layer::new("User Datagram Protocol", 0, (at, at + 8));
+        l.summary = format!("Src Port: {sport}, Dst Port: {dport}");
+        l.field("Source port", sport.to_string(), (at, at + 2));
+        l.field("Destination port", dport.to_string(), (at + 2, at + 4));
+        l.field("Length", len.to_string(), (at + 4, at + 6));
+        let Some(checksum) = be16(u, 6) else {
+            return truncated(d, "UDP", u.len());
+        };
+        l.field("Checksum", format!("0x{:04x}", checksum), (at + 6, at + 8));
+        d.push(l);
+        d.src = sock(&d.src, sport);
+        d.dst = sock(&d.dst, dport);
+        d.proto = "UDP".into();
+        d.info = format!("{sport} → {dport} Len={}", u.len() - 8);
+        if short {
+            d.info.push_str(" [bad length]");
+            d.tag("malformed");
+            return;
+        }
+        if !context.complete {
+            return;
+        }
+        let body = (at + 8, end);
+        let bytes = &p[body.0..body.1];
+        let (src, dst) = (
+            SocketAddr::new(header.src, sport),
+            SocketAddr::new(header.dst, dport),
+        );
+        let key = if src <= dst {
+            (Scope::ROOT, src, dst)
+        } else {
+            (Scope::ROOT, dst, src)
+        };
+        if !self.udp.contains_key(&key) && self.udp.len() >= UDP_CONVERSATIONS {
+            let oldest = self
+                .udp
+                .iter()
+                .min_by_key(|(_, conversation)| conversation.last)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                self.udp.remove(&oldest);
+            }
+        }
+        let conversation = self.udp.entry(key).or_insert_with(|| Datagrams {
+            first: src,
+            ports: (sport, dport),
+            protocol: None,
+            last: 0,
+        });
+        conversation.last = self.packets;
+        let reverse = src != conversation.first;
+        if conversation.protocol.is_none() {
+            conversation.protocol = self
+                .registry
+                .open(Selection {
+                    transport: fictionet::stdlib::dissect::Transport::Udp,
+                    ports: conversation.ports,
+                    protocol: context.protocol,
+                    alpn: None,
+                    first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
+                })
+                .ok();
+        }
+        if let Some(protocol) = &mut conversation.protocol {
+            let place = Place {
+                stream_start: 0,
+                buf: 0,
+                offset: Some(body.0),
+                len: bytes.len(),
+            };
+            protocol.datagram(reverse, bytes, place, d, &[]);
+        }
+    }
+}
+
+/// What came up from the TCP observer for the decoders.
+enum Observation {
+    /// An event of one connection.
+    Event(ChildId, ObservedEvent),
+    /// The connection is gone.
+    Closed(ChildId),
 }
 
 fn sock(ip: &str, port: u16) -> String {
@@ -863,79 +1146,6 @@ fn tcp_options(bytes: &[u8]) -> Vec<String> {
             })
         })
         .collect()
-}
-
-fn udp(
-    p: &[u8],
-    at: usize,
-    end: usize,
-    d: &mut Decoded,
-    registry: &Registry,
-    context: DecodeContext<'_>,
-) {
-    let u = &p[at..end];
-    if u.len() < 8 {
-        return truncated(d, "UDP", u.len());
-    }
-    let Some(source_port) = be16(u, 0) else {
-        return truncated(d, "UDP", u.len());
-    };
-    let Some(destination_port) = be16(u, 2) else {
-        return truncated(d, "UDP", u.len());
-    };
-    let Some(length) = be16(u, 4) else {
-        return truncated(d, "UDP", u.len());
-    };
-    let (sport, dport, len) = (source_port, destination_port, length);
-    // The datagram is as long as its header says, if the packet holds that
-    // much: bytes after it are not part of it. A copy that does not hold
-    // the whole packet, such as a first fragment, cannot be held to the
-    // length its header says.
-    let datagram = fictionet::stdlib::network::udp::Datagram::parse(u);
-    let short = context.complete && datagram.is_none();
-    let end = datagram.map_or(end, |datagram| at + 8 + datagram.payload().len());
-    let u = &p[at..end];
-    let mut l = Layer::new("User Datagram Protocol", 0, (at, at + 8));
-    l.summary = format!("Src Port: {sport}, Dst Port: {dport}");
-    l.field("Source port", sport.to_string(), (at, at + 2));
-    l.field("Destination port", dport.to_string(), (at + 2, at + 4));
-    l.field("Length", len.to_string(), (at + 4, at + 6));
-    let Some(checksum) = be16(u, 6) else {
-        return truncated(d, "UDP", u.len());
-    };
-    l.field("Checksum", format!("0x{:04x}", checksum), (at + 6, at + 8));
-    d.push(l);
-    d.src = sock(&d.src, sport);
-    d.dst = sock(&d.dst, dport);
-    d.proto = "UDP".into();
-    d.info = format!("{sport} → {dport} Len={}", u.len() - 8);
-    if short {
-        d.info.push_str(" [bad length]");
-        d.tag("malformed");
-        return;
-    }
-    let body = (at + 8, end);
-    if !context.complete || body.0 >= body.1 {
-        return;
-    }
-    let bytes = &p[body.0..body.1];
-    let selection = Selection {
-        transport: fictionet::stdlib::dissect::Transport::Udp,
-        ports: (sport, dport),
-        protocol: context.protocol,
-        alpn: None,
-        first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
-    };
-    if let Ok(mut protocol) = registry.open(selection) {
-        let place = Place {
-            stream_start: 0,
-            buf: 0,
-            offset: Some(body.0),
-            len: bytes.len(),
-        };
-        protocol.data(false, bytes, place, d, &[]);
-        protocol.end(false, d);
-    }
 }
 
 fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
@@ -1483,8 +1693,14 @@ mod tests {
         assert_eq!(second.info, "HTTP/1.1 404 Not Found");
     }
 
+    /// A FIN in the middle of an HTTP/2 header block ends the stream there,
+    /// so the incomplete block is reported. A reset ends it without
+    /// claiming a clean end, so nothing is. Either way, payload captured
+    /// after the end is shown at the TCP level and tagged late. It never
+    /// reaches the finished decoders, so the header block it would complete
+    /// is not made up from it.
     #[test]
-    fn captured_payload_after_close_still_completes_http2_headers() {
+    fn captured_payload_after_close_is_late_and_not_decoded() {
         for flags in [0x11, 0x14] {
             let mut dis = Dissector::default();
             let mut first = fictionet::stdlib::protocols::http2::PREFACE.to_vec();
@@ -1493,14 +1709,21 @@ mod tests {
             dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
             let end = 101 + first.len() as u32;
             let close = dis.decode(&tcp(40000, 80, end, flags, b""), &[]);
-            assert!(!close.tags.contains(&"malformed"));
+            assert_eq!(
+                close.tags.contains(&"malformed"),
+                flags & 1 != 0,
+                "{}",
+                close.info
+            );
             let next = end + u32::from(flags & 1 != 0);
-            let done = dis.decode(
+            let late = dis.decode(
                 &tcp(40000, 80, next, 0x18, &h2_frame(9, 4, 1, &[0x84])),
                 &[],
             );
-            assert_eq!(done.info, "CONTINUATION[1]: GET /");
-            assert!(!done.tags.contains(&"malformed"));
+            assert_eq!(late.proto, "TCP");
+            assert!(late.tags.contains(&"late"), "{:?}", late.tags);
+            assert!(!late.info.contains("CONTINUATION"), "{}", late.info);
+            assert!(!late.tags.contains(&"malformed"));
         }
     }
 
@@ -1617,9 +1840,9 @@ mod tests {
 
     #[test]
     fn reassembly_gap_resets_the_http2_header_table() {
-        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
+        use fictionet::stdlib::network::observer::Limits;
         let mut dis = Dissector {
-            tcp: Reassembler::new(Limits {
+            observer: tcp_observer(Limits {
                 segments: 1,
                 ..Limits::default()
             }),
@@ -1659,9 +1882,9 @@ mod tests {
 
     #[test]
     fn reassembly_gap_before_the_first_bytes_also_stops_http2() {
-        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
+        use fictionet::stdlib::network::observer::Limits;
         let mut dis = Dissector {
-            tcp: Reassembler::new(Limits {
+            observer: tcp_observer(Limits {
                 segments: 1,
                 ..Limits::default()
             }),
@@ -1679,9 +1902,9 @@ mod tests {
 
     #[test]
     fn reassembly_gap_without_held_data_keeps_the_packet_tag() {
-        use fictionet::stdlib::protocols::tcp_reassembly::Limits;
+        use fictionet::stdlib::network::observer::Limits;
         let mut dis = Dissector {
-            tcp: Reassembler::new(Limits {
+            observer: tcp_observer(Limits {
                 buffered: 0,
                 ..Limits::default()
             }),
@@ -1713,6 +1936,116 @@ mod tests {
         let d = Dissector::default().decode(&ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp), &[]);
         assert_eq!(d.proto, "UDP");
         assert_eq!(d.info, "49152 → 53 Len=0");
+    }
+
+    fn udp4(src: ([u8; 4], u16), dst: ([u8; 4], u16), payload: &[u8]) -> Vec<u8> {
+        let mut u = src.1.to_be_bytes().to_vec();
+        u.extend(dst.1.to_be_bytes());
+        u.extend(((8 + payload.len()) as u16).to_be_bytes());
+        u.extend([0, 0]);
+        u.extend_from_slice(payload);
+        ipv4(17, src.0, dst.0, &u)
+    }
+
+    /// What a protocol made for UDP conversations saw: each datagram's
+    /// direction and length.
+    type Datagrams = Arc<std::sync::Mutex<Vec<(bool, usize)>>>;
+
+    struct Count(Datagrams);
+
+    impl Protocol for Count {
+        fn data(&mut self, _: bool, _: &[u8], _: Place, _: &mut Decoded, _: &[KeyLine]) {}
+        fn waiting(&self, _: bool) -> bool {
+            false
+        }
+        fn lost(&mut self, _: bool) {}
+        fn datagram(
+            &mut self,
+            reverse: bool,
+            bytes: &[u8],
+            _: Place,
+            _: &mut Decoded,
+            _: &[KeyLine],
+        ) {
+            self.0.lock().unwrap().push((reverse, bytes.len()));
+        }
+    }
+
+    /// Datagrams between two endpoints are one conversation, both ways: the
+    /// protocol is chosen once and keeps getting them, empty ones included.
+    #[test]
+    fn a_udp_conversation_lasts_across_datagrams() {
+        let seen = Datagrams::default();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = Registry::new();
+        let (s, o) = (seen.clone(), opened.clone());
+        registry.register_protocol(
+            "count",
+            |s| {
+                if s.transport == Transport::Udp {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            move |_, _| {
+                o.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::new(Count(s.clone()))
+            },
+        );
+        let mut dis = Dissector::with_registry(registry);
+        let (client, server) = (([10, 0, 0, 2], 49152), ([10, 0, 0, 1], 53));
+        dis.decode(&udp4(client, server, b"query"), &[]);
+        dis.decode(&udp4(server, client, b"answer"), &[]);
+        dis.decode(&udp4(client, server, b""), &[]);
+        assert_eq!(*seen.lock().unwrap(), [(false, 5), (true, 6), (false, 0)]);
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// At most 256 UDP conversations are kept. Past that, the one seen
+    /// longest ago is forgotten, and a datagram for it starts it again.
+    #[test]
+    fn udp_conversations_are_bounded() {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
+        let mut dis = Dissector::default();
+        let server = ([10, 0, 0, 1], 53);
+        assert_eq!(
+            dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q), &[])
+                .proto,
+            "DNS"
+        );
+        for port in 0..300 {
+            let d = dis.decode(&udp4(([10, 0, 0, 2], 1000 + port), server, &q), &[]);
+            assert_eq!(d.proto, "DNS");
+            assert!(dis.udp.len() <= UDP_CONVERSATIONS);
+        }
+        assert_eq!(dis.udp.len(), UDP_CONVERSATIONS);
+        assert!(!dis.udp.keys().any(|(_, low, _)| low.port() == 999));
+        assert_eq!(
+            dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q), &[])
+                .proto,
+            "DNS"
+        );
+    }
+
+    /// The end of the capture decodes what was held past a hole, after the
+    /// gap resets the decoders, and ends what was open. The dissector then
+    /// starts over.
+    #[test]
+    fn finishing_the_capture_decodes_what_was_held_past_a_hole() {
+        let mut dis = Dissector::default();
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let held = dis.decode(
+            &tcp(40000, 80, 111, 0x18, b"GET /after HTTP/1.1\r\n\r\n"),
+            &[],
+        );
+        assert_eq!(held.proto, "TCP");
+        let end = dis.finish(&[]);
+        assert_eq!(end.info, "GET /after HTTP/1.1");
+        assert!(dis.connections.is_empty());
+        let again = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"), &[]);
+        assert_eq!(again.info, "GET / HTTP/1.1");
     }
 
     /// Streams that look like TLS, HTTP/2, HTTP/1.1 and DNS, then turn to

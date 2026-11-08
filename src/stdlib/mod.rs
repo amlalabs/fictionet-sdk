@@ -351,7 +351,6 @@
 //! | [`protocols::ssh`] | SSH transport encryption, authentication and connection messages. |
 //! | [`protocols::stun`] | STUN messages, attributes and binding replies. |
 //! | [`protocols::syslog`] | Syslog messages and stream framing. |
-//! | [`protocols::tcp_reassembly`] | TCP capture reassembly, gaps and end signals. |
 //! | [`protocols::tds`] | SQL Server packets, logins, batches and response tokens. |
 //! | [`protocols::telnet`] | Telnet data, commands and option negotiation. |
 //! | [`protocols::tftp`] | TFTP packets, options and read transfers. |

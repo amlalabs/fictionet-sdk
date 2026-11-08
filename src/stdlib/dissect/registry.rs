@@ -2,15 +2,17 @@ use super::{Decoded, KeyLine, Observed, Place, Present};
 use fictionet::stdlib::dissect::Transport;
 use std::sync::Arc;
 
-/// Inputs to a protocol matcher. TCP ports are in conversation order;
-/// UDP ports are source then destination. `first` is a bounded prefix.
+/// Inputs to a protocol matcher. Ports are in conversation order.
+/// `first` is a bounded prefix.
 #[derive(Clone, Copy, Debug)]
 pub struct Selection<'a> {
     /// The transport carrying these bytes: an ordered TCP byte stream, or
-    /// one UDP datagram, after which the selected decoder receives EOF.
+    /// UDP datagrams, each read whole.
     pub transport: Transport,
     /// The conversation's two ports. TCP endpoints sort by address, then
-    /// port. Direction zero sends from the first port to the second.
+    /// port; UDP endpoints are in the order of the conversation's first
+    /// datagram, its source first. Direction zero sends from the first
+    /// port to the second.
     pub ports: (u16, u16),
     /// First bytes of the direction currently being identified.
     pub first: &'a [u8],
@@ -50,8 +52,28 @@ pub trait Protocol: Send {
     fn waiting(&self, reverse: bool) -> bool;
     /// Discards state invalidated by missing bytes in this direction.
     fn lost(&mut self, reverse: bool);
-    /// Finishes a datagram or stream. The default has no final output.
+    /// Finishes a stream direction that ended cleanly. The default has no
+    /// final output.
     fn end(&mut self, _reverse: bool, _packet: &mut Decoded) {}
+    /// Processes one whole datagram in one direction, empty ones included.
+    /// A datagram's end is not the end of the conversation: the
+    /// conversation's later datagrams, both ways, come to the same
+    /// protocol, which keeps what it needs across them, such as which
+    /// answers match which questions. The default reads the datagram as
+    /// one run of bytes and ends that direction, which suits a protocol
+    /// that reads a single datagram. Decoders registered with
+    /// [`Registry::register`] read each datagram with new decoders.
+    fn datagram(
+        &mut self,
+        reverse: bool,
+        bytes: &[u8],
+        at: Place,
+        packet: &mut Decoded,
+        keys: &[KeyLine],
+    ) {
+        self.data(reverse, bytes, at, packet, keys);
+        self.end(reverse, packet);
+    }
 }
 
 type Matcher = dyn Fn(Selection<'_>) -> Match + Send + Sync;
@@ -139,9 +161,16 @@ impl Registry {
         D: Present + Send + 'static,
         D::Error: Clone + Send,
     {
+        let make: Arc<Make<D>> = Arc::new(make);
         self.register_protocol(name, matches, move |selection, _| {
             Box::new(Pair {
                 dirs: make(selection).map(|d| Some(Observed::with_buffer(d, limit))),
+                make: make.clone(),
+                limit,
+                transport: selection.transport,
+                ports: selection.ports,
+                protocol: selection.protocol.map(str::to_owned),
+                alpn: selection.alpn.map(str::to_owned),
             })
         });
     }
@@ -212,8 +241,18 @@ impl Registry {
     }
 }
 
+type Make<D> = dyn Fn(Selection<'_>) -> [D; 2] + Send + Sync;
+
+/// A registered decoder pair: one decoder for each direction of a stream,
+/// and the factory and selection that make new ones for each datagram.
 struct Pair<D: Present> {
     dirs: [Option<Observed<D>>; 2],
+    make: Arc<Make<D>>,
+    limit: usize,
+    transport: Transport,
+    ports: (u16, u16),
+    protocol: Option<String>,
+    alpn: Option<String>,
 }
 
 impl<D: Present + Send> Protocol for Pair<D>
@@ -255,6 +294,27 @@ where
         {
             dir.end(packet);
         }
+    }
+    /// Reads the datagram with a new decoder, made by the factory as for a
+    /// conversation starting with it, and ends that decoder.
+    fn datagram(
+        &mut self,
+        reverse: bool,
+        bytes: &[u8],
+        at: Place,
+        packet: &mut Decoded,
+        _: &[KeyLine],
+    ) {
+        let [forward, back] = (self.make)(Selection {
+            transport: self.transport,
+            ports: self.ports,
+            first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
+            protocol: self.protocol.as_deref(),
+            alpn: self.alpn.as_deref(),
+        });
+        let mut dir = Observed::with_buffer(if reverse { back } else { forward }, self.limit);
+        dir.data(bytes, at, packet);
+        dir.end(packet);
     }
 }
 

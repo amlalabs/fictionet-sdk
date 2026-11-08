@@ -71,6 +71,15 @@ impl Conversation {
         }
     }
 
+    /// Tells the selected protocol that this direction ended cleanly, and
+    /// appends what that completes to `d`. Before selection there is
+    /// nothing to finish.
+    pub fn end(&mut self, dir: bool, d: &mut Decoded) {
+        if let Some(protocol) = &mut self.protocol {
+            protocol.end(dir, d);
+        }
+    }
+
     /// Processes ordered bytes and appends completed messages to `d`.
     /// `place` locates this chunk in the current packet. Earlier prefix bytes
     /// receive reassembly buffers. `keys` supplies TLS key log entries.
