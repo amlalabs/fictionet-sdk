@@ -354,13 +354,17 @@ impl Output {
     pub fn stderr(&mut self, bytes: &[u8]) -> Result<(), OutputFull> {
         self.push(true, bytes)
     }
-    fn push(&mut self, stderr: bool, bytes: &[u8]) -> Result<(), OutputFull> {
+    fn next_bytes(&self, bytes: usize) -> Result<usize, OutputFull> {
         if self.exited
-            || bytes.len() > OUTPUT_LIMIT.saturating_sub(self.bytes)
+            || bytes > OUTPUT_LIMIT.saturating_sub(self.bytes)
             || self.chunks.len() >= 1024
         {
             return Err(OutputFull);
         }
+        Ok(self.bytes + bytes)
+    }
+    fn push(&mut self, stderr: bool, bytes: &[u8]) -> Result<(), OutputFull> {
+        let next = self.next_bytes(bytes.len())?;
         if !bytes.is_empty() {
             self.reserve()?;
             let charge = self
@@ -369,7 +373,7 @@ impl Output {
                 .unwrap()
                 .charge(bytes.len())
                 .ok_or(OutputFull)?;
-            self.bytes += bytes.len();
+            self.bytes = next;
             self.chunks.push_back(Chunk::Data {
                 stderr,
                 data: Bytes::with_charge(bytes.to_vec(), charge),
@@ -672,6 +676,37 @@ struct Channel {
     sent_eof: bool,
     closed: bool,
 }
+impl Channel {
+    fn consume_receive(&mut self, bytes: usize) -> Result<(), TransportError> {
+        if !self.confirmed
+            || self.eof
+            || self.closed
+            || bytes > PACKET as usize
+            || bytes as u64 > self.receive
+            || bytes > self.advertised as usize
+        {
+            return Err(TransportError::State);
+        }
+        self.receive -= bytes as u64;
+        self.advertised -= bytes as u32;
+        Ok(())
+    }
+
+    fn consume_send(&mut self, bytes: usize) -> Result<(), TransportError> {
+        if self.closed
+            || self.sent_eof
+            || bytes as u64 > self.granted
+            || bytes > self.window as usize
+            || bytes > self.max_packet as usize
+        {
+            return Err(TransportError::State);
+        }
+        self.granted -= bytes as u64;
+        self.window -= bytes as u32;
+        Ok(())
+    }
+}
+
 struct Flight {
     bytes: usize,
     child: Option<(ChildId, u64)>,
@@ -1206,17 +1241,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
     ) -> Result<(), Error> {
         let id = self.id(recipient)?;
         let channel = self.channels.get_mut(id).unwrap();
-        if !channel.confirmed
-            || channel.eof
-            || channel.closed
-            || data.len() > PACKET as usize
-            || data.len() as u64 > channel.receive
-            || data.len() > channel.advertised as usize
-        {
-            return Err(TransportError::State.into());
-        }
-        channel.receive -= data.len() as u64;
-        channel.advertised -= data.len() as u32;
+        channel.consume_receive(data.len())?;
         if kind.is_none() {
             self.handler.observe(
                 &self.context(env.now()),
@@ -1578,6 +1603,9 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                 let Some(channel) = self.channels.get(id) else {
                     return Ok(Admit::Taken);
                 };
+                if channel.closed {
+                    return Ok(Admit::Taken);
+                }
                 let peer = channel.peer;
                 let wire = channel.wire;
                 match command {
@@ -1604,20 +1632,20 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         self.channel_write(env, id, Some(kind), data)?
                     }
                     ChannelCommand::Stream(StreamCommand::End) => {
-                        self.channels.get_mut(id).unwrap().sent_eof = true;
+                        let channel = self.channels.get_mut(id).unwrap();
+                        if channel.sent_eof {
+                            return Err(TransportError::State.into());
+                        }
+                        channel.sent_eof = true;
                         self.send(env, &wire::Message::Eof(peer))?;
                     }
-                    ChannelCommand::Stream(StreamCommand::Reset) => {
+                    ChannelCommand::Stream(StreamCommand::Reset) | ChannelCommand::Close => {
                         self.channels.get_mut(id).unwrap().closed = true;
                         self.send(env, &wire::Message::Close(peer))?;
                         self.up.push_back(MuxEvent::Child(
                             id,
                             ChannelEvent::Stream(StreamEvent::Reset),
                         ));
-                    }
-                    ChannelCommand::Close => {
-                        self.channels.get_mut(id).unwrap().closed = true;
-                        self.send(env, &wire::Message::Close(peer))?;
                     }
                     ChannelCommand::Reply(accepted) => self.send(
                         env,
@@ -1731,16 +1759,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         data: Bytes,
     ) -> Result<(), Error> {
         let channel = self.channels.get_mut(id).unwrap();
-        if channel.closed
-            || channel.sent_eof
-            || data.len() as u64 > channel.granted
-            || data.len() > channel.window as usize
-            || data.len() > channel.max_packet as usize
-        {
-            return Err(TransportError::State.into());
-        }
-        channel.granted -= data.len() as u64;
-        channel.window -= data.len() as u32;
+        channel.consume_send(data.len())?;
         let peer = channel.peer;
         let wire = channel.wire;
         let bytes = data.to_vec();
@@ -1776,8 +1795,8 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    struct Observed(Mutex<Vec<Event>>);
-    struct NoSession;
+    pub(super) struct Observed(pub(super) Mutex<Vec<Event>>);
+    pub(super) struct NoSession;
     impl Session for NoSession {
         fn input(&mut self, _: &Context<'_>, _: &[u8], _: &mut Output) {}
     }
@@ -2449,3 +2468,11 @@ mod tests {
         assert!(output.write(b"after disconnect").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "ssh/tests.rs"]
+mod boundary_tests;
+
+#[cfg(kani)]
+#[path = "../../../verification/ssh-layer/kani/mod.rs"]
+mod proofs;
