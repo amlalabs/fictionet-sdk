@@ -69,3 +69,11 @@ regions; the model exposes every ancestor reservation and release to
 interleaving. The original `Region` configurations remain the single-region
 checks. See `VERIFICATION.md` for scope and the unavailable direct Kani
 attempt over the real mutex path.
+
+`JobContext.tla` projects `Jobs::poll` and the counted context lease in
+`src/cx.rs`. A completed job keeps admission open while a returned value
+retains its context; cancellation ignores those references but still drains
+active tasks. It bounds borrowed references at two and tasks at one.
+Its base config checks borrowed admission and task draining; removing the
+borrow check closes admission before a returned body can start work. This
+is a lifecycle projection, not a model of atomic reference counts or wakers.

@@ -1,7 +1,7 @@
 use std::future::{Future, poll_fn};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::task::{Poll, Waker};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use crate::run::RunShared;
 use crate::time::{Duration, Instant};
@@ -100,9 +100,82 @@ pub use timer::Timer;
 pub struct Cx {
     pub(crate) run: Arc<RunShared>,
     pub(crate) region: Arc<Region>,
+    pub(crate) job_lease: Option<ContextLease>,
+}
+
+/// A job's returned contexts may start work after its first result.
+/// The runner owns one reference; borrowed contexts own the others.
+/// Like region metadata, this fixed allocation belongs to the context,
+/// separately from charged carrier storage. Active jobs are bounded by the
+/// runner's limit; retained contexts keep their metadata after cancellation.
+pub(crate) struct ContextLease(Arc<ContextLeaseState>);
+
+struct ContextLeaseState {
+    references: AtomicUsize,
+    waiter: crate::sync::Mutex<Option<Waker>>,
+    _parent: Option<ContextLease>,
+}
+
+impl ContextLease {
+    fn new(parent: Option<ContextLease>) -> Self {
+        Self(Arc::new(ContextLeaseState {
+            references: AtomicUsize::new(1),
+            waiter: crate::sync::Mutex::new(None),
+            _parent: parent,
+        }))
+    }
+
+    fn poll_unborrowed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut waiter = self.0.waiter.lock();
+        if self.0.references.load(Ordering::Acquire) == 1 {
+            let old = waiter.take();
+            drop(waiter);
+            drop(old);
+            return Poll::Ready(());
+        }
+        if waiter.as_ref().is_none_or(|old| !old.will_wake(cx.waker())) {
+            let old = waiter.replace(cx.waker().clone());
+            drop(waiter);
+            drop(old);
+        }
+        Poll::Pending
+    }
+}
+
+impl Clone for ContextLease {
+    fn clone(&self) -> Self {
+        let lease = self.0.clone();
+        lease.references.fetch_add(1, Ordering::Relaxed);
+        Self(lease)
+    }
+}
+
+impl Drop for ContextLease {
+    fn drop(&mut self) {
+        if self.0.references.fetch_sub(1, Ordering::AcqRel) == 2 {
+            let waiter = self.0.waiter.lock().take();
+            if let Some(waiter) = waiter {
+                waiter.wake();
+            }
+        }
+    }
 }
 
 impl Cx {
+    pub(crate) fn job_context(&self) -> Cx {
+        Cx {
+            run: self.run.clone(),
+            region: self.region.child(),
+            job_lease: Some(ContextLease::new(self.job_lease.clone())),
+        }
+    }
+
+    pub(crate) fn poll_job_context_released(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.job_lease
+            .as_ref()
+            .map_or(Poll::Ready(()), |lease| lease.poll_unborrowed(cx))
+    }
+
     /// The current time on the run's clock: how long ago the run started.
     ///
     /// Under [`run`](crate::run) this is real time, read from the system's
@@ -233,6 +306,7 @@ impl Cx {
         let future = work(Cx {
             run: self.run.clone(),
             region: region.clone(),
+            job_lease: self.job_lease.clone(),
         });
         let join = Arc::new(JoinState::default());
         if !region.try_start_task() {
@@ -425,6 +499,7 @@ impl Cx {
         let mut work = Box::pin(f(Cx {
             run: self.run.clone(),
             region: child.clone(),
+            job_lease: self.job_lease.clone(),
         }));
         let result = work.as_mut().await;
         if let Err(e) = result {
@@ -554,5 +629,46 @@ impl std::error::Error for Cancelled {}
 impl crate::Entropy for Cx {
     fn fill_random(&self, out: &mut [u8]) {
         Cx::fill_random(self, out);
+    }
+}
+
+#[cfg(test)]
+mod context_lease_tests {
+    use super::*;
+    use std::task::Wake;
+
+    struct Wakes(AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn the_last_borrow_wakes_the_waiting_runner() {
+        let owner = ContextLease::new(None);
+        let first = owner.clone();
+        let second = first.clone();
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(owner.poll_unborrowed(&mut cx).is_pending());
+        drop(first);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        drop(second);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert!(owner.poll_unborrowed(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn a_nested_job_keeps_its_parent_context_borrowed() {
+        let parent = ContextLease::new(None);
+        let child = ContextLease::new(Some(parent.clone()));
+        let borrowed = child.clone();
+        let mut cx = Context::from_waker(Waker::noop());
+        drop(child);
+        assert!(parent.poll_unborrowed(&mut cx).is_pending());
+        drop(borrowed);
+        assert!(parent.poll_unborrowed(&mut cx).is_ready());
     }
 }

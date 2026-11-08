@@ -193,3 +193,29 @@ done
 ```
 
 Each ablation's config names the property it must violate.
+
+## Deferred work from returned contexts
+
+The job runner now waits for borrowed contexts before joining a successfully
+completed job region. `ContextLease` counts those references independently of
+tasks, propagates through cloned and nested contexts, and wakes the runner
+when the last borrow ends. Cancellation still drains tasks without waiting
+for retained contexts. Completed jobs must release private context clones
+and transfer contexts needed later into their result. Lease metadata is
+fixed context-owned storage, like region metadata: active jobs are bounded
+by the job limit and retained contexts keep their metadata after cancellation.
+
+`JobContext_base.cfg` passes both invariants: 86 generated states, 31 distinct,
+depth 6. `JobContext_without_borrow.cfg` violates `BorrowKeepsAdmission` with
+a borrow, a returned result, and premature retirement. Both ran with the
+cached JDK, a 6 GiB heap, an 8 GiB systemd limit and state storage on the home
+volume. This model projects lifecycle transitions, not the implementation of
+atomic references, mutexes or waker registration. RegionTree continues to
+cover descendant task accounting separately.
+
+The real HTTP regressions return a body that captures its handler context
+and starts its first clock wait only when a frame is polled. The one-frame
+response succeeds, as does a 130-frame response exceeding the 64 job slots.
+Focused tests check last-borrow wakeup and parent retention by a nested lease.
+The existing Kani compiler limitation above also prevents a direct proof
+over the mutex-backed context lease; no Kani success is claimed for it.

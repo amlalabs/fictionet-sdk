@@ -34,6 +34,13 @@ pub trait Job: Send + 'static {
     /// Moves the work on. `fcx` is the world's context, or `None` in a
     /// harness given none, where work that needs one finishes with its
     /// error.
+    ///
+    /// After returning `Ready`, release completed futures and private clones
+    /// of the supplied context. Release input storage no longer needed by
+    /// retained public state or the cancellation check.
+    /// Transfer contexts needed by the result into that result. The runner
+    /// retains completed work only to observe `cancelled`, while contexts
+    /// transferred to the result keep its region open for deferred work.
     fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Self::Done>;
 }
 
@@ -144,6 +151,17 @@ impl<W: Job> Jobs<W> {
     /// Takes the stack's new work from `driver`. Returns whether there was
     /// any.
     pub(super) fn take<L: Layer<Work = W>>(&mut self, driver: &mut Driver<L>) -> bool {
+        if self.storage.is_none() && !self.budget_failed {
+            let Some(charge) = driver
+                .budget()
+                .charge(JOBS * std::mem::size_of::<Running<W>>())
+            else {
+                self.budget_failed = true;
+                return false;
+            };
+            self.running = Vec::with_capacity(JOBS);
+            self.storage = Some(charge);
+        }
         let mut took = false;
         for _ in 0..INTAKE {
             if self.running.len() == JOBS || self.budget_failed {
@@ -152,17 +170,6 @@ impl<W: Job> Jobs<W> {
             let Some(work) = driver.take_work() else {
                 break;
             };
-            if self.storage.is_none() {
-                let Some(charge) = driver
-                    .budget()
-                    .charge(JOBS * std::mem::size_of::<Running<W>>())
-                else {
-                    self.budget_failed = true;
-                    break;
-                };
-                self.running = Vec::with_capacity(JOBS);
-                self.storage = Some(charge);
-            }
             self.running.push(Running {
                 work: Some(work),
                 completed: false,
@@ -206,26 +213,23 @@ impl<W: Job> Jobs<W> {
                 finished = true;
             }
             if running.work.is_some() && running.region.is_none() {
-                running.region = fcx.map(|parent| Cx {
-                    run: parent.run.clone(),
-                    region: parent.region.child(),
-                });
+                running.region = fcx.map(Cx::job_context);
             }
             if !running.completed
                 && let Some(work) = &mut running.work
                 && let Poll::Ready(result) = work.poll(running.region.as_ref(), cx)
             {
-                // A returned stream may still depend on tasks this work
-                // spawned. Keep its cancellation lease until those tasks end.
+                // Returned streams may retain the context and start work later.
+                // Keep the owner until both borrowed contexts and tasks end.
                 running.completed = true;
                 finished = true;
                 done(result)?;
             }
             let drained = (running.completed || running.work.is_none())
-                && running
-                    .region
-                    .as_ref()
-                    .is_none_or(|region| region.region.poll_done(cx).is_ready());
+                && running.region.as_ref().is_none_or(|region| {
+                    (running.work.is_none() || region.poll_job_context_released(cx).is_ready())
+                        && region.region.poll_done(cx).is_ready()
+                });
             if drained {
                 if let Some(region) = &running.region
                     && let Some(error) = region.region.take_error()
@@ -523,9 +527,9 @@ mod tests {
         assert!(jobs.budget_exhausted());
         assert!(jobs.is_empty());
         assert!(!jobs.take(&mut driver));
-        assert_eq!(driver.layer().extracted, 1);
+        assert_eq!(driver.layer().extracted, 0);
         assert_eq!(driver.layer().polls.load(Ordering::Relaxed), 0);
-        assert_eq!(driver.layer().drops.load(Ordering::Relaxed), 1);
+        assert_eq!(driver.layer().drops.load(Ordering::Relaxed), 0);
     }
 
     #[test]

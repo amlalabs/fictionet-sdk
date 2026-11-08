@@ -157,6 +157,7 @@ where
     let cx = Cx {
         run: shared.clone(),
         region: root.clone(),
+        job_lease: None,
     };
     let future = {
         let _guard = CurrentGuard::enter(shared.id, id, Waker::noop());

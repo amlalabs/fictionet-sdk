@@ -85,7 +85,11 @@ impl Job for Pick {
             }
             (Select::With(_), None, None) => return Poll::Ready(None),
         };
-        picking.as_mut().poll(cx)
+        let result = picking.as_mut().poll(cx);
+        if result.is_ready() {
+            self.picking = None;
+        }
+        result
     }
 }
 

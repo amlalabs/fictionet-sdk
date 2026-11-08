@@ -231,10 +231,14 @@ impl Job for Takeover {
             });
             self.running = Some(takeover(fcx.clone(), conn));
         }
-        match &mut self.running {
+        let result = match &mut self.running {
             Some(running) => running.as_mut().poll(cx),
             None => Poll::Ready(()),
+        };
+        if result.is_ready() {
+            self.running = None;
         }
+        result
     }
 }
 

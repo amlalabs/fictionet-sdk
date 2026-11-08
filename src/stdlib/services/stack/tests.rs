@@ -959,3 +959,92 @@ fn an_async_http_child_runs_over_the_live_stream_with_a_small_window() {
     );
     assert_eq!(result, Ok(StreamEnd::Finished));
 }
+
+type FrameWait = std::pin::Pin<Box<dyn Future<Output = Result<(), Cancelled>> + Send>>;
+
+/// The handler returns before this body first uses its context.
+struct LazyFrames {
+    context: Cx,
+    left: usize,
+    waiting: Option<FrameWait>,
+}
+
+impl http_body::Body for LazyFrames {
+    type Data = bytes::Bytes;
+    type Error = Cancelled;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<bytes::Bytes>, Cancelled>>> {
+        if self.left == 0 {
+            return Poll::Ready(None);
+        }
+        if self.waiting.is_none() {
+            let context = self.context.clone();
+            self.waiting = Some(Box::pin(async move {
+                context.sleep(Duration::from_millis(1)).await
+            }));
+        }
+        match self.waiting.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.waiting = None;
+                self.left -= 1;
+                Poll::Ready(Some(
+                    result.map(|()| http_body::Frame::data(bytes::Bytes::from_static(b"x"))),
+                ))
+            }
+        }
+    }
+}
+
+fn serve_lazy_frames(frames: usize) {
+    use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
+    struct Lazy(usize);
+    impl Handler for Lazy {
+        fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            let left = self.0;
+            Reply::Later(Box::new(move |context| {
+                Box::pin(async move {
+                    Ok(http::Response::new(Body::new(LazyFrames {
+                        context,
+                        left,
+                        waiting: None,
+                    })))
+                })
+            }))
+        }
+    }
+    let client = move |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        conn.write_all(
+            &fcx,
+            b"GET /lazy HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+        let bytes = read_to_end(&fcx, &mut conn).await?;
+        let response = fictionet::stdlib::protocols::http1::Response::parse_for(&bytes, "GET")
+            .expect("the lazy body completes its HTTP framing");
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.body.len(), frames);
+        Ok(())
+    };
+    let result = serve_one(
+        StreamLimits::default(),
+        Budget::new(1024 * 1024),
+        move || Http1::new(Lazy(frames)),
+        client,
+    );
+    assert_eq!(result, Ok(StreamEnd::Finished));
+}
+
+#[test]
+fn a_returned_body_can_start_work_with_its_captured_context() {
+    serve_lazy_frames(1);
+}
+
+#[test]
+fn a_streaming_body_releases_completed_frame_jobs() {
+    serve_lazy_frames(130);
+}
