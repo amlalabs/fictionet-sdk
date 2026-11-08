@@ -108,12 +108,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fictionet::RaceError;
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::network::Connection;
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::protocols::http1;
 use fictionet::stdlib::services::serve::ConnInfo;
 use fictionet::stdlib::services::serve::Prefixed;
-use fictionet::stdlib::services::serve::{self, Budget, ServeOptions};
+use fictionet::stdlib::services::serve::{self, ServeOptions};
 use fictionet::{Cancelled, Cx};
 
 mod body;

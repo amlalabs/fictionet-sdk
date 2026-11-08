@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::services::serve::ConnInfo;
-use fictionet::stdlib::services::serve::{self, Budget, Ended, Flow, Harness, ServeOptions};
+use fictionet::stdlib::services::serve::{self, Ended, Flow, Harness, ServeOptions};
 use fictionet::stdlib::web::httpd::{
     self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply,
 };
