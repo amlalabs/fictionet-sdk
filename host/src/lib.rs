@@ -4,10 +4,13 @@
 //! The `virtio-net` feature adds a polling VFIO driver for a dedicated modern
 //! virtio network device in an explicitly opted-in QEMU guest.
 
+#[cfg(all(target_os = "linux", feature = "tun"))]
+pub mod tun;
+
 #[cfg(all(target_os = "linux", feature = "virtio-net"))]
 pub mod virtio;
 
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "raw-ethernet"))]
 pub mod raw;
 
 #[cfg(all(target_os = "linux", feature = "virtio-net"))]

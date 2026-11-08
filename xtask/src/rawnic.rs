@@ -373,8 +373,8 @@ pub fn run(directory: PathBuf) -> Result {
         "honeypot-world",
         "--features",
         "raw-virtio",
-        "--example",
-        "raw_honeypot",
+        "--bin",
+        "honeypot",
     ]))?;
     let metadata: serde_json::Value =
         serde_json::from_slice(&output(Command::new("cargo").args([
@@ -425,6 +425,7 @@ pub fn run(directory: PathBuf) -> Result {
     ] {
         entry(&mut archive, dir, 0o40755, &[]);
     }
+    entry(&mut archive, "tmp", 0o41777, &[]);
     node(&mut archive, "dev/console", 0o020600, &[], (5, 1));
     executable(
         &mut archive,
@@ -434,17 +435,20 @@ pub fn run(directory: PathBuf) -> Result {
     )?;
     executable(
         &mut archive,
-        &target.join("debug/examples/raw_honeypot"),
-        "raw_honeypot",
+        &target.join("debug/honeypot"),
+        "honeypot",
         &directory,
     )?;
     for (index, binary) in test_binaries.iter().enumerate() {
         executable(&mut archive, binary, &format!("tests/{index}"), &directory)?;
     }
     let mut modules = Vec::new();
-    for module in ["vfio-pci", "vfio_iommu_type1"] {
+    for module in ["vfio-pci", "vfio_iommu_type1", "tun"] {
         let dependencies = output(Command::new("modprobe").args(["--show-depends", module]))?;
         for line in String::from_utf8(dependencies)?.lines() {
+            if line.starts_with("builtin ") {
+                continue;
+            }
             let path = line
                 .strip_prefix("insmod ")
                 .ok_or("unexpected module dependency")?

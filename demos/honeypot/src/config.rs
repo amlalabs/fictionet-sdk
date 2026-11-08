@@ -41,7 +41,7 @@ pub struct Config {
     /// The addresses the `internet` attachment carries.
     pub internet: Internet,
     /// The IPv4 default gateway of the raw Ethernet adapter
-    /// (`start_raw`, with feature `raw-virtio`): the router every IPv4 packet goes
+    /// (`start_raw`, with feature `raw-ethernet`): the router every IPv4 packet goes
     /// to.
     pub gateway: Ipv4Addr,
     /// Where the raw Ethernet adapter's IPv6 default gateway comes from: an
@@ -57,6 +57,10 @@ pub struct Config {
     pub burst: Burst,
     /// Authentication policy of the simulated SSH server.
     pub ssh_auth: SshAuth,
+    /// A persistent Ed25519 seed, or world entropy when embedding without state.
+    pub ssh_host_key: Option<[u8; 32]>,
+    /// Retain exact decrypted SSH bytes in protected evidence files.
+    pub restricted_evidence: bool,
 }
 
 /// Authentication policy for decoy accounts; public keys still require proof.
@@ -176,6 +180,8 @@ impl Default for Config {
             burst: Burst::default(),
             http_profile: HttpProfile::default(),
             ssh_auth: SshAuth::default(),
+            ssh_host_key: None,
+            restricted_evidence: false,
         }
     }
 }

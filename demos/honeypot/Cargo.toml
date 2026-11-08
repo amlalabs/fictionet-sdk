@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
-description = "A Linux server with an MPTCP listener that logs everyone who tries it."
+description = "One Linux honeypot with MPTCP, SSH, and port-zero evidence."
 
 [lib]
 path = "src/lib.rs"
@@ -16,13 +16,13 @@ path = "src/main.rs"
 [dependencies]
 fictionet-extras = { path = "../../extras" }
 fictionet = { path = "../.." }
-fictionet-host = { path = "../../host", default-features = false, features = ["virtio-net"], optional = true }
+fictionet-host = { path = "../../host", default-features = false, features = ["tun"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "signal", "net", "io-util", "macros"] }
+libc = "0.2"
 
 [features]
-raw-virtio = ["dep:fictionet-host"]
-
-[[example]]
-name = "raw_honeypot"
-required-features = ["raw-virtio"]
+default = ["raw-virtio"]
+raw-ethernet = ["fictionet-host/raw-ethernet"]
+raw-virtio = ["raw-ethernet", "fictionet-host/virtio-net"]

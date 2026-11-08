@@ -10,7 +10,9 @@ publish = false
 [features]
 default = ["proxy"]
 proxy = ["fictionet/web-proxy"]
-virtio-net = ["dep:libc"]
+raw-ethernet = []
+virtio-net = ["dep:libc", "raw-ethernet"]
+tun = ["dep:libc", "tokio/macros"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", optional = true }

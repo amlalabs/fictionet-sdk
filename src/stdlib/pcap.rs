@@ -1,6 +1,7 @@
 //! Captures in the pcapng format, which Wireshark and tcpdump read.
 //!
-//! The packets are raw IP with no link layer (`LINKTYPE_RAW`). Available
+//! Default captures contain raw IP with no link layer (`LINKTYPE_RAW`);
+//! [`start_ethernet`](crate::stdlib::pcap::start_ethernet) instead preserves original Ethernet frames. Available
 //! TLS secrets go in a Decryption Secrets Block, so Wireshark decrypts the
 //! TLS in the file with no `SSLKEYLOGFILE` setting. The writer appends one
 //! block at a time, so a caller can send a file in pieces as it walks the
@@ -24,6 +25,15 @@ fn block(out: &mut Vec<u8>, kind: u32, body: &[u8]) {
 /// Appends the section header, the one interface and, if `keylog` (an
 /// `SSLKEYLOGFILE`) is not empty, its Decryption Secrets Block.
 pub fn start(out: &mut Vec<u8>, keylog: &[u8]) {
+    start_link(out, keylog, LINKTYPE_RAW);
+}
+
+/// Appends a section with one Ethernet interface, preserving complete frames.
+pub fn start_ethernet(out: &mut Vec<u8>) {
+    start_link(out, &[], 1);
+}
+
+fn start_link(out: &mut Vec<u8>, keylog: &[u8], link_type: u16) {
     // Section header: byte-order magic, version 1.0, length unknown.
     let mut shb = Vec::new();
     shb.extend_from_slice(&0x1a2b_3c4du32.to_le_bytes());
@@ -33,7 +43,7 @@ pub fn start(out: &mut Vec<u8>, keylog: &[u8]) {
     block(out, 0x0a0d_0d0a, &shb);
     // One interface. Timestamps are in microseconds, the default.
     let mut idb = Vec::new();
-    idb.extend_from_slice(&LINKTYPE_RAW.to_le_bytes());
+    idb.extend_from_slice(&link_type.to_le_bytes());
     idb.extend_from_slice(&0u16.to_le_bytes());
     idb.extend_from_slice(&0u32.to_le_bytes());
     block(out, 1, &idb);

@@ -227,92 +227,330 @@ pub fn honeypot(nic: VirtioNet) -> fictionet::Result {
     Ok(())
 }
 
-/// Runs the shipped example against the same guest NIC and host probes.
-pub fn example(address: fictionet_host::PciAddress, mac: [u8; 6]) -> fictionet::Result {
-    use std::fs::OpenOptions;
+/// Runs the shipped executable against the same guest NIC and host probes.
+pub fn deployed(address: fictionet_host::PciAddress, mac: [u8; 6]) -> fictionet::Result {
+    use std::fs::{self, File};
     use std::io::{self, BufRead, BufReader, Read};
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::DirBuilderExt;
     use std::process::{Command, Stdio};
 
-    // The reader exists before the child opens its log, so neither open blocks.
-    // SAFETY: the name is a valid C string and the permissions apply to this FIFO.
-    if unsafe { libc::mkfifo(c"/raw-example.frames".as_ptr(), 0o600) } != 0 {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create("/honeypot-state")?;
+    // SAFETY: inotify_init1 returns a new owned descriptor on success.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if fd < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    let frames = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open("/raw-example.frames")?;
-    let mut child = Command::new("/raw_honeypot")
-        .arg(address.to_string())
-        .arg("/raw-example.frames")
+    // SAFETY: fd is a new descriptor and ownership transfers to File.
+    let mut changes = unsafe { File::from_raw_fd(fd) };
+    // SAFETY: the descriptor and terminated path are valid.
+    if unsafe {
+        libc::inotify_add_watch(
+            fd,
+            c"/honeypot-state".as_ptr(),
+            libc::IN_MODIFY | libc::IN_CREATE,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut child = Command::new("/honeypot")
+        .args(["run", "--backend", "vfio", "--device", &address.to_string()])
         .args(["--address", &crate::rawnic_frames::ADDRESS.to_string()])
         .args(["--address-v6", &crate::rawnic_frames::ADDRESS6.to_string()])
         .args(["--gateway", &crate::rawnic_frames::GATEWAY.to_string()])
-        .args([
-            "--log",
-            "/raw-example.jsonl",
-            "--pcap",
-            "/raw-example.pcapng",
-        ])
+        .args(["--state-dir", "/honeypot-state"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
-    let mut output = BufReader::new(child.stdout.take().expect("piped example stdout"));
-    let mut frames = BufReader::new(frames);
+    let mut output = BufReader::new(child.stdout.take().expect("piped honeypot stdout"));
     let result = (|| -> fictionet::Result {
         let mut line = String::new();
         if output.read_line(&mut line)? == 0 {
-            return Err(fictionet::Error::msg("raw example exited before startup"));
+            return Err(fictionet::Error::msg("honeypot exited before startup"));
+        }
+        let ready: serde_json::Value = serde_json::from_str(&line)?;
+        if ready["event"] != "local_ready" || ready["backend"] != "vfio" {
+            return Err(fictionet::Error::msg(
+                "honeypot did not report local VFIO readiness",
+            ));
         }
         print!("{line}");
-        // The example opens its frame writer before announcing startup.
-        // SAFETY: frames owns this descriptor; fcntl changes only its status flags.
-        let flags = unsafe { libc::fcntl(frames.get_ref().as_raw_fd(), libc::F_GETFL) };
-        if flags < 0
-            || unsafe {
-                libc::fcntl(
-                    frames.get_ref().as_raw_fd(),
-                    libc::F_SETFL,
-                    flags & !libc::O_NONBLOCK,
-                )
-            } < 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-        println!("RAW EXAMPLE READY");
+        println!("HONEYPOT EXECUTABLE READY");
         let mut acknowledgement = [0x5a; 60];
         acknowledgement[..6].copy_from_slice(&mac);
-        let acknowledgement = hex(&acknowledgement);
         loop {
-            line.clear();
-            if frames.read_line(&mut line)? == 0 {
-                break;
+            for entry in fs::read_dir("/honeypot-state")? {
+                let entry = entry?;
+                if !entry.file_name().to_string_lossy().starts_with("ethernet-") {
+                    continue;
+                }
+                let bytes = fs::read(entry.path())?;
+                if captured_frame(&bytes, &acknowledgement)? {
+                    return Ok(());
+                }
             }
-            let record: serde_json::Value = serde_json::from_str(&line)?;
-            if record["direction"] == "in" && record["bytes"] == acknowledgement {
-                return Ok(());
+            let mut events = [0; 4096];
+            if changes.read(&mut events)? == 0 {
+                return Err(fictionet::Error::msg("evidence notification stream closed"));
             }
         }
-        Err(fictionet::Error::msg(
-            "raw example closed its frame log before acknowledgment",
-        ))
     })();
     let exited = child.try_wait()?;
     if exited.is_none() {
-        child.kill()?;
+        // SAFETY: this is the live child process started above, inside the guest.
+        if unsafe { libc::kill(child.id() as i32, libc::SIGTERM) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
     }
     let status = child.wait()?;
     let mut remaining = String::new();
     output.read_to_string(&mut remaining)?;
     print!("{remaining}");
     result?;
-    if exited.is_some() {
+    if exited.is_some() || !status.success() {
         return Err(fictionet::Error::msg(format!(
-            "raw example exited unexpectedly: {status}"
+            "honeypot exited unexpectedly: {status}"
         )));
     }
-    println!("RAW EXAMPLE PASS");
+    println!("HONEYPOT EXECUTABLE PASS");
+    Ok(())
+}
+
+fn captured_frame(mut bytes: &[u8], expected: &[u8]) -> fictionet::Result<bool> {
+    use fictionet::stdlib::codec::le32;
+    while bytes.len() >= 8 {
+        let kind = le32(bytes, 0).unwrap();
+        let length = le32(bytes, 4).unwrap() as usize;
+        if length < 12 {
+            return Err(fictionet::Error::msg(
+                "invalid Ethernet capture block length",
+            ));
+        }
+        if length > bytes.len() {
+            return Ok(false);
+        }
+        let block = &bytes[..length];
+        if le32(block, length - 4) != Some(length as u32) {
+            return Err(fictionet::Error::msg(
+                "invalid Ethernet capture block trailer",
+            ));
+        }
+        if kind == 6 {
+            let captured = le32(block, 20)
+                .ok_or_else(|| fictionet::Error::msg("missing Ethernet capture length"))?
+                as usize;
+            let frame = block
+                .get(28..28 + captured)
+                .ok_or_else(|| fictionet::Error::msg("truncated Ethernet capture"))?;
+            if frame == expected {
+                return Ok(true);
+            }
+        }
+        bytes = &bytes[length..];
+    }
+    Ok(false)
+}
+
+/// Validates TUN ownership and the direct in-process packet path in the guest.
+pub fn tun() -> fictionet::Result {
+    use fictionet::{Interface, InterfaceExt, Packet};
+    use fictionet_host::tun::{Mode, Tun};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn ioctl(fd: i32, operation: libc::c_ulong, request: &mut [u8; 40]) -> io::Result<()> {
+        // SAFETY: the caller supplies a live descriptor and a complete ifreq buffer.
+        if unsafe { libc::ioctl(fd, operation, request.as_mut_ptr()) } < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    fn index(name: &std::ffi::CStr) -> u32 {
+        // SAFETY: the interface name is terminated and read only.
+        unsafe { libc::if_nametoindex(name.as_ptr()) }
+    }
+    let routes = fs::read("/proc/net/route")?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let tun = Tun::open("hp-test", Mode::Create)?;
+            let ifindex = index(c"hp-test");
+            if ifindex == 0
+                || Tun::open("hp-test", Mode::Create).is_ok()
+                || Tun::open("hp-test", Mode::Existing).is_ok()
+            {
+                return Err(fictionet::Error::msg(
+                    "TUN creation or ownership isolation failed",
+                ));
+            }
+            // SAFETY: socket returns a newly owned descriptor on success.
+            let descriptor = unsafe {
+                libc::socket(
+                    libc::AF_PACKET,
+                    libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    (libc::ETH_P_IP as u16).to_be() as i32,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            // SAFETY: descriptor is new and ownership transfers to File.
+            let packet = unsafe { File::from_raw_fd(descriptor) };
+            // SAFETY: zero is a valid initial sockaddr_ll representation.
+            let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            address.sll_family = libc::AF_PACKET as u16;
+            address.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+            address.sll_ifindex = ifindex as i32;
+            // SAFETY: address and its size describe a complete sockaddr_ll.
+            if unsafe {
+                libc::bind(
+                    descriptor,
+                    (&address as *const libc::sockaddr_ll).cast(),
+                    std::mem::size_of_val(&address) as u32,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error().into());
+            }
+            let ignore_outgoing: i32 = 1;
+            // SAFETY: the option points to one initialized integer of the stated size.
+            if unsafe {
+                libc::setsockopt(
+                    descriptor,
+                    libc::SOL_PACKET,
+                    libc::PACKET_IGNORE_OUTGOING,
+                    (&ignore_outgoing as *const i32).cast(),
+                    std::mem::size_of_val(&ignore_outgoing) as u32,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error().into());
+            }
+            let fixture = crate::rawnic_frames::fixtures().remove(0);
+            let length = u16::from_be_bytes([fixture[16], fixture[17]]) as usize;
+            let expected = fixture[14..14 + length].to_vec();
+            // SAFETY: descriptor and sockaddr_ll are live and bytes remain valid for this send.
+            let sent = unsafe {
+                libc::sendto(
+                    descriptor,
+                    expected.as_ptr().cast(),
+                    expected.len(),
+                    0,
+                    (&address as *const libc::sockaddr_ll).cast(),
+                    std::mem::size_of_val(&address) as u32,
+                )
+            };
+            if sent != expected.len() as isize {
+                return Err(io::Error::last_os_error().into());
+            }
+            // SAFETY: the descriptor remains owned, open and nonblocking until deregistration.
+            let packet = unsafe { tokio::io::unix::AsyncFd::register(packet)? };
+            let (end, mut peer) = fictionet::pair_with_limit(128 * 1024);
+            fictionet::run(fictionet::Seed::from_u64(0), move |fcx| async move {
+                fcx.spawn(move |fcx| tun.relay(fcx, end));
+                let incoming = peer.recv(&fcx).await?;
+                if incoming.0 != expected {
+                    return Err(fictionet::Error::msg(format!(
+                        "TUN ingress changed the IP packet: expected {}, received {}",
+                        fictionet::stdlib::dissect::hex(&expected),
+                        fictionet::stdlib::dissect::hex(&incoming.0)
+                    )));
+                }
+                peer.send(Packet(expected.clone()));
+                let received = fcx
+                    .race(None, async {
+                        loop {
+                            let mut ready = packet.readable().await?;
+                            let mut bytes = [0; 65536];
+                            match ready.try_io(|fd| fd.get_ref().read(&mut bytes)) {
+                                Ok(result) => return result.map(|count| bytes[..count].to_vec()),
+                                Err(_) => continue,
+                            }
+                        }
+                    })
+                    .await??;
+                if received != expected {
+                    return Err(fictionet::Error::msg("TUN egress changed the IP packet"));
+                }
+                fcx.cancel();
+                Ok(())
+            })
+            .await?;
+            if index(c"hp-test") != 0 {
+                return Err(fictionet::Error::msg(
+                    "ephemeral TUN survived descriptor close",
+                ));
+            }
+
+            let control = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let open = || {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open("/dev/net/tun")
+            };
+            let device = open()?;
+            let mut request = [0; 40];
+            request[..10].copy_from_slice(b"hp-managed");
+            request[16..18].copy_from_slice(&0x1001i16.to_ne_bytes());
+            ioctl(device.as_raw_fd(), 0x4004_54ca, &mut request)?;
+            // SAFETY: the ioctl takes an integer persistence flag, not a pointer.
+            if unsafe { libc::ioctl(device.as_raw_fd(), 0x4004_54cbu64 as libc::c_ulong, 1) } < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            request[16..20].copy_from_slice(&1500i32.to_ne_bytes());
+            ioctl(control.as_raw_fd(), libc::SIOCSIFMTU, &mut request)?;
+            ioctl(control.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request)?;
+            let flags =
+                i16::from_ne_bytes(request[16..18].try_into().unwrap()) | libc::IFF_UP as i16;
+            request[16..18].copy_from_slice(&flags.to_ne_bytes());
+            ioctl(control.as_raw_fd(), libc::SIOCSIFFLAGS, &mut request)?;
+            drop(device);
+            let flags_before = fs::read("/sys/class/net/hp-managed/tun_flags")?;
+            let mtu_before = fs::read("/sys/class/net/hp-managed/mtu")?;
+            let existing = Tun::open("hp-managed", Mode::Existing)?;
+            if Tun::open("hp-managed", Mode::Create).is_ok() {
+                return Err(fictionet::Error::msg(
+                    "create mode reused an externally owned TUN",
+                ));
+            }
+            drop(existing);
+            if index(c"hp-managed") == 0
+                || fs::read("/sys/class/net/hp-managed/tun_flags")? != flags_before
+                || fs::read("/sys/class/net/hp-managed/mtu")? != mtu_before
+            {
+                return Err(fictionet::Error::msg(
+                    "existing TUN settings or persistence changed",
+                ));
+            }
+            request[16..20].copy_from_slice(&1400i32.to_ne_bytes());
+            ioctl(control.as_raw_fd(), libc::SIOCSIFMTU, &mut request)?;
+            if Tun::open("hp-managed", Mode::Existing).is_ok() {
+                return Err(fictionet::Error::msg("unsupported TUN MTU accepted"));
+            }
+            let device = open()?;
+            request[16..18].copy_from_slice(&0x1001i16.to_ne_bytes());
+            ioctl(device.as_raw_fd(), 0x4004_54ca, &mut request)?;
+            // SAFETY: the descriptor owns this guest test device and the integer disables persistence.
+            if unsafe { libc::ioctl(device.as_raw_fd(), 0x4004_54cbu64 as libc::c_ulong, 0) } < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            drop(device);
+            if index(c"hp-managed") != 0 || fs::read("/proc/net/route")? != routes {
+                return Err(fictionet::Error::msg(
+                    "TUN lifecycle left a device or changed IPv4 routes",
+                ));
+            }
+            Ok(())
+        })?;
+    println!("TUN lifecycle and bidirectional IP traffic passed");
     Ok(())
 }

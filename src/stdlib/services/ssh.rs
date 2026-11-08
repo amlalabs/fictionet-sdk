@@ -156,7 +156,7 @@ pub struct Context<'a> {
     pub now: Instant,
 }
 
-/// A typed fact emitted by the server, before calling application code.
+/// A typed protocol fact or completed transition emitted by the server.
 #[derive(Clone, Debug)]
 pub enum Event {
     /// Client identification.
@@ -174,6 +174,13 @@ pub enum Event {
     AuthenticationResponses(Vec<Vec<u8>>),
     /// Application authentication decision.
     AuthenticationDecision(AuthDecision),
+    /// Authentication completed and the success response was queued.
+    Authenticated {
+        /// Authenticated account name.
+        user: String,
+        /// The authentication method that completed login.
+        method: String,
+    },
     /// A connection protocol request or channel lifecycle message.
     Connection(wire::Message),
     /// Input bytes on a channel.
@@ -669,10 +676,17 @@ impl<H: Handler> Ssh<H> {
             }
             AuthDecision::Accept => {
                 send(driver, &auth::Message::Success)?;
-                self.user = Some(request.user);
+                self.user = Some(request.user.clone());
                 self.auth_user = None;
                 self.challenge = None;
                 driver.cancel_timer(Timer::Login);
+                self.handler.observe(
+                    &context(driver),
+                    &Event::Authenticated {
+                        user: request.user,
+                        method: request.method.name().to_owned(),
+                    },
+                );
             }
             AuthDecision::Reject {
                 methods,
@@ -1121,7 +1135,7 @@ impl<H: Handler> Service for Ssh<H> {
             driver.decoder().set_proposal(proposal.clone())?;
         }
         let mut bytes = Vec::new();
-        driver.decoder().start(&mut bytes)?;
+        driver.decoder().start_identification(&mut bytes)?;
         driver.reply().extend(bytes);
         driver.set_timer(Timer::Login, self.config.login_grace);
         Ok(Flow::Continue)
@@ -1322,6 +1336,186 @@ impl<H: Handler> Service for Ssh<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct Observed(Mutex<Vec<Event>>);
+    struct NoSession;
+    impl Session for NoSession {
+        fn input(&mut self, _: &Context<'_>, _: &[u8], _: &mut Output) {}
+    }
+    impl Handler for Observed {
+        type Session = NoSession;
+
+        fn authenticate(&self, _: &Context<'_>, attempt: &AuthAttempt<'_>) -> AuthDecision {
+            match attempt.request.method {
+                auth::Method::Password { .. } | auth::Method::PublicKey { .. } => {
+                    AuthDecision::Accept
+                }
+                _ => AuthDecision::Reject {
+                    methods: vec![AuthMethod::Password, AuthMethod::PublicKey],
+                    partial_success: false,
+                    delay: Duration::ZERO,
+                },
+            }
+        }
+
+        fn open(&self, _: &Context<'_>, _: &SessionRequest, _: &mut Output) -> Option<NoSession> {
+            None
+        }
+
+        fn observe(&self, _: &Context<'_>, event: &Event) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    struct Client;
+    impl russh::client::Handler for Client {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    struct Signer {
+        observed: Arc<Observed>,
+        invalid: bool,
+    }
+    impl russh::Signer for Signer {
+        type Error = russh::AgentAuthError;
+
+        async fn auth_sign(
+            &mut self,
+            _: &russh::keys::agent::AgentIdentity,
+            _: Option<russh::keys::HashAlg>,
+            mut data: Vec<u8>,
+        ) -> Result<Vec<u8>, Self::Error> {
+            let events = self.observed.0.lock().unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::AuthenticationDecision(AuthDecision::Accept)
+                ))
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Authenticated { .. }))
+            );
+            drop(events);
+            let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
+            let mut signature = key.sign(&data).as_ref().to_vec();
+            if self.invalid {
+                signature[0] ^= 1;
+            }
+            let mut blob = ssh::SshString(b"ssh-ed25519".to_vec()).to_bytes().unwrap();
+            ssh::SshString(signature).write(&mut blob).unwrap();
+            ssh::SshString(blob).write(&mut data).unwrap();
+            Ok(data)
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_completion_excludes_probes_and_invalid_signatures() {
+        for method in ["password", "publickey", "invalid"] {
+            let observed = Arc::new(Observed(Mutex::new(Vec::new())));
+            let config = Config::new(
+                Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+                ssh::Identification::new("2.0", "test", None).unwrap(),
+            );
+            let mut harness = serve::Harness::new(
+                crate::Seed::from_u64(1),
+                Ssh::new(Arc::new(config), observed.clone()),
+                (),
+            );
+            let (client, mut server) = tokio::io::duplex(1 << 20);
+            let task = tokio::spawn(async move {
+                server.write_all(&harness.open().unwrap()).await.unwrap();
+                let mut input = [0; 8192];
+                loop {
+                    let len = server.read(&mut input).await.unwrap();
+                    if len == 0 {
+                        break;
+                    }
+                    match harness.push(&input[..len]) {
+                        Ok(bytes) => server.write_all(&bytes).await.unwrap(),
+                        Err(_) => break,
+                    }
+                }
+                harness.service().user.clone()
+            });
+            let mut client = russh::client::connect_stream(
+                Arc::new(russh::client::Config::default()),
+                client,
+                Client,
+            )
+            .await
+            .unwrap();
+            let successful = if method == "password" {
+                client
+                    .authenticate_password("guest", "secret")
+                    .await
+                    .unwrap()
+                    .success()
+            } else {
+                let key = russh::keys::PrivateKey::from(
+                    russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]),
+                );
+                client
+                    .authenticate_publickey_with(
+                        "guest",
+                        key.public_key().clone(),
+                        None,
+                        &mut Signer {
+                            observed: observed.clone(),
+                            invalid: method == "invalid",
+                        },
+                    )
+                    .await
+                    .is_ok_and(|result| result.success())
+            };
+            assert_eq!(successful, method != "invalid");
+            if successful {
+                client
+                    .disconnect(russh::Disconnect::ByApplication, "done", "")
+                    .await
+                    .unwrap();
+            }
+            drop(client);
+            let user = task.await.unwrap();
+            assert_eq!(user.as_deref(), (method != "invalid").then_some("guest"));
+            let events = observed.0.lock().unwrap();
+            let completed: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Authenticated { user, method } => Some((user.as_str(), method.as_str())),
+                    _ => None,
+                })
+                .collect();
+            if method == "invalid" {
+                assert!(completed.is_empty());
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    Event::Authentication {
+                        request: auth::Request {
+                            method: auth::Method::PublicKey {
+                                signature: Some(_),
+                                ..
+                            },
+                            ..
+                        },
+                        verified: false
+                    }
+                )));
+            } else {
+                assert_eq!(completed, [("guest", method)]);
+            }
+        }
+    }
 
     #[test]
     fn hangup_preserves_pending_output_and_refuses_more() {

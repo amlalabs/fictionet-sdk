@@ -89,6 +89,7 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
             return Err("guest tests failed".into());
         }
     }
+    rawnic_world::tun().map_err(|error| io::Error::other(error.to_string()))?;
     let device = "0000:00:03.0";
     let path = format!("/sys/bus/pci/devices/{device}");
     if fs::read_to_string(format!("{path}/vendor"))?.trim() != "0x1af4"
@@ -113,7 +114,7 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     rawnic_world::honeypot(reopened).map_err(|error| io::Error::other(error.to_string()))?;
     println!("Guest device reset and reopen passed");
-    rawnic_world::example(address, mac).map_err(|error| io::Error::other(error.to_string()))?;
+    rawnic_world::deployed(address, mac).map_err(|error| io::Error::other(error.to_string()))?;
     println!("RAWNIC PASS");
     Ok(())
 }

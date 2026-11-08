@@ -1333,6 +1333,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "ring",
  "rsa 0.9.10",
+ "russh",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -1936,8 +1937,10 @@ dependencies = [
  "fictionet",
  "fictionet-extras",
  "fictionet-host",
+ "libc",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

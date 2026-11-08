@@ -33,14 +33,18 @@ impl honeypot::Observer for Log {
     }
 }
 
-/// Build the demo's SSH port server with a host key from the world's entropy.
+/// Build the SSH server using the persisted seed, or world entropy when absent.
 pub fn server(
     fcx: &fictionet::Cx,
     policy: SshAuth,
+    host_key: Option<[u8; 32]>,
     observer: Arc<Mutex<Observer>>,
 ) -> ssh::Server<honeypot::Observed<Application, Log>> {
-    let mut seed = [0; 32];
-    fcx.fill_random(&mut seed);
+    let seed = host_key.unwrap_or_else(|| {
+        let mut seed = [0; 32];
+        fcx.fill_random(&mut seed);
+        seed
+    });
     let key = Arc::new(HostKey::ed25519_from_seed(seed).expect("Ed25519 seed"));
     let mut profile = Profile::ubuntu_24_04();
     profile.motd = b"Welcome to Ubuntu 24.04 LTS (GNU/Linux 6.8.0-31-generic x86_64)\r\n\r\n * Documentation:  https://help.ubuntu.com\r\n * Management:     https://landscape.canonical.com\r\n * Support:        https://ubuntu.com/pro\r\n\r\n".to_vec();
@@ -64,7 +68,8 @@ pub fn server(
         options: serve::ServeOptions {
             idle: Some(Duration::from_secs(300)),
             ..serve::ServeOptions::default()
-        },
+        }
+        .budget(serve::Budget::new(32 << 20)),
     }
 }
 

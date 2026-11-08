@@ -7,14 +7,20 @@
 //! a frame are not observable through this device's negotiated features.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
 use std::thread::{self, JoinHandle};
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
 use std::time::Duration;
+use std::time::SystemTime;
 
 use fictionet::{Cx, Error, Result};
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
 use crate::VirtioNet;
 
 const CAPACITY: usize = 64;
@@ -23,6 +29,15 @@ const MAX_FRAME: usize = 2036;
 /// Complete Ethernet bytes, including the Ethernet header, without a frame checksum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EthernetFrame(pub Vec<u8>);
+
+/// An original frame and its host receipt time before entering the queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedFrame {
+    /// The unmodified frame bytes owned by the receiver.
+    pub frame: EthernetFrame,
+    /// Host system time, absent for untimestamped simulated traffic.
+    pub received_at: Option<SystemTime>,
+}
 
 /// The world's complete Ethernet connection.
 pub struct RawAttachment {
@@ -73,7 +88,7 @@ pub struct RawSender {
 
 /// The receiving half of a raw attachment.
 pub struct RawReceiver {
-    rx: mpsc::Receiver<EthernetFrame>,
+    rx: mpsc::Receiver<ReceivedFrame>,
     failure: Arc<Mutex<Option<Error>>>,
 }
 
@@ -127,6 +142,11 @@ impl RawAttachment {
         self.receiver.recv(fcx).await
     }
 
+    /// Waits for a frame with its original backend receipt timestamp.
+    pub async fn recv_with_timestamp(&mut self, fcx: &Cx) -> Result<ReceivedFrame> {
+        self.receiver.recv_with_timestamp(fcx).await
+    }
+
     /// Waits for bounded queue space. Completion means queued, not transmitted.
     pub async fn send(&self, fcx: &Cx, frame: EthernetFrame) -> Result {
         self.sender.send(fcx, frame).await
@@ -144,7 +164,7 @@ impl RawAttachment {
 /// wire reaches the world, so a world's link layer runs against frames a
 /// program writes and reads.
 pub struct RawWire {
-    incoming: mpsc::Sender<EthernetFrame>,
+    incoming: mpsc::Sender<ReceivedFrame>,
     outgoing: mpsc::Receiver<Command>,
     receive_stats: QueueStats,
 }
@@ -182,16 +202,30 @@ impl RawWire {
     /// Puts a frame on the wire without waiting, counting a full receive
     /// queue's discarded frame just as the NIC polling thread does.
     pub fn try_send(&self, frame: EthernetFrame) -> Result<bool> {
-        check_length(&frame)?;
-        self.receive_stats.enqueue(&self.incoming, frame)
+        self.try_send_received(ReceivedFrame {
+            frame,
+            received_at: None,
+        })
+    }
+
+    /// Queues a frame with the backend's receipt timestamp, without waiting.
+    pub fn try_send_received(&self, received: ReceivedFrame) -> Result<bool> {
+        check_length(&received.frame)?;
+        self.receive_stats.enqueue(&self.incoming, received)
     }
 
     /// Puts `frame` on the wire to the world, waiting for room.
     pub async fn send(&self, fcx: &Cx, frame: EthernetFrame) -> Result {
         check_length(&frame)?;
-        fcx.race(None, self.incoming.send(frame))
-            .await?
-            .map_err(|_| Error::msg("raw Ethernet attachment closed"))
+        fcx.race(
+            None,
+            self.incoming.send(ReceivedFrame {
+                frame,
+                received_at: None,
+            }),
+        )
+        .await?
+        .map_err(|_| Error::msg("raw Ethernet attachment closed"))
     }
 
     /// The next frame the world sent, or `None` once the world's side is
@@ -213,6 +247,13 @@ impl RawWire {
 impl RawReceiver {
     /// Drains queued frames before reporting closure or a driver failure.
     pub async fn recv(&mut self, fcx: &Cx) -> Result<EthernetFrame> {
+        self.recv_with_timestamp(fcx)
+            .await
+            .map(|received| received.frame)
+    }
+
+    /// Drains queued frames while preserving the backend's receipt timestamp.
+    pub async fn recv_with_timestamp(&mut self, fcx: &Cx) -> Result<ReceivedFrame> {
         if fcx.is_cancelled() {
             return Err(fictionet::Cancelled.into());
         }
@@ -262,11 +303,13 @@ impl RawSender {
 /// Dropping this handle stops the thread and resets the device, discarding
 /// queued traffic. Call the attachment's `flush` before shutdown when delivery
 /// matters. An idle driver parks between hardware polls.
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
 pub struct RawPump {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result>>,
 }
 
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
 impl RawPump {
     /// Starts host polling and returns the bounded world attachment.
     pub fn attach(nic: VirtioNet) -> io::Result<(Self, RawAttachment)> {
@@ -315,16 +358,18 @@ impl RawPump {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
 impl Drop for RawPump {
     fn drop(&mut self) {
         let _ = self.stop_and_join();
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "virtio-net"))]
 fn pump(
     mut nic: VirtioNet,
     stop: &AtomicBool,
-    incoming: &mpsc::Sender<EthernetFrame>,
+    incoming: &mpsc::Sender<ReceivedFrame>,
     outgoing: &mut mpsc::Receiver<Command>,
     receive_stats: &QueueStats,
 ) -> Result {
@@ -336,8 +381,15 @@ fn pump(
         }
         let mut progress = false;
         if let Some(len) = nic.receive(&mut buffer)? {
+            let received_at = Some(SystemTime::now());
             if receive_stats
-                .enqueue(incoming, EthernetFrame(buffer[..len].to_vec()))
+                .enqueue(
+                    incoming,
+                    ReceivedFrame {
+                        frame: EthernetFrame(buffer[..len].to_vec()),
+                        received_at,
+                    },
+                )
                 .is_err()
             {
                 return Ok(());
@@ -462,12 +514,19 @@ mod tests {
         let failure = Arc::new(Mutex::new(Some(Error::msg("device stopped"))));
         let mut receiver = RawReceiver { rx, failure };
         let frame = EthernetFrame(vec![0xab; 64]);
-        tx.try_send(frame.clone()).unwrap();
+        let received_at = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(12));
+        tx.try_send(ReceivedFrame {
+            frame: frame.clone(),
+            received_at,
+        })
+        .unwrap();
         drop(tx);
         fictionet::block_on(fictionet::run(
             fictionet::Seed::from_u64(0),
             move |fcx| async move {
-                assert_eq!(receiver.recv(&fcx).await?, frame);
+                let received = receiver.recv_with_timestamp(&fcx).await?;
+                assert_eq!(received.frame, frame);
+                assert_eq!(received.received_at, received_at);
                 assert_eq!(
                     receiver.recv(&fcx).await.unwrap_err().to_string(),
                     "device stopped"

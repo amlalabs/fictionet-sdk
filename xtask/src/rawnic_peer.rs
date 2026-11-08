@@ -519,7 +519,11 @@ pub fn ssh6(peer: &mut Peer) -> Result {
     let data = peer.next(from_ssh6)?;
     let payload = &data[usize::from(data[12] >> 4) * 4..];
     if !payload.starts_with(b"SSH-2.0-OpenSSH_") || !payload.ends_with(b"\r\n") {
-        return Err("honeypot did not send the SSH banner over IPv6".into());
+        return Err(format!(
+            "honeypot did not send the SSH banner over IPv6: {}",
+            fictionet::stdlib::dissect::hex(&data)
+        )
+        .into());
     }
     let acked = iss.wrapping_add(1).wrapping_add(payload.len() as u32);
     peer.send(&segment6(22, 1001, acked, 0x10, &[]))?;
