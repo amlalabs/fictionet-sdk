@@ -3,7 +3,9 @@ use fictionet::stdlib::layer::Budget;
 use fictionet::time::Instant;
 
 /// Somewhere a layer's reports go. The driver keeps a bounded number of
-/// them and counts the ones it had no room for.
+/// them and counts the ones it had no room for ([`Observations`]).
+///
+/// [`Observations`]: super::Observations
 pub trait Observe<E> {
     /// Takes one report. Never refuses: a full store drops it and counts.
     fn observe(&mut self, event: E);

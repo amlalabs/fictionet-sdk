@@ -152,12 +152,22 @@
 //! an [`Env`]. Layers do not call each other back: [`Chain`] and [`Switch`]
 //! move items between their parts in a loop, so the depth of calls is the
 //! depth of the stack's type, whatever the traffic.
+//!
+//! # Driving a stack
+//!
+//! [`Driver`] runs a stack: it fires due timers, advances the layers, offers
+//! input and takes output, with no I/O of its own. [`Harness`] is a driver
+//! with a seeded entropy source, a clock that moves only when told, and a
+//! byte-stream peer that takes output only as fast as the test allows, so
+//! backpressure can be tested.
 
 mod budget;
 mod carrier;
 mod chain;
 mod children;
+mod driver;
 mod env;
+mod harness;
 mod switch;
 mod timers;
 
@@ -169,7 +179,9 @@ pub use carrier::{
 };
 pub use chain::Chain;
 pub use children::{ChildReport, Children, Overrun};
+pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
+pub use harness::Harness;
 pub use switch::{Handoff, Handover, Switch};
 pub use timers::Timers;
 
