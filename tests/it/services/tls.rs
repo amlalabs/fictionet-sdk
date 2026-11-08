@@ -79,17 +79,20 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
 fn net_routes_tls_by_name_to_each_service() {
     /// Answers each line in upper case.
     struct Upper;
-    service_fixture! {
-        Upper => (Lines, (), Infallible);
-        decoder(self) {
-            Lines::new(64, Ending::LfOrCrlf)
-        }
-        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
-            driver
-                .reply()
-                .extend_from_slice(&line.unwrap_or_default().to_ascii_uppercase());
-            driver.reply().push(b'\n');
-            Ok(Flow::Continue)
+    impl LineApp for Upper {
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Next = Infallible;
+        type Error = Infallible;
+        fn line(
+            &mut self,
+            line: Result<Vec<u8>, LineError>,
+            out: &mut LineOut<'_, Self>,
+        ) -> Result<(), Infallible> {
+            out.write(&line.unwrap_or_default().to_ascii_uppercase());
+            out.write(b"\n");
+            Ok(())
         }
     }
     let result = block_on(fictionet::lab(
@@ -104,8 +107,8 @@ fn net_routes_tls_by_name_to_each_service() {
                 .add_host(
                     fictionet::stdlib::world::net::Host::new("tls")
                         .at(addr)
-                        .tls(6514, "a.test", move |_| ca.clone(), Arc::new(()), || Echo)
-                        .tls(6514, "b.test", move |_| cb.clone(), Arc::new(()), || Upper),
+                        .tls_stack(6514, "a.test", move |_| ca.clone(), |_| Echo::stack())
+                        .tls_stack(6514, "b.test", move |_| cb.clone(), |_| Lined::new(Upper)),
                 )
                 .start(&fcx, attachments)?;
             let s = machine(&fcx, attacher.attach("agent")?, ME);

@@ -344,7 +344,11 @@ impl<A: LineApp> Layer for Lined<A> {
             moved = true;
         }
         for _ in 0..LINES_PER_ADVANCE {
-            if !self.reading() {
+            // A due timer goes before the next line: the driver fires it
+            // before it advances the stack again. A reply goes below before
+            // the next line is read.
+            let due = self.timers.next().is_some_and(|(at, _)| at <= env.now());
+            if !self.reading() || due || !self.writes.is_empty() {
                 break;
             }
             let Some(item) = self.stream.next() else {
@@ -487,6 +491,9 @@ pub(crate) trait DatagramApp: Send + 'static {
 
     /// `timer` went off.
     fn timer(&mut self, _timer: Self::Timer, _sends: &mut Sends<'_, Self::Timer>) {}
+
+    /// Every line of a datagram from `from` was read.
+    fn finished(&mut self, _from: SocketAddr, _sends: &mut Sends<'_, Self::Timer>) {}
 }
 
 /// A line application over datagrams. Each datagram's lines are read with
@@ -558,6 +565,7 @@ impl<A: DatagramApp> Layer for Datagrammed<A> {
             };
             self.call(env.now(), |app, sends| app.line(line, from, sends));
         }
+        self.call(env.now(), |app, sends| app.finished(from, sends));
         Ok(Admit::Taken)
     }
 
