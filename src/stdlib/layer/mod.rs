@@ -174,6 +174,10 @@ mod timers;
 #[cfg(test)]
 mod tests;
 
+#[cfg(kani)]
+#[path = "../../../verification/layer/kani/mod.rs"]
+mod proofs;
+
 pub use budget::{Budget, Charge};
 pub use carrier::{
     ByteStream, Child, ChildId, Chunk, Credited, Datagram, DatagramCommand, DatagramEvent,
