@@ -375,6 +375,10 @@ impl<M> Datagram<M> {
     pub fn into_parts(self) -> (Chunk, M) {
         (self.payload, self.meta)
     }
+
+    pub(super) fn payload_mut(&mut self) -> &mut Chunk {
+        &mut self.payload
+    }
 }
 
 /// What comes up a datagram port.

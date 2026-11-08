@@ -76,14 +76,16 @@
 //!
 //! # The carriers
 //!
-//! Four port shapes cover what protocols need from what is below them:
+//! Six port shapes cover what protocols need from what is below them:
 //!
 //! | Port | What it keeps |
 //! | --- | --- |
 //! | [`ByteStream`] | Ordered bytes, each direction closing on its own, partial admission, reset, and write completion. Chunk boundaries mean nothing. |
 //! | [`Datagrams`] | One whole message each, empty ones included, with its endpoint metadata. Admission is all or nothing. The end of a datagram is not the end of the conversation. |
+//! | [`Packets`] | Whole packets, such as IP packets, with what is known about them. Admission is all or nothing, and a packet may be lost, repeated or reordered. |
 //! | [`Messages`] | Whole typed protocol units. A message boundary is never turned into an end of input. |
 //! | [`Mux`] | Connection control plus children, each owned through a [`Child`] handle and each with its own port, closing and credit. |
+//! | [`ObservedStream`] | What a passive observer saw of one connection: both directions' bytes in order, explicit gaps, and a typed end. It has no commands. |
 //!
 //! [`Framed`] turns a byte stream into [`Messages`] with a codec, so a
 //! protocol that reads whole frames, such as Modbus/TCP, sits on top of it
@@ -196,6 +198,8 @@ mod driver;
 mod env;
 mod framed;
 mod harness;
+mod observed;
+mod packet;
 mod switch;
 mod timers;
 
@@ -226,6 +230,8 @@ pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
 pub use framed::{BoundedDecode, BoundedWire, Decoded, Framed, FramedError, Framing, Owned};
 pub use harness::{Harness, Worker};
+pub use observed::{Direction, ObservedEvent, ObservedStream, Source, Termination};
+pub use packet::{PacketCommand, PacketEvent, Packets, Whole};
 pub use switch::{Handoff, Handover, Switch};
 pub use timers::Timers;
 
