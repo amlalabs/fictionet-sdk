@@ -573,6 +573,10 @@ impl Http1 {
                 Next::Connect(handler.clone())
             });
             r.close = false;
+        } else if parts.status == StatusCode::SWITCHING_PROTOCOLS {
+            // A 101 ends HTTP on the connection (RFC 9110 section 15.2.2):
+            // with nothing to take it over, the connection closes.
+            r.close = true;
         }
         let policy = ResponsePolicy::new(
             &parts,
@@ -1372,6 +1376,35 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    /// Answers every request with a bare 101: no UpgradeHandler.
+    struct Bare101;
+
+    impl Handler for Bare101 {
+        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+            Reply::Now(response)
+        }
+    }
+
+    /// A 101 ends HTTP on the connection (RFC 9110 section 15.2.2). With
+    /// nothing to take the connection over, it closes: the bytes after the
+    /// upgrade request are not read as another request. Found by
+    /// `verification/http/tla/Pipeline.tla` (`NoHttpAfter101`).
+    #[test]
+    fn a_101_without_an_upgrade_handler_closes() {
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Bare101)).running_work();
+        h.push(
+            b"GET /a HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n\
+              GET /b HTTP/1.1\r\nHost: a\r\n\r\n",
+        )
+        .unwrap();
+        let out = String::from_utf8_lossy(h.output()).into_owned();
+        assert!(out.starts_with("HTTP/1.1 101 "), "{out}");
+        assert_eq!(out.matches("HTTP/1.1 ").count(), 1, "{out}");
+        assert!(h.ended(), "{out}");
     }
 
     /// Counts the requests it answers, each with its path.
