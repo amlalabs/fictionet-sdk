@@ -13,6 +13,10 @@ The divergences from upstream are:
   negotiated-group accessor retain shared ownership, allowing providers to
   carry a world's entropy without static storage. ECH state also retains
   its random provider through `Arc`.
+- Once `close_notify` or a fatal alert is sent, nothing more is queued:
+  `send_fatal_alert` and the `no_renegotiation` warning do nothing then.
+  Upstream queues the alert after `close_notify` and, in debug builds,
+  fails a `debug_assert` when a peer sends a bad record after it.
 - Ring group constants expose their copyable `KxGroup` implementation so
   callers can construct owned groups. The default provider allocates its
   three groups and random/key provider objects with `Arc`.

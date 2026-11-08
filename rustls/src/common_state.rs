@@ -546,6 +546,9 @@ impl CommonState {
     }
 
     fn send_warning_alert(&mut self, desc: AlertDescription) {
+        if self.sent_fatal_alert {
+            return;
+        }
         warn!("Sending warning alert {desc:?}");
         self.send_warning_alert_no_log(desc);
     }
@@ -603,7 +606,10 @@ impl CommonState {
         desc: AlertDescription,
         err: impl Into<Error>,
     ) -> Error {
-        debug_assert!(!self.sent_fatal_alert);
+        // After close_notify the peer may still send; nothing more goes out.
+        if self.sent_fatal_alert {
+            return err.into();
+        }
         let m = Message::build_alert(AlertLevel::Fatal, desc);
         self.send_msg(m, self.record_layer.is_encrypting());
         self.sent_fatal_alert = true;

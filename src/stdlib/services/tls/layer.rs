@@ -391,6 +391,10 @@ impl Layer for TlsLayer {
             HandshakeError::Failed("TLS configuration without a client hello".into())
         })?;
         self.work = false;
+        if self.failed {
+            // The client left during the hello work: send nothing more.
+            return Ok(());
+        }
         let Some(config) = config else {
             self.reject = true;
             self.fail(HandshakeError::Rejected);
