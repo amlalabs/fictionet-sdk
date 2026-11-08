@@ -3,8 +3,8 @@
 //! [`Observed`] forwards authentication, configuration and sessions unchanged.
 //! It retains no history and opens no files. The world supplies an [`Observer`]
 //! and chooses its own bounded storage or streaming log. [`Record`] serializes
-//! typed facts and exact byte arrays, including passwords and challenge answers;
-//! installing it is an explicit choice to collect those credentials.
+//! typed facts. [`Record::redacted`] omits credentials and application bytes;
+//! [`Record::new`] explicitly retains those bytes for restricted evidence.
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::ssh::{self as protocol, auth, connection};
@@ -81,23 +81,36 @@ impl<H: Handler, O: Observer> Handler for Observed<H, O> {
 
 /// A serializable view of a fact and its connection context.
 ///
-/// Byte arrays preserve passwords, commands, signatures and channel streams
-/// without lossy text conversion. `wire_payload` on authentication, proposal and
-/// connection events can be decoded with the corresponding protocol codec.
-/// These are canonical payloads, not original encrypted packets or padding.
+/// [`Record::redacted`] preserves lengths without credentials or application
+/// bytes. [`Record::new`] preserves exact byte arrays for restricted evidence.
+/// Its `wire_payload` fields can be decoded with the corresponding protocol
+/// codec; they are reconstructed payloads, not encrypted packets or padding.
 pub struct Record<'a> {
     context: &'a Context<'a>,
     event: &'a Event,
     origin: Instant,
+    redacted: bool,
 }
 
 impl<'a> Record<'a> {
-    /// Borrow a fact, measuring time from a caller-supplied run origin.
+    /// Borrow a fact with exact credentials and bytes for restricted evidence.
     pub fn new(context: &'a Context<'a>, event: &'a Event, origin: Instant) -> Self {
         Self {
             context,
             event,
             origin,
+            redacted: false,
+        }
+    }
+
+    /// Preserve lengths and protocol facts without credentials or application bytes.
+    /// Reconstructed authentication and connection payloads are omitted too.
+    pub fn redacted(context: &'a Context<'a>, event: &'a Event, origin: Instant) -> Self {
+        Self {
+            context,
+            event,
+            origin,
+            redacted: true,
         }
     }
 }
@@ -114,6 +127,7 @@ impl Serialize for Record<'_> {
         record.serialize_entry("connection", &self.context.connection.id)?;
         record.serialize_entry("local", &self.context.connection.local)?;
         record.serialize_entry("peer", &self.context.connection.peer)?;
+        record.serialize_entry("redacted", &self.redacted)?;
         match self.event {
             Event::Version(version) => {
                 record.serialize_entry("event", "version")?;
@@ -159,8 +173,15 @@ impl Serialize for Record<'_> {
                         password,
                         new_password,
                     } => {
-                        record.serialize_entry("password", password)?;
-                        record.serialize_entry("new_password", new_password)?;
+                        record.serialize_entry("password_bytes", &password.len())?;
+                        record.serialize_entry(
+                            "new_password_bytes",
+                            &new_password.as_ref().map(Vec::len),
+                        )?;
+                        if !self.redacted {
+                            record.serialize_entry("password", password)?;
+                            record.serialize_entry("new_password", new_password)?;
+                        }
                     }
                     auth::Method::PublicKey {
                         algorithm,
@@ -182,14 +203,32 @@ impl Serialize for Record<'_> {
                         record.serialize_entry("language", language)?;
                         record.serialize_entry("submethods", submethods)?;
                     }
-                    auth::Method::Other { data, .. } => record.serialize_entry("data", data)?,
+                    auth::Method::Other { data, .. } => {
+                        record.serialize_entry("data_bytes", &data.len())?;
+                        if !self.redacted {
+                            record.serialize_entry("data", data)?;
+                        }
+                    }
                     auth::Method::None => {}
                 }
-                record.serialize_entry("wire_payload", &wire_bytes::<S, _>(request)?)?;
+                if !self.redacted {
+                    record.serialize_entry("wire_payload", &wire_bytes::<S, _>(request)?)?;
+                }
             }
             Event::AuthenticationResponses(responses) => {
                 record.serialize_entry("event", "authentication_responses")?;
-                record.serialize_entry("responses", responses)?;
+                record.serialize_entry(
+                    "response_bytes",
+                    &responses.iter().map(Vec::len).collect::<Vec<_>>(),
+                )?;
+                if !self.redacted {
+                    record.serialize_entry("responses", responses)?;
+                }
+            }
+            Event::Authenticated { user, method } => {
+                record.serialize_entry("event", "authenticated")?;
+                record.serialize_entry("user", user)?;
+                record.serialize_entry("method", method)?;
             }
             Event::AuthenticationDecision(decision) => {
                 record.serialize_entry("event", "authentication_decision")?;
@@ -228,13 +267,18 @@ impl Serialize for Record<'_> {
             }
             Event::Connection(message) => {
                 record.serialize_entry("event", "connection")?;
-                record.serialize_entry("message", &ConnectionRecord(message))?;
-                record.serialize_entry("wire_payload", &wire_bytes::<S, _>(message)?)?;
+                record.serialize_entry("message", &ConnectionRecord(message, self.redacted))?;
+                if !self.redacted {
+                    record.serialize_entry("wire_payload", &wire_bytes::<S, _>(message)?)?;
+                }
             }
             Event::Input { channel, data } => {
                 record.serialize_entry("event", "input")?;
                 record.serialize_entry("channel", channel)?;
-                record.serialize_entry("data", data)?;
+                record.serialize_entry("data_bytes", &data.len())?;
+                if !self.redacted {
+                    record.serialize_entry("data", data)?;
+                }
             }
             Event::Output {
                 channel,
@@ -244,7 +288,10 @@ impl Serialize for Record<'_> {
                 record.serialize_entry("event", "output")?;
                 record.serialize_entry("channel", channel)?;
                 record.serialize_entry("stderr", stderr)?;
-                record.serialize_entry("data", data)?;
+                record.serialize_entry("data_bytes", &data.len())?;
+                if !self.redacted {
+                    record.serialize_entry("data", data)?;
+                }
             }
             Event::Exit { channel, status } => {
                 record.serialize_entry("event", "exit")?;
@@ -267,7 +314,7 @@ where
     wire.to_bytes().map_err(S::Error::custom)
 }
 
-struct ConnectionRecord<'a>(&'a connection::Message);
+struct ConnectionRecord<'a>(&'a connection::Message, bool);
 
 impl Serialize for ConnectionRecord<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -315,13 +362,18 @@ impl Serialize for ConnectionRecord<'_> {
             } => {
                 record.serialize_entry("recipient", recipient)?;
                 record.serialize_entry("want_reply", want_reply)?;
-                record.serialize_entry("request", &SessionRecord(request))?;
+                record.serialize_entry("request", &SessionRecord(request, self.1))?;
+            }
+            Message::Data { recipient, data }
+            | Message::ExtendedData {
+                recipient, data, ..
+            } => {
+                record.serialize_entry("recipient", recipient)?;
+                record.serialize_entry("data_bytes", &data.len())?;
             }
             Message::ChannelOpenConfirmation { recipient, .. }
             | Message::ChannelOpenFailure { recipient, .. }
             | Message::WindowAdjust { recipient, .. }
-            | Message::Data { recipient, .. }
-            | Message::ExtendedData { recipient, .. }
             | Message::Eof(recipient)
             | Message::Close(recipient)
             | Message::ChannelSuccess(recipient)
@@ -337,7 +389,7 @@ impl Serialize for ConnectionRecord<'_> {
     }
 }
 
-struct SessionRecord<'a>(&'a connection::SessionRequest);
+struct SessionRecord<'a>(&'a connection::SessionRequest, bool);
 
 impl Serialize for SessionRecord<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -373,10 +425,18 @@ impl Serialize for SessionRecord<'_> {
                 )?;
             }
             SessionRequest::WindowChange(dimensions) => dimensions_fields(&mut record, dimensions)?,
-            SessionRequest::Exec(command) => record.serialize_entry("command", command)?,
+            SessionRequest::Exec(command) => {
+                record.serialize_entry("command_bytes", &command.len())?;
+                if !self.1 {
+                    record.serialize_entry("command", command)?;
+                }
+            }
             SessionRequest::Env { name, value } => {
                 record.serialize_entry("name", name)?;
-                record.serialize_entry("value", value)?;
+                record.serialize_entry("value_bytes", &value.len())?;
+                if !self.1 {
+                    record.serialize_entry("value", value)?;
+                }
             }
             SessionRequest::Subsystem(name) => record.serialize_entry("name", name)?,
             SessionRequest::Signal(signal) => record.serialize_entry("signal", signal)?,
@@ -392,7 +452,12 @@ impl Serialize for SessionRecord<'_> {
                 record.serialize_entry("message", message)?;
                 record.serialize_entry("language", language)?;
             }
-            SessionRequest::Other { data, .. } => record.serialize_entry("data", data)?,
+            SessionRequest::Other { data, .. } => {
+                record.serialize_entry("data_bytes", &data.len())?;
+                if !self.1 {
+                    record.serialize_entry("data", data)?;
+                }
+            }
             SessionRequest::Shell => {}
         }
         record.end()
@@ -413,6 +478,94 @@ fn dimensions_fields<M: SerializeMap>(
 mod tests {
     use super::*;
     use fictionet::stdlib::services::serve::ConnInfo;
+
+    #[test]
+    fn redacted_evidence_omits_credentials_and_nested_application_bytes() {
+        let connection = ConnInfo::default();
+        let context = Context {
+            connection: &connection,
+            now: Instant::ZERO,
+        };
+        let secret = b"sensitive command and credential".to_vec();
+        let events = [
+            Event::Authentication {
+                request: auth::Request {
+                    user: "guest".into(),
+                    service: "ssh-connection".into(),
+                    method: auth::Method::Password {
+                        password: secret.clone(),
+                        new_password: Some(secret.clone()),
+                    },
+                },
+                verified: false,
+            },
+            Event::AuthenticationResponses(vec![secret.clone()]),
+            Event::Input {
+                channel: 0,
+                data: secret.clone(),
+            },
+            Event::Output {
+                channel: 0,
+                stderr: false,
+                data: secret.clone(),
+            },
+            Event::Connection(connection::Message::Data {
+                recipient: 0,
+                data: secret.clone(),
+            }),
+            Event::Connection(connection::Message::ChannelRequest {
+                recipient: 0,
+                want_reply: true,
+                request: connection::SessionRequest::Exec(secret.clone()),
+            }),
+            Event::Connection(connection::Message::ChannelRequest {
+                recipient: 0,
+                want_reply: true,
+                request: connection::SessionRequest::Env {
+                    name: b"TOKEN".to_vec(),
+                    value: secret.clone(),
+                },
+            }),
+            Event::Connection(connection::Message::ChannelRequest {
+                recipient: 0,
+                want_reply: true,
+                request: connection::SessionRequest::Other {
+                    name: "custom".into(),
+                    data: secret.clone(),
+                },
+            }),
+        ];
+        for event in events {
+            let value =
+                serde_json::to_value(Record::redacted(&context, &event, Instant::ZERO)).unwrap();
+            assert_eq!(value["redacted"], true);
+            assert!(value.get("wire_payload").is_none());
+            assert!(value.get("password").is_none());
+            assert!(value.get("new_password").is_none());
+            assert!(value.get("responses").is_none());
+            assert!(value.get("data").is_none());
+            for field in ["command", "value", "data"] {
+                assert!(value["message"]["request"].get(field).is_none());
+            }
+            let length = match event {
+                Event::Authentication { .. } => &value["password_bytes"],
+                Event::AuthenticationResponses(_) => &value["response_bytes"][0],
+                Event::Input { .. } | Event::Output { .. } => &value["data_bytes"],
+                Event::Connection(connection::Message::Data { .. }) => {
+                    &value["message"]["data_bytes"]
+                }
+                Event::Connection(connection::Message::ChannelRequest { request, .. }) => {
+                    &value["message"]["request"][match request {
+                        connection::SessionRequest::Exec(_) => "command_bytes",
+                        connection::SessionRequest::Env { .. } => "value_bytes",
+                        _ => "data_bytes",
+                    }]
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(length, secret.len());
+        }
+    }
 
     #[test]
     fn recorded_credentials_round_trip_without_text_loss() {

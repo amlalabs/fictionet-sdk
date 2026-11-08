@@ -1,6 +1,7 @@
 //! A server-side SSH transport with no I/O and caller-seeded randomness.
 //!
-//! Call [`Transport::seed`] before [`Transport::start`]. Feed bytes through
+//! Call [`Transport::seed`] before [`Transport::start`] or
+//! [`Transport::start_identification`]. Feed bytes through
 //! [`Decode`] and immediately pass each event to [`Transport::handle`] before
 //! decoding the next packet, so NEWKEYS takes effect at its packet boundary.
 //! Application messages use [`Transport::write_packet`]. Key exchange supports
@@ -381,6 +382,13 @@ impl Transport {
 
     /// Appends the server identification and first KEXINIT.
     pub fn start(&mut self, out: &mut Vec<u8>) -> Result<(), TransportError> {
+        self.start_identification(out)?;
+        self.send_proposal(out)
+    }
+
+    /// Appends only the server identification. The first KEXINIT follows the
+    /// peer's identification in [`Self::handle`], matching OpenSSH's ordering.
+    pub fn start_identification(&mut self, out: &mut Vec<u8>) -> Result<(), TransportError> {
         if self.started {
             return Err(TransportError::State);
         }
@@ -392,7 +400,7 @@ impl Transport {
         }
         self.identification.write(out)?;
         self.started = true;
-        self.send_proposal(out)
+        Ok(())
     }
 
     fn send_proposal(&mut self, out: &mut Vec<u8>) -> Result<(), TransportError> {
@@ -430,6 +438,9 @@ impl Transport {
                     return Err(Error::BadVersion.into());
                 }
                 self.peer = Some(id);
+                if matches!(self.exchange, Exchange::Idle) {
+                    self.send_proposal(out)?;
+                }
             }
             return Ok(None);
         };
@@ -1076,6 +1087,41 @@ fn unpad(body: &[u8]) -> Result<Vec<u8>, TransportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identification_start_waits_for_complete_peer_identification() {
+        let identification = Identification::new("2.0", "server", None).unwrap();
+        let key = Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap());
+        let mut transport = Transport::new(key, identification.clone());
+        transport.seed([19; 32]).unwrap();
+        let mut output = Vec::new();
+        transport.start_identification(&mut output).unwrap();
+        assert_eq!(output, identification.to_bytes().unwrap());
+        assert!(!transport.is_rekeying());
+        output.clear();
+
+        let peer = Identification::new("2.0", "client", None).unwrap();
+        let bytes = peer.to_bytes().unwrap();
+        for end in 0..bytes.len() {
+            assert!(matches!(
+                transport.decode(&bytes[..end], false).unwrap(),
+                Step::Need
+            ));
+            assert!(output.is_empty());
+        }
+        let Step::Item(event, used) = transport.decode(&bytes, false).unwrap() else {
+            panic!("complete identification did not decode");
+        };
+        assert_eq!(used, bytes.len());
+        assert!(matches!(&event, TransportEvent::Version(id) if id == &peer));
+        assert!(transport.handle(event, &mut output).unwrap().is_none());
+        let packet = Packet::parse(&output).unwrap();
+        assert_eq!(
+            Message::parse(&packet.payload).unwrap(),
+            Message::KexInit(transport.proposal().clone())
+        );
+        assert!(transport.is_rekeying());
+    }
 
     #[test]
     fn randomized_encrypted_packets_roundtrip_incrementally() {

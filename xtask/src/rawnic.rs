@@ -355,7 +355,7 @@ fn oversized_ping(peer: &mut Peer) -> Result {
     Ok(())
 }
 
-pub fn run(directory: PathBuf) -> Result {
+pub fn run(directory: PathBuf, egress: bool) -> Result {
     fs::create_dir_all(&directory)?;
     let directory = fs::canonicalize(directory)?;
     output(Command::new("cargo").args([
@@ -373,8 +373,8 @@ pub fn run(directory: PathBuf) -> Result {
         "honeypot-world",
         "--features",
         "raw-virtio",
-        "--example",
-        "raw_honeypot",
+        "--bin",
+        "honeypot",
     ]))?;
     let metadata: serde_json::Value =
         serde_json::from_slice(&output(Command::new("cargo").args([
@@ -425,6 +425,7 @@ pub fn run(directory: PathBuf) -> Result {
     ] {
         entry(&mut archive, dir, 0o40755, &[]);
     }
+    entry(&mut archive, "tmp", 0o41777, &[]);
     node(&mut archive, "dev/console", 0o020600, &[], (5, 1));
     executable(
         &mut archive,
@@ -434,17 +435,20 @@ pub fn run(directory: PathBuf) -> Result {
     )?;
     executable(
         &mut archive,
-        &target.join("debug/examples/raw_honeypot"),
-        "raw_honeypot",
+        &target.join("debug/honeypot"),
+        "honeypot",
         &directory,
     )?;
     for (index, binary) in test_binaries.iter().enumerate() {
         executable(&mut archive, binary, &format!("tests/{index}"), &directory)?;
     }
     let mut modules = Vec::new();
-    for module in ["vfio-pci", "vfio_iommu_type1"] {
+    for module in ["vfio-pci", "vfio_iommu_type1", "tun"] {
         let dependencies = output(Command::new("modprobe").args(["--show-depends", module]))?;
         for line in String::from_utf8(dependencies)?.lines() {
+            if line.starts_with("builtin ") {
+                continue;
+            }
             let path = line
                 .strip_prefix("insmod ")
                 .ok_or("unexpected module dependency")?
@@ -467,9 +471,14 @@ pub fn run(directory: PathBuf) -> Result {
     entry(&mut archive, "TRAILER!!!", 0, &[]);
     let initrd = directory.join("guest.cpio");
     fs::write(&initrd, archive)?;
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    listener.set_nonblocking(true)?;
-    let address = listener.local_addr()?;
+    let listener = if egress {
+        None
+    } else {
+        Some(TcpListener::bind("127.0.0.1:0")?)
+    };
+    if let Some(listener) = &listener {
+        listener.set_nonblocking(true)?;
+    }
     let log = directory.join("serial.log");
     fs::write(&log, [])?;
     let mut command = Command::new("qemu-system-x86_64");
@@ -494,18 +503,39 @@ pub fn run(directory: PathBuf) -> Result {
     command
         .args(["-kernel", "/boot/vmlinuz-linux", "-initrd"])
         .arg(initrd);
+    if egress {
+        command.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    }
     command.args([
         "-append",
-        "console=ttyS0 panic=-1 intel_iommu=on iommu.strict=1 fictionet.rawnic=1 rdinit=/init",
+        if egress { "console=ttyS0 panic=-1 intel_iommu=on iommu.strict=1 fictionet.rawnic=1 fictionet.egress=1 rdinit=/init" } else { "console=ttyS0 panic=-1 intel_iommu=on iommu.strict=1 fictionet.rawnic=1 rdinit=/init" },
         "-device",
         "intel-iommu,intremap=on,caching-mode=on",
         "-netdev",
     ]);
-    command.arg(format!("socket,id=frames,connect={address}"));
+    if let Some(listener) = &listener {
+        command.arg(format!(
+            "socket,id=frames,connect={}",
+            listener.local_addr()?
+        ));
+    } else {
+        command.arg("hubport,id=frames,hubid=0");
+        command.args(["-netdev", "hubport,id=peer,hubid=0", "-device",
+            "virtio-net-pci,netdev=peer,disable-legacy=on,iommu_platform=on,addr=04.0,mac=52:54:00:12:34:57"]);
+    }
     command.args([
         "-device", "virtio-net-pci,netdev=frames,disable-legacy=on,iommu_platform=on,addr=03.0,mac=52:54:00:12:34:56",
         "-nic", "none",
     ]);
+    if egress {
+        command.args([
+            "-object",
+            &format!(
+                "filter-dump,id=egress-capture,netdev=frames,file={}",
+                directory.join("vfio.pcap").display()
+            ),
+        ]);
+    }
     let mut child = Guest(
         command
             .stdin(Stdio::null())
@@ -514,6 +544,25 @@ pub fn run(directory: PathBuf) -> Result {
             .spawn()?,
     );
 
+    if egress {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let result = loop {
+            if let Some(status) = child.0.try_wait()? {
+                break if status.code() == Some(85) {
+                    Ok(())
+                } else {
+                    Err(format!("egress guest failed with {status}; inspect serial.log").into())
+                };
+            }
+            if Instant::now() > deadline {
+                break Err("egress guest timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        println!("QEMU serial log: {}", log.display());
+        return result;
+    }
+    let listener = listener.expect("raw frame peer listener");
     let result = (|| -> Result {
         let deadline = Instant::now() + Duration::from_secs(120);
         let stream: TcpStream = loop {

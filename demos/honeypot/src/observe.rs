@@ -6,8 +6,9 @@
 //! ([`Observer::crossed`]). The observations are made from whole packets
 //! ([`Observer::whole`]): the relay puts fragments together, and the world
 //! gets the whole packet it made. A packet from the sandbox side whose IPv4
-//! header or TCP checksum is wrong is in the capture only, as a host
-//! discards it unread. Every other one is logged as the world sees it,
+//! header or TCP checksum is wrong is excluded from TCP correlation, as a host
+//! discards it unread. Readable port-zero headers are still recorded with
+//! checksum validity, independently of host acceptance. Other TCP packets are logged as the world sees them,
 //! whether or not the world then takes it: one for an address the world
 //! does not reach, or with a source its route refuses, is logged and
 //! dropped, and its line names that address. For packets from the sandbox
@@ -32,9 +33,11 @@
 //! ([`Observation::Answer`]), with their options. The SYN-ACKs the world
 //! sends again, until the handshake completes, are in the capture only.
 //!
-//! Neither file can stop the world. A record a file refuses, when the disk
-//! is full say, is lost, and the next line the log takes once both files
-//! take records again says how many were ([`Observation::Lost`]).
+//! The executable uses the bounded writer in [`crate::evidence`] to keep disk
+//! I/O outside the world. Rejected admission is counted, and the next line
+//! accepted after capture recovers reports it ([`Observation::Lost`]). The
+//! worker separately counts persistence failures. Embedded callers supplying
+//! their own [`Sinks`] must ensure those writers do not block.
 //!
 //! Each option list is logged twice over: every option with its bytes, in
 //! order ([`Opt`]), and the MPTCP ones decoded with every field the stdlib
@@ -88,6 +91,9 @@ const ACK: u8 = 0x10;
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(63);
 
+/// Maximum entries in each detector collection, independent of expiry.
+pub const STATE_LIMIT: usize = 4096;
+
 /// Which way a packet crosses an attachment, logged as `in` or `out`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +110,36 @@ pub enum Direction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Observation {
+    /// A readable literal zero port on an original incoming IP packet.
+    PortZero {
+        /// Time at the world attachment, not a hardware arrival timestamp.
+        at_us: u64,
+        /// The attachment carrying the original packet.
+        attachment: Arc<str>,
+        /// TCP or UDP as the IP protocol number.
+        protocol: u8,
+        /// The source address and port.
+        src: SocketAddr,
+        /// The destination address and port.
+        dst: SocketAddr,
+        /// Packet identity also recorded in the capture comment.
+        capture_packet: u64,
+        /// Whether the capture sink accepted this packet, not a durability claim.
+        capture_queued: bool,
+        /// Whether this is the first fragment of a fragmented datagram.
+        fragmented: bool,
+        /// IP and transport checksum validity, unknown for incomplete datagrams.
+        checksum_valid: Option<bool>,
+    },
+    /// Correlation state could not be admitted at its hard population limit.
+    StateLimit {
+        /// Time of the rejected admission.
+        at_us: u64,
+        /// The bounded collection whose admission was rejected.
+        collection: &'static str,
+        /// Maximum retained entries.
+        limit: usize,
+    },
     /// A SYN into the world.
     Syn {
         /// When it arrived.
@@ -225,6 +261,10 @@ pub enum Observation {
         completed: bool,
         /// How observation ended.
         end: ProbeEnd,
+        /// No local capture queue rejection was seen during this observation.
+        /// Unknown for reassembled packets without all fragment references.
+        /// Device loss and later persistence failure are accounted separately.
+        capture_queue_complete: Option<bool>,
     },
     /// A source sent a burst of SYNs: see the [module docs](self).
     Burst {
@@ -836,7 +876,8 @@ impl Serialize for Flags {
     }
 }
 
-/// Where the observer writes.
+/// Where the observer writes. Custom writers execute on the world thread;
+/// use [`crate::evidence::Writer`] for bounded asynchronous file persistence.
 pub struct Sinks {
     /// Observations, one JSON object per line.
     pub log: Box<dyn Write + Send>,
@@ -880,8 +921,7 @@ impl Sink {
         self.torn = record[wrote..].to_vec();
         // A writer that keeps what it could not write yet, as a BufWriter
         // does, writes it with a later record.
-        let _ = self.out.flush();
-        true
+        self.out.flush().is_ok()
     }
 
     /// Writes as much of `bytes` as the file takes. Returns how much.
@@ -915,16 +955,18 @@ struct Awaited {
     ack: u32,
 }
 
-/// A connection attempt, separated by attachment and initial sequence number.
+/// A flow on one attachment; its probe records the current initial sequence.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Attempt {
     attachment: Arc<str>,
     src: SocketAddr,
     dst: SocketAddr,
-    seq: u32,
 }
 
 struct Probe {
+    seq: u32,
+    capture_queue_complete: Option<bool>,
+    capture_generation: u64,
     first: Instant,
     last_syn: Instant,
     options: bool,
@@ -936,15 +978,24 @@ struct Probe {
 }
 
 impl Probe {
-    fn report(&self, key: &Attempt, at_us: u64, end: ProbeEnd) -> Option<Observation> {
+    fn report(
+        &self,
+        key: &Attempt,
+        at_us: u64,
+        end: ProbeEnd,
+        capture_generation: u64,
+    ) -> Option<Observation> {
         (self.capable && !self.payload).then(|| Observation::MptcpNoData {
             at_us,
             attachment: key.attachment.clone(),
             src: key.src,
             dst: key.dst,
-            seq: key.seq,
+            seq: self.seq,
             completed: self.completed.is_some(),
             end,
+            capture_queue_complete: self
+                .capture_queue_complete
+                .map(|complete| complete && self.capture_generation == capture_generation),
         })
     }
 }
@@ -980,6 +1031,10 @@ pub struct Observer {
     pending: VecDeque<(Instant, Awaited)>,
     probes: HashMap<Attempt, Probe>,
     expiry_waiter: Option<Waker>,
+    capture_packet: u64,
+    probe_expiry: Option<Instant>,
+    capture_generation: u64,
+    restricted_evidence: bool,
 }
 
 impl Observer {
@@ -1009,7 +1064,26 @@ impl Observer {
             pending: VecDeque::new(),
             probes: HashMap::new(),
             expiry_waiter: None,
+            capture_packet: 0,
+            probe_expiry: None,
+            capture_generation: 0,
+            restricted_evidence: false,
         })
+    }
+
+    pub(crate) fn restricted_evidence(&mut self, enabled: bool) {
+        self.restricted_evidence = enabled;
+    }
+
+    pub(crate) fn connection_limit(&mut self, now: Instant) {
+        self.write_observations(
+            self.clock.micros(now),
+            vec![Observation::StateLimit {
+                at_us: self.clock.micros(now),
+                collection: "connections",
+                limit: crate::CONNECTION_LIMIT,
+            }],
+        );
     }
 
     /// How many source addresses have SYNs in the burst window.
@@ -1027,6 +1101,7 @@ impl Observer {
         now: Instant,
     ) {
         let at_us = self.clock.micros(now);
+        self.capture_packet += 1;
         let mut block = Vec::with_capacity(packet.len() + 64);
         let way = match direction {
             Direction::In => "in",
@@ -1037,11 +1112,26 @@ impl Observer {
             at_us,
             packet.len(),
             packet,
-            Some(&format!("{attachment} {way}")),
+            Some(&format!(
+                "{attachment} {way} packet={}",
+                self.capture_packet
+            )),
         );
         self.capturing = self.pcap.put(&block);
         if !self.capturing {
             self.lost.packets += 1;
+            self.capture_generation = self.capture_generation.saturating_add(1);
+        }
+        if direction == Direction::In
+            && let Some(fact) = port_zero(
+                attachment,
+                packet,
+                at_us,
+                self.capture_packet,
+                self.capturing,
+            )
+        {
+            self.write_observations(at_us, vec![fact]);
         }
     }
 
@@ -1054,8 +1144,42 @@ impl Observer {
         packet: &[u8],
         now: Instant,
     ) {
-        let observations = self.observe(attachment, direction, packet, now);
-        self.write_observations(self.clock.micros(now), observations);
+        self.whole_with_provenance(attachment, direction, packet, now, false);
+    }
+
+    /// Observe a datagram reconstructed from captured fragments. It has no
+    /// single original packet reference; the fragment captures remain separate.
+    pub fn reassembled(
+        &mut self,
+        attachment: &Arc<str>,
+        direction: Direction,
+        packet: &[u8],
+        now: Instant,
+    ) {
+        self.whole_with_provenance(attachment, direction, packet, now, true);
+    }
+
+    fn whole_with_provenance(
+        &mut self,
+        attachment: &Arc<str>,
+        direction: Direction,
+        packet: &[u8],
+        now: Instant,
+        reassembled: bool,
+    ) {
+        let coverage = (!reassembled).then_some(self.capturing);
+        let observations = self.observe(attachment, direction, packet, now, coverage);
+        let capture = (!reassembled && self.capture_packet > 0).then_some(self.capture_packet);
+        self.write_packet_observations(
+            self.clock.micros(now),
+            observations,
+            capture,
+            Some(if reassembled {
+                "reassembled_ip"
+            } else {
+                "attachment_ip"
+            }),
+        );
     }
 
     /// Write an SSH transcript fact through the packet log's record sink.
@@ -1076,7 +1200,11 @@ impl Observer {
         let record = Ssh {
             event: "ssh",
             at_us,
-            ssh: fictionet_extras::ssh::honeypot::Record::new(context, event, Instant::ZERO),
+            ssh: if self.restricted_evidence {
+                fictionet_extras::ssh::honeypot::Record::new(context, event, Instant::ZERO)
+            } else {
+                fictionet_extras::ssh::honeypot::Record::redacted(context, event, Instant::ZERO)
+            },
         };
         match serde_json::to_vec(&record) {
             Ok(mut line) => {
@@ -1089,7 +1217,17 @@ impl Observer {
         }
     }
 
-    fn write_observations(&mut self, at_us: u64, mut observations: Vec<Observation>) {
+    fn write_observations(&mut self, at_us: u64, observations: Vec<Observation>) {
+        self.write_packet_observations(at_us, observations, None, None);
+    }
+
+    fn write_packet_observations(
+        &mut self,
+        at_us: u64,
+        mut observations: Vec<Observation>,
+        capture_packet: Option<u64>,
+        packet_provenance: Option<&str>,
+    ) {
         if self.lost != Lost::default() && self.capturing {
             let lost = Observation::Lost {
                 at_us,
@@ -1100,7 +1238,21 @@ impl Observer {
             self.lost = Lost::default();
         }
         for observation in observations {
-            let mut line = serde_json::to_vec(&observation).expect("observations are plain data");
+            #[derive(Serialize)]
+            struct Record<'a> {
+                #[serde(flatten)]
+                observation: &'a Observation,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                capture_packet: Option<u64>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                packet_provenance: Option<&'a str>,
+            }
+            let record = Record {
+                observation: &observation,
+                capture_packet,
+                packet_provenance,
+            };
+            let mut line = serde_json::to_vec(&record).expect("observations are plain data");
             line.push(b'\n');
             if !self.log.put(&line) {
                 match observation {
@@ -1126,6 +1278,7 @@ impl Observer {
         direction: Direction,
         packet: &[u8],
         now: Instant,
+        capture_queue_complete: Option<bool>,
     ) -> Vec<Observation> {
         self.expire(now);
         let Some(header) = ip::Header::parse_truncated(packet) else {
@@ -1202,61 +1355,59 @@ impl Observer {
             .to_vec());
         let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
         let mut signals = Vec::new();
-        if track && direction == Direction::In && opening {
-            self.probes.retain(|key, _| {
-                key.attachment != attachment || key.src != src || key.dst != dst || key.seq == seq
-            });
+        let key = Attempt {
+            attachment: attachment.clone(),
+            src: if direction == Direction::In {
+                src
+            } else {
+                flow_dst
+            },
+            dst: if direction == Direction::In { dst } else { src },
+        };
+        if track
+            && direction == Direction::In
+            && opening
+            && self.probes.get(&key).is_some_and(|probe| probe.seq != seq)
+        {
+            self.probes.remove(&key);
         }
-        if track && direction == Direction::Out {
-            for (key, probe) in &mut self.probes {
-                if key.attachment == attachment
-                    && key.src == flow_dst
-                    && key.dst == src
-                    && flags & (SYN | ACK | RST | FIN) == SYN | ACK
-                    && ack == key.seq.wrapping_add(1)
-                    && probe.completed.is_none()
-                {
-                    probe.server_seq = Some(seq);
-                    probe.answered.get_or_insert(now);
-                }
+        let mut closing = false;
+        if track && let Some(probe) = self.probes.get_mut(&key) {
+            let incoming = direction == Direction::In;
+            if !incoming
+                && flags & (SYN | ACK | RST | FIN) == SYN | ACK
+                && ack == probe.seq.wrapping_add(1)
+                && probe.completed.is_none()
+            {
+                probe.server_seq = Some(seq);
+                probe.answered.get_or_insert(now);
             }
+            if incoming
+                && flags & (SYN | RST | ACK) == ACK
+                && seq == probe.seq.wrapping_add(1)
+                && probe
+                    .server_seq
+                    .is_some_and(|server| ack == server.wrapping_add(1))
+            {
+                probe.completed.get_or_insert(now);
+            }
+            let belongs = probe.completed.is_some()
+                || (incoming
+                    && seq
+                        == if flags & SYN != 0 {
+                            probe.seq
+                        } else {
+                            probe.seq.wrapping_add(1)
+                        })
+                || (!incoming && flags & ACK != 0 && ack == probe.seq.wrapping_add(1));
+            if incoming && belongs && !payload.is_empty() {
+                probe.payload = true;
+            }
+            closing = belongs && flags & (FIN | RST) != 0;
         }
-        let closing: Vec<_> = self
-            .probes
-            .iter_mut()
-            .filter_map(|(key, probe)| {
-                let incoming = direction == Direction::In && key.src == src && key.dst == dst;
-                let outgoing = direction == Direction::Out && key.src == flow_dst && key.dst == src;
-                if !track || key.attachment != attachment || !(incoming || outgoing) {
-                    return None;
-                }
-                if incoming
-                    && flags & (SYN | RST | ACK) == ACK
-                    && seq == key.seq.wrapping_add(1)
-                    && probe
-                        .server_seq
-                        .is_some_and(|server| ack == server.wrapping_add(1))
-                {
-                    probe.completed.get_or_insert(now);
-                }
-                let belongs = probe.completed.is_some()
-                    || (incoming
-                        && seq
-                            == if flags & SYN != 0 {
-                                key.seq
-                            } else {
-                                key.seq.wrapping_add(1)
-                            })
-                    || (outgoing && flags & ACK != 0 && ack == key.seq.wrapping_add(1));
-                if incoming && belongs && !payload.is_empty() {
-                    probe.payload = true;
-                }
-                (belongs && flags & (FIN | RST) != 0).then(|| key.clone())
-            })
-            .collect();
-        for key in closing {
+        if closing {
             let probe = self.probes.remove(&key).unwrap();
-            signals.extend(probe.report(&key, at_us, ProbeEnd::Close));
+            signals.extend(probe.report(&key, at_us, ProbeEnd::Close, self.capture_generation));
         }
         if direction == Direction::Out {
             let rst = flags & RST != 0;
@@ -1294,7 +1445,6 @@ impl Observer {
                 attachment: attachment.clone(),
                 src,
                 dst,
-                seq,
             };
             if track && opening {
                 if let Some(probe) = self.probes.get_mut(&key) {
@@ -1330,10 +1480,22 @@ impl Observer {
                     let capable = mptcp
                         .iter()
                         .any(|option| matches!(option, Mptcp::MpCapable { .. }));
-                    if has_options || capable {
+                    if (has_options || capable) && self.probes.len() >= STATE_LIMIT {
+                        signals.push(Observation::StateLimit {
+                            at_us,
+                            collection: "probes",
+                            limit: STATE_LIMIT,
+                        });
+                    } else if has_options || capable {
+                        let deadline = now + ANSWER_TIMEOUT;
+                        self.probe_expiry =
+                            Some(self.probe_expiry.map_or(deadline, |at| at.min(deadline)));
                         self.probes.insert(
                             key,
                             Probe {
+                                seq,
+                                capture_queue_complete,
+                                capture_generation: self.capture_generation,
                                 first: now,
                                 last_syn: now,
                                 options: has_options,
@@ -1415,11 +1577,7 @@ impl Observer {
         burst
             .into_iter()
             .chain(answer)
-            .chain(
-                self.probes
-                    .values()
-                    .map(|probe| probe.first + ANSWER_TIMEOUT),
-            )
+            .chain(self.probe_expiry)
             .min()
             .unwrap_or(Instant::from_since_start(Duration::MAX))
     }
@@ -1428,13 +1586,25 @@ impl Observer {
     pub(crate) fn expire(&mut self, now: Instant) {
         let at_us = self.clock.micros(now);
         let mut expired = Vec::new();
-        self.probes.retain(|key, probe| {
-            if now < probe.first + ANSWER_TIMEOUT {
-                return true;
-            }
-            expired.extend(probe.report(key, at_us, ProbeEnd::Expired));
-            false
-        });
+        if self.probe_expiry.is_some_and(|deadline| now >= deadline) {
+            self.probes.retain(|key, probe| {
+                if now < probe.first + ANSWER_TIMEOUT {
+                    return true;
+                }
+                expired.extend(probe.report(
+                    key,
+                    at_us,
+                    ProbeEnd::Expired,
+                    self.capture_generation,
+                ));
+                false
+            });
+            self.probe_expiry = self
+                .probes
+                .values()
+                .map(|probe| probe.first + ANSWER_TIMEOUT)
+                .min();
+        }
         self.write_observations(at_us, expired);
         if self.probes.is_empty() {
             self.probes.shrink_to_fit();
@@ -1486,6 +1656,17 @@ impl Observer {
         now: Instant,
     ) -> (Option<u64>, Vec<(BurstKind, usize)>) {
         self.expire(now);
+        if self.recent.len() >= STATE_LIMIT || self.pending.len() >= STATE_LIMIT {
+            self.write_observations(
+                self.clock.micros(now),
+                vec![Observation::StateLimit {
+                    at_us: self.clock.micros(now),
+                    collection: "syns",
+                    limit: STATE_LIMIT,
+                }],
+            );
+            return (None, Vec::new());
+        }
         self.recent.push_back((now, src, join));
         self.pending.push_back((now, answer));
         let waiting = self.awaited.entry(answer).or_insert((now, 0));
@@ -1519,5 +1700,355 @@ impl Observer {
             bursts.push((BurstKind::Joins, source.joins));
         }
         (gap, bursts)
+    }
+}
+
+/// Read only original packet headers; reassembly must not create a second count.
+fn port_zero(
+    attachment: &Arc<str>,
+    packet: &[u8],
+    at_us: u64,
+    capture_packet: u64,
+    capture_queued: bool,
+) -> Option<Observation> {
+    let header = ip::Header::parse_truncated(packet)?;
+    if header.fragment.is_some_and(|fragment| fragment.offset != 0) {
+        return None;
+    }
+    let transport = header.payload(packet);
+    let minimum = match header.protocol {
+        protocol::TCP => 20,
+        protocol::UDP => 8,
+        _ => return None,
+    };
+    if transport.len() < minimum {
+        return None;
+    }
+    let src = SocketAddr::new(header.src, u16::from_be_bytes([transport[0], transport[1]]));
+    let dst = SocketAddr::new(header.dst, u16::from_be_bytes([transport[2], transport[3]]));
+    if src.port() != 0 && dst.port() != 0 {
+        return None;
+    }
+    let fragmented = header
+        .fragment
+        .is_some_and(|fragment| !fragment.is_atomic());
+    let checksum_valid = (!fragmented && ip::Header::parse(packet).is_some()).then(|| {
+        let ip_valid = !header.src.is_ipv4() || ip::checksum(&packet[..header.payload.start]) == 0;
+        ip_valid
+            && if header.protocol == protocol::UDP {
+                let length = usize::from(u16::from_be_bytes([transport[4], transport[5]]));
+                (8..=transport.len()).contains(&length)
+                    && ip::udp_checksum_ok(header.src, header.dst, &transport[..length])
+            } else {
+                ip::transport_checksum(header.src, header.dst, protocol::TCP, transport) == 0
+            }
+    });
+    Some(Observation::PortZero {
+        at_us,
+        attachment: attachment.clone(),
+        protocol: header.protocol,
+        src,
+        dst,
+        capture_packet,
+        capture_queued,
+        fragmented,
+        checksum_valid,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet(v6: bool, protocol: u8, src: u16, dst: u16) -> Vec<u8> {
+        let (from, to): (IpAddr, IpAddr) = if v6 {
+            (
+                "2001:db8::1".parse().unwrap(),
+                "2001:db8::2".parse().unwrap(),
+            )
+        } else {
+            ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap())
+        };
+        let mut transport = vec![0; if protocol == protocol::TCP { 20 } else { 8 }];
+        transport[..2].copy_from_slice(&src.to_be_bytes());
+        transport[2..4].copy_from_slice(&dst.to_be_bytes());
+        let checksum = if protocol == protocol::TCP {
+            transport[12] = 5 << 4;
+            transport[13] = ACK;
+            16
+        } else {
+            transport[4..6].copy_from_slice(&8u16.to_be_bytes());
+            6
+        };
+        let sum = ip::transport_checksum(from, to, protocol, &transport);
+        transport[checksum..checksum + 2].copy_from_slice(&sum.to_be_bytes());
+        ip::packet(from, to, protocol, &transport).0
+    }
+
+    #[test]
+    fn zero_ports_cover_both_families_and_transports_once() {
+        let attachment = Arc::from("internet");
+        for v6 in [false, true] {
+            for protocol in [protocol::TCP, protocol::UDP] {
+                for (src, dst) in [(0, 22), (22, 0), (0, 0)] {
+                    let packet = packet(v6, protocol, src, dst);
+                    let fact = port_zero(&attachment, &packet, 12, 7, true).unwrap();
+                    assert!(matches!(fact, Observation::PortZero {
+                        src: from, dst: to, protocol: p, capture_packet: 7,
+                        fragmented: false, checksum_valid: Some(true), ..
+                    } if from.port() == src && to.port() == dst && p == protocol));
+                }
+                assert!(
+                    port_zero(&attachment, &packet(v6, protocol, 22, 80), 0, 0, true).is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_ports_do_not_invent_headers_and_keep_bad_checksums() {
+        let attachment = Arc::from("internet");
+        let mut packet = packet(false, protocol::TCP, 0, 22);
+        packet[36] ^= 1;
+        assert!(matches!(
+            port_zero(&attachment, &packet, 0, 0, false),
+            Some(Observation::PortZero {
+                checksum_valid: Some(false),
+                capture_queued: false,
+                ..
+            })
+        ));
+        for len in 0..packet.len() {
+            assert!(port_zero(&attachment, &packet[..len], 0, 0, true).is_none());
+        }
+        packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+        assert!(port_zero(&attachment, &packet, 0, 0, true).is_none());
+        packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        assert!(matches!(
+            port_zero(&attachment, &packet, 0, 0, true),
+            Some(Observation::PortZero {
+                fragmented: true,
+                checksum_valid: None,
+                ..
+            })
+        ));
+        let quote = ip::packet(
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+            protocol::ICMP,
+            &packet,
+        );
+        assert!(port_zero(&attachment, &quote.0, 0, 0, true).is_none());
+    }
+
+    #[test]
+    fn udp_checksums_follow_declared_length() {
+        for v6 in [false, true] {
+            let mut packet = packet(v6, protocol::UDP, 0, 53);
+            packet.extend_from_slice(&[0xaa, 0xbb]);
+            let offset = if v6 { 40 } else { 20 };
+            if v6 {
+                packet[4..6].copy_from_slice(&10u16.to_be_bytes());
+            } else {
+                packet[2..4].copy_from_slice(&30u16.to_be_bytes());
+                ip::set_header_checksum(&mut packet[..20]);
+            }
+            assert!(matches!(
+                port_zero(&Arc::from("internet"), &packet, 0, 0, true),
+                Some(Observation::PortZero {
+                    checksum_valid: Some(true),
+                    ..
+                })
+            ));
+            packet[offset + 4..offset + 6].copy_from_slice(&7u16.to_be_bytes());
+            packet[offset + 6..offset + 8].fill(0);
+            assert!(matches!(
+                port_zero(&Arc::from("internet"), &packet, 0, 0, true),
+                Some(Observation::PortZero {
+                    checksum_valid: Some(false),
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn detector_population_stays_bounded_and_expires() {
+        let mut observer = Observer::new(
+            Sinks {
+                log: Box::new(io::sink()),
+                pcap: Box::new(io::sink()),
+            },
+            Clock::at_unix_secs(0),
+            Burst::default(),
+            Arc::new(Tokens::default()),
+        )
+        .unwrap();
+        for port in 0..STATE_LIMIT + 100 {
+            observer.syn(
+                "192.0.2.1".parse().unwrap(),
+                false,
+                Awaited {
+                    from: "192.0.2.2:80".parse().unwrap(),
+                    to: SocketAddr::new("192.0.2.1".parse().unwrap(), port as u16),
+                    ack: 1,
+                },
+                Instant::ZERO,
+            );
+        }
+        assert_eq!(observer.pending.len(), STATE_LIMIT);
+        assert_eq!(observer.recent.len(), STATE_LIMIT);
+        assert_eq!(observer.awaited.len(), STATE_LIMIT);
+        observer.expire(Instant::from_since_start(ANSWER_TIMEOUT));
+        assert!(observer.pending.is_empty());
+        assert!(observer.recent.is_empty());
+        assert!(observer.awaited.is_empty());
+        assert!(observer.sources.is_empty());
+    }
+
+    fn probe_packet(seq: u32) -> Vec<u8> {
+        let mut packet = packet(false, protocol::TCP, 40000, 80);
+        packet[24..28].copy_from_slice(&seq.to_be_bytes());
+        packet[32] = 6 << 4;
+        packet[33] = SYN;
+        packet.extend_from_slice(&[30, 4, 0x01, 0x01]);
+        packet.splice(20..20, [1, 1, 1, 0]);
+        packet[0] = 0x46;
+        let len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&len.to_be_bytes());
+        packet[40..42].fill(0);
+        let sum = ip::transport_checksum(
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+            protocol::TCP,
+            &packet[24..],
+        );
+        packet[40..42].copy_from_slice(&sum.to_be_bytes());
+        ip::set_header_checksum(&mut packet[..24]);
+        packet
+    }
+
+    #[test]
+    fn probe_correlation_keeps_sequence_and_attachment_boundaries() {
+        let mut observer = Observer::new(
+            Sinks {
+                log: Box::new(io::sink()),
+                pcap: Box::new(io::sink()),
+            },
+            Clock::at_unix_secs(0),
+            Burst::default(),
+            Arc::new(Tokens::default()),
+        )
+        .unwrap();
+        let attachment = Arc::from("internet");
+        let packet = probe_packet(123);
+        observer.observe(
+            &attachment,
+            Direction::In,
+            &packet,
+            Instant::ZERO,
+            Some(true),
+        );
+        assert_eq!(observer.probes.len(), 1);
+        assert!(observer.probes.values().next().unwrap().capable);
+        let later = Instant::from_since_start(Duration::from_millis(10));
+        let events = observer.observe(&attachment, Direction::In, &packet, later, Some(true));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Observation::IpOptionsRetransmit {
+                seq: 123,
+                gap_us: 10000,
+                ..
+            }
+        )));
+        let events = observer.observe(
+            &Arc::from("other"),
+            Direction::In,
+            &packet,
+            later,
+            Some(true),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+        );
+        let events = observer.observe(
+            &attachment,
+            Direction::In,
+            &probe_packet(456),
+            later,
+            Some(true),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Observation::IpOptionsRetransmit { .. }))
+        );
+        assert_eq!(observer.probes.len(), 2);
+        observer.expire(Instant::from_since_start(
+            ANSWER_TIMEOUT + Duration::from_secs(1),
+        ));
+        assert!(observer.probes.is_empty());
+    }
+
+    #[test]
+    fn negative_observations_preserve_unknown_or_lost_capture_coverage() {
+        let mut observer = Observer::new(
+            Sinks {
+                log: Box::new(io::sink()),
+                pcap: Box::new(io::sink()),
+            },
+            Clock::at_unix_secs(0),
+            Burst::default(),
+            Arc::new(Tokens::default()),
+        )
+        .unwrap();
+        let attachment = Arc::from("internet");
+        observer.observe(
+            &attachment,
+            Direction::In,
+            &probe_packet(123),
+            Instant::ZERO,
+            None,
+        );
+        let (key, probe) = observer.probes.iter().next().unwrap();
+        assert!(matches!(
+            probe.report(key, 0, ProbeEnd::Expired, observer.capture_generation),
+            Some(Observation::MptcpNoData {
+                capture_queue_complete: None,
+                ..
+            })
+        ));
+        observer.observe(
+            &attachment,
+            Direction::In,
+            &probe_packet(456),
+            Instant::ZERO,
+            Some(true),
+        );
+        observer.capture_generation += 1;
+        let (key, probe) = observer.probes.iter().next().unwrap();
+        assert!(matches!(
+            probe.report(key, 0, ProbeEnd::Expired, observer.capture_generation),
+            Some(Observation::MptcpNoData {
+                capture_queue_complete: Some(false),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sink_reports_flush_failure() {
+        struct RefusesFlush;
+        impl Write for RefusesFlush {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("storage unavailable"))
+            }
+        }
+        assert!(!Sink::new(Box::new(RefusesFlush)).put(b"record\n"));
     }
 }

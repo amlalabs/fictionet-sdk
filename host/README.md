@@ -23,10 +23,11 @@ The [raw world example](examples/raw_world.rs) parses a `PciAddress`, opens
 - `fictionet::Interface` stays an interface for IP packets.
   `EthernetFrame` carries whole Ethernet frames.
 
-The [raw honeypot example](../demos/honeypot/examples/raw_honeypot.rs),
-built with the honeypot crate's `raw-virtio` feature, uses the same
-attachment. It logs each frame before reading it, and passes IP packets
-on to the honeypot world.
+The [honeypot executable](../demos/honeypot/README.md), built with its
+`raw-virtio` feature, uses the same attachment through `run --backend vfio`.
+It captures each original frame before parsing and passes IP packets on to
+the shared honeypot world. Generic in-memory Ethernet attachments are available
+with `raw-ethernet` independently of the virtio driver.
 
 The driver runs only in a QEMU guest. Before it opens VFIO, it checks
 QEMU's DMI identity and the token `fictionet.rawnic=1` on the guest's
@@ -115,5 +116,7 @@ The driver follows the modern PCI transport and split virtqueue rules of
 the [virtio specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
 and the Linux [VFIO interface](https://www.kernel.org/doc/html/latest/driver-api/vfio.html).
 
-The same guest then runs the shipped `raw_honeypot` example and repeats
-neighbor discovery, IPv6 SSH and the complete MPTCP HTTP exchange.
+The same guest then runs the unified honeypot executable and repeats
+neighbor discovery, IPv6 SSH and the complete MPTCP HTTP exchange. It verifies
+original Ethernet capture and graceful evidence shutdown. TUN lifecycle and
+bidirectional packet checks also run inside this guest.

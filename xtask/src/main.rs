@@ -30,11 +30,11 @@ async fn main() -> Result {
         return ssh_connect::run(&args.collect::<Vec<_>>()).await;
     }
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
-    if task == "rawnic" {
+    if task == "rawnic" || task == "egress" {
         if args.next().is_some() {
             return Err("unexpected argument".into());
         }
-        return rawnic::run(downloads);
+        return rawnic::run(downloads, task == "egress");
     }
     if task == "search-web" {
         let step = match args.next().as_deref() {

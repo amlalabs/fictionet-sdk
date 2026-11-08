@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::sync::Arc;
 use std::task::Waker;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::network::ethernet::frame::Mac;
 use fictionet::stdlib::network::ethernet::host::{self, Host, Ipv4Config, Ipv6Config, Received};
@@ -32,6 +32,8 @@ struct Capture {
 #[derive(Serialize)]
 struct FrameRecord {
     at_us: u64,
+    received_at_us: Option<u64>,
+    timestamp_source: &'static str,
     direction: Direction,
     bytes: Hex,
     lost: u64,
@@ -41,11 +43,25 @@ struct FrameRecord {
 }
 
 impl Capture {
-    fn frame(&mut self, fcx: &Cx, direction: Direction, bytes: Vec<u8>) {
+    fn frame(
+        &mut self,
+        fcx: &Cx,
+        direction: Direction,
+        bytes: Vec<u8>,
+        received_at: Option<SystemTime>,
+    ) {
         let queue_dropped = self.receive_stats.queue_dropped();
         let tx_queue_dropped = self.transmit_stats.queue_dropped();
         let record = FrameRecord {
             at_us: self.clock.micros(fcx.now()),
+            received_at_us: received_at
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_micros().min(u64::MAX as u128) as u64),
+            timestamp_source: if received_at.is_some() {
+                "host_system_time"
+            } else {
+                "world_clock"
+            },
             direction,
             bytes: Hex(bytes),
             lost: self.lost,
@@ -81,7 +97,7 @@ impl Link {
     /// A frame the full transmit queue cannot take is dropped.
     fn put(&mut self, fcx: &Cx, frame: Vec<u8>) -> fictionet::Result {
         let sent = self.sender.try_send(EthernetFrame(frame.clone()));
-        self.capture.frame(fcx, Direction::Out, frame);
+        self.capture.frame(fcx, Direction::Out, frame, None);
         sent.map(|_| ())
     }
 
@@ -134,6 +150,9 @@ fn host(config: &Config, mac: Mac, now: Instant) -> fictionet::Result<Host> {
 /// is null because device and backend losses are unavailable, not zero. Partial records
 /// are completed before the next one. `sinks`
 /// retain the existing IP capture and TCP option observations.
+/// `received_at_us` preserves backend receipt time from the host system clock
+/// before queueing, when available; `at_us` is world processing time. Neither
+/// clock represents a hardware timestamp or independently observed transmission.
 ///
 /// The link-layer work is done by an
 /// [`ethernet::Host`](fictionet::stdlib::network::ethernet::Host), as a
@@ -192,11 +211,12 @@ pub fn start_raw(
         // Keep the attacher alive for the lifetime of its internet endpoint.
         let _attacher = attacher;
         loop {
-            let EthernetFrame(bytes) = receiver.recv(&fcx).await?;
+            let received = receiver.recv_with_timestamp(&fcx).await?;
+            let EthernetFrame(bytes) = received.frame;
             incoming
                 .lock()
                 .capture
-                .frame(&fcx, Direction::In, bytes.clone());
+                .frame(&fcx, Direction::In, bytes.clone(), received.received_at);
             fcx.yield_now().await?;
             let mut link = incoming.lock();
             if let Received::World(packet) = link.host.receive(fcx.now(), &bytes) {
