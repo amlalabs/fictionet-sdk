@@ -18,12 +18,18 @@ Two requested guarantees need qualification:
   both fail `RequestOrder`: accept queries one and two, complete two first, send
   its answer while one is pending. The models check completion order for DoT,
   request order for HTTP/1, and identity and byte order for each HTTP/2 exchange.
-- Generic `Switch` transfers the leftovers its predecessor supplies. It cannot
-  identify plaintext itself. The STARTTLS model checks the concrete mail handoff
-  in `tests/it/services/tls.rs`, which stops plaintext parsing, discards input
-  received while waiting for the switch, and transfers only control events.
-  There is no production mail STARTTLS parser in this branch. A replacement
-  predecessor must enforce the same boundary.
+- STARTTLS safety no longer rests on each plaintext protocol. `Switch` asks its
+  successor which input from before the switch it reads
+  (`Successor::inherits`), and `Secure` reads no data, so the switch drops
+  whatever plaintext the predecessor hands over or refused and the layer below
+  still holds. The STARTTLS model checks the mail handoff in
+  `tests/it/services/tls.rs` with the switch's drop: `Starttls_careless.cfg`
+  keeps the session's pipelined plaintext and still passes. Stopping at the
+  command (`NoPlainPastBoundary`) and handing over only after the go-ahead is
+  written (`PlaintextFence`) remain the plaintext protocol's: the switch cannot
+  see what it parsed or wrote. Bytes the layer below has not offered by the
+  switch reach TLS as its first input, as any bytes in transit do; plaintext
+  there fails the handshake.
 
 ## Models and results
 
@@ -55,7 +61,8 @@ liveness run uses weak fairness. Runs used TLC 2.19, Kani 0.68.0 and CBMC
 | `Listener_without_takefactory.cfg` | Fails `ApplicationOnce`: build twice |
 | `Listener_without_usenegotiated.cfg` | Fails `NegotiatedApplication`: route using requested rather than negotiated metadata |
 | `Starttls_base.cfg` | Pass, 28 states; all three invariants |
-| `Starttls_without_discard.cfg` | Fails `NoPlaintextReplay`: carry old plaintext into TLS |
+| `Starttls_careless.cfg` | Pass, 28 states; the session keeps its pipelined plaintext and the switch drops it |
+| `Starttls_without_discard.cfg` | Fails `NoPlaintextReplay`: neither the session nor the switch drops old plaintext, which reaches TLS |
 | `Starttls_without_stop.cfg` | Fails `NoPlainPastBoundary`: plaintext parser consumes beyond STARTTLS |
 | `Starttls_without_fence.cfg` | Fails `PlaintextFence`: switch before old output completes |
 | `EncryptedDns_dot.cfg` | Pass, 106 states |

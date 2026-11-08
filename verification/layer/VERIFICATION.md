@@ -75,9 +75,9 @@ does, and `Driver::run` advances until nothing moves.
 | --- | --- |
 | `OfferSlot`, `OfferMoved` | `chain.rs:62` `offer` |
 | `StepL`, `StepS`, `StepTU`, `StepOU`, `StepTD`, `StepOD` | `chain.rs:133-171` `Chain::advance` |
-| `StepS`, `StepH` (first phase) | `switch.rs:195-205` |
-| `StepS`, `StepSB`, `StepSA` (second phase), `FeedQueue` | `switch.rs:207-223`, `feed` at `switch.rs:101` |
-| `EventAnswers`, `CommandAnswers` | `switch.rs:128-159` `Switch::on_event`, `on_command` |
+| `StepS`, `StepH` (first phase) | `switch.rs:245-266` |
+| `StepS`, `StepSB`, `StepSA` (second phase), `FeedQueue` | `switch.rs:267-284`, `feed` at `switch.rs:140` |
+| `EventAnswers`, `CommandAnswers` | `switch.rs:167-211` `Switch::on_event`, `on_command` |
 | `StartRun`, `StepE` | `driver.rs:168` `Driver::run` |
 | `SendBelow`, `SendAbove` | `driver.rs:190-226` and `send` at `driver.rs:246` |
 | `Deliver`, `OwnerQueue` | `driver.rs:142`, `harness.rs:249-263` |
@@ -118,15 +118,19 @@ its queue.
 
 - Timers, work and reports. They go to the part their `Side` names and are
   not routed between parts; a timer of `A`'s that fires after the switch is
-  ignored by construction (`switch.rs:161-175`).
+  ignored by construction (`switch.rs:213-243`).
 - Errors. An `Err` from any entry point ends the connection, and nothing
   routes after it.
 - The contract on `Handoff` implementations. The model's `A` hands over
   only once its own output has been taken, as the trait asks. A layer that
   hands over with output still queued loses it; the switch cannot check this.
 - Byte contents and protocol meaning. `A`'s handover keeps everything it did
-  not use; a protocol that hands its successor less on purpose (STARTTLS
-  dropping pipelined plaintext) is the protocol's choice, outside the model.
+  not use, and the model's `B` inherits every event, as tunnels and the
+  HTTP upgrades do. A successor that declines input from before the switch
+  (`Successor::inherits`: TLS after STARTTLS reads no earlier data) has the
+  switch drop it; that is checked by
+  `verification/tls-contract/Starttls.tla` and the careless-session test in
+  `tests/it/services/tls.rs`, not here.
 - Datagrams. They are never split, a special case of the chunks here (only
   whole answers).
 - Nesting: one chain and one switch. A deeper stack is the same rules again
