@@ -27,7 +27,7 @@ Their obligations now live with the code that replaced the engine:
 | `timers_are_armed_once_and_the_earliest_is_due` (`arm`, `due`) | the timer harnesses in `verification/layer/kani/mod.rs` over `layer::Timers`, which every layer keeps its timers in: arming a name again moves it, `next` is the earliest with ties to the first armed, `get` and `len` agree, and `cancel`, `fire` and `retain` touch one name |
 | `charges_sum_to_the_budget_and_never_pass_its_limit` | moved to `verification/layer/kani/mod.rs`, over the same `Budget` and `Charge` |
 | `connections_are_counted_up_to_the_maximum` | moved to `verification/layer-runtime/kani/admission.rs`, over `services::stack::Counted`, which port servers count connections with |
-| `a_wake_is_seen_once_and_not_after_close` (`WakeHandle`) | `WakeHandle` is gone: a stack waits for something from outside as work. `verification/layer-runtime/kani/jobs.rs` proves over `Jobs::poll` that finished work comes back once and work whose owner ended is never polled again |
+| `a_wake_is_seen_once_and_not_after_close` (`WakeHandle`) | `WakeHandle` is gone: a stack waits for something from outside as work, which the runner polls with `Jobs::poll`. That work is never polled once its owner ends: `verification/layer/tla/Children.tla` (`NoCancelledPoll`, which `Children_without_workownership.cfg` breaks, and `CancelledWorkLeaves`) and `verification/runtime/tla/JobContext.tla`, and `cancelled_work_drops_before_another_poll` in `stack/job.rs`. A Kani harness over `Jobs::poll` was tried; Kani 0.68 stops with an internal error in its intrinsics pass on the region code `Jobs::poll` reaches, so it is not kept |
 
 ## One TCP connection: `Conn.tla`
 
