@@ -125,6 +125,12 @@ impl<D: Decode, O> Framed<D, O> {
         }
     }
 
+    /// The bytes taken from below and not decoded. After a framing
+    /// failure, what the decoder could not read.
+    pub fn unread(&self) -> &[u8] {
+        self.stream.unread()
+    }
+
     /// Charges the buffer as it may grow and the decoder's state. The
     /// buffer's limit follows the decoder's capacity on the next push, and
     /// the buffer keeps a consumed prefix until it is as long as what is

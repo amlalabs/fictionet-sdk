@@ -154,6 +154,7 @@ fn a_framing_failure_is_handed_to_the_stack_which_answers_it() {
         matches!(h.layer().upper().failed, Some(Fail::Protocol(_))),
         "the stack heard the failure"
     );
+    assert_eq!(h.layer().lower().unread(), bad, "what it could not read");
     assert!(h.ended(), "nothing can be read after a framing failure");
 }
 
