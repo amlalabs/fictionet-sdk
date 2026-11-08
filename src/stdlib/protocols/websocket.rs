@@ -746,28 +746,33 @@ impl Wire for Frame {
             .checked_add(MAX_HEADER_LEN)
             .ok_or(Error::Unwritable)?;
         out.try_reserve(size).map_err(|_| Error::Allocation)?;
-        out.push(if self.fin { 0x80 } else { 0 } | self.opcode.to_u8());
-        let masked = if self.mask.is_some() { 0x80 } else { 0 };
-        match payload.len() {
-            n if n < 126 => out.push(masked | n as u8),
-            n if n <= 0xffff => {
-                out.push(masked | 126);
-                out.extend_from_slice(&(n as u16).to_be_bytes());
-            }
-            n => {
-                out.push(masked | 127);
-                out.extend_from_slice(&(n as u64).to_be_bytes());
-            }
-        }
-        if let Some(key) = self.mask {
-            out.extend_from_slice(&key);
-        }
+        write_header(out, self.fin, self.opcode, self.mask, payload.len());
         let start = out.len();
         out.extend_from_slice(payload);
         if let Some(key) = self.mask {
             apply_mask(&mut out[start..], key, 0);
         }
         Ok(())
+    }
+}
+
+// Shared by the writer and its bounded proof; payload copying stays in write.
+fn write_header(out: &mut Vec<u8>, fin: bool, opcode: Opcode, mask: Option<[u8; 4]>, len: usize) {
+    out.push(if fin { 0x80 } else { 0 } | opcode.to_u8());
+    let masked = if mask.is_some() { 0x80 } else { 0 };
+    match len {
+        n if n < 126 => out.push(masked | n as u8),
+        n if n <= 0xffff => {
+            out.push(masked | 126);
+            out.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            out.push(masked | 127);
+            out.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    if let Some(key) = mask {
+        out.extend_from_slice(&key);
     }
 }
 
@@ -3018,3 +3023,7 @@ mod tests {
         assert_eq!(d.buffered(), 0);
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/websocket/kani/frames.rs"]
+mod verification;
