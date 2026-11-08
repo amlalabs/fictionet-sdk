@@ -602,6 +602,73 @@ impl Decode for ResponseEvents {
     }
 }
 
+/// One message body whose head was read elsewhere, framed as that head
+/// said: the body framing [`RequestEvents`] and [`ResponseEvents`] use,
+/// for a body that arrives without them, such as one a capture or an
+/// archive holds.
+///
+/// It yields [`Event::Body`] blocks and one [`Event::Done`], then ends. A
+/// [`Framing::Close`] body ends at the end of input. Chunk extensions and
+/// non-empty trailers are refused, unless [`skip_chunk_extras`](Self::skip_chunk_extras)
+/// says to skip them.
+///
+/// ```
+/// use fictionet::stdlib::{codec::Stream, protocols::http1::{BodyEvents, Event, Framing}};
+/// let mut stream = Stream::new(BodyEvents::new(Framing::Chunked));
+/// let bytes = b"5\r\nhello\r\n0\r\n\r\n";
+/// assert_eq!(stream.push(bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(Event::Body(b"hello".to_vec()))));
+/// assert_eq!(stream.next(), Some(Ok(Event::Done)));
+/// assert!(stream.next().is_none());
+/// assert!(stream.is_done());
+/// ```
+pub struct BodyEvents {
+    core: Reader,
+}
+
+impl BodyEvents {
+    /// A body framed by `framing`, with the default limits.
+    pub fn new(framing: Framing) -> Self {
+        Self::with_limits(framing, Limits::default())
+    }
+
+    /// A body framed by `framing`, with these limits: the body block size,
+    /// the chunk-size line, and for trailers the head limits.
+    pub fn with_limits(framing: Framing, limits: Limits) -> Self {
+        let mut core = Reader::new(limits);
+        core.begin(framing, true);
+        Self { core }
+    }
+
+    /// Skips chunk extensions and drops trailer fields instead of refusing
+    /// them, as [`ResponseEvents::skip_chunk_extras`] does.
+    pub fn skip_chunk_extras(mut self) -> Self {
+        self.core.chunk_extras = true;
+        self.core.lines = Lines::new(self.core.chunk_line(), Ending::Crlf);
+        self
+    }
+
+    /// Whether the body has reached its trailer section.
+    pub fn in_trailers(&self) -> bool {
+        matches!(self.core.state, State::Trailers)
+    }
+}
+
+impl Decode for BodyEvents {
+    type Item = Event<std::convert::Infallible>;
+    type Error = Error;
+    const NAME: &'static str = "HTTP/1 body";
+    fn capacity(&self) -> usize {
+        self.core.capacity()
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
+        Ok(self
+            .core
+            .body(input, eof)?
+            .map_or(Step::End, |step| step.map(BorrowedEvent::into_owned)))
+    }
+}
+
 /// Whole requests on a persistent connection, built from [`RequestEvents`].
 ///
 /// Each item consumes its complete wire message. These message decoders give
@@ -1579,17 +1646,14 @@ fn chunk_size(b: &[u8]) -> Result<u64, Error> {
     number(b, 16, Error::ChunkSize)
 }
 // A chunk size, then extensions, each after optional whitespace and a
-// semicolon (RFC 9112 section 7.1.1).
+// semicolon (RFC 9112 section 7.1.1). Whitespace before the size is
+// tolerated too, as some servers send it.
 fn chunk_size_skipping_extensions(b: &[u8]) -> Result<u64, Error> {
     let end = b.iter().position(|b| *b == b';').unwrap_or(b.len());
     if !b[end..].iter().copied().all(field_byte) {
         return Err(Error::ChunkExtension);
     }
-    let mut size = &b[..end];
-    while let [rest @ .., b' ' | b'\t'] = size {
-        size = rest;
-    }
-    number(size, 16, Error::ChunkSize)
+    number(trim(&b[..end]), 16, Error::ChunkSize)
 }
 
 #[derive(Clone, Copy)]
@@ -3334,6 +3398,63 @@ mod tests {
                 decode_all(small, &bytes)
             );
         }
+    }
+
+    /// A body read on its own frames exactly as it does after its head:
+    /// the same blocks, the same end and the same failures, at every cut.
+    #[test]
+    fn a_body_alone_frames_as_it_does_after_its_head() {
+        for (fields, framing, body) in [
+            ("Content-Length: 5\r\n", Framing::Length(5), &b"hello"[..]),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                Framing::Chunked,
+                b"2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n",
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                Framing::Chunked,
+                b"2;x\r\nhe\r\n0\r\n\r\n",
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                Framing::Chunked,
+                b"zz\r\n",
+            ),
+        ] {
+            let bytes = response_with(fields, body);
+            let (after_head, head_failure) =
+                test_support::decode_all(ResponseEvents::default, &bytes);
+            let alone = || BodyEvents::new(framing);
+            let (events, failure) = test_support::decode_all(alone, body);
+            let after_head: Vec<_> = after_head
+                .into_iter()
+                .filter_map(|event| match event {
+                    Event::Head(_) => None,
+                    Event::Body(data) => Some(Event::Body(data)),
+                    Event::Done => Some(Event::Done),
+                })
+                .collect();
+            assert_eq!(events, after_head, "{body:?}");
+            assert_eq!(failure, head_failure, "{body:?}");
+            assert_eq!(
+                decode_chunks(&mut Stream::new(alone()), chunks(body, &[1, 3, 64]), |_| {}),
+                decode_all(alone, body),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// Skipping chunk extras also skips whitespace around a chunk size.
+    #[test]
+    fn skipping_chunk_extras_tolerates_whitespace_around_sizes() {
+        let body = b" \t2 \t;ext\r\nhe\r\n0\r\nX-Sum: 1\r\n\r\n";
+        let make = || BodyEvents::new(Framing::Chunked).skip_chunk_extras();
+        let (events, failure) = test_support::decode_all(make, body);
+        assert_eq!(failure, None);
+        assert_eq!(events, [Event::Body(b"he".to_vec()), Event::Done]);
+        let (_, strict) = test_support::decode_all(|| BodyEvents::new(Framing::Chunked), body);
+        assert!(strict.is_some());
     }
 
     #[test]

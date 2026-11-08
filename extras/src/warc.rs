@@ -1,6 +1,8 @@
 //! Random access replay of record compressed WARC archives, without unpacking.
 
 use bytes::Bytes;
+use fictionet::stdlib::codec::{Stream, finish, pump};
+use fictionet::stdlib::protocols::http1::{BodyEvents, Event, Framing};
 use flate2::bufread::GzDecoder;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -445,38 +447,59 @@ fn http_response(block: &[u8]) -> io::Result<Response> {
         .get(http::header::TRANSFER_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"chunked"))
     {
-        let mut remaining = body.as_slice();
-        let mut decoded = Vec::new();
-        loop {
-            let end = remaining
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .ok_or_else(|| invalid("missing chunk size"))?;
-            let size = std::str::from_utf8(&remaining[..end])
-                .map_err(invalid)?
-                .split(';')
-                .next()
-                .unwrap();
-            let size = usize::from_str_radix(size.trim(), 16).map_err(invalid)?;
-            remaining = &remaining[end + 2..];
-            if size == 0 {
-                break;
-            }
-            decoded.extend_from_slice(
-                remaining
-                    .get(..size)
-                    .ok_or_else(|| invalid("truncated chunk"))?,
-            );
-            if remaining.get(size..size + 2) != Some(b"\r\n") {
-                return Err(invalid("missing chunk terminator"));
-            }
-            remaining = &remaining[size + 2..];
-        }
-        body = decoded;
+        body = dechunk(&body)?;
     }
     Ok(Response {
         status,
         headers,
         body: body.into(),
     })
+}
+
+/// A whole chunked body without its framing, read by the body framing the
+/// server and the capture use. Archives hold what real servers sent, so
+/// chunk extensions and trailers are skipped.
+fn dechunk(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let mut stream = Stream::new(BodyEvents::new(Framing::Chunked).skip_chunk_extras());
+    let mut body = Vec::new();
+    let mut done = false;
+    let mut on = |event| match event {
+        Event::Body(data) => body.extend_from_slice(&data),
+        Event::Done => done = true,
+        Event::Head(never) => match never {},
+    };
+    pump(&mut stream, bytes, &mut on).map_err(invalid)?;
+    finish(&mut stream, &mut on).map_err(invalid)?;
+    if !done {
+        return Err(invalid("truncated chunked body"));
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_bodies_lose_their_framing_extensions_and_trailers() {
+        let block = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+            2;name=value\r\nhe\r\n3 \r\nllo\r\n0\r\nX-Sum: 1\r\n\r\n";
+        let response = http_response(block).unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, &b"hello"[..]);
+    }
+
+    #[test]
+    fn a_cut_off_or_misframed_chunked_body_is_refused() {
+        for body in [
+            &b"5\r\nhel"[..],
+            b"2\r\nhe\r\n0\r\n",
+            b"2\r\nhex\r\n0\r\n\r\n",
+            b"zz\r\nhe\r\n0\r\n\r\n",
+        ] {
+            let mut block = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            block.extend_from_slice(body);
+            assert!(http_response(&block).is_err(), "{body:?}");
+        }
+    }
 }
