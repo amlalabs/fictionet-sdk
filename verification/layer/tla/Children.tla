@@ -15,8 +15,19 @@
 (* synchronous call in Rust; the mux and the layer above act between      *)
 (* calls in any order.                                                    *)
 (*                                                                       *)
+(* The mux's events go up in one order, as they do through Chain: an      *)
+(* event Children hands back (Blocked) waits at the head, and nothing     *)
+(* behind it moves. While it waits the mux reads no input either, as the  *)
+(* HTTP/2 connection stops reading once its events back up (http2.rs,     *)
+(* Http2::read), so the connection's own traffic (SETTINGS, PING,         *)
+(* WINDOW_UPDATE) waits with it.                                          *)
+(*                                                                       *)
 (* Source correspondence:                                                *)
 (*   Opened, MuxSend, MuxCredit, MuxPeerClose: Children::on_event            *)
+(*   Arrivals: Children::on_event for MuxEvent::Child, Children::full,     *)
+(*             Children::refuse                                           *)
+(*   MuxRetry: Chain offering a held event again                           *)
+(*   MuxControl: the mux's own connection traffic, which reads input       *)
 (*   OfferControl: Children::on_command                                    *)
 (*   LateResult: Children::on_timer and Children::on_done                    *)
 (*   Advance, Visit: Children::advance and Children::visit_child             *)
@@ -31,6 +42,9 @@
 (*   ReserveForControl   children's commands leave R places free         *)
 (*   MuxChecksGeneration Slots compare the generation of an id           *)
 (*   KeyByWholeId        Children keys its children by the whole id      *)
+(*   Isolate             a full place gets its child one visit, then the *)
+(*                       child is refused; Children never hands a        *)
+(*                       child's event back to the mux                   *)
 EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANTS NS,          \* the mux's slots
@@ -41,15 +55,19 @@ CONSTANTS NS,          \* the mux's slots
           MaxCredit,   \* the most command credit the mux has out per child
           Costs,       \* what a child's command may cost
           Stalled,     \* children's layers never take an event
+          StuckSlots,  \* the layers of the children in these slots never
+                       \* take an event: any child the user installs
           HonestMux,   \* the mux sends events only within credit
+          Overload,    \* the mux sends a child's events whatever its place
+                       \* holds, as a wire mux parsing frames does
           CheckWorkOwnership, CheckUrgent, CheckJobLimit, JobLimit,
           Readiness,    \* retained buffers and completion traffic
           MayFail,     \* children's layers may fail
           BudgetRefuses, \* the budget may refuse a child's place or inbox
-          RefuseFullInbox, \* a full inbox refuses its child instead of waiting
           Control,     \* the layer above sends control commands
+          Connection,  \* the peer sends the mux connection traffic
           CheckOverrun, CheckCommandCredit, ReserveForControl,
-          MuxChecksGeneration, KeyByWholeId
+          MuxChecksGeneration, KeyByWholeId, Isolate
 
 Slots == 1..NS
 Ids == Slots \X (0..G)
@@ -58,13 +76,16 @@ Key(id) == id[1] * (G + 1) + id[2]
 Max0(n) == IF n < 0 THEN 0 ELSE n
 
 VARIABLES mlive, mgen, mEv, mCmd,   \* the mux's slots
+          mHeld,                    \* the mux's event Children handed back
+          ctrlIn,                   \* the mux has connection traffic to read
           kids,                     \* Children's children, by id
           down,                     \* Children::down, its commands for the mux
           turn,                     \* Children::turn
           ctrlPending,              \* the layer above holds a control command
           misdelivered, overspent, overrun, jobs, polledClosed
-vars == <<mlive, mgen, mEv, mCmd, kids, down, turn, ctrlPending,
+vars == <<mlive, mgen, mEv, mCmd, mHeld, ctrlIn, kids, down, turn, ctrlPending,
           misdelivered, overspent, overrun, jobs, polledClosed>>
+muxIn == <<mHeld, ctrlIn>>
 
 Dead == [live |-> FALSE, granted |-> 0, owed |-> 0, inbox |-> 0,
          credit |-> 0, outbox |-> 0, held |-> 0, empty |-> 0, waiting |-> FALSE, urgent |-> FALSE]
@@ -74,17 +95,112 @@ Live(ks) == {id \in Ids : ks[id].live}
 SendRoom == IF ReserveForControl THEN Q - R ELSE Q
 \* The child in a slot that the mux would reach with `id`.
 Current(id) == <<id[1], mgen[id[1]]>>
+NoHeld == [id |-> NoId, kind |-> "none"]
+Stuck(id) == Stalled \/ id[1] \in StuckSlots
 
 Init == /\ mlive = [s \in Slots |-> FALSE]
         /\ mgen = [s \in Slots |-> 0]
         /\ mEv = [s \in Slots |-> 0]
         /\ mCmd = [s \in Slots |-> 0]
+        /\ mHeld = NoHeld
+        /\ ctrlIn = FALSE
         /\ kids = [id \in Ids |-> Dead]
         /\ down = <<>>
         /\ turn = NoId
         /\ ctrlPending = FALSE
         /\ jobs = {} /\ polledClosed = FALSE
         /\ misdelivered = FALSE /\ overspent = FALSE /\ overrun = FALSE
+
+---------------------------------------------------------------------------
+(* Children Children::advance: every child once, in id order   *)
+(* starting after the one visited first last time.                        *)
+
+RECURSIVE Sorted(_)
+Sorted(set) == IF set = {} THEN <<>>
+               ELSE LET m == CHOOSE x \in set : \A y \in set : Key(x) <= Key(y)
+                    IN <<m>> \o Sorted(set \ {m})
+
+VisitOrder(ks) ==
+  IF turn = NoId THEN Sorted(Live(ks))
+  ELSE Sorted({i \in Live(ks) : Key(i) > Key(turn)})
+       \o Sorted({i \in Live(ks) : Key(i) <= Key(turn)})
+
+\* Children visit_child, every way it can go, as pairs of the
+\* children and the queue after it.
+Visit(ks, d, id) ==
+  LET kid == ks[id]
+      stuck == Stuck(id) IN
+  IF ~kid.live THEN {<<ks, d>>}
+  ELSE
+    \* Children::advance, on_event and fail: the layer fails.
+    (IF MayFail THEN {<<[ks EXCEPT ![id] = Dead], Append(d, Cmd("Close", id, 0))>>}
+                ELSE {})
+    \cup
+    UNION {
+      LET passes == CheckUrgent /\ kid.urgent /\ ~stuck   \* the layer takes it
+          ready == ~kid.waiting \/ passes
+          inbox1 == IF take THEN kid.inbox - 1 ELSE kid.inbox
+          owed1 == IF take /\ ~Readiness THEN kid.owed + 1 ELSE kid.owed
+          sent == IF CheckCommandCredit THEN IF cmd < kid.credit THEN cmd ELSE kid.credit ELSE cmd
+          canSend == /\ sent > 0
+                     /\ Len(d) < SendRoom
+          d1 == IF canSend THEN Append(d, Cmd("Send", id, sent)) ELSE d
+          grant == owed1 > 0 /\ Len(d1) < Q
+          d2 == IF grant THEN Append(d1, Cmd("Credit", id, owed1)) ELSE d1
+          kid2 == [live |-> TRUE,
+                   granted |-> kid.granted + (IF grant THEN owed1 ELSE 0),
+                   owed |-> IF grant THEN 0 ELSE owed1,
+                   inbox |-> inbox1,
+                   credit |-> IF canSend THEN Max0(kid.credit - sent) ELSE kid.credit,
+                   outbox |-> IF canSend THEN cmd - sent ELSE cmd,
+                   held |-> kid.held + (IF take /\ Readiness THEN 1 ELSE 0),
+                   empty |-> IF ready /\ ~stuck /\ kid.empty > 0 THEN kid.empty - 1 ELSE kid.empty,
+                   waiting |-> (kid.waiting /\ ~passes) \/ (Readiness /\ canSend),
+                   urgent |-> IF passes THEN FALSE ELSE kid.urgent]
+      IN {<<[ks EXCEPT ![id] = kid2], d2>>}
+      \* Children: the layer takes its next event, or not.
+      : take \in (IF kid.inbox > 0 /\ ~stuck /\ (~kid.waiting \/ (CheckUrgent /\ kid.urgent))
+                    THEN BOOLEAN ELSE {FALSE}),
+      \* Children: a command waiting, or the layer's next one.
+        cmd \in (IF kid.outbox = 0 THEN {0} \cup Costs ELSE {kid.outbox})
+    }
+
+RECURSIVE VisitAll(_, _, _)
+VisitAll(ks, d, order) ==
+  IF order = <<>> THEN {<<ks, d>>}
+  ELSE UNION {VisitAll(r[1], r[2], Tail(order)) : r \in Visit(ks, d, Head(order))}
+
+---------------------------------------------------------------------------
+(* Children::on_event for an event for live child `id`: one of a credit   *)
+(* unit ("data"), one with no credit ("empty": empty data, an end), or a  *)
+(* completion ("urgent"), which has its own place.                        *)
+
+Full(ks, id, k) == IF k = "urgent" THEN ks[id].urgent
+                   ELSE ks[id].inbox + ks[id].empty >= Q
+
+Place(ks, id, k) ==
+  CASE k = "data" -> [ks EXCEPT ![id].granted = Max0(ks[id].granted - 1),
+                                ![id].inbox = @ + 1]
+    [] k = "empty" -> [ks EXCEPT ![id].empty = @ + 1]
+    [] k = "urgent" -> [ks EXCEPT ![id].urgent = TRUE]
+
+\* Every way it can go, as the children, the queue, and whether Children
+\* took the event. A full place gets the child one visit; a child still
+\* full is refused and closed, and the event goes with it. Without
+\* Isolate, Children hands the event back.
+Arrivals(ks, d, id, k) ==
+  IF ~Full(ks, id, k) THEN {<<Place(ks, id, k), d, TRUE>>}
+  ELSE IF ~Isolate THEN {<<ks, d, FALSE>>}
+  ELSE {IF ~r[1][id].live THEN <<r[1], r[2], TRUE>>
+        ELSE IF Full(r[1], id, k)
+          THEN <<[r[1] EXCEPT ![id] = Dead], Append(r[2], Cmd("Close", id, 0)), TRUE>>
+        ELSE <<Place(r[1], id, k), r[2], TRUE>>
+        : r \in Visit(ks, d, id)}
+
+Deliver(id, k) ==
+  \E r \in Arrivals(kids, down, id, k) :
+    IF r[3] THEN kids' = r[1] /\ down' = r[2] /\ mHeld' = NoHeld
+            ELSE mHeld' = [id |-> id, kind |-> k] /\ UNCHANGED <<kids, down>>
 
 ---------------------------------------------------------------------------
 (* The mux: events up to Children.                                         *)
@@ -94,7 +210,7 @@ Init == /\ mlive = [s \in Slots |-> FALSE]
 \* when the budget cannot hold its place (Children::make_room).
 Opened(s) ==
   LET id == <<s, mgen[s]>> IN
-  /\ ~overrun /\ ~mlive[s] /\ mgen[s] <= G
+  /\ ~overrun /\ mHeld = NoHeld /\ ~mlive[s] /\ mgen[s] <= G
   /\ mlive' = [mlive EXCEPT ![s] = TRUE]
   /\ mEv' = [mEv EXCEPT ![s] = 0] /\ mCmd' = [mCmd EXCEPT ![s] = 0]
   /\ \E refused \in (IF BudgetRefuses THEN BOOLEAN ELSE {FALSE}) :
@@ -102,53 +218,71 @@ Opened(s) ==
          THEN down' = Append(down, Cmd("Close", id, 0)) /\ UNCHANGED kids
          ELSE kids' = [kids EXCEPT ![id] = Fresh] /\ UNCHANGED down
   /\ UNCHANGED <<mgen, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 \* The mux sends a child an event of one credit unit.
 MuxSend(s) ==
   LET id == <<s, mgen[s]>>
       kid == kids[id] IN
-  /\ ~overrun /\ mlive[s] /\ (mEv[s] >= 1 \/ ~HonestMux)
-  /\ (~Readiness \/ kid.inbox + kid.empty < Q \/ RefuseFullInbox)
+  /\ ~overrun /\ mHeld = NoHeld /\ mlive[s] /\ (mEv[s] >= 1 \/ ~HonestMux)
+  /\ (~Readiness \/ Overload \/ kid.inbox + kid.empty < Q)
   /\ mEv' = [mEv EXCEPT ![s] = Max0(mEv[s] - 1)]
   /\ IF ~kid.live
-       THEN UNCHANGED <<kids, down, overrun, jobs, polledClosed>>   \* a child already gone
-     \* Children::refuse_full_inbox: the child whose inbox is full is
-     \* refused and closed, so the mux goes on with its siblings.
-     ELSE IF Readiness /\ kid.inbox + kid.empty >= Q
-       THEN /\ kids' = [kids EXCEPT ![id] = Dead]
-            /\ down' = Append(down, Cmd("Close", id, 0))
-            /\ UNCHANGED overrun
+       THEN UNCHANGED <<kids, down, overrun, mHeld>>   \* a child already gone
      ELSE IF kid.granted < 1 /\ CheckOverrun
-       THEN overrun' = TRUE /\ UNCHANGED <<kids, down>>
-     ELSE \/ /\ kids' = [kids EXCEPT ![id].granted = Max0(kid.granted - 1),
-                                     ![id].inbox = kid.inbox + 1]
-             /\ UNCHANGED <<overrun, down>>
-          \* The budget cannot hold the inbox's growth: the child is
-          \* refused and closed, and its siblings go on.
-          \/ /\ BudgetRefuses
-             /\ kids' = [kids EXCEPT ![id] = Dead]
-             /\ down' = Append(down, Cmd("Close", id, 0))
-             /\ UNCHANGED overrun
-  /\ UNCHANGED <<mlive, mgen, mCmd, turn, ctrlPending, misdelivered, overspent, jobs, polledClosed>>
+       THEN overrun' = TRUE /\ UNCHANGED <<kids, down, mHeld>>
+     ELSE /\ UNCHANGED overrun
+          /\ \/ Deliver(id, "data")
+             \* The budget cannot hold the inbox's growth: the child is
+             \* refused and closed, and its siblings go on.
+             \/ /\ BudgetRefuses
+                /\ kids' = [kids EXCEPT ![id] = Dead]
+                /\ down' = Append(down, Cmd("Close", id, 0))
+                /\ UNCHANGED mHeld
+  /\ UNCHANGED <<mlive, mgen, mCmd, turn, ctrlPending, misdelivered, overspent, jobs, polledClosed, ctrlIn>>
 
-\* The mux lets a child send one more credit unit, within its window.
+\* The mux lets a child send one more credit unit, within its window: the
+\* peer's WINDOW_UPDATE, read as input.
 MuxCredit(s) ==
   LET id == <<s, mgen[s]>> IN
-  /\ ~overrun /\ mlive[s] /\ mCmd[s] < MaxCredit
+  /\ ~overrun /\ mHeld = NoHeld /\ mlive[s] /\ mCmd[s] < MaxCredit
   /\ mCmd' = [mCmd EXCEPT ![s] = mCmd[s] + 1]
   /\ kids' = IF kids[id].live THEN [kids EXCEPT ![id].credit = kids[id].credit + 1]
                               ELSE kids
   /\ UNCHANGED <<mlive, mgen, mEv, down, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 \* The peer resets a child: the mux removes it (Slots::remove, a new
 \* generation for the slot) and says Closed.
 MuxPeerClose(s) ==
   LET id == <<s, mgen[s]>> IN
-  /\ ~overrun /\ mlive[s]
+  /\ ~overrun /\ mHeld = NoHeld /\ mlive[s]
   /\ mlive' = [mlive EXCEPT ![s] = FALSE]
   /\ mgen' = [mgen EXCEPT ![s] = mgen[s] + 1]
   /\ kids' = [kids EXCEPT ![id] = Dead]
   /\ UNCHANGED <<mEv, mCmd, down, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
+
+\* The event Children handed back is offered again. A child gone since
+\* has nothing to deliver to.
+MuxRetry ==
+  /\ ~overrun /\ mHeld # NoHeld
+  /\ IF kids[mHeld.id].live
+       THEN Deliver(mHeld.id, mHeld.kind)
+       ELSE mHeld' = NoHeld /\ UNCHANGED <<kids, down>>
+  /\ UNCHANGED <<mlive, mgen, mEv, mCmd, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed, ctrlIn>>
+
+\* The peer sends connection traffic: a PING, SETTINGS or WINDOW_UPDATE.
+NewConnection ==
+  /\ Connection /\ ~ctrlIn
+  /\ ctrlIn' = TRUE
+  /\ UNCHANGED <<mlive, mgen, mEv, mCmd, mHeld, kids, down, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+
+\* The mux reads and answers it, unless its events are backed up.
+MuxControl ==
+  /\ ~overrun /\ ctrlIn /\ mHeld = NoHeld
+  /\ ctrlIn' = FALSE
+  /\ UNCHANGED <<mlive, mgen, mEv, mCmd, mHeld, kids, down, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
 
 ---------------------------------------------------------------------------
 (* The mux takes Children's next command and applies it to the child its  *)
@@ -176,6 +310,7 @@ MuxTake ==
             /\ kids' = [kids EXCEPT ![Current(c.id)] = Dead]
        ELSE UNCHANGED <<mlive, mgen, kids>>
   /\ UNCHANGED <<turn, ctrlPending, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 ---------------------------------------------------------------------------
 (* The layer above, and results that arrive late.                          *)
@@ -186,11 +321,13 @@ OfferControl ==
   /\ down' = Append(down, Cmd("Control", NoId, 0))
   /\ ctrlPending' = FALSE
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, kids, turn, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 NewControl ==
   /\ Control /\ ~ctrlPending
   /\ ctrlPending' = TRUE
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, kids, down, turn, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 \* Children: a timer or a work result keyed by an id the mux
 \* handed out at some point, which may have closed since. It reaches the
@@ -207,62 +344,9 @@ LateResult(id) ==
         /\ kids' = [kids EXCEPT ![target] = Dead]
         /\ down' = Append(down, Cmd("Close", target, 0))
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, turn, ctrlPending, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 ---------------------------------------------------------------------------
-(* Children Children::advance: every child once, in id order   *)
-(* starting after the one visited first last time.                        *)
-
-RECURSIVE Sorted(_)
-Sorted(set) == IF set = {} THEN <<>>
-               ELSE LET m == CHOOSE x \in set : \A y \in set : Key(x) <= Key(y)
-                    IN <<m>> \o Sorted(set \ {m})
-
-VisitOrder(ks) ==
-  IF turn = NoId THEN Sorted(Live(ks))
-  ELSE Sorted({i \in Live(ks) : Key(i) > Key(turn)})
-       \o Sorted({i \in Live(ks) : Key(i) <= Key(turn)})
-
-\* Children visit_child, every way it can go, as pairs of the
-\* children and the queue after it.
-Visit(ks, d, id) ==
-  LET kid == ks[id] IN
-  IF ~kid.live THEN {<<ks, d>>}
-  ELSE
-    \* Children::advance, on_event and fail: the layer fails.
-    (IF MayFail THEN {<<[ks EXCEPT ![id] = Dead], Append(d, Cmd("Close", id, 0))>>}
-                ELSE {})
-    \cup
-    UNION {
-      LET ready == ~kid.waiting \/ (CheckUrgent /\ kid.urgent)
-          inbox1 == IF take THEN kid.inbox - 1 ELSE kid.inbox
-          owed1 == IF take /\ ~Readiness THEN kid.owed + 1 ELSE kid.owed
-          sent == IF CheckCommandCredit THEN IF cmd < kid.credit THEN cmd ELSE kid.credit ELSE cmd
-          canSend == /\ sent > 0
-                     /\ Len(d) < SendRoom
-          d1 == IF canSend THEN Append(d, Cmd("Send", id, sent)) ELSE d
-          grant == owed1 > 0 /\ Len(d1) < Q
-          d2 == IF grant THEN Append(d1, Cmd("Credit", id, owed1)) ELSE d1
-          kid2 == [live |-> TRUE,
-                   granted |-> kid.granted + (IF grant THEN owed1 ELSE 0),
-                   owed |-> IF grant THEN 0 ELSE owed1,
-                   inbox |-> inbox1,
-                   credit |-> IF canSend THEN Max0(kid.credit - sent) ELSE kid.credit,
-                   outbox |-> IF canSend THEN cmd - sent ELSE cmd,
-                   held |-> kid.held + (IF take /\ Readiness THEN 1 ELSE 0),
-                   empty |-> IF ready /\ kid.empty > 0 THEN kid.empty - 1 ELSE kid.empty,
-                   waiting |-> (kid.waiting /\ ~(CheckUrgent /\ kid.urgent)) \/ (Readiness /\ canSend),
-                   urgent |-> IF CheckUrgent THEN FALSE ELSE kid.urgent]
-      IN {<<[ks EXCEPT ![id] = kid2], d2>>}
-      \* Children: the layer takes its next event, or not.
-      : take \in (IF kid.inbox > 0 /\ ~Stalled /\ (~kid.waiting \/ (CheckUrgent /\ kid.urgent)) THEN BOOLEAN ELSE {FALSE}),
-      \* Children: a command waiting, or the layer's next one.
-        cmd \in (IF kid.outbox = 0 THEN {0} \cup Costs ELSE {kid.outbox})
-    }
-
-RECURSIVE VisitAll(_, _, _)
-VisitAll(ks, d, order) ==
-  IF order = <<>> THEN {<<ks, d>>}
-  ELSE UNION {VisitAll(r[1], r[2], Tail(order)) : r \in Visit(ks, d, Head(order))}
 
 Advance ==
   LET order == VisitOrder(kids) IN
@@ -270,52 +354,62 @@ Advance ==
   /\ turn' = IF order = <<>> THEN NoId ELSE Head(order)
   /\ \E r \in VisitAll(kids, down, order) : kids' = r[1] /\ down' = r[2]
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 ---------------------------------------------------------------------------
 
 \* Empty data consumes an item slot even though it consumes no byte credit.
 MuxEmpty(id) ==
-  /\ Readiness /\ ~overrun /\ kids[id].live
-  /\ kids[id].empty + kids[id].inbox < Q
-  /\ kids' = [kids EXCEPT ![id].empty = @ + 1]
-  /\ UNCHANGED <<mlive, mgen, mEv, mCmd, down, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ Readiness /\ ~overrun /\ mHeld = NoHeld /\ kids[id].live
+  /\ (Overload \/ kids[id].empty + kids[id].inbox < Q)
+  /\ Deliver(id, "empty")
+  /\ UNCHANGED <<mlive, mgen, mEv, mCmd, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed, ctrlIn>>
 
 \* Completion has one reserved slot and bypasses refused ordinary data.
 MuxWritten(id) ==
-  /\ Readiness /\ ~overrun /\ kids[id].live /\ kids[id].waiting /\ ~kids[id].urgent
-  /\ kids' = [kids EXCEPT ![id].urgent = TRUE]
-  /\ UNCHANGED <<mlive, mgen, mEv, mCmd, down, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ Readiness /\ ~overrun /\ mHeld = NoHeld /\ kids[id].live /\ kids[id].waiting
+  /\ (Overload \/ ~kids[id].urgent)
+  /\ Deliver(id, "urgent")
+  /\ UNCHANGED <<mlive, mgen, mEv, mCmd, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed, ctrlIn>>
 
 Release(id) ==
   /\ Readiness /\ ~overrun /\ kids[id].live /\ kids[id].held > 0
   /\ kids' = [kids EXCEPT ![id].held = @ - 1, ![id].owed = @ + 1]
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, down, turn, ctrlPending, misdelivered, overspent, overrun, jobs, polledClosed>>
+  /\ UNCHANGED muxIn
 
 \* Work stays in the runtime after close until the next bounded poll.
 ExtractWork(id) ==
   /\ Readiness /\ ~overrun /\ kids[id].live /\ id \notin jobs /\ (Cardinality(jobs) < JobLimit \/ ~CheckJobLimit)
   /\ jobs' = jobs \cup {id}
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, kids, down, turn, ctrlPending, misdelivered, overspent, overrun, polledClosed>>
+  /\ UNCHANGED muxIn
 
 PollWork(id) ==
   /\ id \in jobs /\ ~kids[id].live
   /\ jobs' = jobs \ {id}
   /\ polledClosed' = (polledClosed \/ (~kids[id].live /\ ~CheckWorkOwnership))
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, kids, down, turn, ctrlPending, misdelivered, overspent, overrun>>
+  /\ UNCHANGED muxIn
 
 \* A live operation may finish, but no fairness assumption requires it.
 FinishWork(id) ==
   /\ id \in jobs /\ kids[id].live
   /\ jobs' = jobs \ {id}
   /\ UNCHANGED <<mlive, mgen, mEv, mCmd, kids, down, turn, ctrlPending, misdelivered, overspent, overrun, polledClosed>>
+  /\ UNCHANGED muxIn
 
 Next == \/ Advance \/ MuxTake \/ OfferControl \/ NewControl
+        \/ MuxRetry \/ NewConnection \/ MuxControl
         \/ \E s \in Slots : Opened(s) \/ MuxSend(s) \/ MuxCredit(s) \/ MuxPeerClose(s)
         \/ \E id \in Ids : LateResult(id) \/ MuxEmpty(id) \/ MuxWritten(id) \/ Release(id) \/ ExtractWork(id) \/ PollWork(id) \/ FinishWork(id)
 
-\* The driver keeps advancing, the mux keeps taking commands, and the
-\* layer above keeps offering its control command.
+\* The driver keeps advancing, the mux keeps taking commands and offering a
+\* held event again, and the layer above keeps offering its control
+\* command. The mux reads connection traffic whenever it can, even if its
+\* events back up now and then; only an event held for good stops it.
 Spec == Init /\ [][Next]_vars /\ WF_vars(Advance) /\ WF_vars(MuxTake) /\ WF_vars(OfferControl)
+        /\ WF_vars(MuxRetry) /\ SF_vars(MuxControl)
         /\ \A id \in Ids : WF_vars(PollWork(id))
 \* The same, with a peer that keeps reading each child: the mux grants
 \* command credit whenever its window has room.
@@ -333,6 +427,8 @@ CostIn(d, id, op) == LET is == {i \in DOMAIN d : d[i].op = op /\ d[i].id = id}
                      IN Sum(is)
 \* The mux and Children name the same child, generation included.
 Agreed(id) == kids[id].live /\ mlive[id[1]] /\ mgen[id[1]] = id[2]
+\* Credit the mux spent on an event Children handed back.
+HeldCredit(id) == IF mHeld.id = id /\ mHeld.kind = "data" THEN 1 ELSE 0
 
 \* A command, timer or result for a child that is gone never reaches the
 \* child that has its slot now, or any other.
@@ -345,7 +441,8 @@ EventCredit == \A id \in Live(kids) : kids[id].granted + kids[id].inbox + kids[i
 \* With a mux that keeps to its credit, the mux's credit for a child is
 \* what Children granted less what is still on its way.
 MuxEventCredit == HonestMux =>
-  \A id \in Ids : Agreed(id) => mEv[id[1]] + CostIn(down, id, "Credit") = kids[id].granted
+  \A id \in Ids : Agreed(id) =>
+    mEv[id[1]] + CostIn(down, id, "Credit") + HeldCredit(id) = kids[id].granted
 
 \* A child sends the mux no more than the mux granted it.
 CommandCredit ==
@@ -357,6 +454,14 @@ SendsLeaveReserve == Cardinality({i \in DOMAIN down : down[i].op = "Send"}) <= Q
 
 \* A control command is taken eventually, whatever the children do.
 ControlProgress == ctrlPending ~> ~ctrlPending
+
+\* Children never hands a child's event back, so the mux never waits on
+\* any child, whatever its layer does.
+MuxNeverHeld == mHeld = NoHeld
+
+\* The connection's own traffic is read eventually, whatever the children
+\* do.
+ConnectionProgress == ctrlIn ~> ~ctrlIn
 
 \* A child's command reaches the mux eventually, while the child lives.
 CommandsGo == \A id \in Ids : (kids[id].live /\ kids[id].outbox > 0)

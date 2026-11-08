@@ -293,6 +293,94 @@ The budget proof the serving engine kept over `Charge::set` moved here as
 `charges_sum_to_the_budget_and_never_pass_its_limit` when the engine was
 deleted: unwind 4, 429 checks, all pass in 2.6 s with Kani 0.68.
 
+### Results after child isolation
+
+`Children` used to hand a child's event back to the mux (`Blocked`) when
+the child's inbox or urgent place was full, unless the composition asked
+for refusal as above; HTTP/2 did not. The mux's events go up in one order, so the event waited at
+the head, and the HTTP/2 connection stopped reading once its own events
+backed up. One child that never reads stalled its siblings and the
+connection's PING, SETTINGS and WINDOW_UPDATE. Now a full place gets the
+child one visit at once (`Children::visit_child`), and a child still full
+is refused alone (`Children::refuse`); the option is gone, and every
+composition, HTTP/2 streams and SSH channels included, gets this one
+behavior.
+
+The model gains:
+
+- `mHeld`, the event Children handed back. While it is held the mux sends
+  nothing else, opens and closes nothing and reads no input; `MuxRetry`
+  offers it again.
+- `ctrlIn` and `MuxControl`, connection traffic the mux reads when nothing
+  is held, with `ConnectionProgress` (`ctrlIn ~> ~ctrlIn`). The mux is
+  assumed to read it whenever it can (strong fairness), so only an event
+  held for good stops it.
+- `Overload`: the mux sends a child's events whatever its place holds, as
+  a wire mux parsing frames does. Arrivals at a full place take the
+  `Arrivals` path: a visit, then refusal, or with `Isolate` off, the event
+  handed back.
+- `StuckSlots`: the layers in these slots never take an event, ordinary or
+  urgent, and never drain empty events: any child a user installs.
+- `MuxNeverHeld`: Children never hands a child's event back.
+  `MuxEventCredit` counts the credit of a held data event.
+
+`RefuseFullInbox` goes with the option it modeled: refusal without a
+visit, and only for ordinary data. Every other configuration sets
+`Isolate` true, `Overload` and `Connection` false and `StuckSlots` empty,
+and keeps its behavior: each passing configuration reaches exactly the
+distinct states it reached before, and each mutation still fails on its
+property. `Children_refuse_full.cfg` keeps its stalled child and its
+successor in the same slot, with `Overload` in place of `RefuseFullInbox`,
+so their events reach a full place and take the isolation path; with
+`Isolate` false the same configuration violates `MuxNeverHeld` after 230
+distinct states, so the path is reached.
+`Children_isolation.cfg` (one hour) has two children, one generation
+each, the one in slot 1 stuck,
+readiness traffic (empty data and completions), a mux that overloads, and
+connection traffic. `Children_without_isolate.cfg` is the same with
+`Isolate` false; its counterexample fills the stuck child's place with
+empty events, the next one is held, and the system stutters with the
+connection's traffic unread.
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Children_isolation.cfg` | 10,081,987 | 663,822 | `MuxNeverHeld`, `ConnectionProgress`, credit, item and generation invariants pass |
+| `Children_without_isolate.cfg` | 183,050 | 29,305 | expected `ConnectionProgress` violation |
+| `Children_refuse_full.cfg` | 77,750 | 10,411 | readiness invariants, `MuxNeverHeld`, `NoStaleDelivery` and `CancelledWorkLeaves` pass |
+| `Children_base.cfg` | 13,067,962 | 1,857,160 | all safety properties pass |
+| `Children_budget.cfg` | 13,657,794 | 1,857,160 | all safety properties pass |
+| `Children_budget_stalled.cfg` | 1,713,569 | 219,760 | safety and control progress pass |
+| `Children_refuse_base.cfg` | 16,775,230 | 2,645,648 | all safety properties pass |
+| `Children_stalled_base.cfg` | 1,639,585 | 219,760 | safety and control progress pass |
+| `Children_commands_base.cfg` | 2,082 | 504 | command credit and delivery pass |
+| `Children_large_command.cfg` | 760 | 191 | command credit and delivery pass |
+| `Children_readiness.cfg` | 71,116 | 10,066 | readiness invariants and progress pass |
+| `Children_without_checkoverrun.cfg` | 36 | 28 | expected `EventCredit` violation |
+| `Children_without_checkcommandcredit.cfg` | 26 | 22 | expected `CommandCredit` violation |
+| `Children_without_reserveforcontrol.cfg` | 854,054 | 150,882 | expected `ControlProgress` violation |
+| `Children_without_muxchecksgeneration.cfg` | 1,720 | 768 | expected `NoStaleDelivery` violation |
+| `Children_without_keybywholeid.cfg` | 1,223 | 582 | expected `NoStaleDelivery` violation |
+| `Children_without_urgent.cfg` | 58,884 | 8,422 | expected `CompletionProgress` violation |
+| `Children_without_workownership.cfg` | 278 | 117 | expected `NoCancelledPoll` violation |
+| `Children_without_joblimit.cfg` | 1,044 | 336 | expected `BoundedJobs` violation |
+
+The Rust tests check the same contract on the code.
+`a_child_that_refuses_everything_holds_up_neither_siblings_nor_control`
+delivers four times a child's bound of empty data and completions to two
+children that never take an event and to one that takes everything,
+interleaved with control events, without running the driver: every event
+is taken, every control event comes up at once, the two stuck children
+alone are refused and closed, and the third took every event.
+`a_child_that_never_reads_holds_up_neither_its_siblings_nor_the_connection`
+(`http2.rs`) installs a custom stream child that refuses every event on
+one stream while its body arrives in 200 small DATA frames, followed by
+PING, SETTINGS, a sibling request and the client's WINDOW_UPDATE: the PING
+and SETTINGS are acknowledged, the stuck stream alone is reset, the
+connection window comes back, and the sibling's body goes out once the
+WINDOW_UPDATE is read. With the old backpressure the first test fails at
+the first refused delivery and the HTTP/2 server writes nothing at all;
+with refusal but no visit, the child that takes everything is refused.
+
 ### Scope and limitations
 
 The model covers partial stream output; atomic-message rejection above the

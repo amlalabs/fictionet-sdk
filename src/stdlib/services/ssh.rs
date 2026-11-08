@@ -813,8 +813,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     SessionLayer::new(handler.clone(), connection.clone(), opening, budget);
                 session.policy_close = Some(policy_close.clone());
                 session
-            })
-            .refuse_full_inbox(),
+            }),
         )
     }
     fn context(&self, now: Instant) -> Context<'_> {
