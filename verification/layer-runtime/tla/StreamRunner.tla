@@ -2,9 +2,9 @@
 (* `services::stack::stream` in src/stdlib/services/stack.rs: the loop      *)
 (* that reads a live connection into a layer stack's byte stream and       *)
 (* writes what the stack gives back. One iteration of its `loop` is        *)
-(* Settle* (stack.rs:178-203, `settle` at 356-379), Check (204-241),       *)
-(* Poll (the `poll_fn` at 242-312, then 314-349). `EndBroken` is           *)
-(* `end_broken` (382-394). The `Driver` (src/stdlib/layer/driver.rs)       *)
+(* Settle* (stack.rs:179-204, `settle` at 362-385), Check (205-247),       *)
+(* Poll (the `poll_fn` at 248-318, then 320-355). `EndBroken` is           *)
+(* `end_broken` (388-400). The `Driver` (src/stdlib/layer/driver.rs)       *)
 (* holds at most one command below (`held`), as `Driver::send_below` and   *)
 (* `send` (driver.rs:180-244) do.                                          *)
 (*                                                                         *)
@@ -16,7 +16,7 @@
 (* stacks have. Bytes are counted, not carried. Time is in ticks.          *)
 (*                                                                         *)
 (* The switches are the rules of the code. TRUE is the code as it is,      *)
-(* except `RestartIdleOnWait`, which is the fix this pass proposes; the    *)
+(* including `RestartIdleOnWait`, the fix of commit 1a183c83e; the       *)
 (* `_without_` configs turn one off and name the property that must fail.  *)
 EXTENDS Integers
 
@@ -29,16 +29,16 @@ CONSTANTS PeerBytes,      \* bytes the peer sends in all
           StackMayEndEarly, \* the stack may end its direction before its input is over
           PeerMayReset,   \* the peer may reset the connection
           PeerMayStall,   \* the peer may stop reading: its transport takes no more bytes
-          BudgetMayFail,  \* a read's charge may not fit (stack.rs:327)
-          ReadOnlyWhenTakenRule, \* `reading` needs `input.is_none()` (stack.rs:226)
-          ReportOnceRule,        \* `written = 0` once delivered (stack.rs:184)
-          StallResetOnProgress,  \* `stalled_since = None` on bytes taken (stack.rs:317)
-          IdleResetOnRead,       \* `idle_from = now` on bytes read (stack.rs:334)
-          ResetOnBreak,          \* `end_broken` offers StreamEvent::Reset (stack.rs:388-392)
-          WriteBeforeEnd,        \* the layer hands writes before its End (framed.rs:181-193)
-          KeepPartialRest,       \* `Admit::Partial(rest) => input = Some(rest)` (stack.rs:194)
-          FinishNeedsInputOver,  \* `if shut && input_over` (stack.rs:209)
-          RestartIdleOnWait      \* proposed: restart `idle_from` when waiting resumes
+          BudgetMayFail,  \* a read's charge may not fit (stack.rs:333)
+          ReadOnlyWhenTakenRule, \* `reading` needs `input.is_none()` (stack.rs:227)
+          ReportOnceRule,        \* `written = 0` once delivered (stack.rs:185)
+          StallResetOnProgress,  \* `stalled_since = None` on bytes taken (stack.rs:323)
+          IdleResetOnRead,       \* `idle_from = now` on bytes read (stack.rs:340)
+          ResetOnBreak,          \* `end_broken` offers StreamEvent::Reset (stack.rs:394-398)
+          WriteBeforeEnd,        \* the layer hands writes before its End (framed.rs:183-195)
+          KeepPartialRest,       \* `Admit::Partial(rest) => input = Some(rest)` (stack.rs:195)
+          FinishNeedsInputOver,  \* `if shut && input_over` (stack.rs:210)
+          RestartIdleOnWait      \* restart `idle_from` when waiting resumes (stack.rs:229-233, the fix)
 
 ASSUME PeerBytes \in Nat /\ Room \in Nat \ {0} /\ Pause \in Nat
 NoLimit == -1  \* stands for `None`; set a limit to it with `<- NoLimit`
@@ -121,7 +121,7 @@ Init ==
   /\ wasHolding = FALSE /\ stuckFrom = 0 /\ earlyStall = FALSE
 
 (* The stack's `take_command`, through Framed: writes first, then its     *)
-(* reset or end (framed.rs:181-193). Nothing after it heard a reset.      *)
+(* reset or end (framed.rs:183-195). Nothing after it heard a reset.      *)
 NextCmd(o, e, r, hr) ==
   IF hr THEN "none"
   ELSE IF o > 0 /\ (WriteBeforeEnd \/ e # "asked") THEN "write"
@@ -129,8 +129,8 @@ NextCmd(o, e, r, hr) ==
   ELSE IF e = "asked" THEN "end"
   ELSE "none"
 
-(* `end_broken` (stack.rs:382-394): the stack is offered a reset, which   *)
-(* Framed takes unless its input is over (framed.rs:121, 143-148), and    *)
+(* `end_broken` (stack.rs:388-400): the stack is offered a reset, which   *)
+(* Framed takes unless its input is over (framed.rs:123, 145-150), and    *)
 (* the runner returns.                                                    *)
 EndBroken(why) ==
   /\ offeredReset' = IF ResetOnBreak THEN offeredReset + 1 ELSE offeredReset
@@ -138,8 +138,8 @@ EndBroken(why) ==
   /\ sOver' = (sOver \/ ResetOnBreak)
   /\ pc' = "done" /\ ret' = why
 
-(* One round of `settle` (stack.rs:356-379) with the offer of stack.rs:   *)
-(* 179-202: the write report, the held input, then `Driver::run`.         *)
+(* One round of `settle` (stack.rs:362-385) with the offer of stack.rs:   *)
+(* 180-203: the write report, the held input, then `Driver::run`.         *)
 Settle ==
   /\ pc = "settle"
   /\ LET m1 == written > 0
@@ -178,7 +178,7 @@ Settle ==
         /\ sOver' = over1
         /\ pausesLeft' = IF arms THEN pausesLeft - 1 ELSE pausesLeft
         /\ sTimer' = IF fires THEN None ELSE sTimer1
-        \* After its End the stack's output is refused (framed.rs:157-158).
+        \* After its End the stack's output is refused (framed.rs:159-160).
         /\ sout' = IF sEnd = "no" THEN sout + sbuf1 ELSE sout
         /\ sbuf' = 0
         /\ sEnd' = IF askEnd THEN "asked" ELSE sEnd
@@ -188,7 +188,7 @@ Settle ==
                  heardReset, peer, transportTook, stackOut, offeredReset, badRead, readTotal,
                  wasWaiting, quietFrom, earlyIdle, wasHolding, stuckFrom, earlyStall>>
 
-(* stack.rs:209-241: the end, the write limit, the idle limit, and the    *)
+(* stack.rs:210-247: the end, the write limit, the idle limit, and the    *)
 (* deadline of the wait.                                                  *)
 Check ==
   /\ pc = "check"
@@ -234,8 +234,8 @@ Check ==
                             ret, stack, peer, readTotal, took, refused, transportTook,
                             reported, stackOut, offeredReset, badRead, earlyIdle, earlyStall>>
 
-(* The `poll_fn` of stack.rs:248-310 begins with `Driver::send_below`     *)
-(* (driver.rs:180-185) into the sink of stack.rs:253-291: `send`          *)
+(* The `poll_fn` of stack.rs:254-316 begins with `Driver::send_below`     *)
+(* (driver.rs:180-185) into the sink of stack.rs:259-297: `send`          *)
 (* (driver.rs:214-244) offers the held command, or takes the next from    *)
 (* the stack, until the sink hands one back. `ws` is what the transport   *)
 (* answers to the first and the second write of this poll (a held write   *)
@@ -313,12 +313,12 @@ Poll ==
      /\ hKind' = p.held[1] /\ hN' = p.held[2]
      /\ sout' = p.sout /\ sEnd' = p.sEnd /\ sReset' = p.sReset /\ stackOut' = p.stackOut
      /\ transportTook' = transportTook + p.pw
-     \* stack.rs:314-319
+     \* stack.rs:320-325
      /\ written' = written + p.pw
      /\ shut' = (shut \/ p.pshut)
      /\ stalledSince' = IF p.pw > 0 /\ StallResetOnProgress THEN None ELSE stalledSince
      /\ stuckFrom' = IF p.pw > 0 THEN now ELSE stuckFrom
-     \* the read, stack.rs:323-339
+     \* the read, stack.rs:329-345
      /\ badRead' = (badRead \/ (rd >= 0 /\ (inKind # "none" \/ inputOver)))
      /\ readTotal' = IF got THEN readTotal + rd ELSE readTotal
      /\ peerLeft' = IF got THEN peerLeft - rd ELSE peerLeft

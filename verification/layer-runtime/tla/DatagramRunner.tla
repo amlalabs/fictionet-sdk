@@ -1,9 +1,9 @@
 --------------------------- MODULE DatagramRunner ---------------------------
 (* `services::stack::datagrams` in src/stdlib/services/stack.rs: one layer  *)
 (* stack holds a UDP socket's conversation for the socket's whole life.    *)
-(* One iteration of its `loop` (stack.rs:431-505) is SettleRound* (the     *)
-(* closure at 434-455 inside `settle`, 356-379), AfterSettle (456-463),    *)
-(* and Wait (465-500).                                                     *)
+(* One iteration of its `loop` (stack.rs:437-513) is SettleRound* (the     *)
+(* closure at 440-461 inside `settle`, 362-385), AfterSettle (462-471),    *)
+(* and Wait (473-508).                                                     *)
 (*                                                                         *)
 (* The stack is abstract, with the shape of the Search time server         *)
 (* (demos/search/world/src/ntp.rs:72-120): it answers a datagram it takes  *)
@@ -16,7 +16,7 @@
 (* the order they reach the socket.                                        *)
 (*                                                                         *)
 (* The switches are the rules of the code. TRUE is the code as it is,      *)
-(* except `SettleBeforeClose`, which is the fix this pass proposes.        *)
+(* including `SettleBeforeClose`, the fix of commit 1a183c83e.            *)
 EXTENDS Integers, Sequences
 
 CONSTANTS Datagrams,      \* datagrams that reach the socket in all
@@ -24,13 +24,13 @@ CONSTANTS Datagrams,      \* datagrams that reach the socket in all
           Fair,           \* FAIR (stack.rs:38): rounds of one `settle`
           Delay,          \* ticks of the stack's timer; 0 for no timer
           StackMayEnd,    \* the stack may close the socket itself
-          ReceiveOnlyWhenTaken, \* `receive = input.is_none() && ..` (stack.rs:467)
-          OneConversation,      \* one stack for the socket's life (stack.rs:427)
-          DeadlineInWait,       \* the wait sleeps until the stack's deadline (stack.rs:465, 469)
-          EndClosesOutput,      \* `_ if ended => Admit::Closed` (stack.rs:443)
-          SendEachDatagram,     \* `socket.send_to(&payload, to)` (stack.rs:446)
-          ReturnOnClose,        \* `socket_closed && input.is_none()` returns (stack.rs:456)
-          SettleBeforeClose     \* proposed: return on a closed socket only once settled
+          ReceiveOnlyWhenTaken, \* `receive = input.is_none() && ..` (stack.rs:475)
+          OneConversation,      \* one stack for the socket's life (stack.rs:433)
+          DeadlineInWait,       \* the wait sleeps until the stack's deadline (stack.rs:473, 477)
+          EndClosesOutput,      \* `_ if ended => Admit::Closed` (stack.rs:449)
+          SendEachDatagram,     \* `socket.send_to(&payload, to)` (stack.rs:452)
+          ReturnOnClose,        \* `socket_closed && input.is_none()` returns (stack.rs:464)
+          SettleBeforeClose     \* return on a closed socket only once settled (stack.rs:462-464, the fix)
 
 ASSUME Datagrams \in Nat /\ Backlog \in Nat /\ Fair \in Nat \ {0} /\ Delay \in Nat
 
@@ -42,7 +42,7 @@ VARIABLES pc,          \* "settle", "after", "wait" or "done"
           now,
           input,       \* `input`: None, a datagram's number, or 0 for DatagramEvent::Ended
           socketClosed,\* `socket_closed`
-          ended,       \* the `ended` of this iteration (stack.rs:433)
+          ended,       \* the `ended` of this iteration (stack.rs:439)
           rounds,      \* rounds of the current `settle`
           settled,     \* what `settle` returned
           \* the socket
@@ -79,7 +79,7 @@ Init ==
   /\ paused = FALSE
   /\ produced = <<>> /\ sent = <<>> /\ afterEnd = FALSE
 
-(* `Driver::send_below` with the sink of stack.rs:442-453: it takes the    *)
+(* `Driver::send_below` with the sink of stack.rs:448-459: it takes the    *)
 (* stack's output in order until there is none; after END, the rest is     *)
 (* refused as closed.                                                      *)
 RECURSIVE Drain(_, _, _, _)
@@ -136,7 +136,7 @@ SettleRound ==
         ELSE /\ rounds' = rounds + 1 /\ UNCHANGED settled /\ UNCHANGED pc
   /\ UNCHANGED <<now, socketClosed, arrived, queue, closed>>
 
-(* stack.rs:456-463. A runner that has not settled yields and settles     *)
+(* stack.rs:462-471. A runner that has not settled yields and settles     *)
 (* again.                                                                 *)
 AfterSettle ==
   /\ pc = "after"
@@ -151,7 +151,7 @@ AfterSettle ==
 
 Receiving == ~socketClosed /\ (input = None \/ ~ReceiveOnlyWhenTaken)
 
-(* The `poll_fn` of stack.rs:471-484 and what follows it (487-500).       *)
+(* The `poll_fn` of stack.rs:479-492 and what follows it (495-508).       *)
 Wait ==
   /\ pc = "wait"
   /\ LET due == DeadlineInWait /\ timer # None /\ now >= timer
