@@ -120,8 +120,10 @@ pub struct Limits {
     pub connections: usize,
     /// Bytes of observed data waiting for the layer above to take them or
     /// grant credit for them, across every connection, with 64 more counted
-    /// for each waiting piece of data or gap. The default is 8 MiB. Past
-    /// it, the connection with the most waiting is evicted.
+    /// for each waiting piece of data or gap. The default is 8 MiB. It is
+    /// checked as each packet comes, so what one packet releases at once
+    /// never counts against it: while more than this waits, the connection
+    /// with the most waiting is evicted.
     pub waiting: usize,
 }
 
@@ -286,8 +288,10 @@ impl Observer {
         self.connections.len()
     }
 
-    /// Takes one captured packet.
+    /// Takes one captured packet, once what the layer above left waiting
+    /// fits [`Limits::waiting`].
     fn packet(&mut self, env: &mut Env<'_, ObserverReport>, packet: &IpPacket) {
+        self.make_room();
         let Some(header) = packet.header() else {
             return;
         };
@@ -323,7 +327,6 @@ impl Observer {
         let dst = SocketAddr::new(header.dst, dport);
         self.tick += 1;
         self.segment(env, packet.ingress().scope, src, dst, ack, segment);
-        self.make_room();
     }
 
     fn segment(

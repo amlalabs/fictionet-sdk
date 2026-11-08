@@ -1,5 +1,6 @@
 use super::*;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fictionet::stdlib::layer::{Budget, Child, Driver};
@@ -937,4 +938,106 @@ fn a_child_closed_from_above_gets_nothing_more() {
     let after = tcp.up(101, 0x18, b"ignored");
     assert!(after.events.is_empty() && after.opened.is_empty());
     assert_eq!(after.late(), 7);
+}
+
+/// Random segments over a few connections, in tight bounds: each
+/// direction's positions follow on through its data and gaps, nothing
+/// follows an end, a child closes only after both its ends, delivered
+/// bytes were captured, and the bounds hold.
+#[test]
+fn random_segments_keep_the_stream_rules() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for round in 0..40 {
+        let limits = Limits {
+            buffered: (rand() % 64) as usize,
+            segments: (rand() % 6) as usize,
+            connections: (rand() % 4) as usize,
+            waiting: (rand() % 2000) as usize,
+        };
+        let mut tcp = Watch::new(limits);
+        tcp.grant = round % 3 != 0;
+        let limits = tcp.observer().limits();
+        let mut next: BTreeMap<(ChildId, Direction), u64> = BTreeMap::new();
+        let mut ended = BTreeSet::new();
+        let mut open = BTreeSet::new();
+        let mut captured = [0usize; 256];
+        let mut base = [0u32; 6];
+        let mut check = |seen: Seen, captured: &mut [usize; 256]| {
+            open.extend(seen.opened.iter().map(|(id, _)| *id));
+            let mut sequences = seen.sequences.iter();
+            for (id, event) in &seen.events {
+                assert!(open.contains(id));
+                let direction = match event {
+                    Ev::Data(d, ..) | Ev::Gap(d, ..) | Ev::End(d, _) => *d,
+                };
+                assert!(!ended.contains(&(*id, direction)), "{event:?} after an end");
+                match event {
+                    Ev::Data(_, _, bytes, _) => {
+                        let (_, sequence) = sequences.next().unwrap();
+                        let expected = next.entry((*id, direction)).or_insert(*sequence);
+                        assert_eq!(*expected, *sequence);
+                        *expected += bytes.len() as u64;
+                        assert!(!bytes.is_empty());
+                        for byte in bytes {
+                            let left = &mut captured[usize::from(*byte)];
+                            *left = left.checked_sub(1).unwrap();
+                        }
+                    }
+                    Ev::Gap(_, _, missing) => {
+                        let (_, sequence) = sequences.next().unwrap();
+                        let expected = next.entry((*id, direction)).or_insert(*sequence);
+                        assert_eq!(*expected, *sequence);
+                        *expected += missing.unwrap();
+                    }
+                    Ev::End(..) => {
+                        ended.insert((*id, direction));
+                    }
+                }
+            }
+            for id in seen.closed {
+                assert!(open.remove(&id));
+                assert!(ended.contains(&(id, Forward)) && ended.contains(&(id, Reverse)));
+            }
+        };
+        for _ in 0..300 {
+            let flow = (rand() % 6) as usize;
+            let client = format!("192.0.2.1:{}", 40000 + flow / 2);
+            let (from, to) = if flow.is_multiple_of(2) {
+                (client.as_str(), SERVER)
+            } else {
+                (SERVER, client.as_str())
+            };
+            let flags = [0x02, 0x12, 0x18, 0x18, 0x18, 0x11, 0x14, 0x10][(rand() % 8) as usize];
+            let len = (rand() % 12) as usize;
+            let payload: Vec<u8> = (0..len).map(|_| rand() as u8).collect();
+            let seq = if rand() % 4 == 0 {
+                rand() as u32
+            } else {
+                base[flow]
+                    .wrapping_add((rand() % 40) as u32)
+                    .wrapping_sub(10)
+            };
+            base[flow] = seq.wrapping_add(len as u32);
+            for byte in &payload {
+                captured[usize::from(*byte)] += 1;
+            }
+            let ack = base[flow ^ 1];
+            let seen = tcp.send(Scope::ROOT, from, to, seq, ack, flags, &payload);
+            check(seen, &mut captured);
+            assert!(tcp.observer().buffered() <= limits.buffered);
+            assert!(tcp.observer().connections() <= limits.connections);
+        }
+        if tcp.grant {
+            let seen = tcp.finish();
+            check(seen, &mut captured);
+            assert!(open.is_empty(), "the capture's end closes every child");
+            assert_eq!(tcp.observer().buffered(), 0);
+        }
+    }
 }
