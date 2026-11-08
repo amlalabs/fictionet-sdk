@@ -223,6 +223,9 @@ where
                 }
                 moved |= self.input.is_some();
             }
+            if self.driver.layer().is_terminal() || (self.input_over && self.shut) {
+                self.jobs.close_completed();
+            }
             let driver = &mut self.driver;
             moved |= self
                 .jobs

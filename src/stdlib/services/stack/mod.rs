@@ -268,6 +268,9 @@ where
     let mut rounds = 0u32;
     loop {
         driver.set_now(fcx.now());
+        if driver.layer().is_terminal() {
+            jobs.close_completed();
+        }
         // Poll work even while a productive layer keeps the runner busy.
         poll_fn(|cx| {
             Poll::Ready(jobs.poll(Some(fcx), cx, |done| {
@@ -311,6 +314,7 @@ where
         // A closed socket still gets what the stack has left, so only a
         // settled stack is done with it.
         if ended || (settled && socket_closed && input.is_none() && jobs.is_empty()) {
+            jobs.close_completed();
             return Ok(());
         }
         if !settled {
@@ -328,6 +332,9 @@ where
             poll_fn(|cx| {
                 if cancelled.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(Err(StackError::Cancelled));
+                }
+                if driver.layer().is_terminal() {
+                    jobs.close_completed();
                 }
                 let done = jobs.poll(Some(fcx), cx, |done| {
                     driver.complete(done).map_err(StackError::Layer)

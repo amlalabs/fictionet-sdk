@@ -108,6 +108,7 @@ const INTAKE: usize = 8;
 
 struct Running<W> {
     work: Option<W>,
+    completed: bool,
     region: Option<Cx>,
 }
 
@@ -164,11 +165,25 @@ impl<W: Job> Jobs<W> {
             }
             self.running.push(Running {
                 work: Some(work),
+                completed: false,
                 region: None,
             });
             took = true;
         }
         took
+    }
+
+    /// End the tasks behind completed work once the whole stack is terminal.
+    /// Half-closing one direction does not end their owner.
+    pub(super) fn close_completed(&mut self) {
+        for running in &mut self.running {
+            if running.completed {
+                running.work = None;
+                if let Some(region) = &running.region {
+                    region.cancel();
+                }
+            }
+        }
     }
 
     /// Polls every piece of work once, oldest first, and hands each result
@@ -196,17 +211,17 @@ impl<W: Job> Jobs<W> {
                     region: parent.region.child(),
                 });
             }
-            if let Some(work) = &mut running.work
+            if !running.completed
+                && let Some(work) = &mut running.work
                 && let Poll::Ready(result) = work.poll(running.region.as_ref(), cx)
             {
-                running.work = None;
-                if let Some(region) = &running.region {
-                    region.cancel();
-                }
+                // A returned stream may still depend on tasks this work
+                // spawned. Keep its cancellation lease until those tasks end.
+                running.completed = true;
                 finished = true;
                 done(result)?;
             }
-            let drained = running.work.is_none()
+            let drained = (running.completed || running.work.is_none())
                 && running
                     .region
                     .as_ref()
@@ -287,6 +302,9 @@ where
     L::Work: Job<Done = L::Done>,
 {
     fn work(&mut self, driver: &mut Driver<L>) -> Result<bool, L::Error> {
+        if driver.layer().is_terminal() {
+            self.jobs.close_completed();
+        }
         let mut moved = self.jobs.take(driver);
         self.woken.0.store(false, Ordering::Relaxed);
         let waker = Waker::from(self.woken.clone());
@@ -332,6 +350,8 @@ mod tests {
         tasks: Arc<AtomicUsize>,
         stopped: Arc<AtomicUsize>,
         start: Start,
+        ready: bool,
+        returned: Arc<AtomicUsize>,
     }
     struct TaskDrop(Arc<AtomicUsize>);
     impl Drop for TaskDrop {
@@ -349,8 +369,13 @@ mod tests {
                 let tasks = self.tasks.clone();
                 let guard = TaskDrop(self.stopped.clone());
                 let start = self.start.lock().take();
+                let returned = self.returned.clone();
+                let ready = self.ready;
                 fcx.spawn(move |fcx| async move {
                     let _guard = guard;
+                    if ready {
+                        assert!(returned.load(Ordering::Relaxed) > 0);
+                    }
                     tasks.fetch_add(1, Ordering::Relaxed);
                     if let Some(start) = start {
                         start.send(()).expect("the setup awaits task start");
@@ -359,7 +384,11 @@ mod tests {
                     Ok(())
                 });
             }
-            Poll::Pending
+            if self.ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         }
     }
     impl Drop for PendingJob {
@@ -375,6 +404,8 @@ mod tests {
         tasks: Arc<AtomicUsize>,
         stopped: Arc<AtomicUsize>,
         start: Start,
+        ready: bool,
+        returned: Arc<AtomicUsize>,
         extracted: usize,
     }
     impl Source {
@@ -386,6 +417,8 @@ mod tests {
                 tasks: Arc::default(),
                 stopped: Arc::default(),
                 start: Arc::default(),
+                ready: false,
+                returned: Arc::default(),
                 extracted: 0,
             }
         }
@@ -426,6 +459,8 @@ mod tests {
                 tasks: self.tasks.clone(),
                 stopped: self.stopped.clone(),
                 start: self.start.clone(),
+                ready: self.ready,
+                returned: self.returned.clone(),
             }))
         }
     }
@@ -552,5 +587,152 @@ mod tests {
             Ok(())
         }))
         .expect("all owned tasks drain");
+    }
+
+    #[test]
+    fn returned_work_keeps_its_producer_until_the_owner_closes() {
+        fictionet::block_on(fictionet::lab(Seed::from_u64(14), |fcx| async move {
+            let mut source = driver(Budget::unlimited());
+            source.layer_mut().ready = true;
+            let (start, started) = tokio::sync::oneshot::channel();
+            *source.layer().start.lock() = Some(start);
+            let returned = source.layer().returned.clone();
+            let mut jobs = Jobs::new();
+            jobs.take(&mut source);
+            std::future::poll_fn(|cx| {
+                Poll::Ready(jobs.poll(Some(&fcx), cx, |_| {
+                    returned.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, Infallible>(())
+                }))
+            })
+            .await
+            .unwrap();
+            started
+                .await
+                .expect("the returned response's producer runs");
+            assert_eq!(returned.load(Ordering::Relaxed), INTAKE);
+            assert_eq!(source.layer().tasks.load(Ordering::Relaxed), 1);
+            assert_eq!(source.layer().stopped.load(Ordering::Relaxed), 0);
+            assert_eq!(jobs.len(), 1);
+            let polls = source.layer().polls.load(Ordering::Relaxed);
+            std::future::poll_fn(|cx| {
+                Poll::Ready(jobs.poll(Some(&fcx), cx, |_| -> Result<(), Infallible> {
+                    panic!("a completed job cannot complete again")
+                }))
+            })
+            .await
+            .unwrap();
+            assert_eq!(source.layer().polls.load(Ordering::Relaxed), polls);
+            source.layer().owner.cancel();
+            std::future::poll_fn(|cx| {
+                jobs.poll(Some(&fcx), cx, |_| -> Result<(), Infallible> {
+                    panic!("a cancelled job cannot complete")
+                })
+                .unwrap();
+                if jobs.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(source.layer().stopped.load(Ordering::Relaxed), 1);
+            assert_eq!(source.layer().drops.load(Ordering::Relaxed), INTAKE);
+            Ok(())
+        }))
+        .expect("the producer's lifetime follows its owner");
+    }
+
+    #[test]
+    fn dropping_an_opened_stack_joins_its_tasks_in_the_enclosing_region() {
+        use fictionet::stdlib::layer::{ByteStream, StreamCommand, StreamEvent};
+        use fictionet::stdlib::network::{ConnError, Connection};
+        struct ByteSource(Source);
+        impl Layer for ByteSource {
+            type Lower = ByteStream;
+            type Upper = ByteStream;
+            type Report = ();
+            type Timer = ();
+            type Work = OwnedWork<PendingJob>;
+            type Done = ();
+            type Error = ConnError;
+            fn on_event(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                _: StreamEvent,
+            ) -> Result<Admit<StreamEvent>, ConnError> {
+                Ok(Admit::Taken)
+            }
+            fn on_command(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                command: StreamCommand,
+            ) -> Result<Admit<StreamCommand>, ConnError> {
+                Ok(Admit::Blocked(command))
+            }
+            fn take_event(&mut self) -> Option<StreamEvent> {
+                None
+            }
+            fn take_command(&mut self) -> Option<StreamCommand> {
+                None
+            }
+            fn take_work(&mut self) -> Option<Self::Work> {
+                self.0.take_work()
+            }
+        }
+        struct Waiting;
+        impl Connection for Waiting {
+            fn poll_read(
+                &mut self,
+                _: &Cx,
+                _: &mut Context<'_>,
+                _: &mut [u8],
+            ) -> Poll<Result<usize, ConnError>> {
+                Poll::Pending
+            }
+            fn poll_write(
+                &mut self,
+                _: &Cx,
+                _: &mut Context<'_>,
+                _: &[u8],
+            ) -> Poll<Result<usize, ConnError>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(
+                &mut self,
+                _: &Cx,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), ConnError>> {
+                Poll::Pending
+            }
+        }
+        fictionet::block_on(fictionet::lab(Seed::from_u64(15), |fcx| async move {
+            let stopped = Arc::new(AtomicUsize::new(0));
+            let count = stopped.clone();
+            fcx.region(move |region| async move {
+                let mut source = Source::new();
+                source.stopped = count;
+                let (start, started) = tokio::sync::oneshot::channel();
+                *source.start.lock() = Some(start);
+                let mut opened = super::super::Opened::new(
+                    &region,
+                    Waiting,
+                    ByteSource(source),
+                    Budget::unlimited(),
+                );
+                std::future::poll_fn(|cx| {
+                    assert!(opened.poll_read(&region, cx, &mut [0; 1]).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                started.await.expect("the stack's task entered");
+                drop(opened);
+                Ok(())
+            })
+            .await?;
+            assert_eq!(stopped.load(Ordering::Relaxed), 1);
+            Ok(())
+        }))
+        .expect("the enclosing region drains dropped stack work");
     }
 }
