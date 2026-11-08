@@ -8,6 +8,7 @@ pub mod ethernet;
 pub mod icmp;
 pub mod ip;
 mod link;
+pub mod observer;
 pub mod packet;
 pub mod ports;
 pub mod route;

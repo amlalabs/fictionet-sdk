@@ -94,6 +94,10 @@ pub enum Termination {
     Truncated,
     /// The observer dropped this connection to stay within its bounds.
     Evicted,
+    /// A new connection on the same endpoints started (a new SYN) before
+    /// this direction ended. What the sender did with this one after that
+    /// is unknown.
+    Replaced,
     /// The capture finished with no FIN, no reset and no known hole in this
     /// direction. What the sender did after the capture is unknown.
     Finalized,
@@ -210,6 +214,7 @@ mod tests {
             Termination::Reset,
             Termination::Truncated,
             Termination::Evicted,
+            Termination::Replaced,
             Termination::Finalized,
         ] {
             assert!(!cause.is_clean(), "{cause:?}");
