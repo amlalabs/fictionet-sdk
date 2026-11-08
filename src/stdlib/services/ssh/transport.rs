@@ -14,13 +14,51 @@ use crate::stdlib::protocols::ssh::transport::Transport;
 pub use crate::stdlib::protocols::ssh::transport::{Negotiated, TransportError};
 use crate::stdlib::protocols::ssh::{self, transport::TransportEvent};
 
+/// Peer metadata observed before transport negotiation accepts or rejects it.
+#[derive(Clone, Debug)]
+pub enum Observation {
+    /// Peer identification, including unsupported versions.
+    Version(ssh::Identification),
+    /// Peer proposal, including unsupported algorithms and rekeys.
+    Proposal(Box<ssh::KexInit>),
+}
+
+/// A terminal receive failure. Framing failures permit a protocol disconnect;
+/// negotiation failures stop immediately, preserving any peer observation.
+#[derive(Debug)]
+pub enum Failure {
+    /// Invalid packet framing, authentication tag or truncated input.
+    Framing(TransportError),
+    /// A decoded message failed transport negotiation or policy.
+    Protocol {
+        /// Fatal transport error.
+        error: TransportError,
+        /// Peer metadata retained even when negotiation fails.
+        observation: Option<Observation>,
+    },
+}
+impl From<TransportError> for Failure {
+    fn from(error: TransportError) -> Self {
+        Self::Protocol {
+            error,
+            observation: None,
+        }
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Framing(error) | Self::Protocol { error, .. } => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for Failure {}
+
 /// An event after transport processing, never an unverified encrypted packet.
 #[derive(Debug)]
 pub enum Event {
-    /// Peer identification accepted by the transport.
-    Version(ssh::Identification),
-    /// Peer proposal, including proposals for subsequent rekeys.
-    Proposal(ssh::KexInit),
+    /// Peer metadata from this transport step.
+    Observed(Observation),
     /// Both directions installed keys. Session identity remains stable on rekey.
     Established {
         /// True after a subsequent exchange, false after the initial exchange.
@@ -80,7 +118,7 @@ pub trait PacketTransport: Send + 'static {
     /// Mark EOF; poll must still process buffered packets or report truncation.
     fn end(&mut self);
     /// None means more input is required. Output belongs exclusively to caller.
-    fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, TransportError>;
+    fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure>;
     /// Current negotiation state and stable session identity.
     fn state(&self) -> State<'_>;
     /// Whether key limits require a new exchange before further output.
@@ -174,23 +212,27 @@ impl PacketTransport for StandardTransport {
     ) -> Result<(), TransportError> {
         self.stream.decoder().disconnect(reason, description, out)
     }
-    fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, TransportError> {
+    fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure> {
         let Some(event) = self.stream.next() else {
             return Ok(self.stream.is_done().then_some(Event::End));
         };
-        let event = event.map_err(|error| match error {
-            crate::stdlib::codec::Fail::Protocol(error) => error,
-            _ => TransportError::State,
+        let event = event.map_err(|error| {
+            Failure::Framing(match error {
+                crate::stdlib::codec::Fail::Protocol(error) => error,
+                _ => TransportError::State,
+            })
         })?;
-        let mut observation = match &event {
-            TransportEvent::Version(version) => Event::Version(version.clone()),
+        let observation = match &event {
+            TransportEvent::Version(version) => Some(Observation::Version(version.clone())),
             TransportEvent::Packet { payload, .. } if payload.first() == Some(&20) => {
-                let ssh::Message::KexInit(proposal) = ssh::Message::parse(payload)? else {
-                    return Err(TransportError::State);
+                let ssh::Message::KexInit(proposal) =
+                    ssh::Message::parse(payload).map_err(TransportError::from)?
+                else {
+                    return Err(TransportError::State.into());
                 };
-                Event::Proposal(proposal)
+                Some(Observation::Proposal(Box::new(proposal)))
             }
-            _ => Event::Progress,
+            _ => None,
         };
         let sequence = match &event {
             TransportEvent::Packet { sequence, .. } => *sequence,
@@ -199,11 +241,19 @@ impl PacketTransport for StandardTransport {
         let transport = self.stream.decoder();
         let established = transport.is_established();
         let exchanging = transport.is_rekeying();
-        if let Some(payload) = transport.handle(event, out)? {
-            observation = Event::Packet { sequence, payload };
+        let payload = transport
+            .handle(event, out)
+            .map_err(|error| Failure::Protocol {
+                error,
+                observation: observation.clone(),
+            })?;
+        let event = if let Some(payload) = payload {
+            Event::Packet { sequence, payload }
         } else if exchanging && !transport.is_rekeying() && transport.is_established() {
-            observation = Event::Established { rekey: established };
-        }
-        Ok(Some(observation))
+            Event::Established { rekey: established }
+        } else {
+            observation.map_or(Event::Progress, Event::Observed)
+        };
+        Ok(Some(event))
     }
 }

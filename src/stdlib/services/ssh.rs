@@ -788,6 +788,13 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             now,
         }
     }
+    fn observe_transport(&self, observation: &transport::Observation, now: Instant) {
+        let event = match observation {
+            transport::Observation::Version(version) => Event::Version(version.clone()),
+            transport::Observation::Proposal(proposal) => Event::KexInit(proposal.as_ref().clone()),
+        };
+        self.handler.observe(&self.context(now), &event);
+    }
     fn resident_bytes(&self) -> usize {
         self.transport.resident_bytes() + 6 * ssh::MAX_PAYLOAD
     }
@@ -1393,7 +1400,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         let event = match self.transport.poll(&mut self.out) {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(false),
-            Err(_) => {
+            Err(transport::Failure::Framing(_)) => {
                 self.transport.disconnect(
                     ssh::DisconnectReason::ProtocolError,
                     "Invalid SSH packet",
@@ -1402,14 +1409,17 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 self.close(env, Ended::Failed);
                 return Ok(true);
             }
+            Err(transport::Failure::Protocol { error, observation }) => {
+                if let Some(observation) = observation {
+                    self.observe_transport(&observation, env.now());
+                }
+                return Err(error.into());
+            }
         };
         match &event {
-            transport::Event::Version(version) => self
-                .handler
-                .observe(&self.context(env.now()), &Event::Version(version.clone())),
-            transport::Event::Proposal(proposal) => self
-                .handler
-                .observe(&self.context(env.now()), &Event::KexInit(proposal.clone())),
+            transport::Event::Observed(observation) => {
+                self.observe_transport(observation, env.now())
+            }
             transport::Event::End => {
                 self.close(env, Ended::Eof);
                 return Ok(true);
@@ -1998,6 +2008,45 @@ mod tests {
         );
         drop(harness);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn rejected_negotiation_preserves_peer_observations() {
+        let observed = Arc::new(Observed(Mutex::new(Vec::new())));
+        let config = Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        ));
+        let mut proposal =
+            ssh::transport::Transport::new(config.host_key.clone(), config.identification.clone())
+                .proposal()
+                .clone();
+        proposal.kex_algorithms = vec!["unsupported-exchange".into()];
+        let packet = ssh::Packet::from_message(&ssh::Message::KexInit(proposal.clone()))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let mut harness = crate::stdlib::layer::Harness::new(
+            crate::Seed::from_u64(3),
+            Ssh::new(config, observed.clone(), Arc::new(ConnInfo::default())),
+        );
+        harness.settle().unwrap();
+        harness.push(b"SSH-2.0-client\r\n").unwrap();
+        assert!(matches!(
+            harness.push(&packet),
+            Err(Error::Protocol(TransportError::Algorithm))
+        ));
+        let events = observed.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Version(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::KexInit(peer) if peer == &proposal))
+        );
     }
 
     struct Echo(Arc<Mutex<Vec<Program>>>);
