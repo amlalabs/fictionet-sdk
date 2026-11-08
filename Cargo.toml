@@ -8,6 +8,7 @@ members = [
     "codegen/tests/golden",
     "codegen/tests/layouts",
     "demos/kit",
+    "examples/copied-tls",
     "demos/search/app",
     "demos/search/world",
     "demos/nuclear/world",

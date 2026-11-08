@@ -1,0 +1,18 @@
+[package]
+name = "fictionet-copied-tls"
+version = "0.0.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+fictionet = { path = "../.." }
+rustls = { package = "fictionet-rustls", path = "../../rustls", default-features = false, features = ["std", "ring", "tls12"] }
+
+[dev-dependencies]
+bytes = "1"
+fictionet-extras = { path = "../../extras" }
+fictionet-test-support = { path = "../../tests/support" }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }

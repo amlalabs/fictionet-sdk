@@ -477,8 +477,8 @@ impl PortServer for Server {
         })
     }
 
-    /// HTTP/2 when TLS agreed on `h2`, else HTTP/1, in the same stack as
-    /// TLS. The network's
+    /// The configured application, by default HTTP/2 when TLS agreed on
+    /// `h2`, else HTTP/1, in the same stack as TLS. The network's
     /// [`write_timeout`](fictionet::stdlib::world::net::Limits::write_timeout)
     /// gives up on a client that stops reading.
     fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
