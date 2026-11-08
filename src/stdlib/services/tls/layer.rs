@@ -1,15 +1,21 @@
 //! The synchronous TLS state machine. The driver owns bytes once they leave it.
 
+use std::future::Future;
 use std::io::{self, BufRead, Write};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use rustls::ServerConfig;
 use rustls::server::{Accepted, AcceptedAlert, Acceptor, ServerConnection};
 
 use super::HandshakeError;
+use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Env, Layer, StreamCommand, StreamEvent,
+    Admit, ByteStream, Charge, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
 };
+use fictionet::stdlib::services::stack::Job;
+use fictionet::time::Instant;
 
 const CHUNK: usize = 16 * 1024;
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
@@ -33,10 +39,64 @@ impl Hello {
     }
 }
 
+/// A config on its way, picked for a client's hello.
+pub type Picking = Pin<Box<dyn Future<Output = Option<Arc<ServerConfig>>> + Send>>;
+
+/// How a [`TlsLayer`] gets its config once it has read the client's hello.
+#[derive(Clone)]
+enum Select {
+    /// Always this one.
+    Config(Arc<ServerConfig>),
+    /// What this picks for the hello, with the world's context.
+    With(Arc<dyn Fn(Cx, Arc<Hello>) -> Picking + Send + Sync>),
+}
+
+/// The work of a [`TlsLayer`]: picking the config for the client's
+/// [`Hello`]. Its result is the config, or `None` to refuse the name the
+/// client asked for with `unrecognized_name`.
+///
+/// Whatever runs the layer polls it as a [`Job`], or, in a
+/// [`Harness`](fictionet::stdlib::layer::Harness) that does not, the test
+/// reads the hello here and completes the work itself.
+pub struct Pick {
+    hello: Arc<Hello>,
+    select: Select,
+    picking: Option<Picking>,
+}
+
+impl Pick {
+    /// What the client asked for.
+    pub fn hello(&self) -> &Hello {
+        &self.hello
+    }
+}
+
+impl Job for Pick {
+    type Done = Option<Arc<ServerConfig>>;
+
+    /// A layer that picks with the world's context refuses the name when
+    /// there is no world to pick in.
+    fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Self::Done> {
+        let picking = match (&self.select, &mut self.picking, fcx) {
+            (Select::Config(config), _, _) => return Poll::Ready(Some(config.clone())),
+            (Select::With(_), Some(picking), _) => picking,
+            (Select::With(select), picking @ None, Some(fcx)) => {
+                picking.insert(select(fcx.clone(), self.hello.clone()))
+            }
+            (Select::With(_), None, None) => return Poll::Ready(None),
+        };
+        picking.as_mut().poll(cx)
+    }
+}
+
 /// Server TLS over an ordered stream, exposing a decrypted ordered stream.
 ///
-/// A work item carries the client's [`Hello`]. Complete it with a server
-/// configuration, or `None` to reject the requested name. The
+/// Once it has read the client's [`Hello`] it asks for its config as work
+/// ([`Pick`]): always the same one ([`new`](Self::new)), or one the world
+/// picks for the hello ([`selecting`](Self::selecting)). No config refuses
+/// the name with `unrecognized_name`. A handshake that has not finished by
+/// its deadline ([`handshake_by`](Self::handshake_by)) fails with
+/// [`HandshakeError::TimedOut`] and the connection ends. The
 /// configuration's crypto provider supplies the connection's explicit entropy.
 /// A failure remains available while its alert drains, allowing the carrier to
 /// report the original TLS failure even if sending the alert also fails.
@@ -50,7 +110,9 @@ pub struct TlsLayer {
     accepted: Option<Accepted>,
     tls: Option<ServerConnection>,
     hello: Option<Arc<Hello>>,
+    select: Select,
     work: bool,
+    deadline: Timers<()>,
     initialized: bool,
     output_reserve: Option<Charge>,
     alert: Option<AcceptedAlert>,
@@ -73,21 +135,41 @@ pub struct TlsLayer {
     credit: u64,
 }
 
-impl Default for TlsLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TlsLayer {
-    /// Waits for a ClientHello without allocating rustls state yet.
-    pub fn new() -> Self {
+    /// Serves `config` to every client. Waits for a ClientHello without
+    /// allocating rustls state yet.
+    pub fn new(config: Arc<ServerConfig>) -> Self {
+        Self::with(Select::Config(config))
+    }
+
+    /// Serves the config `select` picks for the client's hello, with the
+    /// world's context. It may take time: only this handshake waits for it.
+    /// `None` refuses the name the client asked for.
+    pub fn selecting<F>(select: impl Fn(Cx, Arc<Hello>) -> F + Send + Sync + 'static) -> Self
+    where
+        F: Future<Output = Option<Arc<ServerConfig>>> + Send + 'static,
+    {
+        Self::with(Select::With(Arc::new(move |fcx, hello| {
+            Box::pin(select(fcx, hello)) as Picking
+        })))
+    }
+
+    /// Fails the handshake if it has not finished at `at`, picking
+    /// included.
+    pub fn handshake_by(mut self, at: Instant) -> Self {
+        self.deadline.set((), at);
+        self
+    }
+
+    fn with(select: Select) -> Self {
         Self {
             acceptor: None,
             accepted: None,
             tls: None,
             hello: None,
+            select,
             work: false,
+            deadline: Timers::new(),
             initialized: false,
             output_reserve: None,
             alert: None,
@@ -173,6 +255,7 @@ impl TlsLayer {
         self.input_ended = true;
         self.closing = true;
         self.work = false;
+        self.deadline = Timers::new();
         self.above = None;
         self.below = None;
         self.acceptor = None;
@@ -210,7 +293,7 @@ impl Layer for TlsLayer {
     type Upper = ByteStream;
     type Report = ();
     type Timer = ();
-    type Work = Arc<Hello>;
+    type Work = Pick;
     type Done = Option<Arc<ServerConfig>>;
     type Error = HandshakeError;
 
@@ -387,6 +470,10 @@ impl Layer for TlsLayer {
         _env: &mut Env<'_, ()>,
         config: Self::Done,
     ) -> Result<(), HandshakeError> {
+        if self.failed || self.reset {
+            // A pick that finished after the handshake gave up.
+            return Ok(());
+        }
         let accepted = self.accepted.take().ok_or_else(|| {
             HandshakeError::Failed("TLS configuration without a client hello".into())
         })?;
@@ -540,10 +627,30 @@ impl Layer for TlsLayer {
         self.above.take()
     }
 
-    fn take_work(&mut self) -> Option<Arc<Hello>> {
+    fn take_work(&mut self) -> Option<Pick> {
         if !std::mem::take(&mut self.work) {
             return None;
         }
-        self.hello.clone()
+        Some(Pick {
+            hello: self.hello.clone()?,
+            select: self.select.clone(),
+            picking: None,
+        })
+    }
+
+    fn on_timer(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<(), HandshakeError> {
+        if self.deadline.fire(&(), env.now()) && self.is_handshaking() {
+            // No alert: the client hears the end of the stream.
+            self.work = false;
+            self.accepted = None;
+            self.fail(HandshakeError::TimedOut);
+        }
+        Ok(())
+    }
+
+    fn deadline(&self) -> Option<(Instant, ())> {
+        self.deadline
+            .next()
+            .filter(|_| self.is_handshaking() && !self.failed)
     }
 }

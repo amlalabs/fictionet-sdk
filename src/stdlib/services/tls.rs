@@ -62,13 +62,15 @@ mod provider;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
-pub use layer::{Hello, TlsLayer};
+pub use layer::{Hello, Pick, Picking, TlsLayer};
 
-use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, StreamCommand, StreamEvent};
-use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
+
+use fictionet::stdlib::layer::Budget;
+use fictionet::stdlib::services::stack::{Halt, Opened, StackError, StreamEnd};
+use fictionet::sync::Mutex;
 
 pub use rustls::ServerConfig;
 
@@ -115,198 +117,6 @@ pub fn alert_name(code: u8) -> &'static str {
         120 => "no_application_protocol",
         121 => "ech_required",
         _ => "unknown",
-    }
-}
-
-/// How much to read from the connection underneath in one read.
-const READ_CHUNK: usize = 16 * 1024;
-/// Socket readiness translated into the layer driver's owned inputs and outputs.
-struct Io<C> {
-    conn: C,
-    driver: Driver<TlsLayer>,
-    input: Option<StreamEvent>,
-    plaintext: VecDeque<Chunk>,
-    ended: bool,
-    eof: bool,
-    credited: u64,
-    pending_write: Option<Chunk>,
-}
-
-impl<C: Connection> Io<C> {
-    fn new(fcx: &Cx, conn: C) -> Self {
-        Self {
-            conn,
-            driver: Driver::new(
-                TlsLayer::new(),
-                Arc::new(fcx.clone()),
-                Budget::unlimited(),
-                fcx.now(),
-            ),
-            input: None,
-            plaintext: VecDeque::new(),
-            ended: false,
-            eof: false,
-            credited: 0,
-            pending_write: None,
-        }
-    }
-
-    fn collect(&mut self) {
-        self.driver.send_above(|event| {
-            match event {
-                StreamEvent::Data(bytes) => self.plaintext.push_back(bytes),
-                StreamEvent::Written(n) => self.credited += n,
-                StreamEvent::Ended | StreamEvent::Reset => self.ended = true,
-            }
-            Admit::Taken
-        });
-    }
-
-    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), HandshakeError>> {
-        self.driver.set_now(fcx.now());
-        for _ in 0..1024 {
-            self.driver.run()?;
-            let mut written = 0;
-            let mut error = None;
-            let mut blocked = false;
-            let conn = &mut self.conn;
-            let moved = self.driver.send_below(|command| match command {
-                StreamCommand::Write(mut bytes) => match conn.poll_write(fcx, cx, &bytes) {
-                    Poll::Ready(Ok(0)) => {
-                        error = Some(ConnError::Closed);
-                        Admit::Blocked(StreamCommand::Write(bytes))
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        written += n as u64;
-                        bytes.advance(n);
-                        if bytes.is_empty() {
-                            Admit::Taken
-                        } else {
-                            Admit::Partial(StreamCommand::Write(bytes))
-                        }
-                    }
-                    Poll::Ready(Err(e)) => {
-                        error = Some(e);
-                        Admit::Blocked(StreamCommand::Write(bytes))
-                    }
-                    Poll::Pending => {
-                        blocked = true;
-                        Admit::Blocked(StreamCommand::Write(bytes))
-                    }
-                },
-                StreamCommand::End | StreamCommand::Reset => match conn.poll_shutdown(fcx, cx) {
-                    Poll::Ready(Ok(())) => Admit::Taken,
-                    Poll::Ready(Err(e)) => {
-                        error = Some(e);
-                        Admit::Blocked(command)
-                    }
-                    Poll::Pending => {
-                        blocked = true;
-                        Admit::Blocked(command)
-                    }
-                },
-            });
-            if written != 0 {
-                match self.driver.deliver(StreamEvent::Written(written))? {
-                    Admit::Taken => {}
-                    _ => {
-                        return Poll::Ready(Err(HandshakeError::Failed(
-                            "TLS refused write completion".into(),
-                        )));
-                    }
-                }
-            }
-            self.collect();
-            if let Some(e) = error {
-                return Poll::Ready(Err(e.into()));
-            }
-            if blocked {
-                return Poll::Pending;
-            }
-            if !moved && !self.driver.holds_output() && !self.driver.layer().output_pending() {
-                return Poll::Ready(Ok(()));
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
-
-    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), HandshakeError>> {
-        self.driver.set_now(fcx.now());
-        if self.input.is_none() {
-            if self.eof {
-                return Poll::Ready(Ok(()));
-            }
-            let charge = self
-                .driver
-                .budget()
-                .charge(READ_CHUNK)
-                .ok_or_else(|| HandshakeError::Failed("TLS input budget exhausted".into()))?;
-            let mut bytes = vec![0; READ_CHUNK];
-            let n = match self.conn.poll_read(fcx, cx, &mut bytes) {
-                Poll::Ready(result) => result?,
-                Poll::Pending => return Poll::Pending,
-            };
-            self.input = Some(if n == 0 {
-                self.eof = true;
-                StreamEvent::Ended
-            } else {
-                bytes.truncate(n);
-                StreamEvent::Data(Chunk::with_charge(bytes, charge))
-            });
-        }
-        let event = self.input.take().unwrap();
-        match self.driver.deliver(event)? {
-            Admit::Taken | Admit::Closed(_) => {}
-            Admit::Partial(rest) => self.input = Some(rest),
-            Admit::Blocked(rest) => {
-                self.input = Some(rest);
-                return Poll::Pending;
-            }
-        }
-        self.driver.run()?;
-        self.collect();
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_handshake(
-        &mut self,
-        fcx: &Cx,
-        cx: &mut Context<'_>,
-        hello: bool,
-    ) -> Poll<Result<(), HandshakeError>> {
-        if fcx.is_cancelled() {
-            return Poll::Ready(Err(HandshakeError::Cancelled));
-        }
-        for _ in 0..1024 {
-            let flushed = self.poll_flush(fcx, cx);
-            if self.driver.layer().failure().is_some() {
-                if flushed.is_pending() {
-                    return Poll::Pending;
-                }
-                return Poll::Ready(Err(self.driver.layer_mut().take_failure().unwrap()));
-            }
-            match flushed {
-                Poll::Ready(result) => result?,
-                Poll::Pending => return Poll::Pending,
-            }
-            if if hello {
-                self.driver.layer().hello().is_some()
-            } else {
-                !self.driver.layer().is_handshaking()
-            } {
-                return Poll::Ready(Ok(()));
-            }
-            if self.eof {
-                return Poll::Ready(Err(HandshakeError::Closed));
-            }
-            match self.poll_fill(fcx, cx) {
-                Poll::Ready(result) => result?,
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 }
 
@@ -382,14 +192,77 @@ impl From<fictionet::Cancelled> for HandshakeError {
     }
 }
 
-impl HandshakeError {
-    fn into_conn(self) -> ConnError {
-        match self {
+impl From<HandshakeError> for ConnError {
+    /// A handshake's failure as a connection's: the connection's own error
+    /// as it was, a cancel, a timeout, and anything else as
+    /// [`ConnError::Broken`].
+    fn from(e: HandshakeError) -> ConnError {
+        match e {
             HandshakeError::Conn(e) => e,
             HandshakeError::Cancelled => ConnError::Cancelled,
             HandshakeError::TimedOut => ConnError::TimedOut,
             _ => ConnError::Broken,
         }
+    }
+}
+
+impl From<StackError<HandshakeError>> for HandshakeError {
+    fn from(e: StackError<HandshakeError>) -> HandshakeError {
+        match e {
+            StackError::Layer(e) => e,
+            StackError::Cancelled => HandshakeError::Cancelled,
+        }
+    }
+}
+
+/// How a run that ended without the layer's own error ended, as a
+/// handshake's failure.
+fn ended(end: StreamEnd) -> HandshakeError {
+    match end {
+        StreamEnd::Conn(e) => e.into(),
+        StreamEnd::Reset => HandshakeError::Conn(ConnError::Reset),
+        StreamEnd::Finished | StreamEnd::Idle => HandshakeError::Closed,
+        StreamEnd::Budget => HandshakeError::Failed("no budget for the TLS input".into()),
+    }
+}
+
+/// The world's answer to a hello, once it gives one: the config, or `None`
+/// to refuse the name.
+#[derive(Default)]
+struct Answer {
+    config: Option<Option<Arc<ServerConfig>>>,
+    waiting: Option<Waker>,
+}
+
+type Answered = Arc<Mutex<Answer>>;
+
+fn answer(answered: &Answered, config: Option<Arc<ServerConfig>>) {
+    let mut answer = answered.lock();
+    answer.config = Some(config);
+    if let Some(waker) = answer.waiting.take() {
+        waker.wake();
+    }
+}
+
+/// Moves the handshake on until `done` says it has gone far enough, or it
+/// fails. A failure that sends an alert is returned once the alert is out.
+fn poll_handshake<C: Connection>(
+    tls: &mut Opened<TlsLayer, C>,
+    fcx: &Cx,
+    cx: &mut Context<'_>,
+    done: impl Fn(&TlsLayer) -> bool,
+) -> Poll<Result<(), HandshakeError>> {
+    if fcx.is_cancelled() {
+        return Poll::Ready(Err(HandshakeError::Cancelled));
+    }
+    match tls.poll_run(fcx, cx) {
+        Poll::Ready(Ok(Halt::Conn(e))) => Poll::Ready(Err(e.into())),
+        Poll::Ready(Ok(Halt::End(end))) => Poll::Ready(Err(ended(end))),
+        Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+        Poll::Pending if tls.stack().failure().is_none() && done(tls.stack()) => {
+            Poll::Ready(Ok(()))
+        }
+        Poll::Pending => Poll::Pending,
     }
 }
 
@@ -406,9 +279,7 @@ impl HandshakeError {
 /// [`ConnError::Cancelled`] when `fcx`'s [region](fictionet::Cx#regions) is
 /// cancelled, comes out as it is.
 pub async fn server<C: Connection>(fcx: &Cx, conn: C) -> Result<ClientHello<C>, ConnError> {
-    server_detailed(fcx, conn)
-        .await
-        .map_err(HandshakeError::into_conn)
+    Ok(server_detailed(fcx, conn).await?)
 }
 
 /// [`server`], failing with how the hello went wrong. A malformed hello
@@ -417,14 +288,30 @@ pub async fn server_detailed<C: Connection>(
     fcx: &Cx,
     conn: C,
 ) -> Result<ClientHello<C>, HandshakeError> {
-    let mut io = Io::new(fcx, conn);
-    poll_fn(|cx| io.poll_handshake(fcx, cx, true)).await?;
-    Ok(ClientHello { io })
+    let answered = Answered::default();
+    let waiting = answered.clone();
+    let layer = TlsLayer::selecting(move |_, _| {
+        let answered = waiting.clone();
+        poll_fn(move |cx| {
+            let mut answer = answered.lock();
+            match answer.config.take() {
+                Some(config) => Poll::Ready(config),
+                None => {
+                    answer.waiting = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+    });
+    let mut tls = Opened::new(fcx, conn, layer, Budget::unlimited());
+    poll_fn(|cx| poll_handshake(&mut tls, fcx, cx, |tls| tls.hello().is_some())).await?;
+    Ok(ClientHello { tls, answered })
 }
 
 /// What the client asked for, before the server has answered.
 pub struct ClientHello<C> {
-    io: Io<C>,
+    tls: Opened<TlsLayer, C>,
+    answered: Answered,
 }
 
 impl<C: Connection> ClientHello<C> {
@@ -432,15 +319,14 @@ impl<C: Connection> ClientHello<C> {
     /// if the client sent no name, for example when it connected to a bare
     /// IP address.
     pub fn server_name(&self) -> Option<&str> {
-        self.io.driver.layer().hello().and_then(Hello::server_name)
+        self.tls.stack().hello().and_then(Hello::server_name)
     }
 
     /// The application protocols the client offers (ALPN), such as `h2` and
     /// `http/1.1`, in the client's order of preference.
     pub fn alpn(&self) -> Vec<&[u8]> {
-        self.io
-            .driver
-            .layer()
+        self.tls
+            .stack()
             .hello()
             .map(Hello::alpn)
             .unwrap_or_default()
@@ -448,20 +334,17 @@ impl<C: Connection> ClientHello<C> {
 
     /// The connection underneath, for example to see who connected.
     pub fn inner(&self) -> &C {
-        &self.io.conn
+        self.tls.conn()
     }
 
     /// Refuses the name the client asked for: sends the `unrecognized_name`
     /// alert and closes the connection. Dropping the hello instead closes the
     /// connection with no alert.
     pub async fn reject(mut self, fcx: &Cx) -> Result<(), ConnError> {
-        self.io
-            .driver
-            .complete(None)
-            .map_err(HandshakeError::into_conn)?;
-        match poll_fn(|cx| self.io.poll_flush(fcx, cx)).await {
+        answer(&self.answered, None);
+        match poll_fn(|cx| poll_handshake(&mut self.tls, fcx, cx, |_| false)).await {
             Ok(()) | Err(HandshakeError::Rejected) => Ok(()),
-            Err(error) => Err(error.into_conn()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -475,46 +358,43 @@ impl<C: Connection> ClientHello<C> {
         fcx: &Cx,
         config: Arc<ServerConfig>,
     ) -> Result<TlsConnection<C>, ConnError> {
-        self.finish_detailed(fcx, config)
-            .await
-            .map_err(HandshakeError::into_conn)
+        Ok(self.finish_detailed(fcx, config).await?)
     }
 
     /// [`finish`](ClientHello::finish), failing with how the handshake went
     /// wrong.
     pub async fn finish_detailed(
-        self,
+        mut self,
         fcx: &Cx,
         config: Arc<ServerConfig>,
     ) -> Result<TlsConnection<C>, HandshakeError> {
-        let mut io = self.io;
-        io.driver.complete(Some(config))?;
-        poll_fn(|cx| io.poll_handshake(fcx, cx, false)).await?;
-        Ok(TlsConnection { io, closing: false })
+        answer(&self.answered, Some(config));
+        poll_fn(|cx| poll_handshake(&mut self.tls, fcx, cx, |tls| !tls.is_handshaking())).await?;
+        Ok(TlsConnection { tls: self.tls })
     }
 }
 
-/// A finished TLS connection. Reads and writes carry the decrypted bytes.
+/// A finished TLS connection: [`TlsLayer`] over the connection underneath,
+/// [opened](Opened) as a connection. Reads and writes carry the decrypted
+/// bytes.
 ///
 /// A read reports a failure of the connection underneath even when it happened
 /// while sending TLS output, such as a KeyUpdate reply. Plaintext already
-/// decrypted is kept for the next read. Output waits for the next read or write
-/// only when the connection has no room for it.
+/// decrypted is kept for the next read. A write returns once its ciphertext
+/// was taken by the connection underneath.
 pub struct TlsConnection<C> {
-    io: Io<C>,
-    /// `close_notify` is queued.
-    closing: bool,
+    tls: Opened<TlsLayer, C>,
 }
 
 impl<C: Connection> TlsConnection<C> {
     /// The connection underneath.
     pub fn inner(&self) -> &C {
-        &self.io.conn
+        self.tls.conn()
     }
 
     /// The application protocol both sides agreed on (ALPN), if any.
     pub fn alpn(&self) -> Option<&[u8]> {
-        self.io.driver.layer().alpn()
+        self.tls.stack().alpn()
     }
 }
 
@@ -525,46 +405,14 @@ impl<C: Connection> Connection for TlsConnection<C> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ConnError>> {
-        if fcx.is_cancelled() {
-            return Poll::Ready(Err(ConnError::Cancelled));
+        match self.tls.poll_read(fcx, cx, buf) {
+            read @ Poll::Ready(Ok(_)) => read,
+            // A protocol failure is the reader's to hear at once, before its
+            // alert is out, and before a failure of the connection
+            // underneath that sending the alert met.
+            _ if self.tls.stack().failure().is_some() => Poll::Ready(Err(ConnError::Broken)),
+            read => read,
         }
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        for _ in 0..1024 {
-            self.io.collect();
-            if let Some(bytes) = self.io.plaintext.front_mut() {
-                let n = bytes.len().min(buf.len());
-                buf[..n].copy_from_slice(&bytes[..n]);
-                bytes.advance(n);
-                if bytes.is_empty() {
-                    self.io.plaintext.pop_front();
-                }
-                return Poll::Ready(Ok(n));
-            }
-            if self.io.ended {
-                return Poll::Ready(Ok(0));
-            }
-            let filled = self.io.poll_fill(fcx, cx);
-            let flushed = self.io.poll_flush(fcx, cx);
-            if self.io.driver.layer().failure().is_some() {
-                return Poll::Ready(Err(ConnError::Broken));
-            }
-            if let Poll::Ready(Err(e)) = flushed {
-                return Poll::Ready(Err(e.into_conn()));
-            }
-            if !self.io.plaintext.is_empty() || self.io.ended {
-                continue;
-            }
-            match filled {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into_conn())),
-                Poll::Pending if self.io.input.is_some() && flushed.is_ready() => continue,
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 
     fn poll_write(
@@ -573,92 +421,15 @@ impl<C: Connection> Connection for TlsConnection<C> {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
-        if fcx.is_cancelled() {
-            return Poll::Ready(Err(ConnError::Cancelled));
-        }
-        match self.io.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into_conn())),
-            Poll::Pending => return Poll::Pending,
-        }
-        if let Some(previous) = self.io.pending_write.take() {
-            if self.io.credited < previous.len() as u64 {
-                self.io.pending_write = Some(previous);
-                return Poll::Pending;
-            }
-            self.io.credited -= previous.len() as u64;
-            if data.starts_with(&previous) {
-                return Poll::Ready(Ok(previous.len()));
-            }
-        }
-        if self.closing {
-            return Poll::Ready(Err(ConnError::Closed));
-        }
-        if data.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let n = data.len().min(16 * 1024);
-        let budget = self.io.driver.budget();
-        let charge = budget.charge(n).ok_or(ConnError::Broken)?;
-        let retry_charge = budget.charge(n).ok_or(ConnError::Broken)?;
-        let command = StreamCommand::Write(Chunk::with_charge(data[..n].to_vec(), charge));
-        let accepted = match self
-            .io
-            .driver
-            .command(command)
-            .map_err(HandshakeError::into_conn)?
-        {
-            Admit::Taken => n,
-            Admit::Partial(StreamCommand::Write(rest)) => n - rest.len(),
-            Admit::Closed(_) => return Poll::Ready(Err(ConnError::Closed)),
-            Admit::Blocked(_) => return Poll::Pending,
-            _ => return Poll::Ready(Err(ConnError::Broken)),
-        };
-        // A retry is matched by content because Connection's borrowed write
-        // interface has no identity that survives dropping its future.
-        let n = accepted;
-        self.io.pending_write = Some(Chunk::with_charge(data[..n].to_vec(), retry_charge));
-        match self.io.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => {
-                if self.io.credited < n as u64 {
-                    return Poll::Pending;
-                }
-                self.io.credited -= n as u64;
-                self.io.pending_write = None;
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into_conn())),
-            Poll::Pending => Poll::Pending,
-        }
+        self.tls.poll_write(fcx, cx, data)
     }
 
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        if fcx.is_cancelled() {
-            return Poll::Ready(Err(ConnError::Cancelled));
-        }
-        match self.io.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into_conn())),
-            Poll::Pending => return Poll::Pending,
-        }
-        if !self.closing {
-            match self
-                .io
-                .driver
-                .command(StreamCommand::End)
-                .map_err(HandshakeError::into_conn)?
-            {
-                Admit::Taken | Admit::Closed(_) => self.closing = true,
-                _ => return Poll::Pending,
-            }
-        }
-        self.io
-            .poll_flush(fcx, cx)
-            .map(|r| r.map_err(HandshakeError::into_conn))
+        self.tls.poll_shutdown(fcx, cx)
     }
 
     fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.io.conn.poll_gone(cx)
+        self.tls.poll_gone(cx)
     }
 }
 

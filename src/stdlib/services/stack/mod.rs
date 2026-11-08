@@ -50,12 +50,13 @@ use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Driver,
     Layer, Top,
 };
-use fictionet::stdlib::network::{Connection, DatagramSocket};
+use fictionet::stdlib::network::{ConnError, Connection, DatagramSocket};
 use fictionet::stdlib::services::serve::{ConnInfo, PanicNote, Transport};
 use fictionet::sync::Mutex;
 use fictionet::{Cancelled, Cx, RecvError};
 
 use job::Jobs;
+pub(crate) use live::Halt;
 use live::Live;
 
 /// How many rounds a runner makes before it lets the rest of the world
@@ -181,12 +182,20 @@ where
             if cancelled.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(Err(StackError::Cancelled));
             }
-            match live.poll(&fcx, cx, &mut |event| match event {}, &mut report) {
-                Poll::Ready(end) => Poll::Ready(end),
-                Poll::Pending => live
-                    .finished()
-                    .map_or(Poll::Pending, |end| Poll::Ready(Ok(end))),
-            }
+            let above = &mut |event| match event {};
+            let failed = match live.poll(&fcx, cx, above, &mut report) {
+                Poll::Ready(Ok(Halt::End(end))) => return Poll::Ready(Ok(end)),
+                Poll::Ready(Ok(Halt::Conn(e))) => e,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => match live.finished() {
+                    Some(end) => return Poll::Ready(Ok(end)),
+                    // A peer that reset the connection while nothing was
+                    // read or written.
+                    None if live.conn().poll_gone(cx).is_ready() => ConnError::Reset,
+                    None => return Poll::Pending,
+                },
+            };
+            Poll::Ready(live.broken(failed, above, &mut report))
         })
         .await
     })

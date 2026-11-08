@@ -4,6 +4,12 @@ use std::io::{ErrorKind, Read, Write};
 
 type Server = Harness<tls::TlsLayer>;
 
+/// A layer whose test picks its config by hand, and that refuses every
+/// name when nothing does.
+fn refusing() -> tls::TlsLayer {
+    tls::TlsLayer::selecting(|_, _| async { None })
+}
+
 fn client_output(client: &mut rustls::ClientConnection) -> Vec<u8> {
     let mut bytes = Vec::new();
     while client.wants_write() {
@@ -30,7 +36,7 @@ fn handshake(
         rustls::pki_types::ServerName::try_from("example.test").unwrap(),
     )
     .unwrap();
-    let mut server = Harness::new(Seed::from_u64(12), tls::TlsLayer::new());
+    let mut server = Harness::new(Seed::from_u64(12), tls::TlsLayer::new(config.clone()));
     let hello = client_output(&mut client);
     let split = split.min(hello.len());
     server.push(&hello[..split]).unwrap();
@@ -45,8 +51,8 @@ fn handshake(
     );
     assert!(server.take_output().is_empty());
     let selection = server.work().unwrap();
-    assert_eq!(selection.server_name(), Some("example.test"));
-    assert_eq!(selection.alpn(), vec![&b"http/1.1"[..]]);
+    assert_eq!(selection.hello().server_name(), Some("example.test"));
+    assert_eq!(selection.hello().alpn(), vec![&b"http/1.1"[..]]);
     assert!(server.work().is_none());
     server.complete(Some(config)).unwrap();
     for _ in 0..32 {
@@ -174,7 +180,7 @@ fn ciphertext_completion_is_not_admission_and_close_follows_data() {
 #[test]
 fn no_budget_refuses_input_without_consuming_it() {
     let budget = Budget::new(0);
-    let mut server = Harness::with_budget(Seed::from_u64(15), tls::TlsLayer::new(), budget.clone());
+    let mut server = Harness::with_budget(Seed::from_u64(15), refusing(), budget.clone());
     let bytes = vec![22, 3, 3, 0, 4, 1, 0, 0, 0];
     let result = server
         .driver()
@@ -265,7 +271,7 @@ fn reset_aborts_a_queued_close_and_cancels_hello_work() {
             client_config,
             rustls::pki_types::ServerName::try_from("example.test").unwrap(),
         )?;
-        let mut server = Harness::new(Seed::from_u64(18), tls::TlsLayer::new());
+        let mut server = Harness::new(Seed::from_u64(18), refusing());
         server.push(&client_output(&mut client))?;
         assert!(server.layer().hello().is_some());
         assert!(matches!(
@@ -329,10 +335,13 @@ fn rejection_drains_its_alert_before_reporting_failure() {
             client_config(&fcx, &ca, &[]),
             rustls::pki_types::ServerName::try_from("unknown.test").unwrap(),
         )?;
-        let mut server = Harness::new(Seed::from_u64(21), tls::TlsLayer::new());
+        let mut server = Harness::new(Seed::from_u64(21), refusing());
         server.withhold();
         server.push(&client_output(&mut client))?;
-        assert_eq!(server.work().unwrap().server_name(), Some("unknown.test"));
+        assert_eq!(
+            server.work().unwrap().hello().server_name(),
+            Some("unknown.test")
+        );
         server.complete(None)?;
         assert!(server.output().is_empty());
         assert!(matches!(

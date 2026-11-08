@@ -23,6 +23,18 @@ const ROUNDS: usize = 64;
 
 type Sleep = Pin<Box<dyn Future<Output = Result<(), fictionet::Cancelled>> + Send>>;
 
+/// Why [`Live::poll`] stopped before it had to wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Halt {
+    /// Reading or writing the connection failed with this. Nothing else
+    /// changed: the stack has not heard, a write that failed is still held,
+    /// and polling again tries again. A runner that gives up on the
+    /// connection says so with [`Live::broken`].
+    Conn(ConnError),
+    /// The run ended, and keeps answering this.
+    End(StreamEnd),
+}
+
 /// A stack running over a live connection: the one place a stream stack
 /// meets the runtime.
 ///
@@ -134,9 +146,10 @@ where
 
     /// Moves the stack and its connection on until nothing more can move
     /// now: `Pending` once it waits, with `cx` woken when something can
-    /// move again. `Ready` only when the run ended: the stack reset the
-    /// connection or gave up on it, the connection failed, the budget ran
-    /// out, or a write stalled. After that it keeps answering the same.
+    /// move again. `Ready` when reading or writing the connection failed
+    /// ([`Halt::Conn`]), or when the run ended: the stack reset the
+    /// connection or gave up on it, the budget ran out, or a write stalled.
+    /// After it ended it keeps answering the same.
     ///
     /// `above` takes the stack's events for what is above it, and `report`
     /// its reports.
@@ -146,13 +159,13 @@ where
         cx: &mut Context<'_>,
         above: &mut dyn FnMut(EventOf<L::Upper>) -> Admit<EventOf<L::Upper>>,
         report: &mut dyn FnMut(L::Report),
-    ) -> Poll<Result<StreamEnd, StackError<L::Error>>> {
+    ) -> Poll<Result<Halt, StackError<L::Error>>> {
         if let Some(end) = self.stopped {
-            return Poll::Ready(Ok(end));
+            return Poll::Ready(Ok(Halt::End(end)));
         }
         if self.buffer.is_none() {
             // The stack never runs.
-            return Poll::Ready(Ok(self.stop(StreamEnd::Budget)));
+            return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
         }
         let polled = self.step(fcx, cx, above, report);
         if let Poll::Ready(Err(StackError::Layer(_))) = &polled {
@@ -173,12 +186,36 @@ where
         cx: &mut Context<'_>,
         above: &mut dyn FnMut(EventOf<L::Upper>) -> Admit<EventOf<L::Upper>>,
         report: &mut dyn FnMut(L::Report),
-    ) -> Poll<Result<StreamEnd, StackError<L::Error>>> {
+    ) -> Poll<Result<Halt, StackError<L::Error>>> {
         for _ in 0..ROUNDS {
             let now = fcx.now();
             self.driver.set_now(now);
+            // Read first, so input that came with a failed write is not
+            // left behind.
+            let mut read_failed = None;
+            let mut moved = false;
+            if self.input.is_none() && !self.input_over {
+                match self.conn.poll_read(fcx, cx, &mut self.buf) {
+                    Poll::Ready(Ok(0)) => self.input = Some(StreamEvent::Ended),
+                    Poll::Ready(Ok(n)) => {
+                        // Charge first, then copy out of the read buffer.
+                        let Some(charge) = self.driver.budget().charge(n) else {
+                            self.broken(ConnError::Reset, above, report)?;
+                            return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
+                        };
+                        let bytes = self.buf[..n].to_vec();
+                        self.input = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
+                    }
+                    Poll::Ready(Err(ConnError::Cancelled)) => {
+                        return Poll::Ready(Err(StackError::Cancelled));
+                    }
+                    Poll::Ready(Err(e)) => read_failed = Some(e),
+                    Poll::Pending => {}
+                }
+                moved |= self.input.is_some();
+            }
             let driver = &mut self.driver;
-            let mut moved = self
+            moved |= self
                 .jobs
                 .poll(Some(fcx), cx, |done| driver.complete(done))
                 .map_err(StackError::Layer)?;
@@ -225,6 +262,11 @@ where
                         return Admit::Taken;
                     }
                     match conn.poll_write(fcx, cx, &chunk) {
+                        // A connection that takes nothing of a write is closed.
+                        Poll::Ready(Ok(0)) => {
+                            failed = Some(ConnError::Closed);
+                            Admit::Blocked(StreamCommand::Write(chunk))
+                        }
                         Poll::Ready(Ok(n)) => {
                             let n = n.min(chunk.len());
                             chunk.advance(n);
@@ -237,7 +279,7 @@ where
                         }
                         Poll::Ready(Err(e)) => {
                             failed = Some(e);
-                            Admit::Closed(StreamCommand::Write(chunk))
+                            Admit::Blocked(StreamCommand::Write(chunk))
                         }
                         Poll::Pending => Admit::Blocked(StreamCommand::Write(chunk)),
                     }
@@ -249,7 +291,7 @@ where
                     }
                     Poll::Ready(Err(e)) => {
                         failed = Some(e);
-                        Admit::Closed(StreamCommand::End)
+                        Admit::Blocked(StreamCommand::End)
                     }
                     Poll::Pending => Admit::Blocked(StreamCommand::End),
                 },
@@ -259,10 +301,12 @@ where
                 }
             });
             if reset {
-                return Poll::Ready(Ok(self.stop(StreamEnd::Reset)));
+                return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Reset))));
             }
             if let Some(e) = failed {
-                return Poll::Ready(self.broken(e, above, report));
+                // The write stays held, to try again.
+                self.unreported += wrote;
+                return Poll::Ready(Ok(Halt::Conn(e)));
             }
             if wrote > 0 {
                 self.unreported += wrote;
@@ -271,42 +315,19 @@ where
             if !self.driver.holds_output() {
                 self.stalled_since = None;
             }
+            if let Some(e) = read_failed {
+                return Poll::Ready(Ok(Halt::Conn(e)));
+            }
             if moved {
                 continue;
-            }
-
-            if self.input.is_none() && !self.input_over {
-                match self.conn.poll_read(fcx, cx, &mut self.buf) {
-                    Poll::Ready(Ok(0)) => {
-                        self.input = Some(StreamEvent::Ended);
-                        continue;
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        // Charge first, then copy out of the read buffer.
-                        let Some(charge) = self.driver.budget().charge(n) else {
-                            let _ = self.broken(ConnError::Reset, above, report);
-                            return Poll::Ready(Ok(self.stop(StreamEnd::Budget)));
-                        };
-                        let bytes = self.buf[..n].to_vec();
-                        self.input = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
-                        continue;
-                    }
-                    Poll::Ready(Err(ConnError::Cancelled)) => {
-                        return Poll::Ready(Err(StackError::Cancelled));
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(self.broken(e, above, report)),
-                    Poll::Pending => {}
-                }
-            }
-            if self.conn.poll_gone(cx).is_ready() {
-                return Poll::Ready(self.broken(ConnError::Reset, above, report));
             }
 
             // The limits, as of now.
             if self.driver.holds_output() {
                 let since = *self.stalled_since.get_or_insert(now);
                 if self.limits.write_timeout.is_some_and(|d| now >= since + d) {
-                    return Poll::Ready(self.broken(ConnError::TimedOut, above, report));
+                    let end = self.broken(ConnError::TimedOut, above, report)?;
+                    return Poll::Ready(Ok(Halt::End(end)));
                 }
             }
             let waiting = self.input.is_none()
@@ -354,9 +375,10 @@ where
         Poll::Pending
     }
 
-    /// The connection failed with `e`: the stack hears that it is gone, and
-    /// says what it still has to say above.
-    fn broken(
+    /// Gives up on the connection, which failed with `e`: the stack hears
+    /// that it is gone and says what it still has to say above, and the run
+    /// ends with [`StreamEnd::Conn`].
+    pub(super) fn broken(
         &mut self,
         e: ConnError,
         above: &mut dyn FnMut(EventOf<L::Upper>) -> Admit<EventOf<L::Upper>>,

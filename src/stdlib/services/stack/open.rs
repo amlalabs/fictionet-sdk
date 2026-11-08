@@ -7,7 +7,7 @@ use fictionet::stdlib::layer::{
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 
-use super::live::Live;
+use super::live::{Halt, Live};
 use super::{Job, StackError, StreamEnd, StreamLimits};
 
 /// The most decrypted, decoded or otherwise delivered bytes an opened
@@ -38,8 +38,6 @@ pub struct Opened<L: Layer<Lower = ByteStream, Upper = ByteStream>, C> {
     pending: Option<Chunk>,
     /// End went to the stack.
     closing: bool,
-    /// How the run ended, once it has.
-    stopped: Option<ConnError>,
 }
 
 /// What came up from the stack and has not been read.
@@ -101,7 +99,6 @@ where
             above: Above::default(),
             pending: None,
             closing: false,
-            stopped: None,
         }
     }
 
@@ -116,37 +113,50 @@ where
     }
 
     /// Moves the stack and its connection on until nothing more can move
-    /// now. `Pending` while the run goes on, with `cx` woken when it can
-    /// move again; `Ready` with how the run ended, the first time with the
-    /// stack's own error if it gave up, after that as a connection error.
-    pub fn poll_run(
+    /// now. `Pending` while it waits, with `cx` woken when it can move
+    /// again; `Ready` when reading or writing the connection failed, which
+    /// polling again retries, or with how the run ended: the stack's own
+    /// error the first time it gives up.
+    pub(crate) fn poll_run(
         &mut self,
         fcx: &Cx,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<StreamEnd, StackError<L::Error>>> {
+    ) -> Poll<Result<Halt, StackError<L::Error>>> {
         let above = &mut self.above;
         self.live
             .poll(fcx, cx, &mut |event| above.take(event), &mut |_| {})
     }
 
-    /// Runs the stack, keeping a failure for later: what is already
-    /// delivered stays readable.
+    /// Runs the stack, with a failure as the connection's error.
     fn pump(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Result<(), ConnError> {
-        if let Some(e) = self.stopped {
-            return Err(e);
+        match self.poll_run(fcx, cx) {
+            Poll::Pending => Ok(()),
+            Poll::Ready(Ok(Halt::Conn(e))) => Err(e),
+            Poll::Ready(Ok(Halt::End(StreamEnd::Conn(e)))) => Err(e),
+            Poll::Ready(Ok(Halt::End(StreamEnd::Reset))) => Err(ConnError::Reset),
+            Poll::Ready(Ok(Halt::End(_))) => Err(ConnError::Broken),
+            Poll::Ready(Err(StackError::Cancelled)) => Err(ConnError::Cancelled),
+            Poll::Ready(Err(StackError::Layer(e))) => Err(e.into()),
         }
-        let Poll::Ready(end) = self.poll_run(fcx, cx) else {
-            return Ok(());
-        };
-        let e = match end {
-            Ok(StreamEnd::Conn(e)) => e,
-            Ok(StreamEnd::Reset) => ConnError::Reset,
-            Ok(_) => ConnError::Broken,
-            Err(StackError::Cancelled) => ConnError::Cancelled,
-            Err(StackError::Layer(e)) => e.into(),
-        };
-        self.stopped = Some(e);
-        Err(e)
+    }
+
+    /// Reads what the stack delivered into `buf`, if it delivered anything,
+    /// or its end.
+    fn deliver(&mut self, buf: &mut [u8]) -> Option<Result<usize, ConnError>> {
+        if let Some(chunk) = self.above.bytes.front_mut() {
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            chunk.advance(n);
+            if chunk.is_empty() {
+                self.above.bytes.pop_front();
+            }
+            self.above.len -= n;
+            return Some(Ok(n));
+        }
+        if self.above.reset {
+            return Some(Err(ConnError::Reset));
+        }
+        self.above.ended.then_some(Ok(0))
     }
 
     /// Takes `n` bytes of what the stack reported written, if it reported
@@ -180,25 +190,14 @@ where
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let failed = self.pump(fcx, cx).err();
-        if let Some(chunk) = self.above.bytes.front_mut() {
-            let n = chunk.len().min(buf.len());
-            buf[..n].copy_from_slice(&chunk[..n]);
-            chunk.advance(n);
-            if chunk.is_empty() {
-                self.above.bytes.pop_front();
-            }
-            self.above.len -= n;
-            return Poll::Ready(Ok(n));
+        // What came before goes first; a failure comes before what this
+        // call brings.
+        if let Some(read) = self.deliver(buf) {
+            return Poll::Ready(read);
         }
-        if self.above.reset {
-            return Poll::Ready(Err(ConnError::Reset));
-        }
-        if self.above.ended {
-            return Poll::Ready(Ok(0));
-        }
-        match failed {
-            Some(e) => Poll::Ready(Err(e)),
+        self.pump(fcx, cx)?;
+        match self.deliver(buf) {
+            Some(read) => Poll::Ready(read),
             None => Poll::Pending,
         }
     }
