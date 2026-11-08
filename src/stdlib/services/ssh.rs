@@ -1,4 +1,4 @@
-//! SSH servers over [`serve::connection`], following RFCs 4252, 4253 and 4254.
+//! SSH servers over composable byte streams, following RFCs 4252, 4253 and 4254.
 //!
 //! [`Handler`] chooses authentication and starts sessions. [`Session`] consumes
 //! input bytes and terminal events; [`Output`] queues stdout, stderr and exit
@@ -6,15 +6,17 @@
 //! windows apply when the queue is sent.
 //! The world supplies identity, authentication policy and application behavior.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::serve::{self, ConnInfo, Driver, Flow, Service};
+use super::serve::ConnInfo;
+use super::stack;
+use crate::stdlib::layer::{Admit, Budget, ByteStream, Chain, Charge, ChildId, Children, Chunk as Bytes, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand, StreamEvent, Timers, Top};
 use crate::Cx;
-use crate::stdlib::codec::Wire;
+use crate::stdlib::codec::{Stream, Wire};
 use crate::stdlib::protocols::ssh::transport::{
     HostKey, Transport, TransportError, TransportEvent,
 };
@@ -23,6 +25,9 @@ use crate::stdlib::world::net::{Arrival, PortServer};
 use crate::time::Instant;
 
 pub mod channel;
+mod session;
+pub use session::SessionLayer;
+use channel::{ChannelPort, ChannelEvent, ChannelCommand, Opening};
 
 const WINDOW: u32 = 65536;
 const PACKET: u32 = 32000;
@@ -209,7 +214,7 @@ pub enum Event {
         status: u32,
     },
     /// The SSH connection ended.
-    End(serve::Ended),
+    End(Ended),
 }
 
 /// Application policy and session factory for an SSH connection.
@@ -268,6 +273,10 @@ pub trait Session: Send + 'static {
     fn input(&mut self, context: &Context<'_>, bytes: &[u8], output: &mut Output);
     /// Receive terminal changes, signals and channel lifecycle events.
     fn event(&mut self, _context: &Context<'_>, _event: &SessionEvent, _output: &mut Output) {}
+    /// Extended input, such as standard error from another endpoint.
+    fn extended(&mut self, _context: &Context<'_>, _kind: u32, _bytes: &[u8], _output: &mut Output) {}
+    /// A success or failure reply to an application channel request.
+    fn reply(&mut self, _context: &Context<'_>, _accepted: bool, _output: &mut Output) {}
     /// Bytes retained by the application, charged to the connection's budget.
     fn held(&self) -> usize {
         0
@@ -278,8 +287,7 @@ pub trait Session: Send + 'static {
 enum Chunk {
     Data {
         stderr: bool,
-        data: Vec<u8>,
-        offset: usize,
+        data: Bytes,
     },
     Exit(u32),
 }
@@ -292,6 +300,8 @@ pub struct Output {
     exited: bool,
     disconnect: bool,
     hangup: bool,
+    budget: Option<Budget>,
+    storage: Option<Charge>,
 }
 
 /// Output would exceed the queue bound or follow an exit or disconnect.
@@ -304,6 +314,19 @@ impl std::fmt::Display for OutputFull {
 }
 impl std::error::Error for OutputFull {}
 impl Output {
+    fn with_budget(budget: Budget) -> Self { Self { budget: Some(budget), ..Self::default() } }
+    fn clear(&mut self) {
+        self.chunks.clear(); self.bytes = 0; self.exited = false; self.disconnect = false; self.hangup = false;
+    }
+    fn reserve(&mut self) -> Result<(), OutputFull> {
+        if self.storage.is_none() {
+            let budget = self.budget.get_or_insert_with(Budget::unlimited);
+            let charge = budget.charge(1025 * std::mem::size_of::<Chunk>()).ok_or(OutputFull)?;
+            self.chunks = VecDeque::with_capacity(1025);
+            self.storage = Some(charge);
+        }
+        Ok(())
+    }
     /// Queue stdout bytes, preserving their order. Refusal changes nothing.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), OutputFull> {
         self.push(false, bytes)
@@ -320,11 +343,12 @@ impl Output {
             return Err(OutputFull);
         }
         if !bytes.is_empty() {
+            self.reserve()?;
+            let charge = self.budget.as_ref().unwrap().charge(bytes.len()).ok_or(OutputFull)?;
             self.bytes += bytes.len();
             self.chunks.push_back(Chunk::Data {
                 stderr,
-                data: bytes.to_vec(),
-                offset: 0,
+                data: Bytes::with_charge(bytes.to_vec(), charge),
             });
         }
         Ok(())
@@ -334,6 +358,7 @@ impl Output {
     /// have no process status.
     pub fn exit(&mut self, status: u32) {
         if !self.exited {
+            if self.reserve().is_err() { self.disconnect(); return; }
             self.exited = true;
             self.chunks.push_back(Chunk::Exit(status));
         }
@@ -398,69 +423,135 @@ impl Config {
     }
 }
 
-/// A port server that drives SSH through the common service driver.
+
+/// Why the SSH connection ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// The client sent everything it will send, and every item was handled.
+    /// The reply is still written.
+    Eof,
+    /// The application or protocol closed the connection.
+    Closed,
+    /// The SSH packet decoder failed.
+    Failed,
+    /// The idle deadline expired.
+    Idle,
+    /// The connection held more than its [`Budget`] allows.
+    Budget,
+    /// Reading or writing failed: the client reset the connection, or TLS
+    /// broke ([`crate::stdlib::network::ConnError::Broken`]).
+    Conn(crate::stdlib::network::ConnError),
+    /// The connection's region was cancelled. A notification
+    /// delivered to the observer; [`connection`] itself then returns
+    /// [`ServeError::Cancelled`], or the failure that cancelled the region.
+    Cancelled,
+}
+
+impl Ended {
+    /// A stable spelling of the connection's end reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ended::Eof => "eof",
+            Ended::Closed => "closed",
+            Ended::Failed => "failed",
+            Ended::Idle => "idle",
+            Ended::Budget => "budget",
+            Ended::Conn(crate::stdlib::network::ConnError::Reset) => "reset",
+            Ended::Conn(crate::stdlib::network::ConnError::Broken) => "broken",
+            Ended::Conn(crate::stdlib::network::ConnError::TimedOut) => "timed_out",
+            Ended::Conn(_) => "error",
+            Ended::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A port server running SSH and its session children on the common stack runner.
 pub struct Server<H: Handler> {
     /// Protocol configuration.
     pub config: Arc<Config>,
-    /// Application policy and session implementation.
+    /// Application authentication and session policy.
     pub handler: Arc<H>,
-    /// Connection timeouts and budget.
-    pub options: serve::ServeOptions,
-    /// Optional listener backlog; `None` uses the network's default.
+    /// Idle and write deadlines.
+    pub limits: stack::StreamLimits,
+    /// Optional shared allocation budget.
+    pub budget: Option<Budget>,
+    /// Optional listener backlog.
     pub backlog: Option<usize>,
 }
 impl<H: Handler> PortServer for Server<H> {
-    fn backlog(&self) -> Option<usize> {
-        self.backlog
-    }
-
+    fn backlog(&self) -> Option<usize> { self.backlog }
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let mut service = Ssh::new(self.config.clone(), self.handler.clone());
-        let mut options = self.options.clone();
-        if options.budget.is_none() {
-            options.budget = arrival.budget;
-        }
-        options.handshake = arrival.limits.handshake;
+        let info = Arc::new(arrival.info);
+        let layer = Ssh::new(self.config.clone(), self.handler.clone(), info.clone()).sessions();
+        let handler = self.handler.clone();
+        let budget = self.budget.clone().or(arrival.budget).unwrap_or_else(Budget::unlimited);
+        let limits = self.limits;
         Box::pin(async move {
-            let _ = serve::connection(
-                &fcx,
-                arrival.conn,
-                arrival.info,
-                &mut service,
-                &(),
-                &options,
-            )
-            .await;
+            let mut protocol_end = Ended::Eof;
+            let result = stack::stream(&fcx, arrival.conn, &info, layer, budget, limits, |report| {
+                if let crate::stdlib::layer::Side::Lower(reason) = report { protocol_end = reason; }
+            }).await;
+            let end = match result {
+                Ok(stack::StreamEnd::Finished) => protocol_end,
+                Ok(stack::StreamEnd::Idle) => Ended::Idle,
+                Ok(stack::StreamEnd::Budget) | Err(stack::StackError::Budget) => Ended::Budget,
+                Ok(stack::StreamEnd::Conn(error)) => Ended::Conn(error),
+                Ok(stack::StreamEnd::Reset) => Ended::Conn(crate::stdlib::network::ConnError::Reset),
+                Err(stack::StackError::Cancelled) => Ended::Cancelled,
+                Err(stack::StackError::Layer(_)) => Ended::Closed,
+            };
+            handler.observe(&Context { connection: &info, now: fcx.now() }, &Event::End(end));
         })
     }
 }
 
-/// Service timers for authentication and delayed replies.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Authentication deadlines owned by one SSH layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Timer {
-    /// Authentication deadline.
+    /// Maximum authentication time.
     Login,
-    /// A delayed authentication failure.
+    /// Delayed authentication failure.
     Failure,
 }
 
-struct Channel<S> {
+struct Channel {
+    wire: u32,
     peer: u32,
     window: u32,
     max_packet: u32,
-    session_channel: bool,
-    pty: Option<Pty>,
-    environment: Vec<(Vec<u8>, Vec<u8>)>,
-    session: Option<S>,
-    output: Output,
+    granted: u64,
+    receive: u64,
+    advertised: u32,
+    accepted: bool,
     eof: bool,
+    sent_eof: bool,
     closed: bool,
+    written: u64,
 }
+struct Flight { bytes: usize, child: Option<(ChildId, u64)> }
 
-/// One SSH connection, usable directly with [`serve::connection`].
+/// A synchronous SSH connection: a byte stream below and typed channels above.
+/// Authentication and connection requests remain with the parent. Attach
+/// [`Children`] directly for another channel application, or use [`Self::sessions`].
+/// Host configuration and synchronous policy callback allocations belong to the
+/// caller. Bounded transport parsing storage is reserved before decoding.
 pub struct Ssh<H: Handler> {
     config: Arc<Config>,
     handler: Arc<H>,
+    connection: Arc<ConnInfo>,
+    stream: Stream<Transport>,
+    timers: Timers<Timer>,
+    started: bool,
+    ended: bool,
+    end_sent: bool,
+    state: Option<Charge>,
+    out: Vec<u8>,
+    out_charge: Option<Charge>,
+    out_child: Option<(ChildId, u64)>,
+    flights: VecDeque<Flight>,
+    up: VecDeque<MuxEvent<ChannelPort, Top, Owned<Opening>>>,
+    channels: Slots<Channel>,
+    next_channel: u32,
     user: Option<String>,
     auth_user: Option<String>,
     service_requested: bool,
@@ -469,117 +560,82 @@ pub struct Ssh<H: Handler> {
     challenge: Option<(auth::Request, usize)>,
     failure: Option<Vec<u8>>,
     failure_ready: bool,
-    pending_packets: VecDeque<(u32, Vec<u8>)>,
-    channels: BTreeMap<u32, Channel<H::Session>>,
-    next_channel: u32,
-}
-impl<H: Handler> Ssh<H> {
-    /// A fresh connection with shared configuration and application policy.
-    pub fn new(config: Arc<Config>, handler: Arc<H>) -> Self {
-        Self {
-            config,
-            handler,
-            user: None,
-            auth_user: None,
-            service_requested: false,
-            attempts: 0,
-            auth_requests: 0,
-            challenge: None,
-            failure: None,
-            failure_ready: false,
-            pending_packets: VecDeque::new(),
-            channels: BTreeMap::new(),
-            next_channel: 0,
-        }
-    }
+    pending_packets: VecDeque<(u32, Owned<Vec<u8>>)>,
 }
 
-type DriverOf<'a> = Driver<'a, Transport, Timer>;
-
-fn context<'a>(driver: &'a DriverOf<'_>) -> Context<'a> {
-    Context {
-        connection: driver.conn(),
-        now: driver.now(),
-    }
-}
-fn write(driver: &mut DriverOf<'_>, payload: &[u8]) -> Result<(), TransportError> {
-    let mut bytes = Vec::new();
-    driver.decoder().write_packet(payload, &mut bytes)?;
-    driver.reply().extend(bytes);
-    Ok(())
-}
-fn send(
-    driver: &mut DriverOf<'_>,
-    message: &impl Wire<WriteError = ssh::Error>,
-) -> Result<(), TransportError> {
-    write(driver, &message.to_bytes()?)
-}
-
-fn disconnect(
-    driver: &mut DriverOf<'_>,
-    reason: ssh::DisconnectReason,
-    description: &str,
-) -> Result<Flow, TransportError> {
-    let mut bytes = Vec::new();
-    driver
-        .decoder()
-        .disconnect(reason, description, &mut bytes)?;
-    driver.reply().extend(bytes);
-    Ok(Flow::Close)
-}
+/// SSH with one synchronous application adapter on every scoped channel.
+pub type Sessions<H> = Chain<Ssh<H>, Children<SessionLayer<H>, Top, Owned<Opening>>>;
 
 impl<H: Handler> Ssh<H> {
-    fn finish(&mut self, driver: &mut DriverOf<'_>) -> Result<Flow, TransportError> {
-        if self.failure_ready && !driver.peek_decoder().is_rekeying() {
-            if let Some(failure) = self.failure.take() {
-                write(driver, &failure)?;
-            }
-            self.failure_ready = false;
-        }
-        if self.user.is_none()
-            && self.failure.is_none()
-            && (self.attempts >= self.config.max_attempts
-                || self.auth_requests >= MAX_AUTH_REQUESTS)
-        {
-            return disconnect(
-                driver,
-                ssh::DisconnectReason::NoMoreAuthMethodsAvailable,
-                "Too many authentication failures",
-            );
-        }
-        if self
-            .channels
-            .values()
-            .any(|channel| channel.output.disconnect)
-        {
-            return disconnect(
-                driver,
-                ssh::DisconnectReason::ByApplication,
-                "Connection closed by application",
-            );
-        }
-        self.flush(driver)?;
-        if self.channels.values().any(|channel| channel.output.hangup)
-            && self
-                .channels
-                .values()
-                .filter(|channel| channel.output.hangup)
-                .all(|channel| channel.output.chunks.is_empty())
-        {
-            return Ok(Flow::Close);
-        }
-        if driver.peek_decoder().needs_rekey() && !driver.peek_decoder().is_rekeying() {
-            let mut bytes = Vec::new();
-            driver.decoder().rekey(&mut bytes)?;
-            driver.reply().extend(bytes);
-        }
-        Ok(Flow::Continue)
+    /// A fresh SSH layer with explicit connection identity.
+    pub fn new(config: Arc<Config>, handler: Arc<H>, connection: Arc<ConnInfo>) -> Self {
+        let stream = Stream::new(Transport::new(config.host_key.clone(), config.identification.clone()));
+        let limit = config.max_channels;
+        Self { config, handler, connection, stream, timers: Timers::new(), started: false,
+            ended: false, end_sent: false, state: None, out: Vec::new(), out_charge: None,
+            out_child: None, flights: VecDeque::new(), up: VecDeque::new(), channels: Slots::new(limit),
+            next_channel: 0, user: None, auth_user: None, service_requested: false, attempts: 0,
+            auth_requests: 0, challenge: None, failure: None, failure_ready: false, pending_packets: VecDeque::new() }
     }
-
+    /// Run the configured Handler and Session policy on each channel.
+    pub fn sessions(self) -> Sessions<H> {
+        let handler = self.handler.clone();
+        let connection = self.connection.clone();
+        let limit = self.config.max_channels;
+        Chain::new(self, Children::new(limit, u64::from(WINDOW), move |_, opening, budget| {
+            SessionLayer::new(handler.clone(), connection.clone(), opening, budget)
+        }))
+    }
+    fn context(&self, now: Instant) -> Context<'_> { Context { connection: &self.connection, now } }
+    fn reserve(&mut self, env: &Env<'_, Ended>) -> Result<(), TransportError> {
+        if self.state.is_none() {
+            // Name lists can expand into many owned strings; this covers the
+            // buffered packet, transport exchanges, parsing scratch and queues.
+            let bytes = 64 * ssh::MAX_PACKET + 128 * std::mem::size_of::<Flight>()
+                + 128 * std::mem::size_of::<(u32, Owned<Vec<u8>>)>()
+                + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<Opening>>>();
+            let charge = env.budget().charge(bytes).ok_or(TransportError::State)?;
+            self.channels = Slots::with_budget(self.config.max_channels, env.budget()).ok_or(TransportError::State)?;
+            self.flights = VecDeque::with_capacity(128);
+            self.pending_packets = VecDeque::with_capacity(128);
+            self.up = VecDeque::with_capacity(8);
+            self.state = Some(charge);
+        }
+        Ok(())
+    }
+    fn output(&mut self, env: &Env<'_, Ended>) -> Result<(), TransportError> {
+        if self.out_charge.is_none() {
+            let bytes = 4 * ssh::MAX_PACKET;
+            let charge = env.budget().charge(bytes).ok_or(TransportError::State)?;
+            self.out = Vec::with_capacity(bytes);
+            self.out_charge = Some(charge);
+        }
+        Ok(())
+    }
+    fn write(&mut self, env: &Env<'_, Ended>, payload: &[u8]) -> Result<(), TransportError> {
+        self.output(env)?;
+        if self.out.len() + ssh::MAX_PACKET > self.out.capacity() { return Err(TransportError::State); }
+        self.stream.decoder().write_packet(payload, &mut self.out)
+    }
+    fn send(&mut self, env: &Env<'_, Ended>, message: &impl Wire<WriteError = ssh::Error>) -> Result<(), TransportError> {
+        self.write(env, &message.to_bytes()?)
+    }
+    fn close(&mut self, env: &mut Env<'_, Ended>, reason: Ended) {
+        if !self.ended { self.ended = true; self.timers = Timers::new(); env.report(reason); }
+    }
+    fn disconnect(&mut self, env: &mut Env<'_, Ended>, reason: ssh::DisconnectReason, description: &str) -> Result<(), TransportError> {
+        self.output(env)?;
+        self.stream.decoder().disconnect(reason, description, &mut self.out)?;
+        self.close(env, Ended::Closed);
+        Ok(())
+    }
+    fn id(&self, wire: u32) -> Result<ChildId, TransportError> {
+        self.channels.ids().find(|id| self.channels.get(*id).unwrap().wire == wire).ok_or(TransportError::State)
+    }
     fn authentication(
         &mut self,
         payload: &[u8],
-        driver: &mut DriverOf<'_>,
+        env: &mut Env<'_, Ended>,
     ) -> Result<(), TransportError> {
         if !self.service_requested || self.failure.is_some() {
             return Err(TransportError::State);
@@ -593,7 +649,7 @@ impl<H: Handler> Ssh<H> {
                 return Err(TransportError::State);
             };
             self.handler.observe(
-                &context(driver),
+                &self.context(env.now()),
                 &Event::AuthenticationResponses(responses.clone()),
             );
             let (request, count) = self.challenge.take().ok_or(TransportError::State)?;
@@ -618,8 +674,8 @@ impl<H: Handler> Ssh<H> {
         if self.auth_user.is_none() {
             self.auth_user = Some(request.user.clone());
             if let Some(message) = &self.config.banner {
-                send(
-                    driver,
+                self.send(
+                    env,
                     &auth::Message::Banner {
                         message: message.clone(),
                         language: String::new(),
@@ -629,15 +685,14 @@ impl<H: Handler> Ssh<H> {
         }
         let verified = request
             .verify_public_key(
-                driver
-                    .peek_decoder()
+                self.stream.decoder()
                     .session_id()
                     .ok_or(TransportError::State)?,
                 payload,
             )
             .unwrap_or(false);
         self.handler.observe(
-            &context(driver),
+            &self.context(env.now()),
             &Event::Authentication {
                 request: request.clone(),
                 verified,
@@ -648,9 +703,9 @@ impl<H: Handler> Ssh<H> {
             signature_verified: verified,
             responses: responses.as_deref(),
         };
-        let decision = self.handler.authenticate(&context(driver), &attempt);
+        let decision = self.handler.authenticate(&self.context(env.now()), &attempt);
         self.handler.observe(
-            &context(driver),
+            &self.context(env.now()),
             &Event::AuthenticationDecision(decision.clone()),
         );
         let probe = matches!(
@@ -673,17 +728,17 @@ impl<H: Handler> Ssh<H> {
         match decision {
             AuthDecision::Accept if probe => {
                 if let auth::Method::PublicKey { algorithm, key, .. } = request.method {
-                    send(driver, &auth::Message::PublicKeyOk { algorithm, key })?;
+                    self.send(env, &auth::Message::PublicKeyOk { algorithm, key })?;
                 }
             }
             AuthDecision::Accept => {
-                send(driver, &auth::Message::Success)?;
+                self.send(env, &auth::Message::Success)?;
                 self.user = Some(request.user.clone());
                 self.auth_user = None;
                 self.challenge = None;
-                driver.cancel_timer(Timer::Login);
+                self.timers.cancel(&Timer::Login);
                 self.handler.observe(
-                    &context(driver),
+                    &self.context(env.now()),
                     &Event::Authenticated {
                         user: request.user,
                         method: request.method.name().to_owned(),
@@ -706,11 +761,11 @@ impl<H: Handler> Ssh<H> {
                 }
                 .to_bytes()?;
                 if delay.is_zero() {
-                    write(driver, &failure)?;
+                    self.write(env, &failure)?;
                 } else {
                     self.failure = Some(failure);
                     self.failure_ready = false;
-                    driver.set_timer(Timer::Failure, delay);
+                    self.timers.set(Timer::Failure, env.now() + delay);
                 }
             }
             AuthDecision::Challenge {
@@ -722,8 +777,8 @@ impl<H: Handler> Ssh<H> {
                     return Err(TransportError::State);
                 }
                 let count = prompts.len();
-                send(
-                    driver,
+                self.send(
+                    env,
                     &auth::Message::InfoRequest {
                         name,
                         instruction,
@@ -737,807 +792,3 @@ impl<H: Handler> Ssh<H> {
         Ok(())
     }
 
-    fn connection_message(
-        &mut self,
-        message: wire::Message,
-        driver: &mut DriverOf<'_>,
-    ) -> Result<(), TransportError> {
-        self.handler
-            .observe(&context(driver), &Event::Connection(message.clone()));
-        match message {
-            wire::Message::GlobalRequest {
-                want_reply,
-                request,
-            } => {
-                let response = self
-                    .handler
-                    .global_request(&context(driver), &request)
-                    .filter(|data| data.len() < ssh::MAX_PAYLOAD);
-                if want_reply {
-                    send(
-                        driver,
-                        &match response {
-                            Some(data) => wire::Message::RequestSuccess(data),
-                            None => wire::Message::RequestFailure,
-                        },
-                    )?;
-                }
-            }
-            wire::Message::ChannelOpen {
-                sender,
-                window,
-                max_packet,
-                kind,
-            } => {
-                if self.channels.values().any(|c| c.peer == sender) {
-                    return Err(TransportError::State);
-                }
-                if !matches!(
-                    kind,
-                    wire::OpenKind::Session | wire::OpenKind::DirectTcpIp(_)
-                ) || self.channels.len() >= self.config.max_channels
-                    || max_packet == 0
-                {
-                    send(
-                        driver,
-                        &wire::Message::ChannelOpenFailure {
-                            recipient: sender,
-                            reason: 1,
-                            description: "Channel refused".into(),
-                            language: String::new(),
-                        },
-                    )?;
-                    return Ok(());
-                }
-                let id = self.next_channel;
-                let session_channel = matches!(kind, wire::OpenKind::Session);
-                let mut output = Output::default();
-                let session = if let wire::OpenKind::DirectTcpIp(endpoint) = &kind {
-                    let session =
-                        self.handler
-                            .direct_tcpip(&context(driver), id, endpoint, &mut output);
-                    if session.is_none() {
-                        send(
-                            driver,
-                            &wire::Message::ChannelOpenFailure {
-                                recipient: sender,
-                                reason: 1,
-                                description: "Channel refused".into(),
-                                language: String::new(),
-                            },
-                        )?;
-                        return Ok(());
-                    }
-                    session
-                } else {
-                    None
-                };
-                self.next_channel = id.checked_add(1).ok_or(TransportError::State)?;
-                self.channels.insert(
-                    id,
-                    Channel {
-                        peer: sender,
-                        window,
-                        max_packet: max_packet.min(PACKET),
-                        session_channel,
-                        pty: None,
-                        environment: Vec::new(),
-                        session,
-                        output,
-                        eof: false,
-                        closed: false,
-                    },
-                );
-                send(
-                    driver,
-                    &wire::Message::ChannelOpenConfirmation {
-                        recipient: sender,
-                        sender: id,
-                        window: WINDOW,
-                        max_packet: PACKET,
-                        data: Vec::new(),
-                    },
-                )?;
-            }
-            wire::Message::WindowAdjust { recipient, bytes } => {
-                let channel = self
-                    .channels
-                    .get_mut(&recipient)
-                    .ok_or(TransportError::State)?;
-                channel.window = channel
-                    .window
-                    .checked_add(bytes)
-                    .ok_or(TransportError::State)?;
-            }
-            wire::Message::Data { recipient, data } => {
-                let channel = self
-                    .channels
-                    .get_mut(&recipient)
-                    .ok_or(TransportError::State)?;
-                if channel.eof || channel.closed || data.len() > PACKET as usize {
-                    return Err(TransportError::State);
-                }
-                let session = channel.session.as_mut().ok_or(TransportError::State)?;
-                self.handler.observe(
-                    &context(driver),
-                    &Event::Input {
-                        channel: recipient,
-                        data: data.clone(),
-                    },
-                );
-                session.input(&context(driver), &data, &mut channel.output);
-                if !data.is_empty() {
-                    send(
-                        driver,
-                        &wire::Message::WindowAdjust {
-                            recipient: channel.peer,
-                            bytes: data.len() as u32,
-                        },
-                    )?;
-                }
-            }
-            wire::Message::ChannelRequest {
-                recipient,
-                want_reply,
-                request,
-            } => {
-                let channel = self
-                    .channels
-                    .get_mut(&recipient)
-                    .ok_or(TransportError::State)?;
-                if channel.closed {
-                    return Err(TransportError::State);
-                }
-                if !channel.session_channel {
-                    if want_reply {
-                        send(driver, &wire::Message::ChannelFailure(channel.peer))?;
-                    }
-                    return Ok(());
-                }
-                let accepted = match request {
-                    wire::SessionRequest::Pty {
-                        ref terminal,
-                        ref dimensions,
-                        ref modes,
-                    } if channel.session.is_none() && channel.pty.is_none() => {
-                        let accepted =
-                            self.handler
-                                .configure(&context(driver), recipient, &request);
-                        if accepted {
-                            channel.pty = Some(Pty {
-                                terminal: terminal.clone(),
-                                columns: dimensions.columns,
-                                rows: dimensions.rows,
-                                pixel_width: dimensions.pixel_width,
-                                pixel_height: dimensions.pixel_height,
-                                modes: modes.clone(),
-                            });
-                        }
-                        accepted
-                    }
-                    wire::SessionRequest::Env {
-                        ref name,
-                        ref value,
-                    } if channel.session.is_none() && channel.environment.len() < 32 => {
-                        let held: usize = channel
-                            .environment
-                            .iter()
-                            .map(|(n, v)| n.len() + v.len())
-                            .sum();
-                        let accepted = held + name.len() + value.len() <= 8192
-                            && self
-                                .handler
-                                .configure(&context(driver), recipient, &request);
-                        if accepted {
-                            channel.environment.push((name.clone(), value.clone()));
-                        }
-                        accepted
-                    }
-                    wire::SessionRequest::Shell
-                    | wire::SessionRequest::Exec(_)
-                    | wire::SessionRequest::Subsystem(_)
-                        if channel.session.is_none() =>
-                    {
-                        let program = match request {
-                            wire::SessionRequest::Shell => Program::Shell,
-                            wire::SessionRequest::Exec(c) => Program::Exec(c),
-                            wire::SessionRequest::Subsystem(n) => Program::Subsystem(n),
-                            _ => unreachable!(),
-                        };
-                        let request = SessionRequest {
-                            user: self.user.clone().ok_or(TransportError::State)?,
-                            channel: recipient,
-                            program,
-                            pty: channel.pty.clone(),
-                            environment: channel.environment.clone(),
-                        };
-                        channel.session =
-                            self.handler
-                                .open(&context(driver), &request, &mut channel.output);
-                        if let Some(session) = &mut channel.session {
-                            if channel.eof {
-                                session.event(
-                                    &context(driver),
-                                    &SessionEvent::Eof,
-                                    &mut channel.output,
-                                );
-                            }
-                        } else {
-                            channel.output = Output::default();
-                        }
-                        channel.session.is_some()
-                    }
-                    wire::SessionRequest::WindowChange(dimensions) if channel.pty.is_some() => {
-                        if let Some(pty) = &mut channel.pty {
-                            pty.columns = dimensions.columns;
-                            pty.rows = dimensions.rows;
-                            pty.pixel_width = dimensions.pixel_width;
-                            pty.pixel_height = dimensions.pixel_height;
-                        }
-                        if let Some(session) = &mut channel.session {
-                            session.event(
-                                &context(driver),
-                                &SessionEvent::WindowChange {
-                                    columns: dimensions.columns,
-                                    rows: dimensions.rows,
-                                    pixel_width: dimensions.pixel_width,
-                                    pixel_height: dimensions.pixel_height,
-                                },
-                                &mut channel.output,
-                            );
-                        }
-                        true
-                    }
-                    wire::SessionRequest::Signal(signal) if channel.session.is_some() => {
-                        channel.session.as_mut().unwrap().event(
-                            &context(driver),
-                            &SessionEvent::Signal(signal),
-                            &mut channel.output,
-                        );
-                        true
-                    }
-                    _ => false,
-                };
-                if want_reply {
-                    send(
-                        driver,
-                        &if accepted {
-                            wire::Message::ChannelSuccess(channel.peer)
-                        } else {
-                            wire::Message::ChannelFailure(channel.peer)
-                        },
-                    )?;
-                }
-            }
-            wire::Message::Eof(id) => {
-                let channel = self.channels.get_mut(&id).ok_or(TransportError::State)?;
-                if channel.eof {
-                    return Err(TransportError::State);
-                }
-                channel.eof = true;
-                if let Some(session) = &mut channel.session {
-                    session.event(&context(driver), &SessionEvent::Eof, &mut channel.output);
-                }
-            }
-            wire::Message::Close(id) => {
-                let mut channel = self.channels.remove(&id).ok_or(TransportError::State)?;
-                if let Some(session) = &mut channel.session {
-                    session.event(&context(driver), &SessionEvent::Closed, &mut channel.output);
-                }
-                if !channel.closed {
-                    send(driver, &wire::Message::Close(channel.peer))?;
-                }
-            }
-            _ => return Err(TransportError::State),
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self, driver: &mut DriverOf<'_>) -> Result<(), TransportError> {
-        if driver.peek_decoder().is_rekeying() {
-            return Ok(());
-        }
-        let mut packets = 0;
-        for (&id, channel) in &mut self.channels {
-            while let Some(chunk) = channel.output.chunks.front_mut() {
-                if packets >= 64 {
-                    driver.wake_handle().wake();
-                    return Ok(());
-                }
-                match chunk {
-                    Chunk::Data {
-                        stderr,
-                        data,
-                        offset,
-                    } => {
-                        let n = (data.len() - *offset)
-                            .min(channel.window as usize)
-                            .min(channel.max_packet as usize);
-                        if n == 0 {
-                            break;
-                        }
-                        let bytes = data[*offset..*offset + n].to_vec();
-                        let message = if *stderr {
-                            wire::Message::ExtendedData {
-                                recipient: channel.peer,
-                                kind: 1,
-                                data: bytes.clone(),
-                            }
-                        } else {
-                            wire::Message::Data {
-                                recipient: channel.peer,
-                                data: bytes.clone(),
-                            }
-                        };
-                        send(driver, &message)?;
-                        packets += 1;
-                        self.handler.observe(
-                            &context(driver),
-                            &Event::Output {
-                                channel: id,
-                                stderr: *stderr,
-                                data: bytes,
-                            },
-                        );
-                        *offset += n;
-                        channel.window -= n as u32;
-                        channel.output.bytes -= n;
-                        if *offset < data.len() {
-                            continue;
-                        }
-                    }
-                    Chunk::Exit(status) => {
-                        if channel.session_channel {
-                            send(
-                                driver,
-                                &wire::Message::ChannelRequest {
-                                    recipient: channel.peer,
-                                    want_reply: false,
-                                    request: wire::SessionRequest::ExitStatus(*status),
-                                },
-                            )?;
-                            self.handler.observe(
-                                &context(driver),
-                                &Event::Exit {
-                                    channel: id,
-                                    status: *status,
-                                },
-                            );
-                            packets += 1;
-                        }
-                        send(driver, &wire::Message::Eof(channel.peer))?;
-                        send(driver, &wire::Message::Close(channel.peer))?;
-                        channel.closed = true;
-                        packets += 2;
-                    }
-                }
-                channel.output.chunks.pop_front();
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<H: Handler> Service for Ssh<H> {
-    type Timer = Timer;
-    type Decoder = Transport;
-    type State = ();
-    type Error = TransportError;
-    fn decoder(&self) -> Transport {
-        Transport::new(
-            self.config.host_key.clone(),
-            self.config.identification.clone(),
-        )
-    }
-    fn on_open(&mut self, _: &(), driver: &mut DriverOf<'_>) -> Result<Flow, TransportError> {
-        let mut seed = [0; 32];
-        driver.entropy().fill_random(&mut seed);
-        driver.decoder().seed(seed)?;
-        if let Some(proposal) = &self.config.proposal {
-            driver.decoder().set_proposal(proposal.clone())?;
-        }
-        let mut bytes = Vec::new();
-        driver.decoder().start_identification(&mut bytes)?;
-        driver.reply().extend(bytes);
-        driver.set_timer(Timer::Login, self.config.login_grace);
-        Ok(Flow::Continue)
-    }
-    fn on_item(
-        &mut self,
-        event: TransportEvent,
-        _: &(),
-        driver: &mut DriverOf<'_>,
-    ) -> Result<Flow, TransportError> {
-        match &event {
-            TransportEvent::Version(version) => self
-                .handler
-                .observe(&context(driver), &Event::Version(version.clone())),
-            TransportEvent::Packet { payload, .. } if payload.first() == Some(&20) => {
-                if let ssh::Message::KexInit(proposal) = ssh::Message::parse(payload)? {
-                    self.handler
-                        .observe(&context(driver), &Event::KexInit(proposal));
-                }
-            }
-            _ => {}
-        }
-        let sequence = match &event {
-            TransportEvent::Packet { sequence, .. } => *sequence,
-            _ => 0,
-        };
-        let mut bytes = Vec::new();
-        let payload = driver.decoder().handle(event, &mut bytes)?;
-        driver.reply().extend(bytes);
-        if let Some(payload) = payload {
-            if payload.first() == Some(&1) {
-                return Ok(Flow::Close);
-            }
-            let held: usize = self
-                .pending_packets
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum();
-            if self.pending_packets.len() >= 128 || held + payload.len() > OUTPUT_LIMIT {
-                return Err(TransportError::State);
-            }
-            self.pending_packets.push_back((sequence, payload));
-        }
-        if self.failure_ready && !driver.peek_decoder().is_rekeying() {
-            if let Some(failure) = self.failure.take() {
-                write(driver, &failure)?;
-            }
-            self.failure_ready = false;
-        }
-        while !driver.peek_decoder().is_rekeying()
-            && !self
-                .channels
-                .values()
-                .any(|channel| channel.output.disconnect)
-        {
-            let Some((sequence, payload)) = self.pending_packets.pop_front() else {
-                break;
-            };
-            if self.channels.values().any(|channel| channel.output.hangup) {
-                match payload.first() {
-                    Some(93) => {
-                        self.connection_message(wire::Message::parse(&payload)?, driver)?;
-                    }
-                    Some(97) => return Ok(Flow::Close),
-                    _ => {}
-                }
-                continue;
-            }
-            if self.user.is_none()
-                && (self.attempts >= self.config.max_attempts
-                    || self.auth_requests >= MAX_AUTH_REQUESTS)
-            {
-                return disconnect(
-                    driver,
-                    ssh::DisconnectReason::NoMoreAuthMethodsAvailable,
-                    "Too many authentication failures",
-                );
-            }
-            match payload.first().copied().ok_or(TransportError::State)? {
-                5 if self.user.is_none() && !self.service_requested => {
-                    let ssh::Message::ServiceRequest(service) = ssh::Message::parse(&payload)?
-                    else {
-                        return Err(TransportError::State);
-                    };
-                    if service != "ssh-userauth" {
-                        return Err(TransportError::State);
-                    }
-                    send(driver, &ssh::Message::ServiceAccept(service))?;
-                    self.service_requested = true;
-                }
-                50 | 61 if self.user.is_none() => self.authentication(&payload, driver)?,
-                50 if self.user.is_some() => {}
-                80..=82 | 90..=100 if self.user.is_some() => {
-                    self.connection_message(wire::Message::parse(&payload)?, driver)?
-                }
-                _ => send(driver, &ssh::Message::Unimplemented(sequence))?,
-            }
-        }
-        self.finish(driver)
-    }
-    fn on_timer(
-        &mut self,
-        timer: Timer,
-        _: &(),
-        driver: &mut DriverOf<'_>,
-    ) -> Result<Flow, TransportError> {
-        match timer {
-            Timer::Login => disconnect(
-                driver,
-                ssh::DisconnectReason::ByApplication,
-                "Login grace time exceeded",
-            ),
-            Timer::Failure => {
-                self.failure_ready = true;
-                self.finish(driver)
-            }
-        }
-    }
-    fn on_wake(&mut self, _: &(), driver: &mut DriverOf<'_>) -> Result<Flow, TransportError> {
-        self.finish(driver)
-    }
-    fn on_fail(
-        &mut self,
-        _: &crate::stdlib::codec::Fail<TransportError>,
-        _: &(),
-        driver: &mut DriverOf<'_>,
-    ) -> Result<(), TransportError> {
-        disconnect(
-            driver,
-            ssh::DisconnectReason::ProtocolError,
-            "Invalid SSH packet",
-        )?;
-        Ok(())
-    }
-    fn on_end(
-        &mut self,
-        end: serve::Ended,
-        _: &(),
-        driver: &mut DriverOf<'_>,
-    ) -> Result<(), TransportError> {
-        for channel in self.channels.values_mut() {
-            if let Some(session) = &mut channel.session {
-                session.event(&context(driver), &SessionEvent::Closed, &mut channel.output);
-            }
-        }
-        self.handler.observe(&context(driver), &Event::End(end));
-        Ok(())
-    }
-    fn held(&self) -> usize {
-        self.channels
-            .values()
-            .map(|c| {
-                std::mem::size_of_val(c)
-                    + c.output.chunks.capacity() * std::mem::size_of::<Chunk>()
-                    + c.output
-                        .chunks
-                        .iter()
-                        .map(|chunk| match chunk {
-                            Chunk::Data { data, .. } => data.capacity(),
-                            Chunk::Exit(_) => 0,
-                        })
-                        .sum::<usize>()
-                    + c.pty.as_ref().map_or(0, |pty| {
-                        pty.terminal.capacity()
-                            + pty.modes.capacity() * std::mem::size_of::<wire::TerminalMode>()
-                    })
-                    + c.environment.capacity() * std::mem::size_of::<(Vec<u8>, Vec<u8>)>()
-                    + c.environment
-                        .iter()
-                        .map(|(n, v)| n.capacity() + v.capacity())
-                        .sum::<usize>()
-                    + c.session.as_ref().map_or(0, Session::held)
-            })
-            .sum::<usize>()
-            + self.failure.as_ref().map_or(0, Vec::capacity)
-            + self.user.as_ref().map_or(0, String::capacity)
-            + self.auth_user.as_ref().map_or(0, String::capacity)
-            + self.challenge.as_ref().map_or(0, |(request, _)| {
-                request.user.capacity()
-                    + request.service.capacity()
-                    + match &request.method {
-                        auth::Method::KeyboardInteractive {
-                            language,
-                            submethods,
-                        } => language.capacity() + submethods.capacity(),
-                        _ => 0,
-                    }
-            })
-            + self.pending_packets.capacity() * std::mem::size_of::<(u32, Vec<u8>)>()
-            + self
-                .pending_packets
-                .iter()
-                .map(|(_, bytes)| bytes.capacity())
-                .sum::<usize>()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    struct Observed(Mutex<Vec<Event>>);
-    struct NoSession;
-    impl Session for NoSession {
-        fn input(&mut self, _: &Context<'_>, _: &[u8], _: &mut Output) {}
-    }
-    impl Handler for Observed {
-        type Session = NoSession;
-
-        fn authenticate(&self, _: &Context<'_>, attempt: &AuthAttempt<'_>) -> AuthDecision {
-            match attempt.request.method {
-                auth::Method::Password { .. } | auth::Method::PublicKey { .. } => {
-                    AuthDecision::Accept
-                }
-                _ => AuthDecision::Reject {
-                    methods: vec![AuthMethod::Password, AuthMethod::PublicKey],
-                    partial_success: false,
-                    delay: Duration::ZERO,
-                },
-            }
-        }
-
-        fn open(&self, _: &Context<'_>, _: &SessionRequest, _: &mut Output) -> Option<NoSession> {
-            None
-        }
-
-        fn observe(&self, _: &Context<'_>, event: &Event) {
-            self.0.lock().unwrap().push(event.clone());
-        }
-    }
-
-    struct Client;
-    impl russh::client::Handler for Client {
-        type Error = russh::Error;
-
-        async fn check_server_key(
-            &mut self,
-            _: &russh::keys::PublicKeyOrCertificate,
-        ) -> Result<bool, Self::Error> {
-            Ok(true)
-        }
-    }
-
-    struct Signer {
-        observed: Arc<Observed>,
-        invalid: bool,
-    }
-    impl russh::Signer for Signer {
-        type Error = russh::AgentAuthError;
-
-        async fn auth_sign(
-            &mut self,
-            _: &russh::keys::agent::AgentIdentity,
-            _: Option<russh::keys::HashAlg>,
-            mut data: Vec<u8>,
-        ) -> Result<Vec<u8>, Self::Error> {
-            let events = self.observed.0.lock().unwrap();
-            assert!(
-                events.iter().any(|event| matches!(
-                    event,
-                    Event::AuthenticationDecision(AuthDecision::Accept)
-                ))
-            );
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| matches!(event, Event::Authenticated { .. }))
-            );
-            drop(events);
-            let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
-            let mut signature = key.sign(&data).as_ref().to_vec();
-            if self.invalid {
-                signature[0] ^= 1;
-            }
-            let mut blob = ssh::SshString(b"ssh-ed25519".to_vec()).to_bytes().unwrap();
-            ssh::SshString(signature).write(&mut blob).unwrap();
-            ssh::SshString(blob).write(&mut data).unwrap();
-            Ok(data)
-        }
-    }
-
-    #[tokio::test]
-    async fn authentication_completion_excludes_probes_and_invalid_signatures() {
-        for method in ["password", "publickey", "invalid"] {
-            let observed = Arc::new(Observed(Mutex::new(Vec::new())));
-            let config = Config::new(
-                Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
-                ssh::Identification::new("2.0", "test", None).unwrap(),
-            );
-            let mut harness = serve::Harness::new(
-                crate::Seed::from_u64(1),
-                Ssh::new(Arc::new(config), observed.clone()),
-                (),
-            );
-            let (client, mut server) = tokio::io::duplex(1 << 20);
-            let task = tokio::spawn(async move {
-                server.write_all(&harness.open().unwrap()).await.unwrap();
-                let mut input = [0; 8192];
-                loop {
-                    let len = server.read(&mut input).await.unwrap();
-                    if len == 0 {
-                        break;
-                    }
-                    match harness.push(&input[..len]) {
-                        Ok(bytes) => server.write_all(&bytes).await.unwrap(),
-                        Err(_) => break,
-                    }
-                }
-                harness.service().user.clone()
-            });
-            let mut client = russh::client::connect_stream(
-                Arc::new(russh::client::Config::default()),
-                client,
-                Client,
-            )
-            .await
-            .unwrap();
-            let successful = if method == "password" {
-                client
-                    .authenticate_password("guest", "secret")
-                    .await
-                    .unwrap()
-                    .success()
-            } else {
-                let key = russh::keys::PrivateKey::from(
-                    russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]),
-                );
-                client
-                    .authenticate_publickey_with(
-                        "guest",
-                        key.public_key().clone(),
-                        None,
-                        &mut Signer {
-                            observed: observed.clone(),
-                            invalid: method == "invalid",
-                        },
-                    )
-                    .await
-                    .is_ok_and(|result| result.success())
-            };
-            assert_eq!(successful, method != "invalid");
-            if successful {
-                client
-                    .disconnect(russh::Disconnect::ByApplication, "done", "")
-                    .await
-                    .unwrap();
-            }
-            drop(client);
-            let user = task.await.unwrap();
-            assert_eq!(user.as_deref(), (method != "invalid").then_some("guest"));
-            let events = observed.0.lock().unwrap();
-            let completed: Vec<_> = events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Authenticated { user, method } => Some((user.as_str(), method.as_str())),
-                    _ => None,
-                })
-                .collect();
-            if method == "invalid" {
-                assert!(completed.is_empty());
-                assert!(events.iter().any(|event| matches!(
-                    event,
-                    Event::Authentication {
-                        request: auth::Request {
-                            method: auth::Method::PublicKey {
-                                signature: Some(_),
-                                ..
-                            },
-                            ..
-                        },
-                        verified: false
-                    }
-                )));
-            } else {
-                assert_eq!(completed, [("guest", method)]);
-            }
-        }
-    }
-
-    #[test]
-    fn hangup_preserves_pending_output_and_refuses_more() {
-        let mut output = Output::default();
-        output.write(b"pending terminal echo").unwrap();
-        output.stderr(b"pending diagnostic").unwrap();
-        output.hangup();
-        assert!(output.write(b"late output").is_err());
-        assert!(output.stderr(b"late diagnostic").is_err());
-        output.exit(0);
-        assert!(!output.chunks.is_empty());
-        assert!(
-            output
-                .chunks
-                .iter()
-                .all(|chunk| matches!(chunk, Chunk::Data { .. }))
-        );
-
-        output.disconnect();
-        assert!(output.chunks.is_empty());
-        assert!(output.write(b"after disconnect").is_err());
-    }
-}
