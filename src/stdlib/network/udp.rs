@@ -296,23 +296,14 @@ impl Inner {
     }
 
     /// Gives the UDP layer a command from above, making room once if it
-    /// refuses. Returns whether it took the command.
-    fn command(&mut self, command: MuxCommand<layer::Datagrams<SocketAddr>, Control>) -> bool {
-        let command = match self.driver.command(command).expect("credit is kept") {
-            Admit::Blocked(command) => command,
-            admit => {
-                self.pump();
-                return admit.moved();
-            }
-        };
+    /// refuses. It refuses only while it holds output, and the pump takes
+    /// all of it.
+    fn command(&mut self, command: MuxCommand<layer::Datagrams<SocketAddr>, Control>) {
+        if let Admit::Blocked(command) = self.driver.command(command).expect("credit is kept") {
+            self.pump();
+            let _ = self.driver.command(command).expect("credit is kept");
+        }
         self.pump();
-        let taken = self
-            .driver
-            .command(command)
-            .expect("credit is kept")
-            .moved();
-        self.pump();
-        taken
     }
 
     /// Moves everything the stack has: packets into the interface, events
