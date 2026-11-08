@@ -2,12 +2,13 @@ use super::*;
 use fictionet_test_support::sandbox::TlsClient;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+use std::task::Waker;
 
 use fictionet::stdlib::layer::{
     Admit, ByteStream, Chain, Chunk, Env, Handoff, Handover, Harness, Layer, Side, StreamCommand,
     StreamEvent, Switch, Top,
 };
-use fictionet::stdlib::services::stack::{self, Polling, StreamLimits};
+use fictionet::stdlib::services::stack::{self, Job, Polling, StreamLimits};
 use fictionet::stdlib::services::tls::{Secure, TlsLayer};
 use fictionet::time::Instant;
 
@@ -149,7 +150,9 @@ type Starttls = Switch<Mail, Secured>;
 /// After its go-ahead the session reads nothing more in plaintext: what a
 /// client pipelines after STARTTLS is dropped, never read as a command and
 /// never handed to TLS. TLS takes over once the go-ahead
-/// is written, so no completion of a plaintext write reaches it.
+/// is written, so no completion of a plaintext write reaches it. `SUB`
+/// subscribes the session to fills, which its work waits for, on either
+/// side of STARTTLS.
 struct Mail {
     /// Who the session is with, and over TLS the name the client asked
     /// for.
@@ -168,6 +171,54 @@ struct Mail {
     below: Vec<StreamEvent>,
     input_over: bool,
     end_sent: bool,
+    /// Where `SUB` subscribes the session to fills.
+    book: Book,
+    /// The session's fills once it subscribed, carried across STARTTLS.
+    inbox: Option<Inbox>,
+    /// Whether work waits on the inbox.
+    waiting: bool,
+}
+
+/// Fills waiting for one subscribed session, and the waker of the work
+/// that waits for them.
+#[derive(Default)]
+struct Fills {
+    queue: VecDeque<String>,
+    waker: Option<Waker>,
+}
+
+type Inbox = Arc<Mutex<Fills>>;
+
+/// Every subscribed session's inbox.
+type Book = Arc<Mutex<Vec<Inbox>>>;
+
+/// Sends `fill` to every subscribed session and wakes its work.
+fn fill(book: &Book, fill: &str) {
+    for inbox in book.lock().unwrap().iter() {
+        let mut fills = inbox.lock().unwrap();
+        fills.queue.push_back(fill.to_owned());
+        if let Some(waker) = fills.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// Waits for the next fill in one inbox.
+struct NextFill(Inbox);
+
+impl Job for NextFill {
+    type Done = String;
+
+    fn poll(&mut self, _: Option<&Cx>, cx: &mut Context<'_>) -> Poll<String> {
+        let mut fills = self.0.lock().unwrap();
+        match fills.queue.pop_front() {
+            Some(fill) => Poll::Ready(fill),
+            None => {
+                fills.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
 }
 
 impl Mail {
@@ -193,7 +244,16 @@ impl Mail {
             below: Vec::new(),
             input_over: false,
             end_sent: false,
+            book: Book::default(),
+            inbox: None,
+            waiting: false,
         }
+    }
+
+    /// The same session, subscribing to fills in `book`.
+    fn subscribing(mut self, book: Book) -> Mail {
+        self.book = book;
+        self
     }
 
     fn answer(&mut self, now: Instant, line: &[u8]) {
@@ -202,11 +262,22 @@ impl Mail {
                 self.out.push_back(b"220 go ahead\r\n".to_vec());
                 let tls = TlsLayer::new(config).handshake_by(now + handshake);
                 let conn = self.conn.clone();
+                let book = self.book.clone();
+                let inbox = self.inbox.clone();
                 let over: Box<dyn FnOnce(&TlsLayer) -> Mail + Send> = Box::new(move |tls| {
                     let sni = tls.hello().and_then(|hello| hello.server_name());
-                    Mail::secure(conn.over_tls(sni, tls.alpn()))
+                    let mut mail = Mail::secure(conn.over_tls(sni, tls.alpn())).subscribing(book);
+                    mail.inbox = inbox;
+                    mail
                 });
                 self.next = Some(Box::new(Secure::new(tls, over)));
+            }
+            (b"SUB", starttls) => {
+                self.starttls = starttls;
+                let inbox = Inbox::default();
+                self.book.lock().unwrap().push(inbox.clone());
+                self.inbox = Some(inbox);
+                self.out.push_back(b"250 subscribed\r\n".to_vec());
             }
             (b"EHLO", starttls) => {
                 self.starttls = starttls;
@@ -227,8 +298,8 @@ impl Layer for Mail {
     type Upper = Top;
     type Report = Infallible;
     type Timer = ();
-    type Work = Infallible;
-    type Done = Infallible;
+    type Work = NextFill;
+    type Done = String;
     type Error = Infallible;
 
     fn is_terminal(&self) -> bool {
@@ -291,6 +362,21 @@ impl Layer for Mail {
     fn take_event(&mut self) -> Option<Infallible> {
         None
     }
+
+    fn take_work(&mut self) -> Option<NextFill> {
+        if self.waiting || self.next.is_some() {
+            return None;
+        }
+        let inbox = self.inbox.clone()?;
+        self.waiting = true;
+        Some(NextFill(inbox))
+    }
+
+    fn on_done(&mut self, _env: &mut Env<'_, Infallible>, fill: String) -> Result<(), Infallible> {
+        self.waiting = false;
+        self.out.push_back(format!("250 fill {fill}\r\n").into_bytes());
+        Ok(())
+    }
 }
 
 impl Handoff for Mail {
@@ -344,21 +430,58 @@ fn decrypt(client: &mut rustls::ClientConnection, mut bytes: &[u8]) -> Vec<u8> {
     plaintext
 }
 
-/// The plaintext session of connection 1, offering STARTTLS.
-fn starttls(config: Arc<rustls::ServerConfig>) -> Harness<Starttls> {
+/// The plaintext session of connection 1, offering STARTTLS and
+/// subscribing to fills in `book`.
+fn starttls(config: Arc<rustls::ServerConfig>, book: Book) -> Harness<Starttls> {
     let conn = ConnInfo {
         id: Some(1),
         ..ConnInfo::default()
     };
-    let mail = Mail::plain(conn, config, Duration::from_secs(10));
+    let mail = Mail::plain(conn, config, Duration::from_secs(10)).subscribing(book);
     Harness::new(fictionet::Seed::from_u64(0), Switch::new(mail)).with_worker(Polling::new())
+}
+
+/// Fills sent to a session that subscribed before STARTTLS still reach it
+/// after: the subscription goes across with the session, and wakes the
+/// session over TLS.
+#[test]
+fn a_subscription_made_before_starttls_wakes_the_session_after_it() {
+    block_on(lab(fictionet::Seed::from_u64(4), |fcx| async move {
+        let (config, client_config) = mail_configs(&fcx);
+        let book = Book::default();
+        let mut h = starttls(config, book.clone());
+        h.settle()?;
+        h.take_output();
+        h.push(b"SUB\r\n")?;
+        assert_eq!(h.take_output(), b"250 subscribed\r\n");
+        fill(&book, "7@100");
+        h.settle()?;
+        assert_eq!(h.take_output(), b"250 fill 7@100\r\n");
+        h.push(b"STARTTLS\r\n")?;
+        assert_eq!(h.take_output(), b"220 go ahead\r\n");
+        let mut client = mail_client(client_config);
+        for _ in 0..16 {
+            h.push(&ciphertext(&mut client))?;
+            decrypt(&mut client, &h.take_output());
+        }
+        assert!(!client.is_handshaking());
+        // The client sends nothing: the fill alone wakes the session.
+        fill(&book, "5@99");
+        h.settle()?;
+        assert_eq!(
+            decrypt(&mut client, &h.take_output()),
+            b"250 fill 5@99\r\n"
+        );
+        Ok(())
+    }))
+    .unwrap();
 }
 
 #[test]
 fn starttls_hands_the_session_to_tls_once_its_go_ahead_is_written() {
     block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
         let (config, client_config) = mail_configs(&fcx);
-        let mut h = starttls(config);
+        let mut h = starttls(config, Book::default());
         h.settle()?;
         assert_eq!(h.take_output(), b"220 mail ready\r\n");
         // While the go-ahead is not written, plaintext stays in charge.
@@ -402,7 +525,7 @@ fn starttls_hands_the_session_to_tls_once_its_go_ahead_is_written() {
 fn plaintext_pipelined_after_starttls_is_never_read() {
     block_on(lab(fictionet::Seed::from_u64(2), |fcx| async move {
         let (config, client_config) = mail_configs(&fcx);
-        let mut h = starttls(config);
+        let mut h = starttls(config, Book::default());
         h.settle()?;
         h.take_output();
         h.withhold();
@@ -436,7 +559,7 @@ fn plaintext_pipelined_after_starttls_is_never_read() {
 fn a_failed_starttls_handshake_ends_the_connection() {
     block_on(lab(fictionet::Seed::from_u64(3), |fcx| async move {
         let (config, _client_config) = mail_configs(&fcx);
-        let mut h = starttls(config);
+        let mut h = starttls(config, Book::default());
         h.push(b"STARTTLS\r\n")?;
         assert!(h.layer().then().is_some());
         let failed = h.push(b"EHLO\r\nEHLO\r\nEHLO\r\n");
