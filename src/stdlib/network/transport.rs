@@ -212,10 +212,11 @@ pub struct UdpBound {
 /// What goes down a UDP layer's control port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UdpControl {
-    /// Bind a socket on `port`. Port zero is what the endpoint's
-    /// [`Settings::port_zero`](super::udp::Settings::port_zero) says, an
-    /// ephemeral port by default, never a literal port zero by analogy with
-    /// TCP. It opens a child, or fails with [`UdpNotice::BindFailed`].
+    /// Bind a socket on `port`. Port zero asks for a free ephemeral port,
+    /// never a literal port zero by analogy with TCP;
+    /// [`Settings::port_zero`](super::udp::Settings::port_zero) says only
+    /// what a datagram sent to port zero gets. It opens a child, or fails
+    /// with [`UdpNotice::BindFailed`].
     Bind {
         /// The number the answer names.
         request: Request,
@@ -240,8 +241,11 @@ pub enum UdpNotice {
     },
     /// A multicast group could not be joined.
     JoinFailed(IpAddr),
-    /// A datagram for a port nothing is bound to was answered as the
-    /// endpoint's ICMP options say.
+    /// A datagram for a port nothing is bound to was refused: answered with
+    /// ICMP port unreachable built with the endpoint's ICMP options, or not
+    /// at all when
+    /// [`Settings::port_zero`](super::udp::Settings::port_zero) makes port
+    /// zero silent.
     Refused {
         /// Who sent it.
         peer: SocketAddr,
