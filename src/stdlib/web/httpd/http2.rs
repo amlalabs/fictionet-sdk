@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 
@@ -408,6 +408,15 @@ impl Http2 {
             upgrade: None,
             dates: Dates::new(None),
         }
+    }
+
+    /// Dates each response head that has no `Date` as it is framed:
+    /// `start`, the world's date and time at the start of the run, plus the
+    /// run's clock, one header per second shared by every stream. Without
+    /// it, responses carry no `Date`. See [Dates](super#dates).
+    pub fn date(mut self, start: SystemTime) -> Self {
+        self.dates = Dates::new(Some(start));
+        self
     }
 
     /// The connection an HTTP/1 `Upgrade: h2c` started: the client's
@@ -3571,6 +3580,30 @@ mod tests {
             }
         }
         dates
+    }
+
+    #[test]
+    fn a_connection_given_the_world_date_dates_the_heads_of_its_own_children() {
+        use fictionet::stdlib::web::httpd::date_header;
+        fn answer() -> Vec<ExchangeCommand> {
+            vec![head(true)]
+        }
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        let mut dated = sending(Http2::new(Limits::default()).date(start), answer);
+        let mut undated = sending(Http2::new(Limits::default()), answer);
+        for harness in [&mut dated, &mut undated] {
+            harness.push(&client_preface()).unwrap();
+            harness.advance(Duration::from_secs(5)).unwrap();
+            let mut encoder = hpack::Encoder::new(4096);
+            harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        }
+        let now = dated.driver().now();
+        let date = date_header(Some(start), now).unwrap();
+        assert_eq!(
+            dates_on(1, &dated.take_output()),
+            [date.as_bytes().to_vec()]
+        );
+        assert!(dates_on(1, &undated.take_output()).is_empty());
     }
 
     #[test]

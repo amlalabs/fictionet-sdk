@@ -487,7 +487,7 @@ own typed state when readers need to place its observations on a calendar.
 
 HTTP follows the same rule. `httpd` sends a `Date` header only when the
 world gave its date at the start of the run (`Sites::date`, `Server::date`,
-`Http1::date` or `HttpOptions::date`), and the header is
+`Http1::date`, `Http2::date`, `Responder::date` or `HttpOptions::date`), and the header is
 that date plus `Env::now`. With no world date, responses carry no `Date`
 header at all, as RFC 9110 allows for a server without a clock: a world
 that never says what day it is never leaks the host's. A `Date` a handler

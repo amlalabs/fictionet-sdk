@@ -61,8 +61,11 @@
 //!
 //! The world owns its dates. A response carries a `Date` header only when
 //! the world gave the date it was at the start of the run, with
-//! [`Http1::date`], [`HttpOptions::date`] or [`Server::date`]: the header
-//! is then that date plus the run's clock.
+//! [`Http1::date`], [`Http2::date`], [`Responder::date`],
+//! [`HttpOptions::date`] or [`Server::date`]: the header is then that date
+//! plus the run's clock. HTTP/2 dates each head on the connection, as it
+//! frames it, so a connection composed by hand with its own children, such
+//! as [`Grpc`] calls, is dated by [`Http2::date`].
 //! Without one, responses have no `Date` header (RFC 9110 lets a server
 //! with no clock leave it out). The host's clock is never used, so a world
 //! set in 2019 never sends a date from the year it runs in. A `Date` the

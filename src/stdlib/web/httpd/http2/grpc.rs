@@ -47,7 +47,8 @@ pub enum GrpcCommand {
 /// [`MessageEvent::Ended`] when the client half-closes. The application
 /// sends [`GrpcCommand`]s and ends with a status. Each call is its own
 /// child, so calls on one connection interleave without mixing:
-/// `Chain<Http2, Children<Chain<Grpc, App>, Top, Opening>>`.
+/// `Chain<Http2, Children<Chain<Grpc, App>, Top, Opening>>`. The connection
+/// dates the heads when it has the world's date ([`Http2::date`]).
 ///
 /// A request that is not a gRPC call is answered without the application:
 /// the HTTP status or the trailers-only status [`grpc::Request::parse`]
