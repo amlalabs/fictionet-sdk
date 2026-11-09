@@ -186,22 +186,21 @@ was run on this host.
 
 | Original site | Verdict and invariant |
 | --- | --- |
-| `src/stdlib/network/tcp/engine.rs:545` | Keep Send: Pages owns its mapping, is not Sync, and moves with its owning layer. Socket accesses are serialized. |
+| `Pages` in `src/stdlib/network/tcp/engine.rs` | Send and Sync share mapping ownership only. Private, nonoverlapping buffer halves expose bytes through borrows of each half. Reclamation requires exclusive access to the socket and no outstanding slices. |
 | `src/stdlib/network/tcp/engine.rs:554` | Keep, harden constructor: fresh private writable anonymous mapping; check MAP_FAILED. Added checked multiplication, nonzero/isize bounds, and rejection/unmapping of a successful null address before creating slices. Public buffer options already clamp sizes, so no public oversized-allocation exploit was found. |
 | `src/stdlib/network/tcp/engine.rs:571` | Keep: MADV_NOHUGEPAGE covers the live owned allocation and prevents neighboring queues sharing reclamation costs. |
-| `src/stdlib/network/tcp/engine.rs:585`, `src/stdlib/network/tcp/engine.rs:589`, `src/stdlib/network/tcp/engine.rs:663` | Keep private lending contract: exactly one pair of initialized, nonoverlapping u8 slices is handed to exactly one socket. Explicitly document that halves must be called only once. All current callers comply. Socket storage is declared before pages for destruction order, removal removes the socket first, and compaction moves sockets without unmapping. |
+| `MappedHalf` in `src/stdlib/network/tcp/engine.rs` | Each half owns a reference to its mapping. Shared and mutable slices borrow that half for the current access. No static slice is manufactured. Removing or moving a socket carries the mapping owners with its buffers, independently of engine field order or reclamation handles. |
 | `src/stdlib/network/tcp/engine.rs:606`, `src/stdlib/network/tcp/engine.rs:610`, `src/stdlib/network/tcp/engine.rs:832` | Keep with the limitation below: release_quiet requires empty receive/send queues and no out-of-order assembler data. Every current call passes these checks before MADV_DONTNEED. |
 | `src/stdlib/network/tcp/engine.rs:619` | Keep test-only: mincore output has initialized space for one byte per page; accounting assumes 4096-byte pages on the tested Linux host. |
-| `src/stdlib/network/tcp/engine.rs:629` | Keep: munmap owns precisely the original mapping, after its borrowed socket buffers have been removed or dropped. |
-| `src/stdlib/network/tcp/engine.rs:645`, `src/stdlib/network/tcp/engine.rs:650` | Keep unreachable wasm compatibility signatures: Pages is uninhabited on wasm, so these functions cannot execute an unsafe memory operation. They preserve the shared host call contract without adding another conditional path. |
+| `Pages::drop` in `src/stdlib/network/tcp/engine.rs` | The last owning reference unmaps precisely the original mapping. Socket buffers retain their own references until dropped. |
+| The wasm `Pages` implementation | Pages is uninhabited; mapped socket creation returns none and reclamation cannot execute. Heap buffers remain the fallback. |
 
-The mmap lifetime remains manually enforced by a private tuple return rather
-than encoded structurally. MADV_DONTNEED changes bytes through the original mmap
-address while long-lived mutable slices exist inside smoltcp. Empty-buffer
-checks establish logical data lifetime, but strict alias/provenance treatment
-of this OS reclamation is an unresolved model question, not a demonstrated bug
-or a proof of soundness. A stronger design would obtain reclamation pointers
-from current exclusive buffer borrows. No Miri validation is claimed.
+The socket buffers structurally own the mapping. MADV_DONTNEED runs only with
+exclusive socket access, empty receive and send queues, and no out-of-order
+assembler data. Buffer slices exist only during buffer operations, so none
+survive into reclamation. Tests cover ownership through socket removal and
+moves, buffer reuse after reclamation, and final owner release. No Miri
+validation is claimed.
 
 ## Host crate
 

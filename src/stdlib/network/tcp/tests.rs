@@ -790,7 +790,7 @@ fn compaction_keeps_socket_id_scan_order() {
 /// Resident pages of every socket's buffers on `e`.
 fn resident(e: &Endpoint) -> usize {
     let st = e.shared.lock();
-    st.pages.values().map(Pages::resident).sum()
+    st.pages.values().map(|pages| pages.resident()).sum()
 }
 
 fn pattern(n: usize, salt: u8) -> Vec<u8> {
@@ -2683,6 +2683,25 @@ fn initial_sequence_numbers_tell_nothing_of_other_connections() {
     assert_ne!(isn_of(1, 0, 5, other), alone);
     assert_ne!(isn_of(1, 0, 5, "10.0.0.2:3001".parse().unwrap()), alone);
     assert_ne!(isn_of(2, 0, 5, peer), alone);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn mapping_ownership_follows_socket_moves() {
+    let (socket, pages) = new_socket(MIN_BUFFER);
+    let pages = pages.expect("mapping available");
+    let alive = Arc::downgrade(&pages);
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(socket);
+    drop(pages);
+    assert!(alive.upgrade().is_some());
+    let socket = sockets.remove(handle);
+    drop(sockets);
+    assert!(alive.upgrade().is_some());
+    assert_eq!(socket.recv_capacity(), MIN_BUFFER);
+    assert_eq!(socket.send_capacity(), MIN_BUFFER);
+    drop(socket);
+    assert!(alive.upgrade().is_none());
 }
 
 #[test]

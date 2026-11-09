@@ -389,9 +389,8 @@ pub struct TcpLayer {
     /// Slots in `sockets`, empty ones included: the most sockets it held
     /// at once since it was made.
     pub(super) slots: usize,
-    /// The buffers of each socket that has its own pages. Declared after
-    /// `sockets`, so they outlive the sockets that borrow them.
-    pub(super) pages: HashMap<Id, Pages, ById>,
+    /// Reclamation handles. Each socket also owns its mapping.
+    pub(super) pages: HashMap<Id, Arc<Pages>, ById>,
     /// What each socket's buffers are charged to the budget, given back
     /// when the socket goes.
     reserved: HashMap<Id, Charge, ById>,
@@ -615,6 +614,7 @@ impl Conn {
 /// given back while the connection stays open ([`Pages::release`]), and
 /// closing returns all of it.
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
 pub(super) struct Pages {
     ptr: *mut u8,
     len: usize,
@@ -625,6 +625,47 @@ pub(super) struct Pages {
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(unsafe_code, reason = "the owned mapping can move with its socket")]
 unsafe impl Send for Pages {}
+
+// SAFETY: shared handles do not expose bytes. The two exclusive halves
+// lend disjoint slices, and reclamation requires exclusive socket access.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unsafe_code, reason = "shared ownership of disjoint mapped buffers")]
+unsafe impl Sync for Pages {}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct MappedHalf {
+    pages: Arc<Pages>,
+    start: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(
+    unsafe_code,
+    reason = "borrow the owned half for the current buffer access"
+)]
+impl AsRef<[u8]> for MappedHalf {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: construction creates exactly two nonoverlapping halves.
+        // The owner keeps the mapping live for this borrow.
+        unsafe { std::slice::from_raw_parts(self.pages.ptr.add(self.start), self.pages.len / 2) }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(
+    unsafe_code,
+    reason = "borrow the owned half for the current buffer access"
+)]
+impl AsMut<[u8]> for MappedHalf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: this unique half is exclusively borrowed, its owner is
+        // live, and the other half cannot address these bytes.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.pages.ptr.add(self.start), self.pages.len / 2)
+        }
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(
@@ -672,31 +713,31 @@ impl Pages {
         })
     }
 
-    /// The receive and send halves.
-    ///
-    /// SAFETY: call only once for this mapping. The caller hands each half
-    /// to exactly one socket and removes it before dropping the `Pages`.
-    unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
-        let half = self.len / 2;
-        // SAFETY: the mapping is `len` bytes, readable and writable, and
-        // the two halves do not overlap.
-        unsafe {
-            (
-                std::slice::from_raw_parts_mut(self.ptr, half),
-                std::slice::from_raw_parts_mut(self.ptr.add(half), half),
-            )
-        }
+    fn socket(buffer: usize) -> Option<(stcp::Socket<'static>, Arc<Pages>)> {
+        let pages = Arc::new(Self::map(buffer)?);
+        let rx = MappedHalf {
+            pages: pages.clone(),
+            start: 0,
+        };
+        let tx = MappedHalf {
+            pages: pages.clone(),
+            start: buffer,
+        };
+        let socket = stcp::Socket::new(
+            stcp::SocketBuffer::new_owned(rx),
+            stcp::SocketBuffer::new_owned(tx),
+        );
+        Some((socket, pages))
     }
 
     /// Gives the pages of both halves back to the system. They read as
     /// zeros after, and cost memory again only once written.
     ///
-    /// SAFETY: the socket that holds the halves (see [`Pages::halves`])
+    /// SAFETY: the socket that owns the halves must be exclusively borrowed and
     /// must hold nothing in them: no bytes to read, none to send or
     /// resend, and an empty receive assembler. Check `recv_queue`,
-    /// `send_queue`, and `has_pending_recv`. Its buffers are
-    /// `&'static mut` slices of this mapping, and this changes their bytes
-    /// behind them.
+    /// `send_queue`, and `has_pending_recv`. No buffer slices may be borrowed
+    /// during reclamation.
     unsafe fn release(&self) {
         // SAFETY: the range is this mapping. MADV_DONTNEED on a private
         // anonymous mapping only makes its pages read as zeros, and the
@@ -719,8 +760,8 @@ impl Pages {
 #[allow(unsafe_code, reason = "release the owned anonymous mapping")]
 impl Drop for Pages {
     fn drop(&mut self) {
-        // SAFETY: this unmaps exactly the mapping made in `map`, after the
-        // socket that borrowed it was removed.
+        // SAFETY: this unmaps exactly the mapping made in `map`, after all
+        // owning halves and reclamation handles have been dropped.
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
     }
 }
@@ -733,13 +774,8 @@ pub(super) enum Pages {}
 #[cfg(target_arch = "wasm32")]
 #[allow(unsafe_code, reason = "matches the unreachable host mapping interface")]
 impl Pages {
-    fn map(_buffer: usize) -> Option<Pages> {
+    fn socket(_buffer: usize) -> Option<(stcp::Socket<'static>, Arc<Pages>)> {
         None
-    }
-
-    /// SAFETY: as on a host; no `Pages` exists to call it on.
-    unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
-        match *self {}
     }
 
     /// SAFETY: as on a host; no `Pages` exists to call it on.
@@ -749,23 +785,15 @@ impl Pages {
 }
 
 /// A socket with two buffers of `buffer` bytes.
-#[allow(
-    unsafe_code,
-    reason = "lend mapped buffers to the socket until removal"
-)]
-pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Pages>) {
-    let pages = Pages::map(buffer);
-    let mut s = match &pages {
-        Some(p) => {
-            // SAFETY: the halves go to this one socket, and `TcpLayer`
-            // removes it before dropping the pages (`remove_socket`, and
-            // field order for the whole layer).
-            let (rx, tx) = unsafe { p.halves() };
-            stcp::Socket::new(stcp::SocketBuffer::new(rx), stcp::SocketBuffer::new(tx))
-        }
-        None => stcp::Socket::new(
-            stcp::SocketBuffer::new(vec![0; buffer]),
-            stcp::SocketBuffer::new(vec![0; buffer]),
+pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Arc<Pages>>) {
+    let (mut s, pages) = match Pages::socket(buffer) {
+        Some((socket, pages)) => (socket, Some(pages)),
+        None => (
+            stcp::Socket::new(
+                stcp::SocketBuffer::new(vec![0; buffer]),
+                stcp::SocketBuffer::new(vec![0; buffer]),
+            ),
+            None,
         ),
     };
     s.set_tsval_generator(Some(|now| (now.total_micros() / 1000) as u32));
@@ -866,7 +894,7 @@ impl TcpLayer {
     pub(super) fn add_socket(
         &mut self,
         entropy: &dyn Entropy,
-        (mut s, pages): (stcp::Socket<'static>, Option<Pages>),
+        (mut s, pages): (stcp::Socket<'static>, Option<Arc<Pages>>),
     ) -> Id {
         s.set_settings(self.settings.socket);
         if let Some(id) = self.settings.ipv4_id {
