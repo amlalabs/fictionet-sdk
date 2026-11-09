@@ -39,6 +39,31 @@ pub(crate) async fn drive(
         let mut busy = false;
         let mut deadlines = [None; 3];
         for turn in 0..64 {
+            if let Some(packet) = held.take() {
+                match packet.transport() {
+                    Transport::Tcp => {
+                        if let Some(tcp) = &mut tcp
+                            && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
+                        {
+                            held = Some(packet);
+                            busy = true;
+                        }
+                    }
+                    Transport::Udp => {
+                        if let Some(udp) = &mut udp {
+                            udp.deliver(packet);
+                        }
+                    }
+                    _ => {
+                        if let Some((addr, options)) = &ping
+                            && let Some(reply) =
+                                options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
+                        {
+                            outgoing.push_back(PacketCommand::Send(Chunk::new(reply.0)));
+                        }
+                    }
+                }
+            }
             if outgoing.len() < 128
                 && let Some(tcp) = &mut tcp
             {
@@ -65,32 +90,6 @@ pub(crate) async fn drive(
                 {
                     outgoing.push_front(command);
                     break;
-                }
-            }
-            if let Some(packet) = held.take() {
-                match packet.transport() {
-                    Transport::Tcp => {
-                        if let Some(tcp) = &mut tcp
-                            && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
-                        {
-                            held = Some(packet);
-                            busy = true;
-                            break;
-                        }
-                    }
-                    Transport::Udp => {
-                        if let Some(udp) = &mut udp {
-                            udp.deliver(packet);
-                        }
-                    }
-                    _ => {
-                        if let Some((addr, options)) = &ping
-                            && let Some(reply) =
-                                options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
-                        {
-                            outgoing.push_back(PacketCommand::Send(Chunk::new(reply.0)));
-                        }
-                    }
                 }
             }
             ip.run().map_err(|e| fictionet::Error::msg(e.to_string()))?;
