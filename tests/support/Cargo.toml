@@ -32,3 +32,9 @@ fictionet-host = { path = "../../host" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 hyper-util = { version = "0.1", features = ["tokio"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
