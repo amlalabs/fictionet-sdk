@@ -17,6 +17,7 @@ const QUEUE: usize = 64;
 const RESERVE: usize = 8;
 const MAX_CHILDREN: usize = 4096;
 type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> B + Send;
+type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 
 /// One `B` on each child of a multiplexed connection, with the
 /// connection's control port `K` passed up.
@@ -104,6 +105,7 @@ where
     K: Port,
 {
     make: Box<ChildFactory<B, O>>,
+    budget_for: Option<Box<ChildBudget<O>>>,
     kids: Vec<(ChildId, Kid<B>)>,
     limit: usize,
     window: u64,
@@ -124,6 +126,7 @@ struct Kid<B: Layer> {
     owner: WorkOwner,
     urgent: Option<EventOf<B::Lower>>,
     layer: B,
+    budget: Budget,
     /// Events the mux sent within credit that the layer has not taken.
     inbox: VecDeque<(EventOf<B::Lower>, bool)>,
     /// What the inbox is charged: its places, grown as events wait.
@@ -194,6 +197,7 @@ where
         );
         Children {
             make: Box::new(make),
+            budget_for: None,
             kids: Vec::new(),
             storage: None,
             limit,
@@ -206,6 +210,17 @@ where
             remaining_visits: 0,
             sweep_first: None,
         }
+    }
+
+    /// Chooses a child's budget before allocating its receive window or
+    /// invoking its application factory. Siblings may share a budget (for
+    /// example, one sandbox's connections) without sharing a lifetime.
+    pub fn budgets(
+        mut self,
+        select: impl FnMut(ChildId, &O, &Budget) -> Budget + Send + 'static,
+    ) -> Self {
+        self.budget_for = Some(Box::new(select));
+        self
     }
 
     /// The routing storage for `kids` child places: the places themselves,
@@ -350,7 +365,7 @@ where
             return Ok(false);
         };
         let report = move |e| ChildReport::Event(id, e);
-        let mut moved = match env.scoped(report, |env| kid.layer.advance(env)) {
+        let mut moved = match env.scoped_in(&kid.budget, report, |env| kid.layer.advance(env)) {
             Ok(moved) => moved,
             Err(e) => {
                 self.fail(env, id, e);
@@ -358,7 +373,7 @@ where
             }
         };
         if let Some(event) = kid.urgent.take() {
-            match env.scoped(report, |env| kid.layer.on_event(env, event)) {
+            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
                 Ok(Admit::Taken | Admit::Closed(_)) => moved = true,
                 Ok(Admit::Blocked(event) | Admit::Partial(event)) => kid.urgent = Some(event),
                 Err(e) => {
@@ -369,7 +384,7 @@ where
         }
         if let Some((event, retained)) = kid.inbox.pop_front() {
             let cost = event.credit();
-            match env.scoped(report, |env| kid.layer.on_event(env, event)) {
+            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
                 Ok(Admit::Taken | Admit::Closed(_)) => {
                     if !retained {
                         kid.owed += cost;
@@ -399,8 +414,9 @@ where
                 self.refuse(env, id);
                 return Ok(true);
             }
-            if !command.reserve(env.budget()) {
-                return Err(Overrun::Budget);
+            if !command.reserve(&kid.budget) {
+                self.refuse(env, id);
+                return Ok(true);
             }
             if self.down.len() < QUEUE - RESERVE {
                 match command.admit_credit(kid.credit) {
@@ -422,6 +438,11 @@ where
             kid.granted += kid.owed;
             kid.owed = 0;
             moved = true;
+        }
+        if kid.layer.is_terminal() && kid.outbox.is_none() && self.down.len() < QUEUE {
+            let kid = self.remove(id).expect("visited child");
+            self.down.push_back(kid.handle.close());
+            return Ok(true);
         }
         Ok(moved)
     }
@@ -461,13 +482,16 @@ where
                 // A child past the limit, or one whose storage the budget
                 // cannot hold, is refused: closed at once, its siblings
                 // and the connection untouched.
+                let budget = self.budget_for.as_mut().map_or_else(
+                    || env.budget().clone(),
+                    |select| select(id, &opening, env.budget()),
+                );
                 let reserved = (self.kids.len() < self.limit && self.make_room())
                     .then(|| {
                         // The inbox grows as events wait in it (`admit`).
-                        let storage = env.budget().charge(0)?;
-                        let backing = env
-                            .budget()
-                            .charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
+                        let storage = budget.charge(0)?;
+                        let backing =
+                            budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
                         Some((storage, Arc::new(backing)))
                     })
                     .flatten();
@@ -476,11 +500,12 @@ where
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
                 };
-                let layer = (self.make)(id, opening, env.budget());
+                let layer = (self.make)(id, opening, &budget);
                 assert!(layer.depth() < MAX_DEPTH, "composition depth exceeded");
                 let kid = Kid {
                     handle: child,
                     layer,
+                    budget,
                     owner: WorkOwner::new(),
                     urgent: None,
                     inbox: VecDeque::new(),
@@ -505,7 +530,8 @@ where
                 if event.terminal_reset() {
                     if let Some(mut kid) = self.remove(id) {
                         kid.owner.cancel();
-                        if let Err(error) = env.scoped(
+                        if let Err(error) = env.scoped_in(
+                            &kid.budget,
                             |event| ChildReport::Event(id, event),
                             |env| kid.layer.on_event(env, event),
                         ) {
@@ -553,7 +579,7 @@ where
                             }
                             kid.inbox.reserve_exact(places - kid.inbox.len());
                         }
-                        if !event.reserve_receive(env.budget(), &kid.backing) {
+                        if !event.reserve_receive(&kid.budget, &kid.backing) {
                             return Err(Overrun::Budget);
                         }
                         kid.granted -= cost;
@@ -617,7 +643,8 @@ where
             return Ok(());
         };
         self.timer_turn = Some(id);
-        if let Err(e) = env.scoped(
+        if let Err(e) = env.scoped_in(
+            &kid.budget,
             move |e| ChildReport::Event(id, e),
             |env| kid.layer.on_timer(env, timer),
         ) {
@@ -639,7 +666,8 @@ where
         else {
             return Ok(());
         };
-        if let Err(e) = env.scoped(
+        if let Err(e) = env.scoped_in(
+            &kid.budget,
             move |e| ChildReport::Event(id, e),
             |env| kid.layer.on_done(env, done),
         ) {
@@ -820,6 +848,65 @@ mod tests {
             Budget::new(100_000),
             Instant::ZERO,
         )
+    }
+
+    #[test]
+    fn child_budgets_are_selected_before_allocation_and_do_not_refuse_siblings() {
+        let denied = Budget::new(0);
+        let allowed = Budget::new(4096);
+        let (empty, room) = (denied.clone(), allowed.clone());
+        let children = Children::<Reader, Top, bool>::new(2, 8, |_, allowed, budget| {
+            assert!(
+                allowed,
+                "a refused child must not construct its application"
+            );
+            assert!(
+                budget.used() > 0,
+                "receive storage is reserved before construction"
+            );
+            Reader::default()
+        })
+        .budgets(move |_, allowed, _| {
+            if *allowed {
+                room.clone()
+            } else {
+                empty.clone()
+            }
+        });
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(2);
+        let refused = slots.insert(()).unwrap();
+        let accepted = slots.insert(()).unwrap();
+        let (refused_id, accepted_id) = (refused.id(), accepted.id());
+        assert!(
+            driver
+                .deliver(MuxEvent::Opened(refused, false, 8))
+                .unwrap()
+                .moved()
+        );
+        assert!(
+            driver
+                .deliver(MuxEvent::Opened(accepted, true, 8))
+                .unwrap()
+                .moved()
+        );
+        driver.run().unwrap();
+        assert!(driver.layer().child(refused_id).is_none());
+        assert!(driver.layer().child(accepted_id).is_some());
+        assert_eq!(denied.used(), 0);
+        assert!(allowed.used() > 0);
+        assert!(
+            driver
+                .deliver(MuxEvent::Closed(accepted_id))
+                .unwrap()
+                .moved()
+        );
+        assert_eq!(allowed.used(), 0);
     }
 
     #[test]

@@ -13,6 +13,13 @@ the property TLC must then violate. `Children_large_command.cfg`,
 `Children_readiness.cfg`, `Children_refuse_full.cfg` and
 `Children_isolation.cfg` are additional passing configurations.
 
+`Children::budgets` may select a separate budget per child before its receive
+window and application are allocated. The existing nondeterministic
+`BudgetRefuses` abstraction covers refusal by either that budget or the
+parent's routing budget. It does not prove budget-selector purity or model
+byte arithmetic; the Rust child-budget test checks allocation order and
+independent sibling admission.
+
 | Config | Checks |
 | --- | --- |
 | `Route_base.cfg` | `UpConserved`, `DownConserved`, `HandoverOnce`, `RunEnds` |
@@ -80,3 +87,8 @@ cargo kani -p fictionet --harness stream_credit_splits_keep_the_allocation_owned
 Run Cargo under `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0`
 with `CARGO_BUILD_JOBS=6` and the worktree's `CARGO_TARGET_DIR`. Measured results
 and proof scope are recorded in [VERIFICATION.md](VERIFICATION.md).
+
+Application completion in `Children::visit_child` uses the same close and work
+cancellation path as failure. The abstract `MayFail` close includes completion;
+Rust additionally waits for the child outbox to drain. A transport close is
+a request to release that child handle, not proof that a TCP socket retired.
