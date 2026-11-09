@@ -138,12 +138,18 @@ its queue.
   `driver.rs:301-303` keep a `Partial` rest or a `Blocked` event, and a
   `Closed` answer drops it, by reading only. `Route_urgent` moves one whole
   token and assumes the upper layer takes it (`OfferChainUrgent` has no
-  refusal). The switch breaks that assumption: in its second phase
-  `Switch::on_event` answers `Blocked` to every event while leftovers wait
-  (`switch.rs:190`), a `Written` included, although completions are counted
-  apart from the data (`switch.rs:49-50`) and need no ordering against it.
-  A successor that takes no data until its writes complete then waits for
-  ever: see the hazard under the audit below.
+  refusal). The switch once broke that assumption: in its second phase
+  `Switch::on_event` answered `Blocked` to every event while leftovers
+  waited, a `Written` included, although completions are counted apart
+  from the data and need no ordering against it, so a successor that takes
+  no data until its writes complete waited for ever. It now lets an event
+  the port calls urgent (`Port::urgent`: a byte stream's `Written` and
+  `Reset`) pass the leftovers (`switch.rs:193`); the test
+  `a_write_completion_passes_the_leftovers_the_successor_waits_to_read` in
+  `switch.rs` fails on the old switch. See the audit below.
+- The trace check (`RouteTrace.tla`, `src/stdlib/layer/route_trace.rs`)
+  sends only data: no `Written`, no `Ended`, no `Reset`, no timers. It
+  checks the routing of bytes, not the urgent path.
 - `Switch::owed` (`switch.rs:101`, set at `switch.rs:174-180`, consumed at
   `switch.rs:185-188`). With a `B` that inherits every event, as the model's
   does, `declined` is never true, the flag is never set and the consuming
@@ -789,25 +795,44 @@ model does not see:
 `Route.tla` matches `Chain::advance`, `Switch::advance`, `Switch::on_event`
 and `on_command`, `Driver::run`, `send` and the harness's input loop as the
 table above says, with the urgent slots and `owed` left out as described
-under "What `Route.tla` leaves out". One hazard in the code follows from
-that omission and is not a model finding, since no model here has a
-`Written`:
+under "What `Route.tla` leaves out". One bug in the code followed from
+that omission and was not a model finding, since no model here has a
+`Written`; it is fixed:
 
-- `Switch::on_event` in its second phase answers `Blocked` to every event
-  while leftovers wait (`switch.rs:190`), a `Written` from the layer below
-  included, whether it arrives through `Chain::urgent` or from the runner.
+- `Switch::on_event` in its second phase answered `Blocked` to every event
+  while leftovers waited, a `Written` from the layer below included,
+  whether it arrived through `Chain::urgent` or from the runner.
   `Layer::take_urgent`'s contract is that the port above takes every
-  completion it is offered (`mod.rs:420-427`). `Http2` is a successor
+  completion it is offered. `Http2` is a successor
   (`web/httpd/native.rs:97`, `detect.rs:33`), refuses data while
   `out_bytes >= OUT_LIMIT` (`http2.rs:1416`, 64 KiB at `:66`) and lowers
   `out_bytes` only in `written` (`:1337`). So: an h2c upgrade or a
-  prior-knowledge preface whose leftovers hold enough pipelined requests
-  for the responses to pass 64 KiB before `Http2` takes the next leftover
-  chunk; the transport writes them and reports `Written`; the switch
-  refuses it because `below` is not empty; `Http2` never learns, refuses
-  the leftover for ever, and the connection stops. The `Tunnel` successor
-  ignores `Written` (`stack/tunnel.rs:160`) and is not affected. Not run;
-  reported from reading.
+  prior-knowledge preface whose leftovers held enough pipelined requests
+  for the responses to pass 64 KiB before `Http2` took the next leftover
+  chunk; the transport wrote them and reported `Written`; the switch
+  refused it because `below` was not empty; `Http2` never learned, refused
+  the leftover for ever, and the connection stopped. The `Tunnel` successor
+  ignores `Written` (`stack/tunnel.rs:160`) and was not affected. The fix
+  moves the question "may this event pass refused input" to the port
+  (`Port::urgent`, `mod.rs`), asked alike by `Chain`, `Children` and now
+  `Switch` (`switch.rs:193`); the test
+  `a_write_completion_passes_the_leftovers_the_successor_waits_to_read`
+  holds a write completion behind two leftovers a successor refuses until
+  it arrives, and fails on the old switch.
+
+The trace check ties `Route.tla` to the code it describes.
+`src/stdlib/layer/route_trace.rs` runs the real `Chain<L, Switch<A, B>>`
+and `Driver` under abstract layers whose every answer (`Taken`, a
+`Partial` prefix, `Blocked`, `Closed`) and every `advance` choice comes
+from a seed, and logs the owner's actions and every call into a layer.
+`tla/RouteTrace.tla` extends `Route` with the log as a constant and pins
+each step's `\E` to its entry: the chunk offered must be what the model
+holds there and the answer must be the one the code gave; steps the code
+makes without calling a layer consume nothing. The spec has one successor
+per state, so a log the model cannot follow deadlocks at the first entry
+it cannot explain, and `UpConserved`, `DownConserved` and `HandoverOnce`
+are checked along the way. `cargo xtask layer-verify trace` makes 32 logs
+(47 to 87 entries) and replays each: all pass, one to three seconds each.
 
 Runs on main at `e2858ccc4` by the shared check (two workers, 2 GiB heap,
 `check-all/results.tsv`): `Route_base` and `Route_urgent` pass; the nine

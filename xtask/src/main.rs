@@ -1,9 +1,10 @@
 //! Host tooling for demo images and offline web captures, and the
-//! verification of Fictionet's DNS.
+//! verification of Fictionet's DNS, MPTCP and layer routing.
 
 mod capture;
 mod dns_verify;
 mod image;
+mod layer_verify;
 mod mptcp_verify;
 mod rawnic;
 mod ssh_connect;
@@ -25,6 +26,9 @@ async fn main() -> Result {
     }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "layer-verify" {
+        return layer_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "ssh-connect" {
         return ssh_connect::run(&args.collect::<Vec<_>>()).await;

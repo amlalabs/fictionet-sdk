@@ -207,6 +207,10 @@ mod timers;
 #[cfg(test)]
 mod tests;
 
+/// The routing code run against `verification/layer/tla/Route.tla`.
+#[cfg(test)]
+mod route_trace;
+
 /// A frame echo over [`Framed`], for the runners' tests.
 #[cfg(test)]
 pub(crate) use framed::tests as framed_echo;

@@ -70,6 +70,21 @@ systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 ~/.cache/adorably-
 `CHECK_DEADLOCK FALSE` is set because a finished run of the owner, or a
 mux with every slot used up, has nothing left to do.
 
+`tla/RouteTrace.tla` replays a log of the real routing code against
+`Route.tla`. The test `route_trace` in `src/stdlib/layer/route_trace.rs`
+runs `Chain`, `Switch` and the `Driver` under seeded abstract layers and
+writes one `RouteLog_<seed>.tla` and `.cfg` per seed when
+`FICTIONET_ROUTE_TRACE_DIR` is set; each entry is a call the code made with
+the bytes offered and the answer given, and the spec deadlocks at the
+first entry the model cannot follow. Run it all with
+
+```sh
+TLA2TOOLS=~/.cache/adorably-fv/tla2tools.jar JAVA=~/.cache/adorably-fv/jdk/bin/java cargo xtask layer-verify trace
+```
+
+which writes the logs, TLC's output and its states under
+`layer-verify/` in the Cargo target directory.
+
 The Kani harnesses are compiled into `src/stdlib/layer/mod.rs` under
 `cfg(kani)` and call the production code:
 
