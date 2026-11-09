@@ -111,6 +111,12 @@ impl<E> Observe<E> for Observations<E> {
         }
         self.omitted = self.omitted.saturating_add(1);
     }
+
+    /// A store that keeps no reports wants none made, so none is counted
+    /// in [`omitted`](Self::omitted) either.
+    fn interested(&self) -> bool {
+        self.limit > 0
+    }
 }
 
 /// Runs one stack, with no I/O: whatever owns the carrier offers it input
@@ -171,7 +177,8 @@ impl<L: Layer> Driver<L> {
         self.now = now;
     }
 
-    /// Keeps at most `limit` reports from now on.
+    /// Keeps at most `limit` reports from now on. With none kept, the stack
+    /// makes none ([`Env::observing`]).
     pub fn keep_observations(&mut self, limit: usize) {
         self.observed.limit = limit;
     }
@@ -431,6 +438,33 @@ mod tests {
         drop(reports.drain().collect::<Vec<_>>());
         reports.observe(vec![0; slot]);
         assert_eq!(reports.iter().count(), 1);
+    }
+
+    #[test]
+    fn reports_for_a_store_that_keeps_none_are_never_wrapped() {
+        let entropy = SeededEntropy::new(Seed::from_u64(0));
+        let budget = Budget::unlimited();
+        let mut wrapped = 0;
+        let mut none = Observations::bounded(0, 1024, |_: &u32| Some(0));
+        Env::new(Instant::ZERO, &entropy, &budget, &mut none).scoped(
+            |report: u8| {
+                wrapped += 1;
+                u32::from(report)
+            },
+            |env| env.report(1),
+        );
+        assert_eq!(wrapped, 0);
+        assert_eq!((none.iter().count(), none.omitted()), (0, 0));
+        let mut one = Observations::bounded(1, 1024, |_: &u32| Some(0));
+        Env::new(Instant::ZERO, &entropy, &budget, &mut one).scoped(
+            |report: u8| {
+                wrapped += 1;
+                u32::from(report)
+            },
+            |env| env.report(7),
+        );
+        assert_eq!(wrapped, 1);
+        assert_eq!(one.iter().copied().collect::<Vec<_>>(), [7]);
     }
 
     #[test]

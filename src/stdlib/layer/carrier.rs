@@ -17,10 +17,12 @@ use fictionet::stdlib::layer::{Budget, Charge, CommandOf, EventOf, Port};
 /// The backing holds two independent things that are given back when its
 /// last piece is dropped: a reservation that pays for the allocation's
 /// memory (its capacity), and an optional [`CreditLease`] that holds a
-/// child's receive credit until the bytes are consumed. Every change to
-/// either goes through the private transitions below. Shared cursor and
-/// lease metadata are bounded engine storage: routers and layers must also
-/// enforce item limits, including for empty chunks.
+/// child's receive credit until the bytes are consumed. The reservation
+/// changes in one place (`pay_with`), except that an edit pays in place for
+/// unreserved backing ([`make_mut`](Self::make_mut)); a lease is attached
+/// only as bytes enter a receive window. Shared cursor and lease metadata
+/// are bounded engine storage: routers and layers must also enforce item
+/// limits, including for empty chunks.
 pub struct Chunk {
     backing: Arc<ChunkBacking>,
     start: usize,
@@ -49,6 +51,21 @@ impl Reservation {
             Reservation::Shared(charge) => charge.bytes(),
         }
     }
+}
+
+/// A reservation of its own from `budget`, for however many bytes.
+fn own(budget: &Budget) -> impl FnOnce(usize) -> Option<Reservation> + '_ {
+    |bytes| budget.charge(bytes).map(Reservation::Own)
+}
+
+/// What becomes of a backing's credit lease when its bytes change what
+/// pays for them ([`Chunk::pay_with`]).
+#[derive(Clone, Copy)]
+enum Lease {
+    /// The bytes keep holding the credit.
+    Keep,
+    /// The credit is released: the bytes move to a new receive window.
+    Release,
 }
 
 impl Chunk {
@@ -85,38 +102,58 @@ impl Chunk {
         Self::backed(bytes, Some(Reservation::Own(charge)), None)
     }
 
-    /// The backing, when this chunk alone holds it and the bytes are all
-    /// of it, so its reservation and lease can change in place.
-    fn sole_whole(&mut self) -> Option<&mut ChunkBacking> {
-        let whole = self.start == 0 && self.end == self.backing.bytes.len();
-        whole.then(|| Arc::get_mut(&mut self.backing)).flatten()
+    /// Whether the bytes not yet taken are all of the backing's bytes.
+    fn whole(&self) -> bool {
+        self.start == 0 && self.end == self.backing.bytes.len()
     }
 
-    /// Moves the remaining bytes into an allocation of their own size under
-    /// `reservation` and `lease`. Other pieces keep the old backing.
-    fn copy_under(&mut self, reservation: Reservation, lease: Option<Arc<CreditLease>>) {
-        *self = Self::backed(self.to_vec(), Some(reservation), lease);
-    }
-
-    /// Puts the bytes under `charge`, which pays for them already, so what
-    /// paid for them before may release, and drops any lease: the window
-    /// that `charge` pays for takes a new one. In place when this chunk
-    /// alone holds its backing and the bytes are all of it; otherwise they
-    /// are copied into an allocation of their own size, so the shared charge
-    /// covers no more than the bytes.
-    pub(crate) fn reback(&mut self, charge: Arc<Charge>) {
-        if let Some(backing) = self.sole_whole() {
+    /// The one way the bytes change what pays for their memory. `pay`
+    /// makes the reservation for the bytes the backing will hold. When this
+    /// chunk alone holds its backing and the bytes are all of it, that
+    /// happens in place, after trimming spare capacity so the reservation
+    /// covers only what is kept. Otherwise the bytes are copied into an
+    /// allocation of their own size, and the other pieces keep the old
+    /// backing with its reservation and lease. The lease moves with the
+    /// bytes unless `lease` releases it. Refusal leaves the bytes and what
+    /// pays for them unchanged.
+    fn pay_with(&mut self, pay: impl FnOnce(usize) -> Option<Reservation>, lease: Lease) -> bool {
+        if self.whole()
+            && let Some(backing) = Arc::get_mut(&mut self.backing)
+        {
             backing.bytes.shrink_to_fit();
-            backing.reservation = Some(Reservation::Shared(charge));
-            backing.lease = None;
-            return;
+            let Some(reservation) = pay(backing.bytes.capacity()) else {
+                return false;
+            };
+            backing.reservation = Some(reservation);
+            if let Lease::Release = lease {
+                backing.lease = None;
+            }
+            return true;
         }
-        self.copy_under(Reservation::Shared(charge), None);
+        let Some(reservation) = pay(self.len()) else {
+            return false;
+        };
+        let lease = match lease {
+            Lease::Keep => self.backing.lease.clone(),
+            Lease::Release => None,
+        };
+        *self = Self::backed(self.to_vec(), Some(reservation), lease);
+        true
+    }
+
+    /// Puts the bytes in a receive window that `window` already pays for,
+    /// so what paid for them before may release, and releases any lease:
+    /// the window takes a new one ([`hold_lease`](Self::hold_lease)).
+    /// Copied bytes take an allocation of their own size, so the shared
+    /// charge covers no more than the bytes.
+    pub(crate) fn move_into_window(&mut self, window: Arc<Charge>) {
+        self.pay_with(|_| Some(Reservation::Shared(window)), Lease::Release);
     }
 
     /// Makes the bytes hold `lease` until every piece of them is released.
-    /// The caller has just made this chunk the sole owner of its backing.
-    pub(crate) fn lease(&mut self, lease: CreditLease) {
+    /// The caller has just put them in their window, which leaves this
+    /// chunk the sole owner of its backing.
+    fn hold_lease(&mut self, lease: CreditLease) {
         Arc::get_mut(&mut self.backing)
             .expect("leased bytes are held by one chunk")
             .lease = Some(Arc::new(lease));
@@ -125,23 +162,11 @@ impl Chunk {
     /// Puts the bytes under a charge from `budget`, so what paid for them
     /// before releases: for bytes handed from one owner to another. In
     /// place when this chunk alone holds its backing and the bytes are all
-    /// of it; otherwise the bytes are copied into an allocation of their
-    /// own. Receive credit stays with the bytes. Refusal leaves the chunk
-    /// unchanged.
+    /// of it, after trimming spare capacity; otherwise the bytes are copied
+    /// into an allocation of their own. Receive credit stays with the
+    /// bytes. Refusal leaves the chunk unchanged.
     pub fn recharge(&mut self, budget: &Budget) -> bool {
-        if let Some(backing) = self.sole_whole() {
-            let Some(charge) = budget.charge(backing.bytes.capacity()) else {
-                return false;
-            };
-            backing.reservation = Some(Reservation::Own(charge));
-            return true;
-        }
-        let Some(charge) = budget.charge(self.len()) else {
-            return false;
-        };
-        let lease = self.backing.lease.clone();
-        self.copy_under(Reservation::Own(charge), lease);
-        true
+        self.pay_with(own(budget), Lease::Keep)
     }
 
     /// The first `n` bytes, sharing this chunk's backing, without taking
@@ -174,12 +199,7 @@ impl Chunk {
     /// Splits off a prefix without allocating. Both pieces retain the same
     /// backing reservation until their last owner releases it.
     pub fn split_to(&mut self, n: usize) -> Chunk {
-        assert!(n <= self.len(), "chunk prefix exceeds its remaining bytes");
-        let prefix = Chunk {
-            backing: self.backing.clone(),
-            start: self.start,
-            end: self.start + n,
-        };
+        let prefix = self.prefix(n);
         self.start += n;
         prefix
     }
@@ -191,23 +211,7 @@ impl Chunk {
     /// are copied into an allocation of their own size. Receive credit stays
     /// with the bytes either way. Refusal leaves the bytes unreserved.
     pub fn reserve(&mut self, budget: &Budget) -> bool {
-        if self.backing.reservation.is_some() {
-            return true;
-        }
-        if let Some(backing) = self.sole_whole() {
-            backing.bytes.shrink_to_fit();
-            let Some(charge) = budget.charge(backing.bytes.capacity()) else {
-                return false;
-            };
-            backing.reservation = Some(Reservation::Own(charge));
-            return true;
-        }
-        let Some(charge) = budget.charge(self.len()) else {
-            return false;
-        };
-        let lease = self.backing.lease.clone();
-        self.copy_under(Reservation::Own(charge), lease);
-        true
+        self.backing.reservation.is_some() || self.pay_with(own(budget), Lease::Keep)
     }
 
     /// Edits the remaining bytes without losing their reservation or receive
@@ -215,15 +219,15 @@ impl Chunk {
     /// reserving the copy; refusal leaves the chunk unchanged. Receive credit
     /// remains held until every original and edited piece is released.
     pub fn make_mut(&mut self, budget: &Budget) -> Option<&mut [u8]> {
-        if Arc::strong_count(&self.backing) != 1 {
-            let charge = budget.charge(self.len())?;
-            let lease = self.backing.lease.clone();
-            self.copy_under(Reservation::Own(charge), lease);
+        // Shared backing is never whole to this chunk alone, so this copies.
+        if Arc::get_mut(&mut self.backing).is_none() && !self.pay_with(own(budget), Lease::Keep) {
+            return None;
         }
         let backing = Arc::get_mut(&mut self.backing).expect("copied or already sole");
+        // Unique backing is edited where it is, so an unreserved one pays
+        // for all of its capacity, untrimmed: other bytes may follow these.
         if backing.reservation.is_none() {
-            let charge = budget.charge(backing.bytes.capacity())?;
-            backing.reservation = Some(Reservation::Own(charge));
+            backing.reservation = Some(own(budget)(backing.bytes.capacity())?);
         }
         Some(&mut backing.bytes[self.start..self.end])
     }
@@ -233,8 +237,7 @@ impl Chunk {
     /// bytes, and copies them otherwise. Any charge goes back when the
     /// chunk's backing is dropped: the vector carries none.
     pub fn into_vec(self) -> Vec<u8> {
-        let whole = self.start == 0 && self.end == self.backing.bytes.len();
-        if whole && self.backing.reservation.is_none() && self.backing.lease.is_none() {
+        if self.whole() && self.backing.reservation.is_none() && self.backing.lease.is_none() {
             match Arc::try_unwrap(self.backing) {
                 Ok(backing) => return backing.bytes,
                 Err(backing) => return backing.bytes[self.start..self.end].to_vec(),
@@ -282,11 +285,21 @@ impl CreditLease {
     pub(crate) fn new(child: Arc<ChildWake>, units: u64) -> Self {
         Self { child, units }
     }
+
+    /// Gives up the lease without releasing its credit, for a carrier that
+    /// does not hold it: the mux returns that credit itself when the child
+    /// takes the event, so releasing it here would count it twice and wake
+    /// the child for nothing.
+    pub(crate) fn disarm(mut self) {
+        self.units = 0;
+    }
 }
 
 impl Drop for CreditLease {
     fn drop(&mut self) {
-        self.child.release(self.units);
+        if self.units != 0 {
+            self.child.release(self.units);
+        }
     }
 }
 
@@ -315,9 +328,10 @@ pub trait Credited {
         Some(0)
     }
 
-    /// Admits a payload against the already reserved receive backing, or
-    /// reserves its own separately accounted payload for an atomic carrier.
-    fn reserve_receive(&mut self, budget: &Budget, _backing: &Arc<Charge>) -> bool {
+    /// Admits a payload into the receive window `window` already pays for,
+    /// or reserves its own separately accounted payload for an atomic
+    /// carrier.
+    fn reserve_receive(&mut self, budget: &Budget, _window: &Arc<Charge>) -> bool {
         self.reserve(budget)
     }
 
@@ -327,11 +341,12 @@ pub trait Credited {
         true
     }
 
-    /// Attaches receive credit to the retained payload. Atomic messages use
-    /// admission credit; byte and body carriers override this to retain it.
-    fn retain_credit(&mut self, mut credit: CreditLease) -> bool {
-        credit.units = 0;
-        false
+    /// Makes the retained payload hold `lease`, so its receive credit
+    /// returns when the payload is released, or hands the lease back when
+    /// this value does not hold credit. Atomic messages return their credit
+    /// when admitted; byte carriers override this to hold it.
+    fn retain_lease(&mut self, lease: CreditLease) -> Option<CreditLease> {
+        Some(lease)
     }
 
     /// Whether credit can split this value at legal byte boundaries.
@@ -401,11 +416,9 @@ impl Credited for StreamEvent {
         usize::try_from(window).ok()
     }
 
-    fn reserve_receive(&mut self, _: &Budget, backing: &Arc<Charge>) -> bool {
+    fn reserve_receive(&mut self, _: &Budget, window: &Arc<Charge>) -> bool {
         if let Self::Data(chunk) = self {
-            // The receive window pays for the bytes now; what paid before
-            // may release.
-            chunk.reback(backing.clone());
+            chunk.move_into_window(window.clone());
         }
         true
     }
@@ -417,12 +430,13 @@ impl Credited for StreamEvent {
         }
     }
 
-    fn retain_credit(&mut self, credit: CreditLease) -> bool {
-        if let Self::Data(chunk) = self {
-            chunk.lease(credit);
-            true
-        } else {
-            false
+    fn retain_lease(&mut self, lease: CreditLease) -> Option<CreditLease> {
+        match self {
+            Self::Data(chunk) => {
+                chunk.hold_lease(lease);
+                None
+            }
+            _ => Some(lease),
         }
     }
 
@@ -969,6 +983,21 @@ mod slot_tests {
         assert_eq!(chunk.as_ptr(), allocation);
         assert_eq!(&*chunk, &[1, 2, 3, 4]);
         assert_eq!((from.used(), to.used()), (0, 4));
+        drop(chunk);
+        assert_eq!(to.used(), 0);
+    }
+
+    #[test]
+    fn recharging_spare_capacity_charges_only_what_is_kept() {
+        let from = Budget::new(64);
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[1, 2]);
+        let mut chunk = Chunk::with_charge(bytes, from.charge(64).unwrap());
+        let to = Budget::new(2);
+        assert!(chunk.recharge(&to));
+        assert_eq!(&*chunk, &[1, 2]);
+        assert_eq!(from.used(), 0);
+        assert_eq!(chunk.charged(), to.used());
         drop(chunk);
         assert_eq!(to.used(), 0);
     }

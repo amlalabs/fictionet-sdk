@@ -9,6 +9,14 @@ use fictionet::time::Instant;
 pub trait Observe<E> {
     /// Takes one report. Never refuses: a full store drops it and counts.
     fn observe(&mut self, event: E);
+
+    /// Whether this store keeps reports at all. One that keeps none says
+    /// so, and its reports are then never made: [`Env::report`] drops them
+    /// before any wrapping, and a layer can ask [`Env::observing`] before
+    /// building one.
+    fn interested(&self) -> bool {
+        true
+    }
 }
 
 /// What a layer may use during one call: the time, the entropy source, the
@@ -22,6 +30,9 @@ pub struct Env<'a, E> {
     entropy: &'a dyn Entropy,
     budget: &'a Budget,
     observer: &'a mut dyn Observe<E>,
+    /// The observer's interest, asked once: parts of the layer report
+    /// through wrappers that only pass reports on.
+    observing: bool,
 }
 
 impl<'a, E> Env<'a, E> {
@@ -36,6 +47,7 @@ impl<'a, E> Env<'a, E> {
             now,
             entropy,
             budget,
+            observing: observer.interested(),
             observer,
         }
     }
@@ -56,9 +68,17 @@ impl<'a, E> Env<'a, E> {
         self.budget
     }
 
-    /// Reports `report`.
+    /// Whether anything keeps this call's reports. A report that costs
+    /// work to build can be skipped when nothing does.
+    pub fn observing(&self) -> bool {
+        self.observing
+    }
+
+    /// Reports `report`, unless nothing keeps reports.
     pub fn report(&mut self, report: E) {
-        self.observer.observe(report);
+        if self.observing {
+            self.observer.observe(report);
+        }
     }
 
     /// Runs `body` with an environment for a part of this layer, whose
@@ -88,6 +108,7 @@ impl<'a, E> Env<'a, E> {
             entropy: self.entropy,
             budget,
             observer: &mut wrapped,
+            observing: self.observing,
         };
         body(&mut env)
     }
@@ -101,5 +122,9 @@ struct Wrapped<'b, E, F> {
 impl<E, P, F: FnMut(P) -> E> Observe<P> for Wrapped<'_, E, F> {
     fn observe(&mut self, event: P) {
         self.inner.observe((self.wrap)(event));
+    }
+
+    fn interested(&self) -> bool {
+        self.inner.interested()
     }
 }
