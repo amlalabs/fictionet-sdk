@@ -24,6 +24,9 @@
 (* inputOver as well. Terminal application layers, such as HTTP closing   *)
 (* after its final response, are covered by the executable stack tests.   *)
 (* The _without_ configs turn one rule off and must violate its property. *)
+(* Session's output_end, input_end and pending writes use the same       *)
+(* completion conjunction. Its enclosing child router and jobs are      *)
+(* outside this model; this is a projection, not a model of that driver. *)
 EXTENDS Integers
 
 CONSTANTS PeerBytes,      \* bytes the peer sends in all

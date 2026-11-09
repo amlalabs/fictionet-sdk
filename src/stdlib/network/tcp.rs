@@ -67,27 +67,29 @@ use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Child, ChildId, Chunk, Datagram, Driver, Env, Layer, MessageCommand,
-    MessageEvent, Messages, MuxCommand, MuxEvent, Observe, PacketCommand, PacketEvent,
-    StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Child, ChildId, Chunk, Driver, MessageCommand, MessageEvent,
+    Messages, MuxCommand, MuxEvent, MuxOp, PacketCommand, PacketEvent, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::ip::{
     Header, Ipv4Option, Ipv4Reply, checksum, encode_ipv4_options, ipv4_options,
     protocol::{ICMP, TCP},
     transport_checksum,
 };
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, IpPacket, IpReport};
+use fictionet::stdlib::network::packet::{IpPacket, Scope};
 use fictionet::stdlib::network::transport::{
     Request, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::time::{Duration, Instant};
-use fictionet::{Cx, Entropy, Error, Interface, Packet};
+use fictionet::{Cx, Entropy, Error, Interface};
 
+mod applications;
 mod engine;
+mod factory;
 
-pub use engine::TcpLayer;
-use engine::Verdict;
+pub(crate) use applications::Application;
+pub use engine::{TcpLayer, Verdict};
+pub use factory::{EndpointState, Factory, Opening, Stack};
 
 /// The MTU the endpoint assumes. Segments it sends are at most the smaller
 /// of this and what the peer's MSS option allows.
@@ -990,27 +992,112 @@ pub fn prepare_endpoint(
     Endpoint,
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
-    let tcp = TcpLayer::new(addr, options, fcx, fcx.now());
-    let entropy: Arc<dyn Entropy> = Arc::new(fcx.clone());
+    let (endpoint, tcp) = prepare_transport(fcx, addr, options, &Factory::default());
+    let fcx = fcx.clone();
+    let ip = super::packet::Factory::default().build(super::packet::Opening {
+        cx: fcx.clone(),
+        addr,
+        budget: Budget::unlimited(),
+    });
+    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip, Scope::ROOT);
+    (endpoint, Prepared { task })
+}
+
+pub(crate) fn prepare_transport(
+    fcx: &Cx,
+    addr: IpAddr,
+    options: Options,
+    factory: &Factory,
+) -> (Endpoint, PacketDriver) {
+    let tcp = factory.build(Opening {
+        cx: fcx.clone(),
+        addr,
+        options,
+        budget: Budget::unlimited(),
+    });
     let shared = Arc::new(Shared {
         addr,
         state: Mutex::new(Host {
             fcx: fcx.clone(),
-            ip: IpLayer::host(),
-            held: None,
-            tcp: Driver::new(tcp, entropy, Budget::unlimited(), fcx.now()),
-            budget: Budget::unlimited(),
+            tcp: Driver::new(tcp, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now()),
             routes: Routes::default(),
+            controls: VecDeque::new(),
         }),
     });
-    let driver = shared.clone();
-    let fcx = fcx.clone();
-    let task = async move {
-        drive(&fcx, &driver, inner).await;
-        driver.stop();
-        Ok(())
-    };
-    (Endpoint { shared }, Prepared { task })
+    (
+        Endpoint {
+            shared: shared.clone(),
+        },
+        PacketDriver {
+            applications: applications::new(fcx, &shared),
+            fcx: fcx.clone(),
+            shared,
+        },
+    )
+}
+
+pub(crate) struct PacketDriver {
+    shared: Arc<Shared>,
+    fcx: Cx,
+    applications: applications::Applications,
+}
+
+impl PacketDriver {
+    pub(crate) fn deliver(&mut self, packet: IpPacket) -> Admit<PacketEvent<IpPacket>> {
+        let mut host = self.shared.state.lock();
+        host.tick();
+        let result = host.tcp.deliver(PacketEvent::Packet(packet)).unwrap();
+        host.pump();
+        result
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<Chunk>,
+        limit: usize,
+    ) -> fictionet::Result<(bool, Option<Instant>)> {
+        let (busy, deadline, refused, refusals) = {
+            let mut host = self.shared.state.lock();
+            host.routes.driver = Some(cx.waker().clone());
+            let busy = host.visit(out, limit);
+            (
+                busy,
+                host.tcp.deadline(),
+                host.routes.refused.clone(),
+                std::mem::take(&mut host.routes.refusals),
+            )
+        };
+        if let Some(refused) = refused {
+            for (peer, local) in refusals {
+                refused(peer, local);
+            }
+        }
+        let applications = self.applications.poll(
+            &self.fcx,
+            cx,
+            |pending| {
+                std::mem::swap(
+                    pending,
+                    &mut self.shared.state.lock().routes.application_events,
+                )
+            },
+            |command| self.shared.state.lock().offer(command),
+        )?;
+        Ok((
+            busy || applications,
+            [deadline, self.applications.deadline()]
+                .into_iter()
+                .flatten()
+                .min(),
+        ))
+    }
+}
+
+impl Drop for PacketDriver {
+    fn drop(&mut self) {
+        self.shared.stop();
+    }
 }
 
 /// A command for the engine.
@@ -1030,13 +1117,14 @@ struct Shared {
 struct Host {
     /// The endpoint's context: its clock and its entropy.
     fcx: Cx,
-    /// Reads raw packets into whole, checked ones.
-    ip: IpLayer,
-    /// A packet the IP layer read that the engine had no room for yet.
-    held: Option<IpPacket>,
-    tcp: Driver<TcpLayer>,
-    budget: Budget,
+    tcp: Driver<Stack>,
     routes: Routes,
+    /// Control commands the transport refused for now, in the order they
+    /// were given, offered again before anything new. A transport may
+    /// refuse any command (`Admit::Blocked`); a refused `Hold` keeps its
+    /// item here, so a count it carries goes on counting, and a refused
+    /// `Abort` still resets its connection once taken.
+    controls: VecDeque<TcpControl>,
 }
 
 /// What the handles wait for, and where the engine's events go.
@@ -1061,6 +1149,9 @@ struct Routes {
     refusals: Vec<(SocketAddr, SocketAddr)>,
     /// Children accepted for a listener that is gone, to be reset.
     strays: Vec<Child>,
+    applications: BTreeSet<ChildId>,
+    application_events: VecDeque<applications::ApplicationEvent>,
+    accept_again: Vec<u16>,
 }
 
 /// One connection a handle has.
@@ -1110,6 +1201,7 @@ impl Link {
 /// One listening port's accepted connections.
 #[derive(Default)]
 struct Accepting {
+    application: Option<Arc<Application>>,
     /// Children accepted that no `accept` took yet.
     queue: VecDeque<ChildId>,
     /// An accept was asked for and has not opened a child yet.
@@ -1121,8 +1213,23 @@ impl Routes {
     /// Delivers one event from the engine to whatever waits for it.
     fn route(&mut self, event: Event) {
         match event {
-            MuxEvent::Opened(child, opening, _) => {
+            MuxEvent::Opened(child, opening, max_command) => {
                 let id = child.id();
+                if matches!(opening.origin, TcpOrigin::Accepted(_))
+                    && let Some(application) = self
+                        .listeners
+                        .get(&opening.local.port())
+                        .and_then(|listener| listener.application.clone())
+                {
+                    self.applications.insert(id);
+                    self.accept_again.push(opening.local.port());
+                    self.application_events.push_back(MuxEvent::Opened(
+                        child,
+                        (opening, application),
+                        max_command,
+                    ));
+                    return;
+                }
                 match opening.origin {
                     TcpOrigin::Accepted(_) => {
                         let Some(l) = self.listeners.get_mut(&opening.local.port()) else {
@@ -1141,6 +1248,11 @@ impl Routes {
                 self.links.insert(id, Link::new(child, &opening));
             }
             MuxEvent::Child(id, event) => {
+                if self.applications.contains(&id) {
+                    self.application_events
+                        .push_back(MuxEvent::Child(id, event));
+                    return;
+                }
                 let Some(link) = self.links.get_mut(&id) else {
                     return;
                 };
@@ -1159,6 +1271,11 @@ impl Routes {
                 }
             }
             MuxEvent::Credit(id, units) => {
+                if self.applications.contains(&id) {
+                    self.application_events
+                        .push_back(MuxEvent::Credit(id, units));
+                    return;
+                }
                 if let Some(link) = self.links.get_mut(&id) {
                     link.credit += units;
                     if let Some(w) = link.write.take() {
@@ -1167,6 +1284,10 @@ impl Routes {
                 }
             }
             MuxEvent::Closed(id) => {
+                if self.applications.remove(&id) {
+                    self.application_events.push_back(MuxEvent::Closed(id));
+                    return;
+                }
                 if let Some(mut link) = self.links.remove(&id) {
                     link.wake();
                 }
@@ -1217,20 +1338,13 @@ impl Routes {
     }
 }
 
-/// Reports of the IP layer, which nothing reads.
-struct Quiet;
-
-impl Observe<IpReport> for Quiet {
-    fn observe(&mut self, _: IpReport) {}
-}
-
 impl Host {
-    fn engine(&mut self) -> &mut TcpLayer {
-        self.tcp.layer_mut()
+    fn engine(&mut self) -> &mut dyn EndpointState {
+        self.tcp.layer_mut().state_mut()
     }
 
-    fn engine_ref(&self) -> &TcpLayer {
-        self.tcp.layer()
+    fn engine_ref(&self) -> &dyn EndpointState {
+        self.tcp.layer().state()
     }
 
     /// Reads the clock.
@@ -1250,11 +1364,12 @@ impl Host {
     /// endpoint's task if the engine has something to send or do. Returns
     /// whether the engine took the command.
     fn command(&mut self, command: Command) -> bool {
+        matches!(self.offer(command), Admit::Taken)
+    }
+
+    fn offer(&mut self, command: Command) -> Admit<Command> {
         self.tick();
-        let taken = match self.tcp.command(command) {
-            Ok(admit) => matches!(admit, Admit::Taken),
-            Err(never) => match never {},
-        };
+        let taken = self.tcp.command(command).unwrap();
         self.pump();
         if self.engine_ref().busy() {
             self.kick();
@@ -1262,99 +1377,113 @@ impl Host {
         taken
     }
 
+    /// Gives the transport `control` after those it refused before, and
+    /// keeps what it refuses for the next step. A stopped endpoint holds
+    /// nothing, so `control` is dropped there, with any item it carries.
     fn control(&mut self, control: TcpControl) {
-        self.command(MuxCommand::control(MessageCommand::Send(control)));
+        if self.routes.stopped {
+            return;
+        }
+        self.controls.push_back(control);
+        self.tick();
+        self.pump();
+        if self.engine_ref().busy() {
+            self.kick();
+        }
     }
 
-    /// Routes every event the engine has, and resets the children
-    /// accepted for nobody.
+    /// Gives the transport `control`, whose answer the caller reads at
+    /// once, after every control it refused before. It is never queued: a
+    /// command still waiting, or a refusal, leaves the transport without
+    /// it. Returns whether the transport took it.
+    fn request(&mut self, control: TcpControl) -> bool {
+        self.tick();
+        self.pump();
+        self.controls.is_empty() && self.command(MuxCommand::control(MessageCommand::Send(control)))
+    }
+
+    /// Offers the refused controls again, in order, until the transport
+    /// refuses one. Returns whether it took any.
+    fn offer_controls(tcp: &mut Driver<Stack>, controls: &mut VecDeque<TcpControl>) -> bool {
+        let mut moved = false;
+        while let Some(control) = controls.pop_front() {
+            let command = MuxCommand::control(MessageCommand::Send(control));
+            match tcp.command(command).unwrap() {
+                Admit::Blocked(command) | Admit::Partial(command) => {
+                    let MuxOp::Control(MessageCommand::Send(control)) = command.into_op() else {
+                        unreachable!("a control command comes back as one");
+                    };
+                    controls.push_front(control);
+                    return moved;
+                }
+                // A closed transport takes nothing more: the command is
+                // dropped, as everything it held was.
+                Admit::Taken | Admit::Closed(_) => moved = true,
+            }
+        }
+        moved
+    }
+
+    /// Offers the refused controls again, routes every event the engine
+    /// has, and resets the children accepted for nobody.
     fn pump(&mut self) {
         loop {
-            let Host { tcp, routes, .. } = self;
-            let moved = tcp.send_above(|event| {
+            let Host {
+                tcp,
+                routes,
+                controls,
+                ..
+            } = self;
+            let mut moved = Host::offer_controls(tcp, controls);
+            moved |= tcp.send_above(|event| {
+                if routes.application_events.len() >= 64 {
+                    return Admit::Blocked(event);
+                }
                 routes.route(event);
                 Admit::Taken
             });
             let strays = std::mem::take(&mut routes.strays);
-            if strays.is_empty() && !moved {
+            let accepting = std::mem::take(&mut routes.accept_again);
+            if strays.is_empty() && accepting.is_empty() && !moved {
                 return;
             }
+            controls.extend(
+                accepting
+                    .into_iter()
+                    .map(|port| TcpControl::Accept { port, count: 1 }),
+            );
             for child in strays {
-                let abort =
-                    MuxCommand::control(MessageCommand::Send(TcpControl::Abort(child.id())));
-                for command in [abort, child.close()] {
-                    if let Err(never) = tcp.command(command) {
-                        match never {}
-                    }
+                controls.push_back(TcpControl::Abort(child.id()));
+                if let Err(never) = tcp.command(child.close()) {
+                    match never {}
                 }
             }
         }
     }
 
-    /// One turn of the endpoint's task: takes in what of `batch` the
-    /// engine has room for, steps it, and puts what it sends in `out`.
-    /// Returns whether to come back without waiting.
-    fn visit(&mut self, batch: &mut VecDeque<Vec<u8>>, out: &mut Vec<Vec<u8>>) -> bool {
+    /// Steps the transport and drains its output before yielding.
+    fn visit(&mut self, out: &mut Vec<Chunk>, limit: usize) -> bool {
         self.tick();
-        let now = self.tcp.now();
-        if self.ip.deadline().is_some_and(|(at, ())| at <= now) {
-            let mut quiet = Quiet;
-            let mut env = Env::new(now, &self.fcx, &self.budget, &mut quiet);
-            if let Err(never) = self.ip.on_timer(&mut env, ()) {
-                match never {}
-            }
-        }
-        loop {
-            if let Some(packet) = self.held.take() {
-                match self.tcp.deliver(PacketEvent::Packet(packet)) {
-                    Ok(Admit::Blocked(PacketEvent::Packet(packet))) => {
-                        self.held = Some(packet);
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(never) => match never {},
-                }
-            }
-            let Some(raw) = batch.pop_front() else {
+        let mut work_exhausted = false;
+        for turn in 0..64 {
+            let Some(()) = self.tcp.take_work() else {
                 break;
             };
-            let mut quiet = Quiet;
-            let mut env = Env::new(now, &self.fcx, &self.budget, &mut quiet);
-            let raw = PacketEvent::Packet(Datagram::new(Chunk::new(raw), Ingress::default()));
-            match self.ip.on_event(&mut env, raw) {
-                Ok(Admit::Blocked(PacketEvent::Packet(raw))) => {
-                    batch.push_front(raw.into_parts().0.into_vec());
-                    break;
-                }
-                Ok(_) => {}
-                Err(never) => match never {},
-            }
-            while let Some(command) = self.ip.take_command() {
-                if let PacketCommand::Send(answer) = command {
-                    out.push(answer.into_vec());
-                }
-            }
-            if let Some(PacketEvent::Packet(packet)) = self.ip.take_event() {
-                self.held = Some(packet);
-            }
+            self.tcp.complete(()).unwrap();
+            work_exhausted = turn == 63;
         }
-        if let Err(never) = self.tcp.run() {
-            match never {}
-        }
+        self.tcp.run().unwrap();
         self.tcp.send_below(|command| {
+            if out.len() >= limit {
+                return Admit::Blocked(command);
+            }
             if let PacketCommand::Send(packet) = command {
-                out.push(packet.into_vec());
+                out.push(packet);
             }
             Admit::Taken
         });
         self.pump();
-        self.tcp.exhausted() || self.held.is_some() || self.engine_ref().saturated()
-    }
-
-    /// When the engine or the IP layer next needs time.
-    fn deadline(&self) -> Option<Instant> {
-        let ip = self.ip.deadline().map(|(at, ())| at);
-        [self.tcp.deadline(), ip].into_iter().flatten().min()
+        work_exhausted || self.tcp.exhausted() || (out.len() < limit && self.engine_ref().busy())
     }
 
     /// The endpoint stopped: every wait ends with an error. Waits for
@@ -1381,7 +1510,7 @@ impl Host {
                 .into_values()
                 .flatten(),
         );
-        self.engine().stop();
+        let _ = self.tcp.deliver(PacketEvent::Ended).unwrap();
         self.pump();
         wakers
     }
@@ -1409,96 +1538,45 @@ impl std::ops::Deref for Host {
     type Target = TcpLayer;
 
     fn deref(&self) -> &TcpLayer {
-        self.tcp.layer()
+        self.tcp.layer().standard()
     }
 }
 
 #[cfg(test)]
 impl std::ops::DerefMut for Host {
     fn deref_mut(&mut self) -> &mut TcpLayer {
-        self.tcp.layer_mut()
+        self.tcp.layer_mut().standard_mut()
     }
 }
 
 impl Shared {
     /// The endpoint stopped: every wait ends with an error.
     fn stop(&self) {
-        let wakers = self.state.lock().stop();
+        let (wakers, events, applications, controls) = {
+            let mut host = self.state.lock();
+            let wakers = host.stop();
+            // A stopped endpoint holds nothing: controls it never took go,
+            // with the items they carry.
+            let controls = std::mem::take(&mut host.controls);
+            let events = std::mem::take(&mut host.routes.application_events);
+            let applications: Vec<_> = host
+                .routes
+                .listeners
+                .values_mut()
+                .filter_map(|listener| listener.application.take())
+                .collect();
+            host.routes.applications.clear();
+            (wakers, events, applications, controls)
+        };
+        // Factories can retain endpoint handles. Release them outside the
+        // transport lock, including when no application was ever polled.
+        drop(events);
+        drop(applications);
+        drop(controls);
         for w in wakers {
             w.wake();
         }
     }
-}
-
-/// The endpoint's one task: packets in, the engine, packets out, timers.
-async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
-    let mut timer = fictionet::Timer::new(fcx);
-    let mut batch: VecDeque<Vec<u8>> = VecDeque::with_capacity(64);
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut closed = false;
-    poll_fn(|cx| {
-        if fcx.is_cancelled() {
-            return Poll::Ready(());
-        }
-        while batch.len() < 64 && !closed {
-            match inner.poll_recv(fcx, cx) {
-                Poll::Ready(Ok(p)) => batch.push_back(p.0),
-                Poll::Ready(Err(_)) => {
-                    closed = true;
-                    break;
-                }
-                Poll::Pending => break,
-            }
-        }
-        let received = batch.len();
-        let (exhausted, next, old_driver, refused, refusals) = {
-            let mut host = shared.state.lock();
-            let old_driver = match &host.routes.driver {
-                Some(w) if w.will_wake(cx.waker()) => None,
-                _ => host.routes.driver.replace(cx.waker().clone()),
-            };
-            let exhausted = host.visit(&mut batch, &mut out) || !batch.is_empty();
-            (
-                exhausted,
-                host.deadline(),
-                old_driver,
-                host.routes.refused.clone(),
-                std::mem::take(&mut host.routes.refusals),
-            )
-        };
-        drop(old_driver);
-        if let Some(refused) = refused {
-            for (peer, local) in refusals {
-                refused(peer, local);
-            }
-        }
-        for p in out.drain(..) {
-            inner.send(Packet(p));
-        }
-        if closed && batch.is_empty() {
-            return Poll::Ready(());
-        }
-        if received == 64 || exhausted {
-            // Maybe more is waiting: give the rest of the run a turn, then
-            // come back.
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        match next {
-            None => timer.clear(),
-            Some(d) => {
-                if timer.poll_until(cx, d).is_ready() {
-                    // A timer is due, or the region was cancelled. Come back
-                    // next turn, so a timer that keeps asking to run now
-                    // cannot hold the thread.
-                    timer.clear();
-                    cx.waker().wake_by_ref();
-                }
-            }
-        }
-        Poll::Pending
-    })
-    .await
 }
 
 /// One machine's TCP, made by [`endpoint`].
@@ -1543,7 +1621,7 @@ impl Endpoint {
             .state
             .lock()
             .engine()
-            .limit_isolated_peers(isolated);
+            .limit_isolated_peers(Box::new(isolated));
     }
 
     /// The machine's address.
@@ -1579,11 +1657,17 @@ impl Endpoint {
     pub fn listen(&self, port: u16) -> Result<Listener, Error> {
         let mut host = self.shared.state.lock();
         host.routes.listening = None;
-        host.control(TcpControl::Listen {
+        let taken = host.request(TcpControl::Listen {
             port,
             backlog: None,
             answer: None,
         });
+        if !taken {
+            return Err(fictionet::Error::msg(format!(
+                "TCP on {} takes no command now, so it cannot listen on port {port}",
+                self.shared.addr
+            )));
+        }
         if !matches!(host.routes.listening, Some(TcpNotice::Listening { .. })) {
             return Err(fictionet::Error::msg(format!(
                 "TCP port {port} is already in use on {}",
@@ -1626,7 +1710,9 @@ impl Endpoint {
             let mut host = self.shared.state.lock();
             let request = Request(host.routes.next_request);
             host.routes.next_request += 1;
-            host.control(TcpControl::Connect {
+            // A connect the transport does not take now is not under way:
+            // it has no child, and fails below as `Closed`.
+            host.request(TcpControl::Connect {
                 request,
                 remote: to,
             });
@@ -1700,6 +1786,19 @@ pub struct Listener {
 }
 
 impl Listener {
+    pub(crate) fn attach(&mut self, application: Application) {
+        let mut host = self.shared.state.lock();
+        host.routes
+            .listeners
+            .get_mut(&self.port)
+            .expect("live listener")
+            .application = Some(Arc::new(application));
+        host.control(TcpControl::Accept {
+            port: self.port,
+            count: 1,
+        });
+    }
+
     /// Sets this port's limit of connections not accepted yet, including
     /// incomplete handshakes. Uses the bounds of [`Options::backlog`].
     /// Existing connections remain when the limit is lowered.
@@ -1938,6 +2037,24 @@ impl GoneWatch {
             child: self.id,
             item,
         });
+    }
+}
+
+impl super::transport::Retirement for GoneWatch {
+    fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.poll_gone(cx)
+    }
+
+    fn reset(&self) {
+        self.reset();
+    }
+
+    fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
+        self.hold_until_gone(item);
+    }
+
+    fn set_keep_alive(&self, interval: Option<Duration>) {
+        self.set_keep_alive(interval);
     }
 }
 

@@ -1,0 +1,259 @@
+//! Interface readiness and the single IP pass shared by host transports.
+
+use std::future::poll_fn;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::task::Poll;
+
+use fictionet::stdlib::layer::{
+    Admit, Budget, Chunk, Datagram, Driver, PacketCommand, PacketEvent,
+};
+use fictionet::{Cx, Interface, Packet};
+
+use super::Transport;
+use super::packet::{Factory, Ingress, IpPacket, Opening, Origin, Scope, Sort, Stack};
+use super::{icmp, tcp, udp};
+use fictionet::stdlib::services::stack::Jobs;
+
+/// Where the dispatcher sends one packet its IP layer handed up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Destination {
+    /// The TCP transport.
+    Tcp,
+    /// The UDP transport.
+    Udp,
+    /// The host's ping answers: ICMP that quotes neither transport.
+    Icmp,
+    /// Nowhere.
+    Drop,
+}
+
+/// Sorts `packet` for a host on network `scope`. Only a packet a host takes
+/// in reaches a transport: one with a header read by the host's checks, not
+/// an observed copy, and of the host's own network. The IP layer is
+/// replaceable ([`Factory`]), so the dispatcher checks this itself.
+fn destination(packet: &IpPacket, scope: Scope) -> Destination {
+    if packet.ingress().scope != scope
+        || matches!(packet.origin(), Origin::Observed)
+        || packet.header().is_none()
+    {
+        return Destination::Drop;
+    }
+    match packet.sort() {
+        Sort::Transport(Transport::Tcp) => Destination::Tcp,
+        Sort::Transport(Transport::Udp) => Destination::Udp,
+        Sort::Icmp | Sort::Other(_) => Destination::Icmp,
+    }
+}
+
+#[cfg(kani)]
+#[path = "../../../verification/world-layers/kani/dispatch.rs"]
+mod proofs;
+
+/// Runs one host's packets: `interface` below, one IP layer, and the
+/// transports above it, all on network `scope`.
+pub(crate) async fn drive(
+    fcx: Cx,
+    mut interface: impl Interface,
+    mut tcp: Option<tcp::PacketDriver>,
+    mut udp: Option<udp::PacketDriver>,
+    ping: Option<(IpAddr, icmp::Options)>,
+    layer: Stack,
+    scope: Scope,
+) -> fictionet::Result {
+    let mut ip = Driver::new(layer, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now());
+    ip.keep_observations(0);
+    let mut timer = fictionet::Timer::new(&fcx);
+    let mut held: Option<IpPacket> = None;
+    let mut raw = None;
+    let mut output = Vec::new();
+    let mut outgoing = std::collections::VecDeque::new();
+    let mut jobs = Jobs::new();
+    let mut closed = false;
+    poll_fn(|cx| {
+        if fcx.is_cancelled() {
+            return Poll::Ready(Ok(()));
+        }
+        ip.set_now(fcx.now());
+        let mut busy = false;
+        let mut deadlines = [None; 3];
+        for turn in 0..64 {
+            let mut moved = false;
+            let mut more = false;
+            let mut transport = false;
+            while let Some(command) = outgoing.pop_front() {
+                if let Admit::Blocked(command) = ip
+                    .command(command)
+                    .map_err(|e| fictionet::Error::msg(e.to_string()))?
+                {
+                    outgoing.push_front(command);
+                    break;
+                }
+                moved = true;
+            }
+            moved |= ip.run().map_err(|e| fictionet::Error::msg(e.to_string()))?;
+            jobs.take(&mut ip);
+            moved |= jobs
+                .poll(Some(&fcx), cx, |done| ip.complete(done))
+                .map_err(|e| fictionet::Error::msg(e.to_string()))?;
+            if jobs.budget_exhausted() {
+                return Poll::Ready(Err(fictionet::Error::msg(
+                    "packet stack work budget exhausted",
+                )));
+            }
+            moved |= ip.send_below(|command| {
+                if let PacketCommand::Send(bytes) = command {
+                    interface.send(Packet(bytes.into_vec()));
+                }
+                Admit::Taken
+            });
+            moved |= ip.send_above(|event| {
+                if held.is_some() {
+                    return Admit::Blocked(event);
+                }
+                if let PacketEvent::Packet(packet) = event {
+                    held = Some(packet);
+                }
+                Admit::Taken
+            });
+            if let Some(packet) = held.take() {
+                let mut accepted = true;
+                match destination(&packet, scope) {
+                    Destination::Drop => {}
+                    Destination::Tcp => {
+                        if let Some(tcp) = &mut tcp
+                            && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
+                        {
+                            held = Some(packet);
+                            accepted = false;
+                            transport = true;
+                        }
+                    }
+                    Destination::Udp => {
+                        if let Some(udp) = &mut udp {
+                            udp.deliver(packet);
+                        }
+                    }
+                    Destination::Icmp if outgoing.len() >= 128 => {
+                        held = Some(packet);
+                        accepted = false;
+                        transport = true;
+                    }
+                    Destination::Icmp => {
+                        if let Some((addr, options)) = &ping
+                            && let Some(reply) =
+                                options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
+                        {
+                            outgoing.push_back(PacketCommand::Send(Chunk::new(reply.0)));
+                        }
+                    }
+                }
+                moved |= accepted;
+            }
+            if held.is_none() && raw.is_none() && !closed {
+                match interface.poll_recv(&fcx, cx) {
+                    Poll::Ready(Ok(packet)) => {
+                        moved = true;
+                        raw = Some(PacketEvent::Packet(Datagram::new(
+                            Chunk::new(packet.0),
+                            Ingress {
+                                scope,
+                                ..Ingress::default()
+                            },
+                        )));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        moved = true;
+                        closed = true;
+                        raw = Some(PacketEvent::Ended);
+                    }
+                    Poll::Pending => transport = true,
+                }
+            }
+            if let Some(event) = raw.take() {
+                match ip
+                    .deliver(event)
+                    .map_err(|e| fictionet::Error::msg(e.to_string()))?
+                {
+                    Admit::Blocked(event) => {
+                        raw = Some(event);
+                        transport = true;
+                    }
+                    _ => moved = true,
+                }
+            }
+            // Batch ingress before walking every transport connection. A
+            // blocked carrier or an exhausted visit still gets a transport
+            // pass, including its timers and application work.
+            if transport || closed || turn == 63 {
+                let room = 128usize.saturating_sub(outgoing.len());
+                if let Some(tcp) = &mut tcp {
+                    let (pending, deadline) = tcp.poll(cx, &mut output, room)?;
+                    more |= pending;
+                    deadlines[1] = deadline;
+                }
+                if let Some(udp) = &mut udp {
+                    let (pending, deadline) = udp.poll(cx, &mut output, room)?;
+                    more |= pending;
+                    deadlines[2] = deadline;
+                }
+                moved |= !output.is_empty();
+                outgoing.extend(output.drain(..).map(PacketCommand::Send));
+            }
+            if !moved && !more {
+                break;
+            }
+            busy = turn == 63;
+        }
+        if closed && raw.is_none() && held.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        deadlines[0] = ip.deadline();
+        if busy || ip.exhausted() {
+            cx.waker().wake_by_ref();
+        }
+        match deadlines.into_iter().flatten().min() {
+            Some(deadline) if timer.poll_until(cx, deadline).is_ready() => {
+                timer.clear();
+                cx.waker().wake_by_ref();
+            }
+            Some(_) => {}
+            None => timer.clear(),
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Stages both transports without starting progress or publishing a route.
+pub(crate) fn prepare(
+    fcx: &Cx,
+    interface: impl Interface,
+    addr: IpAddr,
+    options: tcp::Options,
+    icmp: icmp::Options,
+    factory: &Factory,
+    tcp_factory: &tcp::Factory,
+) -> (
+    tcp::Endpoint,
+    udp::Endpoint,
+    impl Future<Output = fictionet::Result> + Send + 'static,
+) {
+    let (tcp, tcp_driver) = tcp::prepare_transport(fcx, addr, options, tcp_factory);
+    let (udp, udp_driver) = udp::prepare_transport(fcx, addr);
+    let layer = factory.build(Opening {
+        cx: fcx.clone(),
+        addr,
+        budget: Budget::unlimited(),
+    });
+    let task = drive(
+        fcx.clone(),
+        interface,
+        Some(tcp_driver),
+        Some(udp_driver),
+        Some((addr, icmp)),
+        layer,
+        Scope::ROOT,
+    );
+    (tcp, udp, task)
+}

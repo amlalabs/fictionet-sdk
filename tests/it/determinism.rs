@@ -196,6 +196,7 @@ async fn episode(
     let machine = fictionet_test_support::sandbox::machine(&cx, agent, Ipv4Addr::new(10, 0, 0, 2));
     let mut dns = machine.udp.bind(40000)?;
     for (name, expected) in [("echo.test", ECHO), ("localhost", HTTPS)] {
+        dns.send_to(b"", "10.0.0.1:53".parse()?);
         let mut query = Message::new(cx.random_u64() as u16, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(Name::from_ascii(name)?, RecordType::A));
         // DNS retry uses the lab clock, including when a query or answer is lost.

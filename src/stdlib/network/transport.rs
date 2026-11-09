@@ -50,6 +50,7 @@
 use core::any::Any;
 use core::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::task::{Context, Poll};
 
 use fictionet::stdlib::layer::{
     ByteStream, ChildId, Datagrams, Direction, Messages, Mux, ObservedStream, Top,
@@ -77,6 +78,28 @@ pub type TcpObserver = Mux<ObservedStream, Top, ObservedConnection>;
 /// answer names. The transport never reads anything into it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Request(pub u64);
+
+/// Control of a connection independently of its application child.
+///
+/// A replacement transport implements this boundary for world admission and
+/// service limits. Closing an application must not release held items while
+/// its transport still waits for the peer to finish closing. Retirement
+/// releases them. Reset wakes watches; transport cleanup releases any
+/// items still held by the reset connection.
+pub trait Retirement: Send + Sync {
+    /// Ready once the transport has retired or reset this connection.
+    fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()>;
+
+    /// Reset this connection, including while its transport is closing.
+    fn reset(&self);
+
+    /// Keep an item until transport retirement; release it immediately if
+    /// retirement already happened. Each call retains one more item.
+    fn hold_until_gone(&self, item: Box<dyn Any + Send>);
+
+    /// Set the interval for transport keepalives, or disable them.
+    fn set_keep_alive(&self, interval: Option<Duration>);
+}
 
 // ---------------------------------------------------------------------------
 // TCP

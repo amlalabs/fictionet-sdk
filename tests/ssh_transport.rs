@@ -162,7 +162,7 @@ async fn custom_transport_keeps_standard_public_key_authentication_channels_and_
                     let connection = listener.accept(&fcx).await?;
                     let arrival = Arrival {
                         info: ConnInfo::new(1, connection.local_addr(), connection.peer_addr()),
-                        socket: connection.gone_watch(),
+                        socket: Arc::new(connection.gone_watch()),
                         conn: Box::new(connection),
                         budget: Some(server_budget),
                         limits: Default::default(),

@@ -68,6 +68,17 @@ impl<'a, E> Env<'a, E> {
         wrap: impl FnMut(P) -> E,
         body: impl FnOnce(&mut Env<'_, P>) -> R,
     ) -> R {
+        self.scoped_in(self.budget, wrap, body)
+    }
+
+    /// Runs a child in its own budget while preserving time, entropy and
+    /// report ownership. The parent still accounts for its routing state.
+    pub fn scoped_in<P, R>(
+        &mut self,
+        budget: &Budget,
+        wrap: impl FnMut(P) -> E,
+        body: impl FnOnce(&mut Env<'_, P>) -> R,
+    ) -> R {
         let mut wrapped = Wrapped {
             inner: &mut *self.observer,
             wrap,
@@ -75,7 +86,7 @@ impl<'a, E> Env<'a, E> {
         let mut env = Env {
             now: self.now,
             entropy: self.entropy,
-            budget: self.budget,
+            budget,
             observer: &mut wrapped,
         };
         body(&mut env)

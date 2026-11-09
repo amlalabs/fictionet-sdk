@@ -24,6 +24,8 @@
 (*                                                                       *)
 (* Source correspondence:                                                *)
 (*   Opened, MuxSend, MuxCredit, MuxPeerClose: Children::on_event            *)
+(*   Budget refusal includes the selected child's budget: budgets()       *)
+(*   chooses it before receive storage or application construction.       *)
 (*   Arrivals: Children::on_event for MuxEvent::Child, Children::full,     *)
 (*             Children::refuse                                           *)
 (*   MuxRetry: Chain offering a held event again                           *)
@@ -62,7 +64,7 @@ CONSTANTS NS,          \* the mux's slots
                        \* holds, as a wire mux parsing frames does
           CheckWorkOwnership, CheckUrgent, CheckJobLimit, JobLimit,
           Readiness,    \* retained buffers and completion traffic
-          MayFail,     \* children's layers may fail
+          MayFail,     \* children's layers may fail or finish
           BudgetRefuses, \* the budget may refuse a child's place or inbox
           Control,     \* the layer above sends control commands
           Connection,  \* the peer sends the mux connection traffic
@@ -132,7 +134,8 @@ Visit(ks, d, id) ==
       stuck == Stuck(id) IN
   IF ~kid.live THEN {<<ks, d>>}
   ELSE
-    \* Children::advance, on_event and fail: the layer fails.
+    \* The layer fails or becomes terminal. Terminal completion is a subset
+    \* of this nondeterministic close: Rust waits for the outbox to drain.
     (IF MayFail THEN {<<[ks EXCEPT ![id] = Dead], Append(d, Cmd("Close", id, 0))>>}
                 ELSE {})
     \cup

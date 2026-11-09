@@ -44,6 +44,17 @@ The connection's state now lives in `TcpLayer`
 only through the layer's commands and events. The model's actions map onto
 both:
 
+World admission and service limits use the public `transport::Retirement`
+boundary. `GoneWatch` delegates that boundary to the same operations below;
+the transport holds admission guards independently of application lifetime.
+The custom transport admission test in `world/net/hosts.rs` checks refusal,
+reset, and releasing the peer count at retirement without a TCP application.
+The TCP factory also exposes `tcp::EndpointState` for facade readiness
+queries. The default implementation delegates them to the same `TcpLayer`
+operations; stopping delivers `PacketEvent::Ended` to that layer. A custom
+implementation must preserve the documented retirement contract. This model
+checks the standard implementation, not arbitrary replacement code.
+
 | Model | Rust |
 | --- | --- |
 | `Read`, `Write`, `Shutdown` | `TcpConnection::poll_read` (credit for the child, then its data), `poll_write` (a write within the send buffer's credit), `poll_shutdown` (the child's `End`) |

@@ -103,7 +103,7 @@ impl Job for Infallible {
 
 /// The work a stack handed over that has not finished, in the order it
 /// was handed over.
-pub(super) struct Jobs<W> {
+pub(crate) struct Jobs<W> {
     running: Vec<Running<W>>,
     storage: Option<Charge>,
     budget_failed: bool,
@@ -128,7 +128,7 @@ impl<W> Drop for Running<W> {
 }
 
 impl<W: Job> Jobs<W> {
-    pub(super) fn new() -> Jobs<W> {
+    pub(crate) fn new() -> Jobs<W> {
         Jobs {
             running: Vec::new(),
             storage: None,
@@ -136,21 +136,21 @@ impl<W: Job> Jobs<W> {
         }
     }
 
-    pub(super) fn budget_exhausted(&self) -> bool {
+    pub(crate) fn budget_exhausted(&self) -> bool {
         self.budget_failed
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.running.len()
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.running.is_empty()
     }
 
     /// Takes the stack's new work from `driver`. Returns whether there was
     /// any.
-    pub(super) fn take<L: Layer<Work = W>>(&mut self, driver: &mut Driver<L>) -> bool {
+    pub(crate) fn take<L: Layer<Work = W>>(&mut self, driver: &mut Driver<L>) -> bool {
         if self.storage.is_none() && !self.budget_failed {
             let Some(charge) = driver
                 .budget()
@@ -182,7 +182,7 @@ impl<W: Job> Jobs<W> {
 
     /// End the tasks behind completed work once the whole stack is terminal.
     /// Half-closing one direction does not end their owner.
-    pub(super) fn close_completed(&mut self) {
+    pub(crate) fn close_completed(&mut self) {
         for running in &mut self.running {
             if running.completed {
                 running.work = None;
@@ -195,7 +195,7 @@ impl<W: Job> Jobs<W> {
 
     /// Polls every piece of work once, oldest first, and hands each result
     /// to `done` as it comes. Returns whether any finished.
-    pub(super) fn poll<E>(
+    pub(crate) fn poll<E>(
         &mut self,
         fcx: Option<&Cx>,
         cx: &mut Context<'_>,

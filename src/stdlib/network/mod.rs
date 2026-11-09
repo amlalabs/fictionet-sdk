@@ -3,7 +3,9 @@
 //!
 //! The [module table](super#network-modules) lists the modules.
 
+mod applications;
 mod connection;
+pub(crate) mod endpoint;
 pub mod ethernet;
 pub mod icmp;
 pub mod ip;

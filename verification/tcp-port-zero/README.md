@@ -78,7 +78,10 @@ not exhaustively enumerate the real 16,384-port allocator.
 Preparation models plain, nonsharing TCP service declarations in
 [`Machine::prepare` and the installation path](../../src/stdlib/world/net/hosts.rs):
 temporary listener ownership, duplicate rejection, release on error, and
-publication only after every declaration succeeds. All declaration sequences
+publication only after every declaration succeeds. Bindings are staged
+against the prepared shared packet driver in `network/endpoint.rs`;
+it starts only at `PreparedMachine::commit`. The model's preparation and
+rollback actions are unchanged. All declaration sequences
 of lengths one through three over the same four ports are explored, including
 duplicates at zero and reuse after failed preparations. Installed services
 persist across successive preparations. Properties check listener ownership,

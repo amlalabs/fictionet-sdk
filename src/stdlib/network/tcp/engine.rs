@@ -243,7 +243,7 @@ pub(super) struct Id(pub(super) u64);
 pub(super) const COMPACT_SLOTS: usize = 256;
 
 /// One machine's TCP as a layer: `Packets<IpPacket, Chunk>` below, the
-/// [`Tcp`] mux above. See the [module docs](self).
+/// [`Tcp`] mux above. See the [module docs](super).
 ///
 /// The packets it takes in are the ones the IP layer sorts to TCP, and
 /// only [checked](IpPacket::is_checked) ones of its own network, the
@@ -676,7 +676,7 @@ pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Pages>
 /// What a read, write or connect on a child would get now, for the async
 /// handles that wait on the events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Verdict {
+pub enum Verdict {
     /// Nothing yet: wait for an event of the child.
     Wait,
     /// Done: the end of the stream, or an open connection.

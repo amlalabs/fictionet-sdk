@@ -610,3 +610,27 @@ and the requested 12 GiB systemd limit with swap disabled. TLC used the
 cached JDK and jar, a 6 GiB heap under an 8 GiB limit, and state directories
 on the home volume. Model assumptions and exclusions remain in the
 individual verification reports.
+
+## Native world applications
+
+On November 8, 2026, the native world TCP and UDP application routers were
+checked with the same child isolation and readiness models. The production
+routers select each child's budget before constructing it, drain application
+commands before closing its child, and keep transport retirement independent
+of application lifetime. Packet dispatch and the complete host composition
+are outside these models; their execution checks and benchmark measurements
+are recorded in [the layer runtime notes](../layer-runtime/README.md).
+
+| Configuration | Generated states | Distinct states | Result |
+| --- | ---: | ---: | --- |
+| `Children_isolation.cfg` | 10,081,987 | 663,822 | All configured invariants and temporal properties pass; depth 26 |
+| `Children_readiness.cfg` | 71,116 | 10,066 | All configured invariants and temporal properties pass; depth 21 |
+| `Children_without_urgent.cfg` | 58,884 | 8,422 | A live child's urgent completion remains pending around the counterexample cycle |
+| `Children_without_workownership.cfg` | 225 | 97 | `NoCancelledPoll` violated |
+| `Children_without_joblimit.cfg` | 745 | 250 | `BoundedJobs` violated |
+
+TLC used two workers and a 2 GiB Java heap inside the capped work slice.
+The isolation run completed in 1 hour 32 minutes, including its final
+temporal check. No configuration or property was weakened for this run.
+All Cargo, Kani and TLC invocations used the 10 GiB scope with swap disabled;
+Cargo used four build jobs and the dedicated world-composition target.
