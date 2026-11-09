@@ -9,6 +9,7 @@ members = [
     "codegen/tests/layouts",
     "demos/kit",
     "examples/copied-tls",
+    "examples/custom-ip",
     "demos/search/app",
     "demos/search/world",
     "demos/nuclear/world",
