@@ -301,9 +301,12 @@ pub(super) struct Id(pub(super) u64);
 /// Transport changes and application credit share the socket set's retained queue.
 pub(super) struct Sockets {
     set: SocketSet<'static>,
+    /// Each socket's slot in `set`, ordered by ID so compaction keeps scan order.
     handles: BTreeMap<Id, SocketHandle>,
+    /// The ID in each slot of `set`, empty slots included.
     ids: Vec<Option<Id>>,
     next_id: u64,
+    /// The socket refreshed last, so the next refresh starts after it.
     after: Option<Id>,
 }
 
