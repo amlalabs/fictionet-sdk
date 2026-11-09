@@ -190,6 +190,31 @@ fn wakers_run_once_the_endpoint_is_unlocked() {
 }
 
 #[test]
+fn transmit_batches_retain_descriptor_capacity() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let ep = endpoint(&fcx, side, "10.0.0.1".parse()?);
+        let mut host = ep.shared.lock();
+        let peer = "10.0.0.2:1234".parse()?;
+        let local = "10.0.0.1:80".parse()?;
+        for n in 0..8 {
+            host.dev.tx.push(segment(local, peer, n, 0, 4).0);
+        }
+        let capacity = host.dev.tx.capacity();
+        host.flush_transmit();
+        assert!(host.dev.tx.is_empty());
+        assert!(host.dev.tx.capacity() >= capacity);
+        assert_eq!(host.dev.out.len(), 8);
+        for (n, packet) in host.dev.out.iter().enumerate() {
+            let tcp = Header::parse_whole(packet).unwrap().payload(packet);
+            assert_eq!(u32::from_be_bytes(tcp[4..8].try_into().unwrap()), n as u32);
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn device_output_yields_and_preserves_waiting_input() {
     let mut dev = Dev::default();
     let now = smoltcp::time::Instant::from_micros(0);

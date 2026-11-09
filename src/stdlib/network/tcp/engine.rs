@@ -2377,11 +2377,7 @@ impl TcpLayer {
         self.expire_orphans(now);
         self.housekeeping();
         self.saturated = self.dev.full();
-        let mut sent = std::mem::take(&mut self.dev.tx);
-        for p in &mut sent {
-            self.sent(p);
-        }
-        self.dev.out.extend(sent);
+        self.flush_transmit();
         if self.dirty.is_empty() {
             self.next_release = None;
         } else {
@@ -2404,6 +2400,15 @@ impl TcpLayer {
             .map(unsmol);
         self.primed = false;
         self.stepped = Some(env.now());
+    }
+
+    fn flush_transmit(&mut self) {
+        let mut sent = std::mem::take(&mut self.dev.tx);
+        for p in &mut sent {
+            self.sent(p);
+        }
+        self.dev.out.extend(sent.drain(..));
+        self.dev.tx = sent;
     }
 
     // -----------------------------------------------------------------------
