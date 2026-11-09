@@ -381,6 +381,87 @@ fn a_client_that_stops_reading_times_out() {
     assert_eq!(ended, Ok(StreamEnd::Conn(ConnError::TimedOut)));
 }
 
+/// Writes forever, takes everything, and notes when it heard a reset.
+struct Floods {
+    reset_at: Arc<fictionet::sync::Mutex<Option<Instant>>>,
+}
+
+impl Layer for Floods {
+    type Lower = ByteStream;
+    type Upper = Top;
+    type Report = Infallible;
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn on_event(
+        &mut self,
+        env: &mut Env<'_, Infallible>,
+        event: StreamEvent,
+    ) -> Result<Admit<StreamEvent>, Infallible> {
+        if matches!(event, StreamEvent::Reset) {
+            self.reset_at.lock().get_or_insert(env.now());
+        }
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _env: &mut Env<'_, Infallible>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+        Some(StreamCommand::Write(Chunk::new(vec![b'x'; 64 * 1024])))
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+}
+
+/// Input is no sign the client reads: a client that keeps sending while it
+/// reads nothing still runs into the write limit.
+#[test]
+fn a_client_that_sends_but_never_reads_times_out() {
+    let limit = Duration::from_millis(300);
+    let trickle = Duration::from_secs(3);
+    let limits = StreamLimits {
+        idle: None,
+        write_timeout: Some(limit),
+    };
+    let reset_at = Arc::new(fictionet::sync::Mutex::new(None));
+    let seen = reset_at.clone();
+    let floods = move || Floods { reset_at: seen };
+    let client = move |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        // One byte every 200 ms, never reading, until the server gives up.
+        let until = fcx.now() + trickle;
+        while fcx.now() < until {
+            if conn.write_all(&fcx, b"x").await.is_err() {
+                break;
+            }
+            fcx.sleep_until(fcx.now() + Duration::from_millis(200))
+                .await?;
+        }
+        // Then quiet, still holding the connection.
+        fcx.sleep_until(fcx.now() + Duration::from_secs(5)).await?;
+        drop(conn);
+        Ok(())
+    };
+    let ended = serve_one(limits, Budget::unlimited(), floods, client);
+    assert_eq!(ended, Ok(StreamEnd::Conn(ConnError::TimedOut)));
+    let reset_at = reset_at.lock().expect("the stack heard the reset");
+    assert!(
+        reset_at.since_start() < trickle,
+        "the server gave up at {:?}, only once the client stopped sending",
+        reset_at.since_start()
+    );
+}
+
 #[test]
 fn a_client_reset_ends_the_run() {
     let client = |fcx: Cx, tcp: tcp::Endpoint| async move {

@@ -55,10 +55,16 @@ impl Lifetime {
         }
     }
 
-    /// The application took input or bytes went out: both limits count
-    /// again from the next [`settle`](Self::settle).
-    pub(super) fn progress(&mut self) {
+    /// Input came from the peer, or the application took it: the idle limit counts again from the next
+    /// [`settle`](Self::settle). The write limit keeps counting, since a
+    /// peer that sends is not one that reads.
+    pub(super) fn took_input(&mut self) {
         self.idle_from = None;
+    }
+
+    /// Bytes went out: the write limit counts again from the next
+    /// [`settle`](Self::settle).
+    pub(super) fn wrote(&mut self) {
         self.stalled_since = None;
     }
 
