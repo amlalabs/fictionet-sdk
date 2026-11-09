@@ -1355,8 +1355,17 @@ impl TcpLayer {
             }
         }
         self.dev.rx = Some(packet);
-        self.iface
-            .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+        if let Some(h) = handle {
+            self.iface.poll_ingress_targeted(
+                now,
+                &mut self.dev,
+                &mut self.sockets,
+                self.handles[&h],
+            );
+        } else {
+            self.iface
+                .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+        }
         let consumed = self.dev.rx.is_none();
         self.dev.reclaim();
         for (id, socket) in idle {

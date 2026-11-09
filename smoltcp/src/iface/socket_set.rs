@@ -33,6 +33,10 @@ impl<'a> SocketSet<'a> {
             .expect("invalid socket handle")
     }
 
+    pub(crate) fn try_get(&self, handle: SocketHandle) -> Option<&Socket<'a>> {
+        self.sockets.get(handle.0)?.as_ref()
+    }
+
     /// Get a mutable socket. Panics if its handle is invalid.
     pub fn get_mut(&mut self, handle: SocketHandle) -> &mut Socket<'a> {
         self.sockets[handle.0]

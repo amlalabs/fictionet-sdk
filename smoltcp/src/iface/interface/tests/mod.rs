@@ -3,6 +3,63 @@ use crate::tests::setup;
 use super::*;
 
 #[test]
+fn targeted_ingress_keeps_connection_precedence_and_validates_input() {
+    use crate::socket::tcp::{Socket, SocketBuffer, State};
+    let (mut iface, mut sockets, mut device) = setup();
+    let make = || {
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        );
+        socket.listen(4243).unwrap();
+        socket
+    };
+    let listener = sockets.add(make());
+    let mut connection = make();
+    connection.accept_syn_cookie(
+        (Ipv4Address::new(192, 168, 1, 1), 4243).into(),
+        (Ipv4Address::new(192, 168, 1, 2), 4242).into(),
+        7,
+        100,
+        536,
+        Instant::ZERO,
+    );
+    let target = sockets.add(connection);
+    let ip = IpRepr::Ipv4(Ipv4Repr {
+        identification: 0,
+        options: Ipv4OptionBytes::EMPTY,
+        wire_dst: None,
+        src_addr: Ipv4Address::new(192, 168, 1, 2),
+        dst_addr: Ipv4Address::new(192, 168, 1, 1),
+        next_header: IpProtocol::Tcp,
+        payload_len: 20,
+        hop_limit: 64,
+    });
+    let bytes = syn_bytes(ip.clone());
+    device.rx_queue.push_back(bytes.clone());
+    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    assert_eq!(sockets.get(listener).state(), State::Listen);
+    assert_eq!(sockets.get(target).state(), State::SynReceived);
+
+    let mut invalid = bytes.clone();
+    invalid[36] ^= 1;
+    device.tx_queue.clear();
+    device.rx_queue.push_back(invalid);
+    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.get(target).state(), State::SynReceived);
+
+    let mut other = bytes;
+    let mut tcp = TcpPacket::new_unchecked(&mut other[20..]);
+    tcp.set_src_port(4244);
+    tcp.fill_checksum(&ip.src_addr(), &ip.dst_addr());
+    device.rx_queue.push_back(other);
+    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    assert_eq!(sockets.get(listener).state(), State::SynReceived);
+    assert_eq!(sockets.get(target).remote_endpoint().unwrap().port, 4242);
+}
+
+#[test]
 fn tcp_not_accepted() {
     let (mut iface, mut sockets, _) = setup();
     let tcp = TcpRepr {

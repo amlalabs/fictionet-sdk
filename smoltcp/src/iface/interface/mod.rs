@@ -4,7 +4,7 @@ mod tcp;
 #[cfg(test)]
 mod tests;
 
-use super::socket_set::SocketSet;
+use super::socket_set::{SocketHandle, SocketSet};
 use crate::phy::{Device, RxToken, TxToken};
 use crate::socket::PollAt;
 use crate::time::Instant;
@@ -32,6 +32,7 @@ pub struct InterfaceInner {
     ip_addr: IpAddress,
     ignore_malformed_options: bool,
     reset_closed_ports: bool,
+    ingress_target: Option<SocketHandle>,
 }
 
 /// Picks the initial sequence number of a connection from its local and
@@ -59,6 +60,7 @@ impl Interface {
                 ip_addr: config.ip_addr,
                 ignore_malformed_options: false,
                 reset_closed_ports: true,
+                ingress_target: None,
             },
         }
     }
@@ -118,6 +120,20 @@ impl Interface {
                 }
             });
         }
+    }
+
+    /// Try a known connection before the general socket lookup. Packet
+    /// validation and socket acceptance still apply.
+    pub fn poll_ingress_targeted(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        target: SocketHandle,
+    ) {
+        self.inner.ingress_target = Some(target);
+        self.poll_ingress_single(timestamp, device, sockets);
+        self.inner.ingress_target = None;
     }
 
     /// Update the clock before socket operations.
