@@ -9,7 +9,7 @@ use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,6 +53,18 @@ fn endpoint(
     server: bool,
     make: impl Fn() -> Boxed + Send + 'static,
 ) -> Boxed<Raw> {
+    endpoint_to(addr, scope, "10.0.0.1".parse().unwrap(), server, make)
+}
+
+/// An endpoint at `addr` whose server listens on port 1234, or whose
+/// client connects to port 1234 at `server_addr`.
+fn endpoint_to(
+    addr: IpAddr,
+    scope: Scope,
+    server_addr: IpAddr,
+    server: bool,
+    make: impl Fn() -> Boxed + Send + 'static,
+) -> Boxed<Raw> {
     let entropy = SeededEntropy::new(Seed::from_u64(9));
     let tcp = TcpLayer::new(addr, Options::default(), &entropy, Instant::ZERO).in_scope(scope);
     let commands = if server {
@@ -70,7 +82,7 @@ fn endpoint(
     } else {
         vec![TcpControl::Connect {
             request: Request(0),
-            remote: "10.0.0.1:1234".parse().unwrap(),
+            remote: SocketAddr::new(server_addr, 1234),
         }]
     };
     let children = Children::<_, ControlPort, TcpOpening>::new(4, 16 * 1024, move |_, _, _| make());
@@ -350,6 +362,25 @@ pub(super) fn exchange(
 
 #[test]
 fn unchanged_application_runs_through_live_tcp_and_a_live_packet_tunnel() {
+    for tunnel in [false, true] {
+        live_echo(tunnel, "10.0.0.1".parse().unwrap());
+    }
+}
+
+/// The tunnel's network uses the outer connection's own addresses, and
+/// both networks number their fragments from the same serial, so inner and
+/// outer fragments share source, destination, protocol and identification,
+/// overlapping copies included. Each is put together only by its own
+/// network's IP layer, so the echo still comes back whole.
+#[test]
+fn inner_fragments_with_the_outer_keys_stay_in_their_network() {
+    live_echo(true, "192.0.2.1".parse().unwrap());
+}
+
+/// The echo at 192.0.2.1, reached from 10.0.0.2 over a world link that
+/// fragments its TCP packets, directly or through a packet tunnel whose
+/// echo is at `inner_server`.
+fn live_echo(tunnel: bool, inner_server: IpAddr) {
     use fictionet::stdlib::network::{ConnInfo, ConnectionExt};
     use fictionet::stdlib::services::stack::{self, StreamLimits};
     use fictionet::stdlib::world::net::Net;
@@ -394,100 +425,104 @@ fn unchanged_application_runs_through_live_tcp_and_a_live_packet_tunnel() {
         }
     }
 
-    for tunnel in [false, true] {
-        fictionet_test_support::world::world(Duration::from_secs(30), move |fcx| async move {
-            let scope = Scope::tunnel();
-            let (attacher, attachments) = fictionet::attachments();
-            Net::new(fictionet_extras::network::cdn_pools())
-                .ipv4_only()
-                .host("echo", |host| {
-                    host.at("192.0.2.1".parse::<IpAddr>().unwrap())
-                        .tcp_stack(1234, move |_| {
-                            if tunnel {
-                                Boxed::new(Chain::new(
-                                    Fragmented {
-                                        frames: packet::Framed::new(Ingress {
-                                            scope,
-                                            ..Ingress::default()
-                                        }),
-                                        packets: VecDeque::new(),
-                                        serial: 0,
-                                    },
-                                    endpoint("10.0.0.1".parse().unwrap(), scope, true, echo),
-                                ))
-                            } else {
-                                echo()
-                            }
-                        })
-                })
-                .start(&fcx, attachments)?;
-            let machine = fictionet_test_support::sandbox::machine(
-                &fcx,
-                Link {
-                    inner: attacher.attach("client")?,
-                    pending: VecDeque::new(),
+    fictionet_test_support::world::world(Duration::from_secs(30), move |fcx| async move {
+        let scope = Scope::tunnel();
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("echo", |host| {
+                host.at("192.0.2.1".parse::<IpAddr>().unwrap())
+                    .tcp_stack(1234, move |_| {
+                        if tunnel {
+                            Boxed::new(Chain::new(
+                                Fragmented {
+                                    frames: packet::Framed::new(Ingress {
+                                        scope,
+                                        ..Ingress::default()
+                                    }),
+                                    packets: VecDeque::new(),
+                                    serial: 0,
+                                },
+                                endpoint(inner_server, scope, true, echo),
+                            ))
+                        } else {
+                            echo()
+                        }
+                    })
+            })
+            .start(&fcx, attachments)?;
+        let machine = fictionet_test_support::sandbox::machine(
+            &fcx,
+            Link {
+                inner: attacher.attach("client")?,
+                pending: VecDeque::new(),
+                serial: 0,
+            },
+            "10.0.0.2".parse::<IpAddr>().unwrap(),
+        );
+        let conn = machine
+            .tcp
+            .connect(&fcx, "192.0.2.1:1234".parse().unwrap())
+            .await?;
+        let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let sent = Arc::new(Mutex::new(Some(sent)));
+        let client = move || {
+            let sent = sent.clone();
+            Boxed::new(stack::Tunnel::new(move |fcx, mut conn| async move {
+                conn.write_all(&fcx, &b"one\n".repeat(1000)).await.unwrap();
+                let mut response = Vec::new();
+                while response.len() < 4006 {
+                    let mut bytes = [0; 1024];
+                    let n = conn.read(&fcx, &mut bytes).await.unwrap();
+                    assert!(n > 0, "echo closed before its response completed");
+                    response.extend_from_slice(&bytes[..n]);
+                }
+                sent.lock().unwrap().take().unwrap().send(response).unwrap();
+            }))
+        };
+        let layer = if tunnel {
+            Boxed::new(Chain::new(
+                Fragmented {
+                    frames: packet::Framed::new(Ingress {
+                        scope,
+                        ..Ingress::default()
+                    }),
+                    packets: VecDeque::new(),
                     serial: 0,
                 },
-                "10.0.0.2".parse::<IpAddr>().unwrap(),
-            );
-            let conn = machine
-                .tcp
-                .connect(&fcx, "192.0.2.1:1234".parse().unwrap())
-                .await?;
-            let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
-            let (sent, received) = tokio::sync::oneshot::channel();
-            let sent = Arc::new(Mutex::new(Some(sent)));
-            let client = move || {
-                let sent = sent.clone();
-                Boxed::new(stack::Tunnel::new(move |fcx, mut conn| async move {
-                    conn.write_all(&fcx, &b"one\n".repeat(1000)).await.unwrap();
-                    let mut response = Vec::new();
-                    while response.len() < 4006 {
-                        let mut bytes = [0; 1024];
-                        let n = conn.read(&fcx, &mut bytes).await.unwrap();
-                        assert!(n > 0, "echo closed before its response completed");
-                        response.extend_from_slice(&bytes[..n]);
-                    }
-                    sent.lock().unwrap().take().unwrap().send(response).unwrap();
-                }))
-            };
-            let layer = if tunnel {
-                Boxed::new(Chain::new(
-                    Fragmented {
-                        frames: packet::Framed::new(Ingress {
-                            scope,
-                            ..Ingress::default()
-                        }),
-                        packets: VecDeque::new(),
-                        serial: 0,
-                    },
-                    endpoint("10.0.0.2".parse().unwrap(), scope, false, client),
-                ))
-            } else {
-                client()
-            };
-            fcx.spawn(move |fcx| async move {
-                stack::stream(
-                    &fcx,
-                    conn,
-                    &info,
-                    layer,
-                    Budget::unlimited(),
-                    StreamLimits::default(),
-                    |_| {},
-                )
-                .await
-                .map_err(|error| fictionet::Error::msg(error.to_string()))?;
-                Ok(())
-            });
-            let response = received.await?;
-            assert_eq!(
-                response,
-                [b"hello\n".as_slice(), &b"one\n".repeat(1000)].concat()
-            );
+                endpoint_to(
+                    "10.0.0.2".parse().unwrap(),
+                    scope,
+                    inner_server,
+                    false,
+                    client,
+                ),
+            ))
+        } else {
+            client()
+        };
+        fcx.spawn(move |fcx| async move {
+            stack::stream(
+                &fcx,
+                conn,
+                &info,
+                layer,
+                Budget::unlimited(),
+                StreamLimits::default(),
+                |_| {},
+            )
+            .await
+            .map_err(|error| fictionet::Error::msg(error.to_string()))?;
             Ok(())
         });
-    }
+        let response = received.await?;
+        assert_eq!(
+            response,
+            [b"hello\n".as_slice(), &b"one\n".repeat(1000)].concat()
+        );
+        Ok(())
+    });
 }
 
 #[test]

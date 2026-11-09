@@ -92,7 +92,11 @@ impl Layer for Framed {
             self.charge = None;
             self.size = None;
             self.prefix_len = 0;
-            self.packet = Some(PacketEvent::Ended);
+            // The packets above end once: a reset after the stream's end,
+            // which a peer may send, ends nothing more.
+            if !self.ended {
+                self.packet = Some(PacketEvent::Ended);
+            }
             self.output = None;
             self.ended = true;
             self.output_end = true;
@@ -215,6 +219,22 @@ mod tests {
             assert_eq!(&*packet, b"late");
             assert!(stack.output().is_empty());
         }
+    }
+
+    /// A peer may reset a stream after its end. The packets above end once.
+    #[test]
+    fn a_reset_after_the_end_ends_the_packets_once() {
+        let mut stack = Harness::new(Seed::from_u64(1), Framed::new(Ingress::default()));
+        let mut ends = 0;
+        for event in [StreamEvent::Ended, StreamEvent::Reset] {
+            let _ = stack.driver().deliver(event).unwrap();
+            stack.settle().unwrap();
+            stack.driver().send_above(|event| {
+                ends += usize::from(matches!(event, PacketEvent::Ended));
+                Admit::Taken
+            });
+        }
+        assert_eq!(ends, 1);
     }
 
     #[test]

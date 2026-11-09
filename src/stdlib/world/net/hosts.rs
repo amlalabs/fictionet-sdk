@@ -1351,13 +1351,16 @@ impl Peers {
         true
     }
 
+    /// Counts one more connection for `peer`, unless it has `max` counted.
+    /// The map holds exactly the peers with connections counted: a refusal
+    /// adds no entry.
     pub(super) fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<PeerGuard> {
         let mut map = self.open.lock();
-        let n = map.entry(peer).or_default();
-        if *n >= self.max {
+        let n = map.get(&peer).copied().unwrap_or(0);
+        if n >= self.max {
             return None;
         }
-        *n += 1;
+        map.insert(peer, n + 1);
         Some(PeerGuard {
             peers: self.clone(),
             peer,
@@ -2138,6 +2141,18 @@ impl Layer for ObservedTls {
 mod tests {
     use super::super::{Net, TEST_POOLS};
     use super::*;
+
+    /// A peer refused under a limit of zero is not left in the count, so a
+    /// limit that refuses everyone keeps nothing for each address it meets.
+    #[test]
+    fn a_refused_peer_leaves_nothing_counted() {
+        let peers = Peers::new(0);
+        for n in 1..=3 {
+            let peer = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, n));
+            assert!(peers.enter(peer).is_none());
+        }
+        assert_eq!(peers.peers(), 0);
+    }
 
     #[test]
     fn admission_counts_a_custom_transport_until_retirement() {
