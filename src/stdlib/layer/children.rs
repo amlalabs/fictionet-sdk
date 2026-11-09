@@ -972,7 +972,8 @@ where
                             kid.inbox.reserve_exact(places - kid.inbox.len());
                         }
                         if !event.reserve_receive(&kid.budget, &kid.backing) {
-                            return Err(Overrun::Budget);
+                            self.refuse(env, id);
+                            return Ok(Admit::Taken);
                         }
                         kid.granted -= cost;
                         let retained = if cost > 0 {
@@ -1232,6 +1233,84 @@ mod tests {
             Budget::new(100_000),
             Instant::ZERO,
         )
+    }
+
+    #[test]
+    fn an_uncharged_payload_that_does_not_fit_refuses_only_its_child() {
+        use crate::stdlib::layer::{Direction, ObservedEvent, ObservedStream};
+
+        #[derive(Default)]
+        struct Observe(usize);
+        impl Layer for Observe {
+            type Lower = ObservedStream;
+            type Upper = Top;
+            type Report = ();
+            type Timer = ();
+            type Work = ();
+            type Done = ();
+            type Error = Infallible;
+            fn on_event(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                event: ObservedEvent,
+            ) -> Result<Admit<ObservedEvent>, Infallible> {
+                if let ObservedEvent::Data { bytes, .. } = event {
+                    self.0 += bytes.len();
+                }
+                Ok(Admit::Taken)
+            }
+            fn on_command(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                command: Infallible,
+            ) -> Result<Admit<Infallible>, Infallible> {
+                match command {}
+            }
+            fn take_command(&mut self) -> Option<Infallible> {
+                None
+            }
+            fn take_event(&mut self) -> Option<Infallible> {
+                None
+            }
+        }
+        let budget = Budget::new(4096);
+        let child_budget = budget.clone();
+        let children = Children::<Observe, Top, ()>::new(2, 8, |_, (), _| Observe::default())
+            .budgets(move |_, _, _| child_budget.clone());
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(2);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let child = slots.insert(()).unwrap();
+            ids.push(child.id());
+            let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
+        }
+        driver.run().unwrap();
+        let payload = || ObservedEvent::Data {
+            direction: Direction::Forward,
+            bytes: Chunk::new(vec![1]),
+            sequence: 0,
+            source: None,
+        };
+        for id in &ids {
+            let _ = driver.deliver(MuxEvent::Child(*id, payload())).unwrap();
+            driver.run().unwrap();
+        }
+        let rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        assert!(matches!(
+            driver.deliver(MuxEvent::Child(ids[0], payload())),
+            Ok(Admit::Taken)
+        ));
+        assert!(driver.layer().child(ids[0]).is_none());
+        drop(rest);
+        let _ = driver.deliver(MuxEvent::Child(ids[1], payload())).unwrap();
+        driver.run().unwrap();
+        assert_eq!(driver.layer().child(ids[1]).unwrap().0, 2);
     }
 
     #[test]
