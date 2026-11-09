@@ -1688,44 +1688,21 @@ fn scan_fields<'a>(
     let has_transfer = headers
         .clone()
         .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
-    if has_transfer
-        && headers
-            .clone()
-            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-    {
-        return Err(Error::TransferEncodingAndContentLength);
-    }
+    check_framing_fields(
+        has_transfer,
+        has_transfer
+            && headers
+                .clone()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-length")),
+    )?;
     for (name, value) in headers {
         if !valid_field(name, value) {
             return Err(Error::Header);
         }
         if name.eq_ignore_ascii_case("content-length") {
-            for value in value.split(|b| *b == b',') {
-                let n = number(trim(value), 10, Error::ContentLength)?;
-                if result.length.is_some_and(|old| old != n) {
-                    return Err(Error::ConflictingContentLength);
-                }
-                result.length = Some(n);
-            }
+            content_length(value, &mut result.length)?;
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            if version == Version::Http10 {
-                return Err(Error::Http10TransferEncoding);
-            }
-            for value in value.split(|b| *b == b',') {
-                let value = trim(value);
-                if value.is_empty() {
-                    continue;
-                }
-                if result.chunked {
-                    return Err(Error::ChunkedNotLast);
-                }
-                if !token(value) {
-                    return Err(Error::TransferEncoding);
-                }
-                result.transfer = true;
-                result.chunked = value.eq_ignore_ascii_case(b"chunked");
-                result.unsupported_transfer_coding |= !result.chunked;
-            }
+            transfer_encoding(value, version, &mut result)?;
         } else if name.eq_ignore_ascii_case("connection") {
             for value in value.split(|b| *b == b',') {
                 let value = trim(value);
@@ -1740,14 +1717,62 @@ fn scan_fields<'a>(
             }
         }
     }
-    if has_transfer && !result.transfer {
-        return Err(Error::TransferEncoding);
-    }
+    complete_transfer(has_transfer, &result)?;
     result.close |= version == Version::Http10 && !keep;
     Ok(result)
 }
 fn valid_field(name: &str, value: &[u8]) -> bool {
-    token(name.as_bytes()) && value.iter().copied().all(field_byte) && trim(value) == value
+    token(name.as_bytes()) && valid_field_value(value)
+}
+fn valid_field_value(value: &[u8]) -> bool {
+    value.iter().copied().all(field_byte) && trim(value) == value
+}
+
+fn content_length(value: &[u8], length: &mut Option<u64>) -> Result<(), Error> {
+    for value in value.split(|b| *b == b',') {
+        let n = number(trim(value), 10, Error::ContentLength)?;
+        if length.is_some_and(|old| old != n) {
+            return Err(Error::ConflictingContentLength);
+        }
+        *length = Some(n);
+    }
+    Ok(())
+}
+
+fn check_framing_fields(transfer: bool, length: bool) -> Result<(), Error> {
+    if transfer && length {
+        return Err(Error::TransferEncodingAndContentLength);
+    }
+    Ok(())
+}
+
+fn transfer_encoding(value: &[u8], version: Version, result: &mut Fields) -> Result<(), Error> {
+    if version == Version::Http10 {
+        return Err(Error::Http10TransferEncoding);
+    }
+    for value in value.split(|b| *b == b',') {
+        let value = trim(value);
+        if value.is_empty() {
+            continue;
+        }
+        if result.chunked {
+            return Err(Error::ChunkedNotLast);
+        }
+        if !token(value) {
+            return Err(Error::TransferEncoding);
+        }
+        result.transfer = true;
+        result.chunked = value.eq_ignore_ascii_case(b"chunked");
+        result.unsupported_transfer_coding |= !result.chunked;
+    }
+    Ok(())
+}
+
+fn complete_transfer(present: bool, result: &Fields) -> Result<(), Error> {
+    if present && !result.transfer {
+        return Err(Error::TransferEncoding);
+    }
+    Ok(())
 }
 
 fn request_framing(info: Fields) -> Result<Framing, Error> {
