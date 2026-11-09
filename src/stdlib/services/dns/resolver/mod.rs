@@ -96,6 +96,11 @@ use servers::Servers;
 /// implements.
 pub struct Resolver<V: Verify = Ring> {
     config: Config,
+    /// The indexes of `config.local` in the order the zones answer:
+    /// deepest apex first, and at equal depth the zone added last.
+    local_order: Vec<usize>,
+    /// The apex of every local zone.
+    hosted: Vec<LowerName>,
     /// The front's view of `config`, for the header and EDNS rules
     /// authoritative servers and resolvers share.
     server: ServerConfig,
@@ -267,8 +272,19 @@ impl<V: Verify> Resolver<V> {
                 .serve_stale
                 .map_or(std::time::Duration::ZERO, |stale| stale.max_stale),
         };
+        let mut local_order: Vec<usize> = (0..config.local.len()).collect();
+        local_order.sort_by_key(|&index| {
+            std::cmp::Reverse((label_count(config.local[index].data.apex()), index))
+        });
+        let hosted = config
+            .local
+            .iter()
+            .map(|zone| zone.data.apex().clone())
+            .collect();
         Resolver {
             config,
+            local_order,
+            hosted,
             server,
             verify,
             clock,
@@ -344,13 +360,13 @@ impl<V: Verify> Resolver<V> {
         // zones, and through the cache of a resolver that answers from
         // it, as step 3a goes back to step 1, and a local referral goes
         // out as it is (step 3b).
-        let local = self.local_answer(&request);
-        if let Some(local) = &local
-            && (local.settles() || (!request.rd && !local.onward))
-        {
-            let bytes = self.render_local(&request, local.response.clone(), local.keep_aa);
-            return self.send_answer(client, bytes, Validation::NotPerformed, false);
-        }
+        let local = match self.local_answer(&request) {
+            Some(local) if local.settles() || (!request.rd && !local.onward) => {
+                let bytes = self.render_local(&request, local.response, local.keep_aa);
+                return self.send_answer(client, bytes, Validation::NotPerformed, false);
+            }
+            local => local,
+        };
         if !request.rd && !self.config.rd0_from_cache && local.is_none() {
             let refused = bare_reply(&request, ResponseCode::Refused, None);
             let bytes = self.render_response(&request, refused);
@@ -377,25 +393,14 @@ impl<V: Verify> Resolver<V> {
     /// deepest zone first, and at equal depth the zone added last.
     fn local_answer(&self, request: &Request) -> Option<Local> {
         let qname = LowerName::new(request.question.name());
-        let mut zones: Vec<(usize, &LocalZone)> = self
-            .config
-            .local
+        let mut zones = self
+            .local_order
             .iter()
-            .enumerate()
-            .filter(|(_, zone)| zone.data.apex().zone_of(&qname))
-            .collect();
-        zones.sort_by_key(|(index, zone)| {
-            std::cmp::Reverse((label_count(zone.data.apex()), *index))
-        });
-        let hosted: Vec<LowerName> = self
-            .config
-            .local
-            .iter()
-            .map(|zone| zone.data.apex().clone())
-            .collect();
-        zones.into_iter().find_map(|(_, zone)| {
+            .map(|&index| &self.config.local[index])
+            .filter(|zone| zone.data.apex().zone_of(&qname));
+        zones.find_map(|zone| {
             let view = zone.data.view(&request.question);
-            match answer_onward(&*view, request, self.config.any, &hosted) {
+            match answer_onward(&*view, request, self.config.any, &self.hosted) {
                 (Answered::Response(response), onward) => Some(Local {
                     response,
                     zone: Name::from(zone.data.apex()),
@@ -843,7 +848,7 @@ impl<V: Verify> Resolver<V> {
             .iter()
             .filter(|piece| piece.cached && !piece.stale)
             .any(|piece| {
-                piece.outcome.records().iter().any(|set| {
+                piece.outcome.records().any(|set| {
                     let ttl = std::time::Duration::from_secs(u64::from(set.ttl())).min(max_ttl);
                     !ttl.is_zero() && piece.at + ttl <= self.now
                 })

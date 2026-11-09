@@ -145,14 +145,15 @@ pub(super) enum Outcome {
 impl Outcome {
     /// The RRsets an answer from this outcome carries, with the TTLs they
     /// had when found.
-    pub(super) fn records(&self) -> Vec<&RecordSet> {
-        match self {
-            Outcome::Data { sets, proof, .. } => sets.iter().chain(proof).collect(),
-            Outcome::Alias { cname, proof, .. } => std::iter::once(cname).chain(proof).collect(),
-            Outcome::Negative { soa, denial, .. } => soa.iter().chain(denial).collect(),
-            Outcome::TooLong { dname, .. } => vec![dname],
-            Outcome::Failure(_) => Vec::new(),
-        }
+    pub(super) fn records(&self) -> impl Iterator<Item = &RecordSet> {
+        let (first, rest): (&[RecordSet], &[RecordSet]) = match self {
+            Outcome::Data { sets, proof, .. } => (sets, proof),
+            Outcome::Alias { cname, proof, .. } => (std::slice::from_ref(cname), proof),
+            Outcome::Negative { soa, denial, .. } => (soa.as_slice(), denial),
+            Outcome::TooLong { dname, .. } => (std::slice::from_ref(dname), &[]),
+            Outcome::Failure(_) => (&[], &[]),
+        };
+        first.iter().chain(rest)
     }
 }
 
