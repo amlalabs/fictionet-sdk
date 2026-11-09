@@ -18,7 +18,7 @@ use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
-use super::super::response::{Asked, ResponsePolicy, date_header, error_response};
+use super::super::response::{Asked, Dates, ResponsePolicy, error_response};
 use super::super::{
     Body, Delivery, Exchange, Handler, Later, Limits, Observe, PIECE, Received, Reply, Reset, text,
 };
@@ -121,7 +121,10 @@ impl Responder {
         self.server(Http2::upgraded(self.limits, settings, opening, body))
     }
 
-    fn server(&self, connection: Http2) -> Http2Server {
+    fn server(&self, mut connection: Http2) -> Http2Server {
+        // The connection dates each head as it frames it, so its streams
+        // share one header per second.
+        connection.dates = Dates::new(self.date);
         let shared = Arc::new(self.clone());
         let limit = (self.limits.streams as usize).min(4096);
         Chain::new(
@@ -311,14 +314,14 @@ impl State {
 
     /// The response's head, with the framing fields the shared policy
     /// chose.
-    fn start(&mut self, env: &Env<'_, Infallible>, response: Response<Body>) {
+    fn start(&mut self, response: Response<Body>) {
         let (parts, body) = response.into_parts();
         if let Some(delivery) = &mut self.delivery {
             delivery.response(&parts);
         }
-        let date = || date_header(self.responder.date, env.now());
-        let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), self.wants, date);
-        let mut headers = HeaderMap::with_capacity(parts.headers.len() + 2);
+        // No `Date` here: the connection adds it when it frames the head.
+        let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), self.wants, || None);
+        let mut headers = HeaderMap::with_capacity(parts.headers.len() + 1);
         for (name, value) in &parts.headers {
             if matches!(
                 name.as_str(),
@@ -346,9 +349,6 @@ impl State {
             headers.insert(http::header::CONTENT_LENGTH, length.clone());
         } else if let Some(length) = policy.len {
             headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
-        }
-        if let Some(date) = policy.date {
-            headers.insert(http::header::DATE, date);
         }
         let end = policy.bodiless || body.is_end_stream();
         self.next = Some(ExchangeCommand::Head(Box::new(ResponseHead {
@@ -397,7 +397,7 @@ impl State {
         }
         match std::mem::replace(&mut self.stage, Stage::Done) {
             Stage::Made(response) => {
-                self.start(env, response);
+                self.start(response);
                 true
             }
             Stage::Body(body) if !self.rest.is_empty() => {
