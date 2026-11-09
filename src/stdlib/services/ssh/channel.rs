@@ -85,7 +85,7 @@ pub enum ChannelCommand {
     Hangup,
 }
 
-fn with_stream(data: &mut Chunk, f: impl FnOnce(&mut StreamEvent) -> bool) -> bool {
+fn with_stream<R>(data: &mut Chunk, f: impl FnOnce(&mut StreamEvent) -> R) -> R {
     let mut event = StreamEvent::Data(std::mem::replace(data, Chunk::new(Vec::new())));
     let result = f(&mut event);
     let StreamEvent::Data(bytes) = event else {
@@ -122,11 +122,11 @@ impl Credited for ChannelEvent {
             _ => true,
         }
     }
-    fn retain_credit(&mut self, credit: CreditLease) -> bool {
+    fn retain_lease(&mut self, lease: CreditLease) -> Option<CreditLease> {
         match self {
-            Self::Stream(event) => event.retain_credit(credit),
-            Self::Extended { data, .. } => with_stream(data, |e| e.retain_credit(credit)),
-            _ => false,
+            Self::Stream(event) => event.retain_lease(lease),
+            Self::Extended { data, .. } => with_stream(data, |e| e.retain_lease(lease)),
+            _ => Some(lease),
         }
     }
     fn terminal_reset(&self) -> bool {

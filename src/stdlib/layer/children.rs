@@ -1024,11 +1024,16 @@ where
                             return Ok(Admit::Taken);
                         }
                         kid.granted -= cost;
-                        let retained = if cost > 0 {
-                            event.retain_credit(CreditLease::new(kid.wake.clone(), cost))
-                        } else {
-                            false
-                        };
+                        // Credit the payload does not hold goes back when
+                        // the child takes the event (`visit`).
+                        let retained = cost > 0
+                            && match event.retain_lease(CreditLease::new(kid.wake.clone(), cost)) {
+                                Some(lease) => {
+                                    lease.disarm();
+                                    false
+                                }
+                                None => true,
+                            };
                         kid.inbox.push_back((event, retained));
                     }
                     self.ready.push(&mut self.kids, key);
@@ -1196,7 +1201,10 @@ mod tests {
     use super::*;
     use crate::Seed;
     use crate::entropy::SeededEntropy;
-    use crate::stdlib::layer::{ByteStream, Chunk, Driver, Slots, StreamCommand, StreamEvent};
+    use crate::stdlib::layer::{
+        ByteStream, Chunk, Direction, Driver, ObservedEvent, ObservedStream, Slots, StreamCommand,
+        StreamEvent,
+    };
     use bytes::Bytes;
     use std::convert::Infallible;
 
@@ -1285,44 +1293,82 @@ mod tests {
         )
     }
 
+    /// A child that counts the observed bytes it takes.
+    #[derive(Default)]
+    struct Observe(usize);
+
+    impl Layer for Observe {
+        type Lower = ObservedStream;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: ObservedEvent,
+        ) -> Result<Admit<ObservedEvent>, Infallible> {
+            if let ObservedEvent::Data { bytes, .. } = event {
+                self.0 += bytes.len();
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Infallible> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    fn observed_byte() -> ObservedEvent {
+        ObservedEvent::Data {
+            direction: Direction::Forward,
+            bytes: Chunk::new(vec![1]),
+            sequence: 0,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn credit_returned_at_delivery_wakes_nothing_when_admitted() {
+        let mut driver = Driver::new(
+            Children::<Observe, Top, ()>::new(1, 8, |_, (), _| Some(Observe::default())),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        // Observed data does not hold its credit: the mux returns it when
+        // the child takes the event, so admitting it wakes nothing.
+        let _ = driver
+            .deliver(MuxEvent::Child(id, observed_byte()))
+            .unwrap();
+        assert!(!driver.layer().woken.any.load(Ordering::Acquire));
+        assert!(driver.layer().woken.queue.lock().is_empty());
+        driver.run().unwrap();
+        assert_eq!(driver.layer().child(id).unwrap().0, 1);
+        assert!(matches!(
+            driver.take_command().unwrap().into_op(),
+            super::super::MuxOp::Credit(found, 1) if found == id
+        ));
+    }
+
     #[test]
     fn an_uncharged_payload_that_does_not_fit_refuses_only_its_child() {
-        use crate::stdlib::layer::{Direction, ObservedEvent, ObservedStream};
-
-        #[derive(Default)]
-        struct Observe(usize);
-        impl Layer for Observe {
-            type Lower = ObservedStream;
-            type Upper = Top;
-            type Report = ();
-            type Timer = ();
-            type Work = ();
-            type Done = ();
-            type Error = Infallible;
-            fn on_event(
-                &mut self,
-                _: &mut Env<'_, ()>,
-                event: ObservedEvent,
-            ) -> Result<Admit<ObservedEvent>, Infallible> {
-                if let ObservedEvent::Data { bytes, .. } = event {
-                    self.0 += bytes.len();
-                }
-                Ok(Admit::Taken)
-            }
-            fn on_command(
-                &mut self,
-                _: &mut Env<'_, ()>,
-                command: Infallible,
-            ) -> Result<Admit<Infallible>, Infallible> {
-                match command {}
-            }
-            fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Infallible> {
-                None
-            }
-            fn take_event(&mut self) -> Option<Infallible> {
-                None
-            }
-        }
         let budget = Budget::new(4096);
         let child_budget = budget.clone();
         let children = Children::<Observe, Top, ()>::new(2, 8, |_, (), _| Some(Observe::default()))
@@ -1341,12 +1387,7 @@ mod tests {
             let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
         }
         driver.run().unwrap();
-        let payload = || ObservedEvent::Data {
-            direction: Direction::Forward,
-            bytes: Chunk::new(vec![1]),
-            sequence: 0,
-            source: None,
-        };
+        let payload = observed_byte;
         for id in &ids {
             let _ = driver.deliver(MuxEvent::Child(*id, payload())).unwrap();
             driver.run().unwrap();

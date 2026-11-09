@@ -116,7 +116,7 @@ impl Chunk {
 
     /// Makes the bytes hold `lease` until every piece of them is released.
     /// The caller has just made this chunk the sole owner of its backing.
-    pub(crate) fn lease(&mut self, lease: CreditLease) {
+    fn hold_lease(&mut self, lease: CreditLease) {
         Arc::get_mut(&mut self.backing)
             .expect("leased bytes are held by one chunk")
             .lease = Some(Arc::new(lease));
@@ -282,11 +282,21 @@ impl CreditLease {
     pub(crate) fn new(child: Arc<ChildWake>, units: u64) -> Self {
         Self { child, units }
     }
+
+    /// Gives up the lease without releasing its credit, for a carrier that
+    /// does not hold it: the mux returns that credit itself when the child
+    /// takes the event, so releasing it here would count it twice and wake
+    /// the child for nothing.
+    pub(crate) fn disarm(mut self) {
+        self.units = 0;
+    }
 }
 
 impl Drop for CreditLease {
     fn drop(&mut self) {
-        self.child.release(self.units);
+        if self.units != 0 {
+            self.child.release(self.units);
+        }
     }
 }
 
@@ -327,11 +337,12 @@ pub trait Credited {
         true
     }
 
-    /// Attaches receive credit to the retained payload. Atomic messages use
-    /// admission credit; byte and body carriers override this to retain it.
-    fn retain_credit(&mut self, mut credit: CreditLease) -> bool {
-        credit.units = 0;
-        false
+    /// Makes the retained payload hold `lease`, so its receive credit
+    /// returns when the payload is released, or hands the lease back when
+    /// this value does not hold credit. Atomic messages return their credit
+    /// when admitted; byte carriers override this to hold it.
+    fn retain_lease(&mut self, lease: CreditLease) -> Option<CreditLease> {
+        Some(lease)
     }
 
     /// Whether credit can split this value at legal byte boundaries.
@@ -417,12 +428,13 @@ impl Credited for StreamEvent {
         }
     }
 
-    fn retain_credit(&mut self, credit: CreditLease) -> bool {
-        if let Self::Data(chunk) = self {
-            chunk.lease(credit);
-            true
-        } else {
-            false
+    fn retain_lease(&mut self, lease: CreditLease) -> Option<CreditLease> {
+        match self {
+            Self::Data(chunk) => {
+                chunk.hold_lease(lease);
+                None
+            }
+            _ => Some(lease),
         }
     }
 
