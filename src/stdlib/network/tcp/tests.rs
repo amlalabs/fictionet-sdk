@@ -3244,7 +3244,7 @@ mod layer {
             .unwrap(),
             IpPacket::checked(Chunk::new(syn.clone()), in_tunnel, Origin::Arrived).unwrap(),
         ];
-        assert_eq!(packets[0].transport(), Transport::Tcp);
+        assert_eq!(packets[0].sort(), Sort::Transport(Transport::Tcp));
         let mut answers = Vec::new();
         for packet in packets {
             assert!(matches!(

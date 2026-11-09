@@ -216,7 +216,7 @@ fn observed_copies_and_other_networks_reach_no_socket() {
         )
         .unwrap(),
     ];
-    assert_eq!(packets[0].transport(), Transport::Udp);
+    assert_eq!(packets[0].sort(), Sort::Transport(Transport::Udp));
     for packet in packets {
         assert!(matches!(
             d.deliver(PacketEvent::Packet(packet)),

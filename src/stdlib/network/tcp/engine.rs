@@ -25,7 +25,8 @@ use fictionet::stdlib::layer::{
     MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand, PacketEvent, Packets,
     Slots, StreamCommand, StreamEvent,
 };
-use fictionet::stdlib::network::packet::{IpPacket, Scope, Transport};
+use fictionet::stdlib::network::Transport;
+use fictionet::stdlib::network::packet::{IpPacket, Scope, Sort};
 use fictionet::stdlib::network::transport::{
     Request, Tcp, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
@@ -2449,7 +2450,7 @@ impl Layer for TcpLayer {
         }
         if !packet.is_checked()
             || packet.ingress().scope != self.scope
-            || packet.transport() != Transport::Tcp
+            || packet.sort() != Sort::Transport(Transport::Tcp)
         {
             return Ok(Admit::Taken);
         }

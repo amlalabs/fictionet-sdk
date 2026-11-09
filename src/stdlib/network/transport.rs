@@ -12,11 +12,13 @@
 //! | UDP | `Packets<IpPacket, Chunk>` | [`Udp`] | one bound socket, [`Datagrams`] with the peer's address, opened as a [`UdpBound`] |
 //! | TCP observer | `Packets<IpPacket, Infallible>` | [`TcpObserver`] | one observed connection, an [`ObservedStream`], opened as an [`ObservedConnection`] |
 //!
-//! A transport takes the packets whose
-//! [`IpPacket::transport`](super::packet::IpPacket::transport) is its own,
-//! ICMP errors quoting its packets included, and sends whole IP packets it
-//! built. The observer sends nothing: the only command its lower port has
-//! is the end, and it never gives it.
+//! TCP and UDP each take the [checked](super::packet::IpPacket::is_checked)
+//! packets of their own network whose
+//! [`IpPacket::sort`](super::packet::IpPacket::sort) is their
+//! [`Transport`](super::Transport), ICMP errors quoting their packets
+//! included, and send whole IP packets they built. The observer reads
+//! observed copies of TCP segments and sends nothing: the only command its
+//! lower port has is the end, and it never gives it.
 //!
 //! Applications attach with [`Children`](fictionet::stdlib::layer::Children),
 //! whose factory receives each child's opening context, and whatever runs

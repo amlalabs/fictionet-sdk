@@ -11,7 +11,7 @@
    refused with an answer or without one (`Intake::Refused`), a fragment
    that waits, or a fragment that completes a packet with every fragment
    waiting (`Intake::Whole` from reassembly). How reassembly decides is in
-   Reassembly.tla; which transport a packet goes to is `Transport::read`,
+   Reassembly.tla; where a packet goes is `Sort::read`,
    a function of its bytes, checked with Kani. *)
 EXTENDS Naturals, FiniteSets
 

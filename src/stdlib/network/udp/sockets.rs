@@ -11,7 +11,8 @@ use fictionet::stdlib::layer::{
 };
 use fictionet::stdlib::network::icmp;
 use fictionet::stdlib::network::ip::{self, Fields, protocol};
-use fictionet::stdlib::network::packet::{IpPacket, Scope, Transport};
+use fictionet::stdlib::network::Transport;
+use fictionet::stdlib::network::packet::{IpPacket, Scope, Sort};
 use fictionet::stdlib::network::transport::{Request, Udp, UdpBound, UdpControl, UdpNotice};
 
 use super::wire;
@@ -314,7 +315,7 @@ impl UdpLayer {
     fn take_in(&mut self, env: &mut Env<'_, UdpReport>, packet: IpPacket) {
         if !packet.is_checked()
             || packet.ingress().scope != self.scope
-            || packet.transport() != Transport::Udp
+            || packet.sort() != Sort::Transport(Transport::Udp)
         {
             return;
         }

@@ -89,7 +89,8 @@ use std::task::Poll;
 use fictionet::stdlib::layer::{
     Admit, Budget, Chunk, Datagram, Driver, PacketCommand, PacketEvent,
 };
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, Transport};
+use fictionet::stdlib::network::Transport;
+use fictionet::stdlib::network::packet::{Ingress, IpLayer, Sort};
 use fictionet::stdlib::network::{
     icmp,
     ports::{Event, Ports},
@@ -351,7 +352,7 @@ async fn split(
 /// [`IpLayer`]. Port 0 is the interface being split; ports 1 to 4 take TCP,
 /// UDP, ICMP and everything else. Each packet from port 0 goes into the
 /// layer, and each one the layer hands up goes to the port of its
-/// [`Transport`]. Packets from every other port, and the layer's answers,
+/// [`Sort`]. Packets from every other port, and the layer's answers,
 /// go out on port 0. The layer's deadline is the loop's.
 ///
 /// The layer is drained after every step, so it always has room for the
@@ -396,11 +397,11 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
         });
         ip.send_above(|event| {
             if let PacketEvent::Packet(packet) = event {
-                let to = match packet.transport() {
-                    Transport::Tcp => 1,
-                    Transport::Udp => 2,
-                    Transport::Icmp => 3,
-                    Transport::Other(_) => 4,
+                let to = match packet.sort() {
+                    Sort::Transport(Transport::Tcp) => 1,
+                    Sort::Transport(Transport::Udp) => 2,
+                    Sort::Icmp => 3,
+                    Sort::Other(_) => 4,
                 };
                 ports.send(to, Packet(packet.into_bytes().into_vec()));
             }
@@ -2476,8 +2477,8 @@ mod tests {
                 "parse_whole, next header {next}"
             );
             assert_eq!(
-                Transport::of(&p),
-                Transport::Other(next),
+                Sort::of(&p),
+                Sort::Other(next),
                 "the split, next header {next}"
             );
         }

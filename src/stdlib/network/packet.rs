@@ -6,7 +6,7 @@
 //! [`Datagram`] of bytes with its [`Ingress`]. Above, it hands each whole
 //! packet a host would take in to the transports as an [`IpPacket`]: an
 //! envelope that keeps the bytes together with the header read from those
-//! bytes, the [`Transport`] the packet goes to, and where it came from. It
+//! bytes, where the packet goes ([`Sort`]), and where it came from. It
 //! does what
 //! [`ip::split_protocols`](fictionet::stdlib::network::ip::split_protocols)
 //! promises, and that split now runs on it:
@@ -20,11 +20,11 @@
 //!   [deadline](fictionet::stdlib::layer::Layer::deadline) is when the
 //!   oldest unfinished packet expires;
 //! - each packet is sorted by protocol, and an ICMP error goes to the
-//!   transport of the packet it quotes ([`Transport::of`]).
+//!   transport of the packet it quotes ([`Sort::of`]).
 //!
 //! A transport layer sits above it with `Packets<IpPacket, Chunk>` as its
-//! lower port. It receives the packets whose [`IpPacket::transport`] is its
-//! own, ICMP errors quoting its packets included, and sends whole IP
+//! lower port. It receives the packets whose [`IpPacket::sort`] is its
+//! [`Transport`], ICMP errors quoting its packets included, and sends whole IP
 //! packets it built down. The IP layer sends them on unchanged. What the
 //! IP layer checks is listed above; everything after the IP header (the
 //! transport header, its checksum and its ports) is the transport's to
@@ -40,7 +40,8 @@
 //! use std::sync::Arc;
 //! use fictionet::stdlib::layer::{Admit, Budget, Chunk, Datagram, Driver, PacketEvent};
 //! use fictionet::stdlib::network::ip::{self, protocol};
-//! use fictionet::stdlib::network::packet::{Ingress, IpLayer, Transport};
+//! use fictionet::stdlib::network::Transport;
+//! use fictionet::stdlib::network::packet::{Ingress, IpLayer, Sort};
 //! use fictionet::time::Instant;
 //! use fictionet::{Seed, SeededEntropy};
 //!
@@ -52,7 +53,7 @@
 //! assert!(matches!(ip.deliver(PacketEvent::Packet(raw)), Ok(Admit::Taken)));
 //! ip.send_above(|event| {
 //!     let PacketEvent::Packet(packet) = event else { unreachable!() };
-//!     assert_eq!(packet.transport(), Transport::Udp);
+//!     assert_eq!(packet.sort(), Sort::Transport(Transport::Udp));
 //!     assert_eq!(packet.payload(), &udp);
 //!     Admit::Taken
 //! });
@@ -68,6 +69,7 @@ use fictionet::stdlib::layer::{
     Admit, Budget, Chunk, CommandOf, Datagram, Env, EventOf, Layer, PacketCommand, PacketEvent,
     Packets, Whole,
 };
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, protocol};
 use fictionet::time::Instant;
 
@@ -137,13 +139,12 @@ pub struct Capture {
     pub original_len: usize,
 }
 
-/// Which transport a packet goes to.
+/// Where the IP layer sorts a packet: to a [`Transport`], to ICMP, or to
+/// neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Transport {
-    /// A TCP segment, or an ICMP error quoting one.
-    Tcp,
-    /// A UDP datagram, or an ICMP error quoting one.
-    Udp,
+pub enum Sort {
+    /// A TCP segment or UDP datagram, or an ICMP error quoting one.
+    Transport(Transport),
     /// Any other ICMP or ICMPv6 message: pings, and errors that quote
     /// neither TCP nor UDP.
     Icmp,
@@ -153,48 +154,47 @@ pub enum Transport {
     Other(u8),
 }
 
-impl Transport {
-    /// Which transport a whole packet a host would take in goes to. A packet
-    /// that is not one ([`Header::parse_whole`] refuses it) is
-    /// `Other(protocol::NONE)`. ICMP errors (destination unreachable, source
-    /// quench, time exceeded and parameter problem for IPv4, and every type
-    /// below 128 for IPv6) go to the transport of the packet they quote,
-    /// when it is TCP or UDP.
-    pub fn of(packet: &[u8]) -> Transport {
-        Transport::read(Header::parse_whole(packet).as_ref(), packet)
+impl Sort {
+    /// Where a whole packet a host would take in goes. A packet that is not
+    /// one ([`Header::parse_whole`] refuses it) is `Other(protocol::NONE)`.
+    /// ICMP errors (destination unreachable, source quench, time exceeded
+    /// and parameter problem for IPv4, and every type below 128 for IPv6)
+    /// go to the transport of the packet they quote, when it is TCP or UDP.
+    pub fn of(packet: &[u8]) -> Sort {
+        Sort::read(Header::parse_whole(packet).as_ref(), packet)
     }
 
-    /// Which transport the packet that `header` was read from goes to, or
+    /// Where the packet that `header` was read from goes, or
     /// `Other(protocol::NONE)` when no header could be read.
-    fn read(header: Option<&Header>, packet: &[u8]) -> Transport {
+    fn read(header: Option<&Header>, packet: &[u8]) -> Sort {
         let Some(header) = header else {
-            return Transport::Other(protocol::NONE);
+            return Sort::Other(protocol::NONE);
         };
         if header.fragment.is_some_and(|f| f.offset != 0) {
-            return Transport::Other(header.protocol);
+            return Sort::Other(header.protocol);
         }
         let message = header.payload(packet);
         let quoted = match header.protocol {
-            protocol::TCP => return Transport::Tcp,
-            protocol::UDP => return Transport::Udp,
+            protocol::TCP => return Sort::Transport(Transport::Tcp),
+            protocol::UDP => return Sort::Transport(Transport::Udp),
             protocol::ICMP if header.src.is_ipv4() => {
                 message.len() >= 8 && matches!(message[0], 3 | 4 | 11 | 12)
             }
             protocol::ICMPV6 if header.src.is_ipv6() => message.len() >= 8 && message[0] < 128,
             protocol::ICMP | protocol::ICMPV6 => false,
-            other => return Transport::Other(other),
+            other => return Sort::Other(other),
         };
         if quoted
             && let Some(quoted) = Header::parse_truncated(&message[8..])
             && quoted.fragment.is_none_or(|f| f.offset == 0)
         {
             match quoted.protocol {
-                protocol::TCP => return Transport::Tcp,
-                protocol::UDP => return Transport::Udp,
+                protocol::TCP => return Sort::Transport(Transport::Tcp),
+                protocol::UDP => return Sort::Transport(Transport::Udp),
                 _ => {}
             }
         }
-        Transport::Icmp
+        Sort::Icmp
     }
 }
 
@@ -217,20 +217,20 @@ pub enum Origin {
     Observed,
 }
 
-/// One whole IP packet, with the header read from its own bytes and the
-/// transport it goes to.
+/// One whole IP packet, with the header read from its own bytes and where
+/// it goes ([`Sort`]).
 ///
 /// [`IpLayer`], [`IpPacket::checked`] and [`IpPacket::observed`] make one,
-/// so the header and transport always describe these bytes. A
+/// so the header and sort always describe these bytes. A
 /// [checked](IpPacket::is_checked) packet passed [`Header::check`], is not
 /// a fragment, and has no IPv6 extension headers left. The IP layer hands
 /// up checked packets, and packets it could not read, with no header and
-/// transport `Other(protocol::NONE)`. An observed copy is never checked.
+/// sort `Other(protocol::NONE)`. An observed copy is never checked.
 #[derive(Debug)]
 pub struct IpPacket {
     bytes: Chunk,
     header: Option<Header>,
-    transport: Transport,
+    sort: Sort,
     ingress: Ingress,
     origin: Origin,
     complete: bool,
@@ -241,10 +241,10 @@ impl IpPacket {
     /// [`Header::parse_truncated`], since a capture may hold fewer bytes
     /// than the packet had, and no host policy. Nothing is reassembled,
     /// stripped or answered, and an IPv4 header checksum is not checked. A
-    /// fragment after the first goes to [`Transport::Other`].
+    /// fragment after the first goes to [`Sort::Other`].
     pub fn observed(bytes: Chunk, ingress: Ingress) -> IpPacket {
         let header = Header::parse_truncated(&bytes);
-        let transport = Transport::read(header.as_ref(), &bytes);
+        let sort = Sort::read(header.as_ref(), &bytes);
         let complete = Header::parse(&bytes).is_some()
             && ingress
                 .capture
@@ -252,7 +252,7 @@ impl IpPacket {
         IpPacket {
             bytes,
             header,
-            transport,
+            sort,
             ingress,
             origin: Origin::Observed,
             complete,
@@ -287,11 +287,11 @@ impl IpPacket {
     /// A packet the host takes in, with the header [`check`](IpPacket::check)
     /// read, or none when it could not read one.
     fn host(bytes: Chunk, header: Option<Header>, ingress: Ingress, origin: Origin) -> IpPacket {
-        let transport = Transport::read(header.as_ref(), &bytes);
+        let sort = Sort::read(header.as_ref(), &bytes);
         IpPacket {
             bytes,
             header,
-            transport,
+            sort,
             ingress,
             origin,
             complete: true,
@@ -317,9 +317,9 @@ impl IpPacket {
             .map_or(&[][..], |h| h.payload(&self.bytes))
     }
 
-    /// The transport it goes to.
-    pub fn transport(&self) -> Transport {
-        self.transport
+    /// Where the IP layer sorts it.
+    pub fn sort(&self) -> Sort {
+        self.sort
     }
 
     /// Where it arrived.
@@ -666,17 +666,17 @@ mod tests {
             let got = up(&mut d);
             assert_eq!(got.len(), 1);
             assert_eq!(got[0].bytes(), &p[..]);
-            seen.push(got[0].transport());
+            seen.push(got[0].sort());
         }
         assert_eq!(
             seen,
             [
-                Transport::Tcp,
-                Transport::Udp,
-                Transport::Tcp,
-                Transport::Icmp,
-                Transport::Other(47),
-                Transport::Other(protocol::NONE),
+                Sort::Transport(Transport::Tcp),
+                Sort::Transport(Transport::Udp),
+                Sort::Transport(Transport::Tcp),
+                Sort::Icmp,
+                Sort::Other(47),
+                Sort::Other(protocol::NONE),
             ]
         );
     }
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].bytes(), &whole[..]);
         assert!(matches!(got[0].origin(), Origin::Reassembled));
-        assert_eq!(got[0].transport(), Transport::Udp);
+        assert_eq!(got[0].sort(), Sort::Transport(Transport::Udp));
         assert_eq!(d.deadline(), None);
     }
 
@@ -858,15 +858,15 @@ mod tests {
         };
         let full = IpPacket::observed(Chunk::new(whole.clone()), capture(whole.len()));
         assert!(full.is_complete());
-        assert_eq!(full.transport(), Transport::Tcp);
+        assert_eq!(full.sort(), Sort::Transport(Transport::Tcp));
         let cut = IpPacket::observed(Chunk::new(whole[..30].to_vec()), capture(whole.len()));
         assert!(!cut.is_complete());
-        assert_eq!(cut.transport(), Transport::Tcp);
+        assert_eq!(cut.sort(), Sort::Transport(Transport::Tcp));
         assert_eq!(cut.payload(), &whole[20..30]);
         assert!(matches!(cut.origin(), Origin::Observed));
         assert_eq!(cut.ingress().capture.unwrap().number, 7);
         let garbage = IpPacket::observed(Chunk::new(vec![0x60, 1]), Ingress::default());
-        assert_eq!(garbage.transport(), Transport::Other(protocol::NONE));
+        assert_eq!(garbage.sort(), Sort::Other(protocol::NONE));
         assert!(garbage.header().is_none());
         assert!(!garbage.is_complete());
     }
@@ -877,8 +877,8 @@ mod tests {
         let pieces = fragments(&whole, 32);
         let first = IpPacket::observed(Chunk::new(pieces[0].clone()), Ingress::default());
         let later = IpPacket::observed(Chunk::new(pieces[1].clone()), Ingress::default());
-        assert_eq!(first.transport(), Transport::Udp);
-        assert_eq!(later.transport(), Transport::Other(protocol::UDP));
+        assert_eq!(first.sort(), Sort::Transport(Transport::Udp));
+        assert_eq!(later.sort(), Sort::Other(protocol::UDP));
     }
 
     #[test]
@@ -888,7 +888,7 @@ mod tests {
         let mut packet = IpPacket {
             bytes: Chunk::new(plain.clone()),
             header: Header::parse_whole(&plain),
-            transport: Transport::Udp,
+            sort: Sort::Transport(Transport::Udp),
             ingress: Ingress::default(),
             origin: Origin::Normalized {
                 original: Chunk::new(vec![0; 64]),
@@ -986,10 +986,10 @@ mod tests {
         .unwrap();
         assert!(checked.is_checked() && layer.is_checked());
         assert_eq!(checked.header(), layer.header());
-        assert_eq!(checked.transport(), layer.transport());
+        assert_eq!(checked.sort(), layer.sort());
         // The same bytes observed are read, but not checked.
         let observed = IpPacket::observed(Chunk::new(good.clone()), Ingress::default());
-        assert_eq!(observed.transport(), Transport::Udp);
+        assert_eq!(observed.sort(), Sort::Transport(Transport::Udp));
         assert!(!observed.is_checked());
         // What a host would not take in is handed back unchanged.
         let mut bad_sum = good.clone();
