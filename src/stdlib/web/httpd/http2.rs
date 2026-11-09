@@ -115,6 +115,14 @@ pub struct Http2 {
     children: Option<Slots<u32>>,
     resets: VecDeque<(u32, Instant)>,
     recv_window: i32,
+    /// The DATA bytes all streams hold for their children: they count
+    /// against the connection's receive window.
+    windowed_bytes: u64,
+    /// Streams whose child has not granted credit yet.
+    uncredited: usize,
+    /// Streams whose receive credit may be due: their window, held bytes
+    /// or child credit changed since the last release, or they are new.
+    credit_due: Vec<u32>,
     send_window: i32,
     initial: i32,
     frame: usize,
@@ -142,8 +150,10 @@ pub struct Http2 {
     /// completions so none allocates, bounded by the streams open at once.
     touched: Vec<u32>,
     finished: Vec<u32>,
-    /// The stream whose frame went out last, so streams take turns.
-    turn: u32,
+    /// Streams with a frame they can send, in the order they take turns.
+    runnable: VecDeque<u32>,
+    /// Streams whose next frame waits for the connection's send window.
+    awaiting_window: VecDeque<u32>,
     charge: Option<Charge>,
     last_words: Option<Charge>,
     /// The request an HTTP/1 `Upgrade: h2c` brought, for stream 1.
@@ -179,6 +189,8 @@ struct Receive {
     content_remaining: Option<u64>,
     /// The bytes the client may still send on the stream.
     window: i32,
+    /// The stream is in the connection's `credit_due`.
+    credit_due: bool,
 }
 
 /// The request on its way up to the child, within the credit the child
@@ -282,6 +294,19 @@ struct Response {
     /// Body bytes whose whole frames the transport took.
     written_bytes: u64,
     reply: Reply,
+    turn: Turn,
+}
+
+impl Response {
+    /// Whether the stream has a frame its own window lets it send: body
+    /// bytes, or its end once they are all out.
+    fn has_frame(&self) -> bool {
+        if self.queue.is_empty() {
+            matches!(self.reply, Reply::Ending(_))
+        } else {
+            self.window > 0
+        }
+    }
 }
 
 enum Reply {
@@ -289,6 +314,25 @@ enum Reply {
     Body,
     Ending(Option<Box<HeaderMap>>),
     Ended,
+}
+
+/// Where a stream waits to send.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// Nowhere: it has no frame it can send.
+    Idle,
+    /// In the connection's `runnable`.
+    Runnable,
+    /// In the connection's `awaiting_window`.
+    AwaitingWindow,
+}
+
+/// What one turn of a stream sent.
+enum Sent {
+    Frame,
+    Nothing,
+    /// Its next frame needs the connection's send window.
+    AwaitingWindow,
 }
 
 /// Bytes handed to the transport, and what their completion means.
@@ -330,6 +374,9 @@ impl Http2 {
             children: None,
             resets: VecDeque::new(),
             recv_window: WINDOW,
+            windowed_bytes: 0,
+            uncredited: 0,
+            credit_due: Vec::new(),
             send_window: WINDOW,
             initial: WINDOW,
             frame: wire::DEFAULT_FRAME_SIZE,
@@ -351,7 +398,8 @@ impl Http2 {
             sent: VecDeque::new(),
             touched: Vec::new(),
             finished: Vec::new(),
-            turn: 0,
+            runnable: VecDeque::new(),
+            awaiting_window: VecDeque::new(),
             charge: None,
             last_words: None,
             upgrade: None,
@@ -406,7 +454,14 @@ impl Http2 {
             .saturating_add(self.up.capacity() * size_of::<MuxEvent<HttpExchange, Top, Opening>>())
             .saturating_add(self.out.capacity() * size_of::<StreamCommand>())
             .saturating_add(self.sent.capacity() * size_of::<Piece>())
-            .saturating_add((self.touched.capacity() + self.finished.capacity()) * size_of::<u32>())
+            .saturating_add(
+                (self.touched.capacity()
+                    + self.finished.capacity()
+                    + self.credit_due.capacity()
+                    + self.runnable.capacity()
+                    + self.awaiting_window.capacity())
+                    * size_of::<u32>(),
+            )
     }
 
     /// What the places the queues keep hold.
@@ -414,7 +469,7 @@ impl Http2 {
         KEEP * (size_of::<MuxEvent<HttpExchange, Top, Opening>>()
             + size_of::<StreamCommand>()
             + size_of::<Piece>()
-            + 2 * size_of::<u32>())
+            + 5 * size_of::<u32>())
     }
 
     /// Gives each queue the places it keeps, which [`Self::kept`] counts.
@@ -424,6 +479,9 @@ impl Http2 {
         self.sent.reserve_exact(KEEP);
         self.touched.reserve_exact(KEEP);
         self.finished.reserve_exact(KEEP);
+        self.credit_due.reserve_exact(KEEP);
+        self.runnable.reserve_exact(KEEP);
+        self.awaiting_window.reserve_exact(KEEP);
     }
 
     /// Charges what is held now. Returns whether it fits.
@@ -579,14 +637,22 @@ impl Http2 {
         if matches!(self.phase, Phase::Closing | Phase::Closed) {
             return;
         }
-        let ids: Vec<u32> = self.streams.keys().copied().collect();
-        for id in ids {
-            self.end_stream(id, Ending::Gone);
-        }
+        self.end_all();
         self.resets = VecDeque::new();
         self.input = None;
         self.phase = Phase::Closing;
         self.out.push_back(StreamCommand::End);
+    }
+
+    /// Every stream still open ends: its exchange is told the connection
+    /// is gone, and nothing waits for a turn or for credit.
+    fn end_all(&mut self) {
+        self.runnable = VecDeque::new();
+        self.awaiting_window = VecDeque::new();
+        self.credit_due = Vec::new();
+        while let Some((&id, _)) = self.streams.first_key_value() {
+            self.end_stream(id, Ending::Gone);
+        }
     }
 
     /// The connection holds more than its budget allows: nothing more is
@@ -714,6 +780,7 @@ impl Http2 {
                     closed: ended,
                     content_remaining: remaining,
                     window: WINDOW,
+                    credit_due: false,
                 },
                 delivery: Delivery {
                     pending: ChargedQueue::new(pending),
@@ -732,13 +799,35 @@ impl Http2 {
                     queued_bytes: 0,
                     written_bytes: 0,
                     reply: Reply::Waiting,
+                    turn: Turn::Idle,
                 },
             },
         );
+        self.uncredited += 1;
+        // The next release takes the stream in.
+        self.credit_may_be_due(id);
         self.up
             .push_back(MuxEvent::Opened(child, opening, SEND_CREDIT));
         self.up.push_back(MuxEvent::Credit(child_id, SEND_CREDIT));
         Ok(())
+    }
+
+    /// Stream `id`'s receive credit may be due at the next release.
+    fn credit_may_be_due(&mut self, id: u32) {
+        if let Some(stream) = self.streams.get_mut(&id)
+            && !stream.receive.credit_due
+        {
+            stream.receive.credit_due = true;
+            self.credit_due.push(id);
+        }
+    }
+
+    /// Puts stream `id` in line to send, if it has a frame its window lets
+    /// it send and is not in line already.
+    fn schedule(&mut self, id: u32) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            schedule(&mut self.runnable, id, &mut stream.response);
+        }
     }
 
     /// Sends stream `id`'s child body bytes, in order behind what waits for
@@ -752,7 +841,10 @@ impl Http2 {
         let delivery = &mut stream.delivery;
         let len = chunk.len();
         match delivery.pending.push_back(chunk) {
-            Ok(()) if windowed => delivery.windowed_bytes += len as u32,
+            Ok(()) if windowed => {
+                delivery.windowed_bytes += len as u32;
+                self.windowed_bytes += len as u64;
+            }
             Ok(()) => delivery.unwindowed_bytes += len as u64,
             Err(_) => delivery.overflow = Overflow::Dropped(len as u64),
         }
@@ -788,6 +880,7 @@ impl Http2 {
             return;
         };
         let delivery = &mut stream.delivery;
+        let mut moved = false;
         while delivery.credit_bytes > 0
             && let Some(front) = delivery.pending.front_mut()
         {
@@ -801,8 +894,15 @@ impl Http2 {
             let unwindowed = n.min(delivery.unwindowed_bytes);
             delivery.unwindowed_bytes -= unwindowed;
             delivery.windowed_bytes -= (n - unwindowed) as u32;
+            self.windowed_bytes -= n - unwindowed;
             self.up
                 .push_back(MuxEvent::Child(stream.child, ExchangeEvent::Data(chunk)));
+            moved = true;
+        }
+        // The child's credit and the bytes held changed.
+        if moved && !stream.receive.credit_due {
+            stream.receive.credit_due = true;
+            self.credit_due.push(id);
         }
         if !delivery.pending.is_empty() {
             return;
@@ -830,6 +930,16 @@ impl Http2 {
         };
         // What it held is dropped: its credit may be due.
         self.batch |= stream.delivery.windowed_bytes > 0;
+        self.windowed_bytes -= u64::from(stream.delivery.windowed_bytes);
+        self.uncredited -= usize::from(!stream.delivery.credited);
+        if stream.receive.credit_due {
+            self.credit_due.retain(|&due| due != id);
+        }
+        match stream.response.turn {
+            Turn::Idle => {}
+            Turn::Runnable => self.runnable.retain(|&next| next != id),
+            Turn::AwaitingWindow => self.awaiting_window.retain(|&next| next != id),
+        }
         if let Some(children) = &mut self.children {
             children.remove(stream.child);
         }
@@ -997,6 +1107,10 @@ impl Http2 {
             return self.reset(env, id, ErrorCode::StreamClosed);
         }
         receive.window -= size as i32;
+        if !receive.credit_due {
+            receive.credit_due = true;
+            self.credit_due.push(id);
+        }
         if receive.window < 0 {
             return self.reset(env, id, ErrorCode::FlowControlError);
         }
@@ -1034,11 +1148,12 @@ impl Http2 {
             1 => self.encoder.set_settings_limit(setting.value as usize),
             4 => {
                 let initial = setting.value as i32;
-                for stream in self.streams.values_mut() {
+                for (&id, stream) in self.streams.iter_mut() {
                     stream.response.window = shifted(stream.response.window, self.initial, initial)
                         .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "initial window overflow")
                         })?;
+                    schedule(&mut self.runnable, id, &mut stream.response);
                 }
                 self.initial = initial;
             }
@@ -1116,9 +1231,20 @@ impl Http2 {
                         grown(self.send_window, update.increment).ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "connection window overflow")
                         })?;
+                    if self.send_window > 0 {
+                        // The streams that waited for it take their turns again.
+                        while let Some(id) = self.awaiting_window.pop_front() {
+                            if let Some(stream) = self.streams.get_mut(&id) {
+                                stream.response.turn = Turn::Runnable;
+                                self.runnable.push_back(id);
+                            }
+                        }
+                        trim(&mut self.awaiting_window);
+                    }
                 } else if let Some(stream) = self.streams.get_mut(&update.stream) {
                     if let Some(n) = grown(stream.response.window, update.increment) {
                         stream.response.window = n;
+                        schedule(&mut self.runnable, update.stream, &mut stream.response);
                     } else {
                         self.reset(env, update.stream, ErrorCode::FlowControlError)?;
                     }
@@ -1270,20 +1396,22 @@ impl Http2 {
     /// has left, as h2 does, so many small frames share one WINDOW_UPDATE.
     /// Streams opened in the batch are taken in.
     fn release(&mut self, env: &mut Env<'_, Report>) -> bool {
-        let held: i64 = self
-            .streams
-            .values()
-            .map(|s| i64::from(s.delivery.windowed_bytes))
-            .sum();
+        let held = self.windowed_bytes as i64;
         if let Some(back) = credit_back(self.recv_window, i64::from(WINDOW) - held) {
             if !self.window_update(env, 0, back) {
                 return true;
             }
             self.recv_window += back as i32;
         }
-        let ids: Vec<u32> = self.streams.keys().copied().collect();
-        for id in ids {
-            let stream = self.streams.get_mut(&id).expect("an open stream");
+        // Only streams whose credit changed can be due, in ascending order
+        // as the client reads them.
+        let mut due = std::mem::take(&mut self.credit_due);
+        due.sort_unstable();
+        for &id in &due {
+            let Some(stream) = self.streams.get_mut(&id) else {
+                continue;
+            };
+            stream.receive.credit_due = false;
             stream.accepted = true;
             // A stream's window follows its child: once the child has read
             // all it was given, the client may send what it can take. A
@@ -1297,6 +1425,7 @@ impl Http2 {
                 - i64::from(delivery.windowed_bytes);
             if let Some(back) = credit_back(stream.receive.window, room) {
                 if !self.window_update(env, id, back) {
+                    // The connection is over: every stream has ended.
                     return true;
                 }
                 if let Some(stream) = self.streams.get_mut(&id) {
@@ -1304,6 +1433,9 @@ impl Http2 {
                 }
             }
         }
+        due.clear();
+        due.shrink_to(KEEP);
+        self.credit_due = due;
         self.pending_resets = 0;
         self.batch = false;
         true
@@ -1354,6 +1486,7 @@ impl Http2 {
             // its exchange: the stream alone is reset.
             _ => self.write_reset(env, id, ErrorCode::InternalError),
         }
+        self.schedule(id);
     }
 
     /// Encodes a response head as HEADERS and CONTINUATION frames, which go
@@ -1430,50 +1563,51 @@ impl Http2 {
     /// turn, and the ends of bodies whose bytes are all out.
     fn send(&mut self, env: &mut Env<'_, Report>) -> bool {
         let mut moved = false;
-        loop {
-            // Each stream once, those after the last served first. A stream
-            // may end as it is served, so each is found again from the one
-            // before it instead of from a list made ahead.
-            let turn = self.turn;
-            let mut any = false;
-            for (low, high) in [(turn.saturating_add(1), u32::MAX), (0, turn)] {
-                let mut from = low;
-                while from <= high
-                    && let Some(id) = self.streams.range(from..=high).next().map(|(id, _)| *id)
-                {
-                    if self.unwritten_bytes >= OUT_LIMIT || self.phase != Phase::Open {
-                        return moved;
+        // Streams take turns a frame at a time: one that sent goes to the
+        // back of the line if it has more it can send.
+        while self.unwritten_bytes < OUT_LIMIT
+            && self.phase == Phase::Open
+            && let Some(id) = self.runnable.pop_front()
+        {
+            let Some(stream) = self.streams.get_mut(&id) else {
+                continue;
+            };
+            stream.response.turn = Turn::Idle;
+            match self.send_one(env, id) {
+                Sent::Frame => {
+                    moved = true;
+                    self.schedule(id);
+                }
+                Sent::Nothing => {}
+                Sent::AwaitingWindow => {
+                    if let Some(stream) = self.streams.get_mut(&id) {
+                        stream.response.turn = Turn::AwaitingWindow;
+                        self.awaiting_window.push_back(id);
                     }
-                    if self.send_one(env, id) {
-                        self.turn = id;
-                        any = true;
-                        moved = true;
-                    }
-                    let Some(next) = id.checked_add(1) else {
-                        break;
-                    };
-                    from = next;
                 }
             }
-            if !any {
-                return moved;
-            }
         }
+        trim(&mut self.runnable);
+        moved
     }
 
-    /// One frame of stream `id`'s response, if it can go. Returns whether
-    /// one went.
-    fn send_one(&mut self, env: &mut Env<'_, Report>, id: u32) -> bool {
+    /// One frame of stream `id`'s response, if it can go.
+    fn send_one(&mut self, env: &mut Env<'_, Report>, id: u32) -> Sent {
         let frame = self.frame.min(wire::DEFAULT_FRAME_SIZE);
         let window = self.send_window;
         let Some(stream) = self.streams.get_mut(&id) else {
-            return false;
+            return Sent::Nothing;
         };
         let response = &mut stream.response;
         if let Some(front) = response.queue.front_mut() {
             let n = sendable(front.len(), window, response.window, frame);
             if n == 0 {
-                return false;
+                // A stream window that opens schedules the stream again.
+                return if response.window > 0 {
+                    Sent::AwaitingWindow
+                } else {
+                    Sent::Nothing
+                };
             }
             let payload = front.split_to(n);
             if front.is_empty() {
@@ -1491,7 +1625,7 @@ impl Http2 {
             let len = wire::HEADER_LEN + if whole { n } else { 0 };
             let Some(charge) = env.budget().charge(len) else {
                 self.over_budget(env);
-                return true;
+                return Sent::Frame;
             };
             let mut bytes = Vec::with_capacity(len);
             wire::FrameHeader {
@@ -1510,7 +1644,7 @@ impl Http2 {
                 self.queue_continuation(payload, id, n as u64);
             }
             self.grant(id);
-            return true;
+            return Sent::Frame;
         }
         match std::mem::replace(&mut response.reply, Reply::Ended) {
             Reply::Ending(None) => {
@@ -1526,16 +1660,16 @@ impl Http2 {
                     id,
                     true,
                 );
-                true
+                Sent::Frame
             }
             Reply::Ending(Some(trailers)) => {
                 let fields = fields_of(&trailers);
                 self.header_block(env, id, &fields, true);
-                true
+                Sent::Frame
             }
             other => {
                 response.reply = other;
-                false
+                Sent::Nothing
             }
         }
     }
@@ -1664,10 +1798,7 @@ impl Layer for Http2 {
                 Ok(Admit::Taken)
             }
             StreamEvent::Reset => {
-                let ids: Vec<u32> = self.streams.keys().copied().collect();
-                for id in ids {
-                    self.end_stream(id, Ending::Gone);
-                }
+                self.end_all();
                 self.out.clear();
                 self.sent.clear();
                 self.unwritten_bytes = 0;
@@ -1709,8 +1840,10 @@ impl Layer for Http2 {
                         delivery.credit_bytes = delivery.credit_bytes.saturating_add(units);
                         delivery.peak_credit_bytes =
                             delivery.peak_credit_bytes.max(delivery.credit_bytes);
+                        self.uncredited -= usize::from(!delivery.credited);
                         delivery.credited = true;
                     }
+                    self.credit_may_be_due(id);
                     self.forward(id);
                     // The child read: credit for its stream may be due.
                     self.batch = true;
@@ -1782,7 +1915,7 @@ impl Layer for Http2 {
         if drained
             && self.batch
             && self.up.is_empty()
-            && self.streams.values().all(|s| s.delivery.credited)
+            && self.uncredited == 0
             && self.phase == Phase::Open
         {
             moved |= self.release(env);
@@ -1849,6 +1982,15 @@ fn problem(code: ErrorCode, reason: &'static str) -> wire::Error {
 fn trim<T>(queue: &mut VecDeque<T>) {
     if queue.is_empty() {
         queue.shrink_to(KEEP);
+    }
+}
+
+/// Puts stream `id`, with `response`, at the back of `runnable` if it has
+/// a frame its window lets it send and waits nowhere yet.
+fn schedule(runnable: &mut VecDeque<u32>, id: u32, response: &mut Response) {
+    if response.turn == Turn::Idle && response.has_frame() {
+        response.turn = Turn::Runnable;
+        runnable.push_back(id);
     }
 }
 
@@ -3232,5 +3374,106 @@ mod tests {
             assert!((1..=KEEP).contains(&capacity), "{capacity}");
         }
         assert!(!harness.ended());
+    }
+
+    #[test]
+    fn streams_take_turns_a_frame_at_a_time() {
+        let body = vec![b't'; 3 * wire::DEFAULT_FRAME_SIZE];
+        let mut harness = answering(body.clone(), wire::DEFAULT_FRAME_SIZE, Budget::unlimited());
+        let mut input = client_preface();
+        // Room on the connection for both bodies whole.
+        write(
+            &wire::WindowUpdate {
+                stream: 0,
+                flags: 0,
+                increment: 1 << 20,
+            },
+            &mut input,
+        );
+        let mut encoder = hpack::Encoder::new(4096);
+        input.extend(get(&mut encoder, 1, "/"));
+        input.extend(get(&mut encoder, 3, "/"));
+        harness.push(&input).unwrap();
+        let order: Vec<u32> = frames(&harness.take_output())
+            .into_iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if !d.data.is_empty() => Some(d.stream),
+                _ => None,
+            })
+            .collect();
+        for stream in [1, 3] {
+            let sent = order.iter().filter(|&&s| s == stream).count();
+            assert!(sent >= 3, "{order:?}");
+        }
+        // A stream sends twice in a row only once the other has no frame
+        // left.
+        for (i, pair) in order.windows(2).enumerate() {
+            if pair[0] == pair[1] {
+                assert!(order[i + 1..].iter().all(|&s| s == pair[0]), "{order:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn streams_blocked_on_the_connection_window_send_when_it_opens() {
+        let body = vec![b'c'; 40_000];
+        let mut harness = answering(body.clone(), body.len(), Budget::unlimited());
+        // The client's streams have room for their bodies, but the
+        // connection's window holds less than both.
+        let mut input = wire::PREFACE.to_vec();
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting {
+                    id: 4,
+                    value: 1 << 20,
+                }],
+            },
+            &mut input,
+        );
+        write(
+            &wire::Settings {
+                flags: 1,
+                entries: Vec::new(),
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        harness.take_output();
+        let mut encoder = hpack::Encoder::new(4096);
+        let mut input = get(&mut encoder, 1, "/");
+        input.extend(get(&mut encoder, 3, "/"));
+        harness.push(&input).unwrap();
+        let mut output = frames(&harness.take_output());
+        let data = |output: &[Frame]| -> usize {
+            output
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Data(d) => Some(d.data.len()),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(data(&output), WINDOW as usize);
+        let mut update = Vec::new();
+        write(
+            &wire::WindowUpdate {
+                stream: 0,
+                flags: 0,
+                increment: 1 << 20,
+            },
+            &mut update,
+        );
+        harness.push(&update).unwrap();
+        output.extend(frames(&harness.take_output()));
+        assert_eq!(data(&output), 2 * body.len());
+        for stream in [1, 3] {
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::Data(d) if d.stream == stream && d.flags & 1 != 0)),
+                "{output:?}"
+            );
+        }
     }
 }
