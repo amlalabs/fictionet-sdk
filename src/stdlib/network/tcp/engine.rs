@@ -242,7 +242,7 @@ pub(super) struct Id(pub(super) u64);
 pub(super) const COMPACT_SLOTS: usize = 256;
 
 /// One machine's TCP as a layer: `Packets<IpPacket, Chunk>` below, the
-/// [`Tcp`] mux above. See the [module docs](self).
+/// [`Tcp`] mux above. See the [module docs](super).
 ///
 /// # The layer above
 ///
