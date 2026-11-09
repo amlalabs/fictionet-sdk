@@ -113,34 +113,62 @@ still violates the corresponding temporal or action property. Transactional
 binding preparation passed with 9,986 distinct states. These checks retain
 their existing abstraction limits; they do not prove the entire host loop.
 
-The existing network and runtime benchmarks were run on the same workstation
-against the integration branch before world composition and after batching
-packet ingress and child events. Each row is a median of three samples.
-Other verification jobs shared the workstation, so these are diagnostic
-measurements, not isolated performance guarantees.
+The network and runtime benchmarks compare three builds of the same
+benchmark code: the integration branch before world composition
+(`comp/integ` at 3a9e9b99e), the demo fallback (tag
+`demo-fallback-20261109`), and world composition after the changes below.
+Each build ran three times, the builds interleaved, under the 10 GiB work
+slice. `perf stat -e instructions:u` counted each bench process, setup
+included; instruction counts repeat to within a fraction of a percent, so
+they are the primary measure. Times are Divan medians of the three runs
+and carry the noise of other jobs on the workstation. Bench binaries were
+built with frame pointers and line tables, the same way for all builds.
 
-| Workload | Integration baseline | World composition |
-| --- | ---: | ---: |
-| TCP, one connection, 32 MiB | 28.13 ms | 36.36 ms |
-| TCP, ten connections, 4 MiB each | 45.03 ms | 59.52 ms |
-| TCP, one hundred connections, 1 MiB each | 209.2 ms | 381.8 ms |
-| TCP round trips | 34.66 ms | 51.44 ms |
-| TCP transfer with 99 idle connections | 81.11 ms | 83.98 ms |
-| HTTP/1, 100,000 requests | 1.356 s | 2.094 s |
-| HTTP/2, 100,000 requests | 1.976 s | 3.429 s |
+| Workload | Demo fallback | Integration | World, first | World, now |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP bench process, instructions | 27.56 G | 47.17 G | 80.10 G | 49.94 G |
+| HTTP/1, 100,000 requests | 0.895 s | 1.301 s | 2.032 s | 1.337 s |
+| HTTP/2, 100,000 requests | 1.394 s | 2.043 s | 3.373 s | 2.094 s |
+| HTTP/1 allocations | 4.54 M | 10.84 M | 11.74 M | 11.10 M |
+| HTTP/2 allocations | 7.11 M | 19.27 M | 22.65 M | 19.59 M |
+| TCP bench process, instructions | 4.51 G | 5.72 G | 10.01 G | 5.83 G |
+| TCP, one connection, 32 MiB | 23.73 ms | 28.38 ms | 35.63 ms | 31.09 ms |
+| TCP, ten connections, 4 MiB each | 51.27 ms | 53.21 ms | 60.01 ms | 47.99 ms |
+| TCP, one hundred connections, 1 MiB each | 166.8 ms | 269.1 ms | 388.4 ms | 212.1 ms |
+| TCP round trips, instructions | 0.428 G | 0.616 G | 0.834 G | 0.698 G |
+| TCP round trips | 23.04 ms | 35.09 ms | 51.77 ms | 38.46 ms |
+| Transfer with 99 idle connections, instructions | 2.21 G | 2.63 G | 2.78 G | 2.67 G |
 
-The new packet and child drivers add scheduling and ownership bookkeeping.
-Batching removed a repeated transport sweep per received packet and a
-repeated child sweep per queued child event. Before those changes the
-HTTP runs took 4.004 s and 7.208 s. The remaining slowdown is material;
-these results do not establish performance parity. Peak measured HTTP/1
-allocations were 1.040 MB versus 1.073 MB at baseline, and HTTP/2 used
-1.101 MB versus 0.984 MB. Allocation counts increased from 10.843 million
-to 11.741 million for HTTP/1 and from 19.266 million to 22.654 million
-for HTTP/2. The measurements do not attribute the remaining CPU cost to
-individual components.
-The unchanged HTTP/1 decoder benchmark, using 100 samples, measured
-26.08 ms versus 25.50 ms at baseline.
+"World, first" is `comp/p3-world` at a2ec922a8, measured once the same way.
+Profiles (`perf record --call-graph fp`) attributed its extra cost to these
+causes, each removed in the design:
+
+- `Children` advanced every child on every pass and read every child's
+  deadline and depth through its whole stack on every driver step, so one
+  packet for one connection stepped every connection. It now keeps its
+  children in a slab, links ready children and children with work into
+  intrusive lists, and keeps deadlines in an indexed heap. This took the
+  HTTP bench from 80.1 G to 63.4 G instructions.
+- The packet driver let one packet of a transport walk through the IP layer
+  per turn, so the TCP engine was stepped for every packet or two, each
+  step visiting every connection; it walked the transports again with
+  nothing new; and it re-stepped a saturated engine before writers refilled
+  it, which sent buffer tails as extra short segments (fifteen percent more
+  data packets with a hundred connections). It now drains a walk's output
+  in the same turn, walks only when something is new, and lets a saturated
+  engine continue after the run's other tasks, as before composition.
+- Application work was polled once after the router's turns, so a response
+  body finished one walk late and went out as a second TCP segment: one
+  more packet per HTTP/1 request. Work is now polled within the turns.
+- Smaller costs: full fences in child visits, polling an empty router,
+  self-wakes for the task's own commands, and reading the clock per packet.
+
+The remaining gap to the integration branch, about six percent for HTTP
+and thirteen for round trips, lies in the composition's own layers: the IP
+layer and TCP behind their factories, `Session` and two levels of boxed
+stacks per connection, and boxed work and results, about three more
+allocations per request. The demo fallback predates the layer runtime and
+is faster on every row.
 
 The datagram model rerun generated 32,196 states and found 5,787 distinct
 states, with no violation. Disabling whole-datagram preservation, which
