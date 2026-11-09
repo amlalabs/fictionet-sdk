@@ -768,13 +768,7 @@ impl Dissector {
 
     /// Decodes a TCP segment and gives it to the observer, whose
     /// connections' bytes go to their decoders.
-    fn tcp(
-        &mut self,
-        p: &[u8],
-        header: &Header,
-        d: &mut Decoded,
-        context: DecodeContext<'_>,
-    ) {
+    fn tcp(&mut self, p: &[u8], header: &Header, d: &mut Decoded, context: DecodeContext<'_>) {
         let (at, end) = (header.payload.start, header.payload.end);
         let Some(segment) = TcpHeader::read(&p[at..end]) else {
             return truncated(d, "TCP", end - at);
