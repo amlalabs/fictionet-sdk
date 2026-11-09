@@ -38,7 +38,6 @@ pub(super) struct Hooks {
     pub(super) attachment_observe: Option<super::OnAttachment>,
     pub(super) dns_observe: Option<super::OnDns>,
 
-    pub(super) http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
     /// The sandbox that last bound each address. An entry stays after its
     /// sandbox detaches, until another binds the address, so packets and
     /// connections still on their way name the sandbox that sent them.

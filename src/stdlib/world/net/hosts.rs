@@ -55,8 +55,6 @@ pub type CertificateFor = Arc<dyn Fn(&Cx) -> CertificateFuture + Send + Sync>;
 /// One connection, accepted on a port of a machine, as a [`PortServer`] gets
 /// it.
 pub struct Arrival {
-    /// The network default for HTTP exchange observations.
-    pub http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
     /// The connection: after the TLS handshake, on a TLS port.
     pub conn: Box<dyn Connection>,
     /// Who it is from, and where it arrived.
@@ -76,8 +74,6 @@ pub struct Arrival {
 /// A plain or negotiated TLS stream before its application is constructed.
 /// [`PortServer::stack`] receives this context without a connection adapter.
 pub struct Opening {
-    /// The network default for HTTP exchange observations.
-    pub http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
     /// Who it is from, where it arrived, and the name and protocol TLS
     /// settled ([`ConnInfo::sni`], [`ConnInfo::alpn`]).
     pub info: ConnInfo,
@@ -94,7 +90,6 @@ impl Opening {
     /// The arrival of `conn`, which carries this opening's stream.
     pub fn arrive(self, conn: Box<dyn Connection>) -> Arrival {
         Arrival {
-            http_observe: self.http_observe,
             conn,
             info: self.info,
             socket: self.socket,
@@ -1816,7 +1811,6 @@ impl Machine {
                                     info.handshake = Some(handshake);
                                 }
                                 let opening = Opening {
-                                    http_observe: hooks.http_observe.clone(),
                                     info,
                                     socket,
                                     budget: Some(budget.clone()),
@@ -1935,7 +1929,7 @@ fn secure(fcx: &Cx, opening: Opening, port: Arc<Port>, hooks: Arc<Hooks>) -> Box
         let (fcx, info, budget) = (fcx.clone(), info.clone(), budget.clone());
         let handshook = handshook.clone();
         let names = port.clone();
-        let (http_observe, tls_observe) = (hooks.http_observe.clone(), hooks.tls_observe.clone());
+        let tls_observe = hooks.tls_observe.clone();
         move |state: tls::Handshake<'_>| -> Option<Boxed> {
             handshook.store(true, std::sync::atomic::Ordering::Relaxed);
             let tls::Handshake::Established { server_name, alpn } = state else {
@@ -1951,7 +1945,6 @@ fn secure(fcx: &Cx, opening: Opening, port: Arc<Port>, hooks: Arc<Hooks>) -> Box
                 });
             }
             let opening = Opening {
-                http_observe,
                 info,
                 socket,
                 budget,
@@ -2195,7 +2188,6 @@ mod tests {
                     open: Arc::default(),
                 });
                 let opening = |socket: Arc<Custom>| Opening {
-                    http_observe: None,
                     info: ConnInfo::default(),
                     socket,
                     budget: None,

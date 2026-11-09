@@ -1,6 +1,49 @@
 use super::*;
 use fictionet::Seed;
 
+#[test]
+fn website_observers_follow_dynamic_servers_and_overrides() {
+    use fictionet::stdlib::web::httpd;
+
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let shared = Arc::new(AtomicUsize::new(0));
+        let overridden = Arc::new(AtomicUsize::new(0));
+        let observer = |count: Arc<AtomicUsize>| -> httpd::Observe {
+            Arc::new(move |observation| {
+                assert!(observation.complete);
+                assert_eq!(observation.response.unwrap().status, StatusCode::OK);
+                count.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let own = observer(overridden.clone());
+        let (attacher, attachments) = fictionet::attachments();
+        web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
+            let mut server = httpd::Server::new(fictionet_test_support::handler(|_, _| {
+                Response::new(Bytes::from_static(b"ok"))
+            }));
+            if name == "override.test" {
+                server = server.observe(own.clone());
+            }
+            Some(web::Site::from_server(server))
+        })
+        .observe_http(observer(shared.clone()))
+        .start(&fcx, attachments)?;
+        let machine = default_machine(&fcx, &attacher);
+        for (name, shared_count, own_count) in [
+            ("first.test", 1, 0),
+            ("override.test", 1, 1),
+            ("later.test", 2, 1),
+        ] {
+            let address = lookup(&fcx, &machine, name).await;
+            let mut client = plain_client(&fcx, &machine, address, false).await;
+            assert_eq!(client.get("http", name, "/").await.status, StatusCode::OK);
+            assert_eq!(shared.load(Ordering::SeqCst), shared_count);
+            assert_eq!(overridden.load(Ordering::SeqCst), own_count);
+        }
+        Ok(())
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tests: routing, unreachable, isolation, binding
 
