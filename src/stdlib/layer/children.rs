@@ -106,6 +106,7 @@ where
 {
     make: Box<ChildFactory<B, O>>,
     budget_for: Option<Box<ChildBudget<O>>>,
+    close_finished: bool,
     kids: Vec<(ChildId, Kid<B>)>,
     limit: usize,
     window: u64,
@@ -198,6 +199,7 @@ where
         Children {
             make: Box::new(make),
             budget_for: None,
+            close_finished: false,
             kids: Vec::new(),
             storage: None,
             limit,
@@ -210,6 +212,15 @@ where
             remaining_visits: 0,
             sweep_first: None,
         }
+    }
+
+    /// Releases a child handle when its application is terminal and every
+    /// command has drained. Enable this when the mux owns transport retirement
+    /// independently of application lifetime. By default, the mux controls
+    /// closure; finishing an application does not imply a reset of its carrier.
+    pub fn close_finished(mut self) -> Self {
+        self.close_finished = true;
+        self
     }
 
     /// Chooses a child's budget before allocating its receive window or
@@ -409,6 +420,7 @@ where
             kid.outbox = kid.layer.take_command();
             moved |= kid.outbox.is_some();
         }
+        let output_idle = kid.outbox.is_none();
         if let Some(mut command) = kid.outbox.take() {
             if !command.splittable() && command.credit() > kid.max_command {
                 self.refuse(env, id);
@@ -439,7 +451,8 @@ where
             kid.owed = 0;
             moved = true;
         }
-        if kid.layer.is_terminal() && kid.outbox.is_none() && self.down.len() < QUEUE {
+        if self.close_finished && kid.layer.is_terminal() && output_idle && self.down.len() < QUEUE
+        {
             let kid = self.remove(id).expect("visited child");
             self.down.push_back(kid.handle.close());
             return Ok(true);
@@ -782,6 +795,7 @@ mod tests {
         productive: bool,
         timer: bool,
         fired: usize,
+        terminal: bool,
     }
 
     impl Layer for Reader {
@@ -792,6 +806,9 @@ mod tests {
         type Work = ();
         type Done = ();
         type Error = Infallible;
+        fn is_terminal(&self) -> bool {
+            self.terminal
+        }
         fn on_event(
             &mut self,
             _: &mut Env<'_, ()>,
@@ -848,6 +865,52 @@ mod tests {
             Budget::new(100_000),
             Instant::ZERO,
         )
+    }
+
+    #[test]
+    fn terminal_children_drain_every_command_before_closing() {
+        let mut driver = driver(|_, _, _| Reader {
+            terminal: true,
+            writes: [
+                StreamCommand::Write(Chunk::new(b"first".to_vec())),
+                StreamCommand::Write(Chunk::new(b"last".to_vec())),
+                StreamCommand::End,
+            ]
+            .into(),
+            ..Reader::default()
+        });
+        driver.layer_mut().close_finished = true;
+        let mut slots = Slots::new(1);
+        let child = slots.insert(()).unwrap();
+        let id = child.id();
+        assert!(
+            driver
+                .deliver(MuxEvent::Opened(child, "stream", 9))
+                .unwrap()
+                .moved()
+        );
+        assert!(driver.deliver(MuxEvent::Credit(id, 9)).unwrap().moved());
+        driver.run().unwrap();
+        let mut bytes = Vec::new();
+        let mut ended = false;
+        let mut closed = false;
+        driver.send_below(|command| {
+            match command.into_op() {
+                super::super::MuxOp::Child(_, StreamCommand::Write(chunk)) => {
+                    assert!(!ended && !closed);
+                    bytes.extend_from_slice(&chunk);
+                }
+                super::super::MuxOp::Child(_, StreamCommand::End) => ended = true,
+                super::super::MuxOp::Close(_) => {
+                    assert!(ended);
+                    closed = true;
+                }
+                _ => {}
+            }
+            Admit::Taken
+        });
+        assert_eq!(bytes, b"firstlast");
+        assert!(closed);
     }
 
     #[test]

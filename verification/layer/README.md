@@ -84,11 +84,11 @@ cargo kani -p fictionet --harness a_chunk_cursor_never_passes_the_end
 cargo kani -p fictionet --harness stream_credit_splits_keep_the_allocation_owned
 ```
 
-Run Cargo under `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0`
-with `CARGO_BUILD_JOBS=6` and the worktree's `CARGO_TARGET_DIR`. Measured results
+Run Cargo under `systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0`
+with `CARGO_BUILD_JOBS=4` and the worktree's `CARGO_TARGET_DIR`. Measured results
 and proof scope are recorded in [VERIFICATION.md](VERIFICATION.md).
 
-Application completion in `Children::visit_child` uses the same close and work
+With `close_finished` enabled, application completion in `Children::visit_child` uses the same close and work
 cancellation path as failure. The abstract `MayFail` close includes completion;
 Rust additionally waits for the child outbox to drain. A transport close is
 a request to release that child handle, not proof that a TCP socket retired.

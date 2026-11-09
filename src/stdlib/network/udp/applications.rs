@@ -16,6 +16,7 @@ pub(super) struct Applications {
 impl Applications {
     pub(super) fn new(fcx: &Cx) -> Self {
         let children = Children::new(4096, 1, |_, (application, _), _| application)
+            .close_finished()
             .budgets(|_, (_, budget): &(Application, Budget), _| budget.clone());
         let mut driver = Driver::new(
             children,
@@ -38,6 +39,13 @@ impl Applications {
         cx: &mut std::task::Context<'_>,
     ) -> fictionet::Result<bool> {
         self.driver.set_now(fcx.now());
+        // As in the stream runner, existing work observes transport wakeups
+        // before queued input ends its child lifetime. Work cancelled by that
+        // input is removed before the next poll.
+        let completed = self
+            .jobs
+            .poll(Some(fcx), cx, |done| self.driver.complete(done))
+            .map_err(|e| fictionet::Error::msg(e.to_string()))?;
         let mut exhausted = false;
         for turn in 0..64 {
             if self.pending.is_empty() {
@@ -46,11 +54,10 @@ impl Applications {
                     &mut shared.inner.lock().application_events,
                 );
             }
-            let mut moved = self
-                .driver
+            self.driver
                 .run()
                 .map_err(|e| fictionet::Error::msg(e.to_string()))?;
-            moved |= self
+            let mut moved = self
                 .driver
                 .send_below(|command| shared.with(|inner| inner.application_command(command)));
             if let Some(event) = self.pending.pop_front() {
@@ -79,7 +86,8 @@ impl Applications {
         if self.jobs.budget_exhausted() {
             return Err(fictionet::Error::msg("application work budget exhausted"));
         }
-        Ok(exhausted
+        Ok(completed
+            || exhausted
             || moved
             || !self.pending.is_empty()
             || self.driver.exhausted()

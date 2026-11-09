@@ -109,7 +109,8 @@ where
     }
     fn is_terminal(&self) -> bool {
         self.reset
-            || ((self.layer.is_terminal() || (self.input_end && self.output_end))
+            || (self.output_end
+                && (self.layer.is_terminal() || self.input_end)
                 && self.pending == 0
                 && self.jobs.load(Ordering::Relaxed) == 0
                 && self.command.is_none())

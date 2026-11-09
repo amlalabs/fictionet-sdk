@@ -3,8 +3,7 @@
 The code that runs layer stacks on live sockets, and the first stacks
 ported onto it: `layer::Framed` (`src/stdlib/layer/framed.rs`), the
 runners `services::stack::stream` and `services::stack::datagrams`
-(`src/stdlib/services/stack/`, the stream runner in `live.rs`) that `Host::tcp_stack` and
-`Host::udp_stack` serve ports with, the Nuclear controllers' Modbus/TCP
+(`src/stdlib/services/stack/`, the stream runner in `live.rs`), the Nuclear controllers' Modbus/TCP
 stack (`demos/nuclear/world/src/plc.rs`) and the Search time server
 (`demos/search/world/src/ntp.rs`).
 
@@ -50,3 +49,13 @@ cargo test -p fictionet --lib -- layer::framed services::stack
 ```
 
 TLC 2.19; Kani 0.68 with CBMC 6.11.
+
+World hosts now attach stacks directly to TCP and UDP children. `Session`
+in `services/stack/session.rs` supplies stream idle and write timeouts. Its
+completion predicate requires the output end, no unreported writes or running
+work, and either input end or application termination. The stream model's
+`shut`, `inputOver`, and `written` project those conditions for a nonterminal
+application without jobs. The full `Session` adapter and packet dispatch loop
+are not modeled by `StreamRunner`; child isolation and budget refusal remain
+in the layer models, and integration tests check their composition.
+Transport retirement owns admission counts after application completion.
