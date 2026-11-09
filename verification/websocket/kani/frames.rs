@@ -421,7 +421,12 @@ fn websocket_writer_uses_minimal_length() {
     let fin: bool = kani::any();
     let mut bytes = Vec::new();
     write_header(&mut bytes, fin, Opcode::Binary, mask, len);
-    let header = Header::parse(&bytes).unwrap().unwrap();
+    let parsed = Header::parse(&bytes);
+    assert!(
+        parsed.is_ok(),
+        "written header must satisfy the wire grammar"
+    );
+    let header = parsed.unwrap().unwrap();
     assert_eq!(header.len, len);
     assert_eq!(header.fin, fin);
     assert_eq!(header.mask, mask);
