@@ -47,16 +47,7 @@ fn sources(root: &Path, research: &Path) -> io::Result<Vec<ArchiveFile>> {
     Ok(files)
 }
 
-fn available_space(root: &Path) -> io::Result<u64> {
-    let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // statvfs initializes the output on success; the path is NUL terminated.
-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail * stats.f_frsize)
-}
+use fictionet_host::filesystem::available_space;
 
 impl ReferenceWeb {
     /// Open the prepared index. Research batches published after preparation,
