@@ -1,17 +1,26 @@
+#![deny(unsafe_code)]
+
 //! Guest-only entry point for the isolated raw Ethernet exercise.
 use std::{ffi::CString, fs, io};
+// Guest interface configuration requires Linux ioctls.
+#[allow(unsafe_code)]
 #[path = "../egress.rs"]
 mod egress;
 #[path = "../port_zero.rs"]
 mod port_zero;
 #[path = "../rawnic_frames.rs"]
 mod rawnic_frames;
+// Guest transport exercises own their descriptor and device syscall boundaries.
+#[allow(unsafe_code)]
 #[path = "../rawnic_world.rs"]
 mod rawnic_world;
 
+// Mounting the guest filesystems has no standard library equivalent.
+#[allow(unsafe_code)]
 fn mount(kind: &str, target: &str) -> io::Result<()> {
     let kind = CString::new(kind)?;
     let target = CString::new(target)?;
+    // SAFETY: all strings are terminated and the null data pointer is valid for these mounts.
     if unsafe {
         libc::mount(
             kind.as_ptr(),
@@ -27,6 +36,8 @@ fn mount(kind: &str, target: &str) -> io::Result<()> {
     Ok(())
 }
 
+// Guest initialization loads modules and configures loopback before running workloads.
+#[allow(unsafe_code)]
 fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     if std::process::id() != 1 {
         return Err("guest entry point requires PID one".into());
@@ -50,6 +61,7 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         let bytes = fs::read(path)?;
+        // SAFETY: bytes remains readable for its length and the module arguments are terminated.
         if unsafe {
             libc::syscall(
                 libc::SYS_init_module,
@@ -66,16 +78,20 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     fs::write("/etc/hosts", "127.0.0.1 localhost\n")?;
     // The full host transport tests use guest-local TCP listeners.
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    // SAFETY: ifreq consists of integer fields and a union whose zero bits are valid.
     let mut interface: libc::ifreq = unsafe { std::mem::zeroed() };
     interface.ifr_name[0] = b'l' as libc::c_char;
     interface.ifr_name[1] = b'o' as libc::c_char;
     use std::os::fd::AsRawFd;
+    // SAFETY: the terminated interface name and complete writable ifreq are valid for this call.
     if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &mut interface) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
+    // SAFETY: successful SIOCGIFFLAGS initialized the flags union member.
     unsafe {
         interface.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
     }
+    // SAFETY: the complete request contains the initialized name and flags member.
     if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS, &interface) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -129,6 +145,8 @@ fn run(guest: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Only this guest entry point accesses its exit port or powers off the guest.
+#[allow(unsafe_code)]
 fn main() {
     let mut guest = false;
     let result = run(&mut guest);
@@ -149,6 +167,7 @@ fn main() {
         }
     }
     if guest {
+        // SAFETY: reboot takes a scalar command and no pointers; the guest gate limits its scope.
         unsafe {
             libc::reboot(libc::RB_POWER_OFF);
         }

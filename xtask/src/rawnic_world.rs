@@ -450,7 +450,8 @@ pub fn tun() -> fictionet::Result {
             if sent != expected.len() as isize {
                 return Err(io::Error::last_os_error().into());
             }
-            // SAFETY: the descriptor remains owned, open and nonblocking until deregistration.
+
+            // SAFETY: the owned descriptor stays open with a stable number until deregistration.
             let packet = unsafe { tokio::io::unix::AsyncFd::register(packet)? };
             let (end, mut peer) = fictionet::pair_with_limit(128 * 1024);
             fictionet::run(fictionet::Seed::from_u64(0), move |fcx| async move {

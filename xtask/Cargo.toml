@@ -19,7 +19,7 @@ honeypot-world = { path = "../demos/honeypot", features = ["raw-virtio"], option
 fictionet = { path = ".." }
 fictionet-demo = { path = "../demos/kit" }
 fictionet-extras = { path = "../extras" }
-fictionet-host = { path = "../host" }
+fictionet-host = { path = "../host", features = ["filesystem"] }
 http = "1"
 libc = "0.2"
 web-world = { path = "../demos/search/world" }
@@ -35,3 +35,9 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 mime_guess = "2"
 tar = "0.4"
 xz2 = "0.1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -53,7 +53,8 @@ pub async fn run(args: &[String]) -> crate::Result {
 async fn handshake(path: &str, name: String) -> crate::Result<AsyncFd<OwnedFd>> {
     let fd = unix::connect(path)?;
     unix::set_nonblocking(fd.as_raw_fd(), true)?;
-    // The registration owns the descriptor until it is deregistered.
+
+    // SAFETY: the owned descriptor stays open with a stable number until deregistration.
     let socket = unsafe { AsyncFd::register(fd)? };
     let hello = Message::Hello(Hello {
         version: relay::VERSION,
@@ -235,7 +236,8 @@ async fn bridge(
 ) -> io::Result<()> {
     let input = File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
     unix::set_nonblocking(input.as_raw_fd(), true)?;
-    // The file owns the input pipe throughout its registration.
+
+    // SAFETY: the owned descriptor stays open with a stable number until deregistration.
     let mut input = Input(unsafe { AsyncFd::register(input)? });
     let mut output =
         tokio::fs::File::from_std(File::from(std::io::stdout().as_fd().try_clone_to_owned()?));
