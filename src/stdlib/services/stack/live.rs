@@ -217,7 +217,7 @@ where
                             return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
                         };
                         self.input = Some(StreamEvent::Data(chunk));
-                        self.lifetime.progress();
+                        self.lifetime.took_input();
                     }
                     Poll::Ready(Err(ConnError::Cancelled)) => {
                         return Poll::Ready(Err(StackError::Cancelled));
@@ -335,7 +335,7 @@ where
                 return Poll::Ready(Ok(Halt::Conn(e)));
             }
             if wrote > 0 {
-                self.lifetime.progress();
+                self.lifetime.wrote();
             }
             // Bytes count as written once the connection has handed them on.
             if self.unflushed > 0 {

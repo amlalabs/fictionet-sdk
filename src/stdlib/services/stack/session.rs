@@ -159,8 +159,11 @@ where
                 self.lifetime.end_input();
             }
             self.reset |= reset;
-            if input || written > 0 {
-                self.lifetime.progress();
+            if input {
+                self.lifetime.took_input();
+            }
+            if written > 0 {
+                self.lifetime.wrote();
             }
             self.pending = self.pending.saturating_sub(written);
         }
@@ -542,6 +545,44 @@ pub(super) mod tests {
         assert!(reset_at.since_start() >= Duration::from_millis(200) + limit);
         assert!(session.layer().is_terminal());
         assert_eq!(session.output().len(), 1);
+    }
+
+    /// Input is no sign the peer reads: a peer that keeps sending while it
+    /// takes none of the output still runs into the write limit.
+    #[test]
+    fn input_from_a_peer_that_reads_nothing_does_not_hold_off_the_write_limit() {
+        let limit = Duration::from_millis(300);
+        let mut session = Harness::new(
+            Seed::from_u64(1),
+            Session::new(
+                Says {
+                    write: Some(StreamCommand::Write(Chunk::new(b"four".to_vec()))),
+                    reset_at: None,
+                },
+                StreamLimits {
+                    idle: None,
+                    write_timeout: Some(limit),
+                },
+                Instant::ZERO,
+            ),
+        );
+        session.withhold();
+        session.settle().unwrap();
+        for _ in 0..10 {
+            session.advance(Duration::from_millis(200)).unwrap();
+            session.push(b"x").unwrap();
+        }
+        let reset_at = session
+            .layer()
+            .layer
+            .reset_at
+            .expect("the write limit ran out while the peer kept sending");
+        assert!(
+            reset_at.since_start() <= limit + Duration::from_millis(200),
+            "the reset came at {:?}, long after the limit",
+            reset_at.since_start()
+        );
+        assert!(session.output().is_empty(), "the peer read nothing");
     }
 
     /// Writes once, takes everything, and notes when it heard a reset.
