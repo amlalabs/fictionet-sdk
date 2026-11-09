@@ -56,7 +56,7 @@ use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket
 use fictionet::sync::Mutex;
 use fictionet::{Cancelled, Cx, RecvError};
 
-use job::Jobs;
+pub(crate) use job::Jobs;
 pub(crate) use live::Halt;
 use live::Live;
 

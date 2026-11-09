@@ -51,20 +51,19 @@ use fictionet::sync::Mutex;
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
-use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::layer::{
-    self, Admit, Budget, Chain, Child, ChildId, Chunk, DatagramCommand, DatagramEvent, Driver,
+    self, Admit, Budget, Child, ChildId, Chunk, DatagramCommand, DatagramEvent, Driver,
     MessageCommand, MessageEvent, MuxCommand, MuxEvent, PacketCommand, PacketEvent,
 };
 use fictionet::stdlib::network::icmp;
 
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, Scope};
+use fictionet::stdlib::network::packet::{IpPacket, Scope};
 use fictionet::stdlib::network::transport::{Request, Udp, UdpControl, UdpNotice};
-use fictionet::{Cx, Interface, Packet, RecvError};
+use fictionet::{Cx, Interface, RecvError};
 
 /// Choices for a machine's UDP that a world passes in with
 /// [`Endpoint::settings`]. The default is what the standards say.
@@ -146,11 +145,19 @@ pub fn prepare_endpoint(
     Endpoint,
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
-    let udp = UdpLayer::new(Scope::ROOT, addr, fcx);
-    // The sockets' queues are bounded by the UDP layer's own limits, and
-    // the IP layer holds one packet each way: see `endpoint`.
+    let (endpoint, udp) = prepare_transport(fcx, addr);
+    let ip = super::packet::Factory::default().build(super::packet::Opening {
+        cx: fcx.clone(),
+        addr,
+        budget: Budget::unlimited(),
+    });
+    let task = super::endpoint::drive(fcx.clone(), inner, None, Some(udp), None, ip);
+    (endpoint, Prepared { task })
+}
+
+pub(crate) fn prepare_transport(fcx: &Cx, addr: IpAddr) -> (Endpoint, PacketDriver) {
     let mut driver = Driver::new(
-        Chain::new(IpLayer::host(), udp),
+        UdpLayer::new(Scope::ROOT, addr, fcx),
         Arc::new(fcx.clone()),
         Budget::unlimited(),
         fcx.now(),
@@ -160,7 +167,8 @@ pub fn prepare_endpoint(
         addr,
         inner: Mutex::new(Inner {
             driver,
-            interface: Box::new(inner),
+            output: Vec::new(),
+            wake: None,
             sockets: BTreeMap::new(),
             ports: BTreeMap::new(),
             next_request: 0,
@@ -170,18 +178,50 @@ pub fn prepare_endpoint(
             stopped: false,
         }),
     });
-    let driver = shared.clone();
-    let fcx = fcx.clone();
-    let task = async move {
-        drive(&fcx, &driver).await;
-        driver.with(Inner::stop);
-        Ok(())
-    };
-    (Endpoint { shared }, Prepared { task })
+    (
+        Endpoint {
+            shared: shared.clone(),
+        },
+        PacketDriver {
+            shared,
+            fcx: fcx.clone(),
+        },
+    )
 }
 
-/// The stack an endpoint runs: the IP layer, then UDP.
-type Stack = Chain<IpLayer, UdpLayer>;
+pub(crate) struct PacketDriver {
+    shared: Arc<Shared>,
+    fcx: Cx,
+}
+
+impl PacketDriver {
+    pub(crate) fn deliver(&mut self, packet: IpPacket) {
+        self.shared.with(|inner| {
+            inner.driver.set_now(self.fcx.now());
+            inner.offer(PacketEvent::Packet(packet));
+        });
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        out: &mut Vec<Vec<u8>>,
+    ) -> (bool, Option<fictionet::time::Instant>) {
+        self.shared.with(|inner| {
+            inner.wake = Some(cx.waker().clone());
+            inner.driver.set_now(self.fcx.now());
+            inner.pump();
+            out.append(&mut inner.output);
+            (inner.driver.exhausted(), inner.driver.deadline())
+        })
+    }
+}
+
+impl Drop for PacketDriver {
+    fn drop(&mut self) {
+        self.shared.with(Inner::stop);
+    }
+}
 
 struct Shared {
     addr: IpAddr,
@@ -189,10 +229,9 @@ struct Shared {
 }
 
 struct Inner {
-    driver: Driver<Stack>,
-    /// The interface. The driver task reads it; everything that moves the
-    /// stack writes it.
-    interface: Box<dyn Interface>,
+    driver: Driver<UdpLayer>,
+    output: Vec<Vec<u8>>,
+    wake: Option<Waker>,
     /// The sockets by port.
     sockets: BTreeMap<u16, Mailbox>,
     /// The ports of the sockets by child.
@@ -258,30 +297,13 @@ impl Shared {
         }
         result
     }
-
-    /// Hands one packet from the interface to the stack.
-    fn deliver(&self, fcx: &Cx, packet: Packet) {
-        self.with(|inner| {
-            inner.driver.set_now(fcx.now());
-            let raw = layer::Datagram::new(Chunk::new(packet.0), Ingress::default());
-            inner.offer(PacketEvent::Packet(raw));
-        });
-    }
-
-    /// Lets the stack's timers run.
-    fn tick(&self, fcx: &Cx) {
-        self.with(|inner| {
-            inner.driver.set_now(fcx.now());
-            inner.pump();
-        });
-    }
 }
 
 impl Inner {
     /// Offers the stack an event from the interface, making room once if
     /// it refuses. An event it still refuses is lost, as a packet on a
     /// full link is.
-    fn offer(&mut self, event: PacketEvent<layer::Datagram<Ingress>>) {
+    fn offer(&mut self, event: PacketEvent<IpPacket>) {
         let event = match self
             .driver
             .deliver(event)
@@ -311,7 +333,8 @@ impl Inner {
     fn pump(&mut self) {
         let Inner {
             driver,
-            interface,
+            output,
+            wake,
             sockets,
             ports,
             answers,
@@ -321,8 +344,14 @@ impl Inner {
         loop {
             let mut moved = driver.run().expect("credit is kept");
             moved |= driver.send_below(|command| {
+                if output.len() == 64 {
+                    return Admit::Blocked(command);
+                }
                 if let PacketCommand::Send(bytes) = command {
-                    interface.send(Packet(bytes.into_vec()));
+                    output.push(bytes.into_vec());
+                    if let Some(waker) = wake.take() {
+                        waker.wake();
+                    }
                 }
                 Admit::Taken
             });
@@ -416,47 +445,6 @@ fn route(
     }
 }
 
-async fn drive(fcx: &Cx, shared: &Shared) {
-    loop {
-        let deadline = shared.inner.lock().driver.deadline();
-        let mut sleep = pin!(deadline.map(|t| fcx.sleep_until(t)));
-        let mut n = 0;
-        loop {
-            let next = poll_fn(|cx| {
-                let polled = shared.inner.lock().interface.poll_recv(fcx, cx);
-                match polled {
-                    Poll::Ready(r) => Poll::Ready(Some(r)),
-                    // Only wait when nothing came in this round; otherwise
-                    // hand back to yield.
-                    Poll::Pending if n > 0 => Poll::Ready(None),
-                    Poll::Pending => match sleep.as_mut().as_pin_mut().map(|s| s.poll(cx)) {
-                        Some(Poll::Ready(_)) => Poll::Ready(None),
-                        _ => Poll::Pending,
-                    },
-                }
-            })
-            .await;
-            match next {
-                Some(Ok(packet)) => {
-                    shared.deliver(fcx, packet);
-                    n += 1;
-                    if n == 64 {
-                        break;
-                    }
-                }
-                Some(Err(_)) => return,
-                None => {
-                    shared.tick(fcx);
-                    break;
-                }
-            }
-        }
-        if n == 64 && fcx.yield_now().await.is_err() {
-            return;
-        }
-    }
-}
-
 /// One machine's UDP, made by [`endpoint`].
 ///
 /// An `Endpoint` is a handle to the endpoint's task. Clones share the same
@@ -475,17 +463,13 @@ impl Endpoint {
     /// Sets the header choices for this endpoint's ICMP errors.
     pub fn icmp_options(&self, options: icmp::Options) {
         let mut inner = self.shared.inner.lock();
-        inner
-            .driver
-            .layer_mut()
-            .upper_mut()
-            .set_icmp_options(options);
+        inner.driver.layer_mut().set_icmp_options(options);
     }
 
     /// Sets the choices a world makes for this endpoint's UDP.
     pub fn settings(&self, settings: Settings) {
         let mut inner = self.shared.inner.lock();
-        inner.driver.layer_mut().upper_mut().set_settings(settings);
+        inner.driver.layer_mut().set_settings(settings);
     }
 
     /// Joins the multicast group `group`: datagrams sent to it reach this
@@ -527,7 +511,7 @@ impl Endpoint {
     /// Whether a socket is open on `port`.
     pub fn is_bound(&self, port: u16) -> bool {
         let inner = self.shared.inner.lock();
-        inner.driver.layer().upper().is_bound(port)
+        inner.driver.layer().is_bound(port)
     }
 
     /// Opens a socket on `port`.
@@ -697,6 +681,7 @@ mod tests {
     use super::sockets::{DATAGRAM_COST, QUEUE};
     use super::*;
     use fictionet::InterfaceExt;
+    use fictionet::Packet;
     use fictionet::stdlib::network::ip::{self, protocol};
     use fictionet::{block_on, pair, run};
 

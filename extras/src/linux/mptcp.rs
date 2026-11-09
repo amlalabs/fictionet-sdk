@@ -76,8 +76,8 @@ use std::task::{Context, Poll, Waker};
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::tcp::{
-    AckAnswer, Answer, Handshake, Kept, Received, SegmentVerdict, Segments, Sent, Syn,
-    SynAnswer, TcpOption,
+    AckAnswer, Answer, Handshake, Kept, Received, SegmentVerdict, Segments, Sent, Syn, SynAnswer,
+    TcpOption,
 };
 use fictionet::stdlib::network::{Connection, ConnectionExt};
 use fictionet::stdlib::protocols::mptcp::{

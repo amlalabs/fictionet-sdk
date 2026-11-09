@@ -3,7 +3,7 @@ use super::*;
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::network::ip::{set_header_checksum, transport_checksum};
 use fictionet::stdlib::test_support::rounds;
-use fictionet::{InterfaceExt, Seed, block_on, lab, pair, run};
+use fictionet::{InterfaceExt, Packet, Seed, block_on, lab, pair, run};
 
 #[derive(Debug)]
 struct TestCookies;
@@ -2973,7 +2973,8 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
 
 mod layer {
     use super::*;
-    use fictionet::stdlib::layer::{Chain, MuxOp, PacketEvent};
+    use fictionet::stdlib::layer::{Chain, Datagram, MuxOp, PacketEvent};
+    use fictionet::stdlib::network::packet::{Ingress, IpLayer};
     use fictionet::{Seed, SeededEntropy};
 
     /// One machine: the IP layer, then TCP, run by a driver.

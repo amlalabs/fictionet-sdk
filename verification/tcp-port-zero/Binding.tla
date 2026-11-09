@@ -80,6 +80,8 @@ LiteralDestination ==
 
 \* Plain nonsharing host services: prepare owns temporary listeners until
 \* every declaration succeeds. A duplicate rejects the whole preparation.
+\* Machine::stage prepares the shared packet driver before these listeners;
+\* PreparedMachine::commit starts it only after preparation succeeds.
 VARIABLES installed, held, pending, request, position, phase, before
 preparation == <<installed, held, pending, request, position, phase, before>>
 PreparationInit ==

@@ -4,7 +4,7 @@ use super::{Hooks, LanSeg, Limits, link, normalize};
 use fictionet::stdlib::layer::{Budget, ByteStream, Datagrams, Layer, Top};
 use fictionet::stdlib::network::route::{Prefix, Router};
 use fictionet::stdlib::network::transport::Retirement;
-use fictionet::stdlib::network::{ConnError, Connection, icmp, ip, tcp, udp};
+use fictionet::stdlib::network::{ConnError, Connection, icmp, tcp, udp};
 use fictionet::stdlib::network::{ConnInfo, Transport};
 use fictionet::stdlib::protocols::dns::label_count;
 use fictionet::stdlib::protocols::dns::op::Query;
@@ -19,7 +19,7 @@ use fictionet::stdlib::services::stack::{
 use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
-use fictionet::{Cx, End, Interface, InterfaceExt};
+use fictionet::{Cx, End, Interface};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
@@ -299,6 +299,7 @@ pub struct Host {
     pub(super) ports: Vec<(u16, PortSpec)>,
     lan: Option<super::Lan>,
     tcp_options: tcp::Options,
+    ip_factory: fictionet::stdlib::network::packet::Factory,
     programs: Vec<Arc<dyn Program>>,
     delay: Option<Duration>,
     icmp_options: icmp::Options,
@@ -317,11 +318,19 @@ impl Host {
             ports: Vec::new(),
             lan: None,
             tcp_options: tcp::Options::default(),
+            ip_factory: fictionet::stdlib::network::packet::Factory::default(),
             programs: Vec::new(),
             delay: None,
             icmp_options: icmp::Options::default(),
             udp_settings: udp::Settings::default(),
         }
+    }
+
+    /// Replaces the IP layer shared by this machine's TCP and UDP services.
+    /// The first host installed at an address selects its packet stack.
+    pub fn ip_factory(mut self, factory: fictionet::stdlib::network::packet::Factory) -> Self {
+        self.ip_factory = factory;
+        self
     }
 
     /// Sets transport choices for this host's TCP endpoints.
@@ -1123,11 +1132,6 @@ impl Installation<'_> {
         if placed == Placed::default() {
             return Err("no address is left for it".into());
         }
-        let label = host
-            .names
-            .first()
-            .cloned()
-            .unwrap_or_else(|| host.label.clone());
         let addrs = placed
             .v4
             .map(IpAddr::V4)
@@ -1135,15 +1139,7 @@ impl Installation<'_> {
             .chain(placed.v6.map(IpAddr::V6));
         let prepared = addrs
             .map(|addr| {
-                let machine = Machine::stage(
-                    self,
-                    addr,
-                    &label,
-                    world.machines.get(&addr),
-                    host.tcp_options,
-                    host.icmp_options.clone(),
-                    host.udp_settings,
-                );
+                let machine = Machine::stage(self, addr, world.machines.get(&addr), &host);
                 let ports = machine.machine.prepare(&host)?;
                 Ok((machine, ports))
             })
@@ -1204,16 +1200,7 @@ impl Installation<'_> {
                 .find(|a| free(*a) && !world.machines.contains_key(a))
                 .ok_or_else(|| format!("LAN {name} has no free address left"))?,
         };
-        let label = host.names.first().unwrap_or(&host.label);
-        let mut machine = Machine::stage(
-            self,
-            addr,
-            label,
-            world.machines.get(&addr),
-            host.tcp_options,
-            host.icmp_options.clone(),
-            host.udp_settings,
-        );
+        let mut machine = Machine::stage(self, addr, world.machines.get(&addr), host);
         let ports = machine.machine.prepare(host)?;
         // Joining is the last fallible step. No service or program has
         // started. A delay's task ends when a failed join drops its link.
@@ -1247,15 +1234,7 @@ impl Installation<'_> {
         host: &Host,
         attach: impl FnOnce(Box<dyn Interface>) -> Result<(), String>,
     ) -> Result<tcp::Endpoint, String> {
-        let mut machine = Machine::stage(
-            self,
-            addr,
-            &host.label,
-            None,
-            host.tcp_options,
-            host.icmp_options.clone(),
-            host.udp_settings,
-        );
+        let mut machine = Machine::stage(self, addr, None, host);
         let ports = machine.machine.prepare(host)?;
         if let Some(side) = machine.route.take() {
             attach(self.wire(side, host))?;
@@ -1512,11 +1491,8 @@ impl Machine {
     fn stage(
         installation: &Installation<'_>,
         addr: IpAddr,
-        _label: &str,
         existing: Option<&Arc<Machine>>,
-        options: tcp::Options,
-        icmp_options: icmp::Options,
-        udp_settings: udp::Settings,
+        host: &Host,
     ) -> PreparedMachine {
         if let Some(machine) = existing {
             return PreparedMachine {
@@ -1527,11 +1503,16 @@ impl Machine {
         }
         let fcx = installation.fcx.clone();
         let (router_side, side) = link();
-        let ((tcp, udp, icmp, _other), split) = ip::prepare_split_protocols(&fcx, side);
-        let (tcp, tcp_task) = tcp::prepare_endpoint(&fcx, tcp, addr, options);
+        let (tcp, udp, task) = fictionet::stdlib::network::endpoint::prepare(
+            &fcx,
+            side,
+            addr,
+            host.tcp_options,
+            host.icmp_options.clone(),
+            &host.ip_factory,
+        );
         let hooks = installation.admission.hooks.clone();
         tcp.limit_isolated_peers(move |addr| hooks.by_addr.lock().contains_key(&addr));
-        let (udp, udp_task) = udp::prepare_endpoint(&fcx, udp, addr);
         if installation.admission.hooks.refused_observe.is_some() {
             for protocol in [6, 17] {
                 let hooks = installation.admission.hooks.clone();
@@ -1566,8 +1547,8 @@ impl Machine {
                 }
             }
         }
-        udp.icmp_options(icmp_options.clone());
-        udp.settings(udp_settings);
+        udp.icmp_options(host.icmp_options.clone());
+        udp.settings(host.udp_settings);
         let machine = Arc::new(Machine {
             fcx: fcx.clone(),
             addr,
@@ -1581,10 +1562,7 @@ impl Machine {
             machine,
             route: Some(router_side),
             start: Some(Box::new(move || {
-                split.start(&fcx);
-                tcp_task.start(&fcx);
-                udp_task.start(&fcx);
-                fcx.spawn(move |fcx| pings(fcx, icmp, addr, icmp_options));
+                fcx.spawn(move |_| task);
             })),
         }
     }
@@ -2015,26 +1993,6 @@ async fn connection(
             result: Err(error),
         });
     }
-}
-
-/// Answers pings to `addr`.
-pub(super) async fn pings(
-    fcx: Cx,
-    mut icmp: End,
-    addr: IpAddr,
-    options: icmp::Options,
-) -> fictionet::Result {
-    let mut run = 0;
-    while let Ok(packet) = icmp.recv(&fcx).await {
-        if let Some(reply) = options.echo_reply(&packet, addr) {
-            icmp.send(reply);
-        }
-        run = (run + 1) % 64;
-        if run == 0 && fcx.yield_now().await.is_err() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

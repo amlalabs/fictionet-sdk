@@ -67,22 +67,21 @@ use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Child, ChildId, Chunk, Datagram, Driver, Env, Layer, MessageCommand,
-    MessageEvent, Messages, MuxCommand, MuxEvent, Observe, PacketCommand, PacketEvent,
-    StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Child, ChildId, Chunk, Driver, MessageCommand, MessageEvent,
+    Messages, MuxCommand, MuxEvent, PacketCommand, PacketEvent, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::ip::{
     Header, Ipv4Option, Ipv4Reply, checksum, encode_ipv4_options, ipv4_options,
     protocol::{ICMP, TCP},
     transport_checksum,
 };
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, IpPacket, IpReport};
+use fictionet::stdlib::network::packet::IpPacket;
 use fictionet::stdlib::network::transport::{
     Request, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::time::{Duration, Instant};
-use fictionet::{Cx, Entropy, Error, Interface, Packet};
+use fictionet::{Cx, Entropy, Error, Interface};
 
 mod engine;
 
@@ -989,27 +988,82 @@ pub fn prepare_endpoint(
     Endpoint,
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
+    let (endpoint, tcp) = prepare_transport(fcx, addr, options);
+    let fcx = fcx.clone();
+    let ip = super::packet::Factory::default().build(super::packet::Opening {
+        cx: fcx.clone(),
+        addr,
+        budget: Budget::unlimited(),
+    });
+    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip);
+    (endpoint, Prepared { task })
+}
+
+pub(crate) fn prepare_transport(
+    fcx: &Cx,
+    addr: IpAddr,
+    options: Options,
+) -> (Endpoint, PacketDriver) {
     let tcp = TcpLayer::new(addr, options, fcx, fcx.now());
-    let entropy: Arc<dyn Entropy> = Arc::new(fcx.clone());
     let shared = Arc::new(Shared {
         addr,
         state: Mutex::new(Host {
             fcx: fcx.clone(),
-            ip: IpLayer::host(),
-            held: None,
-            tcp: Driver::new(tcp, entropy, Budget::unlimited(), fcx.now()),
-            budget: Budget::unlimited(),
+            tcp: Driver::new(tcp, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now()),
             routes: Routes::default(),
         }),
     });
-    let driver = shared.clone();
-    let fcx = fcx.clone();
-    let task = async move {
-        drive(&fcx, &driver, inner).await;
-        driver.stop();
-        Ok(())
-    };
-    (Endpoint { shared }, Prepared { task })
+    (
+        Endpoint {
+            shared: shared.clone(),
+        },
+        PacketDriver { shared },
+    )
+}
+
+pub(crate) struct PacketDriver {
+    shared: Arc<Shared>,
+}
+
+impl PacketDriver {
+    pub(crate) fn deliver(&mut self, packet: IpPacket) -> Admit<PacketEvent<IpPacket>> {
+        let mut host = self.shared.state.lock();
+        host.tick();
+        let result = host.tcp.deliver(PacketEvent::Packet(packet)).unwrap();
+        host.pump();
+        host.kick();
+        result
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<Vec<u8>>,
+    ) -> (bool, Option<Instant>) {
+        let (busy, deadline, refused, refusals) = {
+            let mut host = self.shared.state.lock();
+            host.routes.driver = Some(cx.waker().clone());
+            let busy = host.visit(out);
+            (
+                busy,
+                host.tcp.deadline(),
+                host.routes.refused.clone(),
+                std::mem::take(&mut host.routes.refusals),
+            )
+        };
+        if let Some(refused) = refused {
+            for (peer, local) in refusals {
+                refused(peer, local);
+            }
+        }
+        (busy, deadline)
+    }
+}
+
+impl Drop for PacketDriver {
+    fn drop(&mut self) {
+        self.shared.stop();
+    }
 }
 
 /// A command for the engine.
@@ -1029,12 +1083,7 @@ struct Shared {
 struct Host {
     /// The endpoint's context: its clock and its entropy.
     fcx: Cx,
-    /// Reads raw packets into whole, checked ones.
-    ip: IpLayer,
-    /// A packet the IP layer read that the engine had no room for yet.
-    held: Option<IpPacket>,
     tcp: Driver<TcpLayer>,
-    budget: Budget,
     routes: Routes,
 }
 
@@ -1216,13 +1265,6 @@ impl Routes {
     }
 }
 
-/// Reports of the IP layer, which nothing reads.
-struct Quiet;
-
-impl Observe<IpReport> for Quiet {
-    fn observe(&mut self, _: IpReport) {}
-}
-
 impl Host {
     fn engine(&mut self) -> &mut TcpLayer {
         self.tcp.layer_mut()
@@ -1290,56 +1332,10 @@ impl Host {
         }
     }
 
-    /// One turn of the endpoint's task: takes in what of `batch` the
-    /// engine has room for, steps it, and puts what it sends in `out`.
-    /// Returns whether to come back without waiting.
-    fn visit(&mut self, batch: &mut VecDeque<Vec<u8>>, out: &mut Vec<Vec<u8>>) -> bool {
+    /// Steps the transport and drains its output before yielding.
+    fn visit(&mut self, out: &mut Vec<Vec<u8>>) -> bool {
         self.tick();
-        let now = self.tcp.now();
-        if self.ip.deadline().is_some_and(|(at, ())| at <= now) {
-            let mut quiet = Quiet;
-            let mut env = Env::new(now, &self.fcx, &self.budget, &mut quiet);
-            if let Err(never) = self.ip.on_timer(&mut env, ()) {
-                match never {}
-            }
-        }
-        loop {
-            if let Some(packet) = self.held.take() {
-                match self.tcp.deliver(PacketEvent::Packet(packet)) {
-                    Ok(Admit::Blocked(PacketEvent::Packet(packet))) => {
-                        self.held = Some(packet);
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(never) => match never {},
-                }
-            }
-            let Some(raw) = batch.pop_front() else {
-                break;
-            };
-            let mut quiet = Quiet;
-            let mut env = Env::new(now, &self.fcx, &self.budget, &mut quiet);
-            let raw = PacketEvent::Packet(Datagram::new(Chunk::new(raw), Ingress::default()));
-            match self.ip.on_event(&mut env, raw) {
-                Ok(Admit::Blocked(PacketEvent::Packet(raw))) => {
-                    batch.push_front(raw.into_parts().0.into_vec());
-                    break;
-                }
-                Ok(_) => {}
-                Err(never) => match never {},
-            }
-            while let Some(command) = self.ip.take_command() {
-                if let PacketCommand::Send(answer) = command {
-                    out.push(answer.into_vec());
-                }
-            }
-            if let Some(PacketEvent::Packet(packet)) = self.ip.take_event() {
-                self.held = Some(packet);
-            }
-        }
-        if let Err(never) = self.tcp.run() {
-            match never {}
-        }
+        self.tcp.run().unwrap();
         self.tcp.send_below(|command| {
             if let PacketCommand::Send(packet) = command {
                 out.push(packet.into_vec());
@@ -1347,13 +1343,7 @@ impl Host {
             Admit::Taken
         });
         self.pump();
-        self.tcp.exhausted() || self.held.is_some() || self.engine_ref().saturated()
-    }
-
-    /// When the engine or the IP layer next needs time.
-    fn deadline(&self) -> Option<Instant> {
-        let ip = self.ip.deadline().map(|(at, ())| at);
-        [self.tcp.deadline(), ip].into_iter().flatten().min()
+        self.tcp.exhausted() || self.engine_ref().saturated()
     }
 
     /// The endpoint stopped: every wait ends with an error. Waits for
@@ -1427,77 +1417,6 @@ impl Shared {
             w.wake();
         }
     }
-}
-
-/// The endpoint's one task: packets in, the engine, packets out, timers.
-async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
-    let mut timer = fictionet::Timer::new(fcx);
-    let mut batch: VecDeque<Vec<u8>> = VecDeque::with_capacity(64);
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut closed = false;
-    poll_fn(|cx| {
-        if fcx.is_cancelled() {
-            return Poll::Ready(());
-        }
-        while batch.len() < 64 && !closed {
-            match inner.poll_recv(fcx, cx) {
-                Poll::Ready(Ok(p)) => batch.push_back(p.0),
-                Poll::Ready(Err(_)) => {
-                    closed = true;
-                    break;
-                }
-                Poll::Pending => break,
-            }
-        }
-        let received = batch.len();
-        let (exhausted, next, old_driver, refused, refusals) = {
-            let mut host = shared.state.lock();
-            let old_driver = match &host.routes.driver {
-                Some(w) if w.will_wake(cx.waker()) => None,
-                _ => host.routes.driver.replace(cx.waker().clone()),
-            };
-            let exhausted = host.visit(&mut batch, &mut out) || !batch.is_empty();
-            (
-                exhausted,
-                host.deadline(),
-                old_driver,
-                host.routes.refused.clone(),
-                std::mem::take(&mut host.routes.refusals),
-            )
-        };
-        drop(old_driver);
-        if let Some(refused) = refused {
-            for (peer, local) in refusals {
-                refused(peer, local);
-            }
-        }
-        for p in out.drain(..) {
-            inner.send(Packet(p));
-        }
-        if closed && batch.is_empty() {
-            return Poll::Ready(());
-        }
-        if received == 64 || exhausted {
-            // Maybe more is waiting: give the rest of the run a turn, then
-            // come back.
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        match next {
-            None => timer.clear(),
-            Some(d) => {
-                if timer.poll_until(cx, d).is_ready() {
-                    // A timer is due, or the region was cancelled. Come back
-                    // next turn, so a timer that keeps asking to run now
-                    // cannot hold the thread.
-                    timer.clear();
-                    cx.waker().wake_by_ref();
-                }
-            }
-        }
-        Poll::Pending
-    })
-    .await
 }
 
 /// One machine's TCP, made by [`endpoint`].

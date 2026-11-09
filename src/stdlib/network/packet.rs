@@ -70,6 +70,9 @@ use fictionet::stdlib::layer::{
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, protocol};
 use fictionet::time::Instant;
 
+mod factory;
+pub use factory::{Factory, Opening, Stack};
+
 /// Which network a packet belongs to: the world's own, or the network
 /// inside one tunnel.
 ///
