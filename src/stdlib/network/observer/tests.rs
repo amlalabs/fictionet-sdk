@@ -998,7 +998,7 @@ fn data_waits_for_credit_within_a_bound() {
         ]
     );
     assert_eq!(evicted.closed, [id]);
-    assert!(tcp.observer().waiting <= 1000);
+    assert!(tcp.observer().outputs.waiting <= 1000);
     // Later bytes of that connection are not delivered.
     let after = tcp.up(5000, 0x18, b"z");
     assert!(after.events.is_empty() && after.opened.is_empty());
