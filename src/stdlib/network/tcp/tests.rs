@@ -190,6 +190,58 @@ fn wakers_run_once_the_endpoint_is_unlocked() {
 }
 
 #[test]
+fn receive_refresh_rotates_after_the_event_queue_fills() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let now = smol_now(&fcx);
+        let peers = ["10.0.0.2:1234".parse()?, "10.0.0.2:1235".parse()?];
+        let mut connections = Vec::new();
+        for peer in peers {
+            let (h, ack) = established(&mut st, now, local, peer);
+            let child = st.adopt(h);
+            st.conns.get_mut(&h).unwrap().recv_credit = 200;
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                data_segment(peer, local, 101, ack, 16, &[1; 100]).0,
+            );
+            connections.push((h, child, ack));
+        }
+        for turn in 0..2 {
+            st.up.clear();
+            for _ in 0..UP_ROOM - 1 {
+                st.up.push_back(MuxEvent::Credit(connections[0].1, 1));
+            }
+            st.refresh_all(&Budget::unlimited());
+            let received: Vec<_> = st
+                .up
+                .iter()
+                .filter_map(|event| match event {
+                    MuxEvent::Child(id, StreamEvent::Data(_)) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(received, [connections[turn].1]);
+            if turn == 0 {
+                st.ingress(
+                    &fcx,
+                    &Budget::unlimited(),
+                    now,
+                    data_segment(peers[0], local, 201, connections[0].2, 16, &[2; 100]).0,
+                );
+            }
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn transmit_batches_retain_descriptor_capacity() {
     block_on(run(Seed::from_u64(1), |fcx| async move {
         let (_raw, side) = pair();
@@ -399,8 +451,9 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
             "full egress must retain TIME-WAIT"
         );
         assert_eq!(Arc::strong_count(&held), 1);
-        assert_eq!(*log.lock(), [0]);
+        assert!(log.lock().is_empty());
         drop(st);
+        assert_eq!(*log.lock(), [0]);
         assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_ready());
         watch.reset();
         watch.hold_until_gone(Box::new(held.clone()));

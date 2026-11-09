@@ -2,6 +2,136 @@ use crate::tests::setup;
 
 use super::*;
 
+struct LimitedDevice {
+    inner: crate::tests::TestingDevice,
+    remaining: usize,
+}
+
+impl Device for LimitedDevice {
+    type RxToken<'a> = crate::tests::RxToken;
+    type TxToken<'a> = crate::tests::TxToken<'a>;
+
+    fn capabilities(&self) -> crate::phy::DeviceCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.inner.receive(now)
+    }
+
+    fn transmit(&mut self, now: Instant) -> Option<Self::TxToken<'_>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        self.inner.transmit(now)
+    }
+}
+
+#[test]
+fn indexed_deadlines_follow_mutation_removal_and_slot_reuse() {
+    use crate::socket::{
+        PollAt,
+        tcp::{Socket, SocketBuffer},
+    };
+    let (mut iface, mut sockets, mut device) = setup();
+    let make = || {
+        Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        )
+    };
+    let check = |iface: &mut Interface, sockets: &mut SocketSet<'_>, now| {
+        iface.poll_maintenance(now);
+        let expected = sockets
+            .iter()
+            .filter_map(|(_, socket)| match socket.poll_at(iface.context()) {
+                PollAt::Ingress => None,
+                PollAt::Time(at) => Some(at),
+                PollAt::Now => Some(Instant::ZERO),
+            })
+            .min();
+        assert_eq!(iface.poll_at(now, sockets), expected);
+    };
+    let mut handles = Vec::new();
+    for port in [80, 81, 82] {
+        let mut socket = make();
+        socket
+            .connect(
+                iface.context(),
+                (Ipv4Address::new(192, 168, 1, 2), port),
+                (Ipv4Address::new(192, 168, 1, 1), 4242),
+            )
+            .unwrap();
+        handles.push(sockets.add(socket));
+    }
+    for millis in [0, 500, 1000, 2000] {
+        let now = Instant::from_millis(millis);
+        check(&mut iface, &mut sockets, now);
+        iface.poll_egress(now, &mut device, &mut sockets);
+        check(&mut iface, &mut sockets, now);
+    }
+    sockets
+        .get_mut(handles[0])
+        .set_timeout(Some(crate::time::Duration::from_millis(2500)));
+    check(&mut iface, &mut sockets, Instant::from_millis(2000));
+    sockets.remove(handles[0]);
+    let mut listener = make();
+    listener.listen(4243).unwrap();
+    assert_eq!(sockets.add(listener), handles[0]);
+    check(&mut iface, &mut sockets, Instant::from_millis(2000));
+    for h in handles {
+        sockets.remove(h);
+    }
+    assert_eq!(
+        iface.poll_at(Instant::from_millis(3000), &mut sockets),
+        None
+    );
+}
+
+#[test]
+fn egress_rotates_when_an_earlier_socket_becomes_ready_again() {
+    use crate::socket::tcp::{Socket, SocketBuffer};
+    let (mut iface, mut sockets, device) = setup();
+    let mut device = LimitedDevice {
+        inner: device,
+        remaining: 1,
+    };
+    let mut handles = Vec::new();
+    for port in [80, 81] {
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        );
+        socket
+            .connect(
+                iface.context(),
+                (Ipv4Address::new(192, 168, 1, 2), port),
+                (Ipv4Address::new(192, 168, 1, 1), 4242),
+            )
+            .unwrap();
+        handles.push(sockets.add(socket));
+    }
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    sockets.get_mut(handles[0]).abort();
+    device.remaining = 1;
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    let ports: Vec<_> = device
+        .inner
+        .tx_queue
+        .iter()
+        .map(|p| TcpPacket::new_checked(&p[20..]).unwrap().dst_port())
+        .collect();
+    assert_eq!(ports, [80, 81]);
+    device.remaining = 1;
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    assert!(
+        TcpPacket::new_checked(&device.inner.tx_queue.back().unwrap()[20..])
+            .unwrap()
+            .rst()
+    );
+}
+
 #[test]
 fn targeted_ingress_keeps_connection_precedence_and_validates_input() {
     use crate::socket::tcp::{Socket, SocketBuffer, State};

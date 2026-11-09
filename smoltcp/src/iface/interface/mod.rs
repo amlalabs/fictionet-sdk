@@ -6,7 +6,6 @@ mod tests;
 
 use super::socket_set::{SocketHandle, SocketSet};
 use crate::phy::{Device, RxToken, TxToken};
-use crate::socket::PollAt;
 use crate::time::Instant;
 use crate::wire::*;
 use core::result::Result;
@@ -91,13 +90,19 @@ impl Interface {
     ) -> PollResult {
         self.inner.now = timestamp;
         let mut result = PollResult::None;
-        for (_, socket) in sockets.iter_mut() {
+        let count = sockets.prepare(&mut self.inner, timestamp);
+        for _ in 0..count {
+            let Some(handle) = sockets.next_ready() else {
+                break;
+            };
+            let socket = sockets.get_mut(handle);
             let sent: Result<(), ()> = socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
                 let token = device.transmit(inner.now).ok_or(())?;
                 inner.dispatch_ip(token, ip, tcp);
                 result = PollResult::SocketStateChanged;
                 Ok(())
             });
+            sockets.dispatched(handle, sent.is_err());
             if sent.is_err() {
                 break;
             }
@@ -142,16 +147,10 @@ impl Interface {
     }
 
     /// Earliest time a socket needs egress, or `None` if all await input.
-    pub fn poll_at(&mut self, timestamp: Instant, sockets: &SocketSet<'_>) -> Option<Instant> {
+    pub fn poll_at(&mut self, timestamp: Instant, sockets: &mut SocketSet<'_>) -> Option<Instant> {
         self.inner.now = timestamp;
-        sockets
-            .iter()
-            .filter_map(|(_, socket)| match socket.poll_at(&mut self.inner) {
-                PollAt::Ingress => None,
-                PollAt::Time(at) => Some(at),
-                PollAt::Now => Some(Instant::ZERO),
-            })
-            .min()
+        sockets.schedule(&mut self.inner);
+        sockets.next_deadline()
     }
 }
 

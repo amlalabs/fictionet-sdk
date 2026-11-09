@@ -382,6 +382,9 @@ pub struct TcpLayer {
     pub(super) sockets: SocketSet<'static>,
     /// Each socket's slot in `sockets`, ordered by SDK ID for compaction.
     pub(super) handles: BTreeMap<Id, SocketHandle>,
+    socket_ids: HashMap<SocketHandle, Id>,
+    refresh_dirty: BTreeSet<Id>,
+    refresh_after: Option<Id>,
     next_id: u64,
     /// Slots in `sockets`, empty ones included: the most sockets it held
     /// at once since it was made.
@@ -803,6 +806,9 @@ impl TcpLayer {
             addr,
             iface,
             sockets: SocketSet::new(Vec::new()),
+            socket_ids: HashMap::new(),
+            refresh_dirty: BTreeSet::new(),
+            refresh_after: None,
             handles: BTreeMap::new(),
             next_id: 0,
             slots: 0,
@@ -884,7 +890,9 @@ impl TcpLayer {
         }
         let h = Id(self.next_id);
         self.next_id += 1;
-        self.handles.insert(h, self.sockets.add(s));
+        let slot = self.sockets.add(s);
+        self.handles.insert(h, slot);
+        self.socket_ids.insert(slot, h);
         self.slots = self.slots.max(self.handles.len());
         if let Some(p) = pages {
             self.pages.insert(h, p);
@@ -895,6 +903,8 @@ impl TcpLayer {
     /// Removes a socket, then unmaps its buffers and gives back their charge.
     pub(super) fn remove_socket(&mut self, h: Id) {
         let slot = self.handles.remove(&h).expect("a socket has a slot");
+        self.socket_ids.remove(&slot);
+        self.refresh_dirty.remove(&h);
         self.sockets.remove(slot);
         self.pages.remove(&h);
         self.reserved.remove(&h);
@@ -941,8 +951,10 @@ impl TcpLayer {
             return;
         }
         let mut sockets = SocketSet::new(Vec::with_capacity(self.handles.len()));
-        for slot in self.handles.values_mut() {
+        self.socket_ids.clear();
+        for (&id, slot) in &mut self.handles {
             *slot = sockets.add(self.sockets.remove(*slot));
+            self.socket_ids.insert(*slot, id);
         }
         self.sockets = sockets;
         self.slots = self.handles.len();
@@ -1351,6 +1363,7 @@ impl TcpLayer {
             && let Some(listener) = self.listeners.get(&dst.port())
         {
             for &id in &listener.idle {
+                self.socket_ids.remove(&self.handles[&id]);
                 idle.push((id, self.sockets.remove(self.handles[&id])));
             }
         }
@@ -1369,7 +1382,9 @@ impl TcpLayer {
         let consumed = self.dev.rx.is_none();
         self.dev.reclaim();
         for (id, socket) in idle {
-            self.handles.insert(id, self.sockets.add(socket));
+            let slot = self.sockets.add(socket);
+            self.handles.insert(id, slot);
+            self.socket_ids.insert(slot, id);
         }
         if let Some(h) = handle {
             if let Some(c) = self.conns.get_mut(&h)
@@ -2004,6 +2019,7 @@ impl TcpLayer {
 
     /// Opens a child for socket `h`, as `origin` made it.
     fn open_child(&mut self, h: Id, origin: TcpOrigin) {
+        self.refresh_dirty.insert(h);
         let child: Child = self
             .children
             .insert(h)
@@ -2178,22 +2194,45 @@ impl TcpLayer {
         self.orphan(h, false);
     }
 
-    /// Brings every open child up to date, in socket order.
+    /// Brings changed children up to date, rotating after the last served child.
     fn refresh_all(&mut self, budget: &Budget) {
-        // Each open connection is found from the one before it: a refresh
-        // may close connections, and no list is made ahead.
-        let mut from = Id(0);
-        while let Some(h) = self
-            .conns
-            .range(from..)
-            .find(|(_, c)| c.open)
-            .map(|(h, _)| *h)
-        {
-            self.refresh(budget, h);
-            let Some(next) = h.0.checked_add(1) else {
+        use std::ops::Bound::{Excluded, Unbounded};
+        while let Some(slot) = self.sockets.take_changed() {
+            if let Some(&h) = self.socket_ids.get(&slot) {
+                self.refresh_dirty.insert(h);
+            }
+        }
+        let count = self.refresh_dirty.len();
+        for _ in 0..count {
+            if self.up.len() >= UP_ROOM {
+                break;
+            }
+            let Some(h) = self
+                .refresh_after
+                .and_then(|after| {
+                    self.refresh_dirty
+                        .range((Excluded(after), Unbounded))
+                        .next()
+                })
+                .or_else(|| self.refresh_dirty.first())
+                .copied()
+            else {
                 break;
             };
-            from = Id(next);
+            self.refresh_dirty.remove(&h);
+            self.refresh_after = Some(h);
+            self.refresh(budget, h);
+            if let Some(&slot) = self.handles.get(&h) {
+                self.sockets.acknowledge_changed(slot);
+                if self
+                    .conns
+                    .get(&h)
+                    .is_some_and(|c| c.open && c.recv_credit > 0)
+                    && self.sockets.get(slot).can_recv()
+                {
+                    self.refresh_dirty.insert(h);
+                }
+            }
         }
     }
 
@@ -2401,7 +2440,7 @@ impl TcpLayer {
             }
         }
         self.refresh_all(env.budget());
-        let at = self.iface.poll_at(now, &self.sockets);
+        let at = self.iface.poll_at(now, &mut self.sockets);
         self.next = [at, self.next_release, self.next_expiry()]
             .into_iter()
             .flatten()
@@ -2690,7 +2729,10 @@ impl Layer for TcpLayer {
     }
 
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>> {
-        self.urgent.pop_front().or_else(|| self.up.pop_front())
+        let full = self.up.len() >= UP_ROOM;
+        let event = self.urgent.pop_front().or_else(|| self.up.pop_front());
+        self.work |= full && self.up.len() < UP_ROOM && !self.refresh_dirty.is_empty();
+        event
     }
 
     fn take_urgent(&mut self) -> Option<EventOf<Self::Upper>> {
