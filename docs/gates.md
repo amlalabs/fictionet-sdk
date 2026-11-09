@@ -31,8 +31,9 @@ this change. The conversation log records nextest's 6,739 tests passing in
 ## Build profiles
 
 Development now uses line tables, matching the previous test debug setting.
-Tests inherit development settings and compile workspace code at optimization
-level zero. External dependencies stay at level two: their cold optimization
+Tests compile workspace code at optimization level one, so timing-bound tests
+(the UDP ephemeral-port test has a five-second limit) stay fast; they share the
+development line-table setting. External dependencies stay at level two: their cold optimization
 cost is amortized by the shared cache, and cryptography remains fast. The
 wildcard dependency override does not optimize workspace packages such as the
 vendored Rustls and smoltcp. Test assertions and overflow checks remain enabled.
