@@ -137,12 +137,11 @@ impl Log {
     }
     /// Delivers a JSON object with its timestamp to the output.
     pub fn write(&self, value: Value) {
-        let mut line = Map::new();
-        line.insert("ts".into(), json!(now()));
-        if let Value::Object(fields) = value {
-            line.extend(fields);
-        }
-        let value = Value::Object(line);
+        let fields = match value {
+            Value::Object(fields) => fields,
+            _ => Map::new(),
+        };
+        let value = Value::Object(timestamped(fields, now));
         match &mut *self.0.backend.lock() {
             Backend::Lab(writer) => {
                 if let Err(error) = writer.line(now(), value).and_then(|()| writer.flush()) {
@@ -241,26 +240,33 @@ pub fn fold_key(line: &Map<String, Value>, folded: &[&str]) -> Option<String> {
     if !folded.contains(&kind) || line.contains_key("count") {
         return None;
     }
+    static NULL: Value = Value::Null;
     let sandbox = match line.get("sandbox") {
-        Some(Value::Object(s)) => s.get("id").cloned().unwrap_or(Value::Null),
-        Some(other) => other.clone(),
-        None => Value::Null,
+        Some(Value::Object(s)) => s.get("id").unwrap_or(&NULL),
+        Some(other) => other,
+        None => &NULL,
     };
-    let field = |name: &str| line.get(name).cloned().unwrap_or(Value::Null);
-    Some(
-        json!([
-            kind,
-            sandbox,
-            field("why"),
-            field("protocol"),
-            field("src"),
-            field("dst"),
-            field("hop"),
-            field("from"),
-            field("dst_port") == json!(53)
-        ])
-        .to_string(),
-    )
+    let field = |name: &str| line.get(name).unwrap_or(&NULL);
+    let key = (
+        kind,
+        sandbox,
+        field("why"),
+        field("protocol"),
+        field("src"),
+        field("dst"),
+        field("hop"),
+        field("from"),
+        field("dst_port") == &json!(53),
+    );
+    Some(serde_json::to_string(&key).expect("JSON values serialize"))
+}
+
+/// `fields` with `"ts"` first: their own timestamp when they carry one,
+/// otherwise `ts`.
+fn timestamped(mut fields: Map<String, Value>, ts: impl FnOnce() -> f64) -> Map<String, Value> {
+    let ts = fields.get("ts").cloned().unwrap_or_else(|| json!(ts()));
+    fields.shift_insert(0, "ts".into(), ts);
+    fields
 }
 
 /// The repeats of one line, counted in the current window.
@@ -318,9 +324,7 @@ impl Writer {
         }
     }
     fn write_line(&mut self, ts: f64, fields: Map<String, Value>) -> std::io::Result<()> {
-        let mut line = Map::new();
-        line.insert("ts".into(), json!(ts));
-        line.extend(fields);
+        let line = timestamped(fields, || ts);
         let mut text = (self.transform)(Value::Object(line).to_string());
         text.push('\n');
         self.out.write_all(text.as_bytes())
