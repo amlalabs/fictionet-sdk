@@ -86,6 +86,14 @@ pub struct Config {
     pub max_ttl: Duration,
     /// The longest a negative answer is cached.
     pub max_negative_ttl: Duration,
+    /// The most the cache holds at once: entries, each zone of validated
+    /// NSEC records, and each NSEC RRset count one. Past it, what is
+    /// soonest of no use goes first.
+    pub max_cache_entries: usize,
+    /// The most octets of records the cache holds at once, each record as
+    /// a message carries it, owner uncompressed. Past it, what is soonest
+    /// of no use goes first.
+    pub max_cache_bytes: usize,
     /// Serving expired data when resolution fails or is slow (RFC 8767),
     /// or `None` to never serve it.
     pub serve_stale: Option<Stale>,
@@ -227,10 +235,11 @@ impl Config {
     ///   wait never under 1 second (RFC 6298 §2.4) nor over 60 seconds,
     ///   the least maximum RFC 6298 §2.5 allows.
     ///
-    /// Three values are the SDK's own, since no standard fixes them: one
+    /// Four values are the SDK's own, since no standard fixes them: one
     /// client question may send 200 queries and follow 11 aliases, a
-    /// server's round trips are remembered for 600 seconds, and only the
-    /// servers with the quickest wait are chosen among, a band of 0. With
+    /// server's round trips are remembered for 600 seconds, only the
+    /// servers with the quickest wait are chosen among, a band of 0, and
+    /// the cache holds at most 100000 things and 16 MiB of records. With
     /// the 1-second floor, every server that replies within a second has
     /// that wait, so the choice spreads over them all.
     pub fn new() -> Config {
@@ -256,6 +265,8 @@ impl Config {
             failure_ttl: Duration::from_secs(5),
             max_ttl: Duration::from_secs(604800),
             max_negative_ttl: Duration::from_secs(10800),
+            max_cache_entries: 100_000,
+            max_cache_bytes: 16 << 20,
             serve_stale: None,
             rd0_from_cache: true,
             ede: true,

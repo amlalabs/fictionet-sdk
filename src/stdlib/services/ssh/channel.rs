@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::stdlib::layer::{
-    Budget, ByteStream, Charge, Chunk, CreditReturn, Credited, Env, Owned, Port, StreamCommand,
+    Budget, ByteStream, Charge, Chunk, CreditLease, Credited, Env, Owned, Port, StreamCommand,
     StreamEvent,
 };
 use crate::stdlib::protocols::ssh::connection as wire;
@@ -79,15 +79,13 @@ pub enum ChannelCommand {
     Reply(bool),
     /// Complete the channel close handshake after preceding output.
     Close,
-    /// Disconnect the entire SSH connection immediately.
-    Disconnect,
-    /// Stop accepting application input while queued output drains.
-    Draining,
-    /// Silently close the connection after preceding output drains.
+    /// Silently close the connection after preceding output drains. Draining
+    /// and immediate disconnection go on the connection's control
+    /// ([`ConnectionControl`](super::ConnectionControl)), beside channel traffic.
     Hangup,
 }
 
-fn with_stream(data: &mut Chunk, f: impl FnOnce(&mut StreamEvent) -> bool) -> bool {
+fn with_stream<R>(data: &mut Chunk, f: impl FnOnce(&mut StreamEvent) -> R) -> R {
     let mut event = StreamEvent::Data(std::mem::replace(data, Chunk::new(Vec::new())));
     let result = f(&mut event);
     let StreamEvent::Data(bytes) = event else {
@@ -108,12 +106,10 @@ impl Credited for ChannelEvent {
     fn receive_bytes(window: u64) -> Option<usize> {
         StreamEvent::receive_bytes(window)
     }
-    fn reserve_receive(&mut self, budget: &Budget, backing: &Arc<Charge>) -> bool {
+    fn reserve_receive(&mut self, budget: &Budget, window: &Arc<Charge>) -> bool {
         match self {
-            Self::Stream(event) => event.reserve_receive(budget, backing),
-            Self::Extended { data, .. } => {
-                with_stream(data, |e| e.reserve_receive(budget, backing))
-            }
+            Self::Stream(event) => event.reserve_receive(budget, window),
+            Self::Extended { data, .. } => with_stream(data, |e| e.reserve_receive(budget, window)),
             _ => true,
         }
     }
@@ -124,11 +120,11 @@ impl Credited for ChannelEvent {
             _ => true,
         }
     }
-    fn retain_credit(&mut self, credit: CreditReturn) -> bool {
+    fn retain_lease(&mut self, lease: CreditLease) -> Option<CreditLease> {
         match self {
-            Self::Stream(event) => event.retain_credit(credit),
-            Self::Extended { data, .. } => with_stream(data, |e| e.retain_credit(credit)),
-            _ => false,
+            Self::Stream(event) => event.retain_lease(lease),
+            Self::Extended { data, .. } => with_stream(data, |e| e.retain_lease(lease)),
+            _ => Some(lease),
         }
     }
     fn terminal_reset(&self) -> bool {

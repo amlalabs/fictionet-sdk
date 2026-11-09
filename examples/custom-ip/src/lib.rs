@@ -4,20 +4,19 @@
 
 use fictionet::Packet;
 use fictionet::stdlib::layer::{
-    Admit, Chunk, CommandOf, Datagram, Env, EventOf, Layer, PacketCommand, PacketEvent, Packets,
+    Admit, Chunk, CommandOf, Env, EventOf, Layer, PacketCommand, PacketEvent, Packets,
 };
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, set_header_checksum};
-use fictionet::stdlib::network::packet::{Ingress, IpPacket, IpReport, Origin, Scope};
+use fictionet::stdlib::network::packet::{CheckedIpPacket, IpReport, Origin};
 use fictionet::time::Instant;
 use std::convert::Infallible;
 
 /// A replacement IP layer that applies its hop limit to transport output and
 /// its own ICMP replies while preserving the packet's allocation charge.
 pub struct HopLimit {
-    scope: Scope,
     hops: u8,
     reassembly: Reassembly,
-    up: Option<PacketEvent<IpPacket>>,
+    up: Option<PacketEvent<CheckedIpPacket>>,
     answer: Option<Chunk>,
     down: Option<PacketCommand<Chunk>>,
     input_closed: bool,
@@ -28,7 +27,6 @@ impl HopLimit {
     /// Constructs a replacement IP layer with the selected nonzero hop limit.
     pub fn new(hops: std::num::NonZeroU8) -> Self {
         Self {
-            scope: Scope::ROOT,
             hops: hops.get(),
             reassembly: Reassembly::default(),
             up: None,
@@ -39,20 +37,8 @@ impl HopLimit {
         }
     }
 
-    /// The network it serves.
-    pub fn scope(&self) -> Scope {
-        self.scope
-    }
-
     /// Takes in one raw packet the layer has room for.
-    fn take_in(&mut self, env: &mut Env<'_, IpReport>, raw: Datagram<Ingress>) {
-        let (bytes, ingress) = raw.into_parts();
-        if ingress.scope != self.scope {
-            env.report(IpReport::OtherScope {
-                scope: ingress.scope,
-            });
-            return;
-        }
+    fn take_in(&mut self, env: &mut Env<'_, IpReport>, bytes: Chunk) {
         let bytes = bytes.into_vec();
         let before = Header::parse(&bytes);
         let fragment = before.as_ref().is_some_and(|h| h.fragment.is_some());
@@ -70,11 +56,13 @@ impl HopLimit {
                     }
                     _ => Origin::Arrived,
                 };
-                if let Ok(packet) = IpPacket::checked(Chunk::new(whole), ingress, origin) {
-                    self.up = Some(PacketEvent::Packet(packet));
+                match CheckedIpPacket::checked(Chunk::new(whole), origin) {
+                    Ok(packet) => self.up = Some(PacketEvent::Packet(packet)),
+                    Err(_) => env.report(IpReport::Malformed),
                 }
             }
             Intake::Waiting => {}
+            Intake::Discarded => env.report(IpReport::Malformed),
             Intake::Refused { answer, .. } => {
                 let answer = answer.filter(|_| !self.output_closed);
                 env.report(IpReport::Refused {
@@ -87,8 +75,8 @@ impl HopLimit {
 }
 
 impl Layer for HopLimit {
-    type Lower = Packets<Datagram<Ingress>, Chunk>;
-    type Upper = Packets<IpPacket, Chunk>;
+    type Lower = Packets<Chunk, Chunk>;
+    type Upper = Packets<CheckedIpPacket, Chunk>;
     type Report = IpReport;
     type Timer = ();
     type Work = ();
@@ -176,5 +164,44 @@ impl Layer for HopLimit {
 
     fn deadline(&self) -> Option<(Instant, ())> {
         self.reassembly.next_expiry().map(|at| (at, ()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::stdlib::layer::{Budget, Driver};
+    use fictionet::stdlib::network::ip;
+    use fictionet::{Seed, SeededEntropy};
+    use std::sync::Arc;
+
+    #[test]
+    fn malformed_input_is_reported_without_reaching_transports() {
+        let mut fragment = ip::packet(
+            "10.0.0.2".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            ip::protocol::UDP,
+            &[0; 9],
+        )
+        .0;
+        fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        ip::set_header_checksum(&mut fragment[..20]);
+        let mut driver = Driver::new(
+            HopLimit::new(std::num::NonZeroU8::new(32).unwrap()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(1))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        for bytes in [vec![0x45], fragment] {
+            assert!(matches!(
+                driver.deliver(PacketEvent::Packet(Chunk::new(bytes))),
+                Ok(Admit::Taken)
+            ));
+            driver.send_above(|_| panic!("malformed input reached a transport"));
+            assert!(matches!(
+                driver.observations().drain().collect::<Vec<_>>().as_slice(),
+                [IpReport::Malformed]
+            ));
+        }
     }
 }

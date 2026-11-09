@@ -2,13 +2,15 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::common::alloc::allocations;
 use fictionet::stdlib::codec::{Decode, Step, Stream, finish, pump};
 use fictionet::stdlib::layer::{
-    Admit, Budget, Child, Chunk, Driver, MuxEvent, ObservedEvent, PacketEvent, Termination,
+    Admit, Budget, Child, Chunk, Direction, Driver, MuxEvent, ObservedEvent, PacketEvent,
+    Termination,
 };
 use fictionet::stdlib::network::ip::{self, protocol};
 use fictionet::stdlib::network::observer::{Limits, Observer};
-use fictionet::stdlib::network::packet::{Capture as Captured, Ingress, IpPacket};
+use fictionet::stdlib::network::packet::{Capture as Captured, Ingress, ObservedIpPacket};
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 
@@ -45,6 +47,24 @@ impl Capture {
         flags: u8,
         payload: &[u8],
     ) -> Vec<ObservedEvent> {
+        let packet = self.packet(from, to, seq, ack, flags, payload);
+        assert!(matches!(
+            self.tcp.deliver(PacketEvent::Packet(packet)),
+            Ok(Admit::Taken)
+        ));
+        self.events()
+    }
+
+    /// One TCP segment in an IPv4 packet, numbered as the next one captured.
+    fn packet(
+        &mut self,
+        from: SocketAddr,
+        to: SocketAddr,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> ObservedIpPacket {
         let mut segment = vec![0u8; 20];
         segment[0..2].copy_from_slice(&from.port().to_be_bytes());
         segment[2..4].copy_from_slice(&to.port().to_be_bytes());
@@ -63,11 +83,12 @@ impl Capture {
             }),
             ..Ingress::default()
         };
-        let packet = IpPacket::observed(Chunk::new(packet), ingress);
-        assert!(matches!(
-            self.tcp.deliver(PacketEvent::Packet(packet)),
-            Ok(Admit::Taken)
-        ));
+        ObservedIpPacket::observed(Chunk::new(packet), ingress)
+    }
+
+    /// What the connections got since the last segment, in order, with
+    /// credit granted to every child opened meanwhile.
+    fn events(&mut self) -> Vec<ObservedEvent> {
         let mut events = Vec::new();
         loop {
             let mut batch = Vec::new();
@@ -167,6 +188,34 @@ fn observed_events_drive_a_user_decoder_with_gap_and_end_hooks() {
     assert_eq!(pairs, [*b"de", *b"fg"]);
     assert_eq!((gaps, ends), (1, 1));
     assert!(decoder.is_done());
+}
+
+/// A segment that only acknowledges carries nothing for a child, so taking
+/// it allocates nothing. What comes after it still goes up in order: data,
+/// then the ends a RST makes.
+#[test]
+fn a_pure_ack_allocates_nothing() {
+    let mut tcp = Capture::new(Limits::default());
+    tcp.tcp.keep_observations(0);
+    tcp.segment(client(), server(), 100, 0, 0x02, b"");
+    tcp.segment(server(), client(), 500, 101, 0x12, b"");
+    tcp.segment(client(), server(), 101, 501, 0x18, b"hi");
+    for _ in 0..3 {
+        let packet = tcp.packet(server(), client(), 501, 103, 0x10, b"");
+        let (taken, allocated) = allocations(|| tcp.tcp.deliver(PacketEvent::Packet(packet)));
+        assert!(matches!(taken, Ok(Admit::Taken)));
+        assert_eq!(allocated, 0);
+        assert!(tcp.events().is_empty());
+    }
+    let events = tcp.segment(client(), server(), 103, 501, 0x14, b"!");
+    assert!(matches!(
+        &events[..],
+        [
+            ObservedEvent::Data { bytes, direction: Direction::Forward, .. },
+            ObservedEvent::End { direction: Direction::Forward, cause: Termination::Reset },
+            ObservedEvent::End { direction: Direction::Reverse, cause: Termination::Reset },
+        ] if &bytes[..] == b"!"
+    ));
 }
 
 #[test]

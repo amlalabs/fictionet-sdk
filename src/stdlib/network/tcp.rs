@@ -75,11 +75,11 @@ use fictionet::stdlib::network::ip::{
     protocol::{ICMP, TCP},
     transport_checksum,
 };
-use fictionet::stdlib::network::packet::{IpPacket, Scope};
+use fictionet::stdlib::network::packet::CheckedIpPacket;
 use fictionet::stdlib::network::transport::{
     Request, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
-use fictionet::stdlib::network::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection, Read};
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, Entropy, Error, Interface};
 
@@ -1000,7 +1000,7 @@ pub fn prepare_endpoint(
         addr,
         budget: Budget::unlimited(),
     });
-    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip, Scope::ROOT);
+    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip);
     (endpoint, Prepared { task })
 }
 
@@ -1047,10 +1047,10 @@ pub(crate) struct PacketDriver {
 impl PacketDriver {
     pub(crate) fn deliver(
         &mut self,
-        packet: IpPacket,
+        packet: CheckedIpPacket,
         now: Instant,
-    ) -> Admit<PacketEvent<IpPacket>> {
-        let mut host = self.shared.state.lock();
+    ) -> Admit<PacketEvent<CheckedIpPacket>> {
+        let mut host = self.shared.lock();
         host.tcp.set_now(now);
         let result = host.tcp.deliver(PacketEvent::Packet(packet)).unwrap();
         host.pump();
@@ -1067,7 +1067,7 @@ impl PacketDriver {
         // This task's own commands below need no wake: what they leave for
         // the engine makes the walk busy instead.
         let (busy, deadline, refusals, parked) = {
-            let mut host = self.shared.state.lock();
+            let mut host = self.shared.lock();
             let parked = host.routes.driver.take();
             let busy = host.visit(out, limit, now);
             let refusals = (!host.routes.refusals.is_empty())
@@ -1099,18 +1099,15 @@ impl PacketDriver {
                 now,
                 cx,
                 |pending| {
-                    std::mem::swap(
-                        pending,
-                        &mut self.shared.state.lock().routes.application_events,
-                    )
+                    std::mem::swap(pending, &mut self.shared.lock().routes.application_events)
                 },
                 |command| {
-                    let admit = self.shared.state.lock().submit(command);
+                    let admit = self.shared.lock().submit(command);
                     offered |= admit.moved();
                     admit
                 },
             )?;
-            self.shared.state.lock().routes.restore_driver(parked, cx);
+            self.shared.lock().routes.restore_driver(parked, cx);
         }
         // An engine that used its allowance or filled its output continues
         // after the rest of the run has had a turn, as writers refill what
@@ -1143,6 +1140,74 @@ type Event = MuxEvent<ByteStream, Messages<TcpNotice, TcpControl>, TcpOpening>;
 struct Shared {
     addr: IpAddr,
     state: Mutex<Host>,
+}
+
+impl Shared {
+    /// Locks the host. The wakers it queues while locked run once the
+    /// lock is let go.
+    fn lock(&self) -> Locked<'_> {
+        Locked(Some(self.state.lock()))
+    }
+}
+
+/// The host, locked by [`Shared::lock`]. Letting go of it unlocks the
+/// host first and then runs the wakers it queued: a waker runs code of
+/// its own, which may lock the host again.
+struct Locked<'a>(Option<fictionet::sync::MutexGuard<'a, Host>>);
+
+impl std::ops::Deref for Locked<'_> {
+    type Target = Host;
+
+    fn deref(&self) -> &Host {
+        self.0.as_ref().expect("locked until dropped")
+    }
+}
+
+impl std::ops::DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut Host {
+        self.0.as_mut().expect("locked until dropped")
+    }
+}
+
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        if let Some(mut host) = self.0.take() {
+            let wakeups = std::mem::take(&mut host.routes.wakeups);
+            drop(host);
+            wakeups.run();
+        }
+    }
+}
+
+/// Wakers to wake once the host is unlocked, in the order they were
+/// queued, and replaced wakers to drop then.
+#[derive(Default)]
+struct Wakeups {
+    /// The first waker, kept inline: most locks queue one at most.
+    first: Option<Waker>,
+    rest: Vec<Waker>,
+    retired: Vec<Waker>,
+}
+
+impl Wakeups {
+    fn wake(&mut self, waker: Waker) {
+        if self.first.is_none() {
+            self.first = Some(waker);
+        } else {
+            self.rest.push(waker);
+        }
+    }
+
+    fn retire(&mut self, waker: Waker) {
+        self.retired.push(waker);
+    }
+
+    fn run(self) {
+        drop(self.retired);
+        for w in self.first.into_iter().chain(self.rest) {
+            w.wake();
+        }
+    }
 }
 
 /// The engine, the IP layer that reads the packets it takes, and what the
@@ -1186,6 +1251,8 @@ struct Routes {
     applications: BTreeSet<ChildId>,
     application_events: VecDeque<applications::ApplicationEvent>,
     accept_again: Vec<u16>,
+    /// The wakers to run once the host is unlocked: [`Locked`].
+    wakeups: Wakeups,
 }
 
 /// One connection a handle has.
@@ -1225,9 +1292,16 @@ impl Link {
         }
     }
 
-    fn wake(&mut self) {
+    fn wake(&mut self, wakeups: &mut Wakeups) {
         for w in [self.read.take(), self.write.take()].into_iter().flatten() {
-            w.wake();
+            wakeups.wake(w);
+        }
+    }
+
+    /// Lets go of its wakers, unwoken, once the host is unlocked.
+    fn retire(&mut self, wakeups: &mut Wakeups) {
+        for w in [self.read.take(), self.write.take()].into_iter().flatten() {
+            wakeups.retire(w);
         }
     }
 }
@@ -1272,7 +1346,7 @@ impl Routes {
                         l.queue.push_back(id);
                         l.asked = false;
                         if let Some(w) = l.waker.take() {
-                            w.wake();
+                            self.wakeups.wake(w);
                         }
                     }
                     TcpOrigin::Connected(request) => {
@@ -1301,7 +1375,7 @@ impl Routes {
                     StreamEvent::Written(_) => [None, None],
                 };
                 for w in waiting.into_iter().flatten() {
-                    w.wake();
+                    self.wakeups.wake(w);
                 }
             }
             MuxEvent::Credit(id, units) => {
@@ -1313,7 +1387,7 @@ impl Routes {
                 if let Some(link) = self.links.get_mut(&id) {
                     link.credit += units;
                     if let Some(w) = link.write.take() {
-                        w.wake();
+                        self.wakeups.wake(w);
                     }
                 }
             }
@@ -1323,7 +1397,7 @@ impl Routes {
                     return;
                 }
                 if let Some(mut link) = self.links.remove(&id) {
-                    link.wake();
+                    link.wake(&mut self.wakeups);
                 }
             }
             MuxEvent::Control(MessageEvent::Ended) => {}
@@ -1336,7 +1410,7 @@ impl Routes {
                     if let Some(id) = self.requests.remove(&request)
                         && let Some(mut link) = self.links.remove(&id)
                     {
-                        link.wake();
+                        link.wake(&mut self.wakeups);
                     }
                 }
                 TcpNotice::Refused { peer, local } => {
@@ -1346,7 +1420,7 @@ impl Routes {
                 }
                 TcpNotice::Gone(id) => {
                     for w in self.watches.remove(&id).into_iter().flatten() {
-                        w.wake();
+                        self.wakeups.wake(w);
                     }
                 }
             },
@@ -1356,11 +1430,21 @@ impl Routes {
     /// Holds the endpoint task's waker again after the task's own poll,
     /// keeping the one it had if that wakes the same task.
     fn restore_driver(&mut self, parked: Option<Waker>, cx: &Context<'_>) {
+        let kept = match parked {
+            Some(waker) if waker.will_wake(cx.waker()) => Some(waker),
+            Some(waker) => {
+                self.wakeups.retire(waker);
+                None
+            }
+            None => None,
+        };
         if !self.stopped {
-            self.driver = Some(match parked {
-                Some(waker) if waker.will_wake(cx.waker()) => waker,
-                _ => cx.waker().clone(),
-            });
+            let waker = kept.unwrap_or_else(|| cx.waker().clone());
+            if let Some(old) = self.driver.replace(waker) {
+                self.wakeups.retire(old);
+            }
+        } else if let Some(waker) = kept {
+            self.wakeups.retire(waker);
         }
     }
 
@@ -1381,6 +1465,17 @@ impl Routes {
         }
         (n > 0).then_some(n)
     }
+
+    /// Hands over the first chunk that came up for `id`, or its first
+    /// `max` bytes, if anything came up.
+    fn take(&mut self, id: ChildId, max: usize) -> Option<Read> {
+        let link = self.links.get_mut(&id)?;
+        let chunk = link.inbox.front_mut()?;
+        if chunk.len() > max {
+            return Some(Read::Owned(chunk.split_to(max)));
+        }
+        link.inbox.pop_front().map(Read::Owned)
+    }
 }
 
 impl Host {
@@ -1398,10 +1493,10 @@ impl Host {
         self.tcp.set_now(now);
     }
 
-    /// Wakes the endpoint's task.
+    /// Wakes the endpoint's task once the host is unlocked.
     fn kick(&mut self) {
         if let Some(w) = self.routes.driver.take() {
-            w.wake();
+            self.routes.wakeups.wake(w);
         }
     }
 
@@ -1537,33 +1632,33 @@ impl Host {
         work_exhausted || self.tcp.exhausted() || (out.len() < limit && self.engine_ref().busy())
     }
 
-    /// The endpoint stopped: every wait ends with an error. Waits for
-    /// bytes end at once; the wakers returned are the rest, for after the
-    /// lock: listeners in port order, the task, then disappearance watches
-    /// in socket order.
-    fn stop(&mut self) -> Vec<Waker> {
-        self.routes.stopped = true;
-        for link in self.routes.links.values_mut() {
-            link.wake();
+    /// The endpoint stopped: every wait ends with an error. The wakers go
+    /// in this order: waits for bytes, listeners in port order, the task,
+    /// then disappearance watches in socket order.
+    fn stop(&mut self) {
+        let routes = &mut self.routes;
+        routes.stopped = true;
+        for link in routes.links.values_mut() {
+            link.wake(&mut routes.wakeups);
         }
-        let mut wakers: Vec<Waker> = self
-            .routes
-            .listeners
-            .values_mut()
-            .filter_map(|l| l.waker.take())
-            .collect();
-        wakers.extend(self.routes.driver.take());
-        for id in self.engine_ref().child_ids() {
-            wakers.extend(self.routes.watches.remove(&id).into_iter().flatten());
+        for l in routes.listeners.values_mut() {
+            if let Some(w) = l.waker.take() {
+                routes.wakeups.wake(w);
+            }
         }
-        wakers.extend(
-            std::mem::take(&mut self.routes.watches)
-                .into_values()
-                .flatten(),
-        );
+        if let Some(w) = routes.driver.take() {
+            routes.wakeups.wake(w);
+        }
+        for id in self.tcp.layer().state().child_ids() {
+            for w in routes.watches.remove(&id).into_iter().flatten() {
+                routes.wakeups.wake(w);
+            }
+        }
+        for w in std::mem::take(&mut routes.watches).into_values().flatten() {
+            routes.wakeups.wake(w);
+        }
         let _ = self.tcp.deliver(PacketEvent::Ended).unwrap();
         self.pump();
-        wakers
     }
 
     /// Hands over the next connection `port`'s listener accepted.
@@ -1603,9 +1698,11 @@ impl std::ops::DerefMut for Host {
 impl Shared {
     /// The endpoint stopped: every wait ends with an error.
     fn stop(&self) {
-        let (wakers, events, applications, controls) = {
-            let mut host = self.state.lock();
-            let wakers = host.stop();
+        let (wakeups, events, applications, controls) = {
+            let mut host = self.lock();
+            host.stop();
+            // Run after the factories go, below, rather than on unlock.
+            let wakeups = std::mem::take(&mut host.routes.wakeups);
             // A stopped endpoint holds nothing: controls it never took go,
             // with the items they carry.
             let controls = std::mem::take(&mut host.controls);
@@ -1617,16 +1714,14 @@ impl Shared {
                 .filter_map(|listener| listener.application.take())
                 .collect();
             host.routes.applications.clear();
-            (wakers, events, applications, controls)
+            (wakeups, events, applications, controls)
         };
         // Factories can retain endpoint handles. Release them outside the
         // transport lock, including when no application was ever polled.
         drop(events);
         drop(applications);
         drop(controls);
-        for w in wakers {
-            w.wake();
-        }
+        wakeups.run();
     }
 }
 
@@ -1649,12 +1744,13 @@ struct Connecting<'a> {
 
 impl Drop for Connecting<'_> {
     fn drop(&mut self) {
-        let mut host = self.shared.state.lock();
+        let mut host = self.shared.lock();
         host.routes.requests.remove(&self.request);
         host.routes.failed.remove(&self.request);
         if !self.done
-            && let Some(link) = host.routes.links.remove(&self.id)
+            && let Some(mut link) = host.routes.links.remove(&self.id)
         {
+            link.retire(&mut host.routes.wakeups);
             host.command(link.child.close());
         }
     }
@@ -1662,7 +1758,7 @@ impl Drop for Connecting<'_> {
 
 impl Endpoint {
     pub(crate) fn on_refused(&self, observe: Arc<dyn Fn(SocketAddr, SocketAddr) + Send + Sync>) {
-        let previous = self.shared.state.lock().routes.refused.replace(observe);
+        let previous = self.shared.lock().routes.refused.replace(observe);
         drop(previous);
     }
 
@@ -1686,7 +1782,7 @@ impl Endpoint {
     /// addresses someone else may take next. `which` runs with the endpoint
     /// locked.
     pub fn abort_peers(&self, which: impl Fn(IpAddr) -> bool) {
-        let mut host = self.shared.state.lock();
+        let mut host = self.shared.lock();
         let peers: BTreeSet<IpAddr> = host
             .engine_ref()
             .peers()
@@ -1706,7 +1802,7 @@ impl Endpoint {
     /// Fails if something already listens there, or if an outgoing
     /// connection uses the port. Dropping the listener frees the port.
     pub fn listen(&self, port: u16) -> Result<Listener, Error> {
-        let mut host = self.shared.state.lock();
+        let mut host = self.shared.lock();
         host.routes.listening = None;
         let taken = host.request(TcpControl::Listen {
             port,
@@ -1758,7 +1854,7 @@ impl Endpoint {
             return Err(ConnError::Cancelled);
         }
         let (request, id, local) = {
-            let mut host = self.shared.state.lock();
+            let mut host = self.shared.lock();
             let request = Request(host.routes.next_request);
             host.routes.next_request += 1;
             // A connect the transport does not take now is not under way:
@@ -1787,7 +1883,7 @@ impl Endpoint {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             let old = {
-                let mut host = self.shared.state.lock();
+                let mut host = self.shared.lock();
                 if host.routes.stopped {
                     return Poll::Ready(Err(ConnError::Closed));
                 }
@@ -1838,7 +1934,7 @@ pub struct Listener {
 
 impl Listener {
     pub(crate) fn attach(&mut self, application: Application) {
-        let mut host = self.shared.state.lock();
+        let mut host = self.shared.lock();
         host.routes
             .listeners
             .get_mut(&self.port)
@@ -1854,7 +1950,7 @@ impl Listener {
     /// incomplete handshakes. Uses the bounds of [`Options::backlog`].
     /// Existing connections remain when the limit is lowered.
     pub fn backlog(&mut self, connections: usize) {
-        self.shared.state.lock().control(TcpControl::Backlog {
+        self.shared.lock().control(TcpControl::Backlog {
             port: self.port,
             backlog: connections,
         });
@@ -1883,7 +1979,7 @@ impl Listener {
     /// blocks. Otherwise an accepted attempt gets a RST, and a refusal a RST
     /// without them.
     pub fn answer(&mut self, answer: Box<dyn Answer>) {
-        self.shared.state.lock().control(TcpControl::Answer {
+        self.shared.lock().control(TcpControl::Answer {
             port: self.port,
             answer,
         });
@@ -1912,7 +2008,7 @@ impl Listener {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             let old = {
-                let mut host = shared.state.lock();
+                let mut host = shared.lock();
                 if host.routes.stopped {
                     return Poll::Ready(Err(ConnError::Closed));
                 }
@@ -1953,14 +2049,18 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let mut host = self.shared.state.lock();
-        let Some(l) = host.routes.listeners.remove(&self.port) else {
+        let mut host = self.shared.lock();
+        let Some(mut l) = host.routes.listeners.remove(&self.port) else {
             return;
         };
+        if let Some(w) = l.waker.take() {
+            host.routes.wakeups.retire(w);
+        }
         host.control(TcpControl::Unlisten { port: self.port });
         // Connections that never reached accept are reset.
         for id in l.queue {
-            if let Some(link) = host.routes.links.remove(&id) {
+            if let Some(mut link) = host.routes.links.remove(&id) {
+                link.retire(&mut host.routes.wakeups);
                 host.control(TcpControl::Abort(id));
                 host.command(link.child.close());
             }
@@ -2063,7 +2163,7 @@ impl GoneWatch {
     /// handle report [`ConnError::Reset`]. Does nothing once the connection is
     /// gone (see [`GoneWatch::poll_gone`]).
     pub fn reset(&self) {
-        self.shared.state.lock().control(TcpControl::Abort(self.id));
+        self.shared.lock().control(TcpControl::Abort(self.id));
     }
 
     /// Sets how long the connection may sit idle before this side sends a
@@ -2073,7 +2173,7 @@ impl GoneWatch {
     /// this interval is a world setting. Works after the connection itself
     /// was handed on. Does nothing once its handle was dropped.
     pub fn set_keep_alive(&self, interval: Option<Duration>) {
-        self.shared.state.lock().control(TcpControl::KeepAlive {
+        self.shared.lock().control(TcpControl::KeepAlive {
             child: self.id,
             interval,
         });
@@ -2084,7 +2184,7 @@ impl GoneWatch {
     /// itself was handed on, such as boxed behind TLS. Drops `item`
     /// immediately if the connection is gone already.
     pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
-        self.shared.state.lock().control(TcpControl::Hold {
+        self.shared.lock().control(TcpControl::Hold {
             child: self.id,
             item,
         });
@@ -2111,7 +2211,7 @@ impl super::transport::Retirement for GoneWatch {
 
 /// Ready once the connection of child `id` was reset, or is gone.
 fn poll_gone(shared: &Shared, id: ChildId, cx: &mut Context<'_>) -> Poll<()> {
-    let mut host = shared.state.lock();
+    let mut host = shared.lock();
     if host.routes.stopped || host.engine_ref().gone(id) {
         return Poll::Ready(());
     }
@@ -2124,10 +2224,11 @@ fn poll_gone(shared: &Shared, id: ChildId, cx: &mut Context<'_>) -> Poll<()> {
 
 impl Drop for TcpConnection {
     fn drop(&mut self) {
-        let mut host = self.shared.state.lock();
-        let Some(link) = host.routes.links.remove(&self.id) else {
+        let mut host = self.shared.lock();
+        let Some(mut link) = host.routes.links.remove(&self.id) else {
             return;
         };
+        link.retire(&mut host.routes.wakeups);
         // Bytes that came up unread are lost, so the peer gets a RST.
         if self.abort || !link.inbox.is_empty() {
             host.control(TcpControl::Abort(self.id));
@@ -2136,40 +2237,44 @@ impl Drop for TcpConnection {
     }
 }
 
-impl Connection for TcpConnection {
-    fn poll_read(
+impl TcpConnection {
+    /// Polls to read up to `max` bytes, which `take` gets out of what came
+    /// up: `end` once the peer will send nothing more.
+    fn poll_take<T>(
         &mut self,
         fcx: &Cx,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, ConnError>> {
+        max: usize,
+        end: T,
+        mut take: impl FnMut(&mut Routes, ChildId) -> Option<T>,
+    ) -> Poll<Result<T, ConnError>> {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         let old = {
-            let mut host = self.shared.state.lock();
+            let mut host = self.shared.lock();
             if host.routes.stopped {
                 return Poll::Ready(Err(ConnError::Closed));
             }
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
+            if max == 0 {
+                return Poll::Ready(Ok(end));
             }
-            if let Some(n) = host.routes.read(self.id, buf) {
-                return Poll::Ready(Ok(n));
+            if let Some(read) = take(&mut host.routes, self.id) {
+                return Poll::Ready(Ok(read));
             }
             // Ask for as many bytes as this read takes. They come up from
             // the receive buffer, which opens the window by as much.
             let link = host.routes.links.get_mut(&self.id).expect("a live link");
             if link.asked == 0 {
-                link.asked = buf.len() as u64;
-                let grant = link.child.grant(buf.len() as u64);
+                link.asked = max as u64;
+                let grant = link.child.grant(max as u64);
                 host.command(grant);
-                if let Some(n) = host.routes.read(self.id, buf) {
-                    return Poll::Ready(Ok(n));
+                if let Some(read) = take(&mut host.routes, self.id) {
+                    return Poll::Ready(Ok(read));
                 }
             }
             match host.engine().read_verdict(self.id) {
-                Verdict::Done => return Poll::Ready(Ok(0)),
+                Verdict::Done => return Poll::Ready(Ok(end)),
                 Verdict::Failed(error) => return Poll::Ready(Err(error)),
                 Verdict::Wait => {}
             }
@@ -2186,17 +2291,20 @@ impl Connection for TcpConnection {
         Poll::Pending
     }
 
-    fn poll_write(
+    /// Polls to write some of `len` bytes, the first `n` of which `piece`
+    /// gives as a chunk once there is room for them.
+    fn poll_send(
         &mut self,
         fcx: &Cx,
         cx: &mut Context<'_>,
-        data: &[u8],
+        len: usize,
+        piece: impl FnOnce(usize) -> Chunk,
     ) -> Poll<Result<usize, ConnError>> {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         let old = {
-            let mut host = self.shared.state.lock();
+            let mut host = self.shared.lock();
             if host.routes.stopped {
                 return Poll::Ready(Err(ConnError::Closed));
             }
@@ -2204,15 +2312,13 @@ impl Connection for TcpConnection {
             if link.shut {
                 return Poll::Ready(Err(ConnError::Closed));
             }
-            if data.is_empty() {
+            if len == 0 {
                 return Poll::Ready(Ok(0));
             }
             if link.credit > 0 {
-                let n = (link.credit as usize).min(data.len());
+                let n = (link.credit as usize).min(len);
                 link.credit -= n as u64;
-                let write = link
-                    .child
-                    .send(StreamCommand::Write(Chunk::new(data[..n].to_vec())));
+                let write = link.child.send(StreamCommand::Write(piece(n)));
                 if host.command(write) {
                     return Poll::Ready(Ok(n));
                 }
@@ -2235,11 +2341,54 @@ impl Connection for TcpConnection {
         }
         Poll::Pending
     }
+}
+
+impl Connection for TcpConnection {
+    fn poll_read(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        self.poll_take(fcx, cx, buf.len(), 0, |routes, id| routes.read(id, buf))
+    }
+
+    /// Hands over the chunk the transport brought up, without copying it.
+    fn poll_read_owned(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<Read, ConnError>> {
+        let max = buf.len();
+        self.poll_take(fcx, cx, max, Read::Copied(0), |routes, id| {
+            routes.take(id, max)
+        })
+    }
+
+    fn poll_write(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        self.poll_send(fcx, cx, data.len(), |n| Chunk::new(data[..n].to_vec()))
+    }
+
+    /// Sends a piece of `data` that shares its bytes, without copying them.
+    fn poll_write_chunk(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &Chunk,
+    ) -> Poll<Result<usize, ConnError>> {
+        self.poll_send(fcx, cx, data.len(), |n| data.prefix(n))
+    }
 
     /// Sends a FIN once the peer has acknowledged every byte already written.
     /// Returns immediately. A cancel does not stop it.
     fn poll_shutdown(&mut self, _fcx: &Cx, _cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        let mut host = self.shared.state.lock();
+        let mut host = self.shared.lock();
         if host.routes.stopped {
             return Poll::Ready(Err(ConnError::Closed));
         }

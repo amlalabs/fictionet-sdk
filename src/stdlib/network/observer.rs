@@ -3,7 +3,7 @@
 //! connection above.
 //!
 //! [`Observer`] is a [layer](fictionet::stdlib::layer) with whole captured
-//! packets below, as [`IpPacket::observed`] reads them, and the
+//! packets below, as [`ObservedIpPacket::observed`] reads them, and the
 //! [`TcpObserver`] port above. It puts each direction of each connection
 //! back in order and offers the connection as one child, opened with an
 //! [`ObservedConnection`] that names it. It only watches: it sends nothing
@@ -53,7 +53,7 @@
 //! use fictionet::stdlib::layer::{Budget, Chunk, Driver, MuxEvent, ObservedEvent, PacketEvent, Admit};
 //! use fictionet::stdlib::network::ip::{self, protocol};
 //! use fictionet::stdlib::network::observer::Observer;
-//! use fictionet::stdlib::network::packet::{Ingress, IpPacket};
+//! use fictionet::stdlib::network::packet::{Ingress, ObservedIpPacket};
 //! use fictionet::time::Instant;
 //! use fictionet::{Seed, SeededEntropy};
 //!
@@ -64,7 +64,7 @@
 //!
 //! let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
 //! let mut tcp = Driver::new(Observer::default(), entropy, Budget::unlimited(), Instant::ZERO);
-//! let packet = IpPacket::observed(Chunk::new(packet.0), Ingress::default());
+//! let packet = ObservedIpPacket::observed(Chunk::new(packet.0), Ingress::default());
 //! assert!(matches!(tcp.deliver(PacketEvent::Packet(packet)), Ok(Admit::Taken)));
 //! let mut child = None;
 //! tcp.send_above(|event| {
@@ -99,7 +99,7 @@ use fictionet::stdlib::layer::{
     Top,
 };
 use fictionet::stdlib::network::ip::protocol;
-use fictionet::stdlib::network::packet::{IpPacket, Scope};
+use fictionet::stdlib::network::packet::{ObservedIpPacket, Scope};
 use fictionet::stdlib::network::transport::{ObservedConnection, TcpObserver};
 
 use flow::{ACK, Flow, RST, SYN, Segment, Step, Store};
@@ -234,17 +234,53 @@ struct Output {
     queued: bool,
 }
 
-/// The passive TCP observer. See the [module docs](self).
-pub struct Observer {
-    store: Store,
-    connections: BTreeMap<Key, Connection>,
+/// What every child has waiting to go up, and whose turn it is. Kept apart
+/// from the connections, so events go to a child while its connection is
+/// borrowed.
+struct Outputs {
     children: Slots<Output>,
-    /// Children opened, not yet taken.
-    opened: VecDeque<MuxEvent<ObservedStream, Top, ObservedConnection>>,
     /// Children with something to send, in turn.
     ready: VecDeque<ChildId>,
     /// What every child's waiting events count towards [`Limits::waiting`].
     waiting: usize,
+}
+
+impl Outputs {
+    /// Queues `event` for `child`.
+    fn push(&mut self, child: ChildId, event: ObservedEvent) {
+        let Some(output) = self.children.get_mut(child) else {
+            return;
+        };
+        let weight = weight(&event);
+        output.weight = output.weight.saturating_add(weight);
+        self.waiting = self.waiting.saturating_add(weight);
+        output.pending.push_back(event);
+        if !output.queued {
+            output.queued = true;
+            self.ready.push_back(child);
+        }
+    }
+
+    /// Closes `child` once what it has waiting is taken.
+    fn close(&mut self, child: ChildId) {
+        let Some(output) = self.children.get_mut(child) else {
+            return;
+        };
+        output.closing = true;
+        if !output.queued {
+            output.queued = true;
+            self.ready.push_back(child);
+        }
+    }
+}
+
+/// The passive TCP observer. See the [module docs](self).
+pub struct Observer {
+    store: Store,
+    connections: BTreeMap<Key, Connection>,
+    outputs: Outputs,
+    /// Children opened, not yet taken.
+    opened: VecDeque<MuxEvent<ObservedStream, Top, ObservedConnection>>,
     /// Packets taken so far.
     tick: u64,
     /// The capture ended.
@@ -265,10 +301,12 @@ impl Observer {
         Observer {
             store: Store { limits, held: 0 },
             connections: BTreeMap::new(),
-            children: Slots::new(limits.connections.saturating_mul(2)),
+            outputs: Outputs {
+                children: Slots::new(limits.connections.saturating_mul(2)),
+                ready: VecDeque::new(),
+                waiting: 0,
+            },
             opened: VecDeque::new(),
-            ready: VecDeque::new(),
-            waiting: 0,
             tick: 0,
             finished: false,
         }
@@ -291,7 +329,7 @@ impl Observer {
 
     /// Takes one captured packet, once what the layer above left waiting
     /// fits [`Limits::waiting`].
-    fn packet(&mut self, env: &mut Env<'_, ObserverReport>, packet: &IpPacket) {
+    fn packet(&mut self, env: &mut Env<'_, ObserverReport>, packet: &ObservedIpPacket) {
         self.make_room();
         let Some(header) = packet.header() else {
             return;
@@ -453,10 +491,19 @@ impl Observer {
                 bytes: pushed.late,
             });
         }
+        // Events go straight to the child, in the order they happened: what
+        // the segment carried, then the ends a RST makes.
         let child = connection.child;
-        let mut events = Vec::with_capacity(steps.len() + 2);
+        let mut queue = |event| {
+            if let Some(child) = child {
+                self.outputs.push(child, event);
+            }
+        };
+        if !steps.is_empty() {
+            connection.emitted[d] = true;
+        }
         for step in steps {
-            events.push(match step {
+            queue(match step {
                 Step::Data {
                     sequence,
                     bytes,
@@ -481,9 +528,6 @@ impl Observer {
                 }
             });
         }
-        if !events.is_empty() {
-            connection.emitted[d] = true;
-        }
         if segment.flags & RST != 0 {
             for other in DIRECTIONS {
                 let i = index(other);
@@ -494,29 +538,22 @@ impl Observer {
                 if let Some(flow) = &mut connection.flows[i] {
                     flow.end(&mut self.store);
                 }
-                events.push(ObservedEvent::End {
+                queue(ObservedEvent::End {
                     direction: other,
                     cause: Termination::Reset,
                 });
             }
         }
-        let both = connection.ended == [true, true];
-        if both {
-            connection.child = None;
-        }
-        if let Some(child) = child {
-            for event in events {
-                self.push(child, event);
-            }
-            if both {
-                self.close(child);
-            }
+        if connection.ended == [true, true]
+            && let Some(child) = connection.child.take()
+        {
+            self.outputs.close(child);
         }
     }
 
     /// Opens a child for a new connection.
     fn start(&mut self, env: &mut Env<'_, ObserverReport>, key: Key, info: ObservedConnection) {
-        let child = match self.children.insert(Output {
+        let child = match self.outputs.children.insert(Output {
             key,
             credit: 0,
             pending: VecDeque::new(),
@@ -568,7 +605,7 @@ impl Observer {
         let Some(connection) = self.connections.get_mut(&key) else {
             return;
         };
-        let mut events = Vec::new();
+        let child = connection.child.take();
         for direction in DIRECTIONS {
             let i = index(direction);
             if let Some(flow) = &mut connection.flows[i] {
@@ -576,41 +613,14 @@ impl Observer {
             }
             if !connection.ended[i] {
                 connection.ended[i] = true;
-                events.push(ObservedEvent::End { direction, cause });
+                if let Some(child) = child {
+                    self.outputs
+                        .push(child, ObservedEvent::End { direction, cause });
+                }
             }
         }
-        if let Some(child) = connection.child.take() {
-            for event in events {
-                self.push(child, event);
-            }
-            self.close(child);
-        }
-    }
-
-    /// Queues `event` for `child`.
-    fn push(&mut self, child: ChildId, event: ObservedEvent) {
-        let Some(output) = self.children.get_mut(child) else {
-            return;
-        };
-        let weight = weight(&event);
-        output.weight = output.weight.saturating_add(weight);
-        self.waiting = self.waiting.saturating_add(weight);
-        output.pending.push_back(event);
-        if !output.queued {
-            output.queued = true;
-            self.ready.push_back(child);
-        }
-    }
-
-    /// Closes `child` once what it has waiting is taken.
-    fn close(&mut self, child: ChildId) {
-        let Some(output) = self.children.get_mut(child) else {
-            return;
-        };
-        output.closing = true;
-        if !output.queued {
-            output.queued = true;
-            self.ready.push_back(child);
+        if let Some(child) = child {
+            self.outputs.close(child);
         }
     }
 
@@ -630,12 +640,13 @@ impl Observer {
     /// Evicts the connections with the most waiting until what is waiting
     /// fits [`Limits::waiting`].
     fn make_room(&mut self) {
-        while self.waiting > self.store.limits.waiting {
+        while self.outputs.waiting > self.store.limits.waiting {
             let heaviest = self
+                .outputs
                 .children
                 .ids()
                 .filter_map(|id| {
-                    let output = self.children.get(id)?;
+                    let output = self.outputs.children.get(id)?;
                     Some((output.weight, id, output.key))
                 })
                 .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
@@ -643,8 +654,8 @@ impl Observer {
                 break;
             };
             self.detach(key, child);
-            self.waiting = self.waiting.saturating_sub(weight);
-            let Some(output) = self.children.get_mut(child) else {
+            self.outputs.waiting = self.outputs.waiting.saturating_sub(weight);
+            let Some(output) = self.outputs.children.get_mut(child) else {
                 break;
             };
             output.pending.clear();
@@ -657,7 +668,7 @@ impl Observer {
                     });
                 }
             }
-            self.close(child);
+            self.outputs.close(child);
         }
     }
 
@@ -672,7 +683,6 @@ impl Observer {
             let Some(child) = connection.child.take() else {
                 continue;
             };
-            let mut events = Vec::new();
             for direction in DIRECTIONS {
                 let i = index(direction);
                 if connection.ended[i] {
@@ -685,39 +695,40 @@ impl Observer {
                     let mut steps = Vec::new();
                     flow.finish(&mut self.store, &mut steps);
                     for step in steps {
-                        match step {
+                        let event = match step {
                             Step::Data {
                                 sequence,
                                 bytes,
                                 source,
-                            } => events.push(ObservedEvent::Data {
+                            } => ObservedEvent::Data {
                                 direction,
                                 bytes: Chunk::new(bytes),
                                 sequence,
                                 source,
-                            }),
-                            Step::Gap { sequence, missing } => events.push(ObservedEvent::Gap {
+                            },
+                            Step::Gap { sequence, missing } => ObservedEvent::Gap {
                                 direction,
                                 sequence,
                                 missing: Some(missing),
-                            }),
-                            Step::Fin => {}
-                        }
+                            },
+                            Step::Fin => continue,
+                        };
+                        self.outputs.push(child, event);
                     }
                 }
-                events.push(ObservedEvent::End {
-                    direction,
-                    cause: if holed {
-                        Termination::Truncated
-                    } else {
-                        Termination::Finalized
+                self.outputs.push(
+                    child,
+                    ObservedEvent::End {
+                        direction,
+                        cause: if holed {
+                            Termination::Truncated
+                        } else {
+                            Termination::Finalized
+                        },
                     },
-                });
+                );
             }
-            for event in events {
-                self.push(child, event);
-            }
-            self.close(child);
+            self.outputs.close(child);
         }
     }
 }
@@ -742,7 +753,7 @@ fn weight(event: &ObservedEvent) -> usize {
 }
 
 impl Layer for Observer {
-    type Lower = Packets<IpPacket, Infallible>;
+    type Lower = Packets<ObservedIpPacket, Infallible>;
     type Upper = TcpObserver;
     type Report = ObserverReport;
     type Timer = ();
@@ -757,8 +768,8 @@ impl Layer for Observer {
     fn on_event(
         &mut self,
         env: &mut Env<'_, ObserverReport>,
-        event: PacketEvent<IpPacket>,
-    ) -> Result<Admit<PacketEvent<IpPacket>>, Infallible> {
+        event: PacketEvent<ObservedIpPacket>,
+    ) -> Result<Admit<PacketEvent<ObservedIpPacket>>, Infallible> {
         if self.finished {
             return Ok(Admit::Closed(event));
         }
@@ -781,17 +792,17 @@ impl Layer for Observer {
             MuxOp::Child(_, command) => match command {},
             MuxOp::Control(command) => match command {},
             MuxOp::Credit(child, units) => {
-                if let Some(output) = self.children.get_mut(child) {
+                if let Some(output) = self.outputs.children.get_mut(child) {
                     output.credit = output.credit.saturating_add(units);
                     if !output.queued && (!output.pending.is_empty() || output.closing) {
                         output.queued = true;
-                        self.ready.push_back(child);
+                        self.outputs.ready.push_back(child);
                     }
                 }
             }
             MuxOp::Close(child) => {
-                if let Some(output) = self.children.remove(child) {
-                    self.waiting = self.waiting.saturating_sub(output.weight);
+                if let Some(output) = self.outputs.children.remove(child) {
+                    self.outputs.waiting = self.outputs.waiting.saturating_sub(output.weight);
                     self.detach(output.key, child);
                 }
             }
@@ -807,15 +818,15 @@ impl Layer for Observer {
         if let Some(opened) = self.opened.pop_front() {
             return Some(opened);
         }
-        for _ in 0..self.ready.len() {
-            let child = self.ready.pop_front()?;
-            let Some(output) = self.children.get_mut(child) else {
+        for _ in 0..self.outputs.ready.len() {
+            let child = self.outputs.ready.pop_front()?;
+            let Some(output) = self.outputs.children.get_mut(child) else {
                 continue;
             };
             output.queued = false;
             let Some(event) = output.pending.front() else {
                 if output.closing {
-                    self.children.remove(child);
+                    self.outputs.children.remove(child);
                     return Some(MuxEvent::Closed(child));
                 }
                 continue;
@@ -829,13 +840,13 @@ impl Layer for Observer {
             let event = output.pending.pop_front()?;
             let weight = weight(&event);
             output.weight = output.weight.saturating_sub(weight);
-            self.waiting = self.waiting.saturating_sub(weight);
+            self.outputs.waiting = self.outputs.waiting.saturating_sub(weight);
             if let ObservedEvent::End { direction, .. } = event {
                 output.delivered_end[index(direction)] = true;
             }
             if !output.pending.is_empty() || output.closing {
                 output.queued = true;
-                self.ready.push_back(child);
+                self.outputs.ready.push_back(child);
             }
             return Some(MuxEvent::Child(child, event));
         }

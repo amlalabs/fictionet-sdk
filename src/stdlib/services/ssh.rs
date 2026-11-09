@@ -419,6 +419,48 @@ impl Output {
     }
 }
 
+/// Whole-connection shutdown that channel applications ask for. It reaches
+/// the connection beside channel traffic, so it never waits behind output the
+/// peer has granted no window for. The strongest request holds. Closing
+/// silently once a channel's output has drained stays on that channel, after
+/// its output ([`ChannelCommand::Hangup`]).
+#[derive(Clone, Debug)]
+pub struct ConnectionControl(Arc<AtomicU8>);
+
+/// How far the connection has been asked to shut down, weakest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Requested {
+    Open = 0,
+    Drain = 1,
+    Disconnect = 2,
+}
+
+impl ConnectionControl {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(Requested::Open as u8)))
+    }
+    /// Stop reading application input and requests while queued output
+    /// drains. Window adjustments and channel closes are still read.
+    pub fn drain(&self) {
+        self.request(Requested::Drain);
+    }
+    /// Disconnect the whole connection at once.
+    pub fn disconnect(&self) {
+        self.request(Requested::Disconnect);
+    }
+    fn request(&self, requested: Requested) {
+        self.0.fetch_max(requested as u8, Ordering::Relaxed);
+    }
+    fn requested(&self) -> Requested {
+        match self.0.load(Ordering::Relaxed) {
+            0 => Requested::Open,
+            1 => Requested::Drain,
+            _ => Requested::Disconnect,
+        }
+    }
+}
+
 /// SSH identity and per-connection resource limits.
 #[derive(Clone)]
 pub struct Config {
@@ -727,8 +769,7 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     channels: Slots<Channel>,
     next_channel: u32,
     credit_turn: Option<ChildId>,
-    draining: bool,
-    policy_close: Arc<AtomicU8>,
+    control: ConnectionControl,
     user: Option<String>,
     auth_user: Option<String>,
     service_requested: bool,
@@ -779,8 +820,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             channels: Slots::new(limit),
             next_channel: 0,
             credit_turn: None,
-            draining: false,
-            policy_close: Arc::new(AtomicU8::new(0)),
+            control: ConnectionControl::new(),
             user: None,
             auth_user: None,
             service_requested: false,
@@ -797,16 +837,23 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         let handler = self.handler.clone();
         let connection = self.connection.clone();
         let limit = self.config.max_channels;
-        let policy_close = self.policy_close.clone();
+        let control = self.control();
         Chain::new(
             self,
             Children::new(limit, u64::from(WINDOW), move |_, opening, budget| {
-                let mut session =
-                    SessionLayer::new(handler.clone(), connection.clone(), opening, budget);
-                session.policy_close = Some(policy_close.clone());
-                Some(session)
+                Some(SessionLayer::new(
+                    handler.clone(),
+                    connection.clone(),
+                    control.clone(),
+                    opening,
+                    budget,
+                ))
             }),
         )
+    }
+    /// The connection's shutdown control, for the applications on its channels.
+    pub fn control(&self) -> ConnectionControl {
+        self.control.clone()
     }
     fn context(&self, now: Instant) -> Context<'_> {
         Context {
@@ -1259,7 +1306,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         payload: &[u8],
         env: &mut Env<'_, Ended>,
     ) -> Result<(), Error> {
-        if self.draining {
+        if self.control.requested() != Requested::Open {
             return match payload.first() {
                 Some(93) => self.connection_message(wire::Message::parse(payload)?, env),
                 Some(97) => {
@@ -1300,12 +1347,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         Ok(())
     }
     fn progress(&mut self, env: &mut Env<'_, Ended>) -> Result<bool, Error> {
-        // Whole-connection application shutdown must not wait behind a child's
-        // data command whose peer window is closed. This carries only policy,
-        // while channel bytes, lifecycle and credit still go through Children.
-        let policy = self.policy_close.load(Ordering::Relaxed);
-        self.draining |= policy & 1 != 0;
-        if policy & 2 != 0 && !self.ended {
+        if self.control.requested() == Requested::Disconnect && !self.ended {
             self.disconnect(
                 env,
                 ssh::DisconnectReason::ByApplication,
@@ -1669,12 +1711,6 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                             },
                         )?;
                     }
-                    ChannelCommand::Disconnect => self.disconnect(
-                        env,
-                        ssh::DisconnectReason::ByApplication,
-                        "Connection closed by application",
-                    )?,
-                    ChannelCommand::Draining => self.draining = true,
                     ChannelCommand::Hangup => self.close(env, Ended::Closed),
                 }
             }
@@ -2269,6 +2305,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_shutdown_reaches_the_connection_before_queued_output() {
+        for hangup in [false, true] {
+            let budget = Budget::new(1 << 20);
+            let control = ConnectionControl::new();
+            let opening = Owned::new(
+                channel::Opening {
+                    user: "guest".into(),
+                    channel: 0,
+                    kind: wire::OpenKind::Session,
+                },
+                budget.charge(0).unwrap(),
+            );
+            let session = SessionLayer::new(
+                Arc::new(Shutdown(hangup)),
+                Arc::new(ConnInfo::default()),
+                control.clone(),
+                opening,
+                &budget,
+            );
+            let mut driver = crate::stdlib::layer::Driver::new(
+                session,
+                Arc::new(crate::SeededEntropy::new(crate::Seed::from_u64(3))),
+                budget.clone(),
+                Instant::ZERO,
+            );
+            driver.run().unwrap();
+            assert!(matches!(
+                driver.take_command(),
+                Some(ChannelCommand::Accept(true))
+            ));
+            let request = Owned::new(
+                wire::SessionRequest::Exec(b"stop".to_vec()),
+                budget.charge(0).unwrap(),
+            );
+            assert!(
+                driver
+                    .deliver(ChannelEvent::Request {
+                        want_reply: true,
+                        request,
+                    })
+                    .unwrap()
+                    .moved()
+            );
+            driver.run().unwrap();
+            assert!(matches!(
+                driver.take_command(),
+                Some(ChannelCommand::Reply(true))
+            ));
+            // The session's output is queued and not yet taken.
+            assert_eq!(control.requested(), Requested::Open);
+            assert!(
+                driver
+                    .deliver(ChannelEvent::Stream(StreamEvent::Data(Bytes::new(
+                        b"trigger".to_vec()
+                    ))))
+                    .unwrap()
+                    .moved()
+            );
+            driver.run().unwrap();
+            if hangup {
+                assert_eq!(control.requested(), Requested::Drain);
+                let Some(ChannelCommand::Stream(StreamCommand::Write(data))) =
+                    driver.take_command()
+                else {
+                    panic!("queued output must still drain");
+                };
+                assert_eq!(data.len(), 100_000);
+                assert!(matches!(
+                    driver.take_command(),
+                    Some(ChannelCommand::Hangup)
+                ));
+            } else {
+                assert_eq!(control.requested(), Requested::Disconnect);
+            }
+            assert!(driver.take_command().is_none());
+        }
+    }
+
     #[tokio::test]
     async fn connection_shutdown_policy_bypasses_stalled_child_output() {
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -2367,7 +2482,6 @@ mod tests {
                         conn: Box::new(connection),
                         budget: Some(server_budget),
                         limits: Default::default(),
-                        http_observe: None,
                     };
                     let server = Server {
                         config: Arc::new(Config::new(

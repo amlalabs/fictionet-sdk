@@ -159,7 +159,7 @@ impl Watch {
         };
         let mut packet = packet;
         packet.truncate(packet.len() - std::mem::take(&mut self.cut));
-        let packet = IpPacket::observed(Chunk::new(packet), ingress);
+        let packet = ObservedIpPacket::observed(Chunk::new(packet), ingress);
         assert!(matches!(
             self.tcp.deliver(PacketEvent::Packet(packet)),
             Ok(Admit::Taken)
@@ -948,6 +948,22 @@ fn overlapping_tuples_in_other_scopes_do_not_alias() {
     );
 }
 
+/// Connections in many networks count against one capture's limit, so
+/// adding networks does not multiply what the observer holds.
+#[test]
+fn networks_share_the_capture_connection_limit() {
+    let mut tcp = Watch::new(Limits {
+        connections: 2,
+        ..Limits::default()
+    });
+    let scopes = Scopes::default();
+    for _ in 0..8 {
+        tcp.send(scopes.tunnel(), CLIENT, SERVER, 100, 0, 2, b"");
+        assert!(tcp.observer().connections() <= 2);
+    }
+    assert_eq!(tcp.observer().connections(), 2);
+}
+
 /// A child's data waits for credit; its siblings go on. A child that
 /// never takes what waits is evicted once the waiting bound is passed.
 #[test]
@@ -982,7 +998,7 @@ fn data_waits_for_credit_within_a_bound() {
         ]
     );
     assert_eq!(evicted.closed, [id]);
-    assert!(tcp.observer().waiting <= 1000);
+    assert!(tcp.observer().outputs.waiting <= 1000);
     // Later bytes of that connection are not delivered.
     let after = tcp.up(5000, 0x18, b"z");
     assert!(after.events.is_empty() && after.opened.is_empty());

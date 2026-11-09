@@ -1,16 +1,14 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use fictionet::Cx;
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, Chunk, Driver, EventOf, Layer, StreamCommand, StreamEvent,
 };
-use fictionet::stdlib::network::{ConnError, Connection};
-use fictionet::time::Instant;
+use fictionet::stdlib::network::{ConnError, Connection, Read};
+use fictionet::{Cx, Timer};
 
 use super::job::Jobs;
+use super::lifetime::{Expiry, Lifetime, Outstanding};
 use super::{Job, StackError, StreamEnd, StreamLimits};
 
 /// How big each read is. The buffer is charged to the connection's budget
@@ -20,8 +18,6 @@ pub(super) const READ: usize = 16 * 1024;
 /// How many rounds one poll makes before it lets the rest of the world
 /// run.
 const ROUNDS: usize = 64;
-
-type Sleep = Pin<Box<dyn Future<Output = Result<(), fictionet::Cancelled>> + Send>>;
 
 /// Why [`Live::poll`] stopped before it had to wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,41 +36,33 @@ pub(crate) enum Halt {
 ///
 /// Each [`poll`](Self::poll) reads the connection into the stack while the
 /// stack takes what it read before, writes what the stack hands below as
-/// far as the transport takes it and reports each byte taken once as
-/// [`StreamEvent::Written`], polls the stack's work and gives back what
-/// finished, fires the stack's due timers, and keeps the limits. Then it
-/// waits for whichever of those can move next. The stack stays synchronous:
+/// far as the connection takes it, flushes the connection and reports each
+/// byte flushed once as [`StreamEvent::Written`], polls the stack's work
+/// and gives back what finished, fires the stack's due timers, and keeps
+/// the limits. Then it waits for whichever of those can move next. The stack stays synchronous:
 /// this only translates readiness, so it behaves the same here as in a
 /// [`Harness`](fictionet::stdlib::layer::Harness).
 ///
 /// [`stream`](super::stream) polls one until its stack is done;
-/// [`Opened`](super::Opened) polls one whenever its connection is read or
-/// written.
+/// [`Opened`](super::Opened) polls one whenever its connection is read,
+/// written or flushed.
 pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     conn: C,
     driver: Driver<L>,
     jobs: Jobs<L::Work>,
-    limits: StreamLimits,
     /// The read buffer's charge; `None` if the budget had no room for it.
     buffer: Option<Charge>,
     buf: Vec<u8>,
     /// Read and not yet taken by the stack.
     input: Option<StreamEvent>,
-    /// The stack heard the end of its input, or refused input as closed.
-    input_over: bool,
-    /// The stack's end of its direction went out.
-    shut: bool,
-    /// Taken by the transport and not yet reported to the stack.
+    /// Taken by the connection and not yet flushed.
+    unflushed: u64,
+    /// Flushed to the transport and not yet reported to the stack.
     unreported: u64,
-    idled: bool,
-    /// When the peer last read or was written to, or the runner last began
-    /// to wait for it: the idle limit counts from here.
-    idle_from: Instant,
-    /// The runner waited for the peer when it last settled.
-    was_waiting: bool,
-    stalled_since: Option<Instant>,
-    sleep: Option<Sleep>,
-    armed: Option<Instant>,
+    /// The idle and write limits, and the ends of both directions.
+    lifetime: Lifetime,
+    /// Armed for the next deadline, and moved as it moves.
+    timer: Option<Timer>,
     /// How the run ended, once it has.
     stopped: Option<StreamEnd>,
 }
@@ -98,7 +86,6 @@ where
             conn,
             driver: Driver::new(stack, Arc::new(fcx.clone()), budget, fcx.now()),
             jobs: Jobs::new(),
-            limits,
             buf: if buffer.is_some() {
                 vec![0; READ]
             } else {
@@ -106,15 +93,10 @@ where
             },
             buffer,
             input: None,
-            input_over: false,
-            shut: false,
+            unflushed: 0,
             unreported: 0,
-            idled: false,
-            idle_from: fcx.now(),
-            was_waiting: false,
-            stalled_since: None,
-            sleep: None,
-            armed: None,
+            lifetime: Lifetime::new(limits),
+            timer: None,
             stopped: None,
         }
     }
@@ -133,19 +115,32 @@ where
 
     /// Whether the stack's end of its direction went out.
     pub(super) fn shut(&self) -> bool {
-        self.shut
+        self.lifetime.output_over()
+    }
+
+    fn outstanding(&self) -> Outstanding {
+        Outstanding {
+            output: self.writing(),
+            input: self.input.is_some(),
+            work: !self.jobs.is_empty(),
+        }
+    }
+
+    /// Whether output is still on its way down: the stack holds some, or
+    /// the connection took some and has not flushed it.
+    fn writing(&self) -> bool {
+        self.driver.holds_output() || self.unflushed > 0
     }
 
     /// How the run finished, once the stack has ended its direction, every
-    /// byte of it is written, no work is left, and input has ended or the
-    /// stack explicitly declares its whole lifetime terminal.
+    /// byte of it is written and reported, no work is left, and input has
+    /// ended or the stack explicitly declares its whole lifetime terminal.
     pub(super) fn finished(&self) -> Option<StreamEnd> {
-        (self.shut
-            && (self.input_over || self.driver.layer().is_terminal())
-            && !self.driver.holds_output()
-            && self.unreported == 0
-            && self.jobs.is_empty())
-        .then_some(if self.idled {
+        (self.unreported == 0
+            && self
+                .lifetime
+                .finished(self.driver.layer().is_terminal(), self.outstanding()))
+        .then_some(if self.lifetime.idled() {
             StreamEnd::Idle
         } else {
             StreamEnd::Finished
@@ -195,25 +190,34 @@ where
         above: &mut dyn FnMut(EventOf<L::Upper>) -> Admit<EventOf<L::Upper>>,
         report: &mut dyn FnMut(L::Report),
     ) -> Poll<Result<Halt, StackError<L::Error>>> {
+        // One reading of the clock for the batch: time that passes while it
+        // runs is seen when a timer comes due.
+        let mut now = fcx.now();
+        self.driver.set_now(now);
         for _ in 0..ROUNDS {
-            let now = fcx.now();
-            self.driver.set_now(now);
             // Read first, so input that came with a failed write is not
             // left behind.
             let mut read_failed = None;
             let mut moved = false;
-            if self.input.is_none() && !self.input_over {
-                match self.conn.poll_read(fcx, cx, &mut self.buf) {
-                    Poll::Ready(Ok(0)) => self.input = Some(StreamEvent::Ended),
-                    Poll::Ready(Ok(n)) => {
-                        // Charge first, then copy out of the read buffer.
-                        let Some(charge) = self.driver.budget().charge(n) else {
+            if self.input.is_none() && !self.lifetime.input_over() {
+                match self.conn.poll_read_owned(fcx, cx, &mut self.buf) {
+                    Poll::Ready(Ok(Read::Copied(0))) => self.input = Some(StreamEvent::Ended),
+                    Poll::Ready(Ok(read)) => {
+                        // Charge first, then copy out of the read buffer, or
+                        // move what the connection handed over to this budget.
+                        let budget = self.driver.budget();
+                        let chunk = match read {
+                            Read::Copied(n) => budget
+                                .charge(n)
+                                .map(|charge| Chunk::with_charge(self.buf[..n].to_vec(), charge)),
+                            Read::Owned(mut chunk) => chunk.recharge(budget).then_some(chunk),
+                        };
+                        let Some(chunk) = chunk else {
                             self.broken(ConnError::Reset, above, report)?;
                             return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
                         };
-                        let bytes = self.buf[..n].to_vec();
-                        self.input = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
-                        self.idle_from = now;
+                        self.input = Some(StreamEvent::Data(chunk));
+                        self.lifetime.progress();
                     }
                     Poll::Ready(Err(ConnError::Cancelled)) => {
                         return Poll::Ready(Err(StackError::Cancelled));
@@ -223,7 +227,9 @@ where
                 }
                 moved |= self.input.is_some();
             }
-            if self.driver.layer().is_terminal() || (self.input_over && self.shut) {
+            if self.driver.layer().is_terminal()
+                || (self.lifetime.input_over() && self.lifetime.output_over())
+            {
                 self.jobs.close_completed();
             }
             let driver = &mut self.driver;
@@ -250,7 +256,9 @@ where
                 let ended = matches!(event, StreamEvent::Ended);
                 match self.driver.deliver(event).map_err(StackError::Layer)? {
                     Admit::Taken => {
-                        self.input_over |= ended;
+                        if ended {
+                            self.lifetime.end_input();
+                        }
                         moved = true;
                     }
                     Admit::Partial(rest) => {
@@ -259,7 +267,7 @@ where
                     }
                     Admit::Blocked(event) => self.input = Some(event),
                     Admit::Closed(_) => {
-                        self.input_over = true;
+                        self.lifetime.end_input();
                         moved = true;
                     }
                 }
@@ -268,14 +276,16 @@ where
             moved |= self.driver.send_above(&mut *above);
 
             let (mut wrote, mut failed, mut reset) = (0u64, None, false);
-            let (conn, shut) = (&mut self.conn, &mut self.shut);
+            let (conn, lifetime) = (&mut self.conn, &mut self.lifetime);
             let sent = self.driver.send_below(|command| match command {
-                command if *shut || reset || failed.is_some() => Admit::Closed(command),
+                command if lifetime.output_over() || reset || failed.is_some() => {
+                    Admit::Closed(command)
+                }
                 StreamCommand::Write(mut chunk) => {
                     if chunk.is_empty() {
                         return Admit::Taken;
                     }
-                    match conn.poll_write(fcx, cx, &chunk) {
+                    match conn.poll_write_chunk(fcx, cx, &chunk) {
                         // A connection that takes nothing of a write is closed.
                         Poll::Ready(Ok(0)) => {
                             failed = Some(ConnError::Closed);
@@ -300,7 +310,7 @@ where
                 }
                 StreamCommand::End => match conn.poll_shutdown(fcx, cx) {
                     Poll::Ready(Ok(())) => {
-                        *shut = true;
+                        lifetime.end_output();
                         Admit::Taken
                     }
                     Poll::Ready(Err(e)) => {
@@ -319,18 +329,24 @@ where
             if reset {
                 return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Reset))));
             }
+            self.unflushed += wrote;
             if let Some(e) = failed {
                 // The write stays held, to try again.
-                self.unreported += wrote;
                 return Poll::Ready(Ok(Halt::Conn(e)));
             }
             if wrote > 0 {
-                self.unreported += wrote;
-                self.stalled_since = None;
-                self.idle_from = now;
+                self.lifetime.progress();
             }
-            if !self.driver.holds_output() {
-                self.stalled_since = None;
+            // Bytes count as written once the connection has handed them on.
+            if self.unflushed > 0 {
+                match self.conn.poll_flush(fcx, cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.unreported += std::mem::take(&mut self.unflushed);
+                        moved = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Ok(Halt::Conn(e))),
+                    Poll::Pending => {}
+                }
             }
             if let Some(e) = read_failed {
                 return Poll::Ready(Ok(Halt::Conn(e)));
@@ -340,60 +356,47 @@ where
             }
 
             // The limits, as of now.
-            if self.driver.holds_output() {
-                let since = *self.stalled_since.get_or_insert(now);
-                if self.limits.write_timeout.is_some_and(|d| now >= since + d) {
+            self.lifetime.settle(now, self.outstanding());
+            match self.lifetime.due(now) {
+                Some(Expiry::Stalled) => {
+                    self.lifetime.expire(Expiry::Stalled);
                     let end = self.broken(ConnError::TimedOut, above, report)?;
                     return Poll::Ready(Ok(Halt::End(end)));
                 }
-            }
-            let waiting = self.input.is_none()
-                && !self.input_over
-                && !self.driver.holds_output()
-                && self.jobs.is_empty();
-            // The idle clock runs only while the runner waits for the peer,
-            // and starts again each time it begins to.
-            if waiting && !self.was_waiting {
-                self.idle_from = now;
-            }
-            self.was_waiting = waiting;
-            if waiting && self.limits.idle.is_some_and(|d| now >= self.idle_from + d) {
-                self.idled = true;
-                self.input = Some(StreamEvent::Ended);
-                continue;
+                Some(Expiry::Idle) => {
+                    self.lifetime.expire(Expiry::Idle);
+                    self.input = Some(StreamEvent::Ended);
+                    continue;
+                }
+                None => {}
             }
             let deadline = [
                 self.driver.deadline(),
-                self.limits
-                    .idle
-                    .filter(|_| waiting)
-                    .map(|d| self.idle_from + d),
-                self.stalled_since
-                    .zip(self.limits.write_timeout)
-                    .map(|(at, d)| at + d),
+                self.lifetime.deadline().map(|(at, _)| at),
             ]
             .into_iter()
             .flatten()
             .min();
-            if deadline != self.armed {
-                self.sleep = deadline.map(|at| {
-                    let fcx = fcx.clone();
-                    Box::pin(async move { fcx.sleep_until(at).await }) as Sleep
-                });
-                self.armed = deadline;
+            let Some(at) = deadline else {
+                if let Some(timer) = &mut self.timer {
+                    timer.clear();
+                }
+                return Poll::Pending;
+            };
+            let timer = self.timer.get_or_insert_with(|| Timer::new(fcx));
+            match timer.poll_until(cx, at) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {}
+                // Its region was cancelled: the next round arms a timer in
+                // the region of this poll.
+                Poll::Ready(Err(_)) => self.timer = None,
             }
-            if let Some(sleep) = &mut self.sleep
-                && sleep.as_mut().poll(cx).is_ready()
-            {
-                self.sleep = None;
-                self.armed = None;
-                continue;
-            }
-            return Poll::Pending;
+            now = fcx.now();
+            self.driver.set_now(now);
         }
         // Busy for a while: let the rest of the world run, then go on.
         // This pause is internal work, not time spent waiting for the peer.
-        self.was_waiting = false;
+        self.lifetime.interrupt();
         cx.waker().wake_by_ref();
         Poll::Pending
     }
@@ -411,7 +414,7 @@ where
             return Err(StackError::Cancelled);
         }
         self.input = None;
-        self.input_over = true;
+        self.lifetime.end_input();
         let end = self.stop(StreamEnd::Conn(e));
         // A stack that refuses the reset has already closed.
         let _ = self

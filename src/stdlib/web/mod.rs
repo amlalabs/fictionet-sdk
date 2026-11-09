@@ -562,6 +562,7 @@ use httpd::{Handler, Server};
 /// Websites by hostname, and the network around them. See the
 /// [module docs](fictionet::stdlib::web).
 pub struct Sites {
+    observe: Option<httpd::Observe>,
     site_for: Arc<SiteFor>,
     max_sites: usize,
     net: Net,
@@ -592,12 +593,37 @@ impl Sites {
         F: Fn(&str) -> Option<Site> + Send + Sync + 'static,
     {
         Sites {
+            observe: None,
             site_for: Arc::new(site_for),
             max_sites: 20_000,
             net: Net::new(pools),
             date: None,
             on_dns_event: None,
         }
+    }
+
+    /// Observes HTTP delivery for every site created by this preset, including
+    /// sites discovered later. A server's own observer takes precedence.
+    /// Hosts added separately through [`Sites::into_net`] configure their own
+    /// [`Server::observe`] callback.
+    ///
+    /// ```
+    /// # use fictionet::stdlib::web;
+    /// # use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// let delivered = Arc::new(AtomicUsize::new(0));
+    /// let count = delivered.clone();
+    /// let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), |_| {
+    ///     Some(web::Site::new(axum::Router::new()))
+    /// }).observe_http(Arc::new(move |exchange| {
+    ///     if exchange.complete {
+    ///         count.fetch_add(1, Ordering::Relaxed);
+    ///     }
+    /// }));
+    /// # drop(sites);
+    /// ```
+    pub fn observe_http(mut self, observe: httpd::Observe) -> Self {
+        self.observe = Some(observe);
+        self
     }
 
     /// Calls `f` with each event the gateway's resolver reports, in order:
@@ -653,6 +679,7 @@ impl Sites {
     /// and the reverse zones of private addresses.
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
+        let observe = self.observe;
         let date = self.date;
         let on_dns_event = self.on_dns_event;
         let clock = WallClock {
@@ -662,6 +689,7 @@ impl Sites {
             self.net.handle(),
             move |name| {
                 site_for(name).map(|mut site| {
+                    site.server.inherit_observer(&observe);
                     if let Some(date) = date {
                         site = site.date(date);
                     }

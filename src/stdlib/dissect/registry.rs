@@ -1,4 +1,4 @@
-use super::{Decoded, KeyLine, Observed, Place, Present};
+use super::{Decoded, KeyLog, Observed, Place, Present};
 use fictionet::stdlib::layer::Termination;
 use fictionet::stdlib::network::Transport;
 use std::sync::Arc;
@@ -40,15 +40,8 @@ pub enum Match {
 /// [`Registry::register`] and [`Observed`] directly.
 pub trait Protocol: Send {
     /// Processes ordered bytes in one direction. `reverse` selects the
-    /// second direction. Keys are TLS secrets supplied by the capture owner.
-    fn data(
-        &mut self,
-        reverse: bool,
-        bytes: &[u8],
-        at: Place,
-        packet: &mut Decoded,
-        keys: &[KeyLine],
-    );
+    /// second direction.
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, packet: &mut Decoded);
     /// Whether this direction holds part of a message.
     fn waiting(&self, reverse: bool) -> bool;
     /// Discards state invalidated by missing bytes in this direction.
@@ -71,15 +64,8 @@ pub trait Protocol: Send {
     /// one run of bytes and ends that direction, which suits a protocol
     /// that reads a single datagram. Decoders registered with
     /// [`Registry::register`] read each datagram with new decoders.
-    fn datagram(
-        &mut self,
-        reverse: bool,
-        bytes: &[u8],
-        at: Place,
-        packet: &mut Decoded,
-        keys: &[KeyLine],
-    ) {
-        self.data(reverse, bytes, at, packet, keys);
+    fn datagram(&mut self, reverse: bool, bytes: &[u8], at: Place, packet: &mut Decoded) {
+        self.data(reverse, bytes, at, packet);
         self.end(reverse, Termination::Fin, packet);
     }
 }
@@ -101,10 +87,15 @@ struct Entry {
 /// prefix bytes in a direction. It does not fall through to other matchers.
 /// For UDP it acts as `No`: a datagram cannot grow. Explicit selection
 /// bypasses matchers only for the chosen transport.
+///
+/// A registry also holds the capture's TLS secrets, its [`KeyLog`], which
+/// clones share. A session that selects protocols inside itself with a
+/// clone, as TLS does, passes the same secrets to the sessions it makes.
 #[derive(Clone)]
 pub struct Registry {
     entries: Vec<Arc<Entry>>,
     choice: [Option<String>; 2],
+    keys: KeyLog,
 }
 
 impl std::fmt::Debug for Registry {
@@ -128,12 +119,19 @@ impl Default for Registry {
 }
 
 impl Registry {
-    /// Creates a registry with no protocols.
+    /// Creates a registry with no protocols and an empty key log.
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
             choice: [None, None],
+            keys: KeyLog::default(),
         }
+    }
+
+    /// The TLS secrets of the capture this registry decodes, shared with
+    /// its clones.
+    pub fn keys(&self) -> &KeyLog {
+        &self.keys
     }
 
     /// Returns the registered names in registration order, oldest first.
@@ -279,14 +277,7 @@ impl<D: Present + Send> Protocol for Pair<D>
 where
     D::Error: Clone + Send,
 {
-    fn data(
-        &mut self,
-        reverse: bool,
-        bytes: &[u8],
-        at: Place,
-        packet: &mut Decoded,
-        _: &[KeyLine],
-    ) {
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, packet: &mut Decoded) {
         if let Some(dir) = self
             .dirs
             .get_mut(usize::from(reverse))
@@ -320,14 +311,7 @@ where
     }
     /// Reads the datagram with a new decoder, made by the factory as for a
     /// conversation starting with it, and ends that decoder.
-    fn datagram(
-        &mut self,
-        reverse: bool,
-        bytes: &[u8],
-        at: Place,
-        packet: &mut Decoded,
-        _: &[KeyLine],
-    ) {
+    fn datagram(&mut self, reverse: bool, bytes: &[u8], at: Place, packet: &mut Decoded) {
         let [forward, back] = (self.make)(Selection {
             transport: self.transport,
             ports: self.ports,

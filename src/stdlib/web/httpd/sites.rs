@@ -359,6 +359,12 @@ impl Server {
         self
     }
 
+    pub(crate) fn inherit_observer(&mut self, observe: &Option<super::Observe>) {
+        if self.observe.is_none() {
+            self.observe = observe.clone();
+        }
+    }
+
     /// Sets the limits and timers.
     pub fn limits(mut self, limits: Limits) -> Server {
         self.limits = limits;
@@ -473,7 +479,7 @@ impl PortServer for Server {
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let handler = self.handler_for(&arrival.info);
         let opts = HttpOptions {
-            observe: self.observe.clone().or(arrival.http_observe.clone()),
+            observe: self.observe.clone(),
             limits: self.limits,
             first_bytes: (!arrival.info.tls).then_some(arrival.limits.handshake),
             budget: arrival.budget,
@@ -491,7 +497,7 @@ impl PortServer for Server {
     /// gives up on a client that stops reading.
     fn stack(&self, fcx: &Cx, opening: &Opening) -> PortStack {
         let opts = HttpOptions {
-            observe: self.observe.clone().or(opening.http_observe.clone()),
+            observe: self.observe.clone(),
             limits: self.limits,
             first_bytes: (!opening.info.tls).then_some(opening.limits.handshake),
             budget: opening.budget.clone(),

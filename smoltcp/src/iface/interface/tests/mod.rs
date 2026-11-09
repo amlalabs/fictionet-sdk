@@ -2,6 +2,228 @@ use crate::tests::setup;
 
 use super::*;
 
+struct LimitedDevice {
+    inner: crate::tests::TestingDevice,
+    remaining: usize,
+}
+
+impl Device for LimitedDevice {
+    type RxToken<'a> = crate::tests::RxToken;
+    type TxToken<'a> = crate::tests::TxToken<'a>;
+
+    fn capabilities(&self) -> crate::phy::DeviceCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.inner.receive(now)
+    }
+
+    fn transmit(&mut self, now: Instant) -> Option<Self::TxToken<'_>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        self.inner.transmit(now)
+    }
+}
+
+#[test]
+fn indexed_deadlines_follow_mutation_removal_and_slot_reuse() {
+    use crate::socket::{
+        PollAt,
+        tcp::{Socket, SocketBuffer},
+    };
+    let (mut iface, mut sockets, mut device) = setup();
+    let make = || {
+        Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        )
+    };
+    let check = |iface: &mut Interface, sockets: &mut SocketSet<'_>, now| {
+        iface.poll_maintenance(now);
+        let expected = sockets
+            .iter()
+            .filter_map(|(_, socket)| match socket.poll_at(iface.context()) {
+                PollAt::Ingress => None,
+                PollAt::Time(at) => Some(at),
+                PollAt::Now => Some(Instant::ZERO),
+            })
+            .min();
+        assert_eq!(iface.poll_at(now, sockets), expected);
+    };
+    let mut handles = Vec::new();
+    for port in [80, 81, 82] {
+        let mut socket = make();
+        socket
+            .connect(
+                iface.context(),
+                (Ipv4Address::new(192, 168, 1, 2), port),
+                (Ipv4Address::new(192, 168, 1, 1), 4242),
+            )
+            .unwrap();
+        handles.push(sockets.add(socket));
+    }
+    for millis in [0, 500, 1000, 2000] {
+        let now = Instant::from_millis(millis);
+        check(&mut iface, &mut sockets, now);
+        iface.poll_egress(now, &mut device, &mut sockets);
+        check(&mut iface, &mut sockets, now);
+    }
+    sockets
+        .get_mut(handles[0])
+        .set_timeout(Some(crate::time::Duration::from_millis(2500)));
+    check(&mut iface, &mut sockets, Instant::from_millis(2000));
+    sockets.remove(handles[0]);
+    let mut listener = make();
+    listener.listen(4243).unwrap();
+    assert_eq!(sockets.add(listener), handles[0]);
+    check(&mut iface, &mut sockets, Instant::from_millis(2000));
+    for h in handles {
+        sockets.remove(h);
+    }
+    assert_eq!(
+        iface.poll_at(Instant::from_millis(3000), &mut sockets),
+        None
+    );
+}
+
+#[test]
+fn egress_keeps_slot_order_after_an_unsaturated_pass() {
+    use crate::socket::tcp::{Socket, SocketBuffer};
+    let (mut iface, mut sockets, mut device) = setup();
+    let local = (Ipv4Address::new(192, 168, 1, 1), 4242);
+    let remote = Ipv4Address::new(192, 168, 1, 2);
+    let mut handles = Vec::new();
+    for port in [80, 81] {
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        );
+        socket
+            .connect(iface.context(), (remote, port), local)
+            .unwrap();
+        handles.push(sockets.add(socket));
+    }
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    sockets.get_mut(handles[0]).abort();
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    sockets
+        .get_mut(handles[0])
+        .connect(iface.context(), (remote, 80), local)
+        .unwrap();
+    sockets.get_mut(handles[1]).abort();
+    device.tx_queue.clear();
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    let ports: Vec<_> = device
+        .tx_queue
+        .iter()
+        .map(|p| TcpPacket::new_checked(&p[20..]).unwrap().dst_port())
+        .collect();
+    assert_eq!(ports, [80, 81]);
+}
+
+#[test]
+fn egress_rotates_when_an_earlier_socket_becomes_ready_again() {
+    use crate::socket::tcp::{Socket, SocketBuffer};
+    let (mut iface, mut sockets, device) = setup();
+    let mut device = LimitedDevice {
+        inner: device,
+        remaining: 1,
+    };
+    let mut handles = Vec::new();
+    for port in [80, 81] {
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        );
+        socket
+            .connect(
+                iface.context(),
+                (Ipv4Address::new(192, 168, 1, 2), port),
+                (Ipv4Address::new(192, 168, 1, 1), 4242),
+            )
+            .unwrap();
+        handles.push(sockets.add(socket));
+    }
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    sockets.get_mut(handles[0]).abort();
+    device.remaining = 1;
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    let ports: Vec<_> = device
+        .inner
+        .tx_queue
+        .iter()
+        .map(|p| TcpPacket::new_checked(&p[20..]).unwrap().dst_port())
+        .collect();
+    assert_eq!(ports, [80, 81]);
+    device.remaining = 1;
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    assert!(
+        TcpPacket::new_checked(&device.inner.tx_queue.back().unwrap()[20..])
+            .unwrap()
+            .rst()
+    );
+}
+
+#[test]
+fn targeted_ingress_keeps_connection_precedence_and_validates_input() {
+    use crate::socket::tcp::{Socket, SocketBuffer, State};
+    let (mut iface, mut sockets, mut device) = setup();
+    let make = || {
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        );
+        socket.listen(4243).unwrap();
+        socket
+    };
+    let listener = sockets.add(make());
+    let mut connection = make();
+    connection.accept_syn_cookie(
+        (Ipv4Address::new(192, 168, 1, 1), 4243).into(),
+        (Ipv4Address::new(192, 168, 1, 2), 4242).into(),
+        7,
+        100,
+        536,
+        Instant::ZERO,
+    );
+    let target = sockets.add(connection);
+    let ip = IpRepr::Ipv4(Ipv4Repr {
+        identification: 0,
+        options: Ipv4OptionBytes::EMPTY,
+        wire_dst: None,
+        src_addr: Ipv4Address::new(192, 168, 1, 2),
+        dst_addr: Ipv4Address::new(192, 168, 1, 1),
+        next_header: IpProtocol::Tcp,
+        payload_len: 20,
+        hop_limit: 64,
+    });
+    let bytes = syn_bytes(ip.clone());
+    device.rx_queue.push_back(bytes.clone());
+    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    assert_eq!(sockets.get(listener).state(), State::Listen);
+    assert_eq!(sockets.get(target).state(), State::SynReceived);
+
+    let mut invalid = bytes.clone();
+    invalid[36] ^= 1;
+    device.tx_queue.clear();
+    device.rx_queue.push_back(invalid);
+    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.get(target).state(), State::SynReceived);
+
+    let mut other = bytes;
+    let mut tcp = TcpPacket::new_unchecked(&mut other[20..]);
+    tcp.set_src_port(4244);
+    tcp.fill_checksum(&ip.src_addr(), &ip.dst_addr());
+    device.rx_queue.push_back(other);
+    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    assert_eq!(sockets.get(listener).state(), State::SynReceived);
+    assert_eq!(sockets.get(target).remote_endpoint().unwrap().port, 4242);
+}
+
 #[test]
 fn tcp_not_accepted() {
     let (mut iface, mut sockets, _) = setup();

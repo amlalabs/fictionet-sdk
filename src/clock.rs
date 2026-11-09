@@ -19,6 +19,9 @@ pub enum RunMode {
 pub(crate) struct Clock {
     #[cfg(test)]
     pub(crate) reads: std::sync::atomic::AtomicUsize,
+    /// Calls into the host wake driver.
+    #[cfg(test)]
+    host_calls: std::sync::atomic::AtomicUsize,
     origin: Option<crate::sys::Instant>,
     state: Mutex<State>,
     wake: Option<Waker>,
@@ -30,7 +33,15 @@ struct State {
     next_id: u64,
     entries: BTreeMap<(Instant, u64), Waker>,
     deadlines: BTreeMap<u64, Instant>,
-    host: Option<u64>,
+    host: Option<Host>,
+}
+
+/// The run's registration in the host wake driver.
+struct Host {
+    id: u64,
+    /// The deadline the driver holds for `id`. `None` once the driver may
+    /// have consumed the entry, so the next arm sets it again.
+    armed: Option<crate::sys::Instant>,
 }
 
 impl Clock {
@@ -38,6 +49,8 @@ impl Clock {
         Arc::new_cyclic(|wake| Self {
             #[cfg(test)]
             reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            host_calls: std::sync::atomic::AtomicUsize::new(0),
             origin: (mode == RunMode::Real).then(crate::sys::Instant::now),
             state: Mutex::new(State::default()),
             wake: (mode == RunMode::Real).then(|| Waker::from(Arc::new(HostWake(wake.clone())))),
@@ -126,20 +139,40 @@ impl Clock {
         drop(old);
     }
 
-    // Only the earliest logical deadline is represented in the host driver.
+    // Only the earliest logical deadline is represented in the host driver,
+    // and the driver is called only when that deadline changes.
     fn arm(&self, s: &mut State) {
         let Some(origin) = self.origin else { return };
         let next = s.entries.first_key_value().map(|((at, _), _)| *at);
         if let Some(at) = next {
             let deadline = origin.checked_add(at.since_start()).expect("finite timer");
             let waker = self.wake.as_ref().expect("real clock waker");
-            match s.host {
-                Some(id) => crate::timer::timers().reset(id, deadline, waker),
-                None => s.host = Some(crate::timer::timers().add(deadline, waker.clone())),
+            match &mut s.host {
+                Some(host) if host.armed == Some(deadline) => {}
+                Some(host) => {
+                    self.note_host_call();
+                    crate::timer::timers().reset(host.id, deadline, waker);
+                    host.armed = Some(deadline);
+                }
+                None => {
+                    self.note_host_call();
+                    let id = crate::timer::timers().add(deadline, waker.clone());
+                    s.host = Some(Host {
+                        id,
+                        armed: Some(deadline),
+                    });
+                }
             }
-        } else if let Some(id) = s.host.take() {
-            crate::timer::timers().remove(id);
+        } else if let Some(host) = s.host.take() {
+            self.note_host_call();
+            crate::timer::timers().remove(host.id);
         }
+    }
+
+    fn note_host_call(&self) {
+        #[cfg(test)]
+        self.host_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn take_due(s: &mut State, now: Instant) -> Vec<Waker> {
@@ -188,6 +221,12 @@ impl Wake for HostWake {
         };
         let now = clock.now();
         let mut s = clock.state.lock();
+        // The driver removed the host entry before waking this waker, and
+        // an arm since then may have skipped the driver for an unchanged
+        // deadline. Set the entry again.
+        if let Some(host) = &mut s.host {
+            host.armed = None;
+        }
         let due = Clock::take_due(&mut s, now);
         clock.arm(&mut s);
         drop(s);
@@ -199,8 +238,80 @@ impl Wake for HostWake {
 
 impl Drop for Clock {
     fn drop(&mut self) {
-        if let Some(id) = self.state.get_mut().host {
-            crate::timer::timers().remove(id);
+        if let Some(host) = &self.state.get_mut().host {
+            crate::timer::timers().remove(host.id);
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// The deadline the host driver holds for `clock`, if any.
+    fn driver_deadline(clock: &Clock) -> Option<crate::sys::Instant> {
+        let id = clock.state.lock().host.as_ref()?.id;
+        crate::timer::timers().deadline(id)
+    }
+
+    /// The host instant of logical instant `at` on `clock`.
+    fn host_instant(clock: &Clock, at: Instant) -> crate::sys::Instant {
+        clock.origin.unwrap().checked_add(at.since_start()).unwrap()
+    }
+
+    #[test]
+    fn timers_after_the_earliest_leave_the_host_driver_alone() {
+        let clock = Clock::new(RunMode::Real);
+        let waker = Waker::noop();
+        let first = clock.now() + HOUR;
+        clock.add(first, waker.clone());
+        let calls = clock.host_calls.load(Ordering::Relaxed);
+        let tied = clock.add(first, waker.clone());
+        let later = clock.add(first + SECOND, waker.clone());
+        let later = clock.reset(later, first + 2 * SECOND, waker);
+        let tied = clock.reset(tied, first + 3 * SECOND, waker);
+        clock.remove(later);
+        clock.remove(tied);
+        assert_eq!(clock.host_calls.load(Ordering::Relaxed), calls);
+        assert_eq!(driver_deadline(&clock), Some(host_instant(&clock, first)));
+    }
+
+    /// The driver removes a due entry before it wakes the clock, so an arm
+    /// in between sees an unchanged deadline although the driver no longer
+    /// holds it. The wake must set the entry again.
+    #[test]
+    fn a_host_wake_sets_the_driver_entry_again() {
+        let clock = Clock::new(RunMode::Real);
+        let waker = Waker::noop();
+        let first = clock.now() + HOUR;
+        clock.add(first, waker.clone());
+        let id = clock.state.lock().host.as_ref().unwrap().id;
+        crate::timer::timers().remove(id);
+        clock.add(first + SECOND, waker.clone());
+        clock.wake.as_ref().unwrap().wake_by_ref();
+        assert_eq!(driver_deadline(&clock), Some(host_instant(&clock, first)));
+    }
+
+    #[test]
+    fn removing_timers_moves_and_cancels_the_host_wake() {
+        let clock = Clock::new(RunMode::Real);
+        let waker = Waker::noop();
+        let first = clock.now() + HOUR;
+        let a = clock.add(first, waker.clone());
+        let b = clock.add(first + SECOND, waker.clone());
+        let id = clock.state.lock().host.as_ref().unwrap().id;
+        clock.remove(a);
+        assert_eq!(
+            driver_deadline(&clock),
+            Some(host_instant(&clock, first + SECOND))
+        );
+        clock.remove(b);
+        assert_eq!(crate::timer::timers().deadline(id), None);
+        clock.add(first, waker.clone());
+        assert_eq!(driver_deadline(&clock), Some(host_instant(&clock, first)));
     }
 }

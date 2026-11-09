@@ -46,11 +46,15 @@ The divergences from upstream are:
   lockfile, original workspace manifest, external-type audit metadata, and
   unused development dependencies are omitted. The crate belongs to the
   Fictionet workspace and uses its lockfile.
-- Two accessors let Fictionet's TLS layer move bytes without extra copies:
+- Accessors let Fictionet's TLS layer move bytes without extra copies:
   `CommonState::sendable_tls_len` says how many bytes `write_tls` has
   queued, so the layer allocates exactly that, and
   `Reader::take_first_chunk` hands over the decrypted plaintext in the
   buffer that holds it instead of copying it out.
+  `CommonState::take_sendable_tls_chunk` transfers the sole whole queued
+  ciphertext buffer when its capacity fits a caller's reservation. Multiple
+  chunks, partially consumed chunks and oversized allocations stay queued
+  for the existing bounded, coalescing `write_tls` path.
 
 The fork retains upstream `no_std` support and builds for
 `wasm32-unknown-unknown`. Fictionet configures ring's browser randomness

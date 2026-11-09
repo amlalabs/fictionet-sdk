@@ -122,8 +122,9 @@ fn packets(wire: &[(bool, Vec<u8>)]) -> Vec<Vec<u8>> {
 }
 
 fn decode(mut dissector: Dissector, packets: &[Vec<u8>], keys: &[KeyLine]) -> Vec<Decoded> {
-    let mut decoded: Vec<_> = packets.iter().map(|p| dissector.decode(p, keys)).collect();
-    decoded.push(dissector.finish(keys));
+    dissector.keys().extend(keys.iter().cloned());
+    let mut decoded: Vec<_> = packets.iter().map(|p| dissector.decode(p)).collect();
+    decoded.push(dissector.finish());
     decoded
 }
 

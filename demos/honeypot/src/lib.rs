@@ -382,7 +382,7 @@ async fn relay(
                 // does.
                 let packet = match reassembly.push(packet, fcx.now()) {
                     Intake::Whole(packet) | Intake::Refused { packet, .. } => packet,
-                    Intake::Waiting => continue,
+                    Intake::Waiting | Intake::Discarded => continue,
                 };
                 let reassembled = fragment
                     && ip::Header::parse_truncated(&packet.0)

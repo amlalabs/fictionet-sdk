@@ -804,7 +804,6 @@ fn http2_capture_frames(bencher: Bencher, size: usize) {
                     len: preface.len(),
                 },
                 &mut Decoded::default(),
-                &[],
             );
             let mut decoded = Decoded::default();
             conversation.data(
@@ -817,7 +816,6 @@ fn http2_capture_frames(bencher: Bencher, size: usize) {
                     len: input.len(),
                 },
                 &mut decoded,
-                &[],
             );
             black_box(decoded);
         });

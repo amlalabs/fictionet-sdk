@@ -10,6 +10,7 @@ use fictionet::stdlib::layer::{
 use fictionet::stdlib::protocols::http2::PREFACE;
 use fictionet::time::Instant;
 
+use super::Servers;
 use super::http2::Http2Server;
 use super::native::{Http1, Upgraded};
 
@@ -17,43 +18,31 @@ use super::native::{Http1, Upgraded};
 /// hand on to a tunnel or to HTTP/2, or HTTP/2 from the start.
 pub type Versions = Side<Switch<Http1, Upgraded>, Http2Server>;
 
-/// HTTP for one connection: [`Detect`] until the version is known, then
-/// that version's server. [`serve_connection`](super::serve_connection)
-/// runs it.
-pub type Http = Switch<Detect, Versions>;
+/// HTTP for one connection: over TLS, the version ALPN chose; without
+/// TLS, [`Detect`] until the version is known, then that version's server.
+/// [`serve_connection`](super::serve_connection) runs it.
+pub type Http = Side<Versions, Switch<Detect, Versions>>;
 
-/// The version [`Detect`] chose, with its server.
-pub enum Choice {
-    /// HTTP/1.
-    Http1(Box<Switch<Http1, Upgraded>>),
-    /// HTTP/2.
-    Http2(Box<Http2Server>),
-}
-
-impl Successor<Choice> for Versions {
-    fn succeed(choice: Choice) -> Versions {
-        match choice {
-            Choice::Http1(http1) => Side::Lower(*http1),
-            Choice::Http2(http2) => Side::Upper(*http2),
-        }
+impl Successor<Versions> for Versions {
+    fn succeed(versions: Versions) -> Versions {
+        versions
     }
 }
 
 /// Reads no more of a connection's first bytes than it takes to tell
-/// HTTP/2's preface (HTTP/2 with prior knowledge) from HTTP/1, then hands
-/// those bytes, and everything after them, to the server it chose.
+/// HTTP/2's preface (HTTP/2 with prior knowledge) from HTTP/1, then makes
+/// the server it chose and hands it those bytes, and everything after them.
 ///
 /// It holds at most the 24 bytes of the preface. The first byte that
 /// differs from it chooses HTTP/1, as does the client's end inside it; the
 /// whole preface chooses HTTP/2. A client that has not chosen by the
-/// first-bytes deadline is closed with nothing written. Over TLS the
-/// version is ALPN's, known before any byte: [`decided`](Self::decided).
+/// first-bytes deadline is closed with nothing written.
 pub struct Detect {
     first: Vec<u8>,
     charge: Option<Charge>,
     timeout: Option<Duration>,
     deadline: Option<Instant>,
-    servers: Option<(Switch<Http1, Upgraded>, Http2Server)>,
+    servers: Option<Servers>,
     chosen: Option<bool>,
     peer_ended: bool,
     out: Option<StreamCommand>,
@@ -61,27 +50,19 @@ pub struct Detect {
 }
 
 impl Detect {
-    /// Reads the first bytes, for at most `timeout` from the first call.
-    pub fn new(timeout: Duration, http1: Switch<Http1, Upgraded>, http2: Http2Server) -> Self {
+    /// Reads the first bytes, for at most `timeout` from the first call,
+    /// then makes the version they chose from `servers`.
+    pub(super) fn new(timeout: Duration, servers: Servers) -> Self {
         Self {
             first: Vec::new(),
             charge: None,
             timeout: Some(timeout),
             deadline: None,
-            servers: Some((http1, http2)),
+            servers: Some(servers),
             chosen: None,
             peer_ended: false,
             out: None,
             closed: false,
-        }
-    }
-
-    /// The version is already known: HTTP/2 with `h2`, else HTTP/1.
-    pub fn decided(h2: bool, http1: Switch<Http1, Upgraded>, http2: Http2Server) -> Self {
-        Self {
-            timeout: None,
-            chosen: Some(h2),
-            ..Self::new(Duration::ZERO, http1, http2)
         }
     }
 
@@ -218,14 +199,14 @@ fn scan(first: &mut Vec<u8>, bytes: &[u8]) -> (usize, Option<bool>) {
 mod proofs;
 
 impl Handoff for Detect {
-    type Next = Choice;
+    type Next = Versions;
 
-    fn handover(&mut self) -> Option<Handover<Choice, ByteStream, Top>> {
+    fn handover(&mut self) -> Option<Handover<Versions, ByteStream, Top>> {
         let h2 = self.chosen?;
         if self.closed {
             return None;
         }
-        let (http1, http2) = self.servers.take()?;
+        let servers = self.servers.take()?;
         let mut below = Vec::new();
         if !self.first.is_empty() {
             let bytes = std::mem::take(&mut self.first);
@@ -239,11 +220,7 @@ impl Handoff for Detect {
         }
         self.closed = true;
         Some(Handover {
-            next: if h2 {
-                Choice::Http2(Box::new(http2))
-            } else {
-                Choice::Http1(Box::new(http1))
-            },
+            next: servers.make(h2),
             below,
             above: Vec::new(),
         })

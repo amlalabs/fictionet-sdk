@@ -115,11 +115,18 @@
 //! accounting, [`HttpOptions::observe`] receives the request and response heads,
 //! receipt outcome, and body bytes in completely written pieces. Response
 //! extensions carry world-owned facts without a shared event schema.
+//!
+//! Configure [`Server::observe`] for an individual HTTP server, or
+//! [`Sites::observe_http`](super::Sites::observe_http) for the servers a website
+//! preset creates. The preset shares its callback with sites discovered later;
+//! an explicit server callback takes precedence. Sites sharing an address and
+//! port use the first server's callback. When building hosts with `Net` directly,
+//! clone the shared callback into each HTTP server's configuration.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use fictionet::stdlib::layer::{Budget, Switch};
+use fictionet::stdlib::layer::{Budget, Side, Switch};
 use fictionet::stdlib::network::{ConnInfo, Connection};
 use fictionet::stdlib::protocols::http1;
 use fictionet::stdlib::services::stack::{self, StackError, StreamLimits};
@@ -134,20 +141,21 @@ mod response;
 mod sites;
 
 pub use body::Body;
-pub use detect::{Choice, Detect, Http, Versions};
+pub use detect::{Detect, Http, Versions};
 pub use handlers::{
     BadGateway, Exchange, Handler, Later, Reply, Reset, Tower, UpgradeHandler, text, tower,
 };
 
 pub use http2::{
     Ending, ExchangeCommand, ExchangeEvent, Grpc, GrpcCommand, GrpcEvent, Http2, Http2Server,
-    HttpExchange, Opening, Report as Http2Report, Respond, RespondWork, Responder, ResponseHead,
-    Timer as Http2Timer,
+    HttpExchange, Opening, Report as Http2Report, RequestTrailers, Respond, RespondWork, Responder,
+    ResponseHead, Timer as Http2Timer,
 };
 pub use native::{
     Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer, Upgraded,
     Work as Http1Work,
 };
+use response::Dates;
 pub use response::{date_header, http_date};
 pub use sites::{Answer, Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
 
@@ -369,56 +377,83 @@ pub struct HttpOptions {
     pub date: Option<SystemTime>,
 }
 
-/// HTTP/1 for the connection `info` names, answering with `handler` as
-/// `opts` says: what [`serve_connection`] runs, and what a site runs over
-/// TLS in the same stack.
-pub(super) fn http1_for(handler: Arc<dyn Handler>, opts: &HttpOptions, info: &ConnInfo) -> Http1 {
-    let mut http1 = Http1::with(handler, opts.limits).conn(info.clone());
-    http1.date = opts.date;
-    http1.observe = opts.observe.clone();
-    http1
+/// What either version's server for one connection is made from: the
+/// handler and the options both versions share. [`http_for`] makes the
+/// version TLS negotiated at once; without TLS, [`Detect`] keeps this until
+/// the client's first bytes say which version to make.
+pub(super) struct Servers {
+    handler: Arc<dyn Handler>,
+    limits: Limits,
+    observe: Option<Observe>,
+    date: Option<SystemTime>,
+    conn: ConnInfo,
+    /// HTTP/1 accepts `Upgrade: h2c`.
+    h2c: bool,
+    /// When the head of HTTP/1's first request is due, if it is counted
+    /// from the connection's start rather than from HTTP/1's.
+    first_head_deadline: Option<fictionet::time::Instant>,
 }
 
-/// HTTP/2 for the connection `info` names, answering with `handler` as
-/// `opts` says.
-pub(super) fn http2_for(
-    handler: Arc<dyn Handler>,
-    opts: &HttpOptions,
-    info: &ConnInfo,
-) -> Http2Server {
-    Responder::shared(handler)
-        .limits(opts.limits)
-        .maybe_observe(opts.observe.clone())
-        .maybe_date(opts.date)
-        .conn(info.clone())
-        .http2()
+impl Servers {
+    fn new(handler: Arc<dyn Handler>, opts: &HttpOptions, info: &ConnInfo) -> Servers {
+        Servers {
+            handler,
+            limits: opts.limits,
+            observe: opts.observe.clone(),
+            date: opts.date,
+            conn: info.clone(),
+            h2c: false,
+            first_head_deadline: None,
+        }
+    }
+
+    /// The server for one version: HTTP/2 with `h2`, else HTTP/1.
+    pub(super) fn make(self, h2: bool) -> Versions {
+        if h2 {
+            return Side::Upper(
+                Responder::shared(self.handler)
+                    .limits(self.limits)
+                    .maybe_observe(self.observe)
+                    .maybe_date(self.date)
+                    .conn(self.conn)
+                    .http2(),
+            );
+        }
+        let mut http1 = Http1::with(self.handler, self.limits).conn(self.conn);
+        http1.dates = Dates::new(self.date);
+        http1.observe = self.observe;
+        http1.first_head_deadline = self.first_head_deadline;
+        if self.h2c {
+            http1 = http1.h2c();
+        }
+        Side::Lower(http1.upgradable())
+    }
 }
 
 /// HTTP for one connection, answering with `handler` as `opts` says: the
-/// stack [`serve_connection`] runs. Over TLS the version is ALPN's; without
-/// TLS, [`Detect`] tells HTTP/2's preface from HTTP/1 within the first-bytes
-/// deadline, and HTTP/1 accepts `Upgrade: h2c`.
+/// stack [`serve_connection`] runs. Over TLS it is the version ALPN chose,
+/// from the start; without TLS, [`Detect`] tells HTTP/2's preface from
+/// HTTP/1 within the first-bytes deadline and then makes that version, and
+/// HTTP/1 accepts `Upgrade: h2c`.
 pub fn http_for(
     handler: Arc<dyn Handler>,
     opts: &HttpOptions,
     info: &ConnInfo,
     now: fictionet::time::Instant,
 ) -> Http {
-    let mut http1 = http1_for(handler.clone(), opts, info);
-    let http2 = http2_for(handler, opts, info);
-    let detect = if info.tls {
+    let mut servers = Servers::new(handler, opts, info);
+    if info.tls {
         let h2 = info.alpn.as_deref() == Some(b"h2".as_slice());
-        Detect::decided(h2, http1.upgradable(), http2)
-    } else {
-        if opts.first_bytes.is_none() {
-            // The head of the first request has the same deadline from
-            // the start, however long telling the versions apart took.
-            http1.first_head_deadline = Some(now + opts.limits.header_timeout);
-        }
-        let first = opts.first_bytes.unwrap_or(opts.limits.header_timeout);
-        Detect::new(first, http1.h2c().upgradable(), http2)
-    };
-    Switch::new(detect)
+        return Side::Lower(servers.make(h2));
+    }
+    servers.h2c = true;
+    if opts.first_bytes.is_none() {
+        // The head of the first request has the same deadline from the
+        // start, however long telling the versions apart took.
+        servers.first_head_deadline = Some(now + opts.limits.header_timeout);
+    }
+    let first = opts.first_bytes.unwrap_or(opts.limits.header_timeout);
+    Side::Upper(Switch::new(Detect::new(first, servers)))
 }
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or

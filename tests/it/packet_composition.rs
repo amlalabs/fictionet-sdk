@@ -1,7 +1,7 @@
 //! The same application directly on TCP and behind a stream packet tunnel.
 use crate::common::echo_stack::Echo;
 use fictionet::stdlib::layer::*;
-use fictionet::stdlib::network::packet::{self, Ingress, IpLayer, Scope, Scopes};
+use fictionet::stdlib::network::packet::{self, IpLayer};
 use fictionet::stdlib::network::tcp::{Options, TcpLayer};
 use fictionet::stdlib::network::transport::{Request, TcpControl, TcpNotice, TcpOpening};
 use fictionet::stdlib::services::stack::{Boxed, Polling};
@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-type Raw = Packets<Datagram<Ingress>, Chunk>;
+type Raw = Packets<Chunk, Chunk>;
 type ControlPort = Messages<TcpNotice, TcpControl>;
 
 struct Control(VecDeque<TcpControl>);
@@ -50,26 +50,20 @@ impl Layer for Control {
     }
 }
 
-fn endpoint(
-    addr: IpAddr,
-    scope: Scope,
-    server: bool,
-    make: impl Fn() -> Boxed + Send + 'static,
-) -> Boxed<Raw> {
-    endpoint_to(addr, scope, "10.0.0.1".parse().unwrap(), server, make)
+fn endpoint(addr: IpAddr, server: bool, make: impl Fn() -> Boxed + Send + 'static) -> Boxed<Raw> {
+    endpoint_to(addr, "10.0.0.1".parse().unwrap(), server, make)
 }
 
 /// An endpoint at `addr` whose server listens on port 1234, or whose
 /// client connects to port 1234 at `server_addr`.
 fn endpoint_to(
     addr: IpAddr,
-    scope: Scope,
     server_addr: IpAddr,
     server: bool,
     make: impl Fn() -> Boxed + Send + 'static,
 ) -> Boxed<Raw> {
     let entropy = SeededEntropy::new(Seed::from_u64(9));
-    let tcp = TcpLayer::new(addr, Options::default(), &entropy, Instant::ZERO).in_scope(scope);
+    let tcp = TcpLayer::new(addr, Options::default(), &entropy, Instant::ZERO);
     let commands = if server {
         vec![
             TcpControl::Listen {
@@ -91,7 +85,7 @@ fn endpoint_to(
     let children =
         Children::<_, ControlPort, TcpOpening>::new(4, 16 * 1024, move |_, _, _| Some(make()));
     Boxed::new(Chain::new(
-        Chain::new(Chain::new(IpLayer::host_in(scope), tcp), children),
+        Chain::new(Chain::new(IpLayer::host(), tcp), children),
         Control(commands.into()),
     ))
 }
@@ -229,7 +223,7 @@ impl Layer for Fragmented {
     fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.frames.take_command(env)
     }
-    fn take_event(&mut self) -> Option<PacketEvent<Datagram<Ingress>>> {
+    fn take_event(&mut self) -> Option<PacketEvent<Chunk>> {
         self.frames.take_event()
     }
 }
@@ -250,19 +244,15 @@ fn unchanged_application_runs_directly_and_in_a_packet_stream_with_overlapping_f
                 output: client_output.clone(),
             })
         };
-        let scope = Scopes::default().tunnel();
         let server_app: Box<dyn Fn() -> Boxed + Send> = if tunnel {
             Box::new(move || {
                 Boxed::new(Chain::new(
                     Fragmented {
-                        frames: packet::Framed::new(Ingress {
-                            scope,
-                            ..Ingress::default()
-                        }),
+                        frames: packet::Framed::new(),
                         packets: VecDeque::new(),
                         serial: 0,
                     },
-                    endpoint("10.0.0.1".parse().unwrap(), scope, true, echo),
+                    endpoint("10.0.0.1".parse().unwrap(), true, echo),
                 ))
             })
         } else {
@@ -273,14 +263,11 @@ fn unchanged_application_runs_directly_and_in_a_packet_stream_with_overlapping_f
                 let captured = client.clone();
                 Boxed::new(Chain::new(
                     Fragmented {
-                        frames: packet::Framed::new(Ingress {
-                            scope,
-                            ..Ingress::default()
-                        }),
+                        frames: packet::Framed::new(),
                         packets: VecDeque::new(),
                         serial: 0,
                     },
-                    endpoint("10.0.0.2".parse().unwrap(), scope, false, captured),
+                    endpoint("10.0.0.2".parse().unwrap(), false, captured),
                 ))
             })
         } else {
@@ -308,19 +295,57 @@ fn checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+#[test]
+fn nested_packet_tunnels_own_independent_input_paths() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let client_output = output.clone();
+    let server = || {
+        Boxed::new(Chain::new(
+            packet::Framed::new(),
+            endpoint("10.0.0.1".parse().unwrap(), true, || {
+                Boxed::new(Chain::new(
+                    packet::Framed::new(),
+                    endpoint("10.0.0.1".parse().unwrap(), true, echo),
+                ))
+            }),
+        ))
+    };
+    let client = move || {
+        let client_output = client_output.clone();
+        Boxed::new(Chain::new(
+            packet::Framed::new(),
+            endpoint("10.0.0.2".parse().unwrap(), false, move || {
+                let client_output = client_output.clone();
+                Boxed::new(Chain::new(
+                    packet::Framed::new(),
+                    endpoint("10.0.0.2".parse().unwrap(), false, move || {
+                        Boxed::new(Client {
+                            request: Some(Chunk::new(b"nested\n".repeat(100))),
+                            output: client_output.clone(),
+                        })
+                    }),
+                ))
+            }),
+        ))
+    };
+    let expected = [b"hello\n".as_slice(), &b"nested\n".repeat(100)].concat();
+    exchange(server, client, || *output.lock().unwrap() == expected);
+    assert_eq!(*output.lock().unwrap(), expected);
+}
+
 pub(super) fn exchange(
     server_app: impl Fn() -> Boxed + Send + 'static,
     client_app: impl Fn() -> Boxed + Send + 'static,
     done: impl Fn() -> bool,
 ) {
     let mut server = Driver::new(
-        endpoint("10.0.0.1".parse().unwrap(), Scope::ROOT, true, server_app),
+        endpoint("10.0.0.1".parse().unwrap(), true, server_app),
         Arc::new(SeededEntropy::new(Seed::from_u64(3))),
         Budget::unlimited(),
         Instant::ZERO,
     );
     let mut client = Driver::new(
-        endpoint("10.0.0.2".parse().unwrap(), Scope::ROOT, false, client_app),
+        endpoint("10.0.0.2".parse().unwrap(), false, client_app),
         Arc::new(SeededEntropy::new(Seed::from_u64(4))),
         Budget::unlimited(),
         Instant::ZERO,
@@ -346,8 +371,7 @@ pub(super) fn exchange(
                 Admit::Taken
             });
             for packet in packets {
-                let mut event =
-                    PacketEvent::Packet(Datagram::new(Chunk::new(packet), Ingress::default()));
+                let mut event = PacketEvent::Packet(Chunk::new(packet));
                 loop {
                     to.run().unwrap();
                     match to.deliver(event).unwrap() {
@@ -430,7 +454,6 @@ fn live_echo(tunnel: bool, inner_server: IpAddr) {
     }
 
     fictionet_test_support::world::world(Duration::from_secs(30), move |fcx| async move {
-        let scope = Scopes::default().tunnel();
         let (attacher, attachments) = fictionet::attachments();
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
@@ -440,14 +463,11 @@ fn live_echo(tunnel: bool, inner_server: IpAddr) {
                         if tunnel {
                             Boxed::new(Chain::new(
                                 Fragmented {
-                                    frames: packet::Framed::new(Ingress {
-                                        scope,
-                                        ..Ingress::default()
-                                    }),
+                                    frames: packet::Framed::new(),
                                     packets: VecDeque::new(),
                                     serial: 0,
                                 },
-                                endpoint(inner_server, scope, true, echo),
+                                endpoint(inner_server, true, echo),
                             ))
                         } else {
                             echo()
@@ -488,20 +508,11 @@ fn live_echo(tunnel: bool, inner_server: IpAddr) {
         let layer = if tunnel {
             Boxed::new(Chain::new(
                 Fragmented {
-                    frames: packet::Framed::new(Ingress {
-                        scope,
-                        ..Ingress::default()
-                    }),
+                    frames: packet::Framed::new(),
                     packets: VecDeque::new(),
                     serial: 0,
                 },
-                endpoint_to(
-                    "10.0.0.2".parse().unwrap(),
-                    scope,
-                    inner_server,
-                    false,
-                    client,
-                ),
+                endpoint_to("10.0.0.2".parse().unwrap(), inner_server, false, client),
             ))
         } else {
             client()
@@ -589,11 +600,11 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         at: Instant,
         ready: bool,
         blocked: Arc<AtomicBool>,
-        up: Option<PacketEvent<packet::IpPacket>>,
+        up: Option<PacketEvent<packet::CheckedIpPacket>>,
         down: Option<PacketCommand<Chunk>>,
     }
     impl Layer for Gate {
-        type Lower = Packets<packet::IpPacket, Chunk>;
+        type Lower = Packets<packet::CheckedIpPacket, Chunk>;
         type Upper = Self::Lower;
         type Report = Infallible;
         type Timer = ();
@@ -603,8 +614,8 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         fn on_event(
             &mut self,
             _: &mut Env<'_, Infallible>,
-            event: PacketEvent<packet::IpPacket>,
-        ) -> Result<Admit<PacketEvent<packet::IpPacket>>, Infallible> {
+            event: PacketEvent<packet::CheckedIpPacket>,
+        ) -> Result<Admit<PacketEvent<packet::CheckedIpPacket>>, Infallible> {
             if self.up.is_some() {
                 return Ok(Admit::Blocked(event));
             }
@@ -633,7 +644,7 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         fn deadline(&self) -> Option<(Instant, ())> {
             (!self.ready).then_some((self.at, ()))
         }
-        fn take_event(&mut self) -> Option<PacketEvent<packet::IpPacket>> {
+        fn take_event(&mut self) -> Option<PacketEvent<packet::CheckedIpPacket>> {
             self.up.take()
         }
         fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Chunk>> {

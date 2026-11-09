@@ -2637,18 +2637,17 @@ fn cache() {
             max_negative_ttl: max_ttl,
             failure_ttl: Duration::from_secs(number(limits_value, "failure_ttl")),
             stale: Duration::ZERO,
+            // The Lean cache has no capacity.
+            max_entries: usize::MAX,
+            max_bytes: usize::MAX,
         };
         let mut cache = Cache::new(limits);
-        let mut generation = 0;
         let mut rust = Vec::new();
         for op in list(input, "ops") {
             let now = at(number(op, "time"));
             match text(op, "op") {
                 "offer" => offer(&mut cache, field(op, "offer"), now, limits),
-                "advance" => {
-                    generation += 1;
-                    cache.advance(fictionet::stdlib::services::dns::Generation(generation));
-                }
+                "advance" => cache.clear(),
                 _ => rust.push(served(&cache, &cache_key(field(op, "key")), now)),
             }
         }

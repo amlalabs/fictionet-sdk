@@ -136,6 +136,136 @@ fn closed_port_observations_follow_validation_and_release_the_lock() {
     .unwrap();
 }
 
+/// A reader's waker runs once the endpoint is unlocked: a waker runs code
+/// of its own, which may lock the endpoint again.
+#[test]
+fn wakers_run_once_the_endpoint_is_unlocked() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    struct Probe {
+        shared: std::sync::Weak<Shared>,
+        woken: AtomicUsize,
+        while_locked: AtomicUsize,
+    }
+    impl std::task::Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.woken.fetch_add(1, SeqCst);
+            if let Some(shared) = self.shared.upgrade()
+                && shared.state.try_lock().is_none()
+            {
+                self.while_locked.fetch_add(1, SeqCst);
+            }
+        }
+    }
+    let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let (a, b) = pair();
+        let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
+        let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
+        let mut listener = server.listen(80)?;
+        let mut c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+        let mut s = listener.accept(&fcx).await?;
+        let probe = Arc::new(Probe {
+            shared: Arc::downgrade(&server.shared),
+            woken: AtomicUsize::new(0),
+            while_locked: AtomicUsize::new(0),
+        });
+        let waker = Waker::from(probe.clone());
+        let mut buf = [0u8; 4];
+        let read = s.poll_read(&fcx, &mut Context::from_waker(&waker), &mut buf);
+        assert!(read.is_pending());
+        c.write_all(&fcx, b"ping").await?;
+        while probe.woken.load(SeqCst) == 0 {
+            fcx.sleep(Duration::from_millis(1)).await?;
+        }
+        assert_eq!(
+            probe.while_locked.load(SeqCst),
+            0,
+            "a waker ran while the endpoint was locked"
+        );
+        Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+    }));
+    assert_eq!(result.unwrap_err().to_string(), "done");
+}
+
+#[test]
+fn receive_refresh_rotates_after_the_event_queue_fills() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let now = smol_now(&fcx);
+        let peers = ["10.0.0.2:1234".parse()?, "10.0.0.2:1235".parse()?];
+        let mut connections = Vec::new();
+        for peer in peers {
+            let (h, ack) = established(&mut st, now, local, peer);
+            let child = st.adopt(h);
+            st.conns.get_mut(&h).unwrap().recv_credit = 200;
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                data_segment(peer, local, 101, ack, 16, &[1; 100]).0,
+            );
+            connections.push((h, child, ack));
+        }
+        for turn in 0..2 {
+            st.up.clear();
+            for _ in 0..UP_ROOM - 1 {
+                st.up.push_back(MuxEvent::Credit(connections[0].1, 1));
+            }
+            st.refresh_all(&Budget::unlimited());
+            let received: Vec<_> = st
+                .up
+                .iter()
+                .filter_map(|event| match event {
+                    MuxEvent::Child(id, StreamEvent::Data(_)) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(received, [connections[turn].1]);
+            if turn == 0 {
+                st.ingress(
+                    &fcx,
+                    &Budget::unlimited(),
+                    now,
+                    data_segment(peers[0], local, 201, connections[0].2, 16, &[2; 100]).0,
+                );
+            }
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn transmit_batches_retain_descriptor_capacity() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let ep = endpoint(&fcx, side, "10.0.0.1".parse()?);
+        let mut host = ep.shared.lock();
+        let peer = "10.0.0.2:1234".parse()?;
+        let local = "10.0.0.1:80".parse()?;
+        for n in 0..8 {
+            host.dev.tx.push(segment(local, peer, n, 0, 4).0);
+        }
+        let capacity = host.dev.tx.capacity();
+        host.flush_transmit();
+        assert!(host.dev.tx.is_empty());
+        assert!(host.dev.tx.capacity() >= capacity);
+        assert_eq!(host.dev.out.len(), 8);
+        for (n, packet) in host.dev.out.iter().enumerate() {
+            let tcp = Header::parse_whole(packet).unwrap().payload(packet);
+            assert_eq!(u32::from_be_bytes(tcp[4..8].try_into().unwrap()), n as u32);
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
 #[test]
 fn device_output_yields_and_preserves_waiting_input() {
     let mut dev = Dev::default();
@@ -163,7 +293,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         st.ingress(
             &fcx,
             &Budget::unlimited(),
@@ -288,7 +418,7 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let (h, fin) = time_wait(&mut st, now, local, peer);
         let id = st.adopt(h);
         drop(st);
@@ -305,7 +435,7 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
                 .poll_gone(&mut Context::from_waker(&waker))
                 .is_pending()
         );
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         while st.dev.tx.len() < EGRESS_PACKETS {
             st.dev.transmit(now).unwrap().consume(40, |_| {});
         }
@@ -321,13 +451,14 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
             "full egress must retain TIME-WAIT"
         );
         assert_eq!(Arc::strong_count(&held), 1);
-        assert_eq!(*log.lock(), [0]);
+        assert!(log.lock().is_empty());
         drop(st);
+        assert_eq!(*log.lock(), [0]);
         assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_ready());
         watch.reset();
         watch.hold_until_gone(Box::new(held.clone()));
         assert_eq!(Arc::strong_count(&held), 1);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let st: &mut TcpLayer = &mut st;
         assert_eq!(st.get(h).state(), TcpState::TimeWait);
         st.dev.tx.clear();
@@ -383,7 +514,7 @@ fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
         );
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let (kept, _) = time_wait(&mut st, now, local, SocketAddr::new(peer, 1000));
         // Model a TIME-WAIT socket whose application still holds it.
         st.orphans.clear();
@@ -451,7 +582,7 @@ fn local_reset_wakes_watches_before_rst_egress() {
             let mut listener = server.listen(80)?;
             let _client = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
             let conn = listener.accept(&fcx).await?;
-            let h = server.shared.state.lock().socket_of(conn.id);
+            let h = server.shared.lock().socket_of(conn.id);
             let watches = [conn.gone_watch(), conn.gone_watch()];
             let log = Arc::new(Mutex::new(Vec::new()));
             for (i, watch) in watches.iter().enumerate() {
@@ -485,7 +616,7 @@ fn local_reset_wakes_watches_before_rst_egress() {
             }
             let now = smol_now(&fcx);
             {
-                let mut st = server.shared.state.lock();
+                let mut st = server.shared.lock();
                 st.dev.tx.clear();
                 for _ in 0..EGRESS_PACKETS {
                     st.dev.transmit(now).unwrap().consume(40, |_| {});
@@ -509,7 +640,7 @@ fn local_reset_wakes_watches_before_rst_egress() {
                 assert_eq!(st.conns.contains_key(&h), conn.is_some());
             }
             drop(conn);
-            let mut st = server.shared.state.lock();
+            let mut st = server.shared.lock();
             st.housekeeping();
             assert!(!st.conns.contains_key(&h));
             drop(st);
@@ -554,7 +685,7 @@ fn stop_wakes_watches_with_retained_connection() {
             Poll::Ready(Err(ConnError::Closed))
         ));
         {
-            let st = server.shared.state.lock();
+            let st = server.shared.lock();
             assert!(st.conns.contains_key(&st.socket_of(conn.id)));
         }
         fcx.cancel();
@@ -596,7 +727,7 @@ fn abort_peers_wakes_connections_in_socket_order() {
         let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
         let log = Arc::new(Mutex::new(Vec::new()));
         {
-            let mut st = ep.shared.state.lock();
+            let mut st = ep.shared.lock();
             for port in [9000, 80, 443, 22, 8080] {
                 let id = st.add_socket(&fcx, new_socket(MIN_BUFFER));
                 let conn = Conn::new(
@@ -627,7 +758,7 @@ fn compaction_keeps_socket_id_scan_order() {
     block_on(run(fictionet::Seed::random(), |fcx| async move {
         let (_raw, side) = pair();
         let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let mut ids = Vec::new();
         for _ in 0..COMPACT_SLOTS {
             ids.push(st.add_socket(&fcx, new_socket(MIN_BUFFER)));
@@ -658,8 +789,8 @@ fn compaction_keeps_socket_id_scan_order() {
 
 /// Resident pages of every socket's buffers on `e`.
 fn resident(e: &Endpoint) -> usize {
-    let st = e.shared.state.lock();
-    st.pages.values().map(Pages::resident).sum()
+    let st = e.shared.lock();
+    st.pages.values().map(|pages| pages.resident()).sum()
 }
 
 fn pattern(n: usize, salt: u8) -> Vec<u8> {
@@ -716,7 +847,7 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
         let local: SocketAddr = "10.0.0.1:49152".parse().unwrap();
         let peer: SocketAddr = "10.0.0.2:80".parse().unwrap();
         let ep = endpoint(&fcx, side, local.ip());
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let mut previous = None;
         for (attempt, options) in [false, true].into_iter().enumerate() {
             // The second attempt comes a millisecond later. Its initial
@@ -855,7 +986,7 @@ fn syn_rst_does_not_prepare_a_listening_socket() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         st.ingress(
             &fcx,
             &Budget::unlimited(),
@@ -909,7 +1040,7 @@ fn rejected_syn_acks(established: bool) {
                 Options::default().buffer(MIN_BUFFER),
             );
             let now = smol_now(&fcx);
-            let mut st = ep.shared.state.lock();
+            let mut st = ep.shared.lock();
             let mut s = new_socket(MIN_BUFFER);
             s.0.connect(st.iface.context(), peer, local).unwrap();
             let h = st.add_socket(&fcx, s);
@@ -1047,7 +1178,7 @@ fn simultaneous_open_records_the_accepted_syn_origin() {
         let peer: SocketAddr = "10.0.0.2:80".parse()?;
         let ep = endpoint(&fcx, side, local.ip());
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let mut s = new_socket(MIN_BUFFER);
         s.0.connect(st.iface.context(), peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
@@ -1105,7 +1236,7 @@ fn a_rejected_ack_does_not_free_send_buffer() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         // No window has been advertised for this tuple.
         st.ingress(
             &fcx,
@@ -1172,7 +1303,7 @@ fn unread_bytes_outlive_time_wait() {
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
         let mut conn = {
-            let mut st = ep.shared.state.lock();
+            let mut st = ep.shared.lock();
             let (h, ack) = established(&mut st, now, local, peer);
             let conn = accept_by_hand(&ep, &mut st, h);
             // This side shuts down first; the peer answers with its last
@@ -1213,7 +1344,7 @@ fn client_advertised_window_uses_negotiated_scale() {
             let peer: SocketAddr = "10.0.0.2:80".parse()?;
             let ep = endpoint(&fcx, side, local.ip());
             let now = smol_now(&fcx);
-            let mut st = ep.shared.state.lock();
+            let mut st = ep.shared.lock();
             let mut socket = new_socket(BUFFER);
             socket.0.connect(st.iface.context(), peer, local).unwrap();
             let h = st.add_socket(&fcx, socket);
@@ -1269,7 +1400,7 @@ fn legitimate_rounded_window_recovery() {
             let ep = endpoint(&fcx, side, local.ip());
             let _listener = ep.listen(local.port())?;
             let now = smol_now(&fcx);
-            let mut st = ep.shared.state.lock();
+            let mut st = ep.shared.lock();
             let mut syn = segment(peer, local, irs, 0, 0x02).0;
             syn[32] = 6 << 4;
             syn.extend_from_slice(&[1, 3, 3, 7]);
@@ -1406,7 +1537,7 @@ fn ack_window_boundary(irs: u32) {
             );
             let _listener = ep.listen(local.port())?;
             let now = smol_now(&fcx);
-            let mut st = ep.shared.state.lock();
+            let mut st = ep.shared.lock();
             st.ingress(
                 &fcx,
                 &Budget::unlimited(),
@@ -1479,7 +1610,7 @@ fn sack_ack_ahead_without_advertised_window_is_unchanged() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let mut p = segment(peer, local, 9, 100, 0x10).0;
         p[32] = 8 << 4;
         p[34..36].copy_from_slice(&456u16.to_be_bytes());
@@ -1512,7 +1643,7 @@ fn sack_acks_preserve_zero_window_changes() {
             let ep = endpoint(&fcx, side, local.ip());
             let _listener = ep.listen(local.port())?;
             let now = smol_now(&fcx);
-            let mut st = ep.shared.state.lock();
+            let mut st = ep.shared.lock();
             let mut syn = segment(peer, local, 7, 0, 2).0;
             syn[32] = 6 << 4;
             syn.extend_from_slice(&[4, 2, 0, 0]);
@@ -1605,7 +1736,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                 );
                 let _listener = ep.listen(local.port())?;
                 let now = smol_now(&fcx);
-                let mut st = ep.shared.state.lock();
+                let mut st = ep.shared.lock();
                 let irs = u32::MAX - MIN_BUFFER as u32;
                 let origin = irs.wrapping_add(1);
                 st.ingress(
@@ -1758,7 +1889,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                 syn[tcp_at + 12] = 6 << 4;
                 syn.extend_from_slice(&[1, 3, 3, 7]);
                 fix_lengths(&mut syn, tcp_at, peer.ip(), local.ip());
-                let mut st = server.shared.state.lock();
+                let mut st = server.shared.lock();
                 st.ingress(&fcx, &Budget::unlimited(), now, syn);
                 let packets = egress(&mut st, now);
                 let t = Header::parse_whole(&packets[0])
@@ -1778,7 +1909,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
             };
             let mut conn = listener.accept(&fcx).await?;
             let capacity = {
-                let st = server.shared.state.lock();
+                let st = server.shared.lock();
                 st.get(st.socket_of(conn.id)).recv_capacity()
             };
             assert_eq!(capacity, 256 * 1024);
@@ -1791,7 +1922,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                 let mut p = segment(peer, local, seq, start, 0x10).0;
                 p.extend_from_slice(&expected[begin..end]);
                 fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
-                let mut st = server.shared.state.lock();
+                let mut st = server.shared.lock();
                 st.ingress(&fcx, &Budget::unlimited(), now, p);
                 egress(&mut st, now);
             };
@@ -1832,7 +1963,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                 }
                 assert_eq!(got[..capacity], expected[..capacity]);
                 // Resend the trimmed tail once application reads make room.
-                egress(&mut server.shared.state.lock(), now);
+                egress(&mut server.shared.lock(), now);
                 incoming(capacity, expected.len());
                 while read < expected.len() {
                     let n = conn.read(&fcx, &mut got[read..]).await?;
@@ -1862,7 +1993,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             p
         };
         let start = {
-            let mut st = server.shared.state.lock();
+            let mut st = server.shared.lock();
             st.ingress(&fcx, &Budget::unlimited(), now, incoming(7, 0, 0x02, 8));
             let packets = egress(&mut st, now);
             let t = Header::parse_whole(&packets[0])
@@ -1877,7 +2008,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             start
         };
         let mut conn = listener.accept(&fcx).await?;
-        let h = server.shared.state.lock().socket_of(conn.id);
+        let h = server.shared.lock().socket_of(conn.id);
         conn.write_all(&fcx, data).await?;
         if drop_handle {
             drop(conn);
@@ -1885,7 +2016,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             conn.shutdown(&fcx).await?;
             assert_eq!(conn.write_all(&fcx, b"late").await, Err(ConnError::Closed));
         }
-        let mut st = server.shared.state.lock();
+        let mut st = server.shared.lock();
         let sent = egress(&mut st, now);
         assert!(sent.iter().any(|p| {
             let t = Header::parse_whole(p).unwrap().payload(p);
@@ -1923,7 +2054,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
                 .all(|p| Header::parse_whole(p).unwrap().payload(p)[13] & 1 == 0)
         );
         let end = start.wrapping_add(data.len() as u32);
-        let mut st = server.shared.state.lock();
+        let mut st = server.shared.lock();
         st.ingress(
             &fcx,
             &Budget::unlimited(),
@@ -1999,7 +2130,7 @@ fn syns_past_the_backlog_get_cookies_until_accept_falls_behind() {
             quiet(&fcx, &mut raw).await,
             "cookie ACKs past a full queue are dropped"
         );
-        assert_eq!(server.shared.state.lock().listeners[&80].ready.len(), 4);
+        assert_eq!(server.shared.lock().listeners[&80].ready.len(), 4);
         raw.send(segment(from(2000), to, 7, 0, 0x02));
         assert!(
             quiet(&fcx, &mut raw).await,
@@ -2030,7 +2161,7 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
         let mut listener = server.listen(local.port())?;
         let now = smol_now(&fcx);
         {
-            let mut st = server.shared.state.lock();
+            let mut st = server.shared.lock();
             for port in 1000..1000 + BACKLOG_PER_PEER as u16 {
                 st.ingress(
                     &fcx,
@@ -2098,7 +2229,7 @@ fn kept_handshakes_complete_only_while_the_backlog_has_room() {
         let ack = |port, iss: u32| segment(peer(port), local, 1, iss.wrapping_add(1), 0x10).0;
         let mut iss = BTreeMap::new();
         {
-            let mut st = server.shared.state.lock();
+            let mut st = server.shared.lock();
             for port in [1000, 1001, 1002] {
                 st.ingress(
                     &fcx,
@@ -2134,7 +2265,7 @@ fn kept_handshakes_complete_only_while_the_backlog_has_room() {
         assert_eq!(first.peer_addr().port(), 1002);
         {
             // The peer answers the SYN-ACK sent again.
-            let mut st = server.shared.state.lock();
+            let mut st = server.shared.lock();
             st.ingress(&fcx, &Budget::unlimited(), now, ack(1001, iss[&1001]));
             assert_eq!(st.listeners[&80].ready.len(), 2);
             assert!(st.listeners[&80].embryonic.is_empty());
@@ -2181,7 +2312,7 @@ fn a_burst_of_reset_handshakes_leaves_no_pool_of_sockets() {
             acks += 1;
         }
         fcx.sleep(Duration::from_millis(100)).await?;
-        let st = server.shared.state.lock();
+        let st = server.shared.lock();
         let l = &st.listeners[&80];
         assert!(l.embryonic.is_empty() && l.ready.is_empty());
         assert!(
@@ -2219,7 +2350,7 @@ fn unanswered_syns_from_many_addresses_leave_nothing_behind() {
             syn_acks += 1;
         }
         {
-            let st = server.shared.state.lock();
+            let st = server.shared.lock();
             let l = &st.listeners[&80];
             assert_eq!(l.embryonic.len(), sources as usize);
             assert_eq!(l.per_peer.len(), sources as usize);
@@ -2230,7 +2361,7 @@ fn unanswered_syns_from_many_addresses_leave_nothing_behind() {
             Ok(())
         });
         fcx.sleep(TIMEOUT + Duration::from_secs(5)).await?;
-        let st = server.shared.state.lock();
+        let st = server.shared.lock();
         let l = &st.listeners[&80];
         assert!(l.embryonic.is_empty() && l.ready.is_empty());
         assert!(l.per_peer.is_empty(), "{} peers kept", l.per_peer.len());
@@ -2282,7 +2413,7 @@ fn handshakes_wait_and_expire_in_the_order_they_came() {
             (l.embryonic.len(), first.0, st.touched.len())
         };
         {
-            let st = server.shared.state.lock();
+            let st = server.shared.lock();
             let (waiting, next, touched) = due(&st);
             assert_eq!(waiting, 200);
             assert_eq!(touched, 0, "nothing left to look at");
@@ -2302,14 +2433,14 @@ fn handshakes_wait_and_expire_in_the_order_they_came() {
         fcx.sleep_until(start + Settings::default().handshake_timeout + Duration::from_secs(5))
             .await?;
         {
-            let st = server.shared.state.lock();
+            let st = server.shared.lock();
             let (waiting, _, touched) = due(&st);
             assert_eq!(waiting, 99);
             assert_eq!(touched, 0);
         }
         fcx.sleep_until(start + Settings::default().handshake_timeout + Duration::from_secs(15))
             .await?;
-        let st = server.shared.state.lock();
+        let st = server.shared.lock();
         assert!(st.listeners[&80].embryonic.is_empty());
         assert_eq!(st.next_expiry(), None);
         drop(st);
@@ -2401,18 +2532,18 @@ fn the_socket_set_shrinks_after_a_crowd_leaves() {
             let s = listener.accept(&fcx).await?;
             crowd.push((c, s));
         }
-        assert!(server.shared.state.lock().slots >= 401);
+        assert!(server.shared.lock().slots >= 401);
         drop(crowd);
         let deadline = fcx.now() + Duration::from_secs(11);
         while ![&server, &client].iter().all(|e| {
-            let st = e.shared.state.lock();
+            let st = e.shared.lock();
             st.handles.len() <= 3 && st.slots < COMPACT_SLOTS
         }) {
             assert!(fcx.now() < deadline, "closed connections kept socket slots");
             fcx.sleep(Duration::from_millis(5)).await?;
         }
         for e in [&server, &client] {
-            let st = e.shared.state.lock();
+            let st = e.shared.lock();
             assert!(st.handles.len() <= 3, "{} sockets left", st.handles.len());
             // Compacted on the way down: fewer than 256 slots remain,
             // not the 401 it had.
@@ -2450,14 +2581,11 @@ fn a_dropped_connection_uses_the_orphan_timeout() {
         let mut listener = server.listen(80)?;
         let _c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
         let s = listener.accept(&fcx).await?;
-        let h = server.shared.state.lock().socket_of(s.id);
-        assert_eq!(
-            server.shared.state.lock().get(h).timeout(),
-            Some(TIMEOUT.into())
-        );
+        let h = server.shared.lock().socket_of(s.id);
+        assert_eq!(server.shared.lock().get(h).timeout(), Some(TIMEOUT.into()));
         drop(s);
         fcx.sleep(Duration::from_millis(50)).await?;
-        let st = server.shared.state.lock();
+        let st = server.shared.lock();
         assert_eq!(
             st.get(h).state(),
             TcpState::FinWait2,
@@ -2496,7 +2624,7 @@ fn an_orphan_in_fin_wait_2_expires_despite_peer_acks() {
         raw.send(segment(peer, to, 8, acked, 0x10));
         fcx.sleep(Duration::from_millis(10)).await?;
         let open = |server: &Endpoint| {
-            let st = server.shared.state.lock();
+            let st = server.shared.lock();
             st.conns.values().any(|c| c.remote == peer)
         };
         assert!(open(&server), "FIN-WAIT-2 for now");
@@ -2559,6 +2687,25 @@ fn initial_sequence_numbers_tell_nothing_of_other_connections() {
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
+fn mapping_ownership_follows_socket_moves() {
+    let (socket, pages) = new_socket(MIN_BUFFER);
+    let pages = pages.expect("mapping available");
+    let alive = Arc::downgrade(&pages);
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(socket);
+    drop(pages);
+    assert!(alive.upgrade().is_some());
+    let socket = sockets.remove(handle);
+    drop(sockets);
+    assert!(alive.upgrade().is_some());
+    assert_eq!(socket.recv_capacity(), MIN_BUFFER);
+    assert_eq!(socket.send_capacity(), MIN_BUFFER);
+    drop(socket);
+    assert!(alive.upgrade().is_none());
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn mappings_reject_lengths_that_cannot_form_slices() {
     for buffer in [0, isize::MAX as usize, usize::MAX] {
         assert!(Pages::map(buffer).is_none());
@@ -2579,7 +2726,7 @@ fn options_set_the_buffers_of_every_connection() {
             let mut c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
             let mut s = listener.accept(&fcx).await?;
             for (ep, id) in [(&server, s.id), (&client, c.id)] {
-                let st = ep.shared.state.lock();
+                let st = ep.shared.lock();
                 let h = st.socket_of(id);
                 assert_eq!(st.get(h).recv_capacity(), size);
                 assert_eq!(st.get(h).send_capacity(), size);
@@ -2707,7 +2854,7 @@ fn retransmitted_syn_reuses_the_existing_socket() {
         // The peer retransmits its SYN for p2.
         raw.send(segment(p2, to, 7, 0, 0x02));
         fcx.sleep(Duration::from_millis(100)).await?;
-        let st = server.shared.state.lock();
+        let st = server.shared.lock();
         let for_p2 = st.conns.values().filter(|c| c.remote == p2).count();
         drop(st);
         assert_eq!(for_p2, 1, "one socket per tuple");
@@ -2733,7 +2880,7 @@ fn out_of_window_rst_keeps_the_connection_open() {
         fcx.sleep(Duration::from_millis(50)).await?;
         let gone = std::future::poll_fn(|cx| Poll::Ready(conn.poll_gone(cx).is_ready())).await;
         let state = {
-            let st = server.shared.state.lock();
+            let st = server.shared.lock();
             st.get(st.socket_of(conn.id)).state()
         };
         assert_eq!(state, TcpState::Established);
@@ -2763,7 +2910,7 @@ fn rejected_fin_does_not_mark_the_receive_side_closed() {
         ));
         fcx.sleep(Duration::from_millis(50)).await?;
         let (state, fin) = {
-            let st = server.shared.state.lock();
+            let st = server.shared.lock();
             let h = st.socket_of(conn.id);
             let state = st.get(h).state();
             let c = &st.conns[&h];
@@ -2799,7 +2946,7 @@ fn a_handshake_reset_in_one_batch_does_not_lend_its_socket_to_another_peer() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         // One batch: housekeeping runs only after all three packets.
         st.ingress(
             &fcx,
@@ -2861,7 +3008,7 @@ fn a_handshake_restarted_in_one_batch_is_not_reported_reset() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         // The peer resets its handshake and starts again, in one batch.
         st.ingress(
             &fcx,
@@ -2924,7 +3071,7 @@ fn bytes_after_the_peers_fin_are_not_read() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let (h, ack) = established(&mut st, now, local, peer);
         st.ingress(
             &fcx,
@@ -2968,7 +3115,7 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
         let peer: SocketAddr = "10.0.0.2:80".parse()?;
         let ep = endpoint(&fcx, side, local.ip());
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         let mut s = new_socket(MIN_BUFFER);
         s.0.connect(st.iface.context(), peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
@@ -3031,7 +3178,7 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
-        let mut st = ep.shared.state.lock();
+        let mut st = ep.shared.lock();
         // The first peer offers a 1460-byte MSS, then resets its handshake.
         let mut syn = segment(first, local, 100, 0, 0x02).0;
         syn[32] = 6 << 4;
@@ -3096,7 +3243,7 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
 mod layer {
     use super::*;
     use fictionet::stdlib::layer::{Chain, Datagram, MuxOp, PacketEvent};
-    use fictionet::stdlib::network::packet::{Ingress, IpLayer, Origin, Scopes};
+    use fictionet::stdlib::network::packet::{Ingress, IpLayer, NetworkInput, Origin, Scopes};
     use fictionet::{Seed, SeededEntropy};
 
     /// One machine: the IP layer, then TCP, run by a driver.
@@ -3149,8 +3296,7 @@ mod layer {
     /// Hands `packets` to `stack`, a packet at a time.
     fn receive(stack: &mut Stack, packets: Vec<Vec<u8>>) {
         for packet in packets {
-            let mut raw =
-                PacketEvent::Packet(Datagram::new(Chunk::new(packet), Ingress::default()));
+            let mut raw = PacketEvent::Packet(Chunk::new(packet));
             loop {
                 match stack.deliver(raw) {
                     Ok(Admit::Blocked(back)) => raw = back,
@@ -3320,13 +3466,8 @@ mod layer {
         assert_eq!(data(&at_client, c.id()), reply);
     }
 
-    /// The layer takes only checked packets of its own network. A SYN for
-    /// its listener in an observed copy, or checked but from the world's
-    /// network, is not answered; the same SYN checked in its own network,
-    /// a tunnel's, gets a SYN-ACK. Under the tunnel's IP layer the same
-    /// holds for raw packets.
     #[test]
-    fn only_checked_packets_of_its_own_network_reach_tcp() {
+    fn checked_packets_and_owned_inputs_reach_tcp() {
         let tunnel = Scopes::default().tunnel();
         let client: SocketAddr = format!("{CLIENT}:40000").parse().unwrap();
         let server: SocketAddr = format!("{SERVER}:80").parse().unwrap();
@@ -3345,65 +3486,62 @@ mod layer {
                 })
                 .count()
         };
-
         let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(3)));
         let options = Options::default().buffer(MIN_BUFFER);
-        let tcp = TcpLayer::new(SERVER.parse().unwrap(), options, &*entropy, Instant::ZERO)
-            .in_scope(tunnel);
+        let tcp = TcpLayer::new(SERVER.parse().unwrap(), options, &*entropy, Instant::ZERO);
         let mut alone = Driver::new(tcp, entropy, Budget::unlimited(), Instant::ZERO);
         assert!(matches!(alone.command(listen()), Ok(Admit::Taken)));
-        let in_tunnel = Ingress {
-            scope: tunnel,
-            ..Ingress::default()
-        };
-        let packets = [
-            IpPacket::observed(Chunk::new(syn.clone()), in_tunnel),
-            IpPacket::checked(Chunk::new(syn.clone()), Ingress::default(), Origin::Arrived)
-                .unwrap(),
-            IpPacket::checked(Chunk::new(syn.clone()), in_tunnel, Origin::Arrived).unwrap(),
-        ];
-        assert_eq!(packets[0].sort(), Sort::Transport(Transport::Tcp));
-        let mut answers = Vec::new();
-        for packet in packets {
-            assert!(matches!(
-                alone.deliver(PacketEvent::Packet(packet)),
-                Ok(Admit::Taken)
-            ));
-            let _ = alone.run();
-            let mut sent = Vec::new();
-            alone.send_below(|command| {
-                if let PacketCommand::Send(packet) = command {
-                    sent.push(packet.to_vec());
-                }
-                Admit::Taken
-            });
-            answers.push(syn_acks(&sent));
-        }
-        assert_eq!(answers, [0, 0, 1]);
+        let packet = CheckedIpPacket::checked(Chunk::new(syn.clone()), Origin::Arrived).unwrap();
+        assert!(matches!(
+            alone.deliver(PacketEvent::Packet(packet)),
+            Ok(Admit::Taken)
+        ));
+        alone.run().unwrap();
+        let mut sent_packets = Vec::new();
+        alone.send_below(|command| {
+            if let PacketCommand::Send(packet) = command {
+                sent_packets.push(packet.to_vec());
+            }
+            Admit::Taken
+        });
+        assert_eq!(syn_acks(&sent_packets), 1);
 
         let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(4)));
-        let tcp = TcpLayer::new(SERVER.parse().unwrap(), options, &*entropy, Instant::ZERO)
-            .in_scope(tunnel);
+        let tcp = TcpLayer::new(SERVER.parse().unwrap(), options, &*entropy, Instant::ZERO);
         let mut stack = Driver::new(
-            Chain::new(IpLayer::host_in(tunnel), tcp),
+            Chain::new(IpLayer::host(), tcp),
             entropy,
             Budget::unlimited(),
             Instant::ZERO,
         );
-        control(
-            &mut stack,
-            TcpControl::Listen {
-                port: 80,
-                backlog: None,
-                answer: None,
-            },
-        );
+        assert!(matches!(stack.command(listen()), Ok(Admit::Taken)));
+        let mut malformed = syn.clone();
+        malformed[10] ^= 1;
+        assert!(matches!(
+            stack.deliver(PacketEvent::Packet(Chunk::new(malformed))),
+            Ok(Admit::Taken)
+        ));
+        assert_eq!(syn_acks(&sent(&mut stack)), 0);
+        let input = NetworkInput::new(tunnel);
         let mut answers = Vec::new();
-        for ingress in [Ingress::default(), in_tunnel] {
-            let raw = PacketEvent::Packet(Datagram::new(Chunk::new(syn.clone()), ingress));
-            assert!(matches!(stack.deliver(raw), Ok(Admit::Taken)));
+        let mut rejected = 0;
+        for ingress in [
+            Ingress::default(),
+            Ingress {
+                scope: tunnel,
+                ..Ingress::default()
+            },
+        ] {
+            match input.accept(Datagram::new(Chunk::new(syn.clone()), ingress)) {
+                Ok(raw) => assert!(matches!(
+                    stack.deliver(PacketEvent::Packet(raw)),
+                    Ok(Admit::Taken)
+                )),
+                Err(_) => rejected += 1,
+            }
             answers.push(syn_acks(&sent(&mut stack)));
         }
+        assert_eq!(rejected, 1);
         assert_eq!(answers, [0, 1]);
     }
 
@@ -3610,6 +3748,19 @@ mod layer {
             matches!(&back, Ok(Admit::Blocked(command)) if matches!(command.op(), MuxOp::Child(id, StreamCommand::Write(bytes)) if *id == c.id() && bytes.len() == MIN_BUFFER + 1)),
             "the whole write comes back"
         );
+    }
+
+    /// A step hands its packets on and keeps the emptied vector they were
+    /// sent into, so the next step that sends allocates none.
+    #[test]
+    fn a_step_keeps_the_vector_it_sent_into() {
+        let (mut server, _client, (s, _), _) = connected();
+        let write: Command = s.send(StreamCommand::Write(Chunk::new(pattern(3000, 1))));
+        assert!(matches!(server.command(write), Ok(Admit::Taken)));
+        assert!(!sent(&mut server).is_empty());
+        let tx = &server.layer().upper().dev.tx;
+        assert!(tx.is_empty());
+        assert!(tx.capacity() > 0, "the vector went with the packets");
     }
 
     /// Hands the server's layer a token to keep until the connection of

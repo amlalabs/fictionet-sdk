@@ -5,13 +5,11 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::task::Poll;
 
-use fictionet::stdlib::layer::{
-    Admit, Budget, Chunk, Datagram, Driver, PacketCommand, PacketEvent,
-};
+use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, PacketCommand, PacketEvent};
 use fictionet::{Cx, Interface, Packet};
 
 use super::Transport;
-use super::packet::{Factory, Ingress, IpPacket, Opening, Origin, Scope, Sort, Stack};
+use super::packet::{CheckedIpPacket, Factory, Opening, Sort, Stack};
 use super::{icmp, tcp, udp};
 use fictionet::stdlib::services::stack::Jobs;
 
@@ -24,21 +22,12 @@ enum Destination {
     Udp,
     /// The host's ping answers: ICMP that quotes neither transport.
     Icmp,
-    /// Nowhere.
-    Drop,
 }
 
-/// Sorts `packet` for a host on network `scope`. Only a packet a host takes
-/// in reaches a transport: one with a header read by the host's checks, not
-/// an observed copy, and of the host's own network. The IP layer is
-/// replaceable ([`Factory`]), so the dispatcher checks this itself.
-fn destination(packet: &IpPacket, scope: Scope) -> Destination {
-    if packet.ingress().scope != scope
-        || matches!(packet.origin(), Origin::Observed)
-        || packet.header().is_none()
-    {
-        return Destination::Drop;
-    }
+/// Where a packet the host's IP layer handed up goes. The layer is
+/// replaceable ([`Factory`]), but its upper port carries only
+/// [`CheckedIpPacket`]s, so every packet here passed the host's checks.
+fn destination(packet: &CheckedIpPacket) -> Destination {
     match packet.sort() {
         Sort::Transport(Transport::Tcp) => Destination::Tcp,
         Sort::Transport(Transport::Udp) => Destination::Udp,
@@ -51,7 +40,7 @@ fn destination(packet: &IpPacket, scope: Scope) -> Destination {
 mod proofs;
 
 /// Runs one host's packets: `interface` below, one IP layer, and the
-/// transports above it, all on network `scope`.
+/// transports above it.
 pub(crate) async fn drive(
     fcx: Cx,
     mut interface: impl Interface,
@@ -59,13 +48,12 @@ pub(crate) async fn drive(
     mut udp: Option<udp::PacketDriver>,
     ping: Option<(IpAddr, icmp::Options)>,
     layer: Stack,
-    scope: Scope,
 ) -> fictionet::Result {
     // IP uses its engine limits; application byte budgets cover their transport children.
     let mut ip = Driver::new(layer, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now());
     ip.keep_observations(0);
     let mut timer = fictionet::Timer::new(&fcx);
-    let mut held: Option<IpPacket> = None;
+    let mut held: Option<CheckedIpPacket> = None;
     let mut raw = None;
     let mut output = Vec::new();
     let mut outgoing = std::collections::VecDeque::new();
@@ -130,8 +118,7 @@ pub(crate) async fn drive(
             });
             if let Some(packet) = held.take() {
                 let mut accepted = true;
-                match destination(&packet, scope) {
-                    Destination::Drop => {}
+                match destination(&packet) {
                     Destination::Tcp => {
                         if let Some(tcp) = &mut tcp {
                             dirty = true;
@@ -175,13 +162,7 @@ pub(crate) async fn drive(
                 match interface.poll_recv(&fcx, cx) {
                     Poll::Ready(Ok(packet)) => {
                         moved = true;
-                        raw = Some(PacketEvent::Packet(Datagram::new(
-                            Chunk::new(packet.0),
-                            Ingress {
-                                scope,
-                                ..Ingress::default()
-                            },
-                        )));
+                        raw = Some(PacketEvent::Packet(Chunk::new(packet.0)));
                     }
                     Poll::Ready(Err(_)) => {
                         moved = true;
@@ -291,7 +272,6 @@ pub(crate) fn prepare(
         Some(udp_driver),
         Some((addr, icmp)),
         layer,
-        Scope::ROOT,
     );
     (tcp, udp, task)
 }

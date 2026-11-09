@@ -8,13 +8,21 @@ arithmetic by calling the production code. Each spec and harness file
 names the source lines it follows.
 
 This pass found three bugs. Each has a code fix and a test that fails
-without it.
+without it. Since then the IP layer takes raw packets from the input path
+its endpoint owns, with no network label, hands transports a
+`CheckedIpPacket`, and leaves captured copies to `ObservedIpPacket`. The
+models below still have a network constant and the flags that chose
+whether the code checked it; in the code that check is now
+`NetworkInput`, where several networks' packets arrive together, ahead of
+reassembly. The Kani harnesses in `kani/packet.rs` were rewritten for
+`CheckedIpPacket`. None of these has been run since that change; the
+results are those of the earlier code.
 
 | Bug | Found by | Fix | Test |
 |---|---|---|---|
-| One IP layer fed two networks put their fragments together: the reassembly key has addresses, identification and protocol but no network, so a tunnel's first fragment and the world's last made one packet. | `Reassembly_unbound` | Each `IpLayer` serves one `Scope` (`IpLayer::host_in`); a packet of another scope is dropped with `IpReport::OtherScope`. The layer sends packets down with no scope, so it could never answer two networks anyway. | `packet::tests::inner_and_outer_fragments_with_one_key_stay_apart` |
+| One IP layer fed two networks put their fragments together: the reassembly key has addresses, identification and protocol but no network, so a tunnel's first fragment and the world's last made one packet. | `Reassembly_unbound` | First each `IpLayer` dropped packets labelled with another network. Now each endpoint owns its `IpLayer` and its input, and input carrying several networks goes through `NetworkInput`, which passes on only one network's packets, before reassembly. | `packet::tests::inner_and_outer_fragments_with_one_key_stay_apart` |
 | A fragment that arrived once its packet's time was up still completed it. The driver hands a packet in before it fires the layer's timer, and `Reassembly` only expired packets when the timer ran. | `Reassembly_lateexpiry` | `Reassembly::reassemble` expires due packets before it takes each fragment. This also covers the sandbox filter in `world/net/attachments.rs`, which shares `Reassembly`. | `ip::tests::a_late_fragment_completes_nothing_before_expire_runs`, `packet::tests::fragments_after_the_deadline_complete_nothing_before_the_timer_runs` |
-| The UDP layer took any `IpPacket` sorted to UDP: an observed copy (no IPv4 header checksum check, no host policy) or a packet of another network reached a bound socket. | `UdpSockets_unchecked`, `UdpSockets_noscope` | `IpPacket::checked` is the public constructor for packets a host takes in, and `IpPacket::is_checked` tells them from observed copies. `UdpLayer` drops packets that are not checked or not of its scope. | `udp::sockets::tests::observed_copies_and_other_networks_reach_no_socket`, `packet::tests::a_checked_packet_is_what_the_ip_layer_hands_up` |
+| The UDP layer took any packet sorted to UDP: an observed copy (no IPv4 header checksum check, no host policy) or a packet of another network reached a bound socket. | `UdpSockets_unchecked`, `UdpSockets_noscope` | First a check in `UdpLayer`. Now the types: the UDP layer's lower port carries only `CheckedIpPacket`, whose header `CheckedIpPacket::checked` or the IP layer read and checked, and a captured copy is an `ObservedIpPacket`. Packets of another network are parted before IP intake (`NetworkInput`). | `udp::sockets::tests::malformed_and_foreign_host_packets_reach_no_socket`, `packet::tests::a_checked_packet_is_what_the_ip_layer_hands_up` |
 
 ## Properties and results
 
@@ -144,7 +152,7 @@ assertions on. Each harness runs on its own; the files are included as
 | `ipv4_reads_stay_inside_the_packet` | `kani/ip_header.rs` | for all IPv4 bytes up to 24, `parse` and `parse_truncated` give a payload from the header length to the total length (or the bytes present) | 0 of 489 failed |
 | `ipv4_check_requires_the_header_checksum` | `kani/ip_header.rs` | for all 24-byte IPv4 packets, `check` takes only a verifying header checksum and agrees with `parse`; `parse_whole` takes no fragment | 0 of 845 failed |
 | `ipv6_stripping_leaves_a_checked_packet` | `kani/ip_header.rs` | for all 56-byte IPv6 packets with 16 payload bytes starting with one or two 8-byte extension headers, a stripped packet is the original fixed header with the upper protocol (never an extension header) as next header, the upper bytes' length, and the upper bytes, read off the stripped bytes (`parse_whole` is not called on them; see below); fragments are never stripped | 0 of 1,100 failed, 68 s |
-| `checked_ipv4_packets_are_host_packets` | `kani/packet.rs` | for all 48-byte IPv4 packets with a 20-byte header and every origin, `IpPacket::checked` takes exactly whole non-fragment packets under a non-observed origin, with the header `parse_whole` reads and the sort `Sort::of` names; otherwise it hands the bytes back; an observed copy is never checked | 0 of 1,698 failed, 49 s |
+| `checked_ipv4_packets_are_host_packets` | `kani/packet.rs` | for all 48-byte IPv4 packets with a 20-byte header and every origin, `CheckedIpPacket::checked` takes exactly whole non-fragment packets, with the header `parse_whole` reads and the sort `Sort::of` names; otherwise it hands the bytes back. The recorded run was of `IpPacket::checked`, which also refused an observed origin; an observed copy is now its own type | 0 of 1,698 failed, 49 s |
 | `checked_ipv6_packets_are_host_packets` | `kani/packet.rs` | the same for all 48-byte IPv6 packets, which must have no extension headers left | 0 of 1,696 failed, 131 s |
 
 Earlier versions ran past the 12 GB memory cap: IPv4 reads over 28

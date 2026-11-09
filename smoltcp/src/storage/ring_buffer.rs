@@ -1,11 +1,41 @@
 use core::cmp;
+use core::ops::{Deref, DerefMut};
 use managed::ManagedSlice;
+
+trait OwnedStorage: AsRef<[u8]> + AsMut<[u8]> + core::fmt::Debug + Send + Sync {}
+impl<T: AsRef<[u8]> + AsMut<[u8]> + core::fmt::Debug + Send + Sync> OwnedStorage for T {}
+
+#[derive(Debug)]
+enum Storage<'a> {
+    Slice(ManagedSlice<'a, u8>),
+    Owned(Box<dyn OwnedStorage + 'a>),
+}
+
+impl Deref for Storage<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Slice(slice) => slice,
+            Self::Owned(storage) => (**storage).as_ref(),
+        }
+    }
+}
+
+impl DerefMut for Storage<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Slice(slice) => slice,
+            Self::Owned(storage) => (**storage).as_mut(),
+        }
+    }
+}
 
 /// A byte ring for TCP receive and send buffers.
 /// Storage may be borrowed or owned. Slices can cross the end of the ring.
 #[derive(Debug)]
 pub struct RingBuffer<'a> {
-    storage: ManagedSlice<'a, u8>,
+    storage: Storage<'a>,
     read_at: usize,
     length: usize,
 }
@@ -18,7 +48,19 @@ impl<'a> RingBuffer<'a> {
         S: Into<ManagedSlice<'a, u8>>,
     {
         RingBuffer {
-            storage: storage.into(),
+            storage: Storage::Slice(storage.into()),
+            read_at: 0,
+            length: 0,
+        }
+    }
+
+    /// Own storage whose slices are borrowed only for each buffer access.
+    pub fn new_owned<S>(storage: S) -> RingBuffer<'a>
+    where
+        S: AsRef<[u8]> + AsMut<[u8]> + core::fmt::Debug + Send + Sync + 'a,
+    {
+        RingBuffer {
+            storage: Storage::Owned(Box::new(storage)),
             read_at: 0,
             length: 0,
         }

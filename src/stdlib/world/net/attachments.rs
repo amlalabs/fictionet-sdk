@@ -38,7 +38,6 @@ pub(super) struct Hooks {
     pub(super) attachment_observe: Option<super::OnAttachment>,
     pub(super) dns_observe: Option<super::OnDns>,
 
-    pub(super) http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
     /// The sandbox that last bound each address. An entry stays after its
     /// sandbox detaches, until another binds the address, so packets and
     /// connections still on their way name the sandbox that sent them.
@@ -665,7 +664,7 @@ impl Filter {
     fn forward(&mut self, fcx: &Cx, route: Option<usize>, packet: Packet) {
         let packet = match self.reassembly.push(packet, fcx.now()) {
             Intake::Whole(p) => p,
-            Intake::Waiting => return,
+            Intake::Waiting | Intake::Discarded => return,
             Intake::Refused { packet, answer } => {
                 if !self.context.hooks.destinations.is_host(&packet.0) {
                     packet

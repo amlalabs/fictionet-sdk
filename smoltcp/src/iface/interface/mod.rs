@@ -4,9 +4,8 @@ mod tcp;
 #[cfg(test)]
 mod tests;
 
-use super::socket_set::SocketSet;
+use super::socket_set::{SocketHandle, SocketSet};
 use crate::phy::{Device, RxToken, TxToken};
-use crate::socket::PollAt;
 use crate::time::Instant;
 use crate::wire::*;
 use core::result::Result;
@@ -32,6 +31,7 @@ pub struct InterfaceInner {
     ip_addr: IpAddress,
     ignore_malformed_options: bool,
     reset_closed_ports: bool,
+    ingress_target: Option<SocketHandle>,
 }
 
 /// Picks the initial sequence number of a connection from its local and
@@ -59,6 +59,7 @@ impl Interface {
                 ip_addr: config.ip_addr,
                 ignore_malformed_options: false,
                 reset_closed_ports: true,
+                ingress_target: None,
             },
         }
     }
@@ -89,17 +90,24 @@ impl Interface {
     ) -> PollResult {
         self.inner.now = timestamp;
         let mut result = PollResult::None;
-        for (_, socket) in sockets.iter_mut() {
+        let count = sockets.prepare(&mut self.inner, timestamp);
+        for _ in 0..count {
+            let Some(handle) = sockets.next_ready() else {
+                break;
+            };
+            let socket = sockets.get_mut(handle);
             let sent: Result<(), ()> = socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
                 let token = device.transmit(inner.now).ok_or(())?;
                 inner.dispatch_ip(token, ip, tcp);
                 result = PollResult::SocketStateChanged;
                 Ok(())
             });
+            sockets.dispatched(handle, sent.is_err());
             if sent.is_err() {
-                break;
+                return result;
             }
         }
+        sockets.finish_egress();
         result
     }
 
@@ -120,22 +128,30 @@ impl Interface {
         }
     }
 
+    /// Try a known connection before the general socket lookup. Packet
+    /// validation and socket acceptance still apply.
+    pub fn poll_ingress_targeted(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        target: SocketHandle,
+    ) {
+        self.inner.ingress_target = Some(target);
+        self.poll_ingress_single(timestamp, device, sockets);
+        self.inner.ingress_target = None;
+    }
+
     /// Update the clock before socket operations.
     pub fn poll_maintenance(&mut self, timestamp: Instant) {
         self.inner.now = timestamp;
     }
 
     /// Earliest time a socket needs egress, or `None` if all await input.
-    pub fn poll_at(&mut self, timestamp: Instant, sockets: &SocketSet<'_>) -> Option<Instant> {
+    pub fn poll_at(&mut self, timestamp: Instant, sockets: &mut SocketSet<'_>) -> Option<Instant> {
         self.inner.now = timestamp;
-        sockets
-            .iter()
-            .filter_map(|(_, socket)| match socket.poll_at(&mut self.inner) {
-                PollAt::Ingress => None,
-                PollAt::Time(at) => Some(at),
-                PollAt::Now => Some(Instant::ZERO),
-            })
-            .min()
+        sockets.schedule(&mut self.inner);
+        sockets.next_deadline()
     }
 }
 

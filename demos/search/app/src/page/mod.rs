@@ -474,6 +474,9 @@ pub enum Command {
     },
 }
 
+/// The most waiting facts the record writes, flushes and publishes together.
+const RECORD_BATCH: usize = 256;
+
 type Control = (Command, tokio::sync::oneshot::Sender<Result<(), String>>);
 type Receivers = (
     mpsc::UnboundedReceiver<Observation>,
@@ -531,9 +534,14 @@ impl Page {
         views.end_boot();
         self.snapshots.send_replace(views.current());
     }
-    pub fn publish(&self, observation: Observation) {
+    /// Adds `observations` to the view in order and shows the result once.
+    pub fn publish(&self, observations: impl IntoIterator<Item = Observation>) {
         let mut views = self.views.lock().unwrap();
-        if views.push(observation) {
+        let mut changed = false;
+        for observation in observations {
+            changed |= views.push(observation);
+        }
+        if changed {
             self.snapshots.send_replace(views.current());
         }
     }
@@ -607,7 +615,8 @@ impl Page {
         self.refresh(pages, source, Session::Failed);
     }
     /// Writes a separate, private record of each session, a run of its
-    /// own, before publishing each fact.
+    /// own, before publishing each fact. Facts already waiting are
+    /// written and flushed together, then published in one snapshot.
     pub async fn record(
         &self,
         mut observations: mpsc::UnboundedReceiver<Observation>,
@@ -626,42 +635,61 @@ impl Page {
             println!("Run record: {}", path.display());
             Ok(std::io::BufWriter::new(file))
         };
-        let mut file = None;
+        let mut file: Option<std::io::BufWriter<std::fs::File>> = None;
         let mut started_at_ms = self.views.lock().unwrap().view.started_at_ms;
-        while let Some(observation) = observations.recv().await {
-            if let SearchObs::RunStarted {
-                started_at_ms: start,
-            } = observation.fact
-            {
-                started_at_ms = start;
-                file = None;
+        let mut batch = Vec::new();
+        while observations.recv_many(&mut batch, RECORD_BATCH).await > 0 {
+            // `written` facts have their entries written; the first
+            // `recorded` of them are in a file flushed since.
+            let mut written = 0;
+            let mut recorded = 0;
+            let mut result = (|| -> std::io::Result<()> {
+                for observation in &batch {
+                    if let SearchObs::RunStarted {
+                        started_at_ms: start,
+                    } = observation.fact
+                    {
+                        started_at_ms = start;
+                        if let Some(previous) = &mut file {
+                            previous.flush()?;
+                        }
+                        file = None;
+                        recorded = written;
+                    }
+                    let file = match &mut file {
+                        Some(file) => file,
+                        None => file.insert(open()?),
+                    };
+                    #[derive(Serialize)]
+                    struct Entry<'a> {
+                        timestamp: String,
+                        #[serde(flatten)]
+                        observation: &'a Observation,
+                    }
+                    let timestamp = time::OffsetDateTime::from_unix_timestamp_nanos(
+                        i128::from(started_at_ms + observation.at_ms) * 1_000_000,
+                    )
+                    .map_err(std::io::Error::other)?
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(std::io::Error::other)?;
+                    serde_json::to_writer(
+                        &mut *file,
+                        &Entry {
+                            timestamp,
+                            observation,
+                        },
+                    )?;
+                    writeln!(file)?;
+                    written += 1;
+                }
+                Ok(())
+            })();
+            match file.as_mut().map_or(Ok(()), |file| file.flush()) {
+                Ok(()) => recorded = written,
+                Err(error) => result = result.and(Err(error)),
             }
-            let file = match &mut file {
-                Some(file) => file,
-                None => file.insert(open()?),
-            };
-            #[derive(Serialize)]
-            struct Entry<'a> {
-                timestamp: String,
-                #[serde(flatten)]
-                observation: &'a Observation,
-            }
-            let timestamp = time::OffsetDateTime::from_unix_timestamp_nanos(
-                i128::from(started_at_ms + observation.at_ms) * 1_000_000,
-            )
-            .map_err(std::io::Error::other)?
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(std::io::Error::other)?;
-            serde_json::to_writer(
-                &mut *file,
-                &Entry {
-                    timestamp,
-                    observation: &observation,
-                },
-            )?;
-            writeln!(file)?;
-            file.flush()?;
-            self.publish(observation);
+            self.publish(batch.drain(..recorded));
+            result?;
         }
         Ok(())
     }

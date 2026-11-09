@@ -1,7 +1,7 @@
 use super::Display;
 use fictionet::stdlib::codec::{Decode, Fail, Frames, Step};
 use fictionet::stdlib::dissect::{
-    Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol, Registry,
+    Decoded, Layer, Match, Observed, Place, Placement, Present, Protocol, Registry,
 };
 use fictionet::stdlib::network::Transport;
 
@@ -84,7 +84,7 @@ impl ModbusSession {
     }
 }
 impl Protocol for ModbusSession {
-    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, _: &[KeyLine]) {
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded) {
         if self.stopped {
             return;
         }
@@ -225,7 +225,7 @@ mod tests {
         let reply = [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2];
         for (reverse, bytes) in [(false, &bad[..]), (true, &reply[..])] {
             let mut packet = Decoded::default();
-            conversation.data(reverse, bytes, Place::default(), &mut packet, &[]);
+            conversation.data(reverse, bytes, Place::default(), &mut packet);
             assert!(packet.layers.is_empty());
             assert!(packet.tags.is_empty());
             assert!(!conversation.waiting(reverse));

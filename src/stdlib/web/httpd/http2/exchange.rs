@@ -50,6 +50,16 @@ pub struct Opening {
     pub charge: Option<Charge>,
 }
 
+/// A request's trailers, as the connection read and checked them.
+#[derive(Debug)]
+pub struct RequestTrailers {
+    /// The fields.
+    pub fields: HeaderMap,
+    /// What the trailers are charged to the connection's budget. Whoever
+    /// holds them keeps it, and it goes back when they are dropped.
+    pub charge: Charge,
+}
+
 /// What comes up an exchange.
 #[derive(Debug)]
 pub enum ExchangeEvent {
@@ -57,7 +67,7 @@ pub enum ExchangeEvent {
     /// the child's credit.
     Data(Chunk),
     /// The request's trailers. The request has ended.
-    Trailers(Box<HeaderMap>),
+    Trailers(Box<RequestTrailers>),
     /// The request has ended.
     End,
     /// The connection could not hold the next this many bytes of the

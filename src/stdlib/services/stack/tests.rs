@@ -107,6 +107,55 @@ fn a_framed_stack_answers_over_tcp_and_finishes_when_the_client_ends() {
     assert_eq!(ended, Ok(StreamEnd::Finished));
 }
 
+/// A TCP connection hands what it received over as the chunks it came up
+/// in, and sends pieces of a chunk the caller gives it: the stream runner
+/// moves bytes both ways without copying them.
+#[test]
+fn tcp_hands_received_chunks_over_and_sends_pieces_of_chunks() {
+    use fictionet::stdlib::network::Read;
+    let request = vec![7u8; 3000];
+    let reply = vec![9u8; 3000];
+    let (sent, expected) = (request.clone(), reply.clone());
+    block_on(lab(Seed::from_u64(1), move |fcx| async move {
+        let (server, client_machine) = machines(&fcx);
+        let mut listener = server.tcp.listen(PORT)?;
+        let client = fcx.spawn(move |fcx| async move {
+            let mut conn = client_machine.tcp.connect(&fcx, server_addr()).await?;
+            conn.write_all(&fcx, &sent).await?;
+            conn.shutdown(&fcx).await?;
+            assert_eq!(read_to_end(&fcx, &mut conn).await?, expected);
+            Ok(())
+        });
+        let mut conn = listener.accept(&fcx).await?;
+        let budget = Budget::new(request.len());
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 1024];
+        loop {
+            match poll_fn(|cx| conn.poll_read_owned(&fcx, cx, &mut buf)).await? {
+                Read::Copied(0) => break,
+                Read::Copied(n) => panic!("{n} bytes were copied out of the chunks"),
+                Read::Owned(mut chunk) => {
+                    assert!(!chunk.is_empty() && chunk.len() <= buf.len());
+                    assert!(chunk.recharge(&budget));
+                    got.extend_from_slice(&chunk);
+                }
+            }
+        }
+        assert_eq!(got, request);
+        assert_eq!(budget.used(), 0, "every handed chunk was released");
+        let mut reply = Chunk::new(reply);
+        while !reply.is_empty() {
+            let n = poll_fn(|cx| conn.poll_write_chunk(&fcx, cx, &reply)).await?;
+            reply.advance(n);
+        }
+        conn.shutdown(&fcx).await?;
+        client.join(&fcx).await?;
+        fcx.cancel();
+        Ok(())
+    }))
+    .expect("the run finishes");
+}
+
 #[test]
 fn an_idle_connection_has_its_input_ended_after_its_answers() {
     let limits = StreamLimits {
@@ -615,6 +664,33 @@ impl Layer for HalfClosed {
     fn take_event(&mut self) -> Option<Infallible> {
         None
     }
+}
+
+/// Input the stack refuses as closed is over, as it is for an application
+/// on a transport child (`session::tests::input_refused_as_closed_is_over`):
+/// a stack that also ended its direction finishes without waiting for the
+/// idle limit.
+#[test]
+fn input_refused_as_closed_is_over() {
+    let limits = StreamLimits {
+        idle: Some(Duration::from_secs(30)),
+        ..StreamLimits::default()
+    };
+    let client = |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        conn.write_all(&fcx, b"x").await?;
+        read_to_end(&fcx, &mut conn).await?;
+        let waited = fcx.now().since_start();
+        assert!(waited < Duration::from_secs(30), "ended after {waited:?}");
+        Ok(())
+    };
+    let ended = serve_one(
+        limits,
+        Budget::unlimited(),
+        super::session::tests::Closes::default,
+        client,
+    );
+    assert_eq!(ended, Ok(StreamEnd::Finished));
 }
 
 #[test]
@@ -1321,4 +1397,208 @@ fn datagram_extraction_reports_before_waiting() {
 #[test]
 fn datagram_extraction_reports_before_ending() {
     check_datagram_extraction(Some(DatagramCommand::End));
+}
+
+mod flush {
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    use std::time::Duration;
+
+    use fictionet::stdlib::layer::{
+        Admit, Budget, ByteStream, Chunk, Env, Layer, StreamCommand, StreamEvent, Top,
+    };
+    use fictionet::stdlib::network::{ConnError, ConnInfo, Connection};
+    use fictionet::{Cx, Seed, block_on, lab};
+
+    use super::super::{Opened, StreamEnd, StreamLimits, stream};
+
+    /// Passes writes down and everything from below up, as they are.
+    #[derive(Default)]
+    struct Pass {
+        down: VecDeque<StreamCommand>,
+        up: VecDeque<StreamEvent>,
+    }
+
+    impl Layer for Pass {
+        type Lower = ByteStream;
+        type Upper = ByteStream;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = ConnError;
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, ConnError> {
+            self.up.push_back(event);
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: StreamCommand,
+        ) -> Result<Admit<StreamCommand>, ConnError> {
+            self.down.push_back(command);
+            Ok(Admit::Taken)
+        }
+
+        fn take_command(&mut self, _: &mut Env<'_, Infallible>) -> Option<StreamCommand> {
+            self.down.pop_front()
+        }
+
+        fn take_event(&mut self) -> Option<StreamEvent> {
+            self.up.pop_front()
+        }
+    }
+
+    /// Takes every write at once, and flushes only once `flushed` is set.
+    struct Held {
+        taken: Vec<u8>,
+        flushed: Arc<AtomicBool>,
+    }
+
+    impl Connection for Held {
+        fn poll_read(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            Poll::Pending
+        }
+
+        fn poll_write(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            self.taken.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+            if self.flushed.load(Ordering::Relaxed) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stack's bytes count as written only once the connection under it
+    /// flushed them, so a flush above waits for the flush below, and the
+    /// next write waits with it.
+    #[test]
+    fn a_flush_waits_for_the_connection_underneath_to_flush() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let flushed = Arc::new(AtomicBool::new(false));
+            let conn = Held {
+                taken: Vec::new(),
+                flushed: flushed.clone(),
+            };
+            let mut opened = Opened::new(&fcx, conn, Pass::default(), Budget::unlimited());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert_eq!(
+                opened.poll_write(&fcx, &mut cx, b"first"),
+                Poll::Ready(Ok(5))
+            );
+            assert!(opened.poll_flush(&fcx, &mut cx).is_pending());
+            assert_eq!(opened.conn().taken, b"first");
+            assert!(opened.poll_write(&fcx, &mut cx, b"second").is_pending());
+            flushed.store(true, Ordering::Relaxed);
+            assert_eq!(opened.poll_flush(&fcx, &mut cx), Poll::Ready(Ok(())));
+            assert_eq!(
+                opened.poll_write(&fcx, &mut cx, b"second"),
+                Poll::Ready(Ok(6))
+            );
+            assert_eq!(opened.poll_flush(&fcx, &mut cx), Poll::Ready(Ok(())));
+            assert_eq!(opened.conn().taken, b"firstsecond");
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// Writes once, then waits for its peer.
+    #[derive(Default)]
+    struct Once {
+        sent: bool,
+    }
+
+    impl Layer for Once {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = ConnError;
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, ConnError> {
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, ConnError> {
+            match command {}
+        }
+
+        fn take_command(&mut self, _: &mut Env<'_, Infallible>) -> Option<StreamCommand> {
+            (!std::mem::replace(&mut self.sent, true))
+                .then(|| StreamCommand::Write(Chunk::new(b"hello".to_vec())))
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// Bytes the connection took but never flushed are a stalled write.
+    #[test]
+    fn a_write_the_connection_never_flushes_times_out() {
+        block_on(lab(Seed::from_u64(2), |fcx| async move {
+            let conn = Held {
+                taken: Vec::new(),
+                flushed: Arc::new(AtomicBool::new(false)),
+            };
+            let limits = StreamLimits {
+                idle: None,
+                write_timeout: Some(Duration::from_secs(1)),
+            };
+            let info = ConnInfo::default();
+            let end = stream(
+                &fcx,
+                conn,
+                &info,
+                Once::default(),
+                Budget::unlimited(),
+                limits,
+                |_| {},
+            )
+            .await
+            .expect("the run ends with how it ended");
+            assert_eq!(end, StreamEnd::Conn(ConnError::TimedOut));
+            Ok(())
+        }))
+        .unwrap();
+    }
 }

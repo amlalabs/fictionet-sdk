@@ -1,4 +1,4 @@
-use super::carrier::CreditReturn;
+use super::carrier::CreditLease;
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -137,8 +137,8 @@ where
     timers: Vec<usize>,
     /// How many deadlines have been armed, to order those due together.
     armed: u64,
-    /// Set when something outside a call reached a child ([`ChildWake`]).
-    woken: Arc<AtomicBool>,
+    /// The children something outside a call reached ([`ChildWake`]).
+    woken: Arc<Woken>,
     limit: usize,
     window: u64,
     down: VecDeque<MuxCommand<B::Lower, K>>,
@@ -239,7 +239,9 @@ struct Kid<B: Layer> {
     due: Option<(Instant, B::Timer)>,
     armed: u64,
     heap: Option<usize>,
-    backing: Arc<Charge>,
+    /// What pays for the memory of the bytes in its receive window, shared
+    /// by every chunk that waits in it.
+    window: Arc<Charge>,
     max_command: u64,
     /// Credit the mux may still use for this child's events.
     granted: u64,
@@ -256,23 +258,44 @@ struct Kid<B: Layer> {
 /// which may share state with its layer (a tunnel's connection does).
 /// Either gets the child visited at the next advance.
 pub(crate) struct ChildWake {
+    /// The child's place in `Children`, its own while it is open.
+    key: usize,
     released: AtomicU64,
     /// `Children` is calling the child and collects what it releases.
     calling: AtomicBool,
+    /// The child waits in `queue`, or is being readied from it. A closed
+    /// child's stays set.
     woken: AtomicBool,
-    /// The flag `Children` checks before looking for woken children.
-    any: Arc<AtomicBool>,
+    /// The child closed, so a wake queues nothing. Changed and read with
+    /// the queue locked.
+    closed: AtomicBool,
+    /// Where the child waits once woken.
+    queue: Arc<Woken>,
     /// The task that polls the child's work, woken with it.
     task: Mutex<Option<Waker>>,
 }
 
+/// The open children woken from outside `Children`'s calls, each once until
+/// it is collected. Collecting them costs what was woken, not every open
+/// child. A child leaves the queue when it closes, so the queue never holds
+/// more keys than there are open children, and a key in it is never a
+/// later child's at the same place.
+struct Woken {
+    /// Something is queued: an advance with nothing woken skips the lock.
+    any: AtomicBool,
+    /// Their keys.
+    keys: Mutex<Vec<usize>>,
+}
+
 impl ChildWake {
-    fn new(any: Arc<AtomicBool>) -> ChildWake {
+    fn new(key: usize, queue: Arc<Woken>) -> ChildWake {
         ChildWake {
+            key,
             released: AtomicU64::new(0),
             calling: AtomicBool::new(false),
             woken: AtomicBool::new(false),
-            any,
+            closed: AtomicBool::new(false),
+            queue,
             task: Mutex::new(None),
         }
     }
@@ -291,9 +314,29 @@ impl ChildWake {
         }
     }
 
+    /// Queues the child, unless it waits in the queue already or closed.
+    /// Collecting clears `woken` before the visit, so a wake after that
+    /// queues it again.
     fn notify(&self) {
-        self.woken.store(true, Ordering::Release);
-        self.any.store(true, Ordering::Release);
+        if self.woken.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut keys = self.queue.keys.lock();
+        if !self.closed.load(Ordering::Relaxed) {
+            keys.push(self.key);
+            self.queue.any.store(true, Ordering::Release);
+        }
+    }
+
+    /// The child closed: it leaves the queue, and later wakes queue nothing.
+    /// A wake that set `woken` before this either queued the child before
+    /// the lock was taken here, and is taken out, or finds it closed.
+    fn close(&self) {
+        let mut keys = self.queue.keys.lock();
+        self.closed.store(true, Ordering::Relaxed);
+        if self.woken.load(Ordering::Relaxed) {
+            keys.retain(|&key| key != self.key);
+        }
     }
 
     /// `Children` starts calling the child: credit released meanwhile is
@@ -437,7 +480,10 @@ where
             work: List::new(List::WORK),
             timers: Vec::new(),
             armed: 0,
-            woken: Arc::new(AtomicBool::new(false)),
+            woken: Arc::new(Woken {
+                any: AtomicBool::new(false),
+                keys: Mutex::new(Vec::new()),
+            }),
             storage: None,
             limit,
             window,
@@ -467,15 +513,17 @@ where
     }
 
     /// The routing storage for `kids` child places: the places themselves,
-    /// a vacant place's next key included, with their wake state, their ids
-    /// in order and their places in the deadline heap, the command queue
-    /// with one closing place per child, and the control queue.
+    /// a vacant place's next key included, with their wake state, their
+    /// places in the wake queue, their ids in order and their places in the
+    /// deadline heap, the command queue with one closing place per child,
+    /// and the control queue.
     fn routing_bytes(kids: usize) -> Option<usize> {
         let place = size_of::<Kid<B>>()
             + size_of::<usize>()
             // The wake state's shared allocation, with its two counts.
             + size_of::<ChildWake>()
             + 2 * size_of::<usize>()
+            + size_of::<usize>()
             + size_of::<(ChildId, usize)>()
             + size_of::<usize>();
         kids.checked_mul(place)?.checked_add(
@@ -497,6 +545,7 @@ where
         self.kids = Slab::with_capacity(FLOOR);
         self.order = Vec::with_capacity(FLOOR);
         self.timers = Vec::with_capacity(FLOOR);
+        self.woken.keys.lock().reserve_exact(FLOOR);
         self.down = VecDeque::with_capacity(QUEUE + FLOOR);
         self.up = VecDeque::with_capacity(QUEUE);
         self.storage = Some(charge);
@@ -528,6 +577,11 @@ where
         self.kids.reserve_exact(places - self.kids.len());
         self.order.reserve_exact(places - self.order.len());
         self.timers.reserve_exact(places - self.timers.len());
+        // Only open children wait in the wake queue, fewer than `places`.
+        let mut keys = self.woken.keys.lock();
+        let queued = keys.len();
+        keys.reserve_exact(places - queued);
+        drop(keys);
         self.down.reserve_exact(QUEUE + places - self.down.len());
         true
     }
@@ -546,7 +600,9 @@ where
         if let Some(place) = self.kids[key].heap {
             self.unschedule(place);
         }
-        Some(self.kids.remove(key))
+        let kid = self.kids.remove(key);
+        kid.wake.close();
+        Some(kid)
     }
 
     /// Child `key` was called: its layer may have work, its deadline is
@@ -634,18 +690,21 @@ where
         self.kids[self.timers[place]].heap = Some(place);
     }
 
-    /// Readies the children something reached from outside a call.
+    /// Readies the children something reached from outside a call, in id
+    /// order, whatever order their wakes came in.
     fn collect_wakes(&mut self) {
-        if !self.woken.load(Ordering::Relaxed) || !self.woken.swap(false, Ordering::Acquire) {
+        let any = &self.woken.any;
+        if !any.load(Ordering::Relaxed) || !any.swap(false, Ordering::Acquire) {
             return;
         }
-        for at in 0..self.order.len() {
-            let key = self.order[at].1;
-            let wake = &self.kids[key].wake.woken;
-            if wake.load(Ordering::Relaxed) && wake.swap(false, Ordering::Acquire) {
-                self.ready.push(&mut self.kids, key);
-                self.work.push(&mut self.kids, key);
-            }
+        let mut keys = self.woken.keys.lock();
+        let kids = &mut self.kids;
+        keys.sort_unstable_by_key(|&key| kids[key].id);
+        for key in keys.drain(..) {
+            // Reads the wake that queued it, and whatever came before it.
+            kids[key].wake.woken.swap(false, Ordering::Acquire);
+            self.ready.push(kids, key);
+            self.work.push(kids, key);
         }
     }
 
@@ -661,6 +720,8 @@ where
         self.kids = Slab::with_capacity(FLOOR);
         self.order = Vec::with_capacity(FLOOR);
         self.timers = Vec::with_capacity(FLOOR);
+        // Closed children left the wake queue, so it is empty.
+        *self.woken.keys.lock() = Vec::with_capacity(FLOOR);
         self.down.shrink_to((QUEUE + FLOOR).max(self.down.len()));
         let places = self.down.capacity().saturating_sub(QUEUE);
         if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
@@ -881,12 +942,12 @@ where
                     .then(|| {
                         // The inbox grows as events wait in it (`admit`).
                         let storage = budget.charge(0)?;
-                        let backing =
+                        let window =
                             budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
-                        Some((storage, Arc::new(backing)))
+                        Some((storage, Arc::new(window)))
                     })
                     .flatten();
-                let Some((storage, backing)) = reserved else {
+                let Some((storage, window)) = reserved else {
                     self.down.push_back(child.close());
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
@@ -898,7 +959,9 @@ where
                 };
                 let due = layer.deadline();
                 assert!(layer.depth() < MAX_DEPTH, "composition depth exceeded");
-                let key = self.kids.insert(Kid {
+                let place = self.kids.vacant_entry();
+                let key = place.key();
+                place.insert(Kid {
                     id,
                     handle: child,
                     links: [Link::default(); 2],
@@ -911,8 +974,8 @@ where
                     urgent: None,
                     inbox: VecDeque::new(),
                     storage,
-                    wake: Arc::new(ChildWake::new(self.woken.clone())),
-                    backing,
+                    wake: Arc::new(ChildWake::new(key, self.woken.clone())),
+                    window,
                     max_command,
                     granted: 0,
                     owed: self.window,
@@ -979,16 +1042,21 @@ where
                             }
                             kid.inbox.reserve_exact(places - kid.inbox.len());
                         }
-                        if !event.reserve_receive(&kid.budget, &kid.backing) {
+                        if !event.reserve_receive(&kid.budget, &kid.window) {
                             self.refuse(env, id);
                             return Ok(Admit::Taken);
                         }
                         kid.granted -= cost;
-                        let retained = if cost > 0 {
-                            event.retain_credit(CreditReturn::new(kid.wake.clone(), cost))
-                        } else {
-                            false
-                        };
+                        // Credit the payload does not hold goes back when
+                        // the child takes the event (`visit`).
+                        let retained = cost > 0
+                            && match event.retain_lease(CreditLease::new(kid.wake.clone(), cost)) {
+                                Some(lease) => {
+                                    lease.disarm();
+                                    false
+                                }
+                                None => true,
+                            };
                         kid.inbox.push_back((event, retained));
                     }
                     self.ready.push(&mut self.kids, key);
@@ -1156,7 +1224,10 @@ mod tests {
     use super::*;
     use crate::Seed;
     use crate::entropy::SeededEntropy;
-    use crate::stdlib::layer::{ByteStream, Chunk, Driver, Slots, StreamCommand, StreamEvent};
+    use crate::stdlib::layer::{
+        ByteStream, Chunk, Direction, Driver, ObservedEvent, ObservedStream, Slots, StreamCommand,
+        StreamEvent,
+    };
     use bytes::Bytes;
     use std::convert::Infallible;
 
@@ -1245,44 +1316,82 @@ mod tests {
         )
     }
 
+    /// A child that counts the observed bytes it takes.
+    #[derive(Default)]
+    struct Observe(usize);
+
+    impl Layer for Observe {
+        type Lower = ObservedStream;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: ObservedEvent,
+        ) -> Result<Admit<ObservedEvent>, Infallible> {
+            if let ObservedEvent::Data { bytes, .. } = event {
+                self.0 += bytes.len();
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Infallible> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    fn observed_byte() -> ObservedEvent {
+        ObservedEvent::Data {
+            direction: Direction::Forward,
+            bytes: Chunk::new(vec![1]),
+            sequence: 0,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn credit_returned_at_delivery_wakes_nothing_when_admitted() {
+        let mut driver = Driver::new(
+            Children::<Observe, Top, ()>::new(1, 8, |_, (), _| Some(Observe::default())),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        // Observed data does not hold its credit: the mux returns it when
+        // the child takes the event, so admitting it wakes nothing.
+        let _ = driver
+            .deliver(MuxEvent::Child(id, observed_byte()))
+            .unwrap();
+        assert!(!driver.layer().woken.any.load(Ordering::Acquire));
+        assert!(driver.layer().woken.keys.lock().is_empty());
+        driver.run().unwrap();
+        assert_eq!(driver.layer().child(id).unwrap().0, 1);
+        assert!(matches!(
+            driver.take_command().unwrap().into_op(),
+            super::super::MuxOp::Credit(found, 1) if found == id
+        ));
+    }
+
     #[test]
     fn an_uncharged_payload_that_does_not_fit_refuses_only_its_child() {
-        use crate::stdlib::layer::{Direction, ObservedEvent, ObservedStream};
-
-        #[derive(Default)]
-        struct Observe(usize);
-        impl Layer for Observe {
-            type Lower = ObservedStream;
-            type Upper = Top;
-            type Report = ();
-            type Timer = ();
-            type Work = ();
-            type Done = ();
-            type Error = Infallible;
-            fn on_event(
-                &mut self,
-                _: &mut Env<'_, ()>,
-                event: ObservedEvent,
-            ) -> Result<Admit<ObservedEvent>, Infallible> {
-                if let ObservedEvent::Data { bytes, .. } = event {
-                    self.0 += bytes.len();
-                }
-                Ok(Admit::Taken)
-            }
-            fn on_command(
-                &mut self,
-                _: &mut Env<'_, ()>,
-                command: Infallible,
-            ) -> Result<Admit<Infallible>, Infallible> {
-                match command {}
-            }
-            fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Infallible> {
-                None
-            }
-            fn take_event(&mut self) -> Option<Infallible> {
-                None
-            }
-        }
         let budget = Budget::new(4096);
         let child_budget = budget.clone();
         let children = Children::<Observe, Top, ()>::new(2, 8, |_, (), _| Some(Observe::default()))
@@ -1301,12 +1410,7 @@ mod tests {
             let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
         }
         driver.run().unwrap();
-        let payload = || ObservedEvent::Data {
-            direction: Direction::Forward,
-            bytes: Chunk::new(vec![1]),
-            sequence: 0,
-            source: None,
-        };
+        let payload = observed_byte;
         for id in &ids {
             let _ = driver.deliver(MuxEvent::Child(*id, payload())).unwrap();
             driver.run().unwrap();
@@ -1570,6 +1674,76 @@ mod tests {
             assert!(driver.take_command().is_none());
             assert_eq!(budget.used(), 0);
         }
+    }
+
+    /// Opens a child on `driver` that holds one piece of data, taken out of
+    /// its layer and returned, with the commands its opening made taken.
+    fn holding(
+        driver: &mut Driver<Children<Reader, Top, &'static str>>,
+        slots: &mut Slots<()>,
+    ) -> (ChildId, Chunk) {
+        let child = slots.insert(()).unwrap();
+        let id = child.id();
+        let _ = driver
+            .deliver(MuxEvent::Opened(child, "stream", 8))
+            .unwrap();
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        let _ = driver
+            .deliver(MuxEvent::Child(id, StreamEvent::Data(Chunk::new(vec![1]))))
+            .unwrap();
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        let layer = driver.layer_mut();
+        let key = layer.key(id).unwrap();
+        (id, layer.kids[key].layer.held.take().unwrap())
+    }
+
+    #[test]
+    fn children_woken_together_are_visited_in_id_order() {
+        let mut driver = driver(|_, _, _| Reader::default());
+        let mut slots = Slots::new(3);
+        let held: Vec<_> = (0..3).map(|_| holding(&mut driver, &mut slots)).collect();
+        let ids: Vec<_> = held.iter().map(|(id, _)| *id).collect();
+        // Released last child first, so their wakes come in reverse order.
+        for (_, chunk) in held.into_iter().rev() {
+            drop(chunk);
+        }
+        driver.run().unwrap();
+        let mut credited = Vec::new();
+        while let Some(command) = driver.take_command() {
+            if let super::super::MuxOp::Credit(id, 1) = command.into_op() {
+                credited.push(id);
+            }
+        }
+        assert_eq!(credited, ids);
+    }
+
+    #[test]
+    fn a_closed_child_leaves_the_wake_queue_and_its_wakes_reach_no_later_child() {
+        let mut driver = driver(|_, _, _| Reader::default());
+        let mut slots = Slots::new(3);
+        // Woken, then closed before it was collected.
+        let (queued, chunk) = holding(&mut driver, &mut slots);
+        drop(chunk);
+        assert!(!driver.layer().woken.keys.lock().is_empty());
+        let _ = driver.deliver(MuxEvent::Closed(queued)).unwrap();
+        assert!(driver.layer().woken.keys.lock().is_empty());
+        // Closed, then woken: a later child has its place by then.
+        let (closed, chunk) = holding(&mut driver, &mut slots);
+        let place = driver.layer().key(closed);
+        let _ = driver.deliver(MuxEvent::Closed(closed)).unwrap();
+        let (later, later_chunk) = holding(&mut driver, &mut slots);
+        assert_eq!(driver.layer().key(later), place);
+        drop(chunk);
+        assert!(driver.layer().woken.keys.lock().is_empty());
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        // The later child's own wake still reaches it.
+        drop(later_chunk);
+        driver.run().unwrap();
+        assert!(matches!(driver.take_command().unwrap().into_op(),
+            super::super::MuxOp::Credit(found, 1) if found == later));
     }
 
     #[test]

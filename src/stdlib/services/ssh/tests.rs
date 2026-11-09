@@ -259,3 +259,103 @@ fn partial_wire_completions_credit_each_child_write_once() {
     assert!(layer.on_event(&mut env, StreamEvent::Written(1)).is_err());
     assert!(layer.take_event().is_none());
 }
+
+#[test]
+fn control_disconnects_while_channel_commands_wait() {
+    let mut layer = layer();
+    let control = layer.control();
+    let budget = Budget::unlimited();
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    layer.user = Some("guest".into());
+    layer
+        .connection_message(
+            wire::Message::ChannelOpen {
+                sender: 3,
+                window: 1024,
+                max_packet: 1024,
+                kind: wire::OpenKind::Session,
+            },
+            &mut env,
+        )
+        .unwrap();
+    let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
+        panic!("opening missing")
+    };
+    layer.channels.get_mut(child.id()).unwrap().confirmed = true;
+    // Output not yet handed to the byte stream holds back channel commands.
+    layer.write(&env, b"pending").unwrap();
+    let write = child.send(ChannelCommand::Stream(StreamCommand::Write(Bytes::new(
+        b"data".to_vec(),
+    ))));
+    assert!(!layer.on_command(&mut env, write).unwrap().moved());
+    control.disconnect();
+    assert!(layer.advance(&mut env).unwrap());
+    assert!(layer.is_terminal());
+    assert!(matches!(
+        layer.take_command(&mut env),
+        Some(StreamCommand::Write(_))
+    ));
+    assert!(matches!(
+        layer.take_command(&mut env),
+        Some(StreamCommand::End)
+    ));
+}
+
+#[test]
+fn control_drain_reads_only_window_adjustments_and_closes() {
+    let mut layer = layer();
+    let control = layer.control();
+    let budget = Budget::unlimited();
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    layer.reserve(&env).unwrap();
+    layer.started = true;
+    layer.user = Some("guest".into());
+    let open = |sender| {
+        wire::Message::ChannelOpen {
+            sender,
+            window: 1024,
+            max_packet: 1024,
+            kind: wire::OpenKind::Session,
+        }
+        .to_bytes()
+        .unwrap()
+    };
+    layer.packet(0, &open(3), &mut env).unwrap();
+    let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
+        panic!("opening missing")
+    };
+    let channel = layer.channels.get_mut(child.id()).unwrap();
+    channel.confirmed = true;
+    channel.receive = 1024;
+    channel.advertised = 1024;
+    let (number, window) = (channel.wire, channel.window);
+
+    control.drain();
+    layer.packet(1, &open(4), &mut env).unwrap();
+    assert!(layer.take_event().is_none());
+    assert_eq!(layer.channels.ids().count(), 1);
+    let data = wire::Message::Data {
+        recipient: number,
+        data: b"after hangup".to_vec(),
+    };
+    layer
+        .packet(2, &data.to_bytes().unwrap(), &mut env)
+        .unwrap();
+    assert!(layer.take_event().is_none());
+    let adjust = wire::Message::WindowAdjust {
+        recipient: number,
+        bytes: 10,
+    };
+    layer
+        .packet(3, &adjust.to_bytes().unwrap(), &mut env)
+        .unwrap();
+    assert!(layer.channels.get(child.id()).unwrap().window > window);
+    assert!(!layer.is_terminal());
+    let close = wire::Message::Close(number).to_bytes().unwrap();
+    layer.packet(4, &close, &mut env).unwrap();
+    assert!(layer.is_terminal());
+}

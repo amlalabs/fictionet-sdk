@@ -615,7 +615,6 @@ mod tests {
             leases: Arc::default(),
             gateway_tcp: Arc::default(),
             hooks: Arc::new(Hooks {
-                http_observe: None,
                 tls_observe: None,
                 attachment_observe: None,
                 dns_observe: None,
