@@ -50,6 +50,8 @@ where
             .poll(Some(fcx), cx, |done| self.driver.complete(done))
             .map_err(|e| fictionet::Error::msg(e.to_string()))?;
         let mut exhausted = false;
+        let mut intake = 64;
+        let mut blocked = false;
         for turn in 0..64 {
             if self.pending.is_empty() {
                 events(&mut self.pending);
@@ -58,7 +60,9 @@ where
                 .run()
                 .map_err(|e| fictionet::Error::msg(e.to_string()))?;
             let mut moved = self.driver.send_below(&mut command);
-            if let Some(event) = self.pending.pop_front() {
+            while intake > 0
+                && let Some(event) = self.pending.pop_front()
+            {
                 match self
                     .driver
                     .deliver(event)
@@ -66,9 +70,14 @@ where
                 {
                     Admit::Blocked(event) => {
                         self.pending.push_front(event);
+                        blocked = true;
                         break;
                     }
-                    _ => moved = true,
+                    _ => {
+                        intake -= 1;
+                        blocked = false;
+                        moved = true;
+                    }
                 }
             }
             if !moved {
@@ -87,10 +96,109 @@ where
         if self.pending.is_empty() {
             events(&mut self.pending);
         }
-        Ok(completed || exhausted || moved || !self.pending.is_empty() || self.driver.exhausted())
+        Ok(completed
+            || exhausted
+            || moved
+            || (!self.pending.is_empty() && !blocked)
+            || self.driver.exhausted())
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.driver.deadline()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::stdlib::layer::{Env, MessageCommand, MessageEvent, Messages, Top};
+    use std::convert::Infallible;
+    use std::time::Duration;
+
+    struct Waiting {
+        at: Instant,
+        ready: bool,
+        received: usize,
+    }
+    impl Layer for Waiting {
+        type Lower = Messages<(), ()>;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: MessageEvent<()>,
+        ) -> Result<Admit<MessageEvent<()>>, Infallible> {
+            if !self.ready {
+                return Ok(Admit::Blocked(event));
+            }
+            self.received += 1;
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+            self.ready = true;
+            Ok(())
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            (!self.ready).then_some((self.at, ()))
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+        fn take_command(&mut self) -> Option<MessageCommand<()>> {
+            None
+        }
+    }
+
+    #[test]
+    fn refused_input_waits_for_readiness_without_requesting_a_busy_poll() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                let delay = Duration::from_millis(5);
+                let at = cx.now() + delay;
+                let mut applications = Applications::new(
+                    &cx,
+                    Waiting {
+                        at,
+                        ready: false,
+                        received: 0,
+                    },
+                );
+                let mut source = VecDeque::from([MessageEvent::Message(())]);
+                let busy = applications.poll(
+                    &cx,
+                    &mut Context::from_waker(std::task::Waker::noop()),
+                    |pending| std::mem::swap(pending, &mut source),
+                    |_| Admit::Taken,
+                )?;
+                assert!(!busy, "refusal must wait for a timer or a wake");
+                assert_eq!(applications.deadline(), Some(at));
+                assert_eq!(applications.pending.len(), 1);
+                cx.sleep(delay).await?;
+                applications.poll(
+                    &cx,
+                    &mut Context::from_waker(std::task::Waker::noop()),
+                    |pending| std::mem::swap(pending, &mut source),
+                    |_| Admit::Taken,
+                )?;
+                assert!(applications.pending.is_empty());
+                assert_eq!(applications.driver.layer().received, 1);
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }
