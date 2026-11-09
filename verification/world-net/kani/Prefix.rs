@@ -211,3 +211,92 @@ fn ipv6_offsets_and_size_agree() {
     assert_eq!(prefix.nth(0), Some(prefix.network()));
     assert_eq!(prefix.broadcast(), None);
 }
+
+// Failing controls. Each harness below changes one thing as code without
+// that rule would, and must fail on the assertion its comment names.
+
+/// Must fail on "contains compares every prefix bit": `contains` asked
+/// with the length one short, as a mask that drops the last prefix bit.
+#[kani::proof]
+fn ipv4_contains_without_the_last_prefix_bit() {
+    let (prefix, p, len) = any_v4_prefix();
+    let short = Prefix {
+        len: len.saturating_sub(1),
+        ..prefix
+    };
+    let a: u32 = kani::any();
+    assert!(
+        short.contains(Ipv4Addr::from(a).into()) == ((p ^ a) & v4_bits(len) == 0),
+        "contains compares every prefix bit"
+    );
+}
+
+/// Must fail on "contains compares every prefix bit", for IPv6.
+#[kani::proof]
+fn ipv6_contains_without_the_last_prefix_bit() {
+    let (prefix, p, len) = any_v6_prefix();
+    let short = Prefix {
+        len: len.saturating_sub(1),
+        ..prefix
+    };
+    let a: u128 = kani::any();
+    assert!(
+        short.contains(Ipv6Addr::from(a).into()) == ((p ^ a) & v6_bits(len) == 0),
+        "contains compares every prefix bit"
+    );
+}
+
+/// Must fail on "the canonical address is the network address": a
+/// canonical form that clamps the length but keeps the host bits.
+#[kani::proof]
+fn canonical_without_clearing_host_bits() {
+    let (prefix, _, len) = any_v4_prefix();
+    let c = Prefix {
+        addr: prefix.addr,
+        len: len.min(32),
+    };
+    assert!(
+        c.addr == prefix.network(),
+        "the canonical address is the network address"
+    );
+}
+
+/// Must fail on "an address in both means overlap": an overlap test that
+/// asks only whether the first prefix holds the second's address.
+#[kani::proof]
+fn overlap_without_both_directions() {
+    let (p, _, _) = any_v4_prefix();
+    let (q, _, _) = any_v4_prefix();
+    let one_way = p.contains(q.addr);
+    let a: u32 = kani::any();
+    let a = IpAddr::V4(Ipv4Addr::from(a));
+    if p.contains(a) && q.contains(a) {
+        assert!(one_way, "an address in both means overlap");
+    }
+}
+
+/// Must fail on "the last offset is last": a size one too large, as
+/// arithmetic that counts the address past the prefix.
+#[kani::proof]
+fn ipv4_offsets_without_the_exact_size() {
+    let (prefix, _, _) = any_v4_prefix();
+    let size = prefix.size().expect("every IPv4 prefix has a size") + 1;
+    assert!(
+        prefix.nth(size - 1) == Some(prefix.last()),
+        "the last offset is last"
+    );
+}
+
+/// Must fail on "the last offset is last", for IPv6 prefixes that have a
+/// size.
+#[kani::proof]
+fn ipv6_offsets_without_the_exact_size() {
+    let (prefix, _, _) = any_v6_prefix();
+    if let Some(size) = prefix.size() {
+        let size = size + 1;
+        assert!(
+            prefix.nth(size - 1) == Some(prefix.last()),
+            "the last offset is last"
+        );
+    }
+}
