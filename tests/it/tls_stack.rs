@@ -152,6 +152,53 @@ fn https_in_one_chain_means_the_same_however_its_input_is_cut() {
 }
 
 #[test]
+fn a_reset_after_tls_establishes_terminates_the_application_session() {
+    use fictionet::stdlib::layer::{Admit, Layer, StreamEvent};
+    use fictionet::stdlib::services::tls::{Handshake, Negotiation, Secure};
+
+    block_on(lab(Seed::from_u64(40), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let secure = Secure::new(tls::TlsLayer::new(config), |_| {
+            Some(stack::Session::new(
+                Http1::new(handler()),
+                StreamLimits::default(),
+                fcx.now(),
+            ))
+        });
+        let mut server = Harness::new(Seed::from_u64(41), secure).with_worker(Polling::new());
+        let mut client = client(client_config(&fcx, &ca, &[b"http/1.1"]));
+        for _ in 0..32 {
+            server.push(&ciphertext(&mut client))?;
+            decrypt(&mut client, &server.take_output());
+            if !client.is_handshaking() && server.layer().upper().is_some() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(matches!(
+            server.layer().tls().handshake(),
+            Handshake::Established { .. }
+        ));
+        assert!(!server.layer().upper().unwrap().is_terminal());
+
+        assert!(matches!(
+            server.driver().deliver(StreamEvent::Reset)?,
+            Admit::Taken
+        ));
+        server.settle()?;
+
+        assert_eq!(server.layer().tls().handshake(), Handshake::Failed);
+        assert!(
+            server.layer().upper().unwrap().is_terminal(),
+            "the application session must receive the peer reset through TLS"
+        );
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn https_in_one_chain_loses_nothing_when_its_writes_are_held_back() {
     block_on(lab(Seed::from_u64(33), |fcx| async move {
         let ca = Ca::new(&fcx, "Test CA")?;
@@ -546,7 +593,7 @@ fn ip_tcp_tls_and_http_run_in_the_pure_packet_harness() {
         ) -> Result<Admit<Infallible>, Self::Error> {
             match command {}
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             let bytes = ciphertext(&mut self.tls);
             (!bytes.is_empty()).then(|| StreamCommand::Write(Chunk::new(bytes)))
         }

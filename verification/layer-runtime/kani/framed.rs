@@ -9,7 +9,7 @@
 //! | `the_buffer_is_charged_before_bytes_are_taken_A_B` | two pushes of `A` and `B` bytes (each 1 to 3, the bytes any), with up to two items taken between: after each, `Framed`'s charge covers the decoder's input storage and held state and is all the budget holds, and what the push hands back (`Partial` or `Blocked`) is exactly the bytes it did not take |
 //! | `every_charge_comes_back_*` | under a budget of 0, 6, 8, 13 or 14 bytes, two bytes from the peer and a value from above, then two of an end, a reset, an end from above, a taken event, a taken write and its delivery, in ten orders: a budget refusal takes no byte, the budget holds exactly what `Framed` and the chunk in flight are charged, never past its limit, a written value is charged at least its length, and nothing once they are dropped |
 //! | `units_come_up_in_order_and_the_rest_is_handed_back_odd_first_cut_3` | a three-byte unit (its payload any) and then a one-byte one, in two pushes, then the end: each unit comes up once, in order, then `Ended`. The cuts that make a push hand bytes back, and a trailing partial unit, did not fit in 10 GiB with the bytes handed back offered again; `Partial` is covered by the line above, the reassembly after it by `StreamRunner.tla` (`InputKept`) and the unit test `every_cut_of_the_input_gets_every_frame_back_in_order` |
-//! | `a_decoder_failure_comes_up_once_then_ended` | against any decoder items, ends, needs and failures, through any three of input, end, reset and taken events, then three more taken events: no item after a failure; a failure comes up once and `Ended` right after it; nothing after `Ended`; once either came up, input is over, and input offered after its end is refused as `Closed` and changes nothing |
+//! | `a_decoder_failure_comes_up_once_then_ended_first_*` | first actions partitioned exhaustively into input, end, reset and taken event, with input split by the second action too; against any decoder items, ends, needs and failures, through any three of input, end, reset and taken events, then three more taken events: no item after a failure; a failure comes up once and `Ended` right after it; nothing after `Ended`; once either came up, input is over, and input offered after its end is refused as `Closed` and changes nothing |
 
 extern crate alloc;
 
@@ -295,7 +295,7 @@ fn charges_come_back<const LIMIT: usize, const S1: u8, const S2: u8>() {
             }
             _ => {
                 if flying.is_none()
-                    && let Some(StreamCommand::Write(chunk)) = d.layer_mut().take_command()
+                    && let Some(StreamCommand::Write(chunk)) = d.take_command()
                 {
                     assert!(chunk.charged() >= chunk.len(), "a write carries its charge");
                     flying = Some(chunk);
@@ -418,16 +418,18 @@ in_order! {
     units_come_up_in_order_and_the_rest_is_handed_back_odd_first_cut_3: true, 3;
 }
 
-#[kani::proof]
-#[kani::unwind(7)]
-#[kani::solver(minisat)]
-fn a_decoder_failure_comes_up_once_then_ended() {
+fn decoder_failure<const FIRST: u8>(second: Option<u8>) {
     let budget = Budget::unlimited();
     let mut d = driver(Steps, &budget);
     let mut log = [Seen::Item; 7];
     let mut n = 0;
-    for _ in 0..3 {
-        match kani::any::<u8>() {
+    for step in 0..3 {
+        let action = match step {
+            0 => FIRST,
+            1 => second.unwrap_or_else(kani::any),
+            _ => kani::any(),
+        };
+        match action {
             0 => {
                 let over = d.layer().input_over || d.layer().stream.is_eof();
                 let buffered = d.layer().stream.buffered();
@@ -493,6 +495,55 @@ fn a_decoder_failure_comes_up_once_then_ended() {
             Some(MessageEvent::Ended)
         ));
     }
+}
+
+#[kani::proof]
+#[kani::unwind(7)]
+#[kani::solver(cadical)]
+fn a_decoder_failure_comes_up_once_then_ended_first_input_then_input() {
+    decoder_failure::<0>(Some(0));
+}
+
+#[kani::proof]
+#[kani::unwind(7)]
+#[kani::solver(cadical)]
+fn a_decoder_failure_comes_up_once_then_ended_first_input_then_end() {
+    decoder_failure::<0>(Some(1));
+}
+
+#[kani::proof]
+#[kani::unwind(7)]
+#[kani::solver(cadical)]
+fn a_decoder_failure_comes_up_once_then_ended_first_input_then_reset() {
+    decoder_failure::<0>(Some(2));
+}
+
+#[kani::proof]
+#[kani::unwind(7)]
+#[kani::solver(cadical)]
+fn a_decoder_failure_comes_up_once_then_ended_first_input_then_take() {
+    decoder_failure::<0>(Some(3));
+}
+
+#[kani::proof]
+#[kani::unwind(7)]
+#[kani::solver(cadical)]
+fn a_decoder_failure_comes_up_once_then_ended_first_end() {
+    decoder_failure::<1>(None);
+}
+
+#[kani::proof]
+#[kani::unwind(7)]
+#[kani::solver(cadical)]
+fn a_decoder_failure_comes_up_once_then_ended_first_reset() {
+    decoder_failure::<2>(None);
+}
+
+#[kani::proof]
+#[kani::unwind(7)]
+#[kani::solver(cadical)]
+fn a_decoder_failure_comes_up_once_then_ended_first_take() {
+    decoder_failure::<3>(None);
 }
 
 #[kani::proof]

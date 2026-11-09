@@ -382,7 +382,7 @@ impl Layer for Grpc {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<ExchangeCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
         self.next.take()
     }
 

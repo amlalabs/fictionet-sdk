@@ -186,7 +186,11 @@ pub struct Http {
 }
 
 impl PortServer for Http {
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let profile = self.profile;
         arrival.socket.set_keep_alive(match profile {
             // Go's net.defaultTCPKeepAliveIdle, used by Caddy's ListenConfig.

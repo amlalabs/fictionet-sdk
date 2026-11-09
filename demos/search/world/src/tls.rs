@@ -1,6 +1,6 @@
 //! Issue host certificates using the world clock and its certificate authority.
 
-use fictionet::{Cx, stdlib::services::tls::ServerConfig};
+use fictionet::{Cx, stdlib::services::tls::CertifiedKey};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
@@ -54,7 +54,7 @@ impl Ca {
         &self,
         fcx: &Cx,
         host: &str,
-    ) -> fictionet::Result<(Arc<ServerConfig>, String, String)> {
+    ) -> fictionet::Result<(Arc<CertifiedKey>, String, String)> {
         let world_now = self.world_now(fcx);
         let earliest = time::OffsetDateTime::from(self.earliest).min(world_now);
         let leaf = self.issuer.issue_since(
@@ -63,7 +63,7 @@ impl Ca {
             earliest.unix_timestamp(),
             world_now.unix_timestamp(),
         )?;
-        let config = leaf.server_config(fcx, self.start)?;
+        let config = leaf.certified_key();
         let day = |t: time::OffsetDateTime| {
             format!("{:04}-{:02}-{:02}", t.year(), t.month() as u8, t.day())
         };
@@ -83,7 +83,7 @@ impl Ca {
         fcx: &Cx,
         host: &str,
         refusal: &Refusal,
-    ) -> fictionet::Result<Arc<ServerConfig>> {
+    ) -> fictionet::Result<Arc<CertifiedKey>> {
         const YEAR: i64 = 395 * 86_400;
         let now = self.world_now(fcx).unix_timestamp();
         let leaf = match refusal {
@@ -111,7 +111,7 @@ impl Ca {
                 untrusted.issue(fcx, &[host], now)?
             }
         };
-        leaf.server_config(fcx, self.start)
+        Ok(leaf.certified_key())
     }
 }
 

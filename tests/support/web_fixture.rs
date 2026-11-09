@@ -19,7 +19,7 @@ pub fn world(
         .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))
         .route("/big", get(|| async { vec![b'x'; 16 << 20] }))
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
-    let sites = web_world::sites(fcx, chain, key, app, plain)?;
+    let sites = web_world::sites(chain, key, app, plain);
     let upstream = web::proxy(fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
     web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| {
         if host == "upstream" {

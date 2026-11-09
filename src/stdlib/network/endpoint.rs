@@ -61,6 +61,7 @@ pub(crate) async fn drive(
     layer: Stack,
     scope: Scope,
 ) -> fictionet::Result {
+    // IP uses its engine limits; application byte budgets cover their transport children.
     let mut ip = Driver::new(layer, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now());
     ip.keep_observations(0);
     let mut timer = fictionet::Timer::new(&fcx);

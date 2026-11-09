@@ -381,7 +381,7 @@ impl<A: LineApp> Layer for Lined<A> {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if self.reset {
             return None;
         }
@@ -608,7 +608,10 @@ impl<A: DatagramApp> Layer for Datagrammed<A> {
         Ok(true)
     }
 
-    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<DatagramCommand<SocketAddr>> {
         let (bytes, to) = self.sends.pop_front()?;
         Some(DatagramCommand::Send(Datagram::new(Chunk::new(bytes), to)))
     }

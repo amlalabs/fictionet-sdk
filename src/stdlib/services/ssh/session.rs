@@ -335,7 +335,7 @@ impl<H: Handler> Layer for SessionLayer<H> {
     fn take_event(&mut self) -> Option<Infallible> {
         None
     }
-    fn take_command(&mut self) -> Option<ChannelCommand> {
+    fn take_command(&mut self, _env: &mut Env<'_, Self::Report>) -> Option<ChannelCommand> {
         if self.output.disconnect {
             self.output.disconnect = false;
             return Some(ChannelCommand::Disconnect);
@@ -380,7 +380,7 @@ impl<H: Handler> Layer for SessionLayer<H> {
             }
             Some(Chunk::Exit(status)) => {
                 self.exit = Some(status);
-                self.take_command()
+                self.take_command(_env)
             }
             None if self.output.hangup => {
                 self.output.hangup = false;

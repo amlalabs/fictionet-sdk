@@ -22,8 +22,8 @@ pub struct Chain<A: Layer, B: Layer<Lower = A::Upper>> {
     urgent: Option<EventOf<A::Upper>>,
     /// A command `B` handed down that `A` has not taken.
     down: Option<CommandOf<A::Upper>>,
-    work_upper: bool,
-    timer_upper: bool,
+    lower_worked_last: bool,
+    lower_fired_last: bool,
 }
 
 impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
@@ -39,9 +39,23 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Chain<A, B> {
             up: None,
             urgent: None,
             down: None,
-            work_upper: false,
-            timer_upper: false,
+            lower_worked_last: false,
+            lower_fired_last: false,
         }
+    }
+
+    /// Discards buffered events that no longer belong to the upper protocol.
+    /// The lower layer must separately discard any events it still owns.
+    /// Returns whether an event was discarded.
+    pub fn retain_events(&mut self, mut keep: impl FnMut(&EventOf<A::Upper>) -> bool) -> bool {
+        let mut discarded = false;
+        for slot in [&mut self.up, &mut self.urgent] {
+            if slot.as_ref().is_some_and(|event| !keep(event)) {
+                *slot = None;
+                discarded = true;
+            }
+        }
+        discarded
     }
 
     /// The lower part.
@@ -114,7 +128,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
     ) -> Result<(), Self::Error> {
-        self.timer_upper = matches!(timer, Side::Lower(_));
+        self.lower_fired_last = matches!(timer, Side::Lower(_));
         match timer {
             Side::Lower(t) => env
                 .scoped(Side::Lower, |env| self.lower.on_timer(env, t))
@@ -148,7 +162,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
             .scoped(Side::Upper, |env| self.upper.advance(env))
             .map_err(Side::Upper)?;
         // An urgent event goes first, then whatever `A` has.
-        if self.urgent.is_none() && self.up.is_some() {
+        if self.urgent.is_none() {
             self.urgent = self.lower.take_urgent();
         }
         if let Some(event) = self.urgent.take() {
@@ -168,7 +182,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
             moved |= offer(&mut self.up, admit);
         }
         if self.down.is_none() {
-            self.down = self.upper.take_command();
+            self.down = env.scoped(Side::Upper, |env| self.upper.take_command(env));
             moved |= self.down.is_some();
         }
         if let Some(command) = self.down.take() {
@@ -180,8 +194,8 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<A::Lower>> {
-        self.lower.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<A::Lower>> {
+        env.scoped(Side::Lower, |env| self.lower.take_command(env))
     }
 
     fn take_event(&mut self) -> Option<EventOf<B::Upper>> {
@@ -193,7 +207,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
     }
 
     fn take_work(&mut self) -> Option<Self::Work> {
-        let work = if self.work_upper {
+        let work = if self.lower_worked_last {
             self.upper
                 .take_work()
                 .map(Side::Upper)
@@ -205,7 +219,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
                 .or_else(|| self.upper.take_work().map(Side::Upper))
         };
         if let Some(ref work) = work {
-            self.work_upper = matches!(work, Side::Lower(_));
+            self.lower_worked_last = matches!(work, Side::Lower(_));
         }
         work
     }
@@ -229,7 +243,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         let lower = self.lower.deadline();
         let upper = self.upper.deadline();
         match (lower, upper) {
-            (Some((a, t)), Some((b, _))) if a < b || (a == b && !self.timer_upper) => {
+            (Some((a, t)), Some((b, _))) if a < b || (a == b && !self.lower_fired_last) => {
                 Some((a, Side::Lower(t)))
             }
             (_, Some((b, t))) => Some((b, Side::Upper(t))),
@@ -270,7 +284,7 @@ mod tests {
         ) -> Result<Admit<StreamCommand>, Infallible> {
             Ok(Admit::Blocked(command))
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
         fn take_event(&mut self) -> Option<StreamEvent> {

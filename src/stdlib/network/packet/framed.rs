@@ -185,7 +185,7 @@ impl Layer for Framed {
         });
         Ok(Admit::Taken)
     }
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.output.take()
     }
     fn take_event(&mut self) -> Option<PacketEvent<Datagram<Ingress>>> {

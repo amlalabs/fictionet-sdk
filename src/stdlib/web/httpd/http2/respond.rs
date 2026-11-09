@@ -127,7 +127,7 @@ impl Responder {
         Chain::new(
             connection,
             Children::new(limit, Http2::WINDOW, move |_, opening, _| {
-                Respond::new(shared.clone(), opening)
+                Some(Respond::new(shared.clone(), opening))
             }),
         )
     }
@@ -553,7 +553,7 @@ impl Layer for Respond {
         Ok(state.respond(env))
     }
 
-    fn take_command(&mut self) -> Option<ExchangeCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
         self.state.next.take()
     }
 

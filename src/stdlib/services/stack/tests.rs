@@ -155,7 +155,7 @@ impl Layer for Loud {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let n = self.left.min(64 * 1024);
         self.left -= n;
         (n > 0).then(|| StreamCommand::Write(Chunk::new(vec![b'x'; n])))
@@ -220,7 +220,7 @@ impl Layer for Pauses {
         self.until.map(|at| (at, ()))
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if self.seen.lock().1.is_some() && !self.end_sent {
             self.end_sent = true;
             return Some(StreamCommand::End);
@@ -413,7 +413,10 @@ impl Layer for Counter {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<DatagramCommand<SocketAddr>> {
         self.reply.take().map(DatagramCommand::Send)
     }
 
@@ -531,7 +534,10 @@ impl Layer for Goodbyes {
         Ok(true)
     }
 
-    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<DatagramCommand<SocketAddr>> {
         self.slot.take().map(DatagramCommand::Send)
     }
 
@@ -602,7 +608,7 @@ impl Layer for HalfClosed {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         std::mem::take(&mut self.end).then_some(StreamCommand::End)
     }
 
@@ -652,26 +658,65 @@ impl DatagramSocket for OneDatagram {
 }
 
 #[test]
-fn datagram_input_requires_its_backing_capacity_in_the_budget() {
-    let mut bytes = Vec::with_capacity(256);
-    bytes.push(1);
-    let budget = Budget::new(bytes.capacity() - 1);
-    let retained = budget.clone();
-    block_on(lab(Seed::from_u64(4), move |fcx| async move {
-        let result = datagrams(
-            &fcx,
-            OneDatagram(Some(bytes)),
-            server_addr(),
-            Counter::default(),
-            budget,
-            |_| {},
-        )
-        .await;
-        assert!(matches!(result, Err(StackError::Budget)));
-        Ok(())
-    }))
-    .expect("the run finishes");
-    assert_eq!(retained.used(), 0);
+fn an_oversized_datagram_is_dropped_without_ending_the_conversation() {
+    struct DatagramsIn {
+        incoming: std::collections::VecDeque<(Vec<u8>, SocketAddr)>,
+        sent: Arc<fictionet::sync::Mutex<Vec<(u64, SocketAddr)>>>,
+    }
+    impl DatagramSocket for DatagramsIn {
+        async fn recv(&mut self, _: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
+            self.incoming.pop_front().ok_or(RecvError::Closed)
+        }
+        fn send_to(&mut self, data: &[u8], to: SocketAddr) {
+            self.sent
+                .lock()
+                .push((u64::from_be_bytes(data.try_into().unwrap()), to));
+        }
+    }
+    for limit in [255, 256] {
+        let mut bytes = Vec::with_capacity(256);
+        bytes.push(1);
+        let budget = Budget::new(limit);
+        let retained = budget.clone();
+        let sent = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
+        let replies = sent.clone();
+        let first = server_addr();
+        let second = SocketAddr::new(CLIENT.into(), PORT + 1);
+        block_on(lab(Seed::from_u64(4), move |fcx| async move {
+            let socket = DatagramsIn {
+                incoming: [
+                    (vec![1], first),
+                    (bytes, first),
+                    (Vec::new(), first),
+                    (vec![2], second),
+                ]
+                .into(),
+                sent,
+            };
+            let mut reports = Vec::new();
+            let result = datagrams(
+                &fcx,
+                socket,
+                server_addr(),
+                Counter::default(),
+                budget,
+                |report| reports.push(report),
+            )
+            .await;
+            assert_eq!(
+                reports,
+                [DatagramReport::Dropped {
+                    from: first,
+                    bytes: 1
+                }]
+            );
+            assert!(result.is_ok());
+            Ok(())
+        }))
+        .expect("the run finishes");
+        assert_eq!(*replies.lock(), [(1, first), (2, first), (1, second)]);
+        assert_eq!(retained.used(), 0);
+    }
 }
 
 struct BusyDatagram {
@@ -739,7 +784,10 @@ impl Layer for BusyDatagram {
         Ok(())
     }
 
-    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<DatagramCommand<SocketAddr>> {
         if self.end_sent {
             return None;
         }
@@ -875,7 +923,7 @@ impl Layer for StreamChild {
         Ok(Admit::Taken)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.outgoing.take()
     }
 
@@ -951,7 +999,7 @@ fn an_async_http_child_runs_over_the_live_stream_with_a_small_window() {
                 StreamChild::new(),
                 Children::new(1, 65536, |_, context, _| {
                     assert_eq!(context, "http");
-                    Http1::new(Deferred)
+                    Some(Http1::new(Deferred))
                 }),
             )
         },
@@ -1047,4 +1095,230 @@ fn a_returned_body_can_start_work_with_its_captured_context() {
 #[test]
 fn a_streaming_body_releases_completed_frame_jobs() {
     serve_lazy_frames(130);
+}
+
+struct Extraction<P: fictionet::stdlib::layer::Port> {
+    command: Option<fictionet::stdlib::layer::CommandOf<P>>,
+    extracted: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<P: fictionet::stdlib::layer::Port> Layer for Extraction<P> {
+    type Lower = P;
+    type Upper = Top;
+    type Report = ();
+    type Timer = Infallible;
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn report_bytes(_: &()) -> Option<usize> {
+        Some(0)
+    }
+
+    fn on_event(
+        &mut self,
+        _: &mut Env<'_, ()>,
+        _: fictionet::stdlib::layer::EventOf<P>,
+    ) -> Result<Admit<fictionet::stdlib::layer::EventOf<P>>, Infallible> {
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _: &mut Env<'_, ()>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn take_command(
+        &mut self,
+        env: &mut Env<'_, ()>,
+    ) -> Option<fictionet::stdlib::layer::CommandOf<P>> {
+        self.extracted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        env.report(());
+        self.command.take()
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+}
+
+struct ExtractionConnection {
+    fail: bool,
+}
+
+impl Connection for ExtractionConnection {
+    fn poll_read(
+        &mut self,
+        _: &Cx,
+        _: &mut std::task::Context<'_>,
+        _: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        Poll::Pending
+    }
+
+    fn poll_write(
+        &mut self,
+        _: &Cx,
+        _: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        Poll::Ready(if self.fail {
+            Err(ConnError::Broken)
+        } else {
+            Ok(bytes.len())
+        })
+    }
+
+    fn poll_shutdown(
+        &mut self,
+        _: &Cx,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), ConnError>> {
+        Poll::Ready(if self.fail {
+            Err(ConnError::Broken)
+        } else {
+            Ok(())
+        })
+    }
+}
+
+fn check_stream_extraction(command: Option<StreamCommand>, fail: bool) {
+    block_on(lab(Seed::from_u64(81), move |fcx| async move {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reset = matches!(command, Some(StreamCommand::Reset));
+        let end = matches!(command, Some(StreamCommand::End));
+        let extracted = Arc::new(AtomicUsize::new(0));
+        let layer = Extraction::<ByteStream> {
+            command,
+            extracted: extracted.clone(),
+        };
+        let mut live = live::Live::new(
+            &fcx,
+            ExtractionConnection { fail },
+            layer,
+            Budget::unlimited(),
+            StreamLimits::default(),
+        );
+        let mut reports = 0;
+        let result = live.poll(
+            &fcx,
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            &mut |event| match event {},
+            &mut |_| reports += 1,
+        );
+        assert!(extracted.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            reports,
+            extracted.load(Ordering::Relaxed),
+            "every extraction report reaches the observer before polling returns"
+        );
+        if fail {
+            assert!(matches!(
+                result,
+                Poll::Ready(Ok(live::Halt::Conn(ConnError::Broken)))
+            ));
+        } else if reset {
+            assert!(matches!(
+                result,
+                Poll::Ready(Ok(live::Halt::End(StreamEnd::Reset)))
+            ));
+        } else {
+            assert!(result.is_pending());
+            assert_eq!(live.shut(), end);
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn stream_extraction_reports_before_waiting() {
+    check_stream_extraction(None, false);
+}
+
+#[test]
+fn stream_extraction_reports_before_ending() {
+    check_stream_extraction(Some(StreamCommand::End), false);
+}
+
+#[test]
+fn stream_extraction_reports_before_reset() {
+    check_stream_extraction(Some(StreamCommand::Reset), false);
+}
+
+#[test]
+fn stream_extraction_reports_before_write_failure() {
+    check_stream_extraction(Some(StreamCommand::Write(Chunk::new(vec![1]))), true);
+}
+
+#[test]
+fn stream_extraction_reports_before_shutdown_failure() {
+    check_stream_extraction(Some(StreamCommand::End), true);
+}
+
+struct WaitingDatagrams;
+
+impl DatagramSocket for WaitingDatagrams {
+    async fn recv(&mut self, _: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
+        std::future::pending().await
+    }
+
+    fn send_to(&mut self, _: &[u8], _: SocketAddr) {}
+}
+
+fn check_datagram_extraction(command: Option<DatagramCommand<SocketAddr>>) {
+    block_on(lab(Seed::from_u64(82), move |fcx| async move {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let end = command.is_some();
+        let extracted = Arc::new(AtomicUsize::new(0));
+        let reported = Arc::new(AtomicUsize::new(0));
+        let observed = reported.clone();
+        let layer = Extraction::<Datagrams<SocketAddr>> {
+            command,
+            extracted: extracted.clone(),
+        };
+        let mut report = move |event| {
+            assert!(matches!(event, DatagramReport::Layer(())));
+            observed.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut running = pin!(run_datagrams(
+            &fcx,
+            WaitingDatagrams,
+            layer,
+            Budget::unlimited(),
+            &mut report
+        ));
+        poll_fn(|cx| {
+            let result = running.as_mut().poll(cx);
+            assert!(extracted.load(Ordering::Relaxed) > 0);
+            assert_eq!(
+                reported.load(Ordering::Relaxed),
+                extracted.load(Ordering::Relaxed),
+                "every extraction report reaches the observer before polling returns"
+            );
+            if end {
+                assert!(matches!(result, Poll::Ready(Ok(()))));
+            } else {
+                assert!(result.is_pending());
+            }
+            Poll::Ready(())
+        })
+        .await;
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn datagram_extraction_reports_before_waiting() {
+    check_datagram_extraction(None);
+}
+
+#[test]
+fn datagram_extraction_reports_before_ending() {
+    check_datagram_extraction(Some(DatagramCommand::End));
 }

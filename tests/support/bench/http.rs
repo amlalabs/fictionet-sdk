@@ -148,12 +148,7 @@ fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
     World::new(move |fcx, checkpoint| async move {
         let (roots, chain, key) = certs(&fcx);
         let roots = Arc::new(roots);
-        let config = Arc::new(
-            tls::config_builder(&fcx, SystemTime::now())
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(chain, key)?,
-        );
+        let config = Arc::new(tls::CertifiedKey { chain, key });
         let page = Page(Bytes::from(vec![b'x'; case.body]));
         let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), move |_| {
             Some(web::Site::new(page.clone()).tls(config.clone()))

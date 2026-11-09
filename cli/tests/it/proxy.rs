@@ -17,7 +17,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
@@ -38,7 +38,7 @@ const ZERO: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 30);
 struct ZeroPort;
 
 impl PortServer for ZeroPort {
-    fn serve(
+    fn serve_connection(
         &self,
         fcx: fictionet::Cx,
         arrival: Arrival,
@@ -129,12 +129,7 @@ impl World {
                     );
                     let (chain, key) = certs(&fcx, &ca_path);
                     ready_tx.send(()).unwrap();
-                    let config = Arc::new(
-                        tls::config_builder(&fcx, SystemTime::now())
-                            .with_safe_default_protocol_versions()?
-                            .with_no_client_auth()
-                            .with_single_cert(chain, key)?,
-                    );
+                    let config = Arc::new(tls::CertifiedKey { chain, key });
                     let app = axum::Router::new()
                         .route("/", get(|| async { "plain site\n" }))
                         .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))
@@ -286,7 +281,7 @@ struct ResetSite {
 }
 
 impl PortServer for ResetSite {
-    fn serve(
+    fn serve_connection(
         &self,
         fcx: fictionet::Cx,
         arrival: Arrival,

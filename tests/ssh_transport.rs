@@ -186,7 +186,7 @@ async fn custom_transport_keeps_standard_public_key_authentication_channels_and_
                             exchanges: exchanges.clone(),
                         }
                     });
-                    server.serve(fcx, arrival).await;
+                    server.serve_connection(fcx, arrival).await;
                     Ok(())
                 });
                 let connection = client.connect(&fcx, "10.0.0.1:22".parse().unwrap()).await?;

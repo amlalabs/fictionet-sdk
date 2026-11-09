@@ -366,6 +366,14 @@ impl Ca {
 }
 
 impl Leaf {
+    /// The issued certificate and key for any TLS implementation.
+    pub fn certified_key(self) -> Arc<tls::CertifiedKey> {
+        Arc::new(tls::CertifiedKey {
+            chain: self.chain,
+            key: self.key,
+        })
+    }
+
     /// Builds a TLS server configuration using the run's clock and randomness.
     pub fn server_config(
         self,

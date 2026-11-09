@@ -10,7 +10,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use axum::Extension;
 use axum::routing::get;
@@ -113,19 +112,13 @@ pub fn plain() -> axum::Router {
 
 /// Resolves the world's names to sites with the given apps.
 pub fn sites(
-    fcx: &fictionet::Cx,
     chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     app: axum::Router,
     plain: axum::Router,
-) -> Result<impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static> {
-    let config = Arc::new(
-        tls::config_builder(fcx, SystemTime::now())
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(chain, key)?,
-    );
-    Ok(move |host: &str| {
+) -> impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static {
+    let config = Arc::new(tls::CertifiedKey { chain, key });
+    move |host: &str| {
         println!("lookup {host}");
         match host {
             "example.test" | "www.example.test" => Some(
@@ -140,5 +133,5 @@ pub fn sites(
             "plain.test" => Some(web::Site::new(plain.clone())),
             _ => None,
         }
-    })
+    }
 }

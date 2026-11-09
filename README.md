@@ -99,15 +99,15 @@ addresses, a router, one machine per address, TLS and HTTP. Each site is a
 ```rust
 use std::{net::Ipv4Addr, sync::Arc};
 use fictionet::{Attachments, Cx, Result, stdlib::web};
-use rustls::ServerConfig;
+use fictionet::stdlib::services::tls::CertifiedKey;
 
 fn world(
     fcx: Cx,
     attachments: Attachments,
     wiki: axum::Router,
     fake_stripe: axum::Router,
-    wikipedia_tls: Arc<ServerConfig>,
-    stripe_tls: Arc<ServerConfig>,
+    wikipedia_tls: Arc<CertifiedKey>,
+    stripe_tls: Arc<CertifiedKey>,
 ) -> Result {
     web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| match host {
         "en.wikipedia.org" => Some(

@@ -861,7 +861,11 @@ async fn hold(
 }
 
 impl<S: PortServer> PortServer for Listener<S> {
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         match complete(
             arrival
                 .info
@@ -876,7 +880,7 @@ impl<S: PortServer> PortServer for Listener<S> {
                 let socket = arrival.socket.clone();
                 let tokens = self.tokens.clone();
                 let token = token(n.keys.local);
-                let mut service = self.inner.serve(fcx, arrival);
+                let mut service = self.inner.serve_connection(fcx, arrival);
                 Box::pin(async move {
                     poll_fn(|cx| {
                         let mut open = tokens.0.lock();
@@ -906,7 +910,7 @@ impl<S: PortServer> PortServer for Listener<S> {
                 }
             },
             Completion::Plain | Completion::Join(None) | Completion::Drop => {
-                self.inner.serve(fcx, arrival)
+                self.inner.serve_connection(fcx, arrival)
             }
         }
     }

@@ -28,7 +28,7 @@
 //! #     type Work = (); type Done = (); type Error = Infallible;
 //! #     fn on_event(&mut self, _: &mut Env<'_, Infallible>, e: StreamEvent) -> std::result::Result<Admit<StreamEvent>, Infallible> { Ok(Admit::Closed(e)) }
 //! #     fn on_command(&mut self, _: &mut Env<'_, Infallible>, c: Infallible) -> std::result::Result<Admit<Infallible>, Infallible> { match c {} }
-//! #     fn take_command(&mut self) -> Option<StreamCommand> { None }
+//! #     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> { None }
 //! #     fn take_event(&mut self) -> Option<Infallible> { None }
 //! # } } }
 //! # stack!(Ldap); stack!(Plc);
@@ -186,8 +186,8 @@ use attachments::{Destinations, Hooks, filter, udp_packet};
 use dns::Recursive;
 use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};
 pub use hosts::{
-    Arrival, ConfigFor, ConfigFuture, DEFAULT_MAX_CONNS, Declared, Endpoints, Host, Opening,
-    PortServer, PreparedShare, Program, Sni,
+    Arrival, CertificateFor, CertificateFuture, DEFAULT_MAX_CONNS, Declared, Endpoints, Host,
+    Opening, PortServer, PortStack, PreparedShare, Program, Sni,
 };
 pub use names::normalize;
 
@@ -1230,7 +1230,7 @@ mod tests {
     }
 
     impl PortServer for Spy {
-        fn serve(
+        fn serve_connection(
             &self,
             _: Cx,
             arrival: Arrival,
@@ -1472,7 +1472,7 @@ mod tests {
     }
 
     impl PortServer for Answers {
-        fn serve(
+        fn serve_connection(
             &self,
             _: Cx,
             arrival: Arrival,

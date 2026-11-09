@@ -46,6 +46,7 @@ where
     L::Error: std::fmt::Display,
 {
     pub(crate) fn new(fcx: &Cx, layer: L) -> Self {
+        // Routing has engine count limits; each application has its own byte budget.
         let mut driver = Driver::new(layer, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now());
         driver.keep_observations(0);
         Self {
@@ -193,7 +194,7 @@ mod tests {
         fn take_event(&mut self) -> Option<Infallible> {
             None
         }
-        fn take_command(&mut self) -> Option<MessageCommand<()>> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<MessageCommand<()>> {
             None
         }
     }

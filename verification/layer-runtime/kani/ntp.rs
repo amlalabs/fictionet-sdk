@@ -229,6 +229,6 @@ fn the_time_server_reserves_reply_memory_before_reading_the_clock() {
         driver.deliver(datagram(bytes, client(1))).unwrap(),
         Admit::Taken
     ));
-    assert!(driver.layer_mut().take_command().is_none());
+    assert!(driver.take_command().is_none());
     assert_eq!(budget.used(), 0);
 }

@@ -62,12 +62,12 @@ where
     S: fictionet::stdlib::world::net::PortServer,
     F: Fn() -> u32 + Send + Sync + 'static,
 {
-    fn serve(
+    fn serve_connection(
         &self,
         fcx: fictionet::Cx,
         arrival: fictionet::stdlib::world::net::Arrival,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        self.server.serve(fcx, arrival)
+        self.server.serve_connection(fcx, arrival)
     }
 
     fn backlog(&self) -> Option<usize> {

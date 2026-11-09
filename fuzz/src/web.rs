@@ -7,7 +7,6 @@ use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -85,14 +84,7 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
 
 /// Starts the sites, with events on, and returns the attacher.
 pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::services::ca::Leaf) -> Attacher {
-    let config = Arc::new(
-        tls::config_builder(fcx, UNIX_EPOCH + Duration::from_secs(1_800_000_000))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(cert.chain.clone(), cert.key.clone_key())
-            .unwrap(),
-    );
+    let config = Arc::new(tls::CertifiedKey { chain: cert.chain.clone(), key: cert.key.clone_key() });
     let sites = web::Sites::new(
         fictionet::stdlib::world::net::Pools {
             v4: Some("104.18.0.0/15".parse().unwrap()),

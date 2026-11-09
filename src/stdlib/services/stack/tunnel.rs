@@ -182,7 +182,7 @@ impl Layer for Tunnel {
         Ok(false)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let mut shared = self.shared.lock();
         if let Some(chunk) = shared.outbound.pop_front() {
             shared.outbound_len -= chunk.len();

@@ -34,7 +34,14 @@ fn date() -> SystemTime {
 fn copied() -> tls::Factory {
     tls::Factory::new(|opening| {
         fictionet_copied_tls::TlsLayer::selecting(move |cx, hello| {
-            (opening.select)(cx, hello.server_name().map(str::to_owned))
+            let selected = (opening.select)(cx, hello.server_name().map(str::to_owned));
+            let cx = opening.cx.clone();
+            async move {
+                let selected = selected.await?;
+                Some(Arc::new(
+                    selected.rustls_config(&cx, SystemTime::UNIX_EPOCH).ok()?,
+                ))
+            }
         })
         .handshake_by(opening.deadline)
     })
@@ -225,15 +232,18 @@ fn owned_tls_serves_both_http_versions_and_encrypted_dns() {
             "Example CA",
             &["site.example", "neighbor.example", "dns.example"],
         )?;
-        let config = leaf.server_config(&cx, date())?;
+        let config = leaf.certified_key();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.cert_der())?;
         let roots = Arc::new(roots);
         let site_config = config.clone();
-        let site = httpd::Server::new(Page)
-            .tls_with(move |_| site_config.clone())
-            .tls_layer(copied())
-            .served_by(Host::new("site").at(SITE).dns_name("site.example"));
+        let site = fictionet::stdlib::web::Site::from_server(
+            httpd::Server::new(Page)
+                .tls_with(move |_| site_config.clone())
+                .tls_layer(copied()),
+        )
+        .at(SITE)
+        .into_host("site.example");
         // This site's default TLS factory does not replace the existing listener.
         let neighbor_config = config.clone();
         let neighbor = httpd::Server::new(Page)
@@ -354,7 +364,7 @@ fn owned_http1_keeps_standard_tls_and_http2() {
     world(Duration::from_secs(60), |cx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let (ca, leaf) = certs::issue(&cx, "Example CA", &["site.example", "alternate.example"])?;
-        let config = leaf.server_config(&cx, date())?;
+        let config = leaf.certified_key();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.cert_der())?;
         let roots = Arc::new(roots);

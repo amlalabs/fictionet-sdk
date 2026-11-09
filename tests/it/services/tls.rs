@@ -99,7 +99,11 @@ fn net_routes_tls_by_name_to_each_service() {
     let result = block_on(fictionet::lab(
         fictionet::Seed::from_u64(1),
         move |fcx| async move {
-            let (config, roots) = tls_pair(&fcx, &["a.test", "b.test"]);
+            let (ca, leaf) = certs::issue(&fcx, "Test CA", &["a.test", "b.test"])?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.cert_der())?;
+            let roots = Arc::new(roots);
+            let config = leaf.certified_key();
             let (attacher, attachments) = fictionet::attachments();
             let (ca, cb) = (config.clone(), config.clone());
             let addr = Ipv4Addr::new(10, 40, 0, 2);
@@ -139,7 +143,8 @@ fn net_routes_tls_by_name_to_each_service() {
 
 /// What a plaintext [`Mail`] session negotiates at STARTTLS: TLS, and the
 /// same session over it once the handshake is done.
-type Secured = Secure<Mail, Box<dyn FnOnce(&TlsLayer) -> Mail + Send>>;
+type MakeMail = Box<dyn FnOnce(&TlsLayer) -> Option<Mail> + Send>;
+type Secured = Secure<Mail, MakeMail>;
 
 /// A mail connection: plaintext until STARTTLS, then TLS.
 type Starttls = Switch<Mail, Secured>;
@@ -278,11 +283,11 @@ impl Mail {
                 let conn = self.conn.clone();
                 let book = self.book.clone();
                 let inbox = self.inbox.clone();
-                let over: Box<dyn FnOnce(&TlsLayer) -> Mail + Send> = Box::new(move |tls| {
+                let over: MakeMail = Box::new(move |tls| {
                     let sni = tls.hello().and_then(|hello| hello.server_name());
                     let mut mail = Mail::secure(conn.over_tls(sni, tls.alpn())).subscribing(book);
                     mail.inbox = inbox;
-                    mail
+                    Some(mail)
                 });
                 self.next = Some(Box::new(Secure::new(tls, over)));
             }
@@ -377,7 +382,7 @@ impl Layer for Mail {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if let Some(bytes) = self.out.pop_front() {
             self.produced += bytes.len() as u64;
             return Some(StreamCommand::Write(Chunk::new(bytes)));

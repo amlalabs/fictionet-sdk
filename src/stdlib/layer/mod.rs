@@ -24,7 +24,7 @@
 //! #     type Work = (); type Done = (); type Error = ();
 //! #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
 //! #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
-//! #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+//! #     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<L>> { None }
 //! #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
 //! # }
 //! // A datagram carrier under a stream protocol.
@@ -41,7 +41,7 @@
 //! #     type Work = (); type Done = (); type Error = ();
 //! #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
 //! #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
-//! #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+//! #     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<L>> { None }
 //! #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
 //! # }
 //! # struct Request; struct Response;
@@ -61,7 +61,7 @@
 //! #     type Work = (); type Done = (); type Error = ();
 //! #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
 //! #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
-//! #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+//! #     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<L>> { None }
 //! #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
 //! # }
 //! # struct Request; struct Response;
@@ -229,7 +229,10 @@ pub use children::{ChildReport, ChildWork, Children, Overrun};
 pub use choice::Later;
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
-pub use framed::{BoundedDecode, BoundedWire, BoundedWriter, WriteFailure, Decoded, Framed, FramedError, Framing, Owned};
+pub use framed::{
+    BoundedDecode, BoundedWire, BoundedWriter, Decoded, Framed, FramedError, Framing, Owned,
+    WriteFailure,
+};
 pub use harness::{Harness, Worker};
 pub use observed::{Direction, ObservedEvent, ObservedStream, Source, Termination};
 pub use packet::{PacketCommand, PacketEvent, Packets, Whole};
@@ -412,7 +415,9 @@ pub trait Layer: Sized {
     }
 
     /// Hands over the next command for the port below, if one is ready.
-    fn take_command(&mut self) -> Option<CommandOf<Self::Lower>>;
+    /// `env` supplies the same scoped budget, entropy, clock, and reports as
+    /// admission, so output transformations can reserve before allocating.
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>>;
 
     /// Hands over the next event for the port above, if one is ready.
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>>;

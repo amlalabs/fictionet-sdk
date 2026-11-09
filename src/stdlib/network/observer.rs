@@ -799,7 +799,7 @@ impl Layer for Observer {
         Ok(Admit::Taken)
     }
 
-    fn take_command(&mut self) -> Option<PacketCommand<Infallible>> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Infallible>> {
         None
     }
 

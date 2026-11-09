@@ -265,12 +265,11 @@ where
                 }
             }
             moved |= self.driver.run().map_err(StackError::Layer)?;
-            self.driver.observations().drain().for_each(&mut *report);
             moved |= self.driver.send_above(&mut *above);
 
             let (mut wrote, mut failed, mut reset) = (0u64, None, false);
             let (conn, shut) = (&mut self.conn, &mut self.shut);
-            moved |= self.driver.send_below(|command| match command {
+            let sent = self.driver.send_below(|command| match command {
                 command if *shut || reset || failed.is_some() => Admit::Closed(command),
                 StreamCommand::Write(mut chunk) => {
                     if chunk.is_empty() {
@@ -315,6 +314,8 @@ where
                     Admit::Taken
                 }
             });
+            self.driver.observations().drain().for_each(&mut *report);
+            moved |= sent;
             if reset {
                 return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Reset))));
             }

@@ -27,13 +27,13 @@
 //! # use std::net::{Ipv4Addr, Ipv6Addr};
 //! # use std::sync::Arc;
 //! # use fictionet::{Attachments, Cx, Result, stdlib::web};
-//! # use rustls::ServerConfig;
-//! # struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig>, bad: Arc<ServerConfig>, github: Arc<ServerConfig> }
+//! # use fictionet::stdlib::services::tls::CertifiedKey;
+//! # struct Certs { wikipedia: Arc<CertifiedKey>, stripe: Arc<CertifiedKey>, bad: Arc<CertifiedKey>, github: Arc<CertifiedKey> }
 //! # fn my_certs() -> Result<Certs> { unimplemented!() }
 //! async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! #   let wiki: axum::Router = axum::Router::new();
 //! #   let fake_stripe: axum::Router = axum::Router::new();
-//!     // Yours: an Arc<ServerConfig> per certificate, each issued by the world's CA.
+//!     // Yours: an Arc<CertifiedKey> per certificate, each issued by the world's CA.
 //!     let certs = my_certs()?;
 //!
 //!     let client = Arc::new(fictionet_host::Client::new());
@@ -221,7 +221,7 @@
 //! #         not_before: Time::from_unix(1_700_000_000)?,
 //! #         not_after: Time::from_unix(1_900_000_000)?,
 //! #     })?;
-//! #     let config = leaf.server_config(&fcx, start)?;
+//! #     let config = leaf.certified_key();
 //! #     let mut roots = rustls::RootCertStore::empty();
 //! #     roots.add(ca.cert_der())?;
 //! #     let roots = Arc::new(roots);
@@ -552,7 +552,7 @@ use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{EmptyApex, ZoneData, special};
 use fictionet::stdlib::services::dns::{Event, WallClock};
-use fictionet::stdlib::services::tls::ServerConfig;
+use fictionet::stdlib::services::tls::CertifiedKey;
 use fictionet::stdlib::world::net::dns::{self, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, Pools};
 use fictionet::{Attachments, Cx, Error};
@@ -737,8 +737,15 @@ impl Site {
 
     /// A site served by a custom [`httpd::Handler`].
     pub fn handler(handler: impl Handler) -> Site {
+        Self::from_server(Server::new(handler))
+    }
+
+    /// A site using an explicitly configured HTTP server. Use this to supply
+    /// a replacement TLS factory or negotiated application through
+    /// [`Server::tls_layer`] and [`Server::applications`].
+    pub fn from_server(server: Server) -> Site {
         Site {
-            server: Server::new(handler),
+            server,
             at: None,
             at_v6: None,
             family: Family::Both,
@@ -814,37 +821,37 @@ impl Site {
         }
     }
 
-    /// Serves HTTPS with the same configuration on every handshake.
-    pub fn tls(self, config: Arc<ServerConfig>) -> Site {
+    /// Serves HTTPS with the same certificate on every handshake.
+    pub fn tls(self, config: Arc<CertifiedKey>) -> Site {
         self.tls_with(move |_| config.clone())
     }
 
-    /// Serves the site over HTTPS. `config_for` runs on every handshake and
-    /// returns the TLS config to use, so it can choose differently each time,
-    /// with randomness from `fcx`. For one config, use [`tls`](Self::tls).
+    /// Serves the site over HTTPS. `certificate_for` runs on every handshake and
+    /// returns the certificate and key to use, so it can choose differently each time,
+    /// with randomness from `fcx`. For one certificate, use [`tls`](Self::tls).
     ///
-    /// `start` replaces the ALPN list with `h2` and `http/1.1`, so the
-    /// config does not need one.
-    pub fn tls_with<F>(self, config_for: F) -> Site
+    /// The server offers `h2` and `http/1.1` by default. Its TLS factory
+    /// receives the certificate and the application's ALPN list separately.
+    pub fn tls_with<F>(self, certificate_for: F) -> Site
     where
-        F: Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+        F: Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync + 'static,
     {
         Site {
-            server: self.server.tls_with(config_for),
+            server: self.server.tls_with(certificate_for),
             ..self
         }
     }
 
-    /// [`tls_with`](Self::tls_with) with a config that may take time to
+    /// [`tls_with`](Self::tls_with) with a certificate that may take time to
     /// choose (a check of the real host, say): each handshake waits for its
     /// own, up to its deadline, while the world goes on.
-    pub fn tls_when<F, R>(self, config_for: F) -> Site
+    pub fn tls_when<F, R>(self, certificate_for: F) -> Site
     where
         F: Fn(&Cx) -> R + Send + Sync + 'static,
-        R: std::future::Future<Output = Arc<ServerConfig>> + Send + 'static,
+        R: std::future::Future<Output = Arc<CertifiedKey>> + Send + 'static,
     {
         Site {
-            server: self.server.tls_when(config_for),
+            server: self.server.tls_when(certificate_for),
             ..self
         }
     }

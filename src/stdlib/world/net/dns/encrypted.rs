@@ -43,7 +43,7 @@
 //! # let start = SystemTime::now();
 //! # let clock = WallClock { start };
 //! # let validity = Validity { not_before: Time::from_unix(1_700_000_000)?, not_after: Time::from_unix(1_900_000_000)? };
-//! let tls = ca.issue(&fcx, &["dns.example", "45.33.9.9"], validity)?.server_config(&fcx, start)?;
+//! let tls = ca.issue(&fcx, &["dns.example", "45.33.9.9"], validity)?.certified_key();
 //! let resolver = Recursive::new(Config::new(), clock);
 //! let fronts = Fronts::new(resolver.handle(), move |_| tls.clone())
 //!     .names([Name::from_ascii("dns.example.")?]);
@@ -86,11 +86,11 @@ use fictionet::stdlib::protocols::dns::{
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::stack::{self, Boxed, Job, StreamEnd, StreamLimits};
-use fictionet::stdlib::services::tls::{self, ServerConfig};
+use fictionet::stdlib::services::tls::{self, CertifiedKey};
 use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
 use fictionet::time::Instant;
 
-use super::super::{Arrival, Host, Limits, Opening, PortServer, Sni};
+use super::super::{Arrival, Host, Limits, Opening, PortServer, PortStack, Sni};
 use super::ResolverHandle;
 
 /// The port of DNS over TLS (RFC 7858 §3.1).
@@ -110,7 +110,7 @@ const DNS_MESSAGE: &str = "application/dns-message";
 const MAX_MESSAGE: usize = u16::MAX as usize;
 
 /// What a TLS port's handshake gets its config from.
-type TlsFor = Arc<dyn Fn(&Cx) -> Arc<ServerConfig> + Send + Sync>;
+type TlsFor = Arc<dyn Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync>;
 
 /// A query's answer, or `None` when the service leaves it unanswered.
 /// Dropping this future cancels the query. Services must keep any work they
@@ -176,11 +176,11 @@ impl<Q> Clone for Fronts<Q> {
 
 impl<Q: QueryService> Fronts<Q> {
     /// Fronts for the resolver `resolver` reaches, whose TLS handshakes
-    /// use the config `tls` returns for each. Pass a [`ResolverHandle`] for
+    /// use the certificate `tls` returns for each. Pass a [`ResolverHandle`] for
     /// the default recursive service, or any [`QueryService`] to replace it.
     pub fn new(
         resolver: Q,
-        tls: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+        tls: impl Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync + 'static,
     ) -> Self {
         Fronts {
             resolver: Arc::new(resolver),
@@ -388,7 +388,7 @@ struct Dot {
 
 impl Dot {
     /// The stack for the connection `conn`, under the network's `limits`.
-    fn stack(&self, conn: &ConnInfo, limits: &Limits) -> DotStack {
+    fn queries(&self, conn: &ConnInfo, limits: &Limits) -> DotStack {
         Chain::new(
             Framed::new(Queries::new(DnsFraming::Stream)),
             Queried::new(self.front.clone(), conn, limits.dns_tcp_idle),
@@ -402,8 +402,12 @@ impl PortServer for Dot {
     }
 
     /// The same stack over a connection with no TLS in front.
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let stack = self.stack(&arrival.info, &arrival.limits);
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let stack = self.queries(&arrival.info, &arrival.limits);
         let budget = arrival.budget.unwrap_or_else(Budget::unlimited);
         // The stack keeps its own idle time.
         let limits = StreamLimits {
@@ -420,8 +424,8 @@ impl PortServer for Dot {
     }
 
     /// Queries and answers in the same stack as TLS.
-    fn over_tls(&self, _fcx: &Cx, opening: &Opening) -> Option<Boxed> {
-        Some(Boxed::new(self.stack(&opening.info, &opening.limits)))
+    fn stack(&self, _fcx: &Cx, opening: &Opening) -> PortStack {
+        PortStack::Stack(Boxed::new(self.queries(&opening.info, &opening.limits)))
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {
@@ -604,7 +608,10 @@ impl Layer for Queried {
         Ok(false)
     }
 
-    fn take_command(&mut self) -> Option<MessageCommand<Owned<StreamMessage>>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<MessageCommand<Owned<StreamMessage>>> {
         if let Some(answer) = self.answers.pop_front() {
             return Some(MessageCommand::Send(answer));
         }
@@ -1059,7 +1066,7 @@ mod tests {
             };
             let mut h = Harness::with_budget(
                 Seed::from_u64(20),
-                dot.stack(&conn, &Limits::default()),
+                dot.queries(&conn, &Limits::default()),
                 Budget::unlimited(),
             );
             let queries = [message(1, 20), message(2, 25)];

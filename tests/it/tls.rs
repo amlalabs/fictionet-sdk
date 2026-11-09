@@ -932,6 +932,82 @@ fn a_lab_tls_handshake_uses_the_worlds_key_log() {
     );
 }
 
+#[test]
+fn world_tls_resumes_without_reusing_a_rotated_certificate() {
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::protocols::http1;
+    use fictionet::stdlib::web::httpd;
+    use fictionet::stdlib::world::net::{Host, Net};
+    use fictionet_test_support::sandbox::{machine, request};
+    use rustls::HandshakeKind;
+    use std::net::Ipv4Addr;
+
+    fictionet_test_support::world::world(Duration::from_secs(30), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let ca = Ca::new(&fcx, "Resumption CA")?;
+        let material = || {
+            let (chain, key) = issue(&fcx, &ca, &["resume.test"], 2000, 2100, false);
+            Arc::new(tls::CertifiedKey { chain, key })
+        };
+        let certificate = Arc::new(Mutex::new(material()));
+        let selected = certificate.clone();
+        let address = Ipv4Addr::new(203, 0, 113, 90);
+        let server = httpd::Server::new(fictionet_test_support::handler(
+            |_: &mut httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
+                http::Response::new(bytes::Bytes::from_static(b"resumed response"))
+            },
+        ))
+        .https();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .add_host(
+                Host::new("resumption")
+                    .at(address)
+                    .dns_name("resume.test")
+                    .tls_accept(
+                        443,
+                        "resume.test",
+                        move |_| selected.lock().unwrap().clone(),
+                        server,
+                    ),
+            )
+            .start(&fcx, attachments)?;
+        let machine = machine(&fcx, attacher.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let mut config = tls::client_config_builder(&fcx, date(2030, 1, 1))
+                .with_protocol_versions(&[version])?
+                .with_root_certificates(roots(&ca))
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let config = Arc::new(config);
+            for (attempt, expected) in [
+                HandshakeKind::Full,
+                HandshakeKind::Resumed,
+                HandshakeKind::Full,
+                HandshakeKind::Resumed,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if attempt == 2 {
+                    *certificate.lock().unwrap() = material();
+                }
+                let mut conn = machine
+                    .tls_with_config(&fcx, (address, 443).into(), "resume.test", config.clone())
+                    .await?;
+                let query = http1::Request::parse(
+                    b"GET / HTTP/1.1\r\nHost: resume.test\r\nConnection: close\r\n\r\n",
+                )?;
+                let response = request(&fcx, &mut conn, &query).await?;
+                assert_eq!(response.head.status, 200);
+                assert_eq!(conn.tls.protocol_version(), Some(version.version));
+                assert_eq!(conn.tls.handshake_kind(), Some(expected));
+            }
+        }
+        Ok(())
+    });
+}
+
 fn observed_world_handshake_failure(rejected_name: bool) {
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -942,7 +1018,8 @@ fn observed_world_handshake_failure(rejected_name: bool) {
     fictionet_test_support::world::world(Duration::from_secs(20), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let ca = Ca::new(&fcx, "Test CA")?;
-        let config = server_config(&fcx, &ca, "accepted.test", &[b"http/1.1"]);
+        let (chain, key) = issue(&fcx, &ca, &["accepted.test"], 2000, 2100, false);
+        let config = Arc::new(tls::CertifiedKey { chain, key });
         let address = Ipv4Addr::new(192, 0, 2, 10);
         let (observed, observation) = tokio::sync::oneshot::channel();
         let observed = Mutex::new(Some(observed));

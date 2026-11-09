@@ -499,7 +499,7 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match c {}
         }
-        fn take_command(&mut self) -> Option<Infallible> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Infallible> {
             None
         }
         fn take_event(&mut self) -> Option<Infallible> {
@@ -746,7 +746,7 @@ mod tests {
             fn take_event(&mut self) -> Option<StreamEvent> {
                 None
             }
-            fn take_command(&mut self) -> Option<StreamCommand> {
+            fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
                 None
             }
             fn take_work(&mut self) -> Option<Self::Work> {

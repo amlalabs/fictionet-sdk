@@ -2,7 +2,7 @@ use super::*;
 use fictionet::stdlib::layer::Children;
 use fictionet::stdlib::services::stack::Boxed;
 
-type Make = dyn Fn(TcpOpening, GoneWatch, &Budget) -> Boxed + Send + Sync;
+type Make = dyn Fn(TcpOpening, GoneWatch, &Budget) -> Option<Boxed> + Send + Sync;
 type SelectBudget = dyn Fn(&TcpOpening, &GoneWatch) -> Budget + Send + Sync;
 
 pub(crate) struct Application {

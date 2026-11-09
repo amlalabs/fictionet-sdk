@@ -157,6 +157,7 @@ pub fn prepare_endpoint(
 }
 
 pub(crate) fn prepare_transport(fcx: &Cx, addr: IpAddr) -> (Endpoint, PacketDriver) {
+    // UDP uses its engine limits; attached applications have their own byte budgets.
     let mut driver = Driver::new(
         UdpLayer::new(Scope::ROOT, addr, fcx),
         Arc::new(fcx.clone()),
@@ -848,7 +849,10 @@ mod tests {
             ) -> Result<Admit<Infallible>, Infallible> {
                 match command {}
             }
-            fn take_command(&mut self) -> Option<layer::CommandOf<Self::Lower>> {
+            fn take_command(
+                &mut self,
+                _: &mut Env<'_, Self::Report>,
+            ) -> Option<layer::CommandOf<Self::Lower>> {
                 None
             }
             fn take_event(&mut self) -> Option<Infallible> {

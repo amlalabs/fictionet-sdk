@@ -332,7 +332,7 @@ where
         Ok(false)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if self.reset {
             return None;
         }
@@ -476,7 +476,10 @@ pub(crate) mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<MessageCommand<Owned<Frame>>> {
+        fn take_command(
+            &mut self,
+            _: &mut Env<'_, Self::Report>,
+        ) -> Option<MessageCommand<Owned<Frame>>> {
             if let Some(frame) = self.reply.take() {
                 return Some(MessageCommand::Send(frame));
             }
@@ -564,7 +567,7 @@ pub(crate) mod tests {
             Err(FramedError::Write(_))
         ));
         assert_eq!(budget.used(), 0);
-        assert!(d.layer_mut().take_command().is_none());
+        assert!(d.take_command().is_none());
         let mut sibling = Harness::new(Seed::from_u64(9), stack());
         let sent = frames(2);
         sibling.push(&wire(&sent)).unwrap();

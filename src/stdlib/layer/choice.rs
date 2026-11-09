@@ -115,10 +115,10 @@ where
         }
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<A::Lower>> {
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<A::Lower>> {
         match self {
-            Side::Lower(a) => a.take_command(),
-            Side::Upper(b) => b.take_command(),
+            Side::Lower(a) => env.scoped(Side::Lower, |env| a.take_command(env)),
+            Side::Upper(b) => env.scoped(Side::Upper, |env| b.take_command(env)),
         }
     }
 
@@ -267,8 +267,8 @@ where
         }
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<U::Lower>> {
-        self.layer.as_mut()?.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<U::Lower>> {
+        self.layer.as_mut()?.take_command(env)
     }
 
     fn take_event(&mut self) -> Option<EventOf<U::Upper>> {
@@ -318,7 +318,7 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match command {}
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
         fn take_event(&mut self) -> Option<Infallible> {

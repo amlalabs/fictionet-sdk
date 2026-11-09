@@ -1569,7 +1569,7 @@ impl Layer for Http2 {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let command = self.out.pop_front()?;
         if matches!(command, StreamCommand::End | StreamCommand::Reset) {
             self.phase = Phase::Closed;
@@ -2188,7 +2188,7 @@ mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<ExchangeCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
             None
         }
 
@@ -2220,7 +2220,7 @@ mod tests {
         let server = Chain::new(
             Http2::upgraded(Limits::default(), &[], opening, Some(body)),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
-                Sink::reading(opening.request.uri().path() != "/stall")
+                Some(Sink::reading(opening.request.uri().path() != "/stall"))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -2290,7 +2290,7 @@ mod tests {
         let server = Chain::new(
             Http2::new(Limits::default()),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
-                Sink::reading(opening.request.uri().path() != "/stall")
+                Some(Sink::reading(opening.request.uri().path() != "/stall"))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -2347,7 +2347,7 @@ mod tests {
         let server = Chain::new(
             Http2::new(Limits::default()),
             Children::new(8, Http2::WINDOW, move |_, _, _| {
-                child.take().expect("one stream")
+                Some(child.take().expect("one stream"))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -2393,7 +2393,7 @@ mod tests {
         // connection credit must come back.
         let server = Chain::new(
             Http2::new(Limits::default()),
-            Children::new(8, 16_384, |_, _, _| Sink::reading(false)),
+            Children::new(8, 16_384, |_, _, _| Some(Sink::reading(false))),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
         harness.push(&client_preface()).unwrap();
@@ -2530,7 +2530,7 @@ mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<ExchangeCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
             self.out.pop_front()
         }
 
@@ -2559,7 +2559,7 @@ mod tests {
         let server = fictionet::stdlib::layer::Chain::new(
             Http2::new(Limits::default()),
             fictionet::stdlib::layer::Children::new(16, Http2::WINDOW, |_, opening, _| {
-                Picky::new(opening)
+                Some(Picky::new(opening))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(2), server);

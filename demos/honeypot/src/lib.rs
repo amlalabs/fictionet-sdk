@@ -192,14 +192,18 @@ struct Bounded {
 }
 
 impl PortServer for Bounded {
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let Some(guard) = Counted::enter(&self.connections, CONNECTION_LIMIT) else {
             self.observer.lock().connection_limit(fcx.now());
             arrival.socket.reset();
             return Box::pin(async {});
         };
         arrival.socket.hold_until_gone(Box::new(guard));
-        self.inner.serve(fcx, arrival)
+        self.inner.serve_connection(fcx, arrival)
     }
 
     fn backlog(&self) -> Option<usize> {

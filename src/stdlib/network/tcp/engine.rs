@@ -2537,7 +2537,7 @@ impl Layer for TcpLayer {
         Ok(true)
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<Self::Lower>> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
         let full = self.dev.full();
         match self.dev.out.pop_front() {
             Some(packet) => {

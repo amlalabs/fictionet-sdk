@@ -156,7 +156,7 @@ fn serve(
                 },
             )?;
             let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-            let config = leaf.server_config(&fcx, start)?;
+            let config = leaf.certified_key();
             let answer =
                 |_: &mut httpd::Exchange<'_>, _| http::Response::new(Bytes::from_static(BODY));
             let handler: Arc<dyn httpd::Handler> = Arc::new({
