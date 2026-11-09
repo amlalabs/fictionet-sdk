@@ -1399,6 +1399,164 @@ fn datagram_extraction_reports_before_ending() {
     check_datagram_extraction(Some(DatagramCommand::End));
 }
 
+/// A request to stop that another task makes, outside the layer's calls:
+/// it wakes the layer through the waker the layer kept.
+#[derive(Default)]
+struct Stop {
+    asked: std::sync::atomic::AtomicBool,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl Stop {
+    fn ask(&self) {
+        self.asked.store(true, Ordering::Release);
+        if let Some(waker) = self.waker.lock().clone() {
+            waker.wake();
+        }
+    }
+
+    /// Keeps the layer's waker the first time, then reads the request.
+    fn asked(&self, env: &Env<'_, Infallible>) -> bool {
+        self.waker.lock().get_or_insert_with(|| env.waker());
+        self.asked.load(Ordering::Acquire)
+    }
+}
+
+/// Reads nothing and says nothing until it is asked to stop, then ends
+/// its direction.
+struct StopsWhenAsked<P> {
+    stop: Arc<Stop>,
+    stopping: bool,
+    ended: bool,
+    port: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<P> StopsWhenAsked<P> {
+    fn new(stop: Arc<Stop>) -> Self {
+        StopsWhenAsked {
+            stop,
+            stopping: false,
+            ended: false,
+            port: std::marker::PhantomData,
+        }
+    }
+}
+
+/// The end of a direction, on each port the runners carry.
+trait Ends: fictionet::stdlib::layer::Port {
+    fn end() -> Self::Command;
+}
+
+impl Ends for ByteStream {
+    fn end() -> StreamCommand {
+        StreamCommand::End
+    }
+}
+
+impl Ends for Datagrams<SocketAddr> {
+    fn end() -> DatagramCommand<SocketAddr> {
+        DatagramCommand::End
+    }
+}
+
+impl<P: Ends> Layer for StopsWhenAsked<P> {
+    type Lower = P;
+    type Upper = Top;
+    type Report = Infallible;
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn is_terminal(&self) -> bool {
+        self.ended
+    }
+
+    fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+        let asked = self.stop.asked(env);
+        let moved = asked && !self.stopping;
+        self.stopping |= asked;
+        Ok(moved)
+    }
+
+    fn on_event(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        _: P::Event,
+    ) -> Result<Admit<P::Event>, Infallible> {
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _: &mut Env<'_, Infallible>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn take_command(&mut self, _: &mut Env<'_, Infallible>) -> Option<P::Command> {
+        (self.stopping && !self.ended).then(|| {
+            self.ended = true;
+            P::end()
+        })
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+}
+
+/// A stream stack that waits for nothing the runner can see, neither
+/// input nor a timer, ends when another task wakes it.
+#[test]
+fn a_stream_stack_woken_from_another_task_runs_and_ends() {
+    let stop = Arc::new(Stop::default());
+    let asks = stop.clone();
+    let client = move |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        fcx.sleep(Duration::from_secs(1)).await?;
+        asks.ask();
+        assert!(read_to_end(&fcx, &mut conn).await?.is_empty());
+        Ok(())
+    };
+    let ended = serve_one(
+        StreamLimits::default(),
+        Budget::unlimited(),
+        move || StopsWhenAsked::<ByteStream>::new(stop),
+        client,
+    );
+    assert_eq!(ended, Ok(StreamEnd::Finished));
+}
+
+/// The same for a datagram stack whose socket brings nothing.
+#[test]
+fn a_datagram_stack_woken_from_another_task_runs_and_ends() {
+    block_on(lab(Seed::from_u64(4), |fcx| async move {
+        let (server, _client) = machines(&fcx);
+        let socket = server.udp.bind(PORT)?;
+        let stop = Arc::new(Stop::default());
+        let layer = StopsWhenAsked::<Datagrams<SocketAddr>>::new(stop.clone());
+        let run = fcx.spawn(move |fcx| async move {
+            Ok(datagrams(
+                &fcx,
+                socket,
+                server_addr(),
+                layer,
+                Budget::unlimited(),
+                |_| {},
+            )
+            .await?)
+        });
+        fcx.sleep(Duration::from_secs(1)).await?;
+        stop.ask();
+        run.join(&fcx).await?;
+        fcx.cancel();
+        Ok(())
+    }))
+    .expect("the run finishes");
+}
+
 mod flush {
     use std::collections::VecDeque;
     use std::convert::Infallible;

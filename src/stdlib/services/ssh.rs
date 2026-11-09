@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::task::Waker;
 use std::time::Duration;
 
 use super::stack;
@@ -23,6 +24,7 @@ use crate::stdlib::layer::{
 use crate::stdlib::protocols::ssh::transport::{HostKey, TransportError};
 use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
 use crate::stdlib::world::net::{Arrival, PortServer};
+use crate::sync::Mutex;
 use crate::time::Instant;
 use fictionet::stdlib::network::ConnInfo;
 
@@ -424,8 +426,18 @@ impl Output {
 /// peer has granted no window for. The strongest request holds. Closing
 /// silently once a channel's output has drained stays on that channel, after
 /// its output ([`ChannelCommand::Hangup`]).
+///
+/// A request may come from anywhere, such as another task: it wakes the
+/// connection, which acts on it at once.
 #[derive(Clone, Debug)]
-pub struct ConnectionControl(Arc<AtomicU8>);
+pub struct ConnectionControl(Arc<Control>);
+
+#[derive(Debug)]
+struct Control {
+    requested: AtomicU8,
+    /// The connection's [`Env::waker`], from its first step on.
+    waker: Mutex<Option<Waker>>,
+}
 
 /// How far the connection has been asked to shut down, weakest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,7 +450,20 @@ enum Requested {
 
 impl ConnectionControl {
     fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(Requested::Open as u8)))
+        Self(Arc::new(Control {
+            requested: AtomicU8::new(Requested::Open as u8),
+            waker: Mutex::new(None),
+        }))
+    }
+    /// Keeps the connection's waker, the first time it steps: the waker
+    /// stays good for the connection's life ([`Env::waker`]). Called before
+    /// the connection reads [`requested`](Self::requested), so a request
+    /// either finds the waker or is read after it.
+    fn watch(&self, env: &Env<'_, Ended>) {
+        let mut waker = self.0.waker.lock();
+        if waker.is_none() {
+            *waker = Some(env.waker());
+        }
     }
     /// Stop reading application input and requests while queued output
     /// drains. Window adjustments and channel closes are still read.
@@ -450,10 +475,19 @@ impl ConnectionControl {
         self.request(Requested::Disconnect);
     }
     fn request(&self, requested: Requested) {
-        self.0.fetch_max(requested as u8, Ordering::Relaxed);
+        let before = self
+            .0
+            .requested
+            .fetch_max(requested as u8, Ordering::AcqRel);
+        if before < requested as u8 {
+            let waker = self.0.waker.lock().clone();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
     }
     fn requested(&self) -> Requested {
-        match self.0.load(Ordering::Relaxed) {
+        match self.0.requested.load(Ordering::Acquire) {
             0 => Requested::Open,
             1 => Requested::Drain,
             _ => Requested::Disconnect,
@@ -1526,6 +1560,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
     type Done = ();
     type Error = Error;
     fn advance(&mut self, env: &mut Env<'_, Ended>) -> Result<bool, Error> {
+        self.control.watch(env);
         let result = self.progress(env);
         let bytes = self.resident_bytes()
             + 128 * std::mem::size_of::<Flight>()
@@ -2382,6 +2417,58 @@ mod tests {
             }
             assert!(driver.take_command().is_none());
         }
+    }
+
+    /// Counts the wakes of the task that runs the stack.
+    #[derive(Default)]
+    struct Task(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Task {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn a_shutdown_asked_for_between_steps_wakes_the_connection() {
+        let config = Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        ));
+        let ssh = Ssh::new(
+            config,
+            Arc::new(Shutdown(false)),
+            Arc::new(ConnInfo::default()),
+        );
+        let control = ssh.control();
+        let mut driver = crate::stdlib::layer::Driver::new(
+            ssh,
+            Arc::new(crate::SeededEntropy::new(crate::Seed::from_u64(5))),
+            Budget::new(1 << 20),
+            Instant::ZERO,
+        );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        assert!(!driver.layer().is_terminal());
+        // Another task asks, while no call into the connection runs.
+        let drain = control.clone();
+        std::thread::spawn(move || drain.drain()).join().unwrap();
+        assert_eq!(task.0.load(Ordering::Acquire), 1);
+        assert!(driver.woken());
+        driver.run().unwrap();
+        assert!(!driver.woken());
+        assert!(!driver.layer().is_terminal());
+        std::thread::spawn(move || control.disconnect())
+            .join()
+            .unwrap();
+        assert_eq!(task.0.load(Ordering::Acquire), 2);
+        assert!(driver.woken());
+        driver.run().unwrap();
+        assert!(driver.layer().is_terminal());
     }
 
     #[tokio::test]

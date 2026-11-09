@@ -1,6 +1,12 @@
+use std::sync::Arc;
+use std::task::Waker;
+
 use fictionet::Entropy;
 use fictionet::stdlib::layer::Budget;
 use fictionet::time::Instant;
+
+use super::children::ChildWake;
+use super::driver::StackWake;
 
 /// Somewhere a layer's reports go. The driver keeps a bounded number of
 /// them and counts the ones it had no room for ([`Observations`]).
@@ -20,7 +26,7 @@ pub trait Observe<E> {
 }
 
 /// What a layer may use during one call: the time, the entropy source, the
-/// connection's budget, and somewhere to report.
+/// connection's budget, somewhere to report, and a way to be called again.
 ///
 /// Each value comes from the driver. A layer never reads a clock or the
 /// operating system's randomness itself, so the same inputs in the same
@@ -33,10 +39,34 @@ pub struct Env<'a, E> {
     /// The observer's interest, asked once: parts of the layer report
     /// through wrappers that only pass reports on.
     observing: bool,
+    wakes: Wakes<'a>,
+}
+
+/// Who a layer's [`Env::waker`] wakes: the driver of the stack, and on the
+/// way each [`Children`](super::Children) the layer runs inside.
+#[derive(Clone, Copy)]
+enum Wakes<'a> {
+    /// An environment made outside a driver: nothing runs the layer again.
+    Nothing,
+    /// The driver, which wakes whatever runs the stack.
+    Stack(&'a Arc<StackWake>),
+    /// A child, which queues itself for a visit and wakes what it runs in.
+    Child(&'a Arc<ChildWake>, &'a Wakes<'a>),
+}
+
+impl Wakes<'_> {
+    fn waker(&self) -> Waker {
+        match self {
+            Wakes::Nothing => Waker::noop().clone(),
+            Wakes::Stack(stack) => Waker::from(Arc::clone(stack)),
+            Wakes::Child(child, around) => child.waker_in(around.waker()),
+        }
+    }
 }
 
 impl<'a, E> Env<'a, E> {
-    /// An environment for one call.
+    /// An environment for one call, outside any driver: its
+    /// [`waker`](Self::waker) wakes nothing.
     pub fn new(
         now: Instant,
         entropy: &'a dyn Entropy,
@@ -49,7 +79,27 @@ impl<'a, E> Env<'a, E> {
             budget,
             observing: observer.interested(),
             observer,
+            wakes: Wakes::Nothing,
         }
+    }
+
+    /// The same environment, in a driver whose stack `stack` wakes.
+    pub(super) fn in_stack(self, stack: &'a Arc<StackWake>) -> Env<'a, E> {
+        Env {
+            wakes: Wakes::Stack(stack),
+            ..self
+        }
+    }
+
+    /// Gets this layer called again: for state that changes outside the
+    /// layer's calls, such as a request another task makes. Waking it
+    /// wakes whatever runs the stack, which then runs it
+    /// ([`Driver::run`](super::Driver::run)), and a child of
+    /// [`Children`](super::Children) is visited in that run. The waker
+    /// stays good for as long as the layer runs in this stack, so a layer
+    /// may keep the first one it gets.
+    pub fn waker(&self) -> Waker {
+        self.wakes.waker()
     }
 
     /// The run's time, read by the driver before this call.
@@ -99,6 +149,31 @@ impl<'a, E> Env<'a, E> {
         wrap: impl FnMut(P) -> E,
         body: impl FnOnce(&mut Env<'_, P>) -> R,
     ) -> R {
+        let wakes = self.wakes;
+        self.scope(budget, wakes, wrap, body)
+    }
+
+    /// Runs a call into a child of [`Children`](super::Children), as
+    /// [`scoped_in`](Self::scoped_in) does, with a [`waker`](Self::waker)
+    /// that gets the child visited.
+    pub(super) fn scoped_child<P, R>(
+        &mut self,
+        budget: &Budget,
+        child: &Arc<ChildWake>,
+        wrap: impl FnMut(P) -> E,
+        body: impl FnOnce(&mut Env<'_, P>) -> R,
+    ) -> R {
+        let around = self.wakes;
+        self.scope(budget, Wakes::Child(child, &around), wrap, body)
+    }
+
+    fn scope<P, R>(
+        &mut self,
+        budget: &Budget,
+        wakes: Wakes<'_>,
+        wrap: impl FnMut(P) -> E,
+        body: impl FnOnce(&mut Env<'_, P>) -> R,
+    ) -> R {
         let mut wrapped = Wrapped {
             inner: &mut *self.observer,
             wrap,
@@ -109,6 +184,7 @@ impl<'a, E> Env<'a, E> {
             budget,
             observer: &mut wrapped,
             observing: self.observing,
+            wakes,
         };
         body(&mut env)
     }

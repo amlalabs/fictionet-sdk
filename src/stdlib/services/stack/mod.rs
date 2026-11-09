@@ -463,7 +463,10 @@ where
                     .as_mut()
                     .as_pin_mut()
                     .is_some_and(|s| s.poll(cx).is_ready());
-                if done || due {
+                // A layer woken from outside its calls runs again: the
+                // waker first, so a wake after the check wakes this task.
+                driver.set_waker(cx.waker());
+                if done || due || driver.woken() {
                     return Poll::Ready(Ok(None));
                 }
                 Poll::Pending

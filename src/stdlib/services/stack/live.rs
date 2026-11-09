@@ -194,6 +194,9 @@ where
         // runs is seen when a timer comes due.
         let mut now = fcx.now();
         self.driver.set_now(now);
+        // A layer that wakes from outside its calls wakes this task, and
+        // every round below runs the stack.
+        self.driver.set_waker(cx.waker());
         for _ in 0..ROUNDS {
             // Read first, so input that came with a failed write is not
             // left behind.
