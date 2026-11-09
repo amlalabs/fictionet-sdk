@@ -192,31 +192,48 @@ impl ChildWake {
         }
     }
 
+    // A release is never lost. Every call ends by clearing `calling` and is
+    // followed by a visit, which clears it before taking `released` with a
+    // read-modify-write. A release whose add comes after that take reads
+    // from it, so it sees `calling` cleared, or set again by a later visit
+    // whose own take collects it; an add before the take is collected by it.
+
     /// Payload holding `units` of receive credit was released.
     pub(crate) fn release(&self, units: u64) {
-        self.released.fetch_add(units, Ordering::SeqCst);
-        if !self.calling.load(Ordering::SeqCst) {
+        self.released.fetch_add(units, Ordering::AcqRel);
+        if !self.calling.load(Ordering::Acquire) {
             self.notify();
         }
     }
 
     fn notify(&self) {
-        self.woken.store(true, Ordering::SeqCst);
-        self.any.store(true, Ordering::SeqCst);
+        self.woken.store(true, Ordering::Release);
+        self.any.store(true, Ordering::Release);
     }
 
-    /// Brackets a call into the child: credit it releases meanwhile is
-    /// collected after the call instead of waking it.
+    /// `Children` starts calling the child: credit released meanwhile is
+    /// collected after the calls instead of waking it.
+    fn enter(&self) {
+        self.calling.store(true, Ordering::Relaxed);
+    }
+
+    fn leave(&self) {
+        self.calling.store(false, Ordering::Release);
+    }
+
+    /// Brackets one call into the child. A visit follows it.
     fn call<T>(&self, call: impl FnOnce() -> T) -> T {
-        self.calling.store(true, Ordering::SeqCst);
+        self.enter();
         let result = call();
-        self.calling.store(false, Ordering::SeqCst);
+        self.leave();
         result
     }
 
-    /// Credit released since the last time this was asked.
+    /// Ends a visit's calls and takes the credit released since the last
+    /// visit.
     fn take_released(&self) -> u64 {
-        self.released.swap(0, Ordering::SeqCst)
+        self.leave();
+        self.released.swap(0, Ordering::AcqRel)
     }
 
     /// A waker for the child's work that also wakes `task`, the poller.
@@ -453,11 +470,13 @@ where
 
     /// Marks the children something reached from outside a call.
     fn collect_wakes(&mut self) {
-        if !self.woken.swap(false, Ordering::SeqCst) {
+        if !self.woken.load(Ordering::Relaxed) || !self.woken.swap(false, Ordering::Acquire) {
             return;
         }
         for ((_, kid), marks) in self.kids.iter().zip(&mut self.marks) {
-            if kid.wake.woken.swap(false, Ordering::SeqCst) {
+            if kid.wake.woken.load(Ordering::Relaxed)
+                && kid.wake.woken.swap(false, Ordering::Acquire)
+            {
                 *marks = Marks {
                     ready: true,
                     work: true,
@@ -490,6 +509,12 @@ where
     /// The open children, in order.
     pub fn ids(&self) -> impl Iterator<Item = ChildId> + '_ {
         self.kids.iter().map(|(id, _)| *id)
+    }
+
+    /// Whether nothing is open or queued either way: until an event comes,
+    /// no step can move anything, and there is no timer or work.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.kids.is_empty() && self.down.is_empty() && self.up.is_empty()
     }
 
     /// Closes a failed child and reports it.
@@ -558,11 +583,9 @@ where
         let (id, kid) = &mut self.kids[index];
         let id = *id;
         let report = move |e| ChildReport::Event(id, e);
-        let wake = &kid.wake;
-        let layer = &mut kid.layer;
-        let budget = &kid.budget;
-        let mut moved = match wake.call(|| env.scoped_in(budget, report, |env| layer.advance(env)))
-        {
+        // Until `take_released` below. A closed child takes nothing more.
+        kid.wake.enter();
+        let mut moved = match env.scoped_in(&kid.budget, report, |env| kid.layer.advance(env)) {
             Ok(moved) => moved,
             Err(e) => {
                 self.fail(env, id, e);
@@ -570,11 +593,7 @@ where
             }
         };
         if let Some(event) = kid.urgent.take() {
-            let layer = &mut kid.layer;
-            match kid
-                .wake
-                .call(|| env.scoped_in(&kid.budget, report, |env| layer.on_event(env, event)))
-            {
+            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
                 Ok(Admit::Taken | Admit::Closed(_)) => moved = true,
                 Ok(Admit::Blocked(event) | Admit::Partial(event)) => kid.urgent = Some(event),
                 Err(e) => {
@@ -585,11 +604,7 @@ where
         }
         if let Some((event, retained)) = kid.inbox.pop_front() {
             let cost = event.credit();
-            let layer = &mut kid.layer;
-            match kid
-                .wake
-                .call(|| env.scoped_in(&kid.budget, report, |env| layer.on_event(env, event)))
-            {
+            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
                 Ok(Admit::Taken | Admit::Closed(_)) => {
                     if !retained {
                         kid.owed += cost;
@@ -611,8 +626,7 @@ where
             }
         }
         if kid.outbox.is_none() {
-            let layer = &mut kid.layer;
-            kid.outbox = kid.wake.call(|| layer.take_command());
+            kid.outbox = kid.layer.take_command();
             moved |= kid.outbox.is_some();
         }
         let output_idle = kid.outbox.is_none();

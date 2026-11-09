@@ -214,7 +214,9 @@ impl PacketDriver {
         limit: usize,
     ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
         let (busy, deadline) = self.shared.with(|inner| {
-            inner.wake = Some(cx.waker().clone());
+            if !inner.wake.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                inner.wake = Some(cx.waker().clone());
+            }
             inner.driver.set_now(self.fcx.now());
             inner.pump();
             let count = limit.saturating_sub(out.len()).min(inner.output.len());

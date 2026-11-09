@@ -1055,18 +1055,26 @@ impl PacketDriver {
         out: &mut Vec<Chunk>,
         limit: usize,
     ) -> fictionet::Result<(bool, Option<Instant>)> {
-        let (busy, deadline, refused, refusals) = {
+        let (busy, deadline, refusals) = {
             let mut host = self.shared.state.lock();
-            host.routes.driver = Some(cx.waker().clone());
+            if !host
+                .routes
+                .driver
+                .as_ref()
+                .is_some_and(|w| w.will_wake(cx.waker()))
+            {
+                host.routes.driver = Some(cx.waker().clone());
+            }
             let busy = host.visit(out, limit);
-            (
-                busy,
-                host.tcp.deadline(),
-                host.routes.refused.clone(),
-                std::mem::take(&mut host.routes.refusals),
-            )
+            let refusals = (!host.routes.refusals.is_empty())
+                .then(|| {
+                    let refused = host.routes.refused.clone()?;
+                    Some((refused, std::mem::take(&mut host.routes.refusals)))
+                })
+                .flatten();
+            (busy, host.tcp.deadline(), refusals)
         };
-        if let Some(refused) = refused {
+        if let Some((refused, refusals)) = refusals {
             for (peer, local) in refusals {
                 refused(peer, local);
             }

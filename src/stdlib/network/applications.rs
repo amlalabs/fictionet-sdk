@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::task::Context;
 
 use fictionet::Cx;
-use fictionet::stdlib::layer::{Admit, Budget, CommandOf, Driver, EventOf, Layer};
+use fictionet::stdlib::layer::{
+    Admit, Budget, Children, CommandOf, Credited, Driver, EventOf, Layer, Port, Top,
+};
 use fictionet::stdlib::services::stack::{Job, Jobs};
 use fictionet::time::Instant;
 
@@ -18,7 +20,27 @@ where
     pending: VecDeque<EventOf<L::Lower>>,
 }
 
-impl<L: Layer> Applications<L>
+/// Whether a layer has nothing open or queued, so that until an event comes
+/// a step would move nothing.
+pub(crate) trait Idle {
+    fn idle(&self) -> bool {
+        false
+    }
+}
+
+impl<B, K, O> Idle for Children<B, K, O>
+where
+    B: Layer<Upper = Top>,
+    EventOf<B::Lower>: Credited,
+    CommandOf<B::Lower>: Credited,
+    K: Port,
+{
+    fn idle(&self) -> bool {
+        self.is_idle()
+    }
+}
+
+impl<L: Layer + Idle> Applications<L>
 where
     L::Work: Job<Done = L::Done>,
     L::Error: std::fmt::Display,
@@ -41,6 +63,18 @@ where
         command: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
     ) -> fictionet::Result<bool> {
         let mut command = command;
+        // With no application open, no work and nothing held, only a new
+        // event can move anything.
+        if self.pending.is_empty()
+            && self.jobs.is_empty()
+            && !self.driver.holds_output()
+            && self.driver.layer().idle()
+        {
+            events(&mut self.pending);
+            if self.pending.is_empty() {
+                return Ok(false);
+            }
+        }
         self.driver.set_now(fcx.now());
         // As in the stream runner, existing work observes transport wakeups
         // before queued input ends its child lifetime. Work cancelled by that
@@ -120,6 +154,7 @@ mod tests {
         ready: bool,
         received: usize,
     }
+    impl Idle for Waiting {}
     impl Layer for Waiting {
         type Lower = Messages<(), ()>;
         type Upper = Top;
