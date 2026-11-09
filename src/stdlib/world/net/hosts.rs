@@ -496,6 +496,10 @@ impl Host {
     /// once. Past that, a new connection is reset as soon as it is
     /// accepted, and each counts until its socket is gone. A connection the
     /// stack resets is reset.
+    /// Across all services, a machine's native TCP application router holds
+    /// at most 4096 live children, the bound of
+    /// [`fictionet::stdlib::layer::Children`]. Closing transport sockets
+    /// continue to count against admission after their application leaves.
     pub fn tcp_stack<L, M>(self, port: u16, make: M) -> Host
     where
         L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
@@ -509,7 +513,8 @@ impl Host {
     }
 
     /// The same with these limits and at most `max_conns` connections at
-    /// once.
+    /// once, subject to the machine's application-router bound documented
+    /// on [`Host::tcp_stack`].
     pub fn tcp_stack_with<L, M>(
         self,
         port: u16,
@@ -575,6 +580,8 @@ impl Host {
     /// zero asks the endpoint to choose a free port
     /// ([`udp::Endpoint::bind`]). Retained datagrams and layer state share
     /// `budget` across every sender and every instance of this host.
+    /// A machine's native UDP application router holds at most 4096 socket
+    /// children, the bound of [`fictionet::stdlib::layer::Children`].
     pub fn udp_stack<L, M>(mut self, port: u16, budget: Budget, make: M) -> Host
     where
         L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top> + Send + 'static,
