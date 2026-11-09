@@ -46,14 +46,24 @@ pub(crate) async fn drive(
             let mut moved = false;
             let mut more = false;
             let mut transport = false;
+            // The IP layer may hold only a packet or so: when it refuses,
+            // it passes what it holds below and is offered the rest again,
+            // so a walk's output goes down in the same turn.
+            let mut retries = outgoing.len();
             while let Some(command) = outgoing.pop_front() {
-                if let Admit::Blocked(command) = ip
+                let Admit::Blocked(command) = ip
                     .command(command)
                     .map_err(|e| fictionet::Error::msg(e.to_string()))?
-                {
-                    outgoing.push_front(command);
+                else {
+                    moved = true;
+                    continue;
+                };
+                outgoing.push_front(command);
+                let ran = ip.run().map_err(|e| fictionet::Error::msg(e.to_string()))?;
+                if retries == 0 || !(send_below(&mut ip, &mut interface) || ran) {
                     break;
                 }
+                retries -= 1;
                 moved = true;
             }
             moved |= ip.run().map_err(|e| fictionet::Error::msg(e.to_string()))?;
@@ -66,12 +76,7 @@ pub(crate) async fn drive(
                     "packet stack work budget exhausted",
                 )));
             }
-            moved |= ip.send_below(|command| {
-                if let PacketCommand::Send(bytes) = command {
-                    interface.send(Packet(bytes.into_vec()));
-                }
-                Admit::Taken
-            });
+            moved |= send_below(&mut ip, &mut interface);
             moved |= ip.send_above(|event| {
                 if held.is_some() {
                     return Admit::Blocked(event);
@@ -191,6 +196,16 @@ pub(crate) async fn drive(
         Poll::Pending
     })
     .await
+}
+
+/// Sends what the IP layer has for the interface, which takes every packet.
+fn send_below(ip: &mut Driver<Stack>, interface: &mut impl Interface) -> bool {
+    ip.send_below(|command| {
+        if let PacketCommand::Send(bytes) = command {
+            interface.send(Packet(bytes.into_vec()));
+        }
+        Admit::Taken
+    })
 }
 
 /// Stages both transports without starting progress or publishing a route.
