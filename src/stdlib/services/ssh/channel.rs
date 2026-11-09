@@ -79,11 +79,9 @@ pub enum ChannelCommand {
     Reply(bool),
     /// Complete the channel close handshake after preceding output.
     Close,
-    /// Disconnect the entire SSH connection immediately.
-    Disconnect,
-    /// Stop accepting application input while queued output drains.
-    Draining,
-    /// Silently close the connection after preceding output drains.
+    /// Silently close the connection after preceding output drains. Draining
+    /// and immediate disconnection go on the connection's control
+    /// ([`ConnectionControl`](super::ConnectionControl)), beside channel traffic.
     Hangup,
 }
 
