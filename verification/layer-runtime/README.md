@@ -121,12 +121,13 @@ measurements, not isolated performance guarantees.
 
 | Workload | Integration baseline | World composition |
 | --- | ---: | ---: |
-| TCP, one connection, 32 MiB | 28.13 ms | 37.61 ms |
-| TCP, ten connections, 4 MiB each | 45.03 ms | 60.30 ms |
-| TCP, one hundred connections, 1 MiB each | 209.2 ms | 377.2 ms |
-| TCP round trips | 34.66 ms | 51.87 ms |
-| HTTP/1, 100,000 requests | 1.356 s | 2.120 s |
-| HTTP/2, 100,000 requests | 1.976 s | 3.433 s |
+| TCP, one connection, 32 MiB | 28.13 ms | 36.36 ms |
+| TCP, ten connections, 4 MiB each | 45.03 ms | 59.52 ms |
+| TCP, one hundred connections, 1 MiB each | 209.2 ms | 381.8 ms |
+| TCP round trips | 34.66 ms | 51.44 ms |
+| TCP transfer with 99 idle connections | 81.11 ms | 83.98 ms |
+| HTTP/1, 100,000 requests | 1.356 s | 2.094 s |
+| HTTP/2, 100,000 requests | 1.976 s | 3.429 s |
 
 The new packet and child drivers add scheduling and ownership bookkeeping.
 Batching removed a repeated transport sweep per received packet and a
@@ -134,11 +135,17 @@ repeated child sweep per queued child event. Before those changes the
 HTTP runs took 4.004 s and 7.208 s. The remaining slowdown is material;
 these results do not establish performance parity. Peak measured HTTP/1
 allocations were 1.040 MB versus 1.073 MB at baseline, and HTTP/2 used
-1.103 MB versus 0.984 MB. Allocation counts increased from 10.843 million
+1.101 MB versus 0.984 MB. Allocation counts increased from 10.843 million
 to 11.741 million for HTTP/1 and from 19.266 million to 22.654 million
 for HTTP/2. The measurements do not attribute the remaining CPU cost to
 individual components.
+The unchanged HTTP/1 decoder benchmark, using 100 samples, measured
+26.08 ms versus 25.50 ms at baseline.
 
 The datagram model rerun generated 32,196 states and found 5,787 distinct
 states, with no violation. Disabling whole-datagram preservation, which
 allows an empty datagram to disappear, violated `SentInOrder` as expected.
+The child readiness model passed with 71,116 generated and 10,066 distinct
+states. Its mutations retained the expected counterexamples: completion
+remains blocked without urgent delivery, cancelled work is polled without
+work ownership, and retained jobs exceed their limit without the job bound.
