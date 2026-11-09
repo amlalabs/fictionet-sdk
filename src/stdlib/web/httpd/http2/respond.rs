@@ -316,7 +316,7 @@ impl State {
         if let Some(delivery) = &mut self.delivery {
             delivery.response(&parts);
         }
-        let date = date_header(self.responder.date, env.now());
+        let date = || date_header(self.responder.date, env.now());
         let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), self.wants, date);
         let mut headers = HeaderMap::with_capacity(parts.headers.len() + 2);
         for (name, value) in &parts.headers {

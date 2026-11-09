@@ -26,11 +26,10 @@ use fictionet::{Cx, Error};
 use super::body::Inner;
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
-use super::response::{Asked, ResponsePolicy, head_held, request_held};
+use super::response::{Asked, Dates, ResponsePolicy, head_held, request_held};
 use super::sites::no_host;
 use super::{
-    Body, Delivery, Exchange, Handler, Later, Limits, PIECE, Received, Reply, Reset,
-    UpgradeHandler, date_header,
+    Body, Delivery, Exchange, Handler, Later, Limits, PIECE, Received, Reply, Reset, UpgradeHandler,
 };
 
 // ---------------------------------------------------------------------------
@@ -149,8 +148,8 @@ pub struct Http1 {
     pub(super) observe: Option<super::Observe>,
     handler: Arc<dyn Handler>,
     opts: Limits,
-    /// The world's date at the start of the run, for `Date` headers.
-    pub(super) date: Option<SystemTime>,
+    /// `Date` headers, from the world's date at the start of the run.
+    pub(super) dates: Dates,
     conn: ConnInfo,
     /// Whether `Upgrade: h2c` hands the connection to HTTP/2.
     h2c: bool,
@@ -195,7 +194,7 @@ impl Http1 {
             observe: None,
             handler,
             opts,
-            date: None,
+            dates: Dates::new(None),
             conn: ConnInfo::default(),
             h2c: false,
             first_head_deadline: None,
@@ -226,7 +225,7 @@ impl Http1 {
     /// and time at the start of the run, plus the run's clock. See
     /// [Dates](super#dates).
     pub fn date(mut self, start: SystemTime) -> Http1 {
-        self.date = Some(start);
+        self.dates = Dates::new(Some(start));
         self
     }
 
@@ -265,7 +264,7 @@ impl Http1 {
         Responder::shared(self.handler.clone())
             .limits(self.opts)
             .maybe_observe(self.observe.clone())
-            .maybe_date(self.date)
+            .maybe_date(self.dates.start())
             .conn(self.conn.clone())
             .upgraded(settings, request)
     }
@@ -283,6 +282,7 @@ impl Http1 {
             .saturating_add(self.head.as_ref().map_or(0, head_held))
             .saturating_add(self.body.capacity())
             .saturating_add(self.responding.as_ref().map_or(0, Responding::held))
+            .saturating_add(self.dates.held())
     }
 
     /// Parsing copies head strings and grows a header vector geometrically.
@@ -465,7 +465,7 @@ impl Http1 {
         let version = version_of(&head);
         let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method() != "CONNECT";
         let Some(mut request) = to_request(&head, version, body) else {
-            let date = date_header(self.date, env.now());
+            let date = self.dates.at(env.now());
             let Some((out, charge)) = simple_output(env, version, StatusCode::BAD_REQUEST, date)
             else {
                 return self.over_budget(env);
@@ -592,7 +592,7 @@ impl Http1 {
             env.report(Report::Failed(fail));
             return;
         }
-        let date = date_header(self.date, env.now());
+        let date = self.dates.at(env.now());
         let status = if matches!(
             &fail,
             Fail::Protocol(error) if error.reason() == http1::Error::UnsupportedTransferCoding
@@ -700,12 +700,9 @@ impl Http1 {
             // with nothing to take it over, the connection closes.
             r.close = true;
         }
-        let policy = ResponsePolicy::new(
-            &parts,
-            body.size_hint().exact(),
-            r.wants,
-            date_header(self.date, env.now()),
-        );
+        let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), r.wants, || {
+            self.dates.at(env.now())
+        });
         // Room for the head and the first piece of a body held in full: a
         // streamed body has nothing to go with the head yet.
         let first = body.full_len().min(PIECE);
@@ -1482,7 +1479,7 @@ fn simple_output(
     date: Option<HeaderValue>,
 ) -> Option<(Vec<u8>, Charge)> {
     let (parts, _) = status_only(status).into_parts();
-    let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, date);
+    let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || date);
     let (mut out, charge) = output(env, head_bound(&parts, &policy)?)?;
     encode(&mut out, version, &parts, &policy, true);
     Some((out, charge))

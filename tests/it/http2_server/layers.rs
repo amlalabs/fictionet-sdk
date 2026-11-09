@@ -509,6 +509,33 @@ mod detection {
     }
 
     #[test]
+    fn tls_makes_only_the_version_alpn_chose() {
+        use fictionet::stdlib::layer::Side;
+        let handler: Arc<dyn httpd::Handler> =
+            fictionet_test_support::handler(|_, _| http::Response::new(Bytes::from_static(b"ok")));
+        let made = |info: ConnInfo| {
+            httpd::http_for(
+                handler.clone(),
+                &HttpOptions::default(),
+                &info,
+                fictionet::time::Instant::ZERO,
+            )
+        };
+        let tls = |alpn: &[u8]| ConnInfo {
+            tls: true,
+            alpn: Some(Arc::from(alpn)),
+            ..ConnInfo::default()
+        };
+        assert!(matches!(made(tls(b"h2")), Side::Lower(Side::Upper(_))));
+        assert!(matches!(
+            made(tls(b"http/1.1")),
+            Side::Lower(Side::Lower(_))
+        ));
+        let plain = made(ConnInfo::default());
+        assert!(matches!(&plain, Side::Upper(detect) if detect.first().is_some()));
+    }
+
+    #[test]
     fn the_preface_chooses_http2_however_it_is_split() {
         let mut input = preface();
         input.extend(headers(1, "/", true));
