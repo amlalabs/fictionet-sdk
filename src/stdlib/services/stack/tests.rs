@@ -617,6 +617,33 @@ impl Layer for HalfClosed {
     }
 }
 
+/// Input the stack refuses as closed is over, as it is for an application
+/// on a transport child (`session::tests::input_refused_as_closed_is_over`):
+/// a stack that also ended its direction finishes without waiting for the
+/// idle limit.
+#[test]
+fn input_refused_as_closed_is_over() {
+    let limits = StreamLimits {
+        idle: Some(Duration::from_secs(30)),
+        ..StreamLimits::default()
+    };
+    let client = |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        conn.write_all(&fcx, b"x").await?;
+        read_to_end(&fcx, &mut conn).await?;
+        let waited = fcx.now().since_start();
+        assert!(waited < Duration::from_secs(30), "ended after {waited:?}");
+        Ok(())
+    };
+    let ended = serve_one(
+        limits,
+        Budget::unlimited(),
+        super::session::tests::Closes::default,
+        client,
+    );
+    assert_eq!(ended, Ok(StreamEnd::Finished));
+}
+
 #[test]
 fn ending_writes_keeps_reading_the_peers_response() {
     let received = Arc::new(fictionet::sync::Mutex::new(Vec::new()));

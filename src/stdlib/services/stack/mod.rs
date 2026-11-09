@@ -32,6 +32,7 @@
 
 mod boxed;
 mod job;
+mod lifetime;
 mod live;
 mod open;
 mod session;

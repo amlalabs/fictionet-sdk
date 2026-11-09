@@ -9,19 +9,19 @@ use fictionet::Cx;
 use fictionet::stdlib::layer::{Admit, ByteStream, Env, Layer, StreamCommand, StreamEvent, Top};
 use fictionet::time::Instant;
 
+use super::lifetime::{Expiry, Lifetime, Outstanding};
 use super::{Job, StreamLimits};
 
 /// Stream lifetime and timeouts for an application on a transport child.
 /// The transport remains responsible for closing and retiring its socket.
 pub struct Session<L> {
     layer: L,
-    limits: StreamLimits,
+    lifetime: Lifetime,
     now: Instant,
-    idle: Option<Instant>,
-    write: Option<Instant>,
+    /// Bytes handed below that the application has not heard were written.
     pending: u64,
-    input_end: bool,
-    output_end: bool,
+    /// The application refused the input it was last offered.
+    refused: bool,
     reset: bool,
     event: Option<StreamEvent>,
     command: Option<StreamCommand>,
@@ -29,22 +29,34 @@ pub struct Session<L> {
 }
 
 impl<L> Session<L> {
-    /// Applies the same idle and stalled-write policy as the stream adapter.
+    /// Applies the stream adapter's idle and stalled-write policy: one
+    /// policy decides for both. When a write stalls past its limit the
+    /// application hears a reset and the session asks the transport for
+    /// one, where the adapter ends its run.
     pub fn new(layer: L, limits: StreamLimits, now: Instant) -> Self {
         Self {
             layer,
-            limits,
+            lifetime: Lifetime::new(limits),
             now,
-            idle: None,
-            write: None,
             pending: 0,
-            input_end: false,
-            output_end: false,
+            refused: false,
             reset: false,
             event: None,
             command: None,
             jobs: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn outstanding(&self) -> Outstanding {
+        Outstanding {
+            output: self.pending > 0,
+            input: self.refused || self.event.is_some(),
+            work: self.jobs.load(Ordering::Relaxed) > 0,
+        }
+    }
+
+    fn settle(&mut self) {
+        self.lifetime.settle(self.now, self.outstanding());
     }
 }
 
@@ -109,11 +121,10 @@ where
     }
     fn is_terminal(&self) -> bool {
         self.reset
-            || (self.output_end
-                && (self.layer.is_terminal() || self.input_end)
-                && self.pending == 0
-                && self.jobs.load(Ordering::Relaxed) == 0
-                && self.command.is_none())
+            || (self.command.is_none()
+                && self
+                    .lifetime
+                    .finished(self.layer.is_terminal(), self.outstanding()))
     }
     fn on_event(
         &mut self,
@@ -128,27 +139,32 @@ where
         if self.event.is_some() && !matches!(event, StreamEvent::Written(_)) {
             return Ok(Admit::Blocked(event));
         }
-        let (ended, reset, written, data) = match &event {
-            StreamEvent::Ended => (true, false, 0, false),
+        let (ended, reset, written, input) = match &event {
+            StreamEvent::Ended => (true, false, 0, true),
             StreamEvent::Reset => (true, true, 0, false),
             StreamEvent::Written(n) => (false, false, *n, false),
             StreamEvent::Data(_) => (false, false, 0, true),
         };
         let admitted = self.layer.on_event(env, event)?;
-        if admitted.moved() || matches!(&admitted, Admit::Closed(_)) {
-            self.now = env.now();
-            self.input_end |= ended;
-            self.reset |= reset;
-            if data {
-                self.idle = None;
-            }
-            if written > 0 {
-                self.pending = self.pending.saturating_sub(written);
-                self.write = (self.pending > 0)
-                    .then(|| self.limits.write_timeout.map(|by| self.now + by))
-                    .flatten();
-            }
+        self.now = env.now();
+        let closed = matches!(&admitted, Admit::Closed(_));
+        if input {
+            self.refused = matches!(&admitted, Admit::Blocked(_) | Admit::Partial(_));
         }
+        if closed {
+            self.lifetime.end_input();
+        }
+        if admitted.moved() || closed {
+            if ended {
+                self.lifetime.end_input();
+            }
+            self.reset |= reset;
+            if input || written > 0 {
+                self.lifetime.progress();
+            }
+            self.pending = self.pending.saturating_sub(written);
+        }
+        self.settle();
         Ok(admitted)
     }
     fn on_command(
@@ -166,13 +182,13 @@ where
         match timer {
             SessionTimer::Application(timer) => self.layer.on_timer(env, timer),
             SessionTimer::Idle => {
-                self.idle = None;
-                self.input_end = true;
+                self.lifetime.expire(Expiry::Idle);
                 self.event = Some(StreamEvent::Ended);
+                self.settle();
                 Ok(())
             }
             SessionTimer::Write => {
-                self.write = None;
+                self.lifetime.expire(Expiry::Stalled);
                 self.reset = true;
                 self.command = Some(StreamCommand::Reset);
                 let _ = self.layer.on_event(env, StreamEvent::Reset)?;
@@ -189,15 +205,15 @@ where
         if let Some(event) = self.event.take() {
             match self.layer.on_event(env, event)? {
                 Admit::Blocked(event) | Admit::Partial(event) => self.event = Some(event),
-                _ => moved = true,
+                _ => {
+                    // The idle EOF is in: the input is over.
+                    self.lifetime.end_input();
+                    moved = true;
+                }
             }
         }
         moved |= self.layer.advance(env)?;
-        if self.pending > 0 || self.jobs.load(Ordering::Relaxed) > 0 || self.input_end {
-            self.idle = None;
-        } else if self.idle.is_none() {
-            self.idle = self.limits.idle.map(|by| self.now + by);
-        }
+        self.settle();
         Ok(moved)
     }
     fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
@@ -207,13 +223,11 @@ where
             .or_else(|| self.layer.take_command(env))?;
         match &command {
             StreamCommand::Write(bytes) => {
-                if self.pending == 0 {
-                    self.write = self.limits.write_timeout.map(|by| self.now + by);
-                }
+                self.now = env.now();
                 self.pending = self.pending.saturating_add(bytes.len() as u64);
-                self.idle = None;
+                self.settle();
             }
-            StreamCommand::End => self.output_end = true,
+            StreamCommand::End => self.lifetime.end_output(),
             StreamCommand::Reset => self.reset = true,
         }
         Some(command)
@@ -224,28 +238,33 @@ where
     fn take_work(&mut self) -> Option<Self::Work> {
         let work = self.layer.take_work()?;
         self.jobs.fetch_add(1, Ordering::Relaxed);
-        self.idle = None;
+        self.settle();
         Some(SessionWork {
             work,
             active: Some(self.jobs.clone()),
         })
     }
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
-        [
-            self.layer
-                .deadline()
-                .map(|(at, timer)| (at, SessionTimer::Application(timer))),
-            self.idle.map(|at| (at, SessionTimer::Idle)),
-            self.write.map(|at| (at, SessionTimer::Write)),
-        ]
-        .into_iter()
-        .flatten()
-        .min_by_key(|(at, _)| *at)
+        let application = self
+            .layer
+            .deadline()
+            .map(|(at, timer)| (at, SessionTimer::Application(timer)));
+        let lifetime = self.lifetime.deadline().map(|(at, expiry)| {
+            let timer = match expiry {
+                Expiry::Idle => SessionTimer::Idle,
+                Expiry::Stalled => SessionTimer::Write,
+            };
+            (at, timer)
+        });
+        [application, lifetime]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(at, _)| *at)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use fictionet::Seed;
     use fictionet::stdlib::layer::{Chunk, Harness};
@@ -325,5 +344,241 @@ mod tests {
         assert_eq!(session.take_output(), b"last");
         assert!(session.ended());
         assert!(session.layer().is_terminal());
+    }
+
+    /// Takes the first bytes, then refuses input until its own timer goes
+    /// off `pause` later. Notes when its input ended.
+    struct Refuses {
+        pause: Duration,
+        until: Option<Instant>,
+        took_first: bool,
+        input_ended: Option<Instant>,
+    }
+    impl Layer for Refuses {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            env: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            match event {
+                StreamEvent::Data(_) if self.until.is_some() => return Ok(Admit::Blocked(event)),
+                StreamEvent::Data(_) if !self.took_first => {
+                    self.took_first = true;
+                    self.until = Some(env.now() + self.pause);
+                }
+                StreamEvent::Ended => self.input_ended = Some(env.now()),
+                _ => {}
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+            self.until = None;
+            Ok(())
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            self.until.map(|at| (at, ()))
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// The idle limit counts only time spent waiting for the peer. Bytes the
+    /// application refuses are not waiting on the peer, so the idle clock
+    /// starts only once the application takes them, as it does over a
+    /// connection (`the_idle_clock_restarts_when_the_stack_takes_input_again`).
+    #[test]
+    fn the_idle_clock_waits_while_the_application_refuses_input() {
+        let idle = Duration::from_millis(300);
+        let pause = Duration::from_millis(1_000);
+        let mut session = Harness::new(
+            Seed::from_u64(1),
+            Session::new(
+                Refuses {
+                    pause,
+                    until: None,
+                    took_first: false,
+                    input_ended: None,
+                },
+                StreamLimits {
+                    idle: Some(idle),
+                    write_timeout: None,
+                },
+                Instant::ZERO,
+            ),
+        );
+        session.push(b"a").unwrap();
+        session.push(b"b").unwrap();
+        assert_eq!(
+            session.unread(),
+            1,
+            "the application refuses the second byte"
+        );
+        session.advance(Duration::from_secs(5)).unwrap();
+        let ended = session.layer().layer.input_ended.expect("input ended");
+        assert!(
+            ended.since_start() >= pause + idle,
+            "input ended at {:?}, within the idle limit of the application taking input again",
+            ended.since_start()
+        );
+    }
+
+    /// Refuses input as closed and ends its own direction once input comes.
+    #[derive(Default)]
+    pub(in super::super) struct Closes {
+        closed: bool,
+        end_sent: bool,
+    }
+    impl Layer for Closes {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            self.closed = true;
+            Ok(Admit::Closed(event))
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+            (self.closed && !self.end_sent).then(|| {
+                self.end_sent = true;
+                StreamCommand::End
+            })
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// Input refused as closed is over, as it is over a connection: an
+    /// application that also ended its direction is done at once, without
+    /// waiting for the idle limit.
+    #[test]
+    fn input_refused_as_closed_is_over() {
+        let mut session = Harness::new(
+            Seed::from_u64(1),
+            Session::new(
+                Closes::default(),
+                StreamLimits {
+                    idle: Some(Duration::from_millis(300)),
+                    write_timeout: None,
+                },
+                Instant::ZERO,
+            ),
+        );
+        session.push(b"x").unwrap();
+        assert!(session.input_closed());
+        assert!(session.ended());
+        assert!(session.layer().is_terminal());
+    }
+
+    /// A write stalled past its limit gives up on the peer: the application
+    /// hears the reset and the session is done, as the stream adapter ends
+    /// its run. Bytes that go out start the limit again.
+    #[test]
+    fn a_write_stalled_past_its_limit_gives_up_and_progress_restarts_the_limit() {
+        let limit = Duration::from_millis(300);
+        let mut session = Harness::new(
+            Seed::from_u64(1),
+            Session::new(
+                Says {
+                    write: Some(StreamCommand::Write(Chunk::new(b"four".to_vec()))),
+                    reset_at: None,
+                },
+                StreamLimits {
+                    idle: None,
+                    write_timeout: Some(limit),
+                },
+                Instant::ZERO,
+            ),
+        );
+        session.withhold();
+        session.settle().unwrap();
+        session.advance(Duration::from_millis(200)).unwrap();
+        session.allow(1).unwrap();
+        session.advance(Duration::from_millis(250)).unwrap();
+        assert_eq!(
+            session.layer().layer.reset_at,
+            None,
+            "a byte went out 250 ms ago, within the limit"
+        );
+        assert!(!session.layer().is_terminal());
+        session.advance(Duration::from_millis(100)).unwrap();
+        let reset_at = session
+            .layer()
+            .layer
+            .reset_at
+            .expect("the application heard the reset");
+        assert!(reset_at.since_start() >= Duration::from_millis(200) + limit);
+        assert!(session.layer().is_terminal());
+        assert_eq!(session.output().len(), 1);
+    }
+
+    /// Writes once, takes everything, and notes when it heard a reset.
+    struct Says {
+        write: Option<StreamCommand>,
+        reset_at: Option<Instant>,
+    }
+    impl Layer for Says {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            env: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            if matches!(event, StreamEvent::Reset) {
+                self.reset_at.get_or_insert(env.now());
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+            self.write.take()
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
     }
 }
