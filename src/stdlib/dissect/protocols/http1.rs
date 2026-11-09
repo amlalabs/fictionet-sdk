@@ -529,6 +529,11 @@ fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
     d.push(l);
 }
 
+/// Bounded proofs over `Http1::find`, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../../verification/dissector/kani/find.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

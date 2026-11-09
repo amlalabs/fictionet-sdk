@@ -404,6 +404,11 @@ where
     }
 }
 
+/// Bounded proofs over `Place::locate`, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/dissector/kani/place.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

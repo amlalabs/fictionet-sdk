@@ -1427,6 +1427,11 @@ impl Present for Capture {
     }
 }
 
+/// Bounded proofs over the HTTP/2 framing, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/dissector/kani/frames.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

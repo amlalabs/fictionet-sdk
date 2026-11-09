@@ -720,6 +720,11 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
     out
 }
 
+/// Bounded proofs over the handshake readers, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/dissector/kani/handshake.rs"]
+mod proofs;
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
