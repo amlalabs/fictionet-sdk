@@ -1,8 +1,8 @@
 //! Kani proofs over gRPC message framing in src/stdlib/protocols/grpc.rs:
 //! `parse_message`, which `Message::parse_prefix` (read by the `Grpc`
 //! layer in src/stdlib/web/httpd/http2/grpc.rs) and the `Frames<Message>`
-//! decoder both call, and `Message::write`, which the layer frames every
-//! reply with. Compiled only under `cargo kani`, as a child module of
+//! decoder both call; `message_len`, which the layer's `prefix_len` check
+//! calls; and `Message::write`, which the layer frames every reply with. Compiled only under `cargo kani`, as a child module of
 //! grpc.rs, so each harness calls the production code.
 //!
 //! How the layer reads a call's bytes through these, split anywhere and
@@ -16,6 +16,10 @@ use super::*;
 /// over the limit is refused from the prefix alone, however few body bytes
 /// follow; otherwise the message waits until its body is whole, and then
 /// is exactly the flag and the next `length` bytes, taking `5 + length`.
+/// `message_len`, which the layer's early check (`prefix_len`) calls on the
+/// messages still waiting for the application, refuses exactly the same
+/// prefixes with the same errors, and gives `5 + length` once the prefix
+/// is whole, without waiting for the body.
 #[kani::proof]
 #[kani::unwind(10)]
 fn the_prefix_is_read_exactly() {
@@ -25,16 +29,20 @@ fn the_prefix_is_read_exactly() {
     let b = &bytes[..len];
     let limit: usize = kani::any();
     let result = parse_message(b, limit);
+    let early = message_len(b, limit);
     if len == 0 {
         assert_eq!(result, Ok(None));
+        assert_eq!(early, Ok(None));
         return;
     }
     if bytes[0] > 1 {
         assert_eq!(result, Err(Error::Flag(bytes[0])));
+        assert_eq!(early, Err(Error::Flag(bytes[0])));
         return;
     }
     if len < HEADER_LEN {
         assert_eq!(result, Ok(None));
+        assert_eq!(early, Ok(None));
         return;
     }
     let length = u32::from(bytes[1]) << 24
@@ -43,9 +51,11 @@ fn the_prefix_is_read_exactly() {
         | u32::from(bytes[4]);
     if length as usize > limit {
         assert_eq!(result, Err(Error::TooLarge { length, limit }));
+        assert_eq!(early, Err(Error::TooLarge { length, limit }));
         return;
     }
     let end = HEADER_LEN + length as usize;
+    assert_eq!(early, Ok(Some(end)));
     if len < end {
         assert_eq!(result, Ok(None));
         return;

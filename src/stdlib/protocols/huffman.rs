@@ -58,7 +58,7 @@ impl Wire for HuffmanString {
 /// The length in bits of each symbol's Huffman code, 256 being the
 /// end-of-string code. The code is canonical, so the lengths fix the codes.
 #[rustfmt::skip]
-const HUFFMAN_LENGTHS: [u8; 257] = [
+static HUFFMAN_LENGTHS: [u8; 257] = [
     13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28,
     28, 28, 28, 6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12,
     10, 13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6, 15, 5, 6,
@@ -83,7 +83,7 @@ struct Huffman {
     symbols: [u16; 257],
 }
 
-const HUFFMAN: Huffman = build_huffman();
+static HUFFMAN: Huffman = build_huffman();
 
 const fn build_huffman() -> Huffman {
     let mut h = Huffman {
@@ -203,6 +203,11 @@ pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
         Err(Error::InvalidCode)
     }
 }
+
+/// Bounded proofs that the decoder accepts exactly the code, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/hpack-grpc/kani/huffman.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {

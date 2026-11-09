@@ -145,6 +145,11 @@ impl<const PREFIX: u8> Wire for Integer<PREFIX> {
     }
 }
 
+/// Bounded proofs that `read` and `write` follow RFC 7541, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/hpack-grpc/kani/prefix_int.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
