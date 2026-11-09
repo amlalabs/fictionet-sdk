@@ -27,6 +27,7 @@ pub struct Framed {
     packet: Option<PacketEvent<Datagram<Ingress>>>,
     output: Option<StreamCommand>,
     ended: bool,
+    output_end: bool,
 }
 
 /// Why a packet stream could not continue.
@@ -64,6 +65,7 @@ impl Framed {
             packet: None,
             output: None,
             ended: false,
+            output_end: false,
         }
     }
 }
@@ -93,6 +95,7 @@ impl Layer for Framed {
             self.packet = Some(PacketEvent::Ended);
             self.output = None;
             self.ended = true;
+            self.output_end = true;
             return Ok(Admit::Taken);
         }
         if self.ended {
@@ -151,6 +154,9 @@ impl Layer for Framed {
         env: &mut Env<'_, Infallible>,
         command: PacketCommand<Chunk>,
     ) -> Result<Admit<PacketCommand<Chunk>>, FrameError> {
+        if self.output_end {
+            return Ok(Admit::Closed(command));
+        }
         if self.output.is_some() {
             return Ok(Admit::Blocked(command));
         }
@@ -168,7 +174,10 @@ impl Layer for Framed {
                 frame.extend_from_slice(&packet);
                 StreamCommand::Write(Chunk::with_charge(frame, charge))
             }
-            PacketCommand::End => StreamCommand::End,
+            PacketCommand::End => {
+                self.output_end = true;
+                StreamCommand::End
+            }
         });
         Ok(Admit::Taken)
     }
@@ -185,6 +194,28 @@ mod tests {
     use super::*;
     use fictionet::Seed;
     use fictionet::stdlib::layer::{Budget, Harness};
+
+    #[test]
+    fn end_and_reset_refuse_later_packets() {
+        for reset in [false, true] {
+            let mut stack = Harness::new(Seed::from_u64(1), Framed::new(Ingress::default()));
+            if reset {
+                assert!(stack.driver().deliver(StreamEvent::Reset).unwrap().moved());
+            } else {
+                assert!(stack.driver().command(PacketCommand::End).unwrap().moved());
+            }
+            stack.settle().unwrap();
+            let Admit::Closed(PacketCommand::Send(packet)) = stack
+                .driver()
+                .command(PacketCommand::Send(Chunk::new(b"late".to_vec())))
+                .unwrap()
+            else {
+                panic!("output has ended");
+            };
+            assert_eq!(&*packet, b"late");
+            assert!(stack.output().is_empty());
+        }
+    }
 
     #[test]
     fn held_output_preserves_frames_across_partial_and_zero_writes() {
