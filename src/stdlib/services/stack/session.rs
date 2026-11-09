@@ -120,7 +120,12 @@ where
         env: &mut Env<'_, L::Report>,
         event: StreamEvent,
     ) -> Result<Admit<StreamEvent>, L::Error> {
-        if self.event.is_some() {
+        if matches!(event, StreamEvent::Reset) {
+            self.event = None;
+        }
+        // A refused idle EOF may be waiting for a final write to complete.
+        // Completions and reset must pass it, just as they pass refused data.
+        if self.event.is_some() && !matches!(event, StreamEvent::Written(_)) {
             return Ok(Admit::Blocked(event));
         }
         let (ended, reset, written, data) = match &event {
@@ -233,5 +238,89 @@ where
         .into_iter()
         .flatten()
         .min_by_key(|(at, _)| *at)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::Seed;
+    use fictionet::stdlib::layer::{Chunk, Harness};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Flush {
+        write: Option<StreamCommand>,
+        started: bool,
+        written: bool,
+        ended: bool,
+    }
+    impl Layer for Flush {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            match event {
+                StreamEvent::Ended if !self.written => {
+                    if !self.started {
+                        self.write = Some(StreamCommand::Write(Chunk::new(b"last".to_vec())));
+                        self.started = true;
+                    }
+                    return Ok(Admit::Blocked(StreamEvent::Ended));
+                }
+                StreamEvent::Written(4) => self.written = true,
+                StreamEvent::Ended => {
+                    self.ended = true;
+                    self.write = Some(StreamCommand::End);
+                }
+                StreamEvent::Reset => panic!("a writable stream must finish without reset"),
+                _ => {}
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn take_command(&mut self) -> Option<StreamCommand> {
+            self.write.take()
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+        fn is_terminal(&self) -> bool {
+            self.ended
+        }
+    }
+
+    #[test]
+    fn write_completion_passes_an_idle_eof_waiting_for_a_flush() {
+        let mut session = Harness::new(
+            Seed::from_u64(1),
+            Session::new(
+                Flush::default(),
+                StreamLimits {
+                    idle: Some(Duration::from_millis(1)),
+                    write_timeout: Some(Duration::from_millis(10)),
+                },
+                Instant::ZERO,
+            ),
+        );
+        session.settle().unwrap();
+        session.advance(Duration::from_millis(1)).unwrap();
+        assert_eq!(session.take_output(), b"last");
+        assert!(session.ended());
+        assert!(session.layer().is_terminal());
     }
 }
