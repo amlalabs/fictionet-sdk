@@ -3,7 +3,7 @@
 //! connection above.
 //!
 //! [`Observer`] is a [layer](fictionet::stdlib::layer) with whole captured
-//! packets below, as [`IpPacket::observed`] reads them, and the
+//! packets below, as [`ObservedIpPacket::observed`] reads them, and the
 //! [`TcpObserver`] port above. It puts each direction of each connection
 //! back in order and offers the connection as one child, opened with an
 //! [`ObservedConnection`] that names it. It only watches: it sends nothing
@@ -39,9 +39,9 @@
 //!   a time, giving its open directions [`Termination::Evicted`], and
 //!   releases what it held for it at once.
 //!
-//! Connections are keyed by scope, the pair of endpoints and generation, so
-//! the same addresses and ports inside a tunnel are a different connection
-//! from those outside it.
+//! Capture input selects a network before looking up a pair of endpoints.
+//! Each network owns its connections, while all networks share the capture's
+//! limits. Aggregate connection identities retain the network and generation.
 //!
 //! What the observer saw of each segment that is not part of a stream,
 //! such as its sequence numbers relative to the connection and whether it
@@ -53,7 +53,7 @@
 //! use fictionet::stdlib::layer::{Budget, Chunk, Driver, MuxEvent, ObservedEvent, PacketEvent, Admit};
 //! use fictionet::stdlib::network::ip::{self, protocol};
 //! use fictionet::stdlib::network::observer::Observer;
-//! use fictionet::stdlib::network::packet::{Ingress, IpPacket};
+//! use fictionet::stdlib::network::packet::{Ingress, ObservedIpPacket};
 //! use fictionet::time::Instant;
 //! use fictionet::{Seed, SeededEntropy};
 //!
@@ -64,7 +64,7 @@
 //!
 //! let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
 //! let mut tcp = Driver::new(Observer::default(), entropy, Budget::unlimited(), Instant::ZERO);
-//! let packet = IpPacket::observed(Chunk::new(packet.0), Ingress::default());
+//! let packet = ObservedIpPacket::observed(Chunk::new(packet.0), Ingress::default());
 //! assert!(matches!(tcp.deliver(PacketEvent::Packet(packet)), Ok(Admit::Taken)));
 //! let mut child = None;
 //! tcp.send_above(|event| {
@@ -99,7 +99,7 @@ use fictionet::stdlib::layer::{
     Top,
 };
 use fictionet::stdlib::network::ip::protocol;
-use fictionet::stdlib::network::packet::{IpPacket, Scope};
+use fictionet::stdlib::network::packet::{ObservedIpPacket, Scope};
 use fictionet::stdlib::network::transport::{ObservedConnection, TcpObserver};
 
 use flow::{ACK, Flow, RST, SYN, Segment, Step, Store};
@@ -187,8 +187,9 @@ pub enum ObserverReport {
     },
 }
 
-/// A connection's endpoints in a fixed order, the lower first, with its
-/// scope.
+/// Endpoints in a network's local table, with the lower endpoint first.
+type LocalKey = (SocketAddr, SocketAddr);
+/// A child's association with its network and local connection.
 type Key = (Scope, SocketAddr, SocketAddr);
 
 /// Each event a child has waiting counts this much towards
@@ -237,7 +238,7 @@ struct Output {
 /// The passive TCP observer. See the [module docs](self).
 pub struct Observer {
     store: Store,
-    connections: BTreeMap<Key, Connection>,
+    networks: BTreeMap<Scope, BTreeMap<LocalKey, Connection>>,
     children: Slots<Output>,
     /// Children opened, not yet taken.
     opened: VecDeque<MuxEvent<ObservedStream, Top, ObservedConnection>>,
@@ -264,7 +265,7 @@ impl Observer {
         limits.connections = limits.connections.max(1);
         Observer {
             store: Store { limits, held: 0 },
-            connections: BTreeMap::new(),
+            networks: BTreeMap::new(),
             children: Slots::new(limits.connections.saturating_mul(2)),
             opened: VecDeque::new(),
             ready: VecDeque::new(),
@@ -286,12 +287,12 @@ impl Observer {
 
     /// How many connections are followed, ended ones included.
     pub fn connections(&self) -> usize {
-        self.connections.len()
+        self.networks.values().map(BTreeMap::len).sum()
     }
 
     /// Takes one captured packet, once what the layer above left waiting
     /// fits [`Limits::waiting`].
-    fn packet(&mut self, env: &mut Env<'_, ObserverReport>, packet: &IpPacket) {
+    fn packet(&mut self, env: &mut Env<'_, ObserverReport>, packet: &ObservedIpPacket) {
         self.make_room();
         let Some(header) = packet.header() else {
             return;
@@ -366,7 +367,11 @@ impl Observer {
             Answer,
             Connection(u64),
         }
-        let opens = match self.connections.get(&key) {
+        let opens = match self
+            .networks
+            .get(&key.0)
+            .and_then(|network| network.get(&(key.1, key.2)))
+        {
             None => Opens::Connection(0),
             Some(connection) if syn => {
                 let d = index(direction(&connection.info, src));
@@ -391,7 +396,11 @@ impl Observer {
         match opens {
             Opens::Nothing => {}
             Opens::Answer => {
-                if let Some(connection) = self.connections.get_mut(&key) {
+                if let Some(connection) = self
+                    .networks
+                    .get_mut(&key.0)
+                    .and_then(|network| network.get_mut(&(key.1, key.2)))
+                {
                     let d = index(direction(&connection.info, src));
                     if let Some(old) = &mut connection.flows[d] {
                         old.end(&mut self.store);
@@ -402,13 +411,17 @@ impl Observer {
             Opens::Connection(generation) => {
                 if generation != 0 {
                     self.let_go(key, Termination::Replaced);
-                } else if self.connections.len() >= self.store.limits.connections {
+                } else if self.connections() >= self.store.limits.connections {
                     self.evict_oldest();
                 }
                 self.start(env, key, start(generation));
             }
         }
-        let Some(connection) = self.connections.get_mut(&key) else {
+        let Some(connection) = self
+            .networks
+            .get_mut(&key.0)
+            .and_then(|network| network.get_mut(&(key.1, key.2)))
+        else {
             return;
         };
         connection.last = self.tick;
@@ -535,8 +548,8 @@ impl Observer {
                 None
             }
         };
-        self.connections.insert(
-            key,
+        self.networks.entry(key.0).or_default().insert(
+            (key.1, key.2),
             Connection {
                 info,
                 flows: [None, None],
@@ -551,13 +564,23 @@ impl Observer {
     /// Evicts the connection seen longest ago.
     fn evict_oldest(&mut self) {
         let oldest = self
-            .connections
+            .networks
             .iter()
+            .flat_map(|(scope, network)| {
+                network
+                    .iter()
+                    .map(move |((a, b), connection)| ((*scope, *a, *b), connection))
+            })
             .min_by_key(|(_, connection)| connection.last)
-            .map(|(key, _)| *key);
+            .map(|(key, _)| key);
         if let Some(key) = oldest {
             self.let_go(key, Termination::Evicted);
-            self.connections.remove(&key);
+            if let Some(network) = self.networks.get_mut(&key.0) {
+                network.remove(&(key.1, key.2));
+                if network.is_empty() {
+                    self.networks.remove(&key.0);
+                }
+            }
         }
     }
 
@@ -565,7 +588,11 @@ impl Observer {
     /// with `cause`, it gives back what it held, and it stays only as the
     /// ended generation, which a new SYN replaces.
     fn let_go(&mut self, key: Key, cause: Termination) {
-        let Some(connection) = self.connections.get_mut(&key) else {
+        let Some(connection) = self
+            .networks
+            .get_mut(&key.0)
+            .and_then(|network| network.get_mut(&(key.1, key.2)))
+        else {
             return;
         };
         let mut events = Vec::new();
@@ -616,7 +643,10 @@ impl Observer {
 
     /// Stops only the generation still attached to this child.
     fn detach(&mut self, key: Key, child: ChildId) {
-        if let Some(connection) = self.connections.get_mut(&key)
+        if let Some(connection) = self
+            .networks
+            .get_mut(&key.0)
+            .and_then(|network| network.get_mut(&(key.1, key.2)))
             && connection.child == Some(child)
         {
             connection.child = None;
@@ -664,9 +694,17 @@ impl Observer {
     /// Finishes every connection at the end of the capture, in endpoint
     /// order.
     fn finish(&mut self) {
-        let keys: Vec<Key> = self.connections.keys().copied().collect();
+        let keys: Vec<Key> = self
+            .networks
+            .iter()
+            .flat_map(|(scope, network)| network.keys().map(move |(a, b)| (*scope, *a, *b)))
+            .collect();
         for key in keys {
-            let Some(connection) = self.connections.get_mut(&key) else {
+            let Some(connection) = self
+                .networks
+                .get_mut(&key.0)
+                .and_then(|network| network.get_mut(&(key.1, key.2)))
+            else {
                 continue;
             };
             let Some(child) = connection.child.take() else {
@@ -742,7 +780,7 @@ fn weight(event: &ObservedEvent) -> usize {
 }
 
 impl Layer for Observer {
-    type Lower = Packets<IpPacket, Infallible>;
+    type Lower = Packets<ObservedIpPacket, Infallible>;
     type Upper = TcpObserver;
     type Report = ObserverReport;
     type Timer = ();
@@ -757,8 +795,8 @@ impl Layer for Observer {
     fn on_event(
         &mut self,
         env: &mut Env<'_, ObserverReport>,
-        event: PacketEvent<IpPacket>,
-    ) -> Result<Admit<PacketEvent<IpPacket>>, Infallible> {
+        event: PacketEvent<ObservedIpPacket>,
+    ) -> Result<Admit<PacketEvent<ObservedIpPacket>>, Infallible> {
         if self.finished {
             return Ok(Admit::Closed(event));
         }

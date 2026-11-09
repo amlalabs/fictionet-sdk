@@ -36,7 +36,7 @@ use fictionet::stdlib::layer::{
 };
 use fictionet::stdlib::network::ip::Header;
 use fictionet::stdlib::network::observer::{self, Observer, ObserverReport};
-use fictionet::stdlib::network::packet::{Capture, Ingress, IpPacket, Scope};
+use fictionet::stdlib::network::packet::{Capture, Ingress, ObservedIpPacket, Scope};
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 
@@ -162,6 +162,12 @@ pub enum SummaryPriority {
 /// A decoded packet.
 #[derive(Debug, Default)]
 pub struct Decoded {
+    /// The capture association supplied with this observation.
+    pub ingress: Option<Ingress>,
+    /// This observation's number in the dissector's input order. Together
+    /// with `ingress`, records associate local source numbers with the
+    /// original capture, whose packet numbers may repeat across points.
+    pub observation: Option<u64>,
     /// Source endpoint.
     pub src: String,
     /// Destination endpoint.
@@ -385,7 +391,7 @@ impl Decoded {
 pub struct Dissector {
     observer: Driver<Observer>,
     connections: BTreeMap<ChildId, Watched>,
-    udp: BTreeMap<(Scope, SocketAddr, SocketAddr), Datagrams>,
+    udp: BTreeMap<Scope, BTreeMap<(SocketAddr, SocketAddr), Datagrams>>,
     registry: Registry,
     /// Packets decoded so far: the number of the last one.
     packets: u64,
@@ -468,6 +474,7 @@ fn ip_proto_name(p: u8) -> &'static str {
 struct DecodeContext<'a> {
     protocol: Option<&'a str>,
     complete: bool,
+    ingress: Ingress,
 }
 
 impl Dissector {
@@ -515,7 +522,8 @@ impl Dissector {
         self.decode_with(p, keys, None, true)
     }
 
-    /// Decodes a copy with its service identity and payload availability.
+    /// Decodes an unlabelled copy with its service identity and payload
+    /// availability. Use [`Self::decode_captured`] for capture provenance.
     pub fn decode_with(
         &mut self,
         p: &[u8],
@@ -523,9 +531,32 @@ impl Dissector {
         protocol: Option<&str>,
         complete: bool,
     ) -> Decoded {
+        let mut decoded = self.decode_captured(p, keys, protocol, complete, Ingress::default());
+        decoded.ingress = None;
+        decoded
+    }
+
+    /// Decodes an observation in its network and capture point. The caller
+    /// retains these identities across replacement tunnels and replay.
+    pub fn decode_captured(
+        &mut self,
+        p: &[u8],
+        keys: &[KeyLine],
+        protocol: Option<&str>,
+        complete: bool,
+        ingress: Ingress,
+    ) -> Decoded {
         self.packets += 1;
-        let context = DecodeContext { protocol, complete };
-        let mut d = Decoded::default();
+        let context = DecodeContext {
+            protocol,
+            complete: complete && ingress.capture.is_none_or(|c| c.original_len <= p.len()),
+            ingress,
+        };
+        let mut d = Decoded {
+            ingress: Some(ingress),
+            observation: Some(self.packets),
+            ..Decoded::default()
+        };
         match p.first().map(|b| b >> 4) {
             Some(4) => self.ipv4(p, &mut d, keys, context),
             Some(6) => self.ipv6(p, &mut d, keys, context),
@@ -752,19 +783,23 @@ impl Dissector {
         let (seq, ack, flags, win) = (sequence, acknowledgment, t[13], window);
         let payload = (at + off, end);
         // The observer gets what the copy holds of the packet: the headers
-        // alone when the payload is not all here. The dissector is given no
-        // capture times, and the observer reads none.
+        // alone when the payload is not all here.
         let held = if context.complete { p } else { &p[..at + off] };
-        let packet = IpPacket::observed(
+        let packet = ObservedIpPacket::observed(
             Chunk::new(held.to_vec()),
             Ingress {
-                scope: Scope::ROOT,
-                link: 0,
                 capture: Some(Capture {
                     number: self.packets,
-                    at: Instant::ZERO,
-                    original_len: p.len(),
+                    at: context
+                        .ingress
+                        .capture
+                        .map_or(Instant::ZERO, |capture| capture.at),
+                    original_len: context
+                        .ingress
+                        .capture
+                        .map_or(p.len(), |capture| capture.original_len),
                 }),
+                ..context.ingress
             },
         );
         let (reports, seen) = self.observe(PacketEvent::Packet(packet));
@@ -875,7 +910,10 @@ impl Dissector {
     /// Hands the TCP observer `event`, and takes what comes up: its
     /// reports, and what its connections carry, for [`apply`](Self::apply).
     /// A connection the observer opens gets credit for all it sends.
-    fn observe(&mut self, event: PacketEvent<IpPacket>) -> (Vec<ObserverReport>, Vec<Observation>) {
+    fn observe(
+        &mut self,
+        event: PacketEvent<ObservedIpPacket>,
+    ) -> (Vec<ObserverReport>, Vec<Observation>) {
         match self.observer.deliver(event) {
             Ok(_) => {}
             Err(never) => match never {},
@@ -1077,27 +1115,43 @@ impl Dissector {
             SocketAddr::new(header.src, sport),
             SocketAddr::new(header.dst, dport),
         );
-        let key = if src <= dst {
-            (Scope::ROOT, src, dst)
-        } else {
-            (Scope::ROOT, dst, src)
-        };
-        if !self.udp.contains_key(&key) && self.udp.len() >= UDP_CONVERSATIONS {
+        let scope = context.ingress.scope;
+        let key = if src <= dst { (src, dst) } else { (dst, src) };
+        if !self
+            .udp
+            .get(&scope)
+            .is_some_and(|network| network.contains_key(&key))
+            && self.udp.values().map(BTreeMap::len).sum::<usize>() >= UDP_CONVERSATIONS
+        {
             let oldest = self
                 .udp
                 .iter()
+                .flat_map(|(scope, network)| {
+                    network
+                        .iter()
+                        .map(move |(key, conversation)| ((*scope, *key), conversation))
+                })
                 .min_by_key(|(_, conversation)| conversation.last)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                self.udp.remove(&oldest);
+                .map(|(key, _)| key);
+            if let Some((scope, key)) = oldest {
+                let network = self.udp.get_mut(&scope).expect("the oldest network exists");
+                network.remove(&key);
+                if network.is_empty() {
+                    self.udp.remove(&scope);
+                }
             }
         }
-        let conversation = self.udp.entry(key).or_insert_with(|| Datagrams {
-            first: src,
-            ports: (sport, dport),
-            protocol: None,
-            last: 0,
-        });
+        let conversation = self
+            .udp
+            .entry(scope)
+            .or_default()
+            .entry(key)
+            .or_insert_with(|| Datagrams {
+                first: src,
+                ports: (sport, dport),
+                protocol: None,
+                last: 0,
+            });
         conversation.last = self.packets;
         let reverse = src != conversation.first;
         if conversation.protocol.is_none() {
@@ -1338,6 +1392,119 @@ fn push_hex(out: &mut String, b: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_context_separates_overlapping_connections_and_keeps_packet_identity() {
+        let mut dissector = Dissector::default();
+        let scopes = fictionet::stdlib::network::packet::Scopes::default();
+        let networks = [Scope::ROOT, scopes.tunnel(), scopes.tunnel()];
+        let syn = tcp(40000, 80, 100, 0x02, b"");
+        for (index, scope) in networks.into_iter().enumerate() {
+            let ingress = Ingress {
+                scope,
+                link: 7,
+                capture: Some(Capture {
+                    number: 100 + index as u64,
+                    at: Instant::ZERO + std::time::Duration::from_secs(9),
+                    original_len: syn.len(),
+                }),
+            };
+            let decoded = dissector.decode_captured(&syn, &[], None, true, ingress);
+            assert_eq!(decoded.ingress, Some(ingress));
+            assert_eq!(dissector.observer.layer().connections(), index + 1);
+            let replacement = Ingress {
+                link: 19,
+                ..ingress
+            };
+            dissector.decode_captured(&syn, &[], None, true, replacement);
+            assert_eq!(dissector.observer.layer().connections(), index + 1);
+        }
+        for scope in networks {
+            let request = tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n");
+            let ingress = Ingress {
+                scope,
+                link: 19,
+                capture: Some(Capture {
+                    number: 900,
+                    at: Instant::ZERO,
+                    original_len: request.len(),
+                }),
+            };
+            let decoded = dissector.decode_captured(&request, &[], None, true, ingress);
+            assert!(!decoded.tags.contains(&"retransmission"));
+            assert!(decoded.level() > 0);
+            assert!(decoded.extra.is_empty());
+        }
+    }
+
+    #[test]
+    fn capture_wire_length_prevents_decoding_missing_payload() {
+        let request = tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n");
+        let ingress = Ingress {
+            capture: Some(Capture {
+                number: 7,
+                at: Instant::ZERO,
+                original_len: request.len() + 10,
+            }),
+            ..Ingress::default()
+        };
+        let decoded = Dissector::default().decode_captured(&request, &[], None, true, ingress);
+        assert_eq!(decoded.level(), 0);
+        assert_eq!(decoded.ingress, Some(ingress));
+    }
+
+    #[test]
+    fn repeated_capture_numbers_do_not_alias_buffered_observations() {
+        let mut dissector = Dissector::default();
+        let first = b"GET /first HTTP/1.1\r\n\r\n";
+        let second = b"GET /second HTTP/1.1\r\n\r\n";
+        let packets = [
+            tcp(40000, 80, 100, 0x02, b""),
+            tcp(40000, 80, 101 + first.len() as u32, 0x18, second),
+            tcp(40000, 80, 101, 0x18, first),
+        ];
+        let mut result = Decoded::default();
+        let mut observations = std::collections::BTreeSet::new();
+        for (index, packet) in packets.iter().enumerate() {
+            let ingress = Ingress {
+                link: index as u32,
+                capture: Some(Capture {
+                    number: 7,
+                    at: Instant::ZERO,
+                    original_len: packet.len(),
+                }),
+                ..Ingress::default()
+            };
+            result = dissector.decode_captured(packet, &[], None, true, ingress);
+            assert_eq!(result.ingress, Some(ingress));
+            assert!(observations.insert(result.observation.unwrap()));
+        }
+        let application: Vec<_> = result
+            .layers
+            .iter()
+            .filter(|layer| layer.name == "Hypertext Transfer Protocol")
+            .collect();
+        assert_eq!(application.len(), 2);
+        assert_eq!(application[0].buf, 0);
+        assert_ne!(application[1].buf, 0);
+    }
+
+    #[test]
+    fn capture_networks_keep_udp_conversations_separate_with_one_limit() {
+        let mut dissector = Dissector::default();
+        let scopes = fictionet::stdlib::network::packet::Scopes::default();
+        let packet = udp4(([10, 0, 0, 2], 40000), ([10, 0, 0, 1], 9000), b"data");
+        for index in 0..UDP_CONVERSATIONS + 3 {
+            let ingress = Ingress {
+                scope: scopes.tunnel(),
+                ..Ingress::default()
+            };
+            dissector.decode_captured(&packet, &[], None, true, ingress);
+            let count = dissector.udp.values().map(BTreeMap::len).sum::<usize>();
+            assert_eq!(count, (index + 1).min(UDP_CONVERSATIONS));
+            assert_eq!(dissector.udp.len(), count);
+        }
+    }
 
     fn ipv4(proto: u8, src: [u8; 4], dst: [u8; 4], body: &[u8]) -> Vec<u8> {
         let mut p = vec![0x45, 0, 0, 0, 0, 1, 0x40, 0, 64, proto, 0, 0];
@@ -2057,10 +2224,18 @@ mod tests {
         for port in 0..300 {
             let d = dis.decode(&udp4(([10, 0, 0, 2], 1000 + port), server, &q), &[]);
             assert_eq!(d.proto, "DNS");
-            assert!(dis.udp.len() <= UDP_CONVERSATIONS);
+            assert!(dis.udp.values().map(BTreeMap::len).sum::<usize>() <= UDP_CONVERSATIONS);
         }
-        assert_eq!(dis.udp.len(), UDP_CONVERSATIONS);
-        assert!(!dis.udp.keys().any(|(_, low, _)| low.port() == 999));
+        assert_eq!(
+            dis.udp.values().map(BTreeMap::len).sum::<usize>(),
+            UDP_CONVERSATIONS
+        );
+        assert!(
+            !dis.udp
+                .values()
+                .flat_map(BTreeMap::keys)
+                .any(|(low, _)| low.port() == 999)
+        );
         assert_eq!(
             dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q), &[])
                 .proto,
