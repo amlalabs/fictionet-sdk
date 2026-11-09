@@ -187,16 +187,39 @@ pub(super) struct Dev {
     /// Packets the endpoint has looked at, for the layer below to take.
     out: VecDeque<Vec<u8>>,
     /// Buffers of packets smoltcp has read, for the packets it sends.
-    spare: Vec<Vec<u8>>,
+    spare: Spare,
     /// The buffer of the packet smoltcp is reading, once it is done.
     read: Option<Vec<u8>>,
 }
 
-/// How many read buffers the device keeps for sending.
-const SPARE_PACKETS: usize = EGRESS_PACKETS;
+/// The pool of packet buffers an engine keeps: those of the packets it has
+/// read, emptied, for the packets it sends. Bounded in number and size, so
+/// an engine holds at most `PACKETS * BYTES` of them.
+#[derive(Default)]
+struct Spare(Vec<Vec<u8>>);
 
-/// The largest read buffer it keeps.
-const SPARE_BYTES: usize = 16 * 1024;
+impl Spare {
+    /// How many buffers it keeps.
+    const PACKETS: usize = EGRESS_PACKETS;
+
+    /// The largest buffer it keeps.
+    const BYTES: usize = 16 * 1024;
+
+    /// Keeps a buffer, if there is room for one of its size.
+    fn keep(&mut self, mut buffer: Vec<u8>) {
+        if self.0.len() < Self::PACKETS && buffer.capacity() <= Self::BYTES {
+            buffer.clear();
+            self.0.push(buffer);
+        }
+    }
+
+    /// A zeroed buffer of `len` bytes: a kept one when there is one.
+    fn take(&mut self, len: usize) -> Vec<u8> {
+        let mut buffer = self.0.pop().unwrap_or_default();
+        buffer.resize(len, 0);
+        buffer
+    }
+}
 
 impl Dev {
     /// Whether the output allowance is used up: smoltcp may not send
@@ -205,18 +228,10 @@ impl Dev {
         self.tx.len() + self.out.len() >= EGRESS_PACKETS
     }
 
-    /// Keeps the buffer of a packet that was read, or not read, for sending.
-    fn keep(&mut self, mut buffer: Vec<u8>) {
-        if self.spare.len() < SPARE_PACKETS && buffer.capacity() <= SPARE_BYTES {
-            buffer.clear();
-            self.spare.push(buffer);
-        }
-    }
-
-    /// Takes back the buffer of the packet smoltcp read, if it read one.
+    /// Takes back the buffer of the packet smoltcp read, or did not read.
     fn reclaim(&mut self) {
         if let Some(buffer) = self.read.take().or_else(|| self.rx.take()) {
-            self.keep(buffer);
+            self.spare.keep(buffer);
         }
     }
 }
@@ -228,7 +243,7 @@ pub(super) struct Rx<'a> {
 
 pub(super) struct Tx<'a> {
     tx: &'a mut Vec<Vec<u8>>,
-    spare: &'a mut Vec<Vec<u8>>,
+    spare: &'a mut Spare,
 }
 
 impl RxToken for Rx<'_> {
@@ -241,8 +256,7 @@ impl RxToken for Rx<'_> {
 
 impl TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut buf = self.spare.pop().unwrap_or_default();
-        buf.resize(len, 0);
+        let mut buf = self.spare.take(len);
         let r = f(&mut buf);
         self.tx.push(buf);
         r
