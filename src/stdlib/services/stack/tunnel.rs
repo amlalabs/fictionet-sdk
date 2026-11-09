@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use super::Job;
-use fictionet::Cx;
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Chunk, CommandOf, Env, EventOf, Layer, StreamCommand, StreamEvent,
     Successor, Top,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::sync::Mutex;
+use fictionet::{CancelWait, Cx};
 
 /// The most bytes each way a tunnel holds before it stops taking more.
 const ROOM: usize = 64 * 1024;
@@ -29,7 +29,8 @@ type Start =
 /// stream's bytes from below and whose writes go down the stream, so the
 /// code runs over whatever carries the stream: TCP, TLS, or a CONNECT
 /// inside TLS. Each way holds at most 64 KiB; past that, the stream's input
-/// waits and the code's writes wait. Dropping the connection ends the
+/// waits and the code's writes wait. A flush finishes once the stream
+/// below reports every byte written. Dropping the connection ends the
 /// stream's direction, and the stream's end or reset reaches the code's
 /// reads. What the code writes is charged to the stack's budget.
 pub struct Tunnel {
@@ -48,6 +49,9 @@ struct Shared {
     /// Bytes the code wrote that have not gone down.
     outbound: VecDeque<Chunk>,
     outbound_len: usize,
+    /// Bytes the code wrote that the stream below has not reported
+    /// written: still queued here, or on their way down.
+    unwritten: u64,
     /// The code will write nothing more.
     finished: bool,
     /// The application released its connection.
@@ -57,6 +61,8 @@ struct Shared {
     budget: Option<Budget>,
     reader: Option<Waker>,
     writer: Option<Waker>,
+    /// The code's flush, waiting for its bytes to go down.
+    flusher: Option<Waker>,
     gone: Option<Waker>,
     /// Whatever runs the stack, to wake when the code writes from
     /// elsewhere.
@@ -65,9 +71,14 @@ struct Shared {
 
 impl Shared {
     fn wake_code(&mut self) {
-        for waker in [self.reader.take(), self.writer.take(), self.gone.take()]
-            .into_iter()
-            .flatten()
+        for waker in [
+            self.reader.take(),
+            self.writer.take(),
+            self.flusher.take(),
+            self.gone.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             waker.wake();
         }
@@ -96,12 +107,14 @@ impl Tunnel {
                 reset: false,
                 outbound: VecDeque::new(),
                 outbound_len: 0,
+                unwritten: 0,
                 finished: false,
                 released: false,
                 end_sent: false,
                 budget: None,
                 reader: None,
                 writer: None,
+                flusher: None,
                 gone: None,
                 runner: None,
             })),
@@ -157,7 +170,7 @@ impl Layer for Tunnel {
                 shared.inbound_len += chunk.len();
                 shared.inbound.push_back(chunk);
             }
-            StreamEvent::Written(_) => {}
+            StreamEvent::Written(n) => shared.unwritten = shared.unwritten.saturating_sub(n),
             StreamEvent::Ended => shared.ended = true,
             StreamEvent::Reset => shared.reset = true,
         }
@@ -236,6 +249,7 @@ impl Job for Takeover {
             };
             let conn = Box::new(TunnelConn {
                 shared: self.shared.clone(),
+                flush_wait: CancelWait::default(),
             });
             self.running = Some(takeover(fcx.clone(), conn));
         }
@@ -253,6 +267,7 @@ impl Job for Takeover {
 /// The stream as the code sees it.
 struct TunnelConn {
     shared: Arc<Mutex<Shared>>,
+    flush_wait: CancelWait,
 }
 
 impl Connection for TunnelConn {
@@ -320,9 +335,28 @@ impl Connection for TunnelConn {
             None => Chunk::new(bytes),
         };
         shared.outbound_len += n;
+        shared.unwritten += n as u64;
         shared.outbound.push_back(chunk);
         shared.wake_runner();
         Poll::Ready(Ok(n))
+    }
+
+    /// Ready once the stream below has reported every byte written:
+    /// leaving the queue is not enough, as the bytes may still wait below.
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+        let mut shared = self.shared.lock();
+        if shared.unwritten == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if shared.reset {
+            return Poll::Ready(Err(ConnError::Reset));
+        }
+        shared.flusher = Some(cx.waker().clone());
+        drop(shared);
+        if fcx.register_cancel(cx.waker(), &mut self.flush_wait) {
+            return Poll::Ready(Err(ConnError::Cancelled));
+        }
+        Poll::Pending
     }
 
     fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
@@ -348,5 +382,94 @@ impl Drop for TunnelConn {
         shared.finished = true;
         shared.released = true;
         shared.wake_runner();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::layer::Harness;
+    use crate::stdlib::network::ConnectionExt;
+    use crate::stdlib::services::stack::Polling;
+    use fictionet::{Seed, block_on, lab};
+
+    type Outcome = Arc<Mutex<Option<Result<(), ConnError>>>>;
+
+    /// Runs `tunnel` in the world of `fcx`, its writes held back.
+    fn held(fcx: &Cx, tunnel: Tunnel) -> Harness<Tunnel> {
+        let mut harness =
+            Harness::new(Seed::from_u64(1), tunnel).with_worker(Polling::in_world(fcx.clone()));
+        harness.withhold();
+        harness.settle().unwrap();
+        harness
+    }
+
+    /// Writes `data` and notes how its flush ended.
+    fn writes(data: &'static [u8], outcome: Outcome) -> Tunnel {
+        Tunnel::new(move |fcx, mut conn| async move {
+            let flushed = conn.write_all(&fcx, data).await;
+            *outcome.lock() = Some(flushed);
+        })
+    }
+
+    /// A flush waits until every byte written has gone down the stream,
+    /// not just into the tunnel's queue.
+    #[test]
+    fn a_flush_waits_until_the_bytes_go_down_the_stream() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let outcome = Outcome::default();
+            let mut tunnel = held(&fcx, writes(b"hello", outcome.clone()));
+            assert!(outcome.lock().is_none(), "nothing went down");
+            tunnel.allow(1).unwrap();
+            assert!(!tunnel.output().is_empty());
+            assert!(outcome.lock().is_none(), "only part went down");
+            tunnel.allow_all().unwrap();
+            assert_eq!(*outcome.lock(), Some(Ok(())));
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A reset while a flush waits fails the flush: the bytes never went
+    /// down.
+    #[test]
+    fn a_reset_fails_a_waiting_flush() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let outcome = Outcome::default();
+            let mut tunnel = held(&fcx, writes(b"hello", outcome.clone()));
+            let _ = tunnel.driver().deliver(StreamEvent::Reset).unwrap();
+            tunnel.settle().unwrap();
+            assert_eq!(*outcome.lock(), Some(Err(ConnError::Reset)));
+            assert!(tunnel.output().is_empty());
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A flush that waits in a cancelled region stops with the cancel.
+    #[test]
+    fn a_flush_waiting_in_a_cancelled_region_stops() {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let slot = Arc::new(Mutex::new(None));
+            let kept = slot.clone();
+            let tunnel = held(
+                &fcx,
+                Tunnel::new(move |_, conn| {
+                    *kept.lock() = Some(conn);
+                    async {}
+                }),
+            );
+            let mut conn = slot.lock().take().expect("the takeover ran");
+            let region = fcx.job_context();
+            conn.write(&region, b"hello").await.unwrap();
+            region.cancel();
+            assert_eq!(conn.flush(&region).await, Err(ConnError::Cancelled));
+            drop(tunnel);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
     }
 }
