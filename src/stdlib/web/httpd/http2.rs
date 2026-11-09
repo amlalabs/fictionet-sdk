@@ -128,7 +128,8 @@ pub struct Http2 {
     goaway_last: Option<u32>,
     up: VecDeque<MuxEvent<HttpExchange, Top, Opening>>,
     out: VecDeque<StreamCommand>,
-    out_bytes: usize,
+    /// Bytes queued for the transport whose completion has not come.
+    unwritten_bytes: usize,
     /// What was queued, in order, for the transport's completions.
     sent: VecDeque<Piece>,
     /// The streams a completion touched and finished: kept between
@@ -155,32 +156,61 @@ enum Phase {
 struct Stream {
     child: ChildId,
     _entry: Charge,
+    /// A release has taken the stream in. A client reset of a stream not
+    /// yet taken in counts toward the pending reset limit.
     accepted: bool,
-    recv_closed: bool,
-    remaining: Option<u64>,
-    recv_window: i32,
-    /// Bytes of DATA frames waiting in `pending` for the child's credit:
-    /// they count against the receive windows until they go up.
-    held: u32,
+    receive: Receive,
+    delivery: Delivery,
+    response: Response,
+}
+
+/// The request as it comes off the wire, within the stream's receive
+/// window.
+struct Receive {
+    /// The client sent the request's end.
+    closed: bool,
+    /// The body bytes `content-length` still promises.
+    content_remaining: Option<u64>,
+    /// The bytes the client may still send on the stream.
+    window: i32,
+}
+
+/// The request on its way up to the child, within the credit the child
+/// grants.
+struct Delivery {
+    /// What waits for the child's credit, in order.
+    pending: VecDeque<ExchangeEvent>,
+    /// Bytes of DATA frames waiting in `pending`: they count against the
+    /// receive windows until they go up.
+    windowed_bytes: u32,
     /// Bytes waiting in `pending` that came outside the receive windows:
     /// the body an `Upgrade: h2c` request brought over HTTP/1. They are
     /// first in `pending`, ahead of any DATA.
-    outside: u64,
-    /// Credit the child granted for its events.
-    credit: u64,
+    unwindowed_bytes: u64,
+    /// Credit the child granted that its events have not used.
+    credit_bytes: u64,
     /// The most credit the child has held at once: its window. Its credit
     /// is back at the peak once it has read all it was given.
-    peak: u64,
+    peak_credit_bytes: u64,
+    /// The child has granted credit at least once.
     credited: bool,
-    pending: VecDeque<ExchangeEvent>,
+    /// The connection could not hold the body: the rest of it is dropped.
     overflow: bool,
-    send_window: i32,
-    /// Credit the child holds for its body.
-    granted: u64,
-    out: VecDeque<Chunk>,
-    out_bytes: u64,
+}
+
+/// The response on its way out, within the client's send windows.
+struct Response {
+    /// The bytes the client lets the server send on the stream.
+    window: i32,
+    /// Body credit the child holds: the bytes it may still send down.
+    credit_bytes: u64,
+    /// Body bytes the child sent that wait to be framed.
+    queue: VecDeque<Chunk>,
+    /// The bytes in `queue`.
+    queued_bytes: u64,
+    /// Body bytes whose whole frames the transport took.
+    written_bytes: u64,
     reply: Reply,
-    written: u64,
 }
 
 enum Reply {
@@ -246,7 +276,7 @@ impl Http2 {
             goaway_last: None,
             up: VecDeque::new(),
             out: VecDeque::new(),
-            out_bytes: 0,
+            unwritten_bytes: 0,
             sent: VecDeque::new(),
             touched: Vec::new(),
             finished: Vec::new(),
@@ -353,7 +383,7 @@ impl Http2 {
             // The request came whole over HTTP/1: stream 1 is half closed
             // from the client's side (RFC 7540 section 3.2).
             if let Some(stream) = self.streams.get_mut(&1) {
-                stream.recv_closed = true;
+                stream.receive.closed = true;
             }
             if admitted && let Some(mut chunk) = body {
                 if chunk.reserve(env.budget()) {
@@ -383,7 +413,7 @@ impl Http2 {
 
     fn push_piece(&mut self, chunk: Chunk, stream: u32, body: u64, end: bool, continues: bool) {
         let bytes = chunk.len();
-        self.out_bytes += bytes;
+        self.unwritten_bytes += bytes;
         self.sent.push_back(Piece {
             stream,
             bytes: bytes as u64,
@@ -485,7 +515,7 @@ impl Http2 {
         let first = self.sent.len() - self.out.len();
         let keep = usize::from(self.sent.get(first).is_some_and(|piece| piece.continues));
         for piece in self.sent.drain(first + keep..) {
-            self.out_bytes -= piece.bytes as usize;
+            self.unwritten_bytes -= piece.bytes as usize;
         }
         self.out.truncate(keep);
         if let Some(charge) = self.last_words.take() {
@@ -583,22 +613,28 @@ impl Http2 {
                 child: child_id,
                 _entry: entry,
                 accepted: false,
-                recv_closed: ended,
-                remaining,
-                recv_window: WINDOW,
-                held: 0,
-                outside: 0,
-                credit: 0,
-                peak: 0,
-                credited: false,
-                pending: VecDeque::new(),
-                overflow: false,
-                send_window: self.initial,
-                granted: SEND_CREDIT,
-                out: VecDeque::new(),
-                out_bytes: 0,
-                reply: Reply::Waiting,
-                written: 0,
+                receive: Receive {
+                    closed: ended,
+                    content_remaining: remaining,
+                    window: WINDOW,
+                },
+                delivery: Delivery {
+                    pending: VecDeque::new(),
+                    windowed_bytes: 0,
+                    unwindowed_bytes: 0,
+                    credit_bytes: 0,
+                    peak_credit_bytes: 0,
+                    credited: false,
+                    overflow: false,
+                },
+                response: Response {
+                    window: self.initial,
+                    credit_bytes: SEND_CREDIT,
+                    queue: VecDeque::new(),
+                    queued_bytes: 0,
+                    written_bytes: 0,
+                    reply: Reply::Waiting,
+                },
             },
         );
         self.up
@@ -614,8 +650,8 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        stream.held += event.credit() as u32;
-        stream.pending.push_back(event);
+        stream.delivery.windowed_bytes += event.credit() as u32;
+        stream.delivery.pending.push_back(event);
         self.forward(id);
     }
 
@@ -625,8 +661,11 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        stream.outside += chunk.len() as u64;
-        stream.pending.push_back(ExchangeEvent::Data(chunk));
+        stream.delivery.unwindowed_bytes += chunk.len() as u64;
+        stream
+            .delivery
+            .pending
+            .push_back(ExchangeEvent::Data(chunk));
         self.forward(id);
     }
 
@@ -637,22 +676,23 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        while let Some(event) = stream.pending.front_mut() {
+        let delivery = &mut stream.delivery;
+        while let Some(event) = delivery.pending.front_mut() {
             let cost = event.credit();
-            let event = if cost <= stream.credit {
-                stream.pending.pop_front().expect("a pending event")
+            let event = if cost <= delivery.credit_bytes {
+                delivery.pending.pop_front().expect("a pending event")
             } else if let ExchangeEvent::Data(chunk) = event
-                && stream.credit > 0
+                && delivery.credit_bytes > 0
             {
-                ExchangeEvent::Data(chunk.split_to(stream.credit as usize))
+                ExchangeEvent::Data(chunk.split_to(delivery.credit_bytes as usize))
             } else {
                 break;
             };
             let cost = event.credit();
-            stream.credit -= cost;
-            let outside = cost.min(stream.outside);
-            stream.outside -= outside;
-            stream.held -= (cost - outside) as u32;
+            delivery.credit_bytes -= cost;
+            let unwindowed = cost.min(delivery.unwindowed_bytes);
+            delivery.unwindowed_bytes -= unwindowed;
+            delivery.windowed_bytes -= (cost - unwindowed) as u32;
             self.up.push_back(MuxEvent::Child(stream.child, event));
         }
     }
@@ -663,7 +703,7 @@ impl Http2 {
             return;
         };
         // What it held is dropped: its credit may be due.
-        self.batch |= stream.held > 0;
+        self.batch |= stream.delivery.windowed_bytes > 0;
         if let Some(children) = &mut self.children {
             children.remove(stream.child);
         }
@@ -671,7 +711,7 @@ impl Http2 {
             stream.child,
             ExchangeEvent::Closed {
                 why,
-                written: stream.written,
+                written: stream.response.written_bytes,
             },
         ));
     }
@@ -724,20 +764,21 @@ impl Http2 {
             }
         }
         if let Some(stream) = self.streams.get(&id) {
-            if stream.recv_closed {
+            if stream.receive.closed {
                 return self.reset(env, id, ErrorCode::StreamClosed);
             }
             if !read.end || !valid_trailers(&block) {
                 return self.reset(env, id, ErrorCode::ProtocolError);
             }
-            if stream.remaining.is_some_and(|n| n != 0) {
+            if stream.receive.content_remaining.is_some_and(|n| n != 0) {
                 return self.reset(env, id, ErrorCode::ProtocolError);
             }
             let trailers = trailer_map(block);
             self.streams
                 .get_mut(&id)
                 .expect("an open stream")
-                .recv_closed = true;
+                .receive
+                .closed = true;
             self.tell(id, ExchangeEvent::Trailers(Box::new(trailers)));
             return Ok(());
         }
@@ -821,14 +862,15 @@ impl Http2 {
             }
             return self.reset(env, id, ErrorCode::StreamClosed);
         };
-        if stream.recv_closed {
+        let receive = &mut stream.receive;
+        if receive.closed {
             return self.reset(env, id, ErrorCode::StreamClosed);
         }
-        stream.recv_window -= size as i32;
-        if stream.recv_window < 0 {
+        receive.window -= size as i32;
+        if receive.window < 0 {
             return self.reset(env, id, ErrorCode::FlowControlError);
         }
-        if let Some(remaining) = &mut stream.remaining {
+        if let Some(remaining) = &mut receive.content_remaining {
             let Some(n) = remaining.checked_sub(data.data.len() as u64) else {
                 return self.reset(env, id, ErrorCode::ProtocolError);
             };
@@ -838,8 +880,8 @@ impl Http2 {
             }
         }
         let end = data.flags & 1 != 0;
-        stream.recv_closed = end;
-        if !data.data.is_empty() && !stream.overflow {
+        receive.closed = end;
+        if !data.data.is_empty() && !stream.delivery.overflow {
             match env.budget().charge(data.data.capacity()) {
                 Some(charge) => {
                     let chunk = Chunk::with_charge(data.data, charge);
@@ -849,7 +891,8 @@ impl Http2 {
                     // The body is the stream's alone to lose: its child
                     // answers, and the other streams go on.
                     let dropped = data.data.len() as u64;
-                    self.streams.get_mut(&id).expect("an open stream").overflow = true;
+                    let stream = self.streams.get_mut(&id).expect("an open stream");
+                    stream.delivery.overflow = true;
                     self.tell(id, ExchangeEvent::Overflow(dropped));
                 }
             }
@@ -867,7 +910,7 @@ impl Http2 {
             4 => {
                 let initial = setting.value as i32;
                 for stream in self.streams.values_mut() {
-                    stream.send_window = shifted(stream.send_window, self.initial, initial)
+                    stream.response.window = shifted(stream.response.window, self.initial, initial)
                         .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "initial window overflow")
                         })?;
@@ -949,8 +992,8 @@ impl Http2 {
                             problem(ErrorCode::FlowControlError, "connection window overflow")
                         })?;
                 } else if let Some(stream) = self.streams.get_mut(&update.stream) {
-                    if let Some(n) = grown(stream.send_window, update.increment) {
-                        stream.send_window = n;
+                    if let Some(n) = grown(stream.response.window, update.increment) {
+                        stream.response.window = n;
                     } else {
                         self.reset(env, update.stream, ErrorCode::FlowControlError)?;
                     }
@@ -1056,7 +1099,9 @@ impl Http2 {
     fn read(&mut self, env: &mut Env<'_, Report>) -> (bool, bool) {
         let mut moved = false;
         for _ in 0..FRAMES {
-            if self.phase != Phase::Open || self.up.len() >= UP_LIMIT || self.out_bytes >= OUT_LIMIT
+            if self.phase != Phase::Open
+                || self.up.len() >= UP_LIMIT
+                || self.unwritten_bytes >= OUT_LIMIT
             {
                 return (moved, false);
             }
@@ -1100,7 +1145,11 @@ impl Http2 {
     /// has left, as h2 does, so many small frames share one WINDOW_UPDATE.
     /// Streams opened in the batch are taken in.
     fn release(&mut self, env: &mut Env<'_, Report>) -> bool {
-        let held: i64 = self.streams.values().map(|s| i64::from(s.held)).sum();
+        let held: i64 = self
+            .streams
+            .values()
+            .map(|s| i64::from(s.delivery.windowed_bytes))
+            .sum();
         if let Some(back) = credit_back(self.recv_window, i64::from(WINDOW) - held) {
             if !self.window_update(env, 0, back) {
                 return true;
@@ -1115,16 +1164,18 @@ impl Http2 {
             // all it was given, the client may send what it can take. A
             // child that stops reading stops its stream, and only its
             // stream.
-            if stream.credit < stream.peak {
+            let delivery = &stream.delivery;
+            if delivery.credit_bytes < delivery.peak_credit_bytes {
                 continue;
             }
-            let room = (stream.credit.min(WINDOW as u64) as i64) - i64::from(stream.held);
-            if let Some(back) = credit_back(stream.recv_window, room) {
+            let room = (delivery.credit_bytes.min(WINDOW as u64) as i64)
+                - i64::from(delivery.windowed_bytes);
+            if let Some(back) = credit_back(stream.receive.window, room) {
                 if !self.window_update(env, id, back) {
                     return true;
                 }
                 if let Some(stream) = self.streams.get_mut(&id) {
-                    stream.recv_window += back as i32;
+                    stream.receive.window += back as i32;
                 }
             }
         }
@@ -1155,21 +1206,22 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        let body = matches!(stream.reply, Reply::Body);
+        let response = &mut stream.response;
+        let body = matches!(response.reply, Reply::Body);
         match command {
             ExchangeCommand::Reset(code) => self.write_reset(env, id, code),
-            ExchangeCommand::Head(head) if matches!(stream.reply, Reply::Waiting) => {
+            ExchangeCommand::Head(head) if matches!(response.reply, Reply::Waiting) => {
                 self.response_head(env, id, *head);
             }
-            ExchangeCommand::Data(chunk) if body && chunk.len() as u64 <= stream.granted => {
-                stream.granted -= chunk.len() as u64;
-                stream.out_bytes += chunk.len() as u64;
-                stream.out.push_back(chunk);
+            ExchangeCommand::Data(chunk) if body && chunk.len() as u64 <= response.credit_bytes => {
+                response.credit_bytes -= chunk.len() as u64;
+                response.queued_bytes += chunk.len() as u64;
+                response.queue.push_back(chunk);
             }
             ExchangeCommand::Trailers(trailers) if body => {
-                stream.reply = Reply::Ending(Some(trailers));
+                response.reply = Reply::Ending(Some(trailers));
             }
-            ExchangeCommand::End if body => stream.reply = Reply::Ending(None),
+            ExchangeCommand::End if body => response.reply = Reply::Ending(None),
             // A child that answers out of order, or past its credit, broke
             // its exchange: the stream alone is reset.
             _ => self.write_reset(env, id, ErrorCode::InternalError),
@@ -1184,7 +1236,7 @@ impl Http2 {
         if self.header_block(env, id, &fields, head.end)
             && let Some(stream) = self.streams.get_mut(&id)
         {
-            stream.reply = if head.end { Reply::Ended } else { Reply::Body };
+            stream.response.reply = if head.end { Reply::Ended } else { Reply::Body };
         }
     }
 
@@ -1261,7 +1313,7 @@ impl Http2 {
                 while from <= high
                     && let Some(id) = self.streams.range(from..=high).next().map(|(id, _)| *id)
                 {
-                    if self.out_bytes >= OUT_LIMIT || self.phase != Phase::Open {
+                    if self.unwritten_bytes >= OUT_LIMIT || self.phase != Phase::Open {
                         return moved;
                     }
                     if self.send_one(env, id) {
@@ -1289,17 +1341,18 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return false;
         };
-        if let Some(front) = stream.out.front_mut() {
-            let n = sendable(front.len(), window, stream.send_window, frame);
+        let response = &mut stream.response;
+        if let Some(front) = response.queue.front_mut() {
+            let n = sendable(front.len(), window, response.window, frame);
             if n == 0 {
                 return false;
             }
             let payload = front.split_to(n);
             if front.is_empty() {
-                stream.out.pop_front();
+                response.queue.pop_front();
             }
-            stream.send_window -= n as i32;
-            stream.out_bytes -= n as u64;
+            response.window -= n as i32;
+            response.queued_bytes -= n as u64;
             self.send_window -= n as i32;
             let Some(charge) = env.budget().charge(wire::HEADER_LEN) else {
                 self.over_budget(env);
@@ -1319,7 +1372,7 @@ impl Http2 {
             self.grant(id);
             return true;
         }
-        match std::mem::replace(&mut stream.reply, Reply::Ended) {
+        match std::mem::replace(&mut response.reply, Reply::Ended) {
             Reply::Ending(None) => {
                 self.frame_for(
                     env,
@@ -1341,7 +1394,7 @@ impl Http2 {
                 true
             }
             other => {
-                stream.reply = other;
+                response.reply = other;
                 false
             }
         }
@@ -1353,9 +1406,10 @@ impl Http2 {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        let more = more_credit(stream.granted, stream.out_bytes);
-        if more > 0 && matches!(stream.reply, Reply::Body) {
-            stream.granted += more;
+        let response = &mut stream.response;
+        let more = more_credit(response.credit_bytes, response.queued_bytes);
+        if more > 0 && matches!(response.reply, Reply::Body) {
+            response.credit_bytes += more;
             self.up.push_back(MuxEvent::Credit(stream.child, more));
         }
     }
@@ -1374,7 +1428,7 @@ impl Http2 {
             let step = n.min(piece.bytes);
             piece.bytes -= step;
             n -= step;
-            self.out_bytes = self.out_bytes.saturating_sub(step as usize);
+            self.unwritten_bytes = self.unwritten_bytes.saturating_sub(step as usize);
             if piece.bytes > 0 {
                 break;
             }
@@ -1387,7 +1441,7 @@ impl Http2 {
             }
             if let Some(stream) = self.streams.get_mut(&piece.stream) {
                 if piece.body > 0 {
-                    stream.written += piece.body;
+                    stream.response.written_bytes += piece.body;
                     if !touched.contains(&piece.stream) {
                         touched.push(piece.stream);
                     }
@@ -1403,12 +1457,12 @@ impl Http2 {
             {
                 self.up.push_back(MuxEvent::Child(
                     stream.child,
-                    ExchangeEvent::Written(stream.written),
+                    ExchangeEvent::Written(stream.response.written_bytes),
                 ));
             }
         }
         for &id in &finished {
-            let open = self.streams.get(&id).is_some_and(|s| !s.recv_closed);
+            let open = self.streams.get(&id).is_some_and(|s| !s.receive.closed);
             self.end_stream(id, Ending::Done);
             if open {
                 // The response is complete but the request is not: ask the
@@ -1455,7 +1509,7 @@ impl Layer for Http2 {
                 // none while the transport falls behind. The delivery keeps
                 // whatever charge it came with: the bytes are read from it
                 // into the frame buffer, which is held at its bound.
-                if self.input.is_some() || self.out_bytes >= OUT_LIMIT {
+                if self.input.is_some() || self.unwritten_bytes >= OUT_LIMIT {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                 }
                 self.input = Some(chunk);
@@ -1476,7 +1530,7 @@ impl Layer for Http2 {
                 }
                 self.out.clear();
                 self.sent.clear();
-                self.out_bytes = 0;
+                self.unwritten_bytes = 0;
                 self.input = None;
                 self.resets = VecDeque::new();
                 self.phase = Phase::Closed;
@@ -1499,7 +1553,7 @@ impl Layer for Http2 {
         // A response head is framed at once: it waits while the transport
         // falls behind.
         if matches!(command.op(), MuxOp::Child(_, ExchangeCommand::Head(_)))
-            && self.out_bytes >= OUT_LIMIT
+            && self.unwritten_bytes >= OUT_LIMIT
         {
             return Ok(Admit::Blocked(command));
         }
@@ -1511,9 +1565,11 @@ impl Layer for Http2 {
             MuxOp::Credit(child, units) => {
                 if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child)) {
                     if let Some(stream) = self.streams.get_mut(&id) {
-                        stream.credit = stream.credit.saturating_add(units);
-                        stream.peak = stream.peak.max(stream.credit);
-                        stream.credited = true;
+                        let delivery = &mut stream.delivery;
+                        delivery.credit_bytes = delivery.credit_bytes.saturating_add(units);
+                        delivery.peak_credit_bytes =
+                            delivery.peak_credit_bytes.max(delivery.credit_bytes);
+                        delivery.credited = true;
                     }
                     self.forward(id);
                     // The child read: credit for its stream may be due.
@@ -1527,7 +1583,7 @@ impl Layer for Http2 {
                 if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child))
                     && let Some(stream) = self.streams.get(&id)
                 {
-                    let code = if matches!(stream.reply, Reply::Waiting) {
+                    let code = if matches!(stream.response.reply, Reply::Waiting) {
                         ErrorCode::RefusedStream
                     } else {
                         ErrorCode::InternalError
@@ -1586,7 +1642,7 @@ impl Layer for Http2 {
         if drained
             && self.batch
             && self.up.is_empty()
-            && self.streams.values().all(|s| s.credited)
+            && self.streams.values().all(|s| s.delivery.credited)
             && self.phase == Phase::Open
         {
             moved |= self.release(env);
