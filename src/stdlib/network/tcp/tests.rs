@@ -190,6 +190,60 @@ fn wakers_run_once_the_endpoint_is_unlocked() {
 }
 
 #[test]
+fn receive_credit_survives_a_full_event_queue() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let now = smol_now(&fcx);
+        let (h, ack) = established(&mut st, now, local, peer);
+        let child = st.adopt(h);
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            now,
+            data_segment(peer, local, 101, ack, 16, &[1; 100]).0,
+        );
+        st.refresh_all(&Budget::unlimited());
+        let child_handle = st
+            .up
+            .drain(..)
+            .find_map(|event| match event {
+                MuxEvent::Opened(handle, _, _) if handle.id() == child => Some(handle),
+                _ => None,
+            })
+            .unwrap();
+        st.up.clear();
+        st.up
+            .extend((0..UP_ROOM).map(|_| MuxEvent::Credit(child, 1)));
+        st.work = false;
+        let budget = Budget::unlimited();
+        let mut observations = fictionet::stdlib::layer::Observations::new(0);
+        let mut env = Env::new(fcx.now(), &fcx, &budget, &mut observations);
+        assert!(matches!(
+            st.on_command(&mut env, child_handle.grant(100)),
+            Ok(Admit::Taken)
+        ));
+        while st.take_event().is_some() {}
+        assert!(st.advance(&mut env).unwrap());
+        let mut received = 0;
+        while let Some(event) = st.take_event() {
+            if let MuxEvent::Child(id, StreamEvent::Data(bytes)) = event {
+                assert_eq!(id, child);
+                received += bytes.len();
+            }
+        }
+        assert_eq!(received, 100);
+        assert_eq!(st.get(h).recv_queue(), 0);
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn receive_refresh_rotates_after_the_event_queue_fills() {
     block_on(run(Seed::from_u64(1), |fcx| async move {
         let (_raw, side) = pair();

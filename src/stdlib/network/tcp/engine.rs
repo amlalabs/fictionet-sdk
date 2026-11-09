@@ -2714,7 +2714,8 @@ impl Layer for TcpLayer {
                 if let Some(h) = self.open_socket(id) {
                     let c = self.conns.get_mut(&h).unwrap();
                     c.recv_credit = c.recv_credit.saturating_add(units);
-                    self.refresh(env.budget(), h);
+                    self.refresh_dirty.insert(h);
+                    self.refresh_all(env.budget());
                 }
             }
             MuxOp::Close(id) => {
