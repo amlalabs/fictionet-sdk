@@ -170,25 +170,42 @@ impl<W: Job> Jobs<W> {
     /// Takes the stack's new work from `driver`. Returns whether there was
     /// any.
     pub(crate) fn take<L: Layer<Work = W>>(&mut self, driver: &mut Driver<L>) -> bool {
-        if self.storage.is_none() && !self.budget_failed {
-            let Some(charge) = driver
-                .budget()
-                .charge(JOBS * std::mem::size_of::<Running<W>>())
-            else {
-                self.budget_failed = true;
-                return false;
-            };
-            self.running = Vec::with_capacity(JOBS);
-            self.storage = Some(charge);
-        }
         let mut took = false;
         for _ in 0..INTAKE {
             if self.running.len() == JOBS || self.budget_failed {
                 break;
             }
+            if self.running.len() == self.running.capacity() {
+                let capacity = self.running.len() + 1;
+                let bytes = capacity * std::mem::size_of::<Running<W>>();
+                let reserved = match &mut self.storage {
+                    Some(charge) => charge.set(bytes),
+                    None => {
+                        self.storage = driver.budget().charge(bytes);
+                        self.storage.is_some()
+                    }
+                };
+                if !reserved {
+                    self.budget_failed = true;
+                    break;
+                }
+                if self.running.capacity() == 0 {
+                    // Keep one reserved slot while idle so work can be checked
+                    // even when the layer retains the rest of its budget.
+                    self.running.reserve_exact(1);
+                }
+            }
             let Some(work) = driver.take_work() else {
+                if let Some(charge) = &mut self.storage {
+                    assert!(
+                        charge.set(self.running.capacity() * std::mem::size_of::<Running<W>>())
+                    );
+                }
                 break;
             };
+            if self.running.len() == self.running.capacity() {
+                self.running.reserve_exact(1);
+            }
             self.running.push(Running {
                 work: Some(work),
                 completed: false,
@@ -221,6 +238,7 @@ impl<W: Job> Jobs<W> {
         mut done: impl FnMut(W::Done) -> Result<(), E>,
     ) -> Result<bool, E> {
         let mut finished = false;
+        let before = self.running.len();
         let mut i = 0;
         while i < self.running.len() {
             let running = &mut self.running[i];
@@ -266,6 +284,13 @@ impl<W: Job> Jobs<W> {
                 finished = true;
             } else {
                 i += 1;
+            }
+        }
+        if self.running.len() < before {
+            // Release the allocation before returning its reservation.
+            self.running.shrink_to(1);
+            if let Some(charge) = &mut self.storage {
+                assert!(charge.set(self.running.capacity() * std::mem::size_of::<Running<W>>()));
             }
         }
         Ok(finished)
@@ -542,6 +567,25 @@ mod tests {
         assert!(jobs.is_empty());
         assert_eq!(driver.layer().polls.load(Ordering::Relaxed), INTAKE);
         assert_eq!(driver.layer().drops.load(Ordering::Relaxed), INTAKE);
+    }
+
+    #[test]
+    fn checking_an_idle_layer_needs_only_one_reserved_job_slot() {
+        let budget = Budget::new(std::mem::size_of::<Running<OwnedWork<PendingJob>>>());
+        let mut driver = Driver::new(
+            fictionet::stdlib::layer::Later::<Source>::new(),
+            Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+            budget.clone(),
+            Instant::ZERO,
+        );
+        let mut jobs = Jobs::new();
+        assert!(!jobs.take(&mut driver));
+        assert!(!jobs.budget_exhausted());
+        assert!(jobs.is_empty());
+        assert!(!jobs.take(&mut driver));
+        assert!(!jobs.budget_exhausted());
+        drop(jobs);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
