@@ -1,7 +1,8 @@
 use crate::common::alloc::allocations;
 use fictionet::stdlib::codec::{Decode, Step, Stream, Wire};
 use fictionet::stdlib::protocols::http1::{
-    Event, Header, Limits, Request, RequestEvents, Requests, Response, ResponseEvents, Responses,
+    Event, Header, Limits, Request, RequestEvents, RequestHead, Requests, Response, ResponseEvents,
+    Responses,
 };
 use fictionet::stdlib::test_support;
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
@@ -282,19 +283,22 @@ fn edited_bodies_and_duplicate_requests_round_trip_through_wire() {
     let mut output = Vec::new();
     while let Some(result) = stream.next() {
         let mut request = result.unwrap();
-        if request.head.target == "/next" {
+        if request.head.target() == "/next" {
             request.write(&mut output).unwrap();
             expected.push(request.clone());
         } else {
-            request.head.headers.retain(|h| {
-                !h.name.eq_ignore_ascii_case("transfer-encoding")
-                    && !h.name.eq_ignore_ascii_case("content-length")
-            });
             request.body = br#"{"test":true}"#.to_vec();
-            request.head.headers.push(Header {
-                name: "Content-Length".into(),
-                value: request.body.len().to_string().into_bytes(),
-            });
+            let length = request.body.len().to_string();
+            let head = &request.head;
+            let kept = head
+                .headers()
+                .filter(|h| {
+                    !h.name.eq_ignore_ascii_case("transfer-encoding")
+                        && !h.name.eq_ignore_ascii_case("content-length")
+                })
+                .map(|h| (h.name, h.value));
+            let fields = kept.chain([("Content-Length", length.as_bytes())]);
+            request.head = RequestHead::new(head.method(), head.target(), head.version(), fields);
         }
         request.write(&mut output).unwrap();
         expected.push(request);
@@ -302,7 +306,7 @@ fn edited_bodies_and_duplicate_requests_round_trip_through_wire() {
     assert_eq!(expected.len(), 3);
     assert_eq!(expected[0].body, br#"{"test":true}"#);
     assert_eq!(expected[1], expected[2]);
-    assert_eq!(expected[1].head.target, "/next");
+    assert_eq!(expected[1].head.target(), "/next");
     assert_eq!(
         test_support::decode_all(Requests::default, &output),
         (expected, None)

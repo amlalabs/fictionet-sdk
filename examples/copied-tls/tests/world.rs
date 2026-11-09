@@ -338,7 +338,7 @@ fn alternate_http1() -> Boxed {
                 });
                 let mut bytes = Vec::new();
                 response
-                    .write_for(&request.head.method, &mut bytes)
+                    .write_for(request.head.method(), &mut bytes)
                     .unwrap();
                 if conn.write_all(&cx, &bytes).await.is_ok() {
                     let _ = conn.shutdown(&cx).await;

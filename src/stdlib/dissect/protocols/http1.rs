@@ -421,15 +421,19 @@ enum Http1State {
     Tunnel,
 }
 
-fn body_kind(headers: &[http1::Header], none: bool, response: bool) -> Http1State {
+fn body_kind<'a>(
+    headers: impl Iterator<Item = http1::FieldRef<'a>> + Clone,
+    none: bool,
+    response: bool,
+) -> Http1State {
     if none {
         return Http1State::Head;
     }
     let get = |name: &str| {
         headers
-            .iter()
+            .clone()
             .find(|h| h.name.eq_ignore_ascii_case(name))
-            .map(|h| String::from_utf8_lossy(&h.value).to_string())
+            .map(|h| String::from_utf8_lossy(h.value).to_string())
     };
     let framing =
         if get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
@@ -476,7 +480,7 @@ fn read_head(
         let success = (200..300).contains(&code);
         let framed = || {
             body_kind(
-                &r.headers,
+                r.headers.iter().map(http1::FieldRef::from),
                 (100..200).contains(&code) || code == 204 || code == 304,
                 true,
             )
@@ -495,9 +499,9 @@ fn read_head(
         Some((line, "response", body, unpaired))
     } else {
         let (r, _) = http1::RequestHead::parse_lenient(head).ok().flatten()?;
-        let line = format!("{} {} {}", r.method, r.target, r.version.as_str());
-        methods.request(&r.method);
-        Some((line, "request", body_kind(&r.headers, false, false), false))
+        let line = format!("{} {} {}", r.method(), r.target(), r.version().as_str());
+        methods.request(r.method());
+        Some((line, "request", body_kind(r.headers(), false, false), false))
     }
 }
 

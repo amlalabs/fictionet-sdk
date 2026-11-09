@@ -4,7 +4,7 @@ use http::header::{CONTENT_LENGTH, DATE};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 
 use fictionet::Error;
-use fictionet::stdlib::protocols::http1::{self, RequestHead};
+use fictionet::stdlib::protocols::http1::RequestHead;
 use fictionet::time::Instant;
 
 use super::{BadGateway, Body, text};
@@ -29,14 +29,7 @@ pub(super) fn request_held<B>(request: &Request<B>) -> usize {
 }
 
 pub(super) fn head_held(head: &RequestHead) -> usize {
-    head.method.capacity()
-        + head.target.capacity()
-        + head.headers.capacity() * std::mem::size_of::<http1::Header>()
-        + head
-            .headers
-            .iter()
-            .map(|h| h.name.capacity() + h.value.capacity())
-            .sum::<usize>()
+    head.held()
 }
 
 /// The response for a handler error: `502` for [`BadGateway`], else `500`.

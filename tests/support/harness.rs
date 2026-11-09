@@ -182,12 +182,12 @@ pub async fn request<C: fictionet::stdlib::network::Connection>(
         });
     }
     let request = http1::Request {
-        head: http1::RequestHead {
-            method: method.into(),
-            target: path.into(),
-            version: http1::Version::Http11,
-            headers: fields,
-        },
+        head: http1::RequestHead::new(
+            method,
+            path,
+            http1::Version::Http11,
+            fields.iter().map(|h| (&h.name, &h.value)),
+        ),
         body: body.as_bytes().to_vec(),
     };
     let response = sandbox::request(fcx, &mut io, &request).await.unwrap();

@@ -25,7 +25,7 @@
 //! two ends. A request the site would take is not refused here, nor an
 //! answer the client would take turned into a `502`.
 
-use fictionet::stdlib::protocols::http1::{Header, RequestHead, ResponseHead};
+use fictionet::stdlib::protocols::http1::{FieldRef, RequestHead, ResponseHead};
 
 use super::Host;
 
@@ -60,11 +60,7 @@ pub struct Request {
 impl Request {
     /// The first field named `name`, in any case.
     pub fn header(&self, name: &str) -> Option<&[u8]> {
-        self.head
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(name))
-            .map(|h| h.value.as_slice())
+        self.head.header(name)
     }
 }
 
@@ -103,19 +99,19 @@ pub fn parse_request(bytes: &[u8]) -> Result<Option<(Request, usize)>, Reject> {
         Ok(None) => return Ok(None),
         Err(e) => return Err(reject(400, format!("cannot read the request: {e}"))),
     };
-    if head.headers.len() > MAX_HEADERS {
+    if head.headers().len() > MAX_HEADERS {
         return Err(reject(431, "too many header fields"));
     }
-    let target = if head.method == "CONNECT" {
-        let (host, port) = authority(&head.target, None).ok_or_else(|| {
+    let target = if head.method() == "CONNECT" {
+        let (host, port) = authority(head.target(), None).ok_or_else(|| {
             reject(
                 400,
-                format!("cannot read the CONNECT target {:?}", head.target),
+                format!("cannot read the CONNECT target {:?}", head.target()),
             )
         })?;
         Target::Connect { host, port }
     } else {
-        absolute_uri(&head.target)?
+        absolute_uri(head.target())?
     };
     Ok(Some((Request { head, target }, len)))
 }
@@ -191,14 +187,14 @@ fn absolute_uri(uri: &str) -> Result<Target, Reject> {
 
 /// Whether a head asks to switch protocols, or agrees to: an `Upgrade`
 /// field, and `upgrade` among the `Connection` options.
-fn upgrades(headers: &[Header]) -> bool {
+fn upgrades<'a>(headers: impl Iterator<Item = FieldRef<'a>> + Clone) -> bool {
     let has_upgrade = headers
-        .iter()
+        .clone()
         .any(|h| h.name.eq_ignore_ascii_case("upgrade"));
     has_upgrade
-        && headers.iter().any(|h| {
+        && headers.clone().any(|h| {
             h.name.eq_ignore_ascii_case("connection")
-                && String::from_utf8_lossy(&h.value)
+                && String::from_utf8_lossy(h.value)
                     .split(',')
                     .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
         })
@@ -207,8 +203,8 @@ fn upgrades(headers: &[Header]) -> bool {
 /// Header fields that belong to one hop, never passed on: the standard
 /// ones, the proxy's own, and any that `Connection` names. The `Upgrade`
 /// field of a head that [`upgrades`] is kept: the upgrade goes end to end.
-fn hop_by_hop(headers: &[Header]) -> Vec<String> {
-    let keep_upgrade = upgrades(headers);
+fn hop_by_hop<'a>(headers: impl Iterator<Item = FieldRef<'a>> + Clone) -> Vec<String> {
+    let keep_upgrade = upgrades(headers.clone());
     let mut names: Vec<String> = [
         "connection",
         "keep-alive",
@@ -226,7 +222,7 @@ fn hop_by_hop(headers: &[Header]) -> Vec<String> {
         if h.name.eq_ignore_ascii_case("connection")
             || h.name.eq_ignore_ascii_case("proxy-connection")
         {
-            for token in String::from_utf8_lossy(&h.value).split(',') {
+            for token in String::from_utf8_lossy(h.value).split(',') {
                 let t = token.trim().to_ascii_lowercase();
                 if !t.is_empty()
                     && !t.eq_ignore_ascii_case("close")
@@ -244,7 +240,7 @@ fn hop_by_hop(headers: &[Header]) -> Vec<String> {
 }
 
 /// The `Connection` field that ends a forwarded head.
-fn connection(headers: &[Header]) -> &'static [u8] {
+fn connection<'a>(headers: impl Iterator<Item = FieldRef<'a>> + Clone) -> &'static [u8] {
     if upgrades(headers) {
         b"Connection: upgrade\r\n\r\n"
     } else {
@@ -252,14 +248,18 @@ fn connection(headers: &[Header]) -> &'static [u8] {
     }
 }
 
-fn push_headers(out: &mut Vec<u8>, headers: &[Header], skip: &[String]) {
+fn push_headers<'a>(
+    out: &mut Vec<u8>,
+    headers: impl Iterator<Item = FieldRef<'a>>,
+    skip: &[String],
+) {
     for h in headers {
         if skip.iter().any(|s| h.name.eq_ignore_ascii_case(s)) {
             continue;
         }
         out.extend_from_slice(h.name.as_bytes());
         out.extend_from_slice(b": ");
-        out.extend_from_slice(&h.value);
+        out.extend_from_slice(h.value);
         out.extend_from_slice(b"\r\n");
     }
 }
@@ -277,16 +277,16 @@ pub fn forward_head(req: &Request) -> Vec<u8> {
     };
     let mut out = format!(
         "{} {} {}\r\n",
-        req.head.method,
+        req.head.method(),
         path,
-        req.head.version.as_str()
+        req.head.version().as_str()
     )
     .into_bytes();
     out.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
-    let mut skip = hop_by_hop(&req.head.headers);
+    let mut skip = hop_by_hop(req.head.headers());
     skip.push("host".into());
-    push_headers(&mut out, &req.head.headers, &skip);
-    out.extend_from_slice(connection(&req.head.headers));
+    push_headers(&mut out, req.head.headers(), &skip);
+    out.extend_from_slice(connection(req.head.headers()));
     out
 }
 
@@ -340,9 +340,10 @@ pub fn rewrite_response(head: &[u8]) -> Result<Option<Answer>, String> {
             .filter(|h| !h.name.eq_ignore_ascii_case("upgrade"))
             .collect()
     };
-    push_headers(&mut out, &headers, &hop_by_hop(&headers));
+    let fields = || headers.iter().map(FieldRef::from);
+    push_headers(&mut out, fields(), &hop_by_hop(fields()));
     out.extend_from_slice(if status == 101 {
-        connection(&headers)
+        connection(fields())
     } else {
         b"Connection: close\r\n\r\n"
     });
@@ -401,7 +402,7 @@ mod tests {
             }
         );
         assert_eq!(
-            r.head.version,
+            r.head.version(),
             fictionet::stdlib::protocols::http1::Version::Http10
         );
         let r = parse("CONNECT [fd00::1]:443 HTTP/1.1\r\n\r\n").unwrap();
@@ -534,8 +535,7 @@ mod tests {
                 let bytes = forward_head(&request);
                 let (forwarded, _) = RequestHead::parse_lenient(&bytes).unwrap().unwrap();
                 let hosts: Vec<_> = forwarded
-                    .headers
-                    .iter()
+                    .headers()
                     .filter(|header| header.name.eq_ignore_ascii_case("host"))
                     .collect();
                 let [host] = hosts.as_slice() else {

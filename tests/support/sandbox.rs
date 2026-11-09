@@ -338,7 +338,7 @@ pub async fn request(
     request: &fictionet::stdlib::protocols::http1::Request,
 ) -> Result<fictionet::stdlib::protocols::http1::Response, Error> {
     let mut decoder = http1::Responses::new();
-    decoder.expect_method(&request.head.method)?;
+    decoder.expect_method(request.head.method())?;
     let mut stream = Stream::new(decoder);
     conn.write_all(fcx, &request.to_bytes()?).await?;
     let mut buf = [0; 4096];

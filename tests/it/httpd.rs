@@ -546,8 +546,8 @@ fn missing_host_preserves_body_limit_precedence_and_pipeline_boundaries() {
         let Some(rejected) = rejected(&mut h) else {
             panic!("expected the rejected request context");
         };
-        assert_eq!(rejected.head.method, "POST");
-        assert_eq!(rejected.head.target, "/original");
+        assert_eq!(rejected.head.method(), "POST");
+        assert_eq!(rejected.head.target(), "/original");
         assert_eq!(
             rejected.error,
             fictionet::stdlib::protocols::http1::Error::Host

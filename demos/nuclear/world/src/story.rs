@@ -848,12 +848,12 @@ async fn control(fcx: &Cx, operator: &tcp::Endpoint, kind: &str, body: Value) ->
     }
     headers.push(header("Content-Length", &bytes.len().to_string()));
     let request = http1::Request {
-        head: RequestHead {
-            method: "POST".to_owned(),
-            target: format!("{}{kind}", hmi::CONTROL_PREFIX),
-            version: Version::Http11,
-            headers,
-        },
+        head: RequestHead::new(
+            "POST",
+            &format!("{}{kind}", hmi::CONTROL_PREFIX),
+            Version::Http11,
+            headers.iter().map(|h| (&h.name, &h.value)),
+        ),
         body: bytes,
     };
     let response = exchange(fcx, operator, &request).await?;
@@ -870,12 +870,7 @@ async fn control(fcx: &Cx, operator: &tcp::Endpoint, kind: &str, body: Value) ->
 /// Reads the complete HMI view over the operator connection.
 async fn hmi_view(fcx: &Cx, operator: &tcp::Endpoint) -> Result<Value, Error> {
     let request = http1::Request {
-        head: RequestHead {
-            method: "GET".to_owned(),
-            target: "/api/plant".to_owned(),
-            version: Version::Http11,
-            headers: vec![header("Host", hmi::NAME)],
-        },
+        head: RequestHead::new("GET", "/api/plant", Version::Http11, [("Host", hmi::NAME)]),
         body: Vec::new(),
     };
     let response = exchange(fcx, operator, &request).await?;
@@ -905,7 +900,7 @@ async fn exchange(
         .await
         .map_err(|e| Error::msg(format!("the operator cannot reach hmi01: {e:?}")))?;
     let mut decoder = http1::Responses::new();
-    decoder.expect_method(&request.head.method)?;
+    decoder.expect_method(request.head.method())?;
     let mut stream = Stream::new(decoder);
     conn.write_all(fcx, &request.to_bytes()?).await?;
     let mut buf = [0; 4096];

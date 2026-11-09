@@ -244,7 +244,51 @@ pub struct Header {
     pub value: Vec<u8>,
 }
 
+/// A header field borrowed from a [`RequestHead`], or from a [`Header`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldRef<'a> {
+    /// The field name, with its casing as written.
+    pub name: &'a str,
+    /// The field value without outer whitespace.
+    pub value: &'a [u8],
+}
+
+impl<'a> From<&'a Header> for FieldRef<'a> {
+    fn from(h: &'a Header) -> Self {
+        Self {
+            name: &h.name,
+            value: &h.value,
+        }
+    }
+}
+
+// A range of a request head's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
+impl Span {
+    fn at(start: usize, len: usize) -> Self {
+        Self {
+            start,
+            end: start.saturating_add(len),
+        }
+    }
+    fn shift(self, by: usize) -> Self {
+        Self::at(self.start.saturating_add(by), self.end - self.start)
+    }
+    fn of(self, b: &[u8]) -> &[u8] {
+        &b[self.start..self.end]
+    }
+}
+
 /// An HTTP request head. The body follows separately.
+///
+/// The head keeps its bytes in one buffer and reads the method, target and
+/// fields out of it, so a parsed head costs two allocations whatever its
+/// size. Build one with [`RequestHead::new`].
 ///
 /// `Wire` reads and writes exactly a head, using default limits. No body is
 /// required to write a head; [`Request`] validates the complete body length.
@@ -256,21 +300,122 @@ pub struct Header {
 /// let head = RequestHead::parse(b"POST /tools HTTP/1.1\r\nHost: example.test\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n")?;
 /// assert!(head.expects_continue());
 /// assert!(head.keep_alive()?);
+/// assert_eq!(head.method(), "POST");
+/// assert_eq!(head.header("host"), Some(b"example.test".as_slice()));
 /// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct RequestHead {
-    /// Case-sensitive method token.
-    pub method: String,
-    /// Request target, preserved as visible ASCII. Fragments are refused.
-    pub target: String,
-    /// Start-line protocol version.
-    pub version: Version,
-    /// Ordered header fields.
-    pub headers: Vec<Header>,
+    // The head's lines. The method, target and field names in it are UTF-8.
+    bytes: Vec<u8>,
+    method: Span,
+    target: Span,
+    version: Version,
+    // Each field's name and value, the value without outer whitespace.
+    fields: Vec<(Span, Span)>,
+}
+
+impl PartialEq for RequestHead {
+    /// Heads are equal when their method, target, version and fields are,
+    /// however their lines were spaced.
+    fn eq(&self, other: &Self) -> bool {
+        self.method() == other.method()
+            && self.target() == other.target()
+            && self.version == other.version
+            && self.headers().eq(other.headers())
+    }
+}
+impl Eq for RequestHead {}
+
+impl fmt::Debug for RequestHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestHead")
+            .field("method", &self.method())
+            .field("target", &self.target())
+            .field("version", &self.version)
+            .field("headers", &self.headers().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl RequestHead {
+    /// Builds a head from its parts. Nothing is checked here: writing the
+    /// head validates the method, target and fields.
+    pub fn new<N: AsRef<str>, V: AsRef<[u8]>>(
+        method: &str,
+        target: &str,
+        version: Version,
+        headers: impl IntoIterator<Item = (N, V)>,
+    ) -> Self {
+        let mut bytes = Vec::new();
+        let method_span = Span::at(0, method.len());
+        bytes.extend_from_slice(method.as_bytes());
+        bytes.push(b' ');
+        let target_span = Span::at(bytes.len(), target.len());
+        bytes.extend_from_slice(target.as_bytes());
+        bytes.push(b' ');
+        bytes.extend_from_slice(version.as_str().as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        let fields = headers
+            .into_iter()
+            .map(|(name, value)| {
+                let (name, value) = (name.as_ref().as_bytes(), value.as_ref());
+                let name_span = Span::at(bytes.len(), name.len());
+                bytes.extend_from_slice(name);
+                bytes.push(b':');
+                let value_span = Span::at(bytes.len(), value.len());
+                bytes.extend_from_slice(value);
+                bytes.extend_from_slice(b"\r\n");
+                (name_span, value_span)
+            })
+            .collect();
+        bytes.extend_from_slice(b"\r\n");
+        Self {
+            bytes,
+            method: method_span,
+            target: target_span,
+            version,
+            fields,
+        }
+    }
+    /// The case-sensitive method token.
+    pub fn method(&self) -> &str {
+        self.text(self.method)
+    }
+    /// The request target, as written.
+    pub fn target(&self) -> &str {
+        self.text(self.target)
+    }
+    /// The start line's protocol version.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+    /// The header fields in order, duplicates and name casing kept.
+    pub fn headers(&self) -> impl ExactSizeIterator<Item = FieldRef<'_>> + Clone {
+        self.fields.iter().map(|&(name, value)| FieldRef {
+            name: self.text(name),
+            value: value.of(&self.bytes),
+        })
+    }
+    /// The value of the first field named `name`, ignoring ASCII case.
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        named(self.pairs(), name).next()
+    }
+    /// The bytes this head holds: its buffer and its field list.
+    pub fn held(&self) -> usize {
+        self.bytes.capacity() + self.fields.capacity() * std::mem::size_of::<(Span, Span)>()
+    }
+    // Each field's name and value as bytes.
+    fn pairs(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + Clone {
+        self.fields
+            .iter()
+            .map(|&(name, value)| (name.of(&self.bytes), value.of(&self.bytes)))
+    }
+    // The method, target and names were checked as UTF-8 when the head was
+    // made, so this never falls back to the empty string.
+    fn text(&self, span: Span) -> &str {
+        core::str::from_utf8(span.of(&self.bytes)).unwrap_or_default()
+    }
     /// Reads the head at the start of `bytes` by its syntax alone: the
     /// request line and the fields, without the framing, `Host` and target
     /// rules that [`RequestEvents`] and `Wire` apply. For a passive observer or a
@@ -289,12 +434,12 @@ impl RequestHead {
     /// Whether an HTTP/1.1 Expect field contains `100-continue`.
     /// HTTP/1.0 expectations are ignored (RFC 9110 section 10.1.1).
     pub fn expects_continue(&self) -> bool {
-        self.version == Version::Http11 && has_option(&self.headers, "expect", b"100-continue")
+        self.version == Version::Http11 && has_option(self.pairs(), "expect", b"100-continue")
     }
     /// Whether the head permits another HTTP message after this one.
     /// CONNECT still requires the connection owner to handle the response.
     pub fn keep_alive(&self) -> Result<bool, Error> {
-        Ok(!fields(&self.headers, self.version)?.close)
+        Ok(!fields(self.pairs(), self.version)?.close)
     }
 }
 
@@ -348,7 +493,7 @@ impl ResponseHead {
     /// Whether connection options permit reuse. A close-delimited body still
     /// ends the connection even when this method returns true.
     pub fn keep_alive(&self) -> Result<bool, Error> {
-        Ok(!fields(&self.headers, self.version)?.close)
+        Ok(!fields(pairs(&self.headers), self.version)?.close)
     }
 }
 
@@ -882,7 +1027,7 @@ impl RequestEvents {
         let (info, framing) = match request_info(&head) {
             Ok(info) => info,
             Err(error) => {
-                let framing = fields(&head.headers, head.version).and_then(request_framing);
+                let framing = fields(head.pairs(), head.version).and_then(request_framing);
                 let mut received_body_bytes = 0;
                 if let Ok(framing) = framing {
                     self.core.begin(framing, true);
@@ -912,7 +1057,7 @@ impl RequestEvents {
         };
         self.empty_lines = 0;
         self.core
-            .begin(framing, info.close || head.method == "CONNECT");
+            .begin(framing, info.close || head.method() == "CONNECT");
         Ok(Step::Item(BorrowedEvent::Head(head), n))
     }
 }
@@ -1607,13 +1752,25 @@ fn token(b: &[u8]) -> bool {
 fn field_byte(b: u8) -> bool {
     b == b'\t' || (b >= b' ' && b != 127)
 }
-fn named<'a>(headers: &'a [Header], name: &'a str) -> impl Iterator<Item = &'a [u8]> {
+// Each field's name and value as bytes.
+fn pairs(headers: &[Header]) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + Clone {
     headers
         .iter()
-        .filter(move |h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_slice())
+        .map(|h| (h.name.as_bytes(), h.value.as_slice()))
 }
-fn has_option(headers: &[Header], name: &str, option: &[u8]) -> bool {
+fn named<'a, 'n>(
+    headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    name: &'n str,
+) -> impl Iterator<Item = &'a [u8]> {
+    headers
+        .filter(move |(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
+        .map(|(_, value)| value)
+}
+fn has_option<'a>(
+    headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    name: &str,
+    option: &[u8],
+) -> bool {
     named(headers, name)
         .flat_map(|v| v.split(|b| *b == b','))
         .any(|v| trim(v).eq_ignore_ascii_case(option))
@@ -1664,17 +1821,8 @@ struct Fields {
     unsupported_transfer_coding: bool,
     close: bool,
 }
-fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
-    scan_fields(
-        headers
-            .iter()
-            .map(|h| (h.name.as_str(), h.value.as_slice())),
-        version,
-    )
-}
-
-fn scan_fields<'a>(
-    headers: impl Iterator<Item = (&'a str, &'a [u8])> + Clone,
+fn fields<'a>(
+    headers: impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
     version: Version,
 ) -> Result<Fields, Error> {
     let mut result = Fields {
@@ -1687,23 +1835,23 @@ fn scan_fields<'a>(
     let mut keep = false;
     let has_transfer = headers
         .clone()
-        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
+        .any(|(name, _)| name.eq_ignore_ascii_case(b"transfer-encoding"));
     check_framing_fields(
         has_transfer,
         has_transfer
             && headers
                 .clone()
-                .any(|(name, _)| name.eq_ignore_ascii_case("content-length")),
+                .any(|(name, _)| name.eq_ignore_ascii_case(b"content-length")),
     )?;
     for (name, value) in headers {
         if !valid_field(name, value) {
             return Err(Error::Header);
         }
-        if name.eq_ignore_ascii_case("content-length") {
+        if name.eq_ignore_ascii_case(b"content-length") {
             content_length(value, &mut result.length)?;
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
             transfer_encoding(value, version, &mut result)?;
-        } else if name.eq_ignore_ascii_case("connection") {
+        } else if name.eq_ignore_ascii_case(b"connection") {
             for value in value.split(|b| *b == b',') {
                 let value = trim(value);
                 if value.is_empty() {
@@ -1721,8 +1869,8 @@ fn scan_fields<'a>(
     result.close |= version == Version::Http10 && !keep;
     Ok(result)
 }
-fn valid_field(name: &str, value: &[u8]) -> bool {
-    token(name.as_bytes()) && valid_field_value(value)
+fn valid_field(name: impl AsRef<[u8]>, value: &[u8]) -> bool {
+    token(name.as_ref()) && valid_field_value(value)
 }
 fn valid_field_value(value: &[u8]) -> bool {
     value.iter().copied().all(field_byte) && trim(value) == value
@@ -1840,27 +1988,40 @@ fn header_parts(line: &[u8], lenient: bool) -> Result<(&str, &[u8]), Error> {
     ))
 }
 
-fn header_line(line: &[u8], lenient: bool) -> Result<Header, Error> {
+// A field line's name and value, as [`header_parts`] reads them, as spans of
+// `line`.
+fn header_spans(line: &[u8], lenient: bool) -> Result<(Span, Span), Error> {
     let (name, value) = header_parts(line, lenient)?;
-    Ok(Header {
-        name: name.to_owned(),
-        value: value.to_vec(),
-    })
+    let after = name.len().saturating_add(1);
+    let lead = line[after..]
+        .iter()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count();
+    Ok((
+        Span::at(0, name.len()),
+        Span::at(after.saturating_add(lead), value.len()),
+    ))
 }
 
-fn split_head(b: &[u8], lenient: bool) -> Result<(&[u8], Vec<Header>), Error> {
+// Splits a head into its start line, which it returns, and its fields, which
+// it hands to `field` as spans of `b`.
+fn split_head(
+    b: &[u8],
+    lenient: bool,
+    mut field: impl FnMut(Span, Span) -> Result<(), Error>,
+) -> Result<&[u8], Error> {
     let mut lines = b.split(|b| *b == b'\n');
-    let first = lines
-        .next()
-        .and_then(|l| line_end(l, lenient))
-        .ok_or(Error::LineEnding)?;
-    let mut headers = Vec::new();
-    for line in lines {
-        let line = line_end(line, lenient).ok_or(Error::LineEnding)?;
+    let raw = lines.next().ok_or(Error::LineEnding)?;
+    let first = line_end(raw, lenient).ok_or(Error::LineEnding)?;
+    let mut at = raw.len().saturating_add(1);
+    for raw in lines {
+        let line = line_end(raw, lenient).ok_or(Error::LineEnding)?;
         if line.is_empty() {
-            return Ok((first, headers));
+            return Ok(first);
         }
-        headers.push(header_line(line, lenient)?);
+        let (name, value) = header_spans(line, lenient)?;
+        field(name.shift(at), value.shift(at))?;
+        at = at.saturating_add(raw.len()).saturating_add(1);
     }
     Err(Error::Incomplete)
 }
@@ -1901,7 +2062,7 @@ fn lenient_bounds(b: &[u8], request: bool) -> Result<Option<(usize, usize)>, Err
             return Ok(Some((start, at)));
         }
         if !first {
-            header_line(content, true)?;
+            header_parts(content, true)?;
         } else if request {
             request_line(content, true)?;
         } else {
@@ -1971,7 +2132,7 @@ fn validate_target(method: &str, target: &str) -> Result<(), Error> {
     if valid { Ok(()) } else { Err(Error::StartLine) }
 }
 fn validate_host(head: &RequestHead) -> Result<(), Error> {
-    let mut hosts = named(&head.headers, "host");
+    let mut hosts = named(head.pairs(), "host");
     match hosts.next() {
         None if head.version == Version::Http10 => Ok(()),
         Some(host)
@@ -1982,7 +2143,9 @@ fn validate_host(head: &RequestHead) -> Result<(), Error> {
         _ => Err(Error::Host),
     }
 }
-fn request_line(line: &[u8], lenient: bool) -> Result<(String, String, Version), Error> {
+// The method, target and version of a request line, the first two as spans
+// of `line`. Both are UTF-8.
+fn request_line(line: &[u8], lenient: bool) -> Result<(Span, Span, Version), Error> {
     let mut parts = line.split(|b| *b == b' ');
     let method = parts.next().ok_or(Error::StartLine)?;
     let target = parts.next().ok_or(Error::StartLine)?;
@@ -1995,24 +2158,30 @@ fn request_line(line: &[u8], lenient: bool) -> Result<(String, String, Version),
     {
         return Err(Error::StartLine);
     }
+    core::str::from_utf8(method).map_err(|_| Error::StartLine)?;
+    core::str::from_utf8(target).map_err(|_| Error::StartLine)?;
     Ok((
-        core::str::from_utf8(method)
-            .map(str::to_owned)
-            .map_err(|_| Error::StartLine)?,
-        core::str::from_utf8(target)
-            .map(str::to_owned)
-            .map_err(|_| Error::StartLine)?,
+        Span::at(0, method.len()),
+        Span::at(method.len().saturating_add(1), target.len()),
         version,
     ))
 }
+// Copies the head's bytes once and reads its parts as spans of the copy.
 fn request_syntax(b: &[u8], lenient: bool) -> Result<RequestHead, Error> {
-    let (line, headers) = split_head(b, lenient)?;
+    // One line per field, besides the request line and the empty line.
+    let lines = b.iter().filter(|b| **b == b'\n').count();
+    let mut fields = Vec::with_capacity(lines.saturating_sub(2));
+    let line = split_head(b, lenient, |name, value| {
+        fields.push((name, value));
+        Ok(())
+    })?;
     let (method, target, version) = request_line(line, lenient)?;
     Ok(RequestHead {
+        bytes: b.to_vec(),
         method,
         target,
         version,
-        headers,
+        fields,
     })
 }
 fn request_head(b: &[u8]) -> Result<(RequestHead, Fields, Framing), Error> {
@@ -2036,7 +2205,16 @@ fn status_line(line: &[u8]) -> Result<(Version, u16, &[u8]), Error> {
     Ok((version, status, reason))
 }
 fn response_syntax(b: &[u8], lenient: bool) -> Result<ResponseHead, Error> {
-    let (line, headers) = split_head(b, lenient)?;
+    let mut headers = Vec::new();
+    let line = split_head(b, lenient, |name, value| {
+        headers.push(Header {
+            name: core::str::from_utf8(name.of(b))
+                .map_err(|_| Error::Header)?
+                .to_owned(),
+            value: value.of(b).to_vec(),
+        });
+        Ok(())
+    })?;
     let (version, status, reason) = status_line(line)?;
     Ok(ResponseHead {
         version,
@@ -2047,11 +2225,15 @@ fn response_syntax(b: &[u8], lenient: bool) -> Result<ResponseHead, Error> {
 }
 fn response_head(b: &[u8]) -> Result<(ResponseHead, Fields), Error> {
     let head = response_syntax(b, false)?;
-    let info = fields(&head.headers, head.version)?;
+    let info = fields(pairs(&head.headers), head.version)?;
     Ok((head, info))
 }
 
-fn head_size(start: usize, headers: &[Header], limits: Limits) -> Result<(), Error> {
+fn head_size<'a>(
+    start: usize,
+    headers: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])>,
+    limits: Limits,
+) -> Result<(), Error> {
     if start > limits.start_line {
         return Err(Error::StartLineTooLong);
     }
@@ -2059,12 +2241,11 @@ fn head_size(start: usize, headers: &[Header], limits: Limits) -> Result<(), Err
         return Err(Error::TooManyHeaders);
     }
     let mut total = start.checked_add(4).ok_or(Error::HeadTooLong)?;
-    for h in headers {
-        let line = h
-            .name
+    for (name, value) in headers {
+        let line = name
             .len()
             .checked_add(1)
-            .and_then(|n| n.checked_add(h.value.len()))
+            .and_then(|n| n.checked_add(value.len()))
             .ok_or(Error::HeaderLineTooLong)?;
         if line > limits.header_line {
             return Err(Error::HeaderLineTooLong);
@@ -2080,27 +2261,27 @@ fn head_size(start: usize, headers: &[Header], limits: Limits) -> Result<(), Err
     Ok(())
 }
 fn request_info(head: &RequestHead) -> Result<(Fields, Framing), Error> {
-    validate_target(&head.method, &head.target)?;
+    validate_target(head.method(), head.target())?;
     validate_host(head)?;
-    let info = fields(&head.headers, head.version)?;
+    let info = fields(head.pairs(), head.version)?;
     Ok((info, request_framing(info)?))
 }
 fn validate_request(head: &RequestHead) -> Result<Framing, Error> {
     let (_, framing) = request_info(head)?;
     let start = head
-        .method
+        .method()
         .len()
-        .checked_add(head.target.len())
+        .checked_add(head.target().len())
         .and_then(|n| n.checked_add(10))
         .ok_or(Error::StartLineTooLong)?;
-    head_size(start, &head.headers, Limits::default())?;
+    head_size(start, head.pairs(), Limits::default())?;
     Ok(framing)
 }
 fn validate_response_for(head: &ResponseHead, method: Method) -> Result<Framing, Error> {
     if !(100..=599).contains(&head.status) || !head.reason.iter().copied().all(field_byte) {
         return Err(Error::StartLine);
     }
-    let info = fields(&head.headers, head.version)?;
+    let info = fields(pairs(&head.headers), head.version)?;
     response_size(head, Limits::default())?;
     writable_response(head, info, method)
 }
@@ -2110,7 +2291,7 @@ fn response_size(head: &ResponseHead, limits: Limits) -> Result<(), Error> {
             .len()
             .checked_add(13)
             .ok_or(Error::StartLineTooLong)?,
-        &head.headers,
+        pairs(&head.headers),
         limits,
     )
 }
@@ -2127,23 +2308,23 @@ fn writable_response(head: &ResponseHead, info: Fields, method: Method) -> Resul
     }
     response_framing(head, info, method)
 }
-fn emit_headers(headers: &[Header], out: &mut Vec<u8>) {
-    for h in headers {
-        out.extend_from_slice(h.name.as_bytes());
+fn emit_headers<'a>(headers: impl Iterator<Item = (&'a [u8], &'a [u8])>, out: &mut Vec<u8>) {
+    for (name, value) in headers {
+        out.extend_from_slice(name);
         out.push(b':');
-        out.extend_from_slice(&h.value);
+        out.extend_from_slice(value);
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
 }
 fn emit_request(head: &RequestHead, out: &mut Vec<u8>) {
-    out.extend_from_slice(head.method.as_bytes());
+    out.extend_from_slice(head.method().as_bytes());
     out.push(b' ');
-    out.extend_from_slice(head.target.as_bytes());
+    out.extend_from_slice(head.target().as_bytes());
     out.push(b' ');
     out.extend_from_slice(head.version.as_str().as_bytes());
     out.extend_from_slice(b"\r\n");
-    emit_headers(&head.headers, out);
+    emit_headers(head.pairs(), out);
 }
 fn emit_response(head: &ResponseHead, out: &mut Vec<u8>) {
     out.extend_from_slice(head.version.as_str().as_bytes());
@@ -2152,7 +2333,7 @@ fn emit_response(head: &ResponseHead, out: &mut Vec<u8>) {
     out.push(b' ');
     out.extend_from_slice(&head.reason);
     out.extend_from_slice(b"\r\n");
-    emit_headers(&head.headers, out);
+    emit_headers(pairs(&head.headers), out);
 }
 fn validate_body(body: &[u8], framing: Framing) -> Result<(), Error> {
     if body.len() > MAX_BODY {
@@ -2392,6 +2573,29 @@ mod tests {
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 
+    // The head with its parts changed by `edit`, built again.
+    fn edited(
+        head: &RequestHead,
+        edit: impl FnOnce(&mut String, &mut String, &mut Version, &mut Vec<Header>),
+    ) -> RequestHead {
+        let (mut method, mut target) = (head.method().to_owned(), head.target().to_owned());
+        let mut version = head.version();
+        let mut headers: Vec<Header> = head
+            .headers()
+            .map(|h| Header {
+                name: h.name.to_owned(),
+                value: h.value.to_vec(),
+            })
+            .collect();
+        edit(&mut method, &mut target, &mut version, &mut headers);
+        RequestHead::new(
+            &method,
+            &target,
+            version,
+            headers.iter().map(|h| (&h.name, &h.value)),
+        )
+    }
+
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
     const POST: &[u8] =
         b"POST /tools HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\n\r\nhello";
@@ -2406,12 +2610,9 @@ mod tests {
         assert!(RequestHead::parse(&bytes[2..bytes.len() - 4]).is_err());
         let (head, n) = RequestHead::parse_lenient(bytes).unwrap().unwrap();
         assert_eq!(n, bytes.len() - 4);
-        assert_eq!(
-            (head.method.as_str(), head.target.as_str()),
-            ("POST", "http://u@a/x#f")
-        );
-        assert_eq!(head.headers.len(), 3);
-        assert_eq!(head.headers[2].value, b"chunked");
+        assert_eq!((head.method(), head.target()), ("POST", "http://u@a/x#f"));
+        assert_eq!(head.headers().len(), 3);
+        assert_eq!(head.headers().nth(2).unwrap().value, b"chunked");
         assert_eq!(
             RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap(),
             None
@@ -2586,17 +2787,12 @@ mod tests {
                     panic!("expected rejected head: {bytes:?}");
                 };
                 assert_eq!(rejected.error, Error::Host);
-                assert_eq!(rejected.head.method, "POST");
-                assert_eq!(rejected.head.target, "/original");
-                assert_eq!(rejected.head.headers[0].name, "X-Raw");
-                assert_eq!(rejected.head.headers[0].value, b"keep");
-                assert!(
-                    !rejected
-                        .head
-                        .headers
-                        .iter()
-                        .any(|h| h.name.eq_ignore_ascii_case("host"))
-                );
+                assert_eq!(rejected.head.method(), "POST");
+                assert_eq!(rejected.head.target(), "/original");
+                let first = rejected.head.headers().next().unwrap();
+                assert_eq!(first.name, "X-Raw");
+                assert_eq!(first.value, b"keep");
+                assert_eq!(rejected.head.header("host"), None);
                 assert_eq!(rejected.head_bytes, head.len());
                 assert_eq!(rejected.framing, Ok(framing));
                 assert_eq!(rejected.received_body_bytes, received);
@@ -2619,7 +2815,7 @@ mod tests {
             assert_eq!(rejected.framing, Err(Error::ConflictingContentLength));
             assert_eq!(rejected.received_body_bytes, 0);
             assert_eq!(
-                rejected.head.headers.len(),
+                rejected.head.headers().len(),
                 2 + host.matches("Host:").count()
             );
         }
@@ -3110,8 +3306,8 @@ mod tests {
         ] {
             let bytes = format!("GET /%zz+ HTTP/1.1\r\nHost:{host}\r\n\r\n");
             let head = RequestHead::parse(bytes.as_bytes()).unwrap();
-            assert_eq!(head.target, "/%zz+");
-            assert_eq!(head.headers[0].value, host.as_bytes());
+            assert_eq!(head.target(), "/%zz+");
+            assert_eq!(head.header("host"), Some(host.as_bytes()));
             assert_eq!(head.to_bytes().unwrap(), bytes.as_bytes());
         }
         for host in ["a,b", "a:65536", "a:18446744073709551616", "[v1.a]", "a@b"] {
@@ -3129,7 +3325,7 @@ mod tests {
         for host in ["", "a:", "[::1]:"] {
             let bytes = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
             let head = RequestHead::parse(bytes.as_bytes()).unwrap();
-            assert_eq!(head.headers[0].value, host.as_bytes());
+            assert_eq!(head.header("host"), Some(host.as_bytes()));
             if let Ok(value) = RequestHead::parse(bytes.as_bytes()) {
                 assert_write(&value).unwrap();
             }
@@ -3248,11 +3444,11 @@ mod tests {
                     let (events, failure) =
                         test_support::decode_all(RequestEvents::default, &bytes);
                     assert_eq!(failure, None);
-                    let Event::Head(mut head) = events[0].clone() else {
+                    let Event::Head(head) = events[0].clone() else {
                         panic!("head")
                     };
                     assert_eq!(head.to_bytes().unwrap(), bytes);
-                    head.headers[1].value[0] = b'b';
+                    let head = edited(&head, |_, _, _, headers| headers[1].value[0] = b'b');
                     let _ = assert_write(&head);
                     if let Ok(value) = Request::parse(&bytes) {
                         assert_write(&value).unwrap();
@@ -3907,7 +4103,7 @@ mod tests {
             let response = Response::status(status);
             let _ = assert_write(&response);
             assert_eq!(
-                named(&response.head.headers, "content-length").next(),
+                named(pairs(&response.head.headers), "content-length").next(),
                 if [100, 204, 304].contains(&status) {
                     None
                 } else {
@@ -3922,7 +4118,7 @@ mod tests {
         let response = Response::json(b" {\"ok\": true} \n").unwrap();
         assert_eq!(response.body, b" {\"ok\": true} \n");
         assert_eq!(
-            named(&response.head.headers, "content-type").next(),
+            named(pairs(&response.head.headers), "content-type").next(),
             Some(b"application/json".as_slice())
         );
         let _ = assert_write(&response);
@@ -3934,7 +4130,7 @@ mod tests {
         let detail = "quote \" slash \\ newline\n tab\t café";
         let response = Response::problem(404, detail).unwrap();
         assert_eq!(
-            named(&response.head.headers, "content-type").next(),
+            named(pairs(&response.head.headers), "content-type").next(),
             Some(b"application/problem+json".as_slice())
         );
         let value = json::Value::parse(&response.body).unwrap();
@@ -3956,18 +4152,18 @@ mod tests {
         let head = Response::event_stream("session-1");
         let _ = assert_write(&head);
         assert_eq!(
-            named(&head.headers, "content-type").next(),
+            named(pairs(&head.headers), "content-type").next(),
             Some(b"text/event-stream".as_slice())
         );
         assert_eq!(
-            named(&head.headers, "mcp-session-id").next(),
+            named(pairs(&head.headers), "mcp-session-id").next(),
             Some(b"session-1".as_slice())
         );
         assert_eq!(
-            named(&head.headers, "cache-control").next(),
+            named(pairs(&head.headers), "cache-control").next(),
             Some(b"no-cache".as_slice())
         );
-        assert_eq!(named(&head.headers, "content-length").next(), None);
+        assert_eq!(named(pairs(&head.headers), "content-length").next(), None);
         let mut out = head.to_bytes().unwrap();
         let mut stream = Stream::new(ResponseEvents::default());
         assert_eq!(stream.push(&out), out.len());
@@ -4182,11 +4378,11 @@ mod tests {
         let bytes = request_with("Expect: 100-Continue\r\nContent-Length: 5\r\n", b"");
         let mut stream = Stream::new(RequestEvents::default());
         assert_eq!(stream.push(&bytes), bytes.len());
-        let Some(Ok(Event::Head(mut head))) = stream.next() else {
+        let Some(Ok(Event::Head(head))) = stream.next() else {
             panic!("head")
         };
         assert!(head.expects_continue());
-        head.version = Version::Http10;
+        let head = edited(&head, |_, _, version, _| *version = Version::Http10);
         assert!(!head.expects_continue());
         assert_eq!(
             ResponseHead::continue_100().to_bytes().unwrap(),
@@ -4378,9 +4574,10 @@ mod tests {
         );
         let bytes = b"GET / HTTP/1.1\r\nhOsT:\tx \t\r\nX-Data: \xff\tvalue\r\n\r\n";
         let request = Request::parse(bytes).unwrap();
-        assert_eq!(request.head.headers[0].name, "hOsT");
-        assert_eq!(request.head.headers[0].value, b"x");
-        assert_eq!(request.head.headers[1].value, b"\xff\tvalue");
+        let mut fields = request.head.headers();
+        let host = fields.next().unwrap();
+        assert_eq!((host.name, host.value), ("hOsT", b"x".as_slice()));
+        assert_eq!(fields.next().unwrap().value, b"\xff\tvalue");
         if let Ok(value) = Request::parse(bytes) {
             assert_write(&value).unwrap();
         }
@@ -4407,10 +4604,10 @@ mod tests {
         value.body.push(0);
         assert_eq!(assert_write(&value).unwrap_err(), Error::BodyLength);
         value = base.clone();
-        value.head.method = "GET\r\n".into();
+        value.head = edited(&base.head, |method, _, _, _| *method = "GET\r\n".into());
         assert_eq!(assert_write(&value).unwrap_err(), Error::StartLine);
         value = base.clone();
-        value.head.target = "/bad target".into();
+        value.head = edited(&base.head, |_, target, _, _| *target = "/bad target".into());
         assert_eq!(assert_write(&value).unwrap_err(), Error::StartLine);
         for (name, bytes) in [
             ("bad name", b"value".as_slice()),
@@ -4421,17 +4618,21 @@ mod tests {
             ("X", b"value\t"),
         ] {
             value = base.clone();
-            value.head.headers.push(Header {
-                name: name.into(),
-                value: bytes.to_vec(),
+            value.head = edited(&base.head, |_, _, _, headers| {
+                headers.push(Header {
+                    name: name.into(),
+                    value: bytes.to_vec(),
+                })
             });
             assert_eq!(assert_write(&value).unwrap_err(), Error::Header);
             let _ = assert_write(&value);
         }
         value = base.clone();
-        value.head.headers.push(Header {
-            name: "Transfer-Encoding".into(),
-            value: b"chunked".to_vec(),
+        value.head = edited(&base.head, |_, _, _, headers| {
+            headers.push(Header {
+                name: "Transfer-Encoding".into(),
+                value: b"chunked".to_vec(),
+            })
         });
         assert_eq!(
             assert_write(&value).unwrap_err(),
@@ -4445,25 +4646,33 @@ mod tests {
             Error::BodyTooLong
         );
         value = base.clone();
-        value.head.target = format!("/{}", "a".repeat(8192));
+        value.head = edited(&base.head, |_, target, _, _| {
+            *target = format!("/{}", "a".repeat(8192))
+        });
         assert_eq!(assert_write(&value).unwrap_err(), Error::StartLineTooLong);
         value = base.clone();
-        value.head.headers.push(Header {
-            name: "X".into(),
-            value: vec![b'a'; 8192],
+        value.head = edited(&base.head, |_, _, _, headers| {
+            headers.push(Header {
+                name: "X".into(),
+                value: vec![b'a'; 8192],
+            })
         });
         assert_eq!(assert_write(&value).unwrap_err(), Error::HeaderLineTooLong);
         value = base.clone();
-        value.head.headers.extend((0..100).map(|_| Header {
-            name: "X".into(),
-            value: Vec::new(),
-        }));
+        value.head = edited(&base.head, |_, _, _, headers| {
+            headers.extend((0..100).map(|_| Header {
+                name: "X".into(),
+                value: Vec::new(),
+            }))
+        });
         assert_eq!(assert_write(&value).unwrap_err(), Error::TooManyHeaders);
-        value = base;
-        value.head.headers.extend((0..9).map(|_| Header {
-            name: "X".into(),
-            value: vec![b'a'; 8000],
-        }));
+        value = base.clone();
+        value.head = edited(&base.head, |_, _, _, headers| {
+            headers.extend((0..9).map(|_| Header {
+                name: "X".into(),
+                value: vec![b'a'; 8000],
+            }))
+        });
         assert_eq!(assert_write(&value).unwrap_err(), Error::HeadTooLong);
         let mut response = Response::parse(OK).unwrap();
         for status in [0, 99, 600, 1000] {

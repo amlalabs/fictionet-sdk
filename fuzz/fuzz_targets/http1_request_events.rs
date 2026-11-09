@@ -3,7 +3,7 @@
 use fictionet::stdlib::codec::Collect;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
 use fictionet::stdlib::protocols::http1::{
-    Chunk, Header, Request, RequestError, RequestEvents, RequestHead, Version,
+    Chunk, Request, RequestError, RequestEvents, RequestHead, Version,
 };
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet_fuzz::http1::event_limits;
@@ -60,25 +60,22 @@ fuzz_target!(|data: &[u8]| {
     }
     let bounded = &data[..data.len().min(512)];
     let request = Request {
-        head: RequestHead {
-            method: "POST".into(),
-            target: "/".into(),
-            version: Version::Http11,
-            headers: vec![
-                Header {
-                    name: "Host".into(),
-                    value: b"example.test".to_vec(),
-                },
-                Header {
-                    name: "Content-Length".into(),
-                    value: bounded.len().to_string().into_bytes(),
-                },
-                Header {
-                    name: String::from_utf8_lossy(bounded).into_owned(),
-                    value: bounded.to_vec(),
-                },
+        head: RequestHead::new(
+            "POST",
+            "/",
+            Version::Http11,
+            [
+                ("Host".to_owned(), b"example.test".to_vec()),
+                (
+                    "Content-Length".to_owned(),
+                    bounded.len().to_string().into_bytes(),
+                ),
+                (
+                    String::from_utf8_lossy(bounded).into_owned(),
+                    bounded.to_vec(),
+                ),
             ],
-        },
+        ),
         body: bounded.to_vec(),
     };
     let _ = assert_write(&request);
