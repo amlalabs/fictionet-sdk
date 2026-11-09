@@ -149,8 +149,9 @@ impl<L: Layer> Driver<L> {
     /// `budget`.
     ///
     /// The composition's depth is checked here and wherever it grows: when
-    /// a stack is boxed, when a later layer is set, when a switch hands
-    /// over and when a child is made. No call walks the stack for it.
+    /// a stack is boxed, and, against the depth left where the new part
+    /// sits ([`Env::fits_below`]), when a later layer is set, when a switch
+    /// hands over and when a child is made. No call walks the stack for it.
     pub fn new(layer: L, entropy: Arc<dyn Entropy>, budget: Budget, now: Instant) -> Driver<L> {
         assert!(layer.depth() <= super::MAX_DEPTH, "composition is too deep");
         Driver {

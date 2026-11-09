@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use super::*;
 use fictionet::stdlib::codec::{Ending, Lines, Stream};
+use fictionet::stdlib::services::stack::{BoxError, Boxed, Job};
 use fictionet::{Entropy, Seed, SeededEntropy};
 
 // ---------------------------------------------------------------------------
@@ -1493,4 +1494,173 @@ fn slots_never_answer_to_a_stale_or_foreign_id() {
         "another connection's id finds nothing"
     );
     assert_eq!(other.get(b.id()), None);
+}
+
+// ---------------------------------------------------------------------------
+// Depth: a composition that grows while it runs stays within MAX_DEPTH
+
+/// `layer` inside as many boxes as make it `depth` deep. Every box is a
+/// real level of calls.
+fn boxed_to<L>(layer: L, depth: usize) -> Boxed<L::Lower, L::Upper>
+where
+    L: Layer + Send + 'static,
+    L::Report: core::fmt::Debug + Send + 'static,
+    L::Work: Job<Done = L::Done>,
+    L::Done: Send + 'static,
+    L::Error: Into<BoxError> + Send + Sync + 'static,
+{
+    let mut stack = Boxed::new(layer);
+    while stack.depth() < depth {
+        stack = Boxed::new(stack);
+    }
+    stack
+}
+
+/// A layer that takes nothing and, as soon as it runs, hands its carrier
+/// to the successor it holds, if it holds one.
+struct Hands(Option<Boxed>);
+
+impl Layer for Hands {
+    type Lower = ByteStream;
+    type Upper = Top;
+    type Report = ();
+    type Timer = ();
+    type Work = ();
+    type Done = ();
+    type Error = Infallible;
+    fn on_event(
+        &mut self,
+        _: &mut Env<'_, ()>,
+        event: StreamEvent,
+    ) -> Result<Admit<StreamEvent>, Infallible> {
+        Ok(Admit::Blocked(event))
+    }
+    fn on_command(
+        &mut self,
+        _: &mut Env<'_, ()>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+    fn take_command(&mut self, _: &mut Env<'_, ()>) -> Option<StreamCommand> {
+        None
+    }
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+}
+
+impl Handoff for Hands {
+    type Next = Boxed;
+    fn handover(&mut self) -> Option<Handover<Boxed, ByteStream, Top>> {
+        Some(Handover {
+            next: self.0.take()?,
+            below: Vec::new(),
+            above: Vec::new(),
+        })
+    }
+}
+
+impl Successor<Boxed> for Boxed {
+    fn succeed(next: Boxed) -> Boxed {
+        next
+    }
+}
+
+/// A switch two chains down whose successor is `depth` deep.
+fn switching_to(depth: usize) -> Chain<Mask, Chain<Mask, Switch<Hands, Boxed>>> {
+    let successor = boxed_to(Hands(None), depth);
+    Chain::new(
+        Mask::new(KEY, 8),
+        Chain::new(Mask::new(KEY, 8), Switch::new(Hands(Some(successor)))),
+    )
+}
+
+/// [`Muxed`] with boxed children.
+type DeepMuxed = Chain<Chain<Toy, Children<Boxed<Exchange, Top>, Ctl>>, Pong>;
+
+/// A mux one chain down, under the application on its control port, with
+/// children `depth` deep.
+fn muxed_to(depth: usize) -> DeepMuxed {
+    Chain::new(
+        Chain::new(
+            Toy::new(8),
+            Children::new(8, 64, move |_, (), _| {
+                Some(boxed_to(Answer::default(), depth))
+            }),
+        ),
+        Pong::default(),
+    )
+}
+
+#[test]
+fn a_successor_must_fit_where_its_switch_sits() {
+    // The switch is two levels down and is a level itself, so what it
+    // hands over to may be MAX_DEPTH - 3 deep.
+    let fits = MAX_DEPTH - 3;
+    let drive = |stack| {
+        Driver::new(
+            stack,
+            std::sync::Arc::new(SeededEntropy::new(Seed::from_u64(3))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        )
+    };
+    let mut driver = drive(switching_to(fits));
+    let before = driver.layer().depth();
+    driver.run().unwrap();
+    assert!(driver.layer().depth() > before, "the switch handed over");
+    assert_eq!(driver.layer().depth(), MAX_DEPTH);
+
+    let mut deeper = drive(switching_to(fits + 1));
+    let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deeper.run()));
+    assert!(handed.is_err(), "a successor one level too deep was kept");
+}
+
+#[test]
+fn a_child_must_fit_where_its_router_sits() {
+    // The router is two levels down and is a level itself, so its
+    // children may be MAX_DEPTH - 3 deep.
+    let fits = MAX_DEPTH - 3;
+    let open = frame(OPEN, 1, b"fast");
+    let mut h = Harness::new(Seed::from_u64(8), muxed_to(fits));
+    h.push(&open).unwrap();
+    assert_eq!(h.layer().depth(), MAX_DEPTH, "the child is open");
+    h.push(
+        &[
+            frame(DATA, 1, b"deep child"),
+            frame(END, 1, &[]),
+            credit(1, 1000),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    assert_eq!(
+        Seen::of(h.output()).bodies.get(&1),
+        Some(&Answer::capitals(b"deep child"))
+    );
+
+    let mut deeper = Harness::new(Seed::from_u64(8), muxed_to(fits + 1));
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deeper.push(&open)));
+    assert!(opened.is_err(), "a child one level too deep was made");
+}
+
+#[test]
+fn a_later_layer_must_fit_where_its_later_sits() {
+    let entropy = SeededEntropy::new(Seed::from_u64(0));
+    let budget = Budget::unlimited();
+    let mut reports = Observations::new(0);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut reports);
+    // A `Later` two levels down, as the upper part of a chain inside a
+    // chain, is a level itself: what it holds may be MAX_DEPTH - 3 deep.
+    let fits = MAX_DEPTH - 3;
+    let mut later = Later::new();
+    env.part(|env| env.part(|env| later.set(env, boxed_to(Hands(None), fits))));
+    assert_eq!(later.depth() + 2, MAX_DEPTH);
+
+    let mut deeper = Later::new();
+    let set = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.part(|env| env.part(|env| deeper.set(env, boxed_to(Hands(None), fits + 1))));
+    }));
+    assert!(set.is_err(), "a layer one level too deep was set");
 }

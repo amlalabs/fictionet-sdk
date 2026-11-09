@@ -2067,7 +2067,7 @@ impl Layer for ObservedTls {
     ) -> Result<fictionet::stdlib::layer::Admit<fictionet::stdlib::layer::StreamEvent>, Self::Error>
     {
         let reset = matches!(event, fictionet::stdlib::layer::StreamEvent::Reset);
-        let result = self.stack.on_event(env, event);
+        let result = env.part(|env| self.stack.on_event(env, event));
         let result = self.result(result);
         if reset {
             self.failed(HandshakeError::Conn(ConnError::Reset));
@@ -2086,7 +2086,7 @@ impl Layer for ObservedTls {
         env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
         timer: Self::Timer,
     ) -> Result<(), Self::Error> {
-        let result = self.stack.on_timer(env, timer);
+        let result = env.part(|env| self.stack.on_timer(env, timer));
         self.result(result)
     }
     fn on_done(
@@ -2094,21 +2094,21 @@ impl Layer for ObservedTls {
         env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
         done: Self::Done,
     ) -> Result<(), Self::Error> {
-        let result = self.stack.on_done(env, done);
+        let result = env.part(|env| self.stack.on_done(env, done));
         self.result(result)
     }
     fn advance(
         &mut self,
         env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
     ) -> Result<bool, Self::Error> {
-        let result = self.stack.advance(env);
+        let result = env.part(|env| self.stack.advance(env));
         self.result(result)
     }
     fn take_command(
         &mut self,
         env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
     ) -> Option<fictionet::stdlib::layer::StreamCommand> {
-        self.stack.take_command(env)
+        env.part(|env| self.stack.take_command(env))
     }
     fn take_event(&mut self) -> Option<std::convert::Infallible> {
         None

@@ -264,7 +264,7 @@ where
                 );
                 self.above.extend(handover.above);
                 let next = B::succeed(handover.next);
-                assert!(next.depth() < super::MAX_DEPTH, "composition is too deep");
+                assert!(env.fits_below(&next), "composition is too deep");
                 self.owner = WorkOwner::new();
                 self.phase = Phase::Then(next);
                 Ok(true)

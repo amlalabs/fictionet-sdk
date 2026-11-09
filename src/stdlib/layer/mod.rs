@@ -360,6 +360,10 @@ pub trait Layer: Sized {
 
     /// Maximum number of nested layer calls, including this layer.
     /// Composites include their children even when hidden by type erasure.
+    /// A layer that counts itself as a level above its parts calls them one
+    /// level down ([`Env::part`], [`Env::scoped`]), so a part it adds while
+    /// it runs is checked against the depth left where it sits
+    /// ([`Env::fits_below`]).
     fn depth(&self) -> usize {
         1
     }

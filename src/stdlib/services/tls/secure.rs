@@ -157,7 +157,9 @@ where
                         self.refused = true;
                         return Ok(true);
                     };
-                    self.chain.upper_mut().set(upper);
+                    // The chain calls the `Later` one level down, on its upper side.
+                    let later = self.chain.upper_mut();
+                    env.scoped(Side::Upper, |env| later.set(env, upper));
                     moved = true;
                 }
             }

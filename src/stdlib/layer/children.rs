@@ -7,8 +7,8 @@ use std::sync::{
 use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
-    Admit, Budget, Charge, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer, MAX_DEPTH,
-    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
+    Admit, Budget, Charge, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer, Mux,
+    MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -958,7 +958,7 @@ where
                     return Ok(Admit::Taken);
                 };
                 let due = layer.deadline();
-                assert!(layer.depth() < MAX_DEPTH, "composition depth exceeded");
+                assert!(env.fits_below(&layer), "composition is too deep");
                 let place = self.kids.vacant_entry();
                 let key = place.key();
                 place.insert(Kid {

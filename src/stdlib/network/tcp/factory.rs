@@ -225,23 +225,23 @@ impl Layer for Stack {
         env: &mut Env<'_, ()>,
         event: PacketEvent<CheckedIpPacket>,
     ) -> Result<Admit<PacketEvent<CheckedIpPacket>>, Infallible> {
-        self.0.event(env, event)
+        env.part(|env| self.0.event(env, event))
     }
     fn on_command(
         &mut self,
         env: &mut Env<'_, ()>,
         command: CommandOf<Tcp>,
     ) -> Result<Admit<CommandOf<Tcp>>, Infallible> {
-        self.0.command(env, command)
+        env.part(|env| self.0.command(env, command))
     }
     fn on_timer(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
-        self.0.timer(env)
+        env.part(|env| self.0.timer(env))
     }
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
-        self.0.advance(env)
+        env.part(|env| self.0.advance(env))
     }
     fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>> {
-        self.0.take_command(env)
+        env.part(|env| self.0.take_command(env))
     }
     fn take_event(&mut self) -> Option<EventOf<Tcp>> {
         self.0.take_event()
@@ -253,7 +253,7 @@ impl Layer for Stack {
         self.0.work()
     }
     fn on_done(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
-        self.0.done(env)
+        env.part(|env| self.0.done(env))
     }
     fn deadline(&self) -> Option<(Instant, ())> {
         self.0.deadline()
