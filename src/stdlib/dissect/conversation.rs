@@ -21,6 +21,8 @@ pub struct Conversation {
     prefix_start: [u64; 2],
     /// Bytes were lost in this direction before a protocol was chosen.
     lost_early: [bool; 2],
+    /// This direction ended cleanly before a protocol was chosen.
+    ended_early: [bool; 2],
     rejected: bool,
 }
 
@@ -36,6 +38,7 @@ impl Conversation {
             prefix: [Vec::new(), Vec::new()],
             prefix_start: [0; 2],
             lost_early: [false; 2],
+            ended_early: [false; 2],
             rejected: false,
         }
     }
@@ -73,14 +76,19 @@ impl Conversation {
     }
 
     /// Tells the selected protocol how this direction ended, and appends
-    /// what that completes to `d`. Before selection there is nothing to
-    /// finish, and an end that is not clean discards the prefix, as
-    /// [`lost`](Self::lost) does.
+    /// what that completes to `d`. Before selection, an end that is not
+    /// clean discards the prefix, as [`lost`](Self::lost) does; a clean end
+    /// keeps it, and the protocol chosen later is told of the end after
+    /// the prefix, so what the end completes is shown then.
     pub fn end(&mut self, dir: bool, how: Termination, d: &mut Decoded) {
         match &mut self.protocol {
             Some(protocol) => protocol.end(dir, how, d),
             None if !how.is_clean() => self.lost(dir),
-            None => {}
+            None => {
+                if let Some(ended) = self.ended_early.get_mut(usize::from(dir)) {
+                    *ended = true;
+                }
+            }
         }
     }
 
@@ -144,6 +152,9 @@ impl Conversation {
                             keys,
                         );
                         held.clear();
+                    }
+                    if self.ended_early[j] {
+                        protocol.end(j != 0, Termination::Fin, d);
                     }
                 }
                 protocol.data(dir, bytes, place, d, keys);
@@ -266,5 +277,72 @@ mod tests {
                 assert_eq!(packet.extra[0].1, prefix);
             }
         }
+    }
+
+    /// A message read to the end of its stream: it completes only at the
+    /// end.
+    struct ToEnd;
+    impl fictionet::stdlib::codec::Decode for ToEnd {
+        type Item = Vec<u8>;
+        type Error = std::convert::Infallible;
+        const NAME: &'static str = "To end";
+        fn capacity(&self) -> usize {
+            256
+        }
+        fn decode(
+            &mut self,
+            input: &[u8],
+            eof: bool,
+        ) -> Result<fictionet::stdlib::codec::Step<Vec<u8>>, Self::Error> {
+            use fictionet::stdlib::codec::Step;
+            Ok(match (eof, input.len()) {
+                (false, _) => Step::Need,
+                (true, 0) => Step::End,
+                (true, n) => Step::Item(input.to_vec(), n),
+            })
+        }
+    }
+    impl Present for ToEnd {
+        fn summary(item: &Vec<u8>) -> String {
+            String::from_utf8_lossy(item).into_owned()
+        }
+        fn fields(_: &Vec<u8>, _: &[u8], _: &mut Layer) {}
+    }
+
+    /// A direction that ends with a FIN before either direction chose a
+    /// protocol is finished once the other direction chooses one: its
+    /// prefix goes to the protocol, then its end, so a message the FIN
+    /// completes is shown and nothing is left waiting.
+    #[test]
+    fn a_fin_before_the_choice_finishes_the_prefix_after_it() {
+        let mut registry = Registry::new();
+        registry.register(
+            "to-end",
+            |s| {
+                if s.first.starts_with(b"go") {
+                    Match::Yes
+                } else {
+                    Match::More
+                }
+            },
+            |_| [ToEnd, ToEnd],
+        );
+        let mut f = Feeder {
+            c: Conversation::with_registry(1, 2, registry),
+            at: [0, 0],
+        };
+        f.send(false, b"bye", 3);
+        let mut fin = Decoded::default();
+        f.c.end(false, Termination::Fin, &mut fin);
+        assert!(fin.layers.is_empty());
+        let chosen = f.send(true, b"go", 2);
+        let layer = chosen
+            .layers
+            .iter()
+            .find(|l| l.summary == "bye")
+            .expect("the FIN completes the message");
+        assert_eq!(chosen.extra[layer.buf - 1].1, b"bye");
+        assert!(!f.c.waiting(false));
+        assert!(f.c.waiting(true));
     }
 }
