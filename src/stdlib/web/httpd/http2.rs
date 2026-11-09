@@ -1455,21 +1455,33 @@ impl Http2 {
             response.window -= n as i32;
             response.queued_bytes -= n as u64;
             self.send_window -= n as i32;
-            let Some(charge) = env.budget().charge(wire::HEADER_LEN) else {
+            // A frame short of the largest is copied whole into one write,
+            // so the transport, and a TLS layer below it, takes the header
+            // and payload together. A largest frame keeps its payload in
+            // the child's allocation, behind a header of its own: that is
+            // where bulk bodies go, and a TLS record could not hold both.
+            let whole = n < frame;
+            let len = wire::HEADER_LEN + if whole { n } else { 0 };
+            let Some(charge) = env.budget().charge(len) else {
                 self.over_budget(env);
                 return true;
             };
-            let mut header = Vec::with_capacity(wire::HEADER_LEN);
+            let mut bytes = Vec::with_capacity(len);
             wire::FrameHeader {
                 length: n,
                 kind: 0,
                 flags: 0,
                 stream: id,
             }
-            .write(&mut header)
+            .write(&mut bytes)
             .expect("outbound frame has valid fields");
-            self.queue(Chunk::with_charge(header, charge), id, 0, false);
-            self.queue_continuation(payload, id, n as u64);
+            if whole {
+                bytes.extend_from_slice(&payload);
+                self.queue(Chunk::with_charge(bytes, charge), id, n as u64, false);
+            } else {
+                self.queue(Chunk::with_charge(bytes, charge), id, 0, false);
+                self.queue_continuation(payload, id, n as u64);
+            }
             self.grant(id);
             return true;
         }
@@ -3122,5 +3134,44 @@ mod tests {
         harness.push(&reset).unwrap();
         assert!(budget.used() < before + value.len());
         assert!(!harness.ended());
+    }
+
+    /// Every write the server queues for the transport after a request
+    /// for `body`.
+    fn writes_for(body: Vec<u8>) -> Vec<Chunk> {
+        let mut harness = answering(body.clone(), body.len(), Budget::unlimited());
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        harness.withhold();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        let mut writes = Vec::new();
+        while let Some(command) = harness.driver().take_command() {
+            if let StreamCommand::Write(chunk) = command {
+                writes.push(chunk);
+            }
+        }
+        writes
+    }
+
+    #[test]
+    fn a_short_data_frame_goes_down_in_one_write() {
+        let body = vec![b's'; 100];
+        let writes = writes_for(body.clone());
+        // Each write is whole frames, so a TLS layer below seals a frame's
+        // header and payload together.
+        for write in &writes {
+            assert!(whole_frames(write).is_some(), "{write:?}");
+        }
+        let sent: Vec<u8> = writes
+            .iter()
+            .flat_map(|write| frames(write))
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 1 => Some(d.data),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(sent, body);
     }
 }
