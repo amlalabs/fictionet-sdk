@@ -2,13 +2,15 @@ use super::carrier::CreditReturn;
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
     Admit, Budget, Charge, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer, MAX_DEPTH,
     Mux, MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
 };
+use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 
 /// How many commands wait for the mux, and how many of those places only
@@ -77,11 +79,17 @@ type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 /// reading holds at most `window` units plus bounded item and completion
 /// slots. A child's commands wait in a place of their own until the mux
 /// grants credit for them, so a child the peer does
-/// not read holds up nothing but itself. Children are visited in a stable
-/// order, at most 64 per advance, continuing after the last visited child.
-/// At most 4096 children can be configured; work and deadline scans share
-/// that hard bound. Byte receive credit returns when its backing is released;
-/// atomic message credit returns on admission, independently of memory.
+/// not read holds up nothing but itself. An advance visits only the
+/// children that have something to do: one that got an event, credit, a
+/// timer, a work result or a wake from its work, one whose released
+/// payload returned credit, and one whose last visit moved or found the
+/// mux's queue full. They are visited in a stable order, at most 64 per
+/// advance, continuing after the last visited child. A child's layer
+/// changes only when `Children` calls it, so its deadline and depth are
+/// kept from its last call. At most 4096 children can be configured; work
+/// and deadline scans share that hard bound. Byte receive credit returns
+/// when its backing is released; atomic message credit returns on
+/// admission, independently of memory.
 ///
 /// The router's queues are charged to the budget from its first step. Each
 /// child's place and its inbox are charged as they grow, the places up to the
@@ -108,18 +116,28 @@ where
     budget_for: Option<Box<ChildBudget<O>>>,
     close_finished: bool,
     kids: Vec<(ChildId, Kid<B>)>,
+    /// What each child in `kids`, at the same index, has to do.
+    marks: Vec<Marks>,
+    /// Set when something outside a call reached a child ([`ChildWake`]).
+    woken: Arc<AtomicBool>,
     limit: usize,
     window: u64,
     down: VecDeque<MuxCommand<B::Lower, K>>,
     up: VecDeque<EventOf<K>>,
-    /// The child visited first last time.
+    /// Where the next advance starts: after this child.
     turn: Option<ChildId>,
     work_turn: Option<ChildId>,
     timer_turn: Option<ChildId>,
-    remaining_visits: usize,
-    sweep_first: Option<ChildId>,
     // Reservations outlive every allocation they cover during destruction.
     storage: Option<Charge>,
+}
+
+/// Whether a child needs a visit, and whether its layer may have work to
+/// hand over.
+#[derive(Clone, Copy, Default)]
+struct Marks {
+    ready: bool,
+    work: bool,
 }
 
 struct Kid<B: Layer> {
@@ -132,7 +150,10 @@ struct Kid<B: Layer> {
     inbox: VecDeque<(EventOf<B::Lower>, bool)>,
     /// What the inbox is charged: its places, grown as events wait.
     storage: Charge,
-    released: Arc<AtomicU64>,
+    wake: Arc<ChildWake>,
+    /// The layer's deadline and depth after its last call.
+    due: Option<Instant>,
+    depth: usize,
     backing: Arc<Charge>,
     max_command: u64,
     /// Credit the mux may still use for this child's events.
@@ -143,6 +164,114 @@ struct Kid<B: Layer> {
     credit: u64,
     /// A command of the layer's that waits for credit.
     outbox: Option<CommandOf<B::Lower>>,
+}
+
+/// What reaches a child from outside `Children`'s calls into it: receive
+/// credit returned by payload released elsewhere, and wakes from its work,
+/// which may share state with its layer (a tunnel's connection does).
+/// Either gets the child visited at the next advance.
+pub(crate) struct ChildWake {
+    released: AtomicU64,
+    /// `Children` is calling the child and collects what it releases.
+    calling: AtomicBool,
+    woken: AtomicBool,
+    /// The flag `Children` checks before looking for woken children.
+    any: Arc<AtomicBool>,
+    /// The task that polls the child's work, woken with it.
+    task: Mutex<Option<Waker>>,
+}
+
+impl ChildWake {
+    fn new(any: Arc<AtomicBool>) -> ChildWake {
+        ChildWake {
+            released: AtomicU64::new(0),
+            calling: AtomicBool::new(false),
+            woken: AtomicBool::new(false),
+            any,
+            task: Mutex::new(None),
+        }
+    }
+
+    /// Payload holding `units` of receive credit was released.
+    pub(crate) fn release(&self, units: u64) {
+        self.released.fetch_add(units, Ordering::SeqCst);
+        if !self.calling.load(Ordering::SeqCst) {
+            self.notify();
+        }
+    }
+
+    fn notify(&self) {
+        self.woken.store(true, Ordering::SeqCst);
+        self.any.store(true, Ordering::SeqCst);
+    }
+
+    /// Brackets a call into the child: credit it releases meanwhile is
+    /// collected after the call instead of waking it.
+    fn call<T>(&self, call: impl FnOnce() -> T) -> T {
+        self.calling.store(true, Ordering::SeqCst);
+        let result = call();
+        self.calling.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// Credit released since the last time this was asked.
+    fn take_released(&self) -> u64 {
+        self.released.swap(0, Ordering::SeqCst)
+    }
+
+    /// A waker for the child's work that also wakes `task`, the poller.
+    pub(crate) fn waker(self: &Arc<Self>, task: &Waker) -> Waker {
+        {
+            let mut current = self.task.lock();
+            if !current.as_ref().is_some_and(|w| w.will_wake(task)) {
+                *current = Some(task.clone());
+            }
+        }
+        Waker::from(self.clone())
+    }
+}
+
+impl Wake for ChildWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notify();
+        let task = self.task.lock().clone();
+        if let Some(task) = task {
+            task.wake();
+        }
+    }
+}
+
+/// A child's work: its result goes back to the child, and a wake from it,
+/// or its end without a result, gets the child visited.
+pub struct ChildWork<W> {
+    id: ChildId,
+    pub(crate) work: OwnedWork<W>,
+    pub(crate) wake: Arc<ChildWake>,
+    pub(crate) finished: bool,
+}
+
+impl<W> ChildWork<W> {
+    /// The child the work is for.
+    pub fn id(&self) -> ChildId {
+        self.id
+    }
+
+    /// Whether the child has closed.
+    pub fn cancelled(&self) -> bool {
+        self.work.cancelled()
+    }
+}
+
+impl<W> Drop for ChildWork<W> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.wake.notify();
+        }
+    }
 }
 
 /// What [`Children`] reports.
@@ -201,6 +330,8 @@ where
             budget_for: None,
             close_finished: false,
             kids: Vec::new(),
+            marks: Vec::new(),
+            woken: Arc::new(AtomicBool::new(false)),
             storage: None,
             limit,
             window,
@@ -209,8 +340,6 @@ where
             turn: None,
             work_turn: None,
             timer_turn: None,
-            remaining_visits: 0,
-            sweep_first: None,
         }
     }
 
@@ -234,16 +363,20 @@ where
         self
     }
 
-    /// The routing storage for `kids` child places: the places themselves,
-    /// the command queue with one closing place per child, and the control
-    /// queue.
+    /// The routing storage for `kids` child places: the places themselves
+    /// with their marks and wake state, the command queue with one closing
+    /// place per child, and the control queue.
     fn routing_bytes(kids: usize) -> Option<usize> {
-        kids.checked_mul(size_of::<(ChildId, Kid<B>)>())?
-            .checked_add(
-                (QUEUE.checked_add(kids)?)
-                    .checked_mul(size_of::<MuxCommand<B::Lower, K>>())?
-                    .checked_add(QUEUE.checked_mul(size_of::<EventOf<K>>())?)?,
-            )
+        let place = size_of::<(ChildId, Kid<B>)>()
+            + size_of::<Marks>()
+            // The wake state's shared allocation, with its two counts.
+            + size_of::<ChildWake>()
+            + 2 * size_of::<usize>();
+        kids.checked_mul(place)?.checked_add(
+            (QUEUE.checked_add(kids)?)
+                .checked_mul(size_of::<MuxCommand<B::Lower, K>>())?
+                .checked_add(QUEUE.checked_mul(size_of::<EventOf<K>>())?)?,
+        )
     }
 
     /// Reserves the queues the first time anything arrives. Child places
@@ -284,13 +417,53 @@ where
             return false;
         }
         self.kids.reserve_exact(places - self.kids.len());
+        self.marks.reserve_exact(places - self.marks.len());
         self.down.reserve_exact(QUEUE + places - self.down.len());
         true
     }
 
+    /// Where child `id` is in `kids`, which is in id order.
+    fn index(&self, id: ChildId) -> Option<usize> {
+        self.kids.binary_search_by_key(&id, |(key, _)| *key).ok()
+    }
+
+    fn kid_mut(&mut self, id: ChildId) -> Option<&mut Kid<B>> {
+        let index = self.index(id)?;
+        Some(&mut self.kids[index].1)
+    }
+
     fn remove(&mut self, id: ChildId) -> Option<Kid<B>> {
-        let index = self.kids.iter().position(|(key, _)| *key == id)?;
+        let index = self.index(id)?;
+        self.marks.remove(index);
         Some(self.kids.remove(index).1)
+    }
+
+    /// Child `id` was called: its layer may have work, its deadline and
+    /// depth are read again, and with `ready` it needs a visit.
+    fn called(&mut self, id: ChildId, ready: bool) {
+        if let Some(index) = self.index(id) {
+            let marks = &mut self.marks[index];
+            marks.ready |= ready;
+            marks.work = true;
+            let kid = &mut self.kids[index].1;
+            kid.due = kid.layer.deadline().map(|(at, _)| at);
+            kid.depth = kid.layer.depth();
+        }
+    }
+
+    /// Marks the children something reached from outside a call.
+    fn collect_wakes(&mut self) {
+        if !self.woken.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        for ((_, kid), marks) in self.kids.iter().zip(&mut self.marks) {
+            if kid.wake.woken.swap(false, Ordering::SeqCst) {
+                *marks = Marks {
+                    ready: true,
+                    work: true,
+                };
+            }
+        }
     }
 
     /// With no children the places go, so an idle connection holds the same
@@ -301,6 +474,7 @@ where
             return;
         }
         self.kids = Vec::new();
+        self.marks = Vec::new();
         self.down.shrink_to(QUEUE.max(self.down.len()));
         let places = self.down.capacity().saturating_sub(QUEUE);
         if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
@@ -310,10 +484,7 @@ where
 
     /// The layer of child `id`, while it is open.
     pub fn child(&self, id: ChildId) -> Option<&B> {
-        self.kids
-            .iter()
-            .find(|(key, _)| *key == id)
-            .map(|(_, kid)| &kid.layer)
+        self.index(id).map(|index| &self.kids[index].1.layer)
     }
 
     /// The open children, in order.
@@ -347,55 +518,78 @@ where
 
     /// Whether child `id`'s place is full: its urgent place, or its inbox.
     fn full(&self, id: ChildId, urgent: bool) -> bool {
-        self.kids
-            .iter()
-            .find(|(key, _)| *key == id)
-            .is_some_and(|(_, kid)| {
-                if urgent {
-                    kid.urgent.is_some()
-                } else {
-                    kid.inbox.len() >= QUEUE
-                }
-            })
+        self.index(id).is_some_and(|index| {
+            let kid = &self.kids[index].1;
+            if urgent {
+                kid.urgent.is_some()
+            } else {
+                kid.inbox.len() >= QUEUE
+            }
+        })
     }
 
     /// One visit to child `id`: its internal work, one event in, one
     /// command out, and credit granted again. Returns whether anything
-    /// moved.
+    /// moved. The child stays ready if something moved or if the mux's
+    /// queue had no room for what it has to send.
     fn visit_child(
         &mut self,
         env: &mut Env<'_, ChildReport<B::Report, B::Error>>,
         id: ChildId,
     ) -> Result<bool, Overrun> {
-        let Some(kid) = self
-            .kids
-            .iter_mut()
-            .find(|(key, _)| *key == id)
-            .map(|(_, kid)| kid)
-        else {
+        let Some(index) = self.index(id) else {
             return Ok(false);
         };
+        self.marks[index].ready = false;
+        let Some((moved, waiting)) = self.visit_kid(env, index) else {
+            return Ok(true);
+        };
+        self.called(id, moved || waiting);
+        Ok(moved)
+    }
+
+    /// The visit itself: whether anything moved and whether the child waits
+    /// for room in the mux's queue, or `None` if the child was closed.
+    fn visit_kid(
+        &mut self,
+        env: &mut Env<'_, ChildReport<B::Report, B::Error>>,
+        index: usize,
+    ) -> Option<(bool, bool)> {
+        let (id, kid) = &mut self.kids[index];
+        let id = *id;
         let report = move |e| ChildReport::Event(id, e);
-        let mut moved = match env.scoped_in(&kid.budget, report, |env| kid.layer.advance(env)) {
+        let wake = &kid.wake;
+        let layer = &mut kid.layer;
+        let budget = &kid.budget;
+        let mut moved = match wake.call(|| env.scoped_in(budget, report, |env| layer.advance(env)))
+        {
             Ok(moved) => moved,
             Err(e) => {
                 self.fail(env, id, e);
-                return Ok(true);
+                return None;
             }
         };
         if let Some(event) = kid.urgent.take() {
-            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
+            let layer = &mut kid.layer;
+            match kid
+                .wake
+                .call(|| env.scoped_in(&kid.budget, report, |env| layer.on_event(env, event)))
+            {
                 Ok(Admit::Taken | Admit::Closed(_)) => moved = true,
                 Ok(Admit::Blocked(event) | Admit::Partial(event)) => kid.urgent = Some(event),
                 Err(e) => {
                     self.fail(env, id, e);
-                    return Ok(true);
+                    return None;
                 }
             }
         }
         if let Some((event, retained)) = kid.inbox.pop_front() {
             let cost = event.credit();
-            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
+            let layer = &mut kid.layer;
+            match kid
+                .wake
+                .call(|| env.scoped_in(&kid.budget, report, |env| layer.on_event(env, event)))
+            {
                 Ok(Admit::Taken | Admit::Closed(_)) => {
                     if !retained {
                         kid.owed += cost;
@@ -412,23 +606,25 @@ where
                 Ok(Admit::Blocked(event)) => kid.inbox.push_front((event, retained)),
                 Err(e) => {
                     self.fail(env, id, e);
-                    return Ok(true);
+                    return None;
                 }
             }
         }
         if kid.outbox.is_none() {
-            kid.outbox = kid.layer.take_command();
+            let layer = &mut kid.layer;
+            kid.outbox = kid.wake.call(|| layer.take_command());
             moved |= kid.outbox.is_some();
         }
         let output_idle = kid.outbox.is_none();
+        let mut waiting = false;
         if let Some(mut command) = kid.outbox.take() {
             if !command.splittable() && command.credit() > kid.max_command {
                 self.refuse(env, id);
-                return Ok(true);
+                return None;
             }
             if !command.reserve(&kid.budget) {
                 self.refuse(env, id);
-                return Ok(true);
+                return None;
             }
             if self.down.len() < QUEUE - RESERVE {
                 match command.admit_credit(kid.credit) {
@@ -438,26 +634,34 @@ where
                         kid.outbox = rest;
                         moved = true;
                     }
+                    // Credit from the mux gets the child visited again.
                     Err(command) => kid.outbox = Some(command),
                 }
             } else {
                 kid.outbox = Some(command);
+                waiting = true;
             }
         }
-        kid.owed += kid.released.swap(0, Ordering::Relaxed);
-        if kid.owed > 0 && self.down.len() < QUEUE {
-            self.down.push_back(kid.handle.grant(kid.owed));
-            kid.granted += kid.owed;
-            kid.owed = 0;
-            moved = true;
+        kid.owed += kid.wake.take_released();
+        if kid.owed > 0 {
+            if self.down.len() < QUEUE {
+                self.down.push_back(kid.handle.grant(kid.owed));
+                kid.granted += kid.owed;
+                kid.owed = 0;
+                moved = true;
+            } else {
+                waiting = true;
+            }
         }
-        if self.close_finished && kid.layer.is_terminal() && output_idle && self.down.len() < QUEUE
-        {
-            let kid = self.remove(id).expect("visited child");
-            self.down.push_back(kid.handle.close());
-            return Ok(true);
+        if self.close_finished && output_idle && kid.layer.is_terminal() {
+            if self.down.len() < QUEUE {
+                let kid = self.remove(id).expect("visited child");
+                self.down.push_back(kid.handle.close());
+                return None;
+            }
+            waiting = true;
         }
-        Ok(moved)
+        Some((moved, waiting))
     }
 }
 
@@ -472,7 +676,7 @@ where
     type Upper = K;
     type Report = ChildReport<B::Report, B::Error>;
     type Timer = (ChildId, B::Timer);
-    type Work = (ChildId, OwnedWork<B::Work>);
+    type Work = ChildWork<B::Work>;
     type Done = (ChildId, B::Done);
     type Error = Overrun;
 
@@ -514,16 +718,19 @@ where
                     return Ok(Admit::Taken);
                 };
                 let layer = (self.make)(id, opening, &budget);
-                assert!(layer.depth() < MAX_DEPTH, "composition depth exceeded");
+                let depth = layer.depth();
+                assert!(depth < MAX_DEPTH, "composition depth exceeded");
                 let kid = Kid {
                     handle: child,
+                    due: layer.deadline().map(|(at, _)| at),
+                    depth,
                     layer,
                     budget,
                     owner: WorkOwner::new(),
                     urgent: None,
                     inbox: VecDeque::new(),
                     storage,
-                    released: Arc::new(AtomicU64::new(0)),
+                    wake: Arc::new(ChildWake::new(self.woken.clone())),
                     backing,
                     max_command,
                     granted: 0,
@@ -536,6 +743,13 @@ where
                     .binary_search_by_key(&id, |(key, _)| *key)
                     .unwrap_err();
                 self.kids.insert(index, (id, kid));
+                self.marks.insert(
+                    index,
+                    Marks {
+                        ready: true,
+                        work: true,
+                    },
+                );
             }
             MuxEvent::Child(id, mut event) => {
                 // Reset ends this lifetime immediately. Notify the child, then
@@ -555,11 +769,11 @@ where
                     return Ok(Admit::Taken);
                 }
                 // A child already gone has nothing to deliver to.
-                let Some(kid) = self.kids.iter().find(|(key, _)| *key == id) else {
+                let Some(index) = self.index(id) else {
                     return Ok(Admit::Taken);
                 };
                 let cost = event.credit();
-                if cost > kid.1.granted {
+                if cost > self.kids[index].1.granted {
                     return Err(Overrun::Credit(id));
                 }
                 // A full place gets the child one visit to make room. A
@@ -572,12 +786,8 @@ where
                         self.refuse(env, id);
                     }
                 }
-                if let Some(kid) = self
-                    .kids
-                    .iter_mut()
-                    .find(|(key, _)| *key == id)
-                    .map(|(_, kid)| kid)
-                {
+                if let Some(index) = self.index(id) {
+                    let kid = &mut self.kids[index].1;
                     if urgent {
                         kid.urgent = Some(event);
                     } else {
@@ -597,22 +807,20 @@ where
                         }
                         kid.granted -= cost;
                         let retained = if cost > 0 {
-                            event.retain_credit(CreditReturn::new(kid.released.clone(), cost))
+                            event.retain_credit(CreditReturn::new(kid.wake.clone(), cost))
                         } else {
                             false
                         };
                         kid.inbox.push_back((event, retained));
                     }
+                    self.marks[index].ready = true;
                 }
             }
             MuxEvent::Credit(id, units) => {
-                if let Some(kid) = self
-                    .kids
-                    .iter_mut()
-                    .find(|(key, _)| *key == id)
-                    .map(|(_, kid)| kid)
-                {
+                if let Some(index) = self.index(id) {
+                    let kid = &mut self.kids[index].1;
                     kid.credit = kid.credit.saturating_add(units);
+                    self.marks[index].ready = true;
                 }
             }
             MuxEvent::Closed(id) => {
@@ -625,7 +833,6 @@ where
                 self.up.push_back(event);
             }
         }
-        self.remaining_visits = 0;
         Ok(Admit::Taken)
     }
 
@@ -647,21 +854,21 @@ where
         env: &mut Env<'_, Self::Report>,
         (id, timer): Self::Timer,
     ) -> Result<(), Overrun> {
-        let Some(kid) = self
-            .kids
-            .iter_mut()
-            .find(|(key, _)| *key == id)
-            .map(|(_, kid)| kid)
-        else {
+        let Some(kid) = self.kid_mut(id) else {
             return Ok(());
         };
+        let layer = &mut kid.layer;
+        let result = kid.wake.call(|| {
+            env.scoped_in(
+                &kid.budget,
+                move |e| ChildReport::Event(id, e),
+                |env| layer.on_timer(env, timer),
+            )
+        });
         self.timer_turn = Some(id);
-        if let Err(e) = env.scoped_in(
-            &kid.budget,
-            move |e| ChildReport::Event(id, e),
-            |env| kid.layer.on_timer(env, timer),
-        ) {
-            self.fail(env, id, e);
+        match result {
+            Ok(()) => self.called(id, true),
+            Err(e) => self.fail(env, id, e),
         }
         Ok(())
     }
@@ -671,20 +878,20 @@ where
         env: &mut Env<'_, Self::Report>,
         (id, done): Self::Done,
     ) -> Result<(), Overrun> {
-        let Some(kid) = self
-            .kids
-            .iter_mut()
-            .find(|(key, _)| *key == id)
-            .map(|(_, kid)| kid)
-        else {
+        let Some(kid) = self.kid_mut(id) else {
             return Ok(());
         };
-        if let Err(e) = env.scoped_in(
-            &kid.budget,
-            move |e| ChildReport::Event(id, e),
-            |env| kid.layer.on_done(env, done),
-        ) {
-            self.fail(env, id, e);
+        let layer = &mut kid.layer;
+        let result = kid.wake.call(|| {
+            env.scoped_in(
+                &kid.budget,
+                move |e| ChildReport::Event(id, e),
+                |env| layer.on_done(env, done),
+            )
+        });
+        match result {
+            Ok(()) => self.called(id, true),
+            Err(e) => self.fail(env, id, e),
         }
         Ok(())
     }
@@ -693,37 +900,49 @@ where
         // The queues are the router's fixed state: an idle connection holds
         // them from its first step.
         self.reserve(env.budget())?;
-        if self.remaining_visits == 0 {
-            self.remaining_visits = self.kids.len();
-            self.sweep_first = None;
-        }
-        let count = self.remaining_visits.min(QUEUE);
-        let mut last = self.turn;
+        self.collect_wakes();
+        // Ready children after the turn, then from the start up to it, each
+        // at most once and at most QUEUE of them. A visit may close its
+        // child, so the next one is found by id.
+        let turn = self.turn;
+        let mut last = turn;
+        let mut wrapped = turn.is_none();
+        let mut first = None;
+        let mut visits = 0;
         let mut moved = false;
-        for _ in 0..count {
-            let next = self
-                .kids
-                .iter()
-                .map(|(id, _)| *id)
-                .find(|id| last.is_none_or(|last| *id > last))
-                .or_else(|| self.kids.first().map(|(id, _)| *id));
-            let Some(id) = next else {
-                break;
+        let mut more = false;
+        loop {
+            let from = last.map_or(0, |last| self.kids.partition_point(|(id, _)| *id <= last));
+            let to = if wrapped {
+                turn.map_or(self.kids.len(), |turn| {
+                    self.kids.partition_point(|(id, _)| *id <= turn)
+                })
+            } else {
+                self.kids.len()
             };
-            self.sweep_first.get_or_insert(id);
+            let Some(index) = (from..to).find(|&index| self.marks[index].ready) else {
+                if wrapped {
+                    break;
+                }
+                wrapped = true;
+                last = None;
+                continue;
+            };
+            if visits == QUEUE {
+                more = true;
+                break;
+            }
+            let id = self.kids[index].0;
+            first.get_or_insert(id);
             last = Some(id);
+            visits += 1;
             moved |= self.visit_child(env, id)?;
         }
-        self.turn = last;
-        self.remaining_visits = self.remaining_visits.saturating_sub(count);
-        if self.kids.is_empty() {
-            self.remaining_visits = 0;
-        }
-        if self.remaining_visits == 0 {
-            self.turn = self.sweep_first;
-        }
+        // A sweep that reached every ready child starts the next one after
+        // the child it visited first, so each child in turn goes first.
+        self.turn = if more { last } else { first.or(turn) };
         self.release_places();
-        Ok(moved || self.remaining_visits > 0)
+        Ok(moved || more)
     }
 
     fn take_command(&mut self) -> Option<MuxCommand<B::Lower, K>> {
@@ -737,15 +956,30 @@ where
     fn take_work(&mut self) -> Option<Self::Work> {
         let start = self
             .work_turn
-            .and_then(|id| self.kids.iter().position(|(key, _)| *key > id))
-            .unwrap_or(0);
+            .map_or(0, |id| self.kids.partition_point(|(key, _)| *key <= id));
         for offset in 0..self.kids.len() {
             let index = (start + offset) % self.kids.len();
-            let (id, kid) = &mut self.kids[index];
-            if let Some(work) = kid.layer.take_work() {
-                self.work_turn = Some(*id);
-                return Some((*id, kid.owner.own(work)));
+            if !self.marks[index].work {
+                continue;
             }
+            let (id, kid) = &mut self.kids[index];
+            let id = *id;
+            let layer = &mut kid.layer;
+            let Some(work) = kid.wake.call(|| layer.take_work()) else {
+                self.marks[index].work = false;
+                continue;
+            };
+            let work = ChildWork {
+                id,
+                work: kid.owner.own(work),
+                wake: kid.wake.clone(),
+                finished: false,
+            };
+            self.work_turn = Some(id);
+            // Handing work over can change the layer, as a session's idle
+            // timer stops while its work runs.
+            self.called(id, true);
+            return Some(work);
         }
         None
     }
@@ -762,16 +996,20 @@ where
         1 + self
             .kids
             .iter()
-            .map(|(_, kid)| kid.layer.depth())
+            .map(|(_, kid)| kid.depth)
             .max()
             .unwrap_or(0)
     }
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
-        self.kids
+        let (id, kid) = self
+            .kids
             .iter()
-            .filter_map(|(id, kid)| kid.layer.deadline().map(|(at, t)| (at, (*id, t))))
-            .min_by_key(|(at, (id, _))| (*at, !self.timer_turn.is_none_or(|last| *id > last), *id))
+            .filter(|(_, kid)| kid.due.is_some())
+            .min_by_key(|(id, kid)| {
+                (kid.due, !self.timer_turn.is_none_or(|last| *id > last), *id)
+            })?;
+        kid.layer.deadline().map(|(at, timer)| (at, (*id, timer)))
     }
 }
 
@@ -1100,8 +1338,9 @@ mod tests {
         }
         // Empty data costs no credit, but holds one of the bounded places.
         assert_eq!(driver.layer().kids[0].1.inbox.len(), QUEUE);
-        let (first, work) = driver.layer_mut().take_work().unwrap();
-        let (second, _) = driver.layer_mut().take_work().unwrap();
+        let work = driver.layer_mut().take_work().unwrap();
+        let first = work.id();
+        let second = driver.layer_mut().take_work().unwrap().id();
         assert_ne!(first, second);
         assert_eq!([first, second], [a, b]);
         assert!(!work.cancelled());
@@ -1109,7 +1348,7 @@ mod tests {
             .deliver(MuxEvent::Child(a, StreamEvent::Reset))
             .unwrap();
         assert!(work.cancelled());
-        assert_eq!(driver.layer_mut().take_work().unwrap().0, b);
+        assert_eq!(driver.layer_mut().take_work().unwrap().id(), b);
     }
     #[test]
     fn refusing_a_full_inbox_keeps_siblings_and_cancels_its_work() {
@@ -1135,7 +1374,8 @@ mod tests {
                 .unwrap()
                 .moved()
         );
-        let (owner, work) = driver.layer_mut().take_work().unwrap();
+        let work = driver.layer_mut().take_work().unwrap();
+        let owner = work.id();
         assert_eq!(owner, a);
         for _ in 0..=QUEUE {
             assert!(
@@ -1150,7 +1390,7 @@ mod tests {
         }
         assert!(work.cancelled());
         assert_eq!(driver.layer_mut().kids.len(), 1);
-        assert_eq!(driver.layer_mut().take_work().unwrap().0, b);
+        assert_eq!(driver.layer_mut().take_work().unwrap().id(), b);
         assert!(
             driver
                 .deliver(MuxEvent::Child(b, StreamEvent::Written(9)))

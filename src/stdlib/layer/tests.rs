@@ -1025,9 +1025,9 @@ fn gated() -> Gated {
 }
 
 /// The work a muxed stack asks for, as the child it is for.
-fn work_child(work: Side<Side<(), (ChildId, OwnedWork<()>)>, ()>) -> ChildId {
+fn work_child(work: Side<Side<(), ChildWork<()>>, ()>) -> ChildId {
     match work {
-        Side::Lower(Side::Upper((id, _))) => id,
+        Side::Lower(Side::Upper(work)) => work.id(),
         _ => panic!("only children ask for work"),
     }
 }

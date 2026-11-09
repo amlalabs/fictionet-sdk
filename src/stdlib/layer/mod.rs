@@ -225,7 +225,7 @@ pub use carrier::{
     MuxOp, Slots, StreamCommand, StreamEvent,
 };
 pub use chain::Chain;
-pub use children::{ChildReport, Children, Overrun};
+pub use children::{ChildReport, ChildWork, Children, Overrun};
 pub use choice::Later;
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
