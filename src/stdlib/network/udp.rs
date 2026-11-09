@@ -152,7 +152,7 @@ pub fn prepare_endpoint(
         addr,
         budget: Budget::unlimited(),
     });
-    let task = super::endpoint::drive(fcx.clone(), inner, None, Some(udp), None, ip);
+    let task = super::endpoint::drive(fcx.clone(), inner, None, Some(udp), None, ip, Scope::ROOT);
     (endpoint, Prepared { task })
 }
 

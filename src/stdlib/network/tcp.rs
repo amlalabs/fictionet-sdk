@@ -68,14 +68,14 @@ use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
 use fictionet::CancelWait;
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Child, ChildId, Chunk, Driver, MessageCommand, MessageEvent,
-    Messages, MuxCommand, MuxEvent, PacketCommand, PacketEvent, StreamCommand, StreamEvent,
+    Messages, MuxCommand, MuxEvent, MuxOp, PacketCommand, PacketEvent, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::ip::{
     Header, Ipv4Option, Ipv4Reply, checksum, encode_ipv4_options, ipv4_options,
     protocol::{ICMP, TCP},
     transport_checksum,
 };
-use fictionet::stdlib::network::packet::IpPacket;
+use fictionet::stdlib::network::packet::{IpPacket, Scope};
 use fictionet::stdlib::network::transport::{
     Request, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
@@ -998,7 +998,7 @@ pub fn prepare_endpoint(
         addr,
         budget: Budget::unlimited(),
     });
-    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip);
+    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip, Scope::ROOT);
     (endpoint, Prepared { task })
 }
 
@@ -1020,6 +1020,7 @@ pub(crate) fn prepare_transport(
             fcx: fcx.clone(),
             tcp: Driver::new(tcp, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now()),
             routes: Routes::default(),
+            controls: VecDeque::new(),
         }),
     });
     (
@@ -1117,6 +1118,12 @@ struct Host {
     fcx: Cx,
     tcp: Driver<Stack>,
     routes: Routes,
+    /// Control commands the transport refused for now, in the order they
+    /// were given, offered again before anything new. A transport may
+    /// refuse any command (`Admit::Blocked`); a refused `Hold` keeps its
+    /// item here, so a count it carries goes on counting, and a refused
+    /// `Abort` still resets its connection once taken.
+    controls: VecDeque<TcpControl>,
 }
 
 /// What the handles wait for, and where the engine's events go.
@@ -1369,16 +1376,65 @@ impl Host {
         taken
     }
 
+    /// Gives the transport `control` after those it refused before, and
+    /// keeps what it refuses for the next step. A stopped endpoint holds
+    /// nothing, so `control` is dropped there, with any item it carries.
     fn control(&mut self, control: TcpControl) {
-        self.command(MuxCommand::control(MessageCommand::Send(control)));
+        if self.routes.stopped {
+            return;
+        }
+        self.controls.push_back(control);
+        self.tick();
+        self.pump();
+        if self.engine_ref().busy() {
+            self.kick();
+        }
     }
 
-    /// Routes every event the engine has, and resets the children
-    /// accepted for nobody.
+    /// Gives the transport `control`, whose answer the caller reads at
+    /// once, after every control it refused before. It is never queued: a
+    /// command still waiting, or a refusal, leaves the transport without
+    /// it. Returns whether the transport took it.
+    fn request(&mut self, control: TcpControl) -> bool {
+        self.tick();
+        self.pump();
+        self.controls.is_empty() && self.command(MuxCommand::control(MessageCommand::Send(control)))
+    }
+
+    /// Offers the refused controls again, in order, until the transport
+    /// refuses one. Returns whether it took any.
+    fn offer_controls(tcp: &mut Driver<Stack>, controls: &mut VecDeque<TcpControl>) -> bool {
+        let mut moved = false;
+        while let Some(control) = controls.pop_front() {
+            let command = MuxCommand::control(MessageCommand::Send(control));
+            match tcp.command(command).unwrap() {
+                Admit::Blocked(command) | Admit::Partial(command) => {
+                    let MuxOp::Control(MessageCommand::Send(control)) = command.into_op() else {
+                        unreachable!("a control command comes back as one");
+                    };
+                    controls.push_front(control);
+                    return moved;
+                }
+                // A closed transport takes nothing more: the command is
+                // dropped, as everything it held was.
+                Admit::Taken | Admit::Closed(_) => moved = true,
+            }
+        }
+        moved
+    }
+
+    /// Offers the refused controls again, routes every event the engine
+    /// has, and resets the children accepted for nobody.
     fn pump(&mut self) {
         loop {
-            let Host { tcp, routes, .. } = self;
-            let moved = tcp.send_above(|event| {
+            let Host {
+                tcp,
+                routes,
+                controls,
+                ..
+            } = self;
+            let mut moved = Host::offer_controls(tcp, controls);
+            moved |= tcp.send_above(|event| {
                 if routes.application_events.len() >= 64 {
                     return Admit::Blocked(event);
                 }
@@ -1390,20 +1446,15 @@ impl Host {
             if strays.is_empty() && accepting.is_empty() && !moved {
                 return;
             }
-            for port in accepting {
-                let _ = tcp
-                    .command(MuxCommand::control(MessageCommand::Send(
-                        TcpControl::Accept { port, count: 1 },
-                    )))
-                    .unwrap();
-            }
+            controls.extend(
+                accepting
+                    .into_iter()
+                    .map(|port| TcpControl::Accept { port, count: 1 }),
+            );
             for child in strays {
-                let abort =
-                    MuxCommand::control(MessageCommand::Send(TcpControl::Abort(child.id())));
-                for command in [abort, child.close()] {
-                    if let Err(never) = tcp.command(command) {
-                        match never {}
-                    }
+                controls.push_back(TcpControl::Abort(child.id()));
+                if let Err(never) = tcp.command(child.close()) {
+                    match never {}
                 }
             }
         }
@@ -1500,9 +1551,12 @@ impl std::ops::DerefMut for Host {
 impl Shared {
     /// The endpoint stopped: every wait ends with an error.
     fn stop(&self) {
-        let (wakers, events, applications) = {
+        let (wakers, events, applications, controls) = {
             let mut host = self.state.lock();
             let wakers = host.stop();
+            // A stopped endpoint holds nothing: controls it never took go,
+            // with the items they carry.
+            let controls = std::mem::take(&mut host.controls);
             let events = std::mem::take(&mut host.routes.application_events);
             let applications: Vec<_> = host
                 .routes
@@ -1511,12 +1565,13 @@ impl Shared {
                 .filter_map(|listener| listener.application.take())
                 .collect();
             host.routes.applications.clear();
-            (wakers, events, applications)
+            (wakers, events, applications, controls)
         };
         // Factories can retain endpoint handles. Release them outside the
         // transport lock, including when no application was ever polled.
         drop(events);
         drop(applications);
+        drop(controls);
         for w in wakers {
             w.wake();
         }
@@ -1601,11 +1656,17 @@ impl Endpoint {
     pub fn listen(&self, port: u16) -> Result<Listener, Error> {
         let mut host = self.shared.state.lock();
         host.routes.listening = None;
-        host.control(TcpControl::Listen {
+        let taken = host.request(TcpControl::Listen {
             port,
             backlog: None,
             answer: None,
         });
+        if !taken {
+            return Err(fictionet::Error::msg(format!(
+                "TCP on {} takes no command now, so it cannot listen on port {port}",
+                self.shared.addr
+            )));
+        }
         if !matches!(host.routes.listening, Some(TcpNotice::Listening { .. })) {
             return Err(fictionet::Error::msg(format!(
                 "TCP port {port} is already in use on {}",
@@ -1648,7 +1709,9 @@ impl Endpoint {
             let mut host = self.shared.state.lock();
             let request = Request(host.routes.next_request);
             host.routes.next_request += 1;
-            host.control(TcpControl::Connect {
+            // A connect the transport does not take now is not under way:
+            // it has no child, and fails below as `Closed`.
+            host.request(TcpControl::Connect {
                 request,
                 remote: to,
             });

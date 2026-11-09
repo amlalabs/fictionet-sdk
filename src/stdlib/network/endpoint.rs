@@ -10,10 +10,47 @@ use fictionet::stdlib::layer::{
 };
 use fictionet::{Cx, Interface, Packet};
 
-use super::packet::{Factory, Ingress, IpPacket, Opening, Stack, Transport};
+use super::packet::{Factory, Ingress, IpPacket, Opening, Origin, Scope, Stack, Transport};
 use super::{icmp, tcp, udp};
 use fictionet::stdlib::services::stack::Jobs;
 
+/// Where the dispatcher sends one packet its IP layer handed up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Destination {
+    /// The TCP transport.
+    Tcp,
+    /// The UDP transport.
+    Udp,
+    /// The host's ping answers: ICMP that quotes neither transport.
+    Icmp,
+    /// Nowhere.
+    Drop,
+}
+
+/// Sorts `packet` for a host on network `scope`. Only a packet a host takes
+/// in reaches a transport: one with a header read by the host's checks, not
+/// an observed copy, and of the host's own network. The IP layer is
+/// replaceable ([`Factory`]), so the dispatcher checks this itself.
+fn destination(packet: &IpPacket, scope: Scope) -> Destination {
+    if packet.ingress().scope != scope
+        || matches!(packet.origin(), Origin::Observed)
+        || packet.header().is_none()
+    {
+        return Destination::Drop;
+    }
+    match packet.transport() {
+        Transport::Tcp => Destination::Tcp,
+        Transport::Udp => Destination::Udp,
+        Transport::Icmp | Transport::Other(_) => Destination::Icmp,
+    }
+}
+
+#[cfg(kani)]
+#[path = "../../../verification/world-layers/kani/dispatch.rs"]
+mod proofs;
+
+/// Runs one host's packets: `interface` below, one IP layer, and the
+/// transports above it, all on network `scope`.
 pub(crate) async fn drive(
     fcx: Cx,
     mut interface: impl Interface,
@@ -21,6 +58,7 @@ pub(crate) async fn drive(
     mut udp: Option<udp::PacketDriver>,
     ping: Option<(IpAddr, icmp::Options)>,
     layer: Stack,
+    scope: Scope,
 ) -> fictionet::Result {
     let mut ip = Driver::new(layer, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now());
     ip.keep_observations(0);
@@ -79,8 +117,9 @@ pub(crate) async fn drive(
             });
             if let Some(packet) = held.take() {
                 let mut accepted = true;
-                match packet.transport() {
-                    Transport::Tcp => {
+                match destination(&packet, scope) {
+                    Destination::Drop => {}
+                    Destination::Tcp => {
                         if let Some(tcp) = &mut tcp
                             && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
                         {
@@ -89,17 +128,17 @@ pub(crate) async fn drive(
                             transport = true;
                         }
                     }
-                    Transport::Udp => {
+                    Destination::Udp => {
                         if let Some(udp) = &mut udp {
                             udp.deliver(packet);
                         }
                     }
-                    _ if outgoing.len() >= 128 => {
+                    Destination::Icmp if outgoing.len() >= 128 => {
                         held = Some(packet);
                         accepted = false;
                         transport = true;
                     }
-                    _ => {
+                    Destination::Icmp => {
                         if let Some((addr, options)) = &ping
                             && let Some(reply) =
                                 options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
@@ -116,7 +155,10 @@ pub(crate) async fn drive(
                         moved = true;
                         raw = Some(PacketEvent::Packet(Datagram::new(
                             Chunk::new(packet.0),
-                            Ingress::default(),
+                            Ingress {
+                                scope,
+                                ..Ingress::default()
+                            },
                         )));
                     }
                     Poll::Ready(Err(_)) => {
@@ -210,6 +252,7 @@ pub(crate) fn prepare(
         Some(udp_driver),
         Some((addr, icmp)),
         layer,
+        Scope::ROOT,
     );
     (tcp, udp, task)
 }
