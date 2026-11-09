@@ -611,6 +611,11 @@ pub(crate) fn report(
     cx: &fictionet::Cx,
     mut fact: SearchObs,
 ) {
+    // A fact without a destination is not redacted; one with a destination
+    // is redacted outside the lock, then sent under it.
+    if destination.lock().unwrap().is_none() {
+        return;
+    }
     match &mut fact {
         SearchObs::Search { results, .. } | SearchObs::Tool { results, .. } => {
             for hit in results {
