@@ -72,11 +72,15 @@ them. The audit of 2026-11-09 found and fixed two:
   the handshake sends its SYN-ACK again (`mptcp/tla/Listener.tla`,
   `tcp-layer/README.md`).
 
-And one in the resolver's cache, found by reading the Lean model's
-abstractions against the code: an NXDOMAIN's copy under the type it
-answered outlived the entry under ANY when a later NXDOMAIN of another type
-replaced that entry with a shorter one, so data at the name no longer ended
-it. Fixed in `Cache::exists`, with a test in `tests/it/dns/cache.rs`.
+And two found by reading a model's abstractions or a harness against the
+code: an NXDOMAIN's copy under the type it answered outlived the entry
+under ANY when a later NXDOMAIN of another type replaced that entry with a
+shorter one, so data at the name no longer ended it (fixed in
+`Cache::exists`, with a test in `tests/it/dns/cache.rs`); and
+`Stream::with_next` judged a `Need` against the buffer's room before the
+limit followed a capacity the decoder had just raised, so such a decoder
+was reported `Stuck` (fixed, with a test in `codec/tests.rs`; the Kani
+harness `an_honest_decoder_is_never_stuck` covers it).
 
 ## Known gaps
 
@@ -87,11 +91,7 @@ it. Fixed in `Cache::exists`, with a test in `tests/it/dns/cache.rs`.
   default-route fallback (`on_unreachable`) is not restored once an
   internet sandbox was attached and detached (`world-net`); a host placed
   at an address an outside peer was using keeps that peer's connections
-  through the route alive at detach (`world-net`); `Stream::with_next` may
-  report `Stuck` for a decoder that raises its capacity on the call that
-  answers `Need` while the buffer is full at the old capacity (`codec`, by
-  reading; its Kani harness `an_honest_decoder_is_never_stuck` should
-  fail); HTTP/1 dissection skips every later head after a gap inside a
+  through the route alive at detach (`world-net`); HTTP/1 dissection skips every later head after a gap inside a
   body instead of resyncing at the next request line (`dissector`); HEADERS
   on a stream the client itself reset is a connection error where RFC 9113
   asks for a stream error (`http`); `native.rs`'s `after` buffer is dead

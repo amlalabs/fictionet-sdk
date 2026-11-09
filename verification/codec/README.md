@@ -63,13 +63,19 @@ capacity *after* the call, and the zero-byte skip allowance `Stream`
 itself uses. That last rule is the stream's own judgement restated, so the
 harness checks that `Stream` applies its documented rule, not that the
 rule is right. The `Need` rule lets a decoder raise its capacity on the
-call that returns `Need`; `Stream::with_next` judges that call against the
-buffer limit set from the capacity before it (`buf.room() == 0`,
-stream.rs:318) and reports `Stuck` when the buffer was full at the old
-capacity. By reading, the harness should fail on that case (a decoder of
-capacity 1 given one byte, answering `Need` with capacity 2); the pass
-below recorded it as passed, and this audit could not run Kani to settle
-it. See `VERIFICATION.md`.
+call that returns `Need`. `Stream::with_next` judged that call against the
+buffer limit set from the capacity before it (`buf.room() == 0`) and
+reported `Stuck` when the buffer was full at the old capacity: a decoder
+of capacity 1 given one byte, answering `Need` with capacity 2, got
+`Stuck { unread: 1, capacity: 2 }`. The audit of 2026-11-09 found it by
+reading the harness against the code; the unit test
+`a_decoder_that_raises_its_capacity_on_need_is_not_stuck` in
+`src/stdlib/codec/tests.rs` plays that case and failed on the old stream.
+The limit now follows the capacity before the room is judged. The Kani
+harness was not rerun on either the old or the fixed stream: the runs
+were stopped before they finished, so the pass recorded below predates
+the fix and the harness's verdict on the fix is not yet recorded. See
+`VERIFICATION.md`.
 
 ## TLA+
 
