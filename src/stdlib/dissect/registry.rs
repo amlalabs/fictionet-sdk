@@ -251,6 +251,18 @@ impl Registry {
 
 type Make<D> = dyn Fn(Selection<'_>) -> [D; 2] + Send + Sync;
 
+/// Ends `dir` in `packet`, which is not the packet its last bytes came in,
+/// or no packet: the end of a stream comes with its FIN, or with the end
+/// of the capture. What the end completes gets a buffer of its own, since
+/// the offsets its bytes had in their packet are not offsets in this one.
+fn end_elsewhere<D: Present>(dir: &mut Observed<D>, packet: &mut Decoded)
+where
+    D::Error: Clone,
+{
+    dir.placement().packet(Place::default());
+    dir.end(packet);
+}
+
 /// A registered decoder pair: one decoder for each direction of a stream,
 /// and the factory and selection that make new ones for each datagram.
 struct Pair<D: Present> {
@@ -303,7 +315,7 @@ where
             .get_mut(usize::from(reverse))
             .and_then(Option::as_mut)
         {
-            dir.end(packet);
+            end_elsewhere(dir, packet);
         }
     }
     /// Reads the datagram with a new decoder, made by the factory as for a
