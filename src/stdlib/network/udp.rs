@@ -242,8 +242,14 @@ impl PacketDriver {
                 });
             }
         });
+        // A stack that used its allowance continues after the rest of the
+        // run has had a turn. New commands from the applications go out at
+        // once.
+        if busy {
+            cx.waker().wake_by_ref();
+        }
         Ok((
-            busy || more || offered,
+            more || offered,
             [deadline, self.applications.deadline()]
                 .into_iter()
                 .flatten()

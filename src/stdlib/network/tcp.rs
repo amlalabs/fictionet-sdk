@@ -1099,8 +1099,14 @@ impl PacketDriver {
                 });
             }
         }
+        // An engine that used its allowance or filled its output continues
+        // after the rest of the run has had a turn, as writers refill what
+        // it sent. New commands from the applications go out at once.
+        if busy {
+            cx.waker().wake_by_ref();
+        }
         Ok((
-            busy || applications || offered,
+            applications || offered,
             [deadline, self.applications.deadline()]
                 .into_iter()
                 .flatten()
