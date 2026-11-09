@@ -119,6 +119,12 @@ impl Timers {
         drop(removed);
     }
 
+    /// The deadline timer `id` waits for, if it is set.
+    #[cfg(test)]
+    pub(crate) fn deadline(&self, id: u64) -> Option<Instant> {
+        self.state.lock().entries.get(&id).map(|(d, _)| *d)
+    }
+
     /// Moves the wakeup earlier, to `deadline`.
     #[cfg(not(target_arch = "wasm32"))]
     fn earlier(&self, _deadline: Instant) {
