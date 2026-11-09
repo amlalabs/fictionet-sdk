@@ -115,6 +115,13 @@
 //! accounting, [`HttpOptions::observe`] receives the request and response heads,
 //! receipt outcome, and body bytes in completely written pieces. Response
 //! extensions carry world-owned facts without a shared event schema.
+//!
+//! Configure [`Server::observe`] for an individual HTTP server, or
+//! [`Sites::observe_http`](super::Sites::observe_http) for the servers a website
+//! preset creates. The preset shares its callback with sites discovered later;
+//! an explicit server callback takes precedence. Sites sharing an address and
+//! port use the first server's callback. When building hosts with `Net` directly,
+//! clone the shared callback into each HTTP server's configuration.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

@@ -400,7 +400,6 @@ pub struct Net {
     hosts: Vec<Host>,
     gateway: Arc<Gateway>,
     unreachable: Option<Arc<dyn Fn(Unreachable) + Send + Sync>>,
-    http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
     refused_observe: Option<OnRefused>,
     tls_observe: Option<OnTls>,
     attachment_observe: Option<OnAttachment>,
@@ -433,7 +432,6 @@ impl Net {
             hosts: Vec::new(),
             gateway: Arc::new(default_gateway),
             unreachable: None,
-            http_observe: None,
             refused_observe: None,
             tls_observe: None,
             attachment_observe: None,
@@ -475,13 +473,6 @@ impl Net {
         observe: impl Fn(&fictionet::stdlib::services::dns::Event) + Send + Sync + 'static,
     ) -> Self {
         self.dns_observe = Some(Arc::new(observe));
-        self
-    }
-
-    /// Observes HTTP exchanges served by this network, including hosts added later.
-    /// A server's own observer takes precedence over this network default.
-    pub fn observe_http(mut self, observe: fictionet::stdlib::web::httpd::Observe) -> Self {
-        self.http_observe = Some(observe);
         self
     }
 
@@ -696,7 +687,6 @@ impl Net {
                     .collect(),
                 machines: Machines::new(world.clone()),
             },
-            http_observe: self.http_observe,
             refused_observe: self.refused_observe,
             tls_observe: self.tls_observe,
             attachment_observe: self.attachment_observe,
@@ -1182,7 +1172,6 @@ mod tests {
                         trusted: lans.values().map(|l| l.prefix).collect(),
                         machines: Machines::new(world.clone()),
                     },
-                    http_observe: None,
                     refused_observe: None,
                     tls_observe: None,
                     attachment_observe: None,

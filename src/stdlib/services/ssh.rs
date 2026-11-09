@@ -2482,7 +2482,6 @@ mod tests {
                         conn: Box::new(connection),
                         budget: Some(server_budget),
                         limits: Default::default(),
-                        http_observe: None,
                     };
                     let server = Server {
                         config: Arc::new(Config::new(

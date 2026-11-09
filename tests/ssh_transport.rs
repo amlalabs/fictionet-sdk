@@ -166,7 +166,6 @@ async fn custom_transport_keeps_standard_public_key_authentication_channels_and_
                         conn: Box::new(connection),
                         budget: Some(server_budget),
                         limits: Default::default(),
-                        http_observe: None,
                     };
                     let server = ssh::Server {
                         config: Arc::new(ssh::Config::new(
