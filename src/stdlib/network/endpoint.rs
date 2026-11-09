@@ -39,20 +39,27 @@ pub(crate) async fn drive(
         let mut busy = false;
         let mut deadlines = [None; 3];
         for turn in 0..64 {
+            let mut moved = false;
+            let mut more = false;
             if let Some(packet) = held.take() {
+                moved = true;
                 match packet.transport() {
                     Transport::Tcp => {
                         if let Some(tcp) = &mut tcp
                             && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
                         {
                             held = Some(packet);
-                            busy = true;
+                            moved = false;
                         }
                     }
                     Transport::Udp => {
                         if let Some(udp) = &mut udp {
                             udp.deliver(packet);
                         }
+                    }
+                    _ if outgoing.len() >= 128 => {
+                        held = Some(packet);
+                        moved = false;
                     }
                     _ => {
                         if let Some((addr, options)) = &ping
@@ -64,18 +71,15 @@ pub(crate) async fn drive(
                     }
                 }
             }
-            if outgoing.len() < 128
-                && let Some(tcp) = &mut tcp
-            {
-                let (more, deadline) = tcp.poll(cx, &mut output)?;
-                busy |= more;
+            let room = 128usize.saturating_sub(outgoing.len());
+            if let Some(tcp) = &mut tcp {
+                let (pending, deadline) = tcp.poll(cx, &mut output, room)?;
+                more |= pending;
                 deadlines[1] = deadline;
             }
-            if outgoing.len() < 128
-                && let Some(udp) = &mut udp
-            {
-                let (more, deadline) = udp.poll(cx, &mut output)?;
-                busy |= more;
+            if let Some(udp) = &mut udp {
+                let (pending, deadline) = udp.poll(cx, &mut output, room)?;
+                more |= pending;
                 deadlines[2] = deadline;
             }
             outgoing.extend(
@@ -91,23 +95,25 @@ pub(crate) async fn drive(
                     outgoing.push_front(command);
                     break;
                 }
+                moved = true;
             }
             ip.run().map_err(|e| fictionet::Error::msg(e.to_string()))?;
             jobs.take(&mut ip);
-            jobs.poll(Some(&fcx), cx, |done| ip.complete(done))
+            moved |= jobs
+                .poll(Some(&fcx), cx, |done| ip.complete(done))
                 .map_err(|e| fictionet::Error::msg(e.to_string()))?;
             if jobs.budget_exhausted() {
                 return Poll::Ready(Err(fictionet::Error::msg(
                     "packet stack work budget exhausted",
                 )));
             }
-            ip.send_below(|command| {
+            moved |= ip.send_below(|command| {
                 if let PacketCommand::Send(bytes) = command {
                     interface.send(Packet(bytes.into_vec()));
                 }
                 Admit::Taken
             });
-            ip.send_above(|event| {
+            moved |= ip.send_above(|event| {
                 if held.is_some() {
                     return Admit::Blocked(event);
                 }
@@ -116,19 +122,17 @@ pub(crate) async fn drive(
                 }
                 Admit::Taken
             });
-            if held.is_some() {
-                busy = turn == 63;
-                continue;
-            }
-            if raw.is_none() && !closed {
+            if held.is_none() && raw.is_none() && !closed {
                 match interface.poll_recv(&fcx, cx) {
                     Poll::Ready(Ok(packet)) => {
+                        moved = true;
                         raw = Some(PacketEvent::Packet(Datagram::new(
                             Chunk::new(packet.0),
                             Ingress::default(),
                         )));
                     }
                     Poll::Ready(Err(_)) => {
+                        moved = true;
                         closed = true;
                         raw = Some(PacketEvent::Ended);
                     }
@@ -136,22 +140,24 @@ pub(crate) async fn drive(
                 }
             }
             if let Some(event) = raw.take() {
-                if let Admit::Blocked(event) = ip
+                match ip
                     .deliver(event)
                     .map_err(|e| fictionet::Error::msg(e.to_string()))?
                 {
-                    raw = Some(event);
+                    Admit::Blocked(event) => raw = Some(event),
+                    _ => moved = true,
                 }
-                busy = turn == 63;
-            } else {
+            }
+            if !moved && !more {
                 break;
             }
+            busy = turn == 63;
         }
         if closed && raw.is_none() && held.is_none() {
             return Poll::Ready(Ok(()));
         }
         deadlines[0] = ip.deadline();
-        if busy || !outgoing.is_empty() || raw.is_some() || held.is_some() || ip.exhausted() {
+        if busy || ip.exhausted() {
             cx.waker().wake_by_ref();
         }
         match deadlines.into_iter().flatten().min() {

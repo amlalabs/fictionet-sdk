@@ -1046,7 +1046,6 @@ impl PacketDriver {
         host.tick();
         let result = host.tcp.deliver(PacketEvent::Packet(packet)).unwrap();
         host.pump();
-        host.kick();
         result
     }
 
@@ -1054,11 +1053,12 @@ impl PacketDriver {
         &mut self,
         cx: &mut Context<'_>,
         out: &mut Vec<Vec<u8>>,
+        limit: usize,
     ) -> fictionet::Result<(bool, Option<Instant>)> {
         let (busy, deadline, refused, refusals) = {
             let mut host = self.shared.state.lock();
             host.routes.driver = Some(cx.waker().clone());
-            let busy = host.visit(out);
+            let busy = host.visit(out, limit);
             (
                 busy,
                 host.tcp.deadline(),
@@ -1410,7 +1410,7 @@ impl Host {
     }
 
     /// Steps the transport and drains its output before yielding.
-    fn visit(&mut self, out: &mut Vec<Vec<u8>>) -> bool {
+    fn visit(&mut self, out: &mut Vec<Vec<u8>>, limit: usize) -> bool {
         self.tick();
         let mut work_exhausted = false;
         for turn in 0..64 {
@@ -1422,13 +1422,16 @@ impl Host {
         }
         self.tcp.run().unwrap();
         self.tcp.send_below(|command| {
+            if out.len() >= limit {
+                return Admit::Blocked(command);
+            }
             if let PacketCommand::Send(packet) = command {
                 out.push(packet.into_vec());
             }
             Admit::Taken
         });
         self.pump();
-        work_exhausted || self.tcp.exhausted() || self.engine_ref().busy()
+        work_exhausted || self.tcp.exhausted() || (out.len() < limit && self.engine_ref().busy())
     }
 
     /// The endpoint stopped: every wait ends with an error. Waits for

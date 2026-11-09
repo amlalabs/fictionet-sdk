@@ -489,3 +489,116 @@ fn unchanged_application_runs_through_live_tcp_and_a_live_packet_tunnel() {
         });
     }
 }
+
+#[test]
+fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
+    use fictionet::stdlib::network::ConnectionExt;
+    use fictionet::stdlib::world::net::Net;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Gate {
+        at: Instant,
+        ready: bool,
+        blocked: Arc<AtomicBool>,
+        up: Option<PacketEvent<packet::IpPacket>>,
+        down: Option<PacketCommand<Chunk>>,
+    }
+    impl Layer for Gate {
+        type Lower = Packets<packet::IpPacket, Chunk>;
+        type Upper = Self::Lower;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: PacketEvent<packet::IpPacket>,
+        ) -> Result<Admit<PacketEvent<packet::IpPacket>>, Infallible> {
+            if self.up.is_some() {
+                return Ok(Admit::Blocked(event));
+            }
+            self.up = Some(event);
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: PacketCommand<Chunk>,
+        ) -> Result<Admit<PacketCommand<Chunk>>, Infallible> {
+            if !self.ready {
+                self.blocked.store(true, Ordering::SeqCst);
+                return Ok(Admit::Blocked(command));
+            }
+            if self.down.is_some() {
+                return Ok(Admit::Blocked(command));
+            }
+            self.down = Some(command);
+            Ok(Admit::Taken)
+        }
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+            self.ready = true;
+            Ok(())
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            (!self.ready).then_some((self.at, ()))
+        }
+        fn take_event(&mut self) -> Option<PacketEvent<packet::IpPacket>> {
+            self.up.take()
+        }
+        fn take_command(&mut self) -> Option<PacketCommand<Chunk>> {
+            self.down.take()
+        }
+    }
+
+    fictionet_test_support::world::world(Duration::from_secs(10), |cx| async move {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let observed = blocked.clone();
+        let delay = Duration::from_millis(5);
+        let factory = packet::Factory::new(move |opening| {
+            Chain::new(
+                IpLayer::host(),
+                Gate {
+                    at: opening.cx.now() + delay,
+                    ready: false,
+                    blocked: observed.clone(),
+                    up: None,
+                    down: None,
+                },
+            )
+        });
+        let address = Ipv4Addr::new(192, 0, 2, 1);
+        let (attach, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .ipv4_only()
+            .host("echo", |host| {
+                host.at(address)
+                    .ip_factory(factory)
+                    .tcp_stack(1234, |_| Echo::stack())
+            })
+            .start(&cx, attachments)?;
+        let client = fictionet_test_support::sandbox::machine(
+            &cx,
+            attach.attach("client")?,
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
+        let began = cx.now();
+        let mut stream = client
+            .tcp
+            .connect(&cx, SocketAddr::from((address, 1234)))
+            .await?;
+        let mut greeting = [0; 6];
+        let mut used = 0;
+        while used < greeting.len() {
+            let n = stream.read(&cx, &mut greeting[used..]).await?;
+            assert!(n > 0, "echo ended before its greeting");
+            used += n;
+        }
+        assert_eq!(&greeting, b"hello\n");
+        assert!(blocked.load(Ordering::SeqCst));
+        assert!(cx.now() >= began + delay);
+        Ok(())
+    });
+}

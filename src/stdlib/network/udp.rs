@@ -211,12 +211,14 @@ impl PacketDriver {
         &mut self,
         cx: &mut std::task::Context<'_>,
         out: &mut Vec<Vec<u8>>,
+        limit: usize,
     ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
         let (busy, deadline) = self.shared.with(|inner| {
             inner.wake = Some(cx.waker().clone());
             inner.driver.set_now(self.fcx.now());
             inner.pump();
-            out.append(&mut inner.output);
+            let count = limit.saturating_sub(out.len()).min(inner.output.len());
+            out.extend(inner.output.drain(..count));
             (inner.driver.exhausted(), inner.driver.deadline())
         });
         let more = self.applications.poll(
