@@ -58,8 +58,9 @@ java -XX:+UseParallelGC -Xmx6g -cp tla2tools.jar tlc2.TLC -workers 8 \
     -config Resolution_base.cfg Resolution.tla
 ```
 
-`cargo xtask dns-verify tlc` runs TLC once per
-property per config and writes its output to `target/dns-verify/tlc/`. A
+`cargo xtask dns-verify tlc` checks all passing properties together and each
+ablation separately. It prints an exclusive run directory beneath
+`target/dns-verify/`, with output in its `tlc/` subdirectory. A
 config whose first lines read `\* expect violation: <Property>` is expected
 to fail exactly that property, in a run that checks that property alone;
 every other config must pass every property it lists. A config that lists a

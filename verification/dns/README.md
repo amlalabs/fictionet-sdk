@@ -23,7 +23,7 @@ cargo xtask dns-verify all
 
 | Command | Does |
 |---|---|
-| `cargo xtask dns-verify tlc [spec] [config]` | TLC once per property of each config, or of one spec's configs (`Resolution`), or of one config (`Resolution_base` or `base`) |
+| `cargo xtask dns-verify tlc [spec] [config]` | TLC with all passing properties together and each ablation separately; optionally select a spec (`Resolution`) or config (`Resolution_base` or `base`) |
 | `cargo xtask dns-verify lean` | `lake build`, then the axioms of every headline theorem |
 | `cargo xtask dns-verify vectors [seed]` | `lake exe gen` into the vectors directory, from `seed`, or from each of seeds 1 to 8 when left out |
 | `cargo xtask dns-verify diff [seed]` | the vectors, then `cargo test --test dns_vectors` against them, for each seed |
@@ -35,6 +35,9 @@ output, `lean/` the output of `lake`, `vectors/<seed>/` the vectors of each seed
 differential test's output, and `SUMMARY.txt` the summary of `all`. The
 vectors are made again on every run and never committed; the same seed
 always gives the same files.
+
+Each invocation prints its exclusive run directory beneath `dns-verify/`.
+Use that directory for logs and generated vectors.
 
 `tlc` reads `TLA2TOOLS` and `JAVA` and runs TLC with `-Xmx6g`. A config
 whose first lines read `\* expect violation: <Property>` must list exactly
@@ -50,7 +53,7 @@ The differential test is declared with `test = false`, so a plain
 `DNS_VECTORS`:
 
 ```sh
-DNS_VECTORS=target/dns-verify/vectors/1 cargo test --test dns_vectors -- --nocapture
+DNS_VECTORS=/path/to/printed-run-directory/vectors/1 cargo test --test dns_vectors -- --nocapture
 ```
 
 ## What the differential test compares

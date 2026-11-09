@@ -29,7 +29,8 @@ their configuration; a parse error, a crash, and a passing ablation fail the run
 The Lean axiom audit rejects anything beyond `propext`, `Quot.sound`, and
 `Classical.choice`.
 
-Logs, vectors, TLC working files, and `SUMMARY.txt` go under
+Each invocation prints its exclusive run directory.
+Logs, vectors, TLC working files, and `SUMMARY.txt` go into that directory under
 `$CARGO_TARGET_DIR/mptcp-verify/` (or `target/mptcp-verify/`). Logs are written
 while children run. Compilation and generation are separate commands, with
 separate logs. The generator streams one JSON case at a time and never retains
@@ -39,7 +40,7 @@ The differential test is explicitly named, as in DNS verification:
 
 ```sh
 systemd-run --user --scope -p MemoryMax=12G -q \
-  env MPTCP_VECTORS="$CARGO_TARGET_DIR/mptcp-verify/vectors/1" \
+  env MPTCP_VECTORS="/path/to/printed-run-directory/vectors/1" \
   cargo test -p fictionet --test mptcp_vectors -- --nocapture
 ```
 

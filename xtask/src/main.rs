@@ -120,3 +120,20 @@ async fn host(task: &str, mut args: impl Iterator<Item = String>) -> Result {
     }
     image::build(&downloads).await
 }
+
+/// Reserve a run directory without overwriting another invocation's artifacts.
+fn verification_run(parent: &std::path::Path) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(parent)?;
+    for counter in 0.. {
+        let path = parent.join(format!("run-{}-{counter}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                println!("Verification output: {}", path.display());
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!()
+}
