@@ -391,7 +391,7 @@ impl Decoded {
 pub struct Dissector {
     observer: Driver<Observer>,
     connections: BTreeMap<ChildId, Watched>,
-    udp: BTreeMap<Scope, BTreeMap<(SocketAddr, SocketAddr), Datagrams>>,
+    udp: BTreeMap<(Scope, SocketAddr, SocketAddr), Datagrams>,
     registry: Registry,
     /// Packets decoded so far: the number of the last one.
     packets: u64,
@@ -1116,42 +1116,27 @@ impl Dissector {
             SocketAddr::new(header.dst, dport),
         );
         let scope = context.ingress.scope;
-        let key = if src <= dst { (src, dst) } else { (dst, src) };
-        if !self
-            .udp
-            .get(&scope)
-            .is_some_and(|network| network.contains_key(&key))
-            && self.udp.values().map(BTreeMap::len).sum::<usize>() >= UDP_CONVERSATIONS
-        {
+        let key = if src <= dst {
+            (scope, src, dst)
+        } else {
+            (scope, dst, src)
+        };
+        if !self.udp.contains_key(&key) && self.udp.len() >= UDP_CONVERSATIONS {
             let oldest = self
                 .udp
                 .iter()
-                .flat_map(|(scope, network)| {
-                    network
-                        .iter()
-                        .map(move |(key, conversation)| ((*scope, *key), conversation))
-                })
                 .min_by_key(|(_, conversation)| conversation.last)
-                .map(|(key, _)| key);
-            if let Some((scope, key)) = oldest {
-                let network = self.udp.get_mut(&scope).expect("the oldest network exists");
-                network.remove(&key);
-                if network.is_empty() {
-                    self.udp.remove(&scope);
-                }
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                self.udp.remove(&oldest);
             }
         }
-        let conversation = self
-            .udp
-            .entry(scope)
-            .or_default()
-            .entry(key)
-            .or_insert_with(|| Datagrams {
-                first: src,
-                ports: (sport, dport),
-                protocol: None,
-                last: 0,
-            });
+        let conversation = self.udp.entry(key).or_insert_with(|| Datagrams {
+            first: src,
+            ports: (sport, dport),
+            protocol: None,
+            last: 0,
+        });
         conversation.last = self.packets;
         let reverse = src != conversation.first;
         if conversation.protocol.is_none() {
@@ -1500,9 +1485,7 @@ mod tests {
                 ..Ingress::default()
             };
             dissector.decode_captured(&packet, &[], None, true, ingress);
-            let count = dissector.udp.values().map(BTreeMap::len).sum::<usize>();
-            assert_eq!(count, (index + 1).min(UDP_CONVERSATIONS));
-            assert_eq!(dissector.udp.len(), count);
+            assert_eq!(dissector.udp.len(), (index + 1).min(UDP_CONVERSATIONS));
         }
     }
 
@@ -2224,18 +2207,10 @@ mod tests {
         for port in 0..300 {
             let d = dis.decode(&udp4(([10, 0, 0, 2], 1000 + port), server, &q), &[]);
             assert_eq!(d.proto, "DNS");
-            assert!(dis.udp.values().map(BTreeMap::len).sum::<usize>() <= UDP_CONVERSATIONS);
+            assert!(dis.udp.len() <= UDP_CONVERSATIONS);
         }
-        assert_eq!(
-            dis.udp.values().map(BTreeMap::len).sum::<usize>(),
-            UDP_CONVERSATIONS
-        );
-        assert!(
-            !dis.udp
-                .values()
-                .flat_map(BTreeMap::keys)
-                .any(|(low, _)| low.port() == 999)
-        );
+        assert_eq!(dis.udp.len(), UDP_CONVERSATIONS);
+        assert!(!dis.udp.keys().any(|(_, low, _)| low.port() == 999));
         assert_eq!(
             dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q), &[])
                 .proto,

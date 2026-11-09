@@ -39,9 +39,9 @@
 //!   a time, giving its open directions [`Termination::Evicted`], and
 //!   releases what it held for it at once.
 //!
-//! Capture input selects a network before looking up a pair of endpoints.
-//! Each network owns its connections, while all networks share the capture's
-//! limits. Aggregate connection identities retain the network and generation.
+//! Connections are keyed by scope, the pair of endpoints and generation, so
+//! the same addresses and ports inside a tunnel are a different connection
+//! from those outside it.
 //!
 //! What the observer saw of each segment that is not part of a stream,
 //! such as its sequence numbers relative to the connection and whether it
@@ -187,9 +187,8 @@ pub enum ObserverReport {
     },
 }
 
-/// Endpoints in a network's local table, with the lower endpoint first.
-type LocalKey = (SocketAddr, SocketAddr);
-/// A child's association with its network and local connection.
+/// A connection's endpoints in a fixed order, the lower first, with its
+/// scope.
 type Key = (Scope, SocketAddr, SocketAddr);
 
 /// Each event a child has waiting counts this much towards
@@ -238,7 +237,7 @@ struct Output {
 /// The passive TCP observer. See the [module docs](self).
 pub struct Observer {
     store: Store,
-    networks: BTreeMap<Scope, BTreeMap<LocalKey, Connection>>,
+    connections: BTreeMap<Key, Connection>,
     children: Slots<Output>,
     /// Children opened, not yet taken.
     opened: VecDeque<MuxEvent<ObservedStream, Top, ObservedConnection>>,
@@ -265,7 +264,7 @@ impl Observer {
         limits.connections = limits.connections.max(1);
         Observer {
             store: Store { limits, held: 0 },
-            networks: BTreeMap::new(),
+            connections: BTreeMap::new(),
             children: Slots::new(limits.connections.saturating_mul(2)),
             opened: VecDeque::new(),
             ready: VecDeque::new(),
@@ -287,7 +286,7 @@ impl Observer {
 
     /// How many connections are followed, ended ones included.
     pub fn connections(&self) -> usize {
-        self.networks.values().map(BTreeMap::len).sum()
+        self.connections.len()
     }
 
     /// Takes one captured packet, once what the layer above left waiting
@@ -367,11 +366,7 @@ impl Observer {
             Answer,
             Connection(u64),
         }
-        let opens = match self
-            .networks
-            .get(&key.0)
-            .and_then(|network| network.get(&(key.1, key.2)))
-        {
+        let opens = match self.connections.get(&key) {
             None => Opens::Connection(0),
             Some(connection) if syn => {
                 let d = index(direction(&connection.info, src));
@@ -396,11 +391,7 @@ impl Observer {
         match opens {
             Opens::Nothing => {}
             Opens::Answer => {
-                if let Some(connection) = self
-                    .networks
-                    .get_mut(&key.0)
-                    .and_then(|network| network.get_mut(&(key.1, key.2)))
-                {
+                if let Some(connection) = self.connections.get_mut(&key) {
                     let d = index(direction(&connection.info, src));
                     if let Some(old) = &mut connection.flows[d] {
                         old.end(&mut self.store);
@@ -411,17 +402,13 @@ impl Observer {
             Opens::Connection(generation) => {
                 if generation != 0 {
                     self.let_go(key, Termination::Replaced);
-                } else if self.connections() >= self.store.limits.connections {
+                } else if self.connections.len() >= self.store.limits.connections {
                     self.evict_oldest();
                 }
                 self.start(env, key, start(generation));
             }
         }
-        let Some(connection) = self
-            .networks
-            .get_mut(&key.0)
-            .and_then(|network| network.get_mut(&(key.1, key.2)))
-        else {
+        let Some(connection) = self.connections.get_mut(&key) else {
             return;
         };
         connection.last = self.tick;
@@ -548,8 +535,8 @@ impl Observer {
                 None
             }
         };
-        self.networks.entry(key.0).or_default().insert(
-            (key.1, key.2),
+        self.connections.insert(
+            key,
             Connection {
                 info,
                 flows: [None, None],
@@ -564,23 +551,13 @@ impl Observer {
     /// Evicts the connection seen longest ago.
     fn evict_oldest(&mut self) {
         let oldest = self
-            .networks
+            .connections
             .iter()
-            .flat_map(|(scope, network)| {
-                network
-                    .iter()
-                    .map(move |((a, b), connection)| ((*scope, *a, *b), connection))
-            })
             .min_by_key(|(_, connection)| connection.last)
-            .map(|(key, _)| key);
+            .map(|(key, _)| *key);
         if let Some(key) = oldest {
             self.let_go(key, Termination::Evicted);
-            if let Some(network) = self.networks.get_mut(&key.0) {
-                network.remove(&(key.1, key.2));
-                if network.is_empty() {
-                    self.networks.remove(&key.0);
-                }
-            }
+            self.connections.remove(&key);
         }
     }
 
@@ -588,11 +565,7 @@ impl Observer {
     /// with `cause`, it gives back what it held, and it stays only as the
     /// ended generation, which a new SYN replaces.
     fn let_go(&mut self, key: Key, cause: Termination) {
-        let Some(connection) = self
-            .networks
-            .get_mut(&key.0)
-            .and_then(|network| network.get_mut(&(key.1, key.2)))
-        else {
+        let Some(connection) = self.connections.get_mut(&key) else {
             return;
         };
         let mut events = Vec::new();
@@ -643,10 +616,7 @@ impl Observer {
 
     /// Stops only the generation still attached to this child.
     fn detach(&mut self, key: Key, child: ChildId) {
-        if let Some(connection) = self
-            .networks
-            .get_mut(&key.0)
-            .and_then(|network| network.get_mut(&(key.1, key.2)))
+        if let Some(connection) = self.connections.get_mut(&key)
             && connection.child == Some(child)
         {
             connection.child = None;
@@ -694,17 +664,9 @@ impl Observer {
     /// Finishes every connection at the end of the capture, in endpoint
     /// order.
     fn finish(&mut self) {
-        let keys: Vec<Key> = self
-            .networks
-            .iter()
-            .flat_map(|(scope, network)| network.keys().map(move |(a, b)| (*scope, *a, *b)))
-            .collect();
+        let keys: Vec<Key> = self.connections.keys().copied().collect();
         for key in keys {
-            let Some(connection) = self
-                .networks
-                .get_mut(&key.0)
-                .and_then(|network| network.get_mut(&(key.1, key.2)))
-            else {
+            let Some(connection) = self.connections.get_mut(&key) else {
                 continue;
             };
             let Some(child) = connection.child.take() else {

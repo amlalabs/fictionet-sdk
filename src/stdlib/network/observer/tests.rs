@@ -112,13 +112,7 @@ impl Watch {
 
     /// The flow of the only connection, one way.
     fn flow(&mut self, direction: Direction) -> &mut Flow {
-        let connection = self
-            .observer()
-            .networks
-            .values_mut()
-            .flat_map(BTreeMap::values_mut)
-            .next()
-            .unwrap();
+        let connection = self.observer().connections.values_mut().next().unwrap();
         connection.flows[index(direction)].as_mut().unwrap()
     }
 
@@ -954,8 +948,10 @@ fn overlapping_tuples_in_other_scopes_do_not_alias() {
     );
 }
 
+/// Connections in many networks count against one capture's limit, so
+/// adding networks does not multiply what the observer holds.
 #[test]
-fn network_partitions_share_the_capture_connection_limit() {
+fn networks_share_the_capture_connection_limit() {
     let mut tcp = Watch::new(Limits {
         connections: 2,
         ..Limits::default()
@@ -964,7 +960,6 @@ fn network_partitions_share_the_capture_connection_limit() {
     for _ in 0..8 {
         tcp.send(scopes.tunnel(), CLIENT, SERVER, 100, 0, 2, b"");
         assert!(tcp.observer().connections() <= 2);
-        assert!(tcp.observer().networks.len() <= 2);
     }
     assert_eq!(tcp.observer().connections(), 2);
 }
