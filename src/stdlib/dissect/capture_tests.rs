@@ -3,7 +3,9 @@
 //! bytes missing, and with a capture that ends in the middle of a message.
 
 use super::tls::tests::{handshake_message, seal};
-use super::{Decoded, Dissector, KeyLine, Layer};
+use super::{Decoded, Dissector, KeyLine, Layer, Match, Place, Protocol, Registry};
+use fictionet::stdlib::layer::Termination;
+use std::sync::{Arc, Mutex};
 
 const CLIENT: ([u8; 4], u16) = ([10, 0, 0, 2], 40000);
 const SERVER: ([u8; 4], u16) = ([10, 0, 0, 1], 443);
@@ -74,8 +76,13 @@ impl Capture {
     /// The handshake, through the server's encrypted extensions, which
     /// choose HTTP/1.1. With `keys`, the dissector has the key log.
     fn new(keys: bool) -> Capture {
+        Capture::with_registry(keys, Registry::default())
+    }
+
+    /// The same, decoded with the protocols of `registry`.
+    fn with_registry(keys: bool, registry: Registry) -> Capture {
         let mut capture = Capture {
-            dissector: Dissector::default(),
+            dissector: Dissector::with_registry(registry),
             keys: if keys { key_log() } else { Vec::new() },
             next: [1001, 5001],
         };
@@ -290,4 +297,116 @@ fn a_fin_ends_the_decrypted_stream() {
     let fin = capture.fin(true);
     assert!(fin.tags.contains(&"malformed"), "{:?}", fin.tags);
     assert!(fin.info.starts_with("HTTP: "), "{}", fin.info);
+}
+
+/// What a protocol inside TLS was told, each way.
+#[derive(Clone, Debug, PartialEq)]
+enum Told {
+    Data(Vec<u8>),
+    Lost,
+    End(Termination),
+}
+
+/// A protocol that keeps what it is told about the decrypted stream. It
+/// takes the place of HTTP/1.1, which the handshake chooses.
+#[derive(Clone, Default)]
+struct Seen(Arc<Mutex<Vec<(bool, Told)>>>);
+
+impl Seen {
+    fn registry(&self) -> Registry {
+        let mut registry = Registry::default();
+        let seen = self.clone();
+        registry.register_protocol(
+            "seen",
+            |s| {
+                if s.alpn == Some("http/1.1") {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            move |_, _| Box::new(seen.clone()),
+        );
+        registry
+    }
+
+    /// What it was told of the client's direction, the second: the
+    /// client's address sorts after the server's.
+    fn client(&self) -> Vec<Told> {
+        let told = self.0.lock().unwrap();
+        told.iter()
+            .filter(|(reverse, _)| *reverse)
+            .map(|(_, told)| told.clone())
+            .collect()
+    }
+
+    fn tell(&self, reverse: bool, told: Told) {
+        self.0.lock().unwrap().push((reverse, told));
+    }
+}
+
+impl Protocol for Seen {
+    fn data(&mut self, reverse: bool, bytes: &[u8], _: Place, _: &mut Decoded, _: &[KeyLine]) {
+        self.tell(reverse, Told::Data(bytes.to_vec()));
+    }
+    fn waiting(&self, _: bool) -> bool {
+        false
+    }
+    fn lost(&mut self, reverse: bool) {
+        self.tell(reverse, Told::Lost);
+    }
+    fn end(&mut self, reverse: bool, how: Termination, _: &mut Decoded) {
+        self.tell(reverse, Told::End(how));
+    }
+}
+
+/// A record the reader cannot open, such as early data under a key the
+/// key log does not have, carried bytes of the decrypted stream. The
+/// protocol inside is told they are missing before it gets the bytes that
+/// follow them.
+#[test]
+fn a_record_not_opened_leaves_a_gap_in_the_decrypted_stream() {
+    let seen = Seen::default();
+    let mut capture = Capture::with_registry(true, seen.registry());
+    let early = capture.send(true, &seal(&[9; 32], 0, 23, b"GET /early HTTP/1.1\r\n"));
+    assert!(!early.tags.contains(&"decrypted"));
+    let finished = handshake_message(20, &[0; 32]);
+    capture.send(true, &seal(&CLIENT_HANDSHAKE, 0, 22, &finished));
+    let rest = b"Host: example.test\r\n\r\n";
+    let after = capture.send(true, &seal(&CLIENT_APP, 0, 23, rest));
+    assert!(after.tags.contains(&"decrypted"));
+    let client = seen.client();
+    let data = client.iter().position(|t| *t == Told::Data(rest.to_vec()));
+    let lost = client.iter().position(|t| *t == Told::Lost);
+    assert!(
+        matches!((lost, data), (Some(lost), Some(data)) if lost < data),
+        "{client:?}"
+    );
+}
+
+/// A FIN inside a record ends the records with a cut-off one, so the
+/// decrypted stream lost the bytes it carried: its end is not clean. A FIN
+/// after whole records is.
+#[test]
+fn a_fin_inside_a_record_does_not_end_the_decrypted_stream_cleanly() {
+    for cut in [false, true] {
+        let seen = Seen::default();
+        let mut capture = Capture::with_registry(true, seen.registry());
+        capture.send(true, &seal(&CLIENT_APP, 0, 23, b"whole"));
+        if cut {
+            let record = seal(&CLIENT_APP, 1, 23, b"cut short");
+            capture.send(true, &record[..record.len() - 4]);
+        }
+        capture.fin(true);
+        let client = seen.client();
+        assert!(
+            client.contains(&Told::Data(b"whole".to_vec())),
+            "{client:?}"
+        );
+        assert_eq!(
+            client.contains(&Told::End(Termination::Fin)),
+            !cut,
+            "{client:?}"
+        );
+    }
 }

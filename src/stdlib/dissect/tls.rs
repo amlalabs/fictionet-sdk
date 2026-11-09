@@ -32,6 +32,10 @@ struct Tls {
     hs_sealed: [Vec<u8>; 2],
     /// A KeyUpdate came in this direction: its next records use new keys.
     key_update: [bool; 2],
+    /// A record of this direction was not opened since the decrypted
+    /// stream last got bytes, such as early data under a key the key log
+    /// does not have: what it carried is missing from that stream.
+    unopened: [bool; 2],
 }
 
 /// A TLS capture session with record framing, handshake state, and TLS 1.3
@@ -98,16 +102,25 @@ impl Protocol for TlsSession {
     /// Ends the records of this direction, then the decrypted stream they
     /// carried, the same way: a clean end finishes both, so a message
     /// read to the end of the stream completes; any other end discards
-    /// what both held.
+    /// what both held. The decrypted stream ends cleanly only where its
+    /// records did: after a whole record, with every record opened.
+    /// Otherwise bytes it carried are missing, and it ends as truncated.
     fn end(&mut self, reverse: bool, how: Termination, d: &mut Decoded) {
         if !how.is_clean() {
             return self.lost(reverse);
         }
-        if let Some(dir) = &mut self.dirs[usize::from(reverse)] {
+        let i = usize::from(reverse);
+        let whole = self.dirs[i]
+            .as_ref()
+            .is_some_and(|dir| !dir.waiting() && dir.failed().is_none())
+            && !self.tls.unopened[i];
+        if let Some(dir) = &mut self.dirs[i] {
+            // The end comes in a later packet than the bytes, or in none.
+            dir.placement().packet(Place::default());
             dir.end(d);
         }
         if let Some(inner) = &mut self.tls.inner {
-            inner.end(reverse, how, d);
+            inner.end(reverse, if whole { how } else { Termination::Truncated }, d);
         }
     }
     /// Stops reading this direction's records, and tells the decrypted
@@ -120,6 +133,7 @@ impl Protocol for TlsSession {
         }
         self.tls.hs_plain[i] = Vec::new();
         self.tls.hs_sealed[i] = Vec::new();
+        self.tls.unopened[i] = false;
     }
 }
 
@@ -289,6 +303,7 @@ impl Tls {
             hs_plain: [Vec::new(), Vec::new()],
             hs_sealed: [Vec::new(), Vec::new()],
             key_update: [false; 2],
+            unopened: [false; 2],
         }
     }
 
@@ -410,6 +425,7 @@ impl Tls {
                 let opened = self.keys[i].as_mut().and_then(|k| k.open(body));
                 match opened {
                     None => {
+                        self.unopened[i] = true;
                         l.summary = format!("{version} Application Data, encrypted");
                         let why = if !self.tls13 {
                             "only TLS 1.3 is decrypted; download the capture to decrypt it in Wireshark"
@@ -489,6 +505,9 @@ impl Tls {
             self.inner = Some(inner);
         }
         if let Some(conversation) = &mut self.inner {
+            if std::mem::take(&mut self.unopened[i]) {
+                conversation.lost(i != 0);
+            }
             conversation.data(i != 0, plain, place, d, &[]);
         }
     }
