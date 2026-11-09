@@ -2,8 +2,8 @@
 
 use super::channel::{ChannelCommand, ChannelEvent, ChannelPort, Opening};
 use super::{
-    Chunk, ConnInfo, Context, Handler, OUTPUT_LIMIT, Output, Program, Pty, Session, SessionEvent,
-    SessionRequest, TransportError, wire,
+    Chunk, ConnInfo, ConnectionControl, Context, Handler, OUTPUT_LIMIT, Output, Program, Pty,
+    Session, SessionEvent, SessionRequest, TransportError, wire,
 };
 use crate::stdlib::layer::{
     Admit, Budget, Charge, Env, Layer, Owned, StreamCommand, StreamEvent, Top,
@@ -13,10 +13,12 @@ use std::sync::Arc;
 
 /// Adapts the synchronous session policy to one channel. Configuration and
 /// callback-owned memory remain application allocations; retained session bytes
-/// reported by `Session::held` are charged after each callback.
+/// reported by `Session::held` are charged after each callback. Draining and
+/// disconnection the session asks for go to the connection's control, so they
+/// never wait behind this channel's output.
 pub struct SessionLayer<H: Handler> {
     handler: Arc<H>,
-    pub(super) policy_close: Option<Arc<super::AtomicU8>>,
+    control: ConnectionControl,
     connection: Arc<ConnInfo>,
     opening: Owned<Opening>,
     session: Option<H::Session>,
@@ -38,12 +40,13 @@ impl<H: Handler> SessionLayer<H> {
     pub fn new(
         handler: Arc<H>,
         connection: Arc<ConnInfo>,
+        control: ConnectionControl,
         opening: Owned<Opening>,
         budget: &Budget,
     ) -> Self {
         Self {
             handler,
-            policy_close: None,
+            control,
             connection,
             opening,
             session: None,
@@ -61,11 +64,16 @@ impl<H: Handler> SessionLayer<H> {
             state: None,
         }
     }
-    fn account(&mut self, budget: &Budget) -> Result<(), TransportError> {
-        if let Some(signal) = &self.policy_close {
-            let policy = u8::from(self.output.hangup) | (u8::from(self.output.disconnect) << 1);
-            signal.fetch_or(policy, super::Ordering::Relaxed);
+    /// Pass the shutdown a callback asked for to the connection.
+    fn shutdown(&mut self) {
+        if self.output.disconnect {
+            self.control.disconnect();
+        } else if self.output.hangup && !self.draining {
+            self.draining = true;
+            self.control.drain();
         }
+    }
+    fn account(&mut self, budget: &Budget) -> Result<(), TransportError> {
         let bytes = 4 * super::ssh::MAX_PAYLOAD + self.session.as_ref().map_or(0, Session::held);
         let fits = match &mut self.state {
             Some(charge) => charge.set(bytes),
@@ -228,6 +236,7 @@ impl<H: Handler> Layer for SessionLayer<H> {
             _ => false,
         };
         self.pending = Some(ChannelCommand::Accept(accepted));
+        self.shutdown();
         self.account(env.budget())?;
         Ok(true)
     }
@@ -322,6 +331,7 @@ impl<H: Handler> Layer for SessionLayer<H> {
             }
             ChannelEvent::Stream(StreamEvent::Written(_) | StreamEvent::Reset) => unreachable!(),
         }
+        self.shutdown();
         self.account(env.budget())?;
         Ok(Admit::Taken)
     }
@@ -336,16 +346,12 @@ impl<H: Handler> Layer for SessionLayer<H> {
         None
     }
     fn take_command(&mut self, _env: &mut Env<'_, Self::Report>) -> Option<ChannelCommand> {
+        // The connection is disconnecting; nothing more goes on this channel.
         if self.output.disconnect {
-            self.output.disconnect = false;
-            return Some(ChannelCommand::Disconnect);
+            return None;
         }
         if let Some(command) = self.pending.take() {
             return Some(command);
-        }
-        if self.output.hangup && !self.draining {
-            self.draining = true;
-            return Some(ChannelCommand::Draining);
         }
         if let Some(status) = self.exit {
             self.exit_stage += 1;
