@@ -184,9 +184,9 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match command {}
         }
-        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
             self.ready = true;
-            Ok(())
+            Ok(true)
         }
         fn deadline(&self) -> Option<(Instant, ())> {
             (!self.ready).then_some((self.at, ()))

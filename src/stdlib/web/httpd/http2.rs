@@ -1880,10 +1880,10 @@ impl Layer for Http2 {
         }
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, Report>, _: Timer) -> Result<(), Infallible> {
+    fn on_timer(&mut self, env: &mut Env<'_, Report>, _: Timer) -> Result<bool, Infallible> {
         let now = env.now();
         if self.phase != Phase::Open {
-            return Ok(());
+            return Ok(false);
         }
         if self.settings_deadline.is_some_and(|at| at <= now) {
             self.settings_deadline = None;
@@ -1894,12 +1894,14 @@ impl Layer for Http2 {
                     "SETTINGS acknowledgment timed out",
                 ),
             );
-            return Ok(());
+            return Ok(true);
         }
+        let mut forgot = false;
         while self.resets.front().is_some_and(|(_, at)| *at <= now) {
             self.resets.pop_front();
+            forgot = true;
         }
-        Ok(())
+        Ok(forgot)
     }
 
     fn advance(&mut self, env: &mut Env<'_, Report>) -> Result<bool, Infallible> {
@@ -2573,9 +2575,9 @@ mod tests {
             self.from.filter(|_| !self.reads).map(|at| (at, ()))
         }
 
-        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, (): ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, (): ()) -> Result<bool, Infallible> {
             self.reads = true;
-            Ok(())
+            Ok(true)
         }
 
         fn on_command(

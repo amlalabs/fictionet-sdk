@@ -64,7 +64,7 @@ impl Layer for Hesitant {
         }
         self.inner.on_command(env, command)
     }
-    fn on_timer(&mut self, env: &mut Env<'_, ()>, timer: ()) -> Result<(), Infallible> {
+    fn on_timer(&mut self, env: &mut Env<'_, ()>, timer: ()) -> Result<bool, Infallible> {
         self.inner.on_timer(env, timer)
     }
     fn on_done(&mut self, env: &mut Env<'_, ()>, done: ()) -> Result<(), Infallible> {

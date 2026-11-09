@@ -2760,13 +2760,14 @@ impl Layer for TcpLayer {
         Ok(Admit::Taken)
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, ()>, (): ()) -> Result<(), Infallible> {
+    fn on_timer(&mut self, env: &mut Env<'_, ()>, (): ()) -> Result<bool, Infallible> {
         // A step at this time already ran and found nothing to send yet;
-        // another would find the same.
+        // another would find the same, so the timer is declined.
         if self.work || self.stepped != Some(env.now()) {
             self.work = true;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {

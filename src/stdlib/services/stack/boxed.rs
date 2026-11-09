@@ -157,7 +157,7 @@ trait Erased<Lo: Port, Up: Port>: Send {
         env: &mut Env<'_, BoxReport>,
         command: CommandOf<Up>,
     ) -> Result<Admit<CommandOf<Up>>, BoxError>;
-    fn on_timer(&mut self, env: &mut Env<'_, BoxReport>) -> Result<(), BoxError>;
+    fn on_timer(&mut self, env: &mut Env<'_, BoxReport>) -> Result<bool, BoxError>;
     fn on_done(&mut self, env: &mut Env<'_, BoxReport>, done: BoxDone) -> Result<(), BoxError>;
     fn advance(&mut self, env: &mut Env<'_, BoxReport>) -> Result<bool, BoxError>;
     fn take_command(&mut self, env: &mut Env<'_, BoxReport>) -> Option<CommandOf<Lo>>;
@@ -216,9 +216,9 @@ where
             .map_err(error)
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, BoxReport>) -> Result<(), BoxError> {
+    fn on_timer(&mut self, env: &mut Env<'_, BoxReport>) -> Result<bool, BoxError> {
         let Some((_, timer)) = Layer::deadline(self) else {
-            return Ok(());
+            return Ok(false);
         };
         env.scoped(boxed::<L>, |env| Layer::on_timer(self, env, timer))
             .map_err(error)
@@ -306,7 +306,7 @@ impl<Lo: Port, Up: Port> Layer for Boxed<Lo, Up> {
         self.inner.on_command(env, command)
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, BoxReport>, _: ()) -> Result<(), BoxError> {
+    fn on_timer(&mut self, env: &mut Env<'_, BoxReport>, _: ()) -> Result<bool, BoxError> {
         self.inner.on_timer(env)
     }
 

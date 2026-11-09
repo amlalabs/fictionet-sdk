@@ -219,7 +219,7 @@ where
         &mut self,
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<bool, Self::Error> {
         match (&mut self.phase, timer) {
             (Phase::First(a), Side::Lower(t)) => env
                 .scoped(Side::Lower, |env| a.on_timer(env, t))
@@ -227,7 +227,7 @@ where
             (Phase::Then(b), Side::Upper(t)) => env
                 .scoped(Side::Upper, |env| b.on_timer(env, t))
                 .map_err(Side::Upper),
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 
@@ -264,7 +264,7 @@ where
                 );
                 self.above.extend(handover.above);
                 let next = B::succeed(handover.next);
-                assert!(next.depth() < super::MAX_DEPTH, "composition is too deep");
+                assert!(env.fits_below(&next), "composition is too deep");
                 self.owner = WorkOwner::new();
                 self.phase = Phase::Then(next);
                 Ok(true)

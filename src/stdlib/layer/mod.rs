@@ -360,6 +360,10 @@ pub trait Layer: Sized {
 
     /// Maximum number of nested layer calls, including this layer.
     /// Composites include their children even when hidden by type erasure.
+    /// A layer that counts itself as a level above its parts calls them one
+    /// level down ([`Env::part`], [`Env::scoped`]), so a part it adds while
+    /// it runs is checked against the depth left where it sits
+    /// ([`Env::fits_below`]).
     fn depth(&self) -> usize {
         1
     }
@@ -403,13 +407,17 @@ pub trait Layer: Sized {
     ) -> Result<Admit<CommandOf<Self::Upper>>, Self::Error>;
 
     /// The timer `timer`, which [`deadline`](Self::deadline) named, is due.
-    /// The layer disarms or rearms it.
+    /// The layer disarms or rearms it. Returns whether the timer did
+    /// anything: a layer may decline a due timer it has nothing to do for
+    /// yet, such as one whose work already ran at this time, by changing
+    /// nothing and returning `false`. The timer stays due, and the driver
+    /// does not count it as progress, so it never spends the driver's steps.
     fn on_timer(
         &mut self,
         _env: &mut Env<'_, Self::Report>,
         _timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 
     /// Work from [`take_work`](Self::take_work) finished.

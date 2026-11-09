@@ -260,9 +260,9 @@ impl Layer for Pauses {
         match command {}
     }
 
-    fn on_timer(&mut self, _env: &mut Env<'_, Infallible>, _timer: ()) -> Result<(), Infallible> {
+    fn on_timer(&mut self, _env: &mut Env<'_, Infallible>, _timer: ()) -> Result<bool, Infallible> {
         self.until = None;
-        Ok(())
+        Ok(true)
     }
 
     fn deadline(&self) -> Option<(Instant, ())> {

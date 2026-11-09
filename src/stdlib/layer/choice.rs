@@ -76,7 +76,7 @@ where
         &mut self,
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<bool, Self::Error> {
         match (self, timer) {
             (Side::Lower(a), Side::Lower(t)) => env
                 .scoped(Side::Lower, |env| a.on_timer(env, t))
@@ -84,7 +84,7 @@ where
             (Side::Upper(b), Side::Upper(t)) => env
                 .scoped(Side::Upper, |env| b.on_timer(env, t))
                 .map_err(Side::Upper),
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 
@@ -160,7 +160,7 @@ where
 /// and discarded because no upper layer exists to receive them. It gives
 /// nothing until set. Put it on top of the layer
 /// that decides with [`Chain`](super::Chain), and set it from whatever
-/// owns the chain.
+/// owns the chain, during one of its own calls.
 pub struct Later<U> {
     layer: Option<U>,
 }
@@ -177,13 +177,15 @@ impl<U> Later<U> {
         Later::default()
     }
 
-    /// The layer, once it is made. Panics if it was made before: a layer
-    /// is made once.
-    pub fn set(&mut self, layer: U)
+    /// The layer, once it is made. `env` is an environment for this
+    /// `Later`, the one whatever holds it calls it with, and the layer must
+    /// fit below it ([`Env::fits_below`]). Panics if it does not, or if a
+    /// layer was made before: a layer is made once.
+    pub fn set(&mut self, env: &Env<'_, U::Report>, layer: U)
     where
         U: Layer,
     {
-        assert!(layer.depth() < super::MAX_DEPTH, "composition is too deep");
+        assert!(env.fits_below(&layer), "composition is too deep");
         assert!(self.layer.is_none(), "a later layer is made once");
         self.layer = Some(layer);
     }
@@ -229,7 +231,7 @@ where
         event: EventOf<U::Lower>,
     ) -> Result<Admit<EventOf<U::Lower>>, U::Error> {
         match &mut self.layer {
-            Some(layer) => layer.on_event(env, event),
+            Some(layer) => env.part(|env| layer.on_event(env, event)),
             None if <U::Lower as Port>::urgent(&event) => Ok(Admit::Taken),
             None => Ok(Admit::Blocked(event)),
         }
@@ -241,34 +243,39 @@ where
         command: CommandOf<U::Upper>,
     ) -> Result<Admit<CommandOf<U::Upper>>, U::Error> {
         match &mut self.layer {
-            Some(layer) => layer.on_command(env, command),
+            Some(layer) => env.part(|env| layer.on_command(env, command)),
             None => Ok(Admit::Blocked(command)),
         }
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, U::Report>, timer: U::Timer) -> Result<(), U::Error> {
+    fn on_timer(
+        &mut self,
+        env: &mut Env<'_, U::Report>,
+        timer: U::Timer,
+    ) -> Result<bool, U::Error> {
         match &mut self.layer {
-            Some(layer) => layer.on_timer(env, timer),
-            None => Ok(()),
+            Some(layer) => env.part(|env| layer.on_timer(env, timer)),
+            None => Ok(false),
         }
     }
 
     fn on_done(&mut self, env: &mut Env<'_, U::Report>, done: U::Done) -> Result<(), U::Error> {
         match &mut self.layer {
-            Some(layer) => layer.on_done(env, done),
+            Some(layer) => env.part(|env| layer.on_done(env, done)),
             None => Ok(()),
         }
     }
 
     fn advance(&mut self, env: &mut Env<'_, U::Report>) -> Result<bool, U::Error> {
         match &mut self.layer {
-            Some(layer) => layer.advance(env),
+            Some(layer) => env.part(|env| layer.advance(env)),
             None => Ok(false),
         }
     }
 
     fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<U::Lower>> {
-        self.layer.as_mut()?.take_command(env)
+        let layer = self.layer.as_mut()?;
+        env.part(|env| layer.take_command(env))
     }
 
     fn take_event(&mut self) -> Option<EventOf<U::Upper>> {
@@ -292,7 +299,9 @@ where
 mod tests {
     use super::*;
     use core::convert::Infallible;
-    use fictionet::stdlib::layer::{Budget, ByteStream, Driver, StreamCommand, StreamEvent, Top};
+    use fictionet::stdlib::layer::{
+        Budget, ByteStream, Driver, Observations, StreamCommand, StreamEvent, Top,
+    };
     use std::sync::Arc;
 
     struct Sink;
@@ -346,7 +355,13 @@ mod tests {
             driver.deliver(StreamEvent::Ended),
             Ok(Admit::Blocked(StreamEvent::Ended))
         ));
-        driver.layer_mut().set(Sink);
+        // The `Later` is the top of the stack: an environment for the top
+        // is its own.
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(91));
+        let budget = Budget::unlimited();
+        let mut reports = Observations::new(0);
+        let env = Env::new(Instant::ZERO, &entropy, &budget, &mut reports);
+        driver.layer_mut().set(&env, Sink);
         assert!(matches!(
             driver.deliver(StreamEvent::Ended),
             Ok(Admit::Taken)

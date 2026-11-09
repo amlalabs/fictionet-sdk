@@ -145,7 +145,7 @@ where
             StreamEvent::Written(n) => (false, false, *n, false),
             StreamEvent::Data(_) => (false, false, 0, true),
         };
-        let admitted = self.layer.on_event(env, event)?;
+        let admitted = env.part(|env| self.layer.on_event(env, event))?;
         self.now = env.now();
         let closed = matches!(&admitted, Admit::Closed(_));
         if input {
@@ -178,32 +178,32 @@ where
         &mut self,
         env: &mut Env<'_, L::Report>,
         timer: Self::Timer,
-    ) -> Result<(), L::Error> {
+    ) -> Result<bool, L::Error> {
         match timer {
-            SessionTimer::Application(timer) => self.layer.on_timer(env, timer),
+            SessionTimer::Application(timer) => env.part(|env| self.layer.on_timer(env, timer)),
             SessionTimer::Idle => {
                 self.lifetime.expire(Expiry::Idle);
                 self.event = Some(StreamEvent::Ended);
                 self.settle();
-                Ok(())
+                Ok(true)
             }
             SessionTimer::Write => {
                 self.lifetime.expire(Expiry::Stalled);
                 self.reset = true;
                 self.command = Some(StreamCommand::Reset);
-                let _ = self.layer.on_event(env, StreamEvent::Reset)?;
-                Ok(())
+                let _ = env.part(|env| self.layer.on_event(env, StreamEvent::Reset))?;
+                Ok(true)
             }
         }
     }
     fn on_done(&mut self, env: &mut Env<'_, L::Report>, done: L::Done) -> Result<(), L::Error> {
-        self.layer.on_done(env, done)
+        env.part(|env| self.layer.on_done(env, done))
     }
     fn advance(&mut self, env: &mut Env<'_, L::Report>) -> Result<bool, L::Error> {
         self.now = env.now();
         let mut moved = false;
         if let Some(event) = self.event.take() {
-            match self.layer.on_event(env, event)? {
+            match env.part(|env| self.layer.on_event(env, event))? {
                 Admit::Blocked(event) | Admit::Partial(event) => self.event = Some(event),
                 _ => {
                     // The idle EOF is in: the input is over.
@@ -212,7 +212,7 @@ where
                 }
             }
         }
-        moved |= self.layer.advance(env)?;
+        moved |= env.part(|env| self.layer.advance(env))?;
         self.settle();
         Ok(moved)
     }
@@ -220,7 +220,7 @@ where
         let command = self
             .command
             .take()
-            .or_else(|| self.layer.take_command(env))?;
+            .or_else(|| env.part(|env| self.layer.take_command(env)))?;
         match &command {
             StreamCommand::Write(bytes) => {
                 self.now = env.now();
@@ -385,9 +385,9 @@ pub(super) mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match command {}
         }
-        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
             self.until = None;
-            Ok(())
+            Ok(true)
         }
         fn deadline(&self) -> Option<(Instant, ())> {
             self.until.map(|at| (at, ()))

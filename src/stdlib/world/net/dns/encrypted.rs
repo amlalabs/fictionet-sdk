@@ -569,12 +569,17 @@ impl Layer for Queried {
         match command {}
     }
 
-    fn on_timer(&mut self, _env: &mut Env<'_, Infallible>, timer: Quiet) -> Result<(), Infallible> {
-        self.timers.cancel(&timer);
+    fn on_timer(
+        &mut self,
+        _env: &mut Env<'_, Infallible>,
+        timer: Quiet,
+    ) -> Result<bool, Infallible> {
+        let mut fired = self.timers.cancel(&timer);
         if !self.over && self.quiet() {
             self.stop();
+            fired = true;
         }
-        Ok(())
+        Ok(fired)
     }
 
     fn on_done(

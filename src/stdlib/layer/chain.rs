@@ -127,7 +127,7 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         &mut self,
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<bool, Self::Error> {
         self.lower_fired_last = matches!(timer, Side::Lower(_));
         match timer {
             Side::Lower(t) => env
@@ -293,9 +293,9 @@ mod tests {
         fn deadline(&self) -> Option<(Instant, ())> {
             Some((Instant::ZERO, ()))
         }
-        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<bool, Infallible> {
             self.0 += 1;
-            Ok(())
+            Ok(true)
         }
     }
 

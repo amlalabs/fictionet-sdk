@@ -149,8 +149,9 @@ impl<L: Layer> Driver<L> {
     /// `budget`.
     ///
     /// The composition's depth is checked here and wherever it grows: when
-    /// a stack is boxed, when a later layer is set, when a switch hands
-    /// over and when a child is made. No call walks the stack for it.
+    /// a stack is boxed, and, against the depth left where the new part
+    /// sits ([`Env::fits_below`]), when a later layer is set, when a switch
+    /// hands over and when a child is made. No call walks the stack for it.
     pub fn new(layer: L, entropy: Arc<dyn Entropy>, budget: Budget, now: Instant) -> Driver<L> {
         assert!(layer.depth() <= super::MAX_DEPTH, "composition is too deep");
         Driver {
@@ -248,8 +249,7 @@ impl<L: Layer> Driver<L> {
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
             let mut step = false;
             if let Some((_, timer)) = due {
-                self.layer.on_timer(&mut env, timer)?;
-                step = true;
+                step = self.layer.on_timer(&mut env, timer)?;
             }
             step |= self.layer.advance(&mut env)?;
             if !step {
@@ -405,9 +405,9 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match c {}
         }
-        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<bool, Infallible> {
             self.timers += 1;
-            Ok(())
+            Ok(true)
         }
         fn advance(&mut self, _: &mut Env<'_, ()>) -> Result<bool, Infallible> {
             self.advances += 1;
@@ -422,6 +422,78 @@ mod tests {
         fn deadline(&self) -> Option<(Instant, ())> {
             Some((Instant::ZERO, ()))
         }
+    }
+
+    /// A layer whose timer stays due once it has worked, as TCP's does:
+    /// it works once at each time and declines its timer until time moves.
+    struct OncePerTime {
+        worked: Option<Instant>,
+        works: usize,
+        offered: usize,
+    }
+    impl Layer for OncePerTime {
+        type Lower = Units;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<Admit<()>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn on_timer(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<bool, Infallible> {
+            self.offered += 1;
+            if self.worked == Some(env.now()) {
+                return Ok(false);
+            }
+            self.worked = Some(env.now());
+            self.works += 1;
+            Ok(true)
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<()> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            Some((Instant::ZERO, ()))
+        }
+    }
+
+    #[test]
+    fn a_declined_timer_is_not_progress() {
+        let mut driver = Driver::new(
+            OncePerTime {
+                worked: None,
+                works: 0,
+                offered: 0,
+            },
+            Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        assert!(driver.run().unwrap(), "the first timer worked");
+        assert!(!driver.exhausted(), "a declined timer ends the run");
+        assert!(driver.layer().offered < STEPS);
+        let offered = driver.layer().offered;
+        assert!(!driver.run().unwrap(), "the timer is declined at this time");
+        assert!(!driver.exhausted());
+        assert!(driver.layer().offered - offered < STEPS);
+
+        let works = driver.layer().works;
+        driver.set_now(Instant::ZERO + std::time::Duration::from_millis(1));
+        assert!(driver.run().unwrap(), "the timer works once time moves");
+        assert!(driver.layer().works > works);
+        assert!(!driver.exhausted());
     }
 
     #[test]

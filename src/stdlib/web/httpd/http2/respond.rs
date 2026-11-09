@@ -498,15 +498,16 @@ impl Layer for Respond {
         match command {}
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+    fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
         let state = &mut *self.state;
-        if state.deadline.is_some_and(|at| at <= env.now()) {
-            state.deadline = None;
-            if matches!(state.stage, Stage::Collecting) {
-                state.dispatch(env, Received::Timeout);
-            }
+        if state.deadline.is_none_or(|at| at > env.now()) {
+            return Ok(false);
         }
-        Ok(())
+        state.deadline = None;
+        if matches!(state.stage, Stage::Collecting) {
+            state.dispatch(env, Received::Timeout);
+        }
+        Ok(true)
     }
 
     fn on_done(&mut self, env: &mut Env<'_, Infallible>, done: Done) -> Result<(), Infallible> {
