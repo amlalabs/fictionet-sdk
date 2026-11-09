@@ -32,6 +32,10 @@ struct Tls {
     hs_sealed: [Vec<u8>; 2],
     /// A KeyUpdate came in this direction: its next records use new keys.
     key_update: [bool; 2],
+    /// A record of this direction was not opened since the decrypted
+    /// stream last got bytes, such as early data under a key the key log
+    /// does not have: what it carried is missing from that stream.
+    unopened: [bool; 2],
 }
 
 /// A TLS capture session with record framing, handshake state, and TLS 1.3
@@ -98,16 +102,25 @@ impl Protocol for TlsSession {
     /// Ends the records of this direction, then the decrypted stream they
     /// carried, the same way: a clean end finishes both, so a message
     /// read to the end of the stream completes; any other end discards
-    /// what both held.
+    /// what both held. The decrypted stream ends cleanly only where its
+    /// records did: after a whole record, with every record opened.
+    /// Otherwise bytes it carried are missing, and it ends as truncated.
     fn end(&mut self, reverse: bool, how: Termination, d: &mut Decoded) {
         if !how.is_clean() {
             return self.lost(reverse);
         }
-        if let Some(dir) = &mut self.dirs[usize::from(reverse)] {
+        let i = usize::from(reverse);
+        let whole = self.dirs[i]
+            .as_ref()
+            .is_some_and(|dir| !dir.waiting() && dir.failed().is_none())
+            && !self.tls.unopened[i];
+        if let Some(dir) = &mut self.dirs[i] {
+            // The end comes in a later packet than the bytes, or in none.
+            dir.placement().packet(Place::default());
             dir.end(d);
         }
         if let Some(inner) = &mut self.tls.inner {
-            inner.end(reverse, how, d);
+            inner.end(reverse, if whole { how } else { Termination::Truncated }, d);
         }
     }
     /// Stops reading this direction's records, and tells the decrypted
@@ -120,6 +133,7 @@ impl Protocol for TlsSession {
         }
         self.tls.hs_plain[i] = Vec::new();
         self.tls.hs_sealed[i] = Vec::new();
+        self.tls.unopened[i] = false;
     }
 }
 
@@ -289,6 +303,7 @@ impl Tls {
             hs_plain: [Vec::new(), Vec::new()],
             hs_sealed: [Vec::new(), Vec::new()],
             key_update: [false; 2],
+            unopened: [false; 2],
         }
     }
 
@@ -410,6 +425,7 @@ impl Tls {
                 let opened = self.keys[i].as_mut().and_then(|k| k.open(body));
                 match opened {
                     None => {
+                        self.unopened[i] = true;
                         l.summary = format!("{version} Application Data, encrypted");
                         let why = if !self.tls13 {
                             "only TLS 1.3 is decrypted; download the capture to decrypt it in Wireshark"
@@ -451,7 +467,12 @@ impl Tls {
                                 push(d, l);
                                 d.application(1, version, "Encrypted Alert");
                             }
-                            _ => {
+                            // Application data comes only under an
+                            // application key: an endpoint refuses it under
+                            // the handshake key, and refuses any other
+                            // content type, so neither is part of the
+                            // stream the protocol inside reads.
+                            23 if app => {
                                 l.summary = format!(
                                     "{version} Application Data, {} bytes decrypted",
                                     plain.len()
@@ -464,6 +485,20 @@ impl Tls {
                                     len: plain.len(),
                                 };
                                 self.inner_data(i, &plain, inner_place, d);
+                            }
+                            _ => {
+                                l.summary = format!("{version} Record type {inner} (decrypted)");
+                                l.note(
+                                    "Content",
+                                    if inner == 23 {
+                                        "application data under the handshake key, which an endpoint refuses"
+                                    } else {
+                                        "a content type an endpoint refuses in a protected record"
+                                    },
+                                );
+                                push(d, l);
+                                d.tag("malformed");
+                                d.application(1, version, &format!("Record type {inner}"));
                             }
                         }
                     }
@@ -489,6 +524,9 @@ impl Tls {
             self.inner = Some(inner);
         }
         if let Some(conversation) = &mut self.inner {
+            if std::mem::take(&mut self.unopened[i]) {
+                conversation.lost(i != 0);
+            }
             conversation.data(i != 0, plain, place, d, &[]);
         }
     }
@@ -700,6 +738,11 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
     }
     out
 }
+
+/// Bounded proofs over the handshake readers, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/dissector/kani/handshake.rs"]
+mod proofs;
 
 #[cfg(test)]
 pub(super) mod tests {
@@ -1131,6 +1174,115 @@ pub(super) mod tests {
         }
         assert!(feed(&mut tls, &seal(&secret, 0, 23, b"hello")));
         assert!(tls.keys[0].as_ref().unwrap().handshake.is_none());
+    }
+
+    /// A record opens only under its own direction's key in use and at its
+    /// own sequence number: a copy of an earlier record, a record ahead of
+    /// its number, or one of the other direction opens nothing and leaves
+    /// the number as it was. A KeyUpdate moves only its own direction to
+    /// the next key; the other goes on under its key.
+    #[test]
+    fn records_open_only_at_their_own_number_and_key() {
+        let secrets = [([2u8; 32], [1u8; 32]), ([4u8; 32], [3u8; 32])];
+        let keys = secrets.map(|(hs, app)| DirKeys::new(suite(0x1301).unwrap(), &hs, &app));
+        let mut tls = Tls {
+            tls13: true,
+            cipher: Some(0x1301),
+            keys,
+            ..Tls::new((0, 0), Registry::new())
+        };
+        let mut at = [0u64; 2];
+        let mut feed = |tls: &mut Tls, i: usize, record: &[u8]| {
+            let mut d = Decoded::default();
+            let mut dir = Observed::new(protocols::TlsRecords::default());
+            let place = Place {
+                stream_start: at[i],
+                buf: 0,
+                offset: Some(0),
+                len: record.len(),
+            };
+            at[i] += record.len() as u64;
+            dir.data_with(record, place, &mut d, |item, raw, start, place, d| {
+                tls.present_record(i, item, raw, start, place, d, &[])
+            });
+            d.tags.contains(&"decrypted")
+        };
+        const FINISHED: [u8; 4] = [20, 0, 0, 0];
+        const KEY_UPDATE: [u8; 5] = [24, 0, 0, 1, 0];
+        for (i, (hs, app)) in secrets.iter().enumerate() {
+            let hello = seal(hs, 0, 22, &FINISHED);
+            assert!(feed(&mut tls, i, &hello));
+            assert!(!feed(&mut tls, i, &hello), "a copy of the record before");
+            assert!(!feed(&mut tls, i, &seal(hs, 2, 22, &FINISHED)), "ahead");
+            assert!(feed(&mut tls, i, &seal(hs, 1, 22, &FINISHED)));
+            assert!(!feed(&mut tls, i, &seal(app, 1, 23, b"x")), "ahead");
+            assert!(feed(&mut tls, i, &seal(app, 0, 23, b"x")));
+            assert!(!feed(&mut tls, i, &seal(app, 0, 23, b"x")), "a copy");
+            let (theirs, _) = secrets[1 - i];
+            assert!(!feed(&mut tls, i, &seal(&theirs, 1, 22, &FINISHED)));
+        }
+        // The client updates its key; the server's stays as it was.
+        let (_, client) = secrets[0];
+        let (_, server) = secrets[1];
+        assert!(feed(&mut tls, 0, &seal(&client, 1, 22, &KEY_UPDATE)));
+        assert!(!feed(&mut tls, 0, &seal(&client, 2, 23, b"x")), "old key");
+        assert!(feed(&mut tls, 0, &seal(&next_secret(&client), 0, 23, b"x")));
+        assert!(feed(&mut tls, 1, &seal(&server, 1, 23, b"x")));
+        assert!(feed(&mut tls, 1, &seal(&server, 2, 22, &KEY_UPDATE)));
+        assert!(feed(&mut tls, 1, &seal(&next_secret(&server), 0, 23, b"x")));
+        assert!(feed(&mut tls, 0, &seal(&next_secret(&client), 1, 23, b"x")));
+    }
+
+    /// The decrypted stream carries only what an endpoint takes as
+    /// application data: records of that content type under an application
+    /// key. Application data under the handshake key, and a protected
+    /// record of another content type, open but are refused by an
+    /// endpoint, so the protocol inside never reads them.
+    #[test]
+    fn only_application_data_reaches_the_decrypted_stream() {
+        let (hs, app) = ([2u8; 32], [1u8; 32]);
+        let keys = DirKeys::new(suite(0x1301).unwrap(), &hs, &app).unwrap();
+        let mut registry = Registry::new();
+        registry.register("tiny", |_| Match::Yes, |_| [Tiny, Tiny]);
+        let mut tls = Tls {
+            tls13: true,
+            cipher: Some(0x1301),
+            keys: [Some(keys), None],
+            ..Tls::new((40000, 443), registry)
+        };
+        let mut at = 0u64;
+        // What the protocol inside showed for the record, and the packet.
+        let mut feed = |tls: &mut Tls, record: &[u8]| {
+            let mut d = Decoded::default();
+            let mut dir = Observed::new(protocols::TlsRecords::default());
+            let place = Place {
+                stream_start: at,
+                buf: 0,
+                offset: Some(0),
+                len: record.len(),
+            };
+            at += record.len() as u64;
+            dir.data_with(record, place, &mut d, |item, raw, start, place, d| {
+                tls.present_record(0, item, raw, start, place, d, &[])
+            });
+            assert!(d.tags.contains(&"decrypted"), "{d:?}");
+            let inside: Vec<String> = d
+                .layers
+                .iter()
+                .filter(|l| l.name == "Tiny")
+                .map(|l| l.summary.clone())
+                .collect();
+            (inside, d)
+        };
+        let (inside, refused) = feed(&mut tls, &seal(&hs, 0, 23, b"\x01h"));
+        assert!(inside.is_empty(), "{inside:?}");
+        assert!(refused.tags.contains(&"malformed"));
+        feed(&mut tls, &seal(&hs, 1, 22, &[20, 0, 0, 0]));
+        let (inside, refused) = feed(&mut tls, &seal(&app, 0, 24, b"\x01c"));
+        assert!(inside.is_empty(), "{inside:?}");
+        assert!(refused.tags.contains(&"malformed"));
+        let (inside, _) = feed(&mut tls, &seal(&app, 1, 23, b"\x01a"));
+        assert_eq!(inside, ["a"]);
     }
 
     #[test]

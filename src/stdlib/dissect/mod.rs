@@ -503,7 +503,7 @@ impl Dissector {
         end.summary = format!("{} TCP connections were open", self.connections.len());
         d.push(end);
         let (_, seen) = self.observe(PacketEvent::Ended);
-        self.apply(seen, &mut d, keys, None, 0);
+        self.apply(seen, &mut d, keys, None, 0, None);
         self.lost();
         d.cap_info();
         d
@@ -859,7 +859,7 @@ impl Dissector {
             d.tag("late");
         }
         let layers = d.layers.len().checked_add(d.cut);
-        let last = self.apply(seen, d, keys, context.protocol, notes);
+        let last = self.apply(seen, d, keys, context.protocol, notes, Some(self.packets));
         if let Some((id, reverse)) = last
             && d.layers.len().checked_add(d.cut) == layers
             && self
@@ -931,6 +931,10 @@ impl Dissector {
     /// `notes`: which way, how many bytes are missing, and why the stream
     /// ended. A gap tags the packet `missing`. An end that cuts short a
     /// message the decoders were holding tags it `incomplete`.
+    ///
+    /// `packet` is the number of the packet `d` shows, whose bytes the
+    /// decoders may point into: `None` for the end of the capture, which
+    /// shows no packet.
     fn apply(
         &mut self,
         seen: Vec<Observation>,
@@ -938,6 +942,7 @@ impl Dissector {
         keys: &[KeyLine],
         protocol: Option<&str>,
         notes: usize,
+        packet: Option<u64>,
     ) -> Option<(ChildId, bool)> {
         let mut last = None;
         for observation in seen {
@@ -971,7 +976,7 @@ impl Dissector {
                         stream_start: watched.delivered[i],
                         buf: 0,
                         offset: source
-                            .filter(|source| source.packet == self.packets)
+                            .filter(|source| Some(source.packet) == packet)
                             .map(|source| source.offset),
                         len: bytes.len(),
                     };
@@ -2080,6 +2085,84 @@ mod tests {
         assert!(dis.connections.is_empty());
         let again = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"), &[]);
         assert_eq!(again.info, "GET / HTTP/1.1");
+    }
+
+    /// The end of the capture is no packet, so what it decodes cannot point
+    /// into one: bytes held from the last packet decoded come with the end
+    /// as a buffer of their own.
+    #[test]
+    fn held_bytes_decoded_at_the_end_bring_their_own_buffer() {
+        let mut dis = Dissector::default();
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        let request = b"GET /after HTTP/1.1\r\n\r\n";
+        dis.decode(&tcp(40000, 80, 111, 0x18, request), &[]);
+        let end = dis.finish(&[]);
+        let http = end
+            .layers
+            .iter()
+            .find(|l| l.name == "Hypertext Transfer Protocol")
+            .unwrap();
+        assert_ne!(http.buf, 0, "{http:?}");
+        assert_eq!(end.extra[http.buf - 1].1, request);
+    }
+
+    /// A decoder that reads its message to the end of the stream, as a
+    /// user may register one: it completes only at the end.
+    struct UntilClose;
+    impl fictionet::stdlib::codec::Decode for UntilClose {
+        type Item = ();
+        type Error = std::convert::Infallible;
+        const NAME: &'static str = "Until close";
+        fn capacity(&self) -> usize {
+            256
+        }
+        fn decode(
+            &mut self,
+            input: &[u8],
+            eof: bool,
+        ) -> Result<fictionet::stdlib::codec::Step<()>, Self::Error> {
+            use fictionet::stdlib::codec::Step;
+            Ok(match (eof, input.len()) {
+                (false, _) => Step::Need,
+                (true, 0) => Step::End,
+                (true, n) => Step::Item((), n),
+            })
+        }
+    }
+    impl Present for UntilClose {
+        fn summary(_: &()) -> String {
+            "to the close".into()
+        }
+        fn fields(_: &(), bytes: &[u8], layer: &mut Layer) {
+            layer.field("Message", bytes.len().to_string(), (0, bytes.len()));
+        }
+    }
+
+    /// A message a FIN completes, in a packet after the one its bytes came
+    /// in, gets a buffer of its own: its ranges never point into the FIN's
+    /// packet at the offsets the bytes had in theirs.
+    #[test]
+    fn a_message_the_fin_completes_brings_its_own_buffer() {
+        let mut registry = Registry::new();
+        registry.register(
+            "until-close",
+            |s| {
+                if s.ports.0 == 9000 || s.ports.1 == 9000 {
+                    Match::Yes
+                } else {
+                    Match::No
+                }
+            },
+            |_| [UntilClose, UntilClose],
+        );
+        let mut dis = Dissector::with_registry(registry);
+        dis.decode(&tcp(40000, 9000, 100, 0x02, b""), &[]);
+        let open = dis.decode(&tcp(40000, 9000, 101, 0x18, b"hello"), &[]);
+        assert!(!has_layer(&open, "Until close"));
+        let fin = dis.decode(&tcp(40000, 9000, 106, 0x11, b""), &[]);
+        let layer = fin.layers.iter().find(|l| l.name == "Until close").unwrap();
+        assert_ne!(layer.buf, 0, "{layer:?}");
+        assert_eq!(fin.extra[layer.buf - 1].1, b"hello");
     }
 
     /// Streams that look like TLS, HTTP/2, HTTP/1.1 and DNS, then turn to

@@ -7,10 +7,14 @@ use std::fmt::Write;
 
 /// DNS capture messages, either one UDP datagram or length-prefixed TCP.
 /// Oversized TCP messages emit their length header, then skip the payload.
+/// Past missing bytes, a TCP direction is not read again: only the length
+/// before each message marks where it starts.
 pub struct Dns {
     tcp: bool,
     taken: bool,
     skip: usize,
+    /// Bytes went missing in this TCP direction.
+    lost: bool,
 }
 impl Dns {
     /// Registers `dns` when either port is 53, on UDP or TCP.
@@ -41,6 +45,7 @@ impl Dns {
             tcp,
             taken: false,
             skip: 0,
+            lost: false,
         }
     }
 }
@@ -52,53 +57,85 @@ impl Decode for Dns {
         if self.tcp { MAX_BUFFER } else { 65_536 }
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Display>, Infallible> {
+        Ok(match self.next(input, eof) {
+            Next::Step(Step::Item(never, _)) => match never {},
+            Next::Step(Step::Need) => Step::Need,
+            Next::Step(Step::Skip(n)) => Step::Skip(n),
+            Next::Step(Step::End) => Step::End,
+            Next::Long(len) => {
+                let mut d = Decoded::default();
+                let mut layer = Layer::new("Domain Name System", 0, (0, 2));
+                layer.field("Length", len.to_string(), (0, 2));
+                layer.summary = format!("a {len}-byte message, too long to decode here");
+                d.push(layer);
+                d.proto = "DNS".into();
+                d.info = format!("DNS message of {len} bytes, not decoded");
+                Step::Item(Display::from_packet(d, "DNS message length"), 2)
+            }
+            Next::Message(offset, end) => {
+                let mut item = dns_display(input.get(offset..end).unwrap_or_default());
+                item.offset = offset;
+                Step::Item(item, end)
+            }
+        })
+    }
+}
+
+/// Where the next message is, by the framing alone.
+enum Next {
+    /// A step that shows nothing: more input, a skip, or the end.
+    Step(Step<Infallible>),
+    /// A TCP message too long to keep, of this length: its two length
+    /// bytes are shown, and the message is skipped.
+    Long(usize),
+    /// A whole message, from the first offset to the second.
+    Message(usize, usize),
+}
+
+impl Dns {
+    /// The next step of the framing, before anything is shown.
+    fn next(&mut self, input: &[u8], eof: bool) -> Next {
+        if self.lost {
+            return Next::Step(Step::End);
+        }
         if self.skip != 0 {
             let n = self.skip.min(input.len());
             self.skip -= n;
-            return Ok(if n == 0 { Step::Need } else { Step::Skip(n) });
+            return Next::Step(if n == 0 { Step::Need } else { Step::Skip(n) });
         }
         let (offset, len): (usize, usize) = if self.tcp {
             let Some(header) = input.get(..2) else {
-                return Ok(Step::Need);
+                return Next::Step(Step::Need);
             };
             (2, usize::from(u16::from_be_bytes([header[0], header[1]])))
         } else {
             if self.taken {
-                return Ok(Step::End);
+                return Next::Step(Step::End);
             }
             if input.len() >= self.capacity() {
                 self.taken = true;
-                return Ok(Step::End);
+                return Next::Step(Step::End);
             }
             if !eof {
-                return Ok(Step::Need);
+                return Next::Step(Step::Need);
             }
             if input.is_empty() {
-                return Ok(Step::End);
+                return Next::Step(Step::End);
             }
             (0, input.len())
         };
         if self.tcp && len > MAX_BUFFER - 2 && input.len() < len.saturating_add(2) {
             self.skip = len;
-            let mut d = Decoded::default();
-            let mut layer = Layer::new("Domain Name System", 0, (0, 2));
-            layer.field("Length", len.to_string(), (0, 2));
-            layer.summary = format!("a {len}-byte message, too long to decode here");
-            d.push(layer);
-            d.proto = "DNS".into();
-            d.info = format!("DNS message of {len} bytes, not decoded");
-            return Ok(Step::Item(Display::from_packet(d, "DNS message length"), 2));
+            return Next::Long(len);
         }
         let Some(end) = offset.checked_add(len) else {
-            return Ok(Step::End);
+            return Next::Step(Step::End);
         };
-        let Some(bytes) = input.get(offset..end) else {
-            return Ok(Step::Need);
-        };
+        if input.len() < end {
+            return Next::Step(Step::Need);
+        }
         self.taken = true;
-        let mut item = dns_display(bytes);
-        item.offset = offset;
-        Ok(Step::Item(item, end))
+        Next::Message(offset, end)
     }
 }
 impl Present for Dns {
@@ -109,6 +146,7 @@ impl Present for Dns {
     fn reset(&mut self) {
         self.taken = false;
         self.skip = 0;
+        self.lost = self.tcp;
     }
 }
 
@@ -294,6 +332,11 @@ fn opcode_summary(opcode: u8) -> String {
         _ => format!("Opcode {opcode}"),
     }
 }
+
+/// Bounded proofs over the DNS-over-TCP framing, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../../verification/dissector/kani/dns.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {

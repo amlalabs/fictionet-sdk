@@ -193,6 +193,11 @@ impl Present for TlsRecords {
     }
 }
 
+/// Bounded proofs over `TlsRecords::decode`, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/dissector/kani/records.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
