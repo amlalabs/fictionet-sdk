@@ -122,6 +122,39 @@ impl Chunk {
             .lease = Some(Arc::new(lease));
     }
 
+    /// Puts the bytes under a charge from `budget`, so what paid for them
+    /// before releases: for bytes handed from one owner to another. In
+    /// place when this chunk alone holds its backing and the bytes are all
+    /// of it; otherwise the bytes are copied into an allocation of their
+    /// own. Receive credit stays with the bytes. Refusal leaves the chunk
+    /// unchanged.
+    pub fn recharge(&mut self, budget: &Budget) -> bool {
+        if let Some(backing) = self.sole_whole() {
+            let Some(charge) = budget.charge(backing.bytes.capacity()) else {
+                return false;
+            };
+            backing.reservation = Some(Reservation::Own(charge));
+            return true;
+        }
+        let Some(charge) = budget.charge(self.len()) else {
+            return false;
+        };
+        let lease = self.backing.lease.clone();
+        self.copy_under(Reservation::Own(charge), lease);
+        true
+    }
+
+    /// The first `n` bytes, sharing this chunk's backing, without taking
+    /// them from it. Panics if fewer remain.
+    pub(crate) fn prefix(&self, n: usize) -> Chunk {
+        assert!(n <= self.len(), "chunk prefix exceeds its remaining bytes");
+        Chunk {
+            backing: self.backing.clone(),
+            start: self.start,
+            end: self.start + n,
+        }
+    }
+
     /// The bytes not yet taken.
     pub fn len(&self) -> usize {
         self.end - self.start
@@ -918,6 +951,52 @@ mod slot_tests {
         assert_eq!(tail.charged(), 0);
         assert_eq!(budget.used(), 2);
         drop(head);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn recharging_whole_unique_bytes_moves_the_charge_without_copying() {
+        let from = Budget::new(4);
+        let to = Budget::new(4);
+        let mut chunk = Chunk::with_charge(vec![1, 2, 3, 4], from.charge(4).unwrap());
+        let allocation = chunk.as_ptr();
+        assert!(!chunk.recharge(&Budget::new(3)));
+        assert_eq!(from.used(), 4, "a refused recharge leaves the old charge");
+        assert!(chunk.recharge(&to));
+        assert_eq!(chunk.as_ptr(), allocation);
+        assert_eq!(&*chunk, &[1, 2, 3, 4]);
+        assert_eq!((from.used(), to.used()), (0, 4));
+        drop(chunk);
+        assert_eq!(to.used(), 0);
+    }
+
+    #[test]
+    fn recharging_shared_bytes_copies_them_and_keeps_the_sibling_charged() {
+        let from = Budget::new(4);
+        let to = Budget::new(4);
+        let mut tail = Chunk::with_charge(vec![1, 2, 3, 4], from.charge(4).unwrap());
+        let mut head = tail.split_to(1);
+        assert!(head.recharge(&to));
+        assert_eq!(&*head, &[1]);
+        assert_eq!(&*tail, &[2, 3, 4]);
+        assert_eq!((from.used(), to.used()), (4, 1));
+        drop(tail);
+        assert_eq!(from.used(), 0);
+        drop(head);
+        assert_eq!(to.used(), 0);
+    }
+
+    #[test]
+    fn a_prefix_shares_the_backing_and_takes_nothing() {
+        let budget = Budget::new(4);
+        let chunk = Chunk::with_charge(vec![1, 2, 3, 4], budget.charge(4).unwrap());
+        let prefix = chunk.prefix(2);
+        assert_eq!(prefix.as_ptr(), chunk.as_ptr());
+        assert_eq!(&*prefix, &[1, 2]);
+        assert_eq!(chunk.len(), 4);
+        drop(chunk);
+        assert_eq!(budget.used(), 4, "the prefix still holds the backing");
+        drop(prefix);
         assert_eq!(budget.used(), 0);
     }
 

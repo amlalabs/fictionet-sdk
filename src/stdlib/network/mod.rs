@@ -18,5 +18,7 @@ pub mod tcp;
 pub mod transport;
 pub mod udp;
 
-pub use connection::{ConnError, ConnInfo, Connection, ConnectionExt, DatagramSocket, Transport};
+pub use connection::{
+    ConnError, ConnInfo, Connection, ConnectionExt, DatagramSocket, Read, Transport,
+};
 pub use link::{Direction, bottleneck, delay, filter, tap};
