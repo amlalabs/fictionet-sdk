@@ -6,10 +6,12 @@ use fictionet::stdlib::layer::{
     StreamCommand, StreamEvent,
 };
 
-/// A stream tunnel's packet boundaries. Arrival metadata belongs to the
-/// tunnel owner and is never read from the peer's bytes.
-/// The payload kind is raw IP, without a link header; an inner [`super::IpLayer`]
-/// validates the packet. This format does not imply another tunnel protocol.
+/// A stream tunnel's packet boundaries. It hands up raw packets for the
+/// tunnel's own endpoint, so the tunnel's network gets an IP layer of its
+/// own; nothing about where a packet came from is read from the peer's
+/// bytes. The payload kind is raw IP, without a link header; the inner
+/// [`super::IpLayer`] validates the packet. This format does not imply
+/// another tunnel protocol.
 ///
 /// Holds at most one packet in each direction, plus a partial length prefix.
 /// Packets may be empty. Lengths above 65,575 bytes (a full IPv6 packet)

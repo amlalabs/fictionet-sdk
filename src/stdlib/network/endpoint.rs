@@ -24,7 +24,9 @@ enum Destination {
     Icmp,
 }
 
-/// Sorts a checked packet from the endpoint’s owned IP input.
+/// Where a packet the host's IP layer handed up goes. The layer is
+/// replaceable ([`Factory`]), but its upper port carries only
+/// [`CheckedIpPacket`]s, so every packet here passed the host's checks.
 fn destination(packet: &CheckedIpPacket) -> Destination {
     match packet.sort() {
         Sort::Transport(Transport::Tcp) => Destination::Tcp,

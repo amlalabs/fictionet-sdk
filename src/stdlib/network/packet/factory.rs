@@ -27,9 +27,10 @@ pub struct Opening {
 pub struct Factory(Arc<dyn Fn(Opening) -> Stack + Send + Sync>);
 
 impl Factory {
-    /// Uses `make` to construct each machine's layer. Packets emitted upward
-    /// must satisfy the checked `CheckedIpPacket` contract. Egress packets also pass
-    /// through this layer, so a replacement can encapsulate both directions.
+    /// Uses `make` to construct each machine's layer. It takes the raw
+    /// packets of the machine's interface and hands its transports
+    /// [`CheckedIpPacket`]s. Egress packets also pass through this layer,
+    /// so a replacement can encapsulate both directions.
     pub fn new<L>(make: impl Fn(Opening) -> L + Send + Sync + 'static) -> Self
     where
         L: Layer<Lower = Packets<Chunk, Chunk>, Upper = Packets<CheckedIpPacket, Chunk>>

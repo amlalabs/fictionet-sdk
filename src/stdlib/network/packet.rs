@@ -1,13 +1,73 @@
-//! Endpoint IP validation and passive capture packets.
+//! The IP layer: raw packets taken in as a host takes them, checked, and
+//! sorted for the transports above; and captured copies read as a passive
+//! observer reads them.
 //!
-//! An endpoint owns its input path: [IpLayer] takes raw [Chunk] packets,
-//! validates and reassembles them, and emits only [CheckedIpPacket] values.
-//! Transport checksums and ports remain the transport's responsibility.
-//! Malformed input is reported at this boundary and never handed upward.
+//! [`IpLayer`] is a [layer](fictionet::stdlib::layer) with whole packets on
+//! both sides. Below, it takes raw packets, each a [`Chunk`] of bytes from
+//! the input path its endpoint owns. Above, it hands each whole packet a
+//! host would take in to the transports as a [`CheckedIpPacket`]: the
+//! bytes together with the header read from them and where the packet goes
+//! ([`Sort`]). It does what
+//! [`ip::split_protocols`](fictionet::stdlib::network::ip::split_protocols)
+//! promises, and that split now runs on it:
 //!
-//! Passive captures use [ObservedIpPacket], preserving truncation and capture
-//! context without claiming host validation. Where labelled networks share
-//! an input source, [NetworkInput] separates them before endpoint processing.
+//! - an IPv6 packet's extension headers are checked as RFC 8200 asks of the
+//!   packet's destination ([`Header::check`]) and taken out, and a packet
+//!   that fails is dropped, with the ICMPv6 Parameter Problem answer sent
+//!   back down where the RFC asks for one;
+//! - fragments are put back together ([`Reassembly`]), with its limits on
+//!   overlap, size and waiting time, and the layer's
+//!   [deadline](fictionet::stdlib::layer::Layer::deadline) is when the
+//!   oldest unfinished packet expires;
+//! - a packet it cannot read, whose IPv4 header checksum is wrong, or whose
+//!   fragments can never make a packet is dropped and reported
+//!   ([`IpReport::Malformed`]), so it never reaches a transport;
+//! - each packet is sorted by protocol, and an ICMP error goes to the
+//!   transport of the packet it quotes ([`Sort::of`]).
+//!
+//! A transport layer sits above it with `Packets<CheckedIpPacket, Chunk>` as
+//! its lower port. It receives the packets whose [`CheckedIpPacket::sort`]
+//! is its [`Transport`], ICMP errors quoting its packets included, and sends
+//! whole IP packets it built down. The IP layer sends them on unchanged.
+//! Everything after the IP header (the transport header, its checksum and
+//! its ports) is the transport's to check.
+//!
+//! An endpoint serves one network. It owns its interface, its IP layer
+//! and its transports, and a tunnel carrying another network feeds an
+//! endpoint of its own (a [`Framed`] stream below a second `IpLayer`).
+//! Where packets of several networks arrive together, [`NetworkInput`]
+//! picks out one network's packets before they reach an IP layer, since
+//! two networks' fragments may share addresses and identification.
+//!
+//! A passive observer of a capture does not take packets in as a host
+//! does: a capture may hold copies cut short, and nothing answers it.
+//! [`ObservedIpPacket::observed`] reads such a copy with the same parsing
+//! helpers but no host policy, and keeps where the capture saw it
+//! ([`Ingress`]). The two types never mix: a transport cannot be handed an
+//! observed copy.
+//!
+//! ```
+//! use std::sync::Arc;
+//! use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, PacketEvent};
+//! use fictionet::stdlib::network::ip::{self, protocol};
+//! use fictionet::stdlib::network::Transport;
+//! use fictionet::stdlib::network::packet::{IpLayer, Sort};
+//! use fictionet::time::Instant;
+//! use fictionet::{Seed, SeededEntropy};
+//!
+//! let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
+//! let mut ip = Driver::new(IpLayer::host(), entropy, Budget::unlimited(), Instant::ZERO);
+//! let udp = [0, 1, 0, 53, 0, 8, 0, 0];
+//! let packet = ip::packet("10.0.0.2".parse()?, "10.0.0.1".parse()?, protocol::UDP, &udp);
+//! assert!(matches!(ip.deliver(PacketEvent::Packet(Chunk::new(packet.0))), Ok(Admit::Taken)));
+//! ip.send_above(|event| {
+//!     let PacketEvent::Packet(packet) = event else { unreachable!() };
+//!     assert_eq!(packet.sort(), Sort::Transport(Transport::Udp));
+//!     assert_eq!(packet.payload(), &udp);
+//!     Admit::Taken
+//! });
+//! # Ok::<(), std::net::AddrParseError>(())
+//! ```
 
 use core::convert::Infallible;
 use std::sync::Arc;
@@ -30,11 +90,14 @@ pub use framed::{FrameError, Framed};
 /// Which network a packet belongs to: the world's own, or the network
 /// inside one tunnel.
 ///
-/// Mixed captures use this identity to separate overlapping address spaces
-/// before conversation lookup or endpoint input. Ordinary endpoints own
-/// their input paths and carry no network label. The capture owner assigns
-/// identities, never the peer; replacement tunnels can retain an identity
-/// when they continue the same network.
+/// The same addresses and ports may be in use in two networks at once. An
+/// endpoint is never told its network: it owns its input path. Where
+/// several networks' traffic comes together, as in a capture, anything
+/// keyed by addresses (a connection, a conversation) includes the scope,
+/// and [`NetworkInput`] picks out one network's packets before an IP layer
+/// sees them. A scope is made by whatever owns the network, never read
+/// from a peer, and a tunnel that replaces another may keep its scope when
+/// it carries on the same network.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Scope(u64);
 
@@ -48,11 +111,11 @@ impl Scope {
 ///
 /// A world keeps one and every tunnel in it takes its network's scope from
 /// it, nested tunnels included, so no two of the world's networks share a
-/// scope. The numbers come from the world alone: a run of the same world
-/// assigns identities in construction order. Record the network association
-/// explicitly for replay; scheduling alone does not guarantee repeatability.
-/// An identity means nothing outside its owner. A capture reader keeps
-/// its own for the tunnels it reads. Clones share the numbering.
+/// scope. The numbers come in the order tunnels are made, and mean nothing
+/// outside their world. Tunnels made concurrently may be numbered in a
+/// different order on another run, so a replay that needs the same numbers
+/// records which network each one names. A capture reader keeps its own
+/// for the tunnels it reads. Clones share the numbering.
 #[derive(Clone, Debug, Default)]
 pub struct Scopes {
     last: Arc<AtomicU64>,
@@ -69,14 +132,16 @@ impl Scopes {
     }
 }
 
-/// Where a packet arrived: its network, its interface, and, for a captured
-/// copy, what the capture recorded.
+/// Where a packet was seen, given by whoever combines several networks'
+/// packets: its network, the interface or tunnel it was seen on, and, for
+/// a captured copy, what the capture recorded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Ingress {
     /// The network it belongs to.
     pub scope: Scope,
-    /// The interface it arrived on, as numbered by whoever owns the
-    /// interfaces. Zero for a stack with one.
+    /// The interface or tunnel it was seen on, as numbered by whoever owns
+    /// them. Several may see one network, so this does not name the
+    /// network.
     pub link: u32,
     /// What a capture recorded, for a captured copy.
     pub capture: Option<Capture>,
@@ -170,8 +235,14 @@ pub enum Origin {
     Reassembled,
 }
 
-/// A whole host packet with a validated header and no remaining fragments
-/// or IPv6 extension headers. Transport validation remains the transport's job.
+/// One whole IP packet a host takes in, with the header read from its own
+/// bytes and where it goes ([`Sort`]).
+///
+/// It passed [`Header::check`], is not a fragment, and has no IPv6
+/// extension headers left. [`IpLayer`] and [`CheckedIpPacket::checked`]
+/// make one, so the header and sort always describe these bytes, and a
+/// transport given one need not check the IP header again. What follows
+/// the IP header is the transport's to check.
 #[derive(Debug)]
 pub struct CheckedIpPacket {
     bytes: Chunk,
@@ -181,7 +252,15 @@ pub struct CheckedIpPacket {
 }
 
 impl CheckedIpPacket {
-    /// Validates the host IP boundary, returning rejected bytes unchanged.
+    /// Reads a whole packet as a host takes it in, for an IP layer of your
+    /// own to hand its transports, as [`IpLayer`] does. `bytes` must be one
+    /// whole IP packet that passes [`Header::check`] and is not a fragment,
+    /// and an IPv6 packet must have no extension headers left
+    /// ([`strip_extension_headers`] takes them out). `origin` says how the
+    /// bytes relate to what arrived. Hands `bytes` back when any of that
+    /// fails.
+    ///
+    /// [`strip_extension_headers`]: fictionet::stdlib::network::ip::strip_extension_headers
     pub fn checked(bytes: Chunk, origin: Origin) -> Result<Self, Chunk> {
         let Some(header) = Header::parse_whole(&bytes)
             .filter(|header| header.src.is_ipv4() || header.payload.start == 40)
@@ -197,34 +276,46 @@ impl CheckedIpPacket {
         })
     }
 
-    /// The original IP bytes.
+    /// The packet's bytes, IP header first. For a reassembled or normalized
+    /// packet these are not the bytes that arrived ([`origin`](Self::origin)).
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-    /// The validated IP header.
+
+    /// Its header, read from [`bytes`](Self::bytes).
     pub fn header(&self) -> &Header {
         &self.header
     }
-    /// The transport header and payload.
+
+    /// The bytes after the IP header: the transport's header and payload,
+    /// or an ICMP message.
     pub fn payload(&self) -> &[u8] {
         self.header.payload(&self.bytes)
     }
-    /// The destination protocol.
+
+    /// Where the IP layer sorts it.
     pub fn sort(&self) -> Sort {
         self.sort
     }
-    /// How these bytes relate to the input.
+
+    /// How its bytes relate to what arrived.
     pub fn origin(&self) -> &Origin {
         &self.origin
     }
-    /// Takes ownership of the IP bytes.
+
+    /// Its bytes, giving up the rest.
     pub fn into_bytes(self) -> Chunk {
         self.bytes
     }
 }
 
-/// A passive observation. Truncated and malformed captures retain their
-/// bytes and capture context without satisfying the host packet contract.
+/// A captured copy of an IP packet, read as a passive observer reads it,
+/// with where the capture saw it.
+///
+/// A capture may hold fewer bytes than the packet had, and its packets are
+/// not taken in by anyone, so nothing is reassembled, stripped, answered
+/// or checked against host policy. Transports take [`CheckedIpPacket`]s
+/// only; an observed copy cannot be handed to one.
 #[derive(Debug)]
 pub struct ObservedIpPacket {
     bytes: Chunk,
@@ -235,7 +326,10 @@ pub struct ObservedIpPacket {
 }
 
 impl ObservedIpPacket {
-    /// Reads captured bytes without host policy or checksum validation.
+    /// Reads a captured copy: the header with [`Header::parse_truncated`],
+    /// since a capture may hold fewer bytes than the packet had, and no
+    /// host policy. An IPv4 header checksum is not checked. A fragment
+    /// after the first goes to [`Sort::Other`].
     pub fn observed(bytes: Chunk, ingress: Ingress) -> Self {
         let header = Header::parse_truncated(&bytes);
         let sort = Sort::read(header.as_ref(), &bytes);
@@ -251,33 +345,41 @@ impl ObservedIpPacket {
             complete,
         }
     }
-    /// The captured IP bytes.
+    /// The bytes the capture holds, IP header first.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-    /// The header, if enough bytes were captured to read it.
+
+    /// Its header, when the capture holds enough of it to read.
     pub fn header(&self) -> Option<&Header> {
         self.header.as_ref()
     }
-    /// The captured transport header and payload.
+
+    /// The bytes after the IP header and any extension headers that the
+    /// capture holds. Empty when the header could not be read.
     pub fn payload(&self) -> &[u8] {
         self.header
             .as_ref()
             .map_or(&[][..], |header| header.payload(&self.bytes))
     }
-    /// The observed protocol.
+
+    /// Where a host would sort it.
     pub fn sort(&self) -> Sort {
         self.sort
     }
-    /// The network and capture point supplied by the capture owner.
+
+    /// Where the capture saw it.
     pub fn ingress(&self) -> &Ingress {
         &self.ingress
     }
-    /// Whether all bytes declared by the packet and capture are present.
+
+    /// Whether every byte of the packet is here: false when the capture
+    /// holds fewer bytes than the packet had or than its header says.
     pub fn is_complete(&self) -> bool {
         self.complete
     }
-    /// Takes ownership of the captured bytes.
+
+    /// Its bytes, giving up the rest.
     pub fn into_bytes(self) -> Chunk {
         self.bytes
     }
@@ -292,20 +394,26 @@ impl Whole for ObservedIpPacket {
     }
 }
 
-/// Selects one network at a boundary receiving labelled input. The owner
-/// keeps this selector with the destination input path, before reassembly.
+/// Picks one network's packets out of input that carries several, before
+/// they reach that network's IP layer.
+///
+/// An endpoint owns its input path and needs none. A component that takes
+/// in packets of several networks together, each labelled with its
+/// [`Ingress`], keeps one per network it feeds: two networks' fragments may
+/// share addresses and identification, so they must be parted before
+/// reassembly.
 pub struct NetworkInput {
     network: Scope,
 }
 
 impl NetworkInput {
-    /// Binds the input path to a capture owner's network identity.
+    /// Takes the packets of network `network`.
     pub fn new(network: Scope) -> Self {
         Self { network }
     }
 
-    /// Removes capture routing metadata only for the selected network.
-    /// A foreign packet is returned intact for another destination.
+    /// The raw bytes of `packet` if it is of this network; otherwise
+    /// `packet` back, unchanged, for another network's input.
     pub fn accept(&self, packet: Datagram<Ingress>) -> Result<Chunk, Datagram<Ingress>> {
         if packet.meta().scope != self.network {
             return Err(packet);
@@ -351,7 +459,9 @@ pub enum IpReport {
         /// Whether an answer went back.
         answered: bool,
     },
-    /// Input did not satisfy the whole host packet contract.
+    /// A packet was dropped because a host cannot take it in: it could not
+    /// be read, its IPv4 header checksum is wrong, or it is a fragment that
+    /// can never make a packet.
     Malformed,
 }
 
@@ -363,8 +473,11 @@ pub enum IpReport {
 /// taken. A packet it takes in is either handed up whole, kept as a
 /// fragment, or dropped with a report; it never hands back part of one.
 ///
-/// The owner supplies one network's raw input path. Mixed labelled input is
-/// separated by [NetworkInput] before reaching this layer.
+/// It serves one network: the one its endpoint's input path carries. It
+/// sends packets down with no label, so it could not tell two networks'
+/// answers apart, and two networks' fragments may share addresses and
+/// identification. A tunnel's network gets an IP layer of its own, and
+/// input carrying several networks is parted first ([`NetworkInput`]).
 ///
 /// Fragments wait in [`Reassembly`], which holds at most 4 MiB, counting its
 /// bookkeeping, as fixed engine state outside the connection's budget. The
@@ -382,12 +495,12 @@ pub struct IpLayer {
 }
 
 impl IpLayer {
-    /// A host's IP layer taking packets from its owned input path.
+    /// A host's IP layer, taking packets in as their destination.
     pub fn host() -> IpLayer {
         IpLayer::default()
     }
 
-    /// Takes in one raw packet from this endpoint's owned input path.
+    /// Takes in one raw packet the layer has room for.
     fn take_in(&mut self, env: &mut Env<'_, IpReport>, bytes: Chunk) {
         let before = Header::parse(&bytes);
         let fragment = before.as_ref().is_some_and(|h| h.fragment.is_some());
@@ -427,9 +540,8 @@ impl IpLayer {
             }
         }
     }
-}
 
-impl IpLayer {
+    /// Hands `bytes` up if a host takes them in, and reports them otherwise.
     fn checked(&mut self, env: &mut Env<'_, IpReport>, bytes: Chunk, origin: Origin) {
         match CheckedIpPacket::checked(bytes, origin) {
             Ok(packet) => self.up = Some(PacketEvent::Packet(packet)),
