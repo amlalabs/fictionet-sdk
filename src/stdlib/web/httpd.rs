@@ -32,7 +32,8 @@
 //! request's head and on its body. [`serve_connection`] picks the version for a
 //! connection in one layer stack ([`http_for`]): HTTP/2 by ALPN, by the
 //! client's preface ([`Detect`]), or by `Upgrade: h2c` ([`Http1::h2c`]), else
-//! HTTP/1.
+//! HTTP/1. [`Detect::new`] takes a factory for each version, so a copy of
+//! `http_for` passes servers of its own, and only the chosen one is made.
 //! An unknown-length HTTP/1.1 body ends with a zero-size chunk only at EOF.
 //! Pending polls and empty data frames do not end the response.
 //! All backends suppress response bodies for `HEAD`, informational statuses,
@@ -144,7 +145,7 @@ mod response;
 mod sites;
 
 pub use body::Body;
-pub use detect::{Detect, Http, Versions};
+pub use detect::{Detect, Http, MakeVersion, Versions};
 pub use handlers::{
     BadGateway, Exchange, Handler, Later, Reply, Reset, Tower, UpgradeHandler, text, tower,
 };
@@ -383,8 +384,9 @@ pub struct HttpOptions {
 /// What either version's server for one connection is made from: the
 /// handler and the options both versions share. [`http_for`] makes the
 /// version TLS negotiated at once; without TLS, [`Detect`] keeps this until
-/// the client's first bytes say which version to make.
-pub(super) struct Servers {
+/// the client's first bytes say which version to make. A copy of
+/// `http_for` passes [`Detect::new`] factories of its own instead.
+pub struct Servers {
     handler: Arc<dyn Handler>,
     limits: Limits,
     observe: Option<Observe>,
@@ -409,19 +411,10 @@ impl Servers {
             first_head_deadline: None,
         }
     }
+}
 
-    /// The server for one version: HTTP/2 with `h2`, else HTTP/1.
-    pub(super) fn make(self, h2: bool) -> Versions {
-        if h2 {
-            return Side::Upper(
-                Responder::shared(self.handler)
-                    .limits(self.limits)
-                    .maybe_observe(self.observe)
-                    .maybe_date(self.date)
-                    .conn(self.conn)
-                    .http2(),
-            );
-        }
+impl MakeVersion for Servers {
+    fn http1(self) -> Switch<Http1, Upgraded> {
         let mut http1 = Http1::with(self.handler, self.limits).conn(self.conn);
         http1.dates = Dates::new(self.date);
         http1.observe = self.observe;
@@ -429,7 +422,16 @@ impl Servers {
         if self.h2c {
             http1 = http1.h2c();
         }
-        Side::Lower(http1.upgradable())
+        http1.upgradable()
+    }
+
+    fn http2(self) -> Http2Server {
+        Responder::shared(self.handler)
+            .limits(self.limits)
+            .maybe_observe(self.observe)
+            .maybe_date(self.date)
+            .conn(self.conn)
+            .http2()
     }
 }
 
@@ -447,7 +449,7 @@ pub fn http_for(
     let mut servers = Servers::new(handler, opts, info);
     if info.tls {
         let h2 = info.alpn.as_deref() == Some(b"h2".as_slice());
-        return Side::Lower(servers.make(h2));
+        return Side::Lower(servers.version(h2));
     }
     servers.h2c = true;
     if opts.first_bytes.is_none() {
@@ -456,7 +458,7 @@ pub fn http_for(
         servers.first_head_deadline = Some(now + opts.limits.header_timeout);
     }
     let first = opts.first_bytes.unwrap_or(opts.limits.header_timeout);
-    Side::Upper(Switch::new(Detect::new(first, servers)))
+    Side::Upper(Switch::new(Detect::with(first, servers)))
 }
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or

@@ -535,6 +535,58 @@ mod detection {
         assert!(matches!(&plain, Side::Upper(detect) if detect.first().is_some()));
     }
 
+    /// Version detection composed by hand, as a copy of `http_for` would:
+    /// each version a server of the caller's own, made by its factory
+    /// only once the client's first bytes chose it.
+    #[test]
+    fn detect_makes_only_the_callers_server_the_client_chose() {
+        use fictionet::stdlib::layer::Switch;
+        use fictionet::stdlib::web::httpd::{Detect, Http1, Versions};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let answering = |text: &'static str| {
+            fictionet_test_support::handler(move |_, _| {
+                http::Response::new(Bytes::from_static(text.as_bytes()))
+            })
+        };
+        let run = |input: &[u8]| {
+            let made = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+            let (one, two) = (made.clone(), made.clone());
+            let (http1, http2) = (answering("one"), answering("two"));
+            let detect = Detect::new(
+                Duration::from_secs(1),
+                move || {
+                    one[0].fetch_add(1, Ordering::Relaxed);
+                    Http1::new(http1).upgradable()
+                },
+                move || {
+                    two[1].fetch_add(1, Ordering::Relaxed);
+                    Responder::new(http2).http2()
+                },
+            );
+            let mut h = Harness::new(Seed::from_u64(1), Switch::<_, Versions>::new(detect))
+                .with_worker(Polling::new());
+            let before = [0, 1].map(|i| made[i].load(Ordering::Relaxed));
+            h.push(input).unwrap();
+            let after = [0, 1].map(|i| made[i].load(Ordering::Relaxed));
+            (before, after, h.take_output())
+        };
+
+        let (before, after, output) =
+            run(b"GET / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(before, [0, 0], "nothing is made before the first bytes");
+        assert_eq!(after, [1, 0], "only HTTP/1 is made");
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with("HTTP/1.1 200 OK\r\n"), "{output}");
+        assert!(output.ends_with("\r\n\r\none"), "{output}");
+
+        let mut input = preface();
+        input.extend(headers(1, "/", true));
+        let (before, after, output) = run(&input);
+        assert_eq!(before, [0, 0], "nothing is made before the first bytes");
+        assert_eq!(after, [0, 1], "only HTTP/2 is made");
+        assert_eq!(per_stream(&frames(&output))[&1].data, b"two");
+    }
+
     #[test]
     fn the_preface_chooses_http2_however_it_is_split() {
         let mut input = preface();
