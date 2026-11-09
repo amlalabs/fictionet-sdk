@@ -522,3 +522,9 @@ fn gap(out: &mut Vec<Step>, sequence: u64, missing: u64) {
     }
     out.push(Step::Gap { sequence, missing });
 }
+
+/// Bounded proofs over the reassembly of one direction, run with
+/// `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../../verification/observer/kani/Flow.rs"]
+mod proofs;
