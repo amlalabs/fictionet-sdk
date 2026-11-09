@@ -43,6 +43,8 @@ pub struct Http1 {
     // The other decoder in a pair accounts for this shared queue.
     shared_methods: bool,
     scanned: usize,
+    /// Whether this direction carries requests, once it read a head.
+    requests: Option<bool>,
 }
 impl Http1 {
     /// Registers `http1` for TCP method or response prefixes, or `http/1.1` ALPN.
@@ -74,14 +76,22 @@ impl Http1 {
                 methods: Arc::clone(&methods),
                 shared_methods: false,
                 scanned: 0,
+                requests: None,
             },
             Self {
                 state: Http1State::default(),
                 methods,
                 shared_methods: true,
                 scanned: 0,
+                requests: None,
             },
         ]
+    }
+    /// Messages of this direction were missed or skipped: tells the method
+    /// queue. A direction that has not read a head may carry responses.
+    fn miss(&mut self) {
+        let requests = self.requests == Some(true);
+        self.methods.lock().missed(requests);
     }
     fn find(&mut self, input: &[u8], delimiter: &[u8]) -> Option<usize> {
         let from = self
@@ -112,7 +122,7 @@ impl Decode for Http1 {
             preview
         } else {
             let methods = self.methods.lock();
-            preview.saturating_add(methods.0.len())
+            preview.saturating_add(methods.waiting.len())
         }
     }
     fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Display>, Infallible> {
@@ -128,10 +138,14 @@ impl Decode for Http1 {
                 return Ok(Step::Need);
             };
             let mut methods = self.methods.lock();
-            let Some((line, kind, body)) = read_head(head, &mut methods) else {
+            let read = read_head(head, &mut methods);
+            drop(methods);
+            let Some((line, kind, body, unpaired)) = read else {
+                // A head that cannot be read is a message missed.
+                self.miss();
                 return Ok(Step::Skip(head.len()));
             };
-            drop(methods);
+            self.requests = Some(kind == "request");
             self.state = body;
             let mut layer = Layer::new("Hypertext Transfer Protocol", 0, (0, head.len()));
             layer.summary.clone_from(&line);
@@ -158,6 +172,12 @@ impl Decode for Http1 {
                 } else if let Some((k, v)) = t.split_once(':') {
                     layer.field(k.trim(), v.trim(), range);
                 }
+            }
+            if unpaired {
+                layer.note(
+                    "Body",
+                    "not read: bytes went missing, so which request this answers is not known",
+                );
             }
             let mut d = Decoded::default();
             d.push(layer);
@@ -259,15 +279,19 @@ impl Http1 {
         d.push(layer);
         d.tag("malformed");
         self.state = Http1State::ToClose;
+        self.miss();
         self.scanned = 0;
         Step::Item(Display::from_packet(d, what), used)
     }
 }
 impl Present for Http1 {
     display_presenter!();
+    /// Starts over at the next head: bytes were missed, or skipped since
+    /// framing was lost, and the method queue is told.
     fn reset(&mut self) {
         self.state = Http1State::default();
         self.scanned = 0;
+        self.miss();
     }
 }
 fn body_item(total: u64, seen: &[u8]) -> Display {
@@ -293,27 +317,86 @@ fn body_limits() -> http1::Limits {
     }
 }
 
-/// HTTP/1.1 request methods waiting for their responses.
+/// HTTP/1.1 request methods waiting for their responses, in order. Which
+/// request a response answers is known only while no request and no
+/// response was missed: a missed request leaves [`Method::Lost`] where its
+/// method would be, and once responses reach it, or once a response was
+/// missed, it is not known again.
 #[derive(Default)]
-struct Methods(VecDeque<Method>);
+struct Methods {
+    waiting: VecDeque<Method>,
+    /// Which request a response answers is no longer known.
+    unknown: bool,
+}
 
-#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Method {
     Head,
     Connect,
     Other,
+    /// Requests from here on were missed, or not kept.
+    Lost,
 }
 
 impl Methods {
-    fn push(&mut self, m: &str) {
-        if self.0.len() >= 64 {
-            self.0.pop_front();
+    /// The most methods kept waiting.
+    const MAX: usize = 64;
+
+    fn push(&mut self, method: Method) {
+        if self.unknown || self.waiting.back() == Some(&Method::Lost) {
+            return;
         }
-        self.0.push_back(match m {
+        if self.waiting.len() >= Self::MAX {
+            // No room: the newest request and those after it go unpaired.
+            if let Some(newest) = self.waiting.back_mut() {
+                *newest = Method::Lost;
+            }
+            return;
+        }
+        self.waiting.push_back(method);
+    }
+
+    fn request(&mut self, m: &str) {
+        self.push(match m {
             "HEAD" => Method::Head,
             "CONNECT" => Method::Connect,
             _ => Method::Other,
         });
+    }
+
+    /// The method of the request the next response answers, or
+    /// [`Method::Lost`] when that is not known. With no request waiting,
+    /// the request was not seen, as when the capture began after it, and
+    /// it is taken to be neither HEAD nor CONNECT.
+    fn answer(&mut self) -> Method {
+        if self.unknown {
+            return Method::Lost;
+        }
+        match self.waiting.pop_front() {
+            Some(Method::Lost) => {
+                self.forget();
+                Method::Lost
+            }
+            Some(method) => method,
+            None => Method::Other,
+        }
+    }
+
+    /// Bytes of one direction were missed or skipped. If it carries
+    /// requests, those already waiting are still answered in order, and
+    /// what follows them is not known. Otherwise responses were missed,
+    /// and which request any later response answers is not known.
+    fn missed(&mut self, requests: bool) {
+        if requests {
+            self.push(Method::Lost);
+        } else {
+            self.forget();
+        }
+    }
+
+    fn forget(&mut self) {
+        self.waiting = VecDeque::new();
+        self.unknown = true;
     }
 }
 
@@ -370,7 +453,13 @@ fn body_kind(headers: &[http1::Header], none: bool, response: bool) -> Http1Stat
 /// how its body is framed. The head is read by its syntax alone, with
 /// [`http1`]'s lenient reader: a passive observer must not refuse a head
 /// the endpoints took.
-fn read_head(head: &[u8], methods: &mut Methods) -> Option<(String, &'static str, Http1State)> {
+/// The flag says whether a response's body framing depends on a request
+/// that is not known, so the body is not read: a response to HEAD has no
+/// body, and a 2xx response to CONNECT starts a tunnel.
+fn read_head(
+    head: &[u8],
+    methods: &mut Methods,
+) -> Option<(String, &'static str, Http1State, bool)> {
     if head.starts_with(b"HTTP/") {
         let (r, _) = http1::ResponseHead::parse_lenient(head).ok().flatten()?;
         let code = r.status;
@@ -382,23 +471,33 @@ fn read_head(head: &[u8], methods: &mut Methods) -> Option<(String, &'static str
         let method = if (100..200).contains(&code) {
             None
         } else {
-            methods.0.pop_front()
+            Some(methods.answer())
         };
-        let body = match method {
-            Some(Method::Connect) if (200..300).contains(&code) => Http1State::Tunnel,
-            Some(Method::Head) => Http1State::Head,
-            _ => body_kind(
+        let success = (200..300).contains(&code);
+        let framed = || {
+            body_kind(
                 &r.headers,
                 (100..200).contains(&code) || code == 204 || code == 304,
                 true,
-            ),
+            )
         };
-        Some((line, "response", body))
+        let (body, unpaired) = match method {
+            Some(Method::Connect) if success => (Http1State::Tunnel, false),
+            Some(Method::Head) => (Http1State::Head, false),
+            // Without the request, only a response with no body under any
+            // method is framed: one that is not 2xx and has no body.
+            Some(Method::Lost) => match framed() {
+                Http1State::Head if !success => (Http1State::Head, false),
+                _ => (Http1State::ToClose, true),
+            },
+            _ => (framed(), false),
+        };
+        Some((line, "response", body, unpaired))
     } else {
         let (r, _) = http1::RequestHead::parse_lenient(head).ok().flatten()?;
         let line = format!("{} {} {}", r.method, r.target, r.version.as_str());
-        methods.push(&r.method);
-        Some((line, "request", body_kind(&r.headers, false, false)))
+        methods.request(&r.method);
+        Some((line, "request", body_kind(&r.headers, false, false), false))
     }
 }
 
@@ -622,10 +721,90 @@ mod tests {
                         first.len() as u64..(first.len() + next.len()) as u64
                     );
                     assert_eq!(response.offset(), bytes.len() as u64);
-                    assert!(methods.lock().0.is_empty());
+                    assert!(methods.lock().waiting.is_empty());
                 }
             }
         }
+    }
+
+    /// Every item a stream of responses decodes to, piece by piece.
+    fn responses(response: Http1, pieces: &[&[u8]]) -> Vec<Display> {
+        let mut response = Stream::new(response);
+        let mut items = Vec::new();
+        for piece in pieces {
+            assert_eq!(response.push(piece), piece.len());
+            while let Some(item) = response.next() {
+                items.push(item.unwrap());
+            }
+        }
+        items
+    }
+
+    /// Whether some item shows `text` as body bytes.
+    fn as_body(items: &[Display], text: &str) -> bool {
+        items.iter().any(|item| {
+            item.layer
+                .iter()
+                .flat_map(|l| &l.fields)
+                .any(|f| f.name == "Text" && f.value.contains(text))
+        })
+    }
+
+    /// Requests lost from the capture leave the responses after them
+    /// without the method that frames them: a response to a lost HEAD does
+    /// not take the next response as its body. The responses to requests
+    /// read before the gap keep their methods.
+    #[test]
+    fn responses_past_lost_requests_are_not_framed_by_the_wrong_method() {
+        let [request, response] = Http1::pair();
+        let mut request = Stream::new(request);
+        let first = b"HEAD /1 HTTP/1.1\r\n\r\n";
+        assert_eq!(request.push(first), first.len());
+        request.next().unwrap().unwrap();
+        // The bytes of a HEAD request go missing: the decoder starts over.
+        let (_, mut lost) = request.into_parts();
+        Present::reset(&mut lost);
+        let mut request = Stream::new(lost);
+        let third = b"GET /3 HTTP/1.1\r\n\r\n";
+        assert_eq!(request.push(third), third.len());
+        request.next().unwrap().unwrap();
+        let next = b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+        let to_head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", next.len());
+        let items = responses(
+            response,
+            &[
+                to_head.as_bytes(),
+                to_head.as_bytes(),
+                next,
+                b"HTTP/1.1 204 No Content\r\n\r\n",
+            ],
+        );
+        // The answer to the HEAD read before has no body, so the next
+        // response is found; the answer to the lost one is shown too.
+        assert_eq!(items[0].summary(), "HTTP/1.1 200 OK");
+        assert_eq!(items[1].summary(), "HTTP/1.1 200 OK");
+        assert!(!as_body(&items, "404 Not Found"), "{items:?}");
+    }
+
+    /// More requests waiting than the queue holds: the responses past it
+    /// are not framed by a later request's method.
+    #[test]
+    fn a_full_method_queue_does_not_shift_later_responses() {
+        let [request, response] = Http1::pair();
+        let mut request = Stream::new(request);
+        let mut requests = b"GET / HTTP/1.1\r\n\r\n".repeat(63);
+        requests.extend_from_slice(b"HEAD / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n");
+        for piece in requests.chunks(1000) {
+            assert_eq!(request.push(piece), piece.len());
+            while request.next().is_some() {}
+        }
+        let ok = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        let next = b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+        let to_head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", next.len());
+        let mut pieces: Vec<&[u8]> = vec![ok; 63];
+        pieces.extend([to_head.as_bytes(), next]);
+        let items = responses(response, &pieces);
+        assert!(!as_body(&items, "404 Not Found"), "{items:?}");
     }
 
     /// What a stream of `bytes`, ended or not, decodes to.
