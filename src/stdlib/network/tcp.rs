@@ -79,7 +79,7 @@ use fictionet::stdlib::network::packet::{IpPacket, Scope};
 use fictionet::stdlib::network::transport::{
     Request, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
-use fictionet::stdlib::network::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection, Read};
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, Entropy, Error, Interface};
 
@@ -1381,6 +1381,17 @@ impl Routes {
         }
         (n > 0).then_some(n)
     }
+
+    /// Hands over the first chunk that came up for `id`, or its first
+    /// `max` bytes, if anything came up.
+    fn take(&mut self, id: ChildId, max: usize) -> Option<Read> {
+        let link = self.links.get_mut(&id)?;
+        let chunk = link.inbox.front_mut()?;
+        if chunk.len() > max {
+            return Some(Read::Owned(chunk.split_to(max)));
+        }
+        link.inbox.pop_front().map(Read::Owned)
+    }
 }
 
 impl Host {
@@ -2136,13 +2147,17 @@ impl Drop for TcpConnection {
     }
 }
 
-impl Connection for TcpConnection {
-    fn poll_read(
+impl TcpConnection {
+    /// Polls to read up to `max` bytes, which `take` gets out of what came
+    /// up: `end` once the peer will send nothing more.
+    fn poll_take<T>(
         &mut self,
         fcx: &Cx,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, ConnError>> {
+        max: usize,
+        end: T,
+        mut take: impl FnMut(&mut Routes, ChildId) -> Option<T>,
+    ) -> Poll<Result<T, ConnError>> {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
@@ -2151,25 +2166,25 @@ impl Connection for TcpConnection {
             if host.routes.stopped {
                 return Poll::Ready(Err(ConnError::Closed));
             }
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
+            if max == 0 {
+                return Poll::Ready(Ok(end));
             }
-            if let Some(n) = host.routes.read(self.id, buf) {
-                return Poll::Ready(Ok(n));
+            if let Some(read) = take(&mut host.routes, self.id) {
+                return Poll::Ready(Ok(read));
             }
             // Ask for as many bytes as this read takes. They come up from
             // the receive buffer, which opens the window by as much.
             let link = host.routes.links.get_mut(&self.id).expect("a live link");
             if link.asked == 0 {
-                link.asked = buf.len() as u64;
-                let grant = link.child.grant(buf.len() as u64);
+                link.asked = max as u64;
+                let grant = link.child.grant(max as u64);
                 host.command(grant);
-                if let Some(n) = host.routes.read(self.id, buf) {
-                    return Poll::Ready(Ok(n));
+                if let Some(read) = take(&mut host.routes, self.id) {
+                    return Poll::Ready(Ok(read));
                 }
             }
             match host.engine().read_verdict(self.id) {
-                Verdict::Done => return Poll::Ready(Ok(0)),
+                Verdict::Done => return Poll::Ready(Ok(end)),
                 Verdict::Failed(error) => return Poll::Ready(Err(error)),
                 Verdict::Wait => {}
             }
@@ -2186,11 +2201,14 @@ impl Connection for TcpConnection {
         Poll::Pending
     }
 
-    fn poll_write(
+    /// Polls to write some of `len` bytes, the first `n` of which `piece`
+    /// gives as a chunk once there is room for them.
+    fn poll_send(
         &mut self,
         fcx: &Cx,
         cx: &mut Context<'_>,
-        data: &[u8],
+        len: usize,
+        piece: impl FnOnce(usize) -> Chunk,
     ) -> Poll<Result<usize, ConnError>> {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
@@ -2204,15 +2222,13 @@ impl Connection for TcpConnection {
             if link.shut {
                 return Poll::Ready(Err(ConnError::Closed));
             }
-            if data.is_empty() {
+            if len == 0 {
                 return Poll::Ready(Ok(0));
             }
             if link.credit > 0 {
-                let n = (link.credit as usize).min(data.len());
+                let n = (link.credit as usize).min(len);
                 link.credit -= n as u64;
-                let write = link
-                    .child
-                    .send(StreamCommand::Write(Chunk::new(data[..n].to_vec())));
+                let write = link.child.send(StreamCommand::Write(piece(n)));
                 if host.command(write) {
                     return Poll::Ready(Ok(n));
                 }
@@ -2234,6 +2250,49 @@ impl Connection for TcpConnection {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         Poll::Pending
+    }
+}
+
+impl Connection for TcpConnection {
+    fn poll_read(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        self.poll_take(fcx, cx, buf.len(), 0, |routes, id| routes.read(id, buf))
+    }
+
+    /// Hands over the chunk the transport brought up, without copying it.
+    fn poll_read_owned(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<Read, ConnError>> {
+        let max = buf.len();
+        self.poll_take(fcx, cx, max, Read::Copied(0), |routes, id| {
+            routes.take(id, max)
+        })
+    }
+
+    fn poll_write(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
+        self.poll_send(fcx, cx, data.len(), |n| Chunk::new(data[..n].to_vec()))
+    }
+
+    /// Sends a piece of `data` that shares its bytes, without copying them.
+    fn poll_write_chunk(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &Chunk,
+    ) -> Poll<Result<usize, ConnError>> {
+        self.poll_send(fcx, cx, data.len(), |n| data.prefix(n))
     }
 
     /// Sends a FIN once the peer has acknowledged every byte already written.

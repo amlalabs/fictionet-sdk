@@ -107,6 +107,55 @@ fn a_framed_stack_answers_over_tcp_and_finishes_when_the_client_ends() {
     assert_eq!(ended, Ok(StreamEnd::Finished));
 }
 
+/// A TCP connection hands what it received over as the chunks it came up
+/// in, and sends pieces of a chunk the caller gives it: the stream runner
+/// moves bytes both ways without copying them.
+#[test]
+fn tcp_hands_received_chunks_over_and_sends_pieces_of_chunks() {
+    use fictionet::stdlib::network::Read;
+    let request = vec![7u8; 3000];
+    let reply = vec![9u8; 3000];
+    let (sent, expected) = (request.clone(), reply.clone());
+    block_on(lab(Seed::from_u64(1), move |fcx| async move {
+        let (server, client_machine) = machines(&fcx);
+        let mut listener = server.tcp.listen(PORT)?;
+        let client = fcx.spawn(move |fcx| async move {
+            let mut conn = client_machine.tcp.connect(&fcx, server_addr()).await?;
+            conn.write_all(&fcx, &sent).await?;
+            conn.shutdown(&fcx).await?;
+            assert_eq!(read_to_end(&fcx, &mut conn).await?, expected);
+            Ok(())
+        });
+        let mut conn = listener.accept(&fcx).await?;
+        let budget = Budget::new(request.len());
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 1024];
+        loop {
+            match poll_fn(|cx| conn.poll_read_owned(&fcx, cx, &mut buf)).await? {
+                Read::Copied(0) => break,
+                Read::Copied(n) => panic!("{n} bytes were copied out of the chunks"),
+                Read::Owned(mut chunk) => {
+                    assert!(!chunk.is_empty() && chunk.len() <= buf.len());
+                    assert!(chunk.recharge(&budget));
+                    got.extend_from_slice(&chunk);
+                }
+            }
+        }
+        assert_eq!(got, request);
+        assert_eq!(budget.used(), 0, "every handed chunk was released");
+        let mut reply = Chunk::new(reply);
+        while !reply.is_empty() {
+            let n = poll_fn(|cx| conn.poll_write_chunk(&fcx, cx, &reply)).await?;
+            reply.advance(n);
+        }
+        conn.shutdown(&fcx).await?;
+        client.join(&fcx).await?;
+        fcx.cancel();
+        Ok(())
+    }))
+    .expect("the run finishes");
+}
+
 #[test]
 fn an_idle_connection_has_its_input_ended_after_its_answers() {
     let limits = StreamLimits {

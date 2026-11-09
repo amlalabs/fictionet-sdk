@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use fictionet::stdlib::layer::Chunk;
 use fictionet::stdlib::network::tcp::Handshake;
 use fictionet::stdlib::world::net::Sandbox;
 use fictionet::{Cancelled, Cx};
@@ -190,6 +191,44 @@ pub trait Connection: Send + 'static {
     fn poll_gone(&self, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Pending
     }
+
+    /// Polls to read as [`poll_read`](Self::poll_read) does, except that a
+    /// connection that already holds the bytes in a [`Chunk`] may hand the
+    /// chunk over instead of copying it into `buf`: [`Read::Owned`], never
+    /// empty and never longer than `buf`. It is still charged to whatever
+    /// paid for it; the caller moves it to its own budget with
+    /// [`Chunk::recharge`] before keeping it. `Read::Copied(0)` means the
+    /// other side will send nothing more. The default reads into `buf`.
+    fn poll_read_owned(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<Read, ConnError>> {
+        self.poll_read(fcx, cx, buf).map_ok(Read::Copied)
+    }
+
+    /// Polls to write some of `data`, exactly as
+    /// [`poll_write`](Self::poll_write) does, except that a connection that
+    /// keeps bytes in chunks may keep a piece of `data` without copying it.
+    /// The default writes the bytes.
+    fn poll_write_chunk(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &Chunk,
+    ) -> Poll<Result<usize, ConnError>> {
+        self.poll_write(fcx, cx, data)
+    }
+}
+
+/// What [`Connection::poll_read_owned`] read.
+#[derive(Debug)]
+pub enum Read {
+    /// This many bytes went into the caller's buffer. 0 is the end.
+    Copied(usize),
+    /// The connection handed over bytes it held.
+    Owned(Chunk),
 }
 
 impl Connection for Box<dyn Connection> {
@@ -217,6 +256,24 @@ impl Connection for Box<dyn Connection> {
 
     fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
         (**self).poll_gone(cx)
+    }
+
+    fn poll_read_owned(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<Read, ConnError>> {
+        (**self).poll_read_owned(fcx, cx, buf)
+    }
+
+    fn poll_write_chunk(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &Chunk,
+    ) -> Poll<Result<usize, ConnError>> {
+        (**self).poll_write_chunk(fcx, cx, data)
     }
 }
 

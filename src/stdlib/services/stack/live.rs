@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, Chunk, Driver, EventOf, Layer, StreamCommand, StreamEvent,
 };
-use fictionet::stdlib::network::{ConnError, Connection};
+use fictionet::stdlib::network::{ConnError, Connection, Read};
 use fictionet::{Cx, Timer};
 
 use super::job::Jobs;
@@ -191,16 +191,23 @@ where
             let mut read_failed = None;
             let mut moved = false;
             if self.input.is_none() && !self.lifetime.input_over() {
-                match self.conn.poll_read(fcx, cx, &mut self.buf) {
-                    Poll::Ready(Ok(0)) => self.input = Some(StreamEvent::Ended),
-                    Poll::Ready(Ok(n)) => {
-                        // Charge first, then copy out of the read buffer.
-                        let Some(charge) = self.driver.budget().charge(n) else {
+                match self.conn.poll_read_owned(fcx, cx, &mut self.buf) {
+                    Poll::Ready(Ok(Read::Copied(0))) => self.input = Some(StreamEvent::Ended),
+                    Poll::Ready(Ok(read)) => {
+                        // Charge first, then copy out of the read buffer, or
+                        // move what the connection handed over to this budget.
+                        let budget = self.driver.budget();
+                        let chunk = match read {
+                            Read::Copied(n) => budget
+                                .charge(n)
+                                .map(|charge| Chunk::with_charge(self.buf[..n].to_vec(), charge)),
+                            Read::Owned(mut chunk) => chunk.recharge(budget).then_some(chunk),
+                        };
+                        let Some(chunk) = chunk else {
                             self.broken(ConnError::Reset, above, report)?;
                             return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
                         };
-                        let bytes = self.buf[..n].to_vec();
-                        self.input = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
+                        self.input = Some(StreamEvent::Data(chunk));
                         self.lifetime.progress();
                     }
                     Poll::Ready(Err(ConnError::Cancelled)) => {
@@ -269,7 +276,7 @@ where
                     if chunk.is_empty() {
                         return Admit::Taken;
                     }
-                    match conn.poll_write(fcx, cx, &chunk) {
+                    match conn.poll_write_chunk(fcx, cx, &chunk) {
                         // A connection that takes nothing of a write is closed.
                         Poll::Ready(Ok(0)) => {
                             failed = Some(ConnError::Closed);
