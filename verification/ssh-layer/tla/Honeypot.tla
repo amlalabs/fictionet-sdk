@@ -1,15 +1,15 @@
 ---------------------------- MODULE Honeypot ----------------------------
 \* Source: demos/honeypot/src/ssh.rs:150-202 (factory and line submission);
-\* src/stdlib/services/ssh/session.rs:64-68,259-261,338-392 (policy and drain);
-\* src/stdlib/services/ssh.rs:1254-1263,1294-1310 (draining and policy priority).
+\* src/stdlib/services/ssh/session.rs:67-75,268-270,348-397 (control and drain);
+\* src/stdlib/services/ssh.rs:1303-1318,1349-1356 (draining and control priority).
 EXTENDS Naturals
 CONSTANT Mutation
 VARIABLES phase, policy, commandSeen, executed, callbacks, stoppedAt
 vars == <<phase, policy, commandSeen, executed, callbacks, stoppedAt>>
 \* demos/honeypot/src/ssh.rs Application::open and Shell::input: nonempty
 \* lines, exec and subsystem call hangup; empty lines and interrupts prompt.
-\* session.rs on_event refuses after hangup; account publishes policy;
-\* ssh.rs progress checks policy before pending_packets, packet ignores input
+\* session.rs on_event refuses after hangup and asks the connection control to
+\* drain; ssh.rs progress checks control before pending_packets, packet ignores input
 \* while draining but still accepts window adjustments needed to flush echo.
 Init == /\ phase = "prompt" /\ policy = FALSE /\ commandSeen = FALSE
         /\ executed = FALSE /\ callbacks = 0 /\ stoppedAt = 0
