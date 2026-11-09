@@ -635,3 +635,58 @@ builds, the new ones are:
 The rotation also sends 120 fewer packets with a hundred connections. With
 it turned off, the count returns to the old range. The one- and
 ten-connection counts are unchanged, and no packet is lost.
+
+## The review fixes of November 9, 2026 (`comp/fix-integ`)
+
+The fixes from the three reviews of `main` at ff4b0bf96 were merged into
+`main` at 44d98dff0. They came on six branches: `comp/fix-tcp`,
+`comp/fix-layer`, `comp/fix-stack`, `comp/fix-httpd`, `comp/fix-tls` and
+`comp/fix-misc`. This compares `main` before them (ff4b0bf96) with `main`
+after them (44d98dff0).
+
+The method is the one above. Each build ran three times, with the builds
+interleaved, and the table gives the median. Instruction counts repeated
+to within 0.1 percent.
+
+| Workload | Before (ff4b0bf96) | After (44d98dff0) |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 39.77 G | 40.82 G |
+| HTTP/1, 101,010 requests | 1.065 s | 1.108 s |
+| HTTP/2, 101,010 requests | 1.681 s | 1.748 s |
+| HTTP/1 allocations | 5.65 M | 5.65 M |
+| HTTP/2 allocations | 10.00 M | 10.00 M |
+| TCP bulk process, instructions | 4.87 G | 4.82 G |
+| TCP, one connection, 32 MiB | 32.58 ms | 31.97 ms |
+| TCP, ten connections, 4 MiB each | 46.35 ms | 49.44 ms |
+| TCP, one hundred connections, 1 MiB each | 218.9 ms | 213.3 ms |
+| TCP allocations, one connection | 88,858 | 88,858 |
+| TCP allocations, ten connections | 128,730 | 128,729 |
+| TCP allocations, one hundred connections | 518,336 | 479,874 |
+| Packets sent, one hundred connections | 109,400 | 109,400 |
+
+The hundred-connection case allocates 38,462 fewer times. That is the
+`refresh_dirty` B-tree from the polish merge, which `comp/fix-tcp`
+removed: smoltcp's own queue of changed sockets is now the only one. TCP
+bulk runs 1 percent fewer instructions.
+
+The HTTP bench runs 2.6 percent more instructions, with the same
+allocations. To find which fix costs what, the HTTP bench ran once on
+each fix branch alone, each built from ff4b0bf96:
+
+| Build | HTTP bench process, instructions |
+| --- | ---: |
+| ff4b0bf96 | 39.78 G |
+| `comp/fix-tcp` | 39.84 G |
+| `comp/fix-layer` | 40.40 G |
+| `comp/fix-stack` | 39.86 G |
+| `comp/fix-httpd` | 39.75 G |
+| `comp/fix-tls` | 39.78 G |
+| `comp/fix-misc` | 40.29 G |
+| All merged | 40.81 G |
+
+Two branches account for it. `comp/fix-layer` gives each `Env` the depth
+left below its layer, and four wrappers (`Later`, `Session`, the TCP
+factory's `Stack` and `ObservedTls`) now make a new `Env` for their inner
+layer on every call through `Env::part`. `comp/fix-misc` gives each `Env`
+a waker, so every driver call marks its `Env` as in the stack, and every
+`Driver::run` clears the stack's wake flag first.
