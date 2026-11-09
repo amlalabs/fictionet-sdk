@@ -5,6 +5,43 @@ use fictionet::stdlib::network::ip::{set_header_checksum, transport_checksum};
 use fictionet::stdlib::test_support::rounds;
 use fictionet::{InterfaceExt, Packet, Seed, block_on, lab, pair, run};
 
+#[test]
+fn stopping_releases_native_factories_without_polling_applications() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Capture(Arc<Shared>, Arc<AtomicBool>);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            assert!(self.0.state.try_lock().is_some());
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+    block_on(lab(Seed::from_u64(1), |cx| async move {
+        let (endpoint, driver) = prepare_transport(
+            &cx,
+            "10.0.0.1".parse()?,
+            Options::default(),
+            &Factory::default(),
+        );
+        let released = Arc::new(AtomicBool::new(false));
+        let capture = Capture(endpoint.shared.clone(), released.clone());
+        let mut listener = endpoint.listen(80)?;
+        listener.attach(Application {
+            make: Arc::new(move |_, _, _| {
+                let _ = &capture;
+                panic!("no incoming connection");
+            }),
+            budget: Arc::new(|_, _| Budget::unlimited()),
+        });
+        assert!(!released.load(Ordering::SeqCst));
+        drop(driver);
+        assert!(released.load(Ordering::SeqCst));
+        drop(listener);
+        cx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
 #[derive(Debug)]
 struct TestCookies;
 

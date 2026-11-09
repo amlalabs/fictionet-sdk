@@ -1497,7 +1497,23 @@ impl std::ops::DerefMut for Host {
 impl Shared {
     /// The endpoint stopped: every wait ends with an error.
     fn stop(&self) {
-        let wakers = self.state.lock().stop();
+        let (wakers, events, applications) = {
+            let mut host = self.state.lock();
+            let wakers = host.stop();
+            let events = std::mem::take(&mut host.routes.application_events);
+            let applications: Vec<_> = host
+                .routes
+                .listeners
+                .values_mut()
+                .filter_map(|listener| listener.application.take())
+                .collect();
+            host.routes.applications.clear();
+            (wakers, events, applications)
+        };
+        // Factories can retain endpoint handles. Release them outside the
+        // transport lock, including when no application was ever polled.
+        drop(events);
+        drop(applications);
         for w in wakers {
             w.wake();
         }

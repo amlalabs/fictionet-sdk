@@ -237,7 +237,14 @@ impl PacketDriver {
 
 impl Drop for PacketDriver {
     fn drop(&mut self) {
-        self.shared.with(Inner::stop);
+        let events = self.shared.with(|inner| {
+            inner.stop();
+            inner.applications.clear();
+            std::mem::take(&mut inner.application_events)
+        });
+        // An application queued before the first poll can own endpoint
+        // handles. Drop it after releasing the transport lock.
+        drop(events);
     }
 }
 
@@ -764,6 +771,67 @@ mod tests {
     use fictionet::Packet;
     use fictionet::stdlib::network::ip::{self, protocol};
     use fictionet::{block_on, pair, run};
+
+    #[test]
+    fn stopping_releases_native_applications_before_their_first_poll() {
+        use fictionet::stdlib::layer::{Datagrams, Env, EventOf, Layer, Top};
+        use fictionet::stdlib::services::stack::Boxed;
+        use std::convert::Infallible;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Application(Arc<Shared>, Arc<AtomicBool>);
+        impl Drop for Application {
+            fn drop(&mut self) {
+                assert!(self.0.inner.try_lock().is_some());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        impl Layer for Application {
+            type Lower = Datagrams<SocketAddr>;
+            type Upper = Top;
+            type Report = Infallible;
+            type Timer = ();
+            type Work = Infallible;
+            type Done = Infallible;
+            type Error = Infallible;
+            fn on_event(
+                &mut self,
+                _: &mut Env<'_, Infallible>,
+                _: EventOf<Self::Lower>,
+            ) -> Result<Admit<EventOf<Self::Lower>>, Infallible> {
+                Ok(Admit::Taken)
+            }
+            fn on_command(
+                &mut self,
+                _: &mut Env<'_, Infallible>,
+                command: Infallible,
+            ) -> Result<Admit<Infallible>, Infallible> {
+                match command {}
+            }
+            fn take_command(&mut self) -> Option<layer::CommandOf<Self::Lower>> {
+                None
+            }
+            fn take_event(&mut self) -> Option<Infallible> {
+                None
+            }
+        }
+        block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                let (endpoint, driver) = prepare_transport(&cx, "10.0.0.1".parse()?);
+                let released = Arc::new(AtomicBool::new(false));
+                let application = Application(endpoint.shared.clone(), released.clone());
+                endpoint
+                    .bind(53)?
+                    .attach(Boxed::new(application), Budget::unlimited());
+                assert!(!released.load(Ordering::SeqCst));
+                drop(driver);
+                assert!(released.load(Ordering::SeqCst));
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
 
     #[test]
     fn shutdown_wakes_readers_in_port_order() {
