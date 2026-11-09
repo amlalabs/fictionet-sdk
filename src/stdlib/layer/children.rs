@@ -239,7 +239,9 @@ struct Kid<B: Layer> {
     due: Option<(Instant, B::Timer)>,
     armed: u64,
     heap: Option<usize>,
-    backing: Arc<Charge>,
+    /// What pays for the memory of the bytes in its receive window, shared
+    /// by every chunk that waits in it.
+    window: Arc<Charge>,
     max_command: u64,
     /// Credit the mux may still use for this child's events.
     granted: u64,
@@ -919,12 +921,12 @@ where
                     .then(|| {
                         // The inbox grows as events wait in it (`admit`).
                         let storage = budget.charge(0)?;
-                        let backing =
+                        let window =
                             budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
-                        Some((storage, Arc::new(backing)))
+                        Some((storage, Arc::new(window)))
                     })
                     .flatten();
-                let Some((storage, backing)) = reserved else {
+                let Some((storage, window)) = reserved else {
                     self.down.push_back(child.close());
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
@@ -952,7 +954,7 @@ where
                     inbox: VecDeque::new(),
                     storage,
                     wake: Arc::new(ChildWake::new(key, id, self.woken.clone())),
-                    backing,
+                    window,
                     max_command,
                     granted: 0,
                     owed: self.window,
@@ -1019,7 +1021,7 @@ where
                             }
                             kid.inbox.reserve_exact(places - kid.inbox.len());
                         }
-                        if !event.reserve_receive(&kid.budget, &kid.backing) {
+                        if !event.reserve_receive(&kid.budget, &kid.window) {
                             self.refuse(env, id);
                             return Ok(Admit::Taken);
                         }

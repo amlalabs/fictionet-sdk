@@ -106,12 +106,10 @@ impl Credited for ChannelEvent {
     fn receive_bytes(window: u64) -> Option<usize> {
         StreamEvent::receive_bytes(window)
     }
-    fn reserve_receive(&mut self, budget: &Budget, backing: &Arc<Charge>) -> bool {
+    fn reserve_receive(&mut self, budget: &Budget, window: &Arc<Charge>) -> bool {
         match self {
-            Self::Stream(event) => event.reserve_receive(budget, backing),
-            Self::Extended { data, .. } => {
-                with_stream(data, |e| e.reserve_receive(budget, backing))
-            }
+            Self::Stream(event) => event.reserve_receive(budget, window),
+            Self::Extended { data, .. } => with_stream(data, |e| e.reserve_receive(budget, window)),
             _ => true,
         }
     }
