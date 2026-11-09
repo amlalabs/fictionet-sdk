@@ -127,7 +127,7 @@ inside `on_end`, which no service does, so no code changed for it.
 from the moment `accept` or `connect` handed it out until its `Conn` is
 removed: the smoltcp state, whether smoltcp still names the peer (so a RST
 can go out), unread and unacknowledged bytes as booleans, the `Conn` flags
-`rst`, `fin`, `shut`, `orphaned`, `retired`, the handle, membership in
+`rst`, `fin`, `shut`, `orphaned`, `retired`, `released`, the handle, membership in
 `conns`, `orphans` and `time_wait`, what `hold_until_gone` keeps, the
 FIN-WAIT-2 orphan timer, and `stopped`.
 
@@ -139,13 +139,14 @@ both:
 | Model | Rust |
 | --- | --- |
 | `Read`, `Write`, `Shutdown` | `TcpConnection::poll_read` (credit for the child, then its data), `poll_write` (a write within the send buffer's credit), `poll_shutdown` (the child's `End`) |
-| `Drop`, `ResetHandle`, `WatchReset`, `Hold` | `TcpConnection`'s `Drop` (`TcpControl::Abort` first if bytes that came up are unread, then closing the child), `reset` (`Abort`, then the drop); `GoneWatch::reset` (`Abort`) and `hold_until_gone` (`TcpControl::Hold`) |
-| `Orphan`, `AbortSocket`, `CloseIfDrained`, `Remove` | `TcpLayer::orphan` (closing a child), `abort`, `close_if_drained`, `remove_conn` |
-| `PeerData`, `PeerAck`, `PeerFin`, `PeerRst` | `TcpLayer::ingress` after smoltcp's `process`: the flags it sets, `held.clear()` and `TcpNotice::Gone` on a RST, `close_if_drained` after every segment |
+| `Drop`, `ResetHandle`, `WatchReset`, `Hold` | `TcpConnection`'s `Drop` (`TcpControl::Abort` first if bytes that came up are unread, then closing the child), `reset` (`Abort`, then the drop); `GoneWatch::reset` (`Abort`) and `hold_until_gone` (`TcpControl::Hold`); the layer takes `Abort` and `Hold` only while the connection is not gone |
+| `Orphan`, `AbortSocket`, `CloseIfDrained`, `Remove` | `TcpLayer::orphan` (closing a child), `abort` (which lets go of what was held), `close_if_drained`, `remove_conn` |
+| `Release` | `TcpLayer::refresh` for an open child whose socket reached TIME-WAIT or closed on its own: `Conn::released`, what was held let go, `TcpNotice::Gone` |
+| `PeerData`, `PeerAck`, `PeerFin`, `PeerRst` | `TcpLayer::ingress` after smoltcp's `process`: the flags it sets, `held.clear()` and `TcpNotice::Gone` on a RST or on LAST-ACK's final ACK, `close_if_drained` after every segment |
 | `Timeout`, `Egress`, `TimeWaitExpires` | smoltcp's timeout (an abort), the RST going out, TIME-WAIT's expiry |
 | `Housekeeping`, `ExpireOrphans`, `GivesUpDue`, `EvictTimeWait` | the orphan loop and TIME-WAIT cap of `TcpLayer::housekeeping`; `TcpLayer::expire_orphans` and `gives_up` |
-| `Stop` | `Shared::stop`, which stops the layer (`TcpLayer::stop`) |
-| `Gone` | `poll_gone` ready: stopped, removed, `rst`, or `retired`, as `TcpLayer::gone` reads it; `TcpNotice::Gone` wakes the watches |
+| `Stop` | `Shared::stop`, which stops the layer (`TcpLayer::stop`, which lets go of what every connection held) |
+| `Gone` | `poll_gone` ready: stopped, removed, `rst`, `retired` or `released`, as `TcpLayer::gone` reads it; `TcpNotice::Gone` wakes the watches |
 
 What is checked:
 
@@ -153,8 +154,12 @@ What is checked:
   `retired` flags and with `conns`; a dropped handle's live connection is an
   orphan; nothing is held or listed once removed.
 - `HeldOnlyWhileCounted`, `ResetReleases`, `RetireReleases`: what
-  `hold_until_gone` keeps is released by the peer's reset and by retirement,
-  and never survives them.
+  `hold_until_gone` keeps is never kept while the connection is gone, and a
+  reset by either side or retirement releases it.
+- `GoneMeans`, `CountedUntilDone`: the gone watch is ready only once the
+  transport is done with the connection (stopped, removed, reset, or in
+  TIME-WAIT or closed), and what is held is let go only then, never when
+  the handle is dropped while the connection is still closing.
 - `StopCleans`: a stopped endpoint has no orphan or TIME-WAIT state, and a
   handle dropped after the stop leaves nothing.
 - `FinAfterDrain`: a FIN goes only after every queued byte is acknowledged.
@@ -164,19 +169,23 @@ What is checked:
 - `OrphanWatched`, `OrphanRemoved`, `HeldReleased`: once the handle is
   dropped, the gone watch is eventually ready, the connection is eventually
   removed, and what it held is eventually released, whatever the peer does.
+- `GoneWhateverTheHandle`: a connection in TIME-WAIT or closed is
+  eventually gone and lets go of what it held, whether or not the handle is
+  ever dropped.
 
-| Config | Generated | Distinct | Depth | Result |
-| --- | ---: | ---: | ---: | --- |
-| `Conn.cfg` | 2,934 | 720 | 10 | all five invariants and eight properties hold |
-| `Conn_without_orphantimer.cfg` | 2,480 | 580 | 8 | `OrphanRemoved` violated: drop, the FIN acknowledged, the peer sends data forever and never closes |
-| `Conn_without_resetunread.cfg` | 39 | 27 | 2 | `DropResetsUnread` violated at the first drop |
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Conn.cfg` | 2,476 | 754 | all five invariants and ten properties hold |
+| `Conn_without_orphantimer.cfg` | 2,126 | 630 | `OrphanRemoved` violated: drop, the FIN acknowledged, the peer sends data forever and never closes |
+| `Conn_without_resetunread.cfg` | 76 | 40 | `DropResetsUnread` violated at the first drop |
+| `Conn_without_release.cfg` | 2,062 | 576 | `GoneWhateverTheHandle` violated: no release for an open handle, as before `773c5c1a3`; the socket times out and the handle keeps the item for ever |
+| `Conn_without_abortreleases.cfg` | 80 | 48 | `HeldOnlyWhileCounted` violated: `abort` keeps the item, as before `2124865df`; a drop with unread bytes resets and the item stays |
+| `Conn_without_countuntilgone.cfg` | 144 | 66 | `CountedUntilDone` violated: the drop lets go while the connection is in FIN-WAIT-1 |
 
-The connection checks clean. Two observations, neither a bug:
-`hold_until_gone` after the peer's RST keeps the item until the socket is
-removed (the race in `listen` between a RST and `accept`), which lasts until
-the handle is dropped; and smoltcp's own timeout closes the socket without
-waking the gone watch, which the next read or write reports as
-`ConnError::TimedOut`.
+The model described the layer before `773c5c1a3` and `2124865df` until
+`45342c5f3`, which added `released` and the release rules; the
+[TCP layer model](../tcp-layer/README.md) checks the same rules through the
+port, with both kinds of connection and the listener.
 
 ### What `Conn.tla` leaves out
 

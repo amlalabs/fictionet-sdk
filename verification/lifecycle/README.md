@@ -20,6 +20,9 @@ earlier or weakened rule and name the property TLC must then violate:
 | `Conn.cfg` | every invariant and property of `Conn` |
 | `Conn_without_orphantimer.cfg` | no `expire_orphans`: violates `OrphanRemoved` |
 | `Conn_without_resetunread.cfg` | a drop with unread bytes closes instead of resetting: violates `DropResetsUnread` |
+| `Conn_without_release.cfg` | no release for a connection whose handle is kept: violates `GoneWhateverTheHandle` |
+| `Conn_without_abortreleases.cfg` | `abort` keeps what was held: violates `HeldOnlyWhileCounted` |
+| `Conn_without_countuntilgone.cfg` | dropping the handle lets go of what was held: violates `CountedUntilDone` |
 
 Run one with TLC (Java 11 or later and `tla2tools.jar`):
 
