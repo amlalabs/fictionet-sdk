@@ -28,7 +28,9 @@ layer's own steps are fair: refresh, housekeeping, the RST going out,
 TIME-WAIT's end, and the orphan timer. The host and the peer owe nothing.
 
 The header of `Layer.tla` maps each action to its function and its lines in
-`engine.rs` at `a96a0cae9`.
+`engine.rs` at `e2858ccc4` (the drift audit re-read every action against
+the code there; the functions are the ones named at `a96a0cae9`, moved by
+11 to 22 lines).
 
 ## Properties
 
@@ -187,6 +189,31 @@ left out (`verification/tcp-port-zero` and `verification/mptcp` cover the
 listener). `AbortPeers` and ICMP errors are the same `abort` as `Abort`.
 Both configurations are bounded: one connection of each kind, or two from
 peers, and at most two `Accept`s.
+
+Three things the code does that the model does not see:
+
+- `offer` returns early once 64 events wait for the layer above
+  (`UP_ROOM`, `engine.rs` 1912), and only `completed`, `housekeeping` and
+  `Accept` call it again. A connection left in `ready` with `accept`
+  credit is then offered only when another handshake finishes on that
+  port or the host sends another `Accept`. The model's `Offer` is always
+  enabled, so no property here says anything about it.
+- A SYN past `embryonic + ready >= backlog` is answered with a SYN cookie
+  (`attempt` 1408), not dropped as the model's `Syn` has it. That mattered
+  for `BacklogBound`: `take_cookie` checks only `ready` against the
+  backlog, and `completed` pushed into `ready` with no check, so with a
+  backlog of two, two kept handshakes and a cookie's ACK, `ready` held
+  three. `BacklogBound` held of this model, which has no cookie path, and
+  not of the code. `ingress` now drops an ACK that would complete a kept
+  handshake while `ready` is full, as it refuses a cookie's, and the
+  handshake sends its SYN-ACK again. `verification/mptcp/tla/Listener.tla`
+  has the cookie path and both checks; the test
+  `kept_handshakes_complete_only_while_the_backlog_has_room` in
+  `src/stdlib/network/tcp/tests.rs` plays the trace.
+- `End` on a child whose socket has not finished its handshake: the model
+  allows `HostEnd` only in ESTABLISHED and CLOSE-WAIT; the code takes it
+  in any state (`close_if_drained` 891) and smoltcp's `close` in SYN-SENT
+  closes the socket, which `refresh` then reports as a failed connect.
 
 ## Running
 

@@ -1,4 +1,27 @@
 ----------------------------- MODULE Listener -----------------------------
+(***************************************************************************)
+(* One listening port of TcpLayer in src/stdlib/network/tcp/engine.rs,     *)
+(* three peer tuples at a time.                                            *)
+(*                                                                         *)
+(*   Syn     ingress and attempt: a SYN for a tuple no connection has is   *)
+(*           kept in `embryonic` while embryonic and ready together are    *)
+(*           under the backlog, and answered with a SYN cookie from the    *)
+(*           configured codec otherwise. ReuseSyn: a SYN for a tuple in    *)
+(*           by_tuple goes to that handshake's socket, which sends its     *)
+(*           SYN-ACK again. KeepTimeWait: the same for a tuple whose       *)
+(*           connection is in TIME-WAIT, where smoltcp answers with a      *)
+(*           challenge ACK.                                                *)
+(*   Ack     completed, for a kept handshake, and take_cookie, for an ACK  *)
+(*           that returns a cookie. CheckCookie: SynCookies::validate.     *)
+(*           BoundQueue: while `ready` is full, take_cookie refuses an ACK *)
+(*           that returns a cookie, and ingress drops one that would       *)
+(*           complete a kept handshake, which stays in SYN-RECEIVED.       *)
+(*   Accept  offer, on TcpControl::Accept                                  *)
+(*   Close   housekeeping retiring an orphan in TIME-WAIT                  *)
+(*   Expire  expire_handshakes; smoltcp's TIME-WAIT timer and              *)
+(*           housekeeping's removal of the closed socket, or its           *)
+(*           MAX_TIME_WAIT eviction                                        *)
+(***************************************************************************)
 EXTENDS Naturals, FiniteSets
 CONSTANTS Peers, Backlog, ReuseSyn, CheckCookie, KeepTimeWait, BoundQueue
 VARIABLES embryos, ready, active, waiting, cookie, forged, duplicate
@@ -17,6 +40,9 @@ Syn(p) ==
 Ack(p, valid) ==
     /\ p \notin active \cup waiting \cup ready
     /\ p \in embryos \/ (p \in cookie /\ valid) \/ ~CheckCookie
+    \* While ready is full, an ACK that returns a cookie is refused
+    \* (take_cookie) and one completing a kept handshake is dropped
+    \* (ingress); the kept handshake stays in embryos.
     /\ Cardinality(ready) < Backlog \/ ~BoundQueue
     /\ ready' = ready \cup {p} /\ embryos' = embryos \ {p}
     /\ forged' = (forged \/ (p \notin embryos /\ (p \notin cookie \/ ~valid)))
