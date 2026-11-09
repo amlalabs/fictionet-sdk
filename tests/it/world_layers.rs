@@ -9,15 +9,15 @@ use fictionet::stdlib::layer::{
     EventOf, Layer, MessageCommand, MuxOp, PacketCommand, PacketEvent, Packets, Top,
 };
 use fictionet::stdlib::network::packet::{
-    self, Ingress, IpLayer, IpPacket, IpReport, Scope, Scopes, Sort,
+    self, CheckedIpPacket, Ingress, IpLayer, IpReport, NetworkInput, Scope, Scopes,
 };
 use fictionet::stdlib::network::tcp::{self, EndpointState, TcpLayer, Verdict};
 use fictionet::stdlib::network::transport::Tcp;
-use fictionet::stdlib::network::{ConnError, ConnectionExt, Transport};
+use fictionet::stdlib::network::{ConnError, ConnectionExt};
 use fictionet::stdlib::world::net::{Limits, Net};
 use fictionet::time::Instant;
 use fictionet_test_support::world::world;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ struct Hesitant {
 }
 
 impl Layer for Hesitant {
-    type Lower = Packets<IpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, Chunk>;
     type Upper = Tcp;
     type Report = ();
     type Timer = ();
@@ -194,18 +194,16 @@ fn a_tcp_that_refuses_commands_for_now_keeps_the_peer_count_and_resets() {
     });
 }
 
-/// The standard IP layer, which also hands up, for each UDP packet, an
-/// observed copy of it and a copy read on another network.
+/// A mixed input boundary rejects a foreign duplicate before the host IP layer.
 struct Copies {
     main: IpLayer,
-    side: IpLayer,
+    input: NetworkInput,
     tunnel: Scope,
-    extra: VecDeque<PacketEvent<IpPacket>>,
 }
 
 impl Layer for Copies {
-    type Lower = Packets<fictionet::stdlib::layer::Datagram<Ingress>, Chunk>;
-    type Upper = Packets<IpPacket, Chunk>;
+    type Lower = Packets<Chunk, Chunk>;
+    type Upper = Packets<CheckedIpPacket, Chunk>;
     type Report = IpReport;
     type Timer = ();
     type Work = ();
@@ -219,27 +217,22 @@ impl Layer for Copies {
         env: &mut Env<'_, IpReport>,
         event: EventOf<Self::Lower>,
     ) -> Result<Admit<EventOf<Self::Lower>>, Infallible> {
-        let copy = match &event {
-            PacketEvent::Packet(raw) => Some((raw.payload().to_vec(), *raw.meta())),
-            PacketEvent::Ended => None,
-        };
-        let admit = self.main.on_event(env, event)?;
-        if let (Admit::Taken, Some((bytes, ingress))) = (&admit, copy) {
-            let foreign = fictionet::stdlib::layer::Datagram::new(
-                Chunk::new(bytes),
-                Ingress {
-                    scope: self.tunnel,
-                    ..ingress
-                },
-            );
-            let _ = self.side.on_event(env, PacketEvent::Packet(foreign))?;
-            if let Some(PacketEvent::Packet(packet)) = self.side.take_event()
-                && packet.sort() == Sort::Transport(Transport::Udp)
-            {
-                self.extra.push_back(PacketEvent::Packet(packet));
+        let event = match event {
+            PacketEvent::Packet(bytes) => {
+                let foreign = fictionet::stdlib::layer::Datagram::new(
+                    Chunk::new(bytes.to_vec()),
+                    Ingress {
+                        scope: self.tunnel,
+                        ..Ingress::default()
+                    },
+                );
+                assert!(self.input.accept(foreign).is_err());
+                let own = fictionet::stdlib::layer::Datagram::new(bytes, Ingress::default());
+                PacketEvent::Packet(self.input.accept(own).expect("the host input is accepted"))
             }
-        }
-        Ok(admit)
+            PacketEvent::Ended => PacketEvent::Ended,
+        };
+        self.main.on_event(env, event)
     }
     fn on_command(
         &mut self,
@@ -254,18 +247,8 @@ impl Layer for Copies {
     fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Chunk>> {
         self.main.take_command(env)
     }
-    fn take_event(&mut self) -> Option<PacketEvent<IpPacket>> {
-        let Some(event) = self.main.take_event() else {
-            return self.extra.pop_front();
-        };
-        if let PacketEvent::Packet(packet) = &event
-            && packet.sort() == Sort::Transport(Transport::Udp)
-        {
-            let observed =
-                IpPacket::observed(Chunk::new(packet.bytes().to_vec()), *packet.ingress());
-            self.extra.push_back(PacketEvent::Packet(observed));
-        }
-        Some(event)
+    fn take_event(&mut self) -> Option<PacketEvent<CheckedIpPacket>> {
+        self.main.take_event()
     }
     fn deadline(&self) -> Option<(Instant, ())> {
         self.main.deadline()
@@ -311,20 +294,17 @@ impl Layer for Collect {
     }
 }
 
-/// An IP layer installed through the public factory may hand up an
-/// observed copy, or a packet of another network. The host's transports
-/// take neither: each datagram the client sends reaches the application
-/// once.
+/// A replacement IP stack separates mixed network input before reassembly.
+/// Each datagram reaches the application once despite a foreign duplicate.
 #[test]
-fn transports_take_only_checked_packets_of_their_own_network_from_any_ip_layer() {
+fn a_custom_ip_stack_separates_networks_before_host_processing() {
     world(Duration::from_secs(10), |fcx| async move {
         let server = Ipv4Addr::new(104, 18, 0, 2);
         let tunnel = Scopes::default().tunnel();
         let factory = packet::Factory::new(move |_| Copies {
             main: IpLayer::host(),
-            side: IpLayer::host(),
+            input: NetworkInput::new(Scope::ROOT),
             tunnel,
-            extra: VecDeque::new(),
         });
         let received = Arc::new(Mutex::new(Vec::new()));
         let collected = received.clone();

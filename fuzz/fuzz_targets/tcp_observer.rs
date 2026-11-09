@@ -10,7 +10,7 @@ use fictionet::stdlib::layer::{
 };
 use fictionet::stdlib::network::ip::{self, protocol};
 use fictionet::stdlib::network::observer::{Limits, Observer};
-use fictionet::stdlib::network::packet::{Capture, Ingress, IpPacket};
+use fictionet::stdlib::network::packet::{Capture, Ingress, ObservedIpPacket};
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 use libfuzzer_sys::fuzz_target;
@@ -183,7 +183,7 @@ fuzz_target!(|input: Input| {
             }),
             ..Ingress::default()
         };
-        let packet = IpPacket::observed(Chunk::new(packet), ingress);
+        let packet = ObservedIpPacket::observed(Chunk::new(packet), ingress);
         assert!(matches!(
             tcp.deliver(PacketEvent::Packet(packet)),
             Ok(Admit::Taken)

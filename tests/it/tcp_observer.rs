@@ -8,7 +8,7 @@ use fictionet::stdlib::layer::{
 };
 use fictionet::stdlib::network::ip::{self, protocol};
 use fictionet::stdlib::network::observer::{Limits, Observer};
-use fictionet::stdlib::network::packet::{Capture as Captured, Ingress, IpPacket};
+use fictionet::stdlib::network::packet::{Capture as Captured, Ingress, ObservedIpPacket};
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 
@@ -63,7 +63,7 @@ impl Capture {
             }),
             ..Ingress::default()
         };
-        let packet = IpPacket::observed(Chunk::new(packet), ingress);
+        let packet = ObservedIpPacket::observed(Chunk::new(packet), ingress);
         assert!(matches!(
             self.tcp.deliver(PacketEvent::Packet(packet)),
             Ok(Admit::Taken)
