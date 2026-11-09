@@ -1055,16 +1055,11 @@ impl PacketDriver {
         out: &mut Vec<Chunk>,
         limit: usize,
     ) -> fictionet::Result<(bool, Option<Instant>)> {
-        let (busy, deadline, refusals) = {
+        // This task's own commands below need no wake: what they leave for
+        // the engine makes the walk busy instead.
+        let (busy, deadline, refusals, parked) = {
             let mut host = self.shared.state.lock();
-            if !host
-                .routes
-                .driver
-                .as_ref()
-                .is_some_and(|w| w.will_wake(cx.waker()))
-            {
-                host.routes.driver = Some(cx.waker().clone());
-            }
+            let parked = host.routes.driver.take();
             let busy = host.visit(out, limit);
             let refusals = (!host.routes.refusals.is_empty())
                 .then(|| {
@@ -1072,13 +1067,14 @@ impl PacketDriver {
                     Some((refused, std::mem::take(&mut host.routes.refusals)))
                 })
                 .flatten();
-            (busy, host.tcp.deadline(), refusals)
+            (busy, host.tcp.deadline(), refusals, parked)
         };
         if let Some((refused, refusals)) = refusals {
             for (peer, local) in refusals {
                 refused(peer, local);
             }
         }
+        let mut offered = false;
         let applications = self.applications.poll(
             &self.fcx,
             cx,
@@ -1088,10 +1084,23 @@ impl PacketDriver {
                     &mut self.shared.state.lock().routes.application_events,
                 )
             },
-            |command| self.shared.state.lock().offer(command),
+            |command| {
+                let admit = self.shared.state.lock().offer(command);
+                offered |= admit.moved();
+                admit
+            },
         )?;
+        {
+            let mut host = self.shared.state.lock();
+            if !host.routes.stopped {
+                host.routes.driver = Some(match parked {
+                    Some(waker) if waker.will_wake(cx.waker()) => waker,
+                    _ => cx.waker().clone(),
+                });
+            }
+        }
         Ok((
-            busy || applications,
+            busy || applications || offered,
             [deadline, self.applications.deadline()]
                 .into_iter()
                 .flatten()

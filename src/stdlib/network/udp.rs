@@ -213,24 +213,37 @@ impl PacketDriver {
         out: &mut Vec<Chunk>,
         limit: usize,
     ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
-        let (busy, deadline) = self.shared.with(|inner| {
-            if !inner.wake.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-                inner.wake = Some(cx.waker().clone());
-            }
+        // This task's own work needs no wake: what it leaves makes the walk
+        // busy instead.
+        let (busy, deadline, parked) = self.shared.with(|inner| {
+            let parked = inner.wake.take();
             inner.driver.set_now(self.fcx.now());
             inner.pump();
             let count = limit.saturating_sub(out.len()).min(inner.output.len());
             out.extend(inner.output.drain(..count));
-            (inner.driver.exhausted(), inner.driver.deadline())
+            (inner.driver.exhausted(), inner.driver.deadline(), parked)
         });
+        let mut offered = false;
         let more = self.applications.poll(
             &self.fcx,
             cx,
             |pending| std::mem::swap(pending, &mut self.shared.inner.lock().application_events),
-            |command| self.shared.with(|inner| inner.application_command(command)),
+            |command| {
+                let admit = self.shared.with(|inner| inner.application_command(command));
+                offered |= admit.moved();
+                admit
+            },
         )?;
+        self.shared.with(|inner| {
+            if !inner.stopped {
+                inner.wake = Some(match parked {
+                    Some(waker) if waker.will_wake(cx.waker()) => waker,
+                    _ => cx.waker().clone(),
+                });
+            }
+        });
         Ok((
-            busy || more,
+            busy || more || offered,
             [deadline, self.applications.deadline()]
                 .into_iter()
                 .flatten()

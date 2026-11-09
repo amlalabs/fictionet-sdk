@@ -76,24 +76,30 @@ where
             }
         }
         self.driver.set_now(fcx.now());
-        // As in the stream runner, existing work observes transport wakeups
-        // before queued input ends its child lifetime. Work cancelled by that
-        // input is removed before the next poll.
-        let completed = self
-            .jobs
-            .poll(Some(fcx), cx, |done| self.driver.complete(done))
-            .map_err(|e| fictionet::Error::msg(e.to_string()))?;
         let mut exhausted = false;
         let mut intake = 64;
         let mut blocked = false;
+        // As in the stream runner, existing work observes transport wakeups
+        // before queued input ends its child lifetime. Work cancelled by that
+        // input is removed before the next poll. Work handed over in a turn
+        // is polled in the next, so what it finishes at once is answered
+        // before the transport sends what this poll wrote.
+        let mut poll_jobs = true;
         for turn in 0..64 {
+            let mut moved = false;
+            if poll_jobs {
+                moved |= self
+                    .jobs
+                    .poll(Some(fcx), cx, |done| self.driver.complete(done))
+                    .map_err(|e| fictionet::Error::msg(e.to_string()))?;
+            }
             if self.pending.is_empty() {
                 events(&mut self.pending);
             }
             self.driver
                 .run()
                 .map_err(|e| fictionet::Error::msg(e.to_string()))?;
-            let mut moved = self.driver.send_below(&mut command);
+            moved |= self.driver.send_below(&mut command);
             while intake > 0
                 && let Some(event) = self.pending.pop_front()
             {
@@ -114,27 +120,19 @@ where
                     }
                 }
             }
-            if !moved {
+            poll_jobs = self.jobs.take(&mut self.driver);
+            if self.jobs.budget_exhausted() {
+                return Err(fictionet::Error::msg("application work budget exhausted"));
+            }
+            if !(moved || poll_jobs) {
                 break;
             }
             exhausted = turn == 63;
         }
-        self.jobs.take(&mut self.driver);
-        let moved = self
-            .jobs
-            .poll(Some(fcx), cx, |done| self.driver.complete(done))
-            .map_err(|e| fictionet::Error::msg(e.to_string()))?;
-        if self.jobs.budget_exhausted() {
-            return Err(fictionet::Error::msg("application work budget exhausted"));
-        }
         if self.pending.is_empty() {
             events(&mut self.pending);
         }
-        Ok(completed
-            || exhausted
-            || moved
-            || (!self.pending.is_empty() && !blocked)
-            || self.driver.exhausted())
+        Ok(exhausted || (!self.pending.is_empty() && !blocked) || self.driver.exhausted())
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
