@@ -1452,7 +1452,7 @@ impl Layer for Http2 {
             self.open(env);
         }
         if matches!(self.phase, Phase::Closing | Phase::Closed) {
-            return Ok(Admit::Taken);
+            return Ok(Admit::Closed(command));
         }
         // A response head is framed at once: it waits while the transport
         // falls behind.
@@ -1950,6 +1950,29 @@ mod tests {
             },
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn closing_http2_returns_the_unaccepted_command() {
+        use fictionet::stdlib::layer::{Budget, Driver, Slots};
+        for phase in [Phase::Closing, Phase::Closed] {
+            let mut http = Http2::new(Limits::default());
+            http.phase = phase;
+            let mut driver = Driver::new(
+                http,
+                Arc::new(fictionet::SeededEntropy::new(fictionet::Seed::from_u64(91))),
+                Budget::unlimited(),
+                Instant::ZERO,
+            );
+            let mut slots = Slots::new(1);
+            let child = slots.insert(()).unwrap();
+            let id = child.id();
+            let answer = driver.command(child.close()).unwrap();
+            let Admit::Closed(command) = answer else {
+                panic!("closed input must return ownership")
+            };
+            assert!(matches!(command.into_op(), MuxOp::Close(found) if found == id));
+        }
     }
 
     struct NotFound;
