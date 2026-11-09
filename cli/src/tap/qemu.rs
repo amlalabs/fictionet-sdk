@@ -73,10 +73,8 @@ fn lock_path(path: &Path) -> Result<OwnedFd, Failure> {
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(lock)
         .map_err(|e| Failure::Error(format!("opening the lock file {}: {e}", lock.display())))?;
-    let fd = OwnedFd::from(file);
-    // SAFETY: plain syscall on an fd we own.
-    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-        let e = io::Error::last_os_error();
+    if let Err(e) = file.try_lock() {
+        let e = io::Error::from(e);
         if e.kind() == io::ErrorKind::WouldBlock {
             return Err(Failure::Error(format!(
                 "another attach is using {} (it holds {})",
@@ -86,7 +84,7 @@ fn lock_path(path: &Path) -> Result<OwnedFd, Failure> {
         }
         return Err(Failure::Error(format!("locking {}: {e}", lock.display())));
     }
-    Ok(fd)
+    Ok(file.into())
 }
 
 /// Removes the socket file when dropped, and tells the signal handler to
@@ -139,6 +137,7 @@ fn listen(path: &Path) -> io::Result<OwnedFd> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: the preceding syscall returned a fresh descriptor, transferred once.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let (addr, len) = unix::address(path).map_err(|_| {
         io::Error::new(
@@ -151,8 +150,10 @@ fn listen(path: &Path) -> io::Result<OwnedFd> {
         // has one thread here.
         // SAFETY: plain syscalls; `addr` is a valid sockaddr_un.
         let old = unsafe { libc::umask(0o177) };
+        // SAFETY: address validated its length and initialized every address byte.
         let r = unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) };
         let e = io::Error::last_os_error();
+        // SAFETY: restoring the process mask takes no pointers.
         unsafe { libc::umask(old) };
         if r < 0 { Err(e) } else { Ok(()) }
     };
@@ -231,8 +232,7 @@ fn accept(listener: &OwnedFd, world: RawFd) -> Result<Option<OwnedFd>, Failure> 
                 revents: 0,
             },
         ];
-        // SAFETY: `fds` is valid for the call.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+        if crate::linux::poll(&mut fds, -1) < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -264,6 +264,7 @@ fn accept(listener: &OwnedFd, world: RawFd) -> Result<Option<OwnedFd>, Failure> 
                 }
                 return Err(Failure::Error(format!("accepting QEMU's connection: {e}")));
             }
+            // SAFETY: the preceding syscall returned a fresh descriptor, transferred once.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             unix::raise_buffers(fd.as_raw_fd());
             return Ok(Some(fd));

@@ -27,7 +27,11 @@ use crate::lifecycle;
 use crate::linux;
 use crate::world::{self, Failure, Greeting, err};
 
+// TAP configuration and the abstract socket lock require Linux syscalls.
+#[allow(unsafe_code)]
 mod device;
+// QEMU needs explicit socket permissions, backlog and nonblocking accept.
+#[allow(unsafe_code)]
 mod qemu;
 
 use device::run_device;
@@ -207,13 +211,7 @@ impl Port {
         match self {
             Port::Stream { outbox, .. } => Ok(outbox.push(&parts)),
             Port::Device { fd, .. } => {
-                let iov = parts.map(|p| libc::iovec {
-                    iov_base: p.as_ptr() as *mut _,
-                    iov_len: p.len(),
-                });
-                // SAFETY: the iovecs point into `parts`, valid for the call.
-                let n =
-                    unsafe { libc::writev(fd.as_raw_fd(), iov.as_ptr(), iov.len() as libc::c_int) };
+                let n = linux::write_packet(fd.as_raw_fd(), parts);
                 if n >= 0 {
                     return Ok(true);
                 }
@@ -298,8 +296,7 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
                 revents: 0,
             },
         ];
-        // SAFETY: `fds` is valid for the call.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
+        if crate::linux::poll(&mut fds, timeout) < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -394,9 +391,7 @@ fn read_vm(
         match port {
             Port::Stream { fd, decoder, .. } => {
                 let spare = decoder.spare();
-                // SAFETY: `spare` is valid for writes of its length.
-                let n =
-                    unsafe { libc::read(fd.as_raw_fd(), spare.as_mut_ptr().cast(), spare.len()) };
+                let n = crate::linux::read(fd.as_raw_fd(), spare);
                 if n < 0 {
                     let e = io::Error::last_os_error();
                     match e.kind() {
@@ -428,8 +423,7 @@ fn read_vm(
                 }
             }
             Port::Device { fd, buf, .. } => {
-                // SAFETY: `buf` is valid for writes of its length.
-                let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                let n = crate::linux::read(fd.as_raw_fd(), buf);
                 if n < 0 {
                     let e = io::Error::last_os_error();
                     match e.kind() {

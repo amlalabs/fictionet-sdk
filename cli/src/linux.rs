@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
 use crate::world::{Failure, context, err};
@@ -31,19 +31,13 @@ const TUN_PATH: &str = "/dev/net/tun";
 /// 1.2.3.
 pub(crate) fn open_tun_file() -> Result<OwnedFd, Failure> {
     let open = || {
-        let path = c"/dev/net/tun";
-        // SAFETY: plain syscall; the fd is owned from here.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(TUN_PATH)
+            .map(OwnedFd::from)
     };
     let blocked = |e: io::Error| {
         Failure::Error(format!(
@@ -101,10 +95,7 @@ fn make_tun_device(fd: OwnedFd) -> io::Result<(OwnedFd, String)> {
     // struct ifreq: a 16-byte name, then a union; flags are a short at 16.
     let mut ifr = [0u8; 40];
     ifr[16..18].copy_from_slice(&(IFF_TUN | IFF_NO_PI).to_ne_bytes());
-    // SAFETY: `ifr` is as large as struct ifreq.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, ifr.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    set_tun_interface(&fd, &mut ifr)?;
     if ifr[0] == 0 {
         // gVisor makes the device but does not write its name back. Ask
         // for it.
@@ -130,4 +121,45 @@ pub(crate) fn index_of(dev: &str) -> io::Result<u32> {
     } else {
         Ok(index)
     }
+}
+
+/// Sets a TUN or TAP interface using the complete Linux ifreq buffer.
+pub(crate) fn set_tun_interface(fd: &OwnedFd, request: &mut [u8; 40]) -> io::Result<()> {
+    // SAFETY: TUNSETIFF copies at most sizeof(ifreq) bytes to and from this
+    // initialized buffer. The descriptor remains owned throughout the call.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF, request.as_mut_ptr()) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Polls exactly the supplied entries, preserving the syscall result and errno.
+pub(crate) fn poll(fds: &mut [libc::pollfd], timeout: i32) -> i32 {
+    // SAFETY: the mutable slice provides initialized storage for every entry;
+    // poll never retains the pointer. Invalid descriptors are reported in revents.
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) }
+}
+
+/// Reads at most the buffer length, preserving the syscall result and errno.
+pub(crate) fn read(fd: std::os::fd::RawFd, buffer: &mut [u8]) -> isize {
+    // SAFETY: the buffer is writable for its entire length for this call.
+    unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) }
+}
+
+/// Writes the supplied bytes, preserving the syscall result and errno.
+pub(crate) fn write(fd: std::os::fd::RawFd, buffer: &[u8]) -> isize {
+    // SAFETY: the buffer is readable for its entire length for this call.
+    unsafe { libc::write(fd, buffer.as_ptr().cast(), buffer.len()) }
+}
+
+/// Writes a header and payload as one packet without copying their bytes.
+pub(crate) fn write_packet(fd: std::os::fd::RawFd, parts: [&[u8]; 2]) -> isize {
+    let iov = parts.map(|part| libc::iovec {
+        iov_base: part.as_ptr() as *mut _,
+        iov_len: part.len(),
+    });
+    // SAFETY: both iovecs borrow readable slices for the duration of writev,
+    // which reads their bytes and does not retain either pointer.
+    unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) }
 }
