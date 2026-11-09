@@ -20,64 +20,6 @@ use fictionet::time::Instant;
 const CHUNK: usize = 16 * 1024;
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 
-#[cfg(test)]
-mod ciphertext_transfer_tests {
-    use super::*;
-    use fictionet::Seed;
-    use fictionet::stdlib::layer::Harness;
-
-    #[test]
-    fn sole_ciphertext_reaches_the_driver_with_its_original_allocation() {
-        struct Inspect(*const u8);
-        impl Write for Inspect {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0 = bytes.as_ptr();
-                Ok(0)
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let config = Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new())),
-        );
-        let mut tls = ServerConnection::new(config.clone()).unwrap();
-        tls.send_close_notify();
-        let mut inspect = Inspect(std::ptr::null());
-        assert_eq!(tls.write_tls(&mut inspect).unwrap(), 0);
-        assert!(!inspect.0.is_null());
-        let queued = tls.sendable_tls_len();
-        let mut layer = TlsLayer::new(config);
-        layer.tls = Some(tls);
-        let mut harness = Harness::new(Seed::from_u64(42), layer);
-        harness.driver().run().unwrap();
-        let budget = harness.driver().budget().clone();
-        let mut output = None;
-        harness.driver().send_below(|command| {
-            let StreamCommand::Write(bytes) = command else {
-                panic!("expected ciphertext")
-            };
-            assert!(output.replace(bytes).is_none());
-            Admit::Taken
-        });
-        let output = output.unwrap();
-        assert_eq!(output.as_ptr(), inspect.0);
-        assert_eq!(output.len(), queued);
-        assert!(output.charged() >= output.len());
-        assert!(!harness.layer().tls.as_ref().unwrap().wants_write());
-        drop(harness);
-        assert_eq!(budget.used(), output.charged());
-        drop(output);
-        assert_eq!(budget.used(), 0);
-    }
-}
-
 /// Appends to a vector up to its capacity, so a TLS write fills exactly the
 /// allocation made for it and never grows it.
 struct Fill<'a>(&'a mut Vec<u8>);
@@ -224,6 +166,10 @@ pub struct TlsLayer {
     completed_plaintext_bytes: u64,
 }
 
+/// An accepted plaintext write, completed upstream once downstream has
+/// completed the ciphertext through `ciphertext_end`. The end is unknown
+/// until rustls has nothing more queued for the write.
+#[derive(Clone, Copy)]
 struct PlaintextCompletion {
     plaintext_bytes: usize,
     ciphertext_end: Option<u64>,
@@ -372,17 +318,14 @@ impl TlsLayer {
     }
 
     fn complete_plaintext_write(&mut self) {
-        if self
-            .plaintext_completion
-            .as_ref()
-            .is_some_and(|completion| {
-                completion
-                    .ciphertext_end
-                    .is_some_and(|end| self.ciphertext_completed >= end)
-            })
+        if let Some(PlaintextCompletion {
+            plaintext_bytes,
+            ciphertext_end: Some(end),
+        }) = self.plaintext_completion
+            && self.ciphertext_completed >= end
         {
-            self.completed_plaintext_bytes +=
-                self.plaintext_completion.take().unwrap().plaintext_bytes as u64;
+            self.completed_plaintext_bytes += plaintext_bytes as u64;
+            self.plaintext_completion = None;
         }
     }
 }
@@ -534,8 +477,9 @@ impl Layer for TlsLayer {
                 Ok(Admit::Taken)
             }
             StreamCommand::Write(mut chunk) => {
-                // One plaintext write owns the ciphertext fence until delivery.
-                // Pipelining needs separate fences and charges for queued writes.
+                // One plaintext write is outstanding until its ciphertext
+                // completes. Pipelining needs a completion record and a
+                // charge for each queued write.
                 if self.is_handshaking()
                     || self.plaintext_completion.is_some()
                     || self.output_pending()
@@ -651,17 +595,22 @@ impl Layer for TlsLayer {
                 return Ok(false);
             }
             let mut charge = self.output_reserve.take().unwrap();
+            // A single whole record that fits the reservation goes down in
+            // the buffer rustls encrypted it into. Anything else is copied
+            // into room for exactly what is to go, up to a chunk: several
+            // records coalesced, the rest of a split record, the rejection,
+            // or the alert, whose size is not known ahead. Either way the
+            // reservation then shrinks to the allocation it covers.
             let owned = if self.reject || self.alert.is_some() {
                 None
             } else {
                 self.tls
                     .as_mut()
                     .unwrap()
-                    .take_sendable_tls_chunk(charge.bytes().min(CHUNK))
+                    .take_sendable_tls_chunk(charge.bytes())
             };
-            let (bytes, n) = if let Some(bytes) = owned {
-                let n = bytes.len();
-                (bytes, n)
+            let bytes = if let Some(bytes) = owned {
+                bytes
             } else {
                 let room = if self.reject {
                     UNRECOGNIZED_NAME.len()
@@ -678,16 +627,16 @@ impl Layer for TlsLayer {
                 } else {
                     self.tls.as_mut().unwrap().write_tls(&mut Fill(&mut bytes))
                 };
-                let n = result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
+                result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
                 bytes.shrink_to_fit();
-                (bytes, n)
+                bytes
             };
             self.reject = false;
-            if n == 0 {
+            if bytes.is_empty() {
                 self.alert = None;
             } else {
                 charge.set(bytes.capacity());
-                self.ciphertext_emitted += n as u64;
+                self.ciphertext_emitted += bytes.len() as u64;
                 self.below = Some(StreamCommand::Write(Chunk::with_charge(bytes, charge)));
             }
             if let Some(completion) = self.plaintext_completion.as_mut()
@@ -815,5 +764,63 @@ impl super::Negotiation for TlsLayer {
                 alpn: self.alpn(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ciphertext_transfer_tests {
+    use super::*;
+    use fictionet::Seed;
+    use fictionet::stdlib::layer::Harness;
+
+    #[test]
+    fn sole_ciphertext_reaches_the_driver_with_its_original_allocation() {
+        struct Inspect(*const u8);
+        impl Write for Inspect {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0 = bytes.as_ptr();
+                Ok(0)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new())),
+        );
+        let mut tls = ServerConnection::new(config.clone()).unwrap();
+        tls.send_close_notify();
+        let mut inspect = Inspect(std::ptr::null());
+        assert_eq!(tls.write_tls(&mut inspect).unwrap(), 0);
+        assert!(!inspect.0.is_null());
+        let queued = tls.sendable_tls_len();
+        let mut layer = TlsLayer::new(config);
+        layer.tls = Some(tls);
+        let mut harness = Harness::new(Seed::from_u64(42), layer);
+        harness.driver().run().unwrap();
+        let budget = harness.driver().budget().clone();
+        let mut output = None;
+        harness.driver().send_below(|command| {
+            let StreamCommand::Write(bytes) = command else {
+                panic!("expected ciphertext")
+            };
+            assert!(output.replace(bytes).is_none());
+            Admit::Taken
+        });
+        let output = output.unwrap();
+        assert_eq!(output.as_ptr(), inspect.0);
+        assert_eq!(output.len(), queued);
+        assert!(output.charged() >= output.len());
+        assert!(!harness.layer().tls.as_ref().unwrap().wants_write());
+        drop(harness);
+        assert_eq!(budget.used(), output.charged());
+        drop(output);
+        assert_eq!(budget.used(), 0);
     }
 }
