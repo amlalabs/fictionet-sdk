@@ -234,6 +234,77 @@ mod grpc_calls {
         assert_eq!(field(block, "grpc-status"), Some(&b"13"[..]));
         assert!(streams[&1].ended);
     }
+
+    /// Takes a call and then no message, as an application that has fallen
+    /// behind.
+    struct Behind;
+
+    impl Layer for Behind {
+        type Lower = Messages<GrpcEvent, GrpcCommand>;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: MessageEvent<GrpcEvent>,
+        ) -> Result<Admit<MessageEvent<GrpcEvent>>, Infallible> {
+            match event {
+                MessageEvent::Message(GrpcEvent::Call(_)) => Ok(Admit::Taken),
+                event => Ok(Admit::Blocked(event)),
+            }
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+
+        fn take_command(&mut self) -> Option<MessageCommand<GrpcCommand>> {
+            None
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// A message longer than the limit is refused at its prefix, even with
+    /// whole messages before it still waiting for the application: the
+    /// call ends with `RESOURCE_EXHAUSTED` instead of holding the body.
+    #[test]
+    fn a_length_over_the_limit_is_refused_while_the_application_is_behind() {
+        let server = Chain::new(
+            Http2::new(httpd::Limits::default()),
+            Children::new(8, Http2::WINDOW, |_, opening, _| {
+                Chain::new(Grpc::new(opening), Behind)
+            }),
+        );
+        let mut harness = Harness::new(Seed::from_u64(1), server).with_worker(Polling::new());
+        let mut input = preface();
+        input.extend(call(1, "application/grpc"));
+        let mut bytes: Vec<u8> = (0..20).flat_map(|_| message("m")).collect();
+        let over = u32::try_from(grpc::MAX_MESSAGE + 1).unwrap();
+        bytes.push(0);
+        bytes.extend(over.to_be_bytes());
+        bytes.extend([0; 1000]);
+        input.extend(data(1, &bytes, false));
+        harness.push(&input).unwrap();
+        let output = frames(&harness.take_output());
+        let streams = per_stream(&output);
+        let [block] = streams[&1].blocks.as_slice() else {
+            panic!("a trailers-only answer: {output:?}");
+        };
+        assert_eq!(field(block, "grpc-status"), Some(&b"8"[..]));
+        assert!(streams[&1].ended);
+    }
 }
 
 mod h2c {
