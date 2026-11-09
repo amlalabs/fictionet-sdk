@@ -5,18 +5,19 @@
 (* what goes up to its child (Observer in src/stdlib/network/observer.rs), *)
 (* until the child has every event and is closed.                          *)
 (*                                                                         *)
-(* Model                 source (lines at the commit that adds this)       *)
-(*   Seg                  Observer::segment 332 -> Flow::push 209           *)
-(*     Deliver            Flow::deliver 441 (capped at the FIN)             *)
-(*     Hold, Drop         push 258-285 (bounded by Limits::segments)        *)
-(*     RecordFin          Flow::record_fin 356                              *)
-(*     Drain              push 293-318 and Flow::drain_first 405            *)
-(*     Mark               push 319-332 (the place of dropped bytes)         *)
-(*     ReachFin           push 336-349                                      *)
+(* Model                 source (lines at f0dceb76f, which adds dropped_to) *)
+(*   Seg                  Observer::segment 332 -> Flow::push 217           *)
+(*     Deliver            Flow::deliver 456 (capped at the FIN)             *)
+(*     Hold, Drop         push 266-299 (bounded by Limits::segments)        *)
+(*     RecordFin          Flow::record_fin 371                              *)
+(*     Drain              push 308-333 and Flow::drain_first 420            *)
+(*     Mark               push 334-347 (the place of dropped bytes)         *)
+(*     ReachFin           push 351-364                                      *)
 (*     Reset              segment 486-501                                   *)
 (*   LetGo                Observer::let_go 565 (Evicted, Replaced)          *)
 (*   MakeRoom             Observer::make_room 617                           *)
-(*   CaptureEnds          Observer::finish 661 and Flow::finish 191         *)
+(*   CaptureEnds          Observer::finish 661 and Flow::finish 199         *)
+(*   Holed                Flow::holed 183; Flow::dropped_to 283-295         *)
 (*   Take, Closed         Observer::take_event 814                          *)
 (*   CloseAbove           on_command, MuxOp::Close 787                      *)
 (*                                                                         *)
@@ -42,7 +43,9 @@ CONSTANTS
   HolesTruncate,    \* the capture's end with a hole is Truncated
   EndOnlyOpen,      \* let_go ends only directions not ended
   EvictEnds,        \* make_room puts an Evicted end in place of what it drops
-  FinishCloses      \* finish closes the child once its events are taken
+  FinishCloses,     \* finish closes the child once its events are taken
+  DroppedHoles,     \* bytes dropped with no room for a marker leave a hole
+  ReplacedHoles     \* so does the tail of a held segment a shorter one replaced
 
 Dirs == {"F", "R"}
 NoFin == N + 1
@@ -50,6 +53,8 @@ Causes == {"Fin", "Reset", "Truncated", "Evicted", "Replaced", "Finalized"}
 
 VARIABLES
   pos,      \* Flow::position
+  dropto,   \* Flow::dropped_to
+  carried,  \* history: the end of the furthest payload the capture carried
   held,     \* Flow::held: records [at, len, data]; data FALSE is a marker
   fin,      \* Flow::fin, NoFin when none was seen
   ended,    \* Connection::ended
@@ -62,18 +67,20 @@ VARIABLES
   sent,     \* packets the observer put on the wire
   above     \* the layer above closed the child
 
-vars == <<pos, held, fin, ended, pending, closing, log, closed, detached,
-          finished, sent, above>>
+vars == <<pos, dropto, carried, held, fin, ended, pending, closing, log,
+          closed, detached, finished, sent, above>>
 
 Data(d, from, to) == [k |-> "data", d |-> d, from |-> from, to |-> to]
 Gap(d, from, to) == [k |-> "gap", d |-> d, from |-> from, to |-> to]
 \* `holed` is bookkeeping of the model: the capture ended with bytes of the
-\* direction known to be missing.
+\* direction known to be missing (KnownMissing, from what the capture
+\* carried, not from what the flow kept).
 End(d, c) == [k |-> "end", d |-> d, cause |-> c, holed |-> FALSE]
 OtherDir(d) == IF d = "F" THEN "R" ELSE "F"
 
 Init ==
   /\ pos = [d \in Dirs |-> 0] /\ held = [d \in Dirs |-> {}]
+  /\ dropto = [d \in Dirs |-> 0] /\ carried = [d \in Dirs |-> 0]
   /\ fin = [d \in Dirs |-> NoFin] /\ ended = [d \in Dirs |-> FALSE]
   /\ pending = << >> /\ closing = FALSE
   /\ log = [d \in Dirs |-> << >>] /\ closed = 0
@@ -145,6 +152,13 @@ Push(d, s, len, hasFin) ==
                                             \cup {[at |-> s, len |-> len, data |-> TRUE]}]
              ELSE st0
       overflow == len > 0 /\ ~inOrder /\ ~late /\ ~room
+      \* dropped_to: the end of the furthest bytes dropped, or of a held
+      \* segment a new one at its place replaced.
+      replaced == {r \in st0.held : r.at = s}
+      lost == IF len > 0 /\ ~inOrder /\ ~late /\ room /\ replaced # {}
+              THEN IF ReplacedHoles THEN s + (CHOOSE r \in replaced : TRUE).len ELSE 0
+              ELSE IF overflow /\ DroppedHoles THEN s + len ELSE 0
+      dto == IF lost > dropto[d] THEN lost ELSE dropto[d]
       \* record_fin: a FIN at s + len, not behind the position, the first.
       fat == s + len
       st2 == IF hasFin /\ fat >= st1.pos /\ st1.fin = NoFin
@@ -159,13 +173,18 @@ Push(d, s, len, hasFin) ==
              ELSE st3
       \* With FinInOrder FALSE, a FIN ends the direction when it is seen.
       reached == IF FinInOrder THEN st4.fin = st4.pos ELSE st4.fin # NoFin
-  IN [st |-> st4, fin |-> reached]
+  IN [st |-> st4, fin |-> reached, dto |-> dto]
 
 -----------------------------------------------------------------------------
 \* Queue events for the child while it is attached.
 Queue(evs) == IF detached THEN pending ELSE pending \o evs
 
-Holed(d) == held[d] # {} \/ (fin[d] # NoFin /\ fin[d] > pos[d])
+\* Flow::holed.
+Holed(d) == held[d] # {} \/ dropto[d] > pos[d] \/ (fin[d] # NoFin /\ fin[d] > pos[d])
+
+\* What the capture showed, whatever the flow kept: bytes it carried past
+\* what came up, or a FIN past it.
+KnownMissing(d) == carried[d] > pos[d] \/ (fin[d] # NoFin /\ fin[d] > pos[d])
 
 \* A captured segment in direction d: payload [s, s+len), perhaps a FIN
 \* after it (only the sender's own FIN, at N), perhaps a RST.
@@ -181,7 +200,7 @@ Seg(d, s, len, hasFin, rst) ==
              /\ held' = IF rst THEN [x \in Dirs |-> {}] ELSE held
              /\ pending' = Queue(evs)
              /\ closing' = (closing \/ (~detached /\ ended' = [x \in Dirs |-> TRUE]))
-             /\ UNCHANGED <<pos, fin>>
+             /\ UNCHANGED <<pos, dropto, carried, fin>>
      ELSE
        LET p == Push(d, s, len, hasFin)
            evs1 == p.st.out \o (IF p.fin THEN << End(d, "Fin") >> ELSE << >>)
@@ -191,6 +210,8 @@ Seg(d, s, len, hasFin, rst) ==
                      ELSE << >>
            e2 == IF rst THEN [x \in Dirs |-> TRUE] ELSE e1
        IN /\ pos' = [pos EXCEPT ![d] = p.st.pos]
+          /\ dropto' = [dropto EXCEPT ![d] = p.dto]
+          /\ carried' = [carried EXCEPT ![d] = IF len > 0 /\ s + len > @ THEN s + len ELSE @]
           /\ fin' = [fin EXCEPT ![d] = p.st.fin]
           /\ held' = [x \in Dirs |-> IF e2[x] THEN {}
                                      ELSE IF x = d THEN p.st.held ELSE held[x]]
@@ -204,7 +225,7 @@ Seg(d, s, len, hasFin, rst) ==
 Acknowledge ==
   /\ ~Passive /\ \E d \in Dirs : pos[d] > 0
   /\ sent' = sent + 1
-  /\ UNCHANGED <<pos, held, fin, ended, pending, closing, log, closed, detached, finished, above>>
+  /\ UNCHANGED <<pos, dropto, carried, held, fin, ended, pending, closing, log, closed, detached, finished, above>>
 
 \* let_go: the connection is evicted for the connection bound, or replaced
 \* by a new SYN on its endpoints.
@@ -215,7 +236,7 @@ LetGo(cause) ==
      IN /\ pending' = pending \o evs
   /\ ended' = [x \in Dirs |-> TRUE] /\ held' = [x \in Dirs |-> {}]
   /\ closing' = TRUE /\ detached' = TRUE
-  /\ UNCHANGED <<pos, fin, log, closed, finished, sent, above>>
+  /\ UNCHANGED <<pos, dropto, carried, fin, log, closed, finished, sent, above>>
 
 Delivered(d) == \E i \in 1..Len(log[d]) : log[d][i].k = "end"
 
@@ -229,7 +250,7 @@ MakeRoom ==
                   ELSE << >>
   /\ ended' = [x \in Dirs |-> TRUE] /\ held' = [x \in Dirs |-> {}]
   /\ closing' = TRUE /\ detached' = TRUE
-  /\ UNCHANGED <<pos, fin, log, closed, finished, sent, above>>
+  /\ UNCHANGED <<pos, dropto, carried, fin, log, closed, finished, sent, above>>
 
 \* finish for one direction: held bytes past their holes, then the end.
 RECURSIVE FinishDrain(_, _)
@@ -245,7 +266,7 @@ FinishDir(d) ==
   IF ended[d] THEN << >>
   ELSE LET st == FinishDrain([d |-> d, pos |-> pos[d], held |-> held[d],
                               fin |-> fin[d], out |-> << >>], SegLimit + 1)
-       IN st.out \o << [k |-> "end", d |-> d, holed |-> Holed(d),
+       IN st.out \o << [k |-> "end", d |-> d, holed |-> KnownMissing(d),
                        cause |-> IF Holed(d) /\ HolesTruncate THEN "Truncated"
                                  ELSE "Finalized"] >>
 
@@ -256,26 +277,26 @@ CaptureEnds ==
      ELSE /\ pending' = pending \o FinishDir("F") \o FinishDir("R")
           /\ ended' = [x \in Dirs |-> TRUE] /\ held' = [x \in Dirs |-> {}]
           /\ closing' = FinishCloses
-  /\ UNCHANGED <<pos, fin, log, closed, detached, sent, above>>
+  /\ UNCHANGED <<pos, dropto, carried, fin, log, closed, detached, sent, above>>
 
 \* The child takes the next event; Closed goes up once nothing waits.
 Take ==
   /\ closed = 0 /\ pending # << >>
   /\ log' = [log EXCEPT ![Head(pending).d] = Append(@, Head(pending))]
   /\ pending' = Tail(pending)
-  /\ UNCHANGED <<pos, held, fin, ended, closing, closed, detached, finished, sent, above>>
+  /\ UNCHANGED <<pos, dropto, carried, held, fin, ended, closing, closed, detached, finished, sent, above>>
 
 Closed ==
   /\ closed = 0 /\ closing /\ pending = << >>
   /\ closed' = 1
-  /\ UNCHANGED <<pos, held, fin, ended, pending, closing, log, detached, finished, sent, above>>
+  /\ UNCHANGED <<pos, dropto, carried, held, fin, ended, pending, closing, log, detached, finished, sent, above>>
 
 \* The layer above closes the child: it gets nothing more.
 CloseAbove ==
   /\ closed = 0 /\ ~detached
   /\ closed' = 1 /\ pending' = << >> /\ detached' = TRUE /\ above' = TRUE
   /\ ended' = [x \in Dirs |-> TRUE] /\ held' = [x \in Dirs |-> {}]
-  /\ UNCHANGED <<pos, fin, closing, log, finished, sent>>
+  /\ UNCHANGED <<pos, dropto, carried, fin, closing, log, finished, sent>>
 
 Next ==
   \/ \E d \in Dirs, s \in 0..(N - 1), len \in 0..MaxLen, f \in BOOLEAN, r \in BOOLEAN :
@@ -317,9 +338,9 @@ FinIsReached ==
         => /\ i > 1 /\ log[d][i - 1].k # "end" /\ log[d][i - 1].to = N
 
 \* A capture that ends before a direction's FIN was reached never ends it
-\* clean, and one that ends with bytes of it known to be missing (a hole
-\* before held bytes, or before a FIN seen) says Truncated, not
-\* Finalized.
+\* clean, and one that ends with bytes of it known to be missing (bytes the
+\* capture carried that never came up, or a FIN seen and not reached) says
+\* Truncated, not Finalized.
 CutShortIncomplete ==
   \A d \in Dirs :
     \A i \in 1..Len(log[d]) :
