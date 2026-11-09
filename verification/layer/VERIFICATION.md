@@ -219,7 +219,7 @@ to its limit before the first child. Its queues are charged from its first
 step; child places grow geometrically up to the limit, charged before they
 grow, and go once no child is left (`make_room`, `release_places`); each
 inbox grows on demand up to its bound, charged before it grows. A child
-whose place or inbox growth the budget refuses is closed and reported
+whose place, inbox growth or payload reservation the budget refuses is closed and reported
 `Refused`, as one past the limit is, instead of failing the connection.
 The model gains `BudgetRefuses`: `Opened` may refuse a child below the
 limit, and `MuxSend` may close a live child instead of queuing its event.
@@ -681,3 +681,26 @@ The isolation run completed in 1 hour 32 minutes, including its final
 temporal check. No configuration or property was weakened for this run.
 All Cargo, Kani and TLC invocations used the 10 GiB scope with swap disabled;
 Cargo used four build jobs and the dedicated world-composition target.
+
+
+## Scoped output and retained receive credit
+
+On November 9, 2026, `Route_base` passed with 1,058,166 distinct states and
+`Route_urgent` passed with 10. `Route_without_urgent` produced its expected
+`UrgentProgress` counterexample. Chain now extracts a waiting urgent event
+before ordinary output even when its ordinary slot is empty. The urgent
+projection already permits that extraction; Rust additionally tests simultaneous
+written credit and reset delivery before a lower-layer error is returned.
+
+The child budget, stalled budget and isolation configurations passed with
+699,144, 127,444 and 543,490 distinct states. `Children_without_isolate`
+produced its expected `ConnectionProgress` counterexample. Payload reservation
+failure and an absent application now follow the model's child refusal path.
+
+The new `a_shared_chunk_edit_preserves_ownership_and_budget` Kani harness
+passed 1,207 checks. It keeps the four symbolic payload bytes and exercises both
+copy reservation outcomes, sibling immutability and final charge release.
+Receive credit across original and edited backing is covered by the Rust child
+routing regression; the byte-copy harness does not model the receive-credit
+callback. All these runs used a 10 GiB systemd scope without swap, six Cargo
+build jobs, and, for TLC, two workers with a 2 GiB Java heap.

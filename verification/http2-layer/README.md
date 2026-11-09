@@ -324,3 +324,12 @@ practice.
 - `Children`'s own guarantees (slots, generations, credit and inbox
   bounds, urgent completion, work cancellation) are `verification/layer`;
   here they are assumed as `Children` states them.
+
+`Http2::on_command` returns `Admit::Closed(command)` after closing begins,
+so the caller retains ownership of rejected output. `Lifecycle` models
+commands only while the connection is open and does not distinguish the
+admission return variants. The Rust regression offers commands in both
+closing and closed phases and checks ownership is returned intact.
+
+The unchanged `Lifecycle` baseline was rerun on November 9, 2026 and passed all
+configured invariants and liveness properties with 4,011,621 distinct states.

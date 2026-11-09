@@ -15,10 +15,12 @@ the property TLC must then violate. `Children_large_command.cfg`,
 
 `Children::budgets` may select a separate budget per child before its receive
 window and application are allocated. The existing nondeterministic
-`BudgetRefuses` abstraction covers refusal by either that budget or the
-parent's routing budget. It does not prove budget-selector purity or model
-byte arithmetic; the Rust child-budget test checks allocation order and
-independent sibling admission.
+`BudgetRefuses` abstraction covers refusal of a child by its selected budget,
+its payload reservation or its factory. Failure to reserve the parent's fixed
+routing storage still ends the router and is outside this child model. It
+does not prove budget-selector purity or model byte arithmetic; the Rust
+child-budget tests check allocation order, payload refusal, factory refusal,
+reservation release and independent sibling admission.
 
 | Config | Checks |
 | --- | --- |
@@ -35,7 +37,7 @@ independent sibling admission.
 | `Children_base.cfg` | `NoStaleDelivery`, `EventCredit`, `MuxEventCredit`, `CommandCredit`, `SendsLeaveReserve`, with two children at once |
 | `Children_refuse_base.cfg` | the same but `MuxEventCredit`, with a limit of one child (so `Opened` is refused) and a mux that may send past credit |
 | `Children_stalled_base.cfg` | the invariants and `ControlProgress`, with children that never read |
-| `Children_budget.cfg` | the base invariants with `BudgetRefuses`: the budget may refuse a child's place at `Opened` or its inbox's growth at `MuxSend`, closing that child |
+| `Children_budget.cfg` | the base invariants with `BudgetRefuses`: the budget may refuse a child's place at `Opened` or its inbox or payload reservation at `MuxSend`, closing that child |
 | `Children_budget_stalled.cfg` | the stalled configuration with `BudgetRefuses` |
 | `Children_refuse_full.cfg` | with `Overload`: a child that never reads, and its successor in the same slot, each refused and closed when its place is full instead of holding up the mux; the readiness invariants, `MuxNeverHeld` and `CancelledWorkLeaves` |
 | `Children_commands_base.cfg` | `CommandsGo` when every command fits the mux's window |
@@ -95,3 +97,21 @@ With `close_finished` enabled, application completion in `Children::visit_child`
 cancellation path as failure. The abstract `MayFail` close includes completion;
 Rust additionally waits for the child outbox to drain. A transport close is
 a request to release that child handle, not proof that a TCP socket retired.
+
+`Chunk::make_mut` reuses unique charged backing and reserves before copying a
+shared view. Its receive-credit token is shared by all edited and original
+pieces, so copying cannot release receive credit early. The Kani harness
+`a_shared_chunk_edit_preserves_ownership_and_budget` checks a symbolic four-byte
+payload, both sufficient and insufficient budgets, sibling immutability and
+final charge release. Child routing tests also check credit return exactly once
+after every edited piece is released. `Layer::take_command` now receives the
+same scoped `Env` as admission; the proof harnesses extract through `Driver`.
+
+On November 9, 2026 the child budget, stalled budget and isolation
+configurations passed with 699,144, 127,444 and 543,490 distinct states.
+The isolation control failed `ConnectionProgress`: a refused child event
+kept the mux from delivering its waiting connection control message.
+
+The November 9 Kani rerun completed all nine selected ownership, cursor,
+charge and slot harnesses, including the new shared-edit property; the
+interrupted TLS accounting harnesses are tracked in the TLS verification area.

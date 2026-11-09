@@ -262,7 +262,7 @@ old `settle` sent first; the model's round follows the new order.
 | `SettleRound` | one `run_datagrams` round: offer held input, call `Driver::run`, then `send_below` |
 | `Drain` | the `send_below` sink: send complete datagrams, accept End, refuse later output |
 | `AfterSettle` | return on End or on a closed socket only after settling; otherwise yield and continue |
-| `Wait` | receive only with no held input; wake for the next layer deadline |
+| `Wait` | receive only with no held input; drop a refused backing reservation and continue; wake for the next layer deadline |
 | `Arrive`, `Close`, `Tick` | the environment |
 
 The stack has the shape of `TimeServer`: at most one reply per datagram it
@@ -271,26 +271,29 @@ that sends one datagram when it fires (and may hold input refused until
 then), a choice to close the socket itself with one more datagram queued
 after the End, and a backlog of three replies it sends one per step after
 the socket closes. It asks for no work, so `jobs` stay empty. Three
-datagrams arrive; `Fair` is 2.
+datagrams arrive; `Fair` is 2. Each receive may fail its backing reservation;
+that input joins `dropped`, and the same conversation continues.
 
 Properties: `InOrderOnce` (one conversation took every datagram the socket
-got, in order, each once, besides the one held and those queued);
+got, in order, each once, besides budget drops, the one held and those queued);
 `SentInOrder` (each datagram the stack hands down goes out at once, once,
 in order); `NothingAfterEnd`; `CloseFlushes` (when the socket closes the
 stack hears `Ended` and sends all it has before the runner returns);
 `TimerFires` (a timer goes off with no datagram coming); `CloseEnds` (a
-closed socket ends the run).
+closed socket ends the run); `ReturnHasReason` (only an application end or
+socket close returns from the conversation).
 
 | Config | Rule turned off | Generated | Distinct | Result |
 | --- | --- | ---: | ---: | --- |
-| `DatagramRunner_base.cfg` | none | 32,196 | 5,787 | every property holds |
-| `_without_receiveonlywhentaken` | receive while a datagram is held | 4,136 | 828 | `InOrderOnce` violated |
-| `_without_oneconversation` | a fresh stack per datagram | 1,362 | 282 | `InOrderOnce` violated |
-| `_without_sendeachdatagram` | a send taken without `send_to` | 53 | 32 | `SentInOrder` violated |
-| `_without_endclosesoutput` | output after End still sent | 198 | 58 | `NothingAfterEnd` violated |
-| `_without_settlebeforeclose` | returning before settling | 488 | 113 | `CloseFlushes` violated |
-| `_without_deadlineinwait` | the wait ignores the stack's deadline | 25,674 | 4,957 | `TimerFires` violated |
-| `_without_returnonclose` | no return on a closed socket | 33,678 | 6,053 | `CloseEnds` violated |
+| `DatagramRunner_base.cfg` | none | 56,180 | 9,828 | every property holds |
+| `_without_receiveonlywhentaken` | receive while a datagram is held | 6,038 | 1,198 | `InOrderOnce` violated |
+| `_without_oneconversation` | a fresh stack per datagram | 1,593 | 322 | `InOrderOnce` violated |
+| `_without_sendeachdatagram` | a send taken without `send_to` | 64 | 28 | `SentInOrder` violated |
+| `_without_endclosesoutput` | output after End still sent | 179 | 48 | `NothingAfterEnd` violated |
+| `_without_settlebeforeclose` | returning before settling | 1,164 | 221 | `CloseFlushes` violated |
+| `_without_deadlineinwait` | the wait ignores the stack's deadline | 46,426 | 8,650 | `TimerFires` violated |
+| `_without_returnonclose` | no return on a closed socket | 58,988 | 10,332 | `CloseEnds` violated |
+| `_without_droponbudgetmiss` | a budget miss returns while the socket is open | 87 | 22 | `ReturnHasReason` violated |
 
 What it leaves out: datagram contents and addresses (each datagram is its
 number; that answers go to the address the stack names is a Kani property
@@ -298,10 +301,12 @@ of the time server below), the socket dropping datagrams it cannot queue,
 the stack's work, and cancellation. The runner now takes an explicit
 budget and charges the full capacity of each transport-owned receive
 allocation before retaining it; socket allocations themselves remain the
-transport's responsibility. This memory boundary is exercised by
-`datagram_input_requires_its_backing_capacity_in_the_budget`, not modeled
-by the datagram numbers here. Work is polled even while continuous output
-prevents settling; `a_productive_datagram_layer_does_not_starve_its_pending_work`
+transport's responsibility. The model covers the refusal decision, not
+byte arithmetic or reporting. The Rust test
+`an_oversized_datagram_is_dropped_without_ending_the_conversation` checks
+full-capacity charging, a drop report, subsequent delivery to the same
+conversation, independent peers, and release of every charge. Work is polled
+even while continuous output prevents settling; `a_productive_datagram_layer_does_not_starve_its_pending_work`
 checks this in bounded visits. Results go directly to the driver rather
 than through an additional completion vector.
 
@@ -364,7 +369,7 @@ real `Stream`, `Buffer`, `Budget`, `Charge`, `Chunk` and `Driver`.
 | `the_buffer_is_charged_before_bytes_are_taken_A_B`, 9 harnesses, `A`, `B` in 1..3 | two pushes of `A` and `B` bytes of any value, with up to two items taken between: after each, `Framed`'s charge covers the decoder's input storage and held state and is all the budget holds; what a push hands back (`Partial`, `Blocked`) is exactly the bytes it did not take | all 9 verified, 39 to 72 s each |
 | `every_charge_comes_back_*`, 10 harnesses | under budgets of 0, 6, 8, 13 and 14 bytes: two bytes from the peer and a value from above, either of which the budget may refuse, then two steps in ten orders (end, reset, end from above, taken event, taken write, its delivery): a refusal takes no byte; the budget holds exactly what `Framed` and the chunk in flight are charged, never past its limit; a written value is charged at least its length; nothing is left once they are dropped | all 10 verified, 2 to 9 s each |
 | `units_come_up_in_order_and_the_rest_is_handed_back_odd_first_cut_3` | a three-byte unit (payload any) and a one-byte one in two pushes, then the end: each comes up once, in order, then `Ended` | verified, 3 s |
-| `a_decoder_failure_comes_up_once_then_ended` | against any steps of `Steps`, through any three of input, end, reset and taken events and three more taken events: no item after a failure; a failure comes up once with `Ended` right after; nothing after `Ended`; once either came up, input is over, and input offered after its end is refused as `Closed` and changes nothing | verified, 362 s |
+| `a_decoder_failure_comes_up_once_then_ended_first_*`, 7 harnesses | against any steps of `Steps`, through any three of input, end, reset and taken events and three more taken events: no item after a failure; a failure comes up once with `Ended` right after; nothing after `Ended`; once either came up, input is over, and input offered after its end is refused as `Closed` and changes nothing | all 7 verified under 10 GiB; exact cases below |
 
 Before Bug 1's fix, the charge harnesses fail (see the mutations below).
 
@@ -373,6 +378,44 @@ On the merged foundation all 21 were rerun in one `cargo kani -p fictionet
 harnesses in 47 to 80 s each, the ten `every_charge_comes_back_*` in 4 to
 16 s, the ordering harness in 5 s and the decoder-failure harness in
 303 s.
+
+On November 9, 2026 the combined decoder-failure harness exceeded the
+10 GiB scope limit with both MiniSat and CaDiCaL; neither attempt produced
+a proof result. Its input-first partition also exceeded that limit with
+CaDiCaL. The current seven cases call one shared helper: first actions end,
+reset and take, and first input followed by each possible second action.
+Input, end and reset correspond to selector values zero, one and two;
+the take case represents every other value, whose numeric value is never
+otherwise used. Third actions, decoder steps and payloads remain unconstrained,
+as does the second action whenever the first action is not input. The three
+actions, three drains, every assertion and the unwind bound of seven are
+unchanged. The seven cases together cover exactly the original harness.
+
+All seven cases verified with CaDiCaL, one verifier per 10 GiB scope, no
+swap and `-j 1`. Each row names the suffix after
+`a_decoder_failure_comes_up_once_then_ended_first_`; the counts include
+unreachable checks. Times are wall times on a machine shared with other
+verification work.
+
+| Suffix | Checks | Unreachable | Seconds |
+| --- | ---: | ---: | ---: |
+| `end` | 2,374 | 47 | 3.00 |
+| `reset` | 2,377 | 39 | 18.25 |
+| `take` | 2,382 | 25 | 414.20 |
+| `input_then_input` | 2,379 | 27 | 149.92 |
+| `input_then_end` | 2,379 | 25 | 115.85 |
+| `input_then_reset` | 2,378 | 32 | 25.20 |
+| `input_then_take` | 2,381 | 23 | 2,205.13 |
+
+The decoder filter in the README selects exactly these seven cases. Each
+case was run separately with this command, replacing the final harness name
+with its full name:
+
+```sh
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 env CARGO_BUILD_JOBS=6 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-reviewfix cargo kani -p fictionet --output-format terse -Z stubbing -j 1 --harness a_decoder_failure_comes_up_once_then_ended_first_input_then_take
+```
+
+No case was omitted after a resource failure.
 
 Each harness fails when the rule it checks is broken. These manual
 mutations of `framed.rs` were applied one at a time, the named harness
@@ -392,7 +435,9 @@ harness (one harness per length), as are the budget limits and the order
 of operations in the charge harnesses, because leaving those to the
 solver ran out of
 10 GiB; the byte values and the decoder's steps are the solver's, and so
-are the operations of the decoder-failure harness. The ordering harness
+are the third operations of the decoder-failure cases and the second ones
+when the first is not input; the exhaustive partitions collectively cover
+every original selector. The ordering harness
 covers only cuts at which each push is
 taken whole: offering the bytes a push handed back again ran out of
 10 GiB. That a handed-back suffix is exact is proved above; that the
@@ -547,3 +592,15 @@ both sides of this peak bound and retention after the server is dropped.
 `the_time_server_reserves_reply_memory_before_reading_the_clock` proves
 that every budget below the header-only peak rejects before consulting
 the clock and leaves no reply or reservation.
+
+
+On November 9, 2026 the stream baseline completed with 27,865,057 generated
+and 185,569 distinct states. All ten negative controls violated their intended
+invariant or temporal property. The half-close configuration has the same
+specification and constants and only a subset of the baseline's properties;
+its obligations were checked by that baseline, without a duplicate run.
+The model does not represent reports emitted during command extraction.
+Seven Rust regressions failed with the old drain order and passed after both
+runners drained those reports before returning. The final worker-storage
+backpressure change passed its targeted Rust tests; formal reruns stopped at
+the user's request before that change.

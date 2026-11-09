@@ -173,3 +173,14 @@ The tests, which include a randomized check of the stream rules
 ```sh
 cargo test -p fictionet --lib -- network::observer::
 ```
+
+Each observer child keeps the key of its connection. Closing or evicting a
+child looks that key up directly and detaches it only when the connection
+still names the same child generation; a delayed close cannot detach a
+replacement using the same endpoints. This index is outside the
+single-connection model. The Rust tests cover closing an active child and
+closing a replaced child while its successor continues delivering bytes.
+
+The unchanged observer baseline was rerun on November 9, 2026 and passed with
+296,466 distinct states. Direct connection lookup does not change the modeled
+single-connection transitions.
