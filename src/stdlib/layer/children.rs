@@ -1,4 +1,4 @@
-use super::carrier::CreditReturn;
+use super::carrier::CreditLease;
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -985,7 +985,7 @@ where
                         }
                         kid.granted -= cost;
                         let retained = if cost > 0 {
-                            event.retain_credit(CreditReturn::new(kid.wake.clone(), cost))
+                            event.retain_credit(CreditLease::new(kid.wake.clone(), cost))
                         } else {
                             false
                         };
