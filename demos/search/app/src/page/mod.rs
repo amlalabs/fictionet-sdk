@@ -590,11 +590,6 @@ impl Page {
         let source = self.world.borrow().source;
         self.refresh(pages, source, Session::Running);
     }
-    /// A session in `source` started on the workstation already running:
-    /// its console and world stay.
-    pub fn switch_session(&self, pages: &Pages, source: Source) {
-        self.refresh(pages, source, Session::Running);
-    }
     /// The session's workstation failed to start: its console and world
     /// leave the page, and the modes can be chosen again.
     pub fn fail_session(&self, pages: &Pages) {

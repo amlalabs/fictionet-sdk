@@ -112,25 +112,19 @@ async fn main() -> Result {
     page.serve_commands(pages.clone(), commands, sessions);
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    // Each session runs until another mode is chosen. A mode on the same
-    // clock that can use the names the world already answers starts its
-    // session in the running world, on the same workstation; any other
-    // boots a fresh workstation, with a world that starts empty.
+    // Each mode starts with a fresh workstation and an empty world.
     let result = loop {
-        let mut source = *chosen.borrow_and_update();
+        let source = *chosen.borrow_and_update();
         let copied_lag = pages.measure_lag();
-        let lag = clock_lag(source, copied_lag);
         page.begin_session(&pages, source);
         println!("Starting the {source:?} session");
         let console_slot = Arc::new(std::sync::Mutex::new(None));
         let console = console_slot.clone();
-        let cx_slot = Arc::new(std::sync::Mutex::new(None));
-        let (world_page, world_pages, world_token, world_roots, world_cx) = (
+        let (world_page, world_pages, world_token, world_roots) = (
             page.clone(),
             pages.clone(),
             claude_token.clone(),
             roots.clone(),
-            cx_slot.clone(),
         );
         let boot = kit::boot(
             "search",
@@ -148,7 +142,6 @@ async fn main() -> Result {
                     .start_session(&cx, source, copied_lag)
                     .map_err(|error| fictionet::Error::msg(format!("{error:?}")))?;
                 world_page.attach_world(&cx, world_pages.clone());
-                *world_cx.lock().unwrap() = Some(cx.clone());
                 let web = World {
                     ca: Arc::new(Ca::new(&cx, &world_roots, earliest, start)?),
                     pages: world_pages,
@@ -180,25 +173,7 @@ async fn main() -> Result {
                             Ok(()) => { ready = true; page.end_boot(); println!("The Search page stays open until Ctrl-C."); },
                             Err(error) => break Ok(Ended::Failed(error)),
                         },
-                        Ok(()) = chosen.changed() => {
-                            let next = *chosen.borrow_and_update();
-                            let next_lag = pages.measure_lag();
-                            let cx = cx_slot.lock().unwrap().clone();
-                            let Some(cx) = cx.filter(|_| {
-                                clock_lag(next, next_lag) == lag && keeps_names(source, next)
-                            }) else {
-                                break Ok(Ended::Chosen);
-                            };
-                            if let Err(error) = pages.start_session(&cx, next, next_lag) {
-                                break Ok(Ended::Failed(std::io::Error::other(format!("{error:?}"))));
-                            }
-                            if let Err(error) = network::report_run(&pages, &cx) {
-                                break Ok(Ended::Failed(std::io::Error::other(error.to_string())));
-                            }
-                            source = next;
-                            page.switch_session(&pages, source);
-                            println!("Switched the running workstation to the {source:?} session");
-                        }
+                        Ok(()) = chosen.changed() => break Ok(Ended::Chosen),
                         result = &mut observation_task => break Err(recording_error(result)),
                         _ = interrupt.recv() => break Ok(Ended::Stopping),
                         _ = terminate.recv() => break Ok(Ended::Stopping),
@@ -243,28 +218,6 @@ async fn main() -> Result {
     println!("whole run: {} ms", total.elapsed().as_millis());
     result?;
     Ok(())
-}
-
-/// How far a session in `source` sets the workstation's clock back:
-/// Copied's lag, and none for the live modes.
-fn clock_lag(source: Source, copied_lag: Option<std::time::Duration>) -> std::time::Duration {
-    if source == Source::Copied {
-        copied_lag.unwrap_or_default()
-    } else {
-        std::time::Duration::ZERO
-    }
-}
-
-/// Whether a session in `next` can use the names the world answered in
-/// `source`: the world keeps every name it has resolved. Live and Edited
-/// answer every real name, and Copied always the same captured ones;
-/// Live-Depth's names start from its searches, so it starts a new world.
-fn keeps_names(source: Source, next: Source) -> bool {
-    match next {
-        Source::Live | Source::Edited => true,
-        Source::Copied => source == Source::Copied,
-        Source::LiveDepth => false,
-    }
 }
 
 fn recording_error(

@@ -58,12 +58,9 @@ this workstation. The terminal uses ghostty-web and a persistent tmux session;
 Screen shows Firefox. Terminal text starts at 15 px on a dark background in both
 page themes, using the bundled JetBrains Mono font. The page source switch stays
 visible. Choosing Copied, Live, Live-Depth or Edited starts a new session, with
-a new run record and an empty activity view. Live and Edited, from
-any mode but Copied, keep the running workstation and world, and so does
-Copied again on the same day. Switching into Live-Depth, or into or out of
-Copied, boots the workstation again from the prepared image on that mode's
-clock, so the world starts with no names, and the terminal opens once the clock
-is set.
+a new run record and an empty activity view. Every mode switch boots a fresh
+workstation from the prepared image on that mode's clock. The world starts
+with no names, and the terminal opens with a fresh session once the clock is set.
 
 On the workstation, a before-and-after run reached full readiness in 63.384 s
 with boot-time installation and 7.213 s with the prepared image. Desktop readiness
