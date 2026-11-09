@@ -29,6 +29,10 @@ pub struct HttpExchange;
 impl Port for HttpExchange {
     type Event = ExchangeEvent;
     type Command = ExchangeCommand;
+
+    fn urgent(event: &ExchangeEvent) -> bool {
+        matches!(event, ExchangeEvent::Written(_))
+    }
 }
 
 /// What opens an exchange: the request's head, as the connection read and
@@ -132,10 +136,6 @@ impl Credited for ExchangeEvent {
 
     fn terminal_reset(&self) -> bool {
         matches!(self, ExchangeEvent::Closed { .. })
-    }
-
-    fn urgent(&self) -> bool {
-        matches!(self, ExchangeEvent::Written(_))
     }
 }
 

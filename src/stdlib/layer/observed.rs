@@ -204,7 +204,7 @@ mod tests {
         // A reset does not discard what was observed before it, and no
         // end goes past data that is waiting.
         assert!(!end.terminal_reset());
-        assert!(!end.urgent());
+        assert!(!ObservedStream::urgent(&end));
         assert_eq!(end.credit(), 0);
         assert_eq!(end.direction(), Direction::Reverse);
     }

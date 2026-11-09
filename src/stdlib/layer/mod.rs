@@ -245,6 +245,15 @@ pub trait Port {
     type Event;
     /// What the upper side gives the lower side.
     type Command;
+
+    /// Whether `event` may pass input the receiver refused: a byte stream's
+    /// write completion and its reset. Whoever holds a refused event
+    /// ([`Chain`], [`Switch`], [`Children`]) lets these by, so a layer that
+    /// waits for its writes to complete before it reads more never waits
+    /// for ever. An end of input never passes the data before it.
+    fn urgent(_event: &Self::Event) -> bool {
+        false
+    }
 }
 
 /// The events of port `P`.
