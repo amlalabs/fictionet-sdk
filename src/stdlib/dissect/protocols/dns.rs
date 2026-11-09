@@ -7,10 +7,14 @@ use std::fmt::Write;
 
 /// DNS capture messages, either one UDP datagram or length-prefixed TCP.
 /// Oversized TCP messages emit their length header, then skip the payload.
+/// Past missing bytes, a TCP direction is not read again: only the length
+/// before each message marks where it starts.
 pub struct Dns {
     tcp: bool,
     taken: bool,
     skip: usize,
+    /// Bytes went missing in this TCP direction.
+    lost: bool,
 }
 impl Dns {
     /// Registers `dns` when either port is 53, on UDP or TCP.
@@ -41,6 +45,7 @@ impl Dns {
             tcp,
             taken: false,
             skip: 0,
+            lost: false,
         }
     }
 }
@@ -52,6 +57,9 @@ impl Decode for Dns {
         if self.tcp { MAX_BUFFER } else { 65_536 }
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Display>, Infallible> {
+        if self.lost {
+            return Ok(Step::End);
+        }
         if self.skip != 0 {
             let n = self.skip.min(input.len());
             self.skip -= n;
@@ -109,6 +117,7 @@ impl Present for Dns {
     fn reset(&mut self) {
         self.taken = false;
         self.skip = 0;
+        self.lost = self.tcp;
     }
 }
 

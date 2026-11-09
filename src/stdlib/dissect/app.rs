@@ -273,6 +273,24 @@ mod tests {
         );
     }
 
+    /// DNS over TCP marks where a message starts only with the length
+    /// before it. Past missing bytes, where the next message starts is
+    /// unknown, so that direction is not read again; the other goes on.
+    #[test]
+    fn lost_bytes_end_dns_over_tcp_in_their_direction() {
+        let query = [0, 12, 0x12, 0x34, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let answer = [0, 12, 0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut f = Feeder::new((40000, 53));
+        assert_eq!(f.send(false, &query, 1500).proto, "DNS");
+        f.send(false, &query[..5], 1500);
+        f.c.lost(false);
+        // Bytes that would read as a whole message, from the next byte on.
+        let after = f.send(false, &query, 1500);
+        assert!(after.layers.is_empty(), "{}", after.info);
+        assert!(!f.c.waiting(false));
+        assert_eq!(f.send(true, &answer, 1500).proto, "DNS");
+    }
+
     #[test]
     fn a_complete_large_item_keeps_its_packet_bytes() {
         let mut dns = Feeder::new((40000, 53));
