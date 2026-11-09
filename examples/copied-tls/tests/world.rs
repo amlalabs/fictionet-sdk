@@ -81,6 +81,9 @@ impl Connection for Recorded {
     ) -> Poll<Result<usize, ConnError>> {
         self.conn.poll_write(cx, task, buf)
     }
+    fn poll_flush(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+        self.conn.poll_flush(cx, task)
+    }
     fn poll_shutdown(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         self.conn.poll_shutdown(cx, task)
     }
