@@ -2262,6 +2262,9 @@ impl TcpLayer {
                 }
             }
         }
+        if self.up.len() < UP_ROOM {
+            self.refresh_after = None;
+        }
     }
 
     /// Opens a connection to `remote`, as [`TcpControl::Connect`] asks.

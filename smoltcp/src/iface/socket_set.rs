@@ -153,6 +153,10 @@ impl<'a> SocketSet<'a> {
         }
     }
 
+    pub(crate) fn finish_egress(&mut self) {
+        self.served = None;
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         if self.ready.is_empty() {
             self.deadlines.first().map(|&(at, _)| at)

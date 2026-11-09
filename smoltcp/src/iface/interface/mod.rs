@@ -104,9 +104,10 @@ impl Interface {
             });
             sockets.dispatched(handle, sent.is_err());
             if sent.is_err() {
-                break;
+                return result;
             }
         }
+        sockets.finish_egress();
         result
     }
 

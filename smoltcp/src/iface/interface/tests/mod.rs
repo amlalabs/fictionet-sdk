@@ -90,6 +90,29 @@ fn indexed_deadlines_follow_mutation_removal_and_slot_reuse() {
 }
 
 #[test]
+fn egress_keeps_slot_order_after_an_unsaturated_pass() {
+    use crate::socket::tcp::{Socket, SocketBuffer};
+    let (mut iface, mut sockets, mut device) = setup();
+    let local = (Ipv4Address::new(192, 168, 1, 1), 4242);
+    let remote = Ipv4Address::new(192, 168, 1, 2);
+    let mut handles = Vec::new();
+    for port in [80, 81] {
+        let mut socket = Socket::new(SocketBuffer::new(vec![0; 64]), SocketBuffer::new(vec![0; 64]));
+        socket.connect(iface.context(), (remote, port), local).unwrap();
+        handles.push(sockets.add(socket));
+    }
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    sockets.get_mut(handles[0]).abort();
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    sockets.get_mut(handles[0]).connect(iface.context(), (remote, 80), local).unwrap();
+    sockets.get_mut(handles[1]).abort();
+    device.tx_queue.clear();
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    let ports: Vec<_> = device.tx_queue.iter().map(|p| TcpPacket::new_checked(&p[20..]).unwrap().dst_port()).collect();
+    assert_eq!(ports, [80, 81]);
+}
+
+#[test]
 fn egress_rotates_when_an_earlier_socket_becomes_ready_again() {
     use crate::socket::tcp::{Socket, SocketBuffer};
     let (mut iface, mut sockets, device) = setup();
