@@ -320,7 +320,16 @@ mod http {
                 if n == 0 { break; }
                 reply.extend_from_slice(&buf[..n]);
             }
-            assert_eq!(reply, [0x88, 0x02, 0x03, 0xe8]);
+            // One unmasked Close echoing the code, then nothing before EOF.
+            let mut replies = Stream::new(Messages::for_receiver(Side::Client));
+            assert_eq!(replies.push(&reply), reply.len());
+            replies.end();
+            match replies.next() {
+                Some(Ok(Message::Close(Some(close)))) => assert_eq!(close.code, 1000),
+                other => panic!("expected one close reply, got {other:?}"),
+            }
+            assert!(replies.next().is_none());
+            assert!(replies.is_done() && replies.unread().is_empty(), "bytes after the close reply");
             fcx.cancel();
             Ok(())
         })).unwrap();

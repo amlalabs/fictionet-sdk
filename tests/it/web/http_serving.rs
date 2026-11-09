@@ -665,8 +665,19 @@ async fn websockets_work_through_sites() {
             }
             conn.write_all(&fcx, &frames).await.unwrap();
             let response = read_all(&fcx, &mut conn).await.unwrap();
-            // One final, unmasked Close carrying code 1000, then EOF.
-            assert_eq!(response, [0x88, 0x02, 0x03, 0xe8]);
+            // One unmasked Close echoing the code, then nothing before EOF.
+            let mut replies = Stream::new(Messages::for_receiver(Side::Client));
+            assert_eq!(replies.push(&response), response.len());
+            replies.end();
+            match replies.next() {
+                Some(Ok(Message::Close(Some(close)))) => assert_eq!(close.code, 1000),
+                other => panic!("expected one close reply, got {other:?}"),
+            }
+            assert!(replies.next().is_none());
+            assert!(
+                replies.is_done() && replies.unread().is_empty(),
+                "bytes after the close reply"
+            );
             Err(fictionet::Error::from(Done))
         }),
     )
