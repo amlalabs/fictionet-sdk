@@ -148,6 +148,7 @@ pub use native::{
     Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer, Upgraded,
     Work as Http1Work,
 };
+use response::Dates;
 pub use response::{date_header, http_date};
 pub use sites::{Answer, Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
 
@@ -412,7 +413,7 @@ impl Servers {
             );
         }
         let mut http1 = Http1::with(self.handler, self.limits).conn(self.conn);
-        http1.date = self.date;
+        http1.dates = Dates::new(self.date);
         http1.observe = self.observe;
         http1.first_head_deadline = self.first_head_deadline;
         if self.h2c {
