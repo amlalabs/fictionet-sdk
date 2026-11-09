@@ -25,7 +25,7 @@ fuzz_target!(|data: &[u8]| {
                 offset: Some(0),
                 len: piece.len(),
             };
-            c.data(dir, piece, place, &mut d, &[]);
+            c.data(dir, piece, place, &mut d);
             at[usize::from(dir)] += piece.len() as u64;
             let _ = d.layers_json();
         }

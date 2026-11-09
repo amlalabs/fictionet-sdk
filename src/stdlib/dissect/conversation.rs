@@ -1,4 +1,4 @@
-use fictionet::stdlib::dissect::{Decoded, KeyLine, Match, Place, Protocol, Registry, Selection};
+use fictionet::stdlib::dissect::{Decoded, Match, Place, Protocol, Registry, Selection};
 use fictionet::stdlib::layer::Termination;
 use fictionet::stdlib::network::Transport;
 
@@ -94,20 +94,14 @@ impl Conversation {
 
     /// Processes ordered bytes and appends completed messages to `d`.
     /// `place` locates this chunk in the current packet. Earlier prefix bytes
-    /// receive reassembly buffers. `keys` supplies TLS key log entries.
-    pub fn data(
-        &mut self,
-        dir: bool,
-        bytes: &[u8],
-        place: Place,
-        d: &mut Decoded,
-        keys: &[KeyLine],
-    ) {
+    /// receive reassembly buffers. TLS reads its keys from the registry's
+    /// [`KeyLog`](super::KeyLog).
+    pub fn data(&mut self, dir: bool, bytes: &[u8], place: Place, d: &mut Decoded) {
         if self.rejected {
             return;
         }
         if let Some(protocol) = &mut self.protocol {
-            protocol.data(dir, bytes, place, d, keys);
+            protocol.data(dir, bytes, place, d);
             return;
         }
         let i = usize::from(dir);
@@ -149,7 +143,6 @@ impl Conversation {
                                 ..Place::default()
                             },
                             d,
-                            keys,
                         );
                         held.clear();
                     }
@@ -157,7 +150,7 @@ impl Conversation {
                         protocol.end(j != 0, Termination::Fin, d);
                     }
                 }
-                protocol.data(dir, bytes, place, d, keys);
+                protocol.data(dir, bytes, place, d);
                 self.protocol = Some(protocol);
             }
             Err(decision) => {
@@ -183,11 +176,11 @@ mod tests {
         let mut conversation = Conversation::with_registry(1, 2, registry);
         let mut packet = Decoded::default();
         for _ in 0..64 {
-            conversation.data(false, b"x", Place::default(), &mut packet, &[]);
+            conversation.data(false, b"x", Place::default(), &mut packet);
             assert!(!conversation.waiting(false));
         }
         assert!(conversation.rejected);
-        conversation.data(true, b"\x01x", Place::default(), &mut packet, &[]);
+        conversation.data(true, b"\x01x", Place::default(), &mut packet);
         assert!(packet.layers.is_empty());
         assert!(conversation.prefix.iter().all(Vec::is_empty));
     }
@@ -238,7 +231,7 @@ mod tests {
                     offset: Some(0),
                     len: piece.len(),
                 };
-                self.c.data(dir, piece, place, &mut d, &[]);
+                self.c.data(dir, piece, place, &mut d);
                 self.at[dir as usize] += piece.len() as u64;
             }
             d

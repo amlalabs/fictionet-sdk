@@ -65,7 +65,7 @@ mod tests {
                     offset: Some(0),
                     len: piece.len(),
                 };
-                self.c.data(dir, piece, place, &mut d, &[]);
+                self.c.data(dir, piece, place, &mut d);
                 self.at[dir as usize] += piece.len() as u64;
             }
             d

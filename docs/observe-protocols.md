@@ -43,9 +43,11 @@ TlsSession::register(&mut registry);
 ```
 
 For a pcap reader or live capture, create `Dissector::with_registry(registry)`
-and call `decode(packet, keys)` in capture order. `packet` is a raw IPv4 or
+and call `decode(packet)` in capture order. `packet` is a raw IPv4 or
 IPv6 packet. A reader for Ethernet captures must first extract the IP
-payload. Supply TLS key log entries when decryption is wanted, or `&[]`.
+payload. To decrypt TLS, add key log lines to `Dissector::keys`, before or
+during the capture: a session that has not found its keys looks again at
+its next encrypted record, and TLS inside TLS reads the same log.
 The returned `Decoded` exposes layers, fields, tags, and summaries.
 `write_layers` and `write_buffers` encode the result as JSON.
 
@@ -76,8 +78,9 @@ and flush driver, including ordered input, gaps, waiting status and ALPN.
 
 TLS and Modbus sessions use `Registry::register_protocol` when
 shared state requires the `Protocol` interface. The session factory receives
-the active registry. TLS clones it for plaintext selection with the outer
-ports. ALPN hints select `http2` for `h2` or `http1` for `http/1.1` only when
+the active registry. TLS reads its keys from the registry's `KeyLog`, and
+clones the registry for plaintext selection with the outer ports, so the
+sessions it makes share the log. Other protocols never see keys. ALPN hints select `http2` for `h2` or `http1` for `http/1.1` only when
 that name is registered. Other cases use the registry matchers, including
 across split plaintext prefixes. Eight unmatched bytes permanently reject
 plaintext selection in both directions, as in the outer conversation.
