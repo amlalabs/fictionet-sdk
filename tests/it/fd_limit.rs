@@ -42,8 +42,8 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: limit is initialized writable storage for the complete output.
     assert_eq!(
+        // SAFETY: limit is initialized writable storage for the complete output.
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
         0
     );
