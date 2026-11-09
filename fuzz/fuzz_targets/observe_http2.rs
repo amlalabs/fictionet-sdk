@@ -4,7 +4,7 @@
 //! the connection preface, then the server's. Nothing may panic, and the
 //! time must stay in proportion to the input.
 #![no_main]
-use fictionet::stdlib::dissect::{Conversation, Decoded, Place, Registry};
+use fictionet::stdlib::dissect::{Conversation, Decoded, KeyLog, Place, Registry};
 use libfuzzer_sys::fuzz_target;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -14,7 +14,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let chunk = usize::from(chunk).max(1) * 16;
-    let mut c = Conversation::with_registry(40000, 80, Registry::default());
+    let mut c = Conversation::new(40000, 80, Registry::default(), KeyLog::default());
     let mut at = [0u64; 2];
     let mut feed = |dir: bool, bytes: &[u8]| {
         for piece in bytes.chunks(chunk) {
