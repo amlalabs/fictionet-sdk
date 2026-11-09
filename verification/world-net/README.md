@@ -3,8 +3,7 @@
 The models of the world network's attachment lifecycle and the plumbing
 under it: the ready-slot scheduler, the router's table, the cables and
 their packet queues. What each one states, what it found and what it
-leaves out is in [VERIFICATION.md](../../VERIFICATION.md) at the root of
-the repository.
+leaves out is in [VERIFICATION.md](VERIFICATION.md).
 
 | Part | What it is | Where |
 |---|---|---|

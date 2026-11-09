@@ -13,13 +13,13 @@ This pass covers the server TLS layer of the protocol-layer work:
 `TlsLayer` in `src/stdlib/services/tls/layer.rs` (handshake progress,
 application data each way, close_notify and the peer's close, reset, write
 completion and backpressure from the stream below), the live adapter in
-`src/stdlib/services/tls.rs` (`Io` and `TlsConnection`, with write
-cancellation and retry), and the crypto provider in
+`src/stdlib/services/tls.rs` (`TlsConnection`, backed by `Opened` in
+`src/stdlib/services/stack/open.rs`, with write cancellation and retry), and the crypto provider in
 `src/stdlib/services/tls/provider.rs`, which now carries the run's entropy
 in the `Arc` fields of the vendored rustls `CryptoProvider`
 (`rustls/src/crypto/mod.rs`). The write accounting that used to live in
 `tls/output.rs` is now `TlsLayer`'s `produced`, `delivered`,
-`pending_plaintext`, `fence` and `credit`, and `TlsConnection`'s
+`pending_plaintext`, `fence` and `credit`, and `Opened`'s
 `credited` and `pending_write`; both are covered here. The file itself
 moved to `tests/support/sandbox/output.rs`, the sandbox's test client on
 upstream rustls, and is not part of this pass. The models are under
@@ -60,8 +60,8 @@ there, at code revision `6aa68ae5f` (the TLS Kani constructor at
 - `take_urgent` (`layer.rs:630-632`) hands up the same credit
   `take_event` does, so a `Chain` or the `Driver` can pass it around a
   refused event. Both take the whole counter, so `UpperTakes` is either.
-- The live adapter `Io`/`TlsConnection` in `services/tls.rs` is gone. A TLS
-  connection over TCP is now `Opened` (`services/stack/open.rs`), the
+- The former live adapter implementation in `services/tls.rs` is gone.
+  `TlsConnection` now wraps `Opened` (`services/stack/open.rs`), the
   stack runner's connection for a stack with a byte stream above it, over
   `Live` (`services/stack/live.rs`). `Write.tla` was rewritten for
   `Opened::poll_write`; see below.

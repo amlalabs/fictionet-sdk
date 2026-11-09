@@ -73,15 +73,15 @@ does, and `Driver::run` advances until nothing moves.
 
 | Model | Rust (`src/stdlib/layer/`) |
 | --- | --- |
-| `OfferSlot`, `OfferMoved` | `chain.rs:62` `offer` |
-| `StepL`, `StepS`, `StepTU`, `StepOU`, `StepTD`, `StepOD` | `chain.rs:133-171` `Chain::advance` |
+| `OfferSlot`, `OfferMoved` | `chain.rs:71` `offer` |
+| `StepL`, `StepS`, `StepTU`, `StepOU`, `StepTD`, `StepOD` | `chain.rs:143` `Chain::advance` |
 | `StepS`, `StepH` (first phase) | `switch.rs:245-266` |
 | `StepS`, `StepSB`, `StepSA` (second phase), `FeedQueue` | `switch.rs:267-284`, `feed` at `switch.rs:140` |
 | `EventAnswers`, `CommandAnswers` | `switch.rs:167-211` `Switch::on_event`, `on_command` |
-| `StartRun`, `StepE` | `driver.rs:168` `Driver::run` |
-| `SendBelow`, `SendAbove` | `driver.rs:190-226` and `send` at `driver.rs:246` |
-| `Deliver`, `OwnerQueue` | `driver.rs:142`, `harness.rs:249-263` |
-| `Command` | `driver.rs:151` |
+| `StartRun`, `StepE` | `driver.rs:230` `Driver::run` |
+| `SendBelow`, `SendAbove` | `Driver::send_below` at `driver.rs:270`, `send_above` at `driver.rs:281`, and `send` at `driver.rs:330` |
+| `Deliver`, `OwnerQueue` | `driver.rs:192`, `Harness::settle` in `harness.rs` |
+| `Command` | `driver.rs:205` |
 
 What is checked:
 

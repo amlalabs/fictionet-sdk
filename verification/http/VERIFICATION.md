@@ -13,10 +13,10 @@ models, how to run them and the full results are in
 
 | Model | Of | Checker | Result |
 |---|---|---|---|
-| `verification/http/lean/Http/Framing.lean` | `ResponsePolicy::new`, `native::encode` and `Http1::start`, `http1::response_framing`, `Sending::poll_next` | Lean 4 (`lake build`, axiom audit) | 20 theorems proved for every status class, method, body hint and supplied length: never both length fields, HTTP/1.0 never chunked and closes on an unknown length, no length on 1xx or 204, no framing on a 2xx to CONNECT, HEAD's length is GET's, the reader finds the body the server wrote, HTTP/2 END_STREAM and `content-length` agree with the DATA. Only `propext`, `Quot.sound` and `Classical.choice` appear. |
+| `verification/http/lean/Http/Framing.lean` | `ResponsePolicy::new`, `native::encode` and `Http1::start`, `http1::response_framing`, `Respond::start`, `Respond::respond`, `Http2::response_head` and `Http2::send_one` | Lean 4 (`lake build`, axiom audit) | 20 theorems proved for every status class, method, body hint and supplied length: never both length fields, HTTP/1.0 never chunked and closes on an unknown length, no length on 1xx or 204, no framing on a 2xx to CONNECT, HEAD's length is GET's, the reader finds the body the server wrote, HTTP/2 END_STREAM and `content-length` agree with the DATA. Only `propext`, `Quot.sound` and `Classical.choice` appear. |
 | `verification/http/lean/Http/Request.lean` | `http1::fields` and `request_framing` | Lean 4 | 12 theorems: RFC 9112 sections 6.1 and 6.3 for requests (both fields refused, HTTP/1.0 `Transfer-Encoding` refused, `chunked` not final refused, no `chunked` refused, unsupported coding is a 501, equal `Content-Length` values accepted, differing or invalid ones refused, no fields means no body). |
-| `verification/http/tla/Streams.tla` | `Http2::headers`, `headers_on`, `data`, RST_STREAM handling, `cancel`, `write_reset`, `on_timer`, `on_done`, `Sending::poll_next` | TLC 2.19 | Base: 210,019 states generated, 13,277 distinct, depth 14; six invariants and six properties hold, including the liveness `ResponsesEnd`. Four ablations each violate the one property named for them. |
-| `verification/http/tla/Flow.tla` | The receive side of `Http2::data`, `Accept` with `release_window`, the send side of `Sending::poll_next`, the WINDOW_UPDATE and SETTINGS_INITIAL_WINDOW_SIZE arms of `Http2::frame` | TLC 2.19 | Base: 4,581,219 states generated, 1,145,490 distinct, depth 22; four invariants and four properties hold, including the liveness `NoLostWake`, `ResponsesEnd` and `RequestsEnd`. Eight ablations each violate the one property named for them. |
+| `verification/http/tla/Streams.tla` | `Http2::on_headers`, `admit`, `on_data`, RST_STREAM handling, `end_stream`, `write_reset`, `Respond::on_timer`, `Http2::written`, `Respond::start`, `Respond::respond`, `Http2::response_head` and `Http2::send_one` | TLC 2.19 | Base: 210,019 states generated, 13,277 distinct, depth 14; six invariants and six properties hold, including the liveness `ResponsesEnd`. Four ablations each violate the one property named for them. |
+| `verification/http/tla/Flow.tla` | The receive side of `Http2::on_data`, `Http2::release`, the send side of `Respond::start`, `Respond::respond`, `Http2::response_head` and `Http2::send_one`, the WINDOW_UPDATE and SETTINGS_INITIAL_WINDOW_SIZE arms of `Http2::on_frame` | TLC 2.19 | Base: 4,581,219 states generated, 1,145,490 distinct, depth 22; four invariants and four properties hold, including the liveness `NoLostWake`, `ResponsesEnd` and `RequestsEnd`. Eight ablations each violate the one property named for them. |
 | `tests/it/httpd.rs::http1_framing_follows_the_rfcs_for_every_case`, `tests/it/http2_server.rs::http2_framing_follows_the_rfcs_for_every_case` | The server itself, over the Lean domain | `cargo test` | Pass. Every method, status class, supplied length and body kind (and both HTTP/1 request versions) satisfies the rules the theorems state, on the bytes and frames the server writes. |
 | `verification/http/tla/Pipeline.tla` | `Http1::on_event`, `advance`, `read`, `dispatch`, `fail`, `on_done`, `respond`, `start`, `piece`, `finish`, `hand_on`, `close`, `take_command`, `handover`; `Switch::on_event` and `advance`; `Tunnel::on_event` | TLC 2.19 | Base: 1,493,826 states generated, 660,798 distinct, depth 41; six invariants and the liveness `TunnelGetsAll` hold: one request in flight, the next read only after the last response is written, the handover only with nothing of HTTP left to write, the bytes after the request reach the tunnel first, in order, once and all, the end last, and no request after a 101. Nine ablations each violate the one property named for them; one of them is the code before the fix below. |
 | `verification/http/kani/body.rs` | `BodyEvents::decode` (`Reader::body`, `chunk_step`, `chunk_framing`, `chunk_size`, `chunk_size_skipping_extensions`, `number`) | Kani 0.68.0 | 18 harnesses verified: one step from every state, in both chunk modes, does what an independent statement of the RFC 9112 grammar says, never waits while it holds its capacity, and (for every state but the lenient size and trailer lines) gives the same result at every split; chunk-size parsing gives the hex value exactly when it fits in a `u64`, without overflow. Five mutations of `http1.rs` each fail the harness run against them. |
@@ -225,7 +225,7 @@ are left to the owner (README, "Findings in the tunnel").
 - HTTP/2 keeps a valid handler-supplied `content-length` on a 304, where
   HTTP/1 strips it. Both are allowed (RFC 9110 section 15.4.5 lets a 304
   carry the representation's length); the HTTP/2 choice is documented in
-  `Sending::poll_next` and proved as `not_modified_keeps_supplied_length`.
+  `Respond::start` and proved as `not_modified_keeps_supplied_length`.
 - A HEAD handler that supplies a `Content-Length` is believed even when it
   also returns a body of another length: a handler that drops the HEAD body
   is the documented way to name the GET length, and the server cannot tell
@@ -236,8 +236,9 @@ are left to the owner (README, "Findings in the tunnel").
   can follow a tunnel) and PROTOCOL_ERROR rather than STREAM_CLOSED for
   frames on closed streams (RFC 9113 section 5.1 allows either).
 - HTTP/1 pipelining cannot interleave a `100 Continue` or an `on_fail` 400
-  into a streaming response: the serve driver's ordered work blocks reads,
-  timers and wakes until the response drains.
+  into a streaming response: `Http1::advance` reads the next request only
+  in `Phase::Reading`, after `Phase::Answering` finishes the response.
+  `Http1::on_timer` remains active while answering.
 
 ## What the models leave out
 

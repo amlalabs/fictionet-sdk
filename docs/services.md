@@ -429,9 +429,7 @@ books, and sessions keep `Error`. Wire acceptance, limits, error text,
 and recovery are unchanged. A refused item leaves the next frame readable;
 a terminal failure ends the stream.
 
-ITCH's `Error::TooLong` remains for source compatibility but is deprecated.
-Nothing in the module returns it. `codec::Frames<itch::Message>` reports
-`itch::FrameError::TooLong` instead.
+`codec::Frames<itch::Message>` reports `itch::FrameError::TooLong`.
 
 ### Signed frame prefixes
 
@@ -641,18 +639,23 @@ no room for output, sending waits for the next read or write.
 TLS ownership and reproducibility are split across these files:
 
 - [`tls/provider.rs`](../src/stdlib/services/tls/provider.rs) owns config builders,
-  the run clock, context binding, key exchange and signing. Its public functions
+  the run clock, explicit entropy, key exchange and signing. Its public functions
   remain under `tls`. Fixed certificates, a fixed world date, the same seed
   and ordered inputs repeat TLS records in a closed lab. Its docs describe
   the obligations of custom resolvers and signers and the effect of real peers.
-- [`tls.rs`](../src/stdlib/services/tls.rs) owns transport, handshakes, ALPN selection
-  and installs the run's key recorder. [`ca.rs`](../src/stdlib/services/ca.rs) issues certificates
-  using the run's randomness and world-supplied leaf validity.
+- [`tls/layer.rs`](../src/stdlib/services/tls/layer.rs) processes TLS records and
+  accounts for ciphertext delivery and plaintext credit.
+  [`stack/open.rs`](../src/stdlib/services/stack/open.rs) drives the layer through
+  `Live` and handles connection reads, writes and cancellation.
+- [`tls/factory.rs`](../src/stdlib/services/tls/factory.rs) defines replaceable TLS
+  construction and negotiation. [`tls/secure.rs`](../src/stdlib/services/tls/secure.rs)
+  selects the application after the handshake.
+- [`tls.rs`](../src/stdlib/services/tls.rs) provides convenience handshakes and
+  connections backed by the layer. [`ca.rs`](../src/stdlib/services/ca.rs) issues
+  certificates using the run's randomness and world-supplied leaf validity.
 - Supply a world-owned `rustls::KeyLog` to a TLS config when keys are needed.
-  The adapter holds a weak dispatch reference. Capture, key retention, export
-  and decryption belong to `fictionet::stdlib::dissect`.
-- [`tls/output.rs`](../src/stdlib/services/tls/output.rs) drains ciphertext for both
-  the server and the simulated client.
+  Capture, key retention, export and decryption belong to
+  `fictionet::stdlib::dissect`.
 
 [Repeatable runs](../src/guide/running.rs) describes external I/O and clock
 limits. [`httpd.rs`](../src/stdlib/web/httpd.rs) says how the native HTTP/2
