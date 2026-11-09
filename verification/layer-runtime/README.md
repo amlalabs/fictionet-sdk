@@ -526,8 +526,11 @@ removed it (`Reader::take_first_chunk`). Both stages are worth returning
 to for bulk transfer, not for request traffic.
 
 **Stage 4, spans.** The HTTP/1 request head becomes one buffer with
-spans (method, target and every field as offsets into it): see the
-commit for the numbers. HTTP/2 header blocks are the biggest remaining
+spans (method, target and every field as offsets into it). On the HTTP/1
+run it took allocations from 6.06 M to 5.76 M, three fewer per request.
+The HTTP/2 run parses no HTTP/1 heads and stayed at 11.51 M. The HTTP
+bench went from 42.58 G to 42.52 G instructions, inside the spread of
+repeated runs of the Stage 1 build (42.56 G to 43.54 G). HTTP/2 header blocks are the biggest remaining
 per-request family: `hpack::Block::keep` copies each decoded field, 909,000
 times over the HTTP/2 run, 4.5 per request. The dissector's parsers were
 not changed.
@@ -539,6 +542,24 @@ computed it and nothing has changed it since, as Linux's
 `CHECKSUM_UNNECESSARY` does. The sandbox's raw interface can inject any
 bytes, so the flag cannot be assumed; it has to travel with the packet,
 which again needs a core packet type with metadata. Not done.
+
+**The final build.** The pass's last commit was to record the numbers of
+`comp/perf2` with all of the above (9c95ac3ba). That commit never landed;
+these come from its measurement logs, one run of each bench, measured as
+above:
+
+| Workload | `main` (e2858ccc4) | `comp/perf2` (9c95ac3ba) |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 50.28 G | 42.52 G |
+| HTTP/1, 101,010 requests | 1.394 s | 1.061 s |
+| HTTP/2, 101,010 requests | 2.205 s | 1.822 s |
+| HTTP/1 allocations | 11.10 M | 5.76 M |
+| HTTP/2 allocations | 19.59 M | 11.51 M |
+| TCP round trips, instructions | 0.707 G | 0.669 G |
+
+TCP bulk without round trips took 5.73 G instructions, against 5.89 G
+after the first seven commits and 5.71 G after Stage 1. The run on `main`
+included the round trips, so it is not comparable.
 
 ### What is left
 
@@ -561,3 +582,56 @@ which again needs a core packet type with metadata. Not done.
   boundaries), and each costs a few hundred instructions per packet. The
   remaining gap is that cost. On the HTTP bench the pass closed about a
   third of it; the rest is the design.
+
+## The polish merge of November 9, 2026 (`comp/polish-snapshot`)
+
+The work from Astra's three reviews (performance, Scope and elegance, and
+the review of the code without its documentation) was merged into `main`
+at a742b3609. This compares `main` before it (46171e5e1) with `main` after
+it (dd656cf9f, the merge plus a test fix).
+
+The method is the one above. Both builds use the bench profile with frame
+pointers and line tables, each in a target directory of its own. Each
+bench process ran under `perf stat -e instructions:u`, three times per
+build, with the builds interleaved. The table gives the median of the
+three. Instruction counts repeated to within 0.1 percent. Allocation
+counts are Divan's exact counts. Times carry the noise of other jobs on
+the workstation.
+
+| Workload | Before (46171e5e1) | After (dd656cf9f) |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 41.77 G | 39.77 G |
+| HTTP/1, 101,010 requests | 1.035 s | 1.098 s |
+| HTTP/2, 101,010 requests | 1.793 s | 1.718 s |
+| HTTP/1 allocations | 5.86 M | 5.65 M |
+| HTTP/2 allocations | 11.61 M | 10.00 M |
+| TCP bulk process, instructions | 5.74 G | 4.87 G |
+| TCP, one connection, 32 MiB | 29.96 ms | 31.63 ms |
+| TCP, ten connections, 4 MiB each | 45.39 ms | 46.60 ms |
+| TCP, one hundred connections, 1 MiB each | 203.5 ms | 210.7 ms |
+| TCP allocations, one connection | 90,088 | 88,858 |
+| TCP allocations, ten connections | 129,268 | 128,730 |
+| TCP allocations, one hundred connections | 424,282 | 518,336 |
+| Packets sent, one hundred connections | 109,520 to 109,526 | 109,400 |
+
+The HTTP bench runs 4.8 percent fewer instructions, and HTTP/2 makes 16
+fewer allocations per request. TCP bulk runs 15 percent fewer
+instructions. Which change gives how much was not measured.
+
+The TCP times did not follow the instruction count. They are 3 to 6
+percent slower, and the hundred-connection case allocates 94,000 more
+times. Counting allocation sites (the counter described above) on both
+builds, the new ones are:
+
+- `refresh_all` inserts into `refresh_dirty`, a `BTreeSet`, which
+  allocates its root node each time it fills again after emptying: 38,473
+  allocations.
+- Receive refreshes rose from 61,230 to 79,814, each a buffer and its
+  backing. Writes from the bench's senders rose from 27,204 to 33,795, each
+  a buffer and its backing.
+- 14,322 allocations come from a wake in `route`, under the layer
+  driver's `pump`, and 5,432 from `schedule` in `poll_egress`.
+
+The rotation also sends 120 fewer packets with a hundred connections. With
+it turned off, the count returns to the old range. The one- and
+ten-connection counts are unchanged, and no packet is lost.
