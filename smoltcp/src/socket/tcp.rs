@@ -535,8 +535,10 @@ pub struct Socket<'a> {
     /// The congestion control algorithm.
     congestion_controller: reno::Reno,
 
-    /// tsval generator - if some, tcp timestamp is enabled
+    /// Configured timestamp clock, retained when a peer declines timestamps.
     tsval_generator: Option<TcpTimestampGenerator>,
+    /// Whether negotiation permits using the configured clock.
+    timestamps_enabled: bool,
     timestamp_offset: u32,
     /// Private identification counter, when configured by the endpoint.
     ipv4_identification: Option<u16>,
@@ -773,6 +775,7 @@ impl<'a> Socket<'a> {
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
             tsval_generator: None,
+            timestamps_enabled: true,
             timestamp_offset: 0,
             ipv4_identification: None,
             settings: Settings::default(),
@@ -795,6 +798,7 @@ impl<'a> Socket<'a> {
     /// Enable or disable TCP Timestamp. The generator receives the stack clock.
     pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
         self.tsval_generator = generator;
+        self.timestamps_enabled = true;
     }
 
     /// Sets the transport choices before starting a connection.
@@ -869,6 +873,7 @@ impl<'a> Socket<'a> {
 
         if let Some((generator, offset, remote)) = timestamp {
             self.tsval_generator = Some(generator);
+            self.timestamps_enabled = true;
             self.timestamp_offset = offset;
             self.last_remote_tsval = remote;
         }
@@ -876,7 +881,11 @@ impl<'a> Socket<'a> {
 
     /// Return whether TCP Timestamp is enabled.
     pub fn timestamp_enabled(&self) -> bool {
-        self.tsval_generator.is_some()
+        self.timestamp_generator().is_some()
+    }
+
+    fn timestamp_generator(&self) -> Option<TcpTimestampGenerator> {
+        self.tsval_generator.filter(|_| self.timestamps_enabled)
     }
 
     /// Set IPv4 options on SYN segments, including retransmissions. The optional
@@ -1033,7 +1042,7 @@ impl<'a> Socket<'a> {
         self.remote_has_sack = false;
         self.remote_win_scale = None;
         self.remote_win_shift = 0;
-        self.tsval_generator = None;
+        self.timestamps_enabled = false;
         self.tuple = Some(Tuple { local, remote });
         self.local_seq_no = iss;
         self.remote_seq_no = irs + 1;
@@ -1273,6 +1282,7 @@ impl<'a> Socket<'a> {
             .min(14);
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        self.timestamps_enabled = true;
         self.remote_has_sack = false;
         self.local_rx_last_seq = None;
         self.local_rx_last_ack = None;
@@ -1677,7 +1687,7 @@ impl<'a> Socket<'a> {
     ) -> (IpRepr, TcpRepr<'static>) {
         let (mut ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
         reply_repr.timestamp = TcpTimestampRepr::generate_reply_with_tsval(
-            self.tsval_generator,
+            self.timestamp_generator(),
             self.last_remote_tsval,
             cx.now(),
         )
@@ -2330,7 +2340,7 @@ impl<'a> Socket<'a> {
             self.remote_win_shift = 0;
         }
         if repr.timestamp.is_none() {
-            self.tsval_generator = None;
+            self.timestamps_enabled = false;
         }
     }
 
@@ -2427,11 +2437,7 @@ impl<'a> Socket<'a> {
         };
 
         // The effective max segment size, taking into account the options and the local and remote limits.
-        let options_len = if self.tsval_generator.is_some() {
-            12
-        } else {
-            0
-        };
+        let options_len = if self.timestamp_enabled() { 12 } else { 0 };
 
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
         let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
@@ -2669,7 +2675,7 @@ impl<'a> Socket<'a> {
                 align: false,
             },
             timestamp: TcpTimestampRepr::generate_reply_with_tsval(
-                self.tsval_generator,
+                self.timestamp_generator(),
                 self.last_remote_tsval,
                 cx.now(),
             ),
@@ -11583,6 +11589,47 @@ pub(crate) mod test {
             }
         );
         assert_eq!(s.tx_buffer.len(), 0);
+    }
+
+    #[test]
+    fn a_reset_listener_negotiates_timestamps_with_the_next_peer() {
+        let mut s = socket_listen();
+        s.set_tsval_generator(Some(|_| 7));
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert!(!s.timestamp_enabled());
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state(), State::Listen);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ + 100,
+                ack_number: None,
+                timestamp: Some(TcpTimestampRepr::new(9, 0)),
+                ..SEND_TEMPL
+            }
+        );
+        assert!(s.timestamp_enabled());
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            let timestamp = reply.unwrap().timestamp.unwrap();
+            assert_eq!(timestamp.tsecr, 9);
+        });
     }
 
     #[test]

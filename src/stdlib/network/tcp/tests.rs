@@ -190,6 +190,62 @@ fn wakers_run_once_the_endpoint_is_unlocked() {
 }
 
 #[test]
+fn a_syn_changes_only_the_listener_that_accepts_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static OFFSETS: AtomicUsize = AtomicUsize::new(0);
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        st.settings.timestamp_offset = Some(|_, _, _| {
+            OFFSETS.fetch_add(1, Ordering::Relaxed);
+            0
+        });
+        let mut idle = Vec::new();
+        for _ in 0..8 {
+            let mut socket = new_socket(MIN_BUFFER);
+            socket.0.listen(local.port()).unwrap();
+            idle.push(st.add_socket(&fcx, socket));
+        }
+        st.listeners
+            .get_mut(&local.port())
+            .unwrap()
+            .idle
+            .extend(idle.iter().copied());
+        for slot in st.sockets.set.changed().collect::<Vec<_>>() {
+            st.sockets.set.acknowledge_changed(slot);
+        }
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            smol_now(&fcx),
+            segment(peer, local, 100, 0, 2).0,
+        );
+        let accepted = st.by_tuple[&(local, peer)];
+        assert_eq!(OFFSETS.load(Ordering::Relaxed), 1);
+        let changed: Vec<_> = st
+            .sockets
+            .set
+            .changed()
+            .map(|slot| st.sockets.ids[slot.index()].unwrap())
+            .collect();
+        assert_eq!(changed, [accepted]);
+        assert_eq!(accepted, idle[0]);
+        assert!(
+            idle[1..]
+                .iter()
+                .all(|&h| st.get(h).state() == TcpState::Listen)
+        );
+        assert_eq!(egress(&mut st, smol_now(&fcx)).len(), 1);
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn receive_credit_survives_a_full_event_queue() {
     block_on(run(Seed::from_u64(1), |fcx| async move {
         let (_raw, side) = pair();

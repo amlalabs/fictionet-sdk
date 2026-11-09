@@ -1564,6 +1564,10 @@ impl TcpLayer {
                 let local = s.local_endpoint().map(SocketAddr::from).unwrap_or(dst);
                 let remote = s.remote_endpoint().map(SocketAddr::from).unwrap_or(src);
                 *l.per_peer.entry(remote.ip()).or_default() += 1;
+                let offset = self.settings.timestamp_offset.map_or(0, |offset| {
+                    offset(&self.cookie_key, local.ip(), remote.ip())
+                });
+                self.sock(h).set_timestamp_offset(offset);
                 let wire: Vec<_> = added.iter().filter_map(TcpOption::to_wire).collect();
                 self.sock(h)
                     .set_syn_options(&wire)
@@ -1729,15 +1733,6 @@ impl TcpLayer {
             let h = self.add_socket(entropy, s);
             self.reserved.insert(h, charge);
             self.listeners.get_mut(&dst.port()).unwrap().idle.push(h);
-        }
-        for &h in &self.listeners[&dst.port()].idle {
-            let socket = self.sockets.get_mut(h);
-            socket.set_tsval_generator(self.settings.timestamp_clock);
-            socket.set_timestamp_offset(
-                self.settings
-                    .timestamp_offset
-                    .map_or(0, |offset| offset(&self.cookie_key, dst.ip(), src.ip())),
-            );
         }
         Some(Attempt {
             syn,
