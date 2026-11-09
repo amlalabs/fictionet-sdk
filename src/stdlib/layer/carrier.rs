@@ -123,9 +123,22 @@ impl Chunk {
     }
 
     /// Reserves unaccounted backing before retaining it. Charged storage keeps
-    /// its existing reservation, including any unread suffix.
+    /// its existing reservation, including any unread suffix. When this chunk
+    /// alone holds its backing and the bytes are all of it, the charge is
+    /// attached in place, after trimming spare capacity; otherwise the bytes
+    /// are copied into an allocation of their own size. Receive credit stays
+    /// with the bytes either way. Refusal leaves the bytes unreserved.
     pub fn reserve(&mut self, budget: &Budget) -> bool {
         if self.backing.charge.is_some() {
+            return true;
+        }
+        let whole = self.start == 0 && self.end == self.backing.bytes.len();
+        if whole && let Some(backing) = Arc::get_mut(&mut self.backing) {
+            backing.bytes.shrink_to_fit();
+            let Some(charge) = budget.charge(backing.bytes.capacity()) else {
+                return false;
+            };
+            backing.charge = Some(Paid::Own(charge));
             return true;
         }
         let Some(charge) = budget.charge(self.len()) else {
@@ -833,6 +846,49 @@ mod slot_tests {
         assert_eq!(&*head, &[9, 2]);
         assert_eq!(budget.used(), 6);
         drop(tail);
+        assert_eq!(budget.used(), 2);
+        drop(head);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn reserving_unique_whole_backing_reuses_its_allocation() {
+        let mut chunk = Chunk::new(vec![1, 2, 3, 4]);
+        let allocation = chunk.as_ptr();
+        assert!(!chunk.reserve(&Budget::new(3)));
+        assert_eq!(chunk.charged(), 0);
+        let budget = Budget::new(4);
+        assert!(chunk.reserve(&budget));
+        assert_eq!(chunk.as_ptr(), allocation);
+        assert_eq!(&*chunk, &[1, 2, 3, 4]);
+        assert_eq!(budget.used(), 4);
+        drop(chunk);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn reserving_spare_capacity_charges_only_what_is_kept() {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[1, 2]);
+        let mut chunk = Chunk::new(bytes);
+        let budget = Budget::new(2);
+        assert!(chunk.reserve(&budget));
+        assert_eq!(&*chunk, &[1, 2]);
+        assert_eq!(chunk.charged(), budget.used());
+        drop(chunk);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn reserving_shared_backing_copies_and_leaves_siblings_alone() {
+        let mut tail = Chunk::new(vec![1, 2, 3, 4]);
+        let mut head = tail.split_to(2);
+        let budget = Budget::new(2);
+        assert!(head.reserve(&budget));
+        assert_ne!(head.as_ptr(), tail.as_ptr().wrapping_sub(2));
+        assert_eq!(&*head, &[1, 2]);
+        assert_eq!(&*tail, &[3, 4]);
+        assert_eq!(tail.charged(), 0);
         assert_eq!(budget.used(), 2);
         drop(head);
         assert_eq!(budget.used(), 0);
