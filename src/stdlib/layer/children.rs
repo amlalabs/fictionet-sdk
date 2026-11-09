@@ -137,8 +137,8 @@ where
     timers: Vec<usize>,
     /// How many deadlines have been armed, to order those due together.
     armed: u64,
-    /// Set when something outside a call reached a child ([`ChildWake`]).
-    woken: Arc<AtomicBool>,
+    /// The children something outside a call reached ([`ChildWake`]).
+    woken: Arc<Woken>,
     limit: usize,
     window: u64,
     down: VecDeque<MuxCommand<B::Lower, K>>,
@@ -256,23 +256,40 @@ struct Kid<B: Layer> {
 /// which may share state with its layer (a tunnel's connection does).
 /// Either gets the child visited at the next advance.
 pub(crate) struct ChildWake {
+    /// The child's place in `Children` and its id, which tells it from a
+    /// later child at the same place.
+    key: usize,
+    id: ChildId,
     released: AtomicU64,
     /// `Children` is calling the child and collects what it releases.
     calling: AtomicBool,
+    /// The child is in `queue`, or was taken from it and not yet readied.
     woken: AtomicBool,
-    /// The flag `Children` checks before looking for woken children.
-    any: Arc<AtomicBool>,
+    /// Where the child goes when it is woken.
+    queue: Arc<Woken>,
     /// The task that polls the child's work, woken with it.
     task: Mutex<Option<Waker>>,
 }
 
+/// The children woken from outside `Children`'s calls, in the order they
+/// woke, each once until it is collected. Collecting them costs what was
+/// woken, not every open child.
+struct Woken {
+    /// Something is queued: an advance with nothing woken skips the lock.
+    any: AtomicBool,
+    /// Their keys and ids.
+    queue: Mutex<Vec<(usize, ChildId)>>,
+}
+
 impl ChildWake {
-    fn new(any: Arc<AtomicBool>) -> ChildWake {
+    fn new(key: usize, id: ChildId, queue: Arc<Woken>) -> ChildWake {
         ChildWake {
+            key,
+            id,
             released: AtomicU64::new(0),
             calling: AtomicBool::new(false),
             woken: AtomicBool::new(false),
-            any,
+            queue,
             task: Mutex::new(None),
         }
     }
@@ -291,9 +308,13 @@ impl ChildWake {
         }
     }
 
+    /// Queues the child, unless it waits in the queue already. Collecting
+    /// clears `woken` before the visit, so a wake after that queues it again.
     fn notify(&self) {
-        self.woken.store(true, Ordering::Release);
-        self.any.store(true, Ordering::Release);
+        if !self.woken.swap(true, Ordering::AcqRel) {
+            self.queue.queue.lock().push((self.key, self.id));
+            self.queue.any.store(true, Ordering::Release);
+        }
     }
 
     /// `Children` starts calling the child: credit released meanwhile is
@@ -437,7 +458,10 @@ where
             work: List::new(List::WORK),
             timers: Vec::new(),
             armed: 0,
-            woken: Arc::new(AtomicBool::new(false)),
+            woken: Arc::new(Woken {
+                any: AtomicBool::new(false),
+                queue: Mutex::new(Vec::new()),
+            }),
             storage: None,
             limit,
             window,
@@ -467,15 +491,17 @@ where
     }
 
     /// The routing storage for `kids` child places: the places themselves,
-    /// a vacant place's next key included, with their wake state, their ids
-    /// in order and their places in the deadline heap, the command queue
-    /// with one closing place per child, and the control queue.
+    /// a vacant place's next key included, with their wake state, their
+    /// places in the wake queue, their ids in order and their places in the
+    /// deadline heap, the command queue with one closing place per child,
+    /// and the control queue.
     fn routing_bytes(kids: usize) -> Option<usize> {
         let place = size_of::<Kid<B>>()
             + size_of::<usize>()
             // The wake state's shared allocation, with its two counts.
             + size_of::<ChildWake>()
             + 2 * size_of::<usize>()
+            + size_of::<(usize, ChildId)>()
             + size_of::<(ChildId, usize)>()
             + size_of::<usize>();
         kids.checked_mul(place)?.checked_add(
@@ -497,6 +523,7 @@ where
         self.kids = Slab::with_capacity(FLOOR);
         self.order = Vec::with_capacity(FLOOR);
         self.timers = Vec::with_capacity(FLOOR);
+        self.woken.queue.lock().reserve_exact(FLOOR);
         self.down = VecDeque::with_capacity(QUEUE + FLOOR);
         self.up = VecDeque::with_capacity(QUEUE);
         self.storage = Some(charge);
@@ -528,6 +555,10 @@ where
         self.kids.reserve_exact(places - self.kids.len());
         self.order.reserve_exact(places - self.order.len());
         self.timers.reserve_exact(places - self.timers.len());
+        let mut woken = self.woken.queue.lock();
+        let queued = woken.len();
+        woken.reserve_exact(places.saturating_sub(queued));
+        drop(woken);
         self.down.reserve_exact(QUEUE + places - self.down.len());
         true
     }
@@ -634,15 +665,20 @@ where
         self.kids[self.timers[place]].heap = Some(place);
     }
 
-    /// Readies the children something reached from outside a call.
+    /// Readies the children something reached from outside a call, in the
+    /// order they woke. A child closed since it woke is skipped, and so is
+    /// the one that took its place, which its id tells apart.
     fn collect_wakes(&mut self) {
-        if !self.woken.load(Ordering::Relaxed) || !self.woken.swap(false, Ordering::Acquire) {
+        let any = &self.woken.any;
+        if !any.load(Ordering::Relaxed) || !any.swap(false, Ordering::Acquire) {
             return;
         }
-        for at in 0..self.order.len() {
-            let key = self.order[at].1;
-            let wake = &self.kids[key].wake.woken;
-            if wake.load(Ordering::Relaxed) && wake.swap(false, Ordering::Acquire) {
+        let mut queue = self.woken.queue.lock();
+        for (key, id) in queue.drain(..) {
+            let Some(kid) = self.kids.get(key).filter(|kid| kid.id == id) else {
+                continue;
+            };
+            if kid.wake.woken.swap(false, Ordering::Acquire) {
                 self.ready.push(&mut self.kids, key);
                 self.work.push(&mut self.kids, key);
             }
@@ -661,6 +697,8 @@ where
         self.kids = Slab::with_capacity(FLOOR);
         self.order = Vec::with_capacity(FLOOR);
         self.timers = Vec::with_capacity(FLOOR);
+        // Wakes of closed children may still wait to be collected.
+        self.woken.queue.lock().shrink_to(FLOOR);
         self.down.shrink_to((QUEUE + FLOOR).max(self.down.len()));
         let places = self.down.capacity().saturating_sub(QUEUE);
         if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
@@ -898,7 +936,9 @@ where
                 };
                 let due = layer.deadline();
                 assert!(layer.depth() < MAX_DEPTH, "composition depth exceeded");
-                let key = self.kids.insert(Kid {
+                let place = self.kids.vacant_entry();
+                let key = place.key();
+                place.insert(Kid {
                     id,
                     handle: child,
                     links: [Link::default(); 2],
@@ -911,7 +951,7 @@ where
                     urgent: None,
                     inbox: VecDeque::new(),
                     storage,
-                    wake: Arc::new(ChildWake::new(self.woken.clone())),
+                    wake: Arc::new(ChildWake::new(key, id, self.woken.clone())),
                     backing,
                     max_command,
                     granted: 0,
