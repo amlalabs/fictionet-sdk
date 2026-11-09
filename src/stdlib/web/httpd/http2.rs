@@ -2109,15 +2109,21 @@ mod tests {
     }
 
     /// A child that takes every event but body bytes, which it reads only
-    /// while `reads` is set.
+    /// while `reads` is set, or from the time `from` on.
     struct Sink {
-        reads: Arc<std::sync::atomic::AtomicBool>,
+        reads: bool,
+        from: Option<Instant>,
     }
 
     impl Sink {
         fn reading(reads: bool) -> Sink {
+            Sink { reads, from: None }
+        }
+
+        fn reading_from(at: Instant) -> Sink {
             Sink {
-                reads: Arc::new(reads.into()),
+                reads: false,
+                from: Some(at),
             }
         }
     }
@@ -2136,11 +2142,19 @@ mod tests {
             _: &mut Env<'_, Infallible>,
             event: ExchangeEvent,
         ) -> Result<Admit<ExchangeEvent>, Infallible> {
-            let reads = self.reads.load(std::sync::atomic::Ordering::Relaxed);
-            if !reads && matches!(event, ExchangeEvent::Data(_)) {
+            if !self.reads && matches!(event, ExchangeEvent::Data(_)) {
                 return Ok(Admit::Blocked(event));
             }
             Ok(Admit::Taken)
+        }
+
+        fn deadline(&self) -> Option<(Instant, ())> {
+            self.from.filter(|_| !self.reads).map(|at| (at, ()))
+        }
+
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, (): ()) -> Result<(), Infallible> {
+            self.reads = true;
+            Ok(())
         }
 
         fn on_command(
@@ -2305,10 +2319,8 @@ mod tests {
     #[test]
     fn credit_returns_once_a_slow_child_reads() {
         use fictionet::stdlib::layer::{Chain, Children};
-        use std::sync::atomic::Ordering;
-        let child = Sink::reading(false);
-        let reads = child.reads.clone();
-        let mut child = Some(child);
+        let later = std::time::Duration::from_secs(1);
+        let mut child = Some(Sink::reading_from(Instant::ZERO + later));
         let server = Chain::new(
             Http2::new(Limits::default()),
             Children::new(8, Http2::WINDOW, move |_, _, _| {
@@ -2338,8 +2350,7 @@ mod tests {
         );
         // The child reads, long after the batch: the stream's credit comes
         // back with no more input.
-        reads.store(true, Ordering::Relaxed);
-        harness.settle().unwrap();
+        harness.advance(later).unwrap();
         let output = frames(&harness.take_output());
         assert!(
             output
