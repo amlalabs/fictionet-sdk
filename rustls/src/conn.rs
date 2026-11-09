@@ -207,6 +207,21 @@ mod connection {
                 }
             }
         }
+
+        /// Take the first chunk of plaintext data received from the peer, in the buffer
+        /// that holds it, so it is not copied out.
+        ///
+        /// Returns what [`Self::into_first_chunk`] would return, owned: an empty vector
+        /// means the peer closed the session cleanly.
+        pub fn take_first_chunk(self) -> io::Result<Vec<u8>> {
+            match self.received_plaintext.pop() {
+                Some(chunk) => Ok(chunk),
+                None => {
+                    self.check_no_bytes_state()?;
+                    Ok(Vec::new())
+                }
+            }
+        }
     }
 
     impl Read for Reader<'_> {

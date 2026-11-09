@@ -105,6 +105,14 @@ impl CommonState {
         !self.sendable_tls.is_empty()
     }
 
+    /// How many bytes of TLS messages are queued for [`Connection::write_tls`]:
+    /// what a buffer must hold to take them all in one call.
+    ///
+    /// [`Connection::write_tls`]: crate::Connection::write_tls
+    pub fn sendable_tls_len(&self) -> usize {
+        self.sendable_tls.len()
+    }
+
     /// Returns true if the connection is currently performing the TLS handshake.
     ///
     /// During this time plaintext written to the connection is buffered in memory. After
