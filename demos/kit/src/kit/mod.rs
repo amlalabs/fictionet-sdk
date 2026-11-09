@@ -8,9 +8,13 @@ pub mod net;
 pub mod page;
 pub mod preview;
 pub mod seed;
+// This module owns the host syscall boundary.
+#[allow(unsafe_code)]
 pub mod shot;
 pub mod ssh;
 mod util;
+// This module owns the host syscall boundary.
+#[allow(unsafe_code)]
 pub mod vm;
 use fictionet::stdlib::network::ethernet::Family;
 use fictionet::stdlib::network::ethernet::frame::Mac;

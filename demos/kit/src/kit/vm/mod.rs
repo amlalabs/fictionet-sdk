@@ -217,6 +217,8 @@ impl Ownership {
         {
             return Err(io::Error::other("invalid demo name"));
         }
+        // SAFETY: geteuid takes no pointers and cannot invalidate Rust storage.
+        let uid = unsafe { libc::geteuid() };
         // The file stays in place so contenders always lock the same inode.
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -225,9 +227,7 @@ impl Ownership {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(
-                std::env::temp_dir().join(format!("{name}-{}.lock", unsafe { libc::geteuid() })),
-            )?;
+            .open(std::env::temp_dir().join(format!("{name}-{uid}.lock")))?;
         file.try_lock().map_err(|error| {
             io::Error::other(format!(
                 "{name} is already owned or cannot be locked: {error}"
@@ -263,21 +263,9 @@ fn memfd_exe(bytes: &[u8]) -> io::Result<OwnedFd> {
     }
     // SAFETY: memfd_create returned a fresh, owned fd.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let mut written = 0;
-    while written < bytes.len() {
-        // SAFETY: writing `len` bytes from a valid slice to the owned fd.
-        let n = unsafe {
-            libc::write(
-                fd.as_raw_fd(),
-                bytes[written..].as_ptr() as *const libc::c_void,
-                bytes.len() - written,
-            )
-        };
-        if n <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        written += n as usize;
-    }
+    let mut file = std::fs::File::from(fd);
+    std::io::Write::write_all(&mut file, bytes)?;
+    let fd = OwnedFd::from(file);
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     // SAFETY: the owned fd and the write-protection flags.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
