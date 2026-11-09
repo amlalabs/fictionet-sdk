@@ -260,7 +260,7 @@ impl Handler for BothJson {
 fn start(fcx: &Cx, attachments: fictionet::Attachments) -> fictionet::Result<Env> {
     let (hosts, anchors) = authorities();
     let (ca, leaf) = certs::issue(fcx, "World CA", &[DOH_NAME, &RESOLVER.to_string()])?;
-    let tls = leaf.server_config(fcx, date(NOW))?;
+    let tls = leaf.certified_key();
     let mut roots = RootCertStore::empty();
     roots.add(ca.cert_der())?;
     let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
@@ -871,9 +871,7 @@ fn a_front_on_another_host_answers_from_the_resolvers_cache() {
         };
         let sans = cloudflare.sans();
         let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
-        let config = ca
-            .issue(&fcx, &sans, validity)?
-            .server_config(&fcx, date(NOW))?;
+        let config = ca.issue(&fcx, &sans, validity)?.certified_key();
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der())?;
         let roots = Arc::new(roots);
@@ -942,9 +940,7 @@ fn dns_over_tls_to_cloudflare_checks_its_documented_name() {
         };
         let sans = cloudflare.sans();
         let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
-        let config = ca
-            .issue(&fcx, &sans, validity)?
-            .server_config(&fcx, date(NOW))?;
+        let config = ca.issue(&fcx, &sans, validity)?.certified_key();
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der())?;
         let roots = Arc::new(roots);
@@ -985,9 +981,7 @@ fn a_site_cannot_take_a_fronts_name_at_its_address() {
         };
         let sans = cloudflare.sans();
         let sans: Vec<&str> = sans.iter().map(String::as_str).collect();
-        let config = ca
-            .issue(&fcx, &sans, validity)?
-            .server_config(&fcx, date(NOW))?;
+        let config = ca.issue(&fcx, &sans, validity)?.certified_key();
         let site_config = config.clone();
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der())?;
@@ -1048,7 +1042,7 @@ fn each_public_resolver_answers_dns_over_https_as_its_operator() {
             .collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let (ca, leaf) = certs::issue(&fcx, "World CA", &names)?;
-        let config = leaf.server_config(&fcx, date(NOW))?;
+        let config = leaf.certified_key();
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der())?;
         let roots = Arc::new(roots);
@@ -1199,7 +1193,7 @@ fn corporate_egress_keeps_gateway_recursion_and_drops_direct_dns() {
         let (hosts, anchors) = authorities();
         let resolver_ip = PUBLIC_RESOLVERS[0].addresses[0].v4;
         let (_ca, leaf) = certs::issue(&fcx, "World CA", &[DOH_NAME])?;
-        let tls = leaf.server_config(&fcx, date(NOW))?;
+        let tls = leaf.certified_key();
         let sent: Arc<Mutex<Vec<Sent>>> = Arc::default();
         let external = recursive(anchors.clone(), &sent);
         let fronts = Fronts::new(external.handle(), move |_| tls.clone()).names([name(DOH_NAME)]);

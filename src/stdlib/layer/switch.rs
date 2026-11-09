@@ -290,10 +290,10 @@ where
         }
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<A::Lower>> {
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<A::Lower>> {
         match &mut self.phase {
-            Phase::First(a) => a.take_command(),
-            Phase::Then(b) => b.take_command(),
+            Phase::First(a) => env.scoped(Side::Lower, |env| a.take_command(env)),
+            Phase::Then(b) => env.scoped(Side::Upper, |env| b.take_command(env)),
         }
     }
 
@@ -384,7 +384,7 @@ mod tests {
         ) -> Result<Admit<StreamCommand>, Infallible> {
             Ok(Admit::Blocked(command))
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
         fn take_event(&mut self) -> Option<StreamEvent> {
@@ -451,7 +451,7 @@ mod tests {
         ) -> Result<Admit<StreamCommand>, Infallible> {
             Ok(Admit::Blocked(command))
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
         fn take_event(&mut self) -> Option<StreamEvent> {

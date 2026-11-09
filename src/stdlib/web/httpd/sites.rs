@@ -13,9 +13,10 @@ use http::{Request, StatusCode};
 use fictionet::Cx;
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::services::stack::Boxed;
-use fictionet::stdlib::services::tls::{self, ServerConfig};
+use fictionet::stdlib::services::tls::{self, CertifiedKey};
 use fictionet::stdlib::world::net::{
-    Arrival, ConfigFor, ConfigFuture, Host, Opening, PortServer, PreparedShare, Sni,
+    Arrival, CertificateFor, CertificateFuture, Host, Opening, PortServer, PortStack,
+    PreparedShare, Sni,
 };
 
 use super::{
@@ -286,7 +287,7 @@ pub struct Server {
     limits: Limits,
     date: Option<SystemTime>,
     vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
-    tls: Option<ConfigFor>,
+    tls: Option<CertificateFor>,
     tls_layer: tls::Factory,
     application: ApplicationFor,
     protocols: Vec<Vec<u8>>,
@@ -402,25 +403,28 @@ impl Server {
         self
     }
 
-    /// Serves HTTPS on 443 with a config selected for each handshake.
+    /// Serves HTTPS on 443 with a certificate selected for each handshake.
     /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
     pub fn tls_with(
         self,
-        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+        certificate_for: impl Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync + 'static,
     ) -> Server {
-        self.tls_when(move |fcx| std::future::ready(config_for(fcx)))
+        self.tls_when(move |fcx| std::future::ready(certificate_for(fcx)))
     }
 
-    /// [`tls_with`](Self::tls_with) with a config that may take time to
+    /// [`tls_with`](Self::tls_with) with a certificate that may take time to
     /// select: each handshake waits for its own, up to its deadline, while
     /// the world goes on.
-    pub fn tls_when<F>(mut self, config_for: impl Fn(&Cx) -> F + Send + Sync + 'static) -> Server
+    pub fn tls_when<F>(
+        mut self,
+        certificate_for: impl Fn(&Cx) -> F + Send + Sync + 'static,
+    ) -> Server
     where
-        F: Future<Output = Arc<ServerConfig>> + Send + 'static,
+        F: Future<Output = Arc<CertifiedKey>> + Send + 'static,
     {
         self.vhost.https = true;
         self.tls = Some(Arc::new(move |fcx| {
-            Box::pin(config_for(fcx)) as ConfigFuture
+            Box::pin(certificate_for(fcx)) as CertificateFuture
         }));
         self
     }
@@ -462,7 +466,11 @@ impl Server {
 }
 
 impl PortServer for Server {
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let handler = self.handler_for(&arrival.info);
         let opts = HttpOptions {
             observe: self.observe.clone().or(arrival.http_observe.clone()),
@@ -481,7 +489,7 @@ impl PortServer for Server {
     /// `h2`, else HTTP/1, in the same stack as TLS. The network's
     /// [`write_timeout`](fictionet::stdlib::world::net::Limits::write_timeout)
     /// gives up on a client that stops reading.
-    fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+    fn stack(&self, fcx: &Cx, opening: &Opening) -> PortStack {
         let opts = HttpOptions {
             observe: self.observe.clone().or(opening.http_observe.clone()),
             limits: self.limits,
@@ -490,7 +498,7 @@ impl PortServer for Server {
             date: self.date,
         };
         let handler = self.handler_for(&opening.info);
-        Some((self.application)(fcx, opening, handler, &opts))
+        PortStack::Stack((self.application)(fcx, opening, handler, &opts))
     }
 
     fn tls_factory(&self) -> tls::Factory {

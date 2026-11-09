@@ -92,7 +92,10 @@ mod grpc_calls {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<MessageCommand<GrpcCommand>> {
+        fn take_command(
+            &mut self,
+            _: &mut Env<'_, Self::Report>,
+        ) -> Option<MessageCommand<GrpcCommand>> {
             self.out.pop_front()
         }
 
@@ -107,7 +110,7 @@ mod grpc_calls {
         let server = Chain::new(
             Http2::new(httpd::Limits::default()),
             Children::new(8, Http2::WINDOW, |_, opening, _| {
-                Chain::new(Grpc::new(opening), Echo::default())
+                Some(Chain::new(Grpc::new(opening), Echo::default()))
             }),
         );
         Harness::new(Seed::from_u64(1), server).with_worker(Polling::new())
@@ -267,7 +270,10 @@ mod grpc_calls {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<MessageCommand<GrpcCommand>> {
+        fn take_command(
+            &mut self,
+            _: &mut Env<'_, Self::Report>,
+        ) -> Option<MessageCommand<GrpcCommand>> {
             None
         }
 
@@ -284,7 +290,7 @@ mod grpc_calls {
         let server = Chain::new(
             Http2::new(httpd::Limits::default()),
             Children::new(8, Http2::WINDOW, |_, opening, _| {
-                Chain::new(Grpc::new(opening), Behind)
+                Some(Chain::new(Grpc::new(opening), Behind))
             }),
         );
         let mut harness = Harness::new(Seed::from_u64(1), server).with_worker(Polling::new());

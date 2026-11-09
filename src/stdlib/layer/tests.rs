@@ -119,7 +119,7 @@ impl Layer for Mask {
         })
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if !self.down.is_empty() {
             return Some(StreamCommand::Write(Chunk::new(std::mem::take(
                 &mut self.down,
@@ -341,7 +341,7 @@ impl Layer for Echo {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if let Some(chunk) = self.ready.take() {
             self.sent += chunk.len() as u64;
             return Some(StreamCommand::Write(chunk));
@@ -447,7 +447,7 @@ impl Layer for Tunnel {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if !self.out.is_empty() {
             return Some(StreamCommand::Write(Chunk::new(std::mem::take(
                 &mut self.out,
@@ -518,7 +518,7 @@ impl Layer for Beat {
         Ok(true)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         (!self.out.is_empty())
             .then(|| StreamCommand::Write(Chunk::new(std::mem::take(&mut self.out))))
     }
@@ -837,7 +837,7 @@ impl Layer for Toy {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         (!self.out.is_empty())
             .then(|| StreamCommand::Write(Chunk::new(std::mem::take(&mut self.out))))
     }
@@ -933,7 +933,7 @@ impl Layer for Answer {
         Ok(())
     }
 
-    fn take_command(&mut self) -> Option<Part> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Part> {
         self.reply.pop_front()
     }
 
@@ -984,7 +984,7 @@ impl Layer for Pong {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<MessageCommand<u32>> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<MessageCommand<u32>> {
         self.pongs.pop_front().map(MessageCommand::Send)
     }
 
@@ -1014,7 +1014,7 @@ fn muxed() -> Muxed {
     Chain::new(
         Chain::new(
             Toy::new(8),
-            Children::new(8, 64, |_, (), _| Answer::default()),
+            Children::new(8, 64, |_, (), _| Some(Answer::default())),
         ),
         Pong::default(),
     )

@@ -18,10 +18,13 @@
 //! [`TcpConnection`](fictionet::stdlib::network::tcp::TcpConnection), and
 //! gives back a `Connection` that carries the decrypted bytes.
 //!
-//! The world supplies a rustls [`ServerConfig`], using certificate files
-//! or certificates issued by [`ca`](fictionet::stdlib::services::ca). This module
-//! handles the TLS connection. A world can supply a rustls key logger and pass its own
-//! key log entries to [`dissect`](fictionet::stdlib::dissect) for decryption.
+//! World listeners supply [`CertifiedKey`] material, using certificate files
+//! or certificates issued by [`ca`](fictionet::stdlib::services::ca). A
+//! replacement [`Factory`] receives the DER chain, private key and ALPN list;
+//! the default factory builds a rustls [`ServerConfig`]. [`Factory::rustls`]
+//! allows engine settings such as key logging to be configured separately.
+//! Key log entries can be passed to [`dissect`](fictionet::stdlib::dissect)
+//! for decryption.
 //!
 //! The handshake has two steps, so the world can decide how to answer after
 //! it sees what the client asked for. [`server`] reads the client's hello,
@@ -73,7 +76,9 @@ mod contract_buffers;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
-pub use factory::{Factory, Handshake, Negotiation, Opening, Selection};
+pub use factory::{
+    CertifiedKey, Factory, Handshake, Negotiation, Opening, Selected, Selecting, Selection,
+};
 pub use layer::{Hello, Pick, Picking, TlsLayer};
 pub use secure::Secure;
 

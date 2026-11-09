@@ -28,7 +28,7 @@ pub struct Chunk {
 struct ChunkBacking {
     bytes: Vec<u8>,
     charge: Option<Arc<Charge>>,
-    credit: Option<CreditReturn>,
+    credit: Option<Arc<CreditReturn>>,
 }
 
 impl Chunk {
@@ -90,8 +90,8 @@ impl Chunk {
         prefix
     }
 
-    /// Copies unaccounted bytes into a reserved allocation. Already charged
-    /// backing storage keeps its charge, including any unread suffix.
+    /// Reserves unaccounted backing before retaining it. Charged storage keeps
+    /// its existing reservation, including any unread suffix.
     pub fn reserve(&mut self, budget: &Budget) -> bool {
         if self.backing.charge.is_some() {
             return true;
@@ -99,8 +99,28 @@ impl Chunk {
         let Some(charge) = budget.charge(self.len()) else {
             return false;
         };
-        *self = Self::with_charge(self.to_vec(), charge);
+        let mut copy = Self::with_charge(self.to_vec(), charge);
+        Arc::get_mut(&mut copy.backing).unwrap().credit = self.backing.credit.clone();
+        *self = copy;
         true
+    }
+
+    /// Edits the remaining bytes without losing their reservation or receive
+    /// credit. Unique backing is reused. Shared backing is copied only after
+    /// reserving the copy; refusal leaves the chunk unchanged. Receive credit
+    /// remains held until every original and edited piece is released.
+    pub fn make_mut(&mut self, budget: &Budget) -> Option<&mut [u8]> {
+        if Arc::strong_count(&self.backing) != 1 {
+            let charge = budget.charge(self.len())?;
+            let mut copy = Self::with_charge(self.to_vec(), charge);
+            Arc::get_mut(&mut copy.backing).unwrap().credit = self.backing.credit.clone();
+            *self = copy;
+        }
+        let backing = Arc::get_mut(&mut self.backing).unwrap();
+        if backing.charge.is_none() {
+            backing.charge = Some(Arc::new(budget.charge(backing.bytes.capacity())?));
+        }
+        Some(&mut backing.bytes[self.start..self.end])
     }
 
     /// The bytes not yet taken, as a vector. Reuses the allocation when
@@ -294,7 +314,7 @@ impl Credited for StreamEvent {
         if let Self::Data(chunk) = self {
             Arc::get_mut(&mut chunk.backing)
                 .expect("receive backing was reserved uniquely")
-                .credit = Some(credit);
+                .credit = Some(Arc::new(credit));
             true
         } else {
             false
@@ -597,10 +617,15 @@ impl Child {
     }
 }
 
-/// Numbers each [`Slots`], so ids of different connections never match.
+// Numbers each Slots, so ids of different connections never match.
 static SCOPES: AtomicU64 = AtomicU64::new(1);
 
 /// A mux's children, each with the state `T` it keeps for it.
+///
+/// Handles carry an opaque runtime identity that separates muxes, including
+/// worlds with the same seed. Within one mux every handle has the same scope,
+/// so ordering depends only on slot and generation. The scope is not a replay
+/// identifier.
 ///
 /// [`insert`](Self::insert) makes the [`Child`] handle that goes up in
 /// [`MuxEvent::Opened`]; it is the only way to make one. Every lookup checks
@@ -751,6 +776,52 @@ impl<T> Slots<T> {
 #[cfg(test)]
 mod slot_tests {
     use super::*;
+
+    #[test]
+    fn editing_unique_bytes_keeps_the_allocation_and_reservation() {
+        let budget = Budget::new(8);
+        let mut chunk = Chunk::with_charge(vec![1, 2, 3, 4], budget.charge(4).unwrap());
+        chunk.advance(1);
+        let allocation = chunk.as_ptr();
+        chunk.make_mut(&Budget::new(0)).unwrap()[0] = 9;
+        assert_eq!(chunk.as_ptr(), allocation);
+        assert_eq!(&*chunk, &[9, 3, 4]);
+        assert_eq!(budget.used(), 4);
+        drop(chunk);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn editing_shared_bytes_reserves_before_copying_and_preserves_siblings() {
+        let budget = Budget::new(6);
+        let mut tail = Chunk::with_charge(vec![1, 2, 3, 4], budget.charge(4).unwrap());
+        let mut head = tail.split_to(2);
+        assert!(head.make_mut(&Budget::new(1)).is_none());
+        assert_eq!(&*head, &[1, 2]);
+        assert_eq!(budget.used(), 4);
+        head.make_mut(&budget).unwrap()[0] = 9;
+        assert_eq!(&*tail, &[3, 4]);
+        assert_eq!(&*head, &[9, 2]);
+        assert_eq!(budget.used(), 6);
+        drop(tail);
+        assert_eq!(budget.used(), 2);
+        drop(head);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn editing_unreserved_bytes_accounts_for_the_backing_capacity() {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&[1, 2]);
+        let mut chunk = Chunk::new(bytes);
+        assert!(chunk.make_mut(&Budget::new(2)).is_none());
+        assert_eq!(&*chunk, &[1, 2]);
+        let budget = Budget::new(32);
+        chunk.make_mut(&budget).unwrap()[1] = 3;
+        assert_eq!(budget.used(), 32);
+        drop(chunk);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn an_exhausted_generation_retires_its_slot() {

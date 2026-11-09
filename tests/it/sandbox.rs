@@ -31,7 +31,7 @@ fn sandbox_looks_up_connects_and_requests_with_optional_roots() {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(ca.cert_der())?;
             let roots = Arc::new(roots);
-            let config = leaf.server_config(&fcx, start)?;
+            let config = leaf.certified_key();
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
                 (name == "site.test").then(|| {

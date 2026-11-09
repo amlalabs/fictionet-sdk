@@ -68,7 +68,7 @@ CONSTANTS NS,          \* the mux's slots
                        \* beyond its events, timers and work: a subset of
                        \* {"credit", "waiting", "release"}
           MayFail,     \* children's layers may fail or finish
-          BudgetRefuses, \* the budget may refuse a child's place or inbox
+          BudgetRefuses, \* child factory, place, inbox or payload may be refused
           Control,     \* the layer above sends control commands
           Connection,  \* the peer sends the mux connection traffic
           CheckOverrun, CheckCommandCredit, ReserveForControl,

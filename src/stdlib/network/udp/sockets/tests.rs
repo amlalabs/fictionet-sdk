@@ -677,7 +677,10 @@ impl Layer for Echo {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<DatagramCommand<SocketAddr>> {
         self.out.pop_front()
     }
 
@@ -692,9 +695,9 @@ fn an_application_on_each_socket_answers_through_ip_and_udp() {
     let udp = UdpLayer::new(Scope::ROOT, HOST.parse().unwrap(), &*entropy);
     let apps = Children::<Echo, Control, UdpBound>::new(4, 8, |_, bound, _| {
         assert_eq!(bound.local.ip(), HOST.parse::<IpAddr>().unwrap());
-        Echo {
+        Some(Echo {
             out: VecDeque::new(),
-        }
+        })
     });
     let mut d = Driver::new(
         Chain::new(Chain::new(IpLayer::host(), udp), apps),

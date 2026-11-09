@@ -180,7 +180,10 @@ impl Layer for Plc {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<MessageCommand<Owned<Frame>>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<MessageCommand<Owned<Frame>>> {
         if let Some(reply) = self.reply.take() {
             return Some(MessageCommand::Send(reply));
         }

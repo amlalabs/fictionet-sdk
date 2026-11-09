@@ -2,30 +2,27 @@
 EXTENDS Naturals, Sequences
 
 (* Source map, with paths relative to src/stdlib.
-   Install and FirstFactory: world/net/hosts.rs:1787-1788 keeps the first
-   installed TLS server (`TlsNames::first`, 1428-1431) while adding each
-   site's entries to `by_name`.
-   Accept and FactoryIsolation: world/net/hosts.rs:1985-1991 takes the
-   current port's first server and its `tls_factory`;
-   web/httpd/sites.rs:496-498 returns that factory.
-   Select and CertificateIsolation: world/net/hosts.rs:1390-1395 is a
-   name's entry (its config, accept and ALPN), built per site at
-   1731-1741; 1915-1934 resolves the requested name in the current port,
-   falls back to the empty name, and awaits that entry's config.
-   ProtocolIsolation: web/httpd/sites.rs:515-517 preserves the later site's
-   application and protocols; world/net/hosts.rs:1736-1737 stores them and
-   1398-1414 overlays the selected entry's ALPN on its config; 1400-1402
-   preserves the provider's ALPN when the site's override list is empty.
-   ConfigUnchanged: world/net/hosts.rs:1409-1411 clones before editing ALPN.
+   Install and FirstFactory: world/net/hosts.rs:1779, Machines::add retains
+   the first installed server while adding each site's entries.
+   Accept and FactoryIsolation: world/net/hosts.rs:1980, secure selects the
+   current port's first server; web/httpd/sites.rs:504, Server::tls_factory.
+   Select and CertificateIsolation: world/net/hosts.rs:1920, secure resolves the
+   requested name in the current port, falls back to the empty name, and
+   awaits that entry's certificate. TlsName::select at 1401 pairs immutable DER
+   material with its application's ALPN list; an empty list stays empty.
+   ProtocolIsolation: web/httpd/sites.rs:512, Server::prepare_share preserves
+   each site's application and protocols.
+   CertificateUnchanged: tls::Selected retains an Arc<CertifiedKey> and
+   services/tls/factory.rs:64, Selected::rustls_config clones the DER material.
    Build, ApplicationAfterNegotiation and ApplicationOnce:
-   services/tls/secure.rs:123-138 guards construction with Established and
-   consumes make; services/tls/factory.rs:80-82 passes negotiated metadata.
-   NegotiatedApplication: world/net/hosts.rs:1942-1983 uses the established
-   name and ALPN; web/httpd/sites.rs:484-495 invokes the routed application.
+   services/tls/secure.rs:134, Secure::advance constructs only after Established
+   and consumes make; services/tls/factory.rs passes negotiated metadata.
+   NegotiatedApplication: world/net/hosts.rs:1943, secure uses the established
+   name and ALPN; web/httpd/sites.rs:492, Server::stack invokes the application.
    This is a bounded abstraction, not a mechanically checked refinement. *)
 
 CONSTANTS KeepFirst, LocalFactory, LocalCertificate, LocalProtocols,
-          CopyConfig, WaitEstablished, TakeFactory, UseNegotiated
+          PreserveCertificate, WaitEstablished, TakeFactory, UseNegotiated
 
 Listeners == {1, 2}
 Sites == {1, 2}
@@ -102,11 +99,9 @@ Select ==
           /\ advertised' = IF s = NoSite THEN {}
                            ELSE IF overrides[listener][protoSite]
                                 THEN Protocols(listener, protoSite)
-                                ELSE original[listener][protoSite]
-          /\ original' = IF CopyConfig \/ s = NoSite THEN original
-                          ELSE IF overrides[listener][protoSite]
-                               THEN [original EXCEPT ![listener][s] = advertised']
-                               ELSE original
+                                ELSE {}
+          /\ original' = IF PreserveCertificate \/ s = NoSite THEN original
+                          ELSE [original EXCEPT ![listener][s] = {}]
     /\ UNCHANGED <<overrides, installed, first, history, listener, requested, factory,
           negotiatedName, negotiatedProtocol, builds, builtState,
           application, applicationProtocol>>
@@ -153,8 +148,8 @@ CertificateIsolation == certificate # <<0, 0>> => certificate = <<listener, Rout
 ProtocolIsolation == advertised # {} =>
     LET s == Route(listener, requested)
     IN advertised = IF overrides[listener][s] THEN Protocols(listener, s)
-                    ELSE Provided(listener, s)
-ConfigUnchanged == original = [l \in Listeners |-> [s \in Sites |-> Provided(l, s)]]
+                    ELSE {}
+CertificateUnchanged == original = [l \in Listeners |-> [s \in Sites |-> Provided(l, s)]]
 ApplicationAfterNegotiation == builds > 0 => builtState = "established"
 ApplicationOnce == builds <= 1
 NegotiatedApplication == builds > 0 =>

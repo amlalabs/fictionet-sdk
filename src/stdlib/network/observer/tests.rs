@@ -988,6 +988,31 @@ fn data_waits_for_credit_within_a_bound() {
     assert!(after.events.is_empty() && after.opened.is_empty());
 }
 
+#[test]
+fn closing_an_old_child_cannot_detach_its_replacement() {
+    let mut tcp = Watch::new(Limits::default());
+    tcp.grant = false;
+    let first = tcp.up(100, 0x02, b"old");
+    let old = tcp.handles.remove(0);
+    let replacement = tcp.up(200, 0x02, b"new");
+    let id = replacement.opened[0].0;
+    assert_ne!(first.opened[0].0, id);
+    assert!(tcp.tcp.command(old.close()).unwrap().moved());
+    tcp.grant = true;
+    assert!(
+        tcp.tcp
+            .command(tcp.handles[0].grant(u64::MAX))
+            .unwrap()
+            .moved()
+    );
+    let seen = tcp.drain();
+    assert!(seen.events.iter().any(|(child, event)| *child == id
+        && matches!(event, Ev::Data(_, _, bytes, _) if bytes == b"new")));
+    let next = tcp.up(204, 0x10, b"more");
+    assert!(next.events.iter().any(|(child, event)| *child == id
+        && matches!(event, Ev::Data(_, _, bytes, _) if bytes == b"more")));
+}
+
 /// A child closed from above takes nothing more of its connection.
 #[test]
 fn a_child_closed_from_above_gets_nothing_more() {

@@ -7,12 +7,87 @@ use fictionet::stdlib::layer::{
     StreamCommand, StreamEvent,
 };
 
-/// A wire writer whose maximum output allocation is known before writing.
-/// The writer must not reserve beyond this bound or allocate outside its
-/// destination, including on error.
+/// A wire writer whose output allocation is known before writing.
+/// Implementations write only through the supplied bounded destination.
 pub trait BoundedWire: Wire {
-    /// Maximum output capacity needed by `write`, computed without allocating.
+    /// Maximum output capacity needed by `write_bounded`, computed without allocating.
     fn write_bound(&self) -> Result<usize, Self::WriteError>;
+
+    /// Writes without allocating outside the destination. Exceeding its bound
+    /// is a connection error even if the implementation returns success.
+    fn write_bounded(&self, out: &mut BoundedWriter<'_>) -> Result<(), Self::WriteError>;
+}
+
+/// A fixed allocation for a codec's output. Writes past its end are refused;
+/// the framing layer detects that failure even if the codec ignores it.
+pub struct BoundedWriter<'a> {
+    bytes: &'a mut [u8],
+    written: usize,
+    exceeded: bool,
+}
+
+impl<'a> BoundedWriter<'a> {
+    /// Writes into this slice without growing it.
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        Self {
+            bytes,
+            written: 0,
+            exceeded: false,
+        }
+    }
+
+    /// Appends one byte, or marks the writer as exceeded.
+    pub fn push(&mut self, byte: u8) {
+        self.extend_from_slice(&[byte]);
+    }
+
+    /// Appends all bytes, or marks the writer as exceeded without copying.
+    /// Once exceeded, it accepts no further bytes.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if self.exceeded || bytes.len() > self.bytes.len() - self.written {
+            self.exceeded = true;
+            return;
+        }
+        let end = self.written + bytes.len();
+        self.bytes[self.written..end].copy_from_slice(bytes);
+        self.written = end;
+    }
+
+    /// The number written, or an error if any write exceeded the capacity.
+    pub fn finish(self) -> Result<usize, WriteFailure<Infallible>> {
+        if self.exceeded {
+            Err(WriteFailure::Bound)
+        } else {
+            Ok(self.written)
+        }
+    }
+}
+
+/// Why a bounded encoding could not be completed.
+#[derive(Debug)]
+pub enum WriteFailure<E> {
+    /// The value is not representable in its format.
+    Value(E),
+    /// The writer attempted more bytes than its declared bound.
+    Bound,
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for WriteFailure<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Value(error) => error.fmt(f),
+            Self::Bound => f.write_str("the codec exceeded its output bound"),
+        }
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for WriteFailure<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Value(error) => Some(error),
+            Self::Bound => None,
+        }
+    }
 }
 
 /// A decoder with a bound on allocations produced by its next step.
@@ -227,10 +302,19 @@ where
                 if self.out.is_some() {
                     return Ok(Admit::Blocked(MessageCommand::Send(value)));
                 }
-                let bound = value.write_bound().map_err(FramedError::Write)?;
+                let bound = value
+                    .write_bound()
+                    .map_err(|e| FramedError::Write(WriteFailure::Value(e)))?;
                 let charge = env.budget().charge(bound).ok_or(FramedError::Budget)?;
-                let mut bytes = Vec::with_capacity(bound);
-                value.write(&mut bytes).map_err(FramedError::Write)?;
+                let mut bytes = vec![0; bound];
+                let mut writer = BoundedWriter::new(&mut bytes);
+                value
+                    .write_bounded(&mut writer)
+                    .map_err(|e| FramedError::Write(WriteFailure::Value(e)))?;
+                let written = writer
+                    .finish()
+                    .map_err(|_| FramedError::Write(WriteFailure::Bound))?;
+                bytes.truncate(written);
                 self.out = Some(Chunk::with_charge(bytes, charge));
                 Ok(Admit::Taken)
             }
@@ -248,7 +332,7 @@ where
         Ok(false)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if self.reset {
             return None;
         }
@@ -297,7 +381,7 @@ pub enum FramedError<O: Wire> {
     /// written value.
     Budget,
     /// The protocol above sent a value its wire format cannot hold.
-    Write(O::WriteError),
+    Write(WriteFailure<O::WriteError>),
 }
 
 impl<O: Wire> core::fmt::Debug for FramedError<O> {
@@ -392,7 +476,10 @@ pub(crate) mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<MessageCommand<Owned<Frame>>> {
+        fn take_command(
+            &mut self,
+            _: &mut Env<'_, Self::Report>,
+        ) -> Option<MessageCommand<Owned<Frame>>> {
             if let Some(frame) = self.reply.take() {
                 return Some(MessageCommand::Send(frame));
             }
@@ -445,6 +532,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_writer_exceeding_its_bound_fails_only_its_connection() {
+        struct Oversized;
+        impl Wire for Oversized {
+            type ParseError = NoError;
+            type WriteError = NoError;
+            fn parse(_: &[u8]) -> Result<Self, NoError> {
+                Ok(Self)
+            }
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), NoError> {
+                out.extend_from_slice(&[1, 2, 3]);
+                Ok(())
+            }
+        }
+        impl BoundedWire for Oversized {
+            fn write_bounded(&self, out: &mut BoundedWriter<'_>) -> Result<(), NoError> {
+                out.extend_from_slice(&[1, 2, 3]);
+                Ok(())
+            }
+            fn write_bound(&self) -> Result<usize, NoError> {
+                Ok(2)
+            }
+        }
+        let budget = Budget::new(64);
+        let mut d = super::super::Driver::new(
+            Framed::<_, Oversized>::new(Widens { widened: false }),
+            std::sync::Arc::new(fictionet::SeededEntropy::new(Seed::from_u64(8))),
+            budget.clone(),
+            fictionet::time::Instant::ZERO,
+        );
+        let value = Owned::new(Oversized, budget.charge(0).unwrap());
+        assert!(matches!(
+            d.command(MessageCommand::Send(value)),
+            Err(FramedError::Write(_))
+        ));
+        assert_eq!(budget.used(), 0);
+        assert!(d.take_command().is_none());
+        let mut sibling = Harness::new(Seed::from_u64(9), stack());
+        let sent = frames(2);
+        sibling.push(&wire(&sent)).unwrap();
+        assert_eq!(read(sibling.output()), sent);
+    }
+
+    #[test]
     fn output_is_reserved_before_the_writer_runs() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static WROTE: AtomicBool = AtomicBool::new(false);
@@ -462,6 +592,11 @@ pub(crate) mod tests {
             }
         }
         impl BoundedWire for Large {
+            fn write_bounded(&self, out: &mut BoundedWriter<'_>) -> Result<(), NoError> {
+                WROTE.store(true, Ordering::Relaxed);
+                out.extend_from_slice(&[0; 64]);
+                Ok(())
+            }
             fn write_bound(&self) -> Result<usize, NoError> {
                 Ok(64)
             }

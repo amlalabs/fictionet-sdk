@@ -46,7 +46,7 @@ struct Sharing {
 }
 
 impl PortServer for Sharing {
-    fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async {})
     }
 
@@ -222,7 +222,7 @@ fn failed_host_binding_leaves_no_route_service_or_registration() {
                     count.fetch_add(1, Ordering::SeqCst);
                     echo_datagrams(info)
                 });
-            let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::ServerConfig> {
+            let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::CertifiedKey> {
                 panic!("no handshake for a rejected host")
             };
             let bad = match failure {
@@ -873,7 +873,7 @@ fn net_refuses_a_host_it_cannot_serve() {
         assert!(udp.is_some(), "{udp:?}");
         // TLS and plain on one port, in either order. Before, the port
         // served only TLS.
-        let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::ServerConfig> {
+        let config = |_: &Cx| -> Arc<fictionet::stdlib::services::tls::CertifiedKey> {
             unreachable!("no handshake happens")
         };
         let at = Ipv4Addr::new(10, 40, 0, 3);
@@ -1099,7 +1099,11 @@ fn net_refuses_lans_that_overlap() {
 struct Spy(Arc<Mutex<Vec<Option<Budget>>>>);
 
 impl PortServer for Spy {
-    fn serve(&self, _: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        _: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.0.lock().unwrap().push(arrival.budget);
         Box::pin(async {})
     }

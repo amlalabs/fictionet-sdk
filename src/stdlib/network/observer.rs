@@ -221,6 +221,7 @@ struct Connection {
 
 /// What one child has waiting to go up.
 struct Output {
+    key: Key,
     credit: u64,
     pending: VecDeque<ObservedEvent>,
     /// What `pending` counts towards [`Limits::waiting`].
@@ -516,6 +517,7 @@ impl Observer {
     /// Opens a child for a new connection.
     fn start(&mut self, env: &mut Env<'_, ObserverReport>, key: Key, info: ObservedConnection) {
         let child = match self.children.insert(Output {
+            key,
             credit: 0,
             pending: VecDeque::new(),
             weight: 0,
@@ -612,6 +614,19 @@ impl Observer {
         }
     }
 
+    /// Stops only the generation still attached to this child.
+    fn detach(&mut self, key: Key, child: ChildId) {
+        if let Some(connection) = self.connections.get_mut(&key)
+            && connection.child == Some(child)
+        {
+            connection.child = None;
+            connection.ended = [true; 2];
+            for flow in connection.flows.iter_mut().flatten() {
+                flow.end(&mut self.store);
+            }
+        }
+    }
+
     /// Evicts the connections with the most waiting until what is waiting
     /// fits [`Limits::waiting`].
     fn make_room(&mut self) {
@@ -619,25 +634,15 @@ impl Observer {
             let heaviest = self
                 .children
                 .ids()
-                .filter_map(|id| Some((self.children.get(id)?.weight, id)))
+                .filter_map(|id| {
+                    let output = self.children.get(id)?;
+                    Some((output.weight, id, output.key))
+                })
                 .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-            let Some((weight, child)) = heaviest.filter(|(weight, _)| *weight != 0) else {
+            let Some((weight, child, key)) = heaviest.filter(|(weight, _, _)| *weight != 0) else {
                 break;
             };
-            let key = self
-                .connections
-                .iter()
-                .find(|(_, connection)| connection.child == Some(child))
-                .map(|(key, _)| *key);
-            if let Some(key) = key
-                && let Some(connection) = self.connections.get_mut(&key)
-            {
-                connection.child = None;
-                connection.ended = [true; 2];
-                for flow in connection.flows.iter_mut().flatten() {
-                    flow.end(&mut self.store);
-                }
-            }
+            self.detach(key, child);
             self.waiting = self.waiting.saturating_sub(weight);
             let Some(output) = self.children.get_mut(child) else {
                 break;
@@ -787,27 +792,14 @@ impl Layer for Observer {
             MuxOp::Close(child) => {
                 if let Some(output) = self.children.remove(child) {
                     self.waiting = self.waiting.saturating_sub(output.weight);
-                }
-                let key = self
-                    .connections
-                    .iter()
-                    .find(|(_, connection)| connection.child == Some(child))
-                    .map(|(key, _)| *key);
-                if let Some(key) = key
-                    && let Some(connection) = self.connections.get_mut(&key)
-                {
-                    connection.child = None;
-                    connection.ended = [true; 2];
-                    for flow in connection.flows.iter_mut().flatten() {
-                        flow.end(&mut self.store);
-                    }
+                    self.detach(output.key, child);
                 }
             }
         }
         Ok(Admit::Taken)
     }
 
-    fn take_command(&mut self) -> Option<PacketCommand<Infallible>> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Infallible>> {
         None
     }
 

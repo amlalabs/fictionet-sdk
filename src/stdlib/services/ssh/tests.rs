@@ -97,19 +97,19 @@ fn local_close_retires_the_child_before_peer_acknowledgment() {
         matches!(layer.take_urgent(), Some(MuxEvent::Child(id, ChannelEvent::Stream(StreamEvent::Reset))) if id == child.id())
     );
     assert!(layer.channels.contains(child.id()));
-    layer.take_command();
+    layer.take_command(&mut env);
     assert!(
         layer
             .on_command(&mut env, child.send(ChannelCommand::Reply(true)))
             .unwrap()
             .moved()
     );
-    assert!(layer.take_command().is_none());
+    assert!(layer.take_command(&mut env).is_none());
     layer
         .connection_message(wire::Message::Close(0), &mut env)
         .unwrap();
     assert!(!layer.channels.contains(child.id()));
-    assert!(layer.take_command().is_none());
+    assert!(layer.take_command(&mut env).is_none());
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn local_eof_is_sent_once() {
             .unwrap()
             .moved()
     );
-    layer.take_command();
+    layer.take_command(&mut env);
     assert!(
         layer
             .on_command(
@@ -152,7 +152,7 @@ fn local_eof_is_sent_once() {
             )
             .is_err()
     );
-    assert!(layer.take_command().is_none());
+    assert!(layer.take_command(&mut env).is_none());
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn authentication_and_reserved_capacity_precede_confirmation() {
     layer.packet(0, &open, &mut env).unwrap();
     assert!(layer.take_event().is_none());
     assert!(layer.channels.is_empty());
-    layer.take_command();
+    layer.take_command(&mut env);
     layer.user = Some("guest".into());
     layer.packet(1, &open, &mut env).unwrap();
     let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
@@ -188,7 +188,7 @@ fn authentication_and_reserved_capacity_precede_confirmation() {
             .moved()
     );
     assert!(!layer.advance(&mut env).unwrap());
-    assert!(layer.take_command().is_none());
+    assert!(layer.take_command(&mut env).is_none());
     assert!(
         layer
             .on_command(&mut env, child.grant(1024))
@@ -196,7 +196,7 @@ fn authentication_and_reserved_capacity_precede_confirmation() {
             .moved()
     );
     assert!(layer.advance(&mut env).unwrap());
-    let Some(StreamCommand::Write(data)) = layer.take_command() else {
+    let Some(StreamCommand::Write(data)) = layer.take_command(&mut env) else {
         panic!("confirmation missing")
     };
     let wire::Message::ChannelOpenConfirmation { window, .. } =

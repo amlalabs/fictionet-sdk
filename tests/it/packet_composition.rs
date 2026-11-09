@@ -39,7 +39,10 @@ impl Layer for Control {
     ) -> Result<Admit<Infallible>, Infallible> {
         match command {}
     }
-    fn take_command(&mut self) -> Option<MessageCommand<TcpControl>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<MessageCommand<TcpControl>> {
         self.0.pop_front().map(MessageCommand::Send)
     }
     fn take_event(&mut self) -> Option<Infallible> {
@@ -85,7 +88,8 @@ fn endpoint_to(
             remote: SocketAddr::new(server_addr, 1234),
         }]
     };
-    let children = Children::<_, ControlPort, TcpOpening>::new(4, 16 * 1024, move |_, _, _| make());
+    let children =
+        Children::<_, ControlPort, TcpOpening>::new(4, 16 * 1024, move |_, _, _| Some(make()));
     Boxed::new(Chain::new(
         Chain::new(Chain::new(IpLayer::host_in(scope), tcp), children),
         Control(commands.into()),
@@ -121,7 +125,7 @@ impl Layer for Client {
     ) -> Result<Admit<Infallible>, Infallible> {
         match command {}
     }
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.request.take().map(StreamCommand::Write)
     }
     fn take_event(&mut self) -> Option<Infallible> {
@@ -222,8 +226,8 @@ impl Layer for Fragmented {
         }
         Ok(true)
     }
-    fn take_command(&mut self) -> Option<StreamCommand> {
-        self.frames.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+        self.frames.take_command(env)
     }
     fn take_event(&mut self) -> Option<PacketEvent<Datagram<Ingress>>> {
         self.frames.take_event()
@@ -573,7 +577,10 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         fn take_event(&mut self) -> Option<Infallible> {
             None
         }
-        fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+        fn take_command(
+            &mut self,
+            _: &mut Env<'_, Self::Report>,
+        ) -> Option<DatagramCommand<SocketAddr>> {
             None
         }
     }
@@ -629,7 +636,7 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         fn take_event(&mut self) -> Option<PacketEvent<packet::IpPacket>> {
             self.up.take()
         }
-        fn take_command(&mut self) -> Option<PacketCommand<Chunk>> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Chunk>> {
             self.down.take()
         }
     }

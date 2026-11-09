@@ -113,7 +113,7 @@ trait Erased: EndpointState {
     ) -> Result<Admit<CommandOf<Tcp>>, Infallible>;
     fn timer(&mut self, env: &mut Env<'_, ()>) -> Result<(), Infallible>;
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible>;
-    fn take_command(&mut self) -> Option<PacketCommand<Chunk>>;
+    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>>;
     fn take_event(&mut self) -> Option<EventOf<Tcp>>;
     fn take_urgent(&mut self) -> Option<EventOf<Tcp>>;
     fn deadline(&self) -> Option<(Instant, ())>;
@@ -156,8 +156,8 @@ where
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
         Layer::advance(self, env)
     }
-    fn take_command(&mut self) -> Option<PacketCommand<Chunk>> {
-        Layer::take_command(self)
+    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>> {
+        Layer::take_command(self, env)
     }
     fn take_event(&mut self) -> Option<EventOf<Tcp>> {
         Layer::take_event(self)
@@ -240,8 +240,8 @@ impl Layer for Stack {
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
         self.0.advance(env)
     }
-    fn take_command(&mut self) -> Option<PacketCommand<Chunk>> {
-        self.0.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>> {
+        self.0.take_command(env)
     }
     fn take_event(&mut self) -> Option<EventOf<Tcp>> {
         self.0.take_event()

@@ -139,14 +139,10 @@ async fn episode(
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
     let roots = Arc::new(roots);
-    let mut config = tls::config_builder(&cx, date)
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .unwrap();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let config = Arc::new(config);
+    let config = Arc::new(tls::CertifiedKey {
+        chain: vec![cert],
+        key,
+    });
     let (attacher, attachments) = fictionet::attachments();
     let office = fictionet::stdlib::world::net::Lan::new("office", "192.168.10.0/24".parse()?);
     let web_lan = fictionet::stdlib::world::net::Lan::new("web", "192.168.20.0/24".parse()?);
@@ -347,8 +343,7 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(ca.cert_der())?;
             let roots = Arc::new(roots);
-            let mut config = leaf.server_config(&cx, date)?;
-            Arc::get_mut(&mut config).unwrap().alpn_protocols = vec![b"http/1.1".to_vec()];
+            let config = leaf.certified_key();
             let handler_cx = cx.clone();
             let app = axum::Router::new().fallback(move || {
                 let draw = handler_cx.random_u64();

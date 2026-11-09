@@ -32,20 +32,21 @@ systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p M
   -config DatagramRunner_base.cfg DatagramRunner.tla
 
 # Kani, from the root of the repository. A --harness filter matches by
-# substring and runs the harnesses one after another; none needs more
-# than a few GiB.
+# substring. Run one verifier at a time within the memory cap. The decoder
+# failure property is partitioned exhaustively by its first action and,
+# for input first, its second action.
 cd ../../..
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 cargo kani -p fictionet --harness the_buffer_is_charged_before_bytes_are_taken \
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 env CARGO_BUILD_JOBS=6 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-reviewfix cargo kani -p fictionet --output-format terse -Z stubbing -j 1 --harness the_buffer_is_charged_before_bytes_are_taken \
   --harness every_charge_comes_back --harness units_come_up_in_order \
-  --harness a_decoder_failure_comes_up_once_then_ended \
+  --harness a_decoder_failure_comes_up_once_then_ended_first_ \
   --harness encoding_is_not_called_without_its_reservation \
   --harness a_decoded_allocation_keeps_its_charge_outside_the_layer \
   --harness a_reply_comes_only_for_a_request --harness a_header_of_mode_0_6_or_7 \
   --harness connections_are_counted_up_to_the_maximum
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 cargo kani -p nuclear-world --harness each_request_gets_one_answer_in_order \
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 env CARGO_BUILD_JOBS=6 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-reviewfix cargo kani -p nuclear-world --output-format terse -j 1 --harness each_request_gets_one_answer_in_order \
   --harness a_pipelined_request_waits -Z unstable-options \
   --cbmc-args --unwindset "$(cat verification/layer-runtime/kani/plant.unwindset)"
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 cargo kani -p web-world --harness the_time_server \
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 env CARGO_BUILD_JOBS=6 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-reviewfix cargo kani -p web-world --output-format terse -Z stubbing -j 1 --harness the_time_server \
   --harness one_conversation_answers_each_request_in_turn
 
 # The regressions for the bugs.
@@ -181,3 +182,60 @@ The child readiness model passed with 71,116 generated and 10,066 distinct
 states. Its mutations retained the expected counterexamples: completion
 remains blocked without urgent delivery, cancelled work is polled without
 work ownership, and retained jobs exceed their limit without the job bound.
+
+The datagram runner drops a receive whose backing reservation does not fit
+and reports `DatagramReport::Dropped`, keeping the same application and socket
+alive. `DatagramRunner` includes nondeterministic payload reservation refusal;
+`InOrderOnce` excludes exactly those dropped inputs, and `ReturnHasReason`
+requires an application end or socket close. The
+`DatagramRunner_without_droponbudgetmiss.cfg` control ends on a reservation
+miss and must violate `ReturnHasReason`. The Rust regression also checks that
+an oversized backing is refused even when the payload is one byte, and that
+later empty datagrams and another peer still reach the same conversation.
+
+On November 9, 2026 the updated datagram model passed with 56,180 generated
+and 9,828 distinct states. All eight negative controls failed as intended;
+the budget-miss counterexample returns while its socket is open and its
+application has not ended. The deadline and return-on-close controls still
+end in their intended stalled timer and closed-socket traces.
+
+`Framed` now encodes through `BoundedWriter`, a fixed slice with sticky overflow.
+A codec that exceeds its declared bound receives a connection-local write error
+without growing the destination. DNS and Modbus share their encoding routine
+between ordinary and bounded writers. The Kani harness
+`a_bounded_writer_refuses_every_encoding_past_its_capacity` explores arbitrary
+four-byte inputs and every split against a three-byte destination. Existing
+reservation and ownership harnesses use the bounded interface, and command
+extraction runs through `Driver` to supply the layer's budget and reports.
+
+The runtime job table reserves one initial slot and grows with retained work,
+up to its unchanged engine limit. Each growth is charged before asking the
+layer for another job. This lets small conversations run without reserving
+an entire unused job table; a zero-byte budget still extracts no work. The
+bounded-intake and exhausted-storage Rust tests cover this allocation policy;
+the models abstract only job counts and cancellation.
+
+The decoder-failure harness partitions its first action into input, end,
+reset and take. The input-first case is further partitioned by its second
+action, for seven cases in total. The original selector maps zero to input,
+one to end, two to reset, and every other byte to the same take action.
+The union therefore preserves the original state space. Each case still
+executes three actions and three drains, with every assertion and the unwind
+bound of seven unchanged. The third action is always unconstrained; the
+second action is unconstrained in the end-, reset- and take-first cases.
+Run the `a_decoder_failure_comes_up_once_then_ended_first_` filter with
+`-j 1`, or each complete harness name separately.
+
+The seven decoder-failure cases passed under the 10 GiB cap. The combined
+harness had exceeded that cap with both MiniSat and CaDiCaL, and the
+input-first case also exceeded it before the second-action partition.
+The exact case results and unchanged coverage are recorded in
+[VERIFICATION.md](VERIFICATION.md).
+
+The November 9 time-server Kani rerun was stopped at the user's request after 26 of 27 harnesses passed; `the_time_server_answers_with_a_trailer_mode_1` had no result.
+
+The November 9 PLC Kani rerun was stopped at the user's request during compilation, before any of its 18 harnesses produced a result.
+
+The November 9 stream-runner TLC baseline completed with 185,569 distinct states and all ten negative controls produced their intended violations; the identical half-close configuration's properties are included in the baseline, so it was not run separately.
+
+The final worker-storage backpressure change has targeted Rust coverage; no formal rerun followed it after the requested proof stop.

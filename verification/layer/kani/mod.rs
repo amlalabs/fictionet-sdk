@@ -520,3 +520,29 @@ fn work_cancellation_stays_with_its_owner() {
     assert!(second.cancelled());
     assert!(!next.cancelled());
 }
+
+/// A copied edit preserves its sibling, is reserved before allocation, and
+/// returns both reservations when the owners leave.
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_shared_chunk_edit_preserves_ownership_and_budget() {
+    let bytes: [u8; 4] = kani::any();
+    let value: u8 = kani::any();
+    let room: bool = kani::any();
+    let budget = Budget::new(if room { 6 } else { 5 });
+    let mut suffix = Chunk::with_charge(bytes.to_vec(), budget.charge(4).unwrap());
+    let mut prefix = suffix.split_to(2);
+    let edited = prefix.make_mut(&budget);
+    assert_eq!(edited.is_some(), room);
+    if let Some(edited) = edited {
+        edited[0] = value;
+    }
+    assert_eq!(&*suffix, &bytes[2..]);
+    assert_eq!(prefix[0], if room { value } else { bytes[0] });
+    assert_eq!(prefix[1], bytes[1]);
+    assert_eq!(budget.used(), if room { 6 } else { 4 });
+    drop(suffix);
+    assert_eq!(budget.used(), if room { 2 } else { 4 });
+    drop(prefix);
+    assert_eq!(budget.used(), 0);
+}

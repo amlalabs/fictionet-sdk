@@ -200,8 +200,11 @@ where
         }
         Ok(moved)
     }
-    fn take_command(&mut self) -> Option<StreamCommand> {
-        let command = self.command.take().or_else(|| self.layer.take_command())?;
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+        let command = self
+            .command
+            .take()
+            .or_else(|| self.layer.take_command(env))?;
         match &command {
             StreamCommand::Write(bytes) => {
                 if self.pending == 0 {
@@ -293,7 +296,7 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match command {}
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             self.write.take()
         }
         fn take_event(&mut self) -> Option<Infallible> {

@@ -43,12 +43,12 @@ All negative configurations below terminate with a counterexample to the named
 property, rather than a parse error, deadlock, or resource failure. Baselines use
 TLC exhaustive breadth-first search. Counts are distinct reachable states; the
 liveness run uses weak fairness. Runs used TLC 2.19, Kani 0.68.0 and CBMC
-6.11.0 on November 8, 2026.
+6.11.0 on November 8 and 9, 2026.
 
 | Configuration | Result and property |
 | --- | --- |
-| `Secure_base.cfg` | Pass, 152 states; all six safety invariants |
-| `Secure_live.cfg` | Pass, 152 states; `Progress` and `FactoryProgress` |
+| `Secure_base.cfg` | Pass, 728 states; all six safety invariants |
+| `Secure_live.cfg` | Pass, 728 states; `Progress`, `FactoryProgress`, and `ControlProgress` |
 | `Secure_without_waitestablished.cfg` | Fails `Deferred`: construct before establishment |
 | `Secure_without_stopfailed.cfg` | Fails `NoPlaintextOutsideEstablished`: deliver buffered plaintext after failure |
 | `Secure_without_takefactory.cfg` | Fails `FactoryOnce`: reuse construction closure |
@@ -56,13 +56,14 @@ liveness run uses weak fairness. Runs used TLC 2.19, Kani 0.68.0 and CBMC
 | `Secure_without_takebuffer.cfg` | Fails `ExactlyOnce`: retain a delivered offset |
 | `Secure_without_fifo.cfg` | Fails `InOrder`: take the newest buffered offset first |
 | `Secure_without_construct.cfg` | Fails `FactoryProgress`: never construct the established connection’s application |
+| `Secure_without_control.cfg` | Fails `ControlProgress`: failure strands an application control event |
 | `Secure_without_drain.cfg` | Fails `Progress`: established connection never drains its buffer |
-| `Listener_base.cfg` | Pass, 6,608 states; all eight invariants |
+| `Listener_base.cfg` | Pass, 5,648 states; all eight invariants |
 | `Listener_without_keepfirst.cfg` | Fails `FirstFactory`: later site replaces listener owner |
 | `Listener_without_localfactory.cfg` | Fails `FactoryIsolation`: use another listener's factory |
 | `Listener_without_localcertificate.cfg` | Fails `CertificateIsolation`: select another listener's certificate |
 | `Listener_without_localprotocols.cfg` | Fails `ProtocolIsolation`: advertise another site's ALPN |
-| `Listener_without_copyconfig.cfg` | Fails `ConfigUnchanged`: mutate the shared source config |
+| `Listener_without_preservecertificate.cfg` | Fails `CertificateUnchanged`: mutate shared certificate material |
 | `Listener_without_waitestablished.cfg` | Fails `ApplicationAfterNegotiation`: build before success |
 | `Listener_without_takefactory.cfg` | Fails `ApplicationOnce`: build twice |
 | `Listener_without_usenegotiated.cfg` | Fails `NegotiatedApplication`: route using requested rather than negotiated metadata |
@@ -85,7 +86,9 @@ liveness run uses weak fairness. Runs used TLC 2.19, Kani 0.68.0 and CBMC
 `Secure` explores three distinguishable stream offsets, three ALPN values,
 handshake success and failure (including failure after success), and arbitrary
 buffer admission/delivery interleavings. One offset per event abstracts partial
-chunks. It excludes urgent/control events and outgoing application commands.
+chunks. It includes one reset, end, or written control after application construction,
+including delivery after failure. Outgoing application commands and application
+factory refusal are outside this model.
 `Listener` explores two listeners with two sites each, all installation orders,
 exact names, one fallback, one absent-name rejection, and absent negotiated ALPN,
 with one connection per behavior. Each site's configured list independently
@@ -107,19 +110,24 @@ regression failed on the original code: 35 bytes reached the application after
 failure instead of zero.
 
 `Secure::advance` now drives the lower layer and stages its pending output before
-checking authoritative negotiation. Only `Established` permits `Chain` to run.
+checking authoritative negotiation. `Pending` waits for establishment.
+`Failed` drops plaintext from both staging slots and the chain's refused input,
+then runs the chain so reset, end, and write credit still reach the application.
 The private `Driven` adapter prevents another TLS advance or output extraction
 between that check and delivery. It retains at most one normal and one urgent
 event in addition to Chain's slots, preserving the original allocation charges.
-TLS still advances and exposes its outgoing alerts after failure. This stops
-plaintext input delivery; it does not claim to freeze upper timers or work.
+TLS still advances and exposes its outgoing alerts after failure. Upper commands,
+timers and work continue. Returning no application from the construction closure
+refuses the connection with one reset and marks the composition terminal.
 
 `failure_stops_plaintext_waiting_for_the_application` covers failure from a work
 completion, from `advance`, and from urgent output extraction. Existing tests
 cover early buffered bytes, application refusal, factory count and negotiated
 metadata, failed construction, and timer/error propagation. The model's FIFO
-queue abstracts both lower buffering and the new staging slot. Urgent-event
-fairness is outside the liveness proof.
+queue abstracts both lower buffering and the new staging slot. Control delivery now has a weakly fair transition, and the negative control
+reinstates the old failure-wide guard. Rust tests cover reset after a real TLS
+handshake with a `Session`, and replacement failure followed by written credit,
+end and reset. The earlier refused-plaintext tests remain unchanged.
 
 ## Kani
 
@@ -131,13 +139,13 @@ selected the correct STARTTLS boundary. It does not execute TLS cryptography.
 
 | Harness configuration | Result |
 | --- | --- |
-| `tls_partial_admissions_preserve_the_suffix` | Pass, 740 checks |
-| `starttls_split_excludes_the_plaintext_prefix` | Pass, 768 checks |
+| `tls_partial_admissions_preserve_the_suffix` | Pass, 893 checks |
+| `starttls_split_excludes_the_plaintext_prefix` | Pass, 921 checks |
 | `without_consuming_tls_input` | Expected failure, exactly the assertion “only unread bytes remain” |
 | `without_excluding_the_plaintext_prefix` | Expected failure, exactly “the secure suffix excludes plaintext” |
 
-The original [TLS accounting harnesses](../tls/kani/LayerProof.rs) also passed on
-the final code, using their existing commands without stubbing: completion at
+Earlier runs of the [TLS accounting harnesses](../tls/kani/LayerProof.rs) passed
+using their existing commands without stubbing: completion at
 its fence (17,132 checks), acknowledgment after ciphertext completion (16,960),
 and reset clearing owed work (18,344).
 
@@ -145,6 +153,15 @@ The negative harnesses use Kani method stubbing to replace the real cursor
 operation with a broken one. Inputs and assertions are identical to the positive
 harnesses. An intentional negative is not a passing proof. Select harnesses
 explicitly: unfiltered Kani runs include these intentional negatives.
+
+The listener model was rerun on November 9, 2026 after separating certificate
+material from engine configuration. Selection now carries an immutable DER
+chain and private key alongside the site's ALPN list; an empty list remains
+empty. `Listener_base` reaches 5,648 states, and all eight negative controls
+fail their named invariants. Rust unit tests additionally check the default
+factory's bounded configuration cache: certificate and ALPN isolation, expired
+material removal, least-recently-used eviction and isolation between live runs.
+The cache is engine state and is outside this listener-routing abstraction.
 
 ## Rerun
 
@@ -202,3 +219,5 @@ rustfmt --edition 2024 --config skip_children=true --check \
   verification/tls-contract/kani/Buffers.rs
 git diff --check
 ```
+
+The November 9 buffer proofs and both cursor negative controls completed; the three engine-accounting reruns were interrupted and remain incomplete after the requested stop.

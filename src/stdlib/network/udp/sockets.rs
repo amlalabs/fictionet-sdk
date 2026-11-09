@@ -70,7 +70,7 @@ const SOCKETS: usize = 1 << 16;
 /// taken, counting 64 bytes more for each. A datagram past that is dropped,
 /// as with a full socket buffer, and reported ([`UdpReport::Dropped`]).
 /// Each one it keeps is charged, its bytes and those 64 more, to the
-/// layer's [budget](fictionet::stdlib::layer::Env::budget) before it is
+/// layer's [budget](Env::budget) before it is
 /// copied, and the charge goes up with it; one the budget has no room for
 /// is dropped and reported the same way. When the packets below end, each
 /// socket's [`DatagramEvent::Ended`] follows the datagrams it still holds.
@@ -506,7 +506,7 @@ impl Layer for UdpLayer {
         Ok(Admit::Taken)
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<Self::Lower>> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
         let (packet, sender) = self.down.pop_front()?;
         if let Some(id) = sender
             && let Some(socket) = self.sockets.get_mut(id)

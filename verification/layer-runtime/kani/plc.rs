@@ -56,7 +56,7 @@ fn request<const LEN: usize, const FUNCTION: u8>() -> Frame {
 
 /// Takes the server's next command, if any, as the frame layer does.
 fn take(d: &mut Driver<PlcServer>, answers: &mut Vec<Frame>, ended: &mut bool) {
-    match d.layer_mut().take_command() {
+    match d.take_command() {
         Some(MessageCommand::Send(frame)) => {
             assert!(!*ended, "nothing is sent after the end");
             answers.push(frame.into_parts().0);

@@ -30,7 +30,7 @@ pub mod channel;
 pub mod transport;
 use transport::{PacketTransport, StandardTransport, State as TransportState};
 mod session;
-use channel::{ChannelCommand, ChannelEvent, ChannelPort, Opening};
+use channel::{ChannelCommand, ChannelEvent, ChannelPort};
 pub use session::SessionLayer;
 
 const WINDOW: u32 = 65536;
@@ -591,7 +591,11 @@ impl<H: Handler> PortServer for Server<H> {
     fn backlog(&self) -> Option<usize> {
         self.backlog
     }
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.serve_with(fcx, arrival, |opening| {
             StandardTransport::new(opening.config)
         })
@@ -604,7 +608,11 @@ where
     fn backlog(&self) -> Option<usize> {
         self.server.backlog
     }
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.server.serve_with(fcx, arrival, &self.factory)
     }
 }
@@ -715,7 +723,7 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     out_charge: Option<Charge>,
     out_child: Option<(ChildId, u64)>,
     flights: VecDeque<Flight>,
-    up: VecDeque<MuxEvent<ChannelPort, Top, Owned<Opening>>>,
+    up: VecDeque<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>,
     channels: Slots<Channel>,
     next_channel: u32,
     credit_turn: Option<ChildId>,
@@ -734,7 +742,7 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
 
 /// SSH with one synchronous application adapter on every scoped channel.
 pub type Sessions<H, T = StandardTransport> =
-    Chain<Ssh<H, T>, Children<SessionLayer<H>, Top, Owned<Opening>>>;
+    Chain<Ssh<H, T>, Children<SessionLayer<H>, Top, Owned<channel::Opening>>>;
 
 impl<H: Handler> Ssh<H> {
     /// A fresh SSH layer with explicit connection identity.
@@ -745,7 +753,7 @@ impl<H: Handler> Ssh<H> {
 }
 impl<H: Handler, T: PacketTransport> Ssh<H, T> {
     /// Compose a transport with the standard authentication and channel layer.
-    /// With sessions the stack is `Chain<Ssh<H, T>, Children<SessionLayer<H>, Top, Owned<Opening>>>`.
+    /// With sessions the stack is `Chain<Ssh<H, T>, Children<SessionLayer<H>, Top, Owned<channel::Opening>>>`.
     pub fn with_transport(
         config: Arc<Config>,
         handler: Arc<H>,
@@ -796,7 +804,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 let mut session =
                     SessionLayer::new(handler.clone(), connection.clone(), opening, budget);
                 session.policy_close = Some(policy_close.clone());
-                session
+                Some(session)
             }),
         )
     }
@@ -832,7 +840,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             let bytes = self.resident_bytes()
                 + 128 * std::mem::size_of::<Flight>()
                 + 128 * std::mem::size_of::<(u32, Owned<Vec<u8>>)>()
-                + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<Opening>>>();
+                + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>();
             let charge = env.budget().charge(bytes).ok_or(Error::Budget)?;
             self.channels =
                 Slots::with_budget(self.config.max_channels, env.budget()).ok_or(Error::Budget)?;
@@ -1105,7 +1113,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     .charge(ssh::MAX_PAYLOAD * 2)
                     .ok_or(Error::Budget)?;
                 let opening = Owned::new(
-                    Opening {
+                    channel::Opening {
                         user: self.user.clone().ok_or(TransportError::State)?,
                         channel: wire,
                         kind,
@@ -1469,7 +1477,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         self.ended
     }
     type Lower = ByteStream;
-    type Upper = Mux<ChannelPort, Top, Owned<Opening>>;
+    type Upper = Mux<ChannelPort, Top, Owned<channel::Opening>>;
     type Report = Ended;
     type Timer = Timer;
     type Work = ();
@@ -1480,7 +1488,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         let bytes = self.resident_bytes()
             + 128 * std::mem::size_of::<Flight>()
             + 128 * std::mem::size_of::<(u32, Owned<Vec<u8>>)>()
-            + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<Opening>>>();
+            + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>();
         if let Some(charge) = &mut self.state
             && !charge.set(bytes)
         {
@@ -1673,7 +1681,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         }
         Ok(Admit::Taken)
     }
-    fn take_event(&mut self) -> Option<MuxEvent<ChannelPort, Top, Owned<Opening>>> {
+    fn take_event(&mut self) -> Option<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>> {
         self.up.pop_front().or_else(|| {
             if !self.ended {
                 return None;
@@ -1686,7 +1694,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
             ))
         })
     }
-    fn take_urgent(&mut self) -> Option<MuxEvent<ChannelPort, Top, Owned<Opening>>> {
+    fn take_urgent(&mut self) -> Option<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>> {
         let position = self.up.iter().position(|event| {
             matches!(
                 event,
@@ -1698,7 +1706,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         })?;
         self.up.remove(position)
     }
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if !self.out.is_empty() {
             let bytes = std::mem::take(&mut self.out);
             self.flights.push_back(Flight {
@@ -2371,7 +2379,7 @@ mod tests {
                         budget: None,
                         backlog: None,
                     };
-                    server.serve(fcx, arrival).await;
+                    server.serve_connection(fcx, arrival).await;
                     Ok(())
                 });
                 let connection = client.connect(&fcx, "10.0.0.1:22".parse().unwrap()).await?;

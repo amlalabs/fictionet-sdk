@@ -74,6 +74,7 @@ x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 p384 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 rsa = { version = "0.9.10", features = ["sha2"] }
+rustls-pki-types = "1"
 rustls = { package = "fictionet-rustls", path = "rustls", default-features = false, features = ["std", "ring", "tls12"] }
 smoltcp = { path = "smoltcp", default-features = false }
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }

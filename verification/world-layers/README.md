@@ -1,6 +1,6 @@
 # World hosts on the TCP, UDP and IP layers
 
-The checks of the world rebuild in `comp/p3-world`: each world machine
+The checks of the integrated world layers: each world machine
 now runs one packet dispatcher (`network::endpoint::drive`) with one IP
 layer, the TCP and UDP layers above it, and application stacks attached
 straight to the transports' children. The IP layer and TCP are

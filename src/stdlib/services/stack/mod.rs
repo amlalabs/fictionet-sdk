@@ -300,12 +300,27 @@ where
     .await
 }
 
+/// A datagram stack's observation, or an input dropped by its runner.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DatagramReport<R> {
+    /// A report emitted by the application stack.
+    Layer(R),
+    /// The budget could not retain this datagram's backing allocation.
+    Dropped {
+        /// The sender whose datagram was dropped.
+        from: SocketAddr,
+        /// Payload bytes dropped, including zero for an empty datagram.
+        bytes: usize,
+    },
+}
+
 /// Runs `stack` over every datagram of `socket`, which is bound at
 /// `local`, until the socket closes or the stack ends it, handing its
 /// reports to `report`, charging retained input and layer state to `budget`.
 /// The socket owns its receive allocation until it returns; that transport
 /// storage is outside this budget. Before retaining a returned datagram the
-/// runner charges its full capacity, or drops it and returns a budget error.
+/// runner charges its full capacity, or drops that datagram and emits
+/// [`DatagramReport::Dropped`]. The conversation continues for every peer.
 ///
 /// The stack is one conversation for the socket's whole life: it keeps
 /// whatever state it likes between datagrams, and its timers run between
@@ -322,7 +337,7 @@ pub async fn datagrams<L, D>(
     local: SocketAddr,
     stack: L,
     budget: Budget,
-    mut report: impl FnMut(L::Report) + Send,
+    mut report: impl FnMut(DatagramReport<L::Report>) + Send,
 ) -> Result<(), StackError<L::Error>>
 where
     L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top>,
@@ -346,7 +361,7 @@ async fn run_datagrams<L, D>(
     mut socket: D,
     stack: L,
     budget: Budget,
-    report: &mut (impl FnMut(L::Report) + Send),
+    report: &mut (impl FnMut(DatagramReport<L::Report>) + Send),
 ) -> Result<(), StackError<L::Error>>
 where
     L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top>,
@@ -385,8 +400,7 @@ where
                 }
             }
             moved |= driver.run().map_err(StackError::Layer)?;
-            driver.observations().drain().for_each(&mut *report);
-            moved |= driver.send_below(|command| match command {
+            let sent = driver.send_below(|command| match command {
                 _ if ended => Admit::Closed(command),
                 DatagramCommand::Send(datagram) => {
                     let (payload, to) = datagram.into_parts();
@@ -398,6 +412,11 @@ where
                     Admit::Taken
                 }
             });
+            driver
+                .observations()
+                .drain()
+                .for_each(|event| report(DatagramReport::Layer(event)));
+            moved |= sent;
             if !moved {
                 settled = true;
                 break;
@@ -451,14 +470,17 @@ where
         };
         match got {
             Some(Ok((bytes, from))) => {
-                let charge = driver
-                    .budget()
-                    .charge(bytes.capacity())
-                    .ok_or(StackError::Budget)?;
-                input = Some(DatagramEvent::Datagram(Datagram::new(
-                    Chunk::with_charge(bytes, charge),
-                    from,
-                )));
+                if let Some(charge) = driver.budget().charge(bytes.capacity()) {
+                    input = Some(DatagramEvent::Datagram(Datagram::new(
+                        Chunk::with_charge(bytes, charge),
+                        from,
+                    )));
+                } else {
+                    report(DatagramReport::Dropped {
+                        from,
+                        bytes: bytes.len(),
+                    });
+                }
             }
             Some(Err(RecvError::Closed)) => {
                 socket_closed = true;

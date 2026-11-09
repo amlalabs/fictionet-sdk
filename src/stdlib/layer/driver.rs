@@ -268,7 +268,17 @@ impl<L: Layer> Driver<L> {
         &mut self,
         sink: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
     ) -> bool {
-        send(&mut self.below, || self.layer.take_command(), sink)
+        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
+        send(&mut self.below, || self.layer.take_command(&mut env), sink)
+    }
+
+    /// Takes the next command, transferring its ownership and reservation to
+    /// the caller. A previously refused command is returned first.
+    pub fn take_command(&mut self) -> Option<CommandOf<L::Lower>> {
+        self.below.take().or_else(|| {
+            let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
+            self.layer.take_command(&mut env)
+        })
     }
 
     /// Offers the stack's output for what is above it to `sink`. While the
@@ -399,7 +409,7 @@ mod tests {
             self.advances += 1;
             Ok(true)
         }
-        fn take_command(&mut self) -> Option<()> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<()> {
             Some(())
         }
         fn take_event(&mut self) -> Option<Infallible> {

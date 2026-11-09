@@ -439,6 +439,8 @@ impl Layer for TlsLayer {
                 Ok(Admit::Taken)
             }
             StreamCommand::Write(mut chunk) => {
+                // One plaintext write owns the ciphertext fence until delivery.
+                // Pipelining needs separate fences and charges for queued writes.
                 if self.is_handshaking() || self.pending_plaintext != 0 || self.output_pending() {
                     return Ok(Admit::Blocked(StreamCommand::Write(chunk)));
                 }
@@ -620,7 +622,7 @@ impl Layer for TlsLayer {
         Ok(false)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.below.take()
     }
 

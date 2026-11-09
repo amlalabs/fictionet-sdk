@@ -78,8 +78,8 @@ impl Layer for Hesitant {
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
         self.inner.advance(env)
     }
-    fn take_command(&mut self) -> Option<CommandOf<Self::Lower>> {
-        self.inner.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
+        self.inner.take_command(env)
     }
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>> {
         self.inner.take_event()
@@ -251,8 +251,8 @@ impl Layer for Copies {
     fn on_timer(&mut self, env: &mut Env<'_, IpReport>, timer: ()) -> Result<(), Infallible> {
         self.main.on_timer(env, timer)
     }
-    fn take_command(&mut self) -> Option<PacketCommand<Chunk>> {
-        self.main.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Chunk>> {
+        self.main.take_command(env)
     }
     fn take_event(&mut self) -> Option<PacketEvent<IpPacket>> {
         let Some(event) = self.main.take_event() else {
@@ -300,7 +300,10 @@ impl Layer for Collect {
     ) -> Result<Admit<Infallible>, Infallible> {
         match command {}
     }
-    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<DatagramCommand<SocketAddr>> {
         None
     }
     fn take_event(&mut self) -> Option<Infallible> {

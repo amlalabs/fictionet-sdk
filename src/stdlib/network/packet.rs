@@ -554,7 +554,7 @@ impl Layer for IpLayer {
         Ok(())
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<Self::Lower>> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
         self.answer
             .take()
             .map(PacketCommand::Send)

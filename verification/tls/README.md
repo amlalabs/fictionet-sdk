@@ -68,3 +68,5 @@ The entropy tests are compiled into `tests/it` as a child of `tls.rs`:
 ```sh
 cargo test -p fictionet --test it tls::entropy
 ```
+
+The November 9 rerun of all three TLS accounting harnesses was interrupted before any completed result; it remains incomplete after the requested proof stop.

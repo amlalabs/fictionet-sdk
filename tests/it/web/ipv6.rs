@@ -245,14 +245,10 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
             let date = SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000);
             let certs = certs(&fcx, &["a.test", "b.test", "c.test"]);
             let roots = Arc::new(certs.roots);
-            let config = Arc::new(
-                tls::config_builder(&fcx, date)
-                    .with_safe_default_protocol_versions()
-                    .unwrap()
-                    .with_no_client_auth()
-                    .with_single_cert(certs.chain, certs.key)
-                    .unwrap(),
-            );
+            let config = Arc::new(tls::CertifiedKey {
+                chain: certs.chain,
+                key: certs.key,
+            });
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
                 let site = match name {
@@ -392,14 +388,10 @@ fn late_host_failure_keeps_http_defaults_names_and_tls_unchanged() {
         let date = SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000);
         let certs = certs(&fcx, &["first.test", "bad.test", "good.test"]);
         let roots = Arc::new(certs.roots);
-        let config = Arc::new(
-            tls::config_builder(&fcx, date)
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(certs.chain, certs.key)
-                .unwrap(),
-        );
+        let config = Arc::new(tls::CertifiedKey {
+            chain: certs.chain,
+            key: certs.key,
+        });
         let site = |label: &'static str, default| {
             let config = config.clone();
             let server = httpd::Server::new(fictionet_test_support::handler(

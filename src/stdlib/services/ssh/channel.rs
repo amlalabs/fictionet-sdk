@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::stdlib::layer::{
-    Budget, ByteStream, Charge, Chunk, CreditReturn, Credited, Owned, Port, StreamCommand,
+    Budget, ByteStream, Charge, Chunk, CreditReturn, Credited, Env, Owned, Port, StreamCommand,
     StreamEvent,
 };
 use crate::stdlib::protocols::ssh::connection as wire;
@@ -255,7 +255,7 @@ impl<F: FnMut(ChannelEvent) -> Option<ChannelCommand>> crate::stdlib::layer::Lay
     fn take_urgent(&mut self) -> Option<StreamEvent> {
         self.urgent.take()
     }
-    fn take_command(&mut self) -> Option<ChannelCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ChannelCommand> {
         self.down.take()
     }
 }
@@ -303,7 +303,7 @@ mod tests {
         fn take_event(&mut self) -> Option<Infallible> {
             None
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             self.0.take()
         }
     }
@@ -330,7 +330,7 @@ mod tests {
             Instant::ZERO,
         );
         assert!(matches!(
-            driver.layer_mut().take_command(),
+            driver.take_command(),
             Some(ChannelCommand::Accept(true))
         ));
         assert!(
@@ -342,9 +342,7 @@ mod tests {
                 .moved()
         );
         driver.run().unwrap();
-        let Some(ChannelCommand::Stream(StreamCommand::Write(data))) =
-            driver.layer_mut().take_command()
-        else {
+        let Some(ChannelCommand::Stream(StreamCommand::Write(data))) = driver.take_command() else {
             panic!("stream output missing");
         };
         assert_eq!(&*data, b"payload");
@@ -363,7 +361,7 @@ mod tests {
         );
         driver.run().unwrap();
         assert!(matches!(
-            driver.layer_mut().take_command(),
+            driver.take_command(),
             Some(ChannelCommand::Reply(true))
         ));
         assert!(
@@ -387,7 +385,7 @@ mod tests {
         );
         driver.run().unwrap();
         assert!(matches!(
-            driver.layer_mut().take_command(),
+            driver.take_command(),
             Some(ChannelCommand::Stream(StreamCommand::End))
         ));
     }

@@ -12,8 +12,9 @@ use fictionet::time::Instant;
 /// The default is [`Chain`]`<TlsLayer, `[`Later`]`<U>>`: the plaintext the client sends
 /// right after its handshake waits in order until `make` has made the layer
 /// above, then reaches it first. A handshake that fails never makes it.
-/// Once negotiation reports failure, no more input reaches the application,
-/// including plaintext it previously refused. TLS still drains its alerts.
+/// Once negotiation reports failure, no more plaintext reaches the application,
+/// including plaintext it previously refused. Control events and final commands
+/// still pass through, and TLS still drains its alerts.
 ///
 /// It is also what STARTTLS switches to: a plaintext layer whose
 /// [`Handoff`](fictionet::stdlib::layer::Handoff) names a `Secure` as what
@@ -24,16 +25,18 @@ use fictionet::time::Instant;
 pub struct Secure<U: Layer<Lower = ByteStream>, F, T: Negotiation = TlsLayer> {
     chain: Chain<Driven<T>, Later<U>>,
     make: Option<F>,
+    refused: bool,
+    reset_sent: bool,
 }
 
 impl<U, F, T> Secure<U, F, T>
 where
     U: Layer<Lower = ByteStream>,
     T: Negotiation,
-    F: FnOnce(&T) -> U,
+    F: FnOnce(&T) -> Option<U>,
 {
     /// `tls`, with what `make` makes from it above, once its handshake is
-    /// done.
+    /// done. Returning `None` refuses the connection and emits one reset.
     pub fn new(tls: T, make: F) -> Secure<U, F, T> {
         Secure {
             chain: Chain::new(
@@ -45,6 +48,8 @@ where
                 Later::new(),
             ),
             make: Some(make),
+            refused: false,
+            reset_sent: false,
         }
     }
 
@@ -63,7 +68,7 @@ impl<U, F, T> Layer for Secure<U, F, T>
 where
     U: Layer<Lower = ByteStream>,
     T: Negotiation,
-    F: FnOnce(&T) -> U,
+    F: FnOnce(&T) -> Option<U>,
 {
     type Lower = ByteStream;
     type Upper = U::Upper;
@@ -85,7 +90,7 @@ where
     }
 
     fn is_terminal(&self) -> bool {
-        self.chain.is_terminal()
+        self.refused || self.chain.is_terminal()
     }
 
     fn on_event(
@@ -93,6 +98,9 @@ where
         env: &mut Env<'_, Self::Report>,
         event: StreamEvent,
     ) -> Result<Admit<StreamEvent>, Self::Error> {
+        if self.refused {
+            return Ok(Admit::Closed(event));
+        }
         self.chain.on_event(env, event)
     }
 
@@ -101,6 +109,9 @@ where
         env: &mut Env<'_, Self::Report>,
         command: CommandOf<U::Upper>,
     ) -> Result<Admit<CommandOf<U::Upper>>, Self::Error> {
+        if self.refused {
+            return Ok(Admit::Closed(command));
+        }
         self.chain.on_command(env, command)
     }
 
@@ -121,24 +132,49 @@ where
     }
 
     fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Self::Error> {
-        let mut moved = env
-            .scoped(Side::Lower, |env| self.chain.lower_mut().step(env))
-            .map_err(Side::Lower)?;
+        if self.refused {
+            return Ok(false);
+        }
+        let lower = env.scoped(Side::Lower, |env| self.chain.lower_mut().step(env));
+        let mut moved = lower.as_ref().copied().unwrap_or(false);
         match self.tls().handshake() {
-            Handshake::Pending | Handshake::Failed => return Ok(moved),
+            Handshake::Pending => return lower.map_err(Side::Lower),
+            Handshake::Failed => {
+                moved |= self
+                    .chain
+                    .retain_events(|event| !matches!(event, StreamEvent::Data(_)));
+                let driven = self.chain.lower_mut();
+                for slot in [&mut driven.event, &mut driven.urgent] {
+                    if matches!(slot, Some(StreamEvent::Data(_))) {
+                        *slot = None;
+                        moved = true;
+                    }
+                }
+            }
             Handshake::Established { .. } => {
                 if let Some(make) = self.make.take() {
-                    let upper = make(self.tls());
+                    let Some(upper) = make(self.tls()) else {
+                        self.refused = true;
+                        return Ok(true);
+                    };
                     self.chain.upper_mut().set(upper);
                     moved = true;
                 }
             }
         }
-        Ok(self.chain.advance(env)? || moved)
+        let upper = self.chain.advance(env);
+        // Deliver already-produced control before surfacing the lower error.
+        // The connection still fails on this turn, with its original error.
+        lower.map_err(Side::Lower)?;
+        Ok(upper? || moved)
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<ByteStream>> {
-        self.chain.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<ByteStream>> {
+        if self.refused {
+            return (!std::mem::replace(&mut self.reset_sent, true))
+                .then_some(StreamCommand::Reset);
+        }
+        self.chain.take_command(env)
     }
 
     fn take_event(&mut self) -> Option<EventOf<U::Upper>> {
@@ -150,10 +186,16 @@ where
     }
 
     fn take_work(&mut self) -> Option<Self::Work> {
+        if self.refused {
+            return None;
+        }
         self.chain.take_work()
     }
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
+        if self.refused {
+            return None;
+        }
         self.chain.deadline()
     }
 }
@@ -166,7 +208,7 @@ impl<U, F, T> Successor<Secure<U, F, T>> for Secure<U, F, T>
 where
     U: Layer<Lower = ByteStream>,
     T: Negotiation,
-    F: FnOnce(&T) -> U,
+    F: FnOnce(&T) -> Option<U>,
 {
     fn succeed(next: Secure<U, F, T>) -> Secure<U, F, T> {
         next
@@ -187,7 +229,8 @@ struct Driven<T> {
 
 impl<T: Negotiation> Driven<T> {
     fn step(&mut self, env: &mut Env<'_, T::Report>) -> Result<bool, T::Error> {
-        let mut moved = self.tls.advance(env)?;
+        let advanced = self.tls.advance(env);
+        let mut moved = false;
         if self.urgent.is_none() {
             self.urgent = self.tls.take_urgent();
             moved |= self.urgent.is_some();
@@ -196,7 +239,7 @@ impl<T: Negotiation> Driven<T> {
             self.event = self.tls.take_event();
             moved |= self.event.is_some();
         }
-        Ok(moved)
+        advanced.map(|progress| progress || moved)
     }
 }
 
@@ -253,8 +296,8 @@ impl<T: Negotiation> Layer for Driven<T> {
         self.tls.on_done(env, done)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
-        self.tls.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+        self.tls.take_command(env)
     }
 
     fn take_event(&mut self) -> Option<StreamEvent> {
@@ -294,6 +337,7 @@ mod tests {
         Refuse,
         FailWhenAdvanced,
         FailWhenTaken,
+        FailWithError,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,9 +351,11 @@ mod tests {
     struct Replacement {
         state: Handshake<'static>,
         event: Option<StreamEvent>,
+        urgent: Option<StreamEvent>,
         select: Option<Select>,
         fail_on_advance: bool,
         fail_on_take: bool,
+        fail_with_error: bool,
     }
 
     impl Replacement {
@@ -317,9 +363,11 @@ mod tests {
             Self {
                 state: Handshake::Pending,
                 event: None,
+                urgent: None,
                 select: Some(Select),
                 fail_on_advance: false,
                 fail_on_take: false,
+                fail_with_error: false,
             }
         }
     }
@@ -378,6 +426,11 @@ mod tests {
                     self.fail_on_take = true;
                     self.state
                 }
+                Selected::FailWithError => {
+                    self.fail_on_advance = true;
+                    self.fail_with_error = true;
+                    self.state
+                }
                 Selected::FailWhenAdvanced => {
                     self.fail_on_advance = true;
                     self.state
@@ -390,7 +443,11 @@ mod tests {
         fn advance(&mut self, _: &mut Env<'_, Selected>) -> Result<bool, Expired> {
             if std::mem::take(&mut self.fail_on_advance) {
                 self.state = Handshake::Failed;
-                Ok(true)
+                if std::mem::take(&mut self.fail_with_error) {
+                    Err(Expired)
+                } else {
+                    Ok(true)
+                }
             } else {
                 Ok(false)
             }
@@ -401,7 +458,7 @@ mod tests {
             Err(Expired)
         }
 
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
 
@@ -413,7 +470,7 @@ mod tests {
             if std::mem::take(&mut self.fail_on_take) {
                 self.state = Handshake::Failed;
             }
-            None
+            self.urgent.take()
         }
 
         fn take_work(&mut self) -> Option<Select> {
@@ -431,6 +488,8 @@ mod tests {
         received: Vec<u8>,
         received_count: Arc<AtomicUsize>,
         ended: bool,
+        reset: bool,
+        written: u64,
     }
 
     impl Layer for Application {
@@ -457,7 +516,8 @@ mod tests {
                     self.received.extend_from_slice(&chunk);
                 }
                 StreamEvent::Ended => self.ended = true,
-                StreamEvent::Written(_) | StreamEvent::Reset => {}
+                StreamEvent::Written(n) => self.written += n,
+                StreamEvent::Reset => self.reset = true,
             }
             Ok(Admit::Taken)
         }
@@ -470,7 +530,7 @@ mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
 
@@ -482,7 +542,7 @@ mod tests {
     fn application(
         builds: Arc<AtomicUsize>,
         ready: Arc<AtomicBool>,
-    ) -> impl FnOnce(&Replacement) -> Application {
+    ) -> impl FnOnce(&Replacement) -> Option<Application> {
         move |tls| {
             assert_eq!(
                 tls.handshake(),
@@ -492,12 +552,14 @@ mod tests {
                 }
             );
             builds.fetch_add(1, Ordering::Relaxed);
-            Application {
+            Some(Application {
                 ready,
                 received: Vec::new(),
                 received_count: Arc::new(AtomicUsize::new(0)),
                 ended: false,
-            }
+                reset: false,
+                written: 0,
+            })
         }
     }
 
@@ -530,6 +592,67 @@ mod tests {
         let reports: Vec<_> = h.driver().observations().drain().collect();
         assert_eq!(reports, [Side::Lower(Selected::Accept)]);
         assert!(h.layer().deadline().is_none());
+    }
+
+    #[test]
+    fn failed_negotiation_delivers_control_to_the_established_application() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let secure = Secure::new(
+            Replacement::new(),
+            application(Arc::new(AtomicUsize::new(0)), ready),
+        );
+        let mut h = fictionet::stdlib::layer::Driver::new(
+            secure,
+            Arc::new(fictionet::SeededEntropy::new(Seed::from_u64(46))),
+            fictionet::stdlib::layer::Budget::unlimited(),
+            Instant::ZERO,
+        );
+        h.complete(Side::Lower(Selected::Accept)).unwrap();
+        h.run().unwrap();
+        h.complete(Side::Lower(Selected::Refuse)).unwrap();
+        for event in [
+            StreamEvent::Written(17),
+            StreamEvent::Ended,
+            StreamEvent::Reset,
+        ] {
+            assert!(matches!(h.deliver(event).unwrap(), Admit::Taken));
+            h.run().unwrap();
+        }
+        let app = h.layer().upper().unwrap();
+        assert_eq!(app.written, 17);
+        assert!(app.ended);
+        assert!(app.reset);
+    }
+
+    #[test]
+    fn a_lower_error_is_returned_after_delivering_its_last_controls() {
+        let secure = Secure::new(
+            Replacement::new(),
+            application(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicBool::new(true)),
+            ),
+        );
+        let mut driver = fictionet::stdlib::layer::Driver::new(
+            secure,
+            Arc::new(fictionet::SeededEntropy::new(Seed::from_u64(48))),
+            fictionet::stdlib::layer::Budget::unlimited(),
+            Instant::ZERO,
+        );
+        driver.complete(Side::Lower(Selected::Accept)).unwrap();
+        driver.run().unwrap();
+        driver.layer_mut().chain.lower_mut().tls.urgent = Some(StreamEvent::Written(17));
+        assert!(matches!(
+            driver.deliver(StreamEvent::Reset).unwrap(),
+            Admit::Taken
+        ));
+        driver
+            .complete(Side::Lower(Selected::FailWithError))
+            .unwrap();
+        assert_eq!(driver.run(), Err(Side::Lower(Expired)));
+        let app = driver.layer().upper().unwrap();
+        assert_eq!(app.written, 17);
+        assert!(app.reset);
     }
 
     #[test]
@@ -573,6 +696,18 @@ mod tests {
         assert_eq!(builds.load(Ordering::Relaxed), 0);
         assert!(h.layer().upper().is_none());
         assert_eq!(h.layer().tls().handshake(), Handshake::Failed);
+    }
+
+    #[test]
+    fn refusing_an_established_application_resets_once() {
+        let secure = Secure::new(Replacement::new(), |_| None::<Application>);
+        let mut h = Harness::new(Seed::from_u64(47), secure);
+        h.complete(Side::Lower(Selected::Accept)).unwrap();
+        assert!(h.layer().is_terminal());
+        assert!(h.layer().upper().is_none());
+        assert!(h.was_reset());
+        h.settle().unwrap();
+        assert!(h.driver().take_command().is_none());
     }
 
     #[test]

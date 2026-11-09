@@ -74,7 +74,7 @@ trait Erased<Lo: Port, Up: Port>: Send {
     fn on_timer(&mut self, env: &mut Env<'_, BoxReport>) -> Result<(), BoxError>;
     fn on_done(&mut self, env: &mut Env<'_, BoxReport>, done: BoxDone) -> Result<(), BoxError>;
     fn advance(&mut self, env: &mut Env<'_, BoxReport>) -> Result<bool, BoxError>;
-    fn take_command(&mut self) -> Option<CommandOf<Lo>>;
+    fn take_command(&mut self, env: &mut Env<'_, BoxReport>) -> Option<CommandOf<Lo>>;
     fn take_event(&mut self) -> Option<EventOf<Up>>;
     fn take_urgent(&mut self) -> Option<EventOf<Up>>;
     fn take_work(&mut self) -> Option<BoxWork>;
@@ -152,8 +152,8 @@ where
             .map_err(error)
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<Lo>> {
-        Layer::take_command(self)
+    fn take_command(&mut self, env: &mut Env<'_, BoxReport>) -> Option<CommandOf<Lo>> {
+        env.scoped(boxed::<L>, |env| Layer::take_command(self, env))
     }
 
     fn take_event(&mut self) -> Option<EventOf<Up>> {
@@ -250,8 +250,8 @@ impl<Lo: Port, Up: Port> Layer for Boxed<Lo, Up> {
         self.inner.advance(env)
     }
 
-    fn take_command(&mut self) -> Option<CommandOf<Lo>> {
-        self.inner.take_command()
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<Lo>> {
+        self.inner.take_command(env)
     }
 
     fn take_event(&mut self) -> Option<EventOf<Up>> {

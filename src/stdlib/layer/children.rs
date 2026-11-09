@@ -19,7 +19,7 @@ use slab::Slab;
 const QUEUE: usize = 64;
 const RESERVE: usize = 8;
 const MAX_CHILDREN: usize = 4096;
-type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> B + Send;
+type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> Option<B> + Send;
 type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 
 /// One `B` on each child of a multiplexed connection, with the
@@ -40,7 +40,7 @@ type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 /// #     type Work = (); type Done = (); type Error = ();
 /// #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
 /// #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
-/// #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+/// #     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<L>> { None }
 /// #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
 /// # }
 /// # struct Call; struct Reply;
@@ -61,7 +61,7 @@ type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 /// #     type Work = (); type Done = (); type Error = ();
 /// #     fn on_event(&mut self, _: &mut Env<'_, ()>, e: EventOf<L>) -> Result<Admit<EventOf<L>>, ()> { Ok(Admit::Blocked(e)) }
 /// #     fn on_command(&mut self, _: &mut Env<'_, ()>, c: CommandOf<U>) -> Result<Admit<CommandOf<U>>, ()> { Ok(Admit::Blocked(c)) }
-/// #     fn take_command(&mut self) -> Option<CommandOf<L>> { None }
+/// #     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<L>> { None }
 /// #     fn take_event(&mut self) -> Option<EventOf<U>> { None }
 /// # }
 /// # struct Call; struct Reply;
@@ -415,11 +415,11 @@ where
     K: Port,
 {
     /// At most `limit` children at once, each with `window` credit units for
-    /// its events and a layer from `make`.
+    /// its events and a layer from `make`. Returning `None` refuses this child.
     pub fn new(
         limit: usize,
         window: u64,
-        make: impl FnMut(ChildId, O, &Budget) -> B + Send + 'static,
+        make: impl FnMut(ChildId, O, &Budget) -> Option<B> + Send + 'static,
     ) -> Self {
         assert!(
             limit <= MAX_CHILDREN,
@@ -780,7 +780,7 @@ where
             }
         }
         if kid.outbox.is_none() {
-            kid.outbox = kid.layer.take_command();
+            kid.outbox = env.scoped_in(&kid.budget, report, |env| kid.layer.take_command(env));
             moved |= kid.outbox.is_some();
         }
         let output_idle = kid.outbox.is_none();
@@ -885,7 +885,11 @@ where
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
                 };
-                let layer = (self.make)(id, opening, &budget);
+                let Some(layer) = (self.make)(id, opening, &budget) else {
+                    self.down.push_back(child.close());
+                    env.report(ChildReport::Refused(id));
+                    return Ok(Admit::Taken);
+                };
                 let depth = layer.depth();
                 let due = layer.deadline();
                 assert!(depth < MAX_DEPTH, "composition depth exceeded");
@@ -972,7 +976,8 @@ where
                             kid.inbox.reserve_exact(places - kid.inbox.len());
                         }
                         if !event.reserve_receive(&kid.budget, &kid.backing) {
-                            return Err(Overrun::Budget);
+                            self.refuse(env, id);
+                            return Ok(Admit::Taken);
                         }
                         kid.granted -= cost;
                         let retained = if cost > 0 {
@@ -1088,7 +1093,7 @@ where
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<MuxCommand<B::Lower, K>> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<MuxCommand<B::Lower, K>> {
         self.down.pop_front()
     }
 
@@ -1202,7 +1207,7 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match c {}
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             self.writes.pop_front().or_else(|| {
                 self.productive
                     .then(|| StreamCommand::Write(Chunk::new(vec![1])))
@@ -1224,14 +1229,94 @@ mod tests {
     }
 
     fn driver(
-        make: impl FnMut(ChildId, &'static str, &Budget) -> Reader + Send + 'static,
+        mut make: impl FnMut(ChildId, &'static str, &Budget) -> Reader + Send + 'static,
     ) -> Driver<Children<Reader, Top, &'static str>> {
         Driver::new(
-            Children::new(3, 8, make),
+            Children::new(3, 8, move |id, opening, budget| {
+                Some(make(id, opening, budget))
+            }),
             Arc::new(SeededEntropy::new(Seed::from_u64(91))),
             Budget::new(100_000),
             Instant::ZERO,
         )
+    }
+
+    #[test]
+    fn an_uncharged_payload_that_does_not_fit_refuses_only_its_child() {
+        use crate::stdlib::layer::{Direction, ObservedEvent, ObservedStream};
+
+        #[derive(Default)]
+        struct Observe(usize);
+        impl Layer for Observe {
+            type Lower = ObservedStream;
+            type Upper = Top;
+            type Report = ();
+            type Timer = ();
+            type Work = ();
+            type Done = ();
+            type Error = Infallible;
+            fn on_event(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                event: ObservedEvent,
+            ) -> Result<Admit<ObservedEvent>, Infallible> {
+                if let ObservedEvent::Data { bytes, .. } = event {
+                    self.0 += bytes.len();
+                }
+                Ok(Admit::Taken)
+            }
+            fn on_command(
+                &mut self,
+                _: &mut Env<'_, ()>,
+                command: Infallible,
+            ) -> Result<Admit<Infallible>, Infallible> {
+                match command {}
+            }
+            fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Infallible> {
+                None
+            }
+            fn take_event(&mut self) -> Option<Infallible> {
+                None
+            }
+        }
+        let budget = Budget::new(4096);
+        let child_budget = budget.clone();
+        let children = Children::<Observe, Top, ()>::new(2, 8, |_, (), _| Some(Observe::default()))
+            .budgets(move |_, _, _| child_budget.clone());
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(2);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let child = slots.insert(()).unwrap();
+            ids.push(child.id());
+            let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
+        }
+        driver.run().unwrap();
+        let payload = || ObservedEvent::Data {
+            direction: Direction::Forward,
+            bytes: Chunk::new(vec![1]),
+            sequence: 0,
+            source: None,
+        };
+        for id in &ids {
+            let _ = driver.deliver(MuxEvent::Child(*id, payload())).unwrap();
+            driver.run().unwrap();
+        }
+        let rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        assert!(matches!(
+            driver.deliver(MuxEvent::Child(ids[0], payload())),
+            Ok(Admit::Taken)
+        ));
+        assert!(driver.layer().child(ids[0]).is_none());
+        drop(rest);
+        let _ = driver.deliver(MuxEvent::Child(ids[1], payload())).unwrap();
+        driver.run().unwrap();
+        assert_eq!(driver.layer().child(ids[1]).unwrap().0, 2);
     }
 
     #[test]
@@ -1294,7 +1379,7 @@ mod tests {
                 budget.used() > 0,
                 "receive storage is reserved before construction"
             );
-            Reader::default()
+            Some(Reader::default())
         })
         .budgets(move |_, allowed, _| {
             if *allowed {
@@ -1363,7 +1448,7 @@ mod tests {
         for _ in 0..8 {
             assert!(driver.deliver(MuxEvent::Credit(id, 1)).unwrap().moved());
             driver.run().unwrap();
-            while let Some(command) = driver.layer_mut().take_command() {
+            while let Some(command) = driver.take_command() {
                 if let super::super::MuxOp::Child(actual, StreamCommand::Write(bytes)) =
                     command.into_op()
                 {
@@ -1420,7 +1505,7 @@ mod tests {
             .deliver(MuxEvent::Opened(child, "stream", 8))
             .unwrap();
         driver.run().unwrap();
-        while driver.layer_mut().take_command().is_some() {}
+        while driver.take_command().is_some() {}
         let _ = driver
             .deliver(MuxEvent::Child(
                 id,
@@ -1428,16 +1513,86 @@ mod tests {
             ))
             .unwrap();
         driver.run().unwrap();
-        assert!(driver.layer_mut().take_command().is_none());
+        assert!(driver.take_command().is_none());
         let chunk = driver.layer_mut().kids[0].layer.held.take().unwrap();
         driver.run().unwrap();
-        assert!(driver.layer_mut().take_command().is_none());
+        assert!(driver.take_command().is_none());
         drop(chunk);
         driver.run().unwrap();
         assert!(matches!(
-            driver.layer_mut().take_command().unwrap().into_op(),
+            driver.take_command().unwrap().into_op(),
             super::super::MuxOp::Credit(_, 3)
         ));
+    }
+
+    #[test]
+    fn editing_retained_input_returns_credit_only_after_the_last_piece() {
+        for shared in [false, true] {
+            let mut driver = driver(|_, _, _| Reader::default());
+            let mut slots = Slots::new(1);
+            let child = slots.insert(()).unwrap();
+            let id = child.id();
+            let _ = driver
+                .deliver(MuxEvent::Opened(child, "stream", 8))
+                .unwrap();
+            driver.run().unwrap();
+            while driver.take_command().is_some() {}
+            let _ = driver
+                .deliver(MuxEvent::Child(
+                    id,
+                    StreamEvent::Data(Chunk::new(vec![1, 2, 3])),
+                ))
+                .unwrap();
+            driver.run().unwrap();
+            let chunk = driver.layer_mut().kids[0].layer.held.take().unwrap();
+            let mut original = Some(chunk);
+            let mut edit = if shared {
+                original.as_mut().unwrap().split_to(1)
+            } else {
+                original.take().unwrap()
+            };
+            let budget = Budget::new(16);
+            edit.make_mut(&budget).unwrap()[0] = 9;
+            if shared {
+                drop(original.take());
+            }
+            driver.run().unwrap();
+            assert!(driver.take_command().is_none());
+            drop(edit);
+            driver.run().unwrap();
+            assert!(matches!(driver.take_command().unwrap().into_op(),
+                super::super::MuxOp::Credit(found, 3) if found == id));
+            driver.run().unwrap();
+            assert!(driver.take_command().is_none());
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn a_factory_refusal_returns_the_child_and_its_storage() {
+        let budget = Budget::new(4096);
+        let held = budget.clone();
+        let children =
+            Children::<Reader, Top, bool>::new(2, 8, |_, allowed, _| allowed.then(Reader::default))
+                .budgets(move |_, _, _| held.clone());
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(2);
+        let refused = slots.insert(()).unwrap();
+        let id = refused.id();
+        let _ = driver.deliver(MuxEvent::Opened(refused, false, 8)).unwrap();
+        assert!(driver.layer().child(id).is_none());
+        assert_eq!(budget.used(), 0);
+        assert!(matches!(driver.take_command().unwrap().into_op(),
+            super::super::MuxOp::Close(found) if found == id));
+        let accepted = slots.insert(()).unwrap();
+        let id = accepted.id();
+        let _ = driver.deliver(MuxEvent::Opened(accepted, true, 8)).unwrap();
+        assert!(driver.layer().child(id).is_some());
     }
 
     #[test]
@@ -1562,7 +1717,7 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match c {}
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
         fn take_event(&mut self) -> Option<Infallible> {
@@ -1574,7 +1729,7 @@ mod tests {
     fn a_child_that_refuses_everything_holds_up_neither_siblings_nor_control() {
         use crate::stdlib::layer::{MessageEvent, Messages, MuxOp};
         let children: Children<Probe, Messages<u8>, bool> =
-            Children::new(3, 8, |_, refuse, _| Probe { refuse, taken: 0 });
+            Children::new(3, 8, |_, refuse, _| Some(Probe { refuse, taken: 0 }));
         let mut driver = Driver::new(
             children,
             Arc::new(SeededEntropy::new(Seed::from_u64(97))),
@@ -1619,7 +1774,7 @@ mod tests {
         assert!(driver.layer().child(stuck_urgent).is_none());
         assert_eq!(driver.layer().child(ready).unwrap().taken, 2 * rounds);
         let mut closed = Vec::new();
-        while let Some(command) = driver.layer_mut().take_command() {
+        while let Some(command) = driver.take_command() {
             if let MuxOp::Close(id) = command.into_op() {
                 closed.push(id);
             }
@@ -1640,9 +1795,11 @@ mod tests {
 
     #[test]
     fn continuously_ready_children_rotate_across_bounded_sweeps() {
-        let children: Children<Reader, Top> = Children::new(70, 8, |_, (), _| Reader {
-            productive: true,
-            ..Reader::default()
+        let children: Children<Reader, Top> = Children::new(70, 8, |_, (), _| {
+            Some(Reader {
+                productive: true,
+                ..Reader::default()
+            })
         });
         let mut driver = Driver::new(
             children,
@@ -1660,7 +1817,7 @@ mod tests {
         let mut sent = std::collections::BTreeSet::new();
         for _ in 0..70 {
             driver.run().unwrap();
-            while let Some(command) = driver.layer_mut().take_command() {
+            while let Some(command) = driver.take_command() {
                 if let super::super::MuxOp::Child(id, StreamCommand::Write(_)) = command.into_op() {
                     sent.insert(id);
                 }
@@ -1703,7 +1860,7 @@ mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match c {}
         }
-        fn take_command(&mut self) -> Option<StreamCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             None
         }
         fn take_event(&mut self) -> Option<Infallible> {
@@ -1737,10 +1894,12 @@ mod tests {
         let made = plans.clone();
         let record = fired.clone();
         let children: Children<Alarm, Top, usize> =
-            Children::new(8, 8, move |_, name: usize, _| Alarm {
-                times: made[name].iter().map(|n: &u64| ms(*n)).collect(),
-                fired: record.clone(),
-                name,
+            Children::new(8, 8, move |_, name: usize, _| {
+                Some(Alarm {
+                    times: made[name].iter().map(|n: &u64| ms(*n)).collect(),
+                    fired: record.clone(),
+                    name,
+                })
             });
         let mut driver = Driver::new(
             children,
@@ -1813,7 +1972,7 @@ mod tests {
         let count = made.clone();
         let children: Children<Reader, Top, ()> = Children::new(8, 8, move |_, (), _| {
             count.fetch_add(1, Ordering::Relaxed);
-            Reader::default()
+            Some(Reader::default())
         });
         let budget = Budget::new(100_000);
         let mut driver = Driver::new(
@@ -1829,7 +1988,7 @@ mod tests {
         let a = first.id();
         let _ = driver.deliver(MuxEvent::Opened(first, (), 8)).unwrap();
         driver.run().unwrap();
-        while driver.layer_mut().take_command().is_some() {}
+        while driver.take_command().is_some() {}
         // Nothing is left for a second child's places.
         let other = budget.charge(budget.limit() - budget.used()).unwrap();
         let second = slots.insert(()).unwrap();
@@ -1840,7 +1999,7 @@ mod tests {
         ));
         assert!(driver.layer().child(b).is_none());
         assert!(
-            matches!(driver.layer_mut().take_command().unwrap().into_op(), crate::stdlib::layer::MuxOp::Close(id) if id == b)
+            matches!(driver.take_command().unwrap().into_op(), crate::stdlib::layer::MuxOp::Close(id) if id == b)
         );
         assert_eq!(made.load(Ordering::Relaxed), 1);
         drop(other);
@@ -1859,7 +2018,7 @@ mod tests {
         // With no children, the router holds what it held idle.
         let _ = driver.deliver(MuxEvent::Closed(a)).unwrap();
         driver.run().unwrap();
-        while driver.layer_mut().take_command().is_some() {}
+        while driver.take_command().is_some() {}
         assert_eq!(budget.used(), idle);
     }
 
@@ -1869,7 +2028,7 @@ mod tests {
         let flag = called.clone();
         let children: Children<Reader, Top, ()> = Children::new(1, 8, move |_, (), _| {
             flag.store(true, Ordering::Relaxed);
-            Reader::default()
+            Some(Reader::default())
         });
         let budget = Budget::new(0);
         let mut driver = Driver::new(
@@ -1914,14 +2073,17 @@ mod tests {
             ) -> Result<Admit<Infallible>, Infallible> {
                 match c {}
             }
-            fn take_command(&mut self) -> Option<MessageCommand<u8>> {
+            fn take_command(
+                &mut self,
+                _: &mut Env<'_, Self::Report>,
+            ) -> Option<MessageCommand<u8>> {
                 std::mem::take(&mut self.0).then_some(MessageCommand::Send(7))
             }
             fn take_event(&mut self) -> Option<Infallible> {
                 None
             }
         }
-        let children: Children<Atomic, Top> = Children::new(1, 1, |_, (), _| Atomic(true));
+        let children: Children<Atomic, Top> = Children::new(1, 1, |_, (), _| Some(Atomic(true)));
         let mut driver = Driver::new(
             children,
             Arc::new(SeededEntropy::new(Seed::from_u64(93))),
@@ -1935,7 +2097,7 @@ mod tests {
         driver.run().unwrap();
         assert!(driver.layer().child(id).is_none());
         assert!(
-            matches!(driver.layer_mut().take_command().unwrap().into_op(), MuxOp::Close(actual) if actual == id)
+            matches!(driver.take_command().unwrap().into_op(), MuxOp::Close(actual) if actual == id)
         );
     }
 }
@@ -1985,10 +2147,10 @@ mod http_children {
             let flag = dropped.clone();
             let children: Children<Http1, Messages<u8>, &'static str> =
                 Children::new(3, 4096, move |_, name, _| {
-                    Http1::new(Answer {
+                    Some(Http1::new(Answer {
                         name,
                         dropped: flag.clone(),
-                    })
+                    }))
                 });
             let mut driver = Driver::new(
                 children,
@@ -2005,7 +2167,7 @@ mod http_children {
                 let _ = driver.deliver(MuxEvent::Opened(child, name, 4096)).unwrap();
             }
             driver.run().unwrap();
-            while driver.layer_mut().take_command().is_some() {}
+            while driver.take_command().is_some() {}
             for id in &ids {
                 let _ = driver
                     .deliver(MuxEvent::Child(
@@ -2021,7 +2183,7 @@ mod http_children {
             for _ in 0..32 {
                 driver.run().unwrap();
                 worker.work(&mut driver).unwrap();
-                while let Some(command) = driver.layer_mut().take_command() {
+                while let Some(command) = driver.take_command() {
                     if let MuxOp::Child(id, StreamCommand::Write(bytes)) = command.into_op() {
                         assert_eq!(id, ids[2]);
                         response.extend_from_slice(&bytes);

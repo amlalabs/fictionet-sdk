@@ -1078,7 +1078,7 @@ impl Layer for Http1 {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let command = self.out.pop_front()?;
         match &command {
             StreamCommand::Write(chunk) => self.handed += chunk.len() as u64,

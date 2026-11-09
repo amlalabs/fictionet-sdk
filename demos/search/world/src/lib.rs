@@ -34,7 +34,7 @@ use fictionet::stdlib::protocols::dns::rr::{LowerName, Name};
 use fictionet::stdlib::services::dns::Event;
 use fictionet::stdlib::services::dns::resolver::{BlockedNames, Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::ZoneData;
-use fictionet::stdlib::services::tls::ServerConfig;
+use fictionet::stdlib::services::tls::CertifiedKey;
 use fictionet::stdlib::web;
 use fictionet::stdlib::world::net::dns::{Recursive, placing};
 use fictionet::stdlib::world::net::{Host, Net};
@@ -202,8 +202,8 @@ impl Sites {
             self.upstream.clone(),
             host.clone(),
         );
-        let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
-        let refused: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
+        let config: Arc<OnceLock<Arc<CertifiedKey>>> = Arc::new(OnceLock::new());
+        let refused: Arc<OnceLock<Arc<CertifiedKey>>> = Arc::new(OnceLock::new());
         web::Site::new(self.handler.clone())
             .date(self.start)
             .tls_when(move |fcx| {

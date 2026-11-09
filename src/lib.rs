@@ -211,7 +211,7 @@
 //!         match command {}
 //!     }
 //!
-//!     fn take_command(&mut self) -> Option<StreamCommand> {
+//!     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
 //!         self.out.take()
 //!     }
 //!

@@ -333,7 +333,7 @@ impl Layer for Abstract {
         Ok(which != "none")
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.down_out
             .pop_front()
             .map(|bytes| StreamCommand::Write(Chunk::new(bytes)))

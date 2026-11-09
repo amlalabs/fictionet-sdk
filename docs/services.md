@@ -212,7 +212,7 @@ impl Layer for Prompt {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.out.pop_front()
     }
 
@@ -624,12 +624,30 @@ Other kinds of port:
   retransmissions and heartbeats. It is one conversation for the socket's
   whole life, and its factory gets the socket's address. What it retains
   is charged to `budget`.
-- `tls_stack(port, sni, config, make)`: TLS first, picked by the name the
+- `tls_stack(port, sni, certificate, make)`: TLS first, picked by the name the
   client sends (`Sni::Any`, `Sni::Names` for the host's DNS names, or one
   name), then a stack over the decrypted stream; several calls on one port
   route by SNI.
-- `port_server(port, server)` and `tls_accept(port, sni, config, server)`: a
+- `port_server(port, server)` and `tls_accept(port, sni, certificate, server)`: a
   `PortServer` of the world's own. HTTP is one: `httpd::Server`, below.
+
+TLS certificate callbacks return `Arc<tls::CertifiedKey>`, containing the standard
+DER certificate chain and private key. `ca::Leaf::certified_key()` constructs one
+from an issued leaf. A replacement TLS factory receives this material and the
+selected application's ALPN list; it does not need to inspect a rustls config.
+The default factory constructs rustls configs and retains up to 64 recent ones
+for resumption, isolated by run, certificate identity and ALPN. Reuse the
+certificate's `Arc` across handshakes to keep its session state; cache eviction
+can require a full handshake. Its configuration callback runs only when a new
+configuration is built. Configure engine settings such as key logging through `tls::Factory::rustls`. Pass a
+configured `httpd::Server` to `web::Site::from_server` to use replacement TLS
+or negotiated applications inside `web::Sites`.
+
+A `PortServer` constructs an application through `stack(fcx, opening)` on either
+a plain stream or negotiated TLS. `opening.info.tls` identifies the carrier.
+Its `PortStack` result supplies a layer, refuses the connection, or selects the
+asynchronous `serve_connection` adapter. Refusal closes the transport child
+without constructing an application.
 
 Reading a `tls::TlsConnection` can also send TLS output, such as a KeyUpdate
 reply. If that send fails, the read reports the underlying connection error.
@@ -757,7 +775,7 @@ use fictionet_extras::network::cdn_pools;
 
 Net::new(cdn_pools())
     .host("intranet", |h| h.dns_name("intranet.corp.test").port_server(80, Server::new(api.clone())))
-    .add_host(Server::new(api).tls_with(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
+    .add_host(Server::new(api).tls_with(move |_| certificate.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
     /* ... */;
 ```
 

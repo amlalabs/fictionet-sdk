@@ -517,7 +517,7 @@ fn time_wait_expires_after_sixty_seconds() {
 struct Counted(Arc<AtomicUsize>);
 
 impl PortServer for Counted {
-    fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {})
     }

@@ -204,9 +204,12 @@ fn a_reset_drops_what_is_owed_and_sends_only_a_reset() {
     assert!(layer.take_event().is_none());
 
     assert!(matches!(layer.advance(&mut env), Ok(true)));
-    assert!(matches!(layer.take_command(), Some(StreamCommand::Reset)));
+    assert!(matches!(
+        layer.take_command(&mut env),
+        Some(StreamCommand::Reset)
+    ));
     assert!(matches!(layer.advance(&mut env), Ok(false)));
-    assert!(layer.take_command().is_none());
+    assert!(layer.take_command(&mut env).is_none());
     assert!(matches!(
         layer.on_command(&mut env, StreamCommand::Reset),
         Ok(Admit::Closed(StreamCommand::Reset))

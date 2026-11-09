@@ -14,7 +14,7 @@ use fictionet::stdlib::services::dns::zone::{
     Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, additional_targets,
 };
 use fictionet::stdlib::services::stack::{self, Boxed, Counted, Job, StreamEnd, StreamLimits};
-use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig};
+use fictionet::stdlib::services::tls::{self, CertifiedKey, HandshakeError};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, End, Interface};
@@ -44,13 +44,13 @@ enum Family {
     V6,
 }
 
-/// The TLS config for one handshake, once it is picked.
-pub type ConfigFuture = Pin<Box<dyn Future<Output = Arc<ServerConfig>> + Send>>;
+/// The certificate for one handshake, once it is picked.
+pub type CertificateFuture = Pin<Box<dyn Future<Output = Arc<CertifiedKey>> + Send>>;
 
-/// Picks the TLS config for one handshake, with randomness from the `Cx`.
+/// Picks the certificate for one handshake, with randomness from the `Cx`.
 /// Picking may take time (a check of the real host, say): only that
 /// handshake waits, up to its deadline, while the world goes on.
-pub type ConfigFor = Arc<dyn Fn(&Cx) -> ConfigFuture + Send + Sync>;
+pub type CertificateFor = Arc<dyn Fn(&Cx) -> CertificateFuture + Send + Sync>;
 
 /// One connection, accepted on a port of a machine, as a [`PortServer`] gets
 /// it.
@@ -73,9 +73,8 @@ pub struct Arrival {
     pub limits: Limits,
 }
 
-/// A connection on a TLS port whose handshake is done, before anything
-/// serves it: what an [`Arrival`] holds but the connection, which is the
-/// TLS layer's to carry. [`PortServer::over_tls`] gets one.
+/// A plain or negotiated TLS stream before its application is constructed.
+/// [`PortServer::stack`] receives this context without a connection adapter.
 pub struct Opening {
     /// The network default for HTTP exchange observations.
     pub http_observe: Option<fictionet::stdlib::web::httpd::Observe>,
@@ -92,7 +91,7 @@ pub struct Opening {
 }
 
 impl Opening {
-    /// The arrival of `conn`, which carries the decrypted bytes.
+    /// The arrival of `conn`, which carries this opening's stream.
     pub fn arrive(self, conn: Box<dyn Connection>) -> Arrival {
         Arrival {
             http_observe: self.http_observe,
@@ -109,22 +108,19 @@ impl Opening {
 /// for a layer stack; [`httpd::Server`] is HTTP's.
 /// A world writes its own for anything else.
 pub trait PortServer: Any + Send + Sync {
-    /// Serves one connection.
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+    /// Serves one connection through the asynchronous connection adapter.
+    /// Used when [`stack`](Self::stack) returns [`PortStack::UseConnection`].
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
-    /// Constructs the application directly on a transport child. Returning
-    /// `None` uses a `Tunnel` for servers written against `Connection`.
-    fn stack(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
-        self.over_tls(fcx, opening)
-    }
-
-    /// The layer that serves one connection on a TLS port once its
-    /// handshake is done, over the decrypted stream, in the same stack as
-    /// TLS. Default `None`: [`serve`](Self::serve) gets the decrypted stream
-    /// as a connection, through a [`Tunnel`](stack::Tunnel).
-    fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+    /// Constructs the application on a plain or negotiated TLS stream.
+    /// The opening's connection information identifies the carrier.
+    fn stack(&self, fcx: &Cx, opening: &Opening) -> PortStack {
         let _ = (fcx, opening);
-        None
+        PortStack::UseConnection
     }
 
     /// TLS implementation for this listener. The first TLS server installed
@@ -142,7 +138,7 @@ pub trait PortServer: Any + Send + Sync {
     }
 
     /// The protocols to offer with ALPN when this serves a TLS port, such
-    /// as `h2` and `http/1.1`. Default none: the config's own list.
+    /// as `h2` and `http/1.1`. Default none.
     fn alpn(&self) -> Vec<Vec<u8>> {
         Vec::new()
     }
@@ -184,6 +180,16 @@ pub trait PortServer: Any + Send + Sync {
         std::ptr::addr_eq(self as *const Self, Arc::as_ptr(other))
             .then(|| PreparedShare::new(|| {}))
     }
+}
+
+/// How a port serves one accepted stream.
+pub enum PortStack {
+    /// Attach this application directly to the stream.
+    Stack(Boxed),
+    /// Refuse the stream and close its transport child.
+    Refused,
+    /// Call [`PortServer::serve_connection`] through a connection adapter.
+    UseConnection,
 }
 
 /// A side-effect-free sharing decision from [`PortServer::prepare_share`].
@@ -239,24 +245,23 @@ where
     L::Error: Into<stack::BoxError> + Send + Sync,
     M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
 {
-    fn stack(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+    fn stack(&self, fcx: &Cx, opening: &Opening) -> PortStack {
         let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
-            opening.socket.reset();
-            return Some(Boxed::new(stack::Tunnel::new(|_, _| async {})));
+            return PortStack::Refused;
         };
         opening.socket.hold_until_gone(Box::new(guard));
-        Some(Boxed::new(stack::Session::new(
+        PortStack::Stack(Boxed::new(stack::Session::new(
             (self.make)(&opening.info),
             self.limits,
             fcx.now(),
         )))
     }
 
-    fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
-        self.stack(fcx, opening)
-    }
-
-    fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
             arrival.socket.reset();
             return Box::pin(async {});
@@ -302,7 +307,7 @@ pub(super) enum PortSpec {
     Tcp(Arc<dyn PortServer>),
     Tls {
         sni: Sni,
-        config: ConfigFor,
+        config: CertificateFor,
         accept: Arc<dyn PortServer>,
     },
     Udp(UdpStart),
@@ -445,27 +450,27 @@ impl Host {
     }
 
     /// Serves TCP `port` with TLS for the names `sni` gives, with the
-    /// config `config_for` returns for each handshake, then `accept`.
+    /// certificate `certificate_for` returns for each handshake, then `accept`.
     /// The default composition is `Chain<TlsLayer, Later<Boxed>>` through
-    /// `Secure`; `accept.over_tls` constructs the application in the box.
+    /// `Secure`; `accept.stack` constructs the application in the box.
     /// The first TLS server at an address and port supplies the listener's
     /// [`PortServer::tls_factory`], including for names installed later.
     pub fn tls_accept(
         self,
         port: u16,
         sni: impl Into<Sni>,
-        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+        certificate_for: impl Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync + 'static,
         accept: impl PortServer,
     ) -> Host {
         self.tls_accept_when(
             port,
             sni,
-            move |fcx| std::future::ready(config_for(fcx)),
+            move |fcx| std::future::ready(certificate_for(fcx)),
             accept,
         )
     }
 
-    /// [`tls_accept`](Self::tls_accept) with a config that may take time
+    /// [`tls_accept`](Self::tls_accept) with a certificate that may take time
     /// to pick: each handshake waits for its own, up to its deadline.
     /// Uses the same `Chain<TlsLayer, Later<Boxed>>` default composition
     /// and listener-level factory rule as [`tls_accept`](Self::tls_accept).
@@ -473,15 +478,15 @@ impl Host {
         mut self,
         port: u16,
         sni: impl Into<Sni>,
-        config_for: impl Fn(&Cx) -> F + Send + Sync + 'static,
+        certificate_for: impl Fn(&Cx) -> F + Send + Sync + 'static,
         accept: impl PortServer,
     ) -> Host
     where
-        F: Future<Output = Arc<ServerConfig>> + Send + 'static,
+        F: Future<Output = Arc<CertifiedKey>> + Send + 'static,
     {
         let spec = PortSpec::Tls {
             sni: sni.into(),
-            config: Arc::new(move |fcx| Box::pin(config_for(fcx)) as ConfigFuture),
+            config: Arc::new(move |fcx| Box::pin(certificate_for(fcx)) as CertificateFuture),
             accept: Arc::new(accept),
         };
         self.ports.push((port, spec));
@@ -542,7 +547,7 @@ impl Host {
     }
 
     /// Serves TCP `port` with TLS for the names `sni` gives, with the
-    /// config `config_for` returns for each handshake, then a layer stack
+    /// certificate `certificate_for` returns for each handshake, then a layer stack
     /// made by `make` for each connection over the decrypted stream, as
     /// [`tcp_stack`](Self::tcp_stack) does over TCP. Its [`ConnInfo`] has
     /// the name and protocol TLS settled. Several TLS servers on one port
@@ -552,7 +557,7 @@ impl Host {
         self,
         port: u16,
         sni: impl Into<Sni>,
-        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+        certificate_for: impl Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync + 'static,
         make: M,
     ) -> Host
     where
@@ -569,7 +574,7 @@ impl Host {
             limits: StreamLimits::default(),
             open: Arc::default(),
         };
-        self.tls_accept(port, sni, config_for, accept)
+        self.tls_accept(port, sni, certificate_for, accept)
     }
 
     /// Serves UDP `port` with one layer stack made by `make` from the
@@ -1385,32 +1390,19 @@ impl Drop for PeerGuard {
     }
 }
 
-/// A TLS name on a port: its config, with the accept's ALPN list set
-/// (cached), and the accept that serves it.
+/// A TLS name on a port, its certificate selection and application.
 struct TlsName {
-    config: ConfigFor,
+    config: CertificateFor,
     accept: Arc<dyn PortServer>,
     alpn: Vec<Vec<u8>>,
-    last: Mutex<Option<(Arc<ServerConfig>, Arc<ServerConfig>)>>,
 }
 
 impl TlsName {
-    async fn config(&self, fcx: &Cx) -> Arc<ServerConfig> {
-        let given = (self.config)(fcx).await;
-        if self.alpn.is_empty() {
-            return given;
+    async fn select(&self, fcx: &Cx) -> tls::Selected {
+        tls::Selected {
+            certificate: (self.config)(fcx).await,
+            alpn: self.alpn.clone(),
         }
-        let mut last = self.last.lock();
-        if let Some((from, with_alpn)) = &*last
-            && Arc::ptr_eq(from, &given)
-        {
-            return with_alpn.clone();
-        }
-        let mut config = (*given).clone();
-        config.alpn_protocols = self.alpn.clone();
-        let config = Arc::new(config);
-        *last = Some((given, config.clone()));
-        config
     }
 }
 
@@ -1428,6 +1420,7 @@ struct Port {
 struct TlsNames {
     by_name: HashMap<String, Arc<TlsName>>,
     first: Option<Arc<dyn PortServer>>,
+    factory: Option<tls::Factory>,
 }
 
 fn tls_names(sni: &Sni, names: &[String], port: u16) -> Result<Vec<String>, String> {
@@ -1735,7 +1728,6 @@ impl Machine {
                                 config: config.clone(),
                                 accept: application.clone(),
                                 alpn: application.alpn(),
-                                last: Mutex::new(None),
                             };
                             (name, Arc::new(entry))
                         })
@@ -1784,6 +1776,7 @@ impl Machine {
                         }
                         PreparedTcp::Tls { accept, entries } => {
                             let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
+                            tls.factory.get_or_insert_with(|| accept.tls_factory());
                             tls.first.get_or_insert(accept);
                             tls.by_name.extend(entries);
                         }
@@ -1829,9 +1822,7 @@ impl Machine {
                                     budget: Some(budget.clone()),
                                     limits,
                                 };
-                                let Some(port) = names.upgrade() else {
-                                    return Boxed::new(stack::Tunnel::new(|_, _| async {}));
-                                };
+                                let port = names.upgrade()?;
                                 let application = if port
                                     .tls
                                     .read()
@@ -1844,25 +1835,19 @@ impl Machine {
                                         .read()
                                         .unwrap_or_else(|e| e.into_inner())
                                         .clone();
-                                    let Some(accept) = accept else {
-                                        return Boxed::new(stack::Tunnel::new(|_, _| async {}));
-                                    };
-                                    accept.stack(&fcx, &opening).unwrap_or_else(|| {
-                                        Boxed::new(stack::Tunnel::new(move |fcx, conn| {
-                                            accept.serve(fcx, opening.arrive(conn))
-                                        }))
-                                    })
+                                    let accept = accept?;
+                                    application(&fcx, opening, accept)?
                                 } else {
                                     secure(&fcx, opening, port, admission.hooks.clone())
                                 };
-                                Boxed::new(stack::Session::new(
+                                Some(Boxed::new(stack::Session::new(
                                     application,
                                     StreamLimits {
                                         idle: None,
                                         write_timeout: Some(limits.write_timeout),
                                     },
                                     fcx.now(),
-                                ))
+                                )))
                             }),
                         });
                         *port.listener.lock() = Some(listener);
@@ -1900,6 +1885,19 @@ pub(super) fn host_prefix(addr: IpAddr) -> Prefix {
     }
 }
 
+fn application(fcx: &Cx, opening: Opening, accept: Arc<dyn PortServer>) -> Option<Boxed> {
+    match accept.stack(fcx, &opening) {
+        PortStack::Stack(stack) => Some(stack),
+        PortStack::Refused => {
+            opening.socket.reset();
+            None
+        }
+        PortStack::UseConnection => Some(Boxed::new(stack::Tunnel::new(move |fcx, conn| {
+            accept.serve_connection(fcx, opening.arrive(conn))
+        }))),
+    }
+}
+
 /// Builds TLS and its selected application directly on the transport child.
 fn secure(fcx: &Cx, opening: Opening, port: Arc<Port>, hooks: Arc<Hooks>) -> Boxed {
     let Opening {
@@ -1928,9 +1926,8 @@ fn secure(fcx: &Cx, opening: Opening, port: Arc<Port>, hooks: Arc<Hooks>) -> Box
             *requested.lock() = sni;
             Box::pin(async move {
                 let name = name?;
-                let config = name.config(&fcx).await;
-                Some(config)
-            }) as tls::Picking
+                Some(name.select(&fcx).await)
+            }) as tls::Selecting
         }
     };
     let handshook = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1939,7 +1936,7 @@ fn secure(fcx: &Cx, opening: Opening, port: Arc<Port>, hooks: Arc<Hooks>) -> Box
         let handshook = handshook.clone();
         let names = port.clone();
         let (http_observe, tls_observe) = (hooks.http_observe.clone(), hooks.tls_observe.clone());
-        move |state: tls::Handshake<'_>| -> Boxed {
+        move |state: tls::Handshake<'_>| -> Option<Boxed> {
             handshook.store(true, std::sync::atomic::Ordering::Relaxed);
             let tls::Handshake::Established { server_name, alpn } = state else {
                 unreachable!("Secure constructs applications only after negotiation")
@@ -1969,26 +1966,17 @@ fn secure(fcx: &Cx, opening: Opening, port: Arc<Port>, hooks: Arc<Hooks>) -> Box
                     .or_else(|| tls.by_name.get(""))
                     .cloned()
             };
-            let Some(name) = name else {
-                return Boxed::new(stack::Tunnel::new(|_, _| async {}));
-            };
-            if let Some(stack) = name.accept.over_tls(&fcx, &opening) {
-                return stack;
-            }
-            let accept = name.accept.clone();
-            Boxed::new(stack::Tunnel::new(move |fcx, conn| {
-                accept.serve(fcx, opening.arrive(conn))
-            }))
+            let name = name?;
+            application(&fcx, opening, name.accept.clone())
         }
     };
-    let listener = port
+    let factory = port
         .tls
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .first
+        .factory
         .clone()
-        .expect("TLS listener has a server");
-    let factory = listener.tls_factory();
+        .expect("TLS listener has a factory");
     let budget = budget.unwrap_or_else(Budget::unlimited);
     let secure = factory.build(
         tls::Opening {
@@ -2123,8 +2111,11 @@ impl Layer for ObservedTls {
         let result = self.stack.advance(env);
         self.result(result)
     }
-    fn take_command(&mut self) -> Option<fictionet::stdlib::layer::StreamCommand> {
-        self.stack.take_command()
+    fn take_command(
+        &mut self,
+        env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
+    ) -> Option<fictionet::stdlib::layer::StreamCommand> {
+        self.stack.take_command(env)
     }
     fn take_event(&mut self) -> Option<std::convert::Infallible> {
         None
@@ -2154,40 +2145,80 @@ mod tests {
         assert_eq!(peers.peers(), 0);
     }
 
+    #[derive(Default)]
+    struct Custom {
+        held: Mutex<Vec<Box<dyn Any + Send>>>,
+        retired: std::sync::atomic::AtomicBool,
+    }
+
+    impl Retirement for Custom {
+        fn poll_gone(&self, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+
+        fn reset(&self) {
+            let mut held = self.held.lock();
+            self.retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            held.clear();
+        }
+
+        fn hold_until_gone(&self, item: Box<dyn Any + Send>) {
+            let mut held = self.held.lock();
+            if !self.retired.load(std::sync::atomic::Ordering::Acquire) {
+                held.push(item);
+            }
+        }
+
+        fn set_keep_alive(&self, _: Option<Duration>) {}
+    }
+
+    #[test]
+    fn refused_stacks_never_construct_an_application_or_connection_adapter() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(73),
+            |cx| async move {
+                use std::sync::atomic::Ordering;
+                let builds = Arc::new(AtomicUsize::new(0));
+                let made = builds.clone();
+                let accept = Arc::new(StackAccept {
+                    make: move |_: &ConnInfo| {
+                        made.fetch_add(1, Ordering::Relaxed);
+                        stack::Tunnel::new(|_, _| async {})
+                    },
+                    max_conns: 1,
+                    limits: StreamLimits::default(),
+                    open: Arc::default(),
+                });
+                let opening = |socket: Arc<Custom>| Opening {
+                    http_observe: None,
+                    info: ConnInfo::default(),
+                    socket,
+                    budget: None,
+                    limits: Limits::default(),
+                };
+                let first = Arc::new(Custom::default());
+                let app = application(&cx, opening(first.clone()), accept.clone()).unwrap();
+                drop(app);
+                let refused = Arc::new(Custom::default());
+                assert!(application(&cx, opening(refused.clone()), accept.clone()).is_none());
+                assert!(refused.retired.load(Ordering::Acquire));
+                assert_eq!(builds.load(Ordering::Relaxed), 1);
+                first.reset();
+                assert!(application(&cx, opening(Arc::new(Custom::default())), accept).is_some());
+                assert_eq!(builds.load(Ordering::Relaxed), 2);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn admission_counts_a_custom_transport_until_retirement() {
-        #[derive(Default)]
-        struct Custom {
-            held: Mutex<Vec<Box<dyn Any + Send>>>,
-            retired: std::sync::atomic::AtomicBool,
-        }
-
-        impl Retirement for Custom {
-            fn poll_gone(&self, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-                if self.retired.load(std::sync::atomic::Ordering::Acquire) {
-                    std::task::Poll::Ready(())
-                } else {
-                    std::task::Poll::Pending
-                }
-            }
-
-            fn reset(&self) {
-                let mut held = self.held.lock();
-                self.retired
-                    .store(true, std::sync::atomic::Ordering::Release);
-                held.clear();
-            }
-
-            fn hold_until_gone(&self, item: Box<dyn Any + Send>) {
-                let mut held = self.held.lock();
-                if !self.retired.load(std::sync::atomic::Ordering::Acquire) {
-                    held.push(item);
-                }
-            }
-
-            fn set_keep_alive(&self, _: Option<Duration>) {}
-        }
-
         let peers = Peers::new(1);
         let peer = "192.0.2.1".parse().unwrap();
         let closing = Custom::default();
@@ -2210,7 +2241,11 @@ mod tests {
     fn tls_sharing_uses_the_first_installed_accept() {
         struct Offers(&'static str, Arc<Mutex<Vec<&'static str>>>);
         impl PortServer for Offers {
-            fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            fn serve_connection(
+                &self,
+                _: Cx,
+                _: Arrival,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async {})
             }
             fn prepare_share(
@@ -2262,13 +2297,21 @@ mod tests {
     fn a_port_that_answers_handshakes_is_not_shared() {
         struct Plain;
         impl PortServer for Plain {
-            fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            fn serve_connection(
+                &self,
+                _: Cx,
+                _: Arrival,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async {})
             }
         }
         struct Answering;
         impl PortServer for Answering {
-            fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            fn serve_connection(
+                &self,
+                _: Cx,
+                _: Arrival,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async {})
             }
             fn answer(&self) -> Option<Box<dyn tcp::Answer>> {

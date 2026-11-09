@@ -1452,7 +1452,7 @@ impl Layer for Http2 {
             self.open(env);
         }
         if matches!(self.phase, Phase::Closing | Phase::Closed) {
-            return Ok(Admit::Taken);
+            return Ok(Admit::Closed(command));
         }
         // A response head is framed at once: it waits while the transport
         // falls behind.
@@ -1569,7 +1569,7 @@ impl Layer for Http2 {
         Ok(moved)
     }
 
-    fn take_command(&mut self) -> Option<StreamCommand> {
+    fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let command = self.out.pop_front()?;
         if matches!(command, StreamCommand::End | StreamCommand::Reset) {
             self.phase = Phase::Closed;
@@ -1952,6 +1952,29 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn closing_http2_returns_the_unaccepted_command() {
+        use fictionet::stdlib::layer::{Budget, Driver, Slots};
+        for phase in [Phase::Closing, Phase::Closed] {
+            let mut http = Http2::new(Limits::default());
+            http.phase = phase;
+            let mut driver = Driver::new(
+                http,
+                Arc::new(fictionet::SeededEntropy::new(fictionet::Seed::from_u64(91))),
+                Budget::unlimited(),
+                Instant::ZERO,
+            );
+            let mut slots = Slots::new(1);
+            let child = slots.insert(()).unwrap();
+            let id = child.id();
+            let answer = driver.command(child.close()).unwrap();
+            let Admit::Closed(command) = answer else {
+                panic!("closed input must return ownership")
+            };
+            assert!(matches!(command.into_op(), MuxOp::Close(found) if found == id));
+        }
+    }
+
     struct NotFound;
     impl Handler for NotFound {
         fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
@@ -2165,7 +2188,7 @@ mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<ExchangeCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
             None
         }
 
@@ -2197,7 +2220,7 @@ mod tests {
         let server = Chain::new(
             Http2::upgraded(Limits::default(), &[], opening, Some(body)),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
-                Sink::reading(opening.request.uri().path() != "/stall")
+                Some(Sink::reading(opening.request.uri().path() != "/stall"))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -2267,7 +2290,7 @@ mod tests {
         let server = Chain::new(
             Http2::new(Limits::default()),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
-                Sink::reading(opening.request.uri().path() != "/stall")
+                Some(Sink::reading(opening.request.uri().path() != "/stall"))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -2324,7 +2347,7 @@ mod tests {
         let server = Chain::new(
             Http2::new(Limits::default()),
             Children::new(8, Http2::WINDOW, move |_, _, _| {
-                child.take().expect("one stream")
+                Some(child.take().expect("one stream"))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -2370,7 +2393,7 @@ mod tests {
         // connection credit must come back.
         let server = Chain::new(
             Http2::new(Limits::default()),
-            Children::new(8, 16_384, |_, _, _| Sink::reading(false)),
+            Children::new(8, 16_384, |_, _, _| Some(Sink::reading(false))),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
         harness.push(&client_preface()).unwrap();
@@ -2507,7 +2530,7 @@ mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<ExchangeCommand> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
             self.out.pop_front()
         }
 
@@ -2536,7 +2559,7 @@ mod tests {
         let server = fictionet::stdlib::layer::Chain::new(
             Http2::new(Limits::default()),
             fictionet::stdlib::layer::Children::new(16, Http2::WINDOW, |_, opening, _| {
-                Picky::new(opening)
+                Some(Picky::new(opening))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(2), server);

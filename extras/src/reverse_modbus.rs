@@ -186,7 +186,11 @@ impl Reader {
 }
 
 impl PortServer for Reader {
-    fn serve(&self, fcx: Cx, mut arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        mut arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let reader = self.clone();
         Box::pin(async move {
             let result = reader.sample(&fcx, &mut arrival.conn).await;

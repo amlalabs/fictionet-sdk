@@ -30,10 +30,10 @@
 (* The switches are the rules of the code. TRUE is the code as it is,      *)
 (* including `SettleBeforeClose`, the fix of comp/v-framed's commit        *)
 (* 1a183c83e, ported to the split runner in 33fd898e0.                    *)
-(* The explicit allocation budget (the charge of a received datagram's   *)
-(* capacity at mod.rs:454-457, whose refusal ends the run with           *)
-(* StackError::Budget), per-job cancellable regions and the cancel checks *)
-(* (mod.rs:411-413, 429-431, 467) are outside this model. Datagrams are   *)
+(* Payload allocation refusal (the charge of a received datagram's        *)
+(* capacity at mod.rs:473) nondeterministically drops one input.          *)
+(* Byte arithmetic, per-job cancellable regions and the cancel checks     *)
+(* (mod.rs:430, 448) are outside this model. Datagrams are                *)
 (* atomic numbered items here. The production runner polls jobs during   *)
 (* busy visits as well as waits, and gives completions directly to the   *)
 (* driver without an intermediate result vector. Runtime tests cover     *)
@@ -45,13 +45,14 @@ CONSTANTS Datagrams,      \* datagrams that reach the socket in all
           Fair,           \* FAIR (mod.rs:68): rounds before the runner yields
           Delay,          \* ticks of the stack's timer; 0 for no timer
           StackMayEnd,    \* the stack may close the socket itself
-          ReceiveOnlyWhenTaken, \* `receive = input.is_none() && ..` (mod.rs:424)
-          OneConversation,      \* one stack for the socket's life: one `Driver::new` before the loop (mod.rs:356)
-          DeadlineInWait,       \* the wait sleeps until the stack's deadline (mod.rs:422, 426, 441-446)
-          EndClosesOutput,      \* `_ if ended => Admit::Closed` (mod.rs:390)
-          SendEachDatagram,     \* `socket.send_to(&payload, to)` (mod.rs:393)
-          ReturnOnClose,        \* `socket_closed && input.is_none()` returns (mod.rs:408)
-          SettleBeforeClose     \* return on a closed socket only once settled (`settled &&` at mod.rs:408, the fix)
+          ReceiveOnlyWhenTaken, \* `receive = input.is_none() && ..` (mod.rs:442)
+          OneConversation,      \* one stack for the socket's life: one `Driver::new` before the loop (mod.rs:371)
+          DeadlineInWait,       \* the wait sleeps until the stack's deadline (mod.rs:440, 444, 459-462)
+          EndClosesOutput,      \* `_ if ended => Admit::Closed` (mod.rs:404)
+          SendEachDatagram,     \* `socket.send_to(&payload, to)` (mod.rs:407)
+          ReturnOnClose,        \* `socket_closed && input.is_none()` returns (mod.rs:427)
+          DropOnBudgetMiss,     \* a refused receive leaves the conversation alive (mod.rs:473-481)
+          SettleBeforeClose     \* return on a closed socket only once settled (`settled &&` at mod.rs:427, the fix)
 
 ASSUME Datagrams \in Nat /\ Backlog \in Nat /\ Fair \in Nat \ {0} /\ Delay \in Nat
 
@@ -67,6 +68,7 @@ VARIABLES pc,          \* "settle", "after", "wait" or "done"
           rounds,      \* rounds of the current `settle`
           settled,     \* what `settle` returned
           \* the socket
+          dropped,     \* inputs whose backing the budget could not retain
           arrived,     \* datagrams that reached the socket
           queue,       \* those not yet received, in order
           closed,      \* the socket is closed: `recv` answers Closed once the queue is empty
@@ -82,7 +84,7 @@ VARIABLES pc,          \* "settle", "after", "wait" or "done"
           sent,        \* what went to the socket, in order
           afterEnd     \* a datagram went out after the stack closed the socket
 
-vars == <<pc, now, input, socketClosed, ended, rounds, settled, arrived, queue, closed,
+vars == <<pc, now, input, socketClosed, ended, rounds, settled, dropped, arrived, queue, closed,
           seen, outq, owe, heardEnded, timer, paused, produced, sent, afterEnd>>
 
 Upto(n) == [i \in 1..n |-> i]
@@ -90,12 +92,13 @@ Upto(n) == [i \in 1..n |-> i]
 TypeOK ==
   /\ pc \in {"settle", "after", "wait", "done"}
   /\ input \in {None, 0} \cup 1..Datagrams
+  /\ dropped \subseteq 1..Datagrams
   /\ rounds \in 0..Fair /\ arrived \in 0..Datagrams /\ owe \in 0..Backlog
 
 Init ==
   /\ pc = "settle" /\ now = 0 /\ input = None /\ socketClosed = FALSE /\ ended = FALSE
   /\ rounds = 0 /\ settled = TRUE
-  /\ arrived = 0 /\ queue = <<>> /\ closed = FALSE
+  /\ arrived = 0 /\ queue = <<>> /\ closed = FALSE /\ dropped = {}
   /\ seen = <<>> /\ outq = <<>> /\ owe = 0 /\ heardEnded = FALSE /\ timer = None
   /\ paused = FALSE
   /\ produced = <<>> /\ sent = <<>> /\ afterEnd = FALSE
@@ -159,7 +162,7 @@ SettleRound ==
         ELSE IF rounds + 1 = Fair
         THEN /\ settled' = FALSE /\ rounds' = 0 /\ pc' = "after"
         ELSE /\ rounds' = rounds + 1 /\ UNCHANGED settled /\ UNCHANGED pc
-  /\ UNCHANGED <<now, socketClosed, arrived, queue, closed>>
+  /\ UNCHANGED <<now, socketClosed, arrived, queue, closed, dropped>>
 
 (* mod.rs:406-420. A runner that has not settled yields and settles       *)
 (* again.                                                                 *)
@@ -172,7 +175,7 @@ AfterSettle ==
            ELSE "wait"
   /\ ended' = FALSE
   /\ UNCHANGED <<now, input, socketClosed, rounds, settled, arrived, queue, closed, seen,
-                 outq, owe, heardEnded, timer, paused, produced, sent, afterEnd>>
+                 outq, owe, heardEnded, timer, paused, produced, sent, afterEnd, dropped>>
 
 Receiving == ~socketClosed /\ (input = None \/ ~ReceiveOnlyWhenTaken)
 
@@ -184,13 +187,16 @@ Wait ==
          gotClose == Receiving /\ queue = <<>> /\ closed
      IN
      /\ gotDg \/ gotClose \/ due
-     /\ IF gotDg
-        THEN /\ input' = Head(queue) /\ queue' = Tail(queue)
-             /\ UNCHANGED socketClosed
-        ELSE IF gotClose
-        THEN /\ input' = 0 /\ socketClosed' = TRUE /\ UNCHANGED queue
-        ELSE UNCHANGED <<input, socketClosed, queue>>
-     /\ pc' = "settle"
+     /\ \E refuses \in (IF gotDg THEN BOOLEAN ELSE {FALSE}) :
+        /\ IF gotDg
+           THEN /\ input' = IF refuses THEN None ELSE Head(queue)
+                /\ queue' = Tail(queue)
+                /\ dropped' = IF refuses THEN dropped \cup {Head(queue)} ELSE dropped
+                /\ UNCHANGED socketClosed
+           ELSE IF gotClose
+           THEN /\ input' = 0 /\ socketClosed' = TRUE /\ UNCHANGED <<queue, dropped>>
+           ELSE UNCHANGED <<input, socketClosed, queue, dropped>>
+        /\ pc' = IF refuses /\ ~DropOnBudgetMiss THEN "done" ELSE "settle"
   /\ UNCHANGED <<now, ended, rounds, settled, arrived, closed, seen, outq, owe, heardEnded,
                  timer, paused, produced, sent, afterEnd>>
 
@@ -200,18 +206,18 @@ Arrive ==
   /\ arrived < Datagrams /\ ~closed
   /\ arrived' = arrived + 1 /\ queue' = Append(queue, arrived + 1)
   /\ UNCHANGED <<pc, now, input, socketClosed, ended, rounds, settled, closed, seen, outq,
-                 owe, heardEnded, timer, paused, produced, sent, afterEnd>>
+                 owe, heardEnded, timer, paused, produced, sent, afterEnd, dropped>>
 
 Close ==
   /\ ~closed /\ closed' = TRUE
   /\ UNCHANGED <<pc, now, input, socketClosed, ended, rounds, settled, arrived, queue, seen,
-                 outq, owe, heardEnded, timer, paused, produced, sent, afterEnd>>
+                 outq, owe, heardEnded, timer, paused, produced, sent, afterEnd, dropped>>
 
 Tick ==
   /\ pc = "wait" /\ timer # None /\ now < timer
   /\ now' = now + 1
   /\ UNCHANGED <<pc, input, socketClosed, ended, rounds, settled, arrived, queue, closed,
-                 seen, outq, owe, heardEnded, timer, paused, produced, sent, afterEnd>>
+                 seen, outq, owe, heardEnded, timer, paused, produced, sent, afterEnd, dropped>>
 
 Next == SettleRound \/ AfterSettle \/ Wait \/ Arrive \/ Close \/ Tick
 
@@ -224,8 +230,11 @@ Spec == Init /\ [][Next]_vars
 Pending == IF input \notin {None, 0} THEN <<input>> ELSE <<>>
 
 (* One conversation: the stack has taken every datagram the socket got,  *)
-(* in order, each once, except the one it holds and those still queued.  *)
-InOrderOnce == pc # "done" => seen \o Pending \o queue = Upto(arrived)
+(* in order, except budget drops, the one held, and those still queued.  *)
+InOrderOnce == pc # "done" => seen \o Pending \o queue = SelectSeq(Upto(arrived), LAMBDA x : x \notin dropped)
+
+(* Only the stack's end or the socket's close ends the conversation.     *)
+ReturnHasReason == pc = "done" => heardEnded \/ \E i \in 1..Len(produced) : produced[i] = END
 
 (* Each datagram the stack hands down goes to the socket at once, once,  *)
 (* in order.                                                             *)

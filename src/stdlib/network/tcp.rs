@@ -994,6 +994,7 @@ pub fn prepare_endpoint(
 ) {
     let (endpoint, tcp) = prepare_transport(fcx, addr, options, &Factory::default());
     let fcx = fcx.clone();
+    // IP and transport storage follow engine limits, outside child budgets.
     let ip = super::packet::Factory::default().build(super::packet::Opening {
         cx: fcx.clone(),
         addr,
@@ -1009,6 +1010,7 @@ pub(crate) fn prepare_transport(
     options: Options,
     factory: &Factory,
 ) -> (Endpoint, PacketDriver) {
+    // The transport has engine limits; accepted children own their budgets.
     let tcp = factory.build(Opening {
         cx: fcx.clone(),
         addr,

@@ -46,7 +46,11 @@ impl Handler for Maintenance {
 struct SilentEdge(Observe);
 
 impl PortServer for SilentEdge {
-    fn serve(&self, fcx: Cx, mut arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn serve_connection(
+        &self,
+        fcx: Cx,
+        mut arrival: Arrival,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let observe = self.0.clone();
         Box::pin(async move {
             observe(Event::Accepted(arrival.info.clone()));

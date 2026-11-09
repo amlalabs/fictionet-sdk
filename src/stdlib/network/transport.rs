@@ -42,7 +42,7 @@
 //!     C: Layer<Lower = Messages<TcpNotice, TcpControl>>,
 //! {
 //!     let mut app = app;
-//!     let children = Children::new(1024, 64 << 10, move |_, opening, _| app(opening));
+//!     let children = Children::new(1024, 64 << 10, move |_, opening, _| Some(app(opening)));
 //!     Chain::new(Chain::new(tcp, children), control)
 //! }
 //! ```
@@ -444,7 +444,7 @@ mod tests {
             match command {}
         }
 
-        fn take_command(&mut self) -> Option<CommandOf<P>> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<P>> {
             None
         }
 
@@ -483,7 +483,7 @@ mod tests {
             TcpOpening,
         >::new(4, 1024, move |_, opening, _| {
             o.lock().unwrap().push(opening);
-            Keep { seen: s.clone() }
+            Some(Keep { seen: s.clone() })
         }));
         let opening = TcpOpening {
             scope: Scope::ROOT,
@@ -521,7 +521,7 @@ mod tests {
             UdpBound,
         >::new(4, 8, move |_, bound, _| {
             assert_eq!(bound.local, addr("10.0.0.1:53"));
-            Keep { seen: s.clone() }
+            Some(Keep { seen: s.clone() })
         }));
         let bound = UdpBound {
             scope: Scope::ROOT,
@@ -559,7 +559,7 @@ mod tests {
             Children::<Keep<ObservedStream>, Top, ObservedConnection>::new(
                 4,
                 1024,
-                move |_, _, _| Keep { seen: s.clone() },
+                move |_, _, _| Some(Keep { seen: s.clone() }),
             ),
         );
         let connection = ObservedConnection {

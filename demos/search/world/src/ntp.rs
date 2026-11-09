@@ -119,7 +119,10 @@ impl<C: Fn() -> SystemTime> Layer for TimeServer<C> {
         match command {}
     }
 
-    fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+    fn take_command(
+        &mut self,
+        _: &mut Env<'_, Self::Report>,
+    ) -> Option<DatagramCommand<SocketAddr>> {
         self.reply.take().map(DatagramCommand::Send)
     }
 
@@ -214,7 +217,7 @@ mod tests {
             let event =
                 DatagramEvent::Datagram(Datagram::new(Chunk::new(bytes.clone()), client(1)));
             assert!(matches!(driver.deliver(event).unwrap(), Admit::Taken));
-            let command = driver.layer_mut().take_command();
+            let command = driver.take_command();
             assert_eq!(
                 calls.load(std::sync::atomic::Ordering::Relaxed),
                 usize::from(limit == 100)
