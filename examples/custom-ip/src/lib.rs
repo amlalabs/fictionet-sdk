@@ -62,6 +62,7 @@ impl HopLimit {
                 }
             }
             Intake::Waiting => {}
+            Intake::Discarded => env.report(IpReport::Malformed),
             Intake::Refused { answer, .. } => {
                 let answer = answer.filter(|_| !self.output_closed);
                 env.report(IpReport::Refused {
@@ -170,25 +171,37 @@ impl Layer for HopLimit {
 mod tests {
     use super::*;
     use fictionet::stdlib::layer::{Budget, Driver};
+    use fictionet::stdlib::network::ip;
     use fictionet::{Seed, SeededEntropy};
     use std::sync::Arc;
 
     #[test]
     fn malformed_input_is_reported_without_reaching_transports() {
+        let mut fragment = ip::packet(
+            "10.0.0.2".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            ip::protocol::UDP,
+            &[0; 9],
+        )
+        .0;
+        fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        ip::set_header_checksum(&mut fragment[..20]);
         let mut driver = Driver::new(
             HopLimit::new(std::num::NonZeroU8::new(32).unwrap()),
             Arc::new(SeededEntropy::new(Seed::from_u64(1))),
             Budget::unlimited(),
             Instant::ZERO,
         );
-        assert!(matches!(
-            driver.deliver(PacketEvent::Packet(Chunk::new(vec![0x45]))),
-            Ok(Admit::Taken)
-        ));
-        driver.send_above(|_| panic!("malformed input reached a transport"));
-        assert!(matches!(
-            driver.observations().drain().next(),
-            Some(IpReport::Malformed)
-        ));
+        for bytes in [vec![0x45], fragment] {
+            assert!(matches!(
+                driver.deliver(PacketEvent::Packet(Chunk::new(bytes))),
+                Ok(Admit::Taken)
+            ));
+            driver.send_above(|_| panic!("malformed input reached a transport"));
+            assert!(matches!(
+                driver.observations().drain().collect::<Vec<_>>().as_slice(),
+                [IpReport::Malformed]
+            ));
+        }
     }
 }

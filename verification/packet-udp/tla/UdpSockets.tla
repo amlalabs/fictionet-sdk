@@ -37,7 +37,7 @@ CONSTANTS
     Queue,            \* QUEUE, in units
     DatagramCost,     \* DATAGRAM_COST, in units
     CheckScope,       \* the dispatcher drops other networks' packets
-    CheckChecked,     \* take_in drops unchecked packets (the code)
+    CheckChecked,     \* the host input type excludes unchecked packets
     KeepEmpty,        \* take_in queues empty datagrams (the code)
     RemoveOnClose,    \* close removes the slot and its queue (the code)
     QueueInSocket,    \* the queue belongs to the socket, not the port (the code)

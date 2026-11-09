@@ -417,6 +417,7 @@ impl IpLayer {
                 self.checked(env, Chunk::new(whole), origin);
             }
             Intake::Waiting => {}
+            Intake::Discarded => env.report(IpReport::Malformed),
             Intake::Refused { answer, .. } => {
                 let answer = answer.filter(|_| !self.output_closed);
                 env.report(IpReport::Refused {
@@ -604,7 +605,10 @@ mod tests {
         for bytes in [vec![0x45], checksum] {
             assert!(d.deliver(raw(bytes)).unwrap().moved());
             assert!(up(&mut d).is_empty());
-            assert_eq!(d.observations().drain().count(), 1);
+            assert_eq!(
+                d.observations().drain().collect::<Vec<_>>(),
+                [IpReport::Malformed]
+            );
             assert!(down(&mut d).is_empty());
         }
     }
@@ -638,6 +642,30 @@ mod tests {
                 Sort::Other(47),
             ]
         );
+    }
+
+    #[test]
+    fn malformed_fragments_are_reported_without_reaching_transports() {
+        let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
+        let pieces = fragments(&whole, 32);
+        for payload_len in [0, 9] {
+            let mut malformed = pieces[0][..20 + payload_len].to_vec();
+            let len = malformed.len() as u16;
+            malformed[2..4].copy_from_slice(&len.to_be_bytes());
+            ip::set_header_checksum(&mut malformed[..20]);
+            let mut d = driver();
+            assert!(d.deliver(raw(malformed)).unwrap().moved());
+            assert!(up(&mut d).is_empty());
+            assert_eq!(d.deadline(), None);
+            assert!(matches!(
+                d.observations().drain().collect::<Vec<_>>().as_slice(),
+                [IpReport::Malformed]
+            ));
+            assert!(d.deliver(raw(pieces[0].clone())).unwrap().moved());
+            assert!(up(&mut d).is_empty());
+            assert!(d.deadline().is_some());
+            assert_eq!(d.observations().drain().count(), 0);
+        }
     }
 
     #[test]
