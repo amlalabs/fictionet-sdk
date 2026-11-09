@@ -488,9 +488,9 @@ keyed by the peer's addresses keep the keyed hash on purpose. HTTP bench
 43.36 G to 42.58 G instructions, TCP bulk 5.89 G to 5.71 G, round trips
 0.692 G to 0.665 G, allocations over the two HTTP runs 19.15 M to
 18.14 M. No Kani harness ran in this pass. The harnesses in
-`verification/packet-udp` covered the former combined packet constructor
-at the time of that pass; the later split into host and observed packet
-types has not been verified by those harnesses; the IP layer's intake, which did, has none. The layer
+`verification/packet-udp` cover `IpPacket::check` and `checked` (since
+then `CheckedIpPacket::checked`), which did not change; the IP layer's
+intake, which did, has none. The layer
 models in `tla/` and `verification/layer` describe the driver, the
 children and the stream runner, whose rules did not change: the depth
 check moved to where the composition grows, chunks carry their charge

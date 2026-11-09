@@ -29,7 +29,7 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     Nets,          \* the networks packets come from
-    Mine,          \* the input boundary's network
+    Mine,          \* the network NetworkInput passes on
     Keys,          \* reassembly keys (address pair, id, protocol): ip.rs `Key`
     Data,          \* the byte patterns a fragment may carry
     PartialCost,   \* PARTIAL_COST, in units
@@ -38,7 +38,7 @@ CONSTANTS
     Timeout,       \* V4_TIMEOUT, in ticks
     MaxTime,       \* the last tick explored
     MaxArrivals,   \* how many fragments arrive in all
-    BindScope,     \* the dispatcher drops other networks' packets
+    BindScope,     \* NetworkInput passes on one network's packets (the code)
     KeyHasScope,   \* the table key holds the network (the other fix)
     ExpireOnPush,  \* reassemble expires before it takes a fragment (the code)
     Evict          \* reassemble drops the oldest while over MaxWaiting (the code)
@@ -120,7 +120,7 @@ Arrive(n, k, off, dat) ==
     /\ arrivals' = arrivals + 1
     /\ UNCHANGED now
     /\ IF BindScope /\ n # Mine
-       THEN UNCHANGED <<table, size, delivered>>   \* foreign input rejected before reassembly
+       THEN UNCHANGED <<table, size, delivered>>   \* NetworkInput passes it to another input
        ELSE
          LET t0 == IF ExpireOnPush THEN ExpireTable(table, now) ELSE table
              s0 == IF ExpireOnPush THEN size - CostOf(table, Expired(table, now)) ELSE size

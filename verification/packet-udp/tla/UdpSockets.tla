@@ -17,8 +17,8 @@
    budget (`env.budget().charge(cost)`, 358); when the budget has no room
    it is dropped and reported like one for a full queue, so Arrive may
    drop any datagram that fits. Each arriving packet is of some network
-   and is checked or an observed copy. The current Rust transport accepts
-   only CheckedIpPacket; this older model includes the input boundary.
+   and is checked or an observed copy. The code's lower port carries only
+   CheckedIpPacket, so CheckChecked is the type, not a branch.
 
    The code visits sockets in the order of its `ready` list (`wake`,
    217-225) and gives a socket's send credit back (`MuxEvent::Credit`,
@@ -36,8 +36,8 @@ CONSTANTS
     MaxGrant,         \* the most credit outstanding per socket
     Queue,            \* QUEUE, in units
     DatagramCost,     \* DATAGRAM_COST, in units
-    CheckScope,       \* the dispatcher drops other networks' packets
-    CheckChecked,     \* the host input type excludes unchecked packets
+    CheckScope,       \* NetworkInput passes on one network's packets (the code)
+    CheckChecked,     \* the lower port carries only CheckedIpPacket (the code)
     KeepEmpty,        \* take_in queues empty datagrams (the code)
     RemoveOnClose,    \* close removes the slot and its queue (the code)
     QueueInSocket,    \* the queue belongs to the socket, not the port (the code)

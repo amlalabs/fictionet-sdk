@@ -27,7 +27,7 @@ Four, each fixed with a test that fails without the fix.
 | Bug | Found by | Fix | Test |
 |---|---|---|---|
 | A TCP may refuse any command for now (`Admit::Blocked`). `Host::command` dropped a refused control. A refused `Hold` dropped its `PeerGuard`, so an open connection stopped counting against its peer, and a refused `Abort` never reset the connection past the limit. The standard `TcpLayer` never refuses a control, so only a replacement installed with `tcp::Factory` was exposed. | `Admission_dropblocked`, `Admission_dropblocked_reset` | `Host::controls` in `network/tcp.rs` keeps refused controls in order and `Host::pump` offers them again whenever the host steps the transport. `Listen` and `Connect`, whose answers the caller reads at once, go through `Host::request` and are never queued, so a failed `listen` leaves nothing for the transport to take later. A stopped endpoint drops the queue with what it holds. | `world_layers::a_tcp_that_refuses_commands_for_now_keeps_the_peer_count_and_resets` |
-| The dispatcher sent each packet its IP layer handed up to the transport the packet named. A replacement IP layer could hand up an observed copy (no IPv4 header check, no host policy) or a packet of another network, and the UDP layer delivered both. | review of `drive`; the property is proved in `kani/dispatch.rs` | `destination` in `network/endpoint.rs` sends a packet on only if it has a header the host read, is not an observed copy, and is of the dispatcher's own network; the raw packets the dispatcher takes in are marked with that network. | `world_layers::transports_take_only_checked_packets_of_their_own_network_from_any_ip_layer`: each datagram reaches the application once, not three times |
+| The dispatcher sent each packet its IP layer handed up to the transport the packet named. A replacement IP layer could hand up an observed copy (no IPv4 header check, no host policy) or a packet of another network, and the UDP layer delivered both. | review of `drive` | First a check in `destination` and a network label on each raw packet. Now the types: the IP layer's upper port carries only `CheckedIpPacket`, captured copies are `ObservedIpPacket`, and an endpoint owns its interface, so its raw packets carry no network to check. | The check's world test went with the check; the compile_fail example in `guide::lowering` shows an observed copy cannot be handed to a transport |
 | `Peers::enter` inserted a zero entry for a peer it refused, so under `Limits::connections_per_peer` of zero the map grew by one entry for every address that tried. | the test; no `kani/peers.rs` exists in the tree or its history | `enter` reads the count and inserts only when it admits. | `hosts::tests::a_refused_peer_leaves_nothing_counted` |
 | `packet::Framed` handed up a second `PacketEvent::Ended` when the stream was reset after its end, which a peer may do. | review | A reset after the end ends nothing more. | `packet::framed::tests::a_reset_after_the_end_ends_the_packets_once` |
 
@@ -82,18 +82,29 @@ what `Hold` kept when the connection is gone or when it is forgotten
 standard one does, so `NotHeldWhenGone` asks that of a replacement,
 where the contract asks only `GoneReleases`.
 
-**Each packet passes exactly one IP layer, and only checked packets of
-the host's network reach its transports.** A world machine's only packet
+**Each packet passes exactly one IP layer, and only checked packets reach
+the host's transports.** A world machine's only packet
 path is `drive`, built once per machine by `Machine::stage` through
 `network::endpoint::prepare`; `OneDispatcher` checks that staging never
 builds a second. The UDP facade of a machine (`udp::Endpoint`) and its TCP
 handles are views of the transports `drive` owns, with no IP layer of their
-own. Host transports now accept only `CheckedIpPacket`; passive observations
-have a separate type. The endpoint owns its input path and reassembly, and
-a dispatcher separates labelled networks before IP intake. The historical
-`kani/dispatch.rs` harnesses exercised the former combined packet API and
-its repeated scope checks. They have not been ported or rerun for this
-change; the results below do not establish the new type boundary.
+own. The endpoint owns its interface, so every packet it takes in is of
+its own network, and the IP layer's upper port carries `CheckedIpPacket`,
+which a captured copy (`ObservedIpPacket`) is not: a replacement IP layer
+cannot hand a transport an observed copy, and the compile_fail example in
+`guide::lowering` checks that. `kani/dispatch.rs` has one harness on the
+production `destination`, a child module of `network/endpoint.rs` under
+`cfg(kani)`, with no stubs. `a_host_packet_goes_only_to_its_transport`:
+a 28-byte IPv4 packet from 10.0.0.2 to 10.0.0.1 with any protocol,
+"don't fragment" or not, any eight payload bytes and a header checksum
+that verifies or is wrong, taken in by the standard `IpLayer`, reaches
+exactly the transport its own bytes name, and only whole with a checksum
+that verifies. The header's other fields are fixed, since with every
+header byte symbolic the proof ran past 25 minutes. Eight payload bytes
+sort TCP, UDP and a plain ICMP message; an ICMP error that quotes a
+transport needs more and is not reached. The harness was rewritten for
+`CheckedIpPacket` and has not been run since; the run recorded for its
+earlier form also covered a network label the endpoint no longer has.
 
 **Application stacks attach directly to transport children, and counts
 outlive them.** `tcp::Listener::attach` and `udp::Socket::attach` hand the
@@ -175,7 +186,7 @@ Kani, one harness at a time, from the root of the repository:
 
 ```sh
 systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 \
-  env CARGO_BUILD_JOBS=4 cargo kani -p fictionet --lib --harness an_observed_copy_reaches_nothing
+  env CARGO_BUILD_JOBS=4 cargo kani -p fictionet --lib --harness a_host_packet_goes_only_to_its_transport
 ```
 
 The tests:

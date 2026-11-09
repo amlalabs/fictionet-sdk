@@ -88,7 +88,7 @@ fn ipv4_check_requires_the_header_checksum() {
 /// upper-layer protocol, which is no extension header, in its next-header
 /// byte, a payload length of the upper-layer bytes, and those bytes: the
 /// packet `parse_whole` reads with its upper-layer header at 40, which
-/// `IpPacket::checked` takes. A fragment is never stripped. The headers are
+/// `CheckedIpPacket::checked` takes. A fragment is never stripped. The headers are
 /// held to 8 bytes (their length bytes are 0). Calling `parse_whole` on the
 /// stripped packet, rather than reading its bytes, took CBMC past the
 /// 12 GB memory cap; a packet with no extension header is the
