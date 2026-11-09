@@ -1,17 +1,22 @@
 -------------------------- MODULE Starttls --------------------------
 EXTENDS Naturals, Sequences
-CONSTANTS MaxBytes, Boundary, DropSuffix, StopPlain, WaitWritten
+CONSTANTS MaxBytes, Boundary, DropSuffix, StopPlain, WaitWritten, SwitchDrops
 VARIABLES phase, received, plain, discarded, pending, tlsInput, produced, written
 vars == <<phase, received, plain, discarded, pending, tlsInput, produced, written>>
 
-\* Source: tests/it/services/tls.rs 199-209 makes Secure at STARTTLS;
-\* 244-259 stops parsing and clears the same-read suffix, discards later data;
-\* 279-282 counts output, 299-306 waits for completion and hands only control
-\* events to the successor. src/stdlib/layer/switch.rs 138-146 routes by phase,
-\* 198-223 transfers leftovers once. Boundary abstracts the end of STARTTLS,
+\* Source: tests/it/services/tls.rs 273-288 makes Secure at STARTTLS;
+\* 323-370 stops parsing at STARTTLS and, unless the session is careless,
+\* drops the rest of the chunk and later data; a careless session hands
+\* them over or refuses them. 380-384 counts output, 413-425 waits for
+\* completion before handing over. src/stdlib/layer/switch.rs 167-194
+\* routes by phase and drops a refused event Secure does not inherit when
+\* it comes again; 245-264 drops the handed-over events Secure does not
+\* inherit and transfers the rest once; services/tls/secure.rs 175-177
+\* says Secure inherits no data. Boundary abstracts the end of STARTTLS,
 \* every byte position is distinct, and Read explores every chunk boundary.
-\* Only the concrete Mail handoff has the discard rule: generic Switch does
-\* not and cannot distinguish arbitrary protocol plaintext from TLS records.
+\* pending is what the session kept past the boundary, handed over or left
+\* below: both are input the switch saw before it switched. DropSuffix is
+\* the careful session's own drop, SwitchDrops the switch's.
 Init == /\ phase = "plain" /\ received = 0 /\ plain = <<>>
         /\ discarded = <<>> /\ pending = <<>> /\ tlsInput = <<>>
         /\ produced = 0 /\ written = 0
@@ -40,9 +45,11 @@ Complete == /\ written < produced /\ written' = written+1
 Switch == /\ phase = "waiting" /\ produced = 2
           /\ (~WaitWritten \/ written = produced)
           /\ phase' = "tls"
-          /\ tlsInput' = [i \in 1..Len(pending) |-> [byte |-> pending[i], old |-> TRUE]]
+          /\ tlsInput' = IF SwitchDrops THEN <<>>
+                         ELSE [i \in 1..Len(pending) |-> [byte |-> pending[i], old |-> TRUE]]
+          /\ discarded' = IF SwitchDrops THEN discarded \o pending ELSE discarded
           /\ pending' = <<>>
-          /\ UNCHANGED <<received,plain,discarded,produced,written>>
+          /\ UNCHANGED <<received,plain,produced,written>>
 Next == (\E n \in 1..MaxBytes: Read(n)) \/ Produce \/ Complete \/ Switch
 Spec == Init /\ [][Next]_vars
 NoPlainPastBoundary == \A i \in 1..Len(plain): plain[i] <= Boundary
