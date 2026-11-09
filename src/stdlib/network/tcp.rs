@@ -837,9 +837,10 @@ pub use smoltcp::wire::{OptionLayout, OptionOrder};
 /// [`Endpoint::connect`]. Other ICMP messages are dropped. Established
 /// connections ignore ICMP, and there is no path MTU discovery.
 ///
-/// A dropped connection that reaches TIME-WAIT releases items kept with
-/// [`TcpConnection::hold_until_gone`], including connection counts, and
-/// makes its [`GoneWatch`] ready. Only transport recovery state stays:
+/// A connection that reaches TIME-WAIT, or that times out, releases items
+/// kept with [`TcpConnection::hold_until_gone`], including connection
+/// counts, and makes its [`GoneWatch`] ready, whether or not its handle
+/// was dropped. For a dropped one only transport recovery state stays:
 /// its socket, tuple, buffers and outgoing port remain until smoltcp's
 /// configured TIME-WAIT timer expires. Retransmitted FINs get ACKs and
 /// restart that timer. An endpoint retains at most 1,024 such sockets.
@@ -1877,9 +1878,10 @@ impl TcpConnection {
 
     /// Keeps `item` until the connection is gone, which may be
     /// after this handle is dropped: closing waits for the peer (FIN-WAIT,
-    /// LAST-ACK) until [`Settings::orphan_timeout`] expires. A socket that reaches
-    /// TIME-WAIT after handle drop releases its items immediately. Only
-    /// transport recovery state stays as described in [`endpoint`]. Limits
+    /// LAST-ACK) until [`Settings::orphan_timeout`] expires. A connection that
+    /// reaches TIME-WAIT or times out releases its items then, whether or
+    /// not this handle was dropped. Only transport recovery state stays as
+    /// described in [`endpoint`]. Limits
     /// that count connections hold their count here, so a peer that never
     /// finishes closing cannot open more past the limit. Each call keeps
     /// one more item.
@@ -1890,8 +1892,9 @@ impl TcpConnection {
 
 /// Says when a connection has been reset, is gone, or its endpoint has
 /// stopped, without reading from it. See [`TcpConnection::gone_watch`].
-/// A dropped connection is gone once it reaches TIME-WAIT, even while
-/// its transport recovery state stays to ACK retransmitted FINs.
+/// A connection is gone once it reaches TIME-WAIT or times out, whether or
+/// not its handle was dropped, even while its transport recovery state
+/// stays to ACK retransmitted FINs.
 #[derive(Clone)]
 pub struct GoneWatch {
     shared: Arc<Shared>,
@@ -1907,8 +1910,8 @@ impl GoneWatch {
     /// Resets the connection, as [`TcpConnection::reset`] does, after the
     /// connection itself was handed on. Wakes disappearance watches even
     /// while the connection handle is retained. Reads and writes on that
-    /// handle report [`ConnError::Reset`]. Does nothing after the dropped
-    /// connection reaches TIME-WAIT and is retired by housekeeping.
+    /// handle report [`ConnError::Reset`]. Does nothing once the connection is
+    /// gone (see [`GoneWatch::poll_gone`]).
     pub fn reset(&self) {
         self.shared.state.lock().control(TcpControl::Abort(self.id));
     }
@@ -1929,7 +1932,7 @@ impl GoneWatch {
     /// Keeps `item` until the connection is gone: see
     /// [`TcpConnection::hold_until_gone`]. Works after the connection
     /// itself was handed on, such as boxed behind TLS. Drops `item`
-    /// immediately if the connection has already retired into TIME-WAIT.
+    /// immediately if the connection is gone already.
     pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
         self.shared.state.lock().control(TcpControl::Hold {
             child: self.id,

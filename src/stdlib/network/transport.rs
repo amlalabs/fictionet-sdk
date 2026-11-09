@@ -167,7 +167,7 @@ pub enum TcpControl {
     },
     /// Reset the connection of this child at once, whether the child is
     /// open or was closed and its connection is still closing. Nothing once
-    /// the connection is [gone](TcpNotice::Gone) into TIME-WAIT or forgotten.
+    /// the connection is [gone](TcpNotice::Gone).
     Abort(ChildId),
     /// Send a keepalive after this long idle, and as often after that, on
     /// the connection of an open child; `None` sends none.
@@ -178,9 +178,10 @@ pub enum TcpControl {
         interval: Option<Duration>,
     },
     /// Keep `item` until the connection of this child is gone: reset,
-    /// retired into TIME-WAIT, or forgotten, which may be after the child
-    /// is closed. Dropped at once if it is gone already. Limits that count
-    /// connections hold their count here.
+    /// in TIME-WAIT, timed out, or forgotten. That depends on the
+    /// connection alone, never on the child: it may be after the child is
+    /// closed, or while it is still open. Dropped at once if it is gone
+    /// already. Limits that count connections hold their count here.
     Hold {
         /// The child.
         child: ChildId,
@@ -263,10 +264,10 @@ pub enum TcpNotice {
         /// Where it was going.
         local: SocketAddr,
     },
-    /// The connection of this child is gone: reset by either side, retired
-    /// into TIME-WAIT, or forgotten. What [`TcpControl::Hold`] kept for it
-    /// is released, now or when the connection is forgotten. It may be
-    /// said more than once.
+    /// The connection of this child is gone, whether or not the child is
+    /// still open: reset by either side, in TIME-WAIT, timed out, or
+    /// forgotten. What [`TcpControl::Hold`] kept for it is released, now or
+    /// when the connection is forgotten. It may be said more than once.
     Gone(ChildId),
 }
 

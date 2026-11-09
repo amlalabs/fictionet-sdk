@@ -81,3 +81,69 @@ fn renaming_ports_preserves_packet_validation() {
         assert_eq!(original, renamed);
     }
 }
+
+// Failing controls. Each harness below changes one thing, and must fail on
+// the assertion its comment names.
+
+/// Two bit flips that cancel in the ones'-complement sum, one in each port:
+/// the checksum cannot see them, which is why the proof above claims only
+/// that a single flipped bit is caught. Must fail on "a corrupted segment
+/// is rejected".
+#[kani::proof]
+#[kani::unwind(13)]
+fn every_port_pair_without_a_single_bit_flip() {
+    let source: u16 = kani::any();
+    let destination: u16 = kani::any();
+    let (source_address, destination_address) = addresses();
+    let mut bytes = [0; HEADER_LEN];
+    let mut packet = Packet::new_unchecked(&mut bytes[..]);
+    packet.set_header_len(HEADER_LEN as u8);
+    packet.set_src_port(source);
+    packet.set_dst_port(destination);
+    packet.fill_checksum(&source_address, &destination_address);
+    bytes[0] ^= 1;
+    bytes[2] ^= 1;
+    assert!(
+        Repr::parse(
+            &Packet::new_unchecked(&bytes[..]),
+            &source_address,
+            &destination_address,
+        )
+        .is_err(),
+        "a corrupted segment is rejected"
+    );
+}
+
+/// Renaming the ports without filling the checksum again. Must fail on
+/// "renaming keeps the verdict".
+#[kani::proof]
+#[kani::unwind(15)]
+fn renaming_ports_without_the_checksum_refilled() {
+    let (source_address, destination_address) = addresses();
+    let mut original: [u8; HEADER_LEN + 4] = kani::any();
+    Packet::new_unchecked(&mut original[..]).fill_checksum(&source_address, &destination_address);
+    let mut renamed = original;
+    let source: u16 = kani::any();
+    let destination: u16 = kani::any();
+    let mut packet = Packet::new_unchecked(&mut renamed[..]);
+    packet.set_src_port(source);
+    packet.set_dst_port(destination);
+
+    let ignore_malformed: bool = kani::any();
+    let original = Repr::parse_with(
+        &Packet::new_unchecked(&original[..]),
+        &source_address,
+        &destination_address,
+        ignore_malformed,
+    );
+    let renamed = Repr::parse_with(
+        &Packet::new_unchecked(&renamed[..]),
+        &source_address,
+        &destination_address,
+        ignore_malformed,
+    );
+    assert!(
+        original.is_ok() == renamed.is_ok(),
+        "renaming keeps the verdict"
+    );
+}

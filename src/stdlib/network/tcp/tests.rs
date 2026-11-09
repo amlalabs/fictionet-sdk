@@ -3401,4 +3401,226 @@ mod layer {
             "the whole write comes back"
         );
     }
+
+    /// Hands the server's layer a token to keep until the connection of
+    /// `id` is gone, as a limit that counts connections does.
+    fn hold(stack: &mut Stack, id: ChildId) -> Arc<()> {
+        let token = Arc::new(());
+        control(
+            stack,
+            TcpControl::Hold {
+                child: id,
+                item: Box::new(token.clone()),
+            },
+        );
+        token
+    }
+
+    fn said_gone(seen: &[Up], id: ChildId) -> bool {
+        seen.iter().any(|e| {
+            matches!(
+                e,
+                MuxEvent::Control(MessageEvent::Message(TcpNotice::Gone(gone))) if *gone == id
+            )
+        })
+    }
+
+    /// Steps `stack` alone, from timer to timer, until `until`, and
+    /// collects what it says.
+    fn alone_until(stack: &mut Stack, until: Instant) -> Vec<Up> {
+        let mut seen = Vec::new();
+        loop {
+            let _ = sent(stack);
+            seen.extend(events(stack));
+            match stack.deadline() {
+                Some(at) if at <= until => stack.set_now(at),
+                _ => return seen,
+            }
+        }
+    }
+
+    /// A connection whose peer falls silent times out while the layer
+    /// above still holds its child. The transport has let it go, so it is
+    /// gone, and what a limit kept for it is released without waiting for
+    /// the child to close.
+    #[test]
+    fn a_connection_that_times_out_is_gone_with_its_child_open() {
+        let (mut server, _client, (s, _), _) = connected();
+        let token = hold(&mut server, s.id());
+        let write: Command = s.send(StreamCommand::Write(Chunk::new(pattern(100, 4))));
+        assert!(matches!(server.command(write), Ok(Admit::Taken)));
+        let until = server.now() + TIMEOUT + Duration::from_secs(120);
+        let seen = alone_until(&mut server, until);
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, MuxEvent::Child(id, StreamEvent::Reset) if *id == s.id())),
+            "the connection timed out"
+        );
+        assert!(said_gone(&seen, s.id()), "a timed-out connection is gone");
+        assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
+    }
+
+    /// A connection that reaches TIME-WAIT while the layer above still
+    /// holds its child is gone, as one whose child was closed is.
+    #[test]
+    fn an_open_child_in_time_wait_lets_go_of_what_it_held() {
+        let (mut server, mut client, (s, _), (c, _)) = connected();
+        let token = hold(&mut server, s.id());
+        let end: Command = s.send(StreamCommand::End);
+        assert!(matches!(server.command(end), Ok(Admit::Taken)));
+        let _ = exchange(&mut server, &mut client, |_| true);
+        let close: Command = c.close();
+        assert!(matches!(client.command(close), Ok(Admit::Taken)));
+        let (at_server, _) = exchange(&mut server, &mut client, |_| true);
+        let h = server.layer().upper().socket_of(s.id());
+        assert_eq!(server.layer().upper().get(h).state(), TcpState::TimeWait);
+        assert!(said_gone(&at_server, s.id()), "TIME-WAIT is gone");
+        assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
+    }
+
+    /// Something handed to a connection the peer already reset is let go
+    /// at once, as for any connection that is gone, while the child is
+    /// still open.
+    #[test]
+    fn a_hold_after_the_peers_reset_is_let_go_at_once() {
+        let (mut server, mut client, (s, _), (c, _)) = connected();
+        let reset: Command = c.send(StreamCommand::Reset);
+        assert!(matches!(client.command(reset), Ok(Admit::Taken)));
+        let (at_server, _) = exchange(&mut server, &mut client, |_| true);
+        assert!(said_gone(&at_server, s.id()), "the peer's reset is gone");
+        let token = hold(&mut server, s.id());
+        assert_eq!(
+            Arc::strong_count(&token),
+            1,
+            "a gone connection keeps nothing"
+        );
+    }
+
+    /// The end of the layer below stops the endpoint and resets every
+    /// connection. What open children held is released, and each is gone.
+    #[test]
+    fn a_stop_lets_go_of_what_open_children_held() {
+        let (mut server, _client, (s, _), _) = connected();
+        let token = hold(&mut server, s.id());
+        assert!(matches!(
+            server.deliver(PacketEvent::Ended),
+            Ok(Admit::Taken)
+        ));
+        let _ = sent(&mut server);
+        let seen = events(&mut server);
+        assert!(
+            said_gone(&seen, s.id()),
+            "a stopped endpoint's connection is gone"
+        );
+        assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
+    }
+
+    /// Resetting a child whose connection is already gone into TIME-WAIT
+    /// does nothing, as the command's contract says: no RST goes out.
+    #[test]
+    fn an_abort_after_time_wait_sends_nothing() {
+        let (mut server, mut client, (s, _), (c, _)) = connected();
+        let end: Command = s.send(StreamCommand::End);
+        assert!(matches!(server.command(end), Ok(Admit::Taken)));
+        let _ = exchange(&mut server, &mut client, |_| true);
+        let close: Command = c.close();
+        assert!(matches!(client.command(close), Ok(Admit::Taken)));
+        let _ = exchange(&mut server, &mut client, |_| true);
+        let h = server.layer().upper().socket_of(s.id());
+        assert_eq!(server.layer().upper().get(h).state(), TcpState::TimeWait);
+        control(&mut server, TcpControl::Abort(s.id()));
+        let resets = sent(&mut server)
+            .iter()
+            .filter(|p| tcp_flags(p).is_some_and(|f| f & 4 != 0))
+            .count();
+        assert_eq!(resets, 0, "a connection in TIME-WAIT is not reset");
+        assert_eq!(server.layer().upper().get(h).state(), TcpState::TimeWait);
+    }
+
+    /// Resetting a connection from above makes it gone at once, so what a
+    /// limit kept for it is let go then, though the child is still open.
+    #[test]
+    fn an_abort_lets_go_of_what_the_connection_held() {
+        let (mut server, _client, (s, _), _) = connected();
+        let token = hold(&mut server, s.id());
+        control(&mut server, TcpControl::Abort(s.id()));
+        let seen = events(&mut server);
+        assert!(said_gone(&seen, s.id()), "an aborted connection is gone");
+        assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
+    }
+
+    /// Closing a child does not let go of what a limit kept for its
+    /// connection while the connection is still closing: it counts until
+    /// the transport retires it into TIME-WAIT.
+    #[test]
+    fn a_closed_childs_connection_counts_until_it_retires() {
+        let (mut server, mut client, (s, _), (c, _)) = connected();
+        let id = s.id();
+        let token = hold(&mut server, id);
+        let close: Command = s.close();
+        assert!(matches!(server.command(close), Ok(Admit::Taken)));
+        let (at_server, _) = exchange(&mut server, &mut client, |_| true);
+        let h = server.layer().upper().socket_of(id);
+        assert_eq!(server.layer().upper().get(h).state(), TcpState::FinWait2);
+        assert!(
+            !said_gone(&at_server, id),
+            "a closing connection is not gone"
+        );
+        assert_eq!(
+            Arc::strong_count(&token),
+            2,
+            "a closing connection still counts"
+        );
+        let close: Command = c.close();
+        assert!(matches!(client.command(close), Ok(Admit::Taken)));
+        let (at_server, _) = exchange(&mut server, &mut client, |_| true);
+        assert!(said_gone(&at_server, id), "TIME-WAIT is gone");
+        assert_eq!(Arc::strong_count(&token), 1, "what it held is let go");
+    }
+
+    /// A connection the peer resets while it waits in the backlog still
+    /// opens a child when it is accepted, and that child is told at once
+    /// that its connection is gone, not only once it is closed.
+    #[test]
+    fn a_connection_reset_before_it_is_accepted_opens_gone() {
+        let mut server = stack(SERVER, 1, Budget::unlimited());
+        let mut client = stack(CLIENT, 2, Budget::unlimited());
+        control(
+            &mut server,
+            TcpControl::Listen {
+                port: 80,
+                backlog: None,
+                answer: None,
+            },
+        );
+        let remote: SocketAddr = format!("{SERVER}:80").parse().unwrap();
+        control(
+            &mut client,
+            TcpControl::Connect {
+                request: Request(1),
+                remote,
+            },
+        );
+        let mut at_client = events(&mut client);
+        let (at_server, more) = exchange(&mut server, &mut client, |_| true);
+        at_client.extend(more);
+        assert!(at_server.iter().all(|e| !matches!(e, MuxEvent::Opened(..))));
+        let (c, _) = opened(&mut at_client);
+        let reset: Command = c.send(StreamCommand::Reset);
+        assert!(matches!(client.command(reset), Ok(Admit::Taken)));
+        let mut resets = 0;
+        let _ = exchange(&mut server, &mut client, |p| {
+            resets += usize::from(tcp_flags(p).is_some_and(|f| f & 4 != 0));
+            true
+        });
+        assert!(resets >= 1, "the client's RST reached the server");
+        control(&mut server, TcpControl::Accept { port: 80, count: 1 });
+        let _ = sent(&mut server);
+        let mut seen = events(&mut server);
+        let (s, _) = opened(&mut seen);
+        assert!(
+            said_gone(&seen, s.id()),
+            "a connection reset before accept is gone when its child opens"
+        );
+    }
 }

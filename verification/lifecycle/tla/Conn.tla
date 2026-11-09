@@ -12,6 +12,9 @@
 (*       the layer's credit, End, Abort, close and Hold                     *)
 (*   Orphan, Abort, CloseIfDrained, Remove                                 *)
 (*       TcpLayer::orphan, abort, close_if_drained, remove_conn             *)
+(*   Release                                                                *)
+(*       TcpLayer::refresh for an open child whose socket reached          *)
+(*       TIME-WAIT or closed on its own (Conn::released)                   *)
 (*   PeerData, PeerAck, PeerFin, PeerRst                                   *)
 (*       TcpLayer::ingress after smoltcp's `process`, and the flags it sets *)
 (*   Timeout, Egress, TimeWaitExpires                                      *)
@@ -33,9 +36,16 @@
 (***************************************************************************)
 EXTENDS Naturals
 
-\* Both TRUE for the code.  OrphanTimer FALSE leaves out expire_orphans;
-\* ResetUnread FALSE drops a handle with unread bytes as if they were read.
-CONSTANTS OrphanTimer, ResetUnread
+\* Each TRUE for the code.  FALSE keeps a rule as it was, or weakens it:
+\*   OrphanTimer     expire_orphans exists
+\*   ResetUnread     a drop with unread bytes resets (FALSE: as if read)
+\*   ReleaseOpen     refresh lets go of an open child's connection once its
+\*                   socket reached TIME-WAIT or closed (FALSE: before
+\*                   773c5c1a3, kept until the child closed)
+\*   AbortReleases   abort lets go of what was held (FALSE: before 2124865df)
+\*   CountUntilGone  closing the child leaves what it held alone (FALSE: the
+\*                   count is tied to the child's lifetime)
+CONSTANTS OrphanTimer, ResetUnread, ReleaseOpen, AbortReleases, CountUntilGone
 
 Open == {"Established", "FinWait1", "FinWait2", "CloseWait", "Closing", "LastAck"}
 States == Open \cup {"TimeWait", "Closed"}
@@ -45,10 +55,12 @@ VARIABLES
   endpoint,   \* smoltcp still names the peer: a RST can still go out
   rx, tx,     \* unread bytes; unacknowledged bytes
   finRecv,    \* smoltcp took the peer's FIN; Conn::fin
-  rst,        \* Conn::rst: a RST came, or this side aborted
+  rst,        \* Conn::rst: a RST came, this side aborted, or the socket
+              \* closed on a segment (LAST-ACK's final ACK)
   shut,       \* Conn::shut
   orphaned,   \* Conn::orphaned
   retired,    \* Conn::retired
+  released,   \* Conn::released
   handle,     \* "alive" | "dropped"
   inConns,    \* the Conn and its socket exist
   inOrphans,  \* State::orphans
@@ -57,22 +69,22 @@ VARIABLES
   givesUp,    \* Conn::gives_up: "none" | "armed" | "due"
   stopped     \* State::stopped
 
-vars == <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, handle,
-          inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
+vars == <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, released,
+          handle, inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 Init ==
   /\ tcp = "Established" /\ endpoint = TRUE
   /\ rx \in BOOLEAN /\ tx = FALSE
   /\ finRecv = FALSE /\ rst = FALSE /\ shut = FALSE
-  /\ orphaned = FALSE /\ retired = FALSE
+  /\ orphaned = FALSE /\ retired = FALSE /\ released = FALSE
   /\ handle = "alive"
   /\ inConns = TRUE /\ inOrphans = FALSE /\ inTimeWait = FALSE
   /\ held \in BOOLEAN
   /\ givesUp = "none"
   /\ stopped = FALSE
 
-\* GoneWatch::poll_gone is ready.
-Gone == stopped \/ ~inConns \/ rst \/ retired
+\* TcpLayer::gone, which GoneWatch::poll_gone reads.
+Gone == stopped \/ ~inConns \/ rst \/ retired \/ released
 
 -----------------------------------------------------------------------------
 \* State::remove_conn: the Conn is dropped, with what it held, and its
@@ -95,38 +107,43 @@ CloseIfDrained(shutNow, txNow, s) == IF shutNow /\ ~txNow THEN Closed(s) ELSE s
 Read ==
   /\ handle = "alive" /\ ~stopped /\ rx
   /\ rx' = FALSE
-  /\ UNCHANGED <<tcp, endpoint, tx, finRecv, rst, shut, orphaned, retired, handle,
-                 inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
+  /\ UNCHANGED <<tcp, endpoint, tx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 \* poll_write queues bytes while the send half is open.
 Write ==
   /\ handle = "alive" /\ ~stopped /\ ~shut /\ tcp \in {"Established", "CloseWait"}
   /\ tx' = TRUE
-  /\ UNCHANGED <<tcp, endpoint, rx, finRecv, rst, shut, orphaned, retired, handle,
-                 inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
+  /\ UNCHANGED <<tcp, endpoint, rx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 \* poll_shutdown: the FIN follows the last acknowledgement.
 Shutdown ==
   /\ handle = "alive" /\ ~stopped
   /\ shut' = TRUE
   /\ tcp' = CloseIfDrained(TRUE, tx, tcp)
-  /\ UNCHANGED <<endpoint, rx, tx, finRecv, rst, orphaned, retired, handle,
+  /\ UNCHANGED <<endpoint, rx, tx, finRecv, rst, orphaned, retired, released, handle,
                  inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
-\* State::abort: a RST, and the watchers woken.
-AbortSocket == tcp' = "Closed" /\ rst' = TRUE
+\* TcpLayer::abort: a RST, the watchers woken, and what was held let go.
+AbortSocket ==
+  /\ tcp' = "Closed" /\ rst' = TRUE
+  /\ held' = (held /\ ~AbortReleases)
 
-\* State::orphan, after the handle is gone.
+\* TcpLayer::orphan, after the handle is gone (MuxOp::Close).  `abort` is
+\* the TcpControl::Abort the handle sent first, which the layer takes only
+\* while the connection is not gone.
 Orphan(abort) ==
   IF stopped THEN
     /\ Remove
-    /\ UNCHANGED <<tcp, endpoint, rst, shut, orphaned, retired, givesUp>>
+    /\ UNCHANGED <<tcp, endpoint, rst, shut, orphaned, retired, released, givesUp>>
   ELSE
-    /\ IF abort \/ (ResetUnread /\ rx)
+    /\ IF (abort /\ ~Gone) \/ (ResetUnread /\ rx)
        THEN AbortSocket /\ shut' = shut
-       ELSE shut' = TRUE /\ tcp' = CloseIfDrained(TRUE, tx, tcp) /\ rst' = rst
+       ELSE /\ shut' = TRUE /\ tcp' = CloseIfDrained(TRUE, tx, tcp) /\ rst' = rst
+            /\ held' = (held /\ CountUntilGone)
     /\ orphaned' = TRUE /\ inOrphans' = TRUE
-    /\ UNCHANGED <<endpoint, retired, inConns, inTimeWait, held, givesUp>>
+    /\ UNCHANGED <<endpoint, retired, released, inConns, inTimeWait, givesUp>>
 
 \* Drop for TcpConnection.
 Drop ==
@@ -135,30 +152,35 @@ Drop ==
   /\ Orphan(FALSE)
   /\ UNCHANGED <<rx, tx, finRecv, stopped>>
 
-\* TcpConnection::reset: the abort, then the handle's drop.
+\* TcpConnection::reset: Abort, then the handle's drop.
 ResetHandle ==
   /\ handle = "alive"
   /\ handle' = "dropped"
-  /\ IF stopped THEN
-       /\ Remove
-       /\ UNCHANGED <<tcp, endpoint, rst, shut, orphaned, retired, givesUp>>
-     ELSE
-       /\ AbortSocket
-       /\ orphaned' = TRUE /\ inOrphans' = TRUE
-       /\ UNCHANGED <<endpoint, shut, retired, inConns, inTimeWait, held, givesUp>>
+  /\ Orphan(TRUE)
   /\ UNCHANGED <<rx, tx, finRecv, stopped>>
 
-\* GoneWatch::reset, from anyone who kept a watch.
+\* GoneWatch::reset, from anyone who kept a watch: TcpControl::Abort,
+\* nothing once the connection is gone.
 WatchReset ==
-  /\ inConns /\ ~retired
+  /\ ~Gone
   /\ AbortSocket
-  /\ UNCHANGED <<endpoint, rx, tx, finRecv, shut, orphaned, retired, handle,
-                 inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
+  /\ UNCHANGED <<endpoint, rx, tx, finRecv, shut, orphaned, retired, released, handle,
+                 inConns, inOrphans, inTimeWait, givesUp, stopped>>
 
-\* hold_until_gone: kept unless the connection has retired.
+\* hold_until_gone: TcpControl::Hold, kept unless the connection is gone.
 Hold ==
-  /\ inConns /\ ~retired /\ ~held
+  /\ ~Gone /\ ~held
   /\ held' = TRUE
+  /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, inConns, inOrphans, inTimeWait, givesUp, stopped>>
+
+\* refresh, for the open child: a socket that reached TIME-WAIT or closed
+\* on its own (its timeout, TIME-WAIT's end) lets go of what it held, and
+\* the connection is gone.
+Release ==
+  /\ ReleaseOpen /\ handle = "alive" /\ inConns /\ ~stopped
+  /\ tcp \in {"TimeWait", "Closed"} /\ ~rst /\ ~released
+  /\ released' = TRUE /\ held' = FALSE
   /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, handle,
                  inConns, inOrphans, inTimeWait, givesUp, stopped>>
 
@@ -170,11 +192,13 @@ Live == inConns /\ ~stopped
 PeerData ==
   /\ Live /\ tcp \in {"Established", "FinWait1", "FinWait2"} /\ ~finRecv
   /\ rx' = TRUE
-  /\ UNCHANGED <<tcp, endpoint, tx, finRecv, rst, shut, orphaned, retired, handle,
-                 inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
+  /\ UNCHANGED <<tcp, endpoint, tx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 \* An acknowledgement: of data, and perhaps of this side's FIN.  LAST-ACK's
-\* final one forgets the peer.  Then close_if_drained.
+\* final one forgets the peer, and ingress takes the socket's close as the
+\* end of the connection: rst, what was held cleared, Gone.  Then
+\* close_if_drained.
 PeerAck ==
   /\ Live /\ tcp \in Open
   /\ tx' = FALSE
@@ -185,8 +209,10 @@ PeerAck ==
                   [] OTHER -> tcp
        IN /\ tcp' = CloseIfDrained(shut, FALSE, s)
           /\ endpoint' = IF s = "Closed" THEN FALSE ELSE endpoint
-  /\ UNCHANGED <<rx, finRecv, rst, shut, orphaned, retired, handle,
-                 inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
+          /\ rst' = (rst \/ s = "Closed")
+          /\ held' = (held /\ s # "Closed")
+  /\ UNCHANGED <<rx, finRecv, shut, orphaned, retired, released, handle,
+                 inConns, inOrphans, inTimeWait, givesUp, stopped>>
 
 \* The peer's FIN; it may acknowledge this side's FIN too.
 PeerFin ==
@@ -199,7 +225,7 @@ PeerFin ==
                   [] OTHER -> "TimeWait"
        IN /\ tcp' = CloseIfDrained(shut, IF finAcked THEN FALSE ELSE tx, s)
           /\ tx' = IF finAcked THEN FALSE ELSE tx
-  /\ UNCHANGED <<endpoint, rx, rst, shut, orphaned, retired, handle,
+  /\ UNCHANGED <<endpoint, rx, rst, shut, orphaned, retired, released, handle,
                  inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 \* The peer's RST: smoltcp forgets the peer; ingress notes the reset,
@@ -207,7 +233,7 @@ PeerFin ==
 PeerRst ==
   /\ Live /\ tcp # "Closed"
   /\ tcp' = "Closed" /\ endpoint' = FALSE /\ rst' = TRUE /\ held' = FALSE
-  /\ UNCHANGED <<rx, tx, finRecv, shut, orphaned, retired, handle,
+  /\ UNCHANGED <<rx, tx, finRecv, shut, orphaned, retired, released, handle,
                  inConns, inOrphans, inTimeWait, givesUp, stopped>>
 
 \* smoltcp's timeout: an abort, with the RST still to go out.  It can fire
@@ -218,20 +244,20 @@ Timeout ==
   /\ Live /\ tcp \in Open
   /\ tx \/ tcp \in {"FinWait1", "Closing", "LastAck"} \/ handle = "alive"
   /\ tcp' = "Closed"
-  /\ UNCHANGED <<endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, handle,
-                 inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
+  /\ UNCHANGED <<endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 \* The RST of an aborted socket goes out: smoltcp forgets the peer.
 Egress ==
   /\ inConns /\ tcp = "Closed" /\ endpoint
   /\ endpoint' = FALSE
-  /\ UNCHANGED <<tcp, rx, tx, finRecv, rst, shut, orphaned, retired, handle,
+  /\ UNCHANGED <<tcp, rx, tx, finRecv, rst, shut, orphaned, retired, released, handle,
                  inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 TimeWaitExpires ==
   /\ Live /\ tcp = "TimeWait"
   /\ tcp' = "Closed" /\ endpoint' = FALSE
-  /\ UNCHANGED <<rx, tx, finRecv, rst, shut, orphaned, retired, handle,
+  /\ UNCHANGED <<rx, tx, finRecv, rst, shut, orphaned, retired, released, handle,
                  inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
 
 -----------------------------------------------------------------------------
@@ -244,11 +270,11 @@ Housekeeping ==
   /\ \/ /\ tcp = "Closed" /\ ~endpoint
         /\ Remove
         /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired,
-                       handle, givesUp, stopped>>
+                       released, handle, givesUp, stopped>>
      \/ /\ tcp = "TimeWait" /\ ~retired
         /\ retired' = TRUE /\ held' = FALSE /\ inTimeWait' = TRUE
-        /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, handle,
-                       inConns, inOrphans, givesUp, stopped>>
+        /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, released,
+                       handle, inConns, inOrphans, givesUp, stopped>>
 
 \* expire_orphans: an orphan in FIN-WAIT-2 is given up after the orphan
 \* timeout, whatever the peer sends meanwhile.
@@ -257,51 +283,56 @@ ExpireOrphans ==
   /\ \/ /\ tcp = "FinWait2" /\ givesUp = "none"
         /\ givesUp' = "armed"
         /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired,
-                       handle, inConns, inOrphans, inTimeWait, held, stopped>>
+                       released, handle, inConns, inOrphans, inTimeWait, held, stopped>>
      \/ /\ tcp = "FinWait2" /\ givesUp = "due"
         /\ Remove
         /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired,
-                       handle, givesUp, stopped>>
+                       released, handle, givesUp, stopped>>
      \/ /\ tcp # "FinWait2" /\ givesUp # "none"
         /\ givesUp' = "none"
         /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired,
-                       handle, inConns, inOrphans, inTimeWait, held, stopped>>
+                       released, handle, inConns, inOrphans, inTimeWait, held, stopped>>
 
 GivesUpDue ==
   /\ givesUp = "armed" /\ givesUp' = "due"
-  /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, handle,
-                 inConns, inOrphans, inTimeWait, held, stopped>>
+  /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, inConns, inOrphans, inTimeWait, held, stopped>>
 
 \* housekeeping: past MAX_TIME_WAIT, the oldest retired orphans go.
 EvictTimeWait ==
   /\ inTimeWait
   /\ Remove
-  /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, handle,
-                 givesUp, stopped>>
+  /\ UNCHANGED <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, givesUp, stopped>>
 
-\* Shared::stop: every socket is aborted, every orphan removed.
+\* Shared::stop: every socket is aborted and lets go of what it held, every
+\* orphan is removed.
 Stop ==
   /\ ~stopped
   /\ stopped' = TRUE
   /\ tcp' = IF inConns THEN "Closed" ELSE tcp
+  /\ held' = FALSE
   /\ IF inOrphans
      THEN Remove
-     ELSE UNCHANGED <<inConns, inOrphans, held>> /\ inTimeWait' = FALSE
-  /\ UNCHANGED <<endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, handle, givesUp>>
+     ELSE UNCHANGED <<inConns, inOrphans>> /\ inTimeWait' = FALSE
+  /\ UNCHANGED <<endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, released,
+                 handle, givesUp>>
 
 -----------------------------------------------------------------------------
 Next ==
   \/ Read \/ Write \/ Shutdown \/ Drop \/ ResetHandle \/ WatchReset \/ Hold
+  \/ Release
   \/ PeerData \/ PeerAck \/ PeerFin \/ PeerRst
   \/ Timeout \/ Egress \/ TimeWaitExpires
   \/ Housekeeping \/ ExpireOrphans \/ GivesUpDue \/ EvictTimeWait
   \/ Stop
 
 \* The endpoint's task runs, the RST goes out, timers go off.  The peer
-\* owes nothing.
+\* and the handle owe nothing.
 Fairness ==
   WF_vars(Housekeeping) /\ WF_vars(ExpireOrphans) /\ WF_vars(GivesUpDue)
   /\ WF_vars(Egress) /\ WF_vars(TimeWaitExpires) /\ WF_vars(Timeout)
+  /\ WF_vars(Release)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -310,7 +341,7 @@ TypeOK ==
   /\ tcp \in States
   /\ endpoint \in BOOLEAN /\ rx \in BOOLEAN /\ tx \in BOOLEAN
   /\ finRecv \in BOOLEAN /\ rst \in BOOLEAN /\ shut \in BOOLEAN
-  /\ orphaned \in BOOLEAN /\ retired \in BOOLEAN
+  /\ orphaned \in BOOLEAN /\ retired \in BOOLEAN /\ released \in BOOLEAN
   /\ handle \in {"alive", "dropped"}
   /\ inConns \in BOOLEAN /\ inOrphans \in BOOLEAN /\ inTimeWait \in BOOLEAN
   /\ held \in BOOLEAN
@@ -328,14 +359,20 @@ Bookkeeping ==
   /\ orphaned => handle = "dropped"
   /\ ~inConns => ~held /\ ~inOrphans /\ ~inTimeWait
 
-\* Nothing is held past retirement or removal, and stopping leaves no
-\* orphan or TIME-WAIT state behind.
-HeldOnlyWhileCounted == held => inConns /\ ~retired
+\* What is held lasts only while the connection is not gone: never past a
+\* reset by either side, retirement, release, removal or the stop.
+HeldOnlyWhileCounted == held => ~Gone
 StopCleans == stopped => ~inOrphans /\ ~inTimeWait /\ (handle = "dropped" => ~inConns)
 
-\* The gone watch is ready exactly when the doc says: reset by either
-\* side, retired into TIME-WAIT, removed, or the endpoint stopped.
-GoneMeans == Gone <=> (stopped \/ ~inConns \/ rst \/ retired)
+\* The gone watch is ready only once the transport is done with the
+\* connection: stopped, removed, reset, or its socket in TIME-WAIT or
+\* closed.  Never while it is open or closing, whatever the handle does.
+GoneMeans ==
+  Gone => (stopped \/ ~inConns \/ rst \/ tcp \in {"TimeWait", "Closed"})
+
+\* What is held is let go only when the connection becomes gone: closing
+\* the handle does not release it while the connection is still closing.
+CountedUntilDone == [][(held /\ ~held') => Gone']_vars
 
 \* A FIN goes only after every queued byte is acknowledged.
 FinAfterDrain ==
@@ -348,8 +385,8 @@ DropResetsUnread ==
 DropClosesRead ==
   [][(Drop /\ ~stopped /\ ~rx) => (shut' /\ rst' = rst)]_vars
 
-\* A reset from the peer, or retirement, releases what was held.
-ResetReleases == [][PeerRst => ~held']_vars
+\* A reset from either side, or retirement, releases what was held.
+ResetReleases == [][(~rst /\ rst') => ~held']_vars
 RetireReleases == [][(Housekeeping /\ retired' /\ ~retired) => ~held']_vars
 
 \* An orphan is eventually gone for its watchers, and eventually removed.
@@ -357,4 +394,9 @@ OrphanWatched == (handle = "dropped") ~> Gone
 OrphanRemoved == (handle = "dropped") ~> ~inConns
 \* What a connection holds is released once its handle is dropped.
 HeldReleased == (handle = "dropped") ~> ~held
+\* A connection whose socket reached TIME-WAIT or closed is eventually
+\* gone, and what it held released, whether or not the handle is ever
+\* dropped.
+GoneWhateverTheHandle ==
+  (inConns /\ tcp \in {"TimeWait", "Closed"}) ~> (Gone /\ ~held)
 =============================================================================

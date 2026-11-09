@@ -116,6 +116,10 @@ pub(super) struct Flow {
     opened: Option<(TcpSeqNumber, TcpSeqNumber)>,
     /// Where the sender's FIN sits, once one was seen.
     fin: Option<u64>,
+    /// The position just past the furthest payload dropped to stay in
+    /// bounds, marked or not: bytes known to be missing until the position
+    /// passes it.
+    dropped_to: u64,
     ended: bool,
 }
 
@@ -130,6 +134,7 @@ impl Flow {
             held_bytes: 0,
             opened: None,
             fin: None,
+            dropped_to: 0,
             ended: false,
         }
     }
@@ -173,9 +178,12 @@ impl Flow {
     }
 
     /// Whether bytes of this direction are known to be missing: a hole
-    /// before held bytes, a marker, or a FIN not yet reached.
+    /// before held bytes, a marker, dropped bytes not yet passed, or a FIN
+    /// not yet reached.
     pub fn holed(&self) -> bool {
-        !self.held.is_empty() || self.fin.is_some_and(|fin| fin > self.position)
+        !self.held.is_empty()
+            || self.dropped_to > self.position
+            || self.fin.is_some_and(|fin| fin > self.position)
     }
 
     /// Ends the direction, giving back what it held.
@@ -273,11 +281,18 @@ impl Flow {
                             source,
                         };
                         if let Some(old) = self.held.insert(at, held) {
+                            // A longer one's tail is dropped with it.
+                            if let Some(end) = at.checked_add(old.len as u64) {
+                                self.dropped_to = self.dropped_to.max(end);
+                            }
                             self.forget(&old, store);
                         }
                     } else {
                         overflow = true;
                         dropped = Some((at, bytes.len()));
+                        if let Some(end) = at.checked_add(bytes.len() as u64) {
+                            self.dropped_to = self.dropped_to.max(end);
+                        }
                     }
                 } else {
                     overflow = true;
@@ -507,3 +522,9 @@ fn gap(out: &mut Vec<Step>, sequence: u64, missing: u64) {
     }
     out.push(Step::Gap { sequence, missing });
 }
+
+/// Bounded proofs over the reassembly of one direction, run with
+/// `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../../verification/observer/kani/Flow.rs"]
+mod proofs;

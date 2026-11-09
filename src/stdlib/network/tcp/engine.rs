@@ -267,9 +267,10 @@ pub(super) const COMPACT_SLOTS: usize = 256;
 ///
 /// Closing a child is `close(2)`: the connection finishes closing on its
 /// own, with a FIN after what was written, or a RST if the layer above
-/// left received bytes unread. It keeps what [`TcpControl::Hold`] gave it
-/// until it is reset, reaches TIME-WAIT or is forgotten, and then
-/// [`TcpNotice::Gone`] names it.
+/// left received bytes unread. A connection keeps what [`TcpControl::Hold`]
+/// gave it until it is reset, reaches TIME-WAIT, times out or is forgotten,
+/// whether or not its child is still open, and then [`TcpNotice::Gone`]
+/// names it.
 ///
 /// # Time, entropy and memory
 ///
@@ -475,6 +476,10 @@ pub(super) struct Conn {
     ended_sent: bool,
     /// [`StreamEvent::Reset`] went up.
     reset_sent: bool,
+    /// Its socket reached TIME-WAIT or closed on its own (its timeout, or
+    /// the end of TIME-WAIT) while the layer above held the child: what
+    /// it held was let go and [`TcpNotice::Gone`] said.
+    released: bool,
 }
 
 impl Conn {
@@ -504,6 +509,7 @@ impl Conn {
             send_granted: 0,
             ended_sent: false,
             reset_sent: false,
+            released: false,
         }
     }
 }
@@ -879,11 +885,12 @@ impl TcpLayer {
     }
 
     /// Resets the connection and says so, keeping the socket until its RST
-    /// can be sent.
+    /// can be sent. It is gone: what it held is let go.
     fn abort(&mut self, h: Id) {
         let c = self.conns.get_mut(&h).unwrap();
         c.rst = true;
         c.reset = true;
+        c.held.clear();
         let child = c.child;
         let tell = c.open && c.live && !c.reset_sent;
         if tell {
@@ -1838,7 +1845,9 @@ impl TcpLayer {
         for h in handles {
             self.sock(h).abort();
             let c = self.conns.get_mut(&h).unwrap();
-            if let Some(id) = c.child
+            c.held.clear();
+            let child = c.child;
+            if let Some(id) = child
                 && c.open
                 && c.live
                 && !c.reset_sent
@@ -1846,6 +1855,9 @@ impl TcpLayer {
                 c.reset_sent = true;
                 self.urgent
                     .push_back(MuxEvent::Child(id, StreamEvent::Reset));
+            }
+            if let Some(id) = child {
+                self.notice(TcpNotice::Gone(id));
             }
         }
         for h in std::mem::take(&mut self.orphans) {
@@ -1904,7 +1916,15 @@ impl TcpLayer {
             let (remote, handshake) = (c.remote, c.handshake.clone());
             l.left(remote.ip());
             self.open_child(h, TcpOrigin::Accepted(handshake));
-            self.conns.get_mut(&h).unwrap().live = true;
+            let c = self.conns.get_mut(&h).unwrap();
+            c.live = true;
+            // The peer may have reset it while it waited: its child opens
+            // gone, and is told so now rather than when it is closed.
+            if let Some(id) = c.child
+                && self.gone(id)
+            {
+                self.notice(TcpNotice::Gone(id));
+            }
             self.grant(h);
         }
     }
@@ -1944,6 +1964,14 @@ impl TcpLayer {
                 TcpState::Closed => return self.connect_failed(h, id),
                 _ => self.conns.get_mut(&h).unwrap().live = true,
             }
+        }
+        let c = self.conns.get_mut(&h).unwrap();
+        if matches!(state, TcpState::TimeWait | TcpState::Closed) && !c.rst && !c.released {
+            // The transport is done with it, whether or not the layer above
+            // still holds the child: limits that count it stop counting.
+            c.released = true;
+            c.held.clear();
+            self.notice(TcpNotice::Gone(id));
         }
         if self.conns[&h].reset_sent {
             return;
@@ -2001,8 +2029,10 @@ impl TcpLayer {
         };
         let c = self.conns.get_mut(&h).unwrap();
         c.child = None;
+        c.held.clear();
         let request = c.request;
         self.children.remove(id);
+        self.notice(TcpNotice::Gone(id));
         if let Some(request) = request {
             self.notice(TcpNotice::ConnectFailed { request, error });
         }
@@ -2132,8 +2162,8 @@ impl TcpLayer {
                 }
             }
             TcpControl::Abort(id) => {
-                if let Some(&h) = self.children.get(id)
-                    && self.conns.get(&h).is_some_and(|c| !c.retired)
+                if !self.gone(id)
+                    && let Some(&h) = self.children.get(id)
                 {
                     self.abort(h);
                 }
@@ -2148,13 +2178,12 @@ impl TcpLayer {
                     self.work = true;
                 }
             }
-            TcpControl::Hold { child, item } => {
-                let conn = self.children.get(child).copied();
-                match conn.and_then(|h| self.conns.get_mut(&h)) {
-                    Some(c) if !c.retired => c.held.push(item),
-                    _ => drop(item),
+            TcpControl::Hold { child, item } => match self.children.get(child).copied() {
+                Some(h) if !self.gone(child) => {
+                    self.conns.get_mut(&h).unwrap().held.push(item);
                 }
-            }
+                _ => drop(item),
+            },
         }
     }
 
@@ -2317,14 +2346,16 @@ impl TcpLayer {
             .then(|| self.closed_reason(h))
     }
 
-    /// Whether the connection of child `id` is gone: reset by either side,
-    /// retired into TIME-WAIT, forgotten, or the endpoint stopped.
+    /// Whether the connection of child `id` is gone, whether or not the
+    /// layer above still holds the child: reset by either side, retired
+    /// into TIME-WAIT, in TIME-WAIT or closed on its own (see
+    /// [`Conn::released`]), forgotten, or the endpoint stopped.
     pub(super) fn gone(&self, id: ChildId) -> bool {
         self.stopped
             || self
                 .mapped(id)
                 .and_then(|h| self.conns.get(&h))
-                .is_none_or(|c| c.rst || c.retired)
+                .is_none_or(|c| c.rst || c.retired || c.released)
     }
 
     /// The peer addresses of every connection.
