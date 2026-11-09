@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::stdlib::layer::{
-    Budget, ByteStream, Charge, Chunk, CreditReturn, Credited, Env, Owned, Port, StreamCommand,
+    Budget, ByteStream, Charge, Chunk, CreditLease, Credited, Env, Owned, Port, StreamCommand,
     StreamEvent,
 };
 use crate::stdlib::protocols::ssh::connection as wire;
@@ -122,7 +122,7 @@ impl Credited for ChannelEvent {
             _ => true,
         }
     }
-    fn retain_credit(&mut self, credit: CreditReturn) -> bool {
+    fn retain_credit(&mut self, credit: CreditLease) -> bool {
         match self {
             Self::Stream(event) => event.retain_credit(credit),
             Self::Extended { data, .. } => with_stream(data, |e| e.retain_credit(credit)),

@@ -40,7 +40,7 @@ pub(crate) fn pair_with_guard(guard: Option<Box<dyn Send>>) -> (End, End) {
 pub const PACKET_COST: usize = 64;
 
 /// Makes a [`pair`] whose queues each hold at most `limit` bytes, counting
-/// each packet's length plus 64 bytes. A packet sent past that is dropped,
+/// each packet's allocated capacity plus 64 bytes. A packet sent past that is dropped,
 /// as on a congested link. Use it for links on the agent's path, where an
 /// unlimited queue would let the agent grow the world's memory without
 /// end.
