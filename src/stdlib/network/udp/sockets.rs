@@ -12,7 +12,7 @@ use fictionet::stdlib::layer::{
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::icmp;
 use fictionet::stdlib::network::ip::{self, Fields, protocol};
-use fictionet::stdlib::network::packet::{IpPacket, Scope, Sort};
+use fictionet::stdlib::network::packet::{CheckedIpPacket, Sort};
 use fictionet::stdlib::network::transport::{Request, Udp, UdpBound, UdpControl, UdpNotice};
 
 use super::wire;
@@ -48,10 +48,7 @@ const SOCKETS: usize = 1 << 16;
 /// are. Datagrams are never split into fragments. A child's
 /// [`DatagramCommand::End`] or its handle's close frees the port.
 ///
-/// The packets it takes in are the ones the IP layer sorts to UDP, and
-/// only [checked](IpPacket::is_checked) ones of its own network, the
-/// [`Scope`] it was made with: observed copies and packets of other
-/// networks are dropped. Of the packets it takes in, it keeps UDP datagrams
+/// The endpoint supplies checked packets sorted to UDP. It keeps datagrams
 /// sent to its address, and to the multicast
 /// groups joined with [`UdpControl::Join`], and drops the rest, ICMP errors
 /// about datagrams it sent included. A datagram with a bad checksum is
@@ -83,7 +80,6 @@ const SOCKETS: usize = 1 << 16;
 /// taken. Those packets are outside the budget, as the IP layer's are: a
 /// budgeted carrier below reserves them.
 pub struct UdpLayer {
-    scope: Scope,
     addr: IpAddr,
     settings: Settings,
     icmp: icmp::Options,
@@ -171,12 +167,11 @@ impl core::fmt::Display for Overrun {
 impl core::error::Error for Overrun {}
 
 impl UdpLayer {
-    /// The UDP of a machine with address `addr` on network `scope`, with
+    /// The UDP of a machine with address `addr`, with
     /// the standards' [`Settings`] and default [`icmp::Options`]. Draws the
     /// first IP identification from `entropy`.
-    pub fn new(scope: Scope, addr: IpAddr, entropy: &dyn Entropy) -> UdpLayer {
+    pub fn new(addr: IpAddr, entropy: &dyn Entropy) -> UdpLayer {
         UdpLayer {
-            scope,
             addr,
             settings: Settings::default(),
             icmp: icmp::Options::default(),
@@ -264,15 +259,8 @@ impl UdpLayer {
         let id = child.id();
         let local = SocketAddr::new(self.addr, self.sockets.get(id).expect("just bound").port);
         self.ports.insert(local.port(), id);
-        self.up.push_back(MuxEvent::Opened(
-            child,
-            UdpBound {
-                scope: self.scope,
-                local,
-                request,
-            },
-            1,
-        ));
+        self.up
+            .push_back(MuxEvent::Opened(child, UdpBound { local, request }, 1));
         self.wake(id);
     }
 
@@ -312,16 +300,11 @@ impl UdpLayer {
     }
 
     /// Takes in one packet the IP layer sorted to UDP.
-    fn take_in(&mut self, env: &mut Env<'_, UdpReport>, packet: IpPacket) {
-        if !packet.is_checked()
-            || packet.ingress().scope != self.scope
-            || packet.sort() != Sort::Transport(Transport::Udp)
-        {
+    fn take_in(&mut self, env: &mut Env<'_, UdpReport>, packet: CheckedIpPacket) {
+        if packet.sort() != Sort::Transport(Transport::Udp) {
             return;
         }
-        let Some(header) = packet.header() else {
-            return;
-        };
+        let header = packet.header();
         if header.protocol != protocol::UDP {
             return;
         }
@@ -402,7 +385,7 @@ impl UdpLayer {
 }
 
 impl Layer for UdpLayer {
-    type Lower = Packets<IpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, Chunk>;
     type Upper = Udp;
     type Report = UdpReport;
     type Timer = ();

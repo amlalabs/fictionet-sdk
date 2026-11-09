@@ -8,13 +8,13 @@
 //!
 //! | Transport | Lower port | Upper port | A child is |
 //! | --- | --- | --- | --- |
-//! | TCP | `Packets<IpPacket, Chunk>` | [`Tcp`] | one connection, a [`ByteStream`], opened as a [`TcpOpening`] |
-//! | UDP | `Packets<IpPacket, Chunk>` | [`Udp`] | one bound socket, [`Datagrams`] with the peer's address, opened as a [`UdpBound`] |
-//! | TCP observer | `Packets<IpPacket, Infallible>` | [`TcpObserver`] | one observed connection, an [`ObservedStream`], opened as an [`ObservedConnection`] |
+//! | TCP | `Packets<CheckedIpPacket, Chunk>` | [`Tcp`] | one connection, a [`ByteStream`], opened as a [`TcpOpening`] |
+//! | UDP | `Packets<CheckedIpPacket, Chunk>` | [`Udp`] | one bound socket, [`Datagrams`] with the peer's address, opened as a [`UdpBound`] |
+//! | TCP observer | `Packets<ObservedIpPacket, Infallible>` | [`TcpObserver`] | one observed connection, an [`ObservedStream`], opened as an [`ObservedConnection`] |
 //!
-//! TCP and UDP each take the [checked](super::packet::IpPacket::is_checked)
+//! TCP and UDP each take the [checked](super::packet::CheckedIpPacket)
 //! packets of their own network whose
-//! [`IpPacket::sort`](super::packet::IpPacket::sort) is their
+//! [`CheckedIpPacket::sort`](super::packet::CheckedIpPacket::sort) is their
 //! [`Transport`](super::Transport), ICMP errors quoting their packets
 //! included, and send whole IP packets they built. The observer reads
 //! observed copies of TCP segments and sends nothing: the only command its
@@ -107,8 +107,6 @@ pub trait Retirement: Send + Sync {
 /// What a TCP connection is, given when its child opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpOpening {
-    /// The network the connection belongs to.
-    pub scope: Scope,
     /// This side's address and port.
     pub local: SocketAddr,
     /// The peer's address and port.
@@ -301,11 +299,9 @@ pub enum TcpNotice {
 
 /// What a bound UDP socket is, given when its child opens. Its datagrams
 /// carry the peer's address; the destination each one was sent to stays
-/// on the [`IpPacket`](super::packet::IpPacket) it arrived in.
+/// on the [`CheckedIpPacket`](super::packet::CheckedIpPacket) it arrived in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UdpBound {
-    /// The network the socket belongs to.
-    pub scope: Scope,
     /// The address and port it is bound to.
     pub local: SocketAddr,
     /// The [`UdpControl::Bind`] that asked for it.
@@ -486,7 +482,6 @@ mod tests {
             Some(Keep { seen: s.clone() })
         }));
         let opening = TcpOpening {
-            scope: Scope::ROOT,
             local: addr("10.0.0.1:443"),
             remote: addr("10.0.0.2:50000"),
             origin: TcpOrigin::Connected(Request(9)),
@@ -524,7 +519,6 @@ mod tests {
             Some(Keep { seen: s.clone() })
         }));
         let bound = UdpBound {
-            scope: Scope::ROOT,
             local: addr("10.0.0.1:53"),
             request: Request(1),
         };

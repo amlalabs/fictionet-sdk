@@ -86,11 +86,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::task::Poll;
 
-use fictionet::stdlib::layer::{
-    Admit, Budget, Chunk, Datagram, Driver, PacketCommand, PacketEvent,
-};
+use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, PacketCommand, PacketEvent};
 use fictionet::stdlib::network::Transport;
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, Sort};
+use fictionet::stdlib::network::packet::{IpLayer, Sort};
 use fictionet::stdlib::network::{
     icmp,
     ports::{Event, Ports},
@@ -369,7 +367,7 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
         let admit = match ports.next(&fcx, ip.deadline(), |_| Poll::Pending).await? {
             Event::Packet(0, Packet(bytes)) => {
                 ip.set_now(fcx.now());
-                let raw = Datagram::new(Chunk::new(bytes), Ingress::default());
+                let raw = Chunk::new(bytes);
                 ip.deliver(PacketEvent::Packet(raw))?.map(drop)
             }
             Event::Packet(_, Packet(bytes)) => ip
@@ -603,6 +601,8 @@ pub enum Intake {
     Whole(Packet),
     /// A fragment, waiting for the rest of its packet.
     Waiting,
+    /// A fragment discarded because it cannot form a valid packet.
+    Discarded,
     /// A packet dropped for its IPv6 extension headers: the packet, and the
     /// ICMPv6 "parameter problem" its destination sends back to its source,
     /// if RFC 8200 asks for one.
@@ -647,8 +647,10 @@ impl Reassembly {
         {
             return refused(packet, reject);
         }
-        let Some(whole) = self.reassemble(packet, now) else {
-            return Intake::Waiting;
+        let whole = match self.reassemble(packet, now) {
+            Ok(Some(whole)) => whole,
+            Ok(None) => return Intake::Waiting,
+            Err(()) => return Intake::Discarded,
         };
         if version(&whole.0) != Some(6) {
             return Intake::Whole(whole);
@@ -661,12 +663,13 @@ impl Reassembly {
     }
 
     /// Takes a packet. Returns it if it is not a fragment, the whole packet
-    /// if this fragment completed one, and `None` otherwise.
+    /// if this fragment completed one, `Ok(None)` while waiting, or an error
+    /// when the fragment cannot form a valid packet.
     ///
     /// Packets whose time is up are dropped first, so a fragment that comes
     /// after its packet expired never completes it, even when the caller
     /// has not called [`expire`](Reassembly::expire) yet.
-    fn reassemble(&mut self, packet: Packet, now: Instant) -> Option<Packet> {
+    fn reassemble(&mut self, packet: Packet, now: Instant) -> Result<Option<Packet>, ()> {
         self.expire(now);
         let whole = self.push_fragment(packet, now);
         // Every path that may have added bookkeeping ends here, so the cap
@@ -681,25 +684,27 @@ impl Reassembly {
     }
 
     /// [`reassemble`](Reassembly::reassemble), without the cap.
-    fn push_fragment(&mut self, packet: Packet, now: Instant) -> Option<Packet> {
+    fn push_fragment(&mut self, packet: Packet, now: Instant) -> Result<Option<Packet>, ()> {
         let Some(frag) = arrived(&packet.0) else {
-            return Some(packet);
+            return Ok(Some(packet));
         };
         // A packet in one fragment needs no waiting (RFC 6946).
         if frag.offset == 0 && !frag.more {
-            let header = frag.header?;
-            return finish(header, &[(0, frag.data)], frag.data.len()).map(Packet);
+            let header = frag.header.ok_or(())?;
+            return finish(header, &[(0, frag.data)], frag.data.len())
+                .map(|bytes| Some(Packet(bytes)))
+                .ok_or(());
         }
         // Every fragment but the last carries a multiple of 8 bytes, and
         // every fragment carries some.
         if (frag.more && frag.data.len() % 8 != 0) || frag.data.is_empty() {
-            return None;
+            return Err(());
         }
         let end = frag.offset + frag.data.len();
         let key = frag.key;
         if end > 65_535 {
             self.kill(&key);
-            return None;
+            return Err(());
         }
         let by_expiry = &mut self.by_expiry;
         let size = &mut self.size;
@@ -718,7 +723,7 @@ impl Reassembly {
             }
         });
         if partial.dead {
-            return None;
+            return Err(());
         }
         // An exact copy of a fragment that is already here, with the same
         // bytes and the same "more fragments" flag, is ignored. Fragments
@@ -730,10 +735,10 @@ impl Reassembly {
         {
             let was_last = partial.total == Some(end);
             if was_last != frag.more {
-                return None;
+                return Ok(None);
             }
             self.kill(&key);
-            return None;
+            return Err(());
         }
         let mut ok = true;
         // The last fragment sets the length. It must agree with the data.
@@ -770,7 +775,7 @@ impl Reassembly {
         }
         if !ok {
             self.kill(&key);
-            return None;
+            return Err(());
         }
         let mut added = frag.data.len() + PIECE_COST;
         if let Some(h) = frag.header
@@ -792,9 +797,11 @@ impl Reassembly {
                 .iter()
                 .map(|(o, d)| (*o, d.as_slice()))
                 .collect();
-            return finish(partial.header.unwrap(), &pieces, partial.have).map(Packet);
+            return finish(partial.header.unwrap(), &pieces, partial.have)
+                .map(|bytes| Some(Packet(bytes)))
+                .ok_or(());
         }
-        None
+        Ok(None)
     }
 
     /// Takes an unfinished packet out, with its bookkeeping.
@@ -1928,7 +1935,11 @@ mod tests {
     #[test]
     fn unfinished_packets_time_out() {
         let mut r = Reassembly::default();
-        assert!(r.reassemble(frag4(1, 0, 16, true), at(0)).is_none());
+        assert!(
+            r.reassemble(frag4(1, 0, 16, true), at(0))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(r.next_expiry(), Some(at(30)));
         r.expire(at(29));
         assert_eq!(r.partial.len(), 1);
@@ -1936,11 +1947,20 @@ mod tests {
         assert!(r.partial.is_empty());
         assert_eq!(r.size, 0);
         // The rest alone does not make a packet: the first fragment is gone.
-        assert!(r.reassemble(frag4(1, 16, 8, false), at(31)).is_none());
+        assert!(
+            r.reassemble(frag4(1, 16, 8, false), at(31))
+                .unwrap()
+                .is_none()
+        );
         // Within the time, both halves make one.
-        assert!(r.reassemble(frag4(2, 0, 16, true), at(40)).is_none());
+        assert!(
+            r.reassemble(frag4(2, 0, 16, true), at(40))
+                .unwrap()
+                .is_none()
+        );
         let whole = r
             .reassemble(frag4(2, 16, 8, false), at(69))
+            .unwrap()
             .expect("a whole packet");
         assert_eq!(whole.0.len(), 20 + 24);
         assert_eq!(checksum(&whole.0[..20]), 0);
@@ -1952,8 +1972,16 @@ mod tests {
     #[test]
     fn a_late_fragment_completes_nothing_before_expire_runs() {
         let mut r = Reassembly::default();
-        assert!(r.reassemble(frag4(3, 0, 16, true), at(0)).is_none());
-        assert!(r.reassemble(frag4(3, 16, 8, false), at(30)).is_none());
+        assert!(
+            r.reassemble(frag4(3, 0, 16, true), at(0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            r.reassemble(frag4(3, 16, 8, false), at(30))
+                .unwrap()
+                .is_none()
+        );
         r.check();
         // The late fragment starts a packet of its own, which waits.
         assert_eq!(r.next_expiry(), Some(at(60)));
@@ -1965,7 +1993,7 @@ mod tests {
         // 600 unfinished packets of 8,000 bytes is more than 4 MiB.
         for id in 0..600u16 {
             let t = Instant::from_since_start(Duration::from_millis(id as u64));
-            assert!(r.reassemble(frag4(id, 0, 8000, true), t).is_none());
+            assert!(r.reassemble(frag4(id, 0, 8000, true), t).unwrap().is_none());
             r.check();
         }
         assert!(r.partial.len() < 600);
@@ -1988,7 +2016,7 @@ mod tests {
             let mut f = frag4((i % 65_536) as u16, 0, 8, true);
             f.0[15] = (i / 65_536) as u8; // another source for each round of ids
             set_header_checksum(&mut f.0[..20]);
-            assert!(r.reassemble(f, t).is_none());
+            assert!(r.reassemble(f, t).unwrap().is_none());
             assert!(r.size <= MAX_WAITING);
         }
         assert!(r.partial.len() < MAX_WAITING / PARTIAL_COST);
@@ -2006,13 +2034,22 @@ mod tests {
     fn fragments_in_any_order_make_one_packet() {
         let mut r = Reassembly::default();
         // The last first, then the middle ones backward, then the first.
-        assert!(r.reassemble(frag4(9, 64, 5, false), at(0)).is_none());
+        assert!(
+            r.reassemble(frag4(9, 64, 5, false), at(0))
+                .unwrap()
+                .is_none()
+        );
         for k in (1..8).rev() {
-            assert!(r.reassemble(frag4(9, k * 8, 8, true), at(0)).is_none());
+            assert!(
+                r.reassemble(frag4(9, k * 8, 8, true), at(0))
+                    .unwrap()
+                    .is_none()
+            );
         }
         r.check();
         let whole = r
             .reassemble(frag4(9, 0, 8, true), at(0))
+            .unwrap()
             .expect("a whole packet");
         assert_eq!(whole.0.len(), 20 + 69);
         assert!(r.partial.is_empty() && r.by_expiry.is_empty());
@@ -2047,7 +2084,7 @@ mod tests {
             h.extend(std::iter::repeat_n(0xab, len));
             assert_eq!(
                 r.reassemble(Packet(h), at(0)),
-                None,
+                if more { Ok(None) } else { Err(()) },
                 "a packet of {} bytes came out",
                 40 + 20 + offset + len
             );
@@ -2098,7 +2135,7 @@ mod tests {
             p.extend(std::iter::repeat_n(0xab, len));
             assert_eq!(
                 r.reassemble(Packet(p), at(0)),
-                None,
+                if more { Ok(None) } else { Err(()) },
                 "a packet came out at offset {offset}"
             );
             offset += len;
@@ -2143,14 +2180,18 @@ mod tests {
     fn bad_fragments_are_dropped() {
         let mut r = Reassembly::default();
         // Not a multiple of 8 with more to come.
-        assert!(r.reassemble(frag4(3, 0, 13, true), at(0)).is_none());
+        assert!(r.reassemble(frag4(3, 0, 13, true), at(0)).is_err());
         assert!(r.partial.is_empty());
         // Past 65,535 bytes: nothing is kept for a packet not yet started.
-        assert!(r.reassemble(frag4(4, 65_528, 16, false), at(0)).is_none());
+        assert!(r.reassemble(frag4(4, 65_528, 16, false), at(0)).is_err());
         assert!(r.partial.is_empty());
         // Two different lengths for one packet.
-        assert!(r.reassemble(frag4(5, 16, 8, false), at(0)).is_none());
-        assert!(r.reassemble(frag4(5, 32, 8, false), at(0)).is_none());
+        assert!(
+            r.reassemble(frag4(5, 16, 8, false), at(0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(r.reassemble(frag4(5, 32, 8, false), at(0)).is_err());
         assert_eq!(live(&r), 0);
         // What is left of it is its bookkeeping, until it expires.
         assert_eq!(r.size, PARTIAL_COST);
@@ -2161,7 +2202,7 @@ mod tests {
         // Truncated packets are not fragments and pass through as they are.
         let mut cut = frag4(6, 0, 16, true);
         cut.0.truncate(30);
-        assert_eq!(r.reassemble(cut.clone(), at(0)), Some(cut));
+        assert_eq!(r.reassemble(cut.clone(), at(0)), Ok(Some(cut)));
     }
 
     #[test]
@@ -2171,25 +2212,46 @@ mod tests {
         let mut other = first;
         other[8] = 2;
         // The same place, other bytes: an overlap (RFC 5722).
-        assert!(r.reassemble(frag4_of(1, 0, &first, true), at(0)).is_none());
-        assert!(r.reassemble(frag4_of(1, 0, &other, true), at(0)).is_none());
+        assert!(
+            r.reassemble(frag4_of(1, 0, &first, true), at(0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(r.reassemble(frag4_of(1, 0, &other, true), at(0)).is_err());
         assert_eq!(live(&r), 0);
         // Its later fragments cannot start it again.
-        assert!(r.reassemble(frag4_of(1, 0, &first, true), at(10)).is_none());
-        assert!(r.reassemble(frag4(1, 16, 8, false), at(10)).is_none());
+        assert!(r.reassemble(frag4_of(1, 0, &first, true), at(10)).is_err());
+        assert!(r.reassemble(frag4(1, 16, 8, false), at(10)).is_err());
         assert_eq!(live(&r), 0);
         // Once its time is up, the identification can be used again.
         r.expire(at(30));
         assert!(r.partial.is_empty());
-        assert!(r.reassemble(frag4_of(1, 0, &first, true), at(31)).is_none());
+        assert!(
+            r.reassemble(frag4_of(1, 0, &first, true), at(31))
+                .unwrap()
+                .is_none()
+        );
         let whole = r
             .reassemble(frag4(1, 16, 8, false), at(31))
+            .unwrap()
             .expect("a whole packet");
         assert_eq!(&whole.0[20..36], &first);
         // An exact copy is ignored.
-        assert!(r.reassemble(frag4_of(2, 0, &first, true), at(40)).is_none());
-        assert!(r.reassemble(frag4_of(2, 0, &first, true), at(40)).is_none());
-        assert!(r.reassemble(frag4(2, 16, 8, false), at(40)).is_some());
+        assert!(
+            r.reassemble(frag4_of(2, 0, &first, true), at(40))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            r.reassemble(frag4_of(2, 0, &first, true), at(40))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            r.reassemble(frag4(2, 16, 8, false), at(40))
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Fragments that run past 65,535 bytes keep nothing, however many
@@ -2200,7 +2262,7 @@ mod tests {
         for id in 0..rounds(20_000) {
             assert!(
                 r.reassemble(frag4(id as u16, 65_528, 16, false), at(0))
-                    .is_none()
+                    .is_err()
             );
         }
         assert!(r.partial.is_empty());
@@ -2212,8 +2274,8 @@ mod tests {
             set_header_checksum(&mut first.0[..20]);
             let mut other = first.clone();
             other.0[28] ^= 1;
-            r.reassemble(first, at(0));
-            r.reassemble(other, at(0));
+            assert!(r.reassemble(first, at(0)).unwrap().is_none());
+            assert!(r.reassemble(other, at(0)).is_err());
             if id % 4_000 == 0 {
                 r.check();
             }
@@ -2233,15 +2295,19 @@ mod tests {
             } else {
                 (true, false)
             };
-            assert!(r.reassemble(frag4_of(1, 8, &[2; 8], a), at(0)).is_none());
-            assert!(r.reassemble(frag4_of(1, 8, &[2; 8], b), at(0)).is_none());
             assert!(
-                r.reassemble(frag4_of(1, 0, &[1; 8], true), at(0)).is_none(),
+                r.reassemble(frag4_of(1, 8, &[2; 8], a), at(0))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(r.reassemble(frag4_of(1, 8, &[2; 8], b), at(0)).is_err());
+            assert!(
+                r.reassemble(frag4_of(1, 0, &[1; 8], true), at(0)).is_err(),
                 "last first: {last_first}"
             );
             assert!(
                 r.reassemble(frag4_of(1, 16, &[3; 8], false), at(0))
-                    .is_none(),
+                    .is_err(),
                 "last first: {last_first}"
             );
             assert_eq!(live(&r), 0);
@@ -2251,13 +2317,19 @@ mod tests {
         let mut r = Reassembly::default();
         assert!(
             r.reassemble(frag4_of(1, 8, &[2; 8], false), at(0))
+                .unwrap()
                 .is_none()
         );
         assert!(
             r.reassemble(frag4_of(1, 8, &[2; 8], false), at(0))
+                .unwrap()
                 .is_none()
         );
-        assert!(r.reassemble(frag4_of(1, 0, &[1; 8], true), at(0)).is_some());
+        assert!(
+            r.reassemble(frag4_of(1, 0, &[1; 8], true), at(0))
+                .unwrap()
+                .is_some()
+        );
     }
 
     // The IPv6 extension-header chain

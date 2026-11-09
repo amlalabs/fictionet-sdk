@@ -26,7 +26,7 @@ use fictionet::stdlib::layer::{
     Slots, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::Transport;
-use fictionet::stdlib::network::packet::{IpPacket, Scope, Sort};
+use fictionet::stdlib::network::packet::{CheckedIpPacket, Sort};
 use fictionet::stdlib::network::transport::{
     Request, Tcp, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
@@ -327,17 +327,11 @@ impl std::hash::Hasher for IdHasher {
 /// not, on every packet, and its slot list never shrinks by itself.
 pub(super) const COMPACT_SLOTS: usize = 256;
 
-/// One machine's TCP as a layer: `Packets<IpPacket, Chunk>` below, the
+/// One machine's TCP as a layer: `Packets<CheckedIpPacket, Chunk>` below, the
 /// [`Tcp`] mux above. See the [module docs](super).
 ///
-/// The packets it takes in are the ones the IP layer sorts to TCP, and
-/// only [checked](IpPacket::is_checked) ones of its own network, the
-/// [`Scope`] set with [`in_scope`](TcpLayer::in_scope): observed copies and
-/// packets of other networks are dropped. A tunnel's network gets an IP
-/// layer of its own ([`IpLayer::host_in`]) and a TCP layer in the same
-/// scope.
-///
-/// [`IpLayer::host_in`]: fictionet::stdlib::network::packet::IpLayer::host_in
+/// The endpoint owns the input path and supplies checked packets sorted to TCP.
+/// Each independent network has its own IP and TCP layers.
 ///
 /// # The layer above
 ///
@@ -384,7 +378,6 @@ pub(super) const COMPACT_SLOTS: usize = 256;
 /// and their allocations are not measured.
 pub struct TcpLayer {
     pub(super) addr: IpAddr,
-    scope: Scope,
     pub(super) iface: Iface,
     pub(super) sockets: SocketSet<'static>,
     /// Each socket's slot in `sockets`, ordered by SDK ID for compaction.
@@ -808,7 +801,6 @@ impl TcpLayer {
         iface.set_reset_closed_ports(options.settings.closed_port == ClosedPort::Reset);
         TcpLayer {
             addr,
-            scope: Scope::ROOT,
             iface,
             sockets: SocketSet::new(Vec::new()),
             handles: BTreeMap::new(),
@@ -843,13 +835,6 @@ impl TcpLayer {
             saturated: false,
             ended: false,
         }
-    }
-
-    /// The network its connections belong to, as their openings say, and
-    /// the only one whose packets it takes in. [`Scope::ROOT`] unless set.
-    pub fn in_scope(mut self, scope: Scope) -> TcpLayer {
-        self.scope = scope;
-        self
     }
 
     /// Keeps per-source flood limits only for sources `isolated` accepts:
@@ -2018,7 +2003,6 @@ impl TcpLayer {
         c.child = Some(child.id());
         c.open = true;
         let opening = TcpOpening {
-            scope: self.scope,
             local: c.local,
             remote: c.remote,
             origin,
@@ -2553,7 +2537,7 @@ impl TcpLayer {
 }
 
 impl Layer for TcpLayer {
-    type Lower = Packets<IpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, Chunk>;
     type Upper = Tcp;
     type Report = ();
     type Timer = ();
@@ -2589,10 +2573,7 @@ impl Layer for TcpLayer {
         if self.dev.full() || self.up.len() >= UP_ROOM {
             return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
         }
-        if !packet.is_checked()
-            || packet.ingress().scope != self.scope
-            || packet.sort() != Sort::Transport(Transport::Tcp)
-        {
+        if packet.sort() != Sort::Transport(Transport::Tcp) {
             return Ok(Admit::Taken);
         }
         let now = smol(env.now());

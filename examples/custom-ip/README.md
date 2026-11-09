@@ -2,7 +2,7 @@
 
 `HopLimit` copies the IP layer's state machine and owns its validation,
 fragment reassembly, packet queues and deadlines. It uses public parsing and
-reassembly helpers and constructs checked `IpPacket` values. It contains no
+reassembly helpers and constructs `CheckedIpPacket` values. It contains no
 stdlib `IpLayer`.
 
 The world installs it through `packet::Factory` under unchanged TCP, UDP and

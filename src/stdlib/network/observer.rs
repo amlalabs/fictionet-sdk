@@ -3,7 +3,7 @@
 //! connection above.
 //!
 //! [`Observer`] is a [layer](fictionet::stdlib::layer) with whole captured
-//! packets below, as [`IpPacket::observed`] reads them, and the
+//! packets below, as [`ObservedIpPacket::observed`] reads them, and the
 //! [`TcpObserver`] port above. It puts each direction of each connection
 //! back in order and offers the connection as one child, opened with an
 //! [`ObservedConnection`] that names it. It only watches: it sends nothing
@@ -53,7 +53,7 @@
 //! use fictionet::stdlib::layer::{Budget, Chunk, Driver, MuxEvent, ObservedEvent, PacketEvent, Admit};
 //! use fictionet::stdlib::network::ip::{self, protocol};
 //! use fictionet::stdlib::network::observer::Observer;
-//! use fictionet::stdlib::network::packet::{Ingress, IpPacket};
+//! use fictionet::stdlib::network::packet::{Ingress, ObservedIpPacket};
 //! use fictionet::time::Instant;
 //! use fictionet::{Seed, SeededEntropy};
 //!
@@ -64,7 +64,7 @@
 //!
 //! let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
 //! let mut tcp = Driver::new(Observer::default(), entropy, Budget::unlimited(), Instant::ZERO);
-//! let packet = IpPacket::observed(Chunk::new(packet.0), Ingress::default());
+//! let packet = ObservedIpPacket::observed(Chunk::new(packet.0), Ingress::default());
 //! assert!(matches!(tcp.deliver(PacketEvent::Packet(packet)), Ok(Admit::Taken)));
 //! let mut child = None;
 //! tcp.send_above(|event| {
@@ -99,7 +99,7 @@ use fictionet::stdlib::layer::{
     Top,
 };
 use fictionet::stdlib::network::ip::protocol;
-use fictionet::stdlib::network::packet::{IpPacket, Scope};
+use fictionet::stdlib::network::packet::{ObservedIpPacket, Scope};
 use fictionet::stdlib::network::transport::{ObservedConnection, TcpObserver};
 
 use flow::{ACK, Flow, RST, SYN, Segment, Step, Store};
@@ -291,7 +291,7 @@ impl Observer {
 
     /// Takes one captured packet, once what the layer above left waiting
     /// fits [`Limits::waiting`].
-    fn packet(&mut self, env: &mut Env<'_, ObserverReport>, packet: &IpPacket) {
+    fn packet(&mut self, env: &mut Env<'_, ObserverReport>, packet: &ObservedIpPacket) {
         self.make_room();
         let Some(header) = packet.header() else {
             return;
@@ -742,7 +742,7 @@ fn weight(event: &ObservedEvent) -> usize {
 }
 
 impl Layer for Observer {
-    type Lower = Packets<IpPacket, Infallible>;
+    type Lower = Packets<ObservedIpPacket, Infallible>;
     type Upper = TcpObserver;
     type Report = ObserverReport;
     type Timer = ();
@@ -757,8 +757,8 @@ impl Layer for Observer {
     fn on_event(
         &mut self,
         env: &mut Env<'_, ObserverReport>,
-        event: PacketEvent<IpPacket>,
-    ) -> Result<Admit<PacketEvent<IpPacket>>, Infallible> {
+        event: PacketEvent<ObservedIpPacket>,
+    ) -> Result<Admit<PacketEvent<ObservedIpPacket>>, Infallible> {
         if self.finished {
             return Ok(Admit::Closed(event));
         }

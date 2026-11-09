@@ -62,7 +62,7 @@ use fictionet::stdlib::layer::{
 };
 use fictionet::stdlib::network::icmp;
 
-use fictionet::stdlib::network::packet::{IpPacket, Scope};
+use fictionet::stdlib::network::packet::CheckedIpPacket;
 use fictionet::stdlib::network::transport::{Request, Udp, UdpControl, UdpNotice};
 use fictionet::{Cx, Interface, RecvError};
 
@@ -152,14 +152,14 @@ pub fn prepare_endpoint(
         addr,
         budget: Budget::unlimited(),
     });
-    let task = super::endpoint::drive(fcx.clone(), inner, None, Some(udp), None, ip, Scope::ROOT);
+    let task = super::endpoint::drive(fcx.clone(), inner, None, Some(udp), None, ip);
     (endpoint, Prepared { task })
 }
 
 pub(crate) fn prepare_transport(fcx: &Cx, addr: IpAddr) -> (Endpoint, PacketDriver) {
     // UDP uses its engine limits; attached applications have their own byte budgets.
     let mut driver = Driver::new(
-        UdpLayer::new(Scope::ROOT, addr, fcx),
+        UdpLayer::new(addr, fcx),
         Arc::new(fcx.clone()),
         Budget::unlimited(),
         fcx.now(),
@@ -201,7 +201,7 @@ pub(crate) struct PacketDriver {
 }
 
 impl PacketDriver {
-    pub(crate) fn deliver(&mut self, packet: IpPacket, now: fictionet::time::Instant) {
+    pub(crate) fn deliver(&mut self, packet: CheckedIpPacket, now: fictionet::time::Instant) {
         self.shared.with(|inner| {
             inner.driver.set_now(now);
             inner.offer(PacketEvent::Packet(packet));
@@ -361,7 +361,7 @@ impl Inner {
     /// Offers the stack an event from the interface, making room once if
     /// it refuses. An event it still refuses is lost, as a packet on a
     /// full link is.
-    fn offer(&mut self, event: PacketEvent<IpPacket>) {
+    fn offer(&mut self, event: PacketEvent<CheckedIpPacket>) {
         let event = match self
             .driver
             .deliver(event)

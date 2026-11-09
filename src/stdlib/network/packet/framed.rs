@@ -1,30 +1,31 @@
 //! A byte stream carrying whole packets with a four-byte big-endian length.
 
-use super::Ingress;
 use core::convert::Infallible;
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Datagram, Env, Layer, PacketCommand, PacketEvent, Packets,
+    Admit, ByteStream, Charge, Chunk, Env, Layer, PacketCommand, PacketEvent, Packets,
     StreamCommand, StreamEvent,
 };
 
-/// A stream tunnel's packet boundaries. Arrival metadata belongs to the
-/// tunnel owner and is never read from the peer's bytes.
-/// The payload kind is raw IP, without a link header; an inner [`super::IpLayer`]
-/// validates the packet. This format does not imply another tunnel protocol.
+/// A stream tunnel's packet boundaries. It hands up raw packets for the
+/// tunnel's own endpoint, so the tunnel's network gets an IP layer of its
+/// own; nothing about where a packet came from is read from the peer's
+/// bytes. The payload kind is raw IP, without a link header; the inner
+/// [`super::IpLayer`] validates the packet. This format does not imply
+/// another tunnel protocol.
 ///
 /// Holds at most one packet in each direction, plus a partial length prefix.
 /// Packets may be empty. Lengths above 65,575 bytes (a full IPv6 packet)
 /// and truncated frames fail the tunnel. Buffered bytes are budgeted before
 /// allocation. Backpressure retains input ownership, including when a read
 /// contains several frames.
+#[derive(Default)]
 pub struct Framed {
-    ingress: Ingress,
     prefix: [u8; 4],
     prefix_len: usize,
     body: Vec<u8>,
     charge: Option<Charge>,
     size: Option<usize>,
-    packet: Option<PacketEvent<Datagram<Ingress>>>,
+    packet: Option<PacketEvent<Chunk>>,
     output: Option<StreamCommand>,
     ended: bool,
     output_end: bool,
@@ -53,26 +54,15 @@ impl core::fmt::Display for FrameError {
 impl core::error::Error for FrameError {}
 
 impl Framed {
-    /// Frames for one network and interface, identified by `ingress`.
-    pub fn new(ingress: Ingress) -> Self {
-        Self {
-            ingress,
-            prefix: [0; 4],
-            prefix_len: 0,
-            body: Vec::new(),
-            charge: None,
-            size: None,
-            packet: None,
-            output: None,
-            ended: false,
-            output_end: false,
-        }
+    /// Frames raw IP packets for the tunnel owner's input path.
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
 impl Layer for Framed {
     type Lower = ByteStream;
-    type Upper = Packets<Datagram<Ingress>, Chunk>;
+    type Upper = Packets<Chunk, Chunk>;
     type Report = Infallible;
     type Timer = ();
     type Work = Infallible;
@@ -142,7 +132,7 @@ impl Layer for Framed {
                 core::mem::take(&mut self.body),
                 self.charge.take().expect("reserved frame"),
             );
-            self.packet = Some(PacketEvent::Packet(Datagram::new(packet, self.ingress)));
+            self.packet = Some(PacketEvent::Packet(packet));
             self.prefix_len = 0;
             self.size = None;
         }
@@ -188,7 +178,7 @@ impl Layer for Framed {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.output.take()
     }
-    fn take_event(&mut self) -> Option<PacketEvent<Datagram<Ingress>>> {
+    fn take_event(&mut self) -> Option<PacketEvent<Chunk>> {
         self.packet.take()
     }
 }
@@ -202,7 +192,7 @@ mod tests {
     #[test]
     fn end_and_reset_refuse_later_packets() {
         for reset in [false, true] {
-            let mut stack = Harness::new(Seed::from_u64(1), Framed::new(Ingress::default()));
+            let mut stack = Harness::new(Seed::from_u64(1), Framed::new());
             if reset {
                 assert!(stack.driver().deliver(StreamEvent::Reset).unwrap().moved());
             } else {
@@ -224,7 +214,7 @@ mod tests {
     /// A peer may reset a stream after its end. The packets above end once.
     #[test]
     fn a_reset_after_the_end_ends_the_packets_once() {
-        let mut stack = Harness::new(Seed::from_u64(1), Framed::new(Ingress::default()));
+        let mut stack = Harness::new(Seed::from_u64(1), Framed::new());
         let mut ends = 0;
         for event in [StreamEvent::Ended, StreamEvent::Reset] {
             let _ = stack.driver().deliver(event).unwrap();
@@ -239,7 +229,7 @@ mod tests {
 
     #[test]
     fn held_output_preserves_frames_across_partial_and_zero_writes() {
-        let mut stack = Harness::new(Seed::from_u64(1), Framed::new(Ingress::default()));
+        let mut stack = Harness::new(Seed::from_u64(1), Framed::new());
         stack.withhold();
         assert!(
             stack
@@ -283,21 +273,15 @@ mod tests {
             })
             .collect();
         for cut in 0..=wire.len() {
-            let ingress = Ingress {
-                link: 17,
-                ..Ingress::default()
-            };
             let budget = Budget::new(4096);
-            let mut stack =
-                Harness::with_budget(Seed::from_u64(1), Framed::new(ingress), budget.clone());
+            let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), budget.clone());
             let mut received = Vec::new();
             for bytes in [&wire[..cut], &wire[cut..]] {
                 stack.push(bytes).unwrap();
                 for _ in 0..4 {
                     stack.driver().send_above(|event| {
                         if let PacketEvent::Packet(packet) = event {
-                            assert_eq!(*packet.meta(), ingress);
-                            received.push(packet.into_parts().0.into_vec());
+                            received.push(packet.into_vec());
                         }
                         Admit::Taken
                     });
@@ -314,24 +298,16 @@ mod tests {
     #[test]
     fn truncated_and_oversized_frames_fail_before_payload_allocation() {
         for bytes in [&[0, 0][..], &[0, 0, 0, 2, 1]] {
-            let mut stack = Harness::new(Seed::from_u64(1), Framed::new(Ingress::default()));
+            let mut stack = Harness::new(Seed::from_u64(1), Framed::new());
             stack.push(bytes).unwrap();
             assert_eq!(stack.end(), Err(FrameError::Truncated));
         }
-        let mut stack = Harness::with_budget(
-            Seed::from_u64(1),
-            Framed::new(Ingress::default()),
-            Budget::new(1024),
-        );
+        let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), Budget::new(1024));
         assert_eq!(
             stack.push(&u32::MAX.to_be_bytes()),
             Err(FrameError::TooLong)
         );
-        let mut stack = Harness::with_budget(
-            Seed::from_u64(1),
-            Framed::new(Ingress::default()),
-            Budget::new(1024),
-        );
+        let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), Budget::new(1024));
         assert_eq!(stack.push(&2048u32.to_be_bytes()), Err(FrameError::Budget));
     }
 }

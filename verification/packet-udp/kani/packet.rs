@@ -1,8 +1,7 @@
-//! Kani proofs over the IP packet envelope in
-//! `src/stdlib/network/packet.rs`: `IpPacket::checked`, `check` and `host`
-//! (lines 262-299), `IpPacket::observed` (240-260), `is_checked` (335-340)
-//! and `Sort::read` (167-198). Compiled only under `cargo kani`, as a
-//! child module of `packet`, so every harness calls the production code.
+//! Kani proofs over the host packet envelope in
+//! `src/stdlib/network/packet.rs`: `CheckedIpPacket::checked` and
+//! `Sort::read`. Compiled only under `cargo kani`, as a child module of
+//! `packet`, so every harness calls the production code.
 
 use super::*;
 
@@ -19,40 +18,31 @@ fn same_addr(a: std::net::IpAddr, b: std::net::IpAddr) -> bool {
 }
 
 /// Which origin a symbolic choice names.
-fn origin(choice: u8) -> Origin {
-    match choice % 3 {
-        0 => Origin::Arrived,
-        1 => Origin::Reassembled,
-        _ => Origin::Observed,
+fn origin(choice: bool) -> Origin {
+    if choice {
+        Origin::Arrived
+    } else {
+        Origin::Reassembled
     }
 }
 
 /// For `bytes`, `checked` takes exactly the whole, non-fragment packets a
-/// host takes in with no IPv6 extension headers left, under any origin but
-/// `Observed`, and hands the bytes back otherwise. What it makes is
-/// checked, has the header `parse_whole` reads, and goes to the transport
-/// `Sort::of` names, which is TCP or UDP only for a TCP or UDP packet
-/// or an ICMP error. The same bytes observed are never checked.
+/// host takes in with no IPv6 extension headers left, under either origin,
+/// and hands the bytes back otherwise. What it makes has the header
+/// `parse_whole` reads, and goes to the transport `Sort::of` names, which
+/// is TCP or UDP only for a TCP or UDP packet or an ICMP error.
 fn checked_is_a_host_packet(bytes: &[u8]) {
     // The same bytes, compared at a symbolic index: every index at once,
     // without a 48-byte comparison loop for the solver to unwind.
     let at: usize = kani::any();
     kani::assume(at < bytes.len());
     let same = |got: &[u8]| got.len() == bytes.len() && got[at] == bytes[at];
-    let choice: u8 = kani::any();
-    let observed = matches!(origin(choice), Origin::Observed);
     let whole = Header::parse_whole(bytes);
-    match IpPacket::checked(
-        Chunk::new(bytes.to_vec()),
-        Ingress::default(),
-        origin(choice),
-    ) {
+    match CheckedIpPacket::checked(Chunk::new(bytes.to_vec()), origin(kani::any())) {
         Ok(p) => {
             let h = whole.expect("a checked packet is whole");
-            assert!(!observed);
             assert!(h.src.is_ipv4() || h.payload.start == 40);
-            assert!(p.is_checked());
-            let got = p.header().expect("a checked packet has its header");
+            let got = p.header();
             assert!(same_addr(got.src, h.src) && same_addr(got.dst, h.dst));
             assert_eq!(
                 (got.protocol, &got.payload, got.fragment),
@@ -69,10 +59,9 @@ fn checked_is_a_host_packet(bytes: &[u8]) {
         }
         Err(back) => {
             assert!(same(&back));
-            assert!(observed || whole.is_none_or(|h| h.src.is_ipv6() && h.payload.start != 40));
+            assert!(whole.is_none_or(|h| h.src.is_ipv6() && h.payload.start != 40));
         }
     }
-    assert!(!IpPacket::observed(Chunk::new(bytes.to_vec()), Ingress::default()).is_checked());
 }
 
 /// 48-byte IPv4 packets with a 20-byte header, whose total length may be
@@ -109,13 +98,7 @@ fn checked_ipv6_packets_are_host_packets() {
 fn checked_ipv4_packets_without_the_header_checksum() {
     let mut bytes: [u8; 48] = kani::any();
     bytes[0] = 0x45;
-    if IpPacket::checked(
-        Chunk::new(bytes.to_vec()),
-        Ingress::default(),
-        Origin::Arrived,
-    )
-    .is_err()
-    {
+    if CheckedIpPacket::checked(Chunk::new(bytes.to_vec()), Origin::Arrived).is_err() {
         assert!(
             Header::parse(&bytes).is_none(),
             "only unreadable IPv4 bytes are handed back"
@@ -131,13 +114,7 @@ fn checked_ipv4_packets_without_the_header_checksum() {
 fn checked_ipv6_packets_with_extension_headers_left() {
     let mut bytes: [u8; 48] = kani::any();
     bytes[0] = 0x60;
-    if IpPacket::checked(
-        Chunk::new(bytes.to_vec()),
-        Ingress::default(),
-        Origin::Arrived,
-    )
-    .is_err()
-    {
+    if CheckedIpPacket::checked(Chunk::new(bytes.to_vec()), Origin::Arrived).is_err() {
         assert!(
             Header::parse_whole(&bytes).is_none(),
             "every whole IPv6 packet is checked"

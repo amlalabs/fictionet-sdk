@@ -23,9 +23,9 @@ use fictionet::stdlib::layer::{Budget, Chunk, Credited, Datagram, Port};
 /// explicit frame boundary, given by a framing layer.
 ///
 /// The item types say how much is known about a packet. Raw input is a
-/// [`Datagram`] of bytes with its arrival metadata; an IP layer hands its
+/// [`Chunk`] of bytes from an endpoint's input path; an IP layer hands its
 /// transports a checked envelope
-/// ([`IpPacket`](fictionet::stdlib::network::packet::IpPacket)) whose
+/// ([`CheckedIpPacket`](fictionet::stdlib::network::packet::CheckedIpPacket)) whose
 /// metadata was read from its own bytes.
 pub struct Packets<I, O = I>(PhantomData<fn() -> (I, O)>);
 

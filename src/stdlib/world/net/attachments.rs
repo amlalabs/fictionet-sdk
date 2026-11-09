@@ -665,7 +665,7 @@ impl Filter {
     fn forward(&mut self, fcx: &Cx, route: Option<usize>, packet: Packet) {
         let packet = match self.reassembly.push(packet, fcx.now()) {
             Intake::Whole(p) => p,
-            Intake::Waiting => return,
+            Intake::Waiting | Intake::Discarded => return,
             Intake::Refused { packet, answer } => {
                 if !self.context.hooks.destinations.is_host(&packet.0) {
                     packet

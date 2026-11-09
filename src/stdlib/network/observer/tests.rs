@@ -159,7 +159,7 @@ impl Watch {
         };
         let mut packet = packet;
         packet.truncate(packet.len() - std::mem::take(&mut self.cut));
-        let packet = IpPacket::observed(Chunk::new(packet), ingress);
+        let packet = ObservedIpPacket::observed(Chunk::new(packet), ingress);
         assert!(matches!(
             self.tcp.deliver(PacketEvent::Packet(packet)),
             Ok(Admit::Taken)
@@ -946,6 +946,22 @@ fn overlapping_tuples_in_other_scopes_do_not_alias() {
             .events,
         [(a.0, data(5, b"!", Some(0)))]
     );
+}
+
+/// Connections in many networks count against one capture's limit, so
+/// adding networks does not multiply what the observer holds.
+#[test]
+fn networks_share_the_capture_connection_limit() {
+    let mut tcp = Watch::new(Limits {
+        connections: 2,
+        ..Limits::default()
+    });
+    let scopes = Scopes::default();
+    for _ in 0..8 {
+        tcp.send(scopes.tunnel(), CLIENT, SERVER, 100, 0, 2, b"");
+        assert!(tcp.observer().connections() <= 2);
+    }
+    assert_eq!(tcp.observer().connections(), 2);
 }
 
 /// A child's data waits for credit; its siblings go on. A child that
