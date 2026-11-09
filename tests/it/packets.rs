@@ -483,6 +483,7 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
         // GRE (47) is neither.
         let mut gre = udp4.clone();
         gre[9] = 47;
+        ip::set_header_checksum(&mut gre[..20]);
         // A UDP packet behind a hop-by-hop extension header.
         let mut hbh = udp6[..40].to_vec();
         hbh[6] = 0; // next header: hop-by-hop
