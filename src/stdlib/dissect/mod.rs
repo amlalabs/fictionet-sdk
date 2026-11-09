@@ -19,10 +19,12 @@ pub mod protocols;
 mod registry;
 /// Copyable TLS record presentation, handshake state, and decryption.
 pub mod tls;
+mod transport;
 
 pub use conversation::Conversation;
 pub use present::{Observed, Place, Placement, Present};
 pub use registry::{Match, Protocol, Registry, Selection};
+use transport::{IcmpMessage, TcpHeader, UdpHeader, endpoint};
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
@@ -734,7 +736,7 @@ impl Dissector {
             context.complete = false;
         }
         match proto {
-            6 => self.tcp(p, at, end, d, keys, context),
+            6 => self.tcp(p, header, d, keys, context),
             17 => self.udp(p, header, d, context),
             1 => icmp(p, at, end, d, false),
             58 => icmp(p, at, end, d, true),
@@ -750,41 +752,23 @@ impl Dissector {
     fn tcp(
         &mut self,
         p: &[u8],
-        at: usize,
-        end: usize,
+        header: &Header,
         d: &mut Decoded,
         keys: &[KeyLine],
         context: DecodeContext<'_>,
     ) {
-        let t = &p[at..end];
-        if t.len() < 20 {
-            return truncated(d, "TCP", t.len());
-        }
-        let off = usize::from(t[12] >> 4) * 4;
-        if off < 20 || off > t.len() {
-            return truncated(d, "TCP", t.len());
-        }
-        let Some(source_port) = be16(t, 0) else {
-            return truncated(d, "TCP", t.len());
+        let (at, end) = (header.payload.start, header.payload.end);
+        let Some(segment) = TcpHeader::read(&p[at..end]) else {
+            return truncated(d, "TCP", end - at);
         };
-        let Some(destination_port) = be16(t, 2) else {
-            return truncated(d, "TCP", t.len());
-        };
-        let (sport, dport) = (source_port, destination_port);
-        let Some(sequence) = be32(t, 4) else {
-            return truncated(d, "TCP", t.len());
-        };
-        let Some(acknowledgment) = be32(t, 8) else {
-            return truncated(d, "TCP", t.len());
-        };
-        let Some(window) = be16(t, 14) else {
-            return truncated(d, "TCP", t.len());
-        };
-        let (seq, ack, flags, win) = (sequence, acknowledgment, t[13], window);
-        let payload = (at + off, end);
+        let payload = at + segment.len..end;
         // The observer gets what the copy holds of the packet: the headers
         // alone when the payload is not all here.
-        let held = if context.complete { p } else { &p[..at + off] };
+        let held = if context.complete {
+            p
+        } else {
+            &p[..payload.start]
+        };
         let packet = ObservedIpPacket::observed(
             Chunk::new(held.to_vec()),
             Ingress {
@@ -818,71 +802,19 @@ impl Dissector {
                 ObserverReport::Unwatched { .. } => {}
             }
         }
-        let names = flag_names(flags);
-        let mut l = Layer::new("Transmission Control Protocol", 0, (at, at + off));
-        let r = |a: usize, b: usize| (at + a, at + b);
-        l.summary = format!(
-            "Src Port: {sport}, Dst Port: {dport}, Seq: {rel_seq}, Ack: {rel_ack}, Len: {}",
-            payload.1 - payload.0
-        );
-        l.field("Source port", sport.to_string(), r(0, 2));
-        l.field("Destination port", dport.to_string(), r(2, 4));
-        l.field("Sequence number", format!("{rel_seq} (raw {seq})"), r(4, 8));
-        l.field(
-            "Acknowledgment number",
-            format!("{rel_ack} (raw {ack})"),
-            r(8, 12),
-        );
-        l.field("Header length", format!("{off} bytes"), r(12, 13));
-        l.field(
-            "Flags",
-            format!("0x{flags:03x} ({})", names.join(", ")),
-            r(12, 14),
-        );
-        l.field("Window", win.to_string(), r(14, 16));
-        let Some(checksum) = be16(t, 16) else {
-            return truncated(d, "TCP", t.len());
-        };
-        l.field("Checksum", format!("0x{:04x}", checksum), r(16, 18));
-        let Some(urgent) = be16(t, 18) else {
-            return truncated(d, "TCP", t.len());
-        };
-        l.field("Urgent pointer", urgent.to_string(), r(18, 20));
-        let opts = tcp_options(&t[20..off]);
-        if !opts.is_empty() {
-            l.field("Options", opts.join(", "), r(20, off));
-        }
-        l.note("Payload", format!("{} bytes", payload.1 - payload.0));
+        let relative = (rel_seq, rel_ack);
+        let options = segment.options();
         let notes = d.layers.len();
-        d.push(l);
-        d.src = sock(&d.src, sport);
-        d.dst = sock(&d.dst, dport);
+        d.push(segment.layer(at, relative, payload.len(), &options));
+        d.src = endpoint(header.src, segment.ports.0);
+        d.dst = endpoint(header.dst, segment.ports.1);
         d.proto = "TCP".into();
-        let mut info = format!("{sport} → {dport} [{}] Seq={rel_seq} ", names.join(", "));
-        if flags & 0x10 != 0 {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "fmt::Write for String never returns Err"
-            )]
-            let _ = write!(info, "Ack={rel_ack} ");
-        }
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "fmt::Write for String never returns Err"
-        )]
-        let _ = write!(info, "Win={win} Len={}", payload.1 - payload.0);
-        if !opts.is_empty() && flags & 0x02 != 0 {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "fmt::Write for String never returns Err"
-            )]
-            let _ = write!(info, " {}", opts.join(" "));
-        }
+        let mut info = segment.info(relative, payload.len(), &options);
         if retransmission {
             d.tag("retransmission");
             info.push_str(" [retransmission]");
         }
-        if flags & 0x04 != 0 {
+        if segment.flags & transport::RST != 0 {
             d.tag("reset");
         }
         d.info = info;
@@ -1066,19 +998,10 @@ impl Dissector {
     fn udp(&mut self, p: &[u8], header: &Header, d: &mut Decoded, context: DecodeContext<'_>) {
         let (at, end) = (header.payload.start, header.payload.end);
         let u = &p[at..end];
-        if u.len() < 8 {
-            return truncated(d, "UDP", u.len());
-        }
-        let Some(source_port) = be16(u, 0) else {
+        let Some(udp) = UdpHeader::read(u) else {
             return truncated(d, "UDP", u.len());
         };
-        let Some(destination_port) = be16(u, 2) else {
-            return truncated(d, "UDP", u.len());
-        };
-        let Some(length) = be16(u, 4) else {
-            return truncated(d, "UDP", u.len());
-        };
-        let (sport, dport, len) = (source_port, destination_port, length);
+        let (sport, dport) = udp.ports;
         // The datagram is as long as its header says, if the packet holds that
         // much: bytes after it are not part of it. A copy that does not hold
         // the whole packet, such as a first fragment, cannot be held to the
@@ -1086,21 +1009,11 @@ impl Dissector {
         let datagram = fictionet::stdlib::network::udp::Datagram::parse(u);
         let short = context.complete && datagram.is_none();
         let end = datagram.map_or(end, |datagram| at + 8 + datagram.payload().len());
-        let u = &p[at..end];
-        let mut l = Layer::new("User Datagram Protocol", 0, (at, at + 8));
-        l.summary = format!("Src Port: {sport}, Dst Port: {dport}");
-        l.field("Source port", sport.to_string(), (at, at + 2));
-        l.field("Destination port", dport.to_string(), (at + 2, at + 4));
-        l.field("Length", len.to_string(), (at + 4, at + 6));
-        let Some(checksum) = be16(u, 6) else {
-            return truncated(d, "UDP", u.len());
-        };
-        l.field("Checksum", format!("0x{:04x}", checksum), (at + 6, at + 8));
-        d.push(l);
-        d.src = sock(&d.src, sport);
-        d.dst = sock(&d.dst, dport);
+        d.push(udp.layer(at));
+        d.src = endpoint(header.src, sport);
+        d.dst = endpoint(header.dst, dport);
         d.proto = "UDP".into();
-        d.info = format!("{sport} → {dport} Len={}", u.len() - 8);
+        d.info = udp.info(end - at - 8);
         if short {
             d.info.push_str(" [bad length]");
             d.tag("malformed");
@@ -1171,198 +1084,21 @@ enum Observation {
     Closed(ChildId),
 }
 
-fn sock(ip: &str, port: u16) -> String {
-    if ip.contains(':') {
-        format!("[{ip}]:{port}")
-    } else {
-        format!("{ip}:{port}")
-    }
-}
-
 fn truncated(d: &mut Decoded, what: &str, len: usize) {
     d.proto = what.into();
     d.info = format!("Truncated {what} header ({len} bytes)");
     d.tag("malformed");
 }
 
-fn flag_names(flags: u8) -> Vec<&'static str> {
-    let names = [
-        (0x02, "SYN"),
-        (0x10, "ACK"),
-        (0x08, "PSH"),
-        (0x01, "FIN"),
-        (0x04, "RST"),
-        (0x20, "URG"),
-        (0x40, "ECE"),
-        (0x80, "CWR"),
-    ];
-    names
-        .iter()
-        .filter(|(bit, _)| flags & bit != 0)
-        .map(|(_, n)| *n)
-        .collect()
-}
-
-fn tcp_options(bytes: &[u8]) -> Vec<String> {
-    use fictionet::stdlib::network::tcp::{OptionRead, TcpOption, read_options};
-    read_options(bytes)
-        .filter_map(|read| {
-            Some(match read {
-                OptionRead::End { .. } => return None,
-                OptionRead::Malformed { bytes } => format!("malformed option {}", bytes[0]),
-                OptionRead::Option { value, .. } => match value {
-                    TcpOption::NoOperation => return None,
-                    TcpOption::MaxSegmentSize(mss) => format!("MSS={mss}"),
-                    TcpOption::WindowScale(shift) => format!("WS={}", 1u32 << shift.min(14)),
-                    TcpOption::SackPermitted => "SACK_PERM".to_owned(),
-                    TcpOption::Sack(blocks) => format!("SACK({} blocks)", blocks.len()),
-                    TcpOption::Timestamps { tsval, tsecr } => {
-                        format!("TSval={tsval} TSecr={tsecr}")
-                    }
-                    TcpOption::Unknown { kind, .. } => format!("option {kind}"),
-                },
-            })
-        })
-        .collect()
-}
-
+/// Decodes the ICMP or ICMPv6 message at `at..end` in `p`.
 fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
-    let c = &p[at..end];
-    let name = if v6 { "ICMPv6" } else { "ICMP" };
-    if c.len() < 4 {
-        return truncated(d, name, c.len());
-    }
-    let (kind, code) = (c[0], c[1]);
-    let what = icmp_name(kind, code, v6);
-    let mut l = Layer::new(
-        if v6 {
-            "Internet Control Message Protocol v6"
-        } else {
-            "Internet Control Message Protocol"
-        },
-        0,
-        (at, end),
-    );
-    l.summary = what.clone();
-    l.field("Type", format!("{kind} ({what})"), (at, at + 1));
-    l.field("Code", code.to_string(), (at + 1, at + 2));
-    let Some(checksum) = be16(c, 2) else {
-        return truncated(d, name, c.len());
+    let Some(message) = IcmpMessage::read(&p[at..end], v6) else {
+        return truncated(d, if v6 { "ICMPv6" } else { "ICMP" }, end - at);
     };
-    l.field("Checksum", format!("0x{:04x}", checksum), (at + 2, at + 4));
-    let mut info = what;
-    let echo = if v6 {
-        matches!(kind, 128 | 129)
-    } else {
-        matches!(kind, 0 | 8)
-    };
-    if echo && c.len() >= 8 {
-        let Some(identifier) = be16(c, 4) else {
-            return truncated(d, name, c.len());
-        };
-        let Some(sequence) = be16(c, 6) else {
-            return truncated(d, name, c.len());
-        };
-        let (id, seq) = (identifier, sequence);
-        l.field("Identifier", format!("0x{id:04x}"), (at + 4, at + 6));
-        l.field("Sequence number", seq.to_string(), (at + 6, at + 8));
-        l.note("Data", format!("{} bytes", c.len() - 8));
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "fmt::Write for String never returns Err"
-        )]
-        let _ = write!(info, " id=0x{id:04x}, seq={seq}");
-    }
-    let quotes = if v6 {
-        matches!(kind, 1..=4)
-    } else {
-        matches!(kind, 3 | 4 | 5 | 11 | 12)
-    };
-    if quotes && c.len() >= 8 + 20 {
-        let inner = &c[8..];
-        let summary = quoted_summary(inner);
-        l.field("Original packet", summary.clone(), (at + 8, end));
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "fmt::Write for String never returns Err"
-        )]
-        let _ = write!(info, " ({summary})");
-    }
-    d.push(l);
-    d.proto = name.into();
+    let (layer, info) = message.present(at, end);
+    d.push(layer);
+    d.proto = message.protocol().into();
     d.info = info;
-}
-
-/// "10.0.0.2:5000 → 203.0.113.9:80 TCP" for a packet quoted in an ICMP
-/// error.
-fn quoted_summary(q: &[u8]) -> String {
-    let Some(header) = Header::parse_truncated(q) else {
-        return "a packet".into();
-    };
-    let (src, dst, proto, at) = (
-        header.src,
-        header.dst,
-        header.protocol,
-        header.payload.start,
-    );
-    if matches!(proto, 6 | 17)
-        && header.fragment.is_none_or(|fragment| fragment.offset == 0)
-        && header.payload.len() >= 4
-    {
-        let Some(source_port) = be16(q, at) else {
-            return format!("{src} → {dst} {}", ip_proto_name(proto));
-        };
-        let Some(destination_port) = be16(q, at + 2) else {
-            return format!("{src} → {dst} {}", ip_proto_name(proto));
-        };
-        format!(
-            "{} → {} {}",
-            sock(&src.to_string(), source_port),
-            sock(&dst.to_string(), destination_port),
-            ip_proto_name(proto)
-        )
-    } else {
-        format!("{src} → {dst} {}", ip_proto_name(proto))
-    }
-}
-
-fn icmp_name(kind: u8, code: u8, v6: bool) -> String {
-    let s = if v6 {
-        match (kind, code) {
-            (1, 0) => "Destination unreachable (no route)",
-            (1, 1) => "Destination unreachable (administratively prohibited)",
-            (1, 3) => "Destination unreachable (address unreachable)",
-            (1, 4) => "Destination unreachable (port unreachable)",
-            (1, _) => "Destination unreachable",
-            (2, _) => "Packet too big",
-            (3, _) => "Time exceeded",
-            (4, _) => "Parameter problem",
-            (128, _) => "Echo (ping) request",
-            (129, _) => "Echo (ping) reply",
-            (133, _) => "Router solicitation",
-            (134, _) => "Router advertisement",
-            (135, _) => "Neighbor solicitation",
-            (136, _) => "Neighbor advertisement",
-            (143, _) => "Multicast listener report v2",
-            _ => return format!("Type {kind}"),
-        }
-    } else {
-        match (kind, code) {
-            (0, _) => "Echo (ping) reply",
-            (3, 0) => "Destination unreachable (network unreachable)",
-            (3, 1) => "Destination unreachable (host unreachable)",
-            (3, 3) => "Destination unreachable (port unreachable)",
-            (3, 4) => "Destination unreachable (fragmentation needed)",
-            (3, 13) => "Destination unreachable (administratively prohibited)",
-            (3, _) => "Destination unreachable",
-            (5, _) => "Redirect",
-            (8, _) => "Echo (ping) request",
-            (11, 0) => "Time to live exceeded in transit",
-            (11, _) => "Time exceeded",
-            _ => return format!("Type {kind}"),
-        }
-    };
-    s.to_owned()
 }
 
 fn push_hex(out: &mut String, b: &[u8]) {
@@ -1693,7 +1429,10 @@ mod tests {
             assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
             assert_eq!(
                 (d.src.as_str(), d.dst.as_str()),
-                (sock(src, 40000).as_str(), sock(dst, 80).as_str()),
+                (
+                    endpoint(src.parse().unwrap(), 40000).as_str(),
+                    endpoint(dst.parse().unwrap(), 80).as_str()
+                ),
                 "{family}"
             );
             assert!(
@@ -1751,7 +1490,10 @@ mod tests {
             assert!(!d.tags.contains(&"malformed"), "{family}: {}", d.info);
             assert_eq!(
                 (d.src.as_str(), d.dst.as_str()),
-                (sock(src, 49152).as_str(), sock(dst, 53).as_str()),
+                (
+                    endpoint(src.parse().unwrap(), 49152).as_str(),
+                    endpoint(dst.parse().unwrap(), 53).as_str()
+                ),
                 "{family}"
             );
             let d = dis.decode(&second, &[]);
