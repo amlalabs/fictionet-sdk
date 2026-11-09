@@ -6,7 +6,7 @@ use std::time::Duration;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, KeyFlags, Validation, Window, ZoneKey, sign,
 };
-use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
+use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA, TXT};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, RecordSet, RecordType};
 use fictionet::stdlib::services::dns::resolver::{
     Cache, Checked, Entry, FailureKind, Key, Limits, Negative, Offer, Rank,
@@ -85,6 +85,64 @@ fn newer_data_at_a_name_ends_its_nxdomain() {
         cache.get(&key("nope.example.", RecordType::A), now),
         Some(Entry::Positive { .. })
     ));
+}
+
+/// An NXDOMAIN is kept under ANY and under the type it answered. A later
+/// NXDOMAIN of another type with a shorter TTL replaces the entry under
+/// ANY, so the first copy outlives it. Data at the name then ends that
+/// copy too: the name exists, and no type at it is NXDOMAIN.
+#[test]
+fn newer_data_ends_an_nxdomain_copy_that_outlived_its_entry() {
+    let short_soa = rrset(
+        "example.",
+        60,
+        vec![RData::SOA(SOA::new(
+            name("ns.example."),
+            name("hostmaster.example."),
+            1,
+            7200,
+            3600,
+            1209600,
+            60,
+        ))],
+    );
+    let mut cache = cache();
+    // NXDOMAIN for A, 300 s: under ANY and under A until 400.
+    cache.insert(at(100), nxdomain("nope.example."));
+    // NXDOMAIN for TXT, 60 s: under ANY until 260, and under TXT.
+    cache.insert(
+        at(200),
+        Offer::Negative {
+            key: key("nope.example.", RecordType::TXT),
+            kind: Negative::NxDomain,
+            soa: Some(short_soa),
+            rank: Rank::AuthAnswer,
+            denial: Vec::new(),
+            validation: Validation::NotPerformed,
+            truncated: false,
+        },
+    );
+    // The entry under ANY has expired; the copy under A has not.
+    cache.insert(
+        at(300),
+        positive(rrset(
+            "nope.example.",
+            300,
+            vec![RData::TXT(TXT::new(vec!["exists".to_string()]))],
+        )),
+    );
+    let now = at(301);
+    assert!(matches!(
+        cache.get(&key("nope.example.", RecordType::TXT), now),
+        Some(Entry::Positive { .. })
+    ));
+    assert!(
+        cache
+            .get(&key("nope.example.", RecordType::A), now)
+            .is_none(),
+        "the name has data, so no type at it is NXDOMAIN: {:?}",
+        cache.get(&key("nope.example.", RecordType::A), now)
+    );
 }
 
 /// A negative answer ranks as the answer it came in (RFC 2181 §5.4.1): a
