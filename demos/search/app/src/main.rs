@@ -72,7 +72,7 @@ async fn main() -> Result {
     let read_baked = |path: PathBuf| {
         std::fs::read_to_string(&path).map_err(|error| {
             format!(
-                "{}: {error}; build it with cargo xtask search-image <downloads>",
+                "{}: {error}; build it with cargo xtask-host search-image <downloads>",
                 path.display()
             )
         })

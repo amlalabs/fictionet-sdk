@@ -68,7 +68,7 @@ cargo build -p fictionet-host --no-default-features --features virtio-net
 Run the tests:
 
 ```sh
-cargo xtask rawnic target/rawnic-qemu
+cargo xtask-host rawnic target/rawnic-qemu
 ```
 
 The harness builds a guest initramfs, boots QEMU with an emulated Intel

@@ -2,7 +2,7 @@ use fictionet_demo::kit::{self, Guest};
 
 pub const HOST: &str = "workstation";
 pub const USER: &str = "analyst";
-/// The workstation image, built with `cargo xtask search-image`, which also
+/// The workstation image, built with `cargo xtask-host search-image`, which also
 /// leaves its admin key, trust root and credential placeholder beside it.
 pub const IMAGE: &str = "search-workstation.qcow2";
 

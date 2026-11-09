@@ -251,10 +251,10 @@ and network-changing tests run only inside disposable guests:
 
 ```sh
 cargo test -p honeypot-world --no-default-features
-cargo xtask rawnic /tmp/honeypot-qemu
+cargo xtask-host rawnic /tmp/honeypot-qemu
 ```
 
-The existing `cargo xtask rawnic` harness packages and exercises the unified executable
+The existing `cargo xtask-host rawnic` harness packages and exercises the unified executable
 in QEMU, including original Ethernet capture and graceful shutdown. Guest
 checks cover ephemeral and persistent TUN ownership and bidirectional IP traffic
 without adding routes. The harness also retains the in-memory and driver-level protocol checks.
@@ -275,7 +275,7 @@ The backend's routes and, for Ethernet, gateway resolution still apply. This
 hook runs trusted application code; SSH input is never used to initiate traffic.
 The deployed CLI does not start an outbound program.
 
-`cargo xtask egress /path/to/guest-artifacts` builds and boots a disposable QEMU
+`cargo xtask-host egress /path/to/guest-artifacts` builds and boots a disposable QEMU
 guest. It checks IPv4 TCP and UDP request/response exchanges through the
 in-process world attachment, TUN with a guest Linux peer, and two VFIO
 virtio-net devices connected by an internal QEMU hub. All peers run inside the

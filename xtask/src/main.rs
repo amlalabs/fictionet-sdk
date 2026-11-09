@@ -1,26 +1,39 @@
 //! Host tooling for demo images and offline web captures, and the
 //! verification of Fictionet's DNS, MPTCP and layer routing.
 
+#[cfg(feature = "host-tools")]
 mod capture;
 mod dns_verify;
+mod gate;
+#[cfg(feature = "host-tools")]
 mod image;
 mod layer_verify;
 mod mptcp_verify;
+#[cfg(feature = "host-tools")]
 mod rawnic;
+#[cfg(feature = "host-tools")]
 mod ssh_connect;
+#[cfg(feature = "host-tools")]
 mod web;
+#[cfg(feature = "host-tools")]
 mod workstation;
 
+#[cfg(feature = "host-tools")]
 use std::path::PathBuf;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[tokio::main]
-async fn main() -> Result {
+fn main() -> Result {
     let mut args = std::env::args().skip(1);
     let task = args
         .next()
-        .ok_or("expected search-image or search-capture")?;
+        .ok_or("expected gate, dns-verify, mptcp-verify, layer-verify or a host command")?;
+    if task == "kani" {
+        return gate::kani(&args.collect::<Vec<_>>());
+    }
+    if task == "gate" {
+        return gate::run(&args.collect::<Vec<_>>());
+    }
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());
     }
@@ -30,6 +43,36 @@ async fn main() -> Result {
     if task == "layer-verify" {
         return layer_verify::run(&args.collect::<Vec<_>>());
     }
+    if !matches!(
+        task.as_str(),
+        "ssh-connect"
+            | "rawnic"
+            | "egress"
+            | "search-web"
+            | "search-requisites"
+            | "search-capture"
+            | "search-image"
+    ) {
+        return Err(format!("unknown task: {task}").into());
+    }
+    #[cfg(feature = "host-tools")]
+    {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(host(&task, args))
+    }
+    #[cfg(not(feature = "host-tools"))]
+    {
+        Err(
+            format!("{task} requires host tools; run cargo xtask-host {task} with its arguments")
+                .into(),
+        )
+    }
+}
+
+#[cfg(feature = "host-tools")]
+async fn host(task: &str, mut args: impl Iterator<Item = String>) -> Result {
     if task == "ssh-connect" {
         return ssh_connect::run(&args.collect::<Vec<_>>()).await;
     }
@@ -71,9 +114,6 @@ async fn main() -> Result {
             return Err("unexpected argument".into());
         }
         return capture::run(&downloads, python.as_deref()).await;
-    }
-    if task != "search-image" {
-        return Err("expected search-image or search-capture".into());
     }
     if args.next().is_some() {
         return Err("unexpected argument".into());
