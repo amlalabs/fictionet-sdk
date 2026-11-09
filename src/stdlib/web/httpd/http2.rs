@@ -70,6 +70,10 @@ const OUT_LIMIT: usize = 64 << 10;
 const FRAMES: usize = 16;
 /// The bytes of the last GOAWAY, kept back from the start.
 const LAST_WORDS: usize = wire::HEADER_LEN + 8;
+/// The places each connection queue keeps while the connection is idle,
+/// held from the start, so ordinary requests do not allocate them again.
+/// A queue that grew past them gives the rest back once it drains.
+const KEEP: usize = 8;
 
 /// HTTP/2 for one connection: a [`Layer`] with an ordered byte stream below
 /// and one [`HttpExchange`] child per stream above ([`Mux`]).
@@ -402,6 +406,24 @@ impl Http2 {
             .saturating_add(self.up.capacity() * size_of::<MuxEvent<HttpExchange, Top, Opening>>())
             .saturating_add(self.out.capacity() * size_of::<StreamCommand>())
             .saturating_add(self.sent.capacity() * size_of::<Piece>())
+            .saturating_add((self.touched.capacity() + self.finished.capacity()) * size_of::<u32>())
+    }
+
+    /// What the places the queues keep hold.
+    fn kept() -> usize {
+        KEEP * (size_of::<MuxEvent<HttpExchange, Top, Opening>>()
+            + size_of::<StreamCommand>()
+            + size_of::<Piece>()
+            + 2 * size_of::<u32>())
+    }
+
+    /// Gives each queue the places it keeps, which [`Self::kept`] counts.
+    fn keep(&mut self) {
+        self.up.reserve_exact(KEEP);
+        self.out.reserve_exact(KEEP);
+        self.sent.reserve_exact(KEEP);
+        self.touched.reserve_exact(KEEP);
+        self.finished.reserve_exact(KEEP);
     }
 
     /// Charges what is held now. Returns whether it fits.
@@ -412,15 +434,20 @@ impl Http2 {
 
     fn open(&mut self, env: &mut Env<'_, Report>) {
         self.phase = Phase::Open;
-        // The list of recent resets is held at its bound from the start.
+        // The list of recent resets is held at its bound from the start,
+        // and the queues at the places they keep.
         let resets = RESET_MAX * size_of::<(u32, Instant)>();
-        let Some(charge) = env.budget().charge(self.holding() + resets) else {
+        let Some(charge) = env.budget().charge(self.holding() + resets + Self::kept()) else {
             self.phase = Phase::Closing;
             self.out.push_back(StreamCommand::End);
             return;
         };
         self.resets.reserve_exact(RESET_MAX);
+        self.keep();
         self.charge = Some(charge);
+        if !self.fits() {
+            return self.over_budget(env);
+        }
         self.last_words = env.budget().charge(LAST_WORDS);
         self.children = Slots::with_budget(self.limits.streams as usize, env.budget());
         if self.last_words.is_none() || self.children.is_none() {
@@ -1532,8 +1559,6 @@ impl Http2 {
     fn written(&mut self, env: &mut Env<'_, Report>, mut n: u64) {
         let mut touched = std::mem::take(&mut self.touched);
         let mut finished = std::mem::take(&mut self.finished);
-        touched.clear();
-        finished.clear();
         while n > 0 {
             let Some(piece) = self.sent.front_mut() else {
                 break;
@@ -1546,9 +1571,7 @@ impl Http2 {
                 break;
             }
             let piece = self.sent.pop_front().expect("a piece");
-            if self.sent.is_empty() {
-                self.sent = VecDeque::new();
-            }
+            trim(&mut self.sent);
             if piece.stream == 0 {
                 continue;
             }
@@ -1584,6 +1607,10 @@ impl Http2 {
                 self.write_reset(env, id, ErrorCode::NoError);
             }
         }
+        touched.clear();
+        finished.clear();
+        touched.shrink_to(KEEP);
+        finished.shrink_to(KEEP);
         self.touched = touched;
         self.finished = finished;
     }
@@ -1785,19 +1812,14 @@ impl Layer for Http2 {
         if matches!(command, StreamCommand::End | StreamCommand::Reset) {
             self.phase = Phase::Closed;
         }
-        if self.out.is_empty() {
-            // Queues hold nothing while the connection is idle; the next
-            // advance charges what is left.
-            self.out = VecDeque::new();
-        }
+        // The next advance charges what the queue kept.
+        trim(&mut self.out);
         Some(command)
     }
 
     fn take_event(&mut self) -> Option<MuxEvent<HttpExchange, Top, Opening>> {
         let event = self.up.pop_front()?;
-        if self.up.is_empty() {
-            self.up = VecDeque::new();
-        }
+        trim(&mut self.up);
         Some(event)
     }
 
@@ -1821,6 +1843,13 @@ impl Layer for Http2 {
 
 fn problem(code: ErrorCode, reason: &'static str) -> wire::Error {
     wire::Error { code, reason }
+}
+
+/// A drained queue gives back the places it grew past [`KEEP`].
+fn trim<T>(queue: &mut VecDeque<T>) {
+    if queue.is_empty() {
+        queue.shrink_to(KEEP);
+    }
 }
 
 /// The credit `release` returns for a receive window at `window` that may
@@ -3173,5 +3202,35 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(sent, body);
+    }
+
+    #[test]
+    fn drained_queues_keep_a_few_places_between_requests() {
+        let mut harness = Harness::new(fictionet::Seed::from_u64(5), Http2::new(Limits::default()));
+        harness.push(&client_preface()).unwrap();
+        // A burst of PINGs fills the output queues past what they keep.
+        let mut input = Vec::new();
+        for i in 0..64u64 {
+            write(
+                &wire::Ping {
+                    flags: 0,
+                    opaque: i.to_be_bytes(),
+                },
+                &mut input,
+            );
+        }
+        harness.push(&input).unwrap();
+        let acks = frames(&harness.take_output())
+            .iter()
+            .filter(|f| matches!(f, Frame::Ping(p) if p.flags & 1 != 0))
+            .count();
+        assert_eq!(acks, 64);
+        // Drained, they keep a few places for the next request, and no
+        // more.
+        let http = harness.layer();
+        for capacity in [http.out.capacity(), http.sent.capacity()] {
+            assert!((1..=KEEP).contains(&capacity), "{capacity}");
+        }
+        assert!(!harness.ended());
     }
 }
