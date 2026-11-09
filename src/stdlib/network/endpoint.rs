@@ -41,6 +41,7 @@ pub(crate) async fn drive(
         for turn in 0..64 {
             let mut moved = false;
             let mut more = false;
+            let mut transport = false;
             if let Some(packet) = held.take() {
                 moved = true;
                 match packet.transport() {
@@ -50,6 +51,7 @@ pub(crate) async fn drive(
                         {
                             held = Some(packet);
                             moved = false;
+                            transport = true;
                         }
                     }
                     Transport::Udp => {
@@ -71,22 +73,6 @@ pub(crate) async fn drive(
                     }
                 }
             }
-            let room = 128usize.saturating_sub(outgoing.len());
-            if let Some(tcp) = &mut tcp {
-                let (pending, deadline) = tcp.poll(cx, &mut output, room)?;
-                more |= pending;
-                deadlines[1] = deadline;
-            }
-            if let Some(udp) = &mut udp {
-                let (pending, deadline) = udp.poll(cx, &mut output, room)?;
-                more |= pending;
-                deadlines[2] = deadline;
-            }
-            outgoing.extend(
-                output
-                    .drain(..)
-                    .map(|packet| PacketCommand::Send(Chunk::new(packet))),
-            );
             while let Some(command) = outgoing.pop_front() {
                 if let Admit::Blocked(command) = ip
                     .command(command)
@@ -136,7 +122,7 @@ pub(crate) async fn drive(
                         closed = true;
                         raw = Some(PacketEvent::Ended);
                     }
-                    Poll::Pending => {}
+                    Poll::Pending => transport = true,
                 }
             }
             if let Some(event) = raw.take() {
@@ -144,9 +130,34 @@ pub(crate) async fn drive(
                     .deliver(event)
                     .map_err(|e| fictionet::Error::msg(e.to_string()))?
                 {
-                    Admit::Blocked(event) => raw = Some(event),
+                    Admit::Blocked(event) => {
+                        raw = Some(event);
+                        transport = true;
+                    }
                     _ => moved = true,
                 }
+            }
+            // Batch ingress before walking every transport connection. A
+            // blocked carrier or an exhausted visit still gets a transport
+            // pass, including its timers and application work.
+            if transport || closed || turn == 63 {
+                let room = 128usize.saturating_sub(outgoing.len());
+                if let Some(tcp) = &mut tcp {
+                    let (pending, deadline) = tcp.poll(cx, &mut output, room)?;
+                    more |= pending;
+                    deadlines[1] = deadline;
+                }
+                if let Some(udp) = &mut udp {
+                    let (pending, deadline) = udp.poll(cx, &mut output, room)?;
+                    more |= pending;
+                    deadlines[2] = deadline;
+                }
+                moved |= !output.is_empty();
+                outgoing.extend(
+                    output
+                        .drain(..)
+                        .map(|packet| PacketCommand::Send(Chunk::new(packet))),
+                );
             }
             if !moved && !more {
                 break;
