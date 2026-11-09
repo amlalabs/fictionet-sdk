@@ -665,7 +665,8 @@ async fn websockets_work_through_sites() {
             }
             conn.write_all(&fcx, &frames).await.unwrap();
             let response = read_all(&fcx, &mut conn).await.unwrap();
-            assert_eq!(response, close.to_frame(None).unwrap().to_bytes().unwrap());
+            // One final, unmasked Close carrying code 1000, then EOF.
+            assert_eq!(response, [0x88, 0x02, 0x03, 0xe8]);
             Err(fictionet::Error::from(Done))
         }),
     )
