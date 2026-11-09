@@ -451,10 +451,23 @@ impl Header {
         }))
     }
 
+    fn parse_exact(bytes: &[u8]) -> Result<Header, Error> {
+        let header = Self::parse(bytes)?.ok_or(Error::Truncated)?;
+        match header.frame_len().cmp(&bytes.len()) {
+            core::cmp::Ordering::Less => Err(Error::Trailing),
+            core::cmp::Ordering::Greater => Err(Error::Truncated),
+            core::cmp::Ordering::Equal => Ok(header),
+        }
+    }
+
     /// The header and payload lengths together: the whole frame. For a
     /// header built by hand with a huge length it stops at `usize::MAX`.
     pub fn frame_len(&self) -> usize {
         self.header_len.saturating_add(self.len)
+    }
+
+    fn payload(self, bytes: &[u8]) -> Option<&[u8]> {
+        bytes.get(self.header_len..self.frame_len())
     }
 }
 
@@ -484,7 +497,7 @@ impl Frame {
     }
 
     fn from_header(b: &[u8], h: Header) -> Option<Frame> {
-        let body = b.get(h.header_len..h.frame_len())?;
+        let body = h.payload(b)?;
         let mut payload = body.to_vec();
         if let Some(key) = h.mask {
             apply_mask(&mut payload, key, 0);
@@ -716,17 +729,12 @@ impl Wire for Frame {
     /// [`Frames`] checks mask direction; [`Messages`] also checks continuation
     /// order and text. A fragment may end inside a UTF-8 character.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let header = Header::parse(bytes)?.ok_or(Error::Truncated)?;
-        match Self::from_header(bytes, header) {
-            Some(frame) if header.frame_len() == bytes.len() => {
-                if frame.opcode == Opcode::Close {
-                    parse_close(&frame.payload)?;
-                }
-                Ok(frame)
-            }
-            Some(_) => Err(Error::Trailing),
-            None => Err(Error::Truncated),
+        let header = Header::parse_exact(bytes)?;
+        let frame = Self::from_header(bytes, header).ok_or(Error::Truncated)?;
+        if frame.opcode == Opcode::Close {
+            parse_close(&frame.payload)?;
         }
+        Ok(frame)
     }
 
     /// Writes the shortest length form and applies the masking key. Refuses
@@ -734,29 +742,38 @@ impl Wire for Frame {
     /// payloads without changing `out`. A frame carries at most [`MAX_PAYLOAD`]
     /// bytes, or [`MAX_CONTROL_PAYLOAD`] for a control frame.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let payload = &self.payload;
-        if payload.len() > MAX_PAYLOAD
-            || self.opcode.is_control() && (!self.fin || payload.len() > MAX_CONTROL_PAYLOAD)
-            || self.opcode == Opcode::Close && parse_close(payload).is_err()
-        {
-            return Err(Error::Unwritable);
-        }
-        let size = payload
-            .len()
-            .checked_add(MAX_HEADER_LEN)
-            .ok_or(Error::Unwritable)?;
-        out.try_reserve(size).map_err(|_| Error::Allocation)?;
-        write_header(out, self.fin, self.opcode, self.mask, payload.len());
-        let start = out.len();
-        out.extend_from_slice(payload);
-        if let Some(key) = self.mask {
-            apply_mask(&mut out[start..], key, 0);
-        }
-        Ok(())
+        write_frame(out, self.fin, self.opcode, self.mask, &self.payload)
     }
 }
 
-// Shared by the writer and its bounded proof; payload copying stays in write.
+fn write_frame(
+    out: &mut Vec<u8>,
+    fin: bool,
+    opcode: Opcode,
+    mask: Option<[u8; 4]>,
+    payload: &[u8],
+) -> Result<(), Error> {
+    if payload.len() > MAX_PAYLOAD
+        || opcode.is_control() && (!fin || payload.len() > MAX_CONTROL_PAYLOAD)
+        || opcode == Opcode::Close && parse_close(payload).is_err()
+    {
+        return Err(Error::Unwritable);
+    }
+    let size = payload
+        .len()
+        .checked_add(MAX_HEADER_LEN)
+        .ok_or(Error::Unwritable)?;
+    out.try_reserve(size).map_err(|_| Error::Allocation)?;
+    write_header(out, fin, opcode, mask, payload.len());
+    let start = out.len();
+    out.extend_from_slice(payload);
+    if let Some(key) = mask {
+        apply_mask(&mut out[start..], key, 0);
+    }
+    Ok(())
+}
+
+// Shared by the writer and its bounded proof; payload copying stays in write_frame.
 fn write_header(out: &mut Vec<u8>, fin: bool, opcode: Opcode, mask: Option<[u8; 4]>, len: usize) {
     out.push(if fin { 0x80 } else { 0 } | opcode.to_u8());
     let masked = if mask.is_some() { 0x80 } else { 0 };

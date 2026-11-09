@@ -1,13 +1,8 @@
 //! Bounded checks of the production WebSocket codec. Source mappings and
 //! mutation controls are recorded in the adjacent README.
 use super::*;
-use crate::stdlib::codec::Decode;
 
-#[kani::proof]
-#[kani::unwind(16)]
-fn websocket_headers_follow_wire_grammar() {
-    let bytes: [u8; 14] = kani::any();
-    let n: usize = kani::any();
+fn headers_follow_wire_grammar(bytes: [u8; 14], n: usize) {
     kani::assume(n <= bytes.len());
     let b = &bytes[..n];
     let got = Header::parse(b);
@@ -67,6 +62,12 @@ fn websocket_headers_follow_wire_grammar() {
     }
 }
 
+#[kani::proof]
+#[kani::unwind(16)]
+fn websocket_headers_follow_wire_grammar() {
+    headers_follow_wire_grammar(kani::any(), kani::any());
+}
+
 fn mask_is_involution_and_composes(original: [u8; 8], key: [u8; 4], offset: usize, cut: usize) {
     kani::assume(cut <= original.len());
     let mut whole = original;
@@ -88,52 +89,184 @@ fn websocket_mask_is_involution_and_composes() {
     mask_is_involution_and_composes(kani::any(), kani::any(), kani::any(), kani::any());
 }
 
-fn small_frames_roundtrip(data: [u8; 4], n: usize, masked: bool, fin: bool, key: [u8; 4]) {
-    kani::assume(n <= data.len());
-    let frame = Frame {
-        fin,
-        opcode: Opcode::Binary,
-        mask: masked.then_some(key),
-        payload: data[..n].to_vec(),
-    };
-    let wire = frame.to_bytes().unwrap();
-    assert_eq!(wire[1] & 127, n as u8);
-    assert_eq!(wire.len(), n + if masked { 6 } else { 2 });
-    let header_len = if masked { 6 } else { 2 };
+fn exact_frame_boundary(bytes: [u8; 18], n: usize) {
+    kani::assume(n <= bytes.len());
+    let input = &bytes[..n];
+    let parsed = Header::parse(input);
+    let exact = Header::parse_exact(input);
+    match parsed {
+        Err(error) => assert_eq!(exact, Err(error)),
+        Ok(None) => assert_eq!(exact, Err(Error::Truncated)),
+        Ok(Some(header)) => {
+            let end = header.header_len + header.len;
+            if end < n {
+                assert_eq!(exact, Err(Error::Trailing));
+            } else if end > n {
+                assert_eq!(exact, Err(Error::Truncated));
+            } else {
+                assert_eq!(exact, Ok(header));
+                let payload = header.payload(input).expect("complete payload");
+                assert_eq!(payload.len(), header.len);
+                for i in 0..payload.len() {
+                    assert_eq!(payload[i], input[header.header_len + i]);
+                }
+            }
+        }
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(20)]
+fn websocket_exact_frame_boundaries() {
+    exact_frame_boundary(kani::any(), kani::any());
+}
+
+fn accept_trailing(bytes: &[u8]) -> Result<Header, Error> {
+    Header::parse(bytes)?.ok_or(Error::Truncated)
+}
+
+fn include_header(_: Header, bytes: &[u8]) -> Option<&[u8]> {
+    Some(bytes)
+}
+
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::stub(Header::parse_exact, accept_trailing)]
+fn websocket_control_without_exact_end() {
+    let mut bytes = [0; 18];
+    bytes[0] = 0x82;
+    exact_frame_boundary(bytes, 3);
+}
+
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::stub(Header::payload, include_header)]
+fn websocket_control_without_payload_start() {
+    let mut bytes = [0; 18];
+    bytes[0] = 0x82;
+    exact_frame_boundary(bytes, 2);
+}
+
+fn small_frame_wire<const N: usize, const MASKED: bool>(
+    data: [u8; 4],
+    fin: bool,
+    key: [u8; 4],
+) -> ([u8; 10], usize) {
+    kani::assume(N <= data.len());
+    let header_len = if MASKED { 6 } else { 2 };
     let mut expected = [0u8; 10];
     expected[0] = (if fin { 128 } else { 0 }) | 2;
-    expected[1] = (if masked { 128 } else { 0 }) | n as u8;
-    if masked {
+    expected[1] = (if MASKED { 128 } else { 0 }) | N as u8;
+    if MASKED {
         expected[2..6].copy_from_slice(&key);
     }
-    for i in 0..n {
-        expected[header_len + i] = data[i] ^ if masked { key[i % 4] } else { 0 };
+    for i in 0..N {
+        expected[header_len + i] = data[i] ^ if MASKED { key[i % 4] } else { 0 };
     }
-    let expected = &expected[..header_len + n];
-    assert_eq!(wire, expected);
-    assert_eq!(Frame::parse(expected).unwrap(), frame);
+    (expected, header_len + N)
+}
+
+fn small_frames_write<const N: usize, const MASKED: bool>(data: [u8; 4], fin: bool, key: [u8; 4]) {
+    let (expected, len) = small_frame_wire::<N, MASKED>(data, fin, key);
+    let mut wire = Vec::new();
+    let Ok(()) = write_frame(
+        &mut wire,
+        fin,
+        Opcode::Binary,
+        MASKED.then_some(key),
+        &data[..N],
+    ) else {
+        panic!("valid frame must encode");
+    };
+    assert!(wire.as_slice() == &expected[..len]);
+}
+
+fn small_frames_read<const N: usize, const MASKED: bool>(data: [u8; 4], fin: bool, key: [u8; 4]) {
+    let (expected, len) = small_frame_wire::<N, MASKED>(data, fin, key);
+    let header = Header::parse_exact(&expected[..len]).expect("valid frame header");
+    let Some(decoded) = Frame::from_header(&expected[..len], header) else {
+        panic!("valid frame must decode");
+    };
+    assert!(decoded.fin == fin);
+    assert!(decoded.opcode == Opcode::Binary);
+    assert!(decoded.mask == MASKED.then_some(key));
+    assert!(decoded.payload.as_slice() == &data[..N]);
 }
 
 macro_rules! frame_case {
-    ($name:ident, $len:expr, $masked:expr) => {
+    ($write:ident, $read:ident, $len:expr, $masked:expr) => {
         #[kani::proof]
-        #[kani::unwind(8)]
-        fn $name() {
-            small_frames_roundtrip(kani::any(), $len, $masked, kani::any(), kani::any());
+        #[kani::unwind(12)]
+        fn $write() {
+            small_frames_write::<$len, $masked>(kani::any(), kani::any(), kani::any());
+        }
+        #[kani::proof]
+        #[kani::unwind(12)]
+        fn $read() {
+            small_frames_read::<$len, $masked>(kani::any(), kani::any(), kani::any());
         }
     };
 }
-
-frame_case!(websocket_small_frames_roundtrip_unmasked_zero, 0, false);
-frame_case!(websocket_small_frames_roundtrip_unmasked_one, 1, false);
-frame_case!(websocket_small_frames_roundtrip_unmasked_two, 2, false);
-frame_case!(websocket_small_frames_roundtrip_unmasked_three, 3, false);
-frame_case!(websocket_small_frames_roundtrip_unmasked_four, 4, false);
-frame_case!(websocket_small_frames_roundtrip_masked_zero, 0, true);
-frame_case!(websocket_small_frames_roundtrip_masked_one, 1, true);
-frame_case!(websocket_small_frames_roundtrip_masked_two, 2, true);
-frame_case!(websocket_small_frames_roundtrip_masked_three, 3, true);
-frame_case!(websocket_small_frames_roundtrip_masked_four, 4, true);
+frame_case!(
+    websocket_small_frames_write_unmasked_zero,
+    websocket_small_frames_read_unmasked_zero,
+    0,
+    false
+);
+frame_case!(
+    websocket_small_frames_write_unmasked_one,
+    websocket_small_frames_read_unmasked_one,
+    1,
+    false
+);
+frame_case!(
+    websocket_small_frames_write_unmasked_two,
+    websocket_small_frames_read_unmasked_two,
+    2,
+    false
+);
+frame_case!(
+    websocket_small_frames_write_unmasked_three,
+    websocket_small_frames_read_unmasked_three,
+    3,
+    false
+);
+frame_case!(
+    websocket_small_frames_write_unmasked_four,
+    websocket_small_frames_read_unmasked_four,
+    4,
+    false
+);
+frame_case!(
+    websocket_small_frames_write_masked_zero,
+    websocket_small_frames_read_masked_zero,
+    0,
+    true
+);
+frame_case!(
+    websocket_small_frames_write_masked_one,
+    websocket_small_frames_read_masked_one,
+    1,
+    true
+);
+frame_case!(
+    websocket_small_frames_write_masked_two,
+    websocket_small_frames_read_masked_two,
+    2,
+    true
+);
+frame_case!(
+    websocket_small_frames_write_masked_three,
+    websocket_small_frames_read_masked_three,
+    3,
+    true
+);
+frame_case!(
+    websocket_small_frames_write_masked_four,
+    websocket_small_frames_read_masked_four,
+    4,
+    true
+);
 
 fn close_codes_follow_wire_ranges(code: u16) {
     let allowed = (1000 <= code && code <= 1003)
@@ -216,7 +349,18 @@ fn omit_payload_mask(b: &[u8], h: Header) -> Option<Frame> {
 #[kani::unwind(16)]
 #[kani::stub(Opcode::is_control, ignore_control_kind)]
 fn websocket_control_without_control_rules() {
-    websocket_headers_follow_wire_grammar();
+    let mut bytes = [0; 14];
+    bytes[0] = 0x09;
+    headers_follow_wire_grammar(bytes, 2);
+}
+
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::stub(Opcode::is_control, ignore_control_kind)]
+fn websocket_control_without_control_size() {
+    let mut bytes = [0; 14];
+    bytes[..4].copy_from_slice(&[0x89, 126, 0, 126]);
+    headers_follow_wire_grammar(bytes, 4);
 }
 
 #[kani::proof]
@@ -234,10 +378,10 @@ fn websocket_control_without_masking() {
 }
 
 #[kani::proof]
-#[kani::unwind(8)]
+#[kani::unwind(12)]
 #[kani::stub(Frame::from_header, omit_payload_mask)]
 fn websocket_control_without_unmasking() {
-    small_frames_roundtrip([1, 2, 3, 4], 4, true, true, [1, 2, 3, 4]);
+    small_frames_read::<4, true>([1, 2, 3, 4], true, [1, 2, 3, 4]);
 }
 
 #[kani::proof]
@@ -342,8 +486,78 @@ fn websocket_control_without_mask_offset() {
 }
 
 #[kani::proof]
-#[kani::unwind(8)]
+#[kani::unwind(12)]
 #[kani::stub(apply_mask, omit_mask)]
 fn websocket_control_without_frame_masking() {
-    small_frames_roundtrip([0; 4], 4, true, true, [1, 2, 3, 4]);
+    small_frames_write::<4, true>([0; 4], true, [1, 2, 3, 4]);
+}
+
+fn close_payload(bytes: [u8; 6], n: usize) {
+    kani::assume(n <= bytes.len());
+    let result = parse_close(&bytes[..n]);
+    if n == 0 {
+        assert_eq!(result, Ok(None));
+    } else if n == 1 {
+        assert_eq!(result, Err(Error::CloseShort));
+    } else {
+        let code = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let allowed = (1000..=1003).contains(&code)
+            || (1007..=1014).contains(&code)
+            || (3000..=4999).contains(&code);
+        let reason = core::str::from_utf8(&bytes[2..n]);
+        assert_eq!(result.is_ok(), allowed && reason.is_ok());
+        if let Ok(Some(close)) = result {
+            assert_eq!(close.code, code);
+            assert_eq!(close.reason.as_bytes(), &bytes[2..n]);
+        }
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_close_payload_validates_reason() {
+    close_payload(kani::any(), kani::any());
+}
+
+fn lossy_close(payload: &[u8]) -> Result<Close, Error> {
+    let [hi, lo, rest @ ..] = payload else {
+        return Err(Error::CloseShort);
+    };
+    let code = u16::from_be_bytes([*hi, *lo]);
+    if !close_code::is_sendable(code) {
+        return Err(Error::CloseCode(code));
+    }
+    Ok(Close {
+        code,
+        reason: String::from_utf8_lossy(rest).into_owned(),
+    })
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::stub(Close::parse, lossy_close)]
+fn websocket_control_without_close_utf8() {
+    close_payload([3, 232, 255, 0, 0, 0], 3);
+}
+
+fn write_wide_length(
+    out: &mut Vec<u8>,
+    fin: bool,
+    opcode: Opcode,
+    mask: Option<[u8; 4]>,
+    len: usize,
+) {
+    out.push((if fin { 128 } else { 0 }) | opcode.to_u8());
+    out.push((if mask.is_some() { 128 } else { 0 }) | 127);
+    out.extend_from_slice(&(len as u64).to_be_bytes());
+    if let Some(key) = mask {
+        out.extend_from_slice(&key);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::stub(write_header, write_wide_length)]
+fn websocket_control_without_minimal_length() {
+    websocket_writer_uses_minimal_length();
 }

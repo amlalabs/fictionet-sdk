@@ -5,7 +5,7 @@ EXTENDS Naturals
    raw-stream UpgradeHandler. Each message is handled serially; write_all
    finishes before the next message is read. The close branch replies with
    the received payload and returns after that write. Messages::decode in
-   protocols/websocket.rs lines 980-981 independently stops after close.
+   protocols/websocket.rs lines 997-998 independently stops after close.
    StopAfterClose disables both stop rules, allowing adversarial later
    messages to expose duplicate close replies and data after a close.
    ReplyClose = FALSE models the old handler's non-text early return.

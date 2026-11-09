@@ -2,13 +2,13 @@
 EXTENDS Naturals
 
 (* Source: src/stdlib/protocols/websocket.rs at comp/v-ws-http1.
-   Receive models Messages::check_header, lines 943-962, and decode,
-   lines 978-1030, with complete frames. Header::parse lines 394-403
-   checks control FIN and length; 980-981 stop after close; 948-952
-   check continuation order; 955-958 check the aggregate before
-   Frames::decode at 984 copies the payload. Lines 994-995 preserve
-   partial data across ping/pong; 996-999 clear it on close; 1001-1010
-   append; 1018-1026 finish and clear the partial.
+   Receive models Messages::check_header, lines 960-979, and decode,
+   lines 995-1047, with complete frames. Header::parse lines 394-403
+   checks control FIN and length; 997-998 stop after close; 965-969
+   check continuation order; 972-975 check the aggregate before
+   Frames::decode at 1001 copies the payload. Lines 1011-1012 preserve
+   partial data across ping/pong; 1013-1016 clear it on close; 1018-1027
+   append; 1035-1043 finish and clear the partial.
    UTF-8 and raw-byte parsing are deliberately left to the Rust harnesses.
    Failed decode calls terminate through codec::Stream; no next call is
    modeled after failure. CheckBeforeGrowth bounds the logical aggregate
