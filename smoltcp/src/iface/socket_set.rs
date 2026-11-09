@@ -9,6 +9,13 @@ use std::ops::Bound::{Excluded, Unbounded};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub struct SocketHandle(usize);
 
+impl SocketHandle {
+    /// The storage slot, reused after removal from the set.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Pending {
     dirty: bool,
@@ -110,17 +117,35 @@ impl<'a> SocketSet<'a> {
             .filter_map(|(i, socket)| socket.as_ref().map(|socket| (SocketHandle(i), socket)))
     }
 
-    /// Take the next socket whose state may have changed.
-    pub fn take_changed(&mut self) -> Option<SocketHandle> {
-        let handle = self.changed.pop_front()?;
-        self.pending[handle.0].changed = false;
-        Some(handle)
+    /// Sockets whose state the caller has not yet observed.
+    pub fn changed(&self) -> impl ExactSizeIterator<Item = SocketHandle> + '_ {
+        self.changed.iter().copied()
+    }
+
+    /// Orders pending observations without allocating another queue.
+    pub fn order_changed<K: Ord>(&mut self, mut key: impl FnMut(SocketHandle) -> K) {
+        self.changed
+            .make_contiguous()
+            .sort_unstable_by_key(|&handle| key(handle));
+    }
+
+    /// The caller has work for this socket even if its transport state did not change.
+    pub fn mark_changed(&mut self, handle: SocketHandle) {
+        if !self.pending[handle.0].changed {
+            self.changed.push_back(handle);
+            self.pending[handle.0].changed = true;
+        }
     }
 
     /// The caller has observed the socket after its own mutations.
     pub fn acknowledge_changed(&mut self, handle: SocketHandle) {
         if self.pending[handle.0].changed {
-            self.changed.retain(|&h| h != handle);
+            let index = self
+                .changed
+                .iter()
+                .position(|&h| h == handle)
+                .expect("a pending observation is queued");
+            self.changed.remove(index);
             self.pending[handle.0].changed = false;
         }
     }
@@ -131,10 +156,7 @@ impl<'a> SocketSet<'a> {
             self.dirty.push_back(handle);
             pending.dirty = true;
         }
-        if !pending.changed {
-            self.changed.push_back(handle);
-            pending.changed = true;
-        }
+        self.mark_changed(handle);
     }
 
     pub(crate) fn schedule(&mut self, cx: &mut Context) {

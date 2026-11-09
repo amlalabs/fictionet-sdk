@@ -297,6 +297,100 @@ impl Device for Dev {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(super) struct Id(pub(super) u64);
 
+/// Owns socket identities and pending observations across removal, reuse and compaction.
+/// Transport changes and application credit share the socket set's retained queue.
+pub(super) struct Sockets {
+    set: SocketSet<'static>,
+    handles: BTreeMap<Id, SocketHandle>,
+    ids: Vec<Option<Id>>,
+    next_id: u64,
+    after: Option<Id>,
+}
+
+impl Sockets {
+    fn new() -> Self {
+        Self {
+            set: SocketSet::new(Vec::new()),
+            handles: BTreeMap::new(),
+            ids: Vec::new(),
+            next_id: 0,
+            after: None,
+        }
+    }
+
+    fn add(&mut self, socket: stcp::Socket<'static>) -> Id {
+        let id = Id(self.next_id);
+        self.next_id += 1;
+        self.insert(id, socket);
+        id
+    }
+
+    fn insert(&mut self, id: Id, socket: stcp::Socket<'static>) {
+        let slot = self.set.add(socket);
+        assert!(self.handles.insert(id, slot).is_none());
+        if slot.index() == self.ids.len() {
+            self.ids.push(Some(id));
+        } else {
+            assert!(self.ids[slot.index()].replace(id).is_none());
+        }
+    }
+
+    fn remove(&mut self, id: Id) -> stcp::Socket<'static> {
+        let slot = self.handles.remove(&id).expect("a socket has a slot");
+        self.ids[slot.index()] = None;
+        self.set.remove(slot)
+    }
+
+    fn get(&self, id: Id) -> &stcp::Socket<'static> {
+        self.set.get(self.handles[&id])
+    }
+
+    fn get_mut(&mut self, id: Id) -> &mut stcp::Socket<'static> {
+        self.set.get_mut(self.handles[&id])
+    }
+
+    fn mark(&mut self, id: Id) {
+        self.set.mark_changed(self.handles[&id]);
+    }
+
+    fn acknowledge(&mut self, id: Id) {
+        if let Some(&slot) = self.handles.get(&id) {
+            self.set.acknowledge_changed(slot);
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.set.changed().len()
+    }
+
+    fn next(&mut self) -> Option<Id> {
+        let id = self.ids[self.set.changed().next()?.index()].expect("a changed socket has an id");
+        self.after = Some(id);
+        Some(id)
+    }
+
+    fn prepare_refresh(&mut self) -> usize {
+        self.set.order_changed(|slot| {
+            let id = self.ids[slot.index()].expect("a changed socket has an id");
+            (self.after.is_some_and(|after| id <= after), id)
+        });
+        self.pending()
+    }
+
+    fn compact(&mut self) {
+        if self.ids.len() < COMPACT_SLOTS || self.handles.len() * 4 > self.ids.len() {
+            return;
+        }
+        let mut set = SocketSet::new(Vec::with_capacity(self.handles.len()));
+        self.ids.clear();
+        for (&id, slot) in &mut self.handles {
+            *slot = set.add(self.set.remove(*slot));
+            self.ids.push(Some(id));
+        }
+        self.set = set;
+    }
+}
+
 /// Hashes an [`Id`] by one multiplication. The engine hands out the ids
 /// itself, one after another, so a keyed hash defends against nothing
 /// here; maps keyed by addresses the peer chooses keep the default one.
@@ -379,16 +473,7 @@ pub(super) const COMPACT_SLOTS: usize = 256;
 pub struct TcpLayer {
     pub(super) addr: IpAddr,
     pub(super) iface: Iface,
-    pub(super) sockets: SocketSet<'static>,
-    /// Each socket's slot in `sockets`, ordered by SDK ID for compaction.
-    pub(super) handles: BTreeMap<Id, SocketHandle>,
-    socket_ids: HashMap<SocketHandle, Id>,
-    refresh_dirty: BTreeSet<Id>,
-    refresh_after: Option<Id>,
-    next_id: u64,
-    /// Slots in `sockets`, empty ones included: the most sockets it held
-    /// at once since it was made.
-    pub(super) slots: usize,
+    pub(super) sockets: Sockets,
     /// Reclamation handles. Each socket also owns its mapping.
     pub(super) pages: HashMap<Id, Arc<Pages>, ById>,
     /// What each socket's buffers are charged to the budget, given back
@@ -833,13 +918,7 @@ impl TcpLayer {
         TcpLayer {
             addr,
             iface,
-            sockets: SocketSet::new(Vec::new()),
-            socket_ids: HashMap::new(),
-            refresh_dirty: BTreeSet::new(),
-            refresh_after: None,
-            handles: BTreeMap::new(),
-            next_id: 0,
-            slots: 0,
+            sockets: Sockets::new(),
             pages: HashMap::default(),
             reserved: HashMap::default(),
             dirty: HashSet::default(),
@@ -916,12 +995,7 @@ impl TcpLayer {
                 SocketAddr::from(remote).ip(),
             ));
         }
-        let h = Id(self.next_id);
-        self.next_id += 1;
-        let slot = self.sockets.add(s);
-        self.handles.insert(h, slot);
-        self.socket_ids.insert(slot, h);
-        self.slots = self.slots.max(self.handles.len());
+        let h = self.sockets.add(s);
         if let Some(p) = pages {
             self.pages.insert(h, p);
         }
@@ -930,10 +1004,7 @@ impl TcpLayer {
 
     /// Removes a socket, then unmaps its buffers and gives back their charge.
     pub(super) fn remove_socket(&mut self, h: Id) {
-        let slot = self.handles.remove(&h).expect("a socket has a slot");
-        self.socket_ids.remove(&slot);
-        self.refresh_dirty.remove(&h);
-        self.sockets.remove(slot);
+        self.sockets.remove(h);
         self.pages.remove(&h);
         self.reserved.remove(&h);
         self.dirty.remove(&h);
@@ -964,28 +1035,18 @@ impl TcpLayer {
     }
 
     pub(super) fn sock(&mut self, h: Id) -> &mut stcp::Socket<'static> {
-        self.sockets.get_mut(self.handles[&h])
+        self.sockets.get_mut(h)
     }
 
     pub(super) fn get(&self, h: Id) -> &stcp::Socket<'static> {
-        self.sockets.get(self.handles[&h])
+        self.sockets.get(h)
     }
 
     /// Moves every socket into a new set without empty slots, once most
     /// slots are empty. Sockets keep their [`Id`], their state and their
     /// buffers. The new set scans sockets in ascending SDK socket ID order.
     pub(super) fn compact(&mut self) {
-        if self.slots < COMPACT_SLOTS || self.handles.len() * 4 > self.slots {
-            return;
-        }
-        let mut sockets = SocketSet::new(Vec::with_capacity(self.handles.len()));
-        self.socket_ids.clear();
-        for (&id, slot) in &mut self.handles {
-            *slot = sockets.add(self.sockets.remove(*slot));
-            self.socket_ids.insert(*slot, id);
-        }
-        self.sockets = sockets;
-        self.slots = self.handles.len();
+        self.sockets.compact();
     }
 
     pub(super) fn take_port(&mut self, port: u16) {
@@ -1391,8 +1452,7 @@ impl TcpLayer {
             && let Some(listener) = self.listeners.get(&dst.port())
         {
             for &id in &listener.idle {
-                self.socket_ids.remove(&self.handles[&id]);
-                idle.push((id, self.sockets.remove(self.handles[&id])));
+                idle.push((id, self.sockets.remove(id)));
             }
         }
         self.dev.rx = Some(packet);
@@ -1400,19 +1460,17 @@ impl TcpLayer {
             self.iface.poll_ingress_targeted(
                 now,
                 &mut self.dev,
-                &mut self.sockets,
-                self.handles[&h],
+                &mut self.sockets.set,
+                self.sockets.handles[&h],
             );
         } else {
             self.iface
-                .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+                .poll_ingress_single(now, &mut self.dev, &mut self.sockets.set);
         }
         let consumed = self.dev.rx.is_none();
         self.dev.reclaim();
         for (id, socket) in idle {
-            let slot = self.sockets.add(socket);
-            self.handles.insert(id, slot);
-            self.socket_ids.insert(slot, id);
+            self.sockets.insert(id, socket);
         }
         if let Some(h) = handle {
             if let Some(c) = self.conns.get_mut(&h)
@@ -1461,7 +1519,7 @@ impl TcpLayer {
                 c.fin = true;
                 // ACK an accepted FIN immediately, even if the application
                 // drops its handle after reading EOF.
-                self.sockets.get_mut(self.handles[&h]).set_ack_delay(None);
+                self.sockets.get_mut(h).set_ack_delay(None);
             }
             self.close_if_drained(h);
             // A RST in SYN-RECEIVED put the socket back in LISTEN. It is
@@ -1493,16 +1551,16 @@ impl TcpLayer {
         {
             // At most one idle socket took the SYN.
             let l = self.listeners.get_mut(&dst.port()).unwrap();
-            let (sockets, handles) = (&self.sockets, &self.handles);
+            let sockets = &self.sockets;
             if let Some(i) = l
                 .idle
                 .iter()
-                .position(|&h| sockets.get(handles[&h]).state() == TcpState::SynReceived)
+                .position(|&h| sockets.get(h).state() == TcpState::SynReceived)
             {
                 let h = l.idle.swap_remove(i);
                 let gives_up = now + self.settings.handshake_timeout.into();
                 l.embryonic.insert((gives_up, h));
-                let s = self.sockets.get(self.handles[&h]);
+                let s = self.sockets.get(h);
                 let local = s.local_endpoint().map(SocketAddr::from).unwrap_or(dst);
                 let remote = s.remote_endpoint().map(SocketAddr::from).unwrap_or(src);
                 *l.per_peer.entry(remote.ip()).or_default() += 1;
@@ -1673,7 +1731,7 @@ impl TcpLayer {
             self.listeners.get_mut(&dst.port()).unwrap().idle.push(h);
         }
         for &h in &self.listeners[&dst.port()].idle {
-            let socket = self.sockets.get_mut(self.handles[&h]);
+            let socket = self.sockets.get_mut(h);
             socket.set_tsval_generator(self.settings.timestamp_clock);
             socket.set_timestamp_offset(
                 self.settings
@@ -1745,17 +1803,15 @@ impl TcpLayer {
         s.0.accept_syn_cookie(dst.into(), src.into(), irs, iss, kept.mss, now);
         let h = self.add_socket(entropy, s);
         self.reserved.insert(h, charge);
-        self.sockets
-            .get_mut(self.handles[&h])
-            .restore_cookie_options(
-                kept.scale,
-                kept.sack,
-                kept.timestamp.and_then(|(offset, remote)| {
-                    self.settings
-                        .timestamp_clock
-                        .map(|clock| (clock, offset, remote))
-                }),
-            );
+        self.sockets.get_mut(h).restore_cookie_options(
+            kept.scale,
+            kept.sack,
+            kept.timestamp.and_then(|(offset, remote)| {
+                self.settings
+                    .timestamp_clock
+                    .map(|clock| (clock, offset, remote))
+            }),
+        );
         let l = self.listeners.get_mut(&dst.port()).unwrap();
         let gives_up = now + self.settings.handshake_timeout.into();
         l.embryonic.insert((gives_up, h));
@@ -1810,7 +1866,7 @@ impl TcpLayer {
                         .collect();
                     let options = stcp::encode_options_within(&wire, 40)
                         .expect("received handshake options fit a TCP header");
-                    let s = self.sockets.get_mut(self.handles[&h]);
+                    let s = self.sockets.get_mut(h);
                     s.set_segment_options(Box::new(SegmentsOnWire(segments)));
                     s.process_handshake_data(handshake.irs.wrapping_add(1), &options);
                 }
@@ -1853,9 +1909,7 @@ impl TcpLayer {
                 .embryonic
                 .range(..=(now, Id(u64::MAX)))
                 .copied()
-                .filter(|&(_, h)| {
-                    self.sockets.get(self.handles[&h]).state() == TcpState::SynReceived
-                })
+                .filter(|&(_, h)| self.sockets.get(h).state() == TcpState::SynReceived)
                 .collect();
             for key @ (_, h) in due {
                 l.embryonic.remove(&key);
@@ -1930,7 +1984,7 @@ impl TcpLayer {
             let Some(key) = l.embryo(h, &self.conns) else {
                 continue;
             };
-            let s = self.sockets.get(self.handles[&h]);
+            let s = self.sockets.get(h);
             match s.state() {
                 TcpState::SynReceived => {}
                 // An aborted socket keeps its endpoint until smoltcp sends
@@ -2047,7 +2101,7 @@ impl TcpLayer {
 
     /// Opens a child for socket `h`, as `origin` made it.
     fn open_child(&mut self, h: Id, origin: TcpOrigin) {
-        self.refresh_dirty.insert(h);
+        self.sockets.mark(h);
         let child: Child = self
             .children
             .insert(h)
@@ -2101,7 +2155,7 @@ impl TcpLayer {
     /// Grants the child of `h` the send-buffer room it has not been
     /// granted yet, while it may write.
     fn grant(&mut self, h: Id) {
-        let s = self.sockets.get(self.handles[&h]);
+        let s = self.sockets.get(h);
         let writable = matches!(s.state(), TcpState::Established | TcpState::CloseWait);
         let free = (s.send_capacity() - s.send_queue()) as u64;
         let c = self.conns.get_mut(&h).unwrap();
@@ -2147,7 +2201,7 @@ impl TcpLayer {
         }
         self.grant(h);
         let c = self.conns.get_mut(&h).unwrap();
-        let s = self.sockets.get_mut(self.handles[&h]);
+        let s = self.sockets.get_mut(h);
         let mut moved = false;
         while c.recv_credit > 0 && s.can_recv() && self.up.len() < UP_ROOM {
             let n = (c.recv_credit as usize).min(s.recv_queue()).min(DATA_MAX);
@@ -2224,46 +2278,27 @@ impl TcpLayer {
 
     /// Brings changed children up to date, rotating after the last served child.
     fn refresh_all(&mut self, budget: &Budget) {
-        use std::ops::Bound::{Excluded, Unbounded};
-        while let Some(slot) = self.sockets.take_changed() {
-            if let Some(&h) = self.socket_ids.get(&slot) {
-                self.refresh_dirty.insert(h);
-            }
-        }
-        let count = self.refresh_dirty.len();
+        let count = self.sockets.prepare_refresh();
         for _ in 0..count {
             if self.up.len() >= UP_ROOM {
                 break;
             }
-            let Some(h) = self
-                .refresh_after
-                .and_then(|after| {
-                    self.refresh_dirty
-                        .range((Excluded(after), Unbounded))
-                        .next()
-                })
-                .or_else(|| self.refresh_dirty.first())
-                .copied()
-            else {
+            let Some(h) = self.sockets.next() else {
                 break;
             };
-            self.refresh_dirty.remove(&h);
-            self.refresh_after = Some(h);
             self.refresh(budget, h);
-            if let Some(&slot) = self.handles.get(&h) {
-                self.sockets.acknowledge_changed(slot);
-                if self
-                    .conns
-                    .get(&h)
-                    .is_some_and(|c| c.open && c.recv_credit > 0)
-                    && self.sockets.get(slot).can_recv()
-                {
-                    self.refresh_dirty.insert(h);
-                }
+            self.sockets.acknowledge(h);
+            if self
+                .conns
+                .get(&h)
+                .is_some_and(|c| c.open && c.recv_credit > 0)
+                && self.sockets.get(h).can_recv()
+            {
+                self.sockets.mark(h);
             }
         }
         if self.up.len() < UP_ROOM {
-            self.refresh_after = None;
+            self.sockets.after = None;
         }
     }
 
@@ -2450,7 +2485,7 @@ impl TcpLayer {
         self.prime(now);
         while self
             .iface
-            .poll_egress(now, &mut self.dev, &mut self.sockets)
+            .poll_egress(now, &mut self.dev, &mut self.sockets.set)
             != smoltcp::iface::PollResult::None
         {}
         self.expire_orphans(now);
@@ -2471,7 +2506,7 @@ impl TcpLayer {
             }
         }
         self.refresh_all(env.budget());
-        let at = self.iface.poll_at(now, &mut self.sockets);
+        let at = self.iface.poll_at(now, &mut self.sockets.set);
         self.next = [at, self.next_release, self.next_expiry()]
             .into_iter()
             .flatten()
@@ -2670,7 +2705,7 @@ impl Layer for TcpLayer {
         let bytes = packet.into_bytes().into_vec();
         if self.ingress(env.entropy(), env.budget(), now, bytes) {
             self.iface
-                .poll_egress(now, &mut self.dev, &mut self.sockets);
+                .poll_egress(now, &mut self.dev, &mut self.sockets.set);
         }
         Ok(Admit::Taken)
     }
@@ -2714,7 +2749,7 @@ impl Layer for TcpLayer {
                 if let Some(h) = self.open_socket(id) {
                     let c = self.conns.get_mut(&h).unwrap();
                     c.recv_credit = c.recv_credit.saturating_add(units);
-                    self.refresh_dirty.insert(h);
+                    self.sockets.mark(h);
                     self.refresh_all(env.budget());
                 }
             }
@@ -2763,7 +2798,7 @@ impl Layer for TcpLayer {
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>> {
         let full = self.up.len() >= UP_ROOM;
         let event = self.urgent.pop_front().or_else(|| self.up.pop_front());
-        self.work |= full && self.up.len() < UP_ROOM && !self.refresh_dirty.is_empty();
+        self.work |= full && self.up.len() < UP_ROOM && self.sockets.pending() != 0;
         event
     }
 

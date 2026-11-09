@@ -378,7 +378,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
             st.dev.transmit(now).unwrap().consume(40, |_| {});
         }
         let st: &mut TcpLayer = &mut st;
-        st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
+        st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set);
         st.housekeeping();
         assert!(
             st.conns.contains_key(&h),
@@ -496,7 +496,8 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         let later = now + smoltcp::time::Duration::from_millis(20);
         {
             let st: &mut TcpLayer = &mut st;
-            st.iface.poll_egress(later, &mut st.dev, &mut st.sockets);
+            st.iface
+                .poll_egress(later, &mut st.dev, &mut st.sockets.set);
         }
         st.housekeeping();
         st.pump();
@@ -543,7 +544,7 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         assert!(egress(st, expiry).is_empty());
         st.housekeeping();
         assert!(!st.conns.contains_key(&h));
-        assert!(!st.handles.contains_key(&h));
+        assert!(!st.sockets.handles.contains_key(&h));
         assert!(!st.pages.contains_key(&h));
         assert!(!st.by_tuple.contains_key(&(local, peer)));
         assert!(!st.orphans.contains(&h));
@@ -599,7 +600,7 @@ fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
         assert!(st.conns.contains_key(&kept));
         assert!(st.conns.contains_key(&recent));
         assert!(!st.conns.contains_key(&dropped[0]));
-        assert!(!st.handles.contains_key(&dropped[0]));
+        assert!(!st.sockets.handles.contains_key(&dropped[0]));
         assert!(
             !st.by_tuple
                 .contains_key(&(local, SocketAddr::new(peer, 1002)))
@@ -676,7 +677,7 @@ fn local_reset_wakes_watches_before_rst_egress() {
                     st.dev.transmit(now).unwrap().consume(40, |_| {});
                 }
                 let st: &mut TcpLayer = &mut st;
-                st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
+                st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set);
                 st.housekeeping();
                 assert!(
                     st.conns.contains_key(&h),
@@ -825,15 +826,29 @@ fn compaction_keeps_socket_id_scan_order() {
         }
         // Reuse a low storage slot with a newer SDK ID.
         let newest = st.add_socket(&fcx, new_socket(MIN_BUFFER));
-        assert!(st.slots >= COMPACT_SLOTS);
+        assert!(st.sockets.ids.len() >= COMPACT_SLOTS);
         st.compact();
-        assert_eq!(st.slots, 5);
+        assert_eq!(st.sockets.ids.len(), 5);
         let scan: Vec<_> = st
             .sockets
+            .set
             .iter()
-            .map(|(slot, _)| *st.handles.iter().find(|(_, h)| **h == slot).unwrap().0)
+            .map(|(slot, _)| {
+                *st.sockets
+                    .handles
+                    .iter()
+                    .find(|(_, h)| **h == slot)
+                    .unwrap()
+                    .0
+            })
             .collect();
         assert_eq!(scan, [kept[0], kept[1], kept[2], kept[3], newest]);
+        assert_eq!(st.sockets.pending(), scan.len());
+        for id in scan {
+            assert_eq!(st.sockets.next(), Some(id));
+            st.sockets.acknowledge(id);
+        }
+        assert_eq!(st.sockets.pending(), 0);
         drop(st);
         fcx.cancel();
         Ok(())
@@ -882,7 +897,7 @@ fn data_segment(
 
 /// Drives the stack at one fixed time, without running its background task.
 fn egress(st: &mut TcpLayer, now: smoltcp::time::Instant) -> Vec<Vec<u8>> {
-    while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets)
+    while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set)
         != smoltcp::iface::PollResult::None
     {}
     let mut packets = std::mem::take(&mut st.dev.tx);
@@ -1049,7 +1064,7 @@ fn syn_rst_does_not_prepare_a_listening_socket() {
         );
         egress(&mut st, now);
         assert!(st.listeners[&80].idle.is_empty());
-        let count = st.sockets.iter().count();
+        let count = st.sockets.set.iter().count();
         let other = SocketAddr::new(peer.ip(), peer.port() + 1);
         st.ingress(
             &fcx,
@@ -1057,7 +1072,7 @@ fn syn_rst_does_not_prepare_a_listening_socket() {
             now,
             segment(other, local, 7, 0, 0x06).0,
         );
-        assert_eq!(st.sockets.iter().count(), count);
+        assert_eq!(st.sockets.set.iter().count(), count);
         assert!(st.listeners[&80].idle.is_empty());
         assert!(!st.by_tuple.contains_key(&(local, other)));
         assert!(egress(&mut st, now).is_empty());
@@ -2374,7 +2389,7 @@ fn a_burst_of_reset_handshakes_leaves_no_pool_of_sockets() {
             "{} spare listening sockets",
             l.idle.len()
         );
-        assert!(st.sockets.iter().count() <= 1);
+        assert!(st.sockets.set.iter().count() <= 1);
         drop(st);
         Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
     }));
@@ -2421,7 +2436,11 @@ fn unanswered_syns_from_many_addresses_leave_nothing_behind() {
         assert!(l.per_peer.is_empty(), "{} peers kept", l.per_peer.len());
         assert!(st.conns.is_empty(), "{} connections kept", st.conns.len());
         assert!(st.by_tuple.is_empty());
-        assert!(st.handles.len() <= 1, "{} sockets kept", st.handles.len());
+        assert!(
+            st.sockets.handles.len() <= 1,
+            "{} sockets kept",
+            st.sockets.handles.len()
+        );
         drop(st);
         fcx.cancel();
         Ok(())
@@ -2586,23 +2605,31 @@ fn the_socket_set_shrinks_after_a_crowd_leaves() {
             let s = listener.accept(&fcx).await?;
             crowd.push((c, s));
         }
-        assert!(server.shared.lock().slots >= 401);
+        assert!(server.shared.lock().sockets.ids.len() >= 401);
         drop(crowd);
         let deadline = fcx.now() + Duration::from_secs(11);
         while ![&server, &client].iter().all(|e| {
             let st = e.shared.lock();
-            st.handles.len() <= 3 && st.slots < COMPACT_SLOTS
+            st.sockets.handles.len() <= 3 && st.sockets.ids.len() < COMPACT_SLOTS
         }) {
             assert!(fcx.now() < deadline, "closed connections kept socket slots");
             fcx.sleep(Duration::from_millis(5)).await?;
         }
         for e in [&server, &client] {
             let st = e.shared.lock();
-            assert!(st.handles.len() <= 3, "{} sockets left", st.handles.len());
+            assert!(
+                st.sockets.handles.len() <= 3,
+                "{} sockets left",
+                st.sockets.handles.len()
+            );
             // Compacted on the way down: fewer than 256 slots remain,
             // not the 401 it had.
-            assert!(st.slots < COMPACT_SLOTS, "{} slots left", st.slots);
-            assert_eq!(st.sockets.iter().count(), st.handles.len());
+            assert!(
+                st.sockets.ids.len() < COMPACT_SLOTS,
+                "{} slots left",
+                st.sockets.ids.len()
+            );
+            assert_eq!(st.sockets.set.iter().count(), st.sockets.handles.len());
         }
         let size = rounds(1 << 20);
         let data = pattern(size, 9);
