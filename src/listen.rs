@@ -742,11 +742,10 @@ impl SocketLink {
                 }
             }
         }
-        if !out.queue.fits(packet.0.len(), Some(QUEUE_LIMIT)) {
+        if out.queue.try_push(packet, Some(QUEUE_LIMIT)).is_err() {
             out.dropped += 1;
             return;
         }
-        assert!(out.queue.try_push(packet, Some(QUEUE_LIMIT)).is_ok());
         if self.slot.watch_out(&mut out, &self.listen, true).is_err() {
             out.dropped += out.queue.len() as u64;
             // The helper must not flush packets counted as dropped.
