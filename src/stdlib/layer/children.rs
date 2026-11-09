@@ -459,13 +459,17 @@ where
     /// depth are read again, and with `ready` it needs a visit.
     fn called(&mut self, id: ChildId, ready: bool) {
         if let Some(index) = self.index(id) {
-            let marks = &mut self.marks[index];
-            marks.ready |= ready;
-            marks.work = true;
-            let kid = &mut self.kids[index].1;
-            kid.due = kid.layer.deadline().map(|(at, _)| at);
-            kid.depth = kid.layer.depth();
+            self.called_at(index, ready);
         }
+    }
+
+    fn called_at(&mut self, index: usize, ready: bool) {
+        let marks = &mut self.marks[index];
+        marks.ready |= ready;
+        marks.work = true;
+        let kid = &mut self.kids[index].1;
+        kid.due = kid.layer.deadline().map(|(at, _)| at);
+        kid.depth = kid.layer.depth();
     }
 
     /// Marks the children something reached from outside a call.
@@ -561,16 +565,23 @@ where
         &mut self,
         env: &mut Env<'_, ChildReport<B::Report, B::Error>>,
         id: ChildId,
-    ) -> Result<bool, Overrun> {
-        let Some(index) = self.index(id) else {
-            return Ok(false);
-        };
+    ) -> bool {
+        self.index(id)
+            .is_some_and(|index| self.visit_at(env, index))
+    }
+
+    /// The same for the child at `index`.
+    fn visit_at(
+        &mut self,
+        env: &mut Env<'_, ChildReport<B::Report, B::Error>>,
+        index: usize,
+    ) -> bool {
         self.marks[index].ready = false;
         let Some((moved, waiting)) = self.visit_kid(env, index) else {
-            return Ok(true);
+            return true;
         };
-        self.called(id, moved || waiting);
-        Ok(moved)
+        self.called_at(index, moved || waiting);
+        moved
     }
 
     /// The visit itself: whether anything moved and whether the child waits
@@ -795,7 +806,7 @@ where
                 // event is never handed back to block the mux.
                 let urgent = event.urgent();
                 if self.full(id, urgent) {
-                    self.visit_child(env, id)?;
+                    self.visit_child(env, id);
                     if self.full(id, urgent) {
                         self.refuse(env, id);
                     }
@@ -916,32 +927,32 @@ where
         self.reserve(env.budget())?;
         self.collect_wakes();
         // Ready children after the turn, then from the start up to it, each
-        // at most once and at most QUEUE of them. A visit may close its
-        // child, so the next one is found by id.
+        // at most once and at most QUEUE of them. A visit closes no child but
+        // its own, so the places after it move down by one when it does.
         let turn = self.turn;
-        let mut last = turn;
-        let mut wrapped = turn.is_none();
+        let start = turn.map_or(0, |turn| self.kids.partition_point(|(id, _)| *id <= turn));
+        let mut index = start;
+        let mut end = self.kids.len();
+        let mut wrapped = start == 0;
         let mut first = None;
+        let mut last = None;
         let mut visits = 0;
         let mut moved = false;
         let mut more = false;
         loop {
-            let from = last.map_or(0, |last| self.kids.partition_point(|(id, _)| *id <= last));
-            let to = if wrapped {
-                turn.map_or(self.kids.len(), |turn| {
-                    self.kids.partition_point(|(id, _)| *id <= turn)
-                })
-            } else {
-                self.kids.len()
-            };
-            let Some(index) = (from..to).find(|&index| self.marks[index].ready) else {
+            if index >= end {
                 if wrapped {
                     break;
                 }
                 wrapped = true;
-                last = None;
+                index = 0;
+                end = start;
                 continue;
-            };
+            }
+            if !self.marks[index].ready {
+                index += 1;
+                continue;
+            }
             if visits == QUEUE {
                 more = true;
                 break;
@@ -950,7 +961,13 @@ where
             first.get_or_insert(id);
             last = Some(id);
             visits += 1;
-            moved |= self.visit_child(env, id)?;
+            let open = self.kids.len();
+            moved |= self.visit_at(env, index);
+            if self.kids.len() < open {
+                end -= 1;
+            } else {
+                index += 1;
+            }
         }
         // A sweep that reached every ready child starts the next one after
         // the child it visited first, so each child in turn goes first.
