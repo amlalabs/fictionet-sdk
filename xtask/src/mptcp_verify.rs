@@ -10,7 +10,8 @@
 //! | `mptcp-verify diff [seed]` | the vectors, then `tests/mptcp_vectors.rs` against them, for each seed |
 //! | `mptcp-verify all` | all four, with a summary in `SUMMARY.txt` |
 //!
-//! Everything is written under `mptcp-verify/` in Cargo's target directory
+//! Everything is written under a fresh run directory in `mptcp-verify/`
+//! in Cargo's target directory
 //! (`CARGO_TARGET_DIR`, or `target/`): TLC's output in `tlc/`, Lean's in
 //! `lean/`, the vectors of each seed in `vectors/<seed>/`, and the
 //! differential test's output in `diff-<seed>.out`. The vectors are made
@@ -117,7 +118,7 @@ impl Paths {
         Ok(Paths {
             tla: verification.join("tla"),
             lean: verification.join("lean"),
-            out: target.join("mptcp-verify"),
+            out: crate::verification_run(&target.join("mptcp-verify"))?,
             root,
         })
     }

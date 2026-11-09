@@ -868,7 +868,7 @@ fn check_downloads<P: Software>(downloads: &Path, guests: &[Guest<P>]) -> io::Re
         for file in files {
             if !file.is_file() {
                 return Err(io::Error::other(format!(
-                    "missing {}; build it with cargo xtask search-image <downloads>",
+                    "missing {}; build it with cargo xtask-host search-image <downloads>",
                     file.display()
                 )));
             }

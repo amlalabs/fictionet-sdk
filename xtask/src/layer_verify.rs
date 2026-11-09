@@ -5,7 +5,8 @@
 //! | --- | --- |
 //! | `layer-verify trace` | runs `route_trace` in the library's tests, which logs every step the real `Chain`, `Switch` and `Driver` take under abstract layers for each seed, then replays each log against the model with `RouteTrace.tla` |
 //!
-//! Everything is written under `layer-verify/` in Cargo's target directory
+//! Everything is written under a fresh run directory in `layer-verify/`
+//! in Cargo's target directory
 //! (`CARGO_TARGET_DIR`, or `target/`): the logs and the specs in `traces/`,
 //! TLC's output in `tlc/`, and its state files in `states/`.
 //!
@@ -52,7 +53,7 @@ impl Paths {
             .unwrap_or_else(|| root.join("target"));
         Ok(Paths {
             tla: root.join("verification").join("layer").join("tla"),
-            out: target.join("layer-verify"),
+            out: crate::verification_run(&target.join("layer-verify"))?,
             root,
         })
     }
@@ -77,9 +78,8 @@ fn logged(command: &mut Command, log: &Path) -> Result<(String, bool)> {
 fn trace() -> Result {
     let paths = Paths::new()?;
     let traces = paths.out.join("traces");
-    if traces.exists() {
-        std::fs::remove_dir_all(&traces)?;
-    }
+    let temp = paths.out.join("temp");
+    std::fs::create_dir_all(&temp)?;
     std::fs::create_dir_all(&traces)?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let (text, ok) = logged(
@@ -121,9 +121,11 @@ fn trace() -> Result {
             .filter(|line| line.trim_start().starts_with("[a |->"))
             .count();
         let started = Instant::now();
-        let (text, _) = logged(
+        let (text, success) = logged(
             Command::new(&java)
-                .args(["-Xmx2g", "-cp"])
+                .arg("-Xmx2g")
+                .arg(format!("-Djava.io.tmpdir={}", temp.display()))
+                .arg("-cp")
                 .arg(&jar)
                 .args(["tlc2.TLC", "-workers", "2", "-metadir"])
                 .arg(paths.out.join("states").join(name))
@@ -132,7 +134,7 @@ fn trace() -> Result {
             &paths.out.join("tlc").join(format!("{name}.out")),
         )?;
         let seconds = started.elapsed().as_secs();
-        if text.contains("Model checking completed. No error has been found.") {
+        if success && text.contains("Model checking completed. No error has been found.") {
             println!("{name}: {entries} entries replayed, {seconds} s");
         } else {
             failures += 1;

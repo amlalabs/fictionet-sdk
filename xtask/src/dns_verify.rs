@@ -4,13 +4,14 @@
 //!
 //! | Command | Does |
 //! | --- | --- |
-//! | `dns-verify tlc [spec] [config]` | TLC once per property of each config, checking that each ablation fails with exactly the violation its config expects |
+//! | `dns-verify tlc [spec] [config]` | TLC with all passing properties together, and each ablation separately with its expected violation |
 //! | `dns-verify lean` | `lake build`, then the axioms of every headline theorem |
 //! | `dns-verify vectors [seed]` | the Lean model's test vectors, from `seed`, or from each of seeds 1 to 8 when left out |
 //! | `dns-verify diff [seed]` | the vectors, then `tests/dns_vectors.rs` against them, for each seed |
 //! | `dns-verify all` | all four, with a summary in `SUMMARY.txt` |
 //!
-//! Everything is written under `dns-verify/` in Cargo's target directory
+//! Everything is written under a fresh run directory in `dns-verify/`
+//! in Cargo's target directory
 //! (`CARGO_TARGET_DIR`, or `target/`): TLC's output in `tlc/`, Lean's in
 //! `lean/`, the vectors of each seed in `vectors/<seed>/`, and the
 //! differential test's output in `diff-<seed>.out`. The vectors are made
@@ -39,6 +40,7 @@ const SEEDS: std::ops::RangeInclusive<u64> = 1..=8;
 /// Runs `dns-verify` with the arguments after it.
 pub fn run(args: &[String]) -> Result {
     let paths = Paths::new()?;
+    std::fs::create_dir_all(paths.out.join("temp"))?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["tlc", filter @ ..] if filter.len() <= 2 => {
@@ -116,7 +118,7 @@ impl Paths {
         Ok(Paths {
             tla: verification.join("tla"),
             lean: verification.join("lean"),
-            out: target.join("dns-verify"),
+            out: crate::verification_run(&target.join("dns-verify"))?,
             root,
         })
     }
@@ -325,6 +327,9 @@ enum Outcome {
 
 /// Reads how a TLC run of `property` ended from its output.
 fn outcome(text: &str, property: &str) -> Outcome {
+    if !text.lines().any(|line| line.starts_with("Finished in ")) {
+        return Outcome::Error("TLC did not finish".to_string());
+    }
     if text.contains("Model checking completed. No error has been found.") {
         return Outcome::Pass;
     }
@@ -387,15 +392,14 @@ fn configs(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Ve
     Ok(chosen)
 }
 
-/// TLC on each config, once per property. A config that expects
-/// violations must list exactly the properties it expects to fail, and
-/// each must fail; every other config must pass every property.
+/// Passing configs check every property together in one complete exploration.
+/// Expected violations run separately and must name exactly the listed checks.
 fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report> {
     let jar = std::env::var_os("TLA2TOOLS").ok_or("TLA2TOOLS must name tla2tools.jar")?;
     let java = std::env::var_os("JAVA").unwrap_or_else(|| "java".into());
     let out = paths.out.join("tlc");
     // TLC looks for a config in the directory of its spec, so the specs
-    // are copied next to the one-property configs made from them.
+    // are copied next to the full passing configs and single-property ablations.
     let specs = out.join("specs");
     std::fs::create_dir_all(&specs)?;
     for entry in std::fs::read_dir(&paths.tla)? {
@@ -414,20 +418,43 @@ fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report
             ));
             continue;
         }
+        if config.checks.is_empty() {
+            report.fail(format!("{}: no properties listed", config.name));
+            continue;
+        }
         let spec_file = format!("{}.tla", config.spec);
-        for (property, kind) in &config.checks {
-            let expect_violation = config.expected.contains(property);
-            let run = format!("{}-{property}", config.name);
+        let expect_violation = !config.expected.is_empty();
+        let group_size = if expect_violation {
+            1
+        } else {
+            config.checks.len()
+        };
+        for checks in config.checks.chunks(group_size) {
+            let (property, kind) = &checks[0];
+            let run = if expect_violation {
+                format!("{}-{property}", config.name)
+            } else {
+                config.name.clone()
+            };
             let cfg = specs.join(format!("{run}.cfg"));
-            std::fs::write(&cfg, config.checking_only(property, *kind))?;
+            let contents = if expect_violation {
+                config.checking_only(property, *kind)
+            } else {
+                config.text.clone()
+            };
+            std::fs::write(&cfg, contents)?;
             let states = out.join("states").join(&run);
             // One worker for an ablation, so its counterexample is a
             // shortest one.
-            let workers = if expect_violation { "1" } else { "auto" };
+            let workers = if expect_violation { "1" } else { "2" };
             let mut command = Command::new(&java);
             command
                 .arg("-XX:+UseParallelGC")
                 .arg("-Xmx6g")
+                .arg(format!(
+                    "-Djava.io.tmpdir={}",
+                    paths.out.join("temp").display()
+                ))
                 .arg("-cp")
                 .arg(&jar)
                 .arg("tlc2.TLC")
@@ -440,13 +467,21 @@ fn tlc(paths: &Paths, spec: Option<&str>, config: Option<&str>) -> Result<Report
                 .arg(&spec_file)
                 .current_dir(&specs);
             let started = Instant::now();
-            let (text, _) = logged(&mut command, &out.join(format!("{run}.out")))?;
+            let (text, success) = logged(&mut command, &out.join(format!("{run}.out")))?;
             let seconds = started.elapsed().as_secs();
             let _ = std::fs::remove_dir_all(&states);
             let stats = statistics(&text);
             match (outcome(&text, property), expect_violation) {
+                (Outcome::Pass, false) if success => {
+                    for (property, _) in checks {
+                        report.pass(format!(
+                            "{}-{property}: pass, {stats}, {seconds} s; see {run}.out",
+                            config.name
+                        ));
+                    }
+                }
                 (Outcome::Pass, false) => {
-                    report.pass(format!("{run}: pass, {stats}, {seconds} s"));
+                    report.fail(format!("{run}: TLC exited unsuccessfully; see {run}.out"));
                 }
                 (Outcome::Violated, true) => {
                     report.pass(format!("{run}: violated as expected, {stats}, {seconds} s"));

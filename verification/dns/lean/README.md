@@ -18,7 +18,7 @@ lake exe gen <dir> <seed>        # writes <dir>/{names,wire,fit,respond,zone,par
 `lake build` prints the axioms of every headline theorem from `Dns/Axioms.lean`. Each line must list only
 `propext`, `Quot.sound`, and `Classical.choice`, or a subset of them. A `sorryAx` would mean an unfinished
 proof; there is none. `cargo xtask dns-verify` runs this check and writes the vectors
-into `target/dns-verify/vectors/<seed>/`. Vectors are regenerated, not committed. The same seed always
+into `vectors/<seed>/` beneath the run directory printed by xtask. Vectors are regenerated, not committed. The same seed always
 gives the same files.
 
 ## Theorems

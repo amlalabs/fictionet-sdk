@@ -7,7 +7,13 @@ publish = false
 default-run = "xtask"
 
 [features]
-rawnic = ["fictionet-host/virtio-net", "dep:honeypot-world"]
+host-tools = [
+    "dep:fictionet", "dep:fictionet-demo", "dep:fictionet-extras", "dep:fictionet-host",
+    "dep:http", "dep:libc", "dep:web-world", "dep:serde", "dep:serde_json", "dep:url",
+    "dep:tokio", "dep:fatfs", "dep:reqwest", "dep:zim", "dep:zip", "dep:mime_guess",
+    "dep:tar", "dep:xz2",
+]
+rawnic = ["host-tools", "fictionet-host/virtio-net", "dep:honeypot-world"]
 
 [[bin]]
 name = "rawnic-guest"
@@ -16,25 +22,25 @@ required-features = ["rawnic"]
 
 [dependencies]
 honeypot-world = { path = "../demos/honeypot", features = ["raw-virtio"], optional = true }
-fictionet = { path = ".." }
-fictionet-demo = { path = "../demos/kit" }
-fictionet-extras = { path = "../extras" }
-fictionet-host = { path = "../host", features = ["filesystem"] }
-http = "1"
-libc = "0.2"
-web-world = { path = "../demos/search/world" }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
-url = { version = "2", features = ["serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "signal", "net", "fs", "sync"] }
+fictionet = { path = "..", optional = true }
+fictionet-demo = { path = "../demos/kit", optional = true }
+fictionet-extras = { path = "../extras", optional = true }
+fictionet-host = { path = "../host", features = ["filesystem"], optional = true }
+http = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+web-world = { path = "../demos/search/world", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", features = ["raw_value"], optional = true }
+url = { version = "2", features = ["serde"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "signal", "net", "fs", "sync"], optional = true }
 
-fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
-zim = "0.5"
-zip = { version = "9", default-features = false, features = ["deflate"] }
-mime_guess = "2"
-tar = "0.4"
-xz2 = "0.1"
+fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"], optional = true }
+zim = { version = "0.5", optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+mime_guess = { version = "2", optional = true }
+tar = { version = "0.4", optional = true }
+xz2 = { version = "0.1", optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

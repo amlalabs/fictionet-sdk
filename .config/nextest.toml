@@ -12,8 +12,8 @@ worlds = { max-threads = 8 }
 heavy = { max-threads = 1 }
 
 [profile.default]
-# One test per CPU.
-test-threads = "num-cpus"
+# Leave room for compilation and other work in the shared slice.
+test-threads = 8
 # A flaky test fails the run; it is not retried into a pass.
 retries = 0
 # Flag a test after 15 seconds, and stop it after 8 periods (2 minutes).

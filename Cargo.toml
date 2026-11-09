@@ -136,18 +136,18 @@ harness = false
 name = "decoders"
 harness = false
 
-# Dependencies are built optimized once and then cached; ring, rustls and
-# tokio are much faster that way, and debug builds of the crate itself are
-# unchanged.
+# Keep development and test artifacts compatible, including dependency debug info.
+# Backtraces retain file names and line numbers without full variable metadata.
+[profile.dev]
+debug = "line-tables-only"
+
+# Cache optimized external dependencies while compiling workspace code cheaply.
 [profile.dev.package."*"]
 opt-level = 2
 
-# The tests run the protocol code through randomized and large inputs, which
-# runs about five times faster at opt-level 1. Line tables keep file and line
-# numbers in backtraces and make the test binaries quicker to link.
+# Inherit the development profile. Test assertions and overflow checks stay on.
 [profile.test]
-debug = "line-tables-only"
-opt-level = 1
+opt-level = 0
 
 [profile.release.package.web-world]
 debug = 1

@@ -4,7 +4,7 @@ Build the shared workstation image once on Linux with KVM, `qemu-system-x86_64`,
 `qemu-img`, `curl` and `sha256sum` installed:
 
 ```sh
-rustup run 1.99.0 cargo xtask search-image demos/downloads/cloudimage
+rustup run 1.99.0 cargo xtask-host search-image demos/downloads/cloudimage
 ```
 
 The command verifies the pinned Ubuntu cloud disk, kernel and initrd and Cloud
@@ -219,7 +219,7 @@ reference web under the shared downloads directory. Prepare the reference web
 once before starting the demo:
 
 ```sh
-rustup run 1.99.0 cargo xtask search-web /path/to/demos/downloads
+rustup run 1.99.0 cargo xtask-host search-web /path/to/demos/downloads
 ```
 
 This downloads the English Wikipedia ZIM without images and crawls English
@@ -232,7 +232,7 @@ WARCs are stored in `demos/downloads/security/`, outside git. Capture the seed
 pages, references and their requisites with:
 
 ```sh
-rustup run 1.99.0 cargo xtask search-capture /path/to/demos/downloads --research
+rustup run 1.99.0 cargo xtask-host search-capture /path/to/demos/downloads --research
 ```
 
 Each batch gets a separate archive. Captures keep original URLs, redirects, HTTP
@@ -251,7 +251,7 @@ headers; the browser itself has no Internet route.
 Complete requisites for every page in an existing corpus with:
 
 ```sh
-rustup run 1.99.0 cargo xtask search-requisites demos/downloads/security
+rustup run 1.99.0 cargo xtask-host search-requisites demos/downloads/security
 ```
 
 Append URLs to that command to capture or repair individual pages. Cached pages
@@ -278,7 +278,7 @@ Capture the research sources and packages with Python 3.12 and pip available
 on the host:
 
 ```sh
-rustup run 1.99.0 cargo xtask search-capture demos/downloads <python-with-pip>
+rustup run 1.99.0 cargo xtask-host search-capture demos/downloads <python-with-pip>
 ```
 
 The command retains existing captures, resolves research tools with pip,

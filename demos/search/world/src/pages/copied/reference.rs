@@ -54,9 +54,9 @@ impl ReferenceWeb {
     /// such as later page requisites, are served without reindexing.
     pub fn open(root: &Path, research_path: &Path) -> Result<Self, String> {
         let wikipedia = Zim::new(wiki_file(root))
-            .map_err(|e| format!("Offline Wikipedia: {e}. Run cargo xtask search-web"))?;
+            .map_err(|e| format!("Offline Wikipedia: {e}. Run cargo xtask-host search-web"))?;
         let index = DiskIndex::open(&root.join("index/current"))
-            .map_err(|e| format!("Offline search index: {e}. Run cargo xtask search-web"))?;
+            .map_err(|e| format!("Offline search index: {e}. Run cargo xtask-host search-web"))?;
         let prepared: Prepared = serde_json::from_str(
             &index
                 .source()
@@ -70,7 +70,7 @@ impl ReferenceWeb {
                 || metadata.modified().map_err(|e| e.to_string())? != file.modified
             {
                 return Err(format!(
-                    "Indexed archive changed: {}. Run cargo xtask search-web with --index",
+                    "Indexed archive changed: {}. Run cargo xtask-host search-web with --index",
                     file.path.display()
                 ));
             }
