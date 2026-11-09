@@ -192,11 +192,13 @@ impl http_body::Body for Prefixed {
         if let Some(Ok(frame)) = &self.first
             && let Some(data) = frame.data_ref()
         {
+            // The upper bound moves first: each setter checks the bounds
+            // against the other.
             let more = data.len() as u64;
-            hint.set_lower(hint.lower() + more);
             if let Some(upper) = hint.upper() {
                 hint.set_upper(upper + more);
             }
+            hint.set_lower(hint.lower() + more);
         }
         hint
     }
