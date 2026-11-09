@@ -47,8 +47,11 @@ const SOCKETS: usize = 1 << 16;
 /// are. Datagrams are never split into fragments. A child's
 /// [`DatagramCommand::End`] or its handle's close frees the port.
 ///
-/// The packets it takes in are the ones the IP layer sorts to UDP. Of
-/// those, it takes UDP datagrams sent to its address, and to the multicast
+/// The packets it takes in are the ones the IP layer sorts to UDP, and
+/// only [checked](IpPacket::is_checked) ones of its own network, the
+/// [`Scope`] it was made with: observed copies and packets of other
+/// networks are dropped. Of the packets it takes in, it keeps UDP datagrams
+/// sent to its address, and to the multicast
 /// groups joined with [`UdpControl::Join`], and drops the rest, ICMP errors
 /// about datagrams it sent included. A datagram with a bad checksum is
 /// dropped. So is one over IPv6 whose checksum field is zero: that means
@@ -309,7 +312,10 @@ impl UdpLayer {
 
     /// Takes in one packet the IP layer sorted to UDP.
     fn take_in(&mut self, env: &mut Env<'_, UdpReport>, packet: IpPacket) {
-        if packet.transport() != Transport::Udp {
+        if !packet.is_checked()
+            || packet.ingress().scope != self.scope
+            || packet.transport() != Transport::Udp
+        {
             return;
         }
         let Some(header) = packet.header() else {

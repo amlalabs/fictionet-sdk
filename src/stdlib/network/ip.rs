@@ -661,7 +661,12 @@ impl Reassembly {
 
     /// Takes a packet. Returns it if it is not a fragment, the whole packet
     /// if this fragment completed one, and `None` otherwise.
+    ///
+    /// Packets whose time is up are dropped first, so a fragment that comes
+    /// after its packet expired never completes it, even when the caller
+    /// has not called [`expire`](Reassembly::expire) yet.
     fn reassemble(&mut self, packet: Packet, now: Instant) -> Option<Packet> {
+        self.expire(now);
         let whole = self.push_fragment(packet, now);
         // Every path that may have added bookkeeping ends here, so the cap
         // holds after each packet.
@@ -1781,6 +1786,10 @@ pub fn hop(packet: &mut [u8]) -> Hop {
     }
 }
 
+#[cfg(kani)]
+#[path = "../../../verification/packet-udp/kani/ip_header.rs"]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1934,6 +1943,19 @@ mod tests {
             .expect("a whole packet");
         assert_eq!(whole.0.len(), 20 + 24);
         assert_eq!(checksum(&whole.0[..20]), 0);
+    }
+
+    /// A fragment that comes once its packet's time is up does not complete
+    /// it, even when nothing has called `expire` since: the IP layer's
+    /// driver hands a packet in before it fires the layer's timer.
+    #[test]
+    fn a_late_fragment_completes_nothing_before_expire_runs() {
+        let mut r = Reassembly::default();
+        assert!(r.reassemble(frag4(3, 0, 16, true), at(0)).is_none());
+        assert!(r.reassemble(frag4(3, 16, 8, false), at(30)).is_none());
+        r.check();
+        // The late fragment starts a packet of its own, which waits.
+        assert_eq!(r.next_expiry(), Some(at(60)));
     }
 
     #[test]

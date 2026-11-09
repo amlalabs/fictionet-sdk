@@ -206,11 +206,12 @@ pub enum Origin {
 /// One whole IP packet, with the header read from its own bytes and the
 /// transport it goes to.
 ///
-/// Only [`IpLayer`] and [`IpPacket::observed`] make one, so the header and
-/// transport always describe these bytes. A packet from the IP layer passed
-/// [`Header::check`], is not a fragment, and has no IPv6 extension headers
-/// left; its header is there unless its transport is
-/// [`Transport::Other`] and it could not be read.
+/// [`IpLayer`], [`IpPacket::checked`] and [`IpPacket::observed`] make one,
+/// so the header and transport always describe these bytes. A
+/// [checked](IpPacket::is_checked) packet passed [`Header::check`], is not
+/// a fragment, and has no IPv6 extension headers left. The IP layer hands
+/// up checked packets, and packets it could not read, with no header and
+/// transport `Other(protocol::NONE)`. An observed copy is never checked.
 #[derive(Debug)]
 pub struct IpPacket {
     bytes: Chunk,
@@ -244,9 +245,34 @@ impl IpPacket {
         }
     }
 
-    /// A packet the host takes in, sorted by its whole header.
-    fn host(bytes: Chunk, ingress: Ingress, origin: Origin) -> IpPacket {
-        let header = Header::parse_whole(&bytes);
+    /// Reads a whole packet as a host takes it in, for an IP layer of your
+    /// own to hand its transports, as [`IpLayer`] does. `bytes` must be one
+    /// whole IP packet that passes [`Header::check`] and is not a fragment,
+    /// and an IPv6 packet must have no extension headers left
+    /// ([`strip_extension_headers`] takes them out). `origin` says how the
+    /// bytes relate to what arrived; it may not be [`Origin::Observed`],
+    /// since a captured copy is read with [`IpPacket::observed`]. Hands
+    /// `bytes` back when any of that fails.
+    ///
+    /// [`strip_extension_headers`]: fictionet::stdlib::network::ip::strip_extension_headers
+    pub fn checked(bytes: Chunk, ingress: Ingress, origin: Origin) -> Result<IpPacket, Chunk> {
+        match IpPacket::check(&bytes, &origin) {
+            Some(header) => Ok(IpPacket::host(bytes, Some(header), ingress, origin)),
+            None => Err(bytes),
+        }
+    }
+
+    /// The header of `bytes` if [`checked`](IpPacket::checked) takes them.
+    fn check(bytes: &[u8], origin: &Origin) -> Option<Header> {
+        Header::parse_whole(bytes).filter(|header| {
+            !matches!(origin, Origin::Observed)
+                && (header.src.is_ipv4() || header.payload.start == 40)
+        })
+    }
+
+    /// A packet the host takes in, with the header [`check`](IpPacket::check)
+    /// read, or none when it could not read one.
+    fn host(bytes: Chunk, header: Option<Header>, ingress: Ingress, origin: Origin) -> IpPacket {
         let transport = Transport::read(header.as_ref(), &bytes);
         IpPacket {
             bytes,
@@ -290,6 +316,13 @@ impl IpPacket {
     /// How its bytes relate to what arrived.
     pub fn origin(&self) -> &Origin {
         &self.origin
+    }
+
+    /// Whether the packet passed a host's checks: made by
+    /// [`IpPacket::checked`], or by [`IpLayer`] with its header read. Never
+    /// true of an observed copy. A transport takes in only checked packets.
+    pub fn is_checked(&self) -> bool {
+        self.header.is_some() && !matches!(self.origin, Origin::Observed)
     }
 
     /// Whether every byte of the packet is here. Always true for a packet
@@ -342,6 +375,11 @@ pub enum IpReport {
         /// Whether an answer went back.
         answered: bool,
     },
+    /// A packet from another network than the layer's was dropped.
+    OtherScope {
+        /// The network it came from.
+        scope: Scope,
+    },
 }
 
 /// A host's IP layer: raw packets below, whole checked packets for the
@@ -352,6 +390,13 @@ pub enum IpReport {
 /// taken. A packet it takes in is either handed up whole, kept as a
 /// fragment, or dropped with a report; it never hands back part of one.
 ///
+/// It serves one network, its [`Scope`]: the packets it sends down carry
+/// none, so it could not tell two networks' answers apart, and two
+/// networks' fragments may share addresses and identification. A packet
+/// whose [`Ingress::scope`] is another is dropped with
+/// [`IpReport::OtherScope`]. A tunnel's network gets an IP layer of its
+/// own ([`IpLayer::host_in`]).
+///
 /// Fragments wait in [`Reassembly`], which holds at most 4 MiB, counting its
 /// bookkeeping, as fixed engine state outside the connection's budget. The
 /// layer keeps no charge of a packet it takes in: what it hands up is
@@ -359,6 +404,7 @@ pub enum IpReport {
 /// [`Packets`]' credit does.
 #[derive(Default)]
 pub struct IpLayer {
+    scope: Scope,
     reassembly: Reassembly,
     up: Option<PacketEvent<IpPacket>>,
     answer: Option<Chunk>,
@@ -368,14 +414,35 @@ pub struct IpLayer {
 }
 
 impl IpLayer {
-    /// A host's IP layer, taking packets in as their destination.
+    /// A host's IP layer on the world's own network ([`Scope::ROOT`]),
+    /// taking packets in as their destination.
     pub fn host() -> IpLayer {
         IpLayer::default()
+    }
+
+    /// A host's IP layer on network `scope`, such as the network inside a
+    /// tunnel.
+    pub fn host_in(scope: Scope) -> IpLayer {
+        IpLayer {
+            scope,
+            ..IpLayer::default()
+        }
+    }
+
+    /// The network it serves.
+    pub fn scope(&self) -> Scope {
+        self.scope
     }
 
     /// Takes in one raw packet the layer has room for.
     fn take_in(&mut self, env: &mut Env<'_, IpReport>, raw: Datagram<Ingress>) {
         let (bytes, ingress) = raw.into_parts();
+        if ingress.scope != self.scope {
+            env.report(IpReport::OtherScope {
+                scope: ingress.scope,
+            });
+            return;
+        }
         let bytes = bytes.into_vec();
         let before = Header::parse(&bytes);
         let fragment = before.as_ref().is_some_and(|h| h.fragment.is_some());
@@ -393,7 +460,8 @@ impl IpLayer {
                     }
                     _ => Origin::Arrived,
                 };
-                let packet = IpPacket::host(Chunk::new(whole), ingress, origin);
+                let header = IpPacket::check(&whole, &origin);
+                let packet = IpPacket::host(Chunk::new(whole), header, ingress, origin);
                 self.up = Some(PacketEvent::Packet(packet));
             }
             Intake::Waiting => {}
@@ -482,6 +550,10 @@ impl Layer for IpLayer {
         self.reassembly.next_expiry().map(|at| (at, ()))
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/packet-udp/kani/packet.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {
@@ -636,6 +708,26 @@ mod tests {
         }
         assert!(up(&mut d).is_empty());
         assert!(due >= Instant::ZERO + Duration::from_secs(1));
+    }
+
+    /// The driver hands packets in without firing due timers first, so the
+    /// rest of a packet can arrive after its deadline and before the timer
+    /// runs. They still do not complete it.
+    #[test]
+    fn fragments_after_the_deadline_complete_nothing_before_the_timer_runs() {
+        let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
+        let pieces = fragments(&whole, 32);
+        let mut d = driver();
+        assert!(matches!(
+            d.deliver(raw(pieces[0].clone())),
+            Ok(Admit::Taken)
+        ));
+        let due = d.deadline().unwrap();
+        d.set_now(due);
+        for p in &pieces[1..] {
+            assert!(matches!(d.deliver(raw(p.clone())), Ok(Admit::Taken)));
+        }
+        assert!(up(&mut d).is_empty());
     }
 
     #[test]
@@ -797,6 +889,127 @@ mod tests {
         assert!(budget.used() >= plain.len() + 64);
         drop(packet);
         assert_eq!(budget.used(), 0);
+    }
+
+    /// A tunnel's packets and the world's may share addresses, protocol and
+    /// identification. Their fragments, interleaved so that each could fill
+    /// the other's gaps, never meet: each IP layer puts together only its
+    /// own network's packet.
+    #[test]
+    fn inner_and_outer_fragments_with_one_key_stay_apart() {
+        let (a, b) = (addr("10.0.0.2"), addr("10.0.0.1"));
+        let fields = ip::Fields {
+            id: 7,
+            dont_fragment: false,
+            ..ip::Fields::default()
+        };
+        let outer = ip::packet_with(a, b, protocol::UDP, fields, &udp(100)).0;
+        let mut inner_udp = udp(100);
+        inner_udp[8..].reverse();
+        let inner = ip::packet_with(a, b, protocol::UDP, fields, &inner_udp).0;
+        let tunnel = Scope::tunnel();
+        let (outer_pieces, inner_pieces) = (fragments(&outer, 32), fragments(&inner, 32));
+        assert_eq!(outer_pieces.len(), 4);
+        // Alternate the two networks, each filling the other's gaps, then
+        // send the rest the same way.
+        let mut arrivals = Vec::new();
+        for round in [[0, 2], [1, 3]] {
+            for i in 0..4 {
+                let (scope, pieces) = if round.contains(&i) {
+                    (Scope::ROOT, &outer_pieces)
+                } else {
+                    (tunnel, &inner_pieces)
+                };
+                arrivals.push((scope, pieces[i].clone()));
+            }
+        }
+        for (layer, whole) in [
+            (IpLayer::host(), &outer),
+            (IpLayer::host_in(tunnel), &inner),
+        ] {
+            let scope = layer.scope();
+            let mut d = Driver::new(
+                layer,
+                Arc::new(SeededEntropy::new(Seed::from_u64(3))),
+                Budget::unlimited(),
+                Instant::ZERO,
+            );
+            let mut got = Vec::new();
+            for (from, bytes) in &arrivals {
+                let ingress = Ingress {
+                    scope: *from,
+                    ..Ingress::default()
+                };
+                let raw = PacketEvent::Packet(Datagram::new(Chunk::new(bytes.clone()), ingress));
+                assert!(matches!(d.deliver(raw), Ok(Admit::Taken)));
+                got.extend(up(&mut d));
+            }
+            assert_eq!(got.len(), 1, "one packet in scope {scope:?}");
+            assert_eq!(got[0].bytes(), &whole[..]);
+            assert_eq!(got[0].ingress().scope, scope);
+            let other = if scope == Scope::ROOT {
+                tunnel
+            } else {
+                Scope::ROOT
+            };
+            let reports = d.observations().drain().collect::<Vec<_>>();
+            assert_eq!(reports, [IpReport::OtherScope { scope: other }; 4]);
+        }
+    }
+
+    #[test]
+    fn a_checked_packet_is_what_the_ip_layer_hands_up() {
+        let (a, b) = (addr("10.0.0.2"), addr("10.0.0.1"));
+        let good = ip::packet(a, b, protocol::UDP, &udp(4)).0;
+        let mut d = driver();
+        assert!(matches!(d.deliver(raw(good.clone())), Ok(Admit::Taken)));
+        let layer = up(&mut d).pop().unwrap();
+        let checked = IpPacket::checked(
+            Chunk::new(good.clone()),
+            Ingress::default(),
+            Origin::Arrived,
+        )
+        .unwrap();
+        assert!(checked.is_checked() && layer.is_checked());
+        assert_eq!(checked.header(), layer.header());
+        assert_eq!(checked.transport(), layer.transport());
+        // The same bytes observed are read, but not checked.
+        let observed = IpPacket::observed(Chunk::new(good.clone()), Ingress::default());
+        assert_eq!(observed.transport(), Transport::Udp);
+        assert!(!observed.is_checked());
+        // What a host would not take in is handed back unchanged.
+        let mut bad_sum = good.clone();
+        bad_sum[10] ^= 1;
+        let fragment = fragments(&ip::packet(a, b, protocol::UDP, &udp(100)).0, 32).remove(0);
+        let (a6, b6) = (addr("2001:db8::2"), addr("2001:db8::1"));
+        let plain6 = ip::packet(a6, b6, protocol::UDP, &udp(3)).0;
+        let mut options6 = plain6[..40].to_vec();
+        options6[6] = protocol::DEST_OPTIONS;
+        options6.extend_from_slice(&[protocol::UDP, 0, 1, 4, 0, 0, 0, 0]);
+        options6.extend_from_slice(&plain6[40..]);
+        let len = (options6.len() - 40) as u16;
+        options6[4..6].copy_from_slice(&len.to_be_bytes());
+        for refused in [bad_sum, fragment, options6, vec![0x45]] {
+            let back = IpPacket::checked(
+                Chunk::new(refused.clone()),
+                Ingress::default(),
+                Origin::Arrived,
+            )
+            .unwrap_err();
+            assert_eq!(&back[..], &refused[..]);
+        }
+        let back = IpPacket::checked(
+            Chunk::new(good.clone()),
+            Ingress::default(),
+            Origin::Observed,
+        )
+        .unwrap_err();
+        assert_eq!(&back[..], &good[..]);
+        assert!(
+            IpPacket::checked(Chunk::new(plain6), Ingress::default(), Origin::Arrived)
+                .unwrap()
+                .is_checked()
+        );
     }
 
     #[test]
