@@ -126,6 +126,28 @@ that drives the layer through its port alone and failed before the fix:
 the other half of the counting rule in the code: a closed child's
 connection still counts in FIN-WAIT-2 and is let go at TIME-WAIT.
 
+## The other TCP proofs, rerun on the layer
+
+Every older proof that touches TCP was rerun on this branch, with TCP as
+a layer. None broke. Each passing TLC configuration completes with an
+empty queue, each Kani proof has no failed check, and each control fails
+on the property or assertion it names.
+
+| Proof | Passing runs | Controls |
+| --- | --- | --- |
+| [`tcp-port-zero`](../tcp-port-zero/README.md), TLA+ | `Socket` (18,192 generated, 1,072 distinct), `Binding_allocation` (1,506, 288), `Binding_preparation` (233,258, 9,986) | `Socket_nonzero_reset`: `PassiveResetRestores` |
+| `tcp-port-zero`, Kani | the socket, round-trip and renaming proofs (6,203, 452 and 739 checks, `8ef4c8781`) | each of the three fails on its one assertion |
+| [`lifecycle`](../lifecycle/README.md), TLA+ | `Conn` (2,476, 754), `Core_fixed` (508,676, 101,130), `Core_wide` (149,792, 24,000) | the five `Conn_without_*`; `Core_original_idle`: `IdleNeedsQuiet`; `Core_original_broken`: `ObservedCancel` |
+| `lifecycle`, Kani | the four `serve` proofs: timers (1,256 checks), budget (429), connection count (451), wake handle (813) | none: these proofs have no controls yet |
+| [`world-net`](../world-net/README.md), TLA+ | `Attachments_base` (11,046,773, 1,329,160), `Cable_base` (325, 72), `Ports_base` (32,492, 7,338), `Table_base` (875,839, 16,384) | `Attachments_forgetbyaddr` and `Attachments_namesbyroute`: `Attribution`; `Attachments_resetsbyroute`: `AbortsOnlyOwn`; `Cable_dropsilent`: `NothingForTheParked`; `Ports_registerlate`: `Served`; `Table_keeporphans`: `OpenPortsRouted`; `Table_nolengths`: `BestIsLongest` |
+| `world-net`, Kani | the six `Prefix` proofs (`c989c2e81`) | each of the six fails on its one assertion |
+| [`mptcp`](../mptcp/README.md), TLA+ | `Connection_base` (102, 62), `Data_base` (8,524, 2,061), `Listener_base` (5,053, 966), `Observation_base` (253,639, 48,357), `Observation_signals` (617,495,741, 58,398,812) | all sixteen `*_without_*` |
+
+The MPTCP Lean proofs are about the option codecs in `protocols/mptcp.rs`,
+which the layer does not touch. `lake build` still completes, and the
+axioms audit of all 42 headline theorems names no `sorryAx` and no native
+decision.
+
 ## The boundary in the code
 
 The tests in `mod layer` of `tcp/tests.rs` run `TcpLayer` under a `Driver`
