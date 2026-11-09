@@ -1,18 +1,12 @@
 //! Production head framing, supplementing the per-step body proofs.
-//! Source: protocols/http1.rs fields:1667, request_framing:1735,
-//! response_framing:1748, header_line:1787, request_head:1968.
+//! Source: protocols/http1.rs scan_fields:1676, request_framing:1753,
+//! response_framing:1766, header_parts:1805, RequestEvents::scan_request:857.
+//! fields and header_line delegate to these borrowed parsers before copying.
 //! native.rs:202 constructs RequestEvents with strict chunk framing.
 use super::*;
 
 fn find_byte(x: u8, text: &[u8]) -> Option<usize> {
     text.iter().position(|b| *b == x)
-}
-
-fn header(name: &str, value: &[u8]) -> Header {
-    Header {
-        name: name.into(),
-        value: value.to_vec(),
-    }
 }
 
 fn whitespace_trim(bytes: &[u8]) -> &[u8] {
@@ -42,18 +36,23 @@ fn decimal(bytes: &[u8]) -> Option<u64> {
 }
 
 fn lengths(a: [u8; 3], b: [u8; 3], joined: bool) {
+    let mut value = [0; 7];
+    value[..3].copy_from_slice(&a);
+    value[3] = b',';
+    value[4..].copy_from_slice(&b);
     let headers = if joined {
-        let mut value = a.to_vec();
-        value.push(b',');
-        value.extend_from_slice(&b);
-        vec![header("Content-Length", &value)]
+        [("Content-Length", &value[..]), ("", &[][..])]
     } else {
-        vec![header("Content-Length", &a), header("content-length", &b)]
+        [("Content-Length", &a[..]), ("content-length", &b[..])]
     };
-    let result = fields(&headers, Version::Http11).and_then(request_framing);
+    let headers = &headers[..if joined { 1 } else { 2 }];
+    let info = scan_fields(headers.iter().copied(), Version::Http11);
+    let result = info.and_then(request_framing);
     // Arbitrary bytes, including all controls, signs, and invalid digits.
     // Outer whitespace in constructed fields is forbidden by fields.
-    let canonical = headers.iter().all(|h| whitespace_trim(&h.value) == h.value);
+    let canonical = headers
+        .iter()
+        .all(|(_, value)| whitespace_trim(value) == *value);
     let mut expected = None;
     let mut valid = canonical;
     for raw in [&a[..], &b[..]] {
@@ -71,25 +70,35 @@ fn lengths(a: [u8; 3], b: [u8; 3], joined: bool) {
     kani::cover!(!valid);
     if valid {
         let expected = Ok(Framing::Length(expected.unwrap()));
-        assert_eq!(result, expected);
-        let info = fields(&headers, Version::Http11).unwrap();
+        assert!(result == expected);
+        let info = match info {
+            Ok(info) => info,
+            Err(_) => panic!("accepted fields must have framing"),
+        };
         let response = ResponseHead {
             version: Version::Http11,
             status: 200,
             reason: vec![],
-            headers,
+            headers: vec![],
         };
-        assert_eq!(response_framing(&response, info, Method::Other), expected);
+        assert!(response_framing(&response, info, Method::Other) == expected);
     } else {
         assert!(result.is_err());
     }
 }
 
 #[kani::proof]
-#[kani::unwind(24)]
+#[kani::unwind(16)]
 #[kani::stub(core::slice::memchr::memchr, find_byte)]
-fn content_lengths_have_one_value() {
-    lengths(kani::any(), kani::any(), kani::any());
+fn content_lengths_separate_have_one_value() {
+    lengths(kani::any(), kani::any(), false);
+}
+
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::stub(core::slice::memchr::memchr, find_byte)]
+fn content_lengths_joined_have_one_value() {
+    lengths(kani::any(), kani::any(), true);
 }
 
 // A broken numeric reader that ignores all but the first digit. Distinct
@@ -103,7 +112,7 @@ fn first_digit(bytes: &[u8], radix: u32, error: Error) -> Result<u64, Error> {
 }
 
 #[kani::proof]
-#[kani::unwind(24)]
+#[kani::unwind(16)]
 #[kani::stub(core::slice::memchr::memchr, find_byte)]
 #[kani::stub(number, first_digit)]
 fn content_lengths_control_truncated_number() {
@@ -127,58 +136,75 @@ fn transfer_fields(index: usize, with_length: bool, reversed: bool, old: bool, s
     } else {
         Version::Http11
     };
-    let mut headers = if split && matches!(index, 2..=4) {
+    let mut headers = [("", &[][..]); 3];
+    let mut count = if split && matches!(index, 2..=4) {
         let comma = variants[index].iter().position(|b| *b == b',').unwrap();
-        vec![
-            header("Transfer-Encoding", &variants[index][..comma]),
-            header("transfer-encoding", trim(&variants[index][comma + 1..])),
-        ]
+        headers[0] = ("Transfer-Encoding", &variants[index][..comma]);
+        headers[1] = ("transfer-encoding", trim(&variants[index][comma + 1..]));
+        2
     } else {
-        vec![header("Transfer-Encoding", variants[index])]
+        headers[0] = ("Transfer-Encoding", variants[index]);
+        1
     };
     if with_length {
-        let length = header("Content-Length", b"0");
+        let length = ("Content-Length", &b"0"[..]);
         if reversed {
-            headers.insert(0, length);
+            headers[2] = headers[1];
+            headers[1] = headers[0];
+            headers[0] = length;
         } else {
-            headers.push(length);
+            headers[count] = length;
         }
+        count += 1;
     }
-    let result = fields(&headers, version).and_then(request_framing);
+    let info = scan_fields(headers[..count].iter().copied(), version);
+    let result = info.and_then(request_framing);
     kani::cover!(result.is_ok());
     kani::cover!(result.is_err());
     if with_length || old || !matches!(index, 0 | 6) {
         assert!(result.is_err());
     } else {
-        assert_eq!(result, Ok(Framing::Chunked));
-        let info = fields(&headers, version).unwrap();
+        assert!(result == Ok(Framing::Chunked));
+        let info = match info {
+            Ok(info) => info,
+            Err(_) => panic!("accepted fields must have framing"),
+        };
         let response = ResponseHead {
             version,
             status: 200,
             reason: vec![],
-            headers,
+            headers: vec![],
         };
-        assert_eq!(response_framing(&response, info, Method::Other), result);
+        assert!(response_framing(&response, info, Method::Other) == result);
     }
 }
 
-#[kani::proof]
-#[kani::unwind(32)]
-#[kani::stub(core::slice::memchr::memchr, find_byte)]
-fn transfer_fields_have_one_boundary() {
-    transfer_fields(
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-    );
+macro_rules! transfer_proof {
+    ($name:ident, $form:expr) => {
+        #[kani::proof]
+        #[kani::unwind(20)]
+        #[kani::stub(core::slice::memchr::memchr, find_byte)]
+        fn $name() {
+            transfer_fields($form, kani::any(), kani::any(), kani::any(), kani::any());
+        }
+    };
 }
+transfer_proof!(transfer_fields_chunked, 0);
+transfer_proof!(transfer_fields_gzip, 1);
+transfer_proof!(transfer_fields_gzip_then_chunked, 2);
+transfer_proof!(transfer_fields_chunked_then_gzip, 3);
+transfer_proof!(transfer_fields_repeated_chunked, 4);
+transfer_proof!(transfer_fields_empty, 5);
+transfer_proof!(transfer_fields_empty_elements, 6);
+transfer_proof!(transfer_fields_parameters, 7);
 
 // An unsafe alternative field policy: Content-Length takes precedence,
 // otherwise any occurrence of chunked decides the boundary. It performs
 // actual parsing, but drops the ambiguity checks of fields.
-fn length_precedence(headers: &[Header], _: Version) -> Result<Fields, Error> {
+fn length_precedence<'a>(
+    headers: impl Iterator<Item = (&'a str, &'a [u8])> + Clone,
+    _: Version,
+) -> Result<Fields, Error> {
     let mut info = Fields {
         length: None,
         transfer: false,
@@ -186,13 +212,12 @@ fn length_precedence(headers: &[Header], _: Version) -> Result<Fields, Error> {
         unsupported_transfer_coding: false,
         close: false,
     };
-    for h in headers {
-        if h.name.eq_ignore_ascii_case("content-length") {
-            info.length = Some(number(&h.value, 10, Error::ContentLength)?);
-        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            info.length = Some(number(value, 10, Error::ContentLength)?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
             info.transfer = true;
-            info.chunked |= h
-                .value
+            info.chunked |= value
                 .split(|b| *b == b',')
                 .any(|v| trim(v).eq_ignore_ascii_case(b"chunked"));
         }
@@ -205,9 +230,9 @@ fn length_precedence(headers: &[Header], _: Version) -> Result<Fields, Error> {
 }
 
 #[kani::proof]
-#[kani::unwind(32)]
+#[kani::unwind(20)]
 #[kani::stub(core::slice::memchr::memchr, find_byte)]
-#[kani::stub(fields, length_precedence)]
+#[kani::stub(scan_fields, length_precedence)]
 fn transfer_fields_control_length_precedence() {
     transfer_fields(0, true, false, false, false);
 }
@@ -215,27 +240,72 @@ fn transfer_fields_control_length_precedence() {
 fn field_syntax(bytes: [u8; 4]) {
     // A complete field, without its line ending. This includes obs-fold,
     // bare CR/LF, whitespace before the colon, and every non-ASCII byte.
-    let result = header_line(&bytes, false).and_then(|h| fields(&[h], Version::Http11));
+    let result = header_parts(&bytes, false).is_ok_and(|(name, value)| {
+        assert!(name.len() <= 3);
+        assert!(!name.eq_ignore_ascii_case("content-length"));
+        assert!(!name.eq_ignore_ascii_case("transfer-encoding"));
+        assert!(!name.eq_ignore_ascii_case("connection"));
+        valid_field(name, value)
+    });
     let colon = bytes.iter().position(|b| *b == b':');
     let allowed = colon.is_some_and(|n| {
         n > 0
-            && bytes[..n]
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
+            && bytes[..n].iter().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
             && bytes[n + 1..]
                 .iter()
                 .all(|b| *b == 9 || (*b >= 32 && *b != 127))
     });
     kani::cover!(allowed);
     kani::cover!(!allowed);
-    assert_eq!(result.is_ok(), allowed);
+    assert!(result == allowed);
 }
 
+macro_rules! field_proof {
+    ($name:ident, $colon:expr) => {
+        #[kani::proof]
+        #[kani::unwind(16)]
+        #[kani::stub(core::slice::memchr::memchr, find_byte)]
+        fn $name() {
+            let mut bytes: [u8; 4] = kani::any();
+            bytes[$colon] = b':';
+            for byte in &bytes[..$colon] {
+                kani::assume(*byte != b':');
+            }
+            field_syntax(bytes);
+        }
+    };
+}
+field_proof!(strict_head_fields_empty_name, 0);
+field_proof!(strict_head_fields_one_byte_name, 1);
+field_proof!(strict_head_fields_two_byte_name, 2);
+field_proof!(strict_head_fields_three_byte_name, 3);
+
 #[kani::proof]
-#[kani::unwind(24)]
+#[kani::unwind(16)]
 #[kani::stub(core::slice::memchr::memchr, find_byte)]
-fn strict_head_fields_refuse_line_injection() {
-    field_syntax(kani::any());
+fn strict_head_fields_without_colon() {
+    let bytes: [u8; 4] = kani::any();
+    kani::assume(bytes.iter().all(|b| *b != b':'));
+    field_syntax(bytes);
 }
 
 fn allow_controls(_: u8) -> bool {
@@ -243,7 +313,7 @@ fn allow_controls(_: u8) -> bool {
 }
 
 #[kani::proof]
-#[kani::unwind(24)]
+#[kani::unwind(16)]
 #[kani::stub(core::slice::memchr::memchr, find_byte)]
 #[kani::stub(field_byte, allow_controls)]
 fn strict_head_fields_control_allow_controls() {
@@ -270,10 +340,10 @@ fn pipeline(n: usize, payload: [u8; 3]) {
     );
     let mut used = head_end;
     if n > 0 {
-        match decoder.decode(&wire[used..], false).unwrap() {
-            Step::Item(Event::Body(body), count) => {
-                assert_eq!(body, payload[..n]);
-                assert_eq!(count, n);
+        match decoder.decode(&wire[used..], false) {
+            Ok(Step::Item(Event::Body(body), count)) => {
+                assert!(body == payload[..n]);
+                assert!(count == n);
                 used += count;
             }
             _ => panic!("a length delimited body must end at its declared length"),
@@ -283,18 +353,26 @@ fn pipeline(n: usize, payload: [u8; 3]) {
         decoder.decode(&wire[used..], false),
         Ok(Step::Item(Event::Done, 0))
     ));
-    assert_eq!(used, next);
+    assert!(used == next);
     assert!(
         matches!(decoder.decode(&wire[used..], false), Ok(Step::Item(Event::Head(head), count)) if head.target == "/next" && count == wire.len() - next)
     );
 }
 
-#[kani::proof]
-#[kani::unwind(32)]
-#[kani::stub(core::slice::memchr::memchr, find_byte)]
-fn pipeline_starts_at_the_declared_boundary() {
-    pipeline(kani::any(), kani::any());
+macro_rules! pipeline_proof {
+    ($name:ident, $length:expr) => {
+        #[kani::proof]
+        #[kani::unwind(24)]
+        #[kani::stub(core::slice::memchr::memchr, find_byte)]
+        fn $name() {
+            pipeline($length, kani::any());
+        }
+    };
 }
+pipeline_proof!(pipeline_boundary_empty_body, 0);
+pipeline_proof!(pipeline_boundary_one_byte, 1);
+pipeline_proof!(pipeline_boundary_two_bytes, 2);
+pipeline_proof!(pipeline_boundary_three_bytes, 3);
 
 // A framing bug that treats a declared body as empty consumes its bytes
 // as the start of the following request instead.
@@ -303,7 +381,7 @@ fn ignore_length(_: Fields) -> Result<Framing, Error> {
 }
 
 #[kani::proof]
-#[kani::unwind(32)]
+#[kani::unwind(24)]
 #[kani::stub(core::slice::memchr::memchr, find_byte)]
 #[kani::stub(request_framing, ignore_length)]
 fn pipeline_control_ignore_length() {
@@ -342,29 +420,44 @@ fn head_lines(bytes: [u8; 10], len: usize, cut: usize) {
         headers: 4,
         ..Limits::default()
     };
+    kani::assume(cut <= len);
     let mut reader = Reader::new(limits);
     let expected = head_boundary(input);
-    let got = reader.head(input).map_err(|_| ());
+    let first = reader.head(&input[..cut]).map_err(|_| ());
+    let got = if first == Ok(None) {
+        reader.head(input).map_err(|_| ())
+    } else {
+        first
+    };
+    // The cut at zero includes an unsplit scan for every input, so this
+    // single comparison proves both the grammar and split independence.
     kani::cover!(matches!(got, Ok(Some(_))));
     kani::cover!(got.is_err());
     kani::cover!(matches!(got, Ok(None)));
-    assert_eq!(got, expected);
-    kani::assume(cut <= len);
-    let mut split = Reader::new(limits);
-    let first = split.head(&input[..cut]).map_err(|_| ());
-    if first == Ok(None) {
-        assert_eq!(split.head(input).map_err(|_| ()), expected);
-    } else {
-        assert_eq!(first, expected);
-    }
+    assert!(got == expected);
 }
 
-#[kani::proof]
-#[kani::unwind(12)]
-#[kani::stub(core::slice::memchr::memchr, find_byte)]
-fn head_boundaries_require_crlf() {
-    head_lines(kani::any(), kani::any(), kani::any());
+macro_rules! head_proof {
+    ($name:ident, $length:expr) => {
+        #[kani::proof]
+        #[kani::unwind(12)]
+        #[kani::stub(core::slice::memchr::memchr, find_byte)]
+        fn $name() {
+            head_lines(kani::any(), $length, kani::any());
+        }
+    };
 }
+head_proof!(head_boundaries_length_zero, 0);
+head_proof!(head_boundaries_length_one, 1);
+head_proof!(head_boundaries_length_two, 2);
+head_proof!(head_boundaries_length_three, 3);
+head_proof!(head_boundaries_length_four, 4);
+head_proof!(head_boundaries_length_five, 5);
+head_proof!(head_boundaries_length_six, 6);
+head_proof!(head_boundaries_length_seven, 7);
+head_proof!(head_boundaries_length_eight, 8);
+head_proof!(head_boundaries_length_nine, 9);
+head_proof!(head_boundaries_length_ten, 10);
 
 // A lenient scanner that makes a bare LF a line ending. It can disagree
 // with a strict peer on the end of a request head.
