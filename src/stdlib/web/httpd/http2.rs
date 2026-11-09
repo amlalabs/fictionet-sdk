@@ -14,21 +14,23 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 
 use fictionet::stdlib::codec::{self, Fail, Wire};
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, ChildId, Chunk, Credited, Env, Layer, Mux, MuxCommand, MuxEvent,
-    MuxOp, Slots, StreamCommand, StreamEvent, Top,
+    Admit, ByteStream, Charge, ChildId, Chunk, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Slots,
+    StreamCommand, StreamEvent, Top,
 };
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
 use fictionet::time::Instant;
 
 use super::Limits;
-use super::response::request_held;
+use super::response::{headers_held, request_held};
 
 mod exchange;
 mod grpc;
 mod respond;
 
-pub use exchange::{Ending, ExchangeCommand, ExchangeEvent, HttpExchange, Opening, ResponseHead};
+pub use exchange::{
+    Ending, ExchangeCommand, ExchangeEvent, HttpExchange, Opening, RequestTrailers, ResponseHead,
+};
 pub use grpc::{Grpc, GrpcCommand, GrpcEvent};
 pub use respond::{Http2Server, Respond, Responder, Work as RespondWork};
 
@@ -178,8 +180,9 @@ struct Receive {
 /// The request on its way up to the child, within the credit the child
 /// grants.
 struct Delivery {
-    /// What waits for the child's credit, in order.
-    pending: VecDeque<ExchangeEvent>,
+    /// Body bytes that wait for the child's credit, in order. Behind them
+    /// go the overflow, if any, and then the end.
+    pending: ChargedQueue<Chunk>,
     /// Bytes of DATA frames waiting in `pending`: they count against the
     /// receive windows until they go up.
     windowed_bytes: u32,
@@ -194,8 +197,72 @@ struct Delivery {
     peak_credit_bytes: u64,
     /// The child has granted credit at least once.
     credited: bool,
-    /// The connection could not hold the body: the rest of it is dropped.
-    overflow: bool,
+    overflow: Overflow,
+    end: RequestEnd,
+}
+
+/// Whether the connection could hold a request's body.
+enum Overflow {
+    /// All of it so far.
+    None,
+    /// It dropped this many bytes and drops the rest of the body. The
+    /// child hears once the body before them has gone up.
+    Dropped(u64),
+    /// It drops the rest of the body, as the child heard.
+    Told,
+}
+
+/// A request's end on its way to the child.
+enum RequestEnd {
+    /// The request goes on.
+    Open,
+    /// The request ended, with these trailers if it had any. The child
+    /// hears once its body and any overflow have gone up.
+    Ended(Option<Box<RequestTrailers>>),
+    /// The child heard the end.
+    Told,
+}
+
+/// A queue whose storage is charged to the budget before it grows.
+struct ChargedQueue<T> {
+    items: VecDeque<T>,
+    storage: Charge,
+}
+
+impl<T> ChargedQueue<T> {
+    /// An empty queue, its storage charged to `storage` as it grows.
+    fn new(storage: Charge) -> Self {
+        Self {
+            items: VecDeque::new(),
+            storage,
+        }
+    }
+
+    /// Puts `item` at the back, charging the queue's growth first. Hands
+    /// `item` back if the growth does not fit.
+    fn push_back(&mut self, item: T) -> Result<(), T> {
+        if self.items.len() == self.items.capacity() {
+            let places = (self.items.capacity() * 2).max(4);
+            if !self.storage.set(places * size_of::<T>()) {
+                return Err(item);
+            }
+            self.items.reserve_exact(places - self.items.len());
+        }
+        self.items.push_back(item);
+        Ok(())
+    }
+
+    fn front_mut(&mut self) -> Option<&mut T> {
+        self.items.front_mut()
+    }
+
+    fn pop_front(&mut self) -> Option<T> {
+        self.items.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 /// The response on its way out, within the client's send windows.
@@ -205,7 +272,7 @@ struct Response {
     /// Body credit the child holds: the bytes it may still send down.
     credit_bytes: u64,
     /// Body bytes the child sent that wait to be framed.
-    queue: VecDeque<Chunk>,
+    queue: ChargedQueue<Chunk>,
     /// The bytes in `queue`.
     queued_bytes: u64,
     /// Body bytes whose whole frames the transport took.
@@ -387,11 +454,11 @@ impl Http2 {
             }
             if admitted && let Some(mut chunk) = body {
                 if chunk.reserve(env.budget()) {
-                    self.tell_outside(1, chunk);
+                    self.deliver_body(1, chunk, false);
                 } else {
-                    self.tell(1, ExchangeEvent::Overflow(chunk.len() as u64));
+                    self.overflow(1, chunk.len() as u64);
                 }
-                self.tell(1, ExchangeEvent::End);
+                self.end_request(1, None);
             }
         }
     }
@@ -607,6 +674,9 @@ impl Http2 {
         let child_id = child.id();
         opening.charge = Some(head);
         opening.ended = ended;
+        // The stream's queues charge their storage as they grow.
+        let pending = env.budget().charge(0).expect("nothing always fits");
+        let queue = env.budget().charge(0).expect("nothing always fits");
         self.streams.insert(
             id,
             Stream {
@@ -619,18 +689,19 @@ impl Http2 {
                     window: WINDOW,
                 },
                 delivery: Delivery {
-                    pending: VecDeque::new(),
+                    pending: ChargedQueue::new(pending),
                     windowed_bytes: 0,
                     unwindowed_bytes: 0,
                     credit_bytes: 0,
                     peak_credit_bytes: 0,
                     credited: false,
-                    overflow: false,
+                    overflow: Overflow::None,
+                    end: RequestEnd::Open,
                 },
                 response: Response {
                     window: self.initial,
                     credit_bytes: SEND_CREDIT,
-                    queue: VecDeque::new(),
+                    queue: ChargedQueue::new(queue),
                     queued_bytes: 0,
                     written_bytes: 0,
                     reply: Reply::Waiting,
@@ -643,57 +714,85 @@ impl Http2 {
         Ok(())
     }
 
-    /// Sends stream `id`'s child `event`, in order behind what waits for
-    /// its credit. Its body bytes came in DATA frames, within the receive
-    /// windows.
-    fn tell(&mut self, id: u32, event: ExchangeEvent) {
+    /// Sends stream `id`'s child body bytes, in order behind what waits for
+    /// its credit. `windowed` bytes came in DATA frames, within the receive
+    /// windows; the others are the body an `Upgrade: h2c` request brought
+    /// over HTTP/1. Bytes the stream's queue cannot hold overflow.
+    fn deliver_body(&mut self, id: u32, chunk: Chunk, windowed: bool) {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        stream.delivery.windowed_bytes += event.credit() as u32;
-        stream.delivery.pending.push_back(event);
+        let delivery = &mut stream.delivery;
+        let len = chunk.len();
+        match delivery.pending.push_back(chunk) {
+            Ok(()) if windowed => delivery.windowed_bytes += len as u32,
+            Ok(()) => delivery.unwindowed_bytes += len as u64,
+            Err(_) => delivery.overflow = Overflow::Dropped(len as u64),
+        }
         self.forward(id);
     }
 
-    /// Sends stream `id`'s child the body an `Upgrade: h2c` request
-    /// brought, which came outside the receive windows.
-    fn tell_outside(&mut self, id: u32, chunk: Chunk) {
-        let Some(stream) = self.streams.get_mut(&id) else {
-            return;
-        };
-        stream.delivery.unwindowed_bytes += chunk.len() as u64;
-        stream
-            .delivery
-            .pending
-            .push_back(ExchangeEvent::Data(chunk));
+    /// The connection cannot hold the next `dropped` bytes of stream
+    /// `id`'s body: it drops them and the rest of the body, and the child
+    /// hears so.
+    fn overflow(&mut self, id: u32, dropped: u64) {
+        if let Some(stream) = self.streams.get_mut(&id)
+            && matches!(stream.delivery.overflow, Overflow::None)
+        {
+            stream.delivery.overflow = Overflow::Dropped(dropped);
+        }
+        self.forward(id);
+    }
+
+    /// Stream `id`'s request ended, with `trailers` if it had them.
+    fn end_request(&mut self, id: u32, trailers: Option<Box<RequestTrailers>>) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            stream.delivery.end = RequestEnd::Ended(trailers);
+        }
         self.forward(id);
     }
 
     /// Moves what waits for stream `id`'s credit up, as far as it goes. A
     /// body piece larger than the credit goes up in part: the child's
-    /// credit may never cover it whole.
+    /// credit may never cover it whole. The overflow and the end follow
+    /// the body, and need no credit.
     fn forward(&mut self, id: u32) {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
         let delivery = &mut stream.delivery;
-        while let Some(event) = delivery.pending.front_mut() {
-            let cost = event.credit();
-            let event = if cost <= delivery.credit_bytes {
-                delivery.pending.pop_front().expect("a pending event")
-            } else if let ExchangeEvent::Data(chunk) = event
-                && delivery.credit_bytes > 0
-            {
-                ExchangeEvent::Data(chunk.split_to(delivery.credit_bytes as usize))
+        while delivery.credit_bytes > 0
+            && let Some(front) = delivery.pending.front_mut()
+        {
+            let n = (front.len() as u64).min(delivery.credit_bytes);
+            let chunk = if n == front.len() as u64 {
+                delivery.pending.pop_front().expect("a pending chunk")
             } else {
-                break;
+                front.split_to(n as usize)
             };
-            let cost = event.credit();
-            delivery.credit_bytes -= cost;
-            let unwindowed = cost.min(delivery.unwindowed_bytes);
+            delivery.credit_bytes -= n;
+            let unwindowed = n.min(delivery.unwindowed_bytes);
             delivery.unwindowed_bytes -= unwindowed;
-            delivery.windowed_bytes -= (cost - unwindowed) as u32;
-            self.up.push_back(MuxEvent::Child(stream.child, event));
+            delivery.windowed_bytes -= (n - unwindowed) as u32;
+            self.up
+                .push_back(MuxEvent::Child(stream.child, ExchangeEvent::Data(chunk)));
+        }
+        if !delivery.pending.is_empty() {
+            return;
+        }
+        if let Overflow::Dropped(dropped) = delivery.overflow {
+            delivery.overflow = Overflow::Told;
+            self.up.push_back(MuxEvent::Child(
+                stream.child,
+                ExchangeEvent::Overflow(dropped),
+            ));
+        }
+        match std::mem::replace(&mut delivery.end, RequestEnd::Told) {
+            RequestEnd::Ended(trailers) => {
+                let event = trailers.map_or(ExchangeEvent::End, ExchangeEvent::Trailers);
+                self.up.push_back(MuxEvent::Child(stream.child, event));
+            }
+            other => delivery.end = other,
         }
     }
 
@@ -773,13 +872,17 @@ impl Http2 {
             if stream.receive.content_remaining.is_some_and(|n| n != 0) {
                 return self.reset(env, id, ErrorCode::ProtocolError);
             }
-            let trailers = trailer_map(block);
+            let fields = trailer_map(block);
+            let held = size_of::<RequestTrailers>() + headers_held(&fields);
+            let Some(charge) = env.budget().charge(held) else {
+                return self.reset(env, id, ErrorCode::EnhanceYourCalm);
+            };
             self.streams
                 .get_mut(&id)
                 .expect("an open stream")
                 .receive
                 .closed = true;
-            self.tell(id, ExchangeEvent::Trailers(Box::new(trailers)));
+            self.end_request(id, Some(Box::new(RequestTrailers { fields, charge })));
             return Ok(());
         }
         if self.draining || self.streams.len() >= self.limits.streams as usize {
@@ -881,24 +984,19 @@ impl Http2 {
         }
         let end = data.flags & 1 != 0;
         receive.closed = end;
-        if !data.data.is_empty() && !stream.delivery.overflow {
+        if !data.data.is_empty() && matches!(stream.delivery.overflow, Overflow::None) {
             match env.budget().charge(data.data.capacity()) {
                 Some(charge) => {
                     let chunk = Chunk::with_charge(data.data, charge);
-                    self.tell(id, ExchangeEvent::Data(chunk));
+                    self.deliver_body(id, chunk, true);
                 }
-                None => {
-                    // The body is the stream's alone to lose: its child
-                    // answers, and the other streams go on.
-                    let dropped = data.data.len() as u64;
-                    let stream = self.streams.get_mut(&id).expect("an open stream");
-                    stream.delivery.overflow = true;
-                    self.tell(id, ExchangeEvent::Overflow(dropped));
-                }
+                // The body is the stream's alone to lose: its child
+                // answers, and the other streams go on.
+                None => self.overflow(id, data.data.len() as u64),
             }
         }
         if end {
-            self.tell(id, ExchangeEvent::End);
+            self.end_request(id, None);
         }
         Ok(())
     }
@@ -1214,9 +1312,12 @@ impl Http2 {
                 self.response_head(env, id, *head);
             }
             ExchangeCommand::Data(chunk) if body && chunk.len() as u64 <= response.credit_bytes => {
-                response.credit_bytes -= chunk.len() as u64;
-                response.queued_bytes += chunk.len() as u64;
-                response.queue.push_back(chunk);
+                let len = chunk.len() as u64;
+                if response.queue.push_back(chunk).is_err() {
+                    return self.over_budget(env);
+                }
+                response.credit_bytes -= len;
+                response.queued_bytes += len;
             }
             ExchangeCommand::Trailers(trailers) if body => {
                 response.reply = Reply::Ending(Some(trailers));
@@ -2575,19 +2676,22 @@ mod tests {
     struct Picky {
         stuck: bool,
         body: Vec<u8>,
+        /// The bytes of body each command carries.
+        piece: usize,
         out: VecDeque<ExchangeCommand>,
     }
 
     impl Picky {
         fn new(opening: Opening) -> Self {
-            Self::answering(opening, BODY.to_vec())
+            Self::answering(opening, BODY.to_vec(), BODY.len())
         }
 
-        /// The same, answering with `body`.
-        fn answering(opening: Opening, body: Vec<u8>) -> Self {
+        /// The same, answering with `body` in commands of `piece` bytes.
+        fn answering(opening: Opening, body: Vec<u8>, piece: usize) -> Self {
             let mut picky = Picky {
                 stuck: opening.request.uri().path() == "/stuck",
                 body,
+                piece,
                 out: VecDeque::new(),
             };
             if opening.ended && !picky.stuck {
@@ -2597,15 +2701,17 @@ mod tests {
         }
 
         fn answer(&mut self) {
-            self.out.extend([
-                ExchangeCommand::Head(Box::new(ResponseHead {
+            self.out
+                .push_back(ExchangeCommand::Head(Box::new(ResponseHead {
                     status: StatusCode::OK,
                     headers: HeaderMap::new(),
                     end: false,
-                })),
-                ExchangeCommand::Data(Chunk::new(self.body.clone())),
-                ExchangeCommand::End,
-            ]);
+                })));
+            for piece in self.body.chunks(self.piece) {
+                self.out
+                    .push_back(ExchangeCommand::Data(Chunk::new(piece.to_vec())));
+            }
+            self.out.push_back(ExchangeCommand::End);
         }
     }
 
@@ -2818,13 +2924,14 @@ mod tests {
     /// A server whose streams answer `GET` with `body`, charging `budget`.
     fn answering(
         body: Vec<u8>,
+        piece: usize,
         budget: Budget,
     ) -> Harness<impl Layer<Lower = ByteStream, Error: std::fmt::Debug>> {
         use fictionet::stdlib::layer::{Chain, Children};
         let server = Chain::new(
             Http2::new(Limits::default()),
             Children::new(16, Http2::WINDOW, move |_, opening, _| {
-                Some(Picky::answering(opening, body.clone()))
+                Some(Picky::answering(opening, body.clone(), piece))
             }),
         );
         Harness::with_budget(fictionet::Seed::from_u64(3), server, budget)
@@ -2852,7 +2959,7 @@ mod tests {
         // separate writes.
         let body = vec![b'z'; wire::DEFAULT_FRAME_SIZE];
         let budget = Budget::new(1 << 24);
-        let mut harness = answering(body.clone(), budget.clone());
+        let mut harness = answering(body.clone(), body.len(), budget.clone());
         harness.push(&client_preface()).unwrap();
         harness.take_output();
         harness.withhold();
@@ -2892,5 +2999,128 @@ mod tests {
             "{output:?}"
         );
         assert!(harness.ended());
+    }
+
+    #[test]
+    fn a_body_in_many_small_frames_charges_the_queue_that_holds_it() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        // A child that grants one byte of credit and never reads: the rest
+        // of the body waits in the connection, one queue entry per frame.
+        let budget = Budget::unlimited();
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(8, 1, |_, _, _| Some(Sink::reading(false))),
+        );
+        let mut harness =
+            Harness::with_budget(fictionet::Seed::from_u64(4), server, budget.clone());
+        harness.push(&client_preface()).unwrap();
+        harness.push(&headers_without_end(1)).unwrap();
+        let before = budget.used();
+        let count = 8192;
+        let mut input = Vec::new();
+        for _ in 0..count {
+            write(
+                &wire::Data {
+                    stream: 1,
+                    flags: 0,
+                    data: vec![b'y'],
+                    padding: None,
+                },
+                &mut input,
+            );
+        }
+        harness.push(&input).unwrap();
+        assert!(!harness.ended());
+        let charged = budget.used() - before;
+        assert!(
+            charged >= count * size_of::<Chunk>(),
+            "{charged} bytes charged for {count} queued pieces"
+        );
+    }
+
+    #[test]
+    fn a_response_in_many_small_pieces_charges_the_queue_that_holds_it() {
+        let count = 4096;
+        let budget = Budget::unlimited();
+        let mut harness = answering(vec![b'p'; count], 1, budget.clone());
+        // The client's streams start with no window: the body waits in
+        // the connection.
+        let mut input = wire::PREFACE.to_vec();
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting { id: 4, value: 0 }],
+            },
+            &mut input,
+        );
+        write(
+            &wire::Settings {
+                flags: 1,
+                entries: Vec::new(),
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        let before = budget.used();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        let output = frames(&harness.take_output());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Headers(h) if h.stream == 1))
+        );
+        assert!(!output.iter().any(|f| matches!(f, Frame::Data(_))));
+        let charged = budget.used() - before;
+        assert!(
+            charged >= count * size_of::<Chunk>(),
+            "{charged} bytes charged for {count} queued pieces"
+        );
+    }
+
+    #[test]
+    fn received_trailers_are_charged_while_they_are_held() {
+        let budget = Budget::unlimited();
+        // `/stuck` takes no event, so the trailers wait for it.
+        let mut harness = answering(BODY.to_vec(), BODY.len(), budget.clone());
+        harness.push(&client_preface()).unwrap();
+        harness.push(&headers_to(1, "/stuck")).unwrap();
+        let before = budget.used();
+        let value = vec![b'v'; 4000];
+        let mut block = Vec::new();
+        hpack::Encoder::new(0)
+            .encode_block(
+                &[hpack::Field::new("x-trailer", value.as_slice())],
+                &mut block,
+            )
+            .unwrap();
+        let mut input = Vec::new();
+        write(
+            &wire::Headers {
+                stream: 1,
+                flags: 5,
+                fragment: block,
+                priority: None,
+                padding: None,
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        let held = budget.used() - before;
+        assert!(held >= value.len(), "{held} bytes charged while held");
+        // The client gives up on the stream: the trailers are dropped, and
+        // their charge with them.
+        let mut reset = Vec::new();
+        write(
+            &wire::Reset {
+                stream: 1,
+                flags: 0,
+                code: ErrorCode::Cancel as u32,
+            },
+            &mut reset,
+        );
+        harness.push(&reset).unwrap();
+        assert!(budget.used() < before + value.len());
+        assert!(!harness.ended());
     }
 }
