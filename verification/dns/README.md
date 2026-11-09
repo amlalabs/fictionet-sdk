@@ -29,8 +29,8 @@ cargo xtask dns-verify all
 | `cargo xtask dns-verify diff [seed]` | the vectors, then `cargo test --test dns_vectors` against them, for each seed |
 | `cargo xtask dns-verify all` | all of the above, with a summary |
 
-Everything goes under `dns-verify/` in Cargo's target directory
-(`CARGO_TARGET_DIR`, or `target/`): `tlc/` holds each TLC run's config and
+Everything goes into an exclusive run directory beneath `dns-verify/` in
+Cargo's target directory (`CARGO_TARGET_DIR`, or `target/`): `tlc/` holds each TLC run's config and
 output, `lean/` the output of `lake`, `vectors/<seed>/` the vectors of each seed, `diff-<seed>.out` the
 differential test's output, and `SUMMARY.txt` the summary of `all`. The
 vectors are made again on every run and never committed; the same seed

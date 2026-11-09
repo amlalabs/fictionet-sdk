@@ -20,7 +20,9 @@ use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 pub async fn run(args: &[String]) -> crate::Result {
     let [world, address, port] = args else {
-        return Err("usage: cargo xtask-host ssh-connect WORLD_UNIX_SOCKET IPV4_ADDRESS PORT".into());
+        return Err(
+            "usage: cargo xtask-host ssh-connect WORLD_UNIX_SOCKET IPV4_ADDRESS PORT".into(),
+        );
     };
     let target = SocketAddr::new(address.parse::<Ipv4Addr>()?.into(), port.parse()?);
     let seed = fictionet::Seed::random();

@@ -3,6 +3,10 @@
 Issues and pull requests are welcome. For a large change, open an issue first.
 Security problems go by email, not in issues: see [SECURITY.md](SECURITY.md).
 
+See [faster checks](docs/gates.md) for the opt-in `cargo xtask gate`, shared
+build caches, proof scheduling costs, and grouped Kani commands. Host image and
+capture commands use `cargo xtask-host`; verification uses `cargo xtask`.
+
 ## Building and checking
 
 The `fictionet` command is the `fictionet-cli` package in `cli/`, and Cargo
