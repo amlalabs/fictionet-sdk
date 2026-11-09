@@ -1995,12 +1995,25 @@ impl TcpLayer {
             let Some(charge) = budget.charge(n) else {
                 break;
             };
-            let mut bytes = vec![0; n];
-            let got = s.recv_slice(&mut bytes).unwrap_or(0);
+            // Copied straight out of the socket's ring, which may hand the
+            // bytes over in two pieces, into memory nothing zeroed first.
+            let mut bytes = Vec::with_capacity(n);
+            while bytes.len() < n && s.can_recv() {
+                let took = s
+                    .recv(|data| {
+                        let take = data.len().min(n - bytes.len());
+                        bytes.extend_from_slice(&data[..take]);
+                        (take, take)
+                    })
+                    .unwrap_or(0);
+                if took == 0 {
+                    break;
+                }
+            }
+            let got = bytes.len();
             if got == 0 {
                 break;
             }
-            bytes.truncate(got);
             c.recv_credit -= got as u64;
             self.up.push_back(MuxEvent::Child(
                 id,
@@ -2052,14 +2065,20 @@ impl TcpLayer {
 
     /// Brings every open child up to date, in socket order.
     fn refresh_all(&mut self, budget: &Budget) {
-        let open: Vec<Id> = self
+        // Each open connection is found from the one before it: a refresh
+        // may close connections, and no list is made ahead.
+        let mut from = Id(0);
+        while let Some(h) = self
             .conns
-            .iter()
-            .filter(|(_, c)| c.open)
+            .range(from..)
+            .find(|(_, c)| c.open)
             .map(|(h, _)| *h)
-            .collect();
-        for h in open {
+        {
             self.refresh(budget, h);
+            let Some(next) = h.0.checked_add(1) else {
+                break;
+            };
+            from = Id(next);
         }
     }
 
