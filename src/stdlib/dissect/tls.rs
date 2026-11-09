@@ -1,7 +1,7 @@
 use fictionet::stdlib::codec::{be16, be24};
 use fictionet::stdlib::dissect::{
     Conversation, Decoded, KeyLog, Layer, Match, Observed, Place, Placement, Present, Protocol,
-    Registry, protocols,
+    Registry, Seen, protocols,
 };
 use fictionet::stdlib::layer::Termination;
 use fictionet::stdlib::network::Transport;
@@ -38,7 +38,18 @@ struct Tls {
     /// stream last got bytes, such as early data under a key the key log
     /// does not have: what it carried is missing from that stream.
     unopened: [bool; 2],
+    /// How much of the key log was searched for this session's secrets,
+    /// with the hellos as they are now.
+    searched: Seen,
 }
+
+/// The key log labels of each side's secrets (the SSLKEYLOGFILE format):
+/// its handshake traffic secret, then its first application traffic
+/// secret. The client's come first.
+const SECRET_LABELS: [[&str; 2]; 2] = [
+    ["CLIENT_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_TRAFFIC_SECRET_0"],
+    ["SERVER_HANDSHAKE_TRAFFIC_SECRET", "SERVER_TRAFFIC_SECRET_0"],
+];
 
 /// A TLS capture session with record framing, handshake state, and TLS 1.3
 /// decryption from the capture's key log. Register with [`Self::register`].
@@ -310,12 +321,14 @@ impl Tls {
             hs_sealed: [Vec::new(), Vec::new()],
             key_update: [false; 2],
             unopened: [false; 2],
+            searched: Seen::default(),
         }
     }
 
     /// Sets up decryption for both directions, once the hellos are known
     /// and the capture's key log has their secrets. Until then it looks
-    /// again at each encrypted record, so keys added late are found.
+    /// again at each encrypted record that finds the log grown, so keys
+    /// added late are found.
     fn find_keys(&mut self) {
         let (Some(random), Some(cipher), Some(client)) =
             (&self.client_random, self.cipher, self.client)
@@ -328,21 +341,20 @@ impl Tls {
         let Some(suite) = suite(cipher) else {
             return;
         };
-        self.key_log.read(|lines| {
+        let keys = &mut self.keys;
+        self.key_log.read_new(&mut self.searched, |lines| {
             let secret = |label: &str| {
                 lines
                     .iter()
                     .find(|k| k.label == label && &k.client_random == random)
                     .map(|k| k.secret.as_slice())
             };
-            for (dir, side) in [(client, "CLIENT"), (1 - client, "SERVER")] {
-                if self.keys[dir].is_some() {
+            for (dir, [handshake, app]) in [client, 1 - client].into_iter().zip(SECRET_LABELS) {
+                if keys[dir].is_some() {
                     continue;
                 }
-                let hs = secret(&format!("{side}_HANDSHAKE_TRAFFIC_SECRET"));
-                let app = secret(&format!("{side}_TRAFFIC_SECRET_0"));
-                if let (Some(hs), Some(app)) = (hs, app) {
-                    self.keys[dir] = DirKeys::new(suite, hs, app);
+                if let (Some(hs), Some(app)) = (secret(handshake), secret(app)) {
+                    keys[dir] = DirKeys::new(suite, hs, app);
                 }
             }
         });
@@ -618,6 +630,7 @@ impl Tls {
                 1 if m.len() >= 34 && !decrypted => {
                     self.client_random = Some(m[2..34].to_vec());
                     self.client = Some(i);
+                    self.searched = Seen::default();
                     l.field(
                         "Random",
                         fictionet::stdlib::dissect::hex(&m[2..34]),
@@ -647,6 +660,7 @@ impl Tls {
                             return names;
                         };
                         self.cipher = Some(c);
+                        self.searched = Seen::default();
                         l.note("Cipher suite", cipher_name(c));
                     }
                     for (ext, data) in extensions(m, false) {
