@@ -462,14 +462,24 @@ impl IpLayer {
             });
             return;
         }
-        let bytes = bytes.into_vec();
         let before = Header::parse(&bytes);
         let fragment = before.as_ref().is_some_and(|h| h.fragment.is_some());
-        let original = (!fragment
-            && before
-                .as_ref()
-                .is_some_and(|h| h.src.is_ipv6() && h.payload.start != 40))
-        .then(|| Chunk::new(bytes.clone()));
+        let extended = before
+            .as_ref()
+            .is_some_and(|h| h.src.is_ipv6() && h.payload.start != 40);
+        // A whole IPv4 packet goes up as it came, in the buffer it came
+        // in: reassembly would hand it back unchanged. Only its expiry of
+        // waiting fragments is kept up. An IPv6 packet has its chain
+        // checked there first.
+        if before.as_ref().is_some_and(|h| h.src.is_ipv4()) && !fragment {
+            self.reassembly.expire(env.now());
+            let header = IpPacket::check(&bytes, &Origin::Arrived);
+            let packet = IpPacket::host(bytes, header, ingress, Origin::Arrived);
+            self.up = Some(PacketEvent::Packet(packet));
+            return;
+        }
+        let bytes = bytes.into_vec();
+        let original = (!fragment && extended).then(|| Chunk::new(bytes.clone()));
         match self.reassembly.push(Packet(bytes), env.now()) {
             Intake::Whole(Packet(whole)) => {
                 let origin = match original {
