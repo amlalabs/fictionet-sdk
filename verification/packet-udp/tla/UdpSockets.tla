@@ -17,7 +17,8 @@
    budget (`env.budget().charge(cost)`, 358); when the budget has no room
    it is dropped and reported like one for a full queue, so Arrive may
    drop any datagram that fits. Each arriving packet is of some network
-   and is checked (`IpPacket::is_checked`) or an observed copy.
+   and is checked or an observed copy. The current Rust transport accepts
+   only CheckedIpPacket; this older model includes the input boundary.
 
    The code visits sockets in the order of its `ready` list (`wake`,
    217-225) and gives a socket's send credit back (`MuxEvent::Credit`,
@@ -29,13 +30,13 @@ EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS
     Ports,            \* the ports sockets bind
     Nets,             \* the networks packets come from
-    Mine,             \* the layer's network: UdpLayer::new(scope, ..)
+    Mine,             \* the endpoint's input network
     MaxChildren,      \* how many sockets are ever bound
     MaxArrivals,      \* how many packets arrive
     MaxGrant,         \* the most credit outstanding per socket
     Queue,            \* QUEUE, in units
     DatagramCost,     \* DATAGRAM_COST, in units
-    CheckScope,       \* take_in drops other networks' packets (the code)
+    CheckScope,       \* the dispatcher drops other networks' packets
     CheckChecked,     \* take_in drops unchecked packets (the code)
     KeepEmpty,        \* take_in queues empty datagrams (the code)
     RemoveOnClose,    \* close removes the slot and its queue (the code)

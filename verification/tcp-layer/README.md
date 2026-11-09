@@ -157,13 +157,12 @@ over `IpLayer` with no runtime, and reach it only through the `Tcp` port:
 `Listen`, `Accept`, `Connect`, `Hold` and `Abort` down, children,
 `TcpNotice` and stream events up.
 
-Below, the layer takes in only checked packets of its own network, as the
-UDP layer does (`verification/packet-udp`): an observed copy, or a packet
-of another scope, never reaches smoltcp. The model starts at a peer event
-smoltcp accepted, so it does not include that check;
-`only_checked_packets_of_its_own_network_reach_tcp` in `mod layer` tests
-it, alone and under `IpLayer::host_in`, and fails with either half of the
-check taken out.
+Below, the layer takes only `CheckedIpPacket`, as the UDP layer does.
+Its endpoint owns the raw input path and IP reassembly. A component combining
+networks separates them before passing bytes to an endpoint; passive copies
+use `ObservedIpPacket` and cannot enter the transport port. The model starts
+at a peer event smoltcp accepted. Its recorded results predate this API
+separation and have not been rerun for it.
 
 `tcp::Endpoint`, the async handles in `tcp.rs` that the world's hosts use
 today, sends every reset (`Abort`, `AbortPeers`) and every admission

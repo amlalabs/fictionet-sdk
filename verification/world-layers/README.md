@@ -88,26 +88,12 @@ path is `drive`, built once per machine by `Machine::stage` through
 `network::endpoint::prepare`; `OneDispatcher` checks that staging never
 builds a second. The UDP facade of a machine (`udp::Endpoint`) and its TCP
 handles are views of the transports `drive` owns, with no IP layer of their
-own. `kani/dispatch.rs` has two harnesses on the production `destination`:
-the file is a child module of `network/endpoint.rs` under `cfg(kani)`,
-with no stubs. `an_observed_copy_reaches_nothing`: over every 28-byte
-packet, any link, and the world's network or either of two tunnels' for
-the copy and for the host, an observed copy goes nowhere.
-`a_host_packet_goes_only_to_its_transport_on_its_network`: a 28-byte
-IPv4 packet from 10.0.0.2 to 10.0.0.1 with any protocol, "don't
-fragment" or not, any eight payload bytes and a header checksum that
-verifies or is wrong, taken in by the standard `IpLayer` on any of those
-three networks, reaches exactly the transport its own bytes name, only
-on the dispatcher's network and only with a header the host read; a
-packet of another network reaches nothing. The header's other fields are
-fixed, since with every header byte symbolic the proof ran past 25
-minutes. Eight payload bytes sort TCP, UDP and a plain ICMP message; an
-ICMP error that quotes a transport needs more and is not reached.
-Neither harness has a `kani::cover`: that the host path is reached is
-read from `IpLayer::take_in`, which takes in every packet of its network
-and hands it up, with a header when the checksum verifies, not proved.
-The transports check this too (`udp/sockets.rs` 316, `tcp/engine.rs`
-2451); the dispatcher's check is what a replacement TCP gets as well.
+own. Host transports now accept only `CheckedIpPacket`; passive observations
+have a separate type. The endpoint owns its input path and reassembly, and
+a dispatcher separates labelled networks before IP intake. The historical
+`kani/dispatch.rs` harnesses exercised the former combined packet API and
+its repeated scope checks. They have not been ported or rerun for this
+change; the results below do not establish the new type boundary.
 
 **Application stacks attach directly to transport children, and counts
 outlive them.** `tcp::Listener::attach` and `udp::Socket::attach` hand the
@@ -115,7 +101,7 @@ transports' children to the stacks; `Admission` checks that closing a
 finished application never releases the count.
 
 **The tunnel keeps inner and outer networks apart.** A stream carrying
-packet frames feeds an IP layer of its own, with the tunnel's scope, so
+packet frames feeds an IP layer through its own input path, so
 inner fragments never meet the host's reassembly. The new test
 `packet_composition::inner_fragments_with_the_outer_keys_stay_in_their_network`
 gives the inner network the outer connection's addresses, and both

@@ -37,6 +37,15 @@
 //! handshake, so DHCP, neighbor discovery and DNS travel as ordinary
 //! packets when they travel at all.
 //!
+//! Each endpoint owns this input path and its IP reassembly. A packet tunnel
+//! feeds a separate endpoint through `packet::Framed::new()` and
+//! `IpLayer::host()`. The IP boundary validates raw chunks before handing
+//! `CheckedIpPacket` values to host transports. Passive capture input uses
+//! `ObservedIpPacket` instead, retaining truncated bytes and capture context.
+//! When several networks share a capture, the dispatcher separates their
+//! identities before address-based lookup or reassembly; an interface number
+//! alone does not identify an inner tunnel network.
+//!
 //! A message is at most 65,536 bytes, so a packet is at most 65,535
 //! bytes. Attach's `hello`, the first message it sends, carries an MTU, which the world reads with
 //! [`Attachment::mtu`](crate::Attachment::mtu). It is advice for UDP and

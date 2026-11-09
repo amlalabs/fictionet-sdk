@@ -420,7 +420,7 @@ What the SDK already does the Skywalk way, and what it does not:
   charge each child holds: the advisory, per flow, before the bytes move.
 - Batching. The endpoint drains a turn's packets, output and work
   together, up to 64 turns a poll, before it yields.
-- From skb, kept: pull. `IpPacket` keeps the header and its payload as a
+- From skb, kept: pull. `CheckedIpPacket` keeps the header and its payload as a
   range into one chunk, and `Chunk::advance` moves the window without a
   copy. Headroom for pushing headers is not needed: smoltcp writes a
   packet's headers and payload into one buffer in one pass. Shared
@@ -488,8 +488,9 @@ keyed by the peer's addresses keep the keyed hash on purpose. HTTP bench
 43.36 G to 42.58 G instructions, TCP bulk 5.89 G to 5.71 G, round trips
 0.692 G to 0.665 G, allocations over the two HTTP runs 19.15 M to
 18.14 M. No Kani harness ran in this pass. The harnesses in
-`verification/packet-udp` cover `IpPacket::check` and `checked`, which
-did not change; the IP layer's intake, which did, has none. The layer
+`verification/packet-udp` covered the former combined packet constructor
+at the time of that pass; the later split into host and observed packet
+types has not been verified by those harnesses; the IP layer's intake, which did, has none. The layer
 models in `tla/` and `verification/layer` describe the driver, the
 children and the stream runner, whose rules did not change: the depth
 check moved to where the composition grows, chunks carry their charge
