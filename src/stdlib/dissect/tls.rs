@@ -1,7 +1,7 @@
 use fictionet::stdlib::codec::{be16, be24};
 use fictionet::stdlib::dissect::{
-    Conversation, Decoded, KeyLine, Layer, Match, Observed, Place, Placement, Present, Protocol,
-    Registry, protocols,
+    Conversation, Decoded, Layer, Match, Observed, Place, Placement, Present, Protocol, Registry,
+    protocols,
 };
 use fictionet::stdlib::layer::Termination;
 use fictionet::stdlib::network::Transport;
@@ -78,11 +78,11 @@ impl TlsSession {
     }
 }
 impl Protocol for TlsSession {
-    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, keys: &[KeyLine]) {
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded) {
         let i = usize::from(reverse);
         match &mut self.dirs[i] {
             Some(dir) => dir.data_with(bytes, at, d, |item, raw, start, place, d| {
-                self.tls.present_record(i, item, raw, start, place, d, keys)
+                self.tls.present_record(i, item, raw, start, place, d)
             }),
             None => d.application(1, "TLS", "Not decoded: earlier bytes were not captured"),
         }
@@ -307,9 +307,10 @@ impl Tls {
         }
     }
 
-    /// Sets up decryption for both directions, once the hellos and the
-    /// keys are known.
-    fn find_keys(&mut self, keys: &[KeyLine]) {
+    /// Sets up decryption for both directions, once the hellos are known
+    /// and the capture's key log has their secrets. Until then it looks
+    /// again at each encrypted record, so keys added late are found.
+    fn find_keys(&mut self) {
         let (Some(random), Some(cipher), Some(client)) =
             (&self.client_random, self.cipher, self.client)
         else {
@@ -321,24 +322,26 @@ impl Tls {
         let Some(suite) = suite(cipher) else {
             return;
         };
-        let secret = |label: &str| {
-            keys.iter()
-                .find(|k| k.label == label && &k.client_random == random)
-                .map(|k| k.secret.as_slice())
-        };
-        for (dir, side) in [(client, "CLIENT"), (1 - client, "SERVER")] {
-            if self.keys[dir].is_some() {
-                continue;
+        self.registry.keys().read(|lines| {
+            let secret = |label: &str| {
+                lines
+                    .iter()
+                    .find(|k| k.label == label && &k.client_random == random)
+                    .map(|k| k.secret.as_slice())
+            };
+            for (dir, side) in [(client, "CLIENT"), (1 - client, "SERVER")] {
+                if self.keys[dir].is_some() {
+                    continue;
+                }
+                let hs = secret(&format!("{side}_HANDSHAKE_TRAFFIC_SECRET"));
+                let app = secret(&format!("{side}_TRAFFIC_SECRET_0"));
+                if let (Some(hs), Some(app)) = (hs, app) {
+                    self.keys[dir] = DirKeys::new(suite, hs, app);
+                }
             }
-            let hs = secret(&format!("{side}_HANDSHAKE_TRAFFIC_SECRET"));
-            let app = secret(&format!("{side}_TRAFFIC_SECRET_0"));
-            if let (Some(hs), Some(app)) = (hs, app) {
-                self.keys[dir] = DirKeys::new(suite, hs, app);
-            }
-        }
+        });
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn present_record(
         &mut self,
         i: usize,
@@ -347,7 +350,6 @@ impl Tls {
         start: u64,
         place: &Placement,
         d: &mut Decoded,
-        keys: &[KeyLine],
     ) {
         if item.oversized {
             let mut layer = Layer::new("Transport Layer Security", 0, (0, record.len()));
@@ -358,19 +360,11 @@ impl Tls {
             d.application(1, "TLS", "Record too long");
         } else {
             let (buf, base) = place.locate(d, start, record, "Reassembled TLS record");
-            self.record(i, record, buf, base, d, keys);
+            self.record(i, record, buf, base, d);
         }
     }
 
-    fn record(
-        &mut self,
-        i: usize,
-        record: &[u8],
-        buf: usize,
-        base: usize,
-        d: &mut Decoded,
-        keys: &[KeyLine],
-    ) {
+    fn record(&mut self, i: usize, record: &[u8], buf: usize, base: usize, d: &mut Decoded) {
         let kind = record[0];
         let body = &record[5..];
         let version = |tls: &Tls| {
@@ -421,7 +415,7 @@ impl Tls {
             }
             23 => {
                 let version = version(self);
-                self.find_keys(keys);
+                self.find_keys();
                 let opened = self.keys[i].as_mut().and_then(|k| k.open(body));
                 match opened {
                     None => {
@@ -527,7 +521,7 @@ impl Tls {
             if std::mem::take(&mut self.unopened[i]) {
                 conversation.lost(i != 0);
             }
-            conversation.data(i != 0, plain, place, d, &[]);
+            conversation.data(i != 0, plain, place, d);
         }
     }
 
@@ -747,7 +741,7 @@ mod proofs;
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use fictionet::stdlib::dissect::Match;
+    use fictionet::stdlib::dissect::{KeyLine, Match};
 
     #[test]
     fn alpn_matchers_choose_registered_protocols() {
@@ -993,20 +987,8 @@ pub(super) mod tests {
             },
             |_| [Tiny, Tiny],
         );
+        registry.keys().extend(key_lines(7, 2, 1));
         let mut conversation = Conversation::with_registry(40000, 9443, registry);
-        let keys: Vec<_> = [
-            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
-            "CLIENT_TRAFFIC_SECRET_0",
-            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
-            "SERVER_TRAFFIC_SECRET_0",
-        ]
-        .into_iter()
-        .map(|label| KeyLine {
-            label: label.into(),
-            client_random: vec![7; 32],
-            secret: vec![if label.contains("HANDSHAKE") { 2 } else { 1 }; 32],
-        })
-        .collect();
         let mut offsets = [0; 2];
         let mut feed = |reverse: bool, record: &[u8]| {
             let i = usize::from(reverse);
@@ -1021,7 +1003,6 @@ pub(super) mod tests {
                     ..Place::default()
                 },
                 &mut packet,
-                &keys,
             );
             offsets[i] += record.len() as u64;
             packet
@@ -1087,6 +1068,141 @@ pub(super) mod tests {
         }
     }
 
+    /// The plaintext records of a TLS 1.3 session's hellos, the client's
+    /// with random `random` and the server's choosing
+    /// TLS_AES_128_GCM_SHA256.
+    fn hellos(random: u8) -> [Vec<u8>; 2] {
+        let record = |message: Vec<u8>| {
+            let mut record = vec![22, 3, 3, (message.len() >> 8) as u8, message.len() as u8];
+            record.extend_from_slice(&message);
+            record
+        };
+        let mut client = vec![3, 3];
+        client.extend_from_slice(&[random; 32]);
+        client.extend_from_slice(&[0, 0, 2, 0x13, 1, 1, 0, 0, 0]);
+        let mut server = vec![3, 3];
+        server.extend_from_slice(&[random.wrapping_add(1); 32]);
+        server.extend_from_slice(&[0, 0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
+        [
+            record(handshake_message(1, &client)),
+            record(handshake_message(2, &server)),
+        ]
+    }
+
+    /// The key log of the session with client random `random`: every
+    /// handshake secret is `handshake` repeated, every traffic secret
+    /// `traffic`.
+    fn key_lines(random: u8, handshake: u8, traffic: u8) -> Vec<KeyLine> {
+        [
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_TRAFFIC_SECRET_0",
+        ]
+        .into_iter()
+        .map(|label| KeyLine {
+            label: label.into(),
+            client_random: vec![random; 32],
+            secret: vec![
+                if label.contains("HANDSHAKE") {
+                    handshake
+                } else {
+                    traffic
+                };
+                32
+            ],
+        })
+        .collect()
+    }
+
+    /// A registry with the built-ins and "tiny", chosen for a stream that
+    /// starts with a five-byte "hello" message.
+    fn with_tiny(mut registry: Registry) -> Registry {
+        registry.register(
+            "tiny",
+            |s| {
+                if s.first.starts_with(b"\x05hello") {
+                    Match::Yes
+                } else if b"\x05hello".starts_with(s.first) {
+                    Match::More
+                } else {
+                    Match::No
+                }
+            },
+            |_| [Tiny, Tiny],
+        );
+        registry
+    }
+
+    /// A conversation fed one record at a time, each its own packet.
+    struct Records {
+        conversation: Conversation,
+        offsets: [u64; 2],
+    }
+
+    impl Records {
+        fn new(registry: Registry) -> Records {
+            Records {
+                conversation: Conversation::with_registry(40000, 443, registry),
+                offsets: [0; 2],
+            }
+        }
+
+        /// What the packet carrying `record` decoded to.
+        fn feed(&mut self, reverse: bool, record: &[u8]) -> Decoded {
+            let i = usize::from(reverse);
+            let mut packet = Decoded::default();
+            let place = Place {
+                stream_start: self.offsets[i],
+                offset: Some(0),
+                len: record.len(),
+                ..Place::default()
+            };
+            self.conversation.data(reverse, record, place, &mut packet);
+            self.offsets[i] += record.len() as u64;
+            packet
+        }
+    }
+
+    /// TLS inside TLS: the inner session reads the same capture's keys, so
+    /// what it carries is decrypted too.
+    #[test]
+    fn tls_inside_tls_is_decrypted_with_the_captures_keys() {
+        let registry = with_tiny(Registry::default());
+        registry
+            .keys()
+            .extend(key_lines(7, 2, 1).into_iter().chain(key_lines(9, 4, 3)));
+        let mut records = Records::new(registry);
+        let [client, server] = hellos(7);
+        records.feed(false, &client);
+        records.feed(true, &server);
+        let [client, server] = hellos(9);
+        records.feed(false, &seal(&[1; 32], 0, 23, &client));
+        records.feed(true, &seal(&[1; 32], 0, 23, &server));
+        let inner = seal(&[3; 32], 0, 23, b"\x05hello");
+        let packet = records.feed(false, &seal(&[1; 32], 1, 23, &inner));
+        assert_eq!(packet.proto, "Tiny");
+        assert_eq!(packet.info, "hello");
+    }
+
+    /// Keys that reach the capture's log after a session began are found
+    /// at its next encrypted record.
+    #[test]
+    fn keys_added_after_the_handshake_reach_the_open_session() {
+        let registry = with_tiny(Registry::default());
+        let keys = registry.keys().clone();
+        let mut records = Records::new(registry);
+        let [client, server] = hellos(7);
+        records.feed(false, &client);
+        records.feed(true, &server);
+        let early = records.feed(true, &seal(&[1; 32], 0, 23, b"\x05early"));
+        assert!(!early.tags.contains(&"decrypted"));
+        keys.extend(key_lines(7, 2, 1));
+        let packet = records.feed(false, &seal(&[1; 32], 0, 23, b"\x05hello"));
+        assert!(packet.tags.contains(&"decrypted"));
+        assert_eq!(packet.info, "hello");
+    }
+
     #[test]
     fn partial_handshakes_append_without_reallocating_the_held_prefix() {
         for decrypted in [false, true] {
@@ -1150,7 +1266,7 @@ pub(super) mod tests {
             };
             at += record.len() as u64;
             dir.data_with(record, place, &mut d, |item, raw, start, place, d| {
-                tls.present_record(0, item, raw, start, place, d, &[])
+                tls.present_record(0, item, raw, start, place, d)
             });
             d.tags.contains(&"decrypted")
         };
@@ -1203,7 +1319,7 @@ pub(super) mod tests {
             };
             at[i] += record.len() as u64;
             dir.data_with(record, place, &mut d, |item, raw, start, place, d| {
-                tls.present_record(i, item, raw, start, place, d, &[])
+                tls.present_record(i, item, raw, start, place, d)
             });
             d.tags.contains(&"decrypted")
         };
@@ -1263,7 +1379,7 @@ pub(super) mod tests {
             };
             at += record.len() as u64;
             dir.data_with(record, place, &mut d, |item, raw, start, place, d| {
-                tls.present_record(0, item, raw, start, place, d, &[])
+                tls.present_record(0, item, raw, start, place, d)
             });
             assert!(d.tags.contains(&"decrypted"), "{d:?}");
             let inside: Vec<String> = d
@@ -1294,7 +1410,7 @@ pub(super) mod tests {
             fictionet::stdlib::dissect::Conversation::with_registry(40000, 443, registry);
         let mut packet = Decoded::default();
         let record = [22, 3, 3, 0, 4, 20, 0, 0, 0];
-        conversation.data(false, &record[..3], Place::default(), &mut packet, &[]);
+        conversation.data(false, &record[..3], Place::default(), &mut packet);
         assert!(conversation.waiting(false));
         conversation.data(
             false,
@@ -1304,7 +1420,6 @@ pub(super) mod tests {
                 ..Place::default()
             },
             &mut packet,
-            &[],
         );
         assert_eq!(packet.proto, "TLS");
         assert_eq!(packet.info, "Finished");

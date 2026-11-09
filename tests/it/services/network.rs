@@ -547,7 +547,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             .lock()
             .unwrap()
             .iter()
-            .map(|p| dissector.decode(p, &[]))
+            .map(|p| dissector.decode(p))
             .collect();
         let layer_names: BTreeSet<String> = decoded
             .iter()

@@ -37,6 +37,7 @@ use fictionet::stdlib::layer::{
 use fictionet::stdlib::network::ip::Header;
 use fictionet::stdlib::network::observer::{self, Observer, ObserverReport};
 use fictionet::stdlib::network::packet::{Capture, Ingress, ObservedIpPacket, Scope};
+use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 
@@ -58,6 +59,36 @@ impl fmt::Debug for KeyLine {
             .field("label", &self.label)
             .field("client_random", &self.client_random)
             .field("secret_len", &self.secret.len())
+            .finish()
+    }
+}
+
+/// The TLS secrets a capture has, as [`KeyLine`]s. Each [`Registry`] has
+/// one, and its clones share it, so every TLS session of a capture reads
+/// the same log, a session inside another session's decrypted stream
+/// included. A session reads it whenever it still needs keys: lines added
+/// after it began reach it at its next encrypted record.
+#[derive(Clone, Default)]
+pub struct KeyLog {
+    lines: Arc<Mutex<Vec<KeyLine>>>,
+}
+
+impl KeyLog {
+    /// Adds `lines` to the log.
+    pub fn extend(&self, lines: impl IntoIterator<Item = KeyLine>) {
+        self.lines.lock().extend(lines);
+    }
+
+    /// Calls `read` with the lines so far.
+    fn read<T>(&self, read: impl FnOnce(&[KeyLine]) -> T) -> T {
+        read(&self.lines.lock())
+    }
+}
+
+impl fmt::Debug for KeyLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyLog")
+            .field("lines", &self.lines.lock().len())
             .finish()
     }
 }
@@ -486,9 +517,16 @@ impl Dissector {
         }
     }
 
+    /// The capture's TLS secrets: its registry's [`KeyLog`]. Lines added
+    /// to it reach sessions already open, at their next encrypted record.
+    pub fn keys(&self) -> &KeyLog {
+        self.registry.keys()
+    }
+
     /// Forgets every connection after packets were missed, such as when a
     /// capture sampled or evicted some. No decoder joins bytes across the
-    /// gap. Reassembly limits and the registry stay as they are.
+    /// gap. Reassembly limits, the registry and its key log stay as they
+    /// are.
     pub fn lost(&mut self) {
         self.observer = tcp_observer(self.observer.layer().limits());
         self.connections.clear();
@@ -501,7 +539,7 @@ impl Dissector {
     /// that the sender finished. Returns what that completes, as one more
     /// entry, whose first layer notes how each stream ended and what was
     /// missing. The dissector then starts over, as for a new capture.
-    pub fn finish(&mut self, keys: &[KeyLine]) -> Decoded {
+    pub fn finish(&mut self) -> Decoded {
         let mut d = Decoded {
             info: "End of capture".into(),
             ..Decoded::default()
@@ -510,28 +548,23 @@ impl Dissector {
         end.summary = format!("{} TCP connections were open", self.connections.len());
         d.push(end);
         let (_, seen) = self.observe(PacketEvent::Ended);
-        self.apply(seen, &mut d, keys, None, 0, None);
+        self.apply(seen, &mut d, None, 0, None);
         self.lost();
         d.cap_info();
         d
     }
 
-    /// Decodes one raw IPv4 or IPv6 packet. Pass TLS key log entries when
-    /// decryption is wanted. Packet sources may be pcap readers or live captures.
-    pub fn decode(&mut self, p: &[u8], keys: &[KeyLine]) -> Decoded {
-        self.decode_with(p, keys, None, true)
+    /// Decodes one raw IPv4 or IPv6 packet. TLS is decrypted with the
+    /// lines in [`keys`](Self::keys). Packet sources may be pcap readers or
+    /// live captures.
+    pub fn decode(&mut self, p: &[u8]) -> Decoded {
+        self.decode_with(p, None, true)
     }
 
     /// Decodes an unlabelled copy with its service identity and payload
     /// availability. Use [`Self::decode_captured`] for capture provenance.
-    pub fn decode_with(
-        &mut self,
-        p: &[u8],
-        keys: &[KeyLine],
-        protocol: Option<&str>,
-        complete: bool,
-    ) -> Decoded {
-        let mut decoded = self.decode_captured(p, keys, protocol, complete, Ingress::default());
+    pub fn decode_with(&mut self, p: &[u8], protocol: Option<&str>, complete: bool) -> Decoded {
+        let mut decoded = self.decode_captured(p, protocol, complete, Ingress::default());
         decoded.ingress = None;
         decoded
     }
@@ -541,7 +574,6 @@ impl Dissector {
     pub fn decode_captured(
         &mut self,
         p: &[u8],
-        keys: &[KeyLine],
         protocol: Option<&str>,
         complete: bool,
         ingress: Ingress,
@@ -558,8 +590,8 @@ impl Dissector {
             ..Decoded::default()
         };
         match p.first().map(|b| b >> 4) {
-            Some(4) => self.ipv4(p, &mut d, keys, context),
-            Some(6) => self.ipv6(p, &mut d, keys, context),
+            Some(4) => self.ipv4(p, &mut d, context),
+            Some(6) => self.ipv6(p, &mut d, context),
             _ => {
                 d.proto = "?".into();
                 d.info = format!("Not an IP packet ({} bytes)", p.len());
@@ -578,13 +610,7 @@ impl Dissector {
         d
     }
 
-    fn ipv4(
-        &mut self,
-        p: &[u8],
-        d: &mut Decoded,
-        keys: &[KeyLine],
-        mut context: DecodeContext<'_>,
-    ) {
+    fn ipv4(&mut self, p: &[u8], d: &mut Decoded, mut context: DecodeContext<'_>) {
         let Some(header) = Header::parse_truncated(p) else {
             return truncated(d, "IPv4", p.len());
         };
@@ -640,16 +666,10 @@ impl Dissector {
         d.push(l);
         d.src = src.to_string();
         d.dst = dst.to_string();
-        self.transport(p, &header, d, keys, context);
+        self.transport(p, &header, d, context);
     }
 
-    fn ipv6(
-        &mut self,
-        p: &[u8],
-        d: &mut Decoded,
-        keys: &[KeyLine],
-        mut context: DecodeContext<'_>,
-    ) {
+    fn ipv6(&mut self, p: &[u8], d: &mut Decoded, mut context: DecodeContext<'_>) {
         let Some(header) = Header::parse_truncated(p) else {
             return truncated(d, "IPv6", p.len());
         };
@@ -698,7 +718,7 @@ impl Dissector {
         l.range.1 = header.payload.start;
         d.push(l);
         context.complete &= 40 + payload <= p.len();
-        self.transport(p, &header, d, keys, context);
+        self.transport(p, &header, d, context);
     }
 
     /// Decodes what follows the IP header. A fragment after the first
@@ -711,7 +731,6 @@ impl Dissector {
         p: &[u8],
         header: &Header,
         d: &mut Decoded,
-        keys: &[KeyLine],
         mut context: DecodeContext<'_>,
     ) {
         let (at, end, proto) = (header.payload.start, header.payload.end, header.protocol);
@@ -734,7 +753,7 @@ impl Dissector {
             context.complete = false;
         }
         match proto {
-            6 => self.tcp(p, at, end, d, keys, context),
+            6 => self.tcp(p, at, end, d, context),
             17 => self.udp(p, header, d, context),
             1 => icmp(p, at, end, d, false),
             58 => icmp(p, at, end, d, true),
@@ -753,7 +772,6 @@ impl Dissector {
         at: usize,
         end: usize,
         d: &mut Decoded,
-        keys: &[KeyLine],
         context: DecodeContext<'_>,
     ) {
         let t = &p[at..end];
@@ -894,7 +912,7 @@ impl Dissector {
             d.tag("late");
         }
         let layers = d.layers.len().checked_add(d.cut);
-        let last = self.apply(seen, d, keys, context.protocol, notes, Some(self.packets));
+        let last = self.apply(seen, d, context.protocol, notes, Some(self.packets));
         if let Some((id, reverse)) = last
             && d.layers.len().checked_add(d.cut) == layers
             && self
@@ -977,7 +995,6 @@ impl Dissector {
         &mut self,
         seen: Vec<Observation>,
         d: &mut Decoded,
-        keys: &[KeyLine],
         protocol: Option<&str>,
         notes: usize,
         packet: Option<u64>,
@@ -1020,7 +1037,7 @@ impl Dissector {
                     };
                     watched.delivered[i] = watched.delivered[i].saturating_add(bytes.len() as u64);
                     let conversation = watched.conversation.get_or_insert_with(open);
-                    conversation.data(reverse, &bytes, place, d, keys);
+                    conversation.data(reverse, &bytes, place, d);
                     last = Some((id, reverse));
                 }
                 ObservedEvent::Gap { missing, .. } => {
@@ -1158,7 +1175,7 @@ impl Dissector {
                 offset: Some(body.0),
                 len: bytes.len(),
             };
-            protocol.datagram(reverse, bytes, place, d, &[]);
+            protocol.datagram(reverse, bytes, place, d);
         }
     }
 }
@@ -1394,14 +1411,14 @@ mod tests {
                     original_len: syn.len(),
                 }),
             };
-            let decoded = dissector.decode_captured(&syn, &[], None, true, ingress);
+            let decoded = dissector.decode_captured(&syn, None, true, ingress);
             assert_eq!(decoded.ingress, Some(ingress));
             assert_eq!(dissector.observer.layer().connections(), index + 1);
             let replacement = Ingress {
                 link: 19,
                 ..ingress
             };
-            dissector.decode_captured(&syn, &[], None, true, replacement);
+            dissector.decode_captured(&syn, None, true, replacement);
             assert_eq!(dissector.observer.layer().connections(), index + 1);
         }
         for scope in networks {
@@ -1415,7 +1432,7 @@ mod tests {
                     original_len: request.len(),
                 }),
             };
-            let decoded = dissector.decode_captured(&request, &[], None, true, ingress);
+            let decoded = dissector.decode_captured(&request, None, true, ingress);
             assert!(!decoded.tags.contains(&"retransmission"));
             assert!(decoded.level() > 0);
             assert!(decoded.extra.is_empty());
@@ -1433,7 +1450,7 @@ mod tests {
             }),
             ..Ingress::default()
         };
-        let decoded = Dissector::default().decode_captured(&request, &[], None, true, ingress);
+        let decoded = Dissector::default().decode_captured(&request, None, true, ingress);
         assert_eq!(decoded.level(), 0);
         assert_eq!(decoded.ingress, Some(ingress));
     }
@@ -1460,7 +1477,7 @@ mod tests {
                 }),
                 ..Ingress::default()
             };
-            result = dissector.decode_captured(packet, &[], None, true, ingress);
+            result = dissector.decode_captured(packet, None, true, ingress);
             assert_eq!(result.ingress, Some(ingress));
             assert!(observations.insert(result.observation.unwrap()));
         }
@@ -1484,7 +1501,7 @@ mod tests {
                 scope: scopes.tunnel(),
                 ..Ingress::default()
             };
-            dissector.decode_captured(&packet, &[], None, true, ingress);
+            dissector.decode_captured(&packet, None, true, ingress);
             assert_eq!(dissector.udp.len(), (index + 1).min(UDP_CONVERSATIONS));
         }
     }
@@ -1509,7 +1526,7 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: site.test\r\n\r\n",
         );
         let mut dissector = Dissector::default();
-        let decoded = dissector.decode_with(&packet, &[], Some("http1"), false);
+        let decoded = dissector.decode_with(&packet, Some("http1"), false);
         assert_eq!(decoded.proto, "TCP");
         assert!(
             decoded
@@ -1523,7 +1540,7 @@ mod tests {
                 .iter()
                 .any(|layer| layer.name == "Hypertext Transfer Protocol")
         );
-        let decoded = dissector.decode(&packet[..packet.len() - 1], &[]);
+        let decoded = dissector.decode(&packet[..packet.len() - 1]);
         assert_eq!(decoded.proto, "TCP");
         assert!(
             !decoded
@@ -1537,7 +1554,7 @@ mod tests {
     fn a_ping_is_decoded() {
         let mut echo = vec![8, 0, 0, 0, 0x12, 0x34, 0, 7];
         echo.extend_from_slice(&[0; 16]);
-        let d = Dissector::default().decode(&ipv4(1, [10, 0, 0, 2], [10, 0, 0, 1], &echo), &[]);
+        let d = Dissector::default().decode(&ipv4(1, [10, 0, 0, 2], [10, 0, 0, 1], &echo));
         assert_eq!(
             (d.src.as_str(), d.dst.as_str(), d.proto.as_str()),
             ("10.0.0.2", "10.0.0.1", "ICMP")
@@ -1560,7 +1577,7 @@ mod tests {
             &payload,
         );
         let header = Header::parse(&packet.0).unwrap();
-        let decoded = Dissector::default().decode(&packet.0, &[]);
+        let decoded = Dissector::default().decode(&packet.0);
         assert_eq!(decoded.proto, "ICMPv6");
         assert_eq!(decoded.src, header.src.to_string());
         assert_eq!(decoded.dst, header.dst.to_string());
@@ -1578,7 +1595,7 @@ mod tests {
             0xc3, 0x50, 0, 80, 0, 0, 0, 100, 0, 0, 0, 0, 0x60, 0x02, 0xfa, 0xf0, 0, 0, 0, 0,
         ];
         syn.extend_from_slice(&[2, 4, 0x05, 0xb4]);
-        let d = Dissector::default().decode(&ipv4(6, [10, 0, 0, 2], [203, 0, 113, 10], &syn), &[]);
+        let d = Dissector::default().decode(&ipv4(6, [10, 0, 0, 2], [203, 0, 113, 10], &syn));
         assert_eq!(d.src, "10.0.0.2:50000");
         assert_eq!(d.dst, "203.0.113.10:80");
         assert_eq!(d.info, "50000 → 80 [SYN] Seq=0 Win=64240 Len=0 MSS=1460");
@@ -1685,10 +1702,10 @@ mod tests {
         let request = b"GET / HTTP/1.1\r\n\r\nGET /two HTTP/1.1\r\nHost: example.test\r\n\r\n";
         for (family, src, dst, whole, split) in FAMILIES {
             let mut dis = Dissector::default();
-            dis.decode(&whole(6, &segment(40000, 80, 100, 0x02, b"")), &[]);
+            dis.decode(&whole(6, &segment(40000, 80, 100, 0x02, b"")));
             let data = segment(40000, 80, 101, 0x18, request);
             let (first, second) = split(6, &data, 20 + 24);
-            let d = dis.decode(&first, &[]);
+            let d = dis.decode(&first);
             assert_eq!(d.proto, "TCP", "{family}");
             assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
             assert_eq!(
@@ -1705,7 +1722,7 @@ mod tests {
                 !has_layer(&d, "Hypertext Transfer Protocol"),
                 "{family}: a partial payload is not a message"
             );
-            let d = dis.decode(&second, &[]);
+            let d = dis.decode(&second);
             assert_eq!(d.proto, family);
             assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
             assert_eq!(
@@ -1717,7 +1734,7 @@ mod tests {
             // The segment sent whole decodes from its first byte, so both
             // requests are found in this packet alone: the fragment left
             // nothing in the stream.
-            let d = dis.decode(&whole(6, &data), &[]);
+            let d = dis.decode(&whole(6, &data));
             let http: Vec<_> = d
                 .layers
                 .iter()
@@ -1743,9 +1760,9 @@ mod tests {
         udp.extend_from_slice(&q);
         for (family, src, dst, whole, split) in FAMILIES {
             let mut dis = Dissector::default();
-            assert_eq!(dis.decode(&whole(17, &udp), &[]).proto, "DNS", "{family}");
+            assert_eq!(dis.decode(&whole(17, &udp)).proto, "DNS", "{family}");
             let (first, second) = split(17, &udp, 24);
-            let d = dis.decode(&first, &[]);
+            let d = dis.decode(&first);
             assert_eq!(d.proto, "UDP", "{family}");
             assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
             assert!(!d.tags.contains(&"malformed"), "{family}: {}", d.info);
@@ -1754,7 +1771,7 @@ mod tests {
                 (sock(src, 49152).as_str(), sock(dst, 53).as_str()),
                 "{family}"
             );
-            let d = dis.decode(&second, &[]);
+            let d = dis.decode(&second);
             assert_eq!(d.proto, family);
             assert!(d.tags.contains(&"fragment"), "{family}: {:?}", d.tags);
             assert_eq!(
@@ -1771,9 +1788,9 @@ mod tests {
     #[test]
     fn an_atomic_ipv6_fragment_is_a_whole_packet() {
         let mut dis = Dissector::default();
-        dis.decode(&ipv6(6, &segment(40000, 80, 100, 0x02, b"")), &[]);
+        dis.decode(&ipv6(6, &segment(40000, 80, 100, 0x02, b"")));
         let data = segment(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n");
-        let d = dis.decode(&fragment6(6, 0, false, &data), &[]);
+        let d = dis.decode(&fragment6(6, 0, false, &data));
         assert_eq!(d.proto, "HTTP");
         assert!(!d.tags.contains(&"fragment"), "{:?}", d.tags);
     }
@@ -1785,7 +1802,7 @@ mod tests {
         q.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
         let mut udp = vec![0xc0, 0x00, 0, 53, 0, (8 + q.len()) as u8, 0, 0];
         udp.extend_from_slice(&q);
-        let d = Dissector::default().decode(&ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp), &[]);
+        let d = Dissector::default().decode(&ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp));
         assert_eq!(d.proto, "DNS");
         assert_eq!(d.info, "Standard query 0x1234 A example.test");
         // The message is in the packet, so its fields point there.
@@ -1799,10 +1816,10 @@ mod tests {
     fn http_is_reassembled_across_segments() {
         let mut dis = Dissector::default();
         let request = b"GET /count HTTP/1.1\r\nHost: example.test\r\n\r\n";
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
-        let second = dis.decode(&tcp(40000, 80, 111, 0x18, &request[10..]), &[]);
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
+        let second = dis.decode(&tcp(40000, 80, 111, 0x18, &request[10..]));
         assert_eq!(second.proto, "TCP");
-        let first = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]), &[]);
+        let first = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]));
         assert_eq!(
             (first.proto.as_str(), first.info.as_str()),
             ("HTTP", "GET /count HTTP/1.1")
@@ -1819,7 +1836,7 @@ mod tests {
                 .any(|f| f.name == "Host" && f.value == "example.test")
         );
         // The same bytes again are a retransmission, and decode to nothing new.
-        let again = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]), &[]);
+        let again = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]));
         assert!(again.tags.contains(&"retransmission"));
         assert_eq!(again.proto, "TCP");
     }
@@ -1836,14 +1853,14 @@ mod tests {
     fn fast_open_and_retransmission_state_are_kept() {
         for ack in [101u32, 103] {
             let mut dis = Dissector::default();
-            dis.decode(&tcp(40000, 80, 100, 0x02, b"ab"), &[]);
+            dis.decode(&tcp(40000, 80, 100, 0x02, b"ab"));
             let mut syn_ack = tcp_back(500, 0x12, b"");
             syn_ack[28..32].copy_from_slice(&ack.to_be_bytes());
-            dis.decode(&syn_ack, &[]);
-            let repeated = dis.decode(&tcp(40000, 80, 101, 0x18, b"ab"), &[]);
+            dis.decode(&syn_ack);
+            let repeated = dis.decode(&tcp(40000, 80, 101, 0x18, b"ab"));
             assert!(repeated.info.contains("Seq=1 "));
             assert!(repeated.tags.contains(&"retransmission"));
-            let next = dis.decode(&tcp(40000, 80, 103, 0x18, b"cd"), &[]);
+            let next = dis.decode(&tcp(40000, 80, 103, 0x18, b"cd"));
             assert!(next.info.contains("Seq=3 "));
             assert!(!next.tags.contains(&"retransmission"));
         }
@@ -1854,31 +1871,26 @@ mod tests {
     #[test]
     fn a_head_response_has_no_body() {
         let mut dis = Dissector::default();
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
-        dis.decode(&tcp_back(500, 0x12, b""), &[]);
-        dis.decode(
-            &tcp(
-                40000,
-                80,
-                101,
-                0x18,
-                b"HEAD / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n",
-            ),
-            &[],
-        );
-        let first = dis.decode(
-            &tcp_back(501, 0x18, b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n"),
-            &[],
-        );
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
+        dis.decode(&tcp_back(500, 0x12, b""));
+        dis.decode(&tcp(
+            40000,
+            80,
+            101,
+            0x18,
+            b"HEAD / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+        ));
+        let first = dis.decode(&tcp_back(
+            501,
+            0x18,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n",
+        ));
         assert_eq!(first.info, "HTTP/1.1 200 OK");
-        let second = dis.decode(
-            &tcp_back(
-                541,
-                0x18,
-                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n",
-            ),
-            &[],
-        );
+        let second = dis.decode(&tcp_back(
+            541,
+            0x18,
+            b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n",
+        ));
         assert_eq!(second.info, "HTTP/1.1 404 Not Found");
     }
 
@@ -1894,10 +1906,10 @@ mod tests {
             let mut dis = Dissector::default();
             let mut first = fictionet::stdlib::protocols::http2::PREFACE.to_vec();
             first.extend(h2_frame(1, 0, 1, &[0x82]));
-            dis.decode(&tcp(40000, 80, 100, 2, b""), &[]);
-            dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+            dis.decode(&tcp(40000, 80, 100, 2, b""));
+            dis.decode(&tcp(40000, 80, 101, 0x18, &first));
             let end = 101 + first.len() as u32;
-            let close = dis.decode(&tcp(40000, 80, end, flags, b""), &[]);
+            let close = dis.decode(&tcp(40000, 80, end, flags, b""));
             assert_eq!(
                 close.tags.contains(&"malformed"),
                 flags & 1 != 0,
@@ -1905,10 +1917,7 @@ mod tests {
                 close.info
             );
             let next = end + u32::from(flags & 1 != 0);
-            let late = dis.decode(
-                &tcp(40000, 80, next, 0x18, &h2_frame(9, 4, 1, &[0x84])),
-                &[],
-            );
+            let late = dis.decode(&tcp(40000, 80, next, 0x18, &h2_frame(9, 4, 1, &[0x84])));
             assert_eq!(late.proto, "TCP");
             assert!(late.tags.contains(&"late"), "{:?}", late.tags);
             assert!(!late.info.contains("CONTINUATION"), "{}", late.info);
@@ -1923,11 +1932,11 @@ mod tests {
         let mut dis = Dissector::default();
         let request = b"GET /wrap HTTP/1.1\r\nHost: x\r\n\r\n";
         let isn = u32::MAX - 10;
-        dis.decode(&tcp(40000, 80, isn, 0x02, b""), &[]);
+        dis.decode(&tcp(40000, 80, isn, 0x02, b""));
         let (a, b) = request.split_at(10);
         // The second half, past the wrap, comes first, with a FIN.
-        dis.decode(&tcp(40000, 80, isn.wrapping_add(11), 0x19, b), &[]);
-        let done = dis.decode(&tcp(40000, 80, isn.wrapping_add(1), 0x18, a), &[]);
+        dis.decode(&tcp(40000, 80, isn.wrapping_add(11), 0x19, b));
+        let done = dis.decode(&tcp(40000, 80, isn.wrapping_add(1), 0x18, a));
         assert_eq!(done.info, "GET /wrap HTTP/1.1");
     }
 
@@ -1937,37 +1946,27 @@ mod tests {
     #[test]
     fn a_new_connection_on_the_same_ports_starts_over() {
         let mut dis = Dissector::default();
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
-        dis.decode(
-            &tcp(
-                40000,
-                80,
-                101,
-                0x18,
-                b"POST / HTTP/1.1\r\ncontent-length: 100\r\n\r\n",
-            ),
-            &[],
-        );
-        dis.decode(&tcp(40000, 80, 5000, 0x02, b""), &[]);
-        let d = dis.decode(
-            &tcp(40000, 80, 5001, 0x18, b"GET /new HTTP/1.1\r\n\r\n"),
-            &[],
-        );
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
+        dis.decode(&tcp(
+            40000,
+            80,
+            101,
+            0x18,
+            b"POST / HTTP/1.1\r\ncontent-length: 100\r\n\r\n",
+        ));
+        dis.decode(&tcp(40000, 80, 5000, 0x02, b""));
+        let d = dis.decode(&tcp(40000, 80, 5001, 0x18, b"GET /new HTTP/1.1\r\n\r\n"));
         assert_eq!(d.info, "GET /new HTTP/1.1");
         // A SYN-ACK that answers the SYN keeps what the SYN carried, whether
         // it acknowledges the SYN's data (TCP Fast Open) or only the SYN.
         for ack in [9001u32, 9010] {
             let mut dis = Dissector::default();
-            dis.decode(&tcp(40000, 80, 9000, 0x02, b"GET /fast"), &[]);
+            dis.decode(&tcp(40000, 80, 9000, 0x02, b"GET /fast"));
             let mut syn_ack = tcp_back(700, 0x12, b"");
             syn_ack[28..32].copy_from_slice(&ack.to_be_bytes());
-            dis.decode(&syn_ack, &[]);
+            dis.decode(&syn_ack);
             let rest = tcp(40000, 80, 9010, 0x18, b" HTTP/1.1\r\n\r\n");
-            assert_eq!(
-                dis.decode(&rest, &[]).info,
-                "GET /fast HTTP/1.1",
-                "ack {ack}"
-            );
+            assert_eq!(dis.decode(&rest).info, "GET /fast HTTP/1.1", "ack {ack}");
         }
     }
 
@@ -1977,13 +1976,13 @@ mod tests {
     #[test]
     fn one_packet_decodes_to_a_bounded_detail() {
         let mut dis = Dissector::default();
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
         // The preface, and a block that adds x: 4,000 bytes to the table.
         let mut block = vec![0x40, 0x01, b'x', 0x7f, 0xa1, 0x1e];
         block.extend(std::iter::repeat_n(b'v', 4000));
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         first.extend(h2_frame(1, 0x4, 1, &block));
-        dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+        dis.decode(&tcp(40000, 80, 101, 0x18, &first));
         let base = 101 + first.len() as u32;
         // Each segment holds four blocks that name that entry 16 times:
         // 256 KB of headers a segment, from 100 bytes.
@@ -1992,9 +1991,9 @@ mod tests {
             segment.extend(h2_frame(1, 0x4, stream, &[0xbe; 16]));
         }
         for k in (1..256).rev() {
-            dis.decode(&tcp(40000, 80, base + k * 100, 0x18, &segment), &[]);
+            dis.decode(&tcp(40000, 80, base + k * 100, 0x18, &segment));
         }
-        let d = dis.decode(&tcp(40000, 80, base, 0x18, &segment), &[]);
+        let d = dis.decode(&tcp(40000, 80, base, 0x18, &segment));
         let kept: usize = d
             .layers
             .iter()
@@ -2006,16 +2005,13 @@ mod tests {
         assert!(d.info.len() < 2048);
         assert_eq!(d.layers.last().unwrap().name, "Not shown");
         // The table is still known.
-        let d = dis.decode(
-            &tcp(
-                40000,
-                80,
-                base + 256 * 100,
-                0x18,
-                &h2_frame(1, 0x4, 11, &[0xbe]),
-            ),
-            &[],
-        );
+        let d = dis.decode(&tcp(
+            40000,
+            80,
+            base + 256 * 100,
+            0x18,
+            &h2_frame(1, 0x4, 11, &[0xbe]),
+        ));
         let x = d
             .layers
             .last()
@@ -2037,10 +2033,10 @@ mod tests {
             }),
             ..Dissector::default()
         };
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         first.extend(h2_frame(1, 0x4, 1, b"\x40\x01x\x01y"));
-        let initial = dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+        let initial = dis.decode(&tcp(40000, 80, 101, 0x18, &first));
         assert!(
             initial
                 .layers
@@ -2049,8 +2045,8 @@ mod tests {
         );
         let next = 101 + first.len() as u32;
         let indexed = h2_frame(1, 0x4, 3, &[0xbe]);
-        dis.decode(&tcp(40000, 80, next + 10, 0x18, &indexed), &[]);
-        let resumed = dis.decode(&tcp(40000, 80, next + 100, 0x18, b"dropped"), &[]);
+        dis.decode(&tcp(40000, 80, next + 10, 0x18, &indexed));
+        let resumed = dis.decode(&tcp(40000, 80, next + 100, 0x18, b"dropped"));
         assert!(
             !resumed
                 .layers
@@ -2061,10 +2057,13 @@ mod tests {
         assert_eq!(resumed.layers.len(), 2);
         assert!(resumed.extra.is_empty());
         assert!(!resumed.tags.contains(&"gap"));
-        let following = dis.decode(
-            &tcp(40000, 80, next + 10 + indexed.len() as u32, 0x18, &indexed),
-            &[],
-        );
+        let following = dis.decode(&tcp(
+            40000,
+            80,
+            next + 10 + indexed.len() as u32,
+            0x18,
+            &indexed,
+        ));
         assert_eq!(following.proto, "TCP");
         assert_eq!(following.layers.len(), 2);
     }
@@ -2079,11 +2078,11 @@ mod tests {
             }),
             ..Dissector::default()
         };
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         first.extend(h2_frame(1, 0x4, 1, &[0x82]));
-        dis.decode(&tcp(40000, 80, 110, 0x18, &first), &[]);
-        let resumed = dis.decode(&tcp(40000, 80, 1000, 0x18, b"dropped"), &[]);
+        dis.decode(&tcp(40000, 80, 110, 0x18, &first));
+        let resumed = dis.decode(&tcp(40000, 80, 1000, 0x18, b"dropped"));
         assert_eq!(resumed.proto, "TCP");
         assert_eq!(resumed.layers.len(), 2);
         assert!(resumed.extra.is_empty());
@@ -2099,10 +2098,10 @@ mod tests {
             }),
             ..Dissector::default()
         };
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
-        let gap = dis.decode(&tcp(40000, 80, 110, 0x18, b"dropped"), &[]);
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
+        let gap = dis.decode(&tcp(40000, 80, 110, 0x18, b"dropped"));
         assert!(gap.tags.contains(&"gap"));
-        let request = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"), &[]);
+        let request = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"));
         assert_eq!(request.info, "GET / HTTP/1.1");
         assert_eq!(request.layers.last().unwrap().buf, 0);
     }
@@ -2122,7 +2121,7 @@ mod tests {
         q.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
         let mut udp = vec![0xc0, 0x00, 0, 53, 0, 8, 0, 0];
         udp.extend_from_slice(&q);
-        let d = Dissector::default().decode(&ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp), &[]);
+        let d = Dissector::default().decode(&ipv4(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp));
         assert_eq!(d.proto, "UDP");
         assert_eq!(d.info, "49152 → 53 Len=0");
     }
@@ -2143,19 +2142,12 @@ mod tests {
     struct Count(Datagrams);
 
     impl Protocol for Count {
-        fn data(&mut self, _: bool, _: &[u8], _: Place, _: &mut Decoded, _: &[KeyLine]) {}
+        fn data(&mut self, _: bool, _: &[u8], _: Place, _: &mut Decoded) {}
         fn waiting(&self, _: bool) -> bool {
             false
         }
         fn lost(&mut self, _: bool) {}
-        fn datagram(
-            &mut self,
-            reverse: bool,
-            bytes: &[u8],
-            _: Place,
-            _: &mut Decoded,
-            _: &[KeyLine],
-        ) {
+        fn datagram(&mut self, reverse: bool, bytes: &[u8], _: Place, _: &mut Decoded) {
             self.0.lock().unwrap().push((reverse, bytes.len()));
         }
     }
@@ -2184,9 +2176,9 @@ mod tests {
         );
         let mut dis = Dissector::with_registry(registry);
         let (client, server) = (([10, 0, 0, 2], 49152), ([10, 0, 0, 1], 53));
-        dis.decode(&udp4(client, server, b"query"), &[]);
-        dis.decode(&udp4(server, client, b"answer"), &[]);
-        dis.decode(&udp4(client, server, b""), &[]);
+        dis.decode(&udp4(client, server, b"query"));
+        dis.decode(&udp4(server, client, b"answer"));
+        dis.decode(&udp4(client, server, b""));
         assert_eq!(*seen.lock().unwrap(), [(false, 5), (true, 6), (false, 0)]);
         assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -2200,20 +2192,18 @@ mod tests {
         let mut dis = Dissector::default();
         let server = ([10, 0, 0, 1], 53);
         assert_eq!(
-            dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q), &[])
-                .proto,
+            dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q)).proto,
             "DNS"
         );
         for port in 0..300 {
-            let d = dis.decode(&udp4(([10, 0, 0, 2], 1000 + port), server, &q), &[]);
+            let d = dis.decode(&udp4(([10, 0, 0, 2], 1000 + port), server, &q));
             assert_eq!(d.proto, "DNS");
             assert!(dis.udp.len() <= UDP_CONVERSATIONS);
         }
         assert_eq!(dis.udp.len(), UDP_CONVERSATIONS);
         assert!(!dis.udp.keys().any(|(_, low, _)| low.port() == 999));
         assert_eq!(
-            dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q), &[])
-                .proto,
+            dis.decode(&udp4(([10, 0, 0, 2], 999), server, &q)).proto,
             "DNS"
         );
     }
@@ -2224,16 +2214,13 @@ mod tests {
     #[test]
     fn finishing_the_capture_decodes_what_was_held_past_a_hole() {
         let mut dis = Dissector::default();
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
-        let held = dis.decode(
-            &tcp(40000, 80, 111, 0x18, b"GET /after HTTP/1.1\r\n\r\n"),
-            &[],
-        );
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
+        let held = dis.decode(&tcp(40000, 80, 111, 0x18, b"GET /after HTTP/1.1\r\n\r\n"));
         assert_eq!(held.proto, "TCP");
-        let end = dis.finish(&[]);
+        let end = dis.finish();
         assert_eq!(end.info, "GET /after HTTP/1.1");
         assert!(dis.connections.is_empty());
-        let again = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"), &[]);
+        let again = dis.decode(&tcp(40000, 80, 101, 0x18, b"GET / HTTP/1.1\r\n\r\n"));
         assert_eq!(again.info, "GET / HTTP/1.1");
     }
 
@@ -2243,10 +2230,10 @@ mod tests {
     #[test]
     fn held_bytes_decoded_at_the_end_bring_their_own_buffer() {
         let mut dis = Dissector::default();
-        dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
+        dis.decode(&tcp(40000, 80, 100, 0x02, b""));
         let request = b"GET /after HTTP/1.1\r\n\r\n";
-        dis.decode(&tcp(40000, 80, 111, 0x18, request), &[]);
-        let end = dis.finish(&[]);
+        dis.decode(&tcp(40000, 80, 111, 0x18, request));
+        let end = dis.finish();
         let http = end
             .layers
             .iter()
@@ -2306,10 +2293,10 @@ mod tests {
             |_| [UntilClose, UntilClose],
         );
         let mut dis = Dissector::with_registry(registry);
-        dis.decode(&tcp(40000, 9000, 100, 0x02, b""), &[]);
-        let open = dis.decode(&tcp(40000, 9000, 101, 0x18, b"hello"), &[]);
+        dis.decode(&tcp(40000, 9000, 100, 0x02, b""));
+        let open = dis.decode(&tcp(40000, 9000, 101, 0x18, b"hello"));
         assert!(!has_layer(&open, "Until close"));
-        let fin = dis.decode(&tcp(40000, 9000, 106, 0x11, b""), &[]);
+        let fin = dis.decode(&tcp(40000, 9000, 106, 0x11, b""));
         let layer = fin.layers.iter().find(|l| l.name == "Until close").unwrap();
         assert_ne!(layer.buf, 0, "{layer:?}");
         assert_eq!(fin.extra[layer.buf - 1].1, b"hello");
@@ -2360,7 +2347,7 @@ mod tests {
                 let cut = (rand() as usize) % packet.len();
                 packet.truncate(cut.max(1));
             }
-            let _ = dis.decode(&packet, &[]);
+            let _ = dis.decode(&packet);
         }
     }
 
@@ -2436,7 +2423,7 @@ mod tests {
         }
         let mut dis = Dissector::default();
         for p in &packets {
-            let d = dis.decode(p, &[]);
+            let d = dis.decode(p);
             let (layers, buffers) = detail_by_objects(&d, p);
             assert_eq!(d.layers_json(), layers);
             let mut out = String::new();
@@ -2454,7 +2441,7 @@ mod tests {
                 if let Some(b) = p.first_mut() {
                     *b = if len % 2 == 0 { 0x45 } else { 0x60 };
                 }
-                let _ = dis.decode(&p, &[]);
+                let _ = dis.decode(&p);
             }
         }
     }

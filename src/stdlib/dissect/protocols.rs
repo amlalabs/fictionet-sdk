@@ -380,7 +380,6 @@ mod tests {
                 ..Place::default()
             },
             &mut packet,
-            &[],
         );
         assert_eq!(packet.proto, "Modbus/TCP");
         assert_eq!(packet.layers[0].range, (0, bytes.len()));

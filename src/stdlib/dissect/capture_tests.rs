@@ -67,7 +67,6 @@ fn record(kind: u8, body: &[u8]) -> Vec<u8> {
 /// One TLS 1.3 connection as a capture sees it, packet by packet.
 struct Capture {
     dissector: Dissector,
-    keys: Vec<KeyLine>,
     /// The next sequence number each way, the client's first.
     next: [u32; 2],
 }
@@ -83,15 +82,13 @@ impl Capture {
     fn with_registry(keys: bool, registry: Registry) -> Capture {
         let mut capture = Capture {
             dissector: Dissector::with_registry(registry),
-            keys: if keys { key_log() } else { Vec::new() },
             next: [1001, 5001],
         };
-        capture
-            .dissector
-            .decode(&packet(true, 1000, 0x02, b""), &[]);
-        capture
-            .dissector
-            .decode(&packet(false, 5000, 0x12, b""), &[]);
+        if keys {
+            capture.dissector.keys().extend(key_log());
+        }
+        capture.dissector.decode(&packet(true, 1000, 0x02, b""));
+        capture.dissector.decode(&packet(false, 5000, 0x12, b""));
         let mut client = vec![3, 3];
         client.extend_from_slice(&RANDOM);
         client.extend_from_slice(&[0, 0, 2, 0x13, 1, 1, 0, 0, 0]);
@@ -115,7 +112,7 @@ impl Capture {
         let next = &mut self.next[usize::from(!from_client)];
         let p = packet(from_client, *next, 0x18, payload);
         *next = next.wrapping_add(payload.len() as u32);
-        self.dissector.decode(&p, &self.keys)
+        self.dissector.decode(&p)
     }
 
     /// Loses the next `len` bytes one way: the capture never sees them.
@@ -127,12 +124,11 @@ impl Capture {
     /// Decodes a FIN one way.
     fn fin(&mut self, from_client: bool) -> Decoded {
         let next = self.next[usize::from(!from_client)];
-        self.dissector
-            .decode(&packet(from_client, next, 0x11, b""), &self.keys)
+        self.dissector.decode(&packet(from_client, next, 0x11, b""))
     }
 
     fn finish(&mut self) -> Decoded {
-        self.dissector.finish(&self.keys)
+        self.dissector.finish()
     }
 }
 
@@ -346,7 +342,7 @@ impl Seen {
 }
 
 impl Protocol for Seen {
-    fn data(&mut self, reverse: bool, bytes: &[u8], _: Place, _: &mut Decoded, _: &[KeyLine]) {
+    fn data(&mut self, reverse: bool, bytes: &[u8], _: Place, _: &mut Decoded) {
         self.tell(reverse, Told::Data(bytes.to_vec()));
     }
     fn waiting(&self, _: bool) -> bool {
