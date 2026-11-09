@@ -1,112 +1,134 @@
 # WebSocket verification
 
-The Kani harnesses call the production codec. The TLA+ models cover the
-receive state over time and the test server that uses the codec after the
-HTTP/1 switch. They complement the codec buffer proofs and HTTP pipeline
-handoff proofs described in `../codec/README.md` and `../http/README.md`.
-The wire rules follow [RFC 6455 sections 5–8](https://www.rfc-editor.org/rfc/rfc6455.html#section-5).
+Two kinds of checks cover the WebSocket codec in
+`src/stdlib/protocols/websocket.rs`. Kani harnesses in `kani/frames.rs` run
+the production parser and writer on every input up to a fixed size. TLA+
+models in `tla/` follow the receive state over time and the echo servers that
+run the codec after the HTTP/1 switch. The codec buffer proofs and the HTTP
+pipeline handoff proofs are in `../codec/README.md` and `../http/README.md`.
+The wire rules are those of
+[RFC 6455 sections 5–7](https://www.rfc-editor.org/rfc/rfc6455.html#section-5).
 
-## Receive state
+Every property has a control: a configuration or harness that removes one
+check and must then fail on the property it names. A control counts only
+when it fails an assertion or invariant, not on parsing, unwinding or
+memory.
 
-`tla/Messages.tla` follows `Messages::decode`, `Frames::decode` and
-`Header::parse` in `src/stdlib/protocols/websocket.rs`; its header maps the
-checks to source lines. It checks four complete-frame steps, a two-byte
-message limit, all FIN values, data/continuation/ping/pong/close, and lengths
-0, 1, 2, 125 and 126. Data represents both text and binary; UTF-8 and wire
-bytes belong to the Kani harnesses, not this abstraction. `charged` records
-the aggregate before the payload copy, including final frames that release
-the message in the same call. The independently configurable frame limit
-is assumed large enough to admit these lengths (`Messages::from_frames`).
-Errors terminate the stream. EOF, allocation failure, input chunking and
-the allocator's spare capacity are outside this model.
+## Kani on the production code
 
-TLC 2.19 on the cached JDK 21 checked `Messages_base.cfg`: 7,551 states
-generated, 801 distinct, depth 5, all six invariants passed. Every property
-has a checked negative configuration:
+`kani/frames.rs` is included by `protocols/websocket.rs` under `cfg(kani)`.
+Line numbers are in `protocols/websocket.rs`.
 
-| Configuration suffix | Property | Counterexample |
+| Harness | Source | Inputs and property |
 |---|---|---|
-| `without_order` | `ContinuationOrder` | continuation without a partial, depth 2 |
-| `without_control` | `ControlAtomic` | non-final ping, depth 2 |
-| `without_charge` | `ChargedBeforeGrowth` | data exceeds the message limit before copying, depth 2 |
-| `without_preserve` | `ControlPreservesPartial` | ping discards an unfinished empty message, depth 3 |
-| `without_stop` | `ReceiveEndsAtClose` | data accepted after close, depth 3 |
-| `without_close_once` | `OneReceivedClose` | second close delivered, depth 3 |
+| `websocket_headers_follow_wire_grammar` | `Header::parse`:386, `Frames::header`:845 | Every byte string of 0 to 14 bytes. Reserved bits and opcodes are refused. Control frames must be final with at most 125 bytes. Lengths use the 7, 16 or 64-bit form, each only when the shorter form cannot hold it, with the high bit clear and at most `MAX_PAYLOAD`. A short header waits. A frame from a client must be masked and a frame from a server must not be. |
+| `websocket_writer_uses_minimal_length` | `write_header`:777 | Every length from 0 to `MAX_PAYLOAD` (16 MiB), both FIN values, any mask. The writer uses the shortest length form, and the parser reads back the same length, FIN and key. |
+| `websocket_mask_is_involution_and_composes` | `apply_mask`:517 | Eight arbitrary bytes, any key, any offset (including wrapping), every split. Each byte is XORed with the RFC's key byte, masking twice restores the input, and masking in two pieces equals masking at once. |
+| `websocket_small_frames_{write,read}_{masked,unmasked}_{zero..four}` | `write_frame`:749, `Header::parse_exact`:454, `Frame::from_header`:499 | Binary payloads of 0 to 4 arbitrary bytes, any FIN, any key, in twenty harnesses. The writer produces the frame built byte by byte in the harness, and reading that frame gives back the payload, FIN and key. |
+| `websocket_exact_frame_boundaries` | `Header::parse_exact`:454, `Header::payload`:469 | Every input of up to 18 bytes. Exact parsing refuses a truncated frame and a frame followed by more bytes, and the payload is exactly the declared bytes after the header. |
+| `websocket_close_codes_follow_wire_ranges` | `Close::parse`:559, `Close` writer | All 65,536 codes. Parsing and writing accept exactly 1000–1003, 1007–1014 and 3000–4999. |
+| `websocket_close_payload_validates_reason` | `parse_close`:544 | Every close payload of up to 6 bytes. Empty means no code, one byte is refused, and otherwise the code must be in range and the reason valid UTF-8, kept unchanged. |
+| `websocket_fragments_follow_message_order` | `Messages::check_header`:960 | Every two-byte header, with and without a message in progress. A continuation is refused outside a message, a new text or binary frame is refused inside one, and control frames pass in both states. |
+| `websocket_text_across_fragment_boundary` | `validate_text`:1050, called from `Messages::decode`:995 | Every four-byte message split at every point. Text is accepted exactly when the whole message is valid UTF-8, even when a character spans the split, and the checked prefix never passes the bytes held. |
+| `websocket_message_limit_precedes_payload_copy` | `Messages::check_header`:960 | Bytes held and limit from 0 to 3, next frame length 0 to 125. A frame that would take the message over its limit is refused from its header, before `Frames::decode` copies the payload, and the held bytes stay as they were. |
 
-The state-space bounds are not an unbounded proof. In particular, the
-presence of an empty partial matters independently of its byte count.
+`write_header`, `write_frame`, `Header::parse_exact`, `Header::payload`,
+`Messages::check_header` and `validate_text` are blocks moved out of
+`Frame::write`, `Frame::parse` and `Messages::decode` unchanged, so the
+harnesses can call them without building multi-megabyte payloads or whole
+decoders. The callers run the same checks in the same order as before.
 
-## Close handshake through the HTTP switch
+Results (Kani with CBMC 6.11, one harness at a time under a 10 GiB cap): all
+29 harnesses pass. The slowest are `websocket_text_across_fragment_boundary`
+(47 s) and `websocket_close_payload_validates_reason` (30 s); the rest take
+under 5 s each.
 
-The HTTP server does not own a WebSocket session: `Http1::hand_on`
-(`src/stdlib/web/httpd/native.rs:793`) passes unread bytes and EOF to the
-successor; the tunnel runs the caller's `UpgradeHandler` on a raw
-connection. `Messages` only receives, and `Message::to_frame` and
-`Frame::write` are stateless writers. Applications must remember their own
-outgoing close and stop writing data. These APIs alone cannot guarantee
-one close in each direction or prevent application writes after close.
+Each control is a harness named `websocket_control_without_*`. It stubs one
+production function and runs the same property on a concrete input that
+shows the fault. All 17 fail on the assertion listed.
 
-`tla/Echo.tla` follows the concrete `EchoSocket` handler in
-`tests/support/response.rs`, used by `websockets_work_through_sites` in
-`tests/it/web/http_serving.rs`, and the local `echo` handler in
-`tests/it/features.rs:249`, exercised by
-`websocket_continuation_exchanges_messages_through_server` at line 243.
-Both handlers write a close reply before returning, answer Ping with Pong,
-and ignore unsolicited Pong. Text requests and replies are abstracted to
-one event; payload differences between the two echoes are outside the model.
-A close is echoed once and the handler returns. Four incoming
-messages are enough to explore repeated close, close after text, and text
-after close. All payload validation belongs to `Messages`. Successful
-writes are weakly fair: a broken connection cannot promise a close reply.
-
-`Echo_base.cfg` passed: 17 generated and distinct states, depth 9.
-`OneCloseEachWay` checks at most one sent reply; the receive model separately
-checks at most one delivered close. `NoDataAfterClose` checks that no text
-reply follows the close reply, and `CloseIsAnswered` checks eventual reply
-under the stated write assumption.
-
-| Configuration suffix | Property | Counterexample |
+| Control | Change | Failed assertion |
 |---|---|---|
-| `without_reply` | `CloseIsAnswered` | receives close and ends without replying; terminal stuttering |
-| `without_close_once` | `OneCloseEachWay` | two close replies, depth 5 |
-| `without_stop` | `NoDataAfterClose` | text reply after close reply, depth 5 |
+| `control_rules` | every opcode counts as data | a non-final Ping is not refused (`got.is_err()`) |
+| `control_size` | the same, with a final Ping of 126 bytes | an oversized Ping is not refused (`got.is_err()`) |
+| `mask_direction` | `Frames::header` skips the mask check | a frame from the wrong side is accepted |
+| `masking` | masking leaves bytes unchanged | a byte differs from the RFC XOR |
+| `mask_involution` | XOR replaced by addition | masking twice does not restore the input |
+| `mask_offset` | the key restarts at each piece | split masking differs from whole masking |
+| `exact_end` | exact parsing accepts trailing bytes | `exact == Err(Error::Trailing)` |
+| `payload_start` | the payload includes the header | `payload.len() == header.len` |
+| `unmasking` | `Frame::from_header` copies without unmasking | decoded payload differs |
+| `frame_masking` | the writer does not mask | written frame differs from the expected bytes |
+| `minimal_length` | the writer always uses the 64-bit form | the parser refuses the written header |
+| `extended_length` | the writer cuts lengths to 7 bits | `header.len == len` |
+| `close_utf8` | close reasons decoded lossily | an invalid reason is accepted |
+| `close_ranges` | every close code is allowed | code 1005 is accepted |
+| `fragment_order` | `check_header` without the order check | a final continuation with no message is accepted |
+| `held_charge` | held bytes counted as zero | an over-limit frame is not refused |
+| `utf8_carry` | each fragment validated alone | `€a` split after the first byte of `€` is refused |
 
-The latter two controls disable both the decoder's terminal-close check
-and the handler's return after sending close; either stop suffices for
-this handler. This is a paired ablation, not evidence that removing only
-one of those checks breaks the current handler.
+Run one harness or control:
 
-The old test server also returned on Ping and Pong, ending a fragmented
-text message prematurely. The integration regression now sends non-final
-text, Ping, unsolicited Pong, and final continuation together. It requires
-a Pong with the ping payload and the completed text echo before testing
-close. The handler replies to Ping and ignores Pong; these operations
-preserve the close state and are abstracted as stuttering in `Echo.tla`.
+```sh
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 \
+  env CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo kani -p fictionet --lib -Z stubbing --output-format terse \
+  --harness websocket_headers_follow_wire_grammar
+```
 
-The old test server returned on every non-text message, including Close.
-The missing-reply configuration models that path. The regression sends a
-masked close, a second close and text together after a successful text
-echo, then requires exactly one unmasked close and EOF from the real
-server. This is a correction to a test service, not a new production
-WebSocket session API. Production callers remain responsible for their
-own close handshake.
+`--harness websocket_` runs all of them; add `-j 1` to keep one at a time.
+The controls fail by design, so that command exits non-zero.
 
-The feature-test echo also needed its control-message and termination
-handling corrected. Its regression sends a text frame, Ping, and unsolicited
-Pong together with the HTTP upgrade request, exercising preservation of
-unread bytes at the switch. It requires the text echo and a Pong carrying
-the Ping payload. After sending a masked close with code 1000, it reads to
-EOF and requires exactly `[0x88, 0x02, 0x03, 0xe8]` on the wire. This detects
-an unsolicited Pong reply, a missing or repeated close reply, or a handler
-that keeps the connection open after replying. The close projection in
-`Echo.tla` covers this handler too; the wire-level response checks belong
-to the Rust regression. The model's missing-reply control specifically
-represents the old support handler's early return, rather than claiming
-that both handlers had the same previous implementation.
+## TLA+: the receive state
 
-Run the models from the repository root, choosing another configuration
-from the same directory for each control (controls must fail the named
-property, not parsing or state-space construction):
+`tla/Messages.tla` follows `Messages::check_header` and `Messages::decode`
+(lines 960–1047). The model header maps each step to its source lines. It
+takes four complete frames, each data, continuation, Ping, Pong or Close,
+final or not, with length 0, 1, 2, 125 or 126, against a message limit of 2.
+Text and binary are one kind here; UTF-8 and wire bytes are left to Kani. A
+failed decode ends the stream. EOF and input chunking are outside the model.
+
+`Messages_base.cfg`: no error, 7,551 states generated, 801 distinct, depth 5.
+
+| Invariant | Meaning | Control | Counterexample |
+|---|---|---|---|
+| `ContinuationOrder` | continuation only inside a message, data only outside | `without_order` | a continuation with no message, depth 3 |
+| `ControlAtomic` | accepted control frames are final, at most 125 bytes | `without_control` | a non-final Ping, depth 3 |
+| `ChargedBeforeGrowth` | the message size is checked against the limit before the copy | `without_charge` | data over the limit, depth 3 |
+| `ControlPreservesPartial` | Ping and Pong between fragments keep the message in progress | `without_preserve` | a Ping drops the message, depth 3 |
+| `ReceiveEndsAtClose` | nothing is accepted after a Close | `without_stop` | data after Close, depth 4 |
+| `OneReceivedClose` | at most one Close is delivered | `without_close_once` | a second Close, depth 4 |
+
+## TLA+: the close handshake through the HTTP switch
+
+The HTTP server does not own a WebSocket session. `Http1::hand_on`
+(`web/httpd/native.rs`:793) passes unread bytes and EOF to the upgrade
+handler, which runs on the raw connection. `Messages` only receives, and
+`Message::to_frame` and `Frame::write` keep no state, so each handler sends
+its own Close and stops writing after it.
+
+`tla/Echo.tla` follows the two echo handlers the tests install:
+`EchoSocket` in `tests/support/response.rs` (used by
+`websockets_work_through_sites` in `tests/it/web/http_serving.rs`) and
+`echo` in `tests/it/features.rs` (used by
+`websocket_continuation_exchanges_messages_through_server`). Both answer
+Ping with Pong, ignore Pong, echo a Close and return. Text messages are one
+event. Four incoming messages cover a repeated Close, Close after text and
+text after Close. Writes are assumed to succeed and to be weakly fair.
+
+`Echo_base.cfg`: no error, 17 states, depth 9.
+
+| Property | Meaning | Control | Counterexample |
+|---|---|---|---|
+| `CloseIsAnswered` | a received Close is answered | `without_reply` | the handler returns without replying |
+| `OneCloseEachWay` | at most one Close is sent | `without_close_once` | two Close replies, depth 7 |
+| `NoDataAfterClose` | no text follows the Close reply | `without_stop` | text after the Close reply, depth 7 |
+
+The last two controls turn off both the decoder's stop after Close and the
+handler's return after replying; either one alone keeps these handlers
+correct.
+
+Run a configuration from the repository root:
 
 ```sh
 systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 \
@@ -115,113 +137,32 @@ systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p M
   -metadir /home/souvik/Projects/amlalabs/.fictionet-comp-work/tlc-vws-messages \
   -config verification/websocket/tla/Messages_base.cfg \
   verification/websocket/tla/Messages.tla
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 \
-  ~/.cache/adorably-fv/jdk/bin/java -Xmx2g \
-  -cp ~/.cache/adorably-fv/tla2tools.jar tlc2.TLC -workers 2 \
-  -metadir /home/souvik/Projects/amlalabs/.fictionet-comp-work/tlc-vws-echo \
-  -config verification/websocket/tla/Echo_base.cfg \
-  verification/websocket/tla/Echo.tla
 ```
 
-## Production Rust bounds
+## Bugs found
 
-`kani/frames.rs` is included by `protocols/websocket.rs` only under
-`cfg(kani)`. The production source mapping (after extracting the unchanged
-header-writing block) is:
+Both were in the test echo servers, not in the codec.
 
-| Harness | Production source | Domain and assertion |
-|---|---|---|
-| `websocket_headers_follow_wire_grammar` | `Header::parse`:386 and `Frames::header`:845 | every byte string of length 0 through 14; reserved bits/opcodes, control FIN/125-byte bound, 7/16/64-bit lengths, minimal form, high bit, payload cap, incomplete headers, both mask directions |
-| `websocket_writer_uses_minimal_length` | `Frame::write`:744, `write_header`:777 | every length 0 through 16 MiB, both FIN values, arbitrary optional mask; shortest header round-trips with exact length and key |
-| `websocket_mask_is_involution_and_composes` | `apply_mask`:517 | eight arbitrary bytes, arbitrary key and machine-width offset, every split; RFC XOR value, involution and split composition, including wrapping offsets |
-| `websocket_small_frames_{read,write}_*` | `write_frame`:749, `Header::parse_exact`:454, `Frame::from_header`:499 | binary payloads 0 through 4 bytes, arbitrary FIN and optional key; twenty read/write length/mask partitions cover the same domain. The writer must match an independent stack wire image and parsing that image through `Header::parse_exact` and `Frame::from_header` must reconstruct the frame |
-| `websocket_exact_frame_boundaries` | `Header::parse_exact`:454 and `Header::payload`:469 | arbitrary inputs through eighteen bytes; the separately verified header parser determines the declared end, exact parsing rejects truncation and trailing bytes, and the borrowed payload excludes the header |
-| `websocket_close_codes_follow_wire_ranges` | `Close::parse`:559, `Close::write`:579 | all 65,536 codes; acceptance and writing agree with permitted ranges |
-| `websocket_close_payload_validates_reason` | `parse_close`:544 and `Close::parse`:559 | every payload through six bytes; empty/one-byte handling, code ranges, UTF-8 reason validity and preservation |
-| `websocket_text_across_fragment_boundary` | `validate_text`:1050, called by `Messages::decode`:1033 | all four-byte messages, every initial/final fragment boundary; the production incremental validator accepts exactly whole-message UTF-8 and never advances its checked prefix beyond retained bytes |
-| `websocket_message_limit_precedes_payload_copy` | `Messages::check_header`:960, called before copying at `Messages::decode`:1000 | every held/limit pair 0 through 3 and next length 0 through 125; an excessive aggregate fails from the header alone and leaves retained bytes unchanged |
+- `EchoSocket` returned on any message other than text. A Ping or Pong
+  between fragments ended the session in the middle of a message, and a
+  Close got no reply. It now answers Ping with Pong, ignores Pong, and
+  echoes Close before returning. `websockets_work_through_sites` sends
+  non-final text, Ping, an unsolicited Pong and the final continuation
+  together, and requires the Pong and the whole echoed text. It then sends
+  Close, a second Close and text in one write, and requires exactly one
+  unmasked Close with code 1000 and then EOF. Before the fix the reply was
+  empty.
+- The `echo` handler in `features.rs` sent Ping and Pong back unchanged and
+  kept reading after echoing Close. It now handles them the same way.
+  `websocket_continuation_exchanges_messages_through_server` sends text,
+  Ping and an unsolicited Pong with the upgrade request, so they cross the
+  switch as unread bytes, and requires the echo and the Pong. After a
+  Close it requires one unmasked Close with code 1000 and then EOF.
 
-All 28 positive Kani harnesses passed. All 16 mutation controls failed their
-stated semantic assertions; resource failures are excluded from these
-counts. The twenty small-frame partitions ran serially with `-j 1`.
+## Limits
 
-The writer's header extraction contains the same instructions previously
-in `Frame::write`; it permits checking the full length domain without
-allocating a symbolic multi-megabyte payload. Payload copying and
-unmasking are bounded separately through `Frame::from_header`. The read
-proof composes the production header parser and payload constructor; it
-does not call the `Frame::parse` wrapper, whose additional close-payload
-validation is outside this binary-frame domain. The wrapper harness and
-its fixed unmasking control exhausted 10 GiB even in isolation. Existing
-Rust `length_forms_are_minimal`
-tests also exercise real payloads across 125/126 and 65535/65536.
-
-Controls are persistent Kani harnesses named `websocket_control_without_*`.
-Each calls the same property with one stubbed implementation. The UTF-8,
-involution and offset controls use concrete counterexample inputs; positive
-proof domains stay symbolic. Held-charge, close-range and unmasking controls
-also use concrete witnesses through the same property helpers, as does the
-full-frame masking control. They are expected failures, so do not interpret an unfiltered `cargo kani` exit
-status as the baseline result.
-
-| Control suffix | Mutation | Expected failed assertion |
-|---|---|---|
-| `control_rules` | every opcode is treated as non-control | a non-final Ping is accepted |
-| `control_size` | the same mutation with a final Ping declaring 126 bytes | an oversized control is accepted |
-| `mask_direction` | `Frames::header` delegates directly to `Header::parse` | a frame is accepted from the wrong side |
-| `masking` | masking leaves bytes unchanged | wire bytes differ from the RFC XOR rule |
-| `mask_involution` | replace XOR with byte addition | a second mask does not restore the original bytes |
-| `mask_offset` | restart the key at each split | split masking differs from masking the whole payload |
-| `exact_end` | exact parsing accepts trailing bytes | trailing input is accepted |
-| `payload_start` | the payload includes the header | payload length differs from the declared length |
-| `unmasking` | `Frame::from_header` copies without unmasking | decoded payload differs from the frame |
-| `frame_masking` | writer masking leaves bytes unchanged | written frame differs from the independent wire image |
-| `minimal_length` | writer always emits the eight-byte length form | parser rejects the nonminimal header even though the numeric length is preserved |
-| `close_utf8` | close reasons use lossy UTF-8 conversion | invalid reason bytes are accepted |
-| `close_ranges` | every close code is sendable | reserved close accepted |
-| `held_charge` | retained message length is omitted | excessive aggregate is not refused from its header |
-| `utf8_carry` | each fragment is validated independently | the same property rejects `€a` split after the first byte of `€` |
-| `extended_length` | writer truncates every length to seven bits | encoded header loses the declared length |
-
-The pre-copy header guards were also extracted unchanged into
-`Messages::check_header`, which takes `&self` and cannot grow its retained
-payload. Production `decode` calls it with `?` before `Frames::decode`
-copies a payload. The limit proof checks this guard component directly;
-the original whole-decoder harness reached the 12 GiB cap.
-
-The incremental UTF-8 block was extracted unchanged from `Messages::decode`
-so the proof exercises that state update without duplicating frame parsing
-or allocating temporary wire buffers. The UTF-8 harness is a component
-proof, not an end-to-end proof of two complete frame decode calls.
-
-UTF-8 validity uses Rust's standard validator as its specification; this
-checks its incremental use, not the standard library's UTF-8 algorithm.
-The close-reason proof checks the production close parser against that
-validator for reasons up to four bytes; the separate code-range harness
-has empty reasons. Allocation failure and allocator spare capacity
-are not proved. The aggregate bound concerns payload lengths before copies,
-not accounting for vector capacity or total process memory. These finite
-harnesses and models do not prove all possible session histories.
-
-Run an individual property or control with the same memory cap as the
-other verification work:
-
-```sh
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 \
-  env CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-vws \
-  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=4 \
-  cargo kani -p fictionet -Z stubbing --output-format terse \
-  --harness websocket_headers_follow_wire_grammar
-```
-
-## Rust validation
-
-The close-handshake regression failed before the fix with an empty reply
-instead of `[136, 2, 3, 232]`, then passed after the fix. The protocol suite with `--features tokio` passed all 3,259 tests, including
-HTTP/1 and WebSocket tests. All 14 matching `native` tests and the
-`websockets_work_through_sites` integration test also passed. `cargo clippy -p fictionet --features tokio --lib --tests -- -D warnings`,
-`cargo fmt --all -- --check`, and `cargo doc -p fictionet --features tokio
---no-deps` passed. `cargo bench -p fictionet --profile dev --bench decoders
--- 'http1_requests|websocket_frames' --sample-count 2 --sample-size 1` ran
-both decoder benchmarks successfully; this is a smoke check, not a release
-performance comparison.
+These checks cover inputs up to the sizes in the tables and four-frame
+histories in the models, not every possible session. The UTF-8 checks use
+Rust's own validator as the definition of valid text. Allocation failure,
+allocator spare capacity and total process memory are outside them; the
+message limit bounds payload bytes before each copy.

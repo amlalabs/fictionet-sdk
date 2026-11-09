@@ -323,6 +323,53 @@ fn websocket_message_limit_precedes_payload_copy() {
     message_limit_precedes_payload_copy(kani::any(), kani::any(), kani::any());
 }
 
+fn fragment_order(partial: bool, first: u8, len: u8) {
+    kani::assume(len <= 125);
+    let mut decoder = Messages::for_receiver(Side::Client);
+    if partial {
+        decoder.partial = Some(Partial {
+            opcode: Opcode::Text,
+            data: Vec::new(),
+            checked: 0,
+        });
+    }
+    let input = [first, len];
+    let result = decoder.check_header(&input);
+    let Ok(Some(header)) = Header::parse(&input) else {
+        assert!(result.is_err());
+        return;
+    };
+    // Continuation only inside a message, a new data frame only outside one,
+    // and control frames in either state.
+    match header.opcode {
+        Opcode::Continuation if !partial => {
+            assert_eq!(result, Err(Error::UnexpectedContinuation))
+        }
+        Opcode::Text | Opcode::Binary if partial => {
+            assert_eq!(result, Err(Error::ExpectedContinuation))
+        }
+        _ => assert_eq!(result, Ok(())),
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_fragments_follow_message_order() {
+    fragment_order(kani::any(), kani::any(), kani::any());
+}
+
+// The pre-copy guard with the order check removed: only size checks remain.
+fn check_size_only(messages: &Messages, input: &[u8]) -> Result<(), Error> {
+    messages.frames.header(input).map(|_| ())
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::stub(Messages::check_header, check_size_only)]
+fn websocket_control_without_fragment_order() {
+    fragment_order(false, 0x80, 0);
+}
+
 fn ignore_control_kind(_: Opcode) -> bool {
     false
 }
