@@ -660,7 +660,7 @@ pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Pages>
 /// What a read, write or connect on a child would get now, for the async
 /// handles that wait on the events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Verdict {
+pub enum Verdict {
     /// Nothing yet: wait for an event of the child.
     Wait,
     /// Done: the end of the stream, or an open connection.

@@ -176,12 +176,13 @@ pub(crate) fn prepare(
     options: tcp::Options,
     icmp: icmp::Options,
     factory: &Factory,
+    tcp_factory: &tcp::Factory,
 ) -> (
     tcp::Endpoint,
     udp::Endpoint,
     impl Future<Output = fictionet::Result> + Send + 'static,
 ) {
-    let (tcp, tcp_driver) = tcp::prepare_transport(fcx, addr, options);
+    let (tcp, tcp_driver) = tcp::prepare_transport(fcx, addr, options, tcp_factory);
     let (udp, udp_driver) = udp::prepare_transport(fcx, addr);
     let layer = factory.build(Opening {
         cx: fcx.clone(),

@@ -299,6 +299,7 @@ pub struct Host {
     pub(super) ports: Vec<(u16, PortSpec)>,
     lan: Option<super::Lan>,
     tcp_options: tcp::Options,
+    tcp_factory: tcp::Factory,
     ip_factory: fictionet::stdlib::network::packet::Factory,
     programs: Vec<Arc<dyn Program>>,
     delay: Option<Duration>,
@@ -318,6 +319,7 @@ impl Host {
             ports: Vec::new(),
             lan: None,
             tcp_options: tcp::Options::default(),
+            tcp_factory: tcp::Factory::default(),
             ip_factory: fictionet::stdlib::network::packet::Factory::default(),
             programs: Vec::new(),
             delay: None,
@@ -330,6 +332,13 @@ impl Host {
     /// The first host installed at an address selects its packet stack.
     pub fn ip_factory(mut self, factory: fictionet::stdlib::network::packet::Factory) -> Self {
         self.ip_factory = factory;
+        self
+    }
+
+    /// Replaces TCP beneath this machine's application stacks and programs.
+    /// The first host installed at an address selects its transport.
+    pub fn tcp_factory(mut self, factory: tcp::Factory) -> Self {
+        self.tcp_factory = factory;
         self
     }
 
@@ -1510,6 +1519,7 @@ impl Machine {
             host.tcp_options,
             host.icmp_options.clone(),
             &host.ip_factory,
+            &host.tcp_factory,
         );
         let hooks = installation.admission.hooks.clone();
         tcp.limit_isolated_peers(move |addr| hooks.by_addr.lock().contains_key(&addr));

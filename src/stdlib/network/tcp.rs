@@ -84,9 +84,10 @@ use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, Entropy, Error, Interface};
 
 mod engine;
+mod factory;
 
-pub use engine::TcpLayer;
-use engine::Verdict;
+pub use engine::{TcpLayer, Verdict};
+pub use factory::{EndpointState, Factory, Opening, Stack};
 
 /// The MTU the endpoint assumes. Segments it sends are at most the smaller
 /// of this and what the peer's MSS option allows.
@@ -988,7 +989,7 @@ pub fn prepare_endpoint(
     Endpoint,
     Prepared<impl Future<Output = fictionet::Result> + Send + 'static>,
 ) {
-    let (endpoint, tcp) = prepare_transport(fcx, addr, options);
+    let (endpoint, tcp) = prepare_transport(fcx, addr, options, &Factory::default());
     let fcx = fcx.clone();
     let ip = super::packet::Factory::default().build(super::packet::Opening {
         cx: fcx.clone(),
@@ -1003,8 +1004,14 @@ pub(crate) fn prepare_transport(
     fcx: &Cx,
     addr: IpAddr,
     options: Options,
+    factory: &Factory,
 ) -> (Endpoint, PacketDriver) {
-    let tcp = TcpLayer::new(addr, options, fcx, fcx.now());
+    let tcp = factory.build(Opening {
+        cx: fcx.clone(),
+        addr,
+        options,
+        budget: Budget::unlimited(),
+    });
     let shared = Arc::new(Shared {
         addr,
         state: Mutex::new(Host {
@@ -1083,7 +1090,7 @@ struct Shared {
 struct Host {
     /// The endpoint's context: its clock and its entropy.
     fcx: Cx,
-    tcp: Driver<TcpLayer>,
+    tcp: Driver<Stack>,
     routes: Routes,
 }
 
@@ -1266,12 +1273,12 @@ impl Routes {
 }
 
 impl Host {
-    fn engine(&mut self) -> &mut TcpLayer {
-        self.tcp.layer_mut()
+    fn engine(&mut self) -> &mut dyn EndpointState {
+        self.tcp.layer_mut().state_mut()
     }
 
-    fn engine_ref(&self) -> &TcpLayer {
-        self.tcp.layer()
+    fn engine_ref(&self) -> &dyn EndpointState {
+        self.tcp.layer().state()
     }
 
     /// Reads the clock.
@@ -1335,6 +1342,14 @@ impl Host {
     /// Steps the transport and drains its output before yielding.
     fn visit(&mut self, out: &mut Vec<Vec<u8>>) -> bool {
         self.tick();
+        let mut work_exhausted = false;
+        for turn in 0..64 {
+            let Some(()) = self.tcp.take_work() else {
+                break;
+            };
+            self.tcp.complete(()).unwrap();
+            work_exhausted = turn == 63;
+        }
         self.tcp.run().unwrap();
         self.tcp.send_below(|command| {
             if let PacketCommand::Send(packet) = command {
@@ -1343,7 +1358,7 @@ impl Host {
             Admit::Taken
         });
         self.pump();
-        self.tcp.exhausted() || self.engine_ref().saturated()
+        work_exhausted || self.tcp.exhausted() || self.engine_ref().busy()
     }
 
     /// The endpoint stopped: every wait ends with an error. Waits for
@@ -1370,7 +1385,7 @@ impl Host {
                 .into_values()
                 .flatten(),
         );
-        self.engine().stop();
+        let _ = self.tcp.deliver(PacketEvent::Ended).unwrap();
         self.pump();
         wakers
     }
@@ -1398,14 +1413,14 @@ impl std::ops::Deref for Host {
     type Target = TcpLayer;
 
     fn deref(&self) -> &TcpLayer {
-        self.tcp.layer()
+        self.tcp.layer().standard()
     }
 }
 
 #[cfg(test)]
 impl std::ops::DerefMut for Host {
     fn deref_mut(&mut self) -> &mut TcpLayer {
-        self.tcp.layer_mut()
+        self.tcp.layer_mut().standard_mut()
     }
 }
 
@@ -1461,7 +1476,7 @@ impl Endpoint {
             .state
             .lock()
             .engine()
-            .limit_isolated_peers(isolated);
+            .limit_isolated_peers(Box::new(isolated));
     }
 
     /// The machine's address.
