@@ -101,6 +101,16 @@ impl ChunkVecBuffer {
         first
     }
 
+    pub(crate) fn take_sole_whole_chunk(&mut self, max_capacity: usize) -> Option<Vec<u8>> {
+        if self.prefix_used != 0
+            || self.chunks.len() != 1
+            || self.chunks.front()?.capacity() > max_capacity
+        {
+            return None;
+        }
+        self.chunks.pop_front()
+    }
+
     #[cfg(read_buf)]
     /// Read data out of this object, writing it into `cursor`.
     pub(crate) fn read_buf(

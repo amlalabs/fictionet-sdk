@@ -113,6 +113,15 @@ impl CommonState {
         self.sendable_tls.len()
     }
 
+    /// Takes the sole queued ciphertext chunk without copying if it is whole
+    /// and its allocation fits `max_capacity`. Otherwise leaves output queued
+    /// for [`Connection::write_tls`], preserving coalescing and partial writes.
+    ///
+    /// [`Connection::write_tls`]: crate::Connection::write_tls
+    pub fn take_sendable_tls_chunk(&mut self, max_capacity: usize) -> Option<Vec<u8>> {
+        self.sendable_tls.take_sole_whole_chunk(max_capacity)
+    }
+
     /// Returns true if the connection is currently performing the TLS handshake.
     ///
     /// During this time plaintext written to the connection is buffered in memory. After
@@ -1107,3 +1116,52 @@ pub(crate) type HandshakeFlightTls13<'a> = HandshakeFlight<'a, true>;
 
 const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
 pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
+
+#[cfg(all(test, feature = "std"))]
+mod ciphertext_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn sole_whole_ciphertext_transfers_its_allocation() {
+        let mut state = CommonState::new(Side::Server);
+        assert!(state.take_sendable_tls_chunk(64).is_none());
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[1; 16]);
+        let pointer = bytes.as_ptr();
+        let capacity = bytes.capacity();
+        state.sendable_tls.append(bytes);
+        assert!(state.take_sendable_tls_chunk(16).is_none());
+        assert_eq!(state.sendable_tls_len(), 16);
+        let owned = state.take_sendable_tls_chunk(capacity).unwrap();
+        assert_eq!(owned.as_ptr(), pointer);
+        assert_eq!(owned.capacity(), capacity);
+        assert_eq!(owned.len(), 16);
+        assert!(!state.wants_write());
+    }
+
+    #[test]
+    fn ineligible_ciphertext_stays_queued_for_bounded_coalescing() {
+        let mut state = CommonState::new(Side::Server);
+        state.sendable_tls.append(alloc::vec![1; 8]);
+        state.sendable_tls.append(alloc::vec![2; 8]);
+        assert!(state.take_sendable_tls_chunk(64).is_none());
+        let mut output = [0; 12];
+        assert_eq!(
+            state
+                .sendable_tls
+                .write_to(&mut output.as_mut_slice())
+                .unwrap(),
+            12
+        );
+        assert_eq!(state.sendable_tls_len(), 4);
+        assert!(state.take_sendable_tls_chunk(64).is_none());
+        let mut remainder = Vec::new();
+        assert_eq!(state.sendable_tls.write_to(&mut remainder).unwrap(), 4);
+        assert!(!state.wants_write());
+
+        state.sendable_tls.append(alloc::vec![3; 65]);
+        assert!(state.take_sendable_tls_chunk(64).is_none());
+        assert_eq!(state.sendable_tls_len(), 65);
+        assert_eq!(state.sendable_tls.write_to(&mut Vec::new()).unwrap(), 65);
+    }
+}
