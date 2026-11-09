@@ -1,4 +1,5 @@
-//! Dropped TLS writes never credit old bytes to a later write.
+//! A pending TLS write takes nothing, and a flush returns once the
+//! connection underneath took the ciphertext.
 
 use fictionet_test_support::certs;
 
@@ -152,6 +153,7 @@ fn scenario_mode(mode: u8) {
                 let n = conn.write(&fcx, b"hi").await?;
                 eprintln!("write(b\"hi\") (2 bytes) returned Ok({n})");
                 assert_eq!(n, 2);
+                conn.flush(&fcx).await?;
             }
             fcx.race(Some(fcx.now() + ms(500)), peer.join(&fcx))
                 .await??;
@@ -295,7 +297,7 @@ mod contract {
         (conn, peer)
     }
 
-    fn write_waits_for_complete_ciphertext(server: bool) {
+    fn flush_waits_for_complete_ciphertext(server: bool) {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(4),
             move |fcx| async move {
@@ -304,17 +306,23 @@ mod contract {
                 {
                     let mut cx = Context::from_waker(Waker::noop());
                     peer.lock().unwrap().budget = 0;
-                    assert!(client.poll_write(&fcx, &mut cx, data).is_pending());
+                    assert_eq!(
+                        client.poll_write(&fcx, &mut cx, data),
+                        Poll::Ready(Ok(data.len()))
+                    );
+                    assert!(client.poll_flush(&fcx, &mut cx).is_pending());
                     let mut complete = false;
                     for _ in 0..128 {
                         assert!(peer.lock().unwrap().received.is_empty());
                         peer.lock().unwrap().budget = 1;
-                        match client.poll_write(&fcx, &mut cx, data) {
+                        match client.poll_flush(&fcx, &mut cx) {
                             Poll::Pending => {
-                                assert!(client.poll_write(&fcx, &mut cx, data).is_pending());
+                                // The write before is still on its way, so
+                                // this one takes nothing.
+                                assert!(client.poll_write(&fcx, &mut cx, b"?").is_pending());
                             }
                             Poll::Ready(result) => {
-                                assert_eq!(result, Ok(data.len()));
+                                assert_eq!(result, Ok(()));
                                 assert_eq!(peer.lock().unwrap().received, data);
                                 complete = true;
                                 break;
@@ -332,41 +340,37 @@ mod contract {
         .unwrap();
     }
 
-    fn dropped_write_credits_only_matching_retries(server: bool) {
+    /// A write that returned `Pending` took nothing, whatever bytes it
+    /// offered: the next write's bytes are its own and go out once, after
+    /// the bytes taken before.
+    fn a_pending_write_takes_nothing(server: bool) {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(5),
             move |fcx| async move {
                 let original = b"original";
-                let retries: &[&[u8]] = &[original, b"original plus", b"orig", b"other", b""];
+                let next: &[&[u8]] = &[original, b"original plus", b"orig", b"other"];
                 for flush_by_read in [false, true] {
-                    for &retry in retries {
+                    for &next in next {
                         let (mut client, peer) = connected(&fcx, server).await;
                         {
                             let mut cx = Context::from_waker(Waker::noop());
                             peer.lock().unwrap().budget = 1;
-                            {
-                                let mut write = std::pin::pin!(client.write_all(&fcx, original));
-                                assert!(write.as_mut().poll(&mut cx).is_pending());
-                            }
+                            assert_eq!(
+                                client.poll_write(&fcx, &mut cx, original),
+                                Poll::Ready(Ok(original.len()))
+                            );
+                            assert!(client.poll_write(&fcx, &mut cx, next).is_pending());
                             assert!(peer.lock().unwrap().received.is_empty());
-                            assert!(client.poll_write(&fcx, &mut cx, retry).is_pending());
                             peer.lock().unwrap().budget = usize::MAX;
                             if flush_by_read {
                                 assert!(client.poll_read(&fcx, &mut cx, &mut [0]).is_pending());
                                 assert_eq!(peer.lock().unwrap().received, original);
                             }
                         }
-                        let n = client.write(&fcx, retry).await?;
-                        let same = retry.starts_with(original);
-                        assert_eq!(n, if same { original.len() } else { retry.len() });
-                        client.write_all(&fcx, &retry[n..]).await?;
+                        assert_eq!(client.write(&fcx, next).await?, next.len());
                         client.write_all(&fcx, b"!").await?;
                         let mut expected = original.to_vec();
-                        expected.extend_from_slice(if same {
-                            &retry[original.len()..]
-                        } else {
-                            retry
-                        });
+                        expected.extend_from_slice(next);
                         expected.push(b'!');
                         assert_eq!(peer.lock().unwrap().received, expected);
                     }
@@ -377,7 +381,7 @@ mod contract {
         .unwrap();
     }
 
-    fn write_propagates_downstream_failures(server: bool) {
+    fn flush_reports_downstream_failures(server: bool) {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(6),
             move |fcx| async move {
@@ -391,13 +395,18 @@ mod contract {
                         let mut cx = Context::from_waker(Waker::noop());
                         if partial {
                             peer.lock().unwrap().budget = 1;
-                            assert!(client.poll_write(&fcx, &mut cx, b"hello").is_pending());
+                        } else {
+                            peer.lock().unwrap().terminal = Some(result);
                         }
-                        peer.lock().unwrap().terminal = Some(result);
                         assert_eq!(
                             client.poll_write(&fcx, &mut cx, b"hello"),
-                            Poll::Ready(Err(error))
+                            Poll::Ready(Ok(5))
                         );
+                        if partial {
+                            assert!(client.poll_flush(&fcx, &mut cx).is_pending());
+                            peer.lock().unwrap().terminal = Some(result);
+                        }
+                        assert_eq!(client.poll_flush(&fcx, &mut cx), Poll::Ready(Err(error)));
                         assert!(peer.lock().unwrap().received.is_empty());
                     }
                 }
@@ -418,9 +427,12 @@ mod contract {
             move |fcx| async move {
                 let (mut conn, peer) = connected(&fcx, server).await;
                 let mut cx = Context::from_waker(Waker::noop());
-                // Leave ciphertext queued, as when a write future is dropped.
+                // Leave ciphertext queued: taken, not yet flushed.
                 peer.lock().unwrap().budget = 0;
-                assert!(conn.poll_write(&fcx, &mut cx, b"queued").is_pending());
+                assert_eq!(
+                    conn.poll_write(&fcx, &mut cx, b"queued"),
+                    Poll::Ready(Ok(6))
+                );
                 if incoming {
                     let mut peer = peer.lock().unwrap();
                     peer.tls.refresh_traffic_keys().unwrap();
@@ -480,16 +492,16 @@ mod contract {
                 use super::*;
 
                 #[test]
-                fn write_waits_for_complete_ciphertext() {
-                    super::write_waits_for_complete_ciphertext($server);
+                fn flush_waits_for_complete_ciphertext() {
+                    super::flush_waits_for_complete_ciphertext($server);
                 }
                 #[test]
-                fn dropped_write_credits_only_matching_retries() {
-                    super::dropped_write_credits_only_matching_retries($server);
+                fn a_pending_write_takes_nothing() {
+                    super::a_pending_write_takes_nothing($server);
                 }
                 #[test]
-                fn write_propagates_downstream_failures() {
-                    super::write_propagates_downstream_failures($server);
+                fn flush_reports_downstream_failures() {
+                    super::flush_reports_downstream_failures($server);
                 }
                 #[test]
                 fn read_with_input_reports_closed_output() {

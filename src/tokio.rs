@@ -112,10 +112,11 @@ impl<C: Connection + Unpin> ::tokio::io::AsyncWrite for Compat<C> {
             .map_err(std::io::Error::from)
     }
 
-    /// A connection hands bytes on as soon as `poll_write` takes them, so
-    /// there is nothing to flush.
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.inner
+            .poll_flush(&this.fcx, cx)
+            .map_err(std::io::Error::from)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

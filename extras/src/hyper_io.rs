@@ -45,8 +45,11 @@ impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
             .poll_write(&this.fcx, cx, data)
             .map_err(std::io::Error::other)
     }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.conn
+            .poll_flush(&this.fcx, cx)
+            .map_err(std::io::Error::other)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();

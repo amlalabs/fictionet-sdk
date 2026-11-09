@@ -153,23 +153,15 @@ pub trait Connection: Send + 'static {
     ) -> Poll<Result<usize, ConnError>>;
 
     /// Polls to write some of `data`. Returns how many bytes were taken.
-    /// Pending while there is no room.
+    /// Pending while there is no room, and then none of `data` was taken:
+    /// the next call may offer other bytes, or none.
     ///
-    /// After `Poll::Pending`, call again with the same bytes until the call
-    /// returns `Poll::Ready`. A layer may already hold those bytes while it
-    /// waits for the connection underneath. A TLS connection, for example,
-    /// has encrypted them and reports them taken once they are sent. If a
-    /// pending write is dropped, its bytes may still be sent. A later write
-    /// that starts with the same bytes counts as a retry, even if it has
-    /// more bytes after them. A later write with different starting bytes
-    /// must report only bytes from that later call.
+    /// Bytes that were taken belong to the connection, and it sends them
+    /// once. A middleware such as TLS may still hold them, encrypted, until
+    /// [`poll_flush`](Connection::poll_flush) hands them on.
     ///
     /// Never returns `Ok(0)` when `data` is not empty: a connection that can
     /// take no more bytes ever returns an error instead.
-    ///
-    /// Bytes that were taken are on their way. There is no separate flush,
-    /// so a middleware such as TLS must hand its output on before it reports
-    /// bytes as taken.
     fn poll_write(
         &mut self,
         fcx: &Cx,
@@ -177,8 +169,18 @@ pub trait Connection: Send + 'static {
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>>;
 
-    /// Polls to say this side will send nothing more. For TCP this sends a
-    /// FIN. For TLS it first sends `close_notify`. Reading still works.
+    /// Polls until every byte taken so far is on its way: handed to the
+    /// connection underneath, or to the transport. A connection that hands
+    /// bytes on as it takes them, such as TCP, is always flushed, which is
+    /// the default. Middleware that holds bytes flushes them, then passes
+    /// the flush on to the connection underneath.
+    fn poll_flush(&mut self, _fcx: &Cx, _cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// Polls to say this side will send nothing more. Bytes taken before go
+    /// first. For TCP this sends a FIN. For TLS it first sends
+    /// `close_notify`. Reading still works.
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>>;
 
     /// Ready once the other side has reset the connection, or it is gone,
@@ -211,6 +213,10 @@ impl Connection for Box<dyn Connection> {
         (**self).poll_write(fcx, cx, data)
     }
 
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+        (**self).poll_flush(fcx, cx)
+    }
+
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         (**self).poll_shutdown(fcx, cx)
     }
@@ -237,6 +243,9 @@ pub trait ConnectionExt: Connection {
 
     /// Writes some of `data`. Returns how many bytes were taken, which may be
     /// fewer than `data.len()`. Waits only while there is no room at all.
+    /// Dropped before it returns, it took nothing. Call
+    /// [`flush`](ConnectionExt::flush) before waiting on anything other than
+    /// this connection, so the bytes are on their way.
     fn write<'a>(
         &'a mut self,
         fcx: &'a Cx,
@@ -246,9 +255,10 @@ pub trait ConnectionExt: Connection {
     }
 
     /// Writes all of `data`, calling [`write`](ConnectionExt::write) until
-    /// every byte is taken. If a connection breaks the `poll_write` contract
-    /// and takes no bytes, this returns [`ConnError::Closed`] instead of
-    /// looping forever.
+    /// every byte is taken, then flushes, so every byte is on its way when
+    /// it returns. If a connection breaks the `poll_write` contract and
+    /// takes no bytes, this returns [`ConnError::Closed`] instead of looping
+    /// forever.
     fn write_all<'a>(
         &'a mut self,
         fcx: &'a Cx,
@@ -262,8 +272,16 @@ pub trait ConnectionExt: Connection {
                 }
                 data = &data[n..];
             }
-            Ok(())
+            self.flush(fcx).await
         }
+    }
+
+    /// Waits until every byte taken so far is on its way.
+    fn flush<'a>(
+        &'a mut self,
+        fcx: &'a Cx,
+    ) -> impl Future<Output = Result<(), ConnError>> + Send + 'a {
+        std::future::poll_fn(move |cx| self.poll_flush(fcx, cx))
     }
 
     /// Says this side will send nothing more. Reading still works.
