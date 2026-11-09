@@ -22,7 +22,6 @@ use crate::verify::{DigitallySignedStruct, HandshakeSignatureValid};
 /// `intermediates` contains all certificates other than `end_entity` that
 /// were sent as part of the server's `Certificate` message. It is in the
 /// same order that the server sent them and may be empty.
-#[allow(dead_code)]
 pub fn verify_server_cert_signed_by_trust_anchor(
     cert: &ParsedCertificate<'_>,
     roots: &RootCertStore,

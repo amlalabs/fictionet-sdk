@@ -43,6 +43,7 @@ macro_rules! generated_runtime {
         }
         impl std::error::Error for $error {}
 
+        // Each generated schema uses only part of these runtime helpers.
         #[allow(dead_code)]
         mod $wire {
             use super::{$error, $max_allocation, $max_depth, $max_message, $max_nodes};

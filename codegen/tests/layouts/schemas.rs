@@ -1,5 +1,5 @@
-//! Schemas for the layout checks. `codegen/tests/layout.rs` checks them,
-//! and this crate's build script generates modules from the random ones,
+//! Schemas for the layout checks. This crate's build script generates
+//! modules from the random schemas,
 //! which the crate compiles against the SDK and runs the tests of.
 use fictionet_codegen::*;
 

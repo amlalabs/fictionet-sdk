@@ -1468,7 +1468,6 @@ impl ExpectTraffic {
 
         let now = self.config.current_time()?;
 
-        #[allow(unused_mut)]
         let mut value = persist::Tls13ClientSessionValue::new(
             self.suite,
             nst.ticket.clone(),
