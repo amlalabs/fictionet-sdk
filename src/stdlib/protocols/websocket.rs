@@ -451,10 +451,23 @@ impl Header {
         }))
     }
 
+    fn parse_exact(bytes: &[u8]) -> Result<Header, Error> {
+        let header = Self::parse(bytes)?.ok_or(Error::Truncated)?;
+        match header.frame_len().cmp(&bytes.len()) {
+            core::cmp::Ordering::Less => Err(Error::Trailing),
+            core::cmp::Ordering::Greater => Err(Error::Truncated),
+            core::cmp::Ordering::Equal => Ok(header),
+        }
+    }
+
     /// The header and payload lengths together: the whole frame. For a
     /// header built by hand with a huge length it stops at `usize::MAX`.
     pub fn frame_len(&self) -> usize {
         self.header_len.saturating_add(self.len)
+    }
+
+    fn payload(self, bytes: &[u8]) -> Option<&[u8]> {
+        bytes.get(self.header_len..self.frame_len())
     }
 }
 
@@ -484,7 +497,7 @@ impl Frame {
     }
 
     fn from_header(b: &[u8], h: Header) -> Option<Frame> {
-        let body = b.get(h.header_len..h.frame_len())?;
+        let body = h.payload(b)?;
         let mut payload = body.to_vec();
         if let Some(key) = h.mask {
             apply_mask(&mut payload, key, 0);
@@ -716,17 +729,12 @@ impl Wire for Frame {
     /// [`Frames`] checks mask direction; [`Messages`] also checks continuation
     /// order and text. A fragment may end inside a UTF-8 character.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let header = Header::parse(bytes)?.ok_or(Error::Truncated)?;
-        match Self::from_header(bytes, header) {
-            Some(frame) if header.frame_len() == bytes.len() => {
-                if frame.opcode == Opcode::Close {
-                    parse_close(&frame.payload)?;
-                }
-                Ok(frame)
-            }
-            Some(_) => Err(Error::Trailing),
-            None => Err(Error::Truncated),
+        let header = Header::parse_exact(bytes)?;
+        let frame = Self::from_header(bytes, header).ok_or(Error::Truncated)?;
+        if frame.opcode == Opcode::Close {
+            parse_close(&frame.payload)?;
         }
+        Ok(frame)
     }
 
     /// Writes the shortest length form and applies the masking key. Refuses
@@ -734,40 +742,54 @@ impl Wire for Frame {
     /// payloads without changing `out`. A frame carries at most [`MAX_PAYLOAD`]
     /// bytes, or [`MAX_CONTROL_PAYLOAD`] for a control frame.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let payload = &self.payload;
-        if payload.len() > MAX_PAYLOAD
-            || self.opcode.is_control() && (!self.fin || payload.len() > MAX_CONTROL_PAYLOAD)
-            || self.opcode == Opcode::Close && parse_close(payload).is_err()
-        {
-            return Err(Error::Unwritable);
+        write_frame(out, self.fin, self.opcode, self.mask, &self.payload)
+    }
+}
+
+fn write_frame(
+    out: &mut Vec<u8>,
+    fin: bool,
+    opcode: Opcode,
+    mask: Option<[u8; 4]>,
+    payload: &[u8],
+) -> Result<(), Error> {
+    if payload.len() > MAX_PAYLOAD
+        || opcode.is_control() && (!fin || payload.len() > MAX_CONTROL_PAYLOAD)
+        || opcode == Opcode::Close && parse_close(payload).is_err()
+    {
+        return Err(Error::Unwritable);
+    }
+    let size = payload
+        .len()
+        .checked_add(MAX_HEADER_LEN)
+        .ok_or(Error::Unwritable)?;
+    out.try_reserve(size).map_err(|_| Error::Allocation)?;
+    write_header(out, fin, opcode, mask, payload.len());
+    let start = out.len();
+    out.extend_from_slice(payload);
+    if let Some(key) = mask {
+        apply_mask(&mut out[start..], key, 0);
+    }
+    Ok(())
+}
+
+// Shared by the writer and its bounded proof; payload copying stays in write_frame.
+fn write_header(out: &mut Vec<u8>, fin: bool, opcode: Opcode, mask: Option<[u8; 4]>, len: usize) {
+    out.push(if fin { 0x80 } else { 0 } | opcode.to_u8());
+    let masked = if mask.is_some() { 0x80 } else { 0 };
+    match len {
+        n if n < 126 => out.push(masked | n as u8),
+        n if n <= 0xffff => {
+            out.push(masked | 126);
+            out.extend_from_slice(&(n as u16).to_be_bytes());
         }
-        let size = payload
-            .len()
-            .checked_add(MAX_HEADER_LEN)
-            .ok_or(Error::Unwritable)?;
-        out.try_reserve(size).map_err(|_| Error::Allocation)?;
-        out.push(if self.fin { 0x80 } else { 0 } | self.opcode.to_u8());
-        let masked = if self.mask.is_some() { 0x80 } else { 0 };
-        match payload.len() {
-            n if n < 126 => out.push(masked | n as u8),
-            n if n <= 0xffff => {
-                out.push(masked | 126);
-                out.extend_from_slice(&(n as u16).to_be_bytes());
-            }
-            n => {
-                out.push(masked | 127);
-                out.extend_from_slice(&(n as u64).to_be_bytes());
-            }
+        n => {
+            out.push(masked | 127);
+            out.extend_from_slice(&(n as u64).to_be_bytes());
         }
-        if let Some(key) = self.mask {
-            out.extend_from_slice(&key);
-        }
-        let start = out.len();
-        out.extend_from_slice(payload);
-        if let Some(key) = self.mask {
-            apply_mask(&mut out[start..], key, 0);
-        }
-        Ok(())
+    }
+    if let Some(key) = mask {
+        out.extend_from_slice(&key);
     }
 }
 
@@ -934,6 +956,27 @@ impl Messages {
     pub fn limit(&self) -> usize {
         self.limit
     }
+
+    fn check_header(&self, input: &[u8]) -> Result<(), Error> {
+        if let Some(h) = self.frames.header(input).map_err(|error| match error {
+            Error::PayloadTooLarge(_) => Error::TooBig,
+            other => other,
+        })? {
+            match (&self.partial, h.opcode) {
+                (None, Opcode::Continuation) => return Err(Error::UnexpectedContinuation),
+                (Some(_), Opcode::Text | Opcode::Binary) => {
+                    return Err(Error::ExpectedContinuation);
+                }
+                _ => {}
+            }
+            if !h.opcode.is_control()
+                && codec::Decode::held(self).saturating_add(h.len) > self.limit
+            {
+                return Err(Error::TooBig);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl codec::Decode for Messages {
@@ -954,21 +997,7 @@ impl codec::Decode for Messages {
         if self.frames.closed {
             return Ok(Step::End);
         }
-        if let Some(h) = self.frames.header(input).map_err(|error| match error {
-            Error::PayloadTooLarge(_) => Inner(Error::TooBig),
-            other => Inner(other),
-        })? {
-            match (&self.partial, h.opcode) {
-                (None, Opcode::Continuation) => return Err(Inner(Error::UnexpectedContinuation)),
-                (Some(_), Opcode::Text | Opcode::Binary) => {
-                    return Err(Inner(Error::ExpectedContinuation));
-                }
-                _ => {}
-            }
-            if !h.opcode.is_control() && self.held().saturating_add(h.len) > self.limit {
-                return Err(Inner(Error::TooBig));
-            }
-        }
+        self.check_header(input).map_err(Inner)?;
         let (frame, used) = match self.frames.decode(input, eof).map_err(Inner)? {
             Step::Item(frame, used) => (frame, used),
             Step::Need if eof && input.is_empty() && self.partial.is_some() => {
@@ -1001,14 +1030,7 @@ impl codec::Decode for Messages {
         }
         if let Some(p) = self.partial.as_mut() {
             if p.opcode == Opcode::Text {
-                let rest = p.data.get(p.checked..).unwrap_or_default();
-                match core::str::from_utf8(rest) {
-                    Ok(_) => p.checked = p.data.len(),
-                    Err(e) if e.error_len().is_some() || frame.fin => {
-                        return Err(Inner(Error::InvalidUtf8));
-                    }
-                    Err(e) => p.checked = p.checked.saturating_add(e.valid_up_to()),
-                }
+                validate_text(&p.data, &mut p.checked, frame.fin).map_err(Inner)?;
             }
             if frame.fin {
                 let data = core::mem::take(&mut p.data);
@@ -1023,6 +1045,16 @@ impl codec::Decode for Messages {
         }
         Ok(Step::Skip(used))
     }
+}
+
+fn validate_text(data: &[u8], checked: &mut usize, fin: bool) -> Result<(), Error> {
+    let rest = data.get(*checked..).unwrap_or_default();
+    match core::str::from_utf8(rest) {
+        Ok(_) => *checked = data.len(),
+        Err(e) if e.error_len().is_some() || fin => return Err(Error::InvalidUtf8),
+        Err(e) => *checked = checked.saturating_add(e.valid_up_to()),
+    }
+    Ok(())
 }
 
 /// A valid client upgrade request, as [`check_request`] reads it.
@@ -3018,3 +3050,7 @@ mod tests {
         assert_eq!(d.buffered(), 0);
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/websocket/kani/frames.rs"]
+mod verification;

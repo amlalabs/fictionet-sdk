@@ -1837,6 +1837,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ambiguous_framing_never_dispatches_a_pipelined_request() {
+        struct Paths(Arc<Mutex<Vec<String>>>);
+        impl Handler for Paths {
+            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+                self.0.lock().push(request.uri().path().to_owned());
+                Reply::Now(Response::new(Body::empty()))
+            }
+        }
+        for (fields, body, accepted) in [
+            ("Content-Length: 1\r\nContent-Length: 1\r\n", "x", true),
+            ("Content-Length: 1, 1\r\n", "x", true),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                "1\r\nx\r\n0\r\n\r\n",
+                true,
+            ),
+            (
+                "Content-Length: 1\r\nTransfer-Encoding: chunked\r\n",
+                "x",
+                false,
+            ),
+            (
+                "Transfer-Encoding: chunked\r\nContent-Length: 1\r\n",
+                "x",
+                false,
+            ),
+            ("Content-Length: 1\r\nContent-Length: 2\r\n", "x", false),
+            ("Content-Length: 1, 2\r\n", "x", false),
+            ("Transfer-Encoding: chunked, gzip\r\n", "", false),
+            ("Transfer-Encoding: gzip, chunked\r\n", "0\r\n\r\n", false),
+            ("Transfer-Encoding: gzip\r\n", "", false),
+            (
+                "Transfer-Encoding: chunked\r\n",
+                "10000000000000000\r\n",
+                false,
+            ),
+            ("Transfer-Encoding: chunked\r\n", "0;x=y\r\n\r\n", false),
+            ("Transfer-Encoding: chunked\r\n", "0\r\nX: y\r\n\r\n", false),
+            ("Content-Length: 1\r\n 0\r\n", "x", false),
+            ("Content-Length: 1\n", "x", false),
+            ("X: a\rb\r\n", "", false),
+        ] {
+            let first = format!("POST /first HTTP/1.1\r\nHost: a\r\n{fields}\r\n{body}");
+            let mut wire = first.as_bytes().to_vec();
+            wire.extend_from_slice(b"GET /admin HTTP/1.1\r\nHost: a\r\n\r\n");
+            // Exercise every split, including inside the two length fields,
+            // the body boundary and the next request's start line.
+            for cut in 0..=wire.len() {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let mut h = Harness::new(
+                    fictionet::Seed::from_u64(0),
+                    Http1::new(Paths(seen.clone())),
+                )
+                .with_worker(Polling::new());
+                h.push(&wire[..cut]).unwrap();
+                h.push(&wire[cut..]).unwrap();
+                let (responses, error) =
+                    fictionet::stdlib::test_support::decode_all(http1::Responses::new, h.output());
+                assert!(error.is_none(), "{fields:?}, cut {cut}: {error:?}");
+                assert_eq!(responses.len(), if accepted { 2 } else { 1 });
+                assert!(responses.iter().all(|response| response.body.is_empty()));
+                let paths = seen.lock();
+                if accepted {
+                    assert_eq!(&*paths, &["/first", "/admin"], "{fields:?}, cut {cut}");
+                } else {
+                    assert!(
+                        !paths.iter().any(|path| path == "/admin"),
+                        "{fields:?}, cut {cut}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A body that waits until `open` is set, then sends `done`.
     struct Gate(Arc<AtomicBool>, bool);
 

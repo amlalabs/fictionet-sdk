@@ -1665,6 +1665,18 @@ struct Fields {
     close: bool,
 }
 fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
+    scan_fields(
+        headers
+            .iter()
+            .map(|h| (h.name.as_str(), h.value.as_slice())),
+        version,
+    )
+}
+
+fn scan_fields<'a>(
+    headers: impl Iterator<Item = (&'a str, &'a [u8])> + Clone,
+    version: Version,
+) -> Result<Fields, Error> {
     let mut result = Fields {
         length: None,
         transfer: false,
@@ -1673,47 +1685,26 @@ fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
         close: false,
     };
     let mut keep = false;
-    if named(headers, "transfer-encoding").next().is_some()
-        && named(headers, "content-length").next().is_some()
-    {
-        return Err(Error::TransferEncodingAndContentLength);
-    }
-    for h in headers {
-        if !token(h.name.as_bytes())
-            || !h.value.iter().copied().all(field_byte)
-            || trim(&h.value) != h.value
-        {
+    let has_transfer = headers
+        .clone()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
+    check_framing_fields(
+        has_transfer,
+        has_transfer
+            && headers
+                .clone()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-length")),
+    )?;
+    for (name, value) in headers {
+        if !valid_field(name, value) {
             return Err(Error::Header);
         }
-        if h.name.eq_ignore_ascii_case("content-length") {
-            for value in h.value.split(|b| *b == b',') {
-                let n = number(trim(value), 10, Error::ContentLength)?;
-                if result.length.is_some_and(|old| old != n) {
-                    return Err(Error::ConflictingContentLength);
-                }
-                result.length = Some(n);
-            }
-        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            if version == Version::Http10 {
-                return Err(Error::Http10TransferEncoding);
-            }
-            for value in h.value.split(|b| *b == b',') {
-                let value = trim(value);
-                if value.is_empty() {
-                    continue;
-                }
-                if result.chunked {
-                    return Err(Error::ChunkedNotLast);
-                }
-                if !token(value) {
-                    return Err(Error::TransferEncoding);
-                }
-                result.transfer = true;
-                result.chunked = value.eq_ignore_ascii_case(b"chunked");
-                result.unsupported_transfer_coding |= !result.chunked;
-            }
-        } else if h.name.eq_ignore_ascii_case("connection") {
-            for value in h.value.split(|b| *b == b',') {
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length(value, &mut result.length)?;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding(value, version, &mut result)?;
+        } else if name.eq_ignore_ascii_case("connection") {
+            for value in value.split(|b| *b == b',') {
                 let value = trim(value);
                 if value.is_empty() {
                     continue;
@@ -1726,12 +1717,64 @@ fn fields(headers: &[Header], version: Version) -> Result<Fields, Error> {
             }
         }
     }
-    if named(headers, "transfer-encoding").next().is_some() && !result.transfer {
-        return Err(Error::TransferEncoding);
-    }
+    complete_transfer(has_transfer, &result)?;
     result.close |= version == Version::Http10 && !keep;
     Ok(result)
 }
+fn valid_field(name: &str, value: &[u8]) -> bool {
+    token(name.as_bytes()) && valid_field_value(value)
+}
+fn valid_field_value(value: &[u8]) -> bool {
+    value.iter().copied().all(field_byte) && trim(value) == value
+}
+
+fn content_length(value: &[u8], length: &mut Option<u64>) -> Result<(), Error> {
+    for value in value.split(|b| *b == b',') {
+        let n = number(trim(value), 10, Error::ContentLength)?;
+        if length.is_some_and(|old| old != n) {
+            return Err(Error::ConflictingContentLength);
+        }
+        *length = Some(n);
+    }
+    Ok(())
+}
+
+fn check_framing_fields(transfer: bool, length: bool) -> Result<(), Error> {
+    if transfer && length {
+        return Err(Error::TransferEncodingAndContentLength);
+    }
+    Ok(())
+}
+
+fn transfer_encoding(value: &[u8], version: Version, result: &mut Fields) -> Result<(), Error> {
+    if version == Version::Http10 {
+        return Err(Error::Http10TransferEncoding);
+    }
+    for value in value.split(|b| *b == b',') {
+        let value = trim(value);
+        if value.is_empty() {
+            continue;
+        }
+        if result.chunked {
+            return Err(Error::ChunkedNotLast);
+        }
+        if !token(value) {
+            return Err(Error::TransferEncoding);
+        }
+        result.transfer = true;
+        result.chunked = value.eq_ignore_ascii_case(b"chunked");
+        result.unsupported_transfer_coding |= !result.chunked;
+    }
+    Ok(())
+}
+
+fn complete_transfer(present: bool, result: &Fields) -> Result<(), Error> {
+    if present && !result.transfer {
+        return Err(Error::TransferEncoding);
+    }
+    Ok(())
+}
+
 fn request_framing(info: Fields) -> Result<Framing, Error> {
     if info.transfer {
         if !info.chunked {
@@ -1784,20 +1827,27 @@ pub fn header_line_ok(line: &[u8]) -> bool {
     })
 }
 
-fn header_line(line: &[u8], lenient: bool) -> Result<Header, Error> {
+fn header_parts(line: &[u8], lenient: bool) -> Result<(&str, &[u8]), Error> {
     let colon = line.iter().position(|b| *b == b':').ok_or(Error::Header)?;
     let name = &line[..colon];
     let value = trim(&line[colon.saturating_add(1)..]);
     if lenient && !header_line_ok(line) {
         return Err(Error::Header);
     }
+    Ok((
+        core::str::from_utf8(name).map_err(|_| Error::Header)?,
+        value,
+    ))
+}
+
+fn header_line(line: &[u8], lenient: bool) -> Result<Header, Error> {
+    let (name, value) = header_parts(line, lenient)?;
     Ok(Header {
-        name: core::str::from_utf8(name)
-            .map(str::to_owned)
-            .map_err(|_| Error::Header)?,
+        name: name.to_owned(),
         value: value.to_vec(),
     })
 }
+
 fn split_head(b: &[u8], lenient: bool) -> Result<(&[u8], Vec<Header>), Error> {
     let mut lines = b.split(|b| *b == b'\n');
     let first = lines
@@ -2326,6 +2376,10 @@ impl Wire for Chunk {
 #[cfg(kani)]
 #[path = "../../../verification/http/kani/body.rs"]
 mod proofs;
+
+#[cfg(kani)]
+#[path = "../../../verification/http/kani/smuggling.rs"]
+mod smuggling_proofs;
 
 #[cfg(test)]
 mod tests {

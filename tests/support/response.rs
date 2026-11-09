@@ -134,15 +134,18 @@ impl Handler for EchoSocket {
                     let mut buf = [0; 4096];
                     loop {
                         while let Some(message) = stream.next() {
-                            let Ok(ws::Message::Text(text)) = message else {
-                                return;
+                            let reply = match message {
+                                Ok(ws::Message::Text(text)) => {
+                                    ws::Message::Text(format!("echo: {text}"))
+                                }
+                                Ok(ws::Message::Close(close)) => ws::Message::Close(close),
+                                Ok(ws::Message::Ping(payload)) => ws::Message::Pong(payload),
+                                Ok(ws::Message::Pong(_)) => continue,
+                                _ => return,
                             };
-                            let reply = ws::Message::Text(format!("echo: {text}"))
-                                .to_frame(None)
-                                .unwrap()
-                                .to_bytes()
-                                .unwrap();
-                            if conn.write_all(&cx, &reply).await.is_err() {
+                            let closing = matches!(reply, ws::Message::Close(_));
+                            let reply = reply.to_frame(None).unwrap().to_bytes().unwrap();
+                            if conn.write_all(&cx, &reply).await.is_err() || closing {
                                 return;
                             }
                         }

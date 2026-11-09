@@ -245,7 +245,7 @@ mod http {
             codec::{Side, Stream, Wire},
             protocols::websocket::{self, Message, Messages},
         };
-        /// Answers each message with itself, over the upgraded connection.
+        /// Echoes data and handles control messages on the upgraded connection.
         async fn echo(
             fcx: &fictionet::Cx,
             mut conn: Box<dyn fictionet::stdlib::network::Connection>,
@@ -253,9 +253,17 @@ mod http {
             let mut stream = Stream::new(Messages::for_receiver(Side::Server));
             loop {
                 while let Some(message) = stream.next() {
-                    let message = message.map_err(|e| fictionet::Error::msg(e.to_string()))?;
+                    let message = match message.map_err(|e| fictionet::Error::msg(e.to_string()))? {
+                        Message::Ping(payload) => Message::Pong(payload),
+                        Message::Pong(_) => continue,
+                        other => other,
+                    };
+                    let closing = matches!(message, Message::Close(_));
                     conn.write_all(fcx, &message.to_frame(None)?.to_bytes()?)
                         .await?;
+                    if closing {
+                        return Ok(());
+                    }
                 }
                 let mut buf = [0; 1024];
                 let n = conn.read(fcx, &mut buf).await?;
@@ -282,22 +290,46 @@ mod http {
             let mut request = b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n".to_vec();
             // Send the first frame with the handshake to check unread bytes survive.
             request.extend(Message::Text("hello".into()).to_frame(Some([1, 2, 3, 4])).unwrap().to_bytes().unwrap());
+            request.extend(Message::Ping(b"probe".to_vec()).to_frame(Some([5, 6, 7, 8])).unwrap().to_bytes().unwrap());
+            request.extend(Message::Pong(b"unsolicited".to_vec()).to_frame(Some([9, 10, 11, 12])).unwrap().to_bytes().unwrap());
             conn.write_all(&fcx, &request).await?;
             let response = head(&fcx, &mut conn).await;
             assert!(response.starts_with("http/1.1 101"), "{response}");
             assert!(response.contains("connection: upgrade\r\n"), "{response}");
             assert!(response.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{response}");
             let mut stream = Stream::new(Messages::for_receiver(Side::Client));
-            loop {
-                if let Some(message) = stream.next() {
-                    assert_eq!(message.unwrap(), Message::Text("hello".into()));
-                    break;
+            for expected in [Message::Text("hello".into()), Message::Pong(b"probe".to_vec())] {
+                loop {
+                    if let Some(message) = stream.next() {
+                        assert_eq!(message.unwrap(), expected);
+                        break;
+                    }
+                    let mut buf = [0; 1024];
+                    let n = conn.read(&fcx, &mut buf).await?;
+                    assert!(n > 0);
+                    assert_eq!(stream.push(&buf[..n]), n);
                 }
+            }
+            assert!(stream.next().is_none());
+            let close = Message::Close(Some(websocket::Close::new(1000)));
+            conn.write_all(&fcx, &close.to_frame(Some([1, 2, 3, 4]))?.to_bytes()?).await?;
+            let mut reply = Vec::new();
+            loop {
                 let mut buf = [0; 1024];
                 let n = conn.read(&fcx, &mut buf).await?;
-                assert!(n > 0);
-                assert_eq!(stream.push(&buf[..n]), n);
+                if n == 0 { break; }
+                reply.extend_from_slice(&buf[..n]);
             }
+            // One unmasked Close echoing the code, then nothing before EOF.
+            let mut replies = Stream::new(Messages::for_receiver(Side::Client));
+            assert_eq!(replies.push(&reply), reply.len());
+            replies.end();
+            match replies.next() {
+                Some(Ok(Message::Close(Some(close)))) => assert_eq!(close.code, 1000),
+                other => panic!("expected one close reply, got {other:?}"),
+            }
+            assert!(replies.next().is_none());
+            assert!(replies.is_done() && replies.unread().is_empty(), "bytes after the close reply");
             fcx.cancel();
             Ok(())
         })).unwrap();
