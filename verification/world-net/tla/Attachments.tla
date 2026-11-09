@@ -11,7 +11,11 @@
    (`Router::add`, `Edit::Route` in `route::router`) and sees a link close
    some time later (`ports::Event::Closed`). The connections are the ones
    `abort_peers` resets on the machines; the packets are the ones a machine
-   attributes with `Hooks::sandbox_at` when they arrive. *)
+   attributes with `Hooks::sandbox_at` when they arrive. Host admission now
+   obtains peer identity from a TCP child opening, before constructing its
+   application. Reset and retirement go through the public transport
+   boundary; closing the application does not remove the modeled connection.
+   Packet dispatch and protocol bytes remain outside this model. *)
 EXTENDS Naturals, FiniteSets, Sequences
 
 CONSTANTS
