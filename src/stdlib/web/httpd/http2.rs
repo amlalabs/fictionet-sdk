@@ -131,6 +131,10 @@ pub struct Http2 {
     out_bytes: usize,
     /// What was queued, in order, for the transport's completions.
     sent: VecDeque<Piece>,
+    /// The streams a completion touched and finished: kept between
+    /// completions so none allocates, bounded by the streams open at once.
+    touched: Vec<u32>,
+    finished: Vec<u32>,
     /// The stream whose frame went out last, so streams take turns.
     turn: u32,
     charge: Option<Charge>,
@@ -242,6 +246,8 @@ impl Http2 {
             out: VecDeque::new(),
             out_bytes: 0,
             sent: VecDeque::new(),
+            touched: Vec::new(),
+            finished: Vec::new(),
             turn: 0,
             charge: None,
             last_words: None,
@@ -1220,21 +1226,28 @@ impl Http2 {
     fn send(&mut self, env: &mut Env<'_, Report>) -> bool {
         let mut moved = false;
         loop {
+            // Each stream once, those after the last served first. A stream
+            // may end as it is served, so each is found again from the one
+            // before it instead of from a list made ahead.
+            let turn = self.turn;
             let mut any = false;
-            let ids: Vec<u32> = self
-                .streams
-                .range(self.turn.saturating_add(1)..)
-                .chain(self.streams.range(..=self.turn))
-                .map(|(id, _)| *id)
-                .collect();
-            for id in ids {
-                if self.out_bytes >= OUT_LIMIT || self.phase != Phase::Open {
-                    return moved;
-                }
-                if self.send_one(env, id) {
-                    self.turn = id;
-                    any = true;
-                    moved = true;
+            for (low, high) in [(turn.saturating_add(1), u32::MAX), (0, turn)] {
+                let mut from = low;
+                while from <= high
+                    && let Some(id) = self.streams.range(from..=high).next().map(|(id, _)| *id)
+                {
+                    if self.out_bytes >= OUT_LIMIT || self.phase != Phase::Open {
+                        return moved;
+                    }
+                    if self.send_one(env, id) {
+                        self.turn = id;
+                        any = true;
+                        moved = true;
+                    }
+                    let Some(next) = id.checked_add(1) else {
+                        break;
+                    };
+                    from = next;
                 }
             }
             if !any {
@@ -1325,8 +1338,10 @@ impl Http2 {
     /// The transport took `n` more bytes: the frames they finish count for
     /// their streams, and a stream whose response's end went out is over.
     fn written(&mut self, env: &mut Env<'_, Report>, mut n: u64) {
-        let mut touched: Vec<u32> = Vec::new();
-        let mut finished: Vec<u32> = Vec::new();
+        let mut touched = std::mem::take(&mut self.touched);
+        let mut finished = std::mem::take(&mut self.finished);
+        touched.clear();
+        finished.clear();
         while n > 0 {
             let Some(piece) = self.sent.front_mut() else {
                 break;
@@ -1357,7 +1372,7 @@ impl Http2 {
                 }
             }
         }
-        for id in touched {
+        for &id in &touched {
             if let Some(stream) = self.streams.get(&id)
                 && !finished.contains(&id)
             {
@@ -1367,7 +1382,7 @@ impl Http2 {
                 ));
             }
         }
-        for id in finished {
+        for &id in &finished {
             let open = self.streams.get(&id).is_some_and(|s| !s.recv_closed);
             self.end_stream(id, Ending::Done);
             if open {
@@ -1377,6 +1392,8 @@ impl Http2 {
                 self.write_reset(env, id, ErrorCode::NoError);
             }
         }
+        self.touched = touched;
+        self.finished = finished;
     }
 }
 
