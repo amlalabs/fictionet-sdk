@@ -302,6 +302,11 @@ fn number(
     Ok(value)
 }
 
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: geteuid takes no pointers and cannot invalidate Rust storage.
+    unsafe { libc::geteuid() }
+}
+
 pub struct State {
     _lock: File,
     pub sensor_id: String,
@@ -315,9 +320,8 @@ impl State {
             .mode(0o700)
             .create(path)?;
         let metadata = fs::symlink_metadata(path)?;
-        // SAFETY: geteuid takes no arguments and has no side effects.
         if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != effective_uid()
             || metadata.permissions().mode() & 0o077 != 0
         {
             return Err(io::Error::new(
@@ -353,10 +357,9 @@ fn secret(path: &Path, size: usize) -> io::Result<Vec<u8>> {
     {
         Ok(file) => {
             let metadata = file.metadata()?;
-            // SAFETY: geteuid takes no arguments and has no side effects.
             if !metadata.is_file()
                 || metadata.len() != size as u64
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != effective_uid()
                 || metadata.permissions().mode() & 0o077 != 0
             {
                 return Err(io::Error::new(

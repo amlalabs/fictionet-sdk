@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! A shared Linux honeypot with MPTCP, SSH, and literal port-zero observations.
 //!
 //! IPv4 option-bearing SYNs and their retransmissions are logged separately

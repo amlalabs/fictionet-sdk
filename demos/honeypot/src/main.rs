@@ -1,5 +1,9 @@
+#![deny(unsafe_code)]
+
 //! One executable for world, prepared TUN, and guest VFIO attachments.
 
+// This module owns the host syscall boundary.
+#[allow(unsafe_code)]
 mod deploy;
 
 use std::time::Duration;
