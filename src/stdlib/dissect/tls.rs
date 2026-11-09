@@ -1176,6 +1176,63 @@ pub(super) mod tests {
         assert!(tls.keys[0].as_ref().unwrap().handshake.is_none());
     }
 
+    /// A record opens only under its own direction's key in use and at its
+    /// own sequence number: a copy of an earlier record, a record ahead of
+    /// its number, or one of the other direction opens nothing and leaves
+    /// the number as it was. A KeyUpdate moves only its own direction to
+    /// the next key; the other goes on under its key.
+    #[test]
+    fn records_open_only_at_their_own_number_and_key() {
+        let secrets = [([2u8; 32], [1u8; 32]), ([4u8; 32], [3u8; 32])];
+        let keys = secrets.map(|(hs, app)| DirKeys::new(suite(0x1301).unwrap(), &hs, &app));
+        let mut tls = Tls {
+            tls13: true,
+            cipher: Some(0x1301),
+            keys,
+            ..Tls::new((0, 0), Registry::new())
+        };
+        let mut at = [0u64; 2];
+        let mut feed = |tls: &mut Tls, i: usize, record: &[u8]| {
+            let mut d = Decoded::default();
+            let mut dir = Observed::new(protocols::TlsRecords::default());
+            let place = Place {
+                stream_start: at[i],
+                buf: 0,
+                offset: Some(0),
+                len: record.len(),
+            };
+            at[i] += record.len() as u64;
+            dir.data_with(record, place, &mut d, |item, raw, start, place, d| {
+                tls.present_record(i, item, raw, start, place, d, &[])
+            });
+            d.tags.contains(&"decrypted")
+        };
+        const FINISHED: [u8; 4] = [20, 0, 0, 0];
+        const KEY_UPDATE: [u8; 5] = [24, 0, 0, 1, 0];
+        for (i, (hs, app)) in secrets.iter().enumerate() {
+            let hello = seal(hs, 0, 22, &FINISHED);
+            assert!(feed(&mut tls, i, &hello));
+            assert!(!feed(&mut tls, i, &hello), "a copy of the record before");
+            assert!(!feed(&mut tls, i, &seal(hs, 2, 22, &FINISHED)), "ahead");
+            assert!(feed(&mut tls, i, &seal(hs, 1, 22, &FINISHED)));
+            assert!(!feed(&mut tls, i, &seal(app, 1, 23, b"x")), "ahead");
+            assert!(feed(&mut tls, i, &seal(app, 0, 23, b"x")));
+            assert!(!feed(&mut tls, i, &seal(app, 0, 23, b"x")), "a copy");
+            let (theirs, _) = secrets[1 - i];
+            assert!(!feed(&mut tls, i, &seal(&theirs, 1, 22, &FINISHED)));
+        }
+        // The client updates its key; the server's stays as it was.
+        let (_, client) = secrets[0];
+        let (_, server) = secrets[1];
+        assert!(feed(&mut tls, 0, &seal(&client, 1, 22, &KEY_UPDATE)));
+        assert!(!feed(&mut tls, 0, &seal(&client, 2, 23, b"x")), "old key");
+        assert!(feed(&mut tls, 0, &seal(&next_secret(&client), 0, 23, b"x")));
+        assert!(feed(&mut tls, 1, &seal(&server, 1, 23, b"x")));
+        assert!(feed(&mut tls, 1, &seal(&server, 2, 22, &KEY_UPDATE)));
+        assert!(feed(&mut tls, 1, &seal(&next_secret(&server), 0, 23, b"x")));
+        assert!(feed(&mut tls, 0, &seal(&next_secret(&client), 1, 23, b"x")));
+    }
+
     /// The decrypted stream carries only what an endpoint takes as
     /// application data: records of that content type under an application
     /// key. Application data under the handshake key, and a protected

@@ -38,10 +38,40 @@ fn whole_messages_are_read_and_the_rest_is_held() {
     assert!(len - whole < 4 || whole + 4 + length(whole) > len);
 }
 
+/// The longest extension block `extensions_at` is given, with room for
+/// three extensions.
+const BLOCK: usize = 14;
+
+/// For any bytes up to fourteen long and any place in them where an
+/// extension block starts, every extension read lies inside the block the
+/// two-byte length there names, in order and without overlap, and is as
+/// long as its header says.
+#[kani::proof]
+#[kani::unwind(16)]
+fn an_extension_block_is_read_inside_its_length() {
+    let bytes: [u8; BLOCK] = kani::any();
+    let len: usize = kani::any();
+    let start: usize = kani::any();
+    kani::assume(len <= BLOCK && start <= len);
+    let m = &bytes[..len];
+    let base = m.as_ptr() as usize;
+    let block = be16(m, start).map_or(0, |n| start + 2 + usize::from(n));
+    let mut end = start + 2;
+    for (kind, data) in extensions_at(m, start) {
+        let at = data.as_ptr() as usize - base;
+        assert!(at >= end + 4);
+        assert!(at + data.len() <= block.min(len));
+        assert_eq!(usize::from(be16(m, at - 2).unwrap()), data.len());
+        assert_eq!(be16(m, at - 4).unwrap(), kind);
+        end = at + data.len();
+    }
+}
+
 /// For any hello body up to 44 bytes, of a client or a server, every
-/// extension read lies inside the body's extension block, in order and
-/// without overlap, and is as long as its header says. A body that lies
-/// about its lengths gives fewer extensions, never a read past its end.
+/// extension read lies inside the body, in order and without overlap, and
+/// is as long as its header says: the offsets of the session id, cipher
+/// suites and compression methods before the extensions are read without
+/// a read past the end, however the body lies about their lengths.
 #[kani::proof]
 #[kani::unwind(14)]
 fn extensions_lie_inside_the_hello() {
