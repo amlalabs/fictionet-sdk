@@ -22,7 +22,7 @@ use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input,
 use fictionet::time::Instant;
 
 use super::Limits;
-use super::response::{headers_held, request_held};
+use super::response::{Dates, headers_held, request_held};
 
 mod exchange;
 mod grpc;
@@ -158,6 +158,9 @@ pub struct Http2 {
     last_words: Option<Charge>,
     /// The request an HTTP/1 `Upgrade: h2c` brought, for stream 1.
     upgrade: Option<(Opening, Option<Chunk>)>,
+    /// The `Date` headers of the responses: one made per second of the
+    /// world's clock serves every stream framed in that second.
+    dates: Dates,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -403,6 +406,7 @@ impl Http2 {
             charge: None,
             last_words: None,
             upgrade: None,
+            dates: Dates::new(None),
         }
     }
 
@@ -450,6 +454,7 @@ impl Http2 {
             .max(self.frames.allocated())
             .saturating_add(self.headers.allocated())
             .saturating_add(self.encoder.held())
+            .saturating_add(self.dates.held())
             .saturating_add(self.resets.capacity() * size_of::<(u32, Instant)>())
             .saturating_add(self.up.capacity() * size_of::<MuxEvent<HttpExchange, Top, Opening>>())
             .saturating_add(self.out.capacity() * size_of::<StreamCommand>())
@@ -1490,10 +1495,16 @@ impl Http2 {
     }
 
     /// Encodes a response head as HEADERS and CONTINUATION frames, which go
-    /// out together.
+    /// out together. A head without a `Date` is dated as it is framed, when
+    /// the world has a date.
     fn response_head(&mut self, env: &mut Env<'_, Report>, id: u32, head: ResponseHead) {
         let mut fields = vec![hpack::Field::new(":status", head.status.as_str())];
         fields.extend(fields_of(&head.headers));
+        if !head.headers.contains_key(http::header::DATE)
+            && let Some(date) = self.dates.at(env.now())
+        {
+            fields.push(hpack::Field::new("date", date.as_bytes()));
+        }
         if self.header_block(env, id, &fields, head.end)
             && let Some(stream) = self.streams.get_mut(&id)
         {
@@ -3475,5 +3486,78 @@ mod tests {
                 "{output:?}"
             );
         }
+    }
+
+    /// The `Date` fields of the response heads on `stream` in `output`.
+    fn dates_on(stream: u32, output: &[u8]) -> Vec<Vec<u8>> {
+        let mut blocks = wire::HeaderBlocks::with_limits(Default::default());
+        let mut dates = Vec::new();
+        for frame in frames(output) {
+            let on = matches!(&frame, Frame::Headers(h) if h.stream == stream);
+            if let Some(block) = blocks.read_frame(&frame).unwrap().block
+                && on
+            {
+                dates.extend(
+                    block
+                        .headers
+                        .into_iter()
+                        .filter(|field| field.name == b"date")
+                        .map(|field| field.value),
+                );
+            }
+        }
+        dates
+    }
+
+    #[test]
+    fn a_head_held_back_by_the_transport_is_dated_when_it_is_framed() {
+        use fictionet::stdlib::web::httpd::date_header;
+        use std::time::SystemTime;
+        struct Answers;
+        impl Handler for Answers {
+            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+                if request.uri().path() == "/big" {
+                    return Reply::Now(http::Response::new(Body::from(vec![b'b'; 100_000])));
+                }
+                Reply::Later(Box::new(|fcx| {
+                    Box::pin(async move {
+                        fcx.sleep(Duration::from_secs(1)).await?;
+                        Ok(text(StatusCode::OK, "late\n"))
+                    })
+                }))
+            }
+        }
+        let start = SystemTime::UNIX_EPOCH;
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(7),
+            move |fcx| async move {
+                let server = Responder::new(Answers).date(start).http2();
+                let mut harness = Harness::new(fictionet::Seed::from_u64(7), server)
+                    .with_worker(Polling::in_world(fcx.clone()));
+                harness.push(&client_preface()).unwrap();
+                harness.take_output();
+                harness.withhold();
+                let mut encoder = hpack::Encoder::new(4096);
+                let mut input = get(&mut encoder, 1, "/big");
+                input.extend(get(&mut encoder, 3, "/late"));
+                harness.push(&input).unwrap();
+                // The big body fills what the transport may fall behind by.
+                // The late answer comes after it, and its head waits.
+                fcx.sleep(Duration::from_millis(1500)).await?;
+                let made = fcx.now();
+                harness.allow(0).unwrap();
+                fcx.sleep(Duration::from_secs(2)).await?;
+                let framed = fcx.now();
+                harness.allow_all().unwrap();
+                let dates = dates_on(3, harness.output());
+                let when = |at| date_header(Some(start), at).unwrap().as_bytes().to_vec();
+                assert_ne!(when(made), when(framed));
+                assert_eq!(dates, [when(framed)]);
+                assert_eq!(dates_on(1, harness.output()).len(), 1);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }
