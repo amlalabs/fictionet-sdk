@@ -97,18 +97,30 @@ fn egress_keeps_slot_order_after_an_unsaturated_pass() {
     let remote = Ipv4Address::new(192, 168, 1, 2);
     let mut handles = Vec::new();
     for port in [80, 81] {
-        let mut socket = Socket::new(SocketBuffer::new(vec![0; 64]), SocketBuffer::new(vec![0; 64]));
-        socket.connect(iface.context(), (remote, port), local).unwrap();
+        let mut socket = Socket::new(
+            SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 64]),
+        );
+        socket
+            .connect(iface.context(), (remote, port), local)
+            .unwrap();
         handles.push(sockets.add(socket));
     }
     iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
     sockets.get_mut(handles[0]).abort();
     iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
-    sockets.get_mut(handles[0]).connect(iface.context(), (remote, 80), local).unwrap();
+    sockets
+        .get_mut(handles[0])
+        .connect(iface.context(), (remote, 80), local)
+        .unwrap();
     sockets.get_mut(handles[1]).abort();
     device.tx_queue.clear();
     iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
-    let ports: Vec<_> = device.tx_queue.iter().map(|p| TcpPacket::new_checked(&p[20..]).unwrap().dst_port()).collect();
+    let ports: Vec<_> = device
+        .tx_queue
+        .iter()
+        .map(|p| TcpPacket::new_checked(&p[20..]).unwrap().dst_port())
+        .collect();
     assert_eq!(ports, [80, 81]);
 }
 

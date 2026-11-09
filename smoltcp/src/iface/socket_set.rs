@@ -2,19 +2,26 @@ use crate::iface::Context;
 use crate::socket::PollAt;
 use crate::socket::tcp::Socket;
 use crate::time::Instant;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
 
 /// A socket's slot in a set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub struct SocketHandle(usize);
 
+#[derive(Clone, Copy, Debug, Default)]
+struct Pending {
+    dirty: bool,
+    changed: bool,
+}
+
 /// TCP sockets in slot order. Removed slots are reused before the set grows.
 #[derive(Debug)]
 pub struct SocketSet<'a> {
     sockets: Vec<Option<Socket<'a>>>,
-    dirty: BTreeSet<SocketHandle>,
-    changed: BTreeSet<SocketHandle>,
+    dirty: VecDeque<SocketHandle>,
+    changed: VecDeque<SocketHandle>,
+    pending: Vec<Pending>,
     deadlines: BTreeSet<(Instant, SocketHandle)>,
     scheduled: Vec<Option<Instant>>,
     ready: BTreeSet<SocketHandle>,
@@ -23,13 +30,20 @@ pub struct SocketSet<'a> {
 
 impl<'a> SocketSet<'a> {
     pub fn new(sockets: Vec<Option<Socket<'a>>>) -> Self {
-        let dirty: BTreeSet<_> = sockets
+        let dirty: VecDeque<_> = sockets
             .iter()
             .enumerate()
             .filter_map(|(i, s)| s.as_ref().map(|_| SocketHandle(i)))
             .collect();
         Self {
             scheduled: vec![None; sockets.len()],
+            pending: sockets
+                .iter()
+                .map(|s| Pending {
+                    dirty: s.is_some(),
+                    changed: s.is_some(),
+                })
+                .collect(),
             sockets,
             changed: dirty.clone(),
             dirty,
@@ -47,10 +61,10 @@ impl<'a> SocketSet<'a> {
             let handle = SocketHandle(self.sockets.len());
             self.sockets.push(Some(socket));
             self.scheduled.push(None);
+            self.pending.push(Pending::default());
             handle
         };
-        self.dirty.insert(handle);
-        self.changed.insert(handle);
+        self.mark(handle);
         handle
     }
 
@@ -67,8 +81,7 @@ impl<'a> SocketSet<'a> {
 
     /// Get a mutable socket. Panics if its handle is invalid.
     pub fn get_mut(&mut self, handle: SocketHandle) -> &mut Socket<'a> {
-        self.dirty.insert(handle);
-        self.changed.insert(handle);
+        self.mark(handle);
         self.sockets[handle.0]
             .as_mut()
             .expect("invalid socket handle")
@@ -76,8 +89,11 @@ impl<'a> SocketSet<'a> {
 
     /// Remove a socket without changing its state. Panics if its handle is invalid.
     pub fn remove(&mut self, handle: SocketHandle) -> Socket<'a> {
-        self.dirty.remove(&handle);
-        self.changed.remove(&handle);
+        if self.pending[handle.0].dirty {
+            self.dirty.retain(|&h| h != handle);
+        }
+        self.acknowledge_changed(handle);
+        self.pending[handle.0] = Pending::default();
         self.ready.remove(&handle);
         if let Some(at) = self.scheduled[handle.0].take() {
             self.deadlines.remove(&(at, handle));
@@ -96,28 +112,56 @@ impl<'a> SocketSet<'a> {
 
     /// Take the next socket whose state may have changed.
     pub fn take_changed(&mut self) -> Option<SocketHandle> {
-        self.changed.pop_first()
+        let handle = self.changed.pop_front()?;
+        self.pending[handle.0].changed = false;
+        Some(handle)
     }
 
     /// The caller has observed the socket after its own mutations.
     pub fn acknowledge_changed(&mut self, handle: SocketHandle) {
-        self.changed.remove(&handle);
+        if self.pending[handle.0].changed {
+            self.changed.retain(|&h| h != handle);
+            self.pending[handle.0].changed = false;
+        }
+    }
+
+    fn mark(&mut self, handle: SocketHandle) {
+        let pending = &mut self.pending[handle.0];
+        if !pending.dirty {
+            self.dirty.push_back(handle);
+            pending.dirty = true;
+        }
+        if !pending.changed {
+            self.changed.push_back(handle);
+            pending.changed = true;
+        }
     }
 
     pub(crate) fn schedule(&mut self, cx: &mut Context) {
-        while let Some(handle) = self.dirty.pop_first() {
-            if let Some(at) = self.scheduled[handle.0].take() {
-                self.deadlines.remove(&(at, handle));
-            }
-            self.ready.remove(&handle);
+        while let Some(handle) = self.dirty.pop_front() {
+            self.pending[handle.0].dirty = false;
             let at = match self.get(handle).poll_at(cx) {
-                PollAt::Ingress => None,
-                PollAt::Time(at) => Some(at),
-                PollAt::Now => Some(Instant::ZERO),
+                PollAt::Ingress => {
+                    self.ready.remove(&handle);
+                    None
+                }
+                PollAt::Time(at) => {
+                    self.ready.remove(&handle);
+                    Some(at)
+                }
+                PollAt::Now => {
+                    self.ready.insert(handle);
+                    None
+                }
             };
-            self.scheduled[handle.0] = at;
-            if let Some(at) = at {
-                self.deadlines.insert((at, handle));
+            if self.scheduled[handle.0] != at {
+                if let Some(old) = self.scheduled[handle.0] {
+                    self.deadlines.remove(&(old, handle));
+                }
+                self.scheduled[handle.0] = at;
+                if let Some(at) = at {
+                    self.deadlines.insert((at, handle));
+                }
             }
         }
     }
@@ -135,20 +179,15 @@ impl<'a> SocketSet<'a> {
         self.ready.len()
     }
 
-    pub(crate) fn next_ready(&mut self) -> Option<SocketHandle> {
-        let next = self
-            .served
+    pub(crate) fn next_ready(&self) -> Option<SocketHandle> {
+        self.served
             .and_then(|after| self.ready.range((Excluded(after), Unbounded)).next())
             .or_else(|| self.ready.first())
-            .copied()?;
-        self.ready.remove(&next);
-        Some(next)
+            .copied()
     }
 
     pub(crate) fn dispatched(&mut self, handle: SocketHandle, blocked: bool) {
-        if blocked {
-            self.ready.insert(handle);
-        } else {
+        if !blocked {
             self.served = Some(handle);
         }
     }
