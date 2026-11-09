@@ -139,6 +139,8 @@ impl Handler for EchoSocket {
                                     ws::Message::Text(format!("echo: {text}"))
                                 }
                                 Ok(ws::Message::Close(close)) => ws::Message::Close(close),
+                                Ok(ws::Message::Ping(payload)) => ws::Message::Pong(payload),
+                                Ok(ws::Message::Pong(_)) => continue,
                                 _ => return,
                             };
                             let closing = matches!(reply, ws::Message::Close(_));

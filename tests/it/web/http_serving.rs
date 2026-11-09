@@ -617,9 +617,43 @@ async fn websockets_work_through_sites() {
                 fictionet::stdlib::protocols::websocket::Message::Text("echo: hello".into())
             );
             use fictionet::stdlib::{
-                codec::Wire,
-                protocols::websocket::{Close, Message},
+                codec::{Side, Stream, Wire},
+                protocols::websocket::{Close, Frame, Message, Messages, Opcode},
             };
+            let mut frames = Vec::new();
+            for (fin, opcode, payload) in [
+                (false, Opcode::Text, b"frag".as_slice()),
+                (true, Opcode::Ping, b"probe".as_slice()),
+                (true, Opcode::Pong, b"unsolicited".as_slice()),
+                (true, Opcode::Continuation, b"mented".as_slice()),
+            ] {
+                Frame {
+                    fin,
+                    opcode,
+                    mask: Some([1, 2, 3, 4]),
+                    payload: payload.to_vec(),
+                }
+                .write(&mut frames)
+                .unwrap();
+            }
+            conn.write_all(&fcx, &frames).await.unwrap();
+            let mut messages = Stream::new(Messages::for_receiver(Side::Client));
+            for expected in [
+                Message::Pong(b"probe".to_vec()),
+                Message::Text("echo: fragmented".into()),
+            ] {
+                loop {
+                    if let Some(message) = messages.next() {
+                        assert_eq!(message.unwrap(), expected);
+                        break;
+                    }
+                    let mut buf = [0; 4096];
+                    let n = conn.read(&fcx, &mut buf).await.unwrap();
+                    assert!(n > 0, "control frames must preserve the fragmented message");
+                    assert_eq!(messages.push(&buf[..n]), n);
+                }
+            }
+            assert!(messages.next().is_none());
             let close = Message::Close(Some(Close::new(1000)));
             let mut frames = Vec::new();
             for message in [&close, &close, &Message::Text("after close".into())] {
