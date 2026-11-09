@@ -467,7 +467,12 @@ impl Tls {
                                 push(d, l);
                                 d.application(1, version, "Encrypted Alert");
                             }
-                            _ => {
+                            // Application data comes only under an
+                            // application key: an endpoint refuses it under
+                            // the handshake key, and refuses any other
+                            // content type, so neither is part of the
+                            // stream the protocol inside reads.
+                            23 if app => {
                                 l.summary = format!(
                                     "{version} Application Data, {} bytes decrypted",
                                     plain.len()
@@ -480,6 +485,20 @@ impl Tls {
                                     len: plain.len(),
                                 };
                                 self.inner_data(i, &plain, inner_place, d);
+                            }
+                            _ => {
+                                l.summary = format!("{version} Record type {inner} (decrypted)");
+                                l.note(
+                                    "Content",
+                                    if inner == 23 {
+                                        "application data under the handshake key, which an endpoint refuses"
+                                    } else {
+                                        "a content type an endpoint refuses in a protected record"
+                                    },
+                                );
+                                push(d, l);
+                                d.tag("malformed");
+                                d.application(1, version, &format!("Record type {inner}"));
                             }
                         }
                     }
@@ -1155,6 +1174,58 @@ pub(super) mod tests {
         }
         assert!(feed(&mut tls, &seal(&secret, 0, 23, b"hello")));
         assert!(tls.keys[0].as_ref().unwrap().handshake.is_none());
+    }
+
+    /// The decrypted stream carries only what an endpoint takes as
+    /// application data: records of that content type under an application
+    /// key. Application data under the handshake key, and a protected
+    /// record of another content type, open but are refused by an
+    /// endpoint, so the protocol inside never reads them.
+    #[test]
+    fn only_application_data_reaches_the_decrypted_stream() {
+        let (hs, app) = ([2u8; 32], [1u8; 32]);
+        let keys = DirKeys::new(suite(0x1301).unwrap(), &hs, &app).unwrap();
+        let mut registry = Registry::new();
+        registry.register("tiny", |_| Match::Yes, |_| [Tiny, Tiny]);
+        let mut tls = Tls {
+            tls13: true,
+            cipher: Some(0x1301),
+            keys: [Some(keys), None],
+            ..Tls::new((40000, 443), registry)
+        };
+        let mut at = 0u64;
+        // What the protocol inside showed for the record, and the packet.
+        let mut feed = |tls: &mut Tls, record: &[u8]| {
+            let mut d = Decoded::default();
+            let mut dir = Observed::new(protocols::TlsRecords::default());
+            let place = Place {
+                stream_start: at,
+                buf: 0,
+                offset: Some(0),
+                len: record.len(),
+            };
+            at += record.len() as u64;
+            dir.data_with(record, place, &mut d, |item, raw, start, place, d| {
+                tls.present_record(0, item, raw, start, place, d, &[])
+            });
+            assert!(d.tags.contains(&"decrypted"), "{d:?}");
+            let inside: Vec<String> = d
+                .layers
+                .iter()
+                .filter(|l| l.name == "Tiny")
+                .map(|l| l.summary.clone())
+                .collect();
+            (inside, d)
+        };
+        let (inside, refused) = feed(&mut tls, &seal(&hs, 0, 23, b"\x01h"));
+        assert!(inside.is_empty(), "{inside:?}");
+        assert!(refused.tags.contains(&"malformed"));
+        feed(&mut tls, &seal(&hs, 1, 22, &[20, 0, 0, 0]));
+        let (inside, refused) = feed(&mut tls, &seal(&app, 0, 24, b"\x01c"));
+        assert!(inside.is_empty(), "{inside:?}");
+        assert!(refused.tags.contains(&"malformed"));
+        let (inside, _) = feed(&mut tls, &seal(&app, 1, 23, b"\x01a"));
+        assert_eq!(inside, ["a"]);
     }
 
     #[test]
