@@ -256,39 +256,43 @@ struct Kid<B: Layer> {
 /// which may share state with its layer (a tunnel's connection does).
 /// Either gets the child visited at the next advance.
 pub(crate) struct ChildWake {
-    /// The child's place in `Children` and its id, which tells it from a
-    /// later child at the same place.
+    /// The child's place in `Children`, its own while it is open.
     key: usize,
-    id: ChildId,
     released: AtomicU64,
     /// `Children` is calling the child and collects what it releases.
     calling: AtomicBool,
-    /// The child is in `queue`, or was taken from it and not yet readied.
+    /// The child waits in `queue`, or is being readied from it. A closed
+    /// child's stays set.
     woken: AtomicBool,
-    /// Where the child goes when it is woken.
+    /// The child closed, so a wake queues nothing. Changed and read with
+    /// the queue locked.
+    closed: AtomicBool,
+    /// Where the child waits once woken.
     queue: Arc<Woken>,
     /// The task that polls the child's work, woken with it.
     task: Mutex<Option<Waker>>,
 }
 
-/// The children woken from outside `Children`'s calls, in the order they
-/// woke, each once until it is collected. Collecting them costs what was
-/// woken, not every open child.
+/// The open children woken from outside `Children`'s calls, each once until
+/// it is collected. Collecting them costs what was woken, not every open
+/// child. A child leaves the queue when it closes, so the queue never holds
+/// more keys than there are open children, and a key in it is never a
+/// later child's at the same place.
 struct Woken {
     /// Something is queued: an advance with nothing woken skips the lock.
     any: AtomicBool,
-    /// Their keys and ids.
-    queue: Mutex<Vec<(usize, ChildId)>>,
+    /// Their keys.
+    keys: Mutex<Vec<usize>>,
 }
 
 impl ChildWake {
-    fn new(key: usize, id: ChildId, queue: Arc<Woken>) -> ChildWake {
+    fn new(key: usize, queue: Arc<Woken>) -> ChildWake {
         ChildWake {
             key,
-            id,
             released: AtomicU64::new(0),
             calling: AtomicBool::new(false),
             woken: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             queue,
             task: Mutex::new(None),
         }
@@ -308,12 +312,28 @@ impl ChildWake {
         }
     }
 
-    /// Queues the child, unless it waits in the queue already. Collecting
-    /// clears `woken` before the visit, so a wake after that queues it again.
+    /// Queues the child, unless it waits in the queue already or closed.
+    /// Collecting clears `woken` before the visit, so a wake after that
+    /// queues it again.
     fn notify(&self) {
-        if !self.woken.swap(true, Ordering::AcqRel) {
-            self.queue.queue.lock().push((self.key, self.id));
+        if self.woken.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut keys = self.queue.keys.lock();
+        if !self.closed.load(Ordering::Relaxed) {
+            keys.push(self.key);
             self.queue.any.store(true, Ordering::Release);
+        }
+    }
+
+    /// The child closed: it leaves the queue, and later wakes queue nothing.
+    /// A wake that set `woken` before this either queued the child before
+    /// the lock was taken here, and is taken out, or finds it closed.
+    fn close(&self) {
+        let mut keys = self.queue.keys.lock();
+        self.closed.store(true, Ordering::Relaxed);
+        if self.woken.load(Ordering::Relaxed) {
+            keys.retain(|&key| key != self.key);
         }
     }
 
@@ -460,7 +480,7 @@ where
             armed: 0,
             woken: Arc::new(Woken {
                 any: AtomicBool::new(false),
-                queue: Mutex::new(Vec::new()),
+                keys: Mutex::new(Vec::new()),
             }),
             storage: None,
             limit,
@@ -501,7 +521,7 @@ where
             // The wake state's shared allocation, with its two counts.
             + size_of::<ChildWake>()
             + 2 * size_of::<usize>()
-            + size_of::<(usize, ChildId)>()
+            + size_of::<usize>()
             + size_of::<(ChildId, usize)>()
             + size_of::<usize>();
         kids.checked_mul(place)?.checked_add(
@@ -523,7 +543,7 @@ where
         self.kids = Slab::with_capacity(FLOOR);
         self.order = Vec::with_capacity(FLOOR);
         self.timers = Vec::with_capacity(FLOOR);
-        self.woken.queue.lock().reserve_exact(FLOOR);
+        self.woken.keys.lock().reserve_exact(FLOOR);
         self.down = VecDeque::with_capacity(QUEUE + FLOOR);
         self.up = VecDeque::with_capacity(QUEUE);
         self.storage = Some(charge);
@@ -555,10 +575,11 @@ where
         self.kids.reserve_exact(places - self.kids.len());
         self.order.reserve_exact(places - self.order.len());
         self.timers.reserve_exact(places - self.timers.len());
-        let mut woken = self.woken.queue.lock();
-        let queued = woken.len();
-        woken.reserve_exact(places.saturating_sub(queued));
-        drop(woken);
+        // Only open children wait in the wake queue, fewer than `places`.
+        let mut keys = self.woken.keys.lock();
+        let queued = keys.len();
+        keys.reserve_exact(places - queued);
+        drop(keys);
         self.down.reserve_exact(QUEUE + places - self.down.len());
         true
     }
@@ -577,7 +598,9 @@ where
         if let Some(place) = self.kids[key].heap {
             self.unschedule(place);
         }
-        Some(self.kids.remove(key))
+        let kid = self.kids.remove(key);
+        kid.wake.close();
+        Some(kid)
     }
 
     /// Child `key` was called: its layer may have work, its deadline is
@@ -665,23 +688,21 @@ where
         self.kids[self.timers[place]].heap = Some(place);
     }
 
-    /// Readies the children something reached from outside a call, in the
-    /// order they woke. A child closed since it woke is skipped, and so is
-    /// the one that took its place, which its id tells apart.
+    /// Readies the children something reached from outside a call, in id
+    /// order, whatever order their wakes came in.
     fn collect_wakes(&mut self) {
         let any = &self.woken.any;
         if !any.load(Ordering::Relaxed) || !any.swap(false, Ordering::Acquire) {
             return;
         }
-        let mut queue = self.woken.queue.lock();
-        for (key, id) in queue.drain(..) {
-            let Some(kid) = self.kids.get(key).filter(|kid| kid.id == id) else {
-                continue;
-            };
-            if kid.wake.woken.swap(false, Ordering::Acquire) {
-                self.ready.push(&mut self.kids, key);
-                self.work.push(&mut self.kids, key);
-            }
+        let mut keys = self.woken.keys.lock();
+        let kids = &mut self.kids;
+        keys.sort_unstable_by_key(|&key| kids[key].id);
+        for key in keys.drain(..) {
+            // Reads the wake that queued it, and whatever came before it.
+            kids[key].wake.woken.swap(false, Ordering::Acquire);
+            self.ready.push(kids, key);
+            self.work.push(kids, key);
         }
     }
 
@@ -697,8 +718,8 @@ where
         self.kids = Slab::with_capacity(FLOOR);
         self.order = Vec::with_capacity(FLOOR);
         self.timers = Vec::with_capacity(FLOOR);
-        // Wakes of closed children may still wait to be collected.
-        self.woken.queue.lock().shrink_to(FLOOR);
+        // Closed children left the wake queue, so it is empty.
+        *self.woken.keys.lock() = Vec::with_capacity(FLOOR);
         self.down.shrink_to((QUEUE + FLOOR).max(self.down.len()));
         let places = self.down.capacity().saturating_sub(QUEUE);
         if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
@@ -951,7 +972,7 @@ where
                     urgent: None,
                     inbox: VecDeque::new(),
                     storage,
-                    wake: Arc::new(ChildWake::new(key, id, self.woken.clone())),
+                    wake: Arc::new(ChildWake::new(key, self.woken.clone())),
                     backing,
                     max_command,
                     granted: 0,
@@ -1610,6 +1631,76 @@ mod tests {
             assert!(driver.take_command().is_none());
             assert_eq!(budget.used(), 0);
         }
+    }
+
+    /// Opens a child on `driver` that holds one piece of data, taken out of
+    /// its layer and returned, with the commands its opening made taken.
+    fn holding(
+        driver: &mut Driver<Children<Reader, Top, &'static str>>,
+        slots: &mut Slots<()>,
+    ) -> (ChildId, Chunk) {
+        let child = slots.insert(()).unwrap();
+        let id = child.id();
+        let _ = driver
+            .deliver(MuxEvent::Opened(child, "stream", 8))
+            .unwrap();
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        let _ = driver
+            .deliver(MuxEvent::Child(id, StreamEvent::Data(Chunk::new(vec![1]))))
+            .unwrap();
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        let layer = driver.layer_mut();
+        let key = layer.key(id).unwrap();
+        (id, layer.kids[key].layer.held.take().unwrap())
+    }
+
+    #[test]
+    fn children_woken_together_are_visited_in_id_order() {
+        let mut driver = driver(|_, _, _| Reader::default());
+        let mut slots = Slots::new(3);
+        let held: Vec<_> = (0..3).map(|_| holding(&mut driver, &mut slots)).collect();
+        let ids: Vec<_> = held.iter().map(|(id, _)| *id).collect();
+        // Released last child first, so their wakes come in reverse order.
+        for (_, chunk) in held.into_iter().rev() {
+            drop(chunk);
+        }
+        driver.run().unwrap();
+        let mut credited = Vec::new();
+        while let Some(command) = driver.take_command() {
+            if let super::super::MuxOp::Credit(id, 1) = command.into_op() {
+                credited.push(id);
+            }
+        }
+        assert_eq!(credited, ids);
+    }
+
+    #[test]
+    fn a_closed_child_leaves_the_wake_queue_and_its_wakes_reach_no_later_child() {
+        let mut driver = driver(|_, _, _| Reader::default());
+        let mut slots = Slots::new(3);
+        // Woken, then closed before it was collected.
+        let (queued, chunk) = holding(&mut driver, &mut slots);
+        drop(chunk);
+        assert!(!driver.layer().woken.keys.lock().is_empty());
+        let _ = driver.deliver(MuxEvent::Closed(queued)).unwrap();
+        assert!(driver.layer().woken.keys.lock().is_empty());
+        // Closed, then woken: a later child has its place by then.
+        let (closed, chunk) = holding(&mut driver, &mut slots);
+        let place = driver.layer().key(closed);
+        let _ = driver.deliver(MuxEvent::Closed(closed)).unwrap();
+        let (later, later_chunk) = holding(&mut driver, &mut slots);
+        assert_eq!(driver.layer().key(later), place);
+        drop(chunk);
+        assert!(driver.layer().woken.keys.lock().is_empty());
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        // The later child's own wake still reaches it.
+        drop(later_chunk);
+        driver.run().unwrap();
+        assert!(matches!(driver.take_command().unwrap().into_op(),
+            super::super::MuxOp::Credit(found, 1) if found == later));
     }
 
     #[test]
