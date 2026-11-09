@@ -114,12 +114,10 @@ impl Machine {
 
 /// A rustls client carried by a simulated connection.
 ///
-/// A write reports plaintext taken only after the connection underneath has
-/// taken its ciphertext. Backpressure keeps the write pending; a downstream
-/// failure is returned to the caller. Dropping a pending write may still send
-/// its bytes. A later write starting with those same bytes counts as a retry,
-/// even if it has more bytes after them. Different starting bytes receive only
-/// their own credit, as specified by [`Connection::poll_write`].
+/// A write returns once rustls took its plaintext, and waits until the
+/// connection underneath took the ciphertext of the write before. A flush
+/// returns once it took all of it. A downstream failure is returned to the
+/// caller.
 pub struct TlsClient<C> {
     /// The underlying connection.
     pub conn: C,
@@ -157,11 +155,6 @@ impl<C: Connection + Unpin> TlsClient<C> {
             inbuf: vec![0; 4096].into_boxed_slice(),
             pending: Vec::new(),
         }
-    }
-
-    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        self.output.take_output(&mut self.tls)?;
-        self.output.poll_flush(&mut self.conn, fcx, cx)
     }
 
     /// Reads from the connection into rustls once. `Ok(false)` at the end
@@ -264,13 +257,7 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
-        self.output.take_output(&mut self.tls)?;
-        match self.output.poll_credit(&mut self.conn, fcx, cx, data) {
-            Poll::Ready(Ok(Some(n))) => return Poll::Ready(Ok(n)),
-            Poll::Ready(Ok(None)) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
+        // One write at a time: the ciphertext before goes out first.
         match self.poll_flush(fcx, cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -282,8 +269,12 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
             .write(data)
             .map_err(|_| ConnError::Broken)?;
         self.output.take_output(&mut self.tls)?;
-        self.output
-            .poll_written(&mut self.conn, fcx, cx, &data[..n])
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+        self.output.take_output(&mut self.tls)?;
+        self.output.poll_flush(&mut self.conn, fcx, cx)
     }
 
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {

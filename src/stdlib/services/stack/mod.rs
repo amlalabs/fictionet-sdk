@@ -236,8 +236,9 @@ impl Drop for Counted {
 ///
 /// The runner reads only while the stack has taken everything it read
 /// before, so a stack that stops taking input stops the peer, and it
-/// writes only what the transport takes, reporting each byte taken once
-/// as [`StreamEvent::Written`](fictionet::stdlib::layer::StreamEvent::Written).
+/// writes only what the connection takes, reporting each byte once as
+/// [`StreamEvent::Written`](fictionet::stdlib::layer::StreamEvent::Written)
+/// when the connection has flushed it.
 /// Due timers go off before more input is offered. The stack's work runs
 /// with the world's context in a [region](fictionet::Cx#regions) of its
 /// own: what it spawns is cancelled when the run ends. A task of the work

@@ -725,12 +725,11 @@ prefix. `net::dns::placing` is a root zone for the gateway's resolver that
 places a host the first time a name is looked up, which is how `web::Sites`
 works.
 
-Lab clients can use `sandbox::TlsClient` over a simulated connection. Its
-writes report plaintext taken only after the connection underneath has taken
-the ciphertext. A blocked write stays pending, and downstream errors reach
-the caller. Dropping a pending write may still send its bytes. A later write
-starting with those bytes counts as a retry, even with more bytes appended.
-A write with different starting bytes reports only its own bytes.
+Lab clients can use `sandbox::TlsClient` over a simulated connection. A
+write returns once rustls took its plaintext, and waits until the connection
+underneath took the ciphertext of the write before. A flush, or `write_all`,
+returns once it took all of it. A pending write took nothing, and downstream
+errors reach the caller.
 
 ## 4. HTTP
 

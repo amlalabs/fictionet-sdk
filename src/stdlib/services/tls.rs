@@ -398,8 +398,9 @@ impl<C: Connection> ClientHello<C> {
 ///
 /// A read reports a failure of the connection underneath even when it happened
 /// while sending TLS output, such as a KeyUpdate reply. Plaintext already
-/// decrypted is kept for the next read. A write returns once its ciphertext
-/// was taken by the connection underneath.
+/// decrypted is kept for the next read. A write returns once TLS took its
+/// plaintext. A flush returns once the connection underneath took the
+/// ciphertext of every write before it.
 pub struct TlsConnection<C> {
     tls: Opened<TlsLayer, C>,
 }
@@ -440,6 +441,10 @@ impl<C: Connection> Connection for TlsConnection<C> {
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
         self.tls.poll_write(fcx, cx, data)
+    }
+
+    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+        self.tls.poll_flush(fcx, cx)
     }
 
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {

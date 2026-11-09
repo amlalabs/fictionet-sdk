@@ -40,16 +40,16 @@ pub(crate) enum Halt {
 ///
 /// Each [`poll`](Self::poll) reads the connection into the stack while the
 /// stack takes what it read before, writes what the stack hands below as
-/// far as the transport takes it and reports each byte taken once as
-/// [`StreamEvent::Written`], polls the stack's work and gives back what
-/// finished, fires the stack's due timers, and keeps the limits. Then it
-/// waits for whichever of those can move next. The stack stays synchronous:
+/// far as the connection takes it, flushes the connection and reports each
+/// byte flushed once as [`StreamEvent::Written`], polls the stack's work
+/// and gives back what finished, fires the stack's due timers, and keeps
+/// the limits. Then it waits for whichever of those can move next. The stack stays synchronous:
 /// this only translates readiness, so it behaves the same here as in a
 /// [`Harness`](fictionet::stdlib::layer::Harness).
 ///
 /// [`stream`](super::stream) polls one until its stack is done;
-/// [`Opened`](super::Opened) polls one whenever its connection is read or
-/// written.
+/// [`Opened`](super::Opened) polls one whenever its connection is read,
+/// written or flushed.
 pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     conn: C,
     driver: Driver<L>,
@@ -64,7 +64,9 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     input_over: bool,
     /// The stack's end of its direction went out.
     shut: bool,
-    /// Taken by the transport and not yet reported to the stack.
+    /// Taken by the connection and not yet flushed.
+    unflushed: u64,
+    /// Flushed to the transport and not yet reported to the stack.
     unreported: u64,
     idled: bool,
     /// When the peer last read or was written to, or the runner last began
@@ -108,6 +110,7 @@ where
             input: None,
             input_over: false,
             shut: false,
+            unflushed: 0,
             unreported: 0,
             idled: false,
             idle_from: fcx.now(),
@@ -136,13 +139,19 @@ where
         self.shut
     }
 
+    /// Whether output is still on its way down: the stack holds some, or
+    /// the connection took some and has not flushed it.
+    fn writing(&self) -> bool {
+        self.driver.holds_output() || self.unflushed > 0
+    }
+
     /// How the run finished, once the stack has ended its direction, every
     /// byte of it is written, no work is left, and input has ended or the
     /// stack explicitly declares its whole lifetime terminal.
     pub(super) fn finished(&self) -> Option<StreamEnd> {
         (self.shut
             && (self.input_over || self.driver.layer().is_terminal())
-            && !self.driver.holds_output()
+            && !self.writing()
             && self.unreported == 0
             && self.jobs.is_empty())
         .then_some(if self.idled {
@@ -319,17 +328,27 @@ where
             if reset {
                 return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Reset))));
             }
+            self.unflushed += wrote;
             if let Some(e) = failed {
                 // The write stays held, to try again.
-                self.unreported += wrote;
                 return Poll::Ready(Ok(Halt::Conn(e)));
             }
             if wrote > 0 {
-                self.unreported += wrote;
                 self.stalled_since = None;
                 self.idle_from = now;
             }
-            if !self.driver.holds_output() {
+            // Bytes count as written once the connection has handed them on.
+            if self.unflushed > 0 {
+                match self.conn.poll_flush(fcx, cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.unreported += std::mem::take(&mut self.unflushed);
+                        moved = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Ok(Halt::Conn(e))),
+                    Poll::Pending => {}
+                }
+            }
+            if !self.writing() {
                 self.stalled_since = None;
             }
             if let Some(e) = read_failed {
@@ -340,17 +359,15 @@ where
             }
 
             // The limits, as of now.
-            if self.driver.holds_output() {
+            if self.writing() {
                 let since = *self.stalled_since.get_or_insert(now);
                 if self.limits.write_timeout.is_some_and(|d| now >= since + d) {
                     let end = self.broken(ConnError::TimedOut, above, report)?;
                     return Poll::Ready(Ok(Halt::End(end)));
                 }
             }
-            let waiting = self.input.is_none()
-                && !self.input_over
-                && !self.driver.holds_output()
-                && self.jobs.is_empty();
+            let waiting =
+                self.input.is_none() && !self.input_over && !self.writing() && self.jobs.is_empty();
             // The idle clock runs only while the runner waits for the peer,
             // and starts again each time it begins to.
             if waiting && !self.was_waiting {
