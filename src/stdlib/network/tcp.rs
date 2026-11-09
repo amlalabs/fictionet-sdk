@@ -1041,9 +1041,13 @@ pub(crate) struct PacketDriver {
 }
 
 impl PacketDriver {
-    pub(crate) fn deliver(&mut self, packet: IpPacket) -> Admit<PacketEvent<IpPacket>> {
+    pub(crate) fn deliver(
+        &mut self,
+        packet: IpPacket,
+        now: Instant,
+    ) -> Admit<PacketEvent<IpPacket>> {
         let mut host = self.shared.state.lock();
-        host.tick();
+        host.tcp.set_now(now);
         let result = host.tcp.deliver(PacketEvent::Packet(packet)).unwrap();
         host.pump();
         result
@@ -1054,13 +1058,14 @@ impl PacketDriver {
         cx: &mut Context<'_>,
         out: &mut Vec<Chunk>,
         limit: usize,
+        now: Instant,
     ) -> fictionet::Result<(bool, Option<Instant>)> {
         // This task's own commands below need no wake: what they leave for
         // the engine makes the walk busy instead.
         let (busy, deadline, refusals, parked) = {
             let mut host = self.shared.state.lock();
             let parked = host.routes.driver.take();
-            let busy = host.visit(out, limit);
+            let busy = host.visit(out, limit, now);
             let refusals = (!host.routes.refusals.is_empty())
                 .then(|| {
                     let refused = host.routes.refused.clone()?;
@@ -1077,6 +1082,7 @@ impl PacketDriver {
         let mut offered = false;
         let applications = self.applications.poll(
             &self.fcx,
+            now,
             cx,
             |pending| {
                 std::mem::swap(
@@ -1085,7 +1091,7 @@ impl PacketDriver {
                 )
             },
             |command| {
-                let admit = self.shared.state.lock().offer(command);
+                let admit = self.shared.state.lock().submit(command);
                 offered |= admit.moved();
                 admit
             },
@@ -1384,6 +1390,12 @@ impl Host {
 
     fn offer(&mut self, command: Command) -> Admit<Command> {
         self.tick();
+        self.submit(command)
+    }
+
+    /// The same at the time the engine last read, as the endpoint's task
+    /// does within a walk.
+    fn submit(&mut self, command: Command) -> Admit<Command> {
         let taken = self.tcp.command(command).unwrap();
         self.pump();
         if self.engine_ref().busy() {
@@ -1433,8 +1445,8 @@ impl Host {
     }
 
     /// Steps the transport and drains its output before yielding.
-    fn visit(&mut self, out: &mut Vec<Chunk>, limit: usize) -> bool {
-        self.tick();
+    fn visit(&mut self, out: &mut Vec<Chunk>, limit: usize, now: Instant) -> bool {
+        self.tcp.set_now(now);
         let mut work_exhausted = false;
         for turn in 0..64 {
             let Some(()) = self.tcp.take_work() else {

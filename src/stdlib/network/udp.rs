@@ -200,9 +200,9 @@ pub(crate) struct PacketDriver {
 }
 
 impl PacketDriver {
-    pub(crate) fn deliver(&mut self, packet: IpPacket) {
+    pub(crate) fn deliver(&mut self, packet: IpPacket, now: fictionet::time::Instant) {
         self.shared.with(|inner| {
-            inner.driver.set_now(self.fcx.now());
+            inner.driver.set_now(now);
             inner.offer(PacketEvent::Packet(packet));
         });
     }
@@ -212,12 +212,13 @@ impl PacketDriver {
         cx: &mut std::task::Context<'_>,
         out: &mut Vec<Chunk>,
         limit: usize,
+        now: fictionet::time::Instant,
     ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
         // This task's own work needs no wake: what it leaves makes the walk
         // busy instead.
         let (busy, deadline, parked) = self.shared.with(|inner| {
             let parked = inner.wake.take();
-            inner.driver.set_now(self.fcx.now());
+            inner.driver.set_now(now);
             inner.pump();
             let count = limit.saturating_sub(out.len()).min(inner.output.len());
             out.extend(inner.output.drain(..count));
@@ -226,6 +227,7 @@ impl PacketDriver {
         let mut offered = false;
         let more = self.applications.poll(
             &self.fcx,
+            now,
             cx,
             |pending| std::mem::swap(pending, &mut self.shared.inner.lock().application_events),
             |command| {

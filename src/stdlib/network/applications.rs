@@ -58,6 +58,7 @@ where
     pub(crate) fn poll(
         &mut self,
         fcx: &Cx,
+        now: Instant,
         cx: &mut Context<'_>,
         mut events: impl FnMut(&mut VecDeque<EventOf<L::Lower>>),
         command: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
@@ -75,7 +76,7 @@ where
                 return Ok(false);
             }
         }
-        self.driver.set_now(fcx.now());
+        self.driver.set_now(now);
         let mut exhausted = false;
         let mut intake = 64;
         let mut blocked = false;
@@ -212,6 +213,7 @@ mod tests {
                 let mut source = VecDeque::from([MessageEvent::Message(())]);
                 let busy = applications.poll(
                     &cx,
+                    cx.now(),
                     &mut Context::from_waker(std::task::Waker::noop()),
                     |pending| std::mem::swap(pending, &mut source),
                     |_| Admit::Taken,
@@ -222,6 +224,7 @@ mod tests {
                 cx.sleep(delay).await?;
                 applications.poll(
                     &cx,
+                    cx.now(),
                     &mut Context::from_waker(std::task::Waker::noop()),
                     |pending| std::mem::swap(pending, &mut source),
                     |_| Admit::Taken,

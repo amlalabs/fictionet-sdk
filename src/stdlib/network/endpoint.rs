@@ -35,7 +35,8 @@ pub(crate) async fn drive(
         if fcx.is_cancelled() {
             return Poll::Ready(Ok(()));
         }
-        ip.set_now(fcx.now());
+        let now = fcx.now();
+        ip.set_now(now);
         let mut busy = false;
         let mut deadlines = [None; 3];
         // Whether the transports may have something new since their last
@@ -93,7 +94,8 @@ pub(crate) async fn drive(
                     Transport::Tcp => {
                         if let Some(tcp) = &mut tcp {
                             dirty = true;
-                            if let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
+                            if let Admit::Blocked(PacketEvent::Packet(packet)) =
+                                tcp.deliver(packet, now)
                             {
                                 held = Some(packet);
                                 accepted = false;
@@ -104,7 +106,7 @@ pub(crate) async fn drive(
                     Transport::Udp => {
                         if let Some(udp) = &mut udp {
                             dirty = true;
-                            udp.deliver(packet);
+                            udp.deliver(packet, now);
                         }
                     }
                     _ if outgoing.len() >= 128 => {
@@ -168,12 +170,12 @@ pub(crate) async fn drive(
                 let room = 128usize.saturating_sub(outgoing.len());
                 let mut pending = false;
                 if let Some(tcp) = &mut tcp {
-                    let (work, deadline) = tcp.poll(cx, &mut output, room)?;
+                    let (work, deadline) = tcp.poll(cx, &mut output, room, now)?;
                     pending |= work;
                     deadlines[1] = deadline;
                 }
                 if let Some(udp) = &mut udp {
-                    let (work, deadline) = udp.poll(cx, &mut output, room)?;
+                    let (work, deadline) = udp.poll(cx, &mut output, room, now)?;
                     pending |= work;
                     deadlines[2] = deadline;
                 }
