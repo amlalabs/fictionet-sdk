@@ -82,6 +82,13 @@ LiteralDestination ==
 \* every declaration succeeds. A duplicate rejects the whole preparation.
 \* Machine::stage prepares the shared packet driver before these listeners;
 \* PreparedMachine::commit starts it only after preparation succeeds.
+\* Source lines (src/stdlib/world/net/hosts.rs): Machine::prepare 1598,
+\* its listen 1622, PreparedMachine::commit 1487, Machine::add 1764. Listen
+\* goes through Host::request (src/stdlib/network/tcp.rs 1398), which never
+\* queues it, so a failed listen leaves the transport nothing to take later;
+\* Unlisten, sent by Listener::drop, waits in Host::controls if refused.
+\* World-layers Staging.tla models the same preparation across machines,
+\* routes, packet dispatchers and application factories.
 VARIABLES installed, held, pending, request, position, phase, before
 preparation == <<installed, held, pending, request, position, phase, before>>
 PreparationInit ==

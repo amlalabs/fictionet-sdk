@@ -11,11 +11,20 @@
    (`Router::add`, `Edit::Route` in `route::router`) and sees a link close
    some time later (`ports::Event::Closed`). The connections are the ones
    `abort_peers` resets on the machines; the packets are the ones a machine
-   attributes with `Hooks::sandbox_at` when they arrive. Host admission now
-   obtains peer identity from a TCP child opening, before constructing its
-   application. Reset and retirement go through the public transport
-   boundary; closing the application does not remove the modeled connection.
-   Packet dispatch and protocol bytes remain outside this model. *)
+   attributes with `Hooks::sandbox_at` when they arrive.
+
+   Since the world rebuild on the TCP, UDP and IP layers, a machine names
+   the sandbox when the transport opens the connection's child, before the
+   application exists: the `budget` selector and `make` factory that
+   `Machine::add` gives `tcp::Listener::attach` (src/stdlib/world/net/hosts.rs
+   1798-1820, `Hooks::sandbox_at` at 1807 and 1818). `abort_peers` is
+   `Machines::abort_peers` (hosts.rs 1302), which reads the peers through the
+   transport's `EndpointState::peers` and sends `TcpControl::AbortPeers`
+   (`tcp::Endpoint::abort_peers`, src/stdlib/network/tcp.rs 1636); a
+   transport that refuses the command for now gets it again
+   (`Host::control`, tcp.rs 1382; world-layers/tla/Admission.tla). Closing
+   an application does not end the modeled connection. Packet dispatch
+   and protocol bytes are outside this model. *)
 EXTENDS Naturals, FiniteSets, Sequences
 
 CONSTANTS
@@ -194,7 +203,7 @@ Answered(n, p) ==
     IF n \in Filtered THEN table[p] = Current(n) ELSE TRUE
 
 \* A machine accepts a connection from n's attachment and names a sandbox
-\* for it: hosts.rs `connection`, Hooks::sandbox_at.
+\* for it: the factory in `Machine::add` (hosts.rs 1810), Hooks::sandbox_at.
 Connect(n, p) ==
     /\ Carries(n, p) /\ Answered(n, p)
     /\ conns' = conns \cup {[peer |-> p, via |-> Current(n)]}
