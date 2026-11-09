@@ -1,7 +1,7 @@
 use fictionet::stdlib::codec::{be16, be24};
 use fictionet::stdlib::dissect::{
-    Conversation, Decoded, Layer, Match, Observed, Place, Placement, Present, Protocol, Registry,
-    protocols,
+    Conversation, Decoded, KeyLog, Layer, Match, Observed, Place, Placement, Present, Protocol,
+    Registry, Seen, protocols,
 };
 use fictionet::stdlib::layer::Termination;
 use fictionet::stdlib::network::Transport;
@@ -13,6 +13,8 @@ use rustls::{ContentType, ProtocolVersion, SupportedCipherSuite, Tls13CipherSuit
 /// One TLS connection: what its hellos said, and its keys.
 struct Tls {
     registry: Registry,
+    /// The capture's TLS secrets.
+    key_log: KeyLog,
     ports: (u16, u16),
     client_random: Option<Vec<u8>>,
     /// Which direction is the client's.
@@ -36,11 +38,23 @@ struct Tls {
     /// stream last got bytes, such as early data under a key the key log
     /// does not have: what it carried is missing from that stream.
     unopened: [bool; 2],
+    /// How much of the key log was searched for this session's secrets,
+    /// with the hellos as they are now.
+    searched: Seen,
 }
 
+/// The key log labels of each side's secrets (the SSLKEYLOGFILE format):
+/// its handshake traffic secret, then its first application traffic
+/// secret. The client's come first.
+const SECRET_LABELS: [[&str; 2]; 2] = [
+    ["CLIENT_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_TRAFFIC_SECRET_0"],
+    ["SERVER_HANDSHAKE_TRAFFIC_SECRET", "SERVER_TRAFFIC_SECRET_0"],
+];
+
 /// A TLS capture session with record framing, handshake state, and TLS 1.3
-/// decryption from key log entries. Register with [`Self::register`].
-/// The supplied registry also selects protocols in the decrypted stream.
+/// decryption from the capture's key log. Register with [`Self::register`].
+/// The supplied registry also selects protocols in the decrypted stream,
+/// and the sessions it makes there read the same key log.
 pub struct TlsSession {
     tls: Tls,
     /// Each direction's records, until bytes go missing in it. Past a gap,
@@ -50,7 +64,8 @@ pub struct TlsSession {
 }
 impl TlsSession {
     /// Registers `tls` for TCP starting with a TLS handshake record prefix.
-    /// Each session clones the active registry to select decrypted protocols.
+    /// Each session clones the active registry to select decrypted
+    /// protocols, and the capture's key log to decrypt.
     pub fn register(registry: &mut Registry) {
         registry.register_protocol(
             "tls",
@@ -61,13 +76,14 @@ impl TlsSession {
                     Match::No
                 }
             },
-            |s, registry| Box::new(Self::new(s.ports, registry.clone())),
+            |s, cx| Box::new(Self::new(s.ports, cx.registry.clone(), cx.keys.clone())),
         );
     }
-    /// Creates both record directions using the conversation ports and registry.
-    pub fn new(ports: (u16, u16), registry: Registry) -> Self {
+    /// Creates both record directions using the conversation ports, the
+    /// registry, and the capture's key log.
+    pub fn new(ports: (u16, u16), registry: Registry, key_log: KeyLog) -> Self {
         Self {
-            tls: Tls::new(ports, registry),
+            tls: Tls::new(ports, registry, key_log),
             dirs: std::array::from_fn(|_| {
                 Some(Observed::with_buffer(
                     protocols::TlsRecords::default(),
@@ -287,10 +303,11 @@ fn handshake_name(t: u8) -> &'static str {
 }
 
 impl Tls {
-    fn new(ports: (u16, u16), registry: Registry) -> Self {
+    fn new(ports: (u16, u16), registry: Registry, key_log: KeyLog) -> Self {
         Self {
             ports,
             registry,
+            key_log,
             client_random: None,
             client: None,
             sni: None,
@@ -304,12 +321,14 @@ impl Tls {
             hs_sealed: [Vec::new(), Vec::new()],
             key_update: [false; 2],
             unopened: [false; 2],
+            searched: Seen::default(),
         }
     }
 
     /// Sets up decryption for both directions, once the hellos are known
     /// and the capture's key log has their secrets. Until then it looks
-    /// again at each encrypted record, so keys added late are found.
+    /// again at each encrypted record that finds the log grown, so keys
+    /// added late are found.
     fn find_keys(&mut self) {
         let (Some(random), Some(cipher), Some(client)) =
             (&self.client_random, self.cipher, self.client)
@@ -322,21 +341,20 @@ impl Tls {
         let Some(suite) = suite(cipher) else {
             return;
         };
-        self.registry.keys().read(|lines| {
+        let keys = &mut self.keys;
+        self.key_log.read_new(&mut self.searched, |lines| {
             let secret = |label: &str| {
                 lines
                     .iter()
                     .find(|k| k.label == label && &k.client_random == random)
                     .map(|k| k.secret.as_slice())
             };
-            for (dir, side) in [(client, "CLIENT"), (1 - client, "SERVER")] {
-                if self.keys[dir].is_some() {
+            for (dir, [handshake, app]) in [client, 1 - client].into_iter().zip(SECRET_LABELS) {
+                if keys[dir].is_some() {
                     continue;
                 }
-                let hs = secret(&format!("{side}_HANDSHAKE_TRAFFIC_SECRET"));
-                let app = secret(&format!("{side}_TRAFFIC_SECRET_0"));
-                if let (Some(hs), Some(app)) = (hs, app) {
-                    self.keys[dir] = DirKeys::new(suite, hs, app);
+                if let (Some(hs), Some(app)) = (secret(handshake), secret(app)) {
+                    keys[dir] = DirKeys::new(suite, hs, app);
                 }
             }
         });
@@ -513,8 +531,9 @@ impl Tls {
         if self.inner.is_none() {
             let mut registry = self.registry.clone();
             registry.automatic(Transport::Tcp);
-            let inner = Conversation::with_registry(self.ports.0, self.ports.1, registry)
-                .with_alpn(self.alpn.clone());
+            let inner =
+                Conversation::new(self.ports.0, self.ports.1, registry, self.key_log.clone())
+                    .with_alpn(self.alpn.clone());
             self.inner = Some(inner);
         }
         if let Some(conversation) = &mut self.inner {
@@ -611,6 +630,7 @@ impl Tls {
                 1 if m.len() >= 34 && !decrypted => {
                     self.client_random = Some(m[2..34].to_vec());
                     self.client = Some(i);
+                    self.searched = Seen::default();
                     l.field(
                         "Random",
                         fictionet::stdlib::dissect::hex(&m[2..34]),
@@ -640,6 +660,7 @@ impl Tls {
                             return names;
                         };
                         self.cipher = Some(c);
+                        self.searched = Seen::default();
                         l.note("Cipher suite", cipher_name(c));
                     }
                     for (ext, data) in extensions(m, false) {
@@ -780,7 +801,7 @@ pub(super) mod tests {
             }
             // An outer explicit choice must not leak into plaintext selection.
             assert!(registry.choose(Transport::Tcp, "custom_http1"));
-            let mut tls = Tls::new((40000, 443), registry);
+            let mut tls = Tls::new((40000, 443), registry, KeyLog::default());
             tls.alpn = alpn.map(str::to_owned);
             let mut packet = Decoded::default();
             tls.inner_data(0, b"\x01x", Place::default(), &mut packet);
@@ -792,7 +813,7 @@ pub(super) mod tests {
     #[test]
     fn eight_unmatched_plaintext_bytes_reject_later_records() {
         for count in [7, 8] {
-            let mut tls = Tls::new((40000, 443), Registry::default());
+            let mut tls = Tls::new((40000, 443), Registry::default(), KeyLog::default());
             for byte in &b"banner!!"[..count] {
                 let mut packet = Decoded::default();
                 tls.inner_data(0, &[*byte], Place::default(), &mut packet);
@@ -808,7 +829,7 @@ pub(super) mod tests {
 
     #[test]
     fn gaps_release_handshake_allocations() {
-        let mut session = TlsSession::new((40000, 443), Registry::new());
+        let mut session = TlsSession::new((40000, 443), Registry::new(), KeyLog::default());
         for i in 0..2 {
             session.tls.hs_plain[i] = vec![1; MAX_HANDSHAKE];
             session.tls.hs_sealed[i] = vec![2; MAX_HANDSHAKE];
@@ -821,7 +842,7 @@ pub(super) mod tests {
     #[test]
     fn oversized_handshakes_release_their_allocation() {
         for decrypted in [false, true] {
-            let mut tls = Tls::new((0, 0), Registry::new());
+            let mut tls = Tls::new((0, 0), Registry::new(), KeyLog::default());
             let mut packet = Decoded::default();
             let mut layer = Layer::new("TLS", 0, (0, 0));
             tls.handshake_records(
@@ -948,7 +969,13 @@ pub(super) mod tests {
                         Match::No
                     }
                 },
-                |s, registry| Box::new(TlsSession::new(s.ports, registry.clone())),
+                |s, cx| {
+                    Box::new(TlsSession::new(
+                        s.ports,
+                        cx.registry.clone(),
+                        cx.keys.clone(),
+                    ))
+                },
             );
             registry
         };
@@ -987,8 +1014,9 @@ pub(super) mod tests {
             },
             |_| [Tiny, Tiny],
         );
-        registry.keys().extend(key_lines(7, 2, 1));
-        let mut conversation = Conversation::with_registry(40000, 9443, registry);
+        let keys = KeyLog::default();
+        keys.extend(key_lines(7, 2, 1));
+        let mut conversation = Conversation::new(40000, 9443, registry, keys);
         let mut offsets = [0; 2];
         let mut feed = |reverse: bool, record: &[u8]| {
             let i = usize::from(reverse);
@@ -1141,9 +1169,9 @@ pub(super) mod tests {
     }
 
     impl Records {
-        fn new(registry: Registry) -> Records {
+        fn new(registry: Registry, keys: KeyLog) -> Records {
             Records {
-                conversation: Conversation::with_registry(40000, 443, registry),
+                conversation: Conversation::new(40000, 443, registry, keys),
                 offsets: [0; 2],
             }
         }
@@ -1168,11 +1196,9 @@ pub(super) mod tests {
     /// what it carries is decrypted too.
     #[test]
     fn tls_inside_tls_is_decrypted_with_the_captures_keys() {
-        let registry = with_tiny(Registry::default());
-        registry
-            .keys()
-            .extend(key_lines(7, 2, 1).into_iter().chain(key_lines(9, 4, 3)));
-        let mut records = Records::new(registry);
+        let keys = KeyLog::default();
+        keys.extend(key_lines(7, 2, 1).into_iter().chain(key_lines(9, 4, 3)));
+        let mut records = Records::new(with_tiny(Registry::default()), keys);
         let [client, server] = hellos(7);
         records.feed(false, &client);
         records.feed(true, &server);
@@ -1189,9 +1215,8 @@ pub(super) mod tests {
     /// at its next encrypted record.
     #[test]
     fn keys_added_after_the_handshake_reach_the_open_session() {
-        let registry = with_tiny(Registry::default());
-        let keys = registry.keys().clone();
-        let mut records = Records::new(registry);
+        let keys = KeyLog::default();
+        let mut records = Records::new(with_tiny(Registry::default()), keys.clone());
         let [client, server] = hellos(7);
         records.feed(false, &client);
         records.feed(true, &server);
@@ -1206,7 +1231,7 @@ pub(super) mod tests {
     #[test]
     fn partial_handshakes_append_without_reallocating_the_held_prefix() {
         for decrypted in [false, true] {
-            let mut tls = Tls::new((0, 0), Registry::new());
+            let mut tls = Tls::new((0, 0), Registry::new(), KeyLog::default());
             let held = if decrypted {
                 &mut tls.hs_sealed[0]
             } else {
@@ -1252,7 +1277,7 @@ pub(super) mod tests {
             tls13: true,
             cipher: Some(0x1301),
             keys: [Some(keys), None],
-            ..Tls::new((0, 0), Registry::new())
+            ..Tls::new((0, 0), Registry::new(), KeyLog::default())
         };
         let mut at = 0u64;
         let mut feed = |tls: &mut Tls, record: &[u8]| {
@@ -1305,7 +1330,7 @@ pub(super) mod tests {
             tls13: true,
             cipher: Some(0x1301),
             keys,
-            ..Tls::new((0, 0), Registry::new())
+            ..Tls::new((0, 0), Registry::new(), KeyLog::default())
         };
         let mut at = [0u64; 2];
         let mut feed = |tls: &mut Tls, i: usize, record: &[u8]| {
@@ -1364,7 +1389,7 @@ pub(super) mod tests {
             tls13: true,
             cipher: Some(0x1301),
             keys: [Some(keys), None],
-            ..Tls::new((40000, 443), registry)
+            ..Tls::new((40000, 443), registry, KeyLog::default())
         };
         let mut at = 0u64;
         // What the protocol inside showed for the record, and the packet.
@@ -1407,7 +1432,7 @@ pub(super) mod tests {
         let mut registry = Registry::default();
         super::TlsSession::register(&mut registry);
         let mut conversation =
-            fictionet::stdlib::dissect::Conversation::with_registry(40000, 443, registry);
+            fictionet::stdlib::dissect::Conversation::new(40000, 443, registry, KeyLog::default());
         let mut packet = Decoded::default();
         let record = [22, 3, 3, 0, 4, 20, 0, 0, 0];
         conversation.data(false, &record[..3], Place::default(), &mut packet);

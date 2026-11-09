@@ -1,4 +1,4 @@
-use fictionet::stdlib::dissect::{Decoded, Match, Place, Protocol, Registry, Selection};
+use fictionet::stdlib::dissect::{Decoded, KeyLog, Match, Place, Protocol, Registry, Selection};
 use fictionet::stdlib::layer::Termination;
 use fictionet::stdlib::network::Transport;
 
@@ -16,6 +16,7 @@ pub struct Conversation {
     alpn: Option<String>,
     name: Option<String>,
     registry: Registry,
+    keys: KeyLog,
     protocol: Option<Box<dyn Protocol>>,
     prefix: [Vec<u8>; 2],
     prefix_start: [u64; 2],
@@ -27,13 +28,15 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// Starts automatic or explicit selection using the supplied registry.
-    pub fn with_registry(port_a: u16, port_b: u16, registry: Registry) -> Self {
+    /// Starts automatic or explicit selection using the supplied registry,
+    /// for a capture with the TLS secrets in `keys`.
+    pub fn new(port_a: u16, port_b: u16, registry: Registry, keys: KeyLog) -> Self {
         Self {
             ports: (port_a, port_b),
             name: None,
             alpn: None,
             registry,
+            keys,
             protocol: None,
             prefix: [Vec::new(), Vec::new()],
             prefix_start: [0; 2],
@@ -94,8 +97,8 @@ impl Conversation {
 
     /// Processes ordered bytes and appends completed messages to `d`.
     /// `place` locates this chunk in the current packet. Earlier prefix bytes
-    /// receive reassembly buffers. TLS reads its keys from the registry's
-    /// [`KeyLog`](super::KeyLog).
+    /// receive reassembly buffers. TLS reads its keys from the
+    /// conversation's [`KeyLog`].
     pub fn data(&mut self, dir: bool, bytes: &[u8], place: Place, d: &mut Decoded) {
         if self.rejected {
             return;
@@ -117,13 +120,14 @@ impl Conversation {
                 .get(..bytes.len().min(64usize.saturating_sub(old)))
                 .unwrap_or_default(),
         );
-        match self.registry.open(Selection {
+        let selection = Selection {
             transport: Transport::Tcp,
             ports: self.ports,
             first: prefix,
             protocol: self.name.as_deref(),
             alpn: self.alpn.as_deref(),
-        }) {
+        };
+        match self.registry.open(selection, &self.keys) {
             Ok(mut protocol) => {
                 prefix.truncate(old);
                 // Selection applies to both directions. Flush every earlier
@@ -173,7 +177,7 @@ mod tests {
         let mut registry = Registry::new();
         registry.register("fallback", |_| Match::Yes, |_| [Tiny, Tiny]);
         registry.register("pending", |_| Match::More, |_| [Tiny, Tiny]);
-        let mut conversation = Conversation::with_registry(1, 2, registry);
+        let mut conversation = Conversation::new(1, 2, registry, KeyLog::default());
         let mut packet = Decoded::default();
         for _ in 0..64 {
             conversation.data(false, b"x", Place::default(), &mut packet);
@@ -253,7 +257,7 @@ mod tests {
                 |_| [Tiny, Tiny],
             );
             let mut f = Feeder {
-                c: Conversation::with_registry(1, 2, registry),
+                c: Conversation::new(1, 2, registry, KeyLog::default()),
                 at: [0, 0],
             };
             let prefix: &[u8] = if partial { b"\x05he" } else { b"\x01a" };
@@ -321,7 +325,7 @@ mod tests {
             |_| [ToEnd, ToEnd],
         );
         let mut f = Feeder {
-            c: Conversation::with_registry(1, 2, registry),
+            c: Conversation::new(1, 2, registry, KeyLog::default()),
             at: [0, 0],
         };
         f.send(false, b"bye", 3);

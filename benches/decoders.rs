@@ -787,12 +787,13 @@ fn resp_bytewise_lines(bencher: Bencher, size: usize) {
 
 #[divan::bench(args = [20_000, 80_000])]
 fn http2_capture_frames(bencher: Bencher, size: usize) {
-    use fictionet::stdlib::dissect::{Conversation, Decoded, Place, Registry};
+    use fictionet::stdlib::dissect::{Conversation, Decoded, KeyLog, Place, Registry};
     let input = [0, 0, 0, 0xff, 0, 0, 0, 0, 1].repeat(size);
     bencher
         .counter(BytesCount::new(input.len()))
         .bench_local(|| {
-            let mut conversation = Conversation::with_registry(40000, 80, Registry::default());
+            let mut conversation =
+                Conversation::new(40000, 80, Registry::default(), KeyLog::default());
             let preface = fictionet::stdlib::protocols::http2::PREFACE;
             conversation.data(
                 false,

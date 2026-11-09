@@ -78,9 +78,11 @@ and flush driver, including ordered input, gaps, waiting status and ALPN.
 
 TLS and Modbus sessions use `Registry::register_protocol` when
 shared state requires the `Protocol` interface. The session factory receives
-the active registry. TLS reads its keys from the registry's `KeyLog`, and
-clones the registry for plaintext selection with the outer ports, so the
-sessions it makes share the log. Other protocols never see keys. ALPN hints select `http2` for `h2` or `http1` for `http/1.1` only when
+a `Context`: the active registry and the capture's `KeyLog`. The registry is
+configuration only, so one registry can serve many captures, each with its
+own key log. TLS reads its keys from the log, and clones the registry and
+the log for plaintext selection with the outer ports, so the sessions it
+makes share the log. Other protocols never see keys. ALPN hints select `http2` for `h2` or `http1` for `http/1.1` only when
 that name is registered. Other cases use the registry matchers, including
 across split plaintext prefixes. Eight unmatched bytes permanently reject
 plaintext selection in both directions, as in the outer conversation.

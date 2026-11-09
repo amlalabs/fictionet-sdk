@@ -70,8 +70,18 @@ pub trait Protocol: Send {
     }
 }
 
+/// What a session factory gets besides the selection: the registry, to
+/// select protocols inside the session, and the capture's TLS secrets.
+#[derive(Clone, Copy, Debug)]
+pub struct Context<'a> {
+    /// The registry that selected this protocol, with every registration.
+    pub registry: &'a Registry,
+    /// The TLS secrets of the capture the conversation belongs to.
+    pub keys: &'a KeyLog,
+}
+
 type Matcher = dyn Fn(Selection<'_>) -> Match + Send + Sync;
-type Factory = dyn Fn(Selection<'_>, &Registry) -> Box<dyn Protocol> + Send + Sync;
+type Factory = dyn Fn(Selection<'_>, Context<'_>) -> Box<dyn Protocol> + Send + Sync;
 struct Entry {
     name: String,
     matches: Box<Matcher>,
@@ -88,14 +98,12 @@ struct Entry {
 /// For UDP it acts as `No`: a datagram cannot grow. Explicit selection
 /// bypasses matchers only for the chosen transport.
 ///
-/// A registry also holds the capture's TLS secrets, its [`KeyLog`], which
-/// clones share. A session that selects protocols inside itself with a
-/// clone, as TLS does, passes the same secrets to the sessions it makes.
+/// A registry is configuration only. It holds no capture's state, so one
+/// registry can serve as the template for many captures.
 #[derive(Clone)]
 pub struct Registry {
     entries: Vec<Arc<Entry>>,
     choice: [Option<String>; 2],
-    keys: KeyLog,
 }
 
 impl std::fmt::Debug for Registry {
@@ -119,19 +127,12 @@ impl Default for Registry {
 }
 
 impl Registry {
-    /// Creates a registry with no protocols and an empty key log.
+    /// Creates a registry with no protocols.
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
             choice: [None, None],
-            keys: KeyLog::default(),
         }
-    }
-
-    /// The TLS secrets of the capture this registry decodes, shared with
-    /// its clones.
-    pub fn keys(&self) -> &KeyLog {
-        &self.keys
     }
 
     /// Returns the registered names in registration order, oldest first.
@@ -183,13 +184,14 @@ impl Registry {
 
     /// Registers a session factory through the same selection mechanism
     /// as a byte decoder. A duplicate name replaces its earlier factory.
-    /// The factory receives this registry, including all user registrations.
-    /// Clone it to select protocols inside a session such as TLS.
+    /// The factory's [`Context`] has this registry, including all user
+    /// registrations, and the capture's key log. Clone both to select
+    /// protocols inside a session such as TLS.
     pub fn register_protocol(
         &mut self,
         name: &str,
         matches: impl Fn(Selection<'_>) -> Match + Send + Sync + 'static,
-        make: impl Fn(Selection<'_>, &Registry) -> Box<dyn Protocol> + Send + Sync + 'static,
+        make: impl Fn(Selection<'_>, Context<'_>) -> Box<dyn Protocol> + Send + Sync + 'static,
     ) {
         self.entries.retain(|entry| entry.name != name);
         self.entries.push(Arc::new(Entry {
@@ -235,14 +237,19 @@ impl Registry {
         Err(Match::No)
     }
 
-    /// Instantiates the selected conversation. Returns `More` while a
-    /// TCP matcher needs prefix bytes, or `No` when nothing matches.
-    pub fn open(&self, input: Selection<'_>) -> Result<Box<dyn Protocol>, Match> {
+    /// Instantiates the selected conversation of a capture with `keys`.
+    /// Returns `More` while a TCP matcher needs prefix bytes, or `No` when
+    /// nothing matches.
+    pub fn open(&self, input: Selection<'_>, keys: &KeyLog) -> Result<Box<dyn Protocol>, Match> {
         let name = self.select(input)?;
+        let context = Context {
+            registry: self,
+            keys,
+        };
         self.entries
             .iter()
             .find(|e| e.name == name)
-            .map(|e| (e.make)(input, self))
+            .map(|e| (e.make)(input, context))
             .ok_or(Match::No)
     }
 }

@@ -28,7 +28,7 @@ pub(super) fn register(registry: &mut Registry) {
 mod tests {
     use super::*;
     use fictionet::stdlib::dissect::Decoded;
-    use fictionet::stdlib::dissect::{Conversation, Observed, Place};
+    use fictionet::stdlib::dissect::{Conversation, KeyLog, Observed, Place};
     use fictionet::stdlib::protocols::http2::PREFACE as HTTP2_PREFACE;
     use fictionet::stdlib::test_support::hex;
 
@@ -50,7 +50,7 @@ mod tests {
     impl Feeder {
         fn new(ports: (u16, u16)) -> Feeder {
             Feeder {
-                c: Conversation::with_registry(ports.0, ports.1, Registry::default()),
+                c: Conversation::new(ports.0, ports.1, Registry::default(), KeyLog::default()),
                 at: [0, 0],
             }
         }

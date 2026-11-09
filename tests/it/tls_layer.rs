@@ -197,6 +197,9 @@ fn no_budget_refuses_input_without_consuming_it() {
 
 #[test]
 fn ciphertext_batches_and_completions_survive_key_updates_and_record_splits() {
+    // The most one record takes on the wire, in TLS 1.2 (RFC 5246 section
+    // 6.2.3): the layer's output holds one, or several smaller ones.
+    const RECORD: usize = 5 + (1 << 14) + 2048;
     block_on(lab(Seed::from_u64(43), |fcx| async move {
         let ca = Ca::new(&fcx, "Test CA")?;
         for (fragment, size) in [(None, 128), (None, 16 * 1024), (Some(1024), 4096)] {
@@ -227,11 +230,11 @@ fn ciphertext_batches_and_completions_survive_key_updates_and_record_splits() {
                 let StreamCommand::Write(chunk) = command else {
                     panic!("expected ciphertext")
                 };
-                assert!(chunk.len() <= 16 * 1024);
+                assert!(chunk.len() <= RECORD);
                 chunks.push(chunk);
             }
             let ciphertext_len: usize = chunks.iter().map(Chunk::len).sum();
-            assert_eq!(chunks.len(), ciphertext_len.div_ceil(16 * 1024));
+            assert_eq!(chunks.len(), ciphertext_len.div_ceil(RECORD));
             assert!(events(&mut server).is_empty());
             for chunk in &chunks {
                 receive(&mut client, chunk);

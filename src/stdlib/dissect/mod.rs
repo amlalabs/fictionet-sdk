@@ -23,13 +23,14 @@ mod transport;
 
 pub use conversation::Conversation;
 pub use present::{Observed, Place, Placement, Present};
-pub use registry::{Match, Protocol, Registry, Selection};
+pub use registry::{Context, Match, Protocol, Registry, Selection};
 use transport::{IcmpMessage, TcpHeader, UdpHeader, endpoint};
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fictionet::stdlib::codec::{be16, be32};
 use fictionet::stdlib::layer::{
@@ -65,32 +66,56 @@ impl fmt::Debug for KeyLine {
     }
 }
 
-/// The TLS secrets a capture has, as [`KeyLine`]s. Each [`Registry`] has
-/// one, and its clones share it, so every TLS session of a capture reads
-/// the same log, a session inside another session's decrypted stream
+/// The TLS secrets a capture has, as [`KeyLine`]s. Each [`Dissector`] has
+/// one. Clones of a log share its lines, so every TLS session of a capture
+/// reads the same log, a session inside another session's decrypted stream
 /// included. A session reads it whenever it still needs keys: lines added
-/// after it began reach it at its next encrypted record.
+/// after it began reach it at its next encrypted record, and a session
+/// whose log has not grown since it last looked does not look again.
 #[derive(Clone, Default)]
 pub struct KeyLog {
-    lines: Arc<Mutex<Vec<KeyLine>>>,
+    shared: Arc<Lines>,
 }
+
+/// The lines of a [`KeyLog`] and how many there are. Lines are only ever
+/// added, so the count says whether a reader has seen them all, without
+/// taking the lock.
+#[derive(Default)]
+struct Lines {
+    lines: Mutex<Vec<KeyLine>>,
+    count: AtomicUsize,
+}
+
+/// How much of a [`KeyLog`] a reader has seen: the lines it had when the
+/// reader last read it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Seen(usize);
 
 impl KeyLog {
     /// Adds `lines` to the log.
     pub fn extend(&self, lines: impl IntoIterator<Item = KeyLine>) {
-        self.lines.lock().extend(lines);
+        let mut held = self.shared.lines.lock();
+        held.extend(lines);
+        self.shared.count.store(held.len(), Ordering::Release);
     }
 
-    /// Calls `read` with the lines so far.
-    fn read<T>(&self, read: impl FnOnce(&[KeyLine]) -> T) -> T {
-        read(&self.lines.lock())
+    /// Calls `read` with every line when lines were added since `seen`,
+    /// and moves `seen` up to them. Returns `None`, calling nothing, when
+    /// the log has not grown.
+    fn read_new<T>(&self, seen: &mut Seen, read: impl FnOnce(&[KeyLine]) -> T) -> Option<T> {
+        if self.shared.count.load(Ordering::Acquire) == seen.0 {
+            return None;
+        }
+        let lines = self.shared.lines.lock();
+        *seen = Seen(lines.len());
+        Some(read(&lines))
     }
 }
 
 impl fmt::Debug for KeyLog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyLog")
-            .field("lines", &self.lines.lock().len())
+            .field("lines", &self.shared.count.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -426,6 +451,7 @@ pub struct Dissector {
     connections: BTreeMap<ChildId, Watched>,
     udp: BTreeMap<(Scope, SocketAddr, SocketAddr), Datagrams>,
     registry: Registry,
+    keys: KeyLog,
     /// Packets decoded so far: the number of the last one.
     packets: u64,
 }
@@ -480,6 +506,7 @@ impl Default for Dissector {
             connections: BTreeMap::new(),
             udp: BTreeMap::new(),
             registry: Registry::default(),
+            keys: KeyLog::default(),
             packets: 0,
         }
     }
@@ -511,7 +538,8 @@ struct DecodeContext<'a> {
 }
 
 impl Dissector {
-    /// Creates a dissector with built-in or user protocol registrations.
+    /// Creates a dissector with built-in or user protocol registrations,
+    /// and an empty key log of its own.
     pub fn with_registry(registry: Registry) -> Self {
         Self {
             registry,
@@ -519,15 +547,15 @@ impl Dissector {
         }
     }
 
-    /// The capture's TLS secrets: its registry's [`KeyLog`]. Lines added
-    /// to it reach sessions already open, at their next encrypted record.
+    /// The capture's TLS secrets. Lines added to it reach sessions already
+    /// open, at their next encrypted record.
     pub fn keys(&self) -> &KeyLog {
-        self.registry.keys()
+        &self.keys
     }
 
     /// Forgets every connection after packets were missed, such as when a
     /// capture sampled or evicted some. No decoder joins bytes across the
-    /// gap. Reassembly limits, the registry and its key log stay as they
+    /// gap. Reassembly limits, the registry and the key log stay as they
     /// are.
     pub fn lost(&mut self) {
         self.observer = tcp_observer(self.observer.layer().limits());
@@ -947,9 +975,10 @@ impl Dissector {
                 Direction::Forward => format!("{from} → {to}"),
                 Direction::Reverse => format!("{to} → {from}"),
             };
-            let registry = &self.registry;
-            let open =
-                || Conversation::with_registry(low, high, registry.clone()).with_protocol(protocol);
+            let (registry, keys) = (&self.registry, &self.keys);
+            let open = || {
+                Conversation::new(low, high, registry.clone(), keys.clone()).with_protocol(protocol)
+            };
             match event {
                 ObservedEvent::Data { bytes, source, .. } => {
                     let i = usize::from(reverse);
@@ -1066,13 +1095,16 @@ impl Dissector {
         if conversation.protocol.is_none() {
             conversation.protocol = self
                 .registry
-                .open(Selection {
-                    transport: fictionet::stdlib::network::Transport::Udp,
-                    ports: conversation.ports,
-                    protocol: context.protocol,
-                    alpn: None,
-                    first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
-                })
+                .open(
+                    Selection {
+                        transport: fictionet::stdlib::network::Transport::Udp,
+                        ports: conversation.ports,
+                        protocol: context.protocol,
+                        alpn: None,
+                        first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
+                    },
+                    &self.keys,
+                )
                 .ok();
         }
         if let Some(protocol) = &mut conversation.protocol {
@@ -1124,6 +1156,28 @@ fn push_hex(out: &mut String, b: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader reads the key log again only once it has grown, and then
+    /// gets every line, the ones it saw before included.
+    #[test]
+    fn a_key_log_is_read_again_only_once_it_grows() {
+        let line = |label: &str| KeyLine {
+            label: label.into(),
+            client_random: vec![1; 32],
+            secret: vec![2; 32],
+        };
+        let log = KeyLog::default();
+        let mut seen = Seen::default();
+        let count = |lines: &[KeyLine]| lines.len();
+        assert_eq!(log.read_new(&mut seen, count), None);
+        log.extend([line("CLIENT_TRAFFIC_SECRET_0")]);
+        assert_eq!(log.read_new(&mut seen, count), Some(1));
+        assert_eq!(log.read_new(&mut seen, count), None);
+        log.clone().extend([line("SERVER_TRAFFIC_SECRET_0")]);
+        assert_eq!(log.read_new(&mut seen, count), Some(2));
+        assert_eq!(log.read_new(&mut seen, count), None);
+        assert_eq!(log.read_new(&mut Seen::default(), count), Some(2));
+    }
 
     #[test]
     fn capture_context_separates_overlapping_connections_and_keeps_packet_identity() {

@@ -217,10 +217,10 @@ fn modbus_function(f: u8) -> &'static str {
 mod tests {
     #[test]
     fn modbus_session_stops_both_directions_after_bad_framing() {
-        use fictionet::stdlib::dissect::{Conversation, Decoded, Place, Registry};
+        use fictionet::stdlib::dissect::{Conversation, Decoded, KeyLog, Place, Registry};
         let mut registry = Registry::new();
         super::ModbusSession::register(&mut registry);
-        let mut conversation = Conversation::with_registry(40000, 502, registry);
+        let mut conversation = Conversation::new(40000, 502, registry, KeyLog::default());
         let bad = [0, 9, 0, 5, 0, 6, 1, 3, 0, 0, 0, 1];
         let reply = [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2];
         for (reverse, bytes) in [(false, &bad[..]), (true, &reply[..])] {

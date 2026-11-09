@@ -18,6 +18,10 @@ use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
 
 const CHUNK: usize = 16 * 1024;
+/// The most one record takes on the wire: a 5-byte header and at most
+/// 2^14 + 2048 bytes of ciphertext in TLS 1.2 (RFC 5246 section 6.2.3).
+/// TLS 1.3 allows less, 2^14 + 256 (RFC 8446 section 5.2).
+const RECORD: usize = 5 + (1 << 14) + 2048;
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 
 /// Appends to a vector up to its capacity, so a TLS write fills exactly the
@@ -312,7 +316,7 @@ impl TlsLayer {
 
     fn reserve_output(&mut self, env: &Env<'_, ()>) -> bool {
         if self.output_reserve.is_none() {
-            self.output_reserve = env.budget().charge(CHUNK);
+            self.output_reserve = env.budget().charge(RECORD);
         }
         self.output_reserve.is_some()
     }
@@ -595,12 +599,13 @@ impl Layer for TlsLayer {
                 return Ok(false);
             }
             let mut charge = self.output_reserve.take().unwrap();
-            // A single whole record that fits the reservation goes down in
-            // the buffer rustls encrypted it into. Anything else is copied
-            // into room for exactly what is to go, up to a chunk: several
-            // records coalesced, the rest of a split record, the rejection,
-            // or the alert, whose size is not known ahead. Either way the
-            // reservation then shrinks to the allocation it covers.
+            // The reservation holds the largest record, so a single whole
+            // record goes down in the buffer rustls encrypted it into.
+            // Anything else is copied into room for exactly what is to go,
+            // up to the reservation: several records coalesced, the rest
+            // of a split record, the rejection, or the alert, whose size is
+            // not known ahead. Either way the reservation then shrinks to
+            // the allocation it covers.
             let owned = if self.reject || self.alert.is_some() {
                 None
             } else {
@@ -615,9 +620,13 @@ impl Layer for TlsLayer {
                 let room = if self.reject {
                     UNRECOGNIZED_NAME.len()
                 } else if self.alert.is_some() {
-                    CHUNK
+                    charge.bytes()
                 } else {
-                    self.tls.as_ref().unwrap().sendable_tls_len().min(CHUNK)
+                    self.tls
+                        .as_ref()
+                        .unwrap()
+                        .sendable_tls_len()
+                        .min(charge.bytes())
                 };
                 let mut bytes = Vec::with_capacity(room);
                 let result = if self.reject {
@@ -635,7 +644,10 @@ impl Layer for TlsLayer {
             if bytes.is_empty() {
                 self.alert = None;
             } else {
-                charge.set(bytes.capacity());
+                // Both paths above bound the allocation by the reservation,
+                // so shrinking the charge to it always fits.
+                let shrunk = charge.set(bytes.capacity());
+                debug_assert!(shrunk, "ciphertext outgrew its reservation");
                 self.ciphertext_emitted += bytes.len() as u64;
                 self.below = Some(StreamCommand::Write(Chunk::with_charge(bytes, charge)));
             }
@@ -823,5 +835,117 @@ mod ciphertext_transfer_tests {
         assert_eq!(budget.used(), output.charged());
         drop(output);
         assert_eq!(budget.used(), 0);
+    }
+
+    /// A full record, the most plaintext one can carry, goes down whole in
+    /// one write, in the buffer rustls encrypted it into, in TLS 1.2 and
+    /// 1.3 alike.
+    #[test]
+    fn a_full_record_goes_down_in_one_write_without_a_copy() {
+        use fictionet::stdlib::protocols::x509;
+        use fictionet::stdlib::services::ca::Ca;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        struct Inspect(*const u8);
+        impl Write for Inspect {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0 = bytes.as_ptr();
+                Ok(0)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Moves what `from` has to send into `to`.
+        fn deliver<A, B>(
+            from: &mut rustls::ConnectionCommon<A>,
+            to: &mut rustls::ConnectionCommon<B>,
+        ) {
+            let mut bytes = Vec::new();
+            while from.wants_write() {
+                from.write_tls(&mut bytes).unwrap();
+            }
+            let mut rest = bytes.as_slice();
+            while !rest.is_empty() {
+                to.read_tls(&mut rest).unwrap();
+                to.process_new_packets().unwrap();
+            }
+        }
+
+        fictionet::block_on(fictionet::lab(Seed::from_u64(43), |cx| async move {
+            let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+            let ca = Ca::new(&cx, "Record CA")?;
+            let validity = x509::Validity {
+                not_before: x509::Time::from_unix(1_700_000_000).unwrap(),
+                not_after: x509::Time::from_unix(2_000_000_000).unwrap(),
+            };
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.cert_der())?;
+            let roots = Arc::new(roots);
+            for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+                let config = ca
+                    .issue(&cx, &["record.example"], validity.clone())?
+                    .server_config(&cx, start)?;
+                let client_config = Arc::new(
+                    super::super::client_config_builder(&cx, start)
+                        .with_protocol_versions(&[version])?
+                        .with_root_certificates(roots.clone())
+                        .with_no_client_auth(),
+                );
+                let mut client = rustls::ClientConnection::new(
+                    client_config,
+                    "record.example".try_into().unwrap(),
+                )?;
+                let mut tls = ServerConnection::new(config.clone())?;
+                while client.is_handshaking() || tls.is_handshaking() || tls.wants_write() {
+                    deliver(&mut *client, &mut *tls);
+                    deliver(&mut *tls, &mut *client);
+                }
+                assert_eq!(tls.protocol_version(), Some(version.version));
+
+                let plaintext = vec![7u8; 1 << 14];
+                assert_eq!(tls.writer().write(&plaintext)?, plaintext.len());
+                let mut inspect = Inspect(std::ptr::null());
+                assert_eq!(tls.write_tls(&mut inspect)?, 0);
+                let queued = tls.sendable_tls_len();
+                let mut layer = TlsLayer::new(config);
+                layer.tls = Some(tls);
+                let mut harness = Harness::new(Seed::from_u64(44), layer);
+                let mut writes = Vec::new();
+                loop {
+                    harness.driver().run().unwrap();
+                    let moved = harness.driver().send_below(|command| {
+                        let StreamCommand::Write(bytes) = command else {
+                            panic!("expected ciphertext")
+                        };
+                        writes.push(bytes);
+                        Admit::Taken
+                    });
+                    if !moved {
+                        break;
+                    }
+                }
+                assert_eq!(writes.len(), 1, "{version:?}: one write for one record");
+                assert_eq!(writes[0].as_ptr(), inspect.0, "{version:?}: copied");
+                assert_eq!(writes[0].len(), queued);
+                let mut rest = &writes[0][..];
+                while !rest.is_empty() {
+                    client.read_tls(&mut rest)?;
+                    client.process_new_packets()?;
+                }
+                let mut received = Vec::new();
+                if let Err(error) = io::Read::read_to_end(&mut client.reader(), &mut received) {
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                }
+                assert!(
+                    received == plaintext,
+                    "{version:?}: the client reads the plaintext"
+                );
+            }
+            Ok(())
+        }))
+        .unwrap();
     }
 }

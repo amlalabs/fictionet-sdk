@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn presenters_plug_into_observe_and_construct_display_items() {
         use fictionet::stdlib::dissect::{
-            Decoded, Layer, Match, Observed, Place, Present, Registry, Selection,
+            Decoded, KeyLog, Layer, Match, Observed, Place, Present, Registry, Selection,
         };
         use fictionet::stdlib::network::Transport;
         let mut registry = Registry::new();
@@ -360,15 +360,14 @@ mod tests {
             |_| Match::Yes,
             |_| [super::Modbus::new(true), super::Modbus::new(false)],
         );
-        let mut protocol = registry
-            .open(Selection {
-                transport: Transport::Tcp,
-                ports: (40000, 502),
-                first: &[],
-                protocol: None,
-                alpn: None,
-            })
-            .unwrap();
+        let selection = Selection {
+            transport: Transport::Tcp,
+            ports: (40000, 502),
+            first: &[],
+            protocol: None,
+            alpn: None,
+        };
+        let mut protocol = registry.open(selection, &KeyLog::default()).unwrap();
         let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
         let mut packet = Decoded::default();
         protocol.data(

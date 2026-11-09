@@ -162,6 +162,23 @@ fn the_dissector_reads_a_world_tls_session_from_its_packets() {
     );
 }
 
+/// Captures made from one registry each have their own key log: keys given
+/// to one capture decrypt nothing in another.
+#[test]
+fn captures_from_one_registry_keep_their_own_keys() {
+    let (wire, keys) = session();
+    let packets = packets(&wire);
+    let registry = Registry::default();
+    let keyed = Dissector::with_registry(registry.clone());
+    let blind = Dissector::with_registry(registry);
+    keyed.keys().extend(keys.iter().cloned());
+    let decoded = decode(keyed, &packets, &[]);
+    assert!(decoded.iter().any(|d| d.tags.contains(&"decrypted")));
+    let decoded = decode(blind, &packets, &[]);
+    assert!(decoded.iter().any(|d| d.proto == "TLSv1.3"));
+    assert!(decoded.iter().all(|d| !d.tags.contains(&"decrypted")));
+}
+
 /// A capture owner's own HTTP/1 reader, cut down from the built-in one to
 /// the first line of each message, binds into the passive path through
 /// the public registry. TLS selects it for the decrypted stream by the
