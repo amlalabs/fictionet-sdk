@@ -90,7 +90,8 @@ pub enum Termination {
     /// end. Data observed before the reset still comes first.
     Reset,
     /// The capture finished with bytes of this direction known to be
-    /// missing: a hole before buffered data or before a FIN.
+    /// missing: a hole before buffered data, before bytes dropped to stay
+    /// within bounds, or before a FIN.
     Truncated,
     /// The observer dropped this connection to stay within its bounds.
     Evicted,

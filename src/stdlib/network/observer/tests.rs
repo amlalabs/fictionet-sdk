@@ -567,6 +567,61 @@ fn a_drop_without_held_bytes_waits_for_the_missing_segment() {
     }
 }
 
+/// Bytes dropped with no room to mark their place are still known to be
+/// missing: a capture that ends before they come says Truncated.
+#[test]
+fn a_capture_that_ends_past_unmarked_dropped_bytes_is_truncated() {
+    let mut tcp = Watch::new(Limits {
+        segments: 0,
+        ..Limits::default()
+    });
+    tcp.up(100, 2, b"");
+    assert!(tcp.up(103, 0x18, b"cd").dropped());
+    assert_eq!(
+        tcp.finish().evs(),
+        [
+            &Ev::End(Forward, Termination::Truncated),
+            &Ev::End(Reverse, Termination::Finalized),
+        ]
+    );
+    // Once the bytes before them come and pass them, nothing is missing.
+    let mut tcp = Watch::new(Limits {
+        segments: 0,
+        ..Limits::default()
+    });
+    tcp.up(100, 2, b"");
+    tcp.up(103, 0x18, b"cd");
+    tcp.up(101, 0x18, b"abcd");
+    assert_eq!(
+        tcp.finish().evs(),
+        [
+            &Ev::End(Forward, Termination::Finalized),
+            &Ev::End(Reverse, Termination::Finalized),
+        ]
+    );
+}
+
+/// A shorter segment that replaces a held one drops the held one's tail:
+/// a capture that ends before those bytes come again says Truncated.
+#[test]
+fn a_capture_that_ends_past_a_replaced_tail_is_truncated() {
+    let mut tcp = watch();
+    tcp.up(100, 2, b"");
+    tcp.up(103, 0x18, b"old");
+    tcp.up(103, 0x18, b"cd");
+    assert_eq!(
+        tcp.up(101, 0x18, b"ab").evs(),
+        [&data(0, b"ab", Some(0)), &data(2, b"cd", None)]
+    );
+    assert_eq!(
+        tcp.finish().evs(),
+        [
+            &Ev::End(Forward, Termination::Truncated),
+            &Ev::End(Reverse, Termination::Finalized),
+        ]
+    );
+}
+
 #[test]
 fn fin_and_rst_follow_payload_and_are_reported_once() {
     for (flags, ends) in [
