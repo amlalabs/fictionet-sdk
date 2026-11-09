@@ -27,8 +27,24 @@ pub struct Chunk {
 
 struct ChunkBacking {
     bytes: Vec<u8>,
-    charge: Option<Arc<Charge>>,
+    charge: Option<Paid>,
     credit: Option<Arc<CreditReturn>>,
+}
+
+/// What pays for a backing: a charge of its own, or a share of one that
+/// pays for many, such as a child's receive window.
+enum Paid {
+    Own(Charge),
+    Shared(Arc<Charge>),
+}
+
+impl Paid {
+    fn bytes(&self) -> usize {
+        match self {
+            Paid::Own(charge) => charge.bytes(),
+            Paid::Shared(charge) => charge.bytes(),
+        }
+    }
 }
 
 impl Chunk {
@@ -38,7 +54,7 @@ impl Chunk {
         Self::backed(bytes.into(), None)
     }
 
-    fn backed(bytes: Vec<u8>, charge: Option<Arc<Charge>>) -> Chunk {
+    fn backed(bytes: Vec<u8>, charge: Option<Paid>) -> Chunk {
         let end = bytes.len();
         Chunk {
             backing: Arc::new(ChunkBacking {
@@ -58,7 +74,23 @@ impl Chunk {
             charge.bytes() >= bytes.capacity(),
             "chunk backing exceeds its reservation"
         );
-        Self::backed(bytes, Some(Arc::new(charge)))
+        Self::backed(bytes, Some(Paid::Own(charge)))
+    }
+
+    /// Puts the bytes under `charge`, which pays for them already, so what
+    /// paid for them before may release. In place when this chunk alone
+    /// holds its backing and the bytes are all of it; otherwise they are
+    /// copied into an allocation of their own size, so the shared charge
+    /// covers no more than the bytes.
+    pub(crate) fn reback(&mut self, charge: Arc<Charge>) {
+        let whole = self.start == 0 && self.end == self.backing.bytes.len();
+        if whole && let Some(backing) = Arc::get_mut(&mut self.backing) {
+            backing.bytes.shrink_to_fit();
+            backing.charge = Some(Paid::Shared(charge));
+            backing.credit = None;
+            return;
+        }
+        *self = Self::backed(self.to_vec(), Some(Paid::Shared(charge)));
     }
 
     /// The bytes not yet taken.
@@ -118,7 +150,7 @@ impl Chunk {
         }
         let backing = Arc::get_mut(&mut self.backing).unwrap();
         if backing.charge.is_none() {
-            backing.charge = Some(Arc::new(budget.charge(backing.bytes.capacity())?));
+            backing.charge = Some(Paid::Own(budget.charge(backing.bytes.capacity())?));
         }
         Some(&mut backing.bytes[self.start..self.end])
     }
@@ -141,10 +173,7 @@ impl Chunk {
     /// The shared backing allocation's charge. Split pieces name the same
     /// charge; their charged values must not be added together.
     pub fn charged(&self) -> usize {
-        self.backing
-            .charge
-            .as_ref()
-            .map_or(0, |charge| charge.bytes())
+        self.backing.charge.as_ref().map_or(0, Paid::bytes)
     }
 }
 
@@ -296,9 +325,9 @@ impl Credited for StreamEvent {
 
     fn reserve_receive(&mut self, _: &Budget, backing: &Arc<Charge>) -> bool {
         if let Self::Data(chunk) = self {
-            // Normalize arbitrary slices while the receive window already
-            // pays for the new allocation. The old backing may now release.
-            *chunk = Chunk::backed(chunk.to_vec(), Some(backing.clone()));
+            // The receive window pays for the bytes now; what paid before
+            // may release.
+            chunk.reback(backing.clone());
         }
         true
     }

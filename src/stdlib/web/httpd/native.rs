@@ -463,7 +463,7 @@ impl Http1 {
             return self.close(env, Closing::Done);
         };
         let version = version_of(&head);
-        let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method != "CONNECT";
+        let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method() != "CONNECT";
         let Some(mut request) = to_request(&head, version, body) else {
             let date = date_header(self.date, env.now());
             let Some((out, charge)) = simple_output(env, version, StatusCode::BAD_REQUEST, date)
@@ -584,11 +584,7 @@ impl Http1 {
         if let Fail::Protocol(RequestError::Rejected(rejected)) = &fail
             && rejected.error == http1::Error::Host
             && rejected.framing.is_ok()
-            && !rejected
-                .head
-                .headers
-                .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("host"))
+            && rejected.head.header("host").is_none()
         {
             self.too_big = rejected.received_body_bytes > self.opts.body;
             self.head = Some(rejected.head.clone());
@@ -710,8 +706,11 @@ impl Http1 {
             r.wants,
             date_header(self.date, env.now()),
         );
+        // Room for the head and the first piece of a body held in full: a
+        // streamed body has nothing to go with the head yet.
+        let first = body.full_len().min(PIECE);
         let Some(bound) = head_bound(&parts, &policy)
-            .and_then(|n| n.checked_add(PIECE + 2 * size_of::<usize>() + 4))
+            .and_then(|n| n.checked_add(first + 2 * size_of::<usize>() + 4))
         else {
             return self.over_budget(env);
         };
@@ -1180,6 +1179,9 @@ impl Job for Work {
                 };
                 *making = None;
                 let made = made.and_then(|mut response| {
+                    // A body all there now goes out with the head, without
+                    // work of its own.
+                    response.body_mut().settle(cx);
                     let charge =
                         normalize_body(response.body_mut(), &self.budget).ok_or_else(|| {
                             Error::msg("the response body exceeds the connection budget")
@@ -1299,7 +1301,7 @@ fn partial(bytes: Bytes, why: &'static str) -> Body {
 }
 
 fn version_of(head: &RequestHead) -> Version {
-    match head.version {
+    match head.version() {
         http1::Version::Http10 => Version::HTTP_10,
         http1::Version::Http11 => Version::HTTP_11,
     }
@@ -1307,13 +1309,13 @@ fn version_of(head: &RequestHead) -> Version {
 
 fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Request<Body>> {
     let mut builder = Request::builder()
-        .method(head.method.as_bytes())
-        .uri(head.target.as_str())
+        .method(head.method().as_bytes())
+        .uri(head.target())
         .version(version);
     let headers = builder.headers_mut()?;
-    for h in &head.headers {
+    for h in head.headers() {
         let name = HeaderName::from_bytes(h.name.as_bytes()).ok()?;
-        let value = HeaderValue::from_bytes(&h.value).ok()?;
+        let value = HeaderValue::from_bytes(h.value).ok()?;
         headers.append(name, value);
     }
     builder.body(body).ok()

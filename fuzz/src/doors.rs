@@ -22,9 +22,9 @@ pub fn http(data: &[u8]) {
     let token = Token::new(b"s3cret-token").unwrap();
     if let Ok(Some((req, len))) = parse_request(data) {
         assert!(len <= data.len());
-        for h in &req.head.headers {
+        for h in req.head.headers() {
             if h.name.eq_ignore_ascii_case("proxy-authorization") {
-                let _ = token.check_header(&h.value);
+                let _ = token.check_header(h.value);
             }
         }
         match &req.target {

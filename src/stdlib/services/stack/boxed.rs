@@ -20,10 +20,96 @@ impl core::fmt::Debug for BoxReport {
 }
 /// Why a boxed stack gave up.
 pub type BoxError = Box<dyn core::error::Error + Send + Sync>;
-/// The result of a boxed stack's work.
+/// The result of a boxed stack's work: the allocation its work was in.
 pub type BoxDone = Box<dyn Any + Send>;
-/// A boxed stack's work.
-pub type BoxWork = Box<dyn Job<Done = BoxDone>>;
+
+/// A boxed stack's work: a job erased once, in one allocation, which its
+/// result comes back in. Boxing it again allocates nothing.
+pub struct BoxWork(Option<Box<dyn ErasedJob>>);
+
+impl BoxWork {
+    pub(super) fn new<J: Job>(boxing: Boxing<J>) -> BoxWork
+    where
+        J::Done: Send + 'static,
+    {
+        BoxWork(Some(Box::new(boxing)))
+    }
+}
+
+impl Job for BoxWork {
+    type Done = BoxDone;
+
+    fn cancelled(&self) -> bool {
+        self.0.as_ref().is_some_and(|job| job.cancelled())
+    }
+
+    fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<BoxDone> {
+        let job = self
+            .0
+            .as_mut()
+            .expect("boxed work is polled until it is done, not after");
+        std::task::ready!(job.poll(fcx, cx));
+        Poll::Ready(self.0.take().expect("the job that just finished").finish())
+    }
+
+    fn erase(self) -> BoxWork {
+        self
+    }
+
+    fn claim(done: BoxDone) -> Result<BoxDone, BoxDone> {
+        Ok(done)
+    }
+}
+
+/// What [`BoxWork`] needs of a job.
+trait ErasedJob: Send {
+    fn cancelled(&self) -> bool;
+    /// Moves the work on. Once it is ready, its result waits inside.
+    fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<()>;
+    /// The result, in this allocation.
+    fn finish(self: Box<Self>) -> BoxDone;
+}
+
+/// A stack's work, then its result, in one allocation.
+pub(super) struct Boxing<J: Job> {
+    /// The work, until it is done.
+    job: Option<J>,
+    /// Its result, until it is claimed.
+    pub(super) done: Option<J::Done>,
+}
+
+impl<J: Job> Boxing<J> {
+    pub(super) fn new(job: J) -> Boxing<J> {
+        Boxing {
+            job: Some(job),
+            done: None,
+        }
+    }
+}
+
+impl<J: Job> ErasedJob for Boxing<J>
+where
+    J::Done: Send + 'static,
+{
+    fn cancelled(&self) -> bool {
+        self.job.as_ref().is_some_and(Job::cancelled)
+    }
+
+    fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(job) = &mut self.job else {
+            return Poll::Ready(());
+        };
+        let done = std::task::ready!(job.poll(fcx, cx));
+        // Released as soon as it is done, as the work's contract asks.
+        self.job = None;
+        self.done = Some(done);
+        Poll::Ready(())
+    }
+
+    fn finish(self: Box<Self>) -> BoxDone {
+        self
+    }
+}
 
 /// Any stack between ports `Lo` and `Up` behind one type: for whatever
 /// picks a stack at run time from an open set, such as the server that
@@ -140,10 +226,10 @@ where
 
     fn on_done(&mut self, env: &mut Env<'_, BoxReport>, done: BoxDone) -> Result<(), BoxError> {
         // Only this stack's own work comes back here.
-        let Ok(done) = done.downcast::<L::Done>() else {
+        let Ok(done) = <L::Work as Job>::claim(done) else {
             return Ok(());
         };
-        env.scoped(boxed::<L>, |env| Layer::on_done(self, env, *done))
+        env.scoped(boxed::<L>, |env| Layer::on_done(self, env, done))
             .map_err(error)
     }
 
@@ -165,29 +251,11 @@ where
     }
 
     fn take_work(&mut self) -> Option<BoxWork> {
-        Layer::take_work(self).map(|work| Box::new(Boxing(work)) as BoxWork)
+        Layer::take_work(self).map(Job::erase)
     }
 
     fn deadline(&self) -> Option<Instant> {
         Layer::deadline(self).map(|(at, _)| at)
-    }
-}
-
-/// A stack's work, with its result boxed.
-struct Boxing<J>(J);
-
-impl<J: Job> Job for Boxing<J>
-where
-    J::Done: Send + 'static,
-{
-    type Done = BoxDone;
-
-    fn cancelled(&self) -> bool {
-        self.0.cancelled()
-    }
-
-    fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<BoxDone> {
-        self.0.poll(fcx, cx).map(|done| Box::new(done) as BoxDone)
     }
 }
 

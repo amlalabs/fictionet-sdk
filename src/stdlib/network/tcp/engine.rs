@@ -174,6 +174,11 @@ impl Sequences {
 }
 
 /// The packets going into and out of smoltcp.
+///
+/// A packet's buffer is kept once smoltcp has read it, and the next packet
+/// smoltcp sends is written into it: in a steady exchange, the buffers the
+/// peer's packets arrived in carry the answers, and the engine allocates
+/// none. The kept buffers are bounded in number and size.
 #[derive(Default)]
 pub(super) struct Dev {
     pub(super) rx: Option<Vec<u8>>,
@@ -181,6 +186,39 @@ pub(super) struct Dev {
     pub(super) tx: Vec<Vec<u8>>,
     /// Packets the endpoint has looked at, for the layer below to take.
     out: VecDeque<Vec<u8>>,
+    /// Buffers of packets smoltcp has read, for the packets it sends.
+    spare: Spare,
+    /// The buffer of the packet smoltcp is reading, once it is done.
+    read: Option<Vec<u8>>,
+}
+
+/// The pool of packet buffers an engine keeps: those of the packets it has
+/// read, emptied, for the packets it sends. Bounded in number and size, so
+/// an engine holds at most `PACKETS * BYTES` of them.
+#[derive(Default)]
+struct Spare(Vec<Vec<u8>>);
+
+impl Spare {
+    /// How many buffers it keeps.
+    const PACKETS: usize = EGRESS_PACKETS;
+
+    /// The largest buffer it keeps.
+    const BYTES: usize = 16 * 1024;
+
+    /// Keeps a buffer, if there is room for one of its size.
+    fn keep(&mut self, mut buffer: Vec<u8>) {
+        if self.0.len() < Self::PACKETS && buffer.capacity() <= Self::BYTES {
+            buffer.clear();
+            self.0.push(buffer);
+        }
+    }
+
+    /// A zeroed buffer of `len` bytes: a kept one when there is one.
+    fn take(&mut self, len: usize) -> Vec<u8> {
+        let mut buffer = self.0.pop().unwrap_or_default();
+        buffer.resize(len, 0);
+        buffer
+    }
 }
 
 impl Dev {
@@ -189,40 +227,62 @@ impl Dev {
     fn full(&self) -> bool {
         self.tx.len() + self.out.len() >= EGRESS_PACKETS
     }
+
+    /// Takes back the buffer of the packet smoltcp read, or did not read.
+    fn reclaim(&mut self) {
+        if let Some(buffer) = self.read.take().or_else(|| self.rx.take()) {
+            self.spare.keep(buffer);
+        }
+    }
 }
 
-pub(super) struct Rx(Vec<u8>);
-pub(super) struct Tx<'a>(&'a mut Vec<Vec<u8>>);
+pub(super) struct Rx<'a> {
+    bytes: Vec<u8>,
+    read: &'a mut Option<Vec<u8>>,
+}
 
-impl RxToken for Rx {
+pub(super) struct Tx<'a> {
+    tx: &'a mut Vec<Vec<u8>>,
+    spare: &'a mut Spare,
+}
+
+impl RxToken for Rx<'_> {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(&self.0)
+        let r = f(&self.bytes);
+        *self.read = Some(self.bytes);
+        r
     }
 }
 
 impl TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut buf = vec![0; len];
+        let mut buf = self.spare.take(len);
         let r = f(&mut buf);
-        self.0.push(buf);
+        self.tx.push(buf);
         r
     }
 }
 
 impl Device for Dev {
-    type RxToken<'a> = Rx;
+    type RxToken<'a> = Rx<'a>;
     type TxToken<'a> = Tx<'a>;
 
-    fn receive(&mut self, _: smoltcp::time::Instant) -> Option<(Rx, Tx<'_>)> {
+    fn receive(&mut self, _: smoltcp::time::Instant) -> Option<(Rx<'_>, Tx<'_>)> {
         if self.full() {
             return None;
         }
-        let p = self.rx.take()?;
-        Some((Rx(p), Tx(&mut self.tx)))
+        let bytes = self.rx.take()?;
+        let Dev {
+            tx, spare, read, ..
+        } = self;
+        Some((Rx { bytes, read }, Tx { tx, spare }))
     }
 
     fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
-        (!self.full()).then_some(Tx(&mut self.tx))
+        (!self.full()).then_some(Tx {
+            tx: &mut self.tx,
+            spare: &mut self.spare,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -236,6 +296,31 @@ impl Device for Dev {
 /// that change when the socket set is compacted; these never change.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(super) struct Id(pub(super) u64);
+
+/// Hashes an [`Id`] by one multiplication. The engine hands out the ids
+/// itself, one after another, so a keyed hash defends against nothing
+/// here; maps keyed by addresses the peer chooses keep the default one.
+#[derive(Default)]
+pub(super) struct IdHasher(u64);
+
+/// The hasher of a map keyed by [`Id`].
+pub(super) type ById = std::hash::BuildHasherDefault<IdHasher>;
+
+impl std::hash::Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Compact the socket set when at least this many slots exist and at most
 /// a quarter of them hold a socket. smoltcp walks every slot, empty or
@@ -310,12 +395,12 @@ pub struct TcpLayer {
     pub(super) slots: usize,
     /// The buffers of each socket that has its own pages. Declared after
     /// `sockets`, so they outlive the sockets that borrow them.
-    pub(super) pages: HashMap<Id, Pages>,
+    pub(super) pages: HashMap<Id, Pages, ById>,
     /// What each socket's buffers are charged to the budget, given back
     /// when the socket goes.
-    reserved: HashMap<Id, Charge>,
+    reserved: HashMap<Id, Charge, ById>,
     /// Sockets whose buffers may hold pages that could be given back.
-    pub(super) dirty: HashSet<Id>,
+    pub(super) dirty: HashSet<Id, ById>,
     /// When `dirty` is next looked at.
     next_release: Option<smoltcp::time::Instant>,
     pub(super) dev: Dev,
@@ -729,9 +814,9 @@ impl TcpLayer {
             handles: BTreeMap::new(),
             next_id: 0,
             slots: 0,
-            pages: HashMap::new(),
-            reserved: HashMap::new(),
-            dirty: HashSet::new(),
+            pages: HashMap::default(),
+            reserved: HashMap::default(),
+            dirty: HashSet::default(),
             next_release: None,
             dev,
             listeners: BTreeMap::new(),
@@ -1288,7 +1373,7 @@ impl TcpLayer {
         self.iface
             .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
         let consumed = self.dev.rx.is_none();
-        self.dev.rx = None;
+        self.dev.reclaim();
         for (id, socket) in idle {
             self.handles.insert(id, self.sockets.add(socket));
         }
@@ -2032,12 +2117,25 @@ impl TcpLayer {
             let Some(charge) = budget.charge(n) else {
                 break;
             };
-            let mut bytes = vec![0; n];
-            let got = s.recv_slice(&mut bytes).unwrap_or(0);
+            // Copied straight out of the socket's ring, which may hand the
+            // bytes over in two pieces, into memory nothing zeroed first.
+            let mut bytes = Vec::with_capacity(n);
+            while bytes.len() < n && s.can_recv() {
+                let took = s
+                    .recv(|data| {
+                        let take = data.len().min(n - bytes.len());
+                        bytes.extend_from_slice(&data[..take]);
+                        (take, take)
+                    })
+                    .unwrap_or(0);
+                if took == 0 {
+                    break;
+                }
+            }
+            let got = bytes.len();
             if got == 0 {
                 break;
             }
-            bytes.truncate(got);
             c.recv_credit -= got as u64;
             self.up.push_back(MuxEvent::Child(
                 id,
@@ -2089,14 +2187,20 @@ impl TcpLayer {
 
     /// Brings every open child up to date, in socket order.
     fn refresh_all(&mut self, budget: &Budget) {
-        let open: Vec<Id> = self
+        // Each open connection is found from the one before it: a refresh
+        // may close connections, and no list is made ahead.
+        let mut from = Id(0);
+        while let Some(h) = self
             .conns
-            .iter()
-            .filter(|(_, c)| c.open)
+            .range(from..)
+            .find(|(_, c)| c.open)
             .map(|(h, _)| *h)
-            .collect();
-        for h in open {
+        {
             self.refresh(budget, h);
+            let Some(next) = h.0.checked_add(1) else {
+                break;
+            };
+            from = Id(next);
         }
     }
 

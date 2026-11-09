@@ -9,6 +9,8 @@ use fictionet::stdlib::layer::{
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy};
 
+use super::boxed::{BoxDone, BoxWork, Boxing};
+
 /// Work a layer asks the world to do ([`Layer::Work`]), as whatever runs
 /// the stack does it: a handler's async answer, the next frame of a
 /// streamed body, a TLS config picked for a client's hello, code that
@@ -44,6 +46,31 @@ pub trait Job: Send + 'static {
     /// retains completed work only to observe `cancelled`, while contexts
     /// transferred to the result keep its region open for deferred work.
     fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Self::Done>;
+
+    /// This work behind one type, as a [`Boxed`](super::Boxed) stack hands
+    /// it out: one allocation, which its result comes back in. Work that
+    /// is boxed already goes out as it is.
+    fn erase(self) -> BoxWork
+    where
+        Self: Sized,
+        Self::Done: Send + 'static,
+    {
+        BoxWork::new(Boxing::new(self))
+    }
+
+    /// This work's result, back from a [`Boxed`](super::Boxed) stack, or
+    /// the result as it came when it is another's.
+    fn claim(done: BoxDone) -> Result<Self::Done, BoxDone>
+    where
+        Self: Sized,
+        Self::Done: Send + 'static,
+    {
+        let mut boxing = done.downcast::<Boxing<Self>>()?;
+        match boxing.done.take() {
+            Some(done) => Ok(done),
+            None => Err(boxing),
+        }
+    }
 }
 
 /// A composed layer's work: whichever part asked for it does it.

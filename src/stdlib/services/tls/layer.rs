@@ -1,7 +1,7 @@
 //! The synchronous TLS state machine. The driver owns bytes once they leave it.
 
 use std::future::Future;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -19,6 +19,34 @@ use fictionet::time::Instant;
 
 const CHUNK: usize = 16 * 1024;
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
+
+/// Appends to a vector up to its capacity, so a TLS write fills exactly the
+/// allocation made for it and never grows it.
+struct Fill<'a>(&'a mut Vec<u8>);
+
+impl Write for Fill<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len().min(self.0.capacity() - self.0.len());
+        self.0.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            let n = self.write(buf)?;
+            total += n;
+            if n < buf.len() {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// The client's requested name and application protocols, before selection.
 pub struct Hello {
@@ -549,22 +577,32 @@ impl Layer for TlsLayer {
             if !self.reserve_output(env) {
                 return Ok(false);
             }
-            let charge = self.output_reserve.take().unwrap();
-            let mut bytes = vec![0; CHUNK];
-            let mut writer = &mut bytes[..];
-            let result = if self.reject {
-                writer.write(UNRECOGNIZED_NAME.as_slice())
-            } else if let Some(alert) = self.alert.as_mut() {
-                alert.write(&mut writer)
+            let mut charge = self.output_reserve.take().unwrap();
+            // Room for exactly what is to go, up to a chunk: the queued
+            // records, the rejection, or the alert, whose size is not known
+            // ahead. The reservation then shrinks to what was allocated.
+            let room = if self.reject {
+                UNRECOGNIZED_NAME.len()
+            } else if self.alert.is_some() {
+                CHUNK
             } else {
-                self.tls.as_mut().unwrap().write_tls(&mut writer)
+                self.tls.as_ref().unwrap().sendable_tls_len().min(CHUNK)
+            };
+            let mut bytes = Vec::with_capacity(room);
+            let result = if self.reject {
+                Fill(&mut bytes).write(UNRECOGNIZED_NAME.as_slice())
+            } else if let Some(alert) = self.alert.as_mut() {
+                alert.write(&mut Fill(&mut bytes))
+            } else {
+                self.tls.as_mut().unwrap().write_tls(&mut Fill(&mut bytes))
             };
             let n = result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
             self.reject = false;
             if n == 0 {
                 self.alert = None;
             } else {
-                bytes.truncate(n);
+                bytes.shrink_to_fit();
+                charge.set(bytes.capacity());
                 self.produced += n as u64;
                 self.below = Some(StreamCommand::Write(Chunk::with_charge(bytes, charge)));
             }
@@ -590,12 +628,20 @@ impl Layer for TlsLayer {
                     return Ok(true);
                 }
                 Ok(plaintext) => {
-                    let n = plaintext.len().min(CHUNK);
-                    let Some(charge) = env.budget().charge(n) else {
+                    // A record's plaintext is at most a chunk (RFC 8446
+                    // section 5.1), and goes up in the buffer rustls
+                    // decrypted it into.
+                    let n = plaintext.len();
+                    let Some(mut charge) = env.budget().charge(n) else {
                         return Ok(false);
                     };
-                    let bytes = plaintext[..n].to_vec();
-                    tls.reader().consume(n);
+                    let mut bytes = tls
+                        .reader()
+                        .take_first_chunk()
+                        .map_err(|error| HandshakeError::Failed(error.to_string()))?;
+                    if bytes.capacity() > n && !charge.set(bytes.capacity()) {
+                        bytes.shrink_to_fit();
+                    }
                     self.above = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
                     return Ok(true);
                 }

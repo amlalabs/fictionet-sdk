@@ -127,6 +127,10 @@ pub struct Driver<L: Layer> {
 impl<L: Layer> Driver<L> {
     /// Drives `layer` at time `now`, drawing from `entropy` and charging
     /// `budget`.
+    ///
+    /// The composition's depth is checked here and wherever it grows: when
+    /// a stack is boxed, when a later layer is set, when a switch hands
+    /// over and when a child is made. No call walks the stack for it.
     pub fn new(layer: L, entropy: Arc<dyn Entropy>, budget: Budget, now: Instant) -> Driver<L> {
         assert!(layer.depth() <= super::MAX_DEPTH, "composition is too deep");
         Driver {
@@ -193,10 +197,6 @@ impl<L: Layer> Driver<L> {
         &mut self,
         event: EventOf<L::Lower>,
     ) -> Result<Admit<EventOf<L::Lower>>, L::Error> {
-        assert!(
-            self.layer.depth() <= super::MAX_DEPTH,
-            "composition is too deep"
-        );
         let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
         self.layer.on_event(&mut env, event)
     }
@@ -206,20 +206,12 @@ impl<L: Layer> Driver<L> {
         &mut self,
         command: CommandOf<L::Upper>,
     ) -> Result<Admit<CommandOf<L::Upper>>, L::Error> {
-        assert!(
-            self.layer.depth() <= super::MAX_DEPTH,
-            "composition is too deep"
-        );
         let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
         self.layer.on_command(&mut env, command)
     }
 
     /// Gives the stack the result of work it asked for.
     pub fn complete(&mut self, done: L::Done) -> Result<(), L::Error> {
-        assert!(
-            self.layer.depth() <= super::MAX_DEPTH,
-            "composition is too deep"
-        );
         let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
         self.layer.on_done(&mut env, done)
     }
@@ -228,13 +220,8 @@ impl<L: Layer> Driver<L> {
     /// step limit is reached. Returns whether anything moved; call it again
     /// after input or output has moved, or whenever [`exhausted`](Self::exhausted) is true.
     pub fn run(&mut self) -> Result<bool, L::Error> {
-        assert!(
-            self.layer.depth() <= super::MAX_DEPTH,
-            "composition is too deep"
-        );
         self.exhausted = true;
         let mut moved = false;
-        // The depth is checked before the first step and after each one.
         for _ in 0..self.steps {
             let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
@@ -244,10 +231,6 @@ impl<L: Layer> Driver<L> {
                 step = true;
             }
             step |= self.layer.advance(&mut env)?;
-            assert!(
-                self.layer.depth() <= super::MAX_DEPTH,
-                "composition is too deep"
-            );
             if !step {
                 self.exhausted = false;
                 break;

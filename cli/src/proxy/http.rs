@@ -146,7 +146,7 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
         Target::Connect { host, port } => format!("CONNECT {host}:{port}"),
         Target::Forward {
             host, port, path, ..
-        } => format!("{} http://{host}:{port}{path}", req.head.method),
+        } => format!("{} http://{host}:{port}{path}", req.head.method()),
     };
     if !req
         .header("proxy-authorization")

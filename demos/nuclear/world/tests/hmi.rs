@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ConnectionExt};
-use fictionet::stdlib::protocols::http1::{self, Header, RequestHead, Version};
+use fictionet::stdlib::protocols::http1::{self, RequestHead, Version};
 use fictionet::sync::Mutex;
 use fictionet::{Attacher, Cx, Error, Seed};
 use fictionet_test_support::sandbox::{self, Machine};
@@ -66,21 +66,9 @@ fn start_world_at(
     })
 }
 
-fn header(name: &str, value: &str) -> Header {
-    Header {
-        name: name.to_owned(),
-        value: value.as_bytes().to_vec(),
-    }
-}
-
 fn get(target: &str) -> http1::Request {
     http1::Request {
-        head: RequestHead {
-            method: "GET".to_owned(),
-            target: target.to_owned(),
-            version: Version::Http11,
-            headers: vec![header("Host", "hmi01")],
-        },
+        head: RequestHead::new("GET", target, Version::Http11, [("Host", "hmi01")]),
         body: Vec::new(),
     }
 }
@@ -88,16 +76,16 @@ fn get(target: &str) -> http1::Request {
 fn post(target: &str, body: &Value) -> http1::Request {
     let bytes = serde_json::to_vec(body).expect("the body is JSON");
     http1::Request {
-        head: RequestHead {
-            method: "POST".to_owned(),
-            target: target.to_owned(),
-            version: Version::Http11,
-            headers: vec![
-                header("Host", "hmi01"),
-                header("Content-Type", "application/json"),
-                header("Content-Length", &bytes.len().to_string()),
+        head: RequestHead::new(
+            "POST",
+            target,
+            Version::Http11,
+            [
+                ("Host", "hmi01"),
+                ("Content-Type", "application/json"),
+                ("Content-Length", &bytes.len().to_string()),
             ],
-        },
+        ),
         body: bytes,
     }
 }

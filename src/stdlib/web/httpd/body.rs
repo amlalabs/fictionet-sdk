@@ -44,6 +44,39 @@ impl Body {
         Body(Inner::Stream(Box::pin(IntoBytes(Box::pin(body)))))
     }
 
+    /// Takes a stream's bytes when they are all there now, so that no work
+    /// is needed to read them: one frame of data and then its end, or the
+    /// end at once. A stream with more to give, or an error first, stays a
+    /// stream, with what was taken from it still first.
+    pub(super) fn settle(&mut self, cx: &mut Context<'_>) {
+        let Inner::Stream(stream) = &mut self.0 else {
+            return;
+        };
+        if stream.is_end_stream() {
+            self.0 = Inner::Full(None);
+            return;
+        }
+        let Poll::Ready(first) = stream.as_mut().poll_frame(cx) else {
+            return;
+        };
+        let Some(first) = first else {
+            self.0 = Inner::Full(None);
+            return;
+        };
+        if let Ok(frame) = &first
+            && let Some(data) = frame.data_ref()
+            && stream.is_end_stream()
+        {
+            self.0 = Inner::Full((!data.is_empty()).then(|| data.clone()));
+            return;
+        }
+        let rest = std::mem::replace(stream, Box::pin(Body::empty()));
+        self.0 = Inner::Stream(Box::pin(Prefixed {
+            first: Some(first),
+            rest,
+        }));
+    }
+
     /// The bytes held in full: 0 for a stream.
     pub(super) fn full_len(&self) -> usize {
         match &self.0 {
@@ -126,6 +159,48 @@ impl http_body::Body for Body {
             Inner::Full(b) => SizeHint::with_exact(b.as_ref().map_or(0, |b| b.len() as u64)),
             Inner::Stream(s) => s.size_hint(),
         }
+    }
+}
+
+/// A stream with a frame already taken from it, which comes first.
+struct Prefixed {
+    first: Option<Result<Frame<Bytes>, Error>>,
+    rest: Boxed,
+}
+
+impl http_body::Body for Prefixed {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        let this = self.get_mut();
+        if let Some(first) = this.first.take() {
+            return Poll::Ready(Some(first));
+        }
+        this.rest.as_mut().poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.first.is_none() && self.rest.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = self.rest.size_hint();
+        if let Some(Ok(frame)) = &self.first
+            && let Some(data) = frame.data_ref()
+        {
+            // The upper bound moves first: each setter checks the bounds
+            // against the other.
+            let more = data.len() as u64;
+            if let Some(upper) = hint.upper() {
+                hint.set_upper(upper + more);
+            }
+            hint.set_lower(hint.lower() + more);
+        }
+        hint
     }
 }
 

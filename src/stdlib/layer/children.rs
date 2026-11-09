@@ -19,6 +19,9 @@ use slab::Slab;
 const QUEUE: usize = 64;
 const RESERVE: usize = 8;
 const MAX_CHILDREN: usize = 4096;
+/// The child places a router reserves with its queues and keeps once no
+/// child is open.
+const FLOOR: usize = 4;
 type ChildFactory<B, O> = dyn FnMut(ChildId, O, &Budget) -> Option<B> + Send;
 type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 
@@ -96,10 +99,11 @@ type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 /// receive credit returns when its backing is released; atomic message
 /// credit returns on admission, independently of memory.
 ///
-/// The router's queues are charged to the budget from its first step. Each
-/// child's place and its inbox are charged as they grow, the places up to the
-/// limit and each inbox up to its bound, and the places go once no child is
-/// left. A child whose storage the budget cannot hold is refused
+/// The router's queues and its first few child places are charged to the
+/// budget from its first step. Further places and each child's inbox are
+/// charged as they grow, the places up to the limit and each inbox up to
+/// its bound, and the further places go once no child is left. A child
+/// whose storage the budget cannot hold is refused
 /// ([`ChildReport::Refused`]) and its siblings go on.
 ///
 /// The mux never waits for a child. Credit bounds a child's bytes, but not
@@ -235,8 +239,6 @@ struct Kid<B: Layer> {
     due: Option<(Instant, B::Timer)>,
     armed: u64,
     heap: Option<usize>,
-    /// The layer's depth after its last call.
-    depth: usize,
     backing: Arc<Charge>,
     max_command: u64,
     /// Credit the mux may still use for this child's events.
@@ -483,15 +485,19 @@ where
         )
     }
 
-    /// Reserves the queues the first time anything arrives. Child places
-    /// are reserved as children open ([`Self::make_room`]).
+    /// Reserves the queues and the first [`FLOOR`] child places the first
+    /// time anything arrives. Further places are reserved as children open
+    /// ([`Self::make_room`]).
     fn reserve(&mut self, budget: &Budget) -> Result<(), Overrun> {
         if self.storage.is_some() {
             return Ok(());
         }
-        let bytes = Self::routing_bytes(0).ok_or(Overrun::Budget)?;
+        let bytes = Self::routing_bytes(FLOOR).ok_or(Overrun::Budget)?;
         let charge = budget.charge(bytes).ok_or(Overrun::Budget)?;
-        self.down = VecDeque::with_capacity(QUEUE);
+        self.kids = Slab::with_capacity(FLOOR);
+        self.order = Vec::with_capacity(FLOOR);
+        self.timers = Vec::with_capacity(FLOOR);
+        self.down = VecDeque::with_capacity(QUEUE + FLOOR);
         self.up = VecDeque::with_capacity(QUEUE);
         self.storage = Some(charge);
         Ok(())
@@ -499,7 +505,7 @@ where
 
     /// Makes a place for one more child, charging its routing storage
     /// before growing. Places grow geometrically up to the limit and are
-    /// kept once made. Returns whether there is room.
+    /// kept while children are open. Returns whether there is room.
     fn make_room(&mut self) -> bool {
         if self.kids.len() < self.kids.capacity() {
             return true;
@@ -508,7 +514,7 @@ where
             .kids
             .capacity()
             .saturating_mul(2)
-            .max(4)
+            .max(FLOOR)
             .min(self.limit.max(1));
         let Some(bytes) = Self::routing_bytes(places) else {
             return false;
@@ -543,17 +549,15 @@ where
         Some(self.kids.remove(key))
     }
 
-    /// Child `key` was called: its layer may have work, its deadline and
-    /// depth are read again, and with `ready` it needs a visit. A timer that
-    /// `fired` is armed again even at the same moment, behind the others.
+    /// Child `key` was called: its layer may have work, its deadline is
+    /// read again, and with `ready` it needs a visit. A timer that `fired`
+    /// is armed again even at the same moment, behind the others.
     fn called(&mut self, key: usize, ready: bool, fired: bool) {
         if ready {
             self.ready.push(&mut self.kids, key);
         }
         self.work.push(&mut self.kids, key);
-        let kid = &mut self.kids[key];
-        kid.depth = kid.layer.depth();
-        let due = kid.layer.deadline();
+        let due = self.kids[key].layer.deadline();
         self.schedule(key, due, fired);
     }
 
@@ -645,17 +649,19 @@ where
         }
     }
 
-    /// With no children the places go, so an idle connection holds the same
-    /// whatever it held before. Closing commands still queued keep their
-    /// places until the mux takes them.
+    /// With no children, the places past the first [`FLOOR`] go, so an idle
+    /// connection holds the same whatever it held before: its queues and
+    /// those places, so one with a few children at a time never gives
+    /// places back to take them again. Closing commands still queued keep
+    /// their places until the mux takes them.
     fn release_places(&mut self) {
-        if !self.kids.is_empty() || self.storage.is_none() {
+        if !self.kids.is_empty() || self.storage.is_none() || self.kids.capacity() <= FLOOR {
             return;
         }
-        self.kids = Slab::new();
-        self.order = Vec::new();
-        self.timers = Vec::new();
-        self.down.shrink_to(QUEUE.max(self.down.len()));
+        self.kids = Slab::with_capacity(FLOOR);
+        self.order = Vec::with_capacity(FLOOR);
+        self.timers = Vec::with_capacity(FLOOR);
+        self.down.shrink_to((QUEUE + FLOOR).max(self.down.len()));
         let places = self.down.capacity().saturating_sub(QUEUE);
         if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
             storage.set(bytes);
@@ -890,9 +896,8 @@ where
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
                 };
-                let depth = layer.depth();
                 let due = layer.deadline();
-                assert!(depth < MAX_DEPTH, "composition depth exceeded");
+                assert!(layer.depth() < MAX_DEPTH, "composition depth exceeded");
                 let key = self.kids.insert(Kid {
                     id,
                     handle: child,
@@ -900,7 +905,6 @@ where
                     due: None,
                     armed: 0,
                     heap: None,
-                    depth,
                     layer,
                     budget,
                     owner: WorkOwner::new(),
@@ -1135,7 +1139,7 @@ where
         1 + self
             .kids
             .iter()
-            .map(|(_, kid)| kid.depth)
+            .map(|(_, kid)| kid.layer.depth())
             .max()
             .unwrap_or(0)
     }

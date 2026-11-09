@@ -620,7 +620,12 @@ impl Job for Work {
                     None => Err(Error::msg("this answer was already made")),
                 };
                 *making = None;
-                Answer::Made(made)
+                // A body all there now goes out with the head, without
+                // work of its own.
+                Answer::Made(made.map(|mut response| {
+                    response.body_mut().settle(cx);
+                    response
+                }))
             }
             Op::Frame(body) => {
                 let frame = match body {

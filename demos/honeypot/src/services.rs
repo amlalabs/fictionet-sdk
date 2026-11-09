@@ -238,9 +238,9 @@ impl PortServer for Http {
                     Some(Ok(Event::Done)) => {
                         let head = request.take().expect("a request head precedes its body");
                         requests += 1;
-                        let page = match (profile, head.target.split('?').next()) {
+                        let page = match (profile, head.target().split('?').next()) {
                             (HttpProfile::Caddy, Some("/" | "/index.html"))
-                                if !matches!(head.method.as_str(), "GET" | "HEAD") =>
+                                if !matches!(head.method(), "GET" | "HEAD") =>
                             {
                                 Page::MethodNotAllowed
                             }
@@ -254,8 +254,8 @@ impl PortServer for Http {
                             page,
                             head.keep_alive().unwrap_or(false)
                                 && (profile == HttpProfile::Caddy || requests < KEEPALIVE_REQUESTS),
-                            head.method == "HEAD",
-                            head.version == http1::Version::Http10,
+                            head.method() == "HEAD",
+                            head.version() == http1::Version::Http10,
                         )
                     }
                     Some(Err(error)) => {
