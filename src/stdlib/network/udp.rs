@@ -186,7 +186,7 @@ pub(crate) fn prepare_transport(fcx: &Cx, addr: IpAddr) -> (Endpoint, PacketDriv
             shared: shared.clone(),
         },
         PacketDriver {
-            applications: applications::Applications::new(fcx),
+            applications: applications::new(fcx),
             shared,
             fcx: fcx.clone(),
         },
@@ -219,7 +219,12 @@ impl PacketDriver {
             out.append(&mut inner.output);
             (inner.driver.exhausted(), inner.driver.deadline())
         });
-        let more = self.applications.poll(&self.fcx, &self.shared, cx)?;
+        let more = self.applications.poll(
+            &self.fcx,
+            cx,
+            |pending| std::mem::swap(pending, &mut self.shared.inner.lock().application_events),
+            |command| self.shared.with(|inner| inner.application_command(command)),
+        )?;
         Ok((
             busy || more,
             [deadline, self.applications.deadline()]

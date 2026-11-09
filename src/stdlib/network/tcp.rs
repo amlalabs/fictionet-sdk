@@ -1027,7 +1027,7 @@ pub(crate) fn prepare_transport(
             shared: shared.clone(),
         },
         PacketDriver {
-            applications: applications::Applications::new(fcx, &shared),
+            applications: applications::new(fcx, &shared),
             fcx: fcx.clone(),
             shared,
         },
@@ -1071,7 +1071,17 @@ impl PacketDriver {
                 refused(peer, local);
             }
         }
-        let applications = self.applications.poll(&self.fcx, &self.shared, cx)?;
+        let applications = self.applications.poll(
+            &self.fcx,
+            cx,
+            |pending| {
+                std::mem::swap(
+                    pending,
+                    &mut self.shared.state.lock().routes.application_events,
+                )
+            },
+            |command| self.shared.state.lock().offer(command),
+        )?;
         Ok((
             busy || applications,
             [deadline, self.applications.deadline()]
