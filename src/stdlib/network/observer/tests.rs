@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::layer::{Budget, Child, Driver};
 use fictionet::stdlib::network::ip;
-use fictionet::stdlib::network::packet::{Capture, Ingress};
+use fictionet::stdlib::network::packet::{Capture, Ingress, Scopes};
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 
@@ -928,7 +928,7 @@ fn tuple_reuse_starts_a_new_generation() {
 #[test]
 fn overlapping_tuples_in_other_scopes_do_not_alias() {
     let mut tcp = watch();
-    let inner = Scope::tunnel();
+    let inner = Scopes::default().tunnel();
     let outer = tcp.send(Scope::ROOT, CLIENT, SERVER, 100, 0, 2, b"");
     let tunneled = tcp.send(inner, CLIENT, SERVER, 100, 0, 2, b"");
     assert_eq!((outer.opened.len(), tunneled.opened.len()), (1, 1));

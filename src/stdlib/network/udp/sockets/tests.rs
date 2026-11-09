@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::layer::{Budget, Chain, Child, Children, Driver, MuxCommand, Side, Top};
 use fictionet::stdlib::network::ip::Header;
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, Origin};
+use fictionet::stdlib::network::packet::{Ingress, IpLayer, Origin, Scopes};
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 
@@ -198,7 +198,7 @@ fn observed_copies_and_other_networks_reach_no_socket() {
     let mut bad_header = datagram(peer, local, b"observed");
     bad_header[10] ^= 1;
     let tunnel = Ingress {
-        scope: Scope::tunnel(),
+        scope: Scopes::default().tunnel(),
         ..Ingress::default()
     };
     let packets = [

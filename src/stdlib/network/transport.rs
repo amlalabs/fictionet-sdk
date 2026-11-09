@@ -381,6 +381,7 @@ mod tests {
         Admit, Budget, Children, Chunk, CommandOf, Credited, Datagram, DatagramEvent, Driver, Env,
         EventOf, Layer, MuxEvent, ObservedEvent, Port, Slots, StreamEvent, Termination,
     };
+    use fictionet::stdlib::network::packet::Scopes;
     use fictionet::time::Instant;
     use fictionet::{Seed, SeededEntropy};
 
@@ -537,7 +538,7 @@ mod tests {
             ),
         );
         let connection = ObservedConnection {
-            scope: Scope::tunnel(),
+            scope: Scopes::default().tunnel(),
             first: addr("10.0.0.2:50000"),
             second: addr("10.0.0.1:443"),
             generation: 0,
@@ -608,7 +609,7 @@ mod tests {
 
     #[test]
     fn an_observed_connection_has_one_key_for_both_orders() {
-        let scope = Scope::tunnel();
+        let scope = Scopes::default().tunnel();
         let forward = ObservedConnection {
             scope,
             first: addr("10.0.0.2:50000"),

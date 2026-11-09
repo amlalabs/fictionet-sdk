@@ -60,6 +60,7 @@
 //! ```
 
 use core::convert::Infallible;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fictionet::Packet;
@@ -76,22 +77,35 @@ use fictionet::time::Instant;
 /// The same addresses and ports may be in use in two scopes at once, so
 /// anything keyed by addresses (a connection, a capture's conversation)
 /// includes the scope. A scope is made by whatever owns the network, never
-/// read from a peer: a tunnel layer makes a new one for the network it
-/// carries ([`Scope::tunnel`]).
+/// read from a peer: a tunnel layer takes one for the network it carries
+/// from its world's [`Scopes`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Scope(u64);
-
-/// The last scope [`Scope::tunnel`] made.
-static SCOPES: AtomicU64 = AtomicU64::new(0);
 
 impl Scope {
     /// The world's own network.
     pub const ROOT: Scope = Scope(0);
+}
 
-    /// A new scope, different from every other one made in this process,
-    /// for the network inside one tunnel.
-    pub fn tunnel() -> Scope {
-        let previous = SCOPES
+/// Numbers the networks inside one world's tunnels, from 1 in the order
+/// they are made.
+///
+/// A world keeps one and every tunnel in it takes its network's scope from
+/// it, nested tunnels included, so no two of the world's networks share a
+/// scope. The numbers come from the world alone: a run of the same world
+/// numbers its tunnels the same way, so a scope may appear in a replay or
+/// a report, and means nothing outside its world. A capture reader keeps
+/// its own for the tunnels it reads. Clones share the numbering.
+#[derive(Clone, Debug, Default)]
+pub struct Scopes {
+    last: Arc<AtomicU64>,
+}
+
+impl Scopes {
+    /// The scope of the network inside a new tunnel.
+    pub fn tunnel(&self) -> Scope {
+        let previous = self
+            .last
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .expect("network scopes exhausted");
         Scope(previous + 1)
@@ -907,7 +921,7 @@ mod tests {
         let mut inner_udp = udp(100);
         inner_udp[8..].reverse();
         let inner = ip::packet_with(a, b, protocol::UDP, fields, &inner_udp).0;
-        let tunnel = Scope::tunnel();
+        let tunnel = Scopes::default().tunnel();
         let (outer_pieces, inner_pieces) = (fragments(&outer, 32), fragments(&inner, 32));
         assert_eq!(outer_pieces.len(), 4);
         // Alternate the two networks, each filling the other's gaps, then
@@ -1012,11 +1026,20 @@ mod tests {
         );
     }
 
+    /// A world's tunnels never share a scope, whichever clone of its
+    /// numbering makes them, and none is the world's own. Another world
+    /// making its tunnels in the same order gets the same scopes: they come
+    /// from the world, not from what else ran in the process.
     #[test]
-    fn scopes_are_never_shared() {
-        let (a, b) = (Scope::tunnel(), Scope::tunnel());
-        assert_ne!(a, b);
-        assert_ne!(a, Scope::ROOT);
+    fn a_worlds_scopes_are_never_shared_and_repeat_with_the_world() {
+        let made = |scopes: Scopes| {
+            let clone = scopes.clone();
+            [scopes.tunnel(), clone.tunnel(), scopes.tunnel()]
+        };
+        let first = made(Scopes::default());
+        assert!(!first.contains(&Scope::ROOT));
+        assert!(first[0] != first[1] && first[1] != first[2] && first[0] != first[2]);
+        assert_eq!(made(Scopes::default()), first);
         assert_eq!(Ingress::default().scope, Scope::ROOT);
     }
 }
