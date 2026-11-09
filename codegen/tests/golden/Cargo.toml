@@ -16,3 +16,6 @@ doc = false
 [dependencies]
 # No default features, as codegen's own dev-dependency.
 fictionet = { path = "../../..", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"

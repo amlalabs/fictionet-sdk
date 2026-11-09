@@ -21,3 +21,6 @@ fictionet-codegen = { path = "../.." }
 
 [build-dependencies]
 fictionet-codegen = { path = "../.." }
+
+[lints.rust]
+unsafe_code = "forbid"

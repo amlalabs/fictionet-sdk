@@ -13,4 +13,5 @@ fictionet = { path = "..", default-features = false }
 fictionet-codegen-golden = { path = "tests/golden" }
 
 [lints.rust]
+unsafe_code = "forbid"
 missing_docs = "deny"
