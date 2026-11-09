@@ -2,7 +2,7 @@
 
 These finite TLA+ models check the transport/authentication boundary, ordered
 key changes, completion ownership, channel lifecycle and the honeypot policy.
-The Kani harnesses call production Rust arithmetic in
+The positive Kani harnesses call production Rust arithmetic in
 `src/stdlib/services/ssh.rs`. Each model has source references in its header.
 These are bounded checks of the specified transitions, not a refinement proof
 of all Rust code or a cryptographic proof of SSH.
@@ -101,9 +101,15 @@ They exercise production methods, not copied positive models:
 
 | Harness | Scope | Negative harness |
 | --- | --- | --- |
-| `ssh_receive_window` | Full-width receive and advertised windows, arbitrary packet length, confirmation/EOF/close gates; exact subtraction or unchanged refusal. | `ssh_receive_without_bound` removes the length guard and wraps subtraction. |
-| `ssh_send_window` | Full-width peer window, command credit and packet bound; exact subtraction or unchanged refusal after EOF/close. | `ssh_send_without_bound` removes the length guard and wraps subtraction. |
-| `ssh_output_buffer` | All reachable byte counts through the output limit and arbitrary `usize` input length; admission never overflows or exceeds the buffer, and exit refuses writes. | `ssh_output_without_count` drops the accepted increment; `ssh_output_without_limit` removes the length bound; `ssh_output_without_exit` removes the closed-output gate. |
+| `ssh_receive_window` | Full-width receive and advertised windows, arbitrary packet length, confirmation/EOF/close gates; exact subtraction or unchanged refusal. | `ssh_receive_without_bound`: the same subtraction without its guard, written in the harness (`wrapping_sub`), not `consume_receive`. |
+| `ssh_send_window` | Full-width peer window, command credit and packet bound; exact subtraction or unchanged refusal after EOF/close. | `ssh_send_without_bound`: the same subtraction without its guard, written in the harness (`wrapping_sub`), not `consume_send`. |
+| `ssh_output_buffer` | All reachable byte counts through the output limit and arbitrary `usize` input length; admission never overflows or exceeds the buffer, and exit refuses writes. | `ssh_output_without_count` calls `next_bytes` and subtracts the increment from its result in the harness; `ssh_output_without_limit` is the unguarded addition written in the harness (`wrapping_add`); `ssh_output_without_exit` asserts that an open buffer refuses an empty write. |
+
+The negative harnesses are arithmetic written out in `kani/mod.rs`, or
+assertions the production code is right to fail; none calls `consume_receive`,
+`consume_send` or `next_bytes` with a guard removed. They show that the guards
+matter, not that Kani would catch their removal from `ssh.rs`. A mutation of
+`ssh.rs` itself has not been run against the positive harnesses.
 
 The buffer proof calls `Output::next_bytes`, which `Output::push` uses before
 allocation and commits only after reservation succeeds. It assumes the existing

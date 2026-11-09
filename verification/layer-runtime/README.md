@@ -38,6 +38,8 @@ cd ../../..
 systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 cargo kani -p fictionet --harness the_buffer_is_charged_before_bytes_are_taken \
   --harness every_charge_comes_back --harness units_come_up_in_order \
   --harness a_decoder_failure_comes_up_once_then_ended \
+  --harness encoding_is_not_called_without_its_reservation \
+  --harness a_decoded_allocation_keeps_its_charge_outside_the_layer \
   --harness a_reply_comes_only_for_a_request --harness a_header_of_mode_0_6_or_7 \
   --harness connections_are_counted_up_to_the_maximum
 systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 cargo kani -p nuclear-world --harness each_request_gets_one_answer_in_order \
@@ -54,10 +56,12 @@ TLC 2.19; Kani 0.68 with CBMC 6.11.
 
 World hosts now attach stacks directly to TCP and UDP children. `Session`
 in `services/stack/session.rs` supplies stream idle and write timeouts. Its
-completion predicate requires the output end, no unreported writes or running
-work, and either input end or application termination. The stream model's
-`shut`, `inputOver`, and `written` project those conditions for a nonterminal
-application without jobs. The full `Session` adapter and packet dispatch loop
+completion predicate (`Session::is_terminal`, `session.rs:110-117`) is a
+reset, or the output end with no unreported writes, no running work, no
+command still held, and either the input end or the application's own
+termination. The stream model's `shut`, `inputOver`, and `written` project
+those conditions for a nonterminal application without jobs; `Session`
+itself is not modeled. The full `Session` adapter and packet dispatch loop
 are not modeled by `StreamRunner`; child isolation and budget refusal remain
 in the layer models, and integration tests check their composition.
 

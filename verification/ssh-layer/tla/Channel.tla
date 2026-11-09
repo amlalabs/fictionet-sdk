@@ -1,9 +1,22 @@
 ---------------------------- MODULE Channel ----------------------------
-\* Source: src/stdlib/services/ssh.rs:663-709 (windows), :1102-1221
-\* (open, adjust, EOF and peer close), :1363-1417 (confirmation and credit),
-\* :1578-1650 (credit, local EOF and close);
-\* src/stdlib/layer/children.rs:394-479 (reserve before factory/credit),
-\* :484-495 (terminal reset cancels work and removes child-owned timers).
+\* Source: src/stdlib/services/ssh.rs:649-692 (Channel and its two
+\* debits), :1085-1202 (open, adjust, data, EOF and peer close),
+\* :1347-1399 (confirmation, advertisement and credit), :1561-1569
+\* (receive credit from Children), :1570-1584 and :1625-1632 (close),
+\* :1617-1624 (local EOF), :1737-1773 (channel_write);
+\* src/stdlib/layer/children.rs:858-922 (receive backing reserved at
+\* 874-887 before the factory runs at 888; credit granted at 813-818),
+\* :923-939 (terminal reset: remove at 535-544 unlinks the child's
+\* timers and work, 928 cancels its owner).
+\* Units are bytes. window, advertised and max_packet are u32; granted
+\* and receive are u64; the model's windows of two and three bytes stand
+\* for any value. A grant is window.min(max_packet) (:1394); the model
+\* has no max_packet, so a grant is the whole window, which is the
+\* code's when the window is the smaller. Adjust is checked_add (:1141-
+\* 1144) and Credit is checked_add capped at u32::MAX (:1563-1567); both
+\* fail the connection on overflow, which the model's bounds never reach.
+\* Both debits check every bound before subtracting (:664-691); that
+\* arithmetic is proved for all values in ../kani/mod.rs.
 EXTENDS Naturals
 CONSTANT Mutation
 VARIABLES phase, reserved, accepted, confirmed, receive, advertised, held,

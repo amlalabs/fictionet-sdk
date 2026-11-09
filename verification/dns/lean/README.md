@@ -195,19 +195,40 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   definition carries fuel of 256^256 steps only to be total. Each step visits a new name, a CNAME target the
   zone holds or a DNAME substitution of at most 255 octets, so a chain ends another way long before that;
   this is an argument, not a theorem.
-- **Every fact `answer` reads goes through the view**, including the address records of NS, MX, and SRV
-  targets and sibling glue. An unknown fact there also ends the answer with Unknown, because a response that
-  left them out would differ from the complete zone's. `partial.json` expects this of the Rust `answer`.
+- **Every fact `answer` rests on goes through the view.** The address records of NS, MX, and SRV targets and
+  sibling glue are optional additional data (RFC 2181 §5.4.1, RFC 9471 §3.2), so `addrsOf` and `siblingGlue`
+  read them through the view but leave them out when the view does not know the target, instead of ending
+  the answer; `answer_partial_sound` allows exactly that difference (`Response.Grows`). Rust's
+  `Walk::addresses_of` does the same. `partial.json` expects this of the Rust `answer`.
+- **Additional data the model leaves out.** Rust's `Walk::addresses_of` finds a target's addresses at its
+  own node or, for a target under a cut of this zone, in that cut's glue, and uses it both for a referral's
+  out-of-bailiwick NS targets and for the NS, MX, and SRV targets of an exact answer. The model's
+  `siblingGlue` (referrals) reads only glue under another cut, and `addrsOf` (exact answers) only a target's
+  own node, so a referral whose NS target has an address node in this zone, or an MX whose target sits under
+  a delegation, gets more additional data from Rust than from the model. `Gen.lean` makes neither: its
+  delegation targets are under their own cut, under a sibling cut, or outside the zone, and its MX and SRV
+  targets are data nodes. `zone.json` compares the whole additional section, so a generator that made them
+  would show the difference.
 - **The builder** takes RRsets and delegations (child, NS targets, glue, DS) and checks the rules of
   `ZoneError` except `Master`, which is about parsing. Glue whose owner is not below its cut is never served
   rather than rejected. It merges RRsets of the same owner and type and collapses duplicate records
   (RFC 2181 §5). When several rules fail it reports the first in the order `firstError` lists, with the most
-  specific of two overlapping CNAME rules first.
+  specific of two overlapping CNAME rules first. `Spec` is Rust's `Parts` after `Parts::sort`
+  (`zone.rs`): Rust takes a flat list of RRsets and sorts an NS set below the apex into a cut, A and AAAA
+  sets below a cut into its glue, and a DS set at a cut into the cut, before it checks the rules; the model
+  takes them already sorted, so an A record below a cut in `Spec.sets` breaks `R5` while Rust files it as
+  glue. `Gen.lean` writes a `Spec` out as master-file lines, so Rust's sort is exercised only on input of the
+  model's shape. Rust also refuses a CNAME RRset of more than one record (`records_count() > 1` in
+  `Parts::check`); `R2` says nothing about it, and `Gen.lean` never writes one.
 - **Lazy zones** ask the provider about every needed name the zone holds no node at: the path from the apex
   to the name and the wildcard below each name on it. Present answers are inserted as one new revision each;
   absent and unknown answers are not kept. The view reads every fact from the zone after the provider was
-  asked, so it is one revision; a name with held names below it reads as `Empty` whatever the provider says,
-  which is "the zone answers what it holds" of `Lazy`.
+  asked, so it is one revision; a name with held names below it reads as `Empty` whatever the provider says.
+  Rust's `Lazy` (`Probe::fact` in `lazy.rs`) reads such a name as `Empty` only when the provider called it
+  absent; a name the provider does not know stays unknown whatever is held below it, so Rust answers
+  SERVFAIL where the model answers NODATA for an empty non-terminal it can prove exists. Both are sound; the
+  vectors do not reach the difference, since `partial.json` runs `answer` over a view built from a complete
+  zone, not over `Lazy`.
 - **Exchanges** model the state the matching rule touches: the generation, the next exchange number, the
   outstanding exchanges with their tuples, and state derived from replies, tagged with its generation.
   Waiting client queries survive a session change, to be restarted under the new generation.
@@ -263,7 +284,11 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   implementations.
 - **The chain check** runs over a list of signed zones; a zone's parent is the zone whose apex is its deepest
   strict ancestor. A parent that does not delegate to a zone it is the parent of reports the missing no-DS
-  proof. `check_sound` assumes honest signers and DS sets owned by the child (`WellFormed`), that a zone with a
+  proof; Rust's `check_chain` walks each zone's own cuts, so it reports nothing for such a pair, and it skips
+  the no-DS proof when none of the parent's keys uses an algorithm the policy validates (`None if validated`
+  in `chain.rs`), which the model does not: `Gen.lean`'s trees always delegate to the child, and a parent
+  signed only with RSASHA1 still serves the no-DS records, so neither difference reaches `chain.json`.
+  `check_sound` assumes honest signers and DS sets owned by the child (`WellFormed`), that a zone with a
   key in an algorithm the policy validates signs its data with one (`DataAlgorithms`, which Rust checks as
   each RRset's signatures), and an anchor key in such an algorithm; the check itself
   does not look at signature bytes.
@@ -307,7 +332,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 | `Dnssec.Signer`, `Records.Sign` | `dnssec::{ZoneKey, Sign}` |
 | `Dnssec.AlgorithmPolicy`, `AlgorithmPolicy.treat`, `Policy.iana` | `dnssec::AlgorithmPolicy`, its DS treatment, `AlgorithmPolicy::iana` |
 | `Dnssec.Anchor`, `anchorFor` | `dnssec::{TrustAnchor, Anchors}` |
-| `Dnssec.Link`, `Chain`, `walk` | `dnssec::Chain` and the walk from the anchor down |
+| `Dnssec.Link`, `Chain`, `walk`, `keyStep`, `dsStep`, `linkStep` | `dnssec::{Link, Fetched, Chain}` and `Check::{zone_keys, walk, delegation, dnskeys}` in `dnssec/validate.rs` |
 | `Dnssec.noDsProof`, `denialResult`, `nx`, `nx3`, `nodata`, `nodata3` | `dnssec::proof` (RFC 4035 §5.4, RFC 5155 §8) |
 | `Dnssec.validateRrset`, `validateExtra`, `validateDenial`, `validateNegative`, `Validation`, `Insecure`, `Ede` | `dnssec::{validate_rrset, validate_denial, Validation, Insecure}`, `EdeCode` |
 | `Dnssec.SignedZone`, `SignedZone.make`, `nsecChain`, `nsec3Chain`, `anyExtra`, `answerDo` | `zone::Zone::signed` and the DO=1 answer |

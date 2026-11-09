@@ -38,26 +38,26 @@ runner split (commit `2734012ec`), and every model and proof was rerun
 there, at code revision `6aa68ae5f` (the TLS Kani constructor at
 `da718b893`). What changed under it, and what that did to the models:
 
-- `TlsLayer` picks its config as work of its own (`Pick`, `layer.rs:61-90`):
+- `TlsLayer` picks its config as work of its own (`Pick`, `layer.rs:61-94`):
   always the same config (`TlsLayer::new`) or one the world picks for the
   hello (`TlsLayer::selecting`). The model's world was already abstract;
   only the line numbers moved.
 - `on_done` ignores a pick that finishes after the layer failed or was
-  reset, at the top of the function (`layer.rs:473-476`). That guard was
+  reset, at the top of the function (`layer.rs:477-480`). That guard was
   on the foundation before the merge; the branch's copy of fix 2, further
   down, was dead code and was removed (`80f0f98d1`). `Done` in `Layer.tla`
   now checks the guard first, as the code does, so a pick finished after a
   reset is ignored, where before the model (and the code) returned
   `Err("TLS configuration without a client hello")`.
-- A handshake deadline (`handshake_by`, `layer.rs:159-162`; `on_timer` and
-  `deadline` at 645-659) fails a handshake that has not finished, with no
+- A handshake deadline (`handshake_by`, `layer.rs:163-166`; `on_timer` and
+  `deadline` at 649-663) fails a handshake that has not finished, with no
   alert. `Layer.tla` has a new action, `Timeout`, that may fire at any
   moment while the handshake is unfinished and the layer has not failed;
   the constant `HandshakeDeadline` turns it on in every config. With
   `-coverage` on `Layer_live_base.cfg`, TLC counted 1,639 `Timeout` steps,
   783 of them to states the search had not seen; the rest of a timed-out
   handshake looks like a handshake that failed another way.
-- `take_urgent` (`layer.rs:630-632`) hands up the same credit
+- `take_urgent` (`layer.rs:634-636`) hands up the same credit
   `take_event` does, so a `Chain` or the `Driver` can pass it around a
   refused event. Both take the whole counter, so `UpperTakes` is either.
 - The former live adapter implementation in `services/tls.rs` is gone.
@@ -127,7 +127,7 @@ fix the commands below were `["End", "Write(Chunk { len: 1087, .. })"]`.
 Fix (`37e035ba1`): `on_done` takes the hello and sends nothing once the
 layer has failed. On the merged foundation the guard that prevents it is
 the one at the top of `on_done`, which also covers a reset
-(`layer.rs:473-476`); the test passes there.
+(`layer.rs:477-480`); the test passes there.
 
 The existing tests missed both because `Harness` answers a write after End
 with `Admit::Closed` and drops it.
@@ -144,12 +144,12 @@ those fields, and each operator is the Rust function it names:
 
 | Model | Rust (`src/stdlib/services/tls/layer.rs`) |
 | --- | --- |
-| `Handshaking`, `OutputPending`, `Fail`, `CreditWritten`, `Abort` | `is_handshaking` (`layer.rs:202`), `output_pending` (`:222`), `fail` (`:230`), `credit_written` (`:282`), `abort` (`:253`) |
-| `AdvanceNext`, `Produce`, `Read` | one call of `advance` (`:499-617`) that returns `Ok(true)` or an error, in its order: reset, hello, the output arm (`:538-573`, fence at `:565-571`), the plaintext arm (`:574-604`), End (`:605`), the failure (`:610`) |
-| `DeliverInput`, `DeliverData`, `DeliverEnded`, `Accept`, `Process` | `on_event` for the peer's bytes, its end and a reset (`:300-413`), with what the acceptor and `process_new_packets` may make of the bytes |
-| `DeliverWritten` | `on_event(Written)` (`:306-316`) |
-| `UpperTakes`, `TakeWork`, `Done`, `Timeout` | `take_event` (`:623-628`) or `take_urgent` (`:630-632`), `take_work` (`:634-643`), `on_done` (`:468-497`), `on_timer` (`:645-653`) |
-| `UpperCommand`, `UpperCancels` | `on_command` (`:415-466`); dropping a refused write |
+| `Handshaking`, `OutputPending`, `Fail`, `CreditWritten`, `Abort` | `is_handshaking` (`layer.rs:206`), `output_pending` (`:226`), `fail` (`:234`), `credit_written` (`:286`), `abort` (`:257`) |
+| `AdvanceNext`, `Produce`, `Read` | one call of `advance` (`:503-621`) that returns `Ok(true)` or an error, in its order: reset, hello, the output arm (`:542-577`, fence at `:569-575`), the plaintext arm (`:578-608`), End (`:609`), the failure (`:614`) |
+| `DeliverInput`, `DeliverData`, `DeliverEnded`, `Accept`, `Process` | `on_event` for the peer's bytes, its end and a reset (`:304-417`), with what the acceptor and `process_new_packets` may make of the bytes |
+| `DeliverWritten` | `on_event(Written)` (`:310-320`) |
+| `UpperTakes`, `TakeWork`, `Done`, `Timeout` | `take_event` (`:627-632`) or `take_urgent` (`:634-636`), `take_work` (`:638-647`), `on_done` (`:472-501`), `on_timer` (`:649-657`) |
+| `UpperCommand`, `UpperCancels` | `on_command` (`:419-470`); dropping a refused write |
 | `TakeCommand`, `CarrierTakes` | `Driver::send_below` and `take_command`; a carrier taking part or all of a write, End, or Reset, and refusing (dropping) a write after End or a reset, as `Harness` does |
 
 rustls is abstract: its send queue (other output, the pending write's
@@ -232,11 +232,18 @@ Layer.tla` under an 8 GB memory cap.
 
 rustls is abstract: record framing, where chunk boundaries fall, real
 bytes and cryptography are not modeled, and each delivery of the peer's
-bytes is one of the outcomes listed above, with a chunk split at most once.
-That rustls yields no plaintext before the handshake ends, and encrypts a
-whole accepted write at once into its send queue, are assumptions; the
-first is a constant so its role shows. The acceptor's `Ok(0)` read
-(`layer.rs:377`), a `read_tls` error on EOF, and `process_new_packets`
+bytes is one of the outcomes listed above, with a chunk split at most once
+(rustls's `read_tls` takes about 4 KiB a call, so one 16 KiB chunk comes
+back `Partial` several times, `layer.rs:391` and `:413`; the model counts
+each further part as another input, within `MaxInputs`). One record can
+carry application data and close_notify together; the model takes them
+in two deliveries, which the layer handles the same way, in the same
+order. That rustls yields no plaintext before the handshake ends, and
+encrypts a whole accepted write at once into its send queue (its buffer
+limit of two CHUNKs, `:492`, is never reached by one CHUNK of plaintext
+behind at most a KeyUpdate), are assumptions; the first is a constant so
+its role shows. The acceptor's `Ok(0)` read
+(`layer.rs:381`), a `read_tls` error on EOF, and `process_new_packets`
 failing on EOF are not modeled. The budget never refuses: a refusal
 changes nothing by the layer rules, so it is a stutter for safety, and
 the liveness properties assume the budget eventually has room. Driver
@@ -259,9 +266,9 @@ closed. On the branch, a pick finished after a reset returned
 ## Write cancellation: `Write.tla`
 
 [`Write.tla`](tla/Write.tla) is `Opened::poll_write`
-(`src/stdlib/services/stack/open.rs:205-251`), the connection a TLS layer
+(`src/stdlib/services/stack/open.rs:206-252`), the connection a TLS layer
 opened over TCP is, one call per step, as the synchronous function it is.
-Each `pump` inside it (`open.rs:131-141`) runs the stack and its
+Each `pump` inside it (`open.rs:131-142`) runs the stack and its
 connection with `Live::poll` and either fails or returns once nothing more
 can move, having registered the caller's waker with what can move next;
 it never returns Ready(Ok). While it runs, the layer may credit what it
@@ -278,7 +285,7 @@ credited a write; the rule that a Ready flush had credited every write
 (`FlushCredits`) kept it from returning Pending with no waker. `Opened`
 has no such flush: every Pending it returns follows a pump that
 registered the waker. The rule that replaces it is `PumpFirst`: the pump
-runs before `poll_write` looks at the earlier write (`open.rs:214`).
+runs before `poll_write` looks at the earlier write (`open.rs:215`).
 
 What is checked: `ConfirmedOnce` (no write is confirmed twice),
 `ConfirmedIsTheCallers` (`Ok(k)` only when the call's first `k` bytes are
@@ -301,13 +308,13 @@ The layer and the connection below are abstract; credit moves inside
 `poll_write`'s pumps and, between calls, as the runner writes the
 ciphertext (`Flush`), all of a write's at once. `poll_read` and
 `poll_shutdown`, which pump too, only make credit arrive sooner and are
-not modeled; nor are the budget charges (`open.rs:231-233`) or a write the
+not modeled; nor are the budget charges (`open.rs:232-234`) or a write the
 layer takes only in part. That a pump that returns Pending registered a
 waker that fires when the credit can move is an assumption about `Live`:
 it polls the connection's reads and writes, the stack's work and its
 sleep before it returns Pending, or wakes the caller itself after a busy
-stretch (`live.rs:384-386`). Matching a retry by content is a design limit
-the code states (`open.rs:242-243`): a caller that drops a pending write
+stretch (`live.rs:393-397`). Matching a retry by content is a design limit
+the code states (`open.rs:243-244`): a caller that drops a pending write
 and writes other bytes leaves the earlier bytes sent and never confirmed.
 
 ## Proofs against the Rust: `kani/LayerProof.rs`
@@ -356,9 +363,9 @@ foundation; the second is the branch's run:
 
 | Mutation | Harness | Result |
 | --- | --- | --- |
-| `credit_written` keeps `pending_plaintext` (`layer.rs:285` deleted) | `a_completion_credits_...` | merged: 1 of 16,824 failed: `layer.pending_plaintext == 0` |
+| `credit_written` keeps `pending_plaintext` (`layer.rs:289` deleted) | `a_completion_credits_...` | merged: 1 of 16,824 failed: `layer.pending_plaintext == 0` |
 | `credit_written` credits one byte before the fence (`delivered + 1 >= fence`) | `a_write_is_acknowledged_...` | branch: 1 of 16,545 failed: `layer.delivered >= end` |
-| `abort` keeps the credit (`layer.rs:272` deleted) | `a_reset_drops_...` | merged: 1 of 18,545 failed: `(credit, pending_plaintext) == (0, 0)` |
+| `abort` keeps the credit (`layer.rs:276` deleted) | `a_reset_drops_...` | merged: 1 of 18,545 failed: `(credit, pending_plaintext) == (0, 0)` |
 
 ## Entropy: `entropy.rs`
 

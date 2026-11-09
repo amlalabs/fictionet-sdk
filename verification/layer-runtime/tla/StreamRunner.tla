@@ -1,11 +1,15 @@
 ---------------------------- MODULE StreamRunner ----------------------------
-(* `services::stack::stream` in src/stdlib/services/stack/mod.rs drives   *)
-(* Live::step in src/stdlib/services/stack/live.rs. Round reads, reports   *)
-(* writes, offers held input, calls Driver::run and sends output. A round *)
-(* with progress repeats; a settled round checks deadlines and sleeps.   *)
-(* After Pending, stream checks Live::finished and transport poll_gone.   *)
-(* EndBroken corresponds to Live::broken. Driver holds one refused       *)
-(* command below, retaining partial output until the transport takes it. *)
+(* `services::stack::stream` (src/stdlib/services/stack/mod.rs:255-301)   *)
+(* drives Live::step (src/stdlib/services/stack/live.rs:191-398). Round   *)
+(* reads, reports writes, offers held input, calls Driver::run and sends  *)
+(* output: one pass of the `for _ in 0..ROUNDS` at live.rs:198-339. A    *)
+(* round with progress repeats; a settled round checks the limits and     *)
+(* sleeps (live.rs:341-391). After Pending, stream checks Live::finished   *)
+(* (live.rs:142-153, mod.rs:288-289) and the transport's poll_gone        *)
+(* (mod.rs:292). EndBroken corresponds to Live::broken (live.rs:403-428). *)
+(* Driver holds one refused command below (`below`, driver.rs:119; `send` *)
+(* at driver.rs:327-358), retaining partial output until the transport    *)
+(* takes it. Line numbers are those of commit e2858ccc4.                  *)
 (*                                                                     *)
 (* The stack is abstract: an echo with room for `Room` bytes of input that *)
 (* it moves to its output when it runs, asks to end its direction once it  *)
@@ -15,8 +19,11 @@
 (* stacks have. It asks for no work: `jobs` stays empty, so the            *)
 (* `jobs.is_empty()` of `waiting` and `finished` always holds. Bytes are   *)
 (* counted, not carried. Time is in ticks, and passes only while the      *)
-(* runner waits. The ROUNDS bound on one poll  only  *)
-(* yields to the rest of the world, and is left out.                      *)
+(* runner waits. The ROUNDS bound on one poll (live.rs:22, 393-397) only  *)
+(* yields to the rest of the world, and is left out. So are the           *)
+(* `jobs.close_completed()` call of a round (live.rs:226-228), which      *)
+(* touches only work, and the cancel checks of `stream` (mod.rs:274-276,  *)
+(* 281-283) and of a read (live.rs:218-220): cancellation is outside.     *)
 (*                                                                         *)
 (* The switches are the rules of the code. TRUE is the production rule.  *)
 (* This abstract stack never declares its whole lifetime terminal: ending *)
@@ -133,7 +140,7 @@ Init ==
   /\ wasHolding = FALSE /\ stuckFrom = 0 /\ earlyStall = FALSE
 
 (* The stack's `take_command`, through Framed: writes first, then its     *)
-(* reset or end (framed.rs:183-195). Nothing after it heard a reset.      *)
+(* reset or end (framed.rs:251-263). Nothing after it heard a reset.      *)
 NextCmd(o, e, r, hr) ==
   IF hr THEN "none"
   ELSE IF o > 0 /\ (WriteBeforeEnd \/ e # "asked") THEN "write"
@@ -141,27 +148,30 @@ NextCmd(o, e, r, hr) ==
   ELSE IF e = "asked" THEN "end"
   ELSE "none"
 
-(* `Live::broken` : the stack is offered a reset, which  *)
-(* Framed takes unless its input is over (framed.rs:125, 147-152), and    *)
-(* the run ends. `stream` calls it for a failed read or write             *)
-(* (mod.rs:188, 198) and for a peer that is gone (mod.rs:194); `Live`     *)
-(* calls it itself for the budget  and the write limit   *)
-(* .                                                     *)
+(* `Live::broken` (live.rs:403-428): the stack is offered a reset, which  *)
+(* Framed takes unless its input is over (framed.rs:186, 208-213), and    *)
+(* the run ends. `stream` calls it for a failed read or write (Halt::Conn *)
+(* at mod.rs:286, broken at 296) and for a peer that is gone (mod.rs:292); *)
+(* `Live` calls it itself for the budget (live.rs:211) and the write      *)
+(* limit (live.rs:345). The code also clears `input` and sets             *)
+(* `input_over` there (live.rs:412-413); the model leaves them as they    *)
+(* were, which no property reads once pc = "done".                        *)
 EndBroken(why, over) ==
   /\ offeredReset' = IF ResetOnBreak THEN offeredReset + 1 ELSE offeredReset
   /\ heardReset' = (heardReset \/ (ResetOnBreak /\ ~over))
   /\ sOver' = (over \/ ResetOnBreak)
   /\ pc' = "done" /\ ret' = why
 
-(* `Driver::send_below` (driver.rs:190-195, `send` at 246-276) into the   *)
-(* sink of live.rs:264-308: `send` offers the held command, or takes the  *)
+(* `Driver::send_below` (driver.rs:267-272, `send` at 327-358) into the   *)
+(* sink of live.rs:273-317: `send` offers the held command, or takes the  *)
 (* next from the stack, until the sink hands one back. `ws` is what the   *)
 (* transport answers to the first and the second write of this round (a   *)
 (* held write and then a new one), `sd` what it answers to the shutdown.  *)
 (* A write that is ready takes at least one byte, as                      *)
 (* `Connection::poll_write` does for a non-empty buffer; one that takes   *)
-(* none is the "error" answer . A failed write or        *)
-(* shutdown stays held  and `send` stops.       *)
+(* none is the "error" answer (`Ok(0)`, live.rs:281-284). A failed write  *)
+(* or shutdown stays held (`Blocked`, live.rs:283, 297, 309; driver.rs:   *)
+(* 351-354) and `send` stops.                                             *)
 RECURSIVE SendLoop(_, _, _, _)
 SendLoop(st, ws, sd, fuel) ==
   IF fuel = 0 \/ st.stop THEN st
@@ -215,8 +225,9 @@ ReadChoices ==
   ELSE {None} \cup (IF peerLeft > 0 THEN 1..peerLeft ELSE {})
        \cup (IF peerLeft = 0 /\ peerFin THEN {0} ELSE {})
 
-(* One round of `Live::step` . From "wait" a round runs  *)
-(* only if something can move: what woke the runner .        *)
+(* One round of `Live::step` (live.rs:198-339). From "wait" a round runs  *)
+(* only if something can move: what woke the runner (the read, a write,   *)
+(* the sleep of live.rs:384-386, or poll_gone).                           *)
 Round ==
   /\ pc \in {"round", "wait"}
   /\ \E rd \in ReadChoices,
@@ -227,13 +238,14 @@ Round ==
         askReset \in (IF StackMayReset /\ sReset = "no" /\ ~heardReset THEN BOOLEAN ELSE {FALSE}),
         early \in (IF StackMayEndEarly /\ sEnd = "no" /\ ~heardReset THEN BOOLEAN ELSE {FALSE}) :
      LET got == rd > 0
-         \* the read, live.rs:202-221
+         \* the read, live.rs:205-225
          k0 == IF rd = 0 THEN "ended" ELSE IF got THEN "data" ELSE inKind
          n0 == IF got THEN rd ELSE IF rd = 0 THEN 0 ELSE inN
          readMoved == rd >= 0
-         \* the write report, live.rs:229-239
+         \* the write report, live.rs:238-248; Framed always takes a Written
+         \* (framed.rs:185), so the `Blocked` arm is never taken here
          m1 == written > 0
-         \* the held input, live.rs:240-257
+         \* the held input, live.rs:249-266
          blocked == k0 = "data" /\ ~sOver /\ (sTimer # None \/ sbuf = Room)
          closed == k0 # "none" /\ sOver
          j == IF k0 = "data" /\ ~sOver /\ ~blocked THEN Min(n0, Room - sbuf) ELSE 0
@@ -250,7 +262,7 @@ Round ==
          sout1 == IF sEnd = "no" THEN sout + sbuf1 ELSE sout
          sEnd1 == IF askEnd THEN "asked" ELSE sEnd
          sReset1 == IF askReset THEN "asked" ELSE sReset
-         \* `send_below`, live.rs:262-308
+         \* `send_below`, live.rs:273-317
          p == SendLoop([hk |-> hKind, hn |-> hN, o |-> sout1, e |-> sEnd1, r |-> sReset1,
                         out |-> stackOut, pw |-> 0, pshut |-> FALSE, preset |-> FALSE,
                         pfailed |-> FALSE, moved |-> FALSE, wi |-> 1, stop |-> FALSE],
@@ -264,7 +276,10 @@ Round ==
      /\ readTotal' = IF got THEN readTotal + rd ELSE readTotal
      /\ peerLeft' = IF got THEN peerLeft - rd ELSE peerLeft
      /\ IF got /\ budgetFails
-        THEN \* live.rs:207-210: the round ends at the read.
+        THEN \* live.rs:210-213: the round ends at the read. The code never
+             \* stores the bytes (`broken` clears `input`); the model keeps
+             \* them as held so that InputKept counts them, since no
+             \* property reads `input` once pc = "done".
              /\ EndBroken("budget", sOver)
              /\ idleFrom' = IF IdleResetOnRead THEN now ELSE idleFrom
              /\ quietFrom' = now
@@ -289,13 +304,13 @@ Round ==
         /\ heardEnded' = ended1
         /\ pausesLeft' = IF arms THEN pausesLeft - 1 ELSE pausesLeft
         /\ sTimer' = IF fires THEN None ELSE sTimer1
-        \* After its End the stack's output is refused (framed.rs:161-162).
+        \* After its End the stack's output is refused (framed.rs:222-224).
         /\ sbuf' = 0
         /\ hKind' = p.hk /\ hN' = p.hn
         /\ sout' = p.o /\ sEnd' = p.e /\ sReset' = p.r /\ stackOut' = p.out
         /\ transportTook' = transportTook + p.pw
         /\ shut' = (shut \/ p.pshut)
-        \* live.rs:312-323: what the transport took is owed to the stack.
+        \* live.rs:321-333: what the transport took is owed to the stack.
         /\ written' = (IF m1 /\ ReportOnceRule THEN 0 ELSE written) + p.pw
         /\ stalledSince' = IF (p.pw > 0 /\ StallResetOnProgress) \/ p.hk = "none"
                            THEN None ELSE stalledSince
@@ -313,8 +328,11 @@ Round ==
         /\ UNCHANGED <<now, idled, deadline, peerFin, gone, peerStalled, wasWaiting,
                        earlyIdle, wasHolding, earlyStall>>
 
-(* The limits and the sleep , then, when `step` returns  *)
-(* Pending, what `stream` does with it (mod.rs:190-196).                  *)
+(* The limits and the sleep (live.rs:341-391), then, when `step` returns  *)
+(* Pending, what `stream` does with it (mod.rs:288-294). `Live::finished` *)
+(* also needs `unreported == 0` (live.rs:146); a settled round has        *)
+(* `written = 0` here, since a Written is always taken (see Round), so    *)
+(* that conjunct is implied.                                              *)
 Check ==
   /\ pc = "check"
   /\ LET holds == hKind # "none"
@@ -353,7 +371,7 @@ Check ==
                                stack, peer, readTotal, took, refused, transportTook,
                                reported, stackOut, offeredReset, badRead, earlyStall>>
            ELSE IF armed # None /\ now >= armed
-           THEN \* The sleep is due: round again .
+           THEN \* The sleep is due: round again (live.rs:384-390).
                 /\ deadline' = None /\ pc' = "round"
                 /\ UNCHANGED <<now, inKind, inN, written, inputOver, shut, idled, hKind,
                                hN, ret, stack, peer, readTotal, took, refused,
@@ -392,7 +410,7 @@ PeerReset ==
   /\ gone' = TRUE
   /\ UNCHANGED <<runner, stack, peerLeft, peerFin, peerStalled, hist>>
 
-(* `stream` polls `poll_gone` when the runner waits (mod.rs:194): a peer  *)
+(* `stream` polls `poll_gone` when the runner waits (mod.rs:292): a peer  *)
 (* that is gone ends the run even if no read or write tries.              *)
 Gone ==
   /\ pc = "wait" /\ gone

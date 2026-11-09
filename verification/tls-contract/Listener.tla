@@ -2,23 +2,26 @@
 EXTENDS Naturals, Sequences
 
 (* Source map, with paths relative to src/stdlib.
-   Install and FirstFactory: world/net/hosts.rs:1882,1943-1946 retain the
-   first installed server while adding each site's entries.
-   Accept and FactoryIsolation: world/net/hosts.rs:2137-2156 select the
-   current port's first server; web/httpd/sites.rs:496-497 returns its factory.
-   Select and CertificateIsolation: world/net/hosts.rs:1891-1895 stores each
-   site's config; 2067-2093 resolves the requested name in the current port,
+   Install and FirstFactory: world/net/hosts.rs:1787-1788 keeps the first
+   installed TLS server (`TlsNames::first`, 1428-1431) while adding each
+   site's entries to `by_name`.
+   Accept and FactoryIsolation: world/net/hosts.rs:1985-1991 takes the
+   current port's first server and its `tls_factory`;
+   web/httpd/sites.rs:496-498 returns that factory.
+   Select and CertificateIsolation: world/net/hosts.rs:1390-1395 is a
+   name's entry (its config, accept and ALPN), built per site at
+   1731-1741; 1915-1934 resolves the requested name in the current port,
    falls back to the empty name, and awaits that entry's config.
-   ProtocolIsolation: web/httpd/sites.rs:515-518 preserves the later site's
-   application and protocols; world/net/hosts.rs:1891-1895 stores them and
-   1556-1571 overlays the selected entry's ALPN on its config; 1558-1559
+   ProtocolIsolation: web/httpd/sites.rs:515-517 preserves the later site's
+   application and protocols; world/net/hosts.rs:1736-1737 stores them and
+   1398-1414 overlays the selected entry's ALPN on its config; 1400-1402
    preserves the provider's ALPN when the site's override list is empty.
-   ConfigUnchanged: world/net/hosts.rs:1567-1570 clones before editing ALPN.
+   ConfigUnchanged: world/net/hosts.rs:1409-1411 clones before editing ALPN.
    Build, ApplicationAfterNegotiation and ApplicationOnce:
-   services/tls/secure.rs:121-135 guards construction with Established and
-   consumes make; services/tls/factory.rs:80-81 passes negotiated metadata.
-   NegotiatedApplication: world/net/hosts.rs:2097-2129 uses the established
-   name and ALPN; web/httpd/sites.rs:483-493 invokes the routed application.
+   services/tls/secure.rs:123-138 guards construction with Established and
+   consumes make; services/tls/factory.rs:80-82 passes negotiated metadata.
+   NegotiatedApplication: world/net/hosts.rs:1942-1983 uses the established
+   name and ALPN; web/httpd/sites.rs:484-495 invokes the routed application.
    This is a bounded abstraction, not a mechanically checked refinement. *)
 
 CONSTANTS KeepFirst, LocalFactory, LocalCertificate, LocalProtocols,

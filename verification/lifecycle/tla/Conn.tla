@@ -11,9 +11,9 @@
 (*       TcpConnection::reset, GoneWatch::reset, hold_until_gone, through   *)
 (*       the layer's credit, End, Abort, close and Hold                     *)
 (*       Retirement delegates these same operations for world admission   *)
-(*       (tcp.rs 2040); a control the layer refuses for now waits in       *)
-(*       Host::controls (tcp.rs 1382) until it takes it, as here, where    *)
-(*       the layer takes every one.                                         *)
+(*       (tcp.rs 2092); a control the transport refuses for now waits in   *)
+(*       Host::controls (tcp.rs 1159, offered again by offer_controls at   *)
+(*       1456) until it takes it, as here, where the layer takes every one.*)
 (*   Orphan, Abort, CloseIfDrained, Remove                                 *)
 (*       TcpLayer::orphan, abort, close_if_drained, remove_conn             *)
 (*   Release                                                                *)
@@ -28,8 +28,8 @@
 (*       TcpLayer::housekeeping's orphan loop and TIME-WAIT cap,           *)
 (*       TcpLayer::expire_orphans, its timer                                *)
 (*   Stop                                                                   *)
-(*       Shared::stop and Host::stop (tcp.rs 1551, 1492), which hand the   *)
-(*       layer PacketEvent::Ended, through TcpLayer::stop (engine.rs 1835) *)
+(*       Shared::stop and Host::stop (tcp.rs 1603, 1542), which hand the   *)
+(*       layer PacketEvent::Ended, through TcpLayer::stop (engine.rs 1852) *)
 (*                                                                         *)
 (* Bytes are booleans: `rx` says unread bytes wait, in the receive buffer  *)
 (* or come up to the handle and not read yet, `tx` that the send buffer    *)
@@ -67,12 +67,12 @@ VARIABLES
   retired,    \* Conn::retired
   released,   \* Conn::released
   handle,     \* "alive" | "dropped"
-  inConns,    \* the Conn and its socket exist
-  inOrphans,  \* State::orphans
-  inTimeWait, \* State::time_wait
+  inConns,    \* the Conn and its socket exist (TcpLayer::conns)
+  inOrphans,  \* TcpLayer::orphans
+  inTimeWait, \* TcpLayer::time_wait
   held,       \* Conn::held is not empty
   givesUp,    \* Conn::gives_up: "none" | "armed" | "due"
-  stopped     \* State::stopped
+  stopped     \* TcpLayer::stopped
 
 vars == <<tcp, endpoint, rx, tx, finRecv, rst, shut, orphaned, retired, released,
           handle, inConns, inOrphans, inTimeWait, held, givesUp, stopped>>
@@ -92,7 +92,7 @@ Init ==
 Gone == stopped \/ ~inConns \/ rst \/ retired \/ released
 
 -----------------------------------------------------------------------------
-\* State::remove_conn: the Conn is dropped, with what it held, and its
+\* TcpLayer::remove_conn: the Conn is dropped, with what it held, and its
 \* watchers are woken.
 Remove ==
   /\ inConns' = FALSE /\ inOrphans' = FALSE /\ inTimeWait' = FALSE /\ held' = FALSE
@@ -103,7 +103,7 @@ Closed(s) ==
     [] s = "CloseWait" -> "LastAck"
     [] OTHER -> s
 
-\* State::close_if_drained, on the state after the step's other effects.
+\* TcpLayer::close_if_drained, on the state after the step's other effects.
 CloseIfDrained(shutNow, txNow, s) == IF shutNow /\ ~txNow THEN Closed(s) ELSE s
 
 -----------------------------------------------------------------------------
@@ -190,7 +190,7 @@ Release ==
                  inConns, inOrphans, inTimeWait, givesUp, stopped>>
 
 -----------------------------------------------------------------------------
-\* The peer, through smoltcp's `process` and State::ingress.
+\* The peer, through smoltcp's `process` and TcpLayer::ingress.
 Live == inConns /\ ~stopped
 
 \* Data: taken while the receive half is open and before the peer's FIN.
@@ -243,8 +243,11 @@ PeerRst ==
 
 \* smoltcp's timeout: an abort, with the RST still to go out.  It can fire
 \* while the socket waits for an acknowledgement, and on a live handle's
-\* keepalives.  An orphan sends no keepalives, so FIN-WAIT-2 is left to
-\* expire_orphans.
+\* keepalives (smoltcp's `waits_for_answer`: FIN-WAIT-1, CLOSING and
+\* LAST-ACK always; ESTABLISHED and CLOSE-WAIT with bytes to send or
+\* keepalives on; FIN-WAIT-2 only with keepalives on).  `orphan` turns
+\* keepalives off, so an orphan in FIN-WAIT-2 is left to expire_orphans.
+\* A live handle is taken to have keepalives on, as a connection starts.
 Timeout ==
   /\ Live /\ tcp \in Open
   /\ tx \/ tcp \in {"FinWait1", "Closing", "LastAck"} \/ handle = "alive"

@@ -131,7 +131,7 @@ Orders(set) == {f \in [1..Cardinality(set) -> set] :
 
 Wake(ks, id) == IF ks[id].live THEN [ks EXCEPT ![id].woken = TRUE] ELSE ks
 
-\* Children visit_child, every way it can go, as pairs of the
+\* Children::visit_kid, every way it can go, as pairs of the
 \* children and the queue after it.
 Visit(ks, d, id) ==
   LET kid == ks[id]

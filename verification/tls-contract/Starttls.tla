@@ -7,16 +7,24 @@ vars == <<phase, received, plain, discarded, pending, tlsInput, produced, writte
 \* Source: tests/it/services/tls.rs 273-288 makes Secure at STARTTLS;
 \* 323-370 stops parsing at STARTTLS and, unless the session is careless,
 \* drops the rest of the chunk and later data; a careless session hands
-\* them over or refuses them. 380-384 counts output, 413-425 waits for
-\* completion before handing over. src/stdlib/layer/switch.rs 167-194
-\* routes by phase and drops a refused event Secure does not inherit when
-\* it comes again; 245-264 drops the handed-over events Secure does not
-\* inherit and transfers the rest once; services/tls/secure.rs 175-177
-\* says Secure inherits no data. Boundary abstracts the end of STARTTLS,
-\* every byte position is distinct, and Read explores every chunk boundary.
-\* pending is what the session kept past the boundary, handed over or left
-\* below: both are input the switch saw before it switched. DropSuffix is
-\* the careful session's own drop, SwitchDrops the switch's.
+\* them over (332, 352) or refuses them (Blocked at 333, Partial at 356).
+\* 380-384 counts output, 413-425 waits for completion before handing
+\* over. src/stdlib/layer/switch.rs 167-195 routes by phase: 174-180
+\* remembers (`owed`) whether the last Data the session refused, or took
+\* in part, is still held below, and 185-188 drops that one Data when it
+\* comes again after the switch; 245-266 switches, and 254-259 drops every
+\* handed-over event Secure does not inherit; services/tls/secure.rs
+\* 175-177 says Secure inherits no Data. Boundary abstracts the end of
+\* STARTTLS, every byte position is distinct, and Read explores every
+\* chunk boundary. pending is what the session kept past the boundary,
+\* handed over or left below, as one sequence: the switch drops all of
+\* it. That is what the code does because what holds a refused Data below
+\* (Chain::up, the Harness's queue head, the Driver's caller) offers one
+\* at a time, so at most one is ever owed; Written goes past it but is
+\* inherited. Data queued below that the session never saw is not in
+\* pending: the code gives it to TLS as its first input, where plaintext
+\* fails the handshake. DropSuffix is the careful session's own drop,
+\* SwitchDrops the switch's.
 Init == /\ phase = "plain" /\ received = 0 /\ plain = <<>>
         /\ discarded = <<>> /\ pending = <<>> /\ tlsInput = <<>>
         /\ produced = 0 /\ written = 0

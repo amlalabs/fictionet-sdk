@@ -20,22 +20,26 @@
 (* taken it hands over what it took and did not use (Handoff::handover). *)
 (*                                                                       *)
 (* No layer here has urgent events: `take_urgent` answers None, as the   *)
-(* trait's default does, so the urgent slot of Chain (chain.rs:140-149)  *)
-(* and of the Driver (driver.rs:206-224) stays empty and the code runs   *)
+(* trait's default does, so the urgent slot of Chain (chain.rs:150-159)  *)
+(* and of the Driver (driver.rs:283-305) stays empty and the code runs   *)
 (* exactly the statements below. A layer with urgent events (TlsLayer's  *)
 (* Written credit) can pass a refused event; this model does not cover   *)
-(* that ordering.                                                        *)
+(* that ordering, nor what the switch answers an urgent event while its  *)
+(* leftovers wait (switch.rs:190 refuses every event then, Written too). *)
+(* Nor does it cover Switch::owed (switch.rs:101, 174-188): with a B     *)
+(* that inherits every event, as the B below does, the flag is never     *)
+(* set and the statement is never reached.                               *)
 (*                                                                       *)
 (* Source correspondence (file:line in src/stdlib/layer/):               *)
-(*   Offer, the caller side of an answer   chain.rs:62 `offer`           *)
-(*   RunStep "L","S","TU","OU","TD","OD"   chain.rs:133 Chain::advance   *)
-(*   RunStep "S" and "H" in First          switch.rs:195-205             *)
-(*   RunStep "S","SB","SA" in Then         switch.rs:207-223, `feed` :101*)
-(*   SwitchEvent, SwitchCommand            switch.rs:128-159             *)
-(*   StartRun, RunStep "E"                 driver.rs:168 Driver::run     *)
-(*   SendBelow, SendAbove                  driver.rs:190-226, `send` :246*)
-(*   Deliver                               driver.rs:142, harness.rs:249 *)
-(*   Command                               driver.rs:151                 *)
+(*   Offer, the caller side of an answer   chain.rs:71 `offer`           *)
+(*   RunStep "L","S","TU","OU","TD","OD"   chain.rs:143 Chain::advance   *)
+(*   RunStep "S" and "H" in First          switch.rs:247-266             *)
+(*   RunStep "S","SB","SA" in Then         switch.rs:267-284, `feed` :140*)
+(*   SwitchEvent, SwitchCommand            switch.rs:167-211             *)
+(*   StartRun, RunStep "E"                 driver.rs:230 Driver::run     *)
+(*   SendBelow, SendAbove                  driver.rs:267-307, `send` :327*)
+(*   Deliver                               driver.rs:192, harness.rs:261 *)
+(*   Command                               driver.rs:205                 *)
 (*                                                                       *)
 (* Flags keep a part of the code as it is (TRUE) or break it (FALSE):    *)
 (*   KeepBlocked     offer keeps an item refused as Blocked              *)
@@ -93,7 +97,7 @@ Answers(c, mayClose) == (0..Len(c)) \cup (IF mayClose THEN {-1} ELSE {})
 Took(buf, c, k) == IF k > 0 THEN buf \o Pre(c, k) ELSE buf
 Dropped(set, c, k) == IF k = -1 THEN set \cup Range(c) ELSE set
 
-\* chain.rs:62 `offer`: what the slot holds after answer k to item c, and
+\* chain.rs:71 `offer`: what the slot holds after answer k to item c, and
 \* whether anything moved.
 OfferSlot(c, k) ==
   CASE k = 0 -> IF KeepBlocked THEN c ELSE None
@@ -101,7 +105,7 @@ OfferSlot(c, k) ==
     [] OTHER -> None
 OfferMoved(c, k) == IF k = 0 THEN ~BlockedIsStill ELSE TRUE
 
-\* switch.rs:101 `feed`: the queue after answer k to its first item.
+\* switch.rs:140 `feed`: the queue after answer k to its first item.
 FeedQueue(q, k) ==
   LET c == Head(q) IN
   CASE k = 0 -> q
@@ -109,7 +113,7 @@ FeedQueue(q, k) ==
                               ELSE Tail(q) \o <<Rest(c, k)>>
     [] OTHER -> Tail(q)
 
-\* What the owner keeps of the first of its queue (harness.rs:249-263).
+\* What the owner keeps of the first of its queue (harness.rs:261-277).
 OwnerQueue(q, k) ==
   LET c == Head(q) IN
   CASE k = 0 -> q
@@ -147,7 +151,7 @@ InjectDown == /\ nextDown <= ND
                              lCmdIn, lCmdOut, dBelow, bottomOut, downDropped,
                              upVars, ctlVars>>
 
-\* driver.rs:142 Driver::deliver -> Chain::on_event -> L::on_event; the
+\* driver.rs:192 Driver::deliver -> Chain::on_event -> L::on_event; the
 \* harness keeps what is handed back and drops what a closed input refuses.
 Deliver == /\ inQ # <<>>
            /\ LET c == Head(inQ) IN
@@ -158,7 +162,7 @@ Deliver == /\ inQ # <<>>
            /\ UNCHANGED <<nextUp, lOut, cUp, aIn, aOut, aUsed, swBelow, bIn, bOut,
                           dAbove, topOut, downVars, ctlVars>>
 
-\* switch.rs:145 Switch::on_command, reached through Chain::on_command:
+\* switch.rs:197 Switch::on_command, reached through Chain::on_command:
 \* A takes nothing past its boundary, and B nothing while A's leftovers wait.
 CommandAnswers(c) ==
   IF phase = "First"
@@ -176,7 +180,7 @@ Command == /\ cmdQ # <<>>
            /\ UNCHANGED <<nextDown, aCmdOut, swAbove, bCmdOut, cDown, lCmdIn,
                           lCmdOut, dBelow, bottomOut, upVars, ctlVars>>
 
-\* driver.rs:246 `send`, one turn of its loop: the held item, else the
+\* driver.rs:327 `send`, one turn of its loop: the held item, else the
 \* stack's next one, offered to a carrier that may take any part of it.
 SendBelow ==
   /\ dBelow # None \/ lCmdOut # <<>>
@@ -191,7 +195,7 @@ SendBelow ==
   /\ UNCHANGED <<nextDown, cmdQ, aCmdIn, aCmdOut, swAbove, bCmdIn, bCmdOut,
                  cDown, lCmdIn, upVars, ctlVars>>
 
-\* The same above; Chain::take_event is Switch::take_event (switch.rs:235).
+\* The same above; Chain::take_event is Switch::take_event (switch.rs:295).
 SendAbove ==
   LET source == IF phase = "First" THEN aOut ELSE bOut IN
   /\ dAbove # None \/ source # <<>>
@@ -208,7 +212,7 @@ SendAbove ==
   /\ UNCHANGED <<nextUp, inQ, lIn, lOut, cUp, aIn, aUsed, swBelow, bIn,
                  downVars, ctlVars>>
 
-\* driver.rs:168 Driver::run starts: advance until nothing moves.
+\* driver.rs:230 Driver::run starts: advance until nothing moves.
 StartRun == /\ ~running
             /\ running' = TRUE /\ pc' = "L" /\ moved' = FALSE
             /\ UNCHANGED <<upVars, downVars, phase, aDone, handovers>>
@@ -218,9 +222,9 @@ Owner == /\ ~running
             \/ SendBelow \/ SendAbove \/ StartRun
 
 ---------------------------------------------------------------------------
-(* One Chain::advance, a statement at a time (chain.rs:133-171).          *)
+(* One Chain::advance, a statement at a time (chain.rs:143-181).          *)
 
-\* chain.rs:134-136: L::advance moves any prefix of either buffer, or nothing.
+\* chain.rs:144-146: L::advance moves any prefix of either buffer, or nothing.
 StepL ==
   /\ pc = "L" /\ pc' = "S"
   /\ \/ /\ lIn # <<>>
@@ -237,7 +241,7 @@ StepL ==
                  bCmdIn, bCmdOut, cDown, dBelow, bottomOut, downDropped,
                  phase, aDone, handovers, running>>
 
-\* chain.rs:137-139 -> switch.rs:195-197 (A::advance) or :207-209 (B::advance).
+\* chain.rs:147-149 -> switch.rs:248-250 (A::advance) or :268-270 (B::advance).
 AAdvance ==
   /\ \/ /\ ~aDone /\ aIn # <<>>   \* A uses bytes as its own protocol
         /\ \E k \in 1..Len(aIn) : aUsed' = aUsed \cup Range(Pre(aIn, k)) /\ aIn' = Rest(aIn, k)
@@ -269,7 +273,7 @@ StepS ==
                  nextDown, cmdQ, swAbove, cDown, lCmdIn, lCmdOut, dBelow,
                  bottomOut, downDropped, phase, handovers, running>>
 
-\* switch.rs:199-205: once A is past its boundary with its output taken,
+\* switch.rs:251-265: once A is past its boundary with its output taken,
 \* its leftovers join the switch's queues, in any chunking, and B runs.
 \* Switch::advance then returns true without feeding.
 StepH ==
@@ -290,7 +294,7 @@ StepH ==
                  cDown, lCmdIn, lCmdOut, dBelow, bottomOut, downDropped, aDone,
                  running>>
 
-\* switch.rs:211-216: the first leftover from below, offered to B.
+\* switch.rs:271-276: the first leftover from below, offered to B.
 StepSB ==
   /\ pc = "SB" /\ pc' = "SA"
   /\ IF swBelow # <<>>
@@ -304,7 +308,7 @@ StepSB ==
   /\ UNCHANGED <<nextUp, inQ, lIn, lOut, cUp, aIn, aOut, aUsed, bOut, dAbove,
                  topOut, downVars, phase, aDone, handovers, running>>
 
-\* switch.rs:217-222: the first leftover from above, offered to B.
+\* switch.rs:277-282: the first leftover from above, offered to B.
 StepSA ==
   /\ pc = "SA" /\ pc' = "TU"
   /\ IF swAbove # <<>>
@@ -319,7 +323,7 @@ StepSA ==
                  lCmdOut, dBelow, bottomOut, upVars, phase, aDone, handovers,
                  running>>
 
-\* chain.rs:150-153: with the slot empty, take L's next event.
+\* chain.rs:160-163: with the slot empty, take L's next event.
 StepTU ==
   /\ pc = "TU" /\ pc' = "OU"
   /\ IF cUp = None /\ lOut # <<>>
@@ -328,7 +332,7 @@ StepTU ==
   /\ UNCHANGED <<nextUp, inQ, lIn, aIn, aOut, aUsed, swBelow, bIn, bOut, dAbove,
                  topOut, upDropped, downVars, phase, aDone, handovers, running>>
 
-\* chain.rs:154-159 -> switch.rs:128-143: offer the slot's event to the
+\* chain.rs:164-169 -> switch.rs:167-195: offer the slot's event to the
 \* switch, and keep what it hands back.
 EventAnswers(c) ==
   IF phase = "First"
@@ -348,7 +352,7 @@ StepOU ==
   /\ UNCHANGED <<nextUp, inQ, lIn, lOut, aOut, aUsed, swBelow, bOut, dAbove,
                  topOut, downVars, phase, aDone, handovers, running>>
 
-\* chain.rs:160-163: with the slot empty, take the switch's next command.
+\* chain.rs:170-173: with the slot empty, take the switch's next command.
 StepTD ==
   LET source == IF phase = "First" THEN aCmdOut ELSE bCmdOut IN
   /\ pc = "TD" /\ pc' = "OD"
@@ -361,7 +365,7 @@ StepTD ==
                  dBelow, bottomOut, downDropped, upVars, phase, aDone,
                  handovers, running>>
 
-\* chain.rs:164-169: offer the slot's command to L.
+\* chain.rs:174-179: offer the slot's command to L.
 StepOD ==
   /\ pc = "OD" /\ pc' = "E"
   /\ IF cDown # None
@@ -375,7 +379,7 @@ StepOD ==
                  lCmdOut, dBelow, bottomOut, upVars, phase, aDone, handovers,
                  running>>
 
-\* driver.rs:178-182: advance again while something moved.
+\* driver.rs:246-256: advance again while something moved.
 StepE ==
   /\ pc = "E"
   /\ IF moved THEN pc' = "L" /\ moved' = FALSE /\ UNCHANGED running

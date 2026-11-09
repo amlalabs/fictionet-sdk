@@ -70,10 +70,22 @@ interleaving. The original `Region` configurations remain the single-region
 checks. See `VERIFICATION.md` for scope and the unavailable direct Kani
 attempt over the real mutex path.
 
-`JobContext.tla` projects `Jobs::poll` and the counted context lease in
-`src/cx.rs`. A completed job keeps admission open while a returned value
-retains its context; cancellation ignores those references but still drains
-active tasks. It bounds borrowed references at two and tasks at one.
-Its base config checks borrowed admission and task draining; removing the
-borrow check closes admission before a returned body can start work. This
-is a lifecycle projection, not a model of atomic reference counts or wakers.
+`JobContext.tla` projects `Jobs::poll` (`src/stdlib/services/stack/job.rs`)
+and the counted context lease (`ContextLease` in `src/cx.rs`). A completed
+job keeps admission open while a returned value retains its context;
+cancellation ignores those references but still drains active tasks. A
+cancel closes nothing by itself: a retained context can still be cloned and
+can still start a task until the region completes, since `Cx::clone` and
+`Region::try_start_task` check neither `cancelled` nor the lease, and the
+model allows both after its `Cancel`. It bounds borrowed references at two
+and tasks at one. Its base config checks borrowed admission and task
+draining; removing the borrow check closes admission before a returned body
+can start work. This is a lifecycle projection, not a model of atomic
+reference counts or wakers.
+
+Two more things the region models leave out: `Region.tla`'s `Spawn` asks
+only the child region's `completed`, while `Region::try_start_task` also
+refuses a task when an ancestor has completed or expired, which
+`RegionTree.tla` checks; and `LabClock.tla` wakes idle waits in task-number
+order, while `RunState::poll` wakes them in registration order (`Queue::idle`
+is keyed by `next_idle`). No property of either model reads that order.

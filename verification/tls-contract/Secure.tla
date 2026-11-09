@@ -7,12 +7,12 @@ vars == <<state, queue, slot, produced, received, builds, earlyBuild,
           badDelivery, chosen, negotiated>>
 
 \* Paths below are relative to src/stdlib.
-\* services/tls/secure.rs:121-135 drives the lower layer, checks
-\* Handshake, consumes make, then drives Chain. Driven::step (168-178)
-\* stages output before the guard; extraction (239-245) only moves snapshots.
-\* Driven uses Layer's no-op advance (layer/mod.rs:403-405).
-\* Chain::advance (layer/chain.rs:144-196) holds one refused event; offer (74-87) preserves its suffix.
-\* Later (choice.rs 173-201, 225-235) refuses until set. Lower protocol
+\* services/tls/secure.rs:123-138 drives the lower layer, checks
+\* Handshake, consumes make, then drives Chain. Driven::step (189-200)
+\* stages output before the guard; extraction (260-266) only moves snapshots.
+\* Driven uses Layer's no-op advance (layer/mod.rs:414-416).
+\* Chain::advance (layer/chain.rs:143-181) holds one refused event; offer (71-83) preserves its suffix.
+\* Later (choice.rs 173-199, 222-231) refuses until set. Lower protocol
 \* processing is abstracted by Establish/Fail; early bytes may already be
 \* emitted by a replacement. Byte identities represent their stream offsets.
 \* The lower contract is FIFO, no loss, and sticky failure. Backpressure is

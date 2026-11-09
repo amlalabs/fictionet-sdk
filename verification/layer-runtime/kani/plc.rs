@@ -1,5 +1,5 @@
 //! Kani harnesses over the Nuclear PLC's Modbus/TCP server, `PlcServer`
-//! (demos/nuclear/world/src/plc.rs:64-149), the layer `plc::stack` puts
+//! (demos/nuclear/world/src/plc.rs:64-157), the layer `plc::stack` puts
 //! on `Framed` (plc.rs:52-62).
 //!
 //! Included from `demos/nuclear/world/src/plc.rs` under `cfg(kani)` as a

@@ -101,8 +101,8 @@ the stack took input again"), and so did a new one,
 byte, waits 250 ms and writes another, to a stack that writes nothing back,
 under a 300 ms limit, had its input ended "300ms after the first bytes".
 The port (commit `6aa68ae5f`) restarts the clock on bytes read
-(`live.rs:213`) and written (`live.rs:320`), and when waiting begins
-(`was_waiting`, `live.rs:346-349`); both tests pass.
+(now `live.rs:216`) and written (`live.rs:329`), and when waiting begins
+(`was_waiting`, `live.rs:355-358`); both tests pass.
 
 ## Bug 3: a closed socket lost the stack's last datagrams
 
@@ -128,7 +128,7 @@ On the merged foundation, `run_datagrams` returned on
 `socket_closed && input.is_none() && jobs.is_empty()` after its `FAIR`
 rounds, settled or not, and the test failed again (64 sent, not 200).
 The port (commit `33fd898e0`) adds `settled` to that condition
-(`stack/mod.rs:302`); the test passes.
+(now `stack/mod.rs:408`); the test passes.
 
 ## The stream runner: `StreamRunner.tla`
 
@@ -151,11 +151,26 @@ and the run is finished, or the peer is gone.
 A round from the wait runs only if something can move then: the peer
 sent, the transport takes a write, the peer is gone, or the sleep is due.
 
+The model's line references were written against commit `df01d0a5f` and
+now name the lines of `e2858ccc4`; the code they stand for is unchanged
+except where this file says so. After the `090aba987` reruns the runner
+gained, in `f51fa312c` and `00e3c371b`, a `jobs.close_completed()` call
+at the top of each round (`live.rs:226-228`) and the cancel-wins checks
+of `stream` (`mod.rs:274-276`, `281-283`). The modeled stack asks for no
+work, and cancellation is outside the model, so neither changes a modeled
+round; the read, report, offer, run, send and limit steps of `Live::step`
+are the same code at new line numbers. `Live::finished` also requires
+`unreported == 0` (`live.rs:146`), which the model does not state: its
+stack is `Framed`, which always takes a `Written` (`framed.rs:185`), so a
+settled round has nothing unreported. A stack that blocks a `Written`
+(none of the stacks here do) would keep `unreported` across a settled
+round, and the model does not explore that.
+
 The stack is abstract: an echo with room for one byte, which moves input to
 output when it runs, asks to end its direction when it heard the end of
 its input or early, refuses input for three ticks on a timer of its own,
 and may ask for a reset. Its commands come out writes first, then reset or
-end, as `Framed::take_command` (`framed.rs:183-195`) orders them; its
+end, as `Framed::take_command` (`framed.rs:251-263`) orders them; its
 output after its End is refused, as `Framed::on_command` does. It asks for
 no work, so the runner's `jobs` stay empty. The peer sends up to two
 bytes, may end its direction, may reset, and may stop reading for good; a
@@ -203,7 +218,22 @@ Properties:
 Each was rerun with `-workers 4 -Xmx6g` using the JDK in
 `~/.cache/adorably-fv/jdk`, under an 8 GiB systemd memory cap and no
 swap. State directories were on the home volume. TLC
-stops at the first violation. The `_without_restartidleonwait` trace is
+stops at the first violation, so the state counts of a violated
+configuration vary with the worker schedule between runs. On November 9,
+2026, at `e2858ccc4` (the model's comments pointed at that commit's
+lines, with no change to any action, property or configuration), the six
+short mutations were rerun with `-workers 2 -Xmx2g` and each violated the
+property its row names: `_without_finishinput` (61,160 generated, 976
+distinct), `_without_readonlywhentaken` (52,869, 862),
+`_without_keeppartialrest` (5,730, 150), `_without_reportonce` (15,043,
+359), `_without_writebeforeend` (3,358, 65), `_without_resetonbreak`
+(456, 20). The same day's run of the whole tree on `main` at that commit
+reproduced `_without_idleresetonread` (`IdleNeedsQuiet`, 2,842,492
+generated, 20,179 distinct), `_without_restartidleonwait`
+(`IdleNeedsQuiet`, 2,772,001, 19,658) and `_without_stallresetonprogress`
+(`StallNeedsNoProgress`, 3,815,554, 26,903); `StreamRunner_base.cfg`,
+`StreamRunner_halfclose.cfg` and `_without_writetimeout.cfg` were still
+running when this was written. The `_without_restartidleonwait` trace is
 the one of Bug 2: the stack ends its direction at once, the shutdown pends
 for two ticks while the runner holds the End, it completes with no byte
 written, and the next check ends the input with `idle_from` still at zero.
@@ -266,12 +296,24 @@ old `settle` sent first; the model's round follows the new order.
 | `Arrive`, `Close`, `Tick` | the environment |
 
 The stack has the shape of `TimeServer`: at most one reply per datagram it
-takes, the next datagram refused while a reply waits; and also a timer
-that sends one datagram when it fires (and may hold input refused until
-then), a choice to close the socket itself with one more datagram queued
-after the End, and a backlog of three replies it sends one per step after
-the socket closes. It asks for no work, so `jobs` stay empty. Three
-datagrams arrive; `Fair` is 2.
+takes; and also a timer that sends one datagram when it fires (and may
+hold input refused until then), a choice to close the socket itself with
+one more datagram queued after the End, and a backlog of three replies it
+sends one per step after the socket closes. It asks for no work, so `jobs`
+stay empty. Three datagrams arrive; `Fair` is 2. `TimeServer` also
+refuses the next datagram while a reply waits to be taken, and the model
+writes that rule down, but under this runner it never applies: the sink
+takes every `Send` at once (`mod.rs:391-395`), so the stack's output
+queue is empty whenever a round starts. The only refusal TLC explores is
+the pause; the refusal while a reply waits is proved on the real server
+by the Kani harness `one_conversation_answers_each_request_in_turn`.
+
+The model's line references were written against `df01d0a5f` and now
+name the lines of `e2858ccc4`. Since the `090aba987` reruns the loop
+gained `jobs.close_completed()` calls (`mod.rs:363-365`, `409`,
+`432-434`) and the cancel-wins check before a return (`mod.rs:411-413`);
+with no work and no cancellation in the model, the rounds it describes
+are unchanged.
 
 Properties: `InOrderOnce` (one conversation took every datagram the socket
 got, in order, each once, besides the one held and those queued);
@@ -291,6 +333,17 @@ closed socket ends the run).
 | `_without_settlebeforeclose` | returning before settling | 488 | 113 | `CloseFlushes` violated |
 | `_without_deadlineinwait` | the wait ignores the stack's deadline | 25,674 | 4,957 | `TimerFires` violated |
 | `_without_returnonclose` | no return on a closed socket | 33,678 | 6,053 | `CloseEnds` violated |
+
+All eight were rerun on November 9, 2026, at `e2858ccc4`, after the
+model's comments were pointed at that commit's lines (no action,
+property or configuration changed), with `-workers 2 -Xmx2g`: the base
+configuration passed with the same 32,196 generated and 5,787 distinct
+states, `_without_deadlineinwait` and `_without_returnonclose` violated
+their temporal properties with the same counts as above, and the five
+invariant mutations violated the invariant their row names (at counts
+that vary with the worker schedule: 4,350/834, 1,385/274, 43/24, 147/43
+and 1,133/210). The run of the whole tree on `main` at the same commit
+gave the same verdicts.
 
 What it leaves out: datagram contents and addresses (each datagram is its
 number; that answers go to the address the stack names is a Kani property
@@ -335,7 +388,7 @@ Neither runner model covers region cancellation or the work's own region
 not by TLC. The runner code changed for them, so both runner models were
 rerun on it: `StreamRunner_base.cfg`, `StreamRunner_halfclose.cfg` and
 `DatagramRunner_base.cfg` pass with the state counts recorded in their
-tables below.
+tables above.
 
 ## Kani over the connection count: `kani/admission.rs`
 
@@ -365,11 +418,14 @@ real `Stream`, `Buffer`, `Budget`, `Charge`, `Chunk` and `Driver`.
 | `every_charge_comes_back_*`, 10 harnesses | under budgets of 0, 6, 8, 13 and 14 bytes: two bytes from the peer and a value from above, either of which the budget may refuse, then two steps in ten orders (end, reset, end from above, taken event, taken write, its delivery): a refusal takes no byte; the budget holds exactly what `Framed` and the chunk in flight are charged, never past its limit; a written value is charged at least its length; nothing is left once they are dropped | all 10 verified, 2 to 9 s each |
 | `units_come_up_in_order_and_the_rest_is_handed_back_odd_first_cut_3` | a three-byte unit (payload any) and a one-byte one in two pushes, then the end: each comes up once, in order, then `Ended` | verified, 3 s |
 | `a_decoder_failure_comes_up_once_then_ended` | against any steps of `Steps`, through any three of input, end, reset and taken events and three more taken events: no item after a failure; a failure comes up once with `Ended` right after; nothing after `Ended`; once either came up, input is over, and input offered after its end is refused as `Closed` and changes nothing | verified, 362 s |
+| `encoding_is_not_called_without_its_reservation` | a value whose `write_bound` is 64, under any budget below 64: `Framed::on_command` answers `FramedError::Budget`, the writer (which panics if entered) never runs, and the budget holds nothing | verified (the readiness pass, 1 to 3 s) |
+| `a_decoded_allocation_keeps_its_charge_outside_the_layer` | a decoder whose item allocates one byte, under a budget of 8: the item comes up `Owned` with a charge of at least its capacity, the charge stays in the budget after the layer is dropped, and leaves with the item | verified (the readiness pass, 1 to 3 s) |
 
 Before Bug 1's fix, the charge harnesses fail (see the mutations below).
 
-On the merged foundation all 21 were rerun in one `cargo kani -p fictionet
--Z stubbing` under a 12 GB memory cap, and all verified: the nine charge
+On the merged foundation the first 21 were rerun in one `cargo kani -p fictionet
+-Z stubbing` (the flag was for a shared run; no harness in this directory
+stubs anything) under a 12 GB memory cap, and all verified: the nine charge
 harnesses in 47 to 80 s each, the ten `every_charge_comes_back_*` in 4 to
 16 s, the ordering harness in 5 s and the decoder-failure harness in
 303 s.
@@ -412,10 +468,13 @@ writer. These are implementer contracts, not inferred bounds for arbitrary
 small proof decoders implement these contracts; ordinary codec consumers
 keep their existing interfaces.
 
-The new refusal harness makes its writer panic if entered and proves that
-no budget below its output bound invokes it. The new owned-allocation
-harness decodes an allocated byte vector, drops its layer while retaining
-the item, and checks that the reservation remains until the item is dropped.
+The refusal harness (`encoding_is_not_called_without_its_reservation`)
+makes its writer panic if entered and proves that no budget below its
+output bound invokes it. The owned-allocation harness
+(`a_decoded_allocation_keeps_its_charge_outside_the_layer`) decodes an
+allocated byte vector, drops its layer while retaining the item, and
+checks that the reservation remains until the item is dropped. Both are
+in the table above.
 The PLC proof setup now supplies and receives owned frames with reservations;
 its request ordering and identity assertions are unchanged.
 
@@ -532,7 +591,7 @@ version of 1 to 7 (modes 0, 2 and 4 to 7, or modes 1 and 3 with versions 5
 to 7) ran out of 10 GiB when driven through `TimeServer`, and so did a
 whole header with every byte the solver's. Those refusals are proved on
 `Packet::parse` and `server_reply` above, and `TimeServer` sends nothing
-when its `answer` gives `None` (`ntp.rs:96-101`), which the length and
+when its `answer` gives `None` (`demos/search/world/src/ntp.rs:104-111`), which the length and
 version-0 harnesses exercise; that the two compose inside `TimeServer`
 for those headers is shown by the test
 `one_conversation_answers_each_request_and_nothing_else` (a server's

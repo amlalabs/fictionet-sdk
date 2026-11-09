@@ -7,7 +7,7 @@
 //! parses and is not a request, driving `TimeServer` did not fit in
 //! 10 GiB, so this proves the refusal here, on the function `TimeServer`
 //! calls, and `TimeServer` sends nothing when it refuses
-//! (`ntp.rs:96-101`: no reply without `Some`).
+//! (`demos/search/world/src/ntp.rs:104-111`: no reply without `Some`).
 
 use super::*;
 
@@ -70,7 +70,7 @@ fn a_reply_comes_only_for_a_request_and_carries_its_transmit_time() {
 
 /// A header whose mode bits are 0, 6 or 7 does not parse, whatever its
 /// other bytes; `TimeServer` answers nothing it cannot parse
-/// (`demos/search/world/src/ntp.rs:48`).
+/// (`demos/search/world/src/ntp.rs:50`).
 #[kani::proof]
 #[kani::unwind(50)]
 fn a_header_of_mode_0_6_or_7_does_not_parse() {

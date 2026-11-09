@@ -22,7 +22,7 @@ so `Children.tla` and the Kani proofs describe the same code. `chain.rs`,
 `driver.rs` and `switch.rs` gained an urgent path: while the next layer
 refuses an event, a layer's `take_urgent` events (TLS's write credit) go
 past it, one at a time, through a slot of their own in `Chain`
-(`chain.rs:140-149`) and in the `Driver` (`driver.rs:206-224`).
+(now `chain.rs:150-159`) and in the `Driver` (now `driver.rs:283-305`).
 `Route.tla` has no layer with urgent events: with `take_urgent` answering
 None, the trait's default, the code runs exactly the statements the model
 does, and the line numbers above are the merged ones. The order in which
@@ -75,13 +75,15 @@ does, and `Driver::run` advances until nothing moves.
 | --- | --- |
 | `OfferSlot`, `OfferMoved` | `chain.rs:71` `offer` |
 | `StepL`, `StepS`, `StepTU`, `StepOU`, `StepTD`, `StepOD` | `chain.rs:143` `Chain::advance` |
-| `StepS`, `StepH` (first phase) | `switch.rs:245-266` |
+| `StepS`, `StepH` (first phase) | `switch.rs:247-266` |
 | `StepS`, `StepSB`, `StepSA` (second phase), `FeedQueue` | `switch.rs:267-284`, `feed` at `switch.rs:140` |
 | `EventAnswers`, `CommandAnswers` | `switch.rs:167-211` `Switch::on_event`, `on_command` |
-| `StartRun`, `StepE` | `driver.rs:230` `Driver::run` |
-| `SendBelow`, `SendAbove` | `Driver::send_below` at `driver.rs:270`, `send_above` at `driver.rs:281`, and `send` at `driver.rs:330` |
-| `Deliver`, `OwnerQueue` | `driver.rs:192`, `Harness::settle` in `harness.rs` |
+| `StartRun`, `StepE` | `driver.rs:230` `Driver::run`, the loop at `driver.rs:238-256` |
+| `SendBelow`, `SendAbove` | `Driver::send_below` at `driver.rs:267`, the `send` call in `send_above` at `driver.rs:292`, and `send` at `driver.rs:327` |
+| `Deliver`, `OwnerQueue` | `driver.rs:192`, `Harness::settle` at `harness.rs:261-277` |
 | `Command` | `driver.rs:205` |
+
+The line numbers are those of main at `e2858ccc4` (November 9, 2026).
 
 What is checked:
 
@@ -124,6 +126,32 @@ its queue.
 - The contract on `Handoff` implementations. The model's `A` hands over
   only once its own output has been taken, as the trait asks. A layer that
   hands over with output still queued loses it; the switch cannot check this.
+  Urgent output (`take_urgent`) is output too: an `A` dropped at
+  `switch.rs:264` with a completion not yet handed up loses it the same way.
+- Urgent events, and what they leave unchecked. `UpLine` has no place for
+  `Chain::urgent` (`chain.rs:22`) or `Driver::urgent` (`driver.rs:122`).
+  No layer hands stream bytes through `take_urgent` (its thirteen
+  implementations return a `Written` or delegate), so no byte can leave
+  `UpLine` through those slots and `UpConserved` loses nothing by their
+  absence. What is unproven is the handling of the urgent event itself:
+  `offer` at `chain.rs:158` and the arms at `driver.rs:286-288` and
+  `driver.rs:301-303` keep a `Partial` rest or a `Blocked` event, and a
+  `Closed` answer drops it, by reading only. `Route_urgent` moves one whole
+  token and assumes the upper layer takes it (`OfferChainUrgent` has no
+  refusal). The switch breaks that assumption: in its second phase
+  `Switch::on_event` answers `Blocked` to every event while leftovers wait
+  (`switch.rs:190`), a `Written` included, although completions are counted
+  apart from the data (`switch.rs:49-50`) and need no ordering against it.
+  A successor that takes no data until its writes complete then waits for
+  ever: see the hazard under the audit below.
+- `Switch::owed` (`switch.rs:101`, set at `switch.rs:174-180`, consumed at
+  `switch.rs:185-188`). With a `B` that inherits every event, as the model's
+  does, `declined` is never true, the flag is never set and the consuming
+  arm is never reached: the model is exact for that `B`. With a `B` that
+  declines data, the event `A` refused before the switch is taken and
+  dropped on its next offer: a byte leaves `UpLine` into nothing, which
+  `UpConserved` would call a loss. That is the intended STARTTLS behaviour
+  and is checked by `verification/tls-contract/Starttls.tla`, not here.
 - Byte contents and protocol meaning. `A`'s handover keeps everything it did
   not use, and the model's `B` inherits every event, as tunnels and the
   HTTP upgrades do. A successor that declines input from before the switch
@@ -396,8 +424,8 @@ region's task-joining internals. Fixed byte reservations and shared backing
 ownership are exercised against Rust; credit conservation alone does not
 prove all allocations have charges.
 
-A model `Advance` visits its finite set of children. Rust divides a sweep
-into at most 64 child visits and explicitly continues until the sweep ends;
+A model `Advance` visits its ready children. Rust divides a sweep
+into at most 64 child visits (`children.rs:1077-1081`) and explicitly continues until the sweep ends;
 work selection rotates after its last successful extraction. A regression
 with 70 continuously productive children exercises full output queues and
 multiple bounded visit groups. Small model
@@ -411,7 +439,14 @@ a cancelled pending handler, a completing sibling and parent control.
 ## Proofs against the Rust: `kani/mod.rs`
 
 [`kani/mod.rs`](kani/mod.rs) is compiled into `src/stdlib/layer/mod.rs`
-under `cfg(kani)` and calls the production code through its public API.
+under `cfg(kani)` (`#[path]` at `mod.rs:214-215`) and calls the production
+code through its public API. It holds sixteen harnesses: the thirteen in
+the table below, `charges_sum_to_the_budget_and_never_pass_its_limit`
+(under "Refusing a child whose inbox is full"),
+`stream_credit_splits_keep_the_allocation_owned` and
+`work_cancellation_stays_with_its_owner` (under "Shared stream backing
+and cancellation harnesses"). No harness uses `#[kani::stub]`; the
+`-Z stubbing` flag in the combined run below enabled nothing.
 
 | Harness | Proves |
 | --- | --- |
@@ -463,22 +498,28 @@ git); each change below made its harness fail:
 
 | Change (file:line) | Harness | Result |
 | --- | --- | --- |
-| `Slots::entry` ignores the generation (`carrier.rs:464`) | `slots_never_answer_a_stale_id` | fails: `contains` answers the closed child's id |
-| `Slots::entry` ignores the scope (`carrier.rs:459`) | `slots_never_answer_another_connections_id` | fails: `contains` answers the other connection's id |
-| `Slots::insert` refuses only past the limit (`>` for `>=`, `carrier.rs:436`) | `slots_refuse_past_the_limit` | fails: an insert at the limit is taken |
+| `Slots::entry` ignores the generation (now `carrier.rs:688`) | `slots_never_answer_a_stale_id` | fails: `contains` answers the closed child's id |
+| `Slots::entry` ignores the scope (now `carrier.rs:683`) | `slots_never_answer_another_connections_id` | fails: `contains` answers the other connection's id |
+| `Slots::insert` refuses only past the limit (`>` for `>=`, now `carrier.rs:654`) | `slots_refuse_past_the_limit` | fails: an insert at the limit is taken |
 | `Charge::split` skips its check (`budget.rs:127`) | `charges_split_and_drop_within_the_limit` | fails: subtraction overflow |
 | `Charge`'s drop gives nothing back (`budget.rs:140`) | `charges_split_and_drop_within_the_limit` | fails: `used()` is not the sum of the live charges, and not zero at the end |
-| `Timers::next` breaks ties to the last armed (`timers.rs:57`) | `timers_in_order_three_names` | fails: `next` is the later of two timers due at once |
-| `Timers::fire` fires a timer not yet due (`timers.rs:65`) | `timers_cancel_fire_and_retain_touch_one_name` | fails: `fire` reports a timer that was not due |
-| `Chunk::advance` cuts the end instead of the front (`carrier.rs:55`) | `a_chunk_cursor_keeps_the_rest_in_place` | fails: the bytes left are not the suffix |
+| `Timers::next` breaks ties to the last armed (now `timers.rs:79`) | `timers_in_order_three_names` | fails: `next` is the later of two timers due at once |
+| `Timers::fire` fires a timer not yet due (now `timers.rs:87`) | `timers_cancel_fire_and_retain_touch_one_name` | fails: `fire` reports a timer that was not due |
+| `Chunk::advance` cuts the end instead of the front (now `carrier.rs:75-78`) | `a_chunk_cursor_keeps_the_rest_in_place` | fails: the bytes left are not the suffix |
+
+The mutations were applied to the code of that time; "now" gives the line
+of the same statement on main at `e2858ccc4`. They were not rerun for this
+audit.
 
 One more change survived, and correctly so: `Timers::next` keyed by the
-time alone, without the arming count (`timers.rs:57`, run against
+time alone, without the arming count (then `timers.rs:57`, run against
 `timers_in_order_first_armed_twice`), still passes. `set` removes a name
 before pushing it at the end, and `retain` keeps the order, so the vector
 is always in arming order and `min_by_key` already returns the first of
 equal keys. The arming count is redundant; the order stays right without
-it.
+it. That is now the code: `Timers` is eight inline slots with no arming
+counter (`timers.rs:14-17`), `set` cancels then appends (`timers.rs:35-44`)
+and `next` is `min_by_key` over them (`timers.rs:75-81`).
 
 ### What the Kani proofs leave out
 
@@ -681,3 +722,104 @@ The isolation run completed in 1 hour 32 minutes, including its final
 temporal check. No configuration or property was weakened for this run.
 All Cargo, Kani and TLC invocations used the 10 GiB scope with swap disabled;
 Cargo used four build jobs and the dedicated world-composition target.
+
+## Audit against main `e2858ccc4` (November 9, 2026)
+
+Both models were read statement by statement against the code after the
+profiling merge (`children.rs` kept in a slab with intrusive ready and work
+lists and a deadline heap). No action, property, constant or config
+changed; the edits are the line references above and in the models'
+comments, the README's harness list, and this section.
+
+`Children.tla` after the profiling pass. The ready rules of the model
+are the code's: a child joins the ready list when opened
+(`children.rs:919`), when an event is placed (`:985`), when credit comes
+(`:992`, the `"credit"` wake), after a timer, a result or handed-out work
+(`called` with `ready` true at `:1039`, `:1063`, `:1115`), when payload is
+released or its work wakes it (`ChildWake::notify` → `collect_wakes`,
+`:634-646`, the `"release"` wake), and after a visit that moved or found
+the queue full (`visit`, `:726`, the `"waiting"` wake). `advance`
+(`:1077-1086`) pops the head of the list as many times as it had members
+when it started; a child pushed back goes to the tail and waits for the
+next advance, so each advance visits each child that was ready at its
+start exactly once, in list order. The model's `Advance` visits the same
+set in any order: a superset. `visit_kid` (`:732-833`) is `Visit`
+statement for statement: urgent place first (`:749-758`), one inbox event
+(`:759-781`), a new command (`:782-785`), the send within credit and the
+reserve (`:797-811`), released credit and the grant (`:813-823`). What the
+model does not see:
+
+- One event per visit. The code's inbox is one FIFO of data and empty
+  events and a visit pops one of them (`:759`); the model's `Visit` may
+  take a data event and consume an empty one in the same step. The
+  model's visits are therefore never slower than the code's, which is
+  sound for the safety invariants and for `BoundedItems` (the code admits
+  only while `inbox.len() < QUEUE`, `:712`, as `Full` says), but a
+  liveness failure that needs the single-pop pace would not show.
+- Blocked opens and control. `Opened` is handed back when `down` is full
+  (`:860-866`), a `Control` event when `up` is full (`:999-1001`), and a
+  control command when `down` is full (`:1014-1016`). The model's
+  `Opened` never blocks, and `MuxNeverHeld` speaks only of child events,
+  so these holds are outside it. They clear as the mux takes commands and
+  the layer above takes events, which the mux does without delivering
+  anything (`MuxTake`), so no deadlock hides there; the model does not
+  show it.
+- Reset as an event. `MuxEvent::Child(id, Reset)` (`terminal_reset`,
+  `:926-939`) removes the child, cancels its work, offers the reset to
+  the layer and queues a `Close`. From Children's side that is the shape
+  of the `MayFail` close in `Visit`, not of `MuxPeerClose`, which is
+  `MuxEvent::Closed` (`:995-997`, no `Close` queued). Configurations with
+  `MayFail` false do not reach it.
+- `MuxWritten` only reaches a waiting child. The code places a `Written`
+  at any time (`:960-961`); a child with `urgent` set and `waiting`
+  false is unreachable in the model and ordinary in the code. Its visit
+  offers the completion first either way.
+- Refusals the model does not have: an atomic command past `max_command`
+  (`:789-792`), a command whose payload the budget refuses (`:793-796`),
+  and `Overrun::Budget` when receive backing cannot be reserved
+  (`:974-976`), which ends the connection like a credit overrun.
+- The release handshake. `ChildWake::release` adds to a counter and wakes
+  the child only outside a call (`:285-290`); `take_released` collects it
+  at the end of a visit (`:813`). The model's `Release` moves the credit
+  to `owed` and wakes the child in one step. The argument that no release
+  is lost is the comment at `:278-283`; the model does not check it.
+- The layer's own `advance` returning true (`:742`) keeps a child ready
+  with nothing else moving; the model's `moved` has no such term.
+
+`Route.tla` matches `Chain::advance`, `Switch::advance`, `Switch::on_event`
+and `on_command`, `Driver::run`, `send` and the harness's input loop as the
+table above says, with the urgent slots and `owed` left out as described
+under "What `Route.tla` leaves out". One hazard in the code follows from
+that omission and is not a model finding, since no model here has a
+`Written`:
+
+- `Switch::on_event` in its second phase answers `Blocked` to every event
+  while leftovers wait (`switch.rs:190`), a `Written` from the layer below
+  included, whether it arrives through `Chain::urgent` or from the runner.
+  `Layer::take_urgent`'s contract is that the port above takes every
+  completion it is offered (`mod.rs:420-427`). `Http2` is a successor
+  (`web/httpd/native.rs:97`, `detect.rs:33`), refuses data while
+  `out_bytes >= OUT_LIMIT` (`http2.rs:1416`, 64 KiB at `:66`) and lowers
+  `out_bytes` only in `written` (`:1337`). So: an h2c upgrade or a
+  prior-knowledge preface whose leftovers hold enough pipelined requests
+  for the responses to pass 64 KiB before `Http2` takes the next leftover
+  chunk; the transport writes them and reports `Written`; the switch
+  refuses it because `below` is not empty; `Http2` never learns, refuses
+  the leftover for ever, and the connection stops. The `Tunnel` successor
+  ignores `Written` (`stack/tunnel.rs:160`) and is not affected. Not run;
+  reported from reading.
+
+Runs on main at `e2858ccc4` by the shared check (two workers, 2 GiB heap,
+`check-all/results.tsv`): `Route_base` and `Route_urgent` pass; the nine
+`Route_without_*` configs violate the property their README row names
+(`RunEnds`, `UpConserved` ×5, `DownConserved`, `HandoverOnce`,
+`UrgentProgress`); `Children_base`, `_budget`, `_budget_stalled`,
+`_commands_base`, `_large_command`, `_readiness`, `_refuse_base`,
+`_refuse_full` and `_stalled_base` pass; the fourteen `Children_without_*`
+configs violate their named property (`CommandCredit`, `EventCredit`,
+`BoundedJobs`, `NoStaleDelivery` ×2, `NoCancelledPoll` as invariants; the
+rest as the only temporal property in their config). `Route_wide_base` and
+`Children_isolation` had not finished when this was written. After the
+comment edits, `Route_base` was rerun (1,569,747 generated, 1,058,166
+distinct, depth 83, all pass) and `Children_readiness` (76,122 generated,
+10,619 distinct, depth 21, all pass), the counts recorded above.
