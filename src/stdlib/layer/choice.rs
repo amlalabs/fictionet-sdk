@@ -1,7 +1,7 @@
 //! Layers chosen at run time: one of two made at the start, or one made
 //! once what it runs on has negotiated it.
 
-use fictionet::stdlib::layer::{Admit, CommandOf, Env, EventOf, Layer, Side};
+use fictionet::stdlib::layer::{Admit, CommandOf, Credited, Env, EventOf, Layer, Side};
 use fictionet::time::Instant;
 
 /// One of two layers with the same ports, chosen when the stack is made:
@@ -155,9 +155,10 @@ where
 /// is: what runs over TLS, made from the name and protocol the handshake
 /// settled.
 ///
-/// Until it is [`set`](Self::set) it takes nothing, from below or above,
-/// and gives nothing, so what is offered waits where it is, in order, and
-/// reaches the layer first once it is there. Put it on top of the layer
+/// Until it is [`set`](Self::set), ordinary input and commands wait in order
+/// and reach the layer first once it is there. Urgent events are accepted
+/// and discarded because no upper layer exists to receive them. It gives
+/// nothing until set. Put it on top of the layer
 /// that decides with [`Chain`](super::Chain), and set it from whatever
 /// owns the chain.
 pub struct Later<U> {
@@ -198,7 +199,10 @@ impl<U> Later<U> {
     }
 }
 
-impl<U: Layer> Layer for Later<U> {
+impl<U: Layer> Layer for Later<U>
+where
+    EventOf<U::Lower>: Credited,
+{
     type Lower = U::Lower;
     type Upper = U::Upper;
     type Report = U::Report;
@@ -226,6 +230,7 @@ impl<U: Layer> Layer for Later<U> {
     ) -> Result<Admit<EventOf<U::Lower>>, U::Error> {
         match &mut self.layer {
             Some(layer) => layer.on_event(env, event),
+            None if event.urgent() => Ok(Admit::Taken),
             None => Ok(Admit::Blocked(event)),
         }
     }
@@ -280,5 +285,71 @@ impl<U: Layer> Layer for Later<U> {
 
     fn deadline(&self) -> Option<(Instant, U::Timer)> {
         self.layer.as_ref()?.deadline()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::convert::Infallible;
+    use fictionet::stdlib::layer::{Budget, ByteStream, Driver, StreamCommand, StreamEvent, Top};
+    use std::sync::Arc;
+
+    struct Sink;
+    impl Layer for Sink {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn take_command(&mut self) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    #[test]
+    fn an_unset_layer_takes_urgent_completions_and_keeps_regular_input_waiting() {
+        let mut driver = Driver::new(
+            Later::<Sink>::new(),
+            Arc::new(fictionet::SeededEntropy::new(fictionet::Seed::from_u64(91))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        assert!(matches!(
+            driver.deliver(StreamEvent::Written(7)),
+            Ok(Admit::Taken)
+        ));
+        assert!(matches!(
+            driver.deliver(StreamEvent::Reset),
+            Ok(Admit::Taken)
+        ));
+        assert!(matches!(
+            driver.deliver(StreamEvent::Ended),
+            Ok(Admit::Blocked(StreamEvent::Ended))
+        ));
+        driver.layer_mut().set(Sink);
+        assert!(matches!(
+            driver.deliver(StreamEvent::Ended),
+            Ok(Admit::Taken)
+        ));
     }
 }
