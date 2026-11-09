@@ -382,13 +382,15 @@ pub struct TcpLayer {
     pub(super) sockets: SocketSet<'static>,
     /// Each socket's slot in `sockets`, ordered by SDK ID for compaction.
     pub(super) handles: BTreeMap<Id, SocketHandle>,
+    socket_ids: HashMap<SocketHandle, Id>,
+    refresh_dirty: BTreeSet<Id>,
+    refresh_after: Option<Id>,
     next_id: u64,
     /// Slots in `sockets`, empty ones included: the most sockets it held
     /// at once since it was made.
     pub(super) slots: usize,
-    /// The buffers of each socket that has its own pages. Declared after
-    /// `sockets`, so they outlive the sockets that borrow them.
-    pub(super) pages: HashMap<Id, Pages, ById>,
+    /// Reclamation handles. Each socket also owns its mapping.
+    pub(super) pages: HashMap<Id, Arc<Pages>, ById>,
     /// What each socket's buffers are charged to the budget, given back
     /// when the socket goes.
     reserved: HashMap<Id, Charge, ById>,
@@ -612,6 +614,7 @@ impl Conn {
 /// given back while the connection stays open ([`Pages::release`]), and
 /// closing returns all of it.
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
 pub(super) struct Pages {
     ptr: *mut u8,
     len: usize,
@@ -622,6 +625,47 @@ pub(super) struct Pages {
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(unsafe_code, reason = "the owned mapping can move with its socket")]
 unsafe impl Send for Pages {}
+
+// SAFETY: shared handles do not expose bytes. The two exclusive halves
+// lend disjoint slices, and reclamation requires exclusive socket access.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unsafe_code, reason = "shared ownership of disjoint mapped buffers")]
+unsafe impl Sync for Pages {}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct MappedHalf {
+    pages: Arc<Pages>,
+    start: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(
+    unsafe_code,
+    reason = "borrow the owned half for the current buffer access"
+)]
+impl AsRef<[u8]> for MappedHalf {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: construction creates exactly two nonoverlapping halves.
+        // The owner keeps the mapping live for this borrow.
+        unsafe { std::slice::from_raw_parts(self.pages.ptr.add(self.start), self.pages.len / 2) }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(
+    unsafe_code,
+    reason = "borrow the owned half for the current buffer access"
+)]
+impl AsMut<[u8]> for MappedHalf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: this unique half is exclusively borrowed, its owner is
+        // live, and the other half cannot address these bytes.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.pages.ptr.add(self.start), self.pages.len / 2)
+        }
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(
@@ -669,31 +713,31 @@ impl Pages {
         })
     }
 
-    /// The receive and send halves.
-    ///
-    /// SAFETY: call only once for this mapping. The caller hands each half
-    /// to exactly one socket and removes it before dropping the `Pages`.
-    unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
-        let half = self.len / 2;
-        // SAFETY: the mapping is `len` bytes, readable and writable, and
-        // the two halves do not overlap.
-        unsafe {
-            (
-                std::slice::from_raw_parts_mut(self.ptr, half),
-                std::slice::from_raw_parts_mut(self.ptr.add(half), half),
-            )
-        }
+    fn socket(buffer: usize) -> Option<(stcp::Socket<'static>, Arc<Pages>)> {
+        let pages = Arc::new(Self::map(buffer)?);
+        let rx = MappedHalf {
+            pages: pages.clone(),
+            start: 0,
+        };
+        let tx = MappedHalf {
+            pages: pages.clone(),
+            start: buffer,
+        };
+        let socket = stcp::Socket::new(
+            stcp::SocketBuffer::new_owned(rx),
+            stcp::SocketBuffer::new_owned(tx),
+        );
+        Some((socket, pages))
     }
 
     /// Gives the pages of both halves back to the system. They read as
     /// zeros after, and cost memory again only once written.
     ///
-    /// SAFETY: the socket that holds the halves (see [`Pages::halves`])
+    /// SAFETY: the socket that owns the halves must be exclusively borrowed and
     /// must hold nothing in them: no bytes to read, none to send or
     /// resend, and an empty receive assembler. Check `recv_queue`,
-    /// `send_queue`, and `has_pending_recv`. Its buffers are
-    /// `&'static mut` slices of this mapping, and this changes their bytes
-    /// behind them.
+    /// `send_queue`, and `has_pending_recv`. No buffer slices may be borrowed
+    /// during reclamation.
     unsafe fn release(&self) {
         // SAFETY: the range is this mapping. MADV_DONTNEED on a private
         // anonymous mapping only makes its pages read as zeros, and the
@@ -716,8 +760,8 @@ impl Pages {
 #[allow(unsafe_code, reason = "release the owned anonymous mapping")]
 impl Drop for Pages {
     fn drop(&mut self) {
-        // SAFETY: this unmaps exactly the mapping made in `map`, after the
-        // socket that borrowed it was removed.
+        // SAFETY: this unmaps exactly the mapping made in `map`, after all
+        // owning halves and reclamation handles have been dropped.
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
     }
 }
@@ -730,13 +774,8 @@ pub(super) enum Pages {}
 #[cfg(target_arch = "wasm32")]
 #[allow(unsafe_code, reason = "matches the unreachable host mapping interface")]
 impl Pages {
-    fn map(_buffer: usize) -> Option<Pages> {
+    fn socket(_buffer: usize) -> Option<(stcp::Socket<'static>, Arc<Pages>)> {
         None
-    }
-
-    /// SAFETY: as on a host; no `Pages` exists to call it on.
-    unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
-        match *self {}
     }
 
     /// SAFETY: as on a host; no `Pages` exists to call it on.
@@ -746,23 +785,15 @@ impl Pages {
 }
 
 /// A socket with two buffers of `buffer` bytes.
-#[allow(
-    unsafe_code,
-    reason = "lend mapped buffers to the socket until removal"
-)]
-pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Pages>) {
-    let pages = Pages::map(buffer);
-    let mut s = match &pages {
-        Some(p) => {
-            // SAFETY: the halves go to this one socket, and `TcpLayer`
-            // removes it before dropping the pages (`remove_socket`, and
-            // field order for the whole layer).
-            let (rx, tx) = unsafe { p.halves() };
-            stcp::Socket::new(stcp::SocketBuffer::new(rx), stcp::SocketBuffer::new(tx))
-        }
-        None => stcp::Socket::new(
-            stcp::SocketBuffer::new(vec![0; buffer]),
-            stcp::SocketBuffer::new(vec![0; buffer]),
+pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Arc<Pages>>) {
+    let (mut s, pages) = match Pages::socket(buffer) {
+        Some((socket, pages)) => (socket, Some(pages)),
+        None => (
+            stcp::Socket::new(
+                stcp::SocketBuffer::new(vec![0; buffer]),
+                stcp::SocketBuffer::new(vec![0; buffer]),
+            ),
+            None,
         ),
     };
     s.set_tsval_generator(Some(|now| (now.total_micros() / 1000) as u32));
@@ -803,6 +834,9 @@ impl TcpLayer {
             addr,
             iface,
             sockets: SocketSet::new(Vec::new()),
+            socket_ids: HashMap::new(),
+            refresh_dirty: BTreeSet::new(),
+            refresh_after: None,
             handles: BTreeMap::new(),
             next_id: 0,
             slots: 0,
@@ -860,7 +894,7 @@ impl TcpLayer {
     pub(super) fn add_socket(
         &mut self,
         entropy: &dyn Entropy,
-        (mut s, pages): (stcp::Socket<'static>, Option<Pages>),
+        (mut s, pages): (stcp::Socket<'static>, Option<Arc<Pages>>),
     ) -> Id {
         s.set_settings(self.settings.socket);
         if let Some(id) = self.settings.ipv4_id {
@@ -884,7 +918,9 @@ impl TcpLayer {
         }
         let h = Id(self.next_id);
         self.next_id += 1;
-        self.handles.insert(h, self.sockets.add(s));
+        let slot = self.sockets.add(s);
+        self.handles.insert(h, slot);
+        self.socket_ids.insert(slot, h);
         self.slots = self.slots.max(self.handles.len());
         if let Some(p) = pages {
             self.pages.insert(h, p);
@@ -895,6 +931,8 @@ impl TcpLayer {
     /// Removes a socket, then unmaps its buffers and gives back their charge.
     pub(super) fn remove_socket(&mut self, h: Id) {
         let slot = self.handles.remove(&h).expect("a socket has a slot");
+        self.socket_ids.remove(&slot);
+        self.refresh_dirty.remove(&h);
         self.sockets.remove(slot);
         self.pages.remove(&h);
         self.reserved.remove(&h);
@@ -941,8 +979,10 @@ impl TcpLayer {
             return;
         }
         let mut sockets = SocketSet::new(Vec::with_capacity(self.handles.len()));
-        for slot in self.handles.values_mut() {
+        self.socket_ids.clear();
+        for (&id, slot) in &mut self.handles {
             *slot = sockets.add(self.sockets.remove(*slot));
+            self.socket_ids.insert(*slot, id);
         }
         self.sockets = sockets;
         self.slots = self.handles.len();
@@ -1351,16 +1391,28 @@ impl TcpLayer {
             && let Some(listener) = self.listeners.get(&dst.port())
         {
             for &id in &listener.idle {
+                self.socket_ids.remove(&self.handles[&id]);
                 idle.push((id, self.sockets.remove(self.handles[&id])));
             }
         }
         self.dev.rx = Some(packet);
-        self.iface
-            .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+        if let Some(h) = handle {
+            self.iface.poll_ingress_targeted(
+                now,
+                &mut self.dev,
+                &mut self.sockets,
+                self.handles[&h],
+            );
+        } else {
+            self.iface
+                .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
+        }
         let consumed = self.dev.rx.is_none();
         self.dev.reclaim();
         for (id, socket) in idle {
-            self.handles.insert(id, self.sockets.add(socket));
+            let slot = self.sockets.add(socket);
+            self.handles.insert(id, slot);
+            self.socket_ids.insert(slot, id);
         }
         if let Some(h) = handle {
             if let Some(c) = self.conns.get_mut(&h)
@@ -1995,6 +2047,7 @@ impl TcpLayer {
 
     /// Opens a child for socket `h`, as `origin` made it.
     fn open_child(&mut self, h: Id, origin: TcpOrigin) {
+        self.refresh_dirty.insert(h);
         let child: Child = self
             .children
             .insert(h)
@@ -2169,22 +2222,48 @@ impl TcpLayer {
         self.orphan(h, false);
     }
 
-    /// Brings every open child up to date, in socket order.
+    /// Brings changed children up to date, rotating after the last served child.
     fn refresh_all(&mut self, budget: &Budget) {
-        // Each open connection is found from the one before it: a refresh
-        // may close connections, and no list is made ahead.
-        let mut from = Id(0);
-        while let Some(h) = self
-            .conns
-            .range(from..)
-            .find(|(_, c)| c.open)
-            .map(|(h, _)| *h)
-        {
-            self.refresh(budget, h);
-            let Some(next) = h.0.checked_add(1) else {
+        use std::ops::Bound::{Excluded, Unbounded};
+        while let Some(slot) = self.sockets.take_changed() {
+            if let Some(&h) = self.socket_ids.get(&slot) {
+                self.refresh_dirty.insert(h);
+            }
+        }
+        let count = self.refresh_dirty.len();
+        for _ in 0..count {
+            if self.up.len() >= UP_ROOM {
+                break;
+            }
+            let Some(h) = self
+                .refresh_after
+                .and_then(|after| {
+                    self.refresh_dirty
+                        .range((Excluded(after), Unbounded))
+                        .next()
+                })
+                .or_else(|| self.refresh_dirty.first())
+                .copied()
+            else {
                 break;
             };
-            from = Id(next);
+            self.refresh_dirty.remove(&h);
+            self.refresh_after = Some(h);
+            self.refresh(budget, h);
+            if let Some(&slot) = self.handles.get(&h) {
+                self.sockets.acknowledge_changed(slot);
+                if self
+                    .conns
+                    .get(&h)
+                    .is_some_and(|c| c.open && c.recv_credit > 0)
+                    && self.sockets.get(slot).can_recv()
+                {
+                    self.refresh_dirty.insert(h);
+                }
+            }
+        }
+        if self.up.len() < UP_ROOM {
+            self.refresh_after = None;
         }
     }
 
@@ -2377,11 +2456,7 @@ impl TcpLayer {
         self.expire_orphans(now);
         self.housekeeping();
         self.saturated = self.dev.full();
-        let mut sent = std::mem::take(&mut self.dev.tx);
-        for p in &mut sent {
-            self.sent(p);
-        }
-        self.dev.out.extend(sent);
+        self.flush_transmit();
         if self.dirty.is_empty() {
             self.next_release = None;
         } else {
@@ -2396,7 +2471,7 @@ impl TcpLayer {
             }
         }
         self.refresh_all(env.budget());
-        let at = self.iface.poll_at(now, &self.sockets);
+        let at = self.iface.poll_at(now, &mut self.sockets);
         self.next = [at, self.next_release, self.next_expiry()]
             .into_iter()
             .flatten()
@@ -2404,6 +2479,15 @@ impl TcpLayer {
             .map(unsmol);
         self.primed = false;
         self.stepped = Some(env.now());
+    }
+
+    fn flush_transmit(&mut self) {
+        let mut sent = std::mem::take(&mut self.dev.tx);
+        for p in &mut sent {
+            self.sent(p);
+        }
+        self.dev.out.extend(sent.drain(..));
+        self.dev.tx = sent;
     }
 
     // -----------------------------------------------------------------------
@@ -2676,7 +2760,10 @@ impl Layer for TcpLayer {
     }
 
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>> {
-        self.urgent.pop_front().or_else(|| self.up.pop_front())
+        let full = self.up.len() >= UP_ROOM;
+        let event = self.urgent.pop_front().or_else(|| self.up.pop_front());
+        self.work |= full && self.up.len() < UP_ROOM && !self.refresh_dirty.is_empty();
+        event
     }
 
     fn take_urgent(&mut self) -> Option<EventOf<Self::Upper>> {

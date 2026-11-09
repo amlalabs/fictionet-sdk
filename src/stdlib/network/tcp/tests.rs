@@ -190,6 +190,83 @@ fn wakers_run_once_the_endpoint_is_unlocked() {
 }
 
 #[test]
+fn receive_refresh_rotates_after_the_event_queue_fills() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let now = smol_now(&fcx);
+        let peers = ["10.0.0.2:1234".parse()?, "10.0.0.2:1235".parse()?];
+        let mut connections = Vec::new();
+        for peer in peers {
+            let (h, ack) = established(&mut st, now, local, peer);
+            let child = st.adopt(h);
+            st.conns.get_mut(&h).unwrap().recv_credit = 200;
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                data_segment(peer, local, 101, ack, 16, &[1; 100]).0,
+            );
+            connections.push((h, child, ack));
+        }
+        for turn in 0..2 {
+            st.up.clear();
+            for _ in 0..UP_ROOM - 1 {
+                st.up.push_back(MuxEvent::Credit(connections[0].1, 1));
+            }
+            st.refresh_all(&Budget::unlimited());
+            let received: Vec<_> = st
+                .up
+                .iter()
+                .filter_map(|event| match event {
+                    MuxEvent::Child(id, StreamEvent::Data(_)) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(received, [connections[turn].1]);
+            if turn == 0 {
+                st.ingress(
+                    &fcx,
+                    &Budget::unlimited(),
+                    now,
+                    data_segment(peers[0], local, 201, connections[0].2, 16, &[2; 100]).0,
+                );
+            }
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn transmit_batches_retain_descriptor_capacity() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let ep = endpoint(&fcx, side, "10.0.0.1".parse()?);
+        let mut host = ep.shared.lock();
+        let peer = "10.0.0.2:1234".parse()?;
+        let local = "10.0.0.1:80".parse()?;
+        for n in 0..8 {
+            host.dev.tx.push(segment(local, peer, n, 0, 4).0);
+        }
+        let capacity = host.dev.tx.capacity();
+        host.flush_transmit();
+        assert!(host.dev.tx.is_empty());
+        assert!(host.dev.tx.capacity() >= capacity);
+        assert_eq!(host.dev.out.len(), 8);
+        for (n, packet) in host.dev.out.iter().enumerate() {
+            let tcp = Header::parse_whole(packet).unwrap().payload(packet);
+            assert_eq!(u32::from_be_bytes(tcp[4..8].try_into().unwrap()), n as u32);
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn device_output_yields_and_preserves_waiting_input() {
     let mut dev = Dev::default();
     let now = smoltcp::time::Instant::from_micros(0);
@@ -374,8 +451,9 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
             "full egress must retain TIME-WAIT"
         );
         assert_eq!(Arc::strong_count(&held), 1);
-        assert_eq!(*log.lock(), [0]);
+        assert!(log.lock().is_empty());
         drop(st);
+        assert_eq!(*log.lock(), [0]);
         assert!(watch.poll_gone(&mut Context::from_waker(&waker)).is_ready());
         watch.reset();
         watch.hold_until_gone(Box::new(held.clone()));
@@ -712,7 +790,7 @@ fn compaction_keeps_socket_id_scan_order() {
 /// Resident pages of every socket's buffers on `e`.
 fn resident(e: &Endpoint) -> usize {
     let st = e.shared.lock();
-    st.pages.values().map(Pages::resident).sum()
+    st.pages.values().map(|pages| pages.resident()).sum()
 }
 
 fn pattern(n: usize, salt: u8) -> Vec<u8> {
@@ -2605,6 +2683,25 @@ fn initial_sequence_numbers_tell_nothing_of_other_connections() {
     assert_ne!(isn_of(1, 0, 5, other), alone);
     assert_ne!(isn_of(1, 0, 5, "10.0.0.2:3001".parse().unwrap()), alone);
     assert_ne!(isn_of(2, 0, 5, peer), alone);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn mapping_ownership_follows_socket_moves() {
+    let (socket, pages) = new_socket(MIN_BUFFER);
+    let pages = pages.expect("mapping available");
+    let alive = Arc::downgrade(&pages);
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(socket);
+    drop(pages);
+    assert!(alive.upgrade().is_some());
+    let socket = sockets.remove(handle);
+    drop(sockets);
+    assert!(alive.upgrade().is_some());
+    assert_eq!(socket.recv_capacity(), MIN_BUFFER);
+    assert_eq!(socket.send_capacity(), MIN_BUFFER);
+    drop(socket);
+    assert!(alive.upgrade().is_none());
 }
 
 #[test]

@@ -13,10 +13,23 @@ impl InterfaceInner {
         }
         let packet = TcpPacket::new_checked(payload).ok()?;
         let tcp = TcpRepr::parse_with(&packet, &src, &dst, self.ignore_malformed_options).ok()?;
-        for (_, socket) in sockets.iter_mut() {
-            if socket.accepts(self, &ip, &tcp) {
-                return socket.process(self, &ip, &tcp, packet.options());
-            }
+        if let Some(target) = self.ingress_target
+            && let Some(socket) = sockets.try_get(target)
+            && socket.state() != crate::socket::tcp::State::Listen
+            && socket.accepts(self, &ip, &tcp)
+        {
+            return sockets
+                .get_mut(target)
+                .process(self, &ip, &tcp, packet.options());
+        }
+        let accepted = sockets
+            .iter()
+            .find(|(_, socket)| socket.accepts(self, &ip, &tcp))
+            .map(|(handle, _)| handle);
+        if let Some(handle) = accepted {
+            return sockets
+                .get_mut(handle)
+                .process(self, &ip, &tcp, packet.options());
         }
         // A reset never answers another reset, and a host set to answer
         // nothing for a closed port answers nothing.
