@@ -458,8 +458,130 @@ fixed here.
   not fit in 10 GiB); the strict ones are, and the line reader (`Lines`) is
   the same. The strict 128-byte chunk-line limit is not reached (the
   lenient mode's limit, the header line limit, is, up to three). `Stream`
-  itself, the serving decoders' head parsing and the capture parser's and
-  the WARC reader's handling of what `BodyEvents` returns are not covered.
+  itself and the capture parser's and the WARC reader's handling of what
+  `BodyEvents` returns are not covered. The serving decoder's head parsing
+  is checked on small inputs in the next section.
 - `Tunnel.tla` is a model of `tunnel.rs`, not a proof over the code (see
   above): wakers, the takeover's start and drop, `poll_gone` and the stack's
   `Written` events are left out.
+
+## Kani: request smuggling boundaries
+
+`kani/smuggling.rs` checks that every request head is framed one way RFC
+9112 allows, or refused, and that the server and the response reader agree
+on where a message ends ([RFC 9112 sections 5–7](https://www.rfc-editor.org/rfc/rfc9112.html#section-5)).
+It adds to `Request.lean` (the field policy in the abstract), `kani/body.rs`
+(chunk sizes, overflow, extensions and trailers, step by step) and
+`Pipeline.tla` (requests as tokens and the handoff to a tunnel).
+
+The serving decoder refuses ambiguous framing rather than repairing it: a
+request with both Content-Length and Transfer-Encoding, Content-Length
+values that disagree, any coding other than one final `chunked`, chunk
+extensions, non-empty trailers, obs-fold and bare CR or LF are all
+refused. `web/httpd/native.rs`:202 builds the `RequestEvents` that run
+these checks.
+
+The harnesses call these functions in `protocols/http1.rs`:
+
+| Function | Line |
+|---|---|
+| `RequestEvents::scan_request` | 857 |
+| `Reader::head`, `Reader::begin` | 1391, 1432 |
+| `scan_fields`, `valid_field_value` | 1676, 1727 |
+| `content_length`, `check_framing_fields` | 1731, 1742 |
+| `transfer_encoding`, `complete_transfer` | 1749, 1771 |
+| `request_framing`, `response_framing` | 1778, 1791 |
+| `header_parts` | 1830 |
+
+`scan_fields`, `content_length`, `check_framing_fields`,
+`transfer_encoding`, `complete_transfer` and `header_parts` are blocks moved
+out of `fields` and `header_line` unchanged, in the same order, over
+borrowed names and values. The harnesses call them on stack arrays, which
+keeps the solver within the memory cap. Routing a field to its check by
+name, and the copy into an owned `Header`, stay outside the proofs; the
+server test below covers them.
+
+| Harness | Inputs and property |
+|---|---|
+| `content_lengths_separate_have_one_value`, `content_lengths_joined_have_one_value` | Two arbitrary three-byte values, as two fields or one comma-joined field, including commas, controls, signs and whitespace. The request is accepted exactly when every list member is a decimal number and all are equal; it then has that length, and a 200 response with the same fields has the same length. |
+| `transfer_fields_{chunked,gzip,gzip_then_chunked,chunked_then_gzip,repeated_chunked,empty,empty_elements,parameters}` | Eight codings, each with all sixteen combinations of HTTP/1.0 or 1.1, one field or split across two, and no Content-Length or one before or after. Only a final `chunked` on HTTP/1.1 with no Content-Length is accepted, and a 200 response with the same fields is chunked too. |
+| `transfer_values_follow_bounded_grammar` | Every Transfer-Encoding value of 0 to 8 bytes. Accepted exactly when it is `chunked` in any case, with at most one empty list element before or after (the only accepted forms that fit in 8 bytes). |
+| `strict_head_fields_{empty_name,one_byte_name,two_byte_name,three_byte_name,without_colon}` | Every four-byte field line, split by the position of its first colon. Accepted exactly when a non-empty token comes before the colon and only field bytes after it. This includes obs-fold (a leading space), space before the colon, bare CR and LF, and every non-ASCII byte. |
+| `head_boundaries_length_{zero..ten}` | Every input of 0 to 10 bytes, cut at every point, with 8-byte line limits. `Reader::head` waits, refuses, or ends the head at the first empty CRLF line after the start line, and gives the same answer whether the input arrives whole or in two pieces. |
+| `pipeline_boundary_{empty_body,one_byte,two_bytes,three_bytes}` | A head with a length field of 0 to 3, that many arbitrary body bytes, then a second head. The production `Reader` finds the first head, `content_length` and `request_framing` set the body, the reader yields exactly those bytes, ends the message without consuming more, and finds the end of the second head where it is. |
+| `token_character_matches_production` | All 256 bytes: the loop-free token predicate `token_char`, used in place of `ascii::is_tchar` by the harnesses above, equals the production one. |
+
+Results (Kani with CBMC 6.11, one harness at a time under a 10 GiB cap): all
+32 harnesses pass. The slowest are `head_boundaries_length_ten` (201 s),
+`head_boundaries_length_nine` (179 s), `head_boundaries_length_seven`
+(153 s), `content_lengths_separate_have_one_value` (132 s) and
+`transfer_values_follow_bounded_grammar` (117 s).
+
+Two first versions did not fit in 10 GiB and were changed. The pipeline
+harness with full request lines (`POST / HTTP/1.1`, `Host`,
+`Content-Length`) was killed by the out-of-memory killer at 10 GiB after
+11 minutes for three body bytes, and reached 10 GiB after 10 minutes for
+one. It now uses one-letter start lines and a one-letter field name, which
+the reader treats exactly as it treats full ones, and each case takes 3 s.
+The transfer harness with its four flags symbolic reached 10 GiB on the
+parameterized coding; it now checks the sixteen flag combinations one after
+another, and each coding takes under 20 s.
+
+Each control stubs one function and runs the same property on a concrete
+input that shows the fault.
+
+| Control | Change | Witness and failed assertion |
+|---|---|---|
+| `content_lengths_control_truncated_number` | `number` reads only the first digit | fields `100` and `101` read as equal; `result.is_err()` fails |
+| `content_lengths_joined_control_truncated_number` | the same | `100,101` in one field; `result.is_err()` fails |
+| `transfer_fields_control_conflicting_fields` | `check_framing_fields` accepts both fields | `chunked` with Content-Length is accepted |
+| `transfer_fields_control_old_version` | `transfer_encoding` skips the HTTP/1.0 check | `chunked` on HTTP/1.0 is accepted |
+| `transfer_fields_control_unsupported_coding` | `request_framing` skips the unsupported-coding check | `gzip, chunked` is accepted |
+| `transfer_fields_control_missing_final_chunked` | `request_framing` frames any coding as chunked | `gzip` is accepted |
+| `transfer_fields_control_repeated_chunked` | `transfer_encoding` allows a coding after `chunked` | `chunked` in two fields is accepted |
+| `transfer_fields_control_nonfinal_chunked` | both of the last two changes | `chunked` then `gzip` is accepted |
+| `transfer_values_control_missing_final_chunked` | `request_framing` frames any coding as chunked | `gzip` is accepted |
+| `strict_head_fields_control_allow_controls` | `field_byte` accepts every byte | `X:<CR>x` is accepted |
+| `head_boundaries_control_bare_lf` | `Reader::head` also ends lines at a bare LF | `X<LF><LF>` ends a head; `got == expected` fails |
+| `pipeline_control_ignore_length` | `request_framing` ignores Content-Length | the body byte is read as the next request |
+| `token_character_control_allow_invalid` | `ascii::is_tchar` accepts every byte | `is_tchar(byte) == token_char(byte)` fails |
+
+The last two transfer controls change two checks at once because either
+check alone refuses those inputs.
+
+`find_byte` replaces `memchr` with a plain search, as in the body
+harnesses. Unwinding assertions stay on in every harness.
+
+Run one harness or control:
+
+```sh
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 \
+  env CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo kani -p fictionet --lib -Z stubbing --output-format terse \
+  --harness content_lengths_separate_have_one_value
+```
+
+`--harness smuggling_proofs:: -j 1` runs all of them one at a time; the
+controls fail by design, so that command exits non-zero.
+
+### The server test
+
+`ambiguous_framing_never_dispatches_a_pipelined_request` in
+`web/httpd/native.rs` sends sixteen POST requests to the real server, each
+followed by `GET /admin`, cut at every byte. Equal duplicate lengths
+(`1` twice, `1, 1`) and plain chunking dispatch both requests. Content-Length
+with Transfer-Encoding in either order, unequal lengths, unsupported or
+non-final codings, an overflowing chunk size, a chunk extension, a
+trailer, obs-fold, a bare LF and a bare CR never dispatch `/admin`. Every
+response is read back with `http1::Responses`: two for an accepted pair,
+one for a refused one.
+
+### What these checks leave out
+
+Decimal lengths beyond three digits, field lines beyond four bytes, heads
+beyond ten bytes, and pipelines beyond two requests and three body bytes.
+The ten-byte heads do not reach the head-size or header-count limits. The
+response comparison covers 200 responses with declared framing; HEAD,
+CONNECT, statuses without a body and responses with no framing follow
+other rules, covered by the response proofs above. The lenient decoder
+used for captures is not used by the server and is not checked here.
