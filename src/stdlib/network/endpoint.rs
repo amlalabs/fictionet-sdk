@@ -38,6 +38,10 @@ pub(crate) async fn drive(
         ip.set_now(fcx.now());
         let mut busy = false;
         let mut deadlines = [None; 3];
+        // Whether the transports may have something new since their last
+        // pass: a wake, a packet for them, or a pass that left work or
+        // filled the output queue.
+        let mut dirty = true;
         for turn in 0..64 {
             let mut moved = false;
             let mut more = false;
@@ -81,16 +85,19 @@ pub(crate) async fn drive(
                 let mut accepted = true;
                 match packet.transport() {
                     Transport::Tcp => {
-                        if let Some(tcp) = &mut tcp
-                            && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
-                        {
-                            held = Some(packet);
-                            accepted = false;
-                            transport = true;
+                        if let Some(tcp) = &mut tcp {
+                            dirty = true;
+                            if let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
+                            {
+                                held = Some(packet);
+                                accepted = false;
+                                transport = true;
+                            }
                         }
                     }
                     Transport::Udp => {
                         if let Some(udp) = &mut udp {
+                            dirty = true;
                             udp.deliver(packet);
                         }
                     }
@@ -141,19 +148,23 @@ pub(crate) async fn drive(
             }
             // Batch ingress before walking every transport connection. A
             // blocked carrier or an exhausted visit still gets a transport
-            // pass, including its timers and application work.
-            if transport || closed || turn == 63 {
+            // pass, including its timers and application work. A pass with
+            // nothing new for the transports would find nothing to do.
+            if dirty && (transport || closed || turn == 63) {
                 let room = 128usize.saturating_sub(outgoing.len());
+                let mut pending = false;
                 if let Some(tcp) = &mut tcp {
-                    let (pending, deadline) = tcp.poll(cx, &mut output, room)?;
-                    more |= pending;
+                    let (work, deadline) = tcp.poll(cx, &mut output, room)?;
+                    pending |= work;
                     deadlines[1] = deadline;
                 }
                 if let Some(udp) = &mut udp {
-                    let (pending, deadline) = udp.poll(cx, &mut output, room)?;
-                    more |= pending;
+                    let (work, deadline) = udp.poll(cx, &mut output, room)?;
+                    pending |= work;
                     deadlines[2] = deadline;
                 }
+                more |= pending;
+                dirty = pending || output.len() >= room;
                 moved |= !output.is_empty();
                 outgoing.extend(output.drain(..).map(PacketCommand::Send));
             }
