@@ -2974,6 +2974,7 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
 mod layer {
     use super::*;
     use fictionet::stdlib::layer::{Chain, MuxOp, PacketEvent};
+    use fictionet::stdlib::network::packet::{Origin, Scopes};
     use fictionet::{Seed, SeededEntropy};
 
     /// One machine: the IP layer, then TCP, run by a driver.
@@ -3195,6 +3196,97 @@ mod layer {
         assert!(matches!(client.command(grant), Ok(Admit::Taken)));
         let (_, at_client) = exchange(&mut server, &mut client, |_| true);
         assert_eq!(data(&at_client, c.id()), reply);
+    }
+
+    /// The layer takes only checked packets of its own network. A SYN for
+    /// its listener in an observed copy, or checked but from the world's
+    /// network, is not answered; the same SYN checked in its own network,
+    /// a tunnel's, gets a SYN-ACK. Under the tunnel's IP layer the same
+    /// holds for raw packets.
+    #[test]
+    fn only_checked_packets_of_its_own_network_reach_tcp() {
+        let tunnel = Scopes::default().tunnel();
+        let client: SocketAddr = format!("{CLIENT}:40000").parse().unwrap();
+        let server: SocketAddr = format!("{SERVER}:80").parse().unwrap();
+        let syn = segment(client, server, 1000, 0, 0x02).0;
+        let listen = || {
+            MuxCommand::control(MessageCommand::Send(TcpControl::Listen {
+                port: 80,
+                backlog: None,
+                answer: None,
+            }))
+        };
+        let syn_acks = |sent: &[Vec<u8>]| {
+            sent.iter()
+                .filter(|p| {
+                    tcp_flags(p) == Some(0x12) && Header::parse_whole(p).unwrap().dst == client.ip()
+                })
+                .count()
+        };
+
+        let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(3)));
+        let options = Options::default().buffer(MIN_BUFFER);
+        let tcp = TcpLayer::new(SERVER.parse().unwrap(), options, &*entropy, Instant::ZERO)
+            .in_scope(tunnel);
+        let mut alone = Driver::new(tcp, entropy, Budget::unlimited(), Instant::ZERO);
+        assert!(matches!(alone.command(listen()), Ok(Admit::Taken)));
+        let in_tunnel = Ingress {
+            scope: tunnel,
+            ..Ingress::default()
+        };
+        let packets = [
+            IpPacket::observed(Chunk::new(syn.clone()), in_tunnel),
+            IpPacket::checked(
+                Chunk::new(syn.clone()),
+                Ingress::default(),
+                Origin::Arrived,
+            )
+            .unwrap(),
+            IpPacket::checked(Chunk::new(syn.clone()), in_tunnel, Origin::Arrived).unwrap(),
+        ];
+        assert_eq!(packets[0].transport(), Transport::Tcp);
+        let mut answers = Vec::new();
+        for packet in packets {
+            assert!(matches!(
+                alone.deliver(PacketEvent::Packet(packet)),
+                Ok(Admit::Taken)
+            ));
+            let _ = alone.run();
+            let mut sent = Vec::new();
+            alone.send_below(|command| {
+                if let PacketCommand::Send(packet) = command {
+                    sent.push(packet.to_vec());
+                }
+                Admit::Taken
+            });
+            answers.push(syn_acks(&sent));
+        }
+        assert_eq!(answers, [0, 0, 1]);
+
+        let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(4)));
+        let tcp = TcpLayer::new(SERVER.parse().unwrap(), options, &*entropy, Instant::ZERO)
+            .in_scope(tunnel);
+        let mut stack = Driver::new(
+            Chain::new(IpLayer::host_in(tunnel), tcp),
+            entropy,
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        control(
+            &mut stack,
+            TcpControl::Listen {
+                port: 80,
+                backlog: None,
+                answer: None,
+            },
+        );
+        let mut answers = Vec::new();
+        for ingress in [Ingress::default(), in_tunnel] {
+            let raw = PacketEvent::Packet(Datagram::new(Chunk::new(syn.clone()), ingress));
+            assert!(matches!(stack.deliver(raw), Ok(Admit::Taken)));
+            answers.push(syn_acks(&sent(&mut stack)));
+        }
+        assert_eq!(answers, [0, 1]);
     }
 
     #[test]

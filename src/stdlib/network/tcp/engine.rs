@@ -244,6 +244,15 @@ pub(super) const COMPACT_SLOTS: usize = 256;
 /// One machine's TCP as a layer: `Packets<IpPacket, Chunk>` below, the
 /// [`Tcp`] mux above. See the [module docs](self).
 ///
+/// The packets it takes in are the ones the IP layer sorts to TCP, and
+/// only [checked](IpPacket::is_checked) ones of its own network, the
+/// [`Scope`] set with [`in_scope`](TcpLayer::in_scope): observed copies and
+/// packets of other networks are dropped. A tunnel's network gets an IP
+/// layer of its own ([`IpLayer::host_in`]) and a TCP layer in the same
+/// scope.
+///
+/// [`IpLayer::host_in`]: fictionet::stdlib::network::packet::IpLayer::host_in
+///
 /// # The layer above
 ///
 /// Connections are children. A listener ([`TcpControl::Listen`]) takes
@@ -731,8 +740,8 @@ impl TcpLayer {
         }
     }
 
-    /// The network its connections belong to, as their openings say.
-    /// [`Scope::ROOT`] unless set.
+    /// The network its connections belong to, as their openings say, and
+    /// the only one whose packets it takes in. [`Scope::ROOT`] unless set.
     pub fn in_scope(mut self, scope: Scope) -> TcpLayer {
         self.scope = scope;
         self
@@ -2438,7 +2447,10 @@ impl Layer for TcpLayer {
         if self.dev.full() || self.up.len() >= UP_ROOM {
             return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
         }
-        if packet.transport() != Transport::Tcp {
+        if !packet.is_checked()
+            || packet.ingress().scope != self.scope
+            || packet.transport() != Transport::Tcp
+        {
             return Ok(Admit::Taken);
         }
         let now = smol(env.now());
