@@ -86,11 +86,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::task::Poll;
 
-use fictionet::stdlib::layer::{
-    Admit, Budget, Chunk, Datagram, Driver, PacketCommand, PacketEvent,
-};
+use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, PacketCommand, PacketEvent};
 use fictionet::stdlib::network::Transport;
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, Sort};
+use fictionet::stdlib::network::packet::{IpLayer, Sort};
 use fictionet::stdlib::network::{
     icmp,
     ports::{Event, Ports},
@@ -369,7 +367,7 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
         let admit = match ports.next(&fcx, ip.deadline(), |_| Poll::Pending).await? {
             Event::Packet(0, Packet(bytes)) => {
                 ip.set_now(fcx.now());
-                let raw = Datagram::new(Chunk::new(bytes), Ingress::default());
+                let raw = Chunk::new(bytes);
                 ip.deliver(PacketEvent::Packet(raw))?.map(drop)
             }
             Event::Packet(_, Packet(bytes)) => ip

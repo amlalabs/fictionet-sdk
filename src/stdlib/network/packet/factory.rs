@@ -2,13 +2,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use fictionet::Cx;
-use fictionet::stdlib::layer::{Budget, Chunk, Datagram, Layer, Packets};
+use fictionet::stdlib::layer::{Budget, Chunk, Layer, Packets};
 use fictionet::stdlib::services::stack::{BoxError, Boxed, Job};
 
-use super::{Ingress, IpLayer, IpPacket};
+use super::{CheckedIpPacket, IpLayer};
 
 /// An IP implementation between a machine's interface and its transports.
-pub type Stack = Boxed<Packets<Datagram<Ingress>, Chunk>, Packets<IpPacket, Chunk>>;
+pub type Stack = Boxed<Packets<Chunk, Chunk>, Packets<CheckedIpPacket, Chunk>>;
 
 /// Construction context for one machine's IP layer, before its route or
 /// services are published. A factory must not start protocol progress.
@@ -28,11 +28,11 @@ pub struct Factory(Arc<dyn Fn(Opening) -> Stack + Send + Sync>);
 
 impl Factory {
     /// Uses `make` to construct each machine's layer. Packets emitted upward
-    /// must satisfy the checked `IpPacket` contract. Egress packets also pass
+    /// must satisfy the checked `CheckedIpPacket` contract. Egress packets also pass
     /// through this layer, so a replacement can encapsulate both directions.
     pub fn new<L>(make: impl Fn(Opening) -> L + Send + Sync + 'static) -> Self
     where
-        L: Layer<Lower = Packets<Datagram<Ingress>, Chunk>, Upper = Packets<IpPacket, Chunk>>
+        L: Layer<Lower = Packets<Chunk, Chunk>, Upper = Packets<CheckedIpPacket, Chunk>>
             + Send
             + 'static,
         L::Report: core::fmt::Debug + Send + 'static,

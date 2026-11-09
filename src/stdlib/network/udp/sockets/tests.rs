@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::layer::{Budget, Chain, Child, Children, Driver, MuxCommand, Side, Top};
 use fictionet::stdlib::network::ip::Header;
-use fictionet::stdlib::network::packet::{Ingress, IpLayer, Origin, Scopes};
+use fictionet::stdlib::network::packet::{Ingress, IpLayer, NetworkInput, Scope, Scopes};
 use fictionet::time::Instant;
 use fictionet::{Seed, SeededEntropy};
 
@@ -22,7 +22,7 @@ fn addr(s: &str) -> SocketAddr {
 
 fn stack(budget: Budget) -> Driver<Stack> {
     let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
-    let udp = UdpLayer::new(Scope::ROOT, HOST.parse().unwrap(), &*entropy);
+    let udp = UdpLayer::new(HOST.parse().unwrap(), &*entropy);
     Driver::new(
         Chain::new(IpLayer::host(), udp),
         entropy,
@@ -49,7 +49,7 @@ fn datagram(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
 
 /// Offers one raw packet and runs the stack.
 fn arrive(d: &mut Driver<Stack>, bytes: Vec<u8>) {
-    let raw = Datagram::new(Chunk::new(bytes), Ingress::default());
+    let raw = Chunk::new(bytes);
     assert!(matches!(
         d.deliver(PacketEvent::Packet(raw)),
         Ok(Admit::Taken)
@@ -153,7 +153,6 @@ fn a_bound_socket_gets_each_datagram_whole_with_its_peer() {
     assert_eq!(
         bound,
         UdpBound {
-            scope: Scope::ROOT,
             local: addr("10.0.0.1:53"),
             request: Request(4),
         }
@@ -171,67 +170,30 @@ fn a_bound_socket_gets_each_datagram_whole_with_its_peer() {
     assert_eq!(seen(up(&mut d)), expected);
 }
 
-/// The layer takes only checked packets of its own network. An observed
-/// copy whose IPv4 header checksum is wrong, and a checked packet from a
-/// tunnel's network, reach no socket, though each carries a good UDP
-/// datagram for the bound port.
 #[test]
-fn observed_copies_and_other_networks_reach_no_socket() {
-    let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
-    let udp = UdpLayer::new(Scope::ROOT, HOST.parse().unwrap(), &*entropy);
-    let mut d = Driver::new(udp, entropy, Budget::unlimited(), Instant::ZERO);
-    let bind = MuxCommand::control(MessageCommand::Send(UdpControl::Bind {
-        request: Request(1),
-        port: 53,
-    }));
-    assert!(matches!(d.command(bind), Ok(Admit::Taken)));
-    let mut child = None;
-    d.send_above(|event| {
-        if let MuxEvent::Opened(opened, _, _) = event {
-            child = Some(opened);
-        }
-        Admit::Taken
-    });
-    let child = child.expect("the bind opened a child");
+fn malformed_and_foreign_host_packets_reach_no_socket() {
+    let mut d = stack(Budget::unlimited());
+    let (child, bound, _) = bind(&mut d, 1, 53);
     let peer = addr("10.0.0.2:1234");
-    let local = addr("10.0.0.1:53");
-    let mut bad_header = datagram(peer, local, b"observed");
+    let mut bad_header = datagram(peer, bound.local, b"observed");
     bad_header[10] ^= 1;
-    let tunnel = Ingress {
-        scope: Scopes::default().tunnel(),
-        ..Ingress::default()
-    };
-    let packets = [
-        IpPacket::observed(Chunk::new(bad_header), Ingress::default()),
-        IpPacket::checked(
-            Chunk::new(datagram(peer, local, b"tunnel")),
-            tunnel,
-            Origin::Arrived,
-        )
-        .unwrap(),
-        IpPacket::checked(
-            Chunk::new(datagram(peer, local, b"mine")),
-            Ingress::default(),
-            Origin::Arrived,
-        )
-        .unwrap(),
-    ];
-    assert_eq!(packets[0].sort(), Sort::Transport(Transport::Udp));
-    for packet in packets {
-        assert!(matches!(
-            d.deliver(PacketEvent::Packet(packet)),
-            Ok(Admit::Taken)
-        ));
-    }
-    assert!(matches!(d.command(child.grant(3)), Ok(Admit::Taken)));
+    arrive(&mut d, bad_header);
+    assert!(seen(up(&mut d)).is_empty());
+    let input = NetworkInput::new(Scope::ROOT);
+    let foreign = Datagram::new(
+        Chunk::new(datagram(peer, bound.local, b"tunnel")),
+        Ingress {
+            scope: Scopes::default().tunnel(),
+            ..Ingress::default()
+        },
+    );
+    assert!(input.accept(foreign).is_err());
+    assert!(seen(up(&mut d)).is_empty());
+    arrive(&mut d, datagram(peer, bound.local, b"mine"));
+    assert!(matches!(d.command(child.grant(4)), Ok(Admit::Taken)));
     d.run().unwrap();
-    let mut got = Vec::new();
-    d.send_above(|event| {
-        got.push(event);
-        Admit::Taken
-    });
     assert_eq!(
-        seen(got),
+        seen(up(&mut d)),
         [Seen::Datagram(child.id(), b"mine".to_vec(), peer)]
     );
 }
@@ -327,7 +289,7 @@ fn bad_checksums_bad_lengths_and_other_addresses_are_dropped() {
     assert_eq!(down(&mut d), Vec::<Vec<u8>>::new());
 
     let entropy = SeededEntropy::new(Seed::from_u64(1));
-    let udp = UdpLayer::new(Scope::ROOT, dst6.ip(), &entropy);
+    let udp = UdpLayer::new(dst6.ip(), &entropy);
     let mut d6 = Driver::new(
         Chain::new(IpLayer::host(), udp),
         Arc::new(entropy),
@@ -617,7 +579,7 @@ fn a_full_layer_refuses_a_packet_unchanged() {
     let back = loop {
         assert!(taken <= 2 * HELD, "the layer kept taking packets");
         let packet = datagram(peer, local, &(taken as u32).to_be_bytes());
-        let raw = Datagram::new(Chunk::new(packet.clone()), Ingress::default());
+        let raw = Chunk::new(packet.clone());
         match d.deliver(PacketEvent::Packet(raw)) {
             Ok(Admit::Taken) => taken += 1,
             Ok(Admit::Blocked(PacketEvent::Packet(back))) => break (back, packet),
@@ -627,8 +589,7 @@ fn a_full_layer_refuses_a_packet_unchanged() {
     };
     assert!(taken >= HELD, "only {taken} packets were taken");
     let (back, packet) = back;
-    assert_eq!(back.payload(), &packet[..]);
-    assert_eq!(*back.meta(), Ingress::default());
+    assert_eq!(&back[..], &packet[..]);
     // Once its output is taken, every packet it took is answered and
     // reported once, and the refused one goes in as it was.
     let (mut notices, mut answers) = (0, 0);
@@ -692,7 +653,7 @@ impl Layer for Echo {
 #[test]
 fn an_application_on_each_socket_answers_through_ip_and_udp() {
     let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(9)));
-    let udp = UdpLayer::new(Scope::ROOT, HOST.parse().unwrap(), &*entropy);
+    let udp = UdpLayer::new(HOST.parse().unwrap(), &*entropy);
     let apps = Children::<Echo, Control, UdpBound>::new(4, 8, |_, bound, _| {
         assert_eq!(bound.local.ip(), HOST.parse::<IpAddr>().unwrap());
         Some(Echo {
@@ -719,10 +680,7 @@ fn an_application_on_each_socket_answers_through_ip_and_udp() {
     let mut expected = Vec::new();
     for (n, payload) in sent.iter().enumerate() {
         let peer = peers[n % peers.len()];
-        let raw = Datagram::new(
-            Chunk::new(datagram(peer, echo, payload)),
-            Ingress::default(),
-        );
+        let raw = Chunk::new(datagram(peer, echo, payload));
         assert!(matches!(
             d.deliver(PacketEvent::Packet(raw)),
             Ok(Admit::Taken)

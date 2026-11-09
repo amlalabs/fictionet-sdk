@@ -10,7 +10,7 @@ use fictionet::stdlib::layer::{
     Packets,
 };
 use fictionet::stdlib::network::ConnError;
-use fictionet::stdlib::network::packet::IpPacket;
+use fictionet::stdlib::network::packet::CheckedIpPacket;
 use fictionet::stdlib::network::transport::Tcp;
 use fictionet::time::Instant;
 
@@ -67,7 +67,7 @@ impl Factory {
     where
         L: EndpointState
             + Layer<
-                Lower = Packets<IpPacket, Chunk>,
+                Lower = Packets<CheckedIpPacket, Chunk>,
                 Upper = Tcp,
                 Report = (),
                 Timer = (),
@@ -104,8 +104,8 @@ trait Erased: EndpointState {
     fn event(
         &mut self,
         env: &mut Env<'_, ()>,
-        event: PacketEvent<IpPacket>,
-    ) -> Result<Admit<PacketEvent<IpPacket>>, Infallible>;
+        event: PacketEvent<CheckedIpPacket>,
+    ) -> Result<Admit<PacketEvent<CheckedIpPacket>>, Infallible>;
     fn command(
         &mut self,
         env: &mut Env<'_, ()>,
@@ -127,7 +127,7 @@ impl<L> Erased for L
 where
     L: EndpointState
         + Layer<
-            Lower = Packets<IpPacket, Chunk>,
+            Lower = Packets<CheckedIpPacket, Chunk>,
             Upper = Tcp,
             Report = (),
             Timer = (),
@@ -139,8 +139,8 @@ where
     fn event(
         &mut self,
         env: &mut Env<'_, ()>,
-        event: PacketEvent<IpPacket>,
-    ) -> Result<Admit<PacketEvent<IpPacket>>, Infallible> {
+        event: PacketEvent<CheckedIpPacket>,
+    ) -> Result<Admit<PacketEvent<CheckedIpPacket>>, Infallible> {
         self.on_event(env, event)
     }
     fn command(
@@ -204,7 +204,7 @@ impl Stack {
 }
 
 impl Layer for Stack {
-    type Lower = Packets<IpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, Chunk>;
     type Upper = Tcp;
     type Report = ();
     type Timer = ();
@@ -223,8 +223,8 @@ impl Layer for Stack {
     fn on_event(
         &mut self,
         env: &mut Env<'_, ()>,
-        event: PacketEvent<IpPacket>,
-    ) -> Result<Admit<PacketEvent<IpPacket>>, Infallible> {
+        event: PacketEvent<CheckedIpPacket>,
+    ) -> Result<Admit<PacketEvent<CheckedIpPacket>>, Infallible> {
         self.0.event(env, event)
     }
     fn on_command(

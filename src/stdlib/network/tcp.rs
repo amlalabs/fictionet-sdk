@@ -75,7 +75,7 @@ use fictionet::stdlib::network::ip::{
     protocol::{ICMP, TCP},
     transport_checksum,
 };
-use fictionet::stdlib::network::packet::{IpPacket, Scope};
+use fictionet::stdlib::network::packet::CheckedIpPacket;
 use fictionet::stdlib::network::transport::{
     Request, TcpControl, TcpNotice, TcpOpening, TcpOrigin,
 };
@@ -1000,7 +1000,7 @@ pub fn prepare_endpoint(
         addr,
         budget: Budget::unlimited(),
     });
-    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip, Scope::ROOT);
+    let task = super::endpoint::drive(fcx, inner, Some(tcp), None, None, ip);
     (endpoint, Prepared { task })
 }
 
@@ -1047,9 +1047,9 @@ pub(crate) struct PacketDriver {
 impl PacketDriver {
     pub(crate) fn deliver(
         &mut self,
-        packet: IpPacket,
+        packet: CheckedIpPacket,
         now: Instant,
-    ) -> Admit<PacketEvent<IpPacket>> {
+    ) -> Admit<PacketEvent<CheckedIpPacket>> {
         let mut host = self.shared.state.lock();
         host.tcp.set_now(now);
         let result = host.tcp.deliver(PacketEvent::Packet(packet)).unwrap();
