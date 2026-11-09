@@ -27,7 +27,7 @@ Four, each fixed with a test that fails without the fix.
 | Bug | Found by | Fix | Test |
 |---|---|---|---|
 | A TCP may refuse any command for now (`Admit::Blocked`). `Host::command` dropped a refused control. A refused `Hold` dropped its `PeerGuard`, so an open connection stopped counting against its peer, and a refused `Abort` never reset the connection past the limit. The standard `TcpLayer` never refuses a control, so only a replacement installed with `tcp::Factory` was exposed. | `Admission_dropblocked`, `Admission_dropblocked_reset` | `Host::controls` in `network/tcp.rs` keeps refused controls in order and `Host::pump` offers them again whenever the host steps the transport. `Listen` and `Connect`, whose answers the caller reads at once, go through `Host::request` and are never queued, so a failed `listen` leaves nothing for the transport to take later. A stopped endpoint drops the queue with what it holds. | `world_layers::a_tcp_that_refuses_commands_for_now_keeps_the_peer_count_and_resets` |
-| The dispatcher sent each packet its IP layer handed up to the transport the packet named. A replacement IP layer could hand up an observed copy (no IPv4 header check, no host policy) or a packet of another network, and the UDP layer delivered both. | review of `drive` | First a check in `destination` and a network label on each raw packet. Now the types: the IP layer's upper port carries only `CheckedIpPacket`, captured copies are `ObservedIpPacket`, and an endpoint owns its interface, so its raw packets carry no network to check. | The check's world test went with the check; the compile_fail example in `guide::lowering` shows an observed copy cannot be handed to a transport |
+| The dispatcher sent each packet its IP layer handed up to the transport the packet named. A replacement IP layer could hand up an observed copy (no IPv4 header check, no host policy) or a packet of another network, and the UDP layer delivered both. | review of `drive` | First a check in `destination` and a network label on each raw packet. Now the types: the IP layer's upper port carries only `CheckedIpPacket`, captured copies are `ObservedIpPacket`, and an endpoint owns its interface, so its raw packets carry no network to check. | The check's world test went with the check; the compile_fail example in the `network::packet` module docs shows an observed copy cannot be handed to a transport |
 | `Peers::enter` inserted a zero entry for a peer it refused, so under `Limits::connections_per_peer` of zero the map grew by one entry for every address that tried. | the test; no `kani/peers.rs` exists in the tree or its history | `enter` reads the count and inserts only when it admits. | `hosts::tests::a_refused_peer_leaves_nothing_counted` |
 | `packet::Framed` handed up a second `PacketEvent::Ended` when the stream was reset after its end, which a peer may do. | review | A reset after the end ends nothing more. | `packet::framed::tests::a_reset_after_the_end_ends_the_packets_once` |
 
@@ -91,8 +91,8 @@ handles are views of the transports `drive` owns, with no IP layer of their
 own. The endpoint owns its interface, so every packet it takes in is of
 its own network, and the IP layer's upper port carries `CheckedIpPacket`,
 which a captured copy (`ObservedIpPacket`) is not: a replacement IP layer
-cannot hand a transport an observed copy, and the compile_fail example in
-`guide::lowering` checks that. `kani/dispatch.rs` has one harness on the
+cannot hand a transport an observed copy, and the compile_fail example in the
+`network::packet` module docs checks that. `kani/dispatch.rs` has one harness on the
 production `destination`, a child module of `network/endpoint.rs` under
 `cfg(kani)`, with no stubs. `a_host_packet_goes_only_to_its_transport`:
 a 28-byte IPv4 packet from 10.0.0.2 to 10.0.0.1 with any protocol,

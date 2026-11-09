@@ -37,31 +37,6 @@
 //! handshake, so DHCP, neighbor discovery and DNS travel as ordinary
 //! packets when they travel at all.
 //!
-//! Each endpoint owns this input path and its IP reassembly. A packet tunnel
-//! feeds a separate endpoint through `packet::Framed::new()` and
-//! `IpLayer::host()`. The IP boundary validates raw chunks before handing
-//! `CheckedIpPacket` values to host transports. Passive capture input uses
-//! `ObservedIpPacket` instead, retaining truncated bytes and capture context.
-//! When several networks share a capture, the dispatcher separates their
-//! identities before address-based lookup or reassembly; an interface number
-//! alone does not identify an inner tunnel network.
-//! `Dissector::decode_captured` accepts the caller's network, capture point,
-//! timestamp and packet number. Each decoded record retains that context and
-//! a local observation number, so repeated packet numbers from different
-//! capture points remain distinct. Unlabelled decoding leaves this context
-//! absent.
-//!
-//! An observation cannot be substituted for a checked host packet:
-//!
-//! ```compile_fail
-//! use fictionet::stdlib::layer::Chunk;
-//! use fictionet::stdlib::network::packet::{CheckedIpPacket, Ingress, ObservedIpPacket};
-//!
-//! fn transport_input(_: CheckedIpPacket) {}
-//! let captured = ObservedIpPacket::observed(Chunk::new(vec![]), Ingress::default());
-//! transport_input(captured);
-//! ```
-//!
 //! A message is at most 65,536 bytes, so a packet is at most 65,535
 //! bytes. Attach's `hello`, the first message it sends, carries an MTU, which the world reads with
 //! [`Attachment::mtu`](crate::Attachment::mtu). It is advice for UDP and

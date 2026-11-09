@@ -46,6 +46,17 @@
 //! ([`Ingress`]). The two types never mix: a transport cannot be handed an
 //! observed copy.
 //!
+//! ```compile_fail
+//! use fictionet::stdlib::layer::Chunk;
+//! use fictionet::stdlib::network::packet::{CheckedIpPacket, Ingress, ObservedIpPacket};
+//!
+//! fn transport_input(_: CheckedIpPacket) {}
+//! let captured = ObservedIpPacket::observed(Chunk::new(vec![]), Ingress::default());
+//! transport_input(captured);
+//! ```
+//!
+//! A host takes raw packets in:
+//!
 //! ```
 //! use std::sync::Arc;
 //! use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, PacketEvent};
