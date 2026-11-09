@@ -216,11 +216,6 @@ pub trait Credited {
     fn terminal_reset(&self) -> bool {
         false
     }
-
-    /// Whether this event may pass refused input. EOF never may.
-    fn urgent(&self) -> bool {
-        false
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +235,10 @@ pub struct ByteStream;
 impl Port for ByteStream {
     type Event = StreamEvent;
     type Command = StreamCommand;
+
+    fn urgent(event: &StreamEvent) -> bool {
+        matches!(event, StreamEvent::Written(_) | StreamEvent::Reset)
+    }
 }
 
 /// What comes up a byte stream.
@@ -300,10 +299,6 @@ impl Credited for StreamEvent {
         } else {
             false
         }
-    }
-
-    fn urgent(&self) -> bool {
-        matches!(self, StreamEvent::Written(_) | StreamEvent::Reset)
     }
 
     fn credit(&self) -> u64 {

@@ -4,16 +4,16 @@ CONSTANTS Queries, Mode, Gate, Fifo, Identity, Consume, Prefix
 VARIABLES handshake, next, asking, completed, queue, sent, wire, badTiming
 vars == <<handshake,next,asking,completed,queue,sent,wire,badTiming>>
 
-\* Sources: world/net/hosts.rs 2095-2101 builds the application after Secure
-\* reports Established. services/tls/secure.rs 121-135 gates construction.
+\* Sources: world/net/hosts.rs 1942-1946 builds the application after Secure
+\* reports Established. services/tls/secure.rs 123-138 gates construction.
 \* world/net/dns/encrypted.rs 531-551 admits and numbers DoT queries;
 \* 581-586 removes the matching generation and queues its answer;
 \* 607-609 pops the oldest answer, then Framed emits its bytes in order.
 \* 730-739 closes over each DoH request's query and returns that answer.
 \* web/httpd/native.rs 525-544, 621-630 waits on one response;
-\* 774-788, 1065-1073 admits the next request only after it (HTTP/1);
-\* web/httpd/http2/respond.rs 512-523 accepts the matching response once;
-\* web/httpd/http2.rs 1218-1235 sends prefixes of each stream's front buffer.
+\* 776-790, 1065-1073 admits the next request only after it (HTTP/1);
+\* web/httpd/http2/respond.rs 509-524 accepts the matching response once;
+\* web/httpd/http2.rs 1220-1237 sends prefixes of each stream's front buffer.
 \* TLS cryptography, framing lengths and HTTP parsing are abstracted out.
 \* Secure supplies the establishment gate; handshake success/failure are
 \* alternative terminal outcomes here, not post-establishment transport loss.

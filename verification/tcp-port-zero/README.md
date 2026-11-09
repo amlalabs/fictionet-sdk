@@ -35,14 +35,16 @@ retain listener metadata; aborted sockets may retain a tuple until reset
 dispatch. The model preserves both behaviors.
 
 [Socket.cfg](Socket.cfg) completed with **18,192
-generated states, 1,072 distinct states, depth 6, and an empty queue**. All
+generated states, 1,072 distinct states, depth 7, and an empty queue**. All
 four invariants and both action properties passed together.
 
 [Socket_nonzero_reset.cfg](Socket_nonzero_reset.cfg)
 replaces the Option-based reset guard with the old nonzero-port guard while
 still admitting port zero. TLC reports `PassiveResetRestores` violated:
-closed → listen on zero → passive SYN → RST closes the socket. It exits 13
-after 323 generated and 273 distinct states. This is a sensitivity check;
+closed → listen on zero → passive SYN → RST closes the socket. It exits 13.
+How many states it explores before the violation depends on the worker
+count: 323 generated and 273 distinct with one worker, 153 and 135 with
+two. This is a sensitivity check;
 it neither models the whole old implementation nor reproduces a current bug.
 
 State-changing receive events abstract packets that have passed sequence,
@@ -73,7 +75,12 @@ Connection removal represents actual resource release, not handle drop.
 The port domain is `{0, 1, 49152, 65535}` and the ephemeral ring is compressed
 to `<<49152, 65535>>`, with both possible initial cursors. This exercises
 exhaustion, skipping occupied ports, wraparound, release and rebinding; it does
-not exhaustively enumerate the real 16,384-port allocator.
+not exhaustively enumerate the real 16,384-port allocator. The model's
+`Connect` always succeeds once a free port is found. In `connect`, the
+budget charge and the smoltcp `connect` come after the port is chosen, and
+when either fails the connect is refused with `next_port` already advanced
+past the chosen port and no reservation taken. The model does not see that
+skip; no property here depends on which free port the next connect gets.
 
 Preparation models plain, nonsharing TCP service declarations in
 [`Machine::prepare` and the installation path](../../src/stdlib/world/net/hosts.rs):
@@ -97,6 +104,16 @@ or a depth cutoff. The two specifications are checked separately, not as a
 combined concurrent host/allocator system. TLS, shared service callbacks,
 UDP, cancellation, stopped endpoints, invalid addresses, and packet visibility
 of temporary listeners on an already running machine are outside this model.
+So is a listen refused for a reason other than a duplicate declaration: a
+port an outgoing connection or a program's own listener holds, or a
+transport that takes no command. In the model `Prepare` succeeds whenever
+the port is not installed or pending; in Rust each of those refusals takes
+the same `Err` path and releases the same listeners. The model also treats
+the `Unlisten` a dropped listener sends as immediate; in Rust it goes
+through `Host::control`, which queues it in `Host::controls` if the
+transport refuses it. The engine refuses no control command (`refuses` in
+`tcp/engine.rs` answers only child commands), so this queue is empty in
+practice.
 
 ## Proofs against Rust
 
@@ -163,7 +180,8 @@ the abstractions. The smoltcp socket module passed 253 tests and the TCP wire
 module passed 22 tests. The Fictionet literal-port conversation test passed
 across IPv4/IPv6 and ports zero, one and the largest port, checking payload
 roundtrips, endpoint identity, refusal and
-rebinding. All 29 network service tests passed, including zero-port host
+rebinding. Every network service test passed (29 then;
+`tests/it/services/network.rs` now holds 31), including zero-port host
 conversations and rollback after duplicate listeners. These executions support
 the correspondence; they are not a proof of refinement.
 

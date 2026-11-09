@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::stdlib::layer::{
-    Budget, Charge, Chunk, CreditReturn, Credited, Owned, Port, StreamCommand, StreamEvent,
+    Budget, ByteStream, Charge, Chunk, CreditReturn, Credited, Owned, Port, StreamCommand,
+    StreamEvent,
 };
 use crate::stdlib::protocols::ssh::connection as wire;
 
@@ -23,6 +24,10 @@ pub struct ChannelPort;
 impl Port for ChannelPort {
     type Event = ChannelEvent;
     type Command = ChannelCommand;
+
+    fn urgent(event: &ChannelEvent) -> bool {
+        matches!(event, ChannelEvent::Stream(e) if ByteStream::urgent(e))
+    }
 }
 
 /// Events on one SSH channel. Data consumes byte credit; controls have bounded
@@ -126,9 +131,6 @@ impl Credited for ChannelEvent {
             _ => false,
         }
     }
-    fn urgent(&self) -> bool {
-        matches!(self, Self::Stream(e) if e.urgent())
-    }
     fn terminal_reset(&self) -> bool {
         matches!(self, Self::Stream(StreamEvent::Reset))
     }
@@ -214,7 +216,7 @@ impl<F: FnMut(ChannelEvent) -> Option<ChannelCommand>> crate::stdlib::layer::Lay
     ) -> Result<crate::stdlib::layer::Admit<ChannelEvent>, Self::Error> {
         use crate::stdlib::layer::Admit;
         match event {
-            ChannelEvent::Stream(event) if event.urgent() => {
+            ChannelEvent::Stream(event) if ByteStream::urgent(&event) => {
                 if self.urgent.is_some() {
                     return Ok(Admit::Blocked(ChannelEvent::Stream(event)));
                 }

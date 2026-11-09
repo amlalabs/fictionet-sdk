@@ -2,7 +2,7 @@
 //! windows and usize packet lengths are symbolic; there is no small-window
 //! assumption. Buffer admission is proved independently of allocation.
 //! Source: src/stdlib/services/ssh.rs:357-383 (buffer admission),
-//! :680-708 (receive and send debits), :1235-1251 and :1754-1763 (callers).
+//! :664-691 (receive and send debits), :1227 and :1745 (callers).
 use super::*;
 
 fn channel() -> Channel {
@@ -87,8 +87,12 @@ fn ssh_output_buffer() {
     );
 }
 
-// Negative controls remove a guard or change the charged length. Each must
-// fail its conservation assertion; they are deliberately separate harnesses.
+// Negative controls, deliberately separate harnesses that must fail. They
+// do not call the production debits with a guard removed: the three
+// `without_bound`/`without_limit` ones are the unguarded arithmetic
+// written out here, `without_count` subtracts the increment from
+// `next_bytes`'s result here, and `without_exit` asserts that an open
+// buffer refuses an empty write, which it does not.
 #[kani::proof]
 fn ssh_receive_without_bound() {
     let available: u32 = kani::any();

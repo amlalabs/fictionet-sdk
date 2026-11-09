@@ -81,11 +81,13 @@ enum Phase<A, B> {
 /// layer, not TLS.
 ///
 /// The switch moves the handover's leftovers to `B` once each, before
-/// anything newer, and drops `A` with its timers and work. A timer or a
-/// result of `A`'s that arrives after the switch is ignored. Events from
-/// below that came before the switch and that `B` does not
-/// [inherit](Successor::inherits) never reach it, whether `A` handed them
-/// over or refused them.
+/// anything newer, and drops `A` with its timers and work. A write
+/// completion or a reset ([`Port::urgent`]) passes the leftovers: it is
+/// counted apart from the data, and `B` may be waiting for it before it
+/// reads them. A timer or a result of `A`'s that arrives after the switch
+/// is ignored. Events from below that came before the switch and that `B`
+/// does not [inherit](Successor::inherits) never reach it, whether `A`
+/// handed them over or refused them.
 pub struct Switch<A, B>
 where
     A: Handoff,
@@ -186,8 +188,11 @@ where
                 self.owed = false;
                 Ok(Admit::Taken)
             }
-            // The old layer's leftovers go first.
-            Phase::Then(_) if !self.below.is_empty() => Ok(Admit::Blocked(event)),
+            // The old layer's leftovers go first; a completion or a reset
+            // passes them, as it passes refused input anywhere.
+            Phase::Then(_) if !self.below.is_empty() && !A::Lower::urgent(&event) => {
+                Ok(Admit::Blocked(event))
+            }
             Phase::Then(b) => env
                 .scoped(Side::Upper, |env| b.on_event(env, event))
                 .map_err(Side::Upper),
@@ -340,5 +345,144 @@ where
             Phase::First(a) => a.deadline().map(|(at, t)| (at, Side::Lower(t))),
             Phase::Then(b) => b.deadline().map(|(at, t)| (at, Side::Upper(t))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::layer::{Budget, ByteStream, Chunk, Driver, StreamCommand, StreamEvent};
+    use crate::{Seed, SeededEntropy};
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    /// A layer past its boundary from the start, with two chunks of input
+    /// it read past it to hand over.
+    struct Finished {
+        leftovers: Option<Vec<StreamEvent>>,
+    }
+
+    impl Layer for Finished {
+        type Lower = ByteStream;
+        type Upper = ByteStream;
+        type Report = ();
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(Admit::Blocked(event))
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            command: StreamCommand,
+        ) -> Result<Admit<StreamCommand>, Infallible> {
+            Ok(Admit::Blocked(command))
+        }
+        fn take_command(&mut self) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<StreamEvent> {
+            None
+        }
+    }
+
+    impl Handoff for Finished {
+        type Next = ();
+        fn handover(&mut self) -> Option<Handover<(), ByteStream, ByteStream>> {
+            Some(Handover {
+                next: (),
+                below: self.leftovers.take()?,
+                above: Vec::new(),
+            })
+        }
+    }
+
+    /// A successor that reads nothing until the transport has taken what
+    /// it wrote, as HTTP/2 does at its output bound.
+    struct Waiting {
+        written: bool,
+        read: Vec<u8>,
+    }
+
+    impl Successor<()> for Waiting {
+        fn succeed((): ()) -> Waiting {
+            Waiting {
+                written: false,
+                read: Vec::new(),
+            }
+        }
+    }
+
+    impl Layer for Waiting {
+        type Lower = ByteStream;
+        type Upper = ByteStream;
+        type Report = ();
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(match event {
+                StreamEvent::Written(_) => {
+                    self.written = true;
+                    Admit::Taken
+                }
+                StreamEvent::Data(chunk) if self.written => {
+                    self.read.extend_from_slice(&chunk);
+                    Admit::Taken
+                }
+                event => Admit::Blocked(event),
+            })
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            command: StreamCommand,
+        ) -> Result<Admit<StreamCommand>, Infallible> {
+            Ok(Admit::Blocked(command))
+        }
+        fn take_command(&mut self) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<StreamEvent> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_write_completion_passes_the_leftovers_the_successor_waits_to_read() {
+        let first = Finished {
+            leftovers: Some(vec![
+                StreamEvent::Data(Chunk::new(b"first".to_vec())),
+                StreamEvent::Data(Chunk::new(b"second".to_vec())),
+            ]),
+        };
+        let mut driver: Driver<Switch<Finished, Waiting>> = Driver::new(
+            Switch::new(first),
+            Arc::new(SeededEntropy::new(Seed::from_u64(7))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        driver.run().unwrap();
+        assert!(driver.layer().then().is_some(), "the switch handed over");
+        // The successor refuses the leftovers until its writes complete;
+        // the completion must not wait behind them.
+        let admit = driver.deliver(StreamEvent::Written(3)).unwrap();
+        assert!(
+            matches!(admit, Admit::Taken),
+            "the completion was held: {admit:?}"
+        );
+        driver.run().unwrap();
+        assert_eq!(driver.layer().then().unwrap().read, b"firstsecond");
     }
 }

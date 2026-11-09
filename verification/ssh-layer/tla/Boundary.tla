@@ -1,8 +1,11 @@
 ---------------------------- MODULE Boundary ----------------------------
-\* Source: src/stdlib/services/ssh.rs:1013-1027 authentication success;
-\* :1265-1309 packet authorization; :1311-1478 negotiation and queued input;
-\* :804-818 child factory; src/stdlib/layer/children.rs:394-479 reservation
-\* and factory ordering; src/stdlib/services/ssh/transport.rs:214-264 fatal poll errors.
+\* Source: src/stdlib/services/ssh.rs:996-1009 authentication success;
+\* :1264-1293 packet authorization (connection messages need a user,
+\* 1287); :1294-1476 negotiation and queued input (queued packets are
+\* taken only in State::Established, 1322 and 1342-1346; Rekeying is
+\* its own state, services/ssh/transport.rs:205-220); :788-802 child
+\* factory; src/stdlib/layer/children.rs:858-922 reservation and factory
+\* ordering; src/stdlib/services/ssh/transport.rs:242-285 fatal poll errors.
 EXTENDS Naturals, Sequences
 CONSTANT Mutation
 VARIABLES transport, authenticated, queue, delivered, factory

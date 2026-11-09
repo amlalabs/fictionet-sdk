@@ -9,8 +9,10 @@
 (* The client sends N requests, each HEAD or GET (the solver chooses);    *)
 (* the server answers each in order with a response whose body framing    *)
 (* depends on the method, as a 200 with a length does. A response the     *)
-(* reader cannot pair is shown, and its direction is not read further     *)
-(* (`Http1State::ToClose`).                                               *)
+(* reader cannot pair is shown without its body, and its direction is not *)
+(* read further (`Http1State::ToClose`), unless the response has no body  *)
+(* under any method (a non-2xx with none), when the reader goes on to the *)
+(* next head (`read_head`, the `Method::Lost` arm).                       *)
 (*                                                                        *)
 (* Source lines, at the commit in README.md:                              *)
 (*   Methods::push, request, answer,     http1.rs 326-401                 *)
@@ -18,8 +20,10 @@
 (*   Http1::miss                         http1.rs 92-96                   *)
 (*   Http1::decode (a head read or not;  http1.rs 128-190                 *)
 (*     which way the direction carries)                                   *)
-(*   Http1::reset, malformed             http1.rs 282, 291-296            *)
-(*   read_head (answer, unpaired)        http1.rs 459-501                 *)
+(*   Http1::reset, malformed             http1.rs 291-296, 247-285        *)
+(*     (ToClose and miss at 281-282)                                      *)
+(*   read_head (answer, unpaired; a      http1.rs 459-502                 *)
+(*     bodiless non-2xx reads on, 490)                                    *)
 (*                                                                        *)
 (* Left out: the bytes and bodies themselves, 1xx responses (which take   *)
 (* no method), and a response read before its request when the request   *)
@@ -100,13 +104,15 @@ Answer == IF unknown /\ Sticky THEN [m |-> "lost", q |-> queue, u |-> TRUE]
 
 (* The response reader reads response respNext, once its request was read *)
 (* or missed. Its body is framed by the method; without one it is shown   *)
-(* and the direction stops.                                               *)
+(* and the direction stops (read_head: ToClose), unless the response has  *)
+(* no body under any method, a non-2xx with none, when the reader goes on *)
+(* (read_head: Head). `body` says which the response is.                  *)
 ReadResponse ==
   /\ ~stopped /\ respNext <= N /\ respNext < reqNext
   /\ LET a == Answer
      IN /\ queue' = a.q /\ unknown' = a.u
         /\ framed' = Append(framed, IF a.m = "lost" THEN "unknown" ELSE a.m)
-        /\ stopped' = (a.m = "lost")
+        /\ \E body \in BOOLEAN : stopped' = (a.m = "lost" /\ body)
   /\ respNext' = respNext + 1 /\ respRole' = TRUE
   /\ UNCHANGED <<reqs, reqNext, reqRole, gaps, missed, full>>
 

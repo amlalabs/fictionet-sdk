@@ -315,6 +315,10 @@ where
                             unread: self.buf.len(),
                         });
                     }
+                    // The step may have raised the capacity to make room
+                    // for what it needs: the limit follows it before the
+                    // room is judged.
+                    self.sync_limit();
                     if self.buf.len() >= self.dec.capacity() || self.buf.room() == 0 {
                         return self.fail(self.stuck());
                     }

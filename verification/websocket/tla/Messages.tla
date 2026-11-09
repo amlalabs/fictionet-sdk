@@ -14,6 +14,13 @@ EXTENDS Naturals
    modeled after failure. CheckBeforeGrowth bounds the logical aggregate
    before copying, represented by charged, including final frames that
    immediately release. It does not bound total transient allocation.
+   charged is the decoder's own sum, held plus the frame length, that
+   check_header compares with its limit at 972-976; no layer::Budget is
+   involved anywhere in websocket.rs. Frames::decode at 1001 then
+   allocates the frame's payload (Frame::from_header, 877) and decode
+   appends it to the partial message (1027), so a message briefly costs
+   its held bytes plus twice the frame.
+   Line numbers checked against e2858ccc4 on 2026-11-09: all hold.
 *)
 CONSTANTS Limit, Steps, CheckOrder, CheckControl, CheckBeforeGrowth,
           StopAfterClose, PreservePartial

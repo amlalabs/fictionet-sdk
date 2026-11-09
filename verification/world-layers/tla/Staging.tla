@@ -41,21 +41,43 @@
    nondeterministic failure. Programs, names and the addresses' family are
    left out.
 
-   Source lines, in src/stdlib/world/net/hosts.rs unless named (at the
-   commit that adds this model):
-     Begin        1127 `place_inner`, 1196 `place_on_lan`, 1259 `gateway`
+   Three things the code does that this does not see. A UDP port declared
+   twice, or bound on the machine already, fails `bind` (udp.rs 645-649)
+   where a TCP port is shared; here both are shared, and `Fail` covers
+   the bind. A listener staged on an existing machine completes
+   handshakes into its backlog before commit, since `Accept` comes with
+   `attach` (tcp.rs 1845); a failed preparation resets what waits there
+   with the listener (tcp.rs 1952-1965). `Connect` here is an application
+   built, so a handshake alone is not seen. A gateway (`gateway`, called
+   once per address by net.rs 1060 `start_gateway`) is built and started
+   but never entered in `world.machines`; for it `exists` means running.
+   It is staged without a lookup of an existing machine; a host machine
+   never has the gateway's address (addresses.rs 155 `may_serve_v4` and
+   268 `free_auto` keep hosts out of the world's subnet) or a LAN's DNS
+   address (hosts.rs 1137-1141, 1214-1220), so there is one dispatcher
+   there too.
+
+   Source lines, in src/stdlib/world/net/hosts.rs unless named (checked
+   against main e2858ccc4):
+     Begin        1115 `place`, 1127 `place_inner`, 1196 `place_on_lan`,
+                  1259 `gateway`
      Stage        1170, 1231, 1265 (the calls); 1517 `Machine::stage`, 1532
-                  `network::endpoint::prepare` (endpoint.rs 228), 1592 the
+                  `network::endpoint::prepare` (endpoint.rs 266; tcp.rs
+                  1006 and udp.rs 159 `prepare_transport`), 1592 the
                   unspawned task
-     Declare      1598 `Machine::prepare`: 1607 `bind`, 1622 `listen`
+     Declare      1598 `Machine::prepare`: 1607 `bind` (udp.rs 625), 1622
+                  `listen` (tcp.rs 1706)
      NextAddress  1168-1174 (the address loop)
      Fail         the `?` at 1171, 1174, 1232, 1238, 1266, 1268, and the
-                  drops: udp.rs 240 and tcp.rs 1096 `PacketDriver::drop`
+                  drops: udp.rs 795 `Socket::drop`, tcp.rs 1952
+                  `Listener::drop`, udp.rs 268 and tcp.rs 1129
+                  `PacketDriver::drop`
      Commit       1175-1180 (`Router::add`, then commit), 1236-1240 (the
                   LAN join), 1268-1273 (the gateway); 1487
                   `PreparedMachine::commit`; 1764 `Machine::add`, 1769 and
-                  601 (`udp::Socket::attach`), 1798 (`tcp::Listener::attach`)
-     Connect      endpoint.rs 54 `drive`, the dispatcher every packet of the
+                  601 (`udp::Socket::attach`, udp.rs 673), 1798
+                  (`tcp::Listener::attach`, tcp.rs 1838)
+     Connect      endpoint.rs 55 `drive`, the dispatcher every packet of the
                   machine passes; 1810 the factory *)
 EXTENDS Naturals, Sequences, FiniteSets
 

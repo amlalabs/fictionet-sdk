@@ -856,23 +856,23 @@ impl Cache {
     }
 
     /// Drops each live NXDOMAIN at `key`'s name or above it whose rank is
-    /// at most `rank`, with its copies under the types it answered.
+    /// at most `rank`, with its copies under the types it answered. A copy
+    /// is dropped on its own terms: a later NXDOMAIN of another type
+    /// replaces the entry under ANY with a shorter one, and the copy of
+    /// the first outlives it.
     fn exists(&mut self, key: &Key, rank: Rank, now: Instant) {
         let mut at = key.name.clone();
         loop {
             let nxdomain = Key::new(at.clone(), RecordType::ANY, key.class);
-            if let Some(
-                entry @ Entry::Negative {
-                    kind: Negative::NxDomain,
-                    ..
-                },
-            ) = self.live(&nxdomain, now)
-                && entry.rank() <= rank
-            {
-                for copy in self.nxdomain_copies(&nxdomain) {
-                    self.entries.remove(&copy);
+            let mut kept = self.nxdomain_copies(&nxdomain);
+            kept.push(nxdomain);
+            for key in kept {
+                if self
+                    .live(&key, now)
+                    .is_some_and(|entry| entry.rank() <= rank)
+                {
+                    self.entries.remove(&key);
                 }
-                self.entries.remove(&nxdomain);
             }
             if at.is_root() {
                 return;

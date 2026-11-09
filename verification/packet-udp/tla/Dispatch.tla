@@ -1,18 +1,24 @@
 ------------------------------ MODULE Dispatch ------------------------------
-(* The IP layer's slots: `IpLayer` in src/stdlib/network/packet.rs.
-   `on_event` (lines 496-515) refuses input while a packet or an answer
-   waits, and takes a packet in with `take_in` (438-476); `on_command`
-   (517-531) takes one command from the transports; `take_command`
-   (538-543) gives the answer before the command; `take_event` (545-547)
-   hands the packet up; `on_timer` (533-536) expires waiting fragments.
+(* The IP layer's slots: `IpLayer` in src/stdlib/network/packet.rs (lines
+   at e2858ccc4). `on_event` (lines 515-534) refuses input while a packet
+   or an answer waits, and takes a packet in with `take_in` (457-495);
+   `on_command` (536-550) takes one command from the transports;
+   `take_command` (557-562) gives the answer before the command;
+   `take_event` (564-566) hands the packet up; `on_timer` (552-555)
+   expires waiting fragments. The transports take what is up through
+   `Driver::send_above` in `drive`, src/stdlib/network/endpoint.rs
+   121-167, which sorts it with `destination` (35-47).
 
    What `take_in` makes of a packet is its kind, fixed per packet and
    explored over every assignment: a whole packet for a transport, a packet
    refused with an answer or without one (`Intake::Refused`), a fragment
    that waits, or a fragment that completes a packet with every fragment
    waiting (`Intake::Whole` from reassembly). How reassembly decides is in
-   Reassembly.tla; where a packet goes is `Sort::read`,
-   a function of its bytes, checked with Kani. *)
+   Reassembly.tla; where a packet goes is `Sort::of` and `Sort::read`
+   (packet.rs 168-174), a function of its bytes, checked with Kani. A
+   "done" fragment here completes every waiting fragment, and `Timer`
+   expires every one: coarser than the code, which completes and expires
+   per key, but the slots see only whether a packet is waiting. *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS

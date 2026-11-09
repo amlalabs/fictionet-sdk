@@ -1,5 +1,5 @@
 //! Kani harnesses over the Search time server: `TimeServer`, a layer over
-//! `Datagrams<SocketAddr>` (demos/search/world/src/ntp.rs:33-120), with
+//! `Datagrams<SocketAddr>` (demos/search/world/src/ntp.rs:35-129), with
 //! the real `Packet::parse`, `ntp::server_reply` and `Packet::write`
 //! (src/stdlib/protocols/ntp.rs:544-593, 621-689).
 //!

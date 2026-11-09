@@ -13,7 +13,7 @@ models, how to run them and the full results are in
 
 | Model | Of | Checker | Result |
 |---|---|---|---|
-| `verification/http/lean/Http/Framing.lean` | `ResponsePolicy::new`, `native::encode` and `Http1::start`, `http1::response_framing`, `Respond::start`, `Respond::respond`, `Http2::response_head` and `Http2::send_one` | Lean 4 (`lake build`, axiom audit) | 20 theorems proved for every status class, method, body hint and supplied length: never both length fields, HTTP/1.0 never chunked and closes on an unknown length, no length on 1xx or 204, no framing on a 2xx to CONNECT, HEAD's length is GET's, the reader finds the body the server wrote, HTTP/2 END_STREAM and `content-length` agree with the DATA. Only `propext`, `Quot.sound` and `Classical.choice` appear. |
+| `verification/http/lean/Http/Framing.lean` | `ResponsePolicy::new`, `native::encode` and `Http1::start`, `http1::response_framing`, `Respond::start`, `Respond::respond`, `Http2::response_head` and `Http2::send_one` | Lean 4 (`lake build`, axiom audit) | 19 headline theorems (22 with three helper lemmas) proved for every status class, method, body hint and supplied length: never both length fields, HTTP/1.0 never chunked and closes on an unknown length, no length on 1xx or 204, no framing on a 2xx to CONNECT, HEAD's length is GET's, the reader finds the body the server wrote, HTTP/2 END_STREAM and `content-length` agree with the DATA. Only `propext`, `Quot.sound` and `Classical.choice` appear. |
 | `verification/http/lean/Http/Request.lean` | `http1::fields` and `request_framing` | Lean 4 | 12 theorems: RFC 9112 sections 6.1 and 6.3 for requests (both fields refused, HTTP/1.0 `Transfer-Encoding` refused, `chunked` not final refused, no `chunked` refused, unsupported coding is a 501, equal `Content-Length` values accepted, differing or invalid ones refused, no fields means no body). |
 | `verification/http/tla/Streams.tla` | `Http2::on_headers`, `admit`, `on_data`, RST_STREAM handling, `end_stream`, `write_reset`, `Respond::on_timer`, `Http2::written`, `Respond::start`, `Respond::respond`, `Http2::response_head` and `Http2::send_one` | TLC 2.19 | Base: 210,019 states generated, 13,277 distinct, depth 14; six invariants and six properties hold, including the liveness `ResponsesEnd`. Four ablations each violate the one property named for them. |
 | `verification/http/tla/Flow.tla` | The receive side of `Http2::on_data`, `Http2::release`, the send side of `Respond::start`, `Respond::respond`, `Http2::response_head` and `Http2::send_one`, the WINDOW_UPDATE and SETTINGS_INITIAL_WINDOW_SIZE arms of `Http2::on_frame` | TLC 2.19 | Base: 4,581,219 states generated, 1,145,490 distinct, depth 22; four invariants and four properties hold, including the liveness `NoLostWake`, `ResponsesEnd` and `RequestsEnd`. Eight ablations each violate the one property named for them. |
@@ -76,7 +76,16 @@ The foundation readiness pass reran the base configuration and all nine
 mutations after bounding post-framing input admission to the remaining
 stream capacity. The base checked 1,493,826 generated and 660,798 distinct
 states, including `AfterLen <= StreamCap`; all nine mutations violated
-the same named properties listed above. These runs used the cached JDK,
+the same named properties listed above. `AfterLen <= StreamCap` holds
+vacuously: the `after` branch of `HttpData` needs `sdone` with the phase
+still `Reading` or `Answering`, and `sdone` is set only together with
+`Close` or the 400 path, which leave those phases (checked 2026-11-09).
+The code's own `after` buffer (native.rs:924-948) is likewise reached only
+when the decoder is done outside `Closing`, which `Http1::read`
+(native.rs:374-386), the only caller of `Stream::next`, never allows; so
+neither the model nor the code exercises it. The counts to a violation
+above vary by a few hundred between runs; the run of 2026-11-09 on main
+found the same violations. These runs used the cached JDK,
 `-Xmx6g`, a systemd 8 GiB memory limit, and state directories on the home
 volume. The model abstracts allocation: production reserves decoded-head
 storage and wire output before growth, and copied handover bytes carry a
@@ -175,7 +184,7 @@ with the 101 followed by a second `HTTP/1.1` response on the same
 connection.
 
 Fix: `Http1::start` closes the connection after a 101 that carries no
-`UpgradeHandler` (native.rs:577-581). After it the test passes and
+`UpgradeHandler` (native.rs:702-706 at e2858ccc4). After it the test passes and
 `Pipeline_base.cfg`, which checks `NoHttpAfter101`, passes. The rule
 predates B2: the server before the layer had the same one. Commit
 b69a3806f: "Model the HTTP/1 pipeline and handoff; close after a bare 101".

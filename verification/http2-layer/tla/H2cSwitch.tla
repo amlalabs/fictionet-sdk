@@ -18,7 +18,7 @@
 (* Source lines, at the commit in README.md:                              *)
 (*   Detect::on_event, scan                detect.rs 108-153, 202-213     *)
 (*   Detect::handover                      detect.rs 223-250              *)
-(*   Switch::on_event, Switch::advance     switch.rs 133-148, 198-234     *)
+(*   Switch::on_event, Switch::advance     switch.rs 167-195, 245-286     *)
 (*   Http1::on_event (data, end)           native.rs 895-993              *)
 (*   Http1::finish, Http1::hand_on         native.rs 776-820              *)
 (*   Http1::handover                       native.rs 1110-1121            *)

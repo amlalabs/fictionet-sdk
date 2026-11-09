@@ -1,30 +1,37 @@
 ----------------------------- MODULE Reassembly -----------------------------
 (* Fragment reassembly under one IP layer: `IpLayer::take_in`, `on_timer`
-   and `deadline` in src/stdlib/network/packet.rs (lines 438-476, 533-536
-   and 549-551), over `Reassembly` in src/stdlib/network/ip.rs:
-   `reassemble` (lines 668-680), `push_fragment` (683-797), `take`, `kill`
-   (800-824) and `expire` (856-863).
+   and `deadline` in src/stdlib/network/packet.rs (lines 457-495, 552-555
+   and 568-570), over `Reassembly` in src/stdlib/network/ip.rs:
+   `reassemble` (lines 669-681), `push_fragment` (684-798), `take`, `kill`
+   (801-825) and `expire` (857-864). Lines at e2858ccc4.
 
    Two networks send one packet each with the same key: the same
    addresses, identification and protocol, as a tunnel's network and the
    world's can. Each packet is two fragments, the first (offset 0, more to
-   come, with the header) and the last. A fragment's bytes are its
-   network's, so the same place from the other network is "the same place
-   with other bytes" and kills the packet (RFC 5722), and an exact copy is
-   ignored. Sizes are in units: a packet costs PartialCost, a fragment
-   PieceCost more; the code's 192 and 64 plus data bytes scale the same
-   way. Time is whole ticks; a packet expires Timeout ticks after its
-   first fragment, and `expire(now)` drops those with expires <= now.
+   come, with the header) and the last. A fragment carries one of the byte
+   patterns in Data, and its bytes are its network's. A fragment at the
+   place of one waiting, from the same network with the same bytes, is an
+   exact copy and is ignored (push_fragment 727-737); the same place with
+   other bytes, or from the other network, is an overlap and kills the
+   packet (RFC 5722; 757-774, `kill`), which stays dead, dropping its later
+   fragments (720-722), until it expires or the cap drops it. Partial
+   overlaps, the lengths and the "more fragments" flag on a copy are not
+   modeled: a fragment is whole at its offset. Sizes are in units: a packet
+   costs PartialCost, a fragment PieceCost more; the code's 192 and 64 plus
+   data bytes (and the first fragment's header) scale the same way. Time is
+   whole ticks; a packet expires Timeout ticks after its first fragment,
+   and `expire(now)` drops those with expires <= now.
 
-   The driver (src/stdlib/layer/driver.rs, `deliver` and `run`) hands a
-   packet in without firing due timers, so `Arrive` may run with a due
-   deadline and `Timer` is a separate step. *)
+   The driver (src/stdlib/layer/driver.rs: `deliver` 192-202, `run`
+   230-258) hands a packet in without firing due timers, so `Arrive` may
+   run with a due deadline and `Timer` is a separate step. *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     Nets,          \* the networks packets come from
     Mine,          \* the layer's own network: IpLayer::host_in(scope)
-    Keys,          \* reassembly keys (address pair, id, protocol)
+    Keys,          \* reassembly keys (address pair, id, protocol): ip.rs `Key`
+    Data,          \* the byte patterns a fragment may carry
     PartialCost,   \* PARTIAL_COST, in units
     PieceCost,     \* PIECE_COST, in units
     MaxWaiting,    \* MAX_WAITING, in units
@@ -43,7 +50,7 @@ Any == "any"
 TableKeys == (Nets \cup {Any}) \X Keys
 TK(n, k) == <<IF KeyHasScope THEN n ELSE Any, k>>
 
-Piece == [off : Offsets, net : Nets, at : 0..MaxTime]
+Piece == [off : Offsets, net : Nets, data : Data, at : 0..MaxTime]
 NoPartial == [live |-> FALSE, dead |-> FALSE, pieces |-> {}, expires |-> 0]
 
 VARIABLES
@@ -106,8 +113,9 @@ Timer ==
     /\ size' = size - CostOf(table, Expired(table, now))
     /\ UNCHANGED <<now, delivered, arrivals>>
 
-\* One fragment from network n, key k, at offset off reaches take_in.
-Arrive(n, k, off) ==
+\* One fragment from network n, key k, at offset off, carrying bytes dat,
+\* reaches take_in.
+Arrive(n, k, off, dat) ==
     /\ arrivals < MaxArrivals
     /\ arrivals' = arrivals + 1
     /\ UNCHANGED now
@@ -124,14 +132,14 @@ Arrive(n, k, off) ==
                    ELSE t0[tk]
              s1 == IF fresh THEN s0 + PartialCost ELSE s0
              same == {q \in p0.pieces : q.off = off}
-             new == [off |-> off, net |-> n, at |-> now]
+             new == [off |-> off, net |-> n, data |-> dat, at |-> now]
          IN
          IF p0.dead THEN
             \* A dropped packet keeps dropping its fragments.
             /\ table' = [t0 EXCEPT ![tk] = p0]
             /\ size' = s1
             /\ UNCHANGED delivered
-         ELSE IF same # {} /\ (\E q \in same : q.net = n) THEN
+         ELSE IF same # {} /\ (\E q \in same : q.net = n /\ q.data = dat) THEN
             \* An exact copy is ignored.
             /\ table' = [t0 EXCEPT ![tk] = p0]
             /\ size' = s1
@@ -161,7 +169,7 @@ Arrive(n, k, off) ==
 Next ==
     \/ Tick
     \/ Timer
-    \/ \E n \in Nets, k \in Keys, off \in Offsets : Arrive(n, k, off)
+    \/ \E n \in Nets, k \in Keys, off \in Offsets, dat \in Data : Arrive(n, k, off, dat)
 
 Spec == Init /\ [][Next]_vars
 

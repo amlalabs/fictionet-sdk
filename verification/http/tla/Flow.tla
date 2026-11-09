@@ -11,6 +11,20 @@
 (* The exchange child takes each body unit as it comes, as `Respond`     *)
 (* does, so the bytes `Http2::release` holds back for a child that has   *)
 (* not granted credit (`Stream::held`) are zero here.                     *)
+(*                                                                        *)
+(* Written for the serving engine before the layer foundation and checked *)
+(* against the layer `Http2` at e2858ccc4 on 2026-11-09: on_data          *)
+(* (http2.rs 770-830), release (1071-1103, credit_back 1619-1622),        *)
+(* send_one (1248-1310, sendable 1628-1632) and the WINDOW_UPDATE and     *)
+(* SETTINGS arms (914-932, 833-850) do what the actions say. The layer    *)
+(* keeps no per-stream waiting state: `Http2::send` (1220-1244) tries     *)
+(* every stream on every `advance`, so `waiting` and the three `Wake*`    *)
+(* flags stand for that one rule, and each `without_wakeon*` config       *)
+(* removes a part of it that is not a separate line of the code. The      *)
+(* finer model of the same code, with the children, their credit and      *)
+(* `Stream::held`, is verification/http2-layer/tla/Flow.tla; what this    *)
+(* one keeps is padding, the over-credit client and the receive-window    *)
+(* accounting (`CreditMatchesWindow`).                                    *)
 EXTENDS Integers, FiniteSets
 CONSTANTS Ids,        \* the client's stream identifiers, odd
           RecvWindow, \* 65_535: the server's initial receive windows, connection and stream

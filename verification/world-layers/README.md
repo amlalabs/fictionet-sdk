@@ -10,12 +10,15 @@ what the host guarantees, and whether a replacement gets the same.
 | Part | What it is | Where |
 |---|---|---|
 | TLA+ | `Staging`: installing a host on its machines, transactionally. `Admission`: admission, reset and retirement through the transport boundary, for a TCP that may refuse commands | [`tla/`](tla) |
-| Kani | The dispatcher's sorting over packets the production IP code makes, and the per-peer connection count | [`kani/`](kani) |
+| Kani | The dispatcher's sorting over packets the production IP code makes | [`kani/`](kani) |
 | Tests | The reproductions of the bugs below, and a tunnel whose inner packets carry the outer packets' fragment keys | `tests/it/world_layers.rs`, `tests/it/packet_composition.rs`, unit tests |
 
 Each spec names the source lines it follows in its header. Every
-property has a configuration that must fail on it for the reason its
-first line gives (`\* expect violation: <Property>`).
+property but three has a configuration that must fail on it for the
+reason its first line gives (`\* expect violation: <Property>`).
+`TypeOK` is the type invariant; `WithinLimit` follows from the admission
+test alone and `CommitServesAll` from the commit step, and no flag of
+either model breaks them.
 
 ## Bugs found
 
@@ -25,7 +28,7 @@ Four, each fixed with a test that fails without the fix.
 |---|---|---|---|
 | A TCP may refuse any command for now (`Admit::Blocked`). `Host::command` dropped a refused control. A refused `Hold` dropped its `PeerGuard`, so an open connection stopped counting against its peer, and a refused `Abort` never reset the connection past the limit. The standard `TcpLayer` never refuses a control, so only a replacement installed with `tcp::Factory` was exposed. | `Admission_dropblocked`, `Admission_dropblocked_reset` | `Host::controls` in `network/tcp.rs` keeps refused controls in order and `Host::pump` offers them again whenever the host steps the transport. `Listen` and `Connect`, whose answers the caller reads at once, go through `Host::request` and are never queued, so a failed `listen` leaves nothing for the transport to take later. A stopped endpoint drops the queue with what it holds. | `world_layers::a_tcp_that_refuses_commands_for_now_keeps_the_peer_count_and_resets` |
 | The dispatcher sent each packet its IP layer handed up to the transport the packet named. A replacement IP layer could hand up an observed copy (no IPv4 header check, no host policy) or a packet of another network, and the UDP layer delivered both. | review of `drive`; the property is proved in `kani/dispatch.rs` | `destination` in `network/endpoint.rs` sends a packet on only if it has a header the host read, is not an observed copy, and is of the dispatcher's own network; the raw packets the dispatcher takes in are marked with that network. | `world_layers::transports_take_only_checked_packets_of_their_own_network_from_any_ip_layer`: each datagram reaches the application once, not three times |
-| `Peers::enter` inserted a zero entry for a peer it refused, so under `Limits::connections_per_peer` of zero the map grew by one entry for every address that tried. | `kani/peers.rs` | `enter` reads the count and inserts only when it admits. | `hosts::tests::a_refused_peer_leaves_nothing_counted` |
+| `Peers::enter` inserted a zero entry for a peer it refused, so under `Limits::connections_per_peer` of zero the map grew by one entry for every address that tried. | the test; no `kani/peers.rs` exists in the tree or its history | `enter` reads the count and inserts only when it admits. | `hosts::tests::a_refused_peer_leaves_nothing_counted` |
 | `packet::Framed` handed up a second `PacketEvent::Ended` when the stream was reset after its end, which a peer may do. | review | A reset after the end ends nothing more. | `packet::framed::tests::a_reset_after_the_end_ends_the_packets_once` |
 
 ## What was checked
@@ -69,19 +72,42 @@ The fairness asks that a transport that refuses for now takes a command
 offered again and again (strong fairness on the offer). Without that a
 transport could refuse forever, and no host could do better.
 
+`BuiltOnlyAdmitted` covers the peer limit, whose selector runs before
+the factory. The port's `Counted` limit (`StackAccept::stack`, hosts.rs
+242-247) runs inside the factory: it holds and resets through the same
+boundary, and a connection it refuses gets an empty `Tunnel` stack in
+place of the application. The `Tcp` contract lets a transport release
+what `Hold` kept when the connection is gone or when it is forgotten
+(`TcpNotice::Gone`); the transport modeled releases at gone, as the
+standard one does, so `NotHeldWhenGone` asks that of a replacement,
+where the contract asks only `GoneReleases`.
+
 **Each packet passes exactly one IP layer, and only checked packets of
 the host's network reach its transports.** A world machine's only packet
 path is `drive`, built once per machine by `Machine::stage` through
 `network::endpoint::prepare`; `OneDispatcher` checks that staging never
 builds a second. The UDP facade of a machine (`udp::Endpoint`) and its TCP
 handles are views of the transports `drive` owns, with no IP layer of their
-own. `kani/dispatch.rs` proves, over every 28-byte IPv4 packet and both
-networks, that `destination` sends an observed copy nowhere, and sends a
-packet the standard `IpLayer` took in to exactly the transport its own
-bytes name, only on the dispatcher's network and only with a header the
-host read. The transports themselves also check this once
-`comp/v-udp-ip` and the TCP guard merge; the dispatcher's check is what a
-replacement TCP gets too.
+own. `kani/dispatch.rs` has two harnesses on the production `destination`:
+the file is a child module of `network/endpoint.rs` under `cfg(kani)`,
+with no stubs. `an_observed_copy_reaches_nothing`: over every 28-byte
+packet, any link, and the world's network or either of two tunnels' for
+the copy and for the host, an observed copy goes nowhere.
+`a_host_packet_goes_only_to_its_transport_on_its_network`: a 28-byte
+IPv4 packet from 10.0.0.2 to 10.0.0.1 with any protocol, "don't
+fragment" or not, any eight payload bytes and a header checksum that
+verifies or is wrong, taken in by the standard `IpLayer` on any of those
+three networks, reaches exactly the transport its own bytes name, only
+on the dispatcher's network and only with a header the host read; a
+packet of another network reaches nothing. The header's other fields are
+fixed, since with every header byte symbolic the proof ran past 25
+minutes. Eight payload bytes sort TCP, UDP and a plain ICMP message; an
+ICMP error that quotes a transport needs more and is not reached.
+Neither harness has a `kani::cover`: that the host path is reached is
+read from `IpLayer::take_in`, which takes in every packet of its network
+and hands it up, with a header when the checksum verifies, not proved.
+The transports check this too (`udp/sockets.rs` 316, `tcp/engine.rs`
+2451); the dispatcher's check is what a replacement TCP gets as well.
 
 **Application stacks attach directly to transport children, and counts
 outlive them.** `tcp::Listener::attach` and `udp::Socket::attach` hand the
@@ -95,16 +121,37 @@ inner fragments never meet the host's reassembly. The new test
 gives the inner network the outer connection's addresses, and both
 networks number fragments from the same serial, with overlapping poisoned
 copies on both: the echo still comes back whole. The model of one IP layer
-fed two networks is `verification/packet-udp/tla/Reassembly.tla` on
-`comp/v-udp-ip`.
+fed two networks is `verification/packet-udp/tla/Reassembly.tla`.
 
 ## Results
 
-RESULTS
+TLC on main e2858ccc4, 2 workers, `-Xmx2g`; each configuration finished
+in under 20 seconds.
 
-## The existing models against the new wiring
+| Configuration | States generated / distinct | Result |
+|---|---|---|
+| `Admission_base` | 16,499 / 3,766 | passed |
+| `Admission_standard` | 1,237 / 383 | passed |
+| `Admission_wide` (four connections) | 292,627 / 57,410 | passed |
+| `Admission_appfirst` | 745 / 307 | `BuiltOnlyAdmitted` violated |
+| `Admission_childlifetime` | 37 / 28 | `CountedUntilGone` violated |
+| `Admission_dropblocked` | 63 / 43 | `CountedUntilGone` violated |
+| `Admission_dropblocked_reset` | 7,389 / 1,634 | `RefusedAreReset` violated: the refused connection stays open |
+| `Admission_keepsgone` | 221 / 112 | `NotHeldWhenGone` violated |
+| `Admission_keepsgone_release` | 22,565 / 5,458 | `GoneReleases` violated: a guard stays held after the connection is gone |
+| `Staging_base` | 336,305 / 48,084 | passed |
+| `Staging_join` | 336,305 / 48,084 | passed |
+| `Staging_attachearly` | 16,575 / 4,949 | `ServedOnlyInstalled` violated |
+| `Staging_attachearly_factories` | 2,844 / 2,118 | `FactoriesOnlyOnServedPorts` violated |
+| `Staging_buildagain` | 38,614 / 9,055 | `OneDispatcher` violated |
+| `Staging_keeponfailure` | 17,067 / 5,017 | `FailureLeavesTheWorld` violated |
+| `Staging_publishearly` | 519 / 519 | `RouteOnlyToMachines` violated |
+| `Staging_startearly` | 519 / 519 | `RunsOnlyInTheWorld` violated |
 
-RERUNS
+`Staging_join` has the same state graph as `Staging_base`: with `Joins`
+the last address ends in a "joining" phase, where `Fail` and `Commit`
+are enabled exactly as they are after preparation without a join, so a
+failed join is covered either way.
 
 ## What is left out
 
@@ -119,6 +166,13 @@ RERUNS
   in `verification/tcp-layer` and `verification/lifecycle`.
 - The correspondence between the specs and the code is reviewed by hand,
   not a machine-checked refinement.
+- Four things the code does that the specs do not see, each in its
+  spec's header: a gateway machine is built and started like a host's
+  but never entered in `world.machines`; a listener staged on an
+  existing machine completes handshakes into its backlog before commit;
+  a UDP port is never shared, where `Staging` shares it; and `Children`
+  may refuse an admitted child for its child limit or its sandbox
+  budget, closing it with its guard still held in the transport.
 
 ## Running
 

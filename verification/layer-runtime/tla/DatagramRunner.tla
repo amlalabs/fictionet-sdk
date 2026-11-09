@@ -1,17 +1,26 @@
 --------------------------- MODULE DatagramRunner ---------------------------
-(* `services::stack::datagrams` (src/stdlib/services/stack/mod.rs:218-240, *)
-(* `run_datagrams` at 242-359): one layer stack holds a UDP socket's       *)
+(* `services::stack::datagrams` (src/stdlib/services/stack/mod.rs:319-342, *)
+(* `run_datagrams` at 344-475): one layer stack holds a UDP socket's       *)
 (* conversation for the socket's whole life. One iteration of its `loop`  *)
-(* (mod.rs:264-358) is SettleRound* (the `for _ in 0..FAIR` rounds at      *)
-(* 268-299), AfterSettle (300-309), and Wait (311-357).                    *)
+(* (mod.rs:361-474) is SettleRound* (the `for _ in 0..FAIR` rounds at      *)
+(* 375-405), AfterSettle (406-420), and Wait (422-473). Line numbers are   *)
+(* those of commit e2858ccc4.                                              *)
 (*                                                                         *)
-(* The stack asks for no work: the `jobs` and `finished` of the runner    *)
-(* stay empty, so `jobs.is_empty()` holds wherever the code asks it.      *)
+(* The stack asks for no work: the `jobs` of the runner stay empty, so    *)
+(* `jobs.is_empty()` holds wherever the code asks it, `jobs.poll` (mod.rs: *)
+(* 367-372, 435-437) and `jobs.take` (377) move nothing, and the           *)
+(* `jobs.close_completed()` calls (363-365, 409, 432-434) do nothing.      *)
 (*                                                                         *)
 (* The stack is abstract, with the shape of the Search time server         *)
-(* (demos/search/world/src/ntp.rs:72-120): it answers a datagram it takes  *)
-(* with at most one reply, and refuses the next datagram (`Blocked`) while *)
-(* a reply waits to be taken. It may also arm a timer on a datagram whose  *)
+(* (demos/search/world/src/ntp.rs:74-129): it answers a datagram it takes  *)
+(* with at most one reply. The time server refuses the next datagram      *)
+(* (`Blocked`) while a reply waits to be taken, but under this runner a   *)
+(* reply never waits: the sink takes every Send at once (mod.rs:391-395), *)
+(* so `outq` is empty at the start of every round and that refusal does   *)
+(* not arise here (the Kani harness                                        *)
+(* `one_conversation_answers_each_request_in_turn` exercises it on the    *)
+(* real server). The refusal this model exercises is the pause below.     *)
+(* It may also arm a timer on a datagram whose                             *)
 (* firing sends one more datagram, may close the socket itself            *)
 (* (DatagramCommand::End), and when it hears that the socket closed it     *)
 (* has `Backlog` replies left to send, one per step of its own, as a stack *)
@@ -21,25 +30,28 @@
 (* The switches are the rules of the code. TRUE is the code as it is,      *)
 (* including `SettleBeforeClose`, the fix of comp/v-framed's commit        *)
 (* 1a183c83e, ported to the split runner in 33fd898e0.                    *)
-(* The explicit allocation budget and per-job cancellable regions are   *)
-(* outside this model. Datagrams are atomic numbered items here. The     *)
-(* production runner polls jobs during busy visits as well as waits, and *)
-(* gives completions directly to the driver without an intermediate     *)
-(* result vector. Runtime tests cover those resource and work paths.     *)
+(* The explicit allocation budget (the charge of a received datagram's   *)
+(* capacity at mod.rs:454-457, whose refusal ends the run with           *)
+(* StackError::Budget), per-job cancellable regions and the cancel checks *)
+(* (mod.rs:411-413, 429-431, 467) are outside this model. Datagrams are   *)
+(* atomic numbered items here. The production runner polls jobs during   *)
+(* busy visits as well as waits, and gives completions directly to the   *)
+(* driver without an intermediate result vector. Runtime tests cover     *)
+(* those resource and work paths.                                        *)
 EXTENDS Integers, Sequences
 
 CONSTANTS Datagrams,      \* datagrams that reach the socket in all
           Backlog,        \* replies the stack still sends after it hears Ended
-          Fair,           \* FAIR (mod.rs:64): rounds before the runner yields
+          Fair,           \* FAIR (mod.rs:68): rounds before the runner yields
           Delay,          \* ticks of the stack's timer; 0 for no timer
           StackMayEnd,    \* the stack may close the socket itself
-          ReceiveOnlyWhenTaken, \* `receive = input.is_none() && ..` (mod.rs:313)
-          OneConversation,      \* one stack for the socket's life (mod.rs:253-258)
-          DeadlineInWait,       \* the wait sleeps until the stack's deadline (mod.rs:311, 315)
-          EndClosesOutput,      \* `_ if ended => Admit::Closed` (mod.rs:284)
-          SendEachDatagram,     \* `socket.send_to(&payload, to)` (mod.rs:287)
-          ReturnOnClose,        \* `socket_closed && input.is_none()` returns (mod.rs:302)
-          SettleBeforeClose     \* return on a closed socket only once settled (mod.rs:302, the fix)
+          ReceiveOnlyWhenTaken, \* `receive = input.is_none() && ..` (mod.rs:424)
+          OneConversation,      \* one stack for the socket's life: one `Driver::new` before the loop (mod.rs:356)
+          DeadlineInWait,       \* the wait sleeps until the stack's deadline (mod.rs:422, 426, 441-446)
+          EndClosesOutput,      \* `_ if ended => Admit::Closed` (mod.rs:390)
+          SendEachDatagram,     \* `socket.send_to(&payload, to)` (mod.rs:393)
+          ReturnOnClose,        \* `socket_closed && input.is_none()` returns (mod.rs:408)
+          SettleBeforeClose     \* return on a closed socket only once settled (`settled &&` at mod.rs:408, the fix)
 
 ASSUME Datagrams \in Nat /\ Backlog \in Nat /\ Fair \in Nat \ {0} /\ Delay \in Nat
 
@@ -51,7 +63,7 @@ VARIABLES pc,          \* "settle", "after", "wait" or "done"
           now,
           input,       \* `input`: None, a datagram's number, or 0 for DatagramEvent::Ended
           socketClosed,\* `socket_closed`
-          ended,       \* the `ended` of this iteration (mod.rs:266)
+          ended,       \* the `ended` of this iteration (mod.rs:373)
           rounds,      \* rounds of the current `settle`
           settled,     \* what `settle` returned
           \* the socket
@@ -88,7 +100,7 @@ Init ==
   /\ paused = FALSE
   /\ produced = <<>> /\ sent = <<>> /\ afterEnd = FALSE
 
-(* `Driver::send_below` with the sink of mod.rs:283-294: it takes the      *)
+(* `Driver::send_below` with the sink of mod.rs:389-400: it takes the      *)
 (* stack's output in order until there is none; after END, the rest is     *)
 (* refused as closed.                                                      *)
 RECURSIVE Drain(_, _, _, _)
@@ -99,9 +111,11 @@ Drain(q, s, e, bad) ==
   ELSE IF ~SendEachDatagram THEN Drain(Tail(q), s, e, bad)
   ELSE Drain(Tail(q), Append(s, Head(q)), e, bad \/ e)
 
-(* One round (mod.rs:269-298): the offer of the held input, then          *)
+(* One round (mod.rs:376-404): the offer of the held input, then          *)
 (* `Driver::run` (due timer first, then one step of the stack's own),     *)
-(* then `send_below`, which takes everything the stack has.               *)
+(* then `send_below`, which takes everything the stack has. Because it    *)
+(* does, `outq` is always <<>> when a round starts, and `blocked` below   *)
+(* reduces to the pause.                                                  *)
 SettleRound ==
   /\ pc = "settle"
   /\ \E answers, pause \in BOOLEAN, arm \in (IF Delay > 0 /\ timer = None THEN BOOLEAN ELSE {FALSE}),
@@ -147,7 +161,7 @@ SettleRound ==
         ELSE /\ rounds' = rounds + 1 /\ UNCHANGED settled /\ UNCHANGED pc
   /\ UNCHANGED <<now, socketClosed, arrived, queue, closed>>
 
-(* mod.rs:300-309. A runner that has not settled yields and settles       *)
+(* mod.rs:406-420. A runner that has not settled yields and settles       *)
 (* again.                                                                 *)
 AfterSettle ==
   /\ pc = "after"
@@ -162,7 +176,7 @@ AfterSettle ==
 
 Receiving == ~socketClosed /\ (input = None \/ ~ReceiveOnlyWhenTaken)
 
-(* The `poll_fn` of mod.rs:318-337 and what follows it (340-357).         *)
+(* The `poll_fn` of mod.rs:428-450 and what follows it (452-473).         *)
 Wait ==
   /\ pc = "wait"
   /\ LET due == DeadlineInWait /\ timer # None /\ now >= timer

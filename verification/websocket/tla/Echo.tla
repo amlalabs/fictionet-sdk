@@ -1,8 +1,8 @@
 -------------------------------- MODULE Echo --------------------------------
 EXTENDS Naturals
 (* The test handlers, not a production WebSocket session API:
-   tests/support/response.rs EchoSocket::call lines 129-163 installs a
-   raw-stream UpgradeHandler. tests/it/features.rs lines 249-275 defines
+   tests/support/response.rs EchoSocket::call, lines 111-163, installs a
+   raw-stream UpgradeHandler (lines 129-161). tests/it/features.rs lines 249-275 defines
    the local echo used by websocket_continuation_exchanges_messages_through_server
    at line 243, installed as an UpgradeHandler at lines 284-286.
    Both handlers reply to Ping with Pong, ignore Pong, and return after
@@ -13,6 +13,9 @@ EXTENDS Naturals
    StopAfterClose disables both stop rules, allowing adversarial later
    messages to expose duplicate close replies and data after a close.
    ReplyClose = FALSE models the old support handler's non-text early return.
+   EchoSocket still returns without a reply on a Binary message or a decode
+   error (response.rs line 144); the model has no Binary token.
+   Line numbers checked against e2858ccc4 on 2026-11-09.
    Ping followed by its Pong write and an unsolicited Pong leave this
    close-state projection unchanged; they are stuttering steps. Fragment
    state is checked in Messages.tla; payload preservation and ping response

@@ -1,9 +1,9 @@
 ------------------------------ MODULE Write ------------------------------
 (* Write cancellation in `Opened::poll_write`                               *)
-(* (src/stdlib/services/stack/open.rs:205-251), the connection a TLS layer *)
-(* opened over TCP is, over `Opened::pump` (open.rs:131-141), which runs   *)
+(* (src/stdlib/services/stack/open.rs:206-252), the connection a TLS layer *)
+(* opened over TCP is, over `Opened::pump` (open.rs:131-142), which runs   *)
 (* the stack and its connection with `Live::poll`                          *)
-(* (src/stdlib/services/stack/live.rs:161-181), and `Above::take`          *)
+(* (src/stdlib/services/stack/live.rs:164-189), and `Above::take`          *)
 (* (open.rs:55-79), which counts what the stack reports written.           *)
 (*                                                                          *)
 (* A caller writes `call`, a short string. poll_write runs to its return    *)
@@ -11,7 +11,7 @@
 (* either fails, or returns once nothing more can move, having registered   *)
 (* the caller's waker with what can move next (`Live::poll` returns         *)
 (* Pending then, or wakes the caller itself after a busy stretch,           *)
-(* live.rs:384-386). The pump never returns Ready(Ok): while it runs, the   *)
+(* live.rs:393-397). The pump never returns Ready(Ok): while it runs, the   *)
 (* layer may credit what it accepted, or not yet. The layer is abstract: it *)
 (* takes one write at a time and credits it once its ciphertext is written. *)
 (* After a Pending the caller retries the same bytes, or drops the future   *)
@@ -27,10 +27,10 @@ CONSTANTS
   MaxLen,        \* the longest write
   Chunk,         \* the most poll_write offers the layer at once (WRITE, open.rs:17)
   MaxCalls,      \* how many poll_write calls one behavior makes
-  MatchContent,  \* a retry is credited only if it starts with the earlier bytes (open.rs:220)
-  TakePending,   \* poll_write takes the earlier write when it settles it (open.rs:215, 168)
-  RememberWrite, \* poll_write keeps an accepted write for its retry (open.rs:244)
-  PumpFirst      \* poll_write runs the stack before it looks at the earlier write (open.rs:214)
+  MatchContent,  \* a retry is credited only if it starts with the earlier bytes (open.rs:221)
+  TakePending,   \* poll_write takes the earlier write when it settles it (open.rs:216, 169)
+  RememberWrite, \* poll_write keeps an accepted write for its retry (open.rs:245)
+  PumpFirst      \* poll_write runs the stack before it looks at the earlier write (open.rs:215)
 
 VARIABLES
   call,       \* the bytes of the call in progress, <<>> when none
@@ -78,12 +78,12 @@ Confirm(k, cs, st) ==
   /\ twice' = (twice \/ i \in cs)
   /\ wrong' = (wrong \/ segs'[i] # SubSeq(call, 1, k))
 
-\* poll_write(call) after its first pump (open.rs:214), which left cr0
+\* poll_write(call) after its first pump (open.rs:215), which left cr0
 \* credited and inf0 uncredited. `woken` says whether that pump registered
 \* the caller's waker.
 AfterPump(cr0, inf0, woken) ==
   IF pw # <<>> /\ cr0 < Len(pw)
-  THEN \* open.rs:216-219: Pending until the earlier write is credited
+  THEN \* open.rs:217-220: Pending until the earlier write is credited
        /\ hang' = (hang \/ ~woken)
        /\ UNCHANGED <<call, pw, segs, settled, confirmed, twice, wrong, dup, failed>>
        /\ inflight' = inf0 /\ dirty' = (inf0 > 0)
@@ -94,7 +94,7 @@ AfterPump(cr0, inf0, woken) ==
       gaveUp  == IF pw # <<>> /\ ~matched THEN {Len(segs)} ELSE {}
   IN
   IF matched
-  THEN \* open.rs:220-222: Ok(previous.len())
+  THEN \* open.rs:221-223: Ok(previous.len())
        /\ segs' = segs
        /\ Confirm(Len(pw), confirmed, settled)
        /\ pw' = IF TakePending THEN <<>> ELSE pw
@@ -103,7 +103,7 @@ AfterPump(cr0, inf0, woken) ==
        /\ inflight' = inf0 /\ dirty' = (inf0 > 0)
        /\ UNCHANGED <<failed, dup, hang>>
   ELSE IF inf0 > 0
-  THEN \* the layer refuses the write: open.rs:239, Pending
+  THEN \* the layer refuses the write: open.rs:240, Pending
        /\ hang' = (hang \/ ~woken) /\ credited' = cr1 /\ pw' = <<>>
        /\ settled' = settled \cup gaveUp
        /\ inflight' = inf0 /\ dirty' = TRUE
@@ -115,17 +115,17 @@ AfterPump(cr0, inf0, woken) ==
   IN
   /\ segs' = Append(segs, seg)
   /\ dup' = (dup \/ (Len(segs) > 0 /\ Len(segs) \notin st1))
-  \* The second pump (open.rs:245): it fails, or registers the waker with
+  \* The second pump (open.rs:246): it fails, or registers the waker with
   \* the layer's ciphertext all written or not yet.
   /\ \E second \in {"credited", "waiting", "err"} :
        CASE second = "credited" ->
-              \* open.rs:246-250: Ok(n)
+              \* open.rs:247-251: Ok(n)
               /\ Confirm(n, confirmed, st1)
               /\ credited' = cr1 /\ pw' = <<>> /\ inflight' = 0 /\ dirty' = FALSE
               /\ call' = <<>>
               /\ UNCHANGED <<failed, hang>>
          [] second = "waiting" ->
-              \* open.rs:246-247: Pending, the write kept for its retry
+              \* open.rs:247-249: Pending, the write kept for its retry
               /\ credited' = cr1 /\ inflight' = n /\ dirty' = TRUE
               /\ pw' = IF RememberWrite THEN seg ELSE <<>>
               /\ settled' = st1

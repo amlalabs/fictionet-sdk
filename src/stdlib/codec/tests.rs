@@ -330,6 +330,32 @@ fn driver_stuck_overcount_and_growing_need_are_terminal() {
         Some(Err(Fail::Stuck { capacity: 0, .. }))
     ));
 }
+/// A decoder that raises its capacity on the call that answers `Need` with
+/// a full buffer is not stuck: the buffer's limit follows the new capacity
+/// before its room is judged, as it does before the next push or decode.
+#[test]
+fn a_decoder_that_raises_its_capacity_on_need_is_not_stuck() {
+    struct Raises(usize);
+    impl Decode for Raises {
+        type Item = ();
+        type Error = TestError;
+        const NAME: &'static str = "raises";
+        fn capacity(&self) -> usize {
+            self.0
+        }
+        fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<()>, TestError> {
+            self.0 = self.0.max(input.len() + 1);
+            Ok(Step::Need)
+        }
+    }
+    let mut s = Stream::new(Raises(1));
+    assert_eq!(s.push(b"ab"), 1);
+    assert_eq!(s.next(), None, "the decoder asked for more and made room");
+    assert!(!s.is_done());
+    assert_eq!(s.push(b"b"), 1);
+    assert_eq!(s.next(), None);
+    assert_eq!(s.decoder().capacity(), 3);
+}
 #[test]
 fn driver_allows_state_bounded_zero_steps_per_next() {
     for item in [false, true] {

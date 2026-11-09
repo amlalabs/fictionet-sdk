@@ -1,7 +1,9 @@
 ---------------------------- MODULE Completion ----------------------------
-\* Source: src/stdlib/services/ssh.rs:710-713 (Flight), :1533-1557
-\* (partial Written, pop once, child credit), :1718-1728 (flight ownership);
-\* src/stdlib/layer/children.rs:484-502 (retired child discards notifications).
+\* Source: src/stdlib/services/ssh.rs:694-697 (Flight), :1512-1543
+\* (partial Written, pop once, child credit only for a channel still
+\* present), :1701-1712 (flight ownership, from out_child set at 1771);
+\* src/stdlib/layer/children.rs:923-943 (a removed child's notifications
+\* are dropped).
 EXTENDS Naturals, Sequences
 CONSTANT Mutation
 VARIABLES flights, issued, delivered, credited, taken, settled, cancelled, live

@@ -2073,6 +2073,83 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
     .unwrap();
 }
 
+/// The connections waiting for accept never outnumber the backlog, whether
+/// a handshake was kept or answered with a cookie. Two kept handshakes
+/// and one cookie fill a backlog of two the moment the cookie's ACK and
+/// one kept ACK arrive; the other kept ACK waits, and completes once
+/// accept has taken one.
+#[test]
+fn kept_handshakes_complete_only_while_the_backlog_has_room() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer = |port| SocketAddr::new("10.0.0.2".parse().unwrap(), port);
+        let server = endpoint_with(&fcx, side, local.ip(), cookie_options().backlog(2));
+        let mut listener = server.listen(local.port())?;
+        let now = smol_now(&fcx);
+        let syn_ack_iss = |packets: Vec<Vec<u8>>| {
+            assert_eq!(packets.len(), 1);
+            let t = Header::parse_whole(&packets[0])
+                .unwrap()
+                .payload(&packets[0]);
+            assert_eq!(t[13], 0x12, "a SYN-ACK");
+            u32::from_be_bytes(t[4..8].try_into().unwrap())
+        };
+        let ack = |port, iss: u32| segment(peer(port), local, 1, iss.wrapping_add(1), 0x10).0;
+        let mut iss = BTreeMap::new();
+        {
+            let mut st = server.shared.state.lock();
+            for port in [1000, 1001, 1002] {
+                st.ingress(
+                    &fcx,
+                    &Budget::unlimited(),
+                    now,
+                    segment(peer(port), local, 0, 0, 0x02).0,
+                );
+                iss.insert(port, syn_ack_iss(egress(&mut st, now)));
+            }
+            assert_eq!(
+                st.listeners[&80].embryonic.len(),
+                2,
+                "the third SYN got a cookie"
+            );
+            // The cookie's ACK and one kept ACK fill the backlog.
+            st.ingress(&fcx, &Budget::unlimited(), now, ack(1002, iss[&1002]));
+            st.ingress(&fcx, &Budget::unlimited(), now, ack(1000, iss[&1000]));
+            assert_eq!(st.listeners[&80].ready.len(), 2);
+            // The other kept ACK finds no room: its handshake stays open.
+            st.ingress(&fcx, &Budget::unlimited(), now, ack(1001, iss[&1001]));
+            let l = &st.listeners[&80];
+            assert!(
+                l.ready.len() <= l.backlog,
+                "{} connections wait for accept with a backlog of {}",
+                l.ready.len(),
+                l.backlog
+            );
+            assert_eq!(l.embryonic.len(), 1, "the handshake is still open");
+            let h = st.by_tuple[&(local, peer(1001))];
+            assert_eq!(st.get(h).state(), TcpState::SynReceived);
+        }
+        let first = listener.accept(&fcx).await?;
+        assert_eq!(first.peer_addr().port(), 1002);
+        {
+            // The peer answers the SYN-ACK sent again.
+            let mut st = server.shared.state.lock();
+            st.ingress(&fcx, &Budget::unlimited(), now, ack(1001, iss[&1001]));
+            assert_eq!(st.listeners[&80].ready.len(), 2);
+            assert!(st.listeners[&80].embryonic.is_empty());
+        }
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            ports.push(listener.accept(&fcx).await?.peer_addr().port());
+        }
+        assert_eq!(ports, [1000, 1001]);
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
 /// A burst of handshakes that the peer resets in SYN-RECEIVED leaves
 /// at most one spare listening socket, not one per SYN.
 #[test]

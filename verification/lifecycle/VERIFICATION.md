@@ -96,15 +96,30 @@ What is checked:
 | --- | ---: | ---: | --- |
 | `Conn.cfg` | 2,476 | 754 | all five invariants and ten properties hold |
 | `Conn_without_orphantimer.cfg` | 2,126 | 630 | `OrphanRemoved` violated: drop, the FIN acknowledged, the peer sends data forever and never closes |
-| `Conn_without_resetunread.cfg` | 76 | 40 | `DropResetsUnread` violated at the first drop |
+| `Conn_without_resetunread.cfg` | 39 | 24 | `DropResetsUnread` violated at the first drop |
 | `Conn_without_release.cfg` | 2,062 | 576 | `GoneWhateverTheHandle` violated: no release for an open handle, as before `773c5c1a3`; the socket times out and the handle keeps the item for ever |
-| `Conn_without_abortreleases.cfg` | 80 | 48 | `HeldOnlyWhileCounted` violated: `abort` keeps the item, as before `2124865df`; a drop with unread bytes resets and the item stays |
-| `Conn_without_countuntilgone.cfg` | 144 | 66 | `CountedUntilDone` violated: the drop lets go while the connection is in FIN-WAIT-1 |
+| `Conn_without_abortreleases.cfg` | 22 | 17 | `HeldOnlyWhileCounted` violated: `abort` keeps the item, as before `2124865df`; a drop with unread bytes resets and the item stays |
+| `Conn_without_countuntilgone.cfg` | 68 | 36 | `CountedUntilDone` violated: the drop lets go while the connection is in FIN-WAIT-1 |
+
+These are the counts of the rerun at `e2858ccc4` with two workers. The
+count at which TLC finds a safety violation depends on the worker count; the
+runs recorded before, with four, found the same three violations at 76/40,
+80/48 and 144/66.
 
 The model described the layer before `773c5c1a3` and `2124865df` until
 `45342c5f3`, which added `released` and the release rules; the
 [TCP layer model](../tcp-layer/README.md) checks the same rules through the
-port, with both kinds of connection and the listener.
+port, with both kinds of connection and the listener. The layer's struct was
+`State` when the model was written and is `TcpLayer` now; the audit at
+`e2858ccc4` renamed it in the model's comments and brought the model's line
+references to the current tree (`Retirement for GoneWatch` at tcp.rs 2092,
+`Host::controls` at 1159 with `offer_controls` at 1456, `Shared::stop` at
+1603, `Host::stop` at 1542, `TcpLayer::stop` at engine.rs 1852). Every
+action still maps onto the code it names: `orphan` (engine.rs 924), `abort`
+(899), `close_if_drained` (891), `remove_conn` (875), `refresh`'s release
+(1979), `ingress`'s flags (1278, 1295), `expire_orphans` (1720), the orphan
+loop and TIME-WAIT cap of `housekeeping` (1807, 1837), `stop` (1852),
+`gone` (2363), and the `Abort` and `Hold` controls (2174, 2191).
 
 ### What `Conn.tla` leaves out
 
@@ -118,6 +133,38 @@ the listener's backlog and SYN cookies are outside (they are
 Data arriving for an orphan in FIN-WAIT-2 is buffered and acknowledged until
 the orphan timer removes the connection; Linux resets such a connection. The
 model keeps the code's behavior.
+
+Read against the code at `e2858ccc4`, the model also folds away these,
+none of which a property of the model can see:
+
+- `TcpNotice::Gone` is an event in the code and a predicate (`Gone`) in the
+  model. The code can say it twice for one child: `abort` says it again when
+  `orphan` finds unread bytes in a connection already gone, `AbortPeers` and
+  `StreamCommand::Reset` call `abort` without the `gone` check, and the
+  `refresh` that runs after `stop` marks every open child `released` and says
+  it once more (the model's `Release` needs `~stopped`). The one consumer,
+  `Routes::route` (tcp.rs 1345), wakes the watches of that id, so a second
+  notice does nothing.
+- The handle's drop sends `TcpControl::Abort` and then closes the child;
+  `orphan` on the aborted socket still sets `Conn::shut` and calls
+  `close_if_drained`, a no-op on a closed socket. The model's abort branch
+  leaves `shut` as it was. Nothing reads `shut` after a reset.
+- A drop with bytes unread only at the handle, on a connection that timed
+  out and was released, sends an `Abort` the layer refuses as gone; `rst`
+  stays false in the code where the model's `Drop` sets it. No RST can go
+  out either way: the socket forgot the peer when its own RST went.
+- A `Hold` or `Abort` the transport refuses (`Admit::Blocked`) waits in
+  `Host::controls` and is offered again by `pump`; the model takes every
+  control at once. While a `Hold` waits there, its item is kept although the
+  connection may have become gone, until the next `pump` offers it and the
+  layer drops it; `Shared::stop` drops the queue.
+- smoltcp's timeout fires only while the socket `waits_for_answer`: in
+  FIN-WAIT-1, CLOSING and LAST-ACK always, in ESTABLISHED and CLOSE-WAIT with
+  bytes to send or keepalives on, in FIN-WAIT-2 only with keepalives on. The
+  model's `Timeout` takes a live handle to have keepalives on, the default,
+  so `WF(Timeout)` makes an idle ESTABLISHED connection with a live handle
+  time out eventually. The liveness properties start from a dropped handle
+  or from TIME-WAIT/CLOSED, where that disjunct plays no part.
 
 ## Connection contract
 

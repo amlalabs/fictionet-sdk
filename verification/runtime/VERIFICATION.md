@@ -127,7 +127,9 @@ last rounds found, with these outcomes:
   `RunShared::spawn`, `schedule`, `wake_all`, `RunState::poll` (the outer
   waker, the idle wakers, the lab's due wakers), `Drop for RunState`,
   `Clock::reset`, `update`, `remove`, `HostWake::wake`, `Timers::reset`,
-  `remove` and `thread`. The two inserts that happen under a lock
+  `remove` and `thread`, and since `04ff2b09d` `ContextLease::poll_unborrowed`
+  and `Drop for ContextLease` (the waiter is taken under the lease's lock and
+  woken or dropped after it). The two inserts that happen under a lock
   (`Clock::register`, `Timers::add`) use fresh ids, so they never replace a
   waker. `Clock::arm` calls `Timers::reset` with the clock locked, which can
   drop the previous `HostWake` clone there; that type's drop is a reference
@@ -179,6 +181,18 @@ stale wake per task, two harness deadlines, and instants 0 to 3 for the host
 timers. The models say what the runtime does with a task's choices, not what
 world code chooses.
 
+Two abstractions read against the code at `e2858ccc4`, neither of which a
+property of its model can see: `Region.tla`'s `Spawn` refuses a task only
+when the child region has completed, while `Region::try_start_task` since
+`b0fb45ee2` also refuses when an ancestor has completed or its `Arc` has
+gone, which `RegionTree.tla` checks (`CheckAncestors`); and `LabClock.tla`'s
+`EndTurn` wakes the idle waits in task-number order (`Ordered` over the task
+ids), while `RunState::poll` wakes `Queue::idle` in the order the waits
+registered (its `next_idle` keys). The model's `Spawn` after the owner was
+dropped also admits a task the code may refuse once the parent region has
+completed. The counts in the tables above are from the runs recorded when
+each section was written; the audit reran only the two `JobContext` configs.
+
 ## Rerunning
 
 ```sh
@@ -205,13 +219,22 @@ and transfer contexts needed later into their result. Lease metadata is
 fixed context-owned storage, like region metadata: active jobs are bounded
 by the job limit and retained contexts keep their metadata after cancellation.
 
-`JobContext_base.cfg` passes both invariants: 86 generated states, 31 distinct,
+`JobContext_base.cfg` passes both invariants: 98 generated states, 31 distinct,
 depth 6. `JobContext_without_borrow.cfg` violates `BorrowKeepsAdmission` with
-a borrow, a returned result, and premature retirement. Both ran with the
-cached JDK, a 6 GiB heap, an 8 GiB systemd limit and state storage on the home
-volume. This model projects lifecycle transitions, not the implementation of
-atomic references, mutexes or waker registration. RegionTree continues to
-cover descendant task accounting separately.
+a borrow, a returned result, and premature retirement (24 distinct states to
+the counterexample). Both ran with the cached JDK, a 2 GiB heap, two workers,
+a 10 GiB systemd limit and state storage on the home volume. This model
+projects lifecycle transitions, not the implementation of atomic references,
+mutexes or waker registration. RegionTree continues to cover descendant task
+accounting separately.
+
+The audit at `e2858ccc4` took the guard `~cancelled` off `Borrow` and
+`Start`: `Cx::clone` and `Cx::spawn` check neither the region's `cancelled`
+nor the lease, and `Region::try_start_task` refuses only a completed region,
+so a retained context can be cloned and can start a task after a cancel until
+`poll_done` closes the region. The model had forbidden both. With them
+allowed the base config still passes with the same 31 distinct states (98
+generated, up from 86) and the ablation still violates `BorrowKeepsAdmission`.
 
 When the serving engine was deleted, `Jobs::poll` gained a rule: work whose
 own region was cancelled, as when a task it spawned failed, is never polled

@@ -21,8 +21,14 @@ Two requested guarantees need qualification:
 - STARTTLS safety no longer rests on each plaintext protocol. `Switch` asks its
   successor which input from before the switch it reads
   (`Successor::inherits`), and `Secure` reads no data, so the switch drops
-  whatever plaintext the predecessor hands over or refused and the layer below
-  still holds. The STARTTLS model checks the mail handoff in
+  every `Data` the predecessor hands over (`switch.rs:254-259`) and the one
+  `Data` the predecessor refused, or took in part, that the layer below still
+  holds and offers again first (`owed`, `switch.rs:174-180` and `185-188`).
+  One is all there can be: `Chain` holds one refused event (`up`), the
+  `Harness` re-offers the head of its queue, and the `Driver` hands a refused
+  event back to its caller; a `Written` goes past a refused `Data` but is
+  inherited. The model's `pending` is both kinds in one sequence, and its
+  switch drops all of it. The STARTTLS model checks the mail handoff in
   `tests/it/services/tls.rs` with the switch's drop: `Starttls_careless.cfg`
   keeps the session's pipelined plaintext and still passes. Stopping at the
   command (`NoPlainPastBoundary`) and handing over only after the go-ahead is

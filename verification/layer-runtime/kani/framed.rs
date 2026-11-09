@@ -1,4 +1,4 @@
-//! `Framed` (src/stdlib/layer/framed.rs:41-213) over two decoders: `Units`,
+//! `Framed` (src/stdlib/layer/framed.rs:95-292) over two decoders: `Units`,
 //! which keeps the `Decode` contract with a capacity of three, the
 //! smallest at which the buffer can grow past its limit; and `Steps`,
 //! whose every step the solver chooses. The real `Stream`, `Buffer`,

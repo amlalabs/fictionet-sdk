@@ -948,7 +948,7 @@ where
                 // A full place gets the child one visit to make room. A
                 // child that makes none is overloaded and goes alone: the
                 // event is never handed back to block the mux.
-                let urgent = event.urgent();
+                let urgent = B::Lower::urgent(&event);
                 if self.full(id, urgent) {
                     self.visit(env, key);
                     if self.full(id, urgent) {

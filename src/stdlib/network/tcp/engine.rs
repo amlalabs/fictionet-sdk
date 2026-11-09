@@ -1233,6 +1233,23 @@ impl TcpLayer {
         }
         let handle = self.by_tuple.get(&(dst, src)).copied();
         let before = handle.map(|h| self.get(h).state());
+        // An ACK that would complete a kept handshake while the connections
+        // waiting for accept fill the backlog is dropped, as one returning
+        // a cookie is: the socket sends its SYN-ACK again, and the
+        // handshake completes once accept has taken one, or is given up.
+        if let Some(h) = handle
+            && before == Some(TcpState::SynReceived)
+            && ack
+            && !syn
+            && !rst
+            && self.conns[&h].side == Side::Server
+            && self
+                .listeners
+                .get(&dst.port())
+                .is_some_and(|l| l.ready.len() >= l.backlog)
+        {
+            return false;
+        }
         // The options of an ACK that may complete a handshake.
         let completing = (before == Some(TcpState::SynReceived)).then(|| segment_options(t));
         // A listening socket in an earlier slot must not take a SYN for

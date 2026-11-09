@@ -54,6 +54,9 @@ Theorems, each over every status class, method, hint and supplied length:
 - `reader_agrees`, `reader_close_agrees`: the HTTP/1 reader finds exactly
   the body the server wrote, and expects a close exactly when the server
   closes, for every response but the 101 that hands the connection on.
+- `reader_no_body_is_bodiless`, `http11_body_is_delimited`: the reader
+  expects no body exactly when the policy is bodiless, and on HTTP/1.1 a
+  body is always delimited by a length or by chunks, never by the close.
 - `never_both`: no head carries both `Content-Length` and
   `Transfer-Encoding` (RFC 9112 section 6.1).
 - `http10_never_chunked`, `http10_unknown_length_closes`: an HTTP/1.0
@@ -131,7 +134,18 @@ the frame size; a wait for a retry when that is zero), and the WINDOW_UPDATE
 and SETTINGS_INITIAL_WINDOW_SIZE arms of `Http2::on_frame` with their
 2^31 - 1 checks. The `Wake*` flags are the retry: `Http2::advance` tries
 every stream's `send_one` again after each batch of frames it reads, so all
-three are on in the code. The model's exchange takes each body unit as it
+three are on in the code. The layer keeps no per-stream waiting state
+(`Http2::send`, http2.rs:1220-1244, tries every stream on every
+`advance`), so the three flags are one rule in the code and each
+`without_wakeon*` config removes a part of it that is not a separate line
+of code. This model was written for the serving engine before the layer
+foundation; checked against the layer `Http2` at e2858ccc4 on 2026-11-09,
+`on_data` (770-830), `release` (1071-1103), `send_one` (1248-1310) and the
+WINDOW_UPDATE and SETTINGS arms (914-932, 833-850) still do what its
+actions say. The finer model of today's `Http2`, with the children, their
+credit and `Stream::held`, is `verification/http2-layer/tla/Flow.tla`;
+what this one keeps that it lacks is padding, the over-credit client and
+the receive-window accounting (`CreditMatchesWindow`). The model's exchange takes each body unit as it
 comes, as `Respond` does, so the bytes `release` holds back for a child
 that has not granted credit (`Stream::held`) are zero in it. Bytes are
 units; the windows hold a few units. The client is any client: it may send
@@ -173,8 +187,9 @@ violates `ServerSpendsWithinWindows`, and `without_wakeonconnectionupdate`,
 successor in `dispatch` and then takes the same `start`, `finish`,
 `hand_on` and `handover` path as the model's `U` token, so the model does
 not tell the two successors apart. The header of the file maps each action
-to its functions with line numbers (at commit 50b69c60d, the code this pass
-checked; the fix below moves `native.rs` lines after 575 down by four):
+to its functions with line numbers (checked again at e2858ccc4 on
+2026-11-09; `native.rs` has changed much since the model was written at
+50b69c60d, and every rule was found again in it):
 `on_event` for data, the end and
 `Written`; `advance` with `read`, `dispatch` and `fail`; `on_done`;
 `respond`, `start`, `piece`, `finish` and `hand_on`; `close` and
@@ -212,17 +227,30 @@ turns one off and violates the property it names:
 
 | Config | The rule turned off | Violates | States to the violation |
 |---|---|---|---|
-| `without_waitwritten` | `all_written` waits for `Written` (native.rs:276-278) | `ReadAfterWritten` | 255,857 generated, depth 8 |
-| `without_readonlyinreading` | `advance` reads only in `Reading` (native.rs:872) | `OneInFlight` | 23,412, depth 5 |
-| `without_keepunread` | `hand_on` passes the unread bytes (native.rs:639-647) | `TunnelGetsTheRest` | 578,788, depth 11 |
-| `without_leftoverinswitching` | data while `Switching` joins the leftovers (native.rs:748-750) | `TunnelGetsTheRest` | 806,786, depth 13 |
-| `without_endlast` | `hand_on` puts the client's end last (native.rs:651-653) | `TunnelEndsLast` | 1,236,115, depth 19 |
-| `without_handoverafterwritten` | `handover` only once `Switching` (native.rs:908) | `HandoverAfterWritten` | 106,530, depth 6 |
-| `without_leftoverfirst` | `Switch` blocks new input behind leftovers (switch.rs:138) | `TunnelGetsTheRest` | 578,870, depth 11 |
-| `without_feedleftovers` | `Switch::advance` feeds a leftover (switch.rs:211-216) | `TunnelGetsAll` | 1,471,808 generated, the whole graph |
-| `without_closeafterbare101` | a 101 without an `UpgradeHandler` closes (native.rs:577-581) | `NoHttpAfter101` | 391,698, depth 9 |
+| `without_waitwritten` | `all_written` waits for `Written` (native.rs:339-341) | `ReadAfterWritten` | 255,857 generated, depth 8 |
+| `without_readonlyinreading` | `advance` reads only in `Reading` (native.rs:1071) | `OneInFlight` | 23,412, depth 5 |
+| `without_keepunread` | `hand_on` passes the unread bytes (native.rs:795-802) | `TunnelGetsTheRest` | 578,788, depth 11 |
+| `without_leftoverinswitching` | data while `Switching` joins the leftovers (native.rs:911-923) | `TunnelGetsTheRest` | 806,786, depth 13 |
+| `without_endlast` | `hand_on` puts the client's end last (native.rs:816-818) | `TunnelEndsLast` | 1,236,115, depth 19 |
+| `without_handoverafterwritten` | `handover` only once `Switching` (native.rs:1111-1113) | `HandoverAfterWritten` | 106,530, depth 6 |
+| `without_leftoverfirst` | `Switch` blocks new input behind leftovers (switch.rs:190) | `TunnelGetsTheRest` | 578,870, depth 11 |
+| `without_feedleftovers` | `Switch::advance` feeds a leftover (switch.rs:271-276) | `TunnelGetsAll` | 1,471,808 generated, the whole graph |
+| `without_closeafterbare101` | a 101 without an `UpgradeHandler` closes (native.rs:702-706) | `NoHttpAfter101` | 391,698, depth 9 |
 
-The last is the code before commit b69a3806f: see the bugs below.
+The last is the code before commit b69a3806f: see the bugs below. The
+states generated to a violation vary by a few hundred between runs (the
+workers race to it); the run of 2026-11-09 on main found the same
+violations at the same depths.
+
+The model's `after` (bytes behind a request whose decoder has finished,
+bounded by `StreamCap`) is never filled: `sdone` is set only together
+with `Close` or the 400 path, which leave `Reading` and `Answering`, and
+the `after` branch of `HttpData` needs both, so `AfterLen <= StreamCap`
+holds vacuously. The code is the same: `Http1::read` (native.rs:374-386)
+is the only caller of `Stream::next`, and it closes as soon as the decoder
+is done, so `on_event`'s `after` buffer (native.rs:924-948) is not reached
+either. Bytes behind a CONNECT or a `Connection: close` request wait in
+the decoder's own buffer in both.
 
 ## Kani: HTTP/1 body framing
 
@@ -344,10 +372,13 @@ With `Room = 2`, `Limit = 3`, chunks from below of 1 or 3 units, writes of
 1 or 3, reads of 1 or 2 and three of each: `Tunnel_base.cfg` passes,
 30,275 states generated, 5,644 distinct, depth 15. Each ablation violates
 its property: `without_checkroom` (a write takes `min(room, len)`,
-tunnel.rs:286-291) violates `OutboundWithinRoom`; `without_chargewrites`
-(the charge before the queue, tunnel.rs:292-303) violates `ChargesMatch`;
-`without_admitbelowroom` (`Blocked` at the room, tunnel.rs:141-143)
-violates `InboundBelowRoomAndAChunk`.
+tunnel.rs:304-309) violates `OutboundWithinRoom`; `without_chargewrites`
+(the charge before the queue, tunnel.rs:310-323) violates `ChargesMatch`;
+`without_admitbelowroom` (`Blocked` at the room, tunnel.rs:154-156)
+violates `InboundBelowRoomAndAChunk`. Since the model was written,
+`tunnel.rs` moved to `services/stack` and gained `released`,
+`is_terminal` and a `Successor` impl; its room, charge and read paths are
+as they were (checked at e2858ccc4 on 2026-11-09).
 
 Two configs check the code against what it promises and find it does not
 keep it; both are findings below. `Tunnel_doc_room.cfg` checks the doc
@@ -357,9 +388,9 @@ violates it in 6 steps: a chunk that arrives below the room is taken whole.
 `NoEofWhileOpen` in 4 steps: an empty chunk at the front makes `poll_read`
 return `Ok(0)`, end of input, to a stream that has not ended. The base
 config sends no empty chunks because no producer in this tree does:
-`Http1::on_event` takes an empty chunk and drops it (native.rs:745-747),
-the stack runner turns a zero-byte read into `Ended` (stack/live.rs:204) and
-`Harness::push` skips empty input (harness.rs:117-120).
+`Http1::on_event` takes an empty chunk and drops it (native.rs:908-910),
+the stack runner turns a zero-byte read into `Ended` (stack/live.rs:207) and
+`Harness::push` skips empty input (harness.rs:128-132).
 
 ## Rust
 
@@ -416,7 +447,7 @@ could not run on the code, so they are reported for the owner rather than
 fixed here.
 
 - **An empty chunk from below reads as end of input.** `TunnelConn::poll_read`
-  (tunnel.rs:248-258) copies `min(chunk.len(), buf.len())` bytes from the
+  (tunnel.rs:266-276) copies `min(chunk.len(), buf.len())` bytes from the
   first chunk and pops it when it is empty, so an empty `Data` chunk at the
   front returns `Ok(0)` to a read with room, which every `Connection` user
   takes as the peer's end, while the stream is still open
@@ -426,12 +457,12 @@ fixed here.
   `Http1::on_event` already has: take an empty chunk and drop it in
   `Tunnel::on_event`.
 - **The inbound room is a soft limit.** `Tunnel::on_event` takes a chunk
-  whole whenever it holds less than `ROOM` (tunnel.rs:141-145), so it can
+  whole whenever it holds less than `ROOM` (tunnel.rs:150-159), so it can
   hold up to `ROOM - 1` plus the largest chunk from below, not the "at most
   64 KiB" its doc comment says (`Tunnel_doc_room.cfg`). The tunnel charges
   nothing for what it holds from below: a chunk carries whatever charge its
   producer gave it; the stack runner's carry the charge of the bytes read
-  (stack/live.rs:207-212). Taking a prefix up to the room and answering
+  (stack/live.rs:208-215). Taking a prefix up to the room and answering
   `Admit::Partial` would make the doc true.
 
 ## What the models leave out

@@ -61,8 +61,22 @@ starts at 4, `MAX_TABLE` is 5, SETTINGS carry 0, 3 or 6, one or two values
 a frame, an entry costs 1 for its 32 octets of overhead plus 0 or 1 each
 for its name and value, and the static table is one entry. With
 `Adversary` the blocks are any one or two representations (size updates
-of 0 to 6, indexes 1 to 3, literals of each kind), and only the decoder's
-own guarantees are checked.
+of 0 to 6, indexes 1 to 3, a literal with incremental indexing with a new
+or an indexed name, and one without indexing; no never-indexed literal),
+and only the decoder's own guarantees are checked.
+
+`EncoderInit` is the settings limit `Encoder::new` is given. The base
+configs give it 4096 (`Initial`), the `Encoder` at its default, which the
+tests and the HTTP/3 code build; the encoder then uses its dynamic table,
+and `set_capacity` (`MaxCaps`) is open to it. The server builds its
+encoder as `Encoder::new(0)` (`Http2::new`, `web/httpd/http2.rs` line
+221) and never calls `set_capacity`, so its table stays at capacity 0:
+its first block carries a size update of 0, every field after is a static
+index or a literal without indexing, and the client's reductions never
+find a table to shrink (`header_block`, lines 1169-1172).
+`HpackSync_server_base` is that encoder (`EncoderInit` 0, `MaxCaps` 0),
+checked against the same decoder; `without_minpending` and
+`without_secondupdate` break rules the server's encoder cannot reach.
 
 | Property | States |
 | --- | --- |
@@ -78,6 +92,7 @@ own guarantees are checked.
 | --- | --- | --- |
 | `HpackSync_base` | the `Encoder` and the decoder; two SETTINGS frames, two blocks, one capacity choice | passes: 22,730,309 states generated, 7,575,842 distinct, depth 12, 3 min 32 s |
 | `HpackSync_adversary_base` | any encoder | passes: 78,742,468 generated, 27,403,587 distinct, depth 11, 6 min 30 s |
+| `HpackSync_server_base` | the server's encoder, `Encoder::new(0)`, no capacity choice | passes: 1,359,822 generated, 470,588 distinct, depth 11 |
 | `HpackSync_without_minpending` | `resize` keeps the last capacity as the pending update, not the least | violates `NoError` (7 states): SETTINGS `[0, 3]`, then `set_capacity(1)`, and the block carries 1 where 0 is owed |
 | `HpackSync_without_secondupdate` | `write_block` sends only the pending minimum | violates `InStep` (7 states): the encoder's table is at 1, the decoder's at 0 |
 | `HpackSync_without_encevict` | `write_block` does not evict after inserting | violates `WithinMax` (2 states) |
@@ -92,7 +107,11 @@ own guarantees are checked.
 7541 section 4.2 puts the size update that answers a SETTINGS reduction
 after the SETTINGS acknowledgment. The server's `Http2` queues the ACK
 right after applying the values (`on_frame`, `web/httpd/http2.rs` lines
-897-911), so no block comes between, which is what `ImmediateAck` models.
+897-911), on the one FIFO every outbound frame takes (`queue`, lines
+357-375), so no block encoded after the values is written before the ACK,
+which is what `ImmediateAck` models. (The server's encoder, at capacity
+0, also never has a table to shrink; the hazard needs an encoder that
+raised its capacity above an owed minimum before the ACK.)
 An `Encoder` used by code that writes a block first sends the reduction
 early: with SETTINGS `[0, 3]`, then `set_capacity(1)`, the block carries
 updates 0 and 1 before the ACK, the decoder then owes 0 again, and the
@@ -151,7 +170,7 @@ did not finish, or ran out of 10 GiB, on the symbolic form.
 | `encoding_is_the_codes_then_ones` | any two octets encode, after what the output held, to their codes from the table and the fewest one bits that fill the last byte, in `encoded_len` bytes | 139 s |
 | `table_size_is_exactly_its_entries` | each insertion adds exactly name + value + 32 and puts the entry first, and an eviction to any capacity leaves the size within it, removes the fewest oldest entries that do, and says whether it removed any, for tables of zero to three entries of up to four-octet names and values; so any sequence keeps the size the exact sum | 200 s |
 | `indexes_resolve_only_inside_the_tables` | with zero to three dynamic entries: indexes 1 to 61 give the static table, 0 is an error, 62 on give the dynamic entries newest first, and every index past them is absent, never wrapped | 90 s |
-| `representations_read_back_exactly` | a size update, an indexed field and a literal of each indexing kind, with any size or index up to 14, read back exactly | 84 s |
+| `representations_read_back_exactly` | a size update, an indexed field and a literal of each indexing kind, with any size or index up to 14 (the incremental literal carries a new, empty name), read back exactly | 84 s |
 | `size_updates_come_only_first` | in every block of three representations, each a size update or an indexed field (8 blocks in turn), each reads back exactly until an update follows a field, which is `SizeUpdateOrder`, and nothing is read after | 8.6 s |
 | `the_prefix_is_read_exactly` | for any input of up to eight bytes and any limit: nothing is a message before the 5-byte prefix is whole, except that a flag above 1 is refused at the first byte; a big-endian length over the limit is refused from the prefix alone; a message is exactly the flag and the next `length` bytes; `message_len`, which the layer's early check calls, refuses the same prefixes with the same errors and gives `5 + length` without waiting for the body | 5.1 s |
 | `messages_write_and_read_back` | any message of up to three body bytes is written as its flag, its length big-endian and its body, after what the output held, and reads back as itself; a body over `MAX_MESSAGE` is refused, for every length | 8.3 s |
@@ -238,7 +257,17 @@ the fix. Model: `GrpcCall_without_checkearly`.
 - `GrpcCall.tla` leaves out the connection's budget (running out fails a
   call the way an oversized buffer does), compression (`check_encoding`),
   the response side, and HTTP/2 flow control, which `verification/http2-layer`
-  models.
+  models. Its `up` queue holds messages and the end only: the code's also
+  holds the `Call` event first (`Grpc::new`, lines 129-134), so until the
+  application takes it one fewer message waits than `WAITING`. The
+  `Overflow` arm (a body the connection could not hold, lines 327-329)
+  and the `Closed` arm (the stream gone, lines 331-336) are not in it.
+- `HpackSync.tla` reads the server's SETTINGS path for the ACK's place
+  only. The server's encoder is `Encoder::new(0)`: in
+  `HpackSync_server_base` its table is empty throughout, so `RoundTrip`
+  and `InStep` there check the first block's update to 0 and literal
+  fields, and the eviction and indexing rules are checked only with
+  `EncoderInit` 4096, the library's default.
 - The Kani harnesses are bounded: Huffman inputs of one or two bytes,
   tables of up to three entries with short names and values, integers of
   one byte in the grammar harnesses, three representations a block.

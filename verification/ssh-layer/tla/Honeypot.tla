@@ -1,7 +1,7 @@
 ---------------------------- MODULE Honeypot ----------------------------
 \* Source: demos/honeypot/src/ssh.rs:150-202 (factory and line submission);
-\* src/stdlib/services/ssh/session.rs:64-68,259-267,338-389 (policy and drain);
-\* src/stdlib/services/ssh.rs:1272-1281,1311-1328 (draining and policy priority).
+\* src/stdlib/services/ssh/session.rs:64-68,259-261,338-392 (policy and drain);
+\* src/stdlib/services/ssh.rs:1254-1263,1294-1310 (draining and policy priority).
 EXTENDS Naturals
 CONSTANT Mutation
 VARIABLES phase, policy, commandSeen, executed, callbacks, stoppedAt
