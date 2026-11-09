@@ -1037,6 +1037,11 @@ pub struct Header {
     /// Where the upper-layer header starts and the packet ends, as byte
     /// offsets into the packet. The end is cut to the bytes present.
     pub payload: Range<usize>,
+    /// The packet's length as its header gives it: the IPv4 total length,
+    /// or 40 plus the IPv6 payload length. More than the bytes present
+    /// only in a header read with [`Header::parse_truncated`] from a
+    /// packet cut short.
+    pub length: usize,
     /// The fragment this packet is, if it is one.
     pub fragment: Option<Fragment>,
 }
@@ -1210,6 +1215,7 @@ fn v4(bytes: &[u8], truncated: bool) -> Option<Header> {
         dst: IpAddr::V4(<[u8; 4]>::try_from(&bytes[16..20]).ok()?.into()),
         protocol: bytes[9],
         payload: ihl..total.min(bytes.len()),
+        length: total,
         fragment,
     })
 }
@@ -1246,6 +1252,7 @@ fn v6(bytes: &[u8], chain: &Chain) -> Header {
         dst: addr(24),
         protocol: chain.proto,
         payload: chain.upper..chain.end,
+        length: chain.length,
         fragment,
     }
 }
@@ -1282,6 +1289,8 @@ struct Chain {
     /// The packet's length, from its payload length field, cut to the
     /// bytes present.
     end: usize,
+    /// The packet's length, from its payload length field, not cut.
+    length: usize,
 }
 
 /// Walks the extension-header chain of an IPv6 packet: the one walker
@@ -1295,13 +1304,11 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
         return Err(Discard);
     }
     let check = walk == Walk::Check;
-    let mut end = 40 + u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
-    if end > bytes.len() {
-        if walk != (Walk::Read { truncated: true }) {
-            return Err(Discard);
-        }
-        end = bytes.len();
+    let length = 40 + u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    if length > bytes.len() && walk != (Walk::Read { truncated: true }) {
+        return Err(Discard);
     }
+    let end = length.min(bytes.len());
     // A first fragment: offset 0, more to come.
     let first = |frag: Option<(usize, usize)>| {
         frag.is_some_and(|(at, _): (usize, usize)| {
@@ -1345,6 +1352,7 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
                 proto_at: next_at,
                 frag,
                 end,
+                length,
             });
         };
         match next {
@@ -1393,6 +1401,7 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
         proto_at: next_at,
         frag,
         end,
+        length,
     })
 }
 
@@ -2373,7 +2382,8 @@ mod tests {
                 upper: 40,
                 proto_at: 6,
                 frag: None,
-                end: 48
+                end: 48,
+                length: 48
             })
         );
         // An Authentication header is read past.
@@ -2399,7 +2409,8 @@ mod tests {
                 upper: 64,
                 proto_at: 56,
                 frag: None,
-                end: 72
+                end: 72,
+                length: 72
             })
         );
         let stripped = strip_extension_headers(&p).unwrap().unwrap();
@@ -2562,6 +2573,44 @@ mod tests {
             Some(protocol::NONE)
         );
         assert_eq!(Header::parse(&cut[..44]), None);
+    }
+
+    /// A header read from a packet cut short still gives the length the
+    /// packet had, so a reader can tell it was cut without reading again.
+    #[test]
+    fn a_header_read_from_a_cut_packet_keeps_the_packet_length() {
+        // Each packet with the length of its fixed header: an IPv6 cut
+        // inside its Destination Options header is read too.
+        let whole = [
+            (
+                packet(
+                    "10.0.0.2".parse().unwrap(),
+                    "10.0.0.1".parse().unwrap(),
+                    protocol::UDP,
+                    &[7; 30],
+                )
+                .0,
+                20,
+            ),
+            (
+                chained(60, &[&[17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]),
+                40,
+            ),
+        ];
+        for (p, fixed) in whole {
+            let read = Header::parse(&p).expect("a whole packet");
+            assert_eq!(read.length, p.len());
+            for held in fixed..=p.len() {
+                let cut = Header::parse_truncated(&p[..held]).expect("a whole header");
+                assert_eq!(cut.length, p.len(), "{held} of {} bytes", p.len());
+                assert_eq!(
+                    Header::parse(&p[..held]).is_some(),
+                    cut.length <= held,
+                    "{held} of {} bytes",
+                    p.len()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2794,6 +2843,7 @@ mod tests {
                 dst: d,
                 protocol: protocol::UDP,
                 payload: 20..28,
+                length: 28,
                 fragment: None
             })
         );
