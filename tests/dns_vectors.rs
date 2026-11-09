@@ -2639,16 +2639,12 @@ fn cache() {
             stale: Duration::ZERO,
         };
         let mut cache = Cache::new(limits);
-        let mut generation = 0;
         let mut rust = Vec::new();
         for op in list(input, "ops") {
             let now = at(number(op, "time"));
             match text(op, "op") {
                 "offer" => offer(&mut cache, field(op, "offer"), now, limits),
-                "advance" => {
-                    generation += 1;
-                    cache.advance(fictionet::stdlib::services::dns::Generation(generation));
-                }
+                "advance" => cache.clear(),
                 _ => rust.push(served(&cache, &cache_key(field(op, "key")), now)),
             }
         }

@@ -1037,7 +1037,7 @@ impl<V: Verify> Engine for Resolver<V> {
         for token in self.graph.clear() {
             self.queue.push_back(Action::Abandon(token));
         }
-        self.cache.advance(session.generation);
+        self.cache.clear();
         self.servers.clear();
         let ids: Vec<AskerId> = self.askers.keys().copied().collect();
         for id in &ids {

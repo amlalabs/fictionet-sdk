@@ -1518,8 +1518,20 @@ fn a_new_session_keeps_old_completions_out_and_checks_signatures_against_its_clo
         reply.metadata.authentic_data,
         "validated against the new session's date"
     );
-    // Every cache entry is of the new generation.
-    assert_eq!(watched.engine.cache().generation(), Generation(1));
+    // Nothing the cache holds was judged by the old clock, under which
+    // every signature had expired.
+    let cache = watched.engine.cache();
+    assert!(cache.entries(at(0)).count() > 0);
+    assert!(cache.entries(at(0)).all(|(_, entry)| !matches!(
+        entry,
+        Entry::Positive {
+            validation: Validation::Bogus(_),
+            ..
+        } | Entry::Negative {
+            validation: Validation::Bogus(_),
+            ..
+        }
+    )));
 }
 
 #[test]

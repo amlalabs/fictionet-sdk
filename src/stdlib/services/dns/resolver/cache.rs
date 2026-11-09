@@ -9,7 +9,6 @@ use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Record, RecordSet, RecordType};
 use fictionet::time::Instant;
 
-use super::super::exchange::Generation;
 use super::super::zone::negative_ttl;
 
 /// What the cache holds an entry under: an owner name, a type, and a
@@ -329,7 +328,7 @@ struct SecureNsec {
     sets: BTreeMap<LowerName, (RecordSet, Instant)>,
 }
 
-/// A stored entry and the generation that wrote it.
+/// A stored entry, with what it was laid over.
 #[derive(Clone, Debug)]
 struct Stored {
     entry: Entry,
@@ -343,7 +342,6 @@ struct Stored {
     /// its parent reaches it, so this still finds the zone's servers
     /// (RFC 2181 §5.4.1, RFC 1034 §5.3.3).
     glue: Option<Entry>,
-    generation: Generation,
 }
 
 /// A resolver's cache, by owner name, type, and class.
@@ -385,12 +383,9 @@ struct Stored {
 ///   the entry of the type it answered, and is not kept at all when live
 ///   data or NODATA of higher rank, of any type, at the name or below it
 ///   shows the name exists.
-/// - Every entry records the generation that wrote it, and a new
-///   generation starts empty.
 #[derive(Clone, Debug)]
 pub struct Cache {
     limits: Limits,
-    generation: Generation,
     entries: BTreeMap<Key, Stored>,
     /// Validated NSEC records by zone, for synthesizing negative answers
     /// (RFC 8198).
@@ -400,25 +395,19 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// An empty cache in generation 0.
+    /// An empty cache.
     pub fn new(limits: Limits) -> Cache {
         Cache {
             limits,
-            generation: Generation(0),
             entries: BTreeMap::new(),
             nsec: BTreeMap::new(),
             swept: 0,
         }
     }
 
-    /// The generation the cache serves.
-    pub fn generation(&self) -> Generation {
-        self.generation
-    }
-
-    /// Starts `generation`: nothing of the old one is served again.
-    pub fn advance(&mut self, generation: Generation) {
-        self.generation = generation;
+    /// Forgets everything, as a resolver does when its session changes:
+    /// nothing learned before is served again.
+    pub fn clear(&mut self) {
         self.entries.clear();
         self.nsec.clear();
         self.swept = 0;
@@ -499,20 +488,11 @@ impl Cache {
                 entry: entry.clone(),
                 under: None,
                 glue: glue(self, &asked),
-                generation: self.generation,
             };
             self.entries.insert(asked, stored);
         }
         let glue = glue(self, &key);
-        self.entries.insert(
-            key,
-            Stored {
-                entry,
-                under,
-                glue,
-                generation: self.generation,
-            },
-        );
+        self.entries.insert(key, Stored { entry, under, glue });
         if self.entries.len() >= 2 * self.swept.max(64) {
             self.sweep(now);
         }
@@ -564,11 +544,9 @@ impl Cache {
             })
     }
 
-    /// What is stored for `key` in this generation.
+    /// What is stored for `key`.
     fn stored(&self, key: &Key) -> Option<&Stored> {
-        self.entries
-            .get(key)
-            .filter(|stored| stored.generation == self.generation)
+        self.entries.get(key)
     }
 
     /// An entry for `key` that expired at most [`Limits::stale`] before
@@ -579,7 +557,7 @@ impl Cache {
             .filter(|entry| now < entry.expires() + self.limits.stale)
     }
 
-    /// The data stored for `key` in this generation, live or not: the
+    /// The data stored for `key`, live or not: the
     /// entry, or what a failure was laid over.
     fn stored_data(&self, key: &Key) -> Option<&Entry> {
         let stored = self.stored(key)?;
@@ -689,14 +667,10 @@ impl Cache {
         secure_until: Option<Instant>,
         now: Instant,
     ) {
-        let generation = self.generation;
         let Some(stored) = self.entries.get_mut(key) else {
             return;
         };
-        if stored.generation != generation
-            || now >= stored.entry.expires()
-            || !checked.held_by(&stored.entry)
-        {
+        if now >= stored.entry.expires() || !checked.held_by(&stored.entry) {
             return;
         }
         match &mut stored.entry {
@@ -818,16 +792,13 @@ impl Cache {
     pub fn entries(&self, now: Instant) -> impl Iterator<Item = (&Key, &Entry)> {
         self.entries
             .iter()
-            .filter(move |(_, stored)| {
-                stored.generation == self.generation && now < stored.entry.expires()
-            })
+            .filter(move |(_, stored)| now < stored.entry.expires())
             .map(|(key, stored)| (key, &stored.entry))
     }
 
     fn live(&self, key: &Key, now: Instant) -> Option<&Entry> {
         self.entries
             .get(key)
-            .filter(|stored| stored.generation == self.generation)
             .map(|stored| &stored.entry)
             .filter(|entry| now < entry.expires())
     }
@@ -841,7 +812,6 @@ impl Cache {
             .take_while(|(other, _)| key.name.zone_of(&other.name))
             .any(|(other, stored)| {
                 other.class == key.class
-                    && stored.generation == self.generation
                     && now < stored.entry.expires()
                     && stored.entry.rank() > rank
                     && matches!(
@@ -886,7 +856,6 @@ impl Cache {
     /// persisting.
     fn sweep(&mut self, now: Instant) {
         let stale = self.limits.stale;
-        let generation = self.generation;
         self.entries.retain(|_, stored| {
             let persists = match stored.entry {
                 Entry::Failure { until, lasts, .. } => until + lasts,
@@ -897,7 +866,7 @@ impl Cache {
                 .flatten()
                 .map(Entry::expires)
                 .fold(persists, Instant::max);
-            stored.generation == generation && now < last + stale
+            now < last + stale
         });
         // Aggressive denial proofs are usable only with a live SOA and
         // live NSEC records. They have no stale-serving path.
