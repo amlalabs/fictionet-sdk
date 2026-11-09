@@ -55,6 +55,15 @@ where
         }
     }
 
+    /// With no application open, no work and nothing held, only a new event
+    /// can move anything.
+    pub(crate) fn idle(&self) -> bool {
+        self.pending.is_empty()
+            && self.jobs.is_empty()
+            && !self.driver.holds_output()
+            && self.driver.layer().idle()
+    }
+
     pub(crate) fn poll(
         &mut self,
         fcx: &Cx,
@@ -64,13 +73,7 @@ where
         command: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
     ) -> fictionet::Result<bool> {
         let mut command = command;
-        // With no application open, no work and nothing held, only a new
-        // event can move anything.
-        if self.pending.is_empty()
-            && self.jobs.is_empty()
-            && !self.driver.holds_output()
-            && self.driver.layer().idle()
-        {
+        if self.idle() {
             events(&mut self.pending);
             if self.pending.is_empty() {
                 return Ok(false);

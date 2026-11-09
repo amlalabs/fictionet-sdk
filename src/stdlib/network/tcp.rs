@@ -1072,6 +1072,14 @@ impl PacketDriver {
                     Some((refused, std::mem::take(&mut host.routes.refusals)))
                 })
                 .flatten();
+            // With no application and no event for one, the applications
+            // have nothing to do and the task's waker goes back at once.
+            let parked = if self.applications.idle() && host.routes.application_events.is_empty() {
+                host.routes.restore_driver(parked, cx);
+                None
+            } else {
+                Some(parked)
+            };
             (busy, host.tcp.deadline(), refusals, parked)
         };
         if let Some((refused, refusals)) = refusals {
@@ -1080,30 +1088,25 @@ impl PacketDriver {
             }
         }
         let mut offered = false;
-        let applications = self.applications.poll(
-            &self.fcx,
-            now,
-            cx,
-            |pending| {
-                std::mem::swap(
-                    pending,
-                    &mut self.shared.state.lock().routes.application_events,
-                )
-            },
-            |command| {
-                let admit = self.shared.state.lock().submit(command);
-                offered |= admit.moved();
-                admit
-            },
-        )?;
-        {
-            let mut host = self.shared.state.lock();
-            if !host.routes.stopped {
-                host.routes.driver = Some(match parked {
-                    Some(waker) if waker.will_wake(cx.waker()) => waker,
-                    _ => cx.waker().clone(),
-                });
-            }
+        let mut applications = false;
+        if let Some(parked) = parked {
+            applications = self.applications.poll(
+                &self.fcx,
+                now,
+                cx,
+                |pending| {
+                    std::mem::swap(
+                        pending,
+                        &mut self.shared.state.lock().routes.application_events,
+                    )
+                },
+                |command| {
+                    let admit = self.shared.state.lock().submit(command);
+                    offered |= admit.moved();
+                    admit
+                },
+            )?;
+            self.shared.state.lock().routes.restore_driver(parked, cx);
         }
         // An engine that used its allowance or filled its output continues
         // after the rest of the run has had a turn, as writers refill what
@@ -1337,6 +1340,17 @@ impl Routes {
                     }
                 }
             },
+        }
+    }
+
+    /// Holds the endpoint task's waker again after the task's own poll,
+    /// keeping the one it had if that wakes the same task.
+    fn restore_driver(&mut self, parked: Option<Waker>, cx: &Context<'_>) {
+        if !self.stopped {
+            self.driver = Some(match parked {
+                Some(waker) if waker.will_wake(cx.waker()) => waker,
+                _ => cx.waker().clone(),
+            });
         }
     }
 
