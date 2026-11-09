@@ -76,7 +76,7 @@ use std::task::{Context, Poll, Waker};
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::network::tcp::{
-    AckAnswer, Answer, GoneWatch, Handshake, Kept, Received, SegmentVerdict, Segments, Sent, Syn,
+    AckAnswer, Answer, Handshake, Kept, Received, SegmentVerdict, Segments, Sent, Syn,
     SynAnswer, TcpOption,
 };
 use fictionet::stdlib::network::{Connection, ConnectionExt};
@@ -835,7 +835,12 @@ impl Answer for Answers {
 
 /// Reads a joined subflow until the client closes it or the connection it
 /// joined is gone.
-async fn hold(fcx: Cx, mut conn: Box<dyn Connection>, socket: GoneWatch, joined: Joined) {
+async fn hold(
+    fcx: Cx,
+    mut conn: Box<dyn Connection>,
+    socket: Arc<dyn fictionet::stdlib::network::transport::Retirement>,
+    joined: Joined,
+) {
     let mut buf = [0; 4096];
     loop {
         let mut read = pin!(conn.read(&fcx, &mut buf));
