@@ -939,6 +939,27 @@ impl Messages {
     pub fn limit(&self) -> usize {
         self.limit
     }
+
+    fn check_header(&self, input: &[u8]) -> Result<(), Error> {
+        if let Some(h) = self.frames.header(input).map_err(|error| match error {
+            Error::PayloadTooLarge(_) => Error::TooBig,
+            other => other,
+        })? {
+            match (&self.partial, h.opcode) {
+                (None, Opcode::Continuation) => return Err(Error::UnexpectedContinuation),
+                (Some(_), Opcode::Text | Opcode::Binary) => {
+                    return Err(Error::ExpectedContinuation);
+                }
+                _ => {}
+            }
+            if !h.opcode.is_control()
+                && codec::Decode::held(self).saturating_add(h.len) > self.limit
+            {
+                return Err(Error::TooBig);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl codec::Decode for Messages {
@@ -959,21 +980,7 @@ impl codec::Decode for Messages {
         if self.frames.closed {
             return Ok(Step::End);
         }
-        if let Some(h) = self.frames.header(input).map_err(|error| match error {
-            Error::PayloadTooLarge(_) => Inner(Error::TooBig),
-            other => Inner(other),
-        })? {
-            match (&self.partial, h.opcode) {
-                (None, Opcode::Continuation) => return Err(Inner(Error::UnexpectedContinuation)),
-                (Some(_), Opcode::Text | Opcode::Binary) => {
-                    return Err(Inner(Error::ExpectedContinuation));
-                }
-                _ => {}
-            }
-            if !h.opcode.is_control() && self.held().saturating_add(h.len) > self.limit {
-                return Err(Inner(Error::TooBig));
-            }
-        }
+        self.check_header(input).map_err(Inner)?;
         let (frame, used) = match self.frames.decode(input, eof).map_err(Inner)? {
             Step::Item(frame, used) => (frame, used),
             Step::Need if eof && input.is_empty() && self.partial.is_some() => {
