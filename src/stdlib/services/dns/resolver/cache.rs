@@ -546,9 +546,7 @@ impl Cache {
     /// whose SOA expired or that hold no live records. Nothing dropped
     /// could serve a read at `now` or later.
     pub fn expire(&mut self, now: Instant) {
-        while let Some((at, _)) = self.drops.first()
-            && *at <= now
-        {
+        while self.drops.first().is_some_and(|(at, _)| *at <= now) {
             self.drop_first();
         }
     }
@@ -556,15 +554,18 @@ impl Cache {
     /// Drops what is soonest of no use until the cache is within its
     /// limits.
     fn fit(&mut self) {
-        while self.drops.len() > self.limits.max_entries || self.bytes > self.limits.max_bytes {
-            self.drop_first();
-        }
+        while (self.drops.len() > self.limits.max_entries || self.bytes > self.limits.max_bytes)
+            && self.drop_first()
+        {}
     }
 
-    /// Drops what is soonest of no use.
-    fn drop_first(&mut self) {
-        let Some((_, slot)) = self.drops.first().cloned() else {
-            return;
+    /// Drops what is soonest of no use, or returns false when nothing is
+    /// held. Its place in [`drops`](Cache::drops) goes first, so every
+    /// call takes one place off and the loops over it end, whatever the
+    /// stores behind it hold.
+    fn drop_first(&mut self) -> bool {
+        let Some((_, slot)) = self.drops.pop_first() else {
+            return false;
         };
         match slot {
             Slot::Entry(key) => {
@@ -573,6 +574,7 @@ impl Cache {
             Slot::Zone(zone) => self.drop_zone(&zone),
             Slot::Nsec(zone, owner) => self.drop_nsec(&zone, &owner),
         }
+        true
     }
 
     /// Stores `stored` at `key`, in place of what was there.
@@ -1310,6 +1312,27 @@ mod tests {
         assert!(cache.entries.is_empty());
         assert!(cache.drops.is_empty());
         assert_eq!(cache.bytes, 0);
+    }
+
+    /// Dropping takes a place off the index before what it names, so a
+    /// place whose entry is gone, or an index that runs out while bytes
+    /// still count, cannot keep `expire` or `fit` turning.
+    #[test]
+    fn dropping_ends_when_the_index_and_the_stores_disagree() {
+        let mut cache = Cache::new(limits(usize::MAX));
+        cache.insert(at(0), address("host.example.", 50));
+        let key = cache.entries.keys().next().cloned().unwrap();
+        let stored = cache.entries.remove(&key).unwrap();
+        cache.bytes -= stored.bytes;
+        cache.expire(at(400));
+        assert!(cache.drops.is_empty());
+
+        let mut cache = Cache::new(limits(usize::MAX));
+        cache.insert(at(0), address("host.example.", 50));
+        cache.drops.clear();
+        cache.limits.max_bytes = 0;
+        cache.fit();
+        assert!(cache.drops.is_empty());
     }
 
     #[test]

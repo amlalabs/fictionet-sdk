@@ -254,9 +254,10 @@ struct Kid<B: Layer> {
 }
 
 /// What reaches a child from outside `Children`'s calls into it: receive
-/// credit returned by payload released elsewhere, and wakes from its work,
-/// which may share state with its layer (a tunnel's connection does).
-/// Either gets the child visited at the next advance.
+/// credit returned by payload released elsewhere, wakes from its work,
+/// which may share state with its layer (a tunnel's connection does), and
+/// wakes of the [`Env::waker`] its calls get. Each gets the child visited
+/// at the next advance.
 pub(crate) struct ChildWake {
     /// The child's place in `Children`, its own while it is open.
     key: usize,
@@ -387,6 +388,35 @@ impl Wake for ChildWake {
         if let Some(task) = task {
             task.wake();
         }
+    }
+}
+
+impl ChildWake {
+    /// The child's [`Env::waker`]: it queues the child, then wakes
+    /// `around`, what the child runs in. It changes nothing in the child's
+    /// wake, so it stays good while the child is open.
+    pub(crate) fn waker_in(self: &Arc<Self>, around: Waker) -> Waker {
+        Waker::from(Arc::new(Within {
+            child: self.clone(),
+            around,
+        }))
+    }
+}
+
+/// A child's [`Env::waker`] ([`ChildWake::waker_in`]).
+struct Within {
+    child: Arc<ChildWake>,
+    around: Waker,
+}
+
+impl Wake for Within {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.child.notify();
+        self.around.wake_by_ref();
     }
 }
 
@@ -806,15 +836,18 @@ where
         let report = move |e| ChildReport::Event(id, e);
         // Until `take_released` below. A closed child takes nothing more.
         kid.wake.enter();
-        let mut moved = match env.scoped_in(&kid.budget, report, |env| kid.layer.advance(env)) {
-            Ok(moved) => moved,
-            Err(e) => {
-                self.fail(env, id, e);
-                return None;
-            }
-        };
+        let mut moved =
+            match env.scoped_child(&kid.budget, &kid.wake, report, |env| kid.layer.advance(env)) {
+                Ok(moved) => moved,
+                Err(e) => {
+                    self.fail(env, id, e);
+                    return None;
+                }
+            };
         if let Some(event) = kid.urgent.take() {
-            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
+            match env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+                kid.layer.on_event(env, event)
+            }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => moved = true,
                 Ok(Admit::Blocked(event) | Admit::Partial(event)) => kid.urgent = Some(event),
                 Err(e) => {
@@ -825,7 +858,9 @@ where
         }
         if let Some((event, retained)) = kid.inbox.pop_front() {
             let cost = event.credit();
-            match env.scoped_in(&kid.budget, report, |env| kid.layer.on_event(env, event)) {
+            match env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+                kid.layer.on_event(env, event)
+            }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => {
                     if !retained {
                         kid.owed += cost;
@@ -847,7 +882,9 @@ where
             }
         }
         if kid.outbox.is_none() {
-            kid.outbox = env.scoped_in(&kid.budget, report, |env| kid.layer.take_command(env));
+            kid.outbox = env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+                kid.layer.take_command(env)
+            });
             moved |= kid.outbox.is_some();
         }
         let output_idle = kid.outbox.is_none();
@@ -997,8 +1034,9 @@ where
                 if event.terminal_reset() {
                     if let Some(mut kid) = self.remove(id) {
                         kid.owner.cancel();
-                        if let Err(error) = env.scoped_in(
+                        if let Err(error) = env.scoped_child(
                             &kid.budget,
+                            &kid.wake,
                             |event| ChildReport::Event(id, event),
                             |env| kid.layer.on_event(env, event),
                         ) {
@@ -1106,8 +1144,9 @@ where
         let kid = &mut self.kids[key];
         let layer = &mut kid.layer;
         let result = kid.wake.call(|| {
-            env.scoped_in(
+            env.scoped_child(
                 &kid.budget,
+                &kid.wake,
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_timer(env, timer),
             )
@@ -1137,8 +1176,9 @@ where
         let kid = &mut self.kids[key];
         let layer = &mut kid.layer;
         let result = kid.wake.call(|| {
-            env.scoped_in(
+            env.scoped_child(
                 &kid.budget,
+                &kid.wake,
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_done(env, done),
             )
@@ -1704,6 +1744,103 @@ mod tests {
         let layer = driver.layer_mut();
         let key = layer.key(id).unwrap();
         (id, layer.kids[key].layer.held.take().unwrap())
+    }
+
+    /// A child whose state changes outside its calls: it keeps the waker
+    /// its calls get, and writes once `go` is set.
+    struct Waits {
+        go: Arc<AtomicBool>,
+        kept: Arc<Mutex<Option<Waker>>>,
+        wrote: bool,
+    }
+
+    impl Layer for Waits {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
+            self.kept.lock().get_or_insert_with(|| env.waker());
+            Ok(false)
+        }
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            _: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, ()>) -> Option<StreamCommand> {
+            (self.go.load(Ordering::Acquire) && !self.wrote).then(|| {
+                self.wrote = true;
+                StreamCommand::Write(Chunk::new(vec![1]))
+            })
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// Counts the wakes of the task that runs the stack.
+    #[derive(Default)]
+    struct Task(AtomicU64);
+
+    impl Wake for Task {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn a_child_woken_from_outside_its_calls_wakes_the_runner_and_is_visited() {
+        let go = Arc::new(AtomicBool::new(false));
+        let kept = Arc::new(Mutex::new(None));
+        let (child_go, child_kept) = (go.clone(), kept.clone());
+        let mut driver = Driver::new(
+            Children::<Waits, Top, ()>::new(1, 8, move |_, (), _| {
+                Some(Waits {
+                    go: child_go.clone(),
+                    kept: child_kept.clone(),
+                    wrote: false,
+                })
+            }),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+        assert!(driver.deliver(MuxEvent::Credit(id, 8)).unwrap().moved());
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        assert!(!driver.woken());
+        // Another thread changes the child's state and wakes it.
+        go.store(true, Ordering::Release);
+        let waker = kept.lock().clone().expect("the child kept its waker");
+        std::thread::spawn(move || waker.wake()).join().unwrap();
+        assert_eq!(task.0.load(Ordering::Acquire), 1);
+        assert!(driver.woken());
+        driver.run().unwrap();
+        assert!(!driver.woken());
+        assert!(matches!(
+            driver.take_command().unwrap().into_op(),
+            super::super::MuxOp::Child(found, StreamCommand::Write(_)) if found == id
+        ));
     }
 
     #[test]

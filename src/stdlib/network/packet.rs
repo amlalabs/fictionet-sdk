@@ -333,7 +333,6 @@ pub struct ObservedIpPacket {
     header: Option<Header>,
     sort: Sort,
     ingress: Ingress,
-    complete: bool,
 }
 
 impl ObservedIpPacket {
@@ -344,18 +343,14 @@ impl ObservedIpPacket {
     pub fn observed(bytes: Chunk, ingress: Ingress) -> Self {
         let header = Header::parse_truncated(&bytes);
         let sort = Sort::read(header.as_ref(), &bytes);
-        let complete = Header::parse(&bytes).is_some()
-            && ingress
-                .capture
-                .is_none_or(|capture| capture.original_len <= bytes.len());
         Self {
             bytes,
             header,
             sort,
             ingress,
-            complete,
         }
     }
+
     /// The bytes the capture holds, IP header first.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -387,7 +382,14 @@ impl ObservedIpPacket {
     /// Whether every byte of the packet is here: false when the capture
     /// holds fewer bytes than the packet had or than its header says.
     pub fn is_complete(&self) -> bool {
-        self.complete
+        let held = self.bytes.len();
+        self.header
+            .as_ref()
+            .is_some_and(|header| header.length <= held)
+            && self
+                .ingress
+                .capture
+                .is_none_or(|capture| capture.original_len <= held)
     }
 
     /// Its bytes, giving up the rest.

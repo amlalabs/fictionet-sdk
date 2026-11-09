@@ -74,6 +74,9 @@ where
         command: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
     ) -> fictionet::Result<bool> {
         let mut command = command;
+        // An application woken from outside its calls wakes this task,
+        // which polls the applications again.
+        self.driver.set_waker(cx.waker());
         if self.idle() {
             events(&mut self.pending);
             if self.pending.is_empty() {
@@ -235,6 +238,114 @@ mod tests {
                 )?;
                 assert!(applications.pending.is_empty());
                 assert_eq!(applications.driver.layer().received, 1);
+                cx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// Keeps the waker its calls get, and sends one message once another
+    /// thread asks.
+    struct Asked {
+        asked: Arc<std::sync::atomic::AtomicBool>,
+        kept: Arc<fictionet::sync::Mutex<Option<std::task::Waker>>>,
+        sent: bool,
+    }
+    impl Idle for Asked {}
+    impl Layer for Asked {
+        type Lower = Messages<(), ()>;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+            self.kept.lock().get_or_insert_with(|| env.waker());
+            Ok(false)
+        }
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: MessageEvent<()>,
+        ) -> Result<Admit<MessageEvent<()>>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<MessageCommand<()>> {
+            let asked = self.asked.load(std::sync::atomic::Ordering::Acquire);
+            (asked && !self.sent).then(|| {
+                self.sent = true;
+                MessageCommand::Send(())
+            })
+        }
+    }
+
+    /// Counts the wakes of the task that polls the applications.
+    #[derive(Default)]
+    struct Task(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for Task {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn an_application_woken_from_another_thread_wakes_the_polling_task() {
+        use std::sync::atomic::Ordering;
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |cx| async move {
+                let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let kept = Arc::new(fictionet::sync::Mutex::new(None));
+                let mut applications = Applications::new(
+                    &cx,
+                    Asked {
+                        asked: asked.clone(),
+                        kept: kept.clone(),
+                        sent: false,
+                    },
+                );
+                let task = Arc::new(Task::default());
+                let waker = std::task::Waker::from(task.clone());
+                let mut sent = 0;
+                let busy = applications.poll(
+                    &cx,
+                    cx.now(),
+                    &mut Context::from_waker(&waker),
+                    |_| {},
+                    |_| {
+                        sent += 1;
+                        Admit::Taken
+                    },
+                )?;
+                assert!(!busy);
+                assert_eq!(sent, 0);
+                asked.store(true, Ordering::Release);
+                let kept = kept.lock().clone().expect("the application kept its waker");
+                std::thread::spawn(move || kept.wake()).join().unwrap();
+                assert_eq!(task.0.load(Ordering::Acquire), 1);
+                applications.poll(
+                    &cx,
+                    cx.now(),
+                    &mut Context::from_waker(&waker),
+                    |_| {},
+                    |_| {
+                        sent += 1;
+                        Admit::Taken
+                    },
+                )?;
+                assert_eq!(sent, 1);
                 cx.cancel();
                 Ok(())
             },
