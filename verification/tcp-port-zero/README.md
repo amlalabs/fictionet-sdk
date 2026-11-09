@@ -132,6 +132,27 @@ including unwinding assertions, with 19 unreachable checks and unwind bound
 with its default solver and safety checks; no assumptions restrict the
 symbolic ports, origin or packet bytes. No harness failed or was abandoned.
 
+### Rerun against the TCP layer, and failing controls
+
+All three harnesses were rerun on `comp/v-tcp-obs`, with TCP running as a
+layer, under Kani 0.68.0 (CBMC 6.11.0). `SocketProof.rs` now shares its
+setup with its control; the proof itself is unchanged.
+
+| Harness | Checks | Result |
+| --- | ---: | --- |
+| `handshake_reset_preserves_only_passive_listeners` | 6,203 (320 unreachable) | 0 failed, 14 s |
+| `every_port_pair_roundtrips_and_checksums_are_required` | 452 (19 unreachable) | 0 failed, 9 s |
+| `renaming_ports_preserves_packet_validation` | 739 (18 unreachable) | 0 failed, 388 s |
+
+Each harness has a failing control that changes one thing and must fail on
+the one assertion its comment names. Each failed on exactly that check:
+
+| Control | What it changes | Failed check |
+| --- | --- | --- |
+| `handshake_reset_without_port_zero_listeners` | reads a listening port of zero as no listener, as the reset guard before `c27e21447` did | "a passive socket listens again after a handshake reset" (1 of 6,165) |
+| `every_port_pair_without_a_single_bit_flip` | flips one bit in each port, which the ones'-complement sum cannot see; the proof claims only single flips | "a corrupted segment is rejected" (1 of 448) |
+| `renaming_ports_without_the_checksum_refilled` | renames the ports without filling the checksum again | "renaming keeps the verdict" (1 of 448) |
+
 ## Executed Rust validation
 
 Existing tests were run unchanged to check concrete behavior corresponding to
@@ -192,6 +213,16 @@ systemd-run --user --scope -p MemoryMax=10G cargo kani -p smoltcp --lib \
   --harness every_port_pair_roundtrips_and_checksums_are_required --output-format terse
 systemd-run --user --scope -p MemoryMax=10G cargo kani -p smoltcp --lib \
   --harness renaming_ports_preserves_packet_validation --output-format terse
+```
+
+The controls run the same way and must report `VERIFICATION:- FAILED` with
+the check named above:
+
+```sh
+systemd-run --user --scope -p MemoryMax=10G cargo kani -p smoltcp --lib --tests \
+  --harness handshake_reset_without_port_zero_listeners \
+  --harness every_port_pair_without_a_single_bit_flip \
+  --harness renaming_ports_without_the_checksum_refilled --output-format terse
 ```
 
 The corresponding ordinary checks are:
