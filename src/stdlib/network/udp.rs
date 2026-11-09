@@ -42,13 +42,14 @@
 //! # Ok::<(), udp::Error>(())
 //! ```
 
+mod applications;
 mod sockets;
 mod wire;
 pub use sockets::{Dropped, Overrun, UdpLayer, UdpReport};
 pub use wire::{Datagram, Error, encode, encoded_len};
 
 use fictionet::sync::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -170,6 +171,8 @@ pub(crate) fn prepare_transport(fcx: &Cx, addr: IpAddr) -> (Endpoint, PacketDriv
             output: Vec::new(),
             wake: None,
             sockets: BTreeMap::new(),
+            applications: BTreeSet::new(),
+            application_events: VecDeque::new(),
             ports: BTreeMap::new(),
             next_request: 0,
             answers: Vec::new(),
@@ -183,6 +186,7 @@ pub(crate) fn prepare_transport(fcx: &Cx, addr: IpAddr) -> (Endpoint, PacketDriv
             shared: shared.clone(),
         },
         PacketDriver {
+            applications: applications::Applications::new(fcx),
             shared,
             fcx: fcx.clone(),
         },
@@ -190,6 +194,7 @@ pub(crate) fn prepare_transport(fcx: &Cx, addr: IpAddr) -> (Endpoint, PacketDriv
 }
 
 pub(crate) struct PacketDriver {
+    applications: applications::Applications,
     shared: Arc<Shared>,
     fcx: Cx,
 }
@@ -206,14 +211,22 @@ impl PacketDriver {
         &mut self,
         cx: &mut std::task::Context<'_>,
         out: &mut Vec<Vec<u8>>,
-    ) -> (bool, Option<fictionet::time::Instant>) {
-        self.shared.with(|inner| {
+    ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
+        let (busy, deadline) = self.shared.with(|inner| {
             inner.wake = Some(cx.waker().clone());
             inner.driver.set_now(self.fcx.now());
             inner.pump();
             out.append(&mut inner.output);
             (inner.driver.exhausted(), inner.driver.deadline())
-        })
+        });
+        let more = self.applications.poll(&self.fcx, &self.shared, cx)?;
+        Ok((
+            busy || more,
+            [deadline, self.applications.deadline()]
+                .into_iter()
+                .flatten()
+                .min(),
+        ))
     }
 }
 
@@ -234,6 +247,8 @@ struct Inner {
     wake: Option<Waker>,
     /// The sockets by port.
     sockets: BTreeMap<u16, Mailbox>,
+    applications: BTreeSet<ChildId>,
+    application_events: VecDeque<applications::ApplicationEvent>,
     /// The ports of the sockets by child.
     ports: BTreeMap<ChildId, u16>,
     next_request: u64,
@@ -328,6 +343,18 @@ impl Inner {
         self.pump();
     }
 
+    fn application_command(
+        &mut self,
+        command: MuxCommand<layer::Datagrams<SocketAddr>, Control>,
+    ) -> Admit<MuxCommand<layer::Datagrams<SocketAddr>, Control>> {
+        let result = self.driver.command(command).expect("credit is kept");
+        self.pump();
+        if let Some(waker) = self.wake.take() {
+            waker.wake();
+        }
+        result
+    }
+
     /// Moves everything the stack has: packets into the interface, events
     /// to the sockets.
     fn pump(&mut self) {
@@ -339,6 +366,8 @@ impl Inner {
             ports,
             answers,
             refused,
+            applications,
+            application_events,
             ..
         } = self;
         loop {
@@ -356,7 +385,28 @@ impl Inner {
                 Admit::Taken
             });
             moved |= driver.send_above(|event| {
-                route(event, sockets, ports, answers, refused);
+                let application = match &event {
+                    MuxEvent::Child(id, _) | MuxEvent::Credit(id, _) | MuxEvent::Closed(id) => {
+                        applications.contains(id)
+                    }
+                    _ => false,
+                };
+                if application {
+                    if application_events.len() >= 64 {
+                        return Admit::Blocked(event);
+                    }
+                    application_events.push_back(match event {
+                        MuxEvent::Child(id, event) => MuxEvent::Child(id, event),
+                        MuxEvent::Credit(id, credit) => MuxEvent::Credit(id, credit),
+                        MuxEvent::Closed(id) => {
+                            applications.remove(&id);
+                            MuxEvent::Closed(id)
+                        }
+                        _ => unreachable!("application child event"),
+                    });
+                } else {
+                    route(event, sockets, ports, answers, refused);
+                }
                 Admit::Taken
             });
             if !moved && !driver.exhausted() {
@@ -566,6 +616,31 @@ impl fictionet::stdlib::network::DatagramSocket for Socket {
 }
 
 impl Socket {
+    /// Transfers this bound transport child to its application stack.
+    pub(crate) fn attach(
+        self,
+        application: fictionet::stdlib::services::stack::Boxed<layer::Datagrams<SocketAddr>>,
+        budget: Budget,
+    ) {
+        self.shared.with(|inner| {
+            let mailbox = inner.sockets.remove(&self.port).expect("bound socket");
+            let id = mailbox.child.id();
+            inner.ports.remove(&id);
+            inner.applications.insert(id);
+            inner.application_events.push_back(MuxEvent::Opened(
+                mailbox.child,
+                (application, budget),
+                1,
+            ));
+            inner
+                .application_events
+                .push_back(MuxEvent::Credit(id, mailbox.credit));
+            if let Some(waker) = inner.wake.take() {
+                waker.wake();
+            }
+        });
+    }
+
     /// The address and port this socket receives on.
     pub fn local_addr(&self) -> SocketAddr {
         SocketAddr::new(self.shared.addr, self.port)

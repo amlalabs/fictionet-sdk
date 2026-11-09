@@ -27,17 +27,20 @@
 //!
 //! [`Host::tcp_stack`](fictionet::stdlib::world::net::Host::tcp_stack) and
 //! [`Host::udp_stack`](fictionet::stdlib::world::net::Host::udp_stack)
-//! serve a host's port with these.
+//! attach applications directly to transport children. [`Session`] applies
+//! stream lifetime and timeout policy to those applications.
 
 mod boxed;
 mod job;
 mod live;
 mod open;
+mod session;
 mod tunnel;
 
 pub use boxed::{BoxError, Boxed};
 pub use job::{Job, Polling};
 pub use open::Opened;
+pub use session::{Session, SessionTimer, SessionWork};
 pub use tunnel::{Takeover, Tunnel};
 
 use std::future::{Future, poll_fn};

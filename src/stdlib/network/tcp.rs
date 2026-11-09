@@ -83,9 +83,11 @@ use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, Entropy, Error, Interface};
 
+mod applications;
 mod engine;
 mod factory;
 
+pub(crate) use applications::Application;
 pub use engine::{TcpLayer, Verdict};
 pub use factory::{EndpointState, Factory, Opening, Stack};
 
@@ -1024,12 +1026,18 @@ pub(crate) fn prepare_transport(
         Endpoint {
             shared: shared.clone(),
         },
-        PacketDriver { shared },
+        PacketDriver {
+            applications: applications::Applications::new(fcx, &shared),
+            fcx: fcx.clone(),
+            shared,
+        },
     )
 }
 
 pub(crate) struct PacketDriver {
     shared: Arc<Shared>,
+    fcx: Cx,
+    applications: applications::Applications,
 }
 
 impl PacketDriver {
@@ -1046,7 +1054,7 @@ impl PacketDriver {
         &mut self,
         cx: &mut Context<'_>,
         out: &mut Vec<Vec<u8>>,
-    ) -> (bool, Option<Instant>) {
+    ) -> fictionet::Result<(bool, Option<Instant>)> {
         let (busy, deadline, refused, refusals) = {
             let mut host = self.shared.state.lock();
             host.routes.driver = Some(cx.waker().clone());
@@ -1063,7 +1071,14 @@ impl PacketDriver {
                 refused(peer, local);
             }
         }
-        (busy, deadline)
+        let applications = self.applications.poll(&self.fcx, &self.shared, cx)?;
+        Ok((
+            busy || applications,
+            [deadline, self.applications.deadline()]
+                .into_iter()
+                .flatten()
+                .min(),
+        ))
     }
 }
 
@@ -1116,6 +1131,9 @@ struct Routes {
     refusals: Vec<(SocketAddr, SocketAddr)>,
     /// Children accepted for a listener that is gone, to be reset.
     strays: Vec<Child>,
+    applications: BTreeSet<ChildId>,
+    application_events: VecDeque<applications::ApplicationEvent>,
+    accept_again: Vec<u16>,
 }
 
 /// One connection a handle has.
@@ -1165,6 +1183,7 @@ impl Link {
 /// One listening port's accepted connections.
 #[derive(Default)]
 struct Accepting {
+    application: Option<Arc<Application>>,
     /// Children accepted that no `accept` took yet.
     queue: VecDeque<ChildId>,
     /// An accept was asked for and has not opened a child yet.
@@ -1176,8 +1195,23 @@ impl Routes {
     /// Delivers one event from the engine to whatever waits for it.
     fn route(&mut self, event: Event) {
         match event {
-            MuxEvent::Opened(child, opening, _) => {
+            MuxEvent::Opened(child, opening, max_command) => {
                 let id = child.id();
+                if matches!(opening.origin, TcpOrigin::Accepted(_))
+                    && let Some(application) = self
+                        .listeners
+                        .get(&opening.local.port())
+                        .and_then(|listener| listener.application.clone())
+                {
+                    self.applications.insert(id);
+                    self.accept_again.push(opening.local.port());
+                    self.application_events.push_back(MuxEvent::Opened(
+                        child,
+                        (opening, application),
+                        max_command,
+                    ));
+                    return;
+                }
                 match opening.origin {
                     TcpOrigin::Accepted(_) => {
                         let Some(l) = self.listeners.get_mut(&opening.local.port()) else {
@@ -1196,6 +1230,11 @@ impl Routes {
                 self.links.insert(id, Link::new(child, &opening));
             }
             MuxEvent::Child(id, event) => {
+                if self.applications.contains(&id) {
+                    self.application_events
+                        .push_back(MuxEvent::Child(id, event));
+                    return;
+                }
                 let Some(link) = self.links.get_mut(&id) else {
                     return;
                 };
@@ -1214,6 +1253,11 @@ impl Routes {
                 }
             }
             MuxEvent::Credit(id, units) => {
+                if self.applications.contains(&id) {
+                    self.application_events
+                        .push_back(MuxEvent::Credit(id, units));
+                    return;
+                }
                 if let Some(link) = self.links.get_mut(&id) {
                     link.credit += units;
                     if let Some(w) = link.write.take() {
@@ -1222,6 +1266,10 @@ impl Routes {
                 }
             }
             MuxEvent::Closed(id) => {
+                if self.applications.remove(&id) {
+                    self.application_events.push_back(MuxEvent::Closed(id));
+                    return;
+                }
                 if let Some(mut link) = self.links.remove(&id) {
                     link.wake();
                 }
@@ -1298,11 +1346,12 @@ impl Host {
     /// endpoint's task if the engine has something to send or do. Returns
     /// whether the engine took the command.
     fn command(&mut self, command: Command) -> bool {
+        matches!(self.offer(command), Admit::Taken)
+    }
+
+    fn offer(&mut self, command: Command) -> Admit<Command> {
         self.tick();
-        let taken = match self.tcp.command(command) {
-            Ok(admit) => matches!(admit, Admit::Taken),
-            Err(never) => match never {},
-        };
+        let taken = self.tcp.command(command).unwrap();
         self.pump();
         if self.engine_ref().busy() {
             self.kick();
@@ -1320,12 +1369,23 @@ impl Host {
         loop {
             let Host { tcp, routes, .. } = self;
             let moved = tcp.send_above(|event| {
+                if routes.application_events.len() >= 64 {
+                    return Admit::Blocked(event);
+                }
                 routes.route(event);
                 Admit::Taken
             });
             let strays = std::mem::take(&mut routes.strays);
-            if strays.is_empty() && !moved {
+            let accepting = std::mem::take(&mut routes.accept_again);
+            if strays.is_empty() && accepting.is_empty() && !moved {
                 return;
+            }
+            for port in accepting {
+                let _ = tcp
+                    .command(MuxCommand::control(MessageCommand::Send(
+                        TcpControl::Accept { port, count: 1 },
+                    )))
+                    .unwrap();
             }
             for child in strays {
                 let abort =
@@ -1633,6 +1693,19 @@ pub struct Listener {
 }
 
 impl Listener {
+    pub(crate) fn attach(&mut self, application: Application) {
+        let mut host = self.shared.state.lock();
+        host.routes
+            .listeners
+            .get_mut(&self.port)
+            .expect("live listener")
+            .application = Some(Arc::new(application));
+        host.control(TcpControl::Accept {
+            port: self.port,
+            count: 1,
+        });
+    }
+
     /// Sets this port's limit of connections not accepted yet, including
     /// incomplete handshakes. Uses the bounds of [`Options::backlog`].
     /// Existing connections remain when the limit is lowered.

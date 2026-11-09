@@ -485,7 +485,7 @@ impl PortServer for Server {
         let opts = HttpOptions {
             observe: self.observe.clone().or(opening.http_observe.clone()),
             limits: self.limits,
-            first_bytes: None,
+            first_bytes: (!opening.info.tls).then_some(opening.limits.handshake),
             budget: opening.budget.clone(),
             date: self.date,
         };

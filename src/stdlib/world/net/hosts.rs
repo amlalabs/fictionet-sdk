@@ -13,9 +13,7 @@ use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{
     Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, additional_targets,
 };
-use fictionet::stdlib::services::stack::{
-    self, Boxed, Counted, Job, StackError, StreamEnd, StreamLimits,
-};
+use fictionet::stdlib::services::stack::{self, Boxed, Counted, Job, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::{self, HandshakeError, ServerConfig};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -113,6 +111,12 @@ impl Opening {
 pub trait PortServer: Any + Send + Sync {
     /// Serves one connection.
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// Constructs the application directly on a transport child. Returning
+    /// `None` uses a `Tunnel` for servers written against `Connection`.
+    fn stack(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+        self.over_tls(fcx, opening)
+    }
 
     /// The layer that serves one connection on a TLS port once its
     /// handshake is done, over the decrypted stream, in the same stack as
@@ -230,11 +234,28 @@ impl<L, M> PortServer for StackAccept<M>
 where
     L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
     L::Work: Job<Done = L::Done>,
-    L::Report: Send,
+    L::Report: std::fmt::Debug + Send,
     L::Done: Send,
-    L::Error: Send,
+    L::Error: Into<stack::BoxError> + Send + Sync,
     M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
 {
+    fn stack(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+        let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
+            opening.socket.reset();
+            return Some(Boxed::new(stack::Tunnel::new(|_, _| async {})));
+        };
+        opening.socket.hold_until_gone(Box::new(guard));
+        Some(Boxed::new(stack::Session::new(
+            (self.make)(&opening.info),
+            self.limits,
+            fcx.now(),
+        )))
+    }
+
+    fn over_tls(&self, fcx: &Cx, opening: &Opening) -> Option<Boxed> {
+        self.stack(fcx, opening)
+    }
+
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
             arrival.socket.reset();
@@ -470,7 +491,7 @@ impl Host {
     /// Serves the literal TCP `port`, including zero, with a layer stack
     /// made by `make` for each connection, from the connection's
     /// [`ConnInfo`], which numbers it and names its sandbox.
-    /// [`stack::stream`] runs it with the default [`StreamLimits`],
+    /// It attaches to the transport child with the default [`StreamLimits`],
     /// charging the sandbox's budget, at most [`DEFAULT_MAX_CONNS`] at
     /// once. Past that, a new connection is reset as soon as it is
     /// accepted, and each counts until its socket is gone. A connection the
@@ -479,9 +500,9 @@ impl Host {
     where
         L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
         L::Work: Job<Done = L::Done>,
-        L::Report: Send,
+        L::Report: std::fmt::Debug + Send,
         L::Done: Send,
-        L::Error: Send,
+        L::Error: Into<stack::BoxError> + Send + Sync,
         M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
         self.tcp_stack_with(port, StreamLimits::default(), DEFAULT_MAX_CONNS, make)
@@ -499,9 +520,9 @@ impl Host {
     where
         L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
         L::Work: Job<Done = L::Done>,
-        L::Report: Send,
+        L::Report: std::fmt::Debug + Send,
         L::Done: Send,
-        L::Error: Send,
+        L::Error: Into<stack::BoxError> + Send + Sync,
         M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
         self.port_server(
@@ -532,9 +553,9 @@ impl Host {
     where
         L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
         L::Work: Job<Done = L::Done>,
-        L::Report: Send,
+        L::Report: std::fmt::Debug + Send,
         L::Done: Send,
-        L::Error: Send,
+        L::Error: Into<stack::BoxError> + Send + Sync,
         M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
         let accept = StackAccept {
@@ -550,7 +571,7 @@ impl Host {
     /// socket's [`ConnInfo`]: its address, which says the port the
     /// endpoint chose for port zero, and [`Transport::Udp`]. The stack
     /// holds the conversation for the socket's whole life and gets every
-    /// datagram with its sender's address ([`stack::datagrams`]). Port
+    /// datagram with its sender's address directly from its UDP child. Port
     /// zero asks the endpoint to choose a free port
     /// ([`udp::Endpoint::bind`]). Retained datagrams and layer state share
     /// `budget` across every sender and every instance of this host.
@@ -558,28 +579,19 @@ impl Host {
     where
         L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top> + Send + 'static,
         L::Work: Job<Done = L::Done>,
-        L::Report: Send,
+        L::Report: core::fmt::Debug + Send,
         L::Done: Send,
         L::Error: core::error::Error + Send + Sync + 'static,
         M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
-        let start: UdpStart = Arc::new(move |fcx, socket, local| {
+        let start: UdpStart = Arc::new(move |_, socket, local| {
             let budget = budget.clone();
             let layer = make(&ConnInfo {
                 local: Some(local),
                 transport: Transport::Udp,
                 ..ConnInfo::default()
             });
-            fcx.spawn(move |fcx| async move {
-                match stack::datagrams(&fcx, socket, local, layer, budget, |_| {}).await {
-                    Ok(()) => Ok(()),
-                    Err(StackError::Cancelled) => Err(fictionet::Cancelled.into()),
-                    Err(StackError::Layer(e)) => Err(e.into()),
-                    Err(StackError::Budget) => {
-                        Err(std::io::Error::other("datagram memory budget exhausted").into())
-                    }
-                }
-            });
+            socket.attach(Boxed::new(layer), budget);
         });
         self.ports.push((port, PortSpec::Udp(start)));
         self
@@ -1295,12 +1307,6 @@ pub(super) struct Admission {
     pub(super) hooks: Arc<Hooks>,
 }
 
-impl Admission {
-    pub(super) fn admit(&self, _fcx: &Cx, conn: tcp::TcpConnection) -> Option<tcp::TcpConnection> {
-        self.peers.admit(conn)
-    }
-}
-
 /// Open connections by peer address, for
 /// [`Limits::connections_per_peer`].
 pub(super) struct Peers {
@@ -1401,6 +1407,7 @@ impl TlsName {
 /// What one TCP port of a machine serves.
 #[derive(Default)]
 struct Port {
+    listener: Mutex<Option<tcp::Listener>>,
     plain: RwLock<Option<Arc<dyn PortServer>>>,
     /// TLS by SNI; the empty name is "any name".
     tls: RwLock<TlsNames>,
@@ -1771,11 +1778,84 @@ impl Machine {
                             tls.by_name.extend(entries);
                         }
                     }
-                    if let Some(listener) = listener {
+                    if let Some(mut listener) = listener {
                         self.ports.lock().insert(number, port.clone());
-                        let machine = self.clone();
-                        self.fcx
-                            .spawn(move |fcx| accept(fcx, listener, machine, port));
+                        let names = Arc::downgrade(&port);
+                        let admission = self.admission.clone();
+                        let peer_admission = admission.clone();
+                        let fcx = self.fcx.clone();
+                        let limits = self.limits;
+                        listener.attach(tcp::Application {
+                            budget: Arc::new(move |opening, socket| {
+                                if !peer_admission
+                                    .peers
+                                    .admit_transport(opening.remote.ip(), socket)
+                                {
+                                    return Budget::new(0);
+                                }
+                                let hooks = &peer_admission.hooks;
+                                let sandbox = hooks.sandbox_at(opening.remote.ip());
+                                hooks.budget(sandbox.id).unwrap_or_else(Budget::unlimited)
+                            }),
+                            make: Arc::new(move |transport, socket, budget| {
+                                let socket: Arc<dyn Retirement> = Arc::new(socket);
+                                let hooks = &admission.hooks;
+                                let mut info = ConnInfo::new(
+                                    hooks.next_conn(),
+                                    transport.local,
+                                    transport.remote,
+                                )
+                                .from_sandbox(Some(hooks.sandbox_at(transport.remote.ip())));
+                                if let fictionet::stdlib::network::transport::TcpOrigin::Accepted(
+                                    handshake,
+                                ) = transport.origin
+                                {
+                                    info.handshake = Some(handshake);
+                                }
+                                let opening = Opening {
+                                    http_observe: hooks.http_observe.clone(),
+                                    info,
+                                    socket,
+                                    budget: Some(budget.clone()),
+                                    limits,
+                                };
+                                let Some(port) = names.upgrade() else {
+                                    return Boxed::new(stack::Tunnel::new(|_, _| async {}));
+                                };
+                                let application = if port
+                                    .tls
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .by_name
+                                    .is_empty()
+                                {
+                                    let accept = port
+                                        .plain
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone();
+                                    let Some(accept) = accept else {
+                                        return Boxed::new(stack::Tunnel::new(|_, _| async {}));
+                                    };
+                                    accept.stack(&fcx, &opening).unwrap_or_else(|| {
+                                        Boxed::new(stack::Tunnel::new(move |fcx, conn| {
+                                            accept.serve(fcx, opening.arrive(conn))
+                                        }))
+                                    })
+                                } else {
+                                    secure(&fcx, opening, port, admission.hooks.clone())
+                                };
+                                Boxed::new(stack::Session::new(
+                                    application,
+                                    StreamLimits {
+                                        idle: None,
+                                        write_timeout: Some(limits.write_timeout),
+                                    },
+                                    fcx.now(),
+                                ))
+                            }),
+                        });
+                        *port.listener.lock() = Some(listener);
                     }
                 }
             }
@@ -1810,84 +1890,16 @@ pub(super) fn host_prefix(addr: IpAddr) -> Prefix {
     }
 }
 
-/// Accepts connections on one port of a machine. Each is served in its own
-/// region.
-async fn accept(
-    fcx: Cx,
-    mut listener: tcp::Listener,
-    machine: Arc<Machine>,
-    port: Arc<Port>,
-) -> fictionet::Result {
-    loop {
-        match listener.accept(&fcx).await {
-            Ok(conn) => {
-                let admission = machine.admission.clone();
-                let Some(conn) = admission.admit(&fcx, conn) else {
-                    continue;
-                };
-                let hooks = &admission.hooks;
-                let sandbox = Some(hooks.sandbox_at(conn.peer_addr().ip()));
-                let mut info =
-                    ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
-                        .from_sandbox(sandbox);
-                info.handshake = conn.handshake().cloned();
-                let accepted = fcx.now();
-                let limits = machine.limits;
-                let port = port.clone();
-                fcx.spawn(move |fcx| async move {
-                    let _ = fcx
-                        .region(move |fcx| async move {
-                            connection(fcx, conn, info, accepted, port, admission, limits).await;
-                            Ok(())
-                        })
-                        .await;
-                    Ok(())
-                });
-            }
-            Err(ConnError::Cancelled | ConnError::Closed) => return Ok(()),
-            Err(_) => {}
-        }
-    }
-}
-
-/// Serves one connection: on a port with TLS names, one stack of TLS and,
-/// once its handshake is done, what the name's accept serves over it;
-/// otherwise the port's accept.
-async fn connection(
-    fcx: Cx,
-    conn: tcp::TcpConnection,
-    info: ConnInfo,
-    accepted: Instant,
-    port: Arc<Port>,
-    admission: Admission,
-    limits: Limits,
-) {
-    let hooks = admission.hooks;
-    let socket: Arc<dyn Retirement> = Arc::new(conn.gone_watch());
-    let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
-    let budget = sandbox_id.and_then(|id| hooks.budget(id));
-    let has_tls = !port
-        .tls
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .by_name
-        .is_empty();
-    if !has_tls {
-        let plain = port.plain.read().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(accept) = plain {
-            let arrival = Arrival {
-                http_observe: hooks.http_observe.clone(),
-                conn: Box::new(conn),
-                info,
-                socket,
-                budget,
-                limits,
-            };
-            accept.serve(fcx.clone(), arrival).await;
-        }
-        return;
-    }
-
+/// Builds TLS and its selected application directly on the transport child.
+fn secure(fcx: &Cx, opening: Opening, port: Arc<Port>, hooks: Arc<Hooks>) -> Boxed {
+    let Opening {
+        info,
+        socket,
+        budget,
+        limits,
+        ..
+    } = opening;
+    let accepted = fcx.now();
     // The name the client asked for, as the port knows its names.
     let requested: Arc<Mutex<Option<Arc<str>>>> = Arc::default();
     let select = {
@@ -1967,10 +1979,6 @@ async fn connection(
         .clone()
         .expect("TLS listener has a server");
     let factory = listener.tls_factory();
-    let stream = StreamLimits {
-        idle: None,
-        write_timeout: Some(limits.write_timeout),
-    };
     let budget = budget.unwrap_or_else(Budget::unlimited);
     let secure = factory.build(
         tls::Opening {
@@ -1982,26 +1990,140 @@ async fn connection(
         },
         serve,
     );
-    let ended = stack::stream(&fcx, conn, &info, secure, budget, stream, |_| {}).await;
-    if handshook.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
+    Boxed::new(ObservedTls {
+        stack: secure,
+        factory,
+        fcx: fcx.clone(),
+        info,
+        requested,
+        handshook,
+        observe: hooks.tls_observe.clone(),
+        reported: false,
+    })
+}
+
+/// Keeps failed handshakes observable even when their child is cancelled.
+struct ObservedTls {
+    stack: Boxed,
+    factory: tls::Factory,
+    fcx: Cx,
+    info: ConnInfo,
+    requested: Arc<Mutex<Option<Arc<str>>>>,
+    handshook: Arc<std::sync::atomic::AtomicBool>,
+    observe: Option<super::OnTls>,
+    reported: bool,
+}
+
+impl ObservedTls {
+    fn failed(&mut self, error: HandshakeError) {
+        if self.reported || self.handshook.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.reported = true;
+        if let Some(observe) = &self.observe {
+            let mut info = self.info.clone();
+            info.tls = true;
+            info.sni = self.requested.lock().clone();
+            observe(&super::TlsObservation {
+                at: self.fcx.now(),
+                conn: info,
+                result: Err(error),
+            });
+        }
     }
-    let error = match ended {
-        Err(StackError::Layer(e)) => factory.handshake_error(e),
-        Err(StackError::Cancelled) => HandshakeError::Cancelled,
-        Ok(StreamEnd::Conn(e)) => e.into(),
-        Ok(StreamEnd::Budget) => HandshakeError::Failed("no budget for the handshake".into()),
-        Ok(_) | Err(StackError::Budget) => HandshakeError::Closed,
-    };
-    if let Some(observe) = &hooks.tls_observe {
-        let mut info = info;
-        info.tls = true;
-        info.sni = requested.lock().take();
-        observe(&super::TlsObservation {
-            at: fcx.now(),
-            conn: info,
-            result: Err(error),
+
+    fn result<T>(&mut self, result: Result<T, stack::BoxError>) -> Result<T, stack::BoxError> {
+        result.map_err(|error| {
+            let message = error.to_string();
+            let error = self.factory.handshake_error(error);
+            self.failed(error);
+            std::io::Error::other(message).into()
+        })
+    }
+}
+
+impl Drop for ObservedTls {
+    fn drop(&mut self) {
+        self.failed(if self.fcx.is_cancelled() {
+            HandshakeError::Cancelled
+        } else {
+            HandshakeError::Closed
         });
+    }
+}
+
+impl Layer for ObservedTls {
+    type Lower = ByteStream;
+    type Upper = Top;
+    type Report = <Boxed as Layer>::Report;
+    type Timer = <Boxed as Layer>::Timer;
+    type Work = <Boxed as Layer>::Work;
+    type Done = <Boxed as Layer>::Done;
+    type Error = stack::BoxError;
+    fn report_bytes(report: &Self::Report) -> Option<usize> {
+        <Boxed as Layer>::report_bytes(report)
+    }
+    fn depth(&self) -> usize {
+        1 + self.stack.depth()
+    }
+    fn is_terminal(&self) -> bool {
+        self.stack.is_terminal()
+    }
+    fn on_event(
+        &mut self,
+        env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
+        event: fictionet::stdlib::layer::StreamEvent,
+    ) -> Result<fictionet::stdlib::layer::Admit<fictionet::stdlib::layer::StreamEvent>, Self::Error>
+    {
+        let reset = matches!(event, fictionet::stdlib::layer::StreamEvent::Reset);
+        let result = self.stack.on_event(env, event);
+        let result = self.result(result);
+        if reset {
+            self.failed(HandshakeError::Conn(ConnError::Reset));
+        }
+        result
+    }
+    fn on_command(
+        &mut self,
+        _: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
+        command: std::convert::Infallible,
+    ) -> Result<fictionet::stdlib::layer::Admit<std::convert::Infallible>, Self::Error> {
+        match command {}
+    }
+    fn on_timer(
+        &mut self,
+        env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
+        timer: Self::Timer,
+    ) -> Result<(), Self::Error> {
+        let result = self.stack.on_timer(env, timer);
+        self.result(result)
+    }
+    fn on_done(
+        &mut self,
+        env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
+        done: Self::Done,
+    ) -> Result<(), Self::Error> {
+        let result = self.stack.on_done(env, done);
+        self.result(result)
+    }
+    fn advance(
+        &mut self,
+        env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
+    ) -> Result<bool, Self::Error> {
+        let result = self.stack.advance(env);
+        self.result(result)
+    }
+    fn take_command(&mut self) -> Option<fictionet::stdlib::layer::StreamCommand> {
+        self.stack.take_command()
+    }
+    fn take_event(&mut self) -> Option<std::convert::Infallible> {
+        None
+    }
+    fn take_work(&mut self) -> Option<Self::Work> {
+        self.stack.take_work()
+    }
+    fn deadline(&self) -> Option<(Instant, Self::Timer)> {
+        self.stack.deadline()
     }
 }
 

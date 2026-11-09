@@ -42,14 +42,14 @@ pub(crate) async fn drive(
             if outgoing.len() < 128
                 && let Some(tcp) = &mut tcp
             {
-                let (more, deadline) = tcp.poll(cx, &mut output);
+                let (more, deadline) = tcp.poll(cx, &mut output)?;
                 busy |= more;
                 deadlines[1] = deadline;
             }
             if outgoing.len() < 128
                 && let Some(udp) = &mut udp
             {
-                let (more, deadline) = udp.poll(cx, &mut output);
+                let (more, deadline) = udp.poll(cx, &mut output)?;
                 busy |= more;
                 deadlines[2] = deadline;
             }
