@@ -1,6 +1,7 @@
 //! What a resolver remembers between questions: RRsets, negative answers,
 //! and failures, each until its TTL runs out.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -320,12 +321,56 @@ pub struct Limits {
 /// minutes), unless [`Limits::failure_ttl`] is longer.
 const MAX_FAILURE_TTL: Duration = Duration::from_secs(300);
 
-/// The validated NSEC records of one zone.
+/// The validated NSEC records of one zone, by owner in canonical order.
 #[derive(Clone, Debug)]
 struct SecureNsec {
     soa: RecordSet,
     soa_expires: Instant,
-    sets: BTreeMap<LowerName, (RecordSet, Instant)>,
+    sets: BTreeMap<LowerName, Nsec>,
+}
+
+/// A validated NSEC RRset and when it stops proving anything.
+#[derive(Clone, Debug)]
+pub(super) struct Nsec {
+    set: RecordSet,
+    expires: Instant,
+}
+
+impl Borrow<RecordSet> for Nsec {
+    fn borrow(&self) -> &RecordSet {
+        &self.set
+    }
+}
+
+/// The validated NSEC records of the zone [`Cache::secure_nsec`] found,
+/// borrowed from the cache. Nothing is copied until an answer picks the
+/// records it carries.
+pub(super) struct ZoneNsecs<'a> {
+    /// The zone's apex.
+    pub(super) zone: &'a LowerName,
+    nsec: &'a SecureNsec,
+    now: Instant,
+}
+
+impl<'a> ZoneNsecs<'a> {
+    /// The zone's SOA RRset, and the TTL it has left.
+    pub(super) fn soa(&self) -> (&'a RecordSet, u32) {
+        (&self.nsec.soa, ttl_left(self.nsec.soa_expires, self.now))
+    }
+
+    /// The NSEC RRsets still live, by owner in canonical order.
+    pub(super) fn live(&self) -> impl Iterator<Item = &'a Nsec> + Clone + use<'a> {
+        let now = self.now;
+        self.nsec
+            .sets
+            .values()
+            .filter(move |nsec| now < nsec.expires)
+    }
+
+    /// The TTL `nsec`, one of [`live`](ZoneNsecs::live), has left.
+    pub(super) fn ttl_left(&self, nsec: &Nsec) -> u32 {
+        ttl_left(nsec.expires, self.now)
+    }
 }
 
 /// A stored entry, with what it was laid over.
@@ -736,37 +781,21 @@ impl Cache {
             );
             entry
                 .sets
-                .insert(LowerName::new(set.name()), (set, expires));
+                .insert(LowerName::new(set.name()), Nsec { set, expires });
         }
     }
 
     /// The deepest zone holding `name` with validated NSEC records live at
-    /// `now`: its apex, its SOA RRset with the TTL left, and those records
-    /// with theirs.
-    pub fn secure_nsec(
-        &self,
-        name: &LowerName,
-        now: Instant,
-    ) -> Option<(&LowerName, RecordSet, Vec<RecordSet>)> {
+    /// `now`, with its SOA RRset, borrowed.
+    pub(super) fn secure_nsec(&self, name: &LowerName, now: Instant) -> Option<ZoneNsecs<'_>> {
         let mut at = name.clone();
         loop {
-            if let Some((zone, entry)) = self.nsec.get_key_value(&at)
-                && now < entry.soa_expires
+            if let Some((zone, nsec)) = self.nsec.get_key_value(&at)
+                && now < nsec.soa_expires
             {
-                let sets: Vec<RecordSet> = entry
-                    .sets
-                    .values()
-                    .filter(|(_, expires)| now < *expires)
-                    .map(|(set, expires)| {
-                        let mut set = set.clone();
-                        set.set_ttl(ttl_left(*expires, now));
-                        set
-                    })
-                    .collect();
-                if !sets.is_empty() {
-                    let mut soa = entry.soa.clone();
-                    soa.set_ttl(ttl_left(entry.soa_expires, now));
-                    return Some((zone, soa, sets));
+                let found = ZoneNsecs { zone, nsec, now };
+                if found.live().next().is_some() {
+                    return Some(found);
                 }
             }
             if at.is_root() {
@@ -871,7 +900,7 @@ impl Cache {
         // Aggressive denial proofs are usable only with a live SOA and
         // live NSEC records. They have no stale-serving path.
         self.nsec.retain(|_, zone| {
-            zone.sets.retain(|_, (_, expires)| now < *expires);
+            zone.sets.retain(|_, nsec| now < nsec.expires);
             now < zone.soa_expires && !zone.sets.is_empty()
         });
         self.swept = self.entries.len();
@@ -1066,7 +1095,7 @@ mod tests {
         for zone in cache.nsec.values() {
             assert!(zone.soa_expires > at(2));
             assert!(!zone.sets.is_empty());
-            assert!(zone.sets.values().all(|(_, expires)| *expires > at(2)));
+            assert!(zone.sets.values().all(|nsec| nsec.expires > at(2)));
         }
         let live = LowerName::new(&Name::from_ascii("live.example.").unwrap());
         assert!(cache.secure_nsec(&live, at(2)).is_some());

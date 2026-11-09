@@ -22,6 +22,7 @@
 //! runs out, and then goes on charged to another tree it does work for,
 //! directly or through the lookups and checks that wait on it.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
@@ -991,30 +992,34 @@ impl<V: Verify> Resolver<V> {
         if !self.config.aggressive_nsec {
             return None;
         }
-        let (zone, soa, cached) = self.cache.secure_nsec(&key.name, self.now)?;
+        let nsecs = self.cache.secure_nsec(&key.name, self.now)?;
         let name = Name::from(&key.name);
-        let zone_name = Name::from(zone);
+        let zone_name = Name::from(nsecs.zone);
         // The answer carries the records that prove it, and lives as long
-        // as they do (RFC 8198 §5.4).
-        let (kind, records) = match proof::nxdomain_nsecs(&name, &zone_name, &cached) {
+        // as they do (RFC 8198 §5.4). Only those are copied.
+        let (kind, records) = match proof::nxdomain_nsecs(&name, &zone_name, nsecs.live()) {
             Some(records) => (Negative::NxDomain, records),
             None => (
                 Negative::NoData,
-                proof::nodata_nsecs(&name, key.rtype, &zone_name, &cached)?,
+                proof::nodata_nsecs(&name, key.rtype, &zone_name, nsecs.live())?,
             ),
         };
+        let (soa, soa_ttl) = nsecs.soa();
         let ttl = records
             .iter()
-            .map(RecordSet::ttl)
-            .chain(std::iter::once(soa.ttl()))
+            .map(|nsec| nsecs.ttl_left(nsec))
+            .chain(std::iter::once(soa_ttl))
             .min()
             .unwrap_or(0);
         let outcome = Outcome::Negative {
             kind,
             name,
             qtype: key.rtype,
-            soa: Some(with_ttl(&soa, ttl)),
-            denial: records.iter().map(|set| with_ttl(set, ttl)).collect(),
+            soa: Some(with_ttl(soa, ttl)),
+            denial: records
+                .into_iter()
+                .map(|nsec| with_ttl(nsec.borrow(), ttl))
+                .collect(),
             zone: zone_name,
         };
         let subjects = subjects(&outcome);

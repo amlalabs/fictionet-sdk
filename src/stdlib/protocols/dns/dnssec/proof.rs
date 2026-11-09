@@ -14,6 +14,7 @@
 //! [`Proof::Proven`] (RFC 5155 §6, §8.9). NSEC3 hashes use SHA-1 with each
 //! record's own salt and iterations, as RFC 5155 §5 requires.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 
 use super::rdata::{DNSSECRData, NSEC, NSEC3};
@@ -82,40 +83,49 @@ pub fn alias(name: &Name, zone: &Name, records: &[RecordSet], max_iterations: u1
 
 /// The NSEC RRsets among `records` that prove `name` does not exist in
 /// `zone`, the ones a reply carries for the claim (RFC 4035 §3.1.3.2), or
-/// `None` when NSEC records do not prove it.
-pub fn nxdomain_nsecs(name: &Name, zone: &Name, records: &[RecordSet]) -> Option<Vec<RecordSet>> {
+/// `None` when NSEC records do not prove it. The records are borrowed,
+/// and so are the ones chosen, so nothing is copied.
+pub fn nxdomain_nsecs<'a, R: Borrow<RecordSet> + 'a>(
+    name: &Name,
+    zone: &Name,
+    records: impl IntoIterator<Item = &'a R> + Clone,
+) -> Option<Vec<&'a R>> {
     let name = fqdn(name);
-    let owners = Denial::new(zone, records).nsec.nxdomain_owners(&name)?;
+    let sets = records.clone().into_iter().map(Borrow::borrow);
+    let owners = Denial::new(zone, sets).nsec.nxdomain_owners(&name)?;
     Some(nsecs_of(records, zone, &owners))
 }
 
 /// The NSEC RRsets among `records` that prove `name` in `zone` has no
 /// records of type `qtype`, the ones a reply carries for the claim
 /// (RFC 4035 §3.1.3.1 and §3.1.3.4), or `None` when NSEC records do not
-/// prove it.
-pub fn nodata_nsecs(
+/// prove it. Borrowed as in [`nxdomain_nsecs`].
+pub fn nodata_nsecs<'a, R: Borrow<RecordSet> + 'a>(
     name: &Name,
     qtype: RecordType,
     zone: &Name,
-    records: &[RecordSet],
-) -> Option<Vec<RecordSet>> {
+    records: impl IntoIterator<Item = &'a R> + Clone,
+) -> Option<Vec<&'a R>> {
     let name = fqdn(name);
-    let owners = Denial::new(zone, records)
-        .nsec
-        .nodata_owners(&name, qtype)?;
+    let sets = records.clone().into_iter().map(Borrow::borrow);
+    let owners = Denial::new(zone, sets).nsec.nodata_owners(&name, qtype)?;
     Some(nsecs_of(records, zone, &owners))
 }
 
 /// The NSEC RRsets of `zone` among `records` owned by one of `owners`.
-fn nsecs_of(records: &[RecordSet], zone: &Name, owners: &[&Name]) -> Vec<RecordSet> {
+fn nsecs_of<'a, R: Borrow<RecordSet> + 'a>(
+    records: impl IntoIterator<Item = &'a R>,
+    zone: &Name,
+    owners: &[&Name],
+) -> Vec<&'a R> {
     records
-        .iter()
-        .filter(|set| {
+        .into_iter()
+        .filter(|record| {
+            let set: &RecordSet = (*record).borrow();
             set.record_type() == RecordType::NSEC
                 && of_zone(set, zone)
                 && owners.contains(&set.name())
         })
-        .cloned()
         .collect()
 }
 
@@ -237,7 +247,12 @@ pub fn proof_of(claim: Claim<'_>, zone: &Name, records: &[RecordSet]) -> Option<
             .map(|(owner, _)| vec![owner]),
     };
     if let Some(owners) = nsec {
-        return Some(nsecs_of(records, zone, &owners));
+        return Some(
+            nsecs_of(records, zone, &owners)
+                .into_iter()
+                .cloned()
+                .collect(),
+        );
     }
     let hashes = match claim {
         Claim::Nxdomain(name) => denial.nsec3.nxdomain_proof(&fqdn(name)),
@@ -284,10 +299,10 @@ struct Denial<'a> {
 }
 
 impl<'a> Denial<'a> {
-    fn new(zone: &'a Name, records: &'a [RecordSet]) -> Denial<'a> {
+    fn new<'r: 'a>(zone: &'a Name, records: impl IntoIterator<Item = &'r RecordSet>) -> Denial<'a> {
         let mut nsec = Vec::new();
         let mut nsec3 = Vec::new();
-        let sets = records.iter().filter(|set| of_zone(set, zone));
+        let sets = records.into_iter().filter(|set| of_zone(set, zone));
         for record in sets.flat_map(|set| set.records_without_rrsigs()) {
             match &record.data {
                 RData::DNSSEC(DNSSECRData::NSEC(rdata)) => {
