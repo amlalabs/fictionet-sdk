@@ -615,9 +615,9 @@ impl Layer for IpLayer {
         Ok(Admit::Taken)
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, IpReport>, (): ()) -> Result<(), Infallible> {
+    fn on_timer(&mut self, env: &mut Env<'_, IpReport>, (): ()) -> Result<bool, Infallible> {
         self.reassembly.expire(env.now());
-        Ok(())
+        Ok(true)
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {

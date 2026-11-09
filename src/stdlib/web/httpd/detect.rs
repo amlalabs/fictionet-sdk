@@ -141,14 +141,15 @@ impl Layer for Detect {
         match command {}
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
-        if self.undecided() && self.deadline.is_some_and(|at| at <= env.now()) {
-            // Past the first-bytes deadline: close with nothing written.
-            self.deadline = None;
-            self.closed = true;
-            self.out = Some(StreamCommand::End);
+    fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
+        if !self.undecided() || self.deadline.is_none_or(|at| at > env.now()) {
+            return Ok(false);
         }
-        Ok(())
+        // Past the first-bytes deadline: close with nothing written.
+        self.deadline = None;
+        self.closed = true;
+        self.out = Some(StreamCommand::End);
+        Ok(true)
     }
 
     fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {

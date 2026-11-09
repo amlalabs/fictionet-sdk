@@ -2085,7 +2085,7 @@ impl Layer for ObservedTls {
         &mut self,
         env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,
         timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<bool, Self::Error> {
         let result = env.part(|env| self.stack.on_timer(env, timer));
         self.result(result)
     }

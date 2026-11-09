@@ -996,11 +996,12 @@ impl Layer for Http1 {
         match command {}
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, Report>, timer: Timer) -> Result<(), Self::Error> {
-        if self.timers.fire(&timer, env.now()) {
+    fn on_timer(&mut self, env: &mut Env<'_, Report>, timer: Timer) -> Result<bool, Self::Error> {
+        let fired = self.timers.fire(&timer, env.now());
+        if fired {
             self.close(env, Closing::Timeout(timer));
         }
-        Ok(())
+        Ok(fired)
     }
 
     fn on_done(&mut self, env: &mut Env<'_, Report>, done: Done) -> Result<(), Self::Error> {

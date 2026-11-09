@@ -76,7 +76,7 @@ where
         &mut self,
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<bool, Self::Error> {
         match (self, timer) {
             (Side::Lower(a), Side::Lower(t)) => env
                 .scoped(Side::Lower, |env| a.on_timer(env, t))
@@ -84,7 +84,7 @@ where
             (Side::Upper(b), Side::Upper(t)) => env
                 .scoped(Side::Upper, |env| b.on_timer(env, t))
                 .map_err(Side::Upper),
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 
@@ -248,10 +248,14 @@ where
         }
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, U::Report>, timer: U::Timer) -> Result<(), U::Error> {
+    fn on_timer(
+        &mut self,
+        env: &mut Env<'_, U::Report>,
+        timer: U::Timer,
+    ) -> Result<bool, U::Error> {
         match &mut self.layer {
             Some(layer) => env.part(|env| layer.on_timer(env, timer)),
-            None => Ok(()),
+            None => Ok(false),
         }
     }
 

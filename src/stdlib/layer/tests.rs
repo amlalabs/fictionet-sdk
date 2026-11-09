@@ -502,12 +502,13 @@ impl Layer for Beat {
         match command {}
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, ()>, timer: ()) -> Result<(), Infallible> {
-        if self.timers.fire(&timer, env.now()) {
+    fn on_timer(&mut self, env: &mut Env<'_, ()>, timer: ()) -> Result<bool, Infallible> {
+        let fired = self.timers.fire(&timer, env.now());
+        if fired {
             self.out.push(b'.');
             self.timers.set((), env.now() + self.every);
         }
-        Ok(())
+        Ok(fired)
     }
 
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {

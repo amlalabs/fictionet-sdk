@@ -119,7 +119,7 @@ where
         &mut self,
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<bool, Self::Error> {
         self.chain.on_timer(env, timer)
     }
 
@@ -286,7 +286,7 @@ impl<T: Negotiation> Layer for Driven<T> {
         &mut self,
         env: &mut Env<'_, Self::Report>,
         timer: Self::Timer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<bool, Self::Error> {
         self.tls.on_timer(env, timer)
     }
 
@@ -455,7 +455,7 @@ mod tests {
             }
         }
 
-        fn on_timer(&mut self, _: &mut Env<'_, Selected>, _: Deadline) -> Result<(), Expired> {
+        fn on_timer(&mut self, _: &mut Env<'_, Selected>, _: Deadline) -> Result<bool, Expired> {
             self.state = Handshake::Failed;
             Err(Expired)
         }

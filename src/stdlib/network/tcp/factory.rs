@@ -111,7 +111,7 @@ trait Erased: EndpointState {
         env: &mut Env<'_, ()>,
         command: CommandOf<Tcp>,
     ) -> Result<Admit<CommandOf<Tcp>>, Infallible>;
-    fn timer(&mut self, env: &mut Env<'_, ()>) -> Result<(), Infallible>;
+    fn timer(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible>;
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible>;
     fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>>;
     fn take_event(&mut self) -> Option<EventOf<Tcp>>;
@@ -150,7 +150,7 @@ where
     ) -> Result<Admit<CommandOf<Tcp>>, Infallible> {
         self.on_command(env, command)
     }
-    fn timer(&mut self, env: &mut Env<'_, ()>) -> Result<(), Infallible> {
+    fn timer(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
         self.on_timer(env, ())
     }
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
@@ -234,7 +234,7 @@ impl Layer for Stack {
     ) -> Result<Admit<CommandOf<Tcp>>, Infallible> {
         env.part(|env| self.0.command(env, command))
     }
-    fn on_timer(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
+    fn on_timer(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<bool, Infallible> {
         env.part(|env| self.0.timer(env))
     }
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {

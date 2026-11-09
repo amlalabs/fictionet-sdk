@@ -1763,8 +1763,9 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
     fn deadline(&self) -> Option<(Instant, Timer)> {
         self.timers.next()
     }
-    fn on_timer(&mut self, env: &mut Env<'_, Ended>, timer: Timer) -> Result<(), Error> {
-        if self.timers.fire(&timer, env.now()) {
+    fn on_timer(&mut self, env: &mut Env<'_, Ended>, timer: Timer) -> Result<bool, Error> {
+        let fired = self.timers.fire(&timer, env.now());
+        if fired {
             match timer {
                 Timer::Login => self.disconnect(
                     env,
@@ -1774,7 +1775,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                 Timer::Failure => self.failure_ready = true,
             }
         }
-        Ok(())
+        Ok(fired)
     }
 }
 impl<H: Handler, T: PacketTransport> Ssh<H, T> {

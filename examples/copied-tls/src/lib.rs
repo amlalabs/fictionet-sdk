@@ -651,14 +651,15 @@ impl Layer for TlsLayer {
         })
     }
 
-    fn on_timer(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<(), HandshakeError> {
-        if self.deadline.fire(&(), env.now()) && self.is_handshaking() {
+    fn on_timer(&mut self, env: &mut Env<'_, ()>, _: ()) -> Result<bool, HandshakeError> {
+        let fired = self.deadline.fire(&(), env.now());
+        if fired && self.is_handshaking() {
             // No alert: the client hears the end of the stream.
             self.work = false;
             self.accepted = None;
             self.fail(HandshakeError::TimedOut);
         }
-        Ok(())
+        Ok(fired)
     }
 
     fn deadline(&self) -> Option<(Instant, ())> {

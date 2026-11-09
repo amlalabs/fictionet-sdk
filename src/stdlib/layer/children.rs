@@ -1099,9 +1099,9 @@ where
         &mut self,
         env: &mut Env<'_, Self::Report>,
         (id, timer): Self::Timer,
-    ) -> Result<(), Overrun> {
+    ) -> Result<bool, Overrun> {
         let Some(key) = self.key(id) else {
-            return Ok(());
+            return Ok(false);
         };
         let kid = &mut self.kids[key];
         let layer = &mut kid.layer;
@@ -1112,11 +1112,18 @@ where
                 |env| layer.on_timer(env, timer),
             )
         });
+        // A child that declines its timer still goes behind its siblings
+        // due at the same time, so theirs fire first.
         match result {
-            Ok(()) => self.called(key, true, true),
-            Err(e) => self.fail(env, id, e),
+            Ok(fired) => {
+                self.called(key, true, true);
+                Ok(fired)
+            }
+            Err(e) => {
+                self.fail(env, id, e);
+                Ok(true)
+            }
         }
-        Ok(())
     }
 
     fn on_done(
@@ -1297,9 +1304,9 @@ mod tests {
         fn deadline(&self) -> Option<(Instant, ())> {
             self.timer.then_some((Instant::ZERO, ()))
         }
-        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<bool, Infallible> {
             self.fired += 1;
-            Ok(())
+            Ok(true)
         }
     }
 
@@ -2047,11 +2054,11 @@ mod tests {
         fn deadline(&self) -> Option<(Instant, ())> {
             self.times.front().map(|at| (*at, ()))
         }
-        fn on_timer(&mut self, env: &mut Env<'_, ()>, (): ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, env: &mut Env<'_, ()>, (): ()) -> Result<bool, Infallible> {
             let at = self.times.pop_front().expect("an armed timer");
             assert!(env.now() >= at, "a timer fired early");
             self.fired.lock().unwrap().push((self.name, at));
-            Ok(())
+            Ok(true)
         }
     }
 

@@ -178,21 +178,21 @@ where
         &mut self,
         env: &mut Env<'_, L::Report>,
         timer: Self::Timer,
-    ) -> Result<(), L::Error> {
+    ) -> Result<bool, L::Error> {
         match timer {
             SessionTimer::Application(timer) => env.part(|env| self.layer.on_timer(env, timer)),
             SessionTimer::Idle => {
                 self.lifetime.expire(Expiry::Idle);
                 self.event = Some(StreamEvent::Ended);
                 self.settle();
-                Ok(())
+                Ok(true)
             }
             SessionTimer::Write => {
                 self.lifetime.expire(Expiry::Stalled);
                 self.reset = true;
                 self.command = Some(StreamCommand::Reset);
                 let _ = env.part(|env| self.layer.on_event(env, StreamEvent::Reset))?;
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -385,9 +385,9 @@ pub(super) mod tests {
         ) -> Result<Admit<Infallible>, Infallible> {
             match command {}
         }
-        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
             self.until = None;
-            Ok(())
+            Ok(true)
         }
         fn deadline(&self) -> Option<(Instant, ())> {
             self.until.map(|at| (at, ()))

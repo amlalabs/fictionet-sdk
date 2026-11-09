@@ -574,9 +574,9 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         ) -> Result<Admit<Infallible>, Infallible> {
             match command {}
         }
-        fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
             *self.fired.lock().unwrap() = Some(env.now());
-            Ok(())
+            Ok(true)
         }
         fn deadline(&self) -> Option<(Instant, ())> {
             self.fired
@@ -637,9 +637,9 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
             self.down = Some(command);
             Ok(Admit::Taken)
         }
-        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+        fn on_timer(&mut self, _: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
             self.ready = true;
-            Ok(())
+            Ok(true)
         }
         fn deadline(&self) -> Option<(Instant, ())> {
             (!self.ready).then_some((self.at, ()))

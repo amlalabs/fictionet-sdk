@@ -321,11 +321,14 @@ impl<A: LineApp> Layer for Lined<A> {
         &mut self,
         env: &mut Env<'_, Infallible>,
         timer: A::Timer,
-    ) -> Result<(), Self::Error> {
-        if !self.timers.fire(&timer, env.now()) || self.reset {
-            return Ok(());
+    ) -> Result<bool, Self::Error> {
+        if !self.timers.fire(&timer, env.now()) {
+            return Ok(false);
         }
-        self.call(env, |app, out| app.timer(timer, out))
+        if !self.reset {
+            self.call(env, |app, out| app.timer(timer, out))?;
+        }
+        Ok(true)
     }
 
     fn on_done(&mut self, env: &mut Env<'_, Infallible>, done: A::Done) -> Result<(), Self::Error> {
@@ -592,11 +595,12 @@ impl<A: DatagramApp> Layer for Datagrammed<A> {
         &mut self,
         env: &mut Env<'_, Infallible>,
         timer: A::Timer,
-    ) -> Result<(), Infallible> {
-        if self.timers.fire(&timer, env.now()) {
+    ) -> Result<bool, Infallible> {
+        let fired = self.timers.fire(&timer, env.now());
+        if fired {
             self.call(env.now(), |app, sends| app.timer(timer, sends));
         }
-        Ok(())
+        Ok(fired)
     }
 
     fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
