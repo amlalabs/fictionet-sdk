@@ -30,5 +30,6 @@ http-body-util = "0.1"
 tower-service = "0.3"
 
 [lints.rust]
+unsafe_code = "forbid"
 # `cargo kani` builds with `--cfg kani`, which adds the proofs in `verification/`.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
