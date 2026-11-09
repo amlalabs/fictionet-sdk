@@ -196,6 +196,8 @@ struct Piece {
     bytes: u64,
     body: u64,
     end: bool,
+    /// The bytes continue the frame of the piece before them.
+    continues: bool,
 }
 
 /// The stream a client HEADERS lands on.
@@ -370,6 +372,16 @@ impl Http2 {
     /// Queues output bytes, charged before they were allocated, for
     /// `stream` (0 for the connection).
     fn queue(&mut self, chunk: Chunk, stream: u32, body: u64, end: bool) {
+        self.push_piece(chunk, stream, body, end, false);
+    }
+
+    /// Queues the rest of the frame queued last: a DATA frame's payload
+    /// behind its header.
+    fn queue_continuation(&mut self, chunk: Chunk, stream: u32, body: u64) {
+        self.push_piece(chunk, stream, body, false, true);
+    }
+
+    fn push_piece(&mut self, chunk: Chunk, stream: u32, body: u64, end: bool, continues: bool) {
         let bytes = chunk.len();
         self.out_bytes += bytes;
         self.sent.push_back(Piece {
@@ -377,6 +389,7 @@ impl Http2 {
             bytes: bytes as u64,
             body,
             end,
+            continues,
         });
         self.out.push_back(StreamCommand::Write(chunk));
     }
@@ -460,9 +473,21 @@ impl Http2 {
             return;
         }
         env.report(Report::Budget);
-        self.out.clear();
-        self.sent.clear();
-        self.out_bytes = 0;
+        // What the transport has not taken is dropped, except the rest of
+        // a frame whose start it took: GOAWAY must begin a frame of its
+        // own. Bytes the transport took keep their pieces, so the
+        // completions still to come count against them.
+        debug_assert!(
+            self.out
+                .iter()
+                .all(|command| matches!(command, StreamCommand::Write(_)))
+        );
+        let first = self.sent.len() - self.out.len();
+        let keep = usize::from(self.sent.get(first).is_some_and(|piece| piece.continues));
+        for piece in self.sent.drain(first + keep..) {
+            self.out_bytes -= piece.bytes as usize;
+        }
+        self.out.truncate(keep);
         if let Some(charge) = self.last_words.take() {
             let mut bytes = Vec::with_capacity(LAST_WORDS);
             wire::GoAway {
@@ -1290,7 +1315,7 @@ impl Http2 {
             .write(&mut header)
             .expect("outbound frame has valid fields");
             self.queue(Chunk::with_charge(header, charge), id, 0, false);
-            self.queue(payload, id, n as u64, false);
+            self.queue_continuation(payload, id, n as u64);
             self.grant(id);
             return true;
         }
@@ -1850,7 +1875,7 @@ mod tests {
     use super::super::{Body, Exchange, Handler, HttpOptions, Reply, text};
     use super::*;
     use fictionet::Cx;
-    use fictionet::stdlib::layer::Harness;
+    use fictionet::stdlib::layer::{Budget, Harness};
     use fictionet::stdlib::network::ConnInfo;
     use fictionet::stdlib::network::{ConnError, Connection};
     use fictionet::stdlib::services::stack::Polling;
@@ -2049,15 +2074,20 @@ mod tests {
         bytes
     }
 
-    fn frames(mut bytes: &[u8]) -> Vec<Frame> {
+    fn frames(bytes: &[u8]) -> Vec<Frame> {
+        whole_frames(bytes).expect("the output is whole frames")
+    }
+
+    /// The frames in `bytes`, or `None` if they are not whole frames.
+    fn whole_frames(mut bytes: &[u8]) -> Option<Vec<Frame>> {
         let mut frames = Vec::new();
         while !bytes.is_empty() {
-            let header = wire::FrameHeader::parse(&bytes[..9]).unwrap();
-            let end = 9 + header.length;
-            frames.push(Frame::parse(&bytes[..end]).unwrap());
+            let header = wire::FrameHeader::parse(bytes.get(..wire::HEADER_LEN)?).ok()?;
+            let end = wire::HEADER_LEN + header.length;
+            frames.push(Frame::parse(bytes.get(..end)?).ok()?);
             bytes = &bytes[end..];
         }
-        frames
+        Some(frames)
     }
 
     #[test]
@@ -2488,13 +2518,20 @@ mod tests {
     /// [`BODY`] once the request ends.
     struct Picky {
         stuck: bool,
+        body: Vec<u8>,
         out: VecDeque<ExchangeCommand>,
     }
 
     impl Picky {
         fn new(opening: Opening) -> Self {
+            Self::answering(opening, BODY.to_vec())
+        }
+
+        /// The same, answering with `body`.
+        fn answering(opening: Opening, body: Vec<u8>) -> Self {
             let mut picky = Picky {
                 stuck: opening.request.uri().path() == "/stuck",
+                body,
                 out: VecDeque::new(),
             };
             if opening.ended && !picky.stuck {
@@ -2510,7 +2547,7 @@ mod tests {
                     headers: HeaderMap::new(),
                     end: false,
                 })),
-                ExchangeCommand::Data(Chunk::new(BODY.to_vec())),
+                ExchangeCommand::Data(Chunk::new(self.body.clone())),
                 ExchangeCommand::End,
             ]);
         }
@@ -2720,5 +2757,84 @@ mod tests {
             assert_eq!(frames(&push(&mut harness, &late)), [], "{late:?}");
         }
         assert!(!harness.ended());
+    }
+
+    /// A server whose streams answer `GET` with `body`, charging `budget`.
+    fn answering(
+        body: Vec<u8>,
+        budget: Budget,
+    ) -> Harness<impl Layer<Lower = ByteStream, Error: std::fmt::Debug>> {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(16, Http2::WINDOW, move |_, opening, _| {
+                Some(Picky::answering(opening, body.clone()))
+            }),
+        );
+        Harness::with_budget(fictionet::Seed::from_u64(3), server, budget)
+    }
+
+    /// `GET <path>` on `stream`, with no body.
+    fn get(encoder: &mut hpack::Encoder, stream: u32, path: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write(
+            &wire::Headers {
+                stream,
+                flags: 5,
+                fragment: request_block(encoder, "GET", path),
+                priority: None,
+                padding: None,
+            },
+            &mut bytes,
+        );
+        bytes
+    }
+
+    #[test]
+    fn running_out_of_budget_mid_frame_finishes_the_frame_before_goaway() {
+        // A whole frame of body: its DATA header and payload go down as
+        // separate writes.
+        let body = vec![b'z'; wire::DEFAULT_FRAME_SIZE];
+        let budget = Budget::new(1 << 24);
+        let mut harness = answering(body.clone(), budget.clone());
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        harness.withhold();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        // The transport takes the response's HEADERS frame and part of the
+        // DATA frame's header; the payload waits behind it.
+        harness.allow(wire::HEADER_LEN).unwrap();
+        let head = wire::FrameHeader::parse(harness.output()).unwrap();
+        assert_eq!(head.kind, 1, "the response's HEADERS go first");
+        harness.allow(head.length + 4).unwrap();
+        // The budget runs out while a PING waits for its answer.
+        let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        let mut ping = Vec::new();
+        write(
+            &wire::Ping {
+                flags: 0,
+                opaque: *b"overfull",
+            },
+            &mut ping,
+        );
+        harness.push(&ping).unwrap();
+        harness.allow_all().unwrap();
+        let output = whole_frames(harness.output()).expect("the output is whole frames");
+        let sent: Vec<u8> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 1 => Some(d.data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(sent, body);
+        assert!(
+            matches!(output.last(), Some(Frame::GoAway(g))
+                if g.code == ErrorCode::EnhanceYourCalm as u32),
+            "{output:?}"
+        );
+        assert!(harness.ended());
     }
 }
