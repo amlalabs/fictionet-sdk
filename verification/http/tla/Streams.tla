@@ -24,7 +24,7 @@ ASSUME MaxStreams \in Nat /\ ResetMax \in Nat /\ Responses \subseteq Nat
 
 VARIABLES sstate,     \* per stream: Idle, Open, HalfRemote, Ignored or Closed
           last,       \* Http2::last_stream
-          dispatched, \* Stream::request taken: the handler was called
+          dispatched, \* the child's Respond::dispatch ran: the handler was called
           headSent,   \* the response HEADERS frame is out
           endSent,    \* the response's END_STREAM is out
           pending,    \* response body units left to send

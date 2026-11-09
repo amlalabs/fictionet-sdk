@@ -13,23 +13,32 @@
 (*     Table::new, ::set_settings_limit       lines 574-591                *)
 (*     Table::decode_block, ::read_block      lines 617-685                *)
 (*     Encoder::new, ::set_settings_limit,                                 *)
-(*       ::set_capacity, ::resize             lines 705-748                *)
-(*     Encoder::write_block                   lines 781-837                *)
+(*       ::set_capacity, ::resize             lines 705-752                *)
+(*     Encoder::write_block                   lines 785-841                *)
 (*   src/stdlib/protocols/http2.rs (Session, the decoding endpoint)        *)
-(*     Session::new: table_limit 4096, Table::new(4096)                    *)
-(*     apply_peer: table_min, raise at once   lines 1542-1584              *)
+(*     Session::new: table_limit 4096 (line 1369); HeaderBlocks::          *)
+(*       with_limits: Table::new(4096) (line 1158)                         *)
+(*     apply_peer: table_min, raise at once   lines 1542-1585              *)
 (*     acknowledge_settings                   lines 1613-1634              *)
-(*   src/stdlib/web/httpd/http2.rs, peer_setting: the server's encoder     *)
-(*     applies each SETTINGS entry in order when it arrives (line 835),    *)
-(*     and on_frame queues the ACK right after (lines 897-911).            *)
+(*   src/stdlib/web/httpd/http2.rs, the server's encoder:                  *)
+(*     Http2::new builds it as Encoder::new(0) (line 221), so its table    *)
+(*     stays at capacity 0 and its first block carries a size update of   *)
+(*     0 (header_block, lines 1169-1172); nothing in the server calls     *)
+(*     set_capacity. peer_setting applies each SETTINGS entry in order     *)
+(*     when it arrives (line 835), and on_frame queues the ACK right      *)
+(*     after (lines 897-911) on the one FIFO every frame takes (queue,    *)
+(*     lines 357-375), so no block encoded after the values is written    *)
+(*     before the ACK.                                                     *)
 (*                                                                         *)
 (* Sizes are scaled: Initial stands for 4096, MaxTable for MAX_TABLE, and *)
 (* an entry costs its name and value lengths (0 or 1 here) plus 1 for the *)
 (* 32 octets of ENTRY_OVERHEAD. The static table is one entry, s: "".     *)
-(* Frames between the two sides keep their order (one TCP stream each     *)
-(* way). With ImmediateAck, as in the server, the ACK goes out as the     *)
-(* SETTINGS are applied, before any later block; without it, the encoder  *)
-(* may write blocks in between.                                           *)
+(* EncoderInit is the settings limit Encoder::new is given: Initial for   *)
+(* the Encoder at its default (Encoder::new(4096), as the tests and the   *)
+(* other users build it), 0 for the server's. Frames between the two      *)
+(* sides keep their order (one TCP stream each way). With ImmediateAck,   *)
+(* as in the server, the ACK goes out as the SETTINGS are applied, before *)
+(* any later block; without it, the encoder may write blocks in between.  *)
 (*                                                                         *)
 (* With Adversary FALSE the blocks come from the Encoder; with Adversary  *)
 (* TRUE from any encoder, as a block of up to two arbitrary                *)
@@ -42,6 +51,7 @@ EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANTS
     Initial,          \* the table size both sides start with (4096)
+    EncoderInit,      \* the settings limit Encoder::new is given
     MaxTable,         \* MAX_TABLE: every settings limit is capped here
     SettingsVals,     \* values a SETTINGS_HEADER_TABLE_SIZE entry may carry
     MaxBlocks,        \* header blocks sent in one run
@@ -240,8 +250,11 @@ vars == <<enc, dec, tableLimit, peerSize, pend, toEnc, acksOwed, toDec,
 Msg(k, reps, fs, t, m) == [kind |-> k, reps |-> reps, fields |-> fs, table |-> t, max |-> m]
 
 Init ==
-    \* Encoder::new(4096) and Session::new.
-    /\ enc = [table |-> <<>>, max |-> Initial, settings |-> Initial, pending |-> None]
+    \* Encoder::new(EncoderInit): Table::default() at 4096, then
+    \* set_settings_limit(EncoderInit) (hpack.rs lines 705-713); and
+    \* Session::new.
+    /\ enc = EncLimit([table |-> <<>>, max |-> Initial, settings |-> Initial, pending |-> None],
+                      EncoderInit)
     /\ dec = [table |-> <<>>, max |-> Initial, settings |-> Initial, required |-> None]
     /\ tableLimit = Initial
     /\ peerSize = Initial

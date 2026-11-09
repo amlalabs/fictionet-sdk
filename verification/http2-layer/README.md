@@ -13,7 +13,10 @@ This directory checks that composition: four TLA+ models of the protocol
 state machines and the composition, and Kani proofs of the arithmetic and
 the byte scan the models take as given. Each model's header names the
 source lines it follows, at commit 733f6c2c2 on `comp/v-http2` (the code
-after the fixes below). Each property has a configuration that breaks one
+after the fixes below). On 2026-11-09 they were checked against
+e2858ccc4: the `http2.rs`, `detect.rs`, `respond.rs` and `native.rs`
+lines still hold, and the `children.rs` and `switch.rs` lines in the
+headers were brought up to date. Each property has a configuration that breaks one
 rule of the code and must violate that property; each counterexample was
 read to check that it fails for the stated reason.
 
@@ -97,17 +100,25 @@ checks. Bytes are units and windows hold a few.
 | `Flow_stalled_base` | the h2c child never reads a 4-unit body | passes: 109,536 generated, 32,910 distinct, depth 29 |
 | `Flow_sibling_base` | stream 1's child never reads; stream 3's does | passes: 486,880 generated, 136,142 distinct, depth 34 |
 | `Flow_reset_base` | three streams with half-window child credit; two never read and are reset by the client in the end | passes: 728,686 generated, 176,031 distinct, depth 28 |
-| `Flow_without_splittocredit` | `forward` moves whole events only | violates `BodyReachesChild` (18 states): the h2c body waits in `pending` forever |
+| `Flow_without_splittocredit` | `forward` moves whole events only | violates `BodyReachesChild` (14 states): the h2c body waits in `pending` forever |
 | `Flow_without_heldonlywindowed` | the h2c body counts as held | violates `RequestsEnd` (12 states): `held` 2 on stream 1, both connection windows 0, stream 3 stuck |
-| `Flow_without_followchild` | a stream's credit returns once its bytes go up, read or not | violates `RequestsEnd` (13 states): the stalled stream holds the connection's whole window |
+| `Flow_without_followchild` | a stream's credit returns once its bytes go up, read or not | violates `RequestsEnd` (10 states): the stalled stream holds the connection's whole window |
 | `Flow_without_followchild_held` | as above | violates `NothingHeld` (5 states) |
-| `Flow_without_releaseoncredit` | a child's grant makes no release due | violates `RequestsEnd` (13 states): stream 3's child caught up, its window stays 0 |
-| `Flow_without_releaseonend` | a stream ending with held bytes makes no release due | violates `RequestsEnd` (11 states): streams 1 and 3 reset, the connection window stays 0 |
+| `Flow_without_releaseoncredit` | a child's grant makes no release due | violates `RequestsEnd` (9 states): stream 3's child caught up, its window stays 0 |
+| `Flow_without_releaseonend` | a stream ending with held bytes makes no release due | violates `RequestsEnd` (21 states): streams 1 and 3 reset, the connection window stays 0 |
 | `Flow_without_countheld` | `release` ignores held bytes | violates `ReleasedOnlyFreed` (4 states) |
 | `Flow_without_checkoverflow` | no 2^31 - 1 checks | violates `SendWindowsBounded` (4 states) |
 | `Flow_without_spendwithinwindows` | `send_one` ignores the windows | violates `ServerSpendsWithinWindows` (6 states) |
-| `Flow_without_countoutbytes` | `grant` ignores queued bytes | violates `ChildWithinGrant` (5 states) |
+| `Flow_without_countoutbytes` | `grant` ignores queued bytes | violates `ChildWithinGrant` (6 states) |
 | `Flow_without_recordgrant` | `grant` does not add to `Stream::granted` | violates `CreditAgrees` (5 states) |
+
+The state counts in parentheses, here and in the tables below, are the
+lengths of TLC's traces in the run of 2026-11-09 on main (two workers),
+the initial state included; a liveness trace includes the loop it ends in.
+They vary by one to three states between runs: a rerun the same day gave
+13 for `splittocredit`, 10 for `releaseoncredit`, 11 for `endonwritten`,
+7 for `takedeciding`, 8 for `handfirst`, 19 for `blockwhenfull` and 8 for
+`cancelwork`.
 
 ## Lifecycle.tla: streams, children, RST_STREAM and GOAWAY
 
@@ -146,7 +157,7 @@ cancels its work. GOAWAY comes from the client or from `graceful_shutdown`
 | `Lifecycle_without_removeslot` (`end_stream` keeps the slot) | violates `SlotsMatchStreams` (3 states) |
 | `Lifecycle_without_childrenretire` (`Children` hands `Closed` on as any event) | violates `ChildRetiresWithStream` (5 states) |
 | `Lifecycle_without_cancelwork` (`Children` drops a child without cancelling its work) | violates `NoWorkAfterRetire` (7 states): the handler's work runs on after the reset |
-| `Lifecycle_without_endonwritten` (`written` does not end a stream) | violates `StreamsEnd` (14 states): stream 3's END_STREAM is out and the stream stays open, holding the drain up |
+| `Lifecycle_without_endonwritten` (`written` does not end a stream) | violates `StreamsEnd` (13 states): stream 3's END_STREAM is out and the stream stays open, holding the drain up |
 
 ## Settings.tla: SETTINGS and their acknowledgment
 
@@ -201,12 +212,12 @@ offers each delivery again until it is taken.
 | `H2cSwitch_h2c_roomy_base` (h2c, the client's end before the 101 is written) | passes: 193 generated, 101 distinct, depth 17 |
 | `H2cSwitch_pk_base` (prior knowledge) | passes: 50 generated, 31 distinct, depth 13 |
 | `H2cSwitch_h1_base` (bytes leave the preface at the second) | passes: 38 generated, 25 distinct, depth 12 |
-| `H2cSwitch_without_takedeciding` | violates `H2GetsTheRest` (7 states): the last preface byte read twice |
+| `H2cSwitch_without_takedeciding` | violates `H2GetsTheRest` (9 states): the last preface byte read twice |
 | `H2cSwitch_without_takedeciding_h1` | violates `H1GetsTheInput` (7 states): the differing byte read twice |
-| `H2cSwitch_without_handfirst` | violates `H2GetsTheRest` (6 states) |
+| `H2cSwitch_without_handfirst` | violates `H2GetsTheRest` (7 states) |
 | `H2cSwitch_without_leftoversfirst` | violates `H2GetsTheRest` (6 states): a newer byte passes the preface |
 | `H2cSwitch_without_keepunread` | violates `H2GetsTheRest` (11 states) |
-| `H2cSwitch_without_blockwhenfull` | violates `H2GetsAll` (18 states): a chunk dropped while switching |
+| `H2cSwitch_without_blockwhenfull` | violates `H2GetsAll` (20 states): a chunk dropped while switching |
 | `H2cSwitch_without_endafterdata` | violates `H2EndLast` (15 states) |
 
 ## Kani
@@ -313,7 +324,15 @@ practice.
 - `Flow.tla` has two or three streams, windows of a few units, and
   children that read all they hold at once; `send_one` takes from a
   stream's queued bytes as one run. `Lifecycle.tla` has three streams, two
-  at once, four client frames, and one body piece per response.
+  at once, four client frames, and one body piece per response. It arms
+  the body deadline on every `opened`, while `Respond::new` arms none for
+  a request that arrived complete, so the model allows a 408 the code
+  cannot give (more behaviors, none hidden); `Respond` sends head, body
+  and end as one step, while `Children` takes one command per visit, so
+  in the code commands of different streams interleave; the client's end
+  of input (`peer_ended`, `advance` http2.rs:1557-1562), the 431 and
+  PROTOCOL_ERROR refusals in `on_headers` (head limits, a bad request, a
+  bad content-length) and the pending-reset count are not in it.
   `Settings.tla` models only the initial window. `H2cSwitch.tla` has a
   two-token preface and messages of three to five tokens, and treats an
   HTTP/1 request as one token (the HTTP/1 pipeline is `Pipeline.tla` in

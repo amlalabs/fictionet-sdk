@@ -16,9 +16,15 @@ own.
 This directory checks that path for bugs: four TLA+ models of the state
 across directions, gaps and ends, and Kani proofs of the readers on bounded
 inputs. The models' headers name the source lines they follow, at commit
-0b884a309 on `comp/v-dissect` (the code after the fixes below). Every property
-has a configuration or a broken copy of its function that must fail it,
-and each failure was read to check that it fails for the stated reason.
+0b884a309 on `comp/v-dissect` (the code after the fixes below). The
+dissector (`src/stdlib/dissect`) and `codec/stream.rs` are unchanged from
+there through e2858ccc4, the main this directory was audited against, so
+those lines still hold; `protocols/hpack.rs` gained nine lines after line
+725, past the `Table::read_block` the models name. Every property has a
+configuration or a broken copy of its function that must fail it, and each
+failure was read to check that it fails for the stated reason. A
+counterexample's length below counts the states of TLC's trace, the
+initial state included.
 
 What is checked:
 
@@ -121,15 +127,32 @@ capture, which shows no packet.
 | `Stream_stop_base` | `stop`, three messages of two tokens, three packets, one gap | passes: 354,592 states generated, 274,488 distinct, depth 12 |
 | `Stream_head_base` | `head`, the same | passes: 371,216 generated, 297,104 distinct, depth 12 |
 | `Stream_close_base` | `close`, one message, no gap | passes: 1,180 generated, 870 distinct, depth 8 |
-| `Stream_without_stoponreset` | `Dns::reset` before 9ce2440c9: DNS over TCP reads on after a gap | violates `ItemsAreMessages` (4 states) |
-| `Stream_without_headonly` | HTTP/1 reads on from the byte after a gap | violates `ItemsAreMessages` (4 states) |
-| `Stream_without_dropbuffer` | `Observed::reset` keeps the bytes it held | violates `NoJoinAcrossGap` (5 states) |
-| `Stream_without_tellearly` | the conversation does not tell the protocol it chooses of a gap before the choice | violates `StopsAfterGap` (4 states) |
-| `Stream_without_shownpacket` | `apply` before 045b537eb: the end of the capture places bytes of the last packet in it | violates `PointsOnlyIntoItsPacket` (5 states) |
-| `Stream_without_clearatend` | `Pair::end` before 045b537eb: an end keeps the last run's offsets | violates `PointsOnlyIntoItsPacket` (5 states) |
-| `Stream_without_finfinishes` | a FIN discards what was held | violates `FinFinishesHeld` (4 states) |
-| `Stream_without_endafterchoice` | `Conversation::end` before 71f61b9e4: a FIN before the choice never reaches the protocol | violates `FinFinishesHeld` (5 states): the other direction chose, and the prefix stays held |
-| `Stream_without_othersdiscard` | a reset finishes what was held, as a FIN does | violates `OthersDiscardHeld` (4 states) |
+| `Stream_without_stoponreset` | `Dns::reset` before 9ce2440c9: DNS over TCP reads on after a gap | violates `ItemsAreMessages` (3 states) |
+| `Stream_without_headonly` | HTTP/1 reads on from the byte after a gap | violates `ItemsAreMessages` (3 states) |
+| `Stream_without_dropbuffer` | `Observed::reset` keeps the bytes it held | violates `NoJoinAcrossGap` (4 states) |
+| `Stream_without_tellearly` | the conversation does not tell the protocol it chooses of a gap before the choice | violates `StopsAfterGap` (3 states) |
+| `Stream_without_shownpacket` | `apply` before 045b537eb: the end of the capture places bytes of the last packet in it | violates `PointsOnlyIntoItsPacket` (3 states) |
+| `Stream_without_clearatend` | `Pair::end` before 045b537eb: an end keeps the last run's offsets | violates `PointsOnlyIntoItsPacket` (4 states) |
+| `Stream_without_finfinishes` | a FIN discards what was held | violates `FinFinishesHeld` (3 states) |
+| `Stream_without_endafterchoice` | `Conversation::end` before 71f61b9e4: a FIN before the choice never reaches the protocol | violates `FinFinishesHeld` (4 states): the other direction chose, and the prefix stays held |
+| `Stream_without_othersdiscard` | a reset finishes what was held, as a FIN does | violates `OthersDiscardHeld` (3 states) |
+
+The `head` reader is more hopeful than `Http1`. After a gap the model
+skips to the next message's first token and reads on from there. The code
+(`Http1::decode`, protocols/http1.rs 130-147) looks for the next blank
+line (`Http1::find`) and reads everything before it as one head: when the
+gap fell inside a body, the rest of that body comes first, the head fails
+to parse, and `decode` skips the head along with it, telling the method
+queue of a miss. With a body in every message, that repeats at each head,
+and the direction shows nothing more. Nothing the code shows is missing
+from the model, so the properties hold of the code too; what the model
+shows after a gap inside a body, the code may not. The code also counts
+the bytes it holds while looking for that blank line as a message in
+progress (`Observed::waiting`), so an end that is not a FIN tags the
+packet `incomplete` where the model, holding nothing while it seeks, does
+not. Both are reported in the audit, not changed. A non-clean end before
+the protocol is chosen marks the direction as having lost bytes
+(`Conversation::lost`), as the model's `early` now does.
 
 ## Tls.tla: opening both directions' records
 
@@ -162,8 +185,8 @@ A FIN may cut the next record short.
 | `Tls_without_updateown` | a KeyUpdate moves the other direction's key | violates `KeysInStep` (6 states) |
 | `Tls_without_resetseq` | the key after a KeyUpdate keeps the old number | violates `KeysInStep` (6 states) |
 | `Tls_without_markunopened` | `Tls::record` before 9fe091d0b: a record not opened leaves no mark | violates `NoSilentHole` (4 states) |
-| `Tls_without_wholeend` | `TlsSession::end` before 9fe091d0b: the decrypted stream always ends cleanly on a FIN | violates `InnerEndClean` (3 states) |
-| `Tls_without_appdataonly` | `Tls::record` before 6fc3f7e3a: every opened record that is not a handshake message or an alert reaches the decrypted stream | violates `InnerOnlyAppData` (4 states): the client's application data under the handshake key |
+| `Tls_without_wholeend` | `TlsSession::end` before 9fe091d0b: the decrypted stream always ends cleanly on a FIN | violates `InnerEndClean` (2 states) |
+| `Tls_without_appdataonly` | `Tls::record` before 6fc3f7e3a: every opened record that is not a handshake message or an alert reaches the decrypted stream | violates `InnerOnlyAppData` (3 states): the server's application data under the handshake key, right after its handshake record |
 
 The model takes rustls's AEAD as given: a record opens only under its key
 and nonce. Two unit tests in `tls.rs` run the real key schedule and record
@@ -180,8 +203,11 @@ Its endpoint decodes each (`hpack::Table::read_block`: insert, then evict
 to the maximum). The capture reads a block, cannot read it (and forgets
 the table), or misses bytes, which stops that direction. Entries are
 their sizes, in units where the smallest HPACK entry (32 bytes) is 2;
-the passive table keeps at most 7 (`hpack::MAX_TABLE`), and maximums go
-up to 8, past it.
+the passive table keeps at most 7 (`hpack::MAX_TABLE`, 64 KiB; an entry
+costs its name and value plus `hpack::ENTRY_OVERHEAD`, 32), and maximums
+go up to 8, past it. The table's `unsure` flag, `forget` and `evict`,
+with the `>` that makes it sure again, are `PartialTable` in
+`dissect/http2.rs` lines 70-124 (the comparison at line 120).
 
 | Property | States |
 | --- | --- |
@@ -197,18 +223,23 @@ block, so they never show in place of a header; `InStep` allows them.
 | --- | --- | --- |
 | `Hpack_base` | three blocks each way | passes: 12,791,641 states generated, 301,512 distinct, depth 7 |
 | `Hpack_long_base` | four blocks each way | passes: 192,387,181 generated, 3,145,857 distinct, depth 9, 4 min 13 s |
-| `Hpack_without_strictsure` | sure again once one more smallest entry would fill the table exactly (`>=` in `evict`) | violates `InStep` (4 states): after a block not read, a size update to the smallest entry leaves an empty table sure while the endpoint holds one entry |
-| `Hpack_without_forgetunsure` | `forget` leaves the table sure | violates `InStep` (3 states) |
-| `Hpack_without_capunsure` | evicting past the cap leaves the table sure | violates `InStep` (6 states) |
-| `Hpack_without_unknownnameforgets` | a new entry whose name is not known is skipped and the table kept | violates `InStep` (5 states): every later entry sits one index off |
-| `Hpack_without_gapstops` | a gap resets the reader but not `Capture` (the direction reads on with its table) | violates `InStep` (3 states) |
+| `Hpack_without_strictsure` | sure again once one more smallest entry would fill the table exactly (`>=` in `evict`) | violates `InStep` (3 states): after a block not read, a size update to the smallest entry leaves an empty table sure while the endpoint holds one entry |
+| `Hpack_without_forgetunsure` | `forget` leaves the table sure | violates `InStep` (2 states) |
+| `Hpack_without_capunsure` | evicting past the cap leaves the table sure | violates `InStep` (5 states) |
+| `Hpack_without_unknownnameforgets` | a new entry whose name is not known is skipped and the table kept | violates `InStep` (4 states): every later entry sits one index off |
+| `Hpack_without_gapstops` | a gap resets the reader but not `Capture` (the direction reads on with its table) | violates `InStep` (2 states) |
 
 ## Pairing.tla: which request each HTTP/1 response answers
 
 The request direction queues each request's method; the response
 direction takes one per response, since a response to HEAD has no body and
 a 2xx to CONNECT starts a tunnel. Either direction may miss requests or
-responses, and the queue may fill.
+responses, and the queue may fill. A response whose request is not known
+is shown without its body and stops its direction (`Http1State::ToClose`),
+unless it has no body under any method, a non-2xx with none, when the
+reader goes on to the next head (`read_head`, protocols/http1.rs 489-492);
+the model's `ReadResponse` takes either, and the responses after it stay
+unpaired.
 
 | Property | States |
 | --- | --- |
@@ -217,8 +248,8 @@ responses, and the queue may fill.
 
 | Config | Setting | Result |
 | --- | --- | --- |
-| `Pairing_base` | three requests, a queue of two, one gap | passes: 560 generated, 440 distinct, depth 7 |
-| `Pairing_full_base` | four requests, a queue of one, two gaps | passes: 5,792 generated, 3,088 distinct, depth 9 |
+| `Pairing_base` | three requests, a queue of two, one gap | passes: 1,032 generated, 760 distinct, depth 7 |
+| `Pairing_full_base` | four requests, a queue of one, two gaps | passes: 14,560 generated, 8,640 distinct, depth 9 |
 | `Pairing_without_markrequestgap` | `Http1::reset` before 834104fac: a missed request leaves no mark | violates `FramedByItsRequest` (5 states) |
 | `Pairing_without_forgetonresponsegap` | before 834104fac: missed responses leave the methods waiting | violates `FramedByItsRequest` (3 states) |
 | `Pairing_without_markfull` | `Methods::push` before 834104fac: a full queue drops its oldest method | violates `FramedByItsRequest` (4 states) |
@@ -251,7 +282,9 @@ loop.
 | `extensions_lie_inside_the_hello` | `extensions` on any 44-byte hello body of a client or a server: each extension lies inside the body, however the body lies about the lengths before the extensions | 48 s |
 | `an_item_points_only_at_its_own_bytes` | `Place::locate` for any run and any item of up to 3 bytes: it points into the run only at exactly the item's bytes, else gives a new buffer holding exactly them; a run with no offset never points | 2.9 s |
 
-Each reports `VERIFICATION:- SUCCESSFUL`. Each was also run once against a
+No harness stubs a function, so `-Z stubbing` is not needed; each builds
+the production type and calls the production function. Each reports
+`VERIFICATION:- SUCCESSFUL` at 0b884a309. Each was also run once against a
 broken copy of its function (every harness in one run, the full-buffer
 one alone), and each failed for that break:
 
@@ -340,7 +373,11 @@ harness reaches it without the DNS parser behind each message.
   Huffman coding (`src/stdlib/protocols/hpack.rs`), gRPC, and the text
   each item shows. `Stream.tla` takes a head as naming itself: HTTP/1
   reading again after a gap is only as good as a head's first line is
-  told from other bytes.
+  told from other bytes (`lenient_bounds` checks the first line's shape,
+  so a text body's line of token characters before `GET` would read as a
+  method). And it takes the reader to find the next head at once, where
+  `Http1` finds it only at the next blank line and loses it when a cut
+  body comes first (the paragraph after the `Stream.tla` table).
 - The observer itself (`network/tcp*`), which `Stream.tla` takes as
   delivering bytes in order with gaps and ends as its contract states.
 - `Stream.tla` follows one direction; the other shares only the choice

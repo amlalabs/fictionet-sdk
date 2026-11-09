@@ -3,7 +3,8 @@ namespace Http
 /-!
 The response framing of `src/stdlib/web/httpd`: the shared length policy
 in `httpd/response.rs`, the HTTP/1 head writer and body writer in
-`httpd/native.rs`, and the HTTP/2 head writer in `httpd/http2.rs`. Each
+`httpd/native.rs`, and the HTTP/2 head writer (`Respond::start` in
+`httpd/http2/respond.rs`). Each
 definition names the Rust it follows. The theorems are the rules of
 RFC 9110 sections 8.6 and 9.3.6, RFC 9112 section 6, and RFC 9113
 section 8.1, and the agreement between what the server writes and what an
@@ -81,7 +82,7 @@ def policy (st : Status) (hint : Hint) (asked : Asked) (supplied : Supplied) : P
 
 /-- The body bytes the server writes after the head: none when the policy
 says bodiless, else what the body yields (`Http1::start` and
-`Sending::poll_next` both drop the body when `policy.bodiless`). -/
+`Respond::start` both drop the body when `policy.bodiless`). -/
 def written (p : Policy) (actual : Nat) : Nat :=
   if p.bodiless then 0 else actual
 
@@ -289,7 +290,7 @@ theorem reader_close_agrees (v : Version) (st : Status) (p : Policy) (close hand
 
 -- HTTP/2 ---------------------------------------------------------------------
 
-/-- The framing of an HTTP/2 response as `Sending::poll_next` writes it: the
+/-- The framing of an HTTP/2 response as `Respond::start` writes it: the
 `content-length` field, END_STREAM on the HEADERS frame, and the DATA
 payload bytes that follow. -/
 structure Head2 where
@@ -298,7 +299,7 @@ structure Head2 where
   data : Nat
   deriving DecidableEq, Repr
 
-/-- The `content-length` field `Sending::poll_next` writes: the handler's
+/-- The `content-length` field `Respond::start` writes: the handler's
 value when it is valid and agrees with the policy or the status is 304, else
 the policy's length. -/
 def contentLength2 (st : Status) (p : Policy) (supplied : Supplied) : Option Nat :=
@@ -306,7 +307,7 @@ def contentLength2 (st : Status) (p : Policy) (supplied : Supplied) : Option Nat
   | .valid n => if p.len == some n || st == .notModified then some n else p.len
   | _ => p.len
 
-/-- `Sending::poll_next` from `ResponsePolicy::new` to the HEADERS frame.
+/-- `Respond::start` (`httpd/http2/respond.rs`) from `ResponsePolicy::new` to the HEADERS frame.
 `endsNow` is `body.is_end_stream()` when the head is written. -/
 def headers2 (st : Status) (hint : Hint) (asked : Asked) (supplied : Supplied)
     (endsNow : Bool) (actual : Nat) : Head2 :=

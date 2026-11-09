@@ -14,7 +14,13 @@
 (*           over TCP): after a gap the direction stops;                  *)
 (*   "head"  HTTP/1: after a gap it reads again from a head, which names  *)
 (*           itself (a request or status line), taken here as a message's *)
-(*           first token;                                                 *)
+(*           first token. The code finds the next head at the first blank *)
+(*           line (`Http1::find`) and reads everything before it as one   *)
+(*           head: the bytes of a cut body before that head make it fail, *)
+(*           and `decode` skips the head with them (http1.rs 130-147).    *)
+(*           This reader skips only to the next head, so it shows         *)
+(*           messages the code loses after a gap inside a body; nothing   *)
+(*           the code shows is missing from it;                           *)
 (*   "close" a message read to the end of the stream (a decoder a user   *)
 (*           may register, `UntilClose` in the tests): it completes only  *)
 (*           at a FIN.                                                    *)
@@ -25,18 +31,21 @@
 (*                                                                        *)
 (* Source lines, at the commit in README.md:                              *)
 (*   Dissector::finish, apply (Data, Gap, End)  mod.rs 497-510, 938-1025  *)
-(*   Conversation::lost, end, data           conversation.rs 67-168       *)
-(*   Pair::lost, Pair::end, end_elsewhere    registry.rs 258-321          *)
+(*   Conversation::lost, end, data           conversation.rs 67-170       *)
+(*   Pair::lost, Pair::end, end_elsewhere    registry.rs 258-320          *)
 (*   Observed::reset, data_with, end         present.rs 293-404           *)
-(*   Place::locate                           present.rs 101-115           *)
-(*   Stream::with_next (Need at EOF is       codec/stream.rs 248-330      *)
-(*     Truncated)                                                         *)
-(*   Dns::decode, next, reset                protocols/dns.rs 59-150      *)
-(*   Http1::decode (a head), Http1::reset    protocols/http1.rs 128-300   *)
+(*   Place::locate                           present.rs 101-118           *)
+(*   Stream::with_next (Need at EOF is       codec/stream.rs 248-329      *)
+(*     Truncated, 308-316)                                                *)
+(*   Dns::decode, next, reset                protocols/dns.rs 59-151      *)
+(*   Http1::decode (a head), Http1::reset    protocols/http1.rs 128-296   *)
+(*   Capture::reset (HTTP/2 stops)           http2.rs 1422-1427, 1059     *)
+(*   TlsSession::lost (TLS records stop)     tls.rs 128-137               *)
 (*                                                                        *)
 (* Left out: what a message says, read-ahead limits and refusal (a        *)
-(* refused direction stops, as after a gap), and the other direction,     *)
-(* which shares only the selection.                                       *)
+(* refused direction stops, as after a gap), a conversation no protocol   *)
+(* matches (rejected: it shows nothing), and the other direction, which   *)
+(* shares only the selection.                                             *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS Kind,          \* "stop", "head" or "close"
@@ -44,7 +53,7 @@ CONSTANTS Kind,          \* "stop", "head" or "close"
           L,             \* tokens a message has
           MaxPkt,        \* packets shown before the capture ends
           MaxGaps,       \* gaps the observer reports
-          StopOnReset,   \* a "stop" reader's reset ends its direction (Dns::reset, Capture::reset)
+          StopOnReset,   \* a "stop" reader's reset ends its direction (Dns::reset, Capture::reset, TlsSession::lost)
           HeadOnly,      \* a "head" reader reads again only from a head
           DropBuffer,    \* Observed::reset drops the bytes it held
           TellEarly,     \* Conversation tells the protocol it chooses of a gap before it
@@ -174,7 +183,11 @@ End(cause) ==
   /\ atEnd' = IF chosen /\ ~stopped THEN held ELSE <<>>
   /\ incomplete' = (cause # "fin" /\ chosen /\ ~stopped /\ held # <<>>)
   /\ IF ~chosen
-     THEN /\ prefix' = IF cause = "fin" THEN prefix ELSE <<>>
+     THEN \* Conversation::end before the choice: a FIN keeps the prefix
+          \* (ended_early); any other end discards it as missing bytes
+          \* (Conversation::lost, which also sets lost_early).
+          /\ prefix' = IF cause = "fin" THEN prefix ELSE <<>>
+          /\ early' = IF cause = "fin" THEN early ELSE TRUE
           /\ UNCHANGED <<held, seeking, stopped, run, reported>>
      ELSE IF (cause = "fin" /\ FinFinishes) \/ (cause # "fin" /\ ~OthersDiscard)
      THEN \* Observed::end: the decoder sees the end of its input. Whole items
@@ -185,10 +198,10 @@ End(cause) ==
              /\ reported' = IF held = <<>> \/ stopped THEN reported
                             ELSE Append(reported, Show(held, Kind = "close", r))
              /\ held' = <<>>
-             /\ UNCHANGED <<prefix, seeking, stopped>>
+             /\ UNCHANGED <<prefix, early, seeking, stopped>>
      ELSE /\ held' = <<>> /\ stopped' = TRUE
-          /\ UNCHANGED <<prefix, seeking, run, reported>>
-  /\ UNCHANGED <<next, pkt, last, src, lost, gaps, chosen, early, runs>>
+          /\ UNCHANGED <<prefix, early, seeking, run, reported>>
+  /\ UNCHANGED <<next, pkt, last, src, lost, gaps, chosen, runs>>
 
 (* The other direction's bytes choose the protocol (Conversation::data,   *)
 (* the loop over both directions): this direction's prefix goes to it     *)

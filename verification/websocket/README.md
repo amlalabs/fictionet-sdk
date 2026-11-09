@@ -30,7 +30,7 @@ Line numbers are in `protocols/websocket.rs`.
 | `websocket_close_payload_validates_reason` | `parse_close`:544 | Every close payload of up to 6 bytes. Empty means no code, one byte is refused, and otherwise the code must be in range and the reason valid UTF-8, kept unchanged. |
 | `websocket_fragments_follow_message_order` | `Messages::check_header`:960 | Every two-byte header, with and without a message in progress. A continuation is refused outside a message, a new text or binary frame is refused inside one, and control frames pass in both states. |
 | `websocket_text_across_fragment_boundary` | `validate_text`:1050, called from `Messages::decode`:995 | Every four-byte message split at every point. Text is accepted exactly when the whole message is valid UTF-8, even when a character spans the split, and the checked prefix never passes the bytes held. |
-| `websocket_message_limit_precedes_payload_copy` | `Messages::check_header`:960 | Bytes held and limit from 0 to 3, next frame length 0 to 125. A frame that would take the message over its limit is refused from its header, before `Frames::decode` copies the payload, and the held bytes stay as they were. |
+| `websocket_message_limit_precedes_payload_copy` | `Messages::check_header`:960 | Bytes held and limit from 0 to 3, next frame length 0 to 125. `check_header` refuses, with `TooBig`, a frame whose length plus the bytes held passes the limit. The harness calls `check_header` alone: that `decode` calls it (line 1000) before `Frames::decode` copies the payload (1001, `Frame::from_header` at 877) is read from the code, not proved, and `check_header` takes `&self`, so the held bytes cannot change in it. |
 
 `write_header`, `write_frame`, `Header::parse_exact`, `Header::payload`,
 `Messages::check_header` and `validate_text` are blocks moved out of
@@ -79,6 +79,9 @@ systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p M
 `--harness websocket_` runs all of them; add `-j 1` to keep one at a time.
 The controls fail by design, so that command exits non-zero.
 
+The line numbers in both tables were checked against e2858ccc4 on
+2026-11-09 and hold. The Kani results were not rerun then.
+
 ## TLA+: the receive state
 
 `tla/Messages.tla` follows `Messages::check_header` and `Messages::decode`
@@ -88,16 +91,26 @@ final or not, with length 0, 1, 2, 125 or 126, against a message limit of 2.
 Text and binary are one kind here; UTF-8 and wire bytes are left to Kani. A
 failed decode ends the stream. EOF and input chunking are outside the model.
 
+`charged` is the sum `check_header` compares with `limit` (lines 972–976),
+the decoder's own arithmetic: `layer::Budget` does not appear in
+`websocket.rs`, and nothing under `src/` drives `Messages` (its users are
+the tests and the doc examples). The check runs before the copy, but the
+copy allocates the frame's payload (`Frame::from_header`, line 877) and
+then appends it to the partial message (line 1027), so a message briefly
+costs its held bytes plus twice the frame.
+
 `Messages_base.cfg`: no error, 7,551 states generated, 801 distinct, depth 5.
+Counterexample lengths below are TLC's trace lengths, the initial state
+included, from the run of 2026-11-09 at e2858ccc4.
 
 | Invariant | Meaning | Control | Counterexample |
 |---|---|---|---|
-| `ContinuationOrder` | continuation only inside a message, data only outside | `without_order` | a continuation with no message, depth 3 |
-| `ControlAtomic` | accepted control frames are final, at most 125 bytes | `without_control` | a non-final Ping, depth 3 |
-| `ChargedBeforeGrowth` | the message size is checked against the limit before the copy | `without_charge` | data over the limit, depth 3 |
-| `ControlPreservesPartial` | Ping and Pong between fragments keep the message in progress | `without_preserve` | a Ping drops the message, depth 3 |
-| `ReceiveEndsAtClose` | nothing is accepted after a Close | `without_stop` | data after Close, depth 4 |
-| `OneReceivedClose` | at most one Close is delivered | `without_close_once` | a second Close, depth 4 |
+| `ContinuationOrder` | continuation only inside a message, data only outside | `without_order` | a continuation with no message, 2 states |
+| `ControlAtomic` | accepted control frames are final, at most 125 bytes | `without_control` | a non-final Ping, 2 states |
+| `ChargedBeforeGrowth` | the message size is checked against the limit before the copy | `without_charge` | data over the limit, 2 states |
+| `ControlPreservesPartial` | Ping and Pong between fragments keep the message in progress | `without_preserve` | a Ping drops the message, 3 states |
+| `ReceiveEndsAtClose` | nothing is accepted after a Close | `without_stop` | data after Close, 4 states |
+| `OneReceivedClose` | at most one Close is delivered | `without_close_once` | a second Close, 4 states |
 
 ## TLA+: the close handshake through the HTTP switch
 
@@ -120,9 +133,9 @@ text after Close. Writes are assumed to succeed and to be weakly fair.
 
 | Property | Meaning | Control | Counterexample |
 |---|---|---|---|
-| `CloseIsAnswered` | a received Close is answered | `without_reply` | the handler returns without replying |
-| `OneCloseEachWay` | at most one Close is sent | `without_close_once` | two Close replies, depth 7 |
-| `NoDataAfterClose` | no text follows the Close reply | `without_stop` | text after the Close reply, depth 7 |
+| `CloseIsAnswered` | a received Close is answered | `without_reply` | the handler returns without replying, 3 states then stuttering |
+| `OneCloseEachWay` | at most one Close is sent | `without_close_once` | two Close replies, 5 states |
+| `NoDataAfterClose` | no text follows the Close reply | `without_stop` | text after the Close reply, 5 states |
 
 The last two controls turn off both the decoder's stop after Close and the
 handler's return after replying; either one alone keeps these handlers
