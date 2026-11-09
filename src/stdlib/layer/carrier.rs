@@ -246,7 +246,10 @@ impl Chunk {
     /// The shared backing allocation's charge. Split pieces name the same
     /// charge; their charged values must not be added together.
     pub fn charged(&self) -> usize {
-        self.backing.reservation.as_ref().map_or(0, Reservation::bytes)
+        self.backing
+            .reservation
+            .as_ref()
+            .map_or(0, Reservation::bytes)
     }
 }
 

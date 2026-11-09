@@ -2504,10 +2504,7 @@ fn a_dropped_connection_uses_the_orphan_timeout() {
         let _c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
         let s = listener.accept(&fcx).await?;
         let h = server.shared.lock().socket_of(s.id);
-        assert_eq!(
-            server.shared.lock().get(h).timeout(),
-            Some(TIMEOUT.into())
-        );
+        assert_eq!(server.shared.lock().get(h).timeout(), Some(TIMEOUT.into()));
         drop(s);
         fcx.sleep(Duration::from_millis(50)).await?;
         let st = server.shared.lock();

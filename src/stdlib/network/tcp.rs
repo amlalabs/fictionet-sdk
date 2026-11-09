@@ -1099,10 +1099,7 @@ impl PacketDriver {
                 now,
                 cx,
                 |pending| {
-                    std::mem::swap(
-                        pending,
-                        &mut self.shared.lock().routes.application_events,
-                    )
+                    std::mem::swap(pending, &mut self.shared.lock().routes.application_events)
                 },
                 |command| {
                     let admit = self.shared.lock().submit(command);
