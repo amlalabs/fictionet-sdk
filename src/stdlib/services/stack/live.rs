@@ -1,14 +1,11 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use fictionet::Cx;
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, Chunk, Driver, EventOf, Layer, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
-use fictionet::time::Instant;
+use fictionet::{Cx, Timer};
 
 use super::job::Jobs;
 use super::lifetime::{Expiry, Lifetime, Outstanding};
@@ -21,8 +18,6 @@ pub(super) const READ: usize = 16 * 1024;
 /// How many rounds one poll makes before it lets the rest of the world
 /// run.
 const ROUNDS: usize = 64;
-
-type Sleep = Pin<Box<dyn Future<Output = Result<(), fictionet::Cancelled>> + Send>>;
 
 /// Why [`Live::poll`] stopped before it had to wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +59,8 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     unreported: u64,
     /// The idle and write limits, and the ends of both directions.
     lifetime: Lifetime,
-    sleep: Option<Sleep>,
-    armed: Option<Instant>,
+    /// Armed for the next deadline, and moved as it moves.
+    timer: Option<Timer>,
     /// How the run ended, once it has.
     stopped: Option<StreamEnd>,
 }
@@ -98,8 +93,7 @@ where
             input: None,
             unreported: 0,
             lifetime: Lifetime::new(limits),
-            sleep: None,
-            armed: None,
+            timer: None,
             stopped: None,
         }
     }
@@ -187,9 +181,11 @@ where
         above: &mut dyn FnMut(EventOf<L::Upper>) -> Admit<EventOf<L::Upper>>,
         report: &mut dyn FnMut(L::Report),
     ) -> Poll<Result<Halt, StackError<L::Error>>> {
+        // One reading of the clock for the batch: time that passes while it
+        // runs is seen when a timer comes due.
+        let mut now = fcx.now();
+        self.driver.set_now(now);
         for _ in 0..ROUNDS {
-            let now = fcx.now();
-            self.driver.set_now(now);
             // Read first, so input that came with a failed write is not
             // left behind.
             let mut read_failed = None;
@@ -355,21 +351,22 @@ where
             .into_iter()
             .flatten()
             .min();
-            if deadline != self.armed {
-                self.sleep = deadline.map(|at| {
-                    let fcx = fcx.clone();
-                    Box::pin(async move { fcx.sleep_until(at).await }) as Sleep
-                });
-                self.armed = deadline;
+            let Some(at) = deadline else {
+                if let Some(timer) = &mut self.timer {
+                    timer.clear();
+                }
+                return Poll::Pending;
+            };
+            let timer = self.timer.get_or_insert_with(|| Timer::new(fcx));
+            match timer.poll_until(cx, at) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {}
+                // Its region was cancelled: the next round arms a timer in
+                // the region of this poll.
+                Poll::Ready(Err(_)) => self.timer = None,
             }
-            if let Some(sleep) = &mut self.sleep
-                && sleep.as_mut().poll(cx).is_ready()
-            {
-                self.sleep = None;
-                self.armed = None;
-                continue;
-            }
-            return Poll::Pending;
+            now = fcx.now();
+            self.driver.set_now(now);
         }
         // Busy for a while: let the rest of the world run, then go on.
         // This pause is internal work, not time spent waiting for the peer.
