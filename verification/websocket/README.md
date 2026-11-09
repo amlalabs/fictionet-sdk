@@ -48,8 +48,13 @@ one close in each direction or prevent application writes after close.
 
 `tla/Echo.tla` follows the concrete `EchoSocket` handler in
 `tests/support/response.rs`, used by `websockets_work_through_sites` in
-`tests/it/web/http_serving.rs`. Text requests and replies are abstracted to
-one event; a close is echoed once and the handler returns. Four incoming
+`tests/it/web/http_serving.rs`, and the local `echo` handler in
+`tests/it/features.rs:249`, exercised by
+`websocket_continuation_exchanges_messages_through_server` at line 243.
+Both handlers write a close reply before returning, answer Ping with Pong,
+and ignore unsolicited Pong. Text requests and replies are abstracted to
+one event; payload differences between the two echoes are outside the model.
+A close is echoed once and the handler returns. Four incoming
 messages are enough to explore repeated close, close after text, and text
 after close. All payload validation belongs to `Messages`. Successful
 writes are weakly fair: a broken connection cannot promise a close reply.
@@ -85,6 +90,19 @@ echo, then requires exactly one unmasked close and EOF from the real
 server. This is a correction to a test service, not a new production
 WebSocket session API. Production callers remain responsible for their
 own close handshake.
+
+The feature-test echo also needed its control-message and termination
+handling corrected. Its regression sends a text frame, Ping, and unsolicited
+Pong together with the HTTP upgrade request, exercising preservation of
+unread bytes at the switch. It requires the text echo and a Pong carrying
+the Ping payload. After sending a masked close with code 1000, it reads to
+EOF and requires exactly `[0x88, 0x02, 0x03, 0xe8]` on the wire. This detects
+an unsolicited Pong reply, a missing or repeated close reply, or a handler
+that keeps the connection open after replying. The close projection in
+`Echo.tla` covers this handler too; the wire-level response checks belong
+to the Rust regression. The model's missing-reply control specifically
+represents the old support handler's early return, rather than claiming
+that both handlers had the same previous implementation.
 
 Run the models from the repository root, choosing another configuration
 from the same directory for each control (controls must fail the named

@@ -261,7 +261,9 @@ mod http {
                     let closing = matches!(message, Message::Close(_));
                     conn.write_all(fcx, &message.to_frame(None)?.to_bytes()?)
                         .await?;
-                    if closing { return Ok(()); }
+                    if closing {
+                        return Ok(());
+                    }
                 }
                 let mut buf = [0; 1024];
                 let n = conn.read(fcx, &mut buf).await?;
