@@ -196,6 +196,79 @@ fn no_budget_refuses_input_without_consuming_it() {
 }
 
 #[test]
+fn ciphertext_batches_and_completions_survive_key_updates_and_record_splits() {
+    block_on(lab(Seed::from_u64(43), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        for (fragment, size) in [(None, 128), (None, 16 * 1024), (Some(1024), 4096)] {
+            let mut config = (*server_config(&fcx, &ca, "example.test", &[b"http/1.1"])).clone();
+            config.max_fragment_size = fragment;
+            let (mut server, mut client) = handshake(
+                Arc::new(config),
+                client_config(&fcx, &ca, &[b"http/1.1"]),
+                0,
+            );
+            events(&mut server);
+            client.refresh_traffic_keys()?;
+            server.push(&client_output(&mut client))?;
+            receive(&mut client, &server.take_output());
+            let payload: Vec<_> = (0..size).map(|i| i as u8).collect();
+            assert!(matches!(
+                server
+                    .driver()
+                    .command(StreamCommand::Write(Chunk::new(payload.clone())))?,
+                Admit::Taken
+            ));
+            let mut chunks = Vec::new();
+            loop {
+                server.driver().run()?;
+                let Some(command) = server.driver().take_command() else {
+                    break;
+                };
+                let StreamCommand::Write(chunk) = command else {
+                    panic!("expected ciphertext")
+                };
+                assert!(chunk.len() <= 16 * 1024);
+                chunks.push(chunk);
+            }
+            let ciphertext_len: usize = chunks.iter().map(Chunk::len).sum();
+            assert_eq!(chunks.len(), ciphertext_len.div_ceil(16 * 1024));
+            assert!(events(&mut server).is_empty());
+            for chunk in &chunks {
+                receive(&mut client, chunk);
+            }
+            let mut decrypted = vec![0; size];
+            client.reader().read_exact(&mut decrypted)?;
+            assert_eq!(decrypted, payload);
+            assert!(matches!(
+                server
+                    .driver()
+                    .deliver(StreamEvent::Written(ciphertext_len as u64 - 1))?,
+                Admit::Taken
+            ));
+            assert!(events(&mut server).is_empty());
+            assert!(matches!(
+                server.driver().deliver(StreamEvent::Written(1))?,
+                Admit::Taken
+            ));
+            assert!(matches!(
+                events(&mut server).as_slice(),
+                [StreamEvent::Written(n)] if *n == size as u64
+            ));
+            assert!(matches!(
+                server.driver().command(StreamCommand::End)?,
+                Admit::Taken
+            ));
+            server.push(&[])?;
+            receive(&mut client, &server.take_output());
+            assert_eq!(client.reader().read(&mut [0])?, 0);
+            assert!(server.ended());
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn transport_eof_waits_for_buffered_plaintext() {
     block_on(lab(Seed::from_u64(16), |fcx| async move {
         let ca = Ca::new(&fcx, "Test CA")?;

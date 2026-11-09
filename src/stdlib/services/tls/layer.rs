@@ -20,6 +20,64 @@ use fictionet::time::Instant;
 const CHUNK: usize = 16 * 1024;
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 
+#[cfg(test)]
+mod ciphertext_transfer_tests {
+    use super::*;
+    use fictionet::Seed;
+    use fictionet::stdlib::layer::Harness;
+
+    #[test]
+    fn sole_ciphertext_reaches_the_driver_with_its_original_allocation() {
+        struct Inspect(*const u8);
+        impl Write for Inspect {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0 = bytes.as_ptr();
+                Ok(0)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new())),
+        );
+        let mut tls = ServerConnection::new(config.clone()).unwrap();
+        tls.send_close_notify();
+        let mut inspect = Inspect(std::ptr::null());
+        assert_eq!(tls.write_tls(&mut inspect).unwrap(), 0);
+        assert!(!inspect.0.is_null());
+        let queued = tls.sendable_tls_len();
+        let mut layer = TlsLayer::new(config);
+        layer.tls = Some(tls);
+        let mut harness = Harness::new(Seed::from_u64(42), layer);
+        harness.driver().run().unwrap();
+        let budget = harness.driver().budget().clone();
+        let mut output = None;
+        harness.driver().send_below(|command| {
+            let StreamCommand::Write(bytes) = command else {
+                panic!("expected ciphertext")
+            };
+            assert!(output.replace(bytes).is_none());
+            Admit::Taken
+        });
+        let output = output.unwrap();
+        assert_eq!(output.as_ptr(), inspect.0);
+        assert_eq!(output.len(), queued);
+        assert!(output.charged() >= output.len());
+        assert!(!harness.layer().tls.as_ref().unwrap().wants_write());
+        drop(harness);
+        assert_eq!(budget.used(), output.charged());
+        drop(output);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
 /// Appends to a vector up to its capacity, so a TLS write fills exactly the
 /// allocation made for it and never grows it.
 struct Fill<'a>(&'a mut Vec<u8>);
@@ -160,11 +218,15 @@ pub struct TlsLayer {
     reset_sent: bool,
     below: Option<StreamCommand>,
     above: Option<StreamEvent>,
-    produced: u64,
-    delivered: u64,
-    pending_plaintext: usize,
-    fence: Option<u64>,
-    credit: u64,
+    ciphertext_emitted: u64,
+    ciphertext_completed: u64,
+    plaintext_completion: Option<PlaintextCompletion>,
+    completed_plaintext_bytes: u64,
+}
+
+struct PlaintextCompletion {
+    plaintext_bytes: usize,
+    ciphertext_end: Option<u64>,
 }
 
 impl TlsLayer {
@@ -217,11 +279,10 @@ impl TlsLayer {
             reset_sent: false,
             below: None,
             above: None,
-            produced: 0,
-            delivered: 0,
-            pending_plaintext: 0,
-            fence: None,
-            credit: 0,
+            ciphertext_emitted: 0,
+            ciphertext_completed: 0,
+            plaintext_completion: None,
+            completed_plaintext_bytes: 0,
         }
     }
 
@@ -253,7 +314,7 @@ impl TlsLayer {
     /// Whether ciphertext remains queued or awaits downstream completion.
     pub fn output_pending(&self) -> bool {
         self.below.is_some()
-            || self.produced != self.delivered
+            || self.ciphertext_emitted != self.ciphertext_completed
             || self.alert.is_some()
             || self.reject
             || self.tls.as_ref().is_some_and(|tls| tls.wants_write())
@@ -298,10 +359,9 @@ impl TlsLayer {
         self.reject = false;
         self.failure = None;
         self.output_reserve = None;
-        self.delivered = self.produced;
-        self.pending_plaintext = 0;
-        self.fence = None;
-        self.credit = 0;
+        self.ciphertext_completed = self.ciphertext_emitted;
+        self.plaintext_completion = None;
+        self.completed_plaintext_bytes = 0;
     }
 
     fn reserve_output(&mut self, env: &Env<'_, ()>) -> bool {
@@ -311,11 +371,18 @@ impl TlsLayer {
         self.output_reserve.is_some()
     }
 
-    fn credit_written(&mut self) {
-        if self.fence.is_some_and(|fence| self.delivered >= fence) {
-            self.credit += self.pending_plaintext as u64;
-            self.pending_plaintext = 0;
-            self.fence = None;
+    fn complete_plaintext_write(&mut self) {
+        if self
+            .plaintext_completion
+            .as_ref()
+            .is_some_and(|completion| {
+                completion
+                    .ciphertext_end
+                    .is_some_and(|end| self.ciphertext_completed >= end)
+            })
+        {
+            self.completed_plaintext_bytes +=
+                self.plaintext_completion.take().unwrap().plaintext_bytes as u64;
         }
     }
 }
@@ -337,13 +404,13 @@ impl Layer for TlsLayer {
         match event {
             event if self.reset => Ok(Admit::Closed(event)),
             StreamEvent::Written(n) => {
-                if n > self.produced - self.delivered {
+                if n > self.ciphertext_emitted - self.ciphertext_completed {
                     return Err(HandshakeError::Failed(
                         "TLS output completed more than once".into(),
                     ));
                 }
-                self.delivered += n;
-                self.credit_written();
+                self.ciphertext_completed += n;
+                self.complete_plaintext_write();
                 Ok(Admit::Taken)
             }
             StreamEvent::Reset => {
@@ -469,7 +536,10 @@ impl Layer for TlsLayer {
             StreamCommand::Write(mut chunk) => {
                 // One plaintext write owns the ciphertext fence until delivery.
                 // Pipelining needs separate fences and charges for queued writes.
-                if self.is_handshaking() || self.pending_plaintext != 0 || self.output_pending() {
+                if self.is_handshaking()
+                    || self.plaintext_completion.is_some()
+                    || self.output_pending()
+                {
                     return Ok(Admit::Blocked(StreamCommand::Write(chunk)));
                 }
                 if chunk.is_empty() {
@@ -488,7 +558,10 @@ impl Layer for TlsLayer {
                 if n == 0 {
                     return Ok(Admit::Blocked(StreamCommand::Write(chunk)));
                 }
-                self.pending_plaintext = n;
+                self.plaintext_completion = Some(PlaintextCompletion {
+                    plaintext_bytes: n,
+                    ciphertext_end: None,
+                });
                 chunk.advance(n);
                 Ok(if chunk.is_empty() {
                     Admit::Taken
@@ -578,40 +651,51 @@ impl Layer for TlsLayer {
                 return Ok(false);
             }
             let mut charge = self.output_reserve.take().unwrap();
-            // Room for exactly what is to go, up to a chunk: the queued
-            // records, the rejection, or the alert, whose size is not known
-            // ahead. The reservation then shrinks to what was allocated.
-            let room = if self.reject {
-                UNRECOGNIZED_NAME.len()
-            } else if self.alert.is_some() {
-                CHUNK
+            let owned = if self.reject || self.alert.is_some() {
+                None
             } else {
-                self.tls.as_ref().unwrap().sendable_tls_len().min(CHUNK)
+                self.tls
+                    .as_mut()
+                    .unwrap()
+                    .take_sendable_tls_chunk(charge.bytes().min(CHUNK))
             };
-            let mut bytes = Vec::with_capacity(room);
-            let result = if self.reject {
-                Fill(&mut bytes).write(UNRECOGNIZED_NAME.as_slice())
-            } else if let Some(alert) = self.alert.as_mut() {
-                alert.write(&mut Fill(&mut bytes))
+            let (bytes, n) = if let Some(bytes) = owned {
+                let n = bytes.len();
+                (bytes, n)
             } else {
-                self.tls.as_mut().unwrap().write_tls(&mut Fill(&mut bytes))
+                let room = if self.reject {
+                    UNRECOGNIZED_NAME.len()
+                } else if self.alert.is_some() {
+                    CHUNK
+                } else {
+                    self.tls.as_ref().unwrap().sendable_tls_len().min(CHUNK)
+                };
+                let mut bytes = Vec::with_capacity(room);
+                let result = if self.reject {
+                    Fill(&mut bytes).write(UNRECOGNIZED_NAME.as_slice())
+                } else if let Some(alert) = self.alert.as_mut() {
+                    alert.write(&mut Fill(&mut bytes))
+                } else {
+                    self.tls.as_mut().unwrap().write_tls(&mut Fill(&mut bytes))
+                };
+                let n = result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
+                bytes.shrink_to_fit();
+                (bytes, n)
             };
-            let n = result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
             self.reject = false;
             if n == 0 {
                 self.alert = None;
             } else {
-                bytes.shrink_to_fit();
                 charge.set(bytes.capacity());
-                self.produced += n as u64;
+                self.ciphertext_emitted += n as u64;
                 self.below = Some(StreamCommand::Write(Chunk::with_charge(bytes, charge)));
             }
-            if self.pending_plaintext != 0
-                && self.fence.is_none()
+            if let Some(completion) = self.plaintext_completion.as_mut()
+                && completion.ciphertext_end.is_none()
                 && !self.tls.as_ref().is_some_and(|tls| tls.wants_write())
             {
-                self.fence = Some(self.produced);
-                self.credit_written();
+                completion.ciphertext_end = Some(self.ciphertext_emitted);
+                self.complete_plaintext_write();
             }
             return Ok(true);
         }
@@ -673,14 +757,17 @@ impl Layer for TlsLayer {
     }
 
     fn take_event(&mut self) -> Option<StreamEvent> {
-        if self.credit != 0 {
-            return Some(StreamEvent::Written(std::mem::take(&mut self.credit)));
+        if self.completed_plaintext_bytes != 0 {
+            return Some(StreamEvent::Written(std::mem::take(
+                &mut self.completed_plaintext_bytes,
+            )));
         }
         self.above.take()
     }
 
     fn take_urgent(&mut self) -> Option<StreamEvent> {
-        (self.credit != 0).then(|| StreamEvent::Written(std::mem::take(&mut self.credit)))
+        (self.completed_plaintext_bytes != 0)
+            .then(|| StreamEvent::Written(std::mem::take(&mut self.completed_plaintext_bytes)))
     }
 
     fn take_work(&mut self) -> Option<Pick> {
