@@ -121,7 +121,7 @@ in `_concurrent` explores the same states as the invariants there.
 | Resolution_base | the 11 invariants, `ReferralsDescend` | pass | 2749819 | 66 | 11-16 s | |
 | Resolution_base | `EveryQueryAnswered` | pass | 2749819 | 66 | 142 s | |
 | Resolution_concurrent | the 11 invariants, `ReferralsDescend` (symmetry) | pass | 4359020 | 59 | 19-20 s | |
-| Resolution_concurrent_live | `EveryQueryAnswered` | pending | pending: /home/souvik/Projects/amlalabs/.fictionet-comp-work/fvdeep-logs/dns-tla-Resolution_concurrent_live.log | pending | 519 s | |
+| Resolution_concurrent_live | `EveryQueryAnswered` | not finished | the rerun after the restart fix was stopped at 5669737 distinct states with no error found so far (log /home/souvik/Projects/amlalabs/.fictionet-comp-work/fvdeep-logs/dns-tla-Resolution_concurrent_live.log); 9038685 before the fix | 59 before the fix | 519 s | |
 | Resolution_loop | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 12560 | 30 | 0-1 s | |
 | Resolution_rogue | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 36437 | 33 | 0-2 s | |
 | Resolution_edit | the 11 invariants, `ReferralsDescend` | pass | 468532 | 45 | 2 s | |
