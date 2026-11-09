@@ -9,8 +9,10 @@ use super::*;
 /// How the RFC reads `bytes`: the value worked out in `u128`, so nothing
 /// wraps, with the byte count; or why it cannot be read. An integer fails
 /// as `Overflow` at the first byte that takes the running value past
-/// `u64::MAX`, and when it would need more than `MAX_BYTES` bytes.
-fn rfc(bytes: &[u8], prefix: u8) -> Result<(u64, usize), Error> {
+/// `u64::MAX`, and when it would need more than `MAX_BYTES` bytes. The
+/// HPACK harnesses read integers through it in place of `read`, which
+/// `read_is_the_rfc_integer` proves it equal to.
+pub(crate) fn rfc(bytes: &[u8], prefix: u8) -> Result<(u64, usize), Error> {
     let mask = (1u128 << prefix) - 1;
     let first = u128::from(*bytes.first().ok_or(Error::Truncated)?) & mask;
     if first < mask {
