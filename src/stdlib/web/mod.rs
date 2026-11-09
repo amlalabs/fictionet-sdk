@@ -606,6 +606,21 @@ impl Sites {
     /// sites discovered later. A server's own observer takes precedence.
     /// Hosts added separately through [`Sites::into_net`] configure their own
     /// [`Server::observe`] callback.
+    ///
+    /// ```
+    /// # use fictionet::stdlib::web;
+    /// # use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// let delivered = Arc::new(AtomicUsize::new(0));
+    /// let count = delivered.clone();
+    /// let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), |_| {
+    ///     Some(web::Site::new(axum::Router::new()))
+    /// }).observe_http(Arc::new(move |exchange| {
+    ///     if exchange.complete {
+    ///         count.fetch_add(1, Ordering::Relaxed);
+    ///     }
+    /// }));
+    /// # drop(sites);
+    /// ```
     pub fn observe_http(mut self, observe: httpd::Observe) -> Self {
         self.observe = Some(observe);
         self

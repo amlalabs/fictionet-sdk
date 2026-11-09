@@ -3,9 +3,38 @@ use fictionet::Seed;
 
 #[test]
 fn website_observers_follow_dynamic_servers_and_overrides() {
+    website_observers(false, false);
+}
+
+#[test]
+fn website_observers_follow_http2_servers() {
+    website_observers(false, true);
+}
+
+#[test]
+fn website_observers_follow_tls_servers() {
+    website_observers(true, false);
+}
+
+#[test]
+fn website_observers_follow_tls_http2_servers() {
+    website_observers(true, true);
+}
+
+fn website_observers(secure: bool, h2: bool) {
     use fictionet::stdlib::web::httpd;
 
-    run_world::world(Duration::from_secs(60), |fcx| async move {
+    run_world::world(Duration::from_secs(60), move |fcx| async move {
+        let certs = certs(
+            &fcx,
+            &["first.test", "override.test", "shared.test", "later.test"],
+        );
+        let roots = Arc::new(certs.roots);
+        let certificate = Arc::new(tls::CertifiedKey {
+            chain: certs.chain,
+            key: certs.key,
+        });
+        let date = SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000);
         let shared = Arc::new(AtomicUsize::new(0));
         let overridden = Arc::new(AtomicUsize::new(0));
         let observer = |count: Arc<AtomicUsize>| -> httpd::Observe {
@@ -21,22 +50,52 @@ fn website_observers_follow_dynamic_servers_and_overrides() {
             let mut server = httpd::Server::new(fictionet_test_support::handler(|_, _| {
                 Response::new(Bytes::from_static(b"ok"))
             }));
-            if name == "override.test" {
+            if secure {
+                let certificate = certificate.clone();
+                server = server.tls_with(move |_| certificate.clone());
+            }
+            if name == "override.test" || name == "shared.test" {
                 server = server.observe(own.clone());
             }
-            Some(web::Site::from_server(server))
+            let site = web::Site::from_server(server);
+            Some(if name == "first.test" || name == "shared.test" {
+                site.at(Ipv4Addr::new(203, 0, 113, 8))
+            } else {
+                site
+            })
         })
+        .ipv4_only()
         .observe_http(observer(shared.clone()))
         .start(&fcx, attachments)?;
         let machine = default_machine(&fcx, &attacher);
         for (name, shared_count, own_count) in [
             ("first.test", 1, 0),
             ("override.test", 1, 1),
-            ("later.test", 2, 1),
+            ("shared.test", 2, 1),
+            ("later.test", 3, 1),
         ] {
             let address = lookup(&fcx, &machine, name).await;
-            let mut client = plain_client(&fcx, &machine, address, false).await;
-            assert_eq!(client.get("http", name, "/").await.status, StatusCode::OK);
+            let (mut client, scheme) = if secure {
+                let tcp = machine
+                    .tcp
+                    .connect(&fcx, SocketAddr::new(address.into(), 443))
+                    .await?;
+                let protocol: &[u8] = if h2 { b"h2" } else { b"http/1.1" };
+                let conn = TlsClient::new(&fcx, tcp, &roots, name, &[protocol], date)?;
+                (Client::new(&fcx, conn, h2).await, "https")
+            } else {
+                (plain_client(&fcx, &machine, address, h2).await, "http")
+            };
+            let response = client.get(scheme, name, "/").await;
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(
+                response.version,
+                if h2 {
+                    Version::HTTP_2
+                } else {
+                    Version::HTTP_11
+                }
+            );
             assert_eq!(shared.load(Ordering::SeqCst), shared_count);
             assert_eq!(overridden.load(Ordering::SeqCst), own_count);
         }
