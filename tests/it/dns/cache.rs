@@ -22,6 +22,8 @@ fn cache() -> Cache {
         max_negative_ttl: Duration::from_secs(3600),
         failure_ttl: Duration::from_secs(5),
         stale: Duration::ZERO,
+        max_entries: usize::MAX,
+        max_bytes: usize::MAX,
     })
 }
 
@@ -584,4 +586,94 @@ fn a_failure_persists_from_when_its_resolution_began() {
     let follows = cache.persisting(&www, at(6));
     cache.insert(at(60), offer(follows));
     assert_eq!(cache.get(&www, at(60)).map(Entry::expires), Some(at(70)));
+}
+
+fn limited(max_entries: usize, max_bytes: usize) -> Cache {
+    Cache::new(Limits {
+        max_ttl: Duration::from_secs(86400),
+        max_negative_ttl: Duration::from_secs(3600),
+        failure_ttl: Duration::from_secs(5),
+        stale: Duration::ZERO,
+        max_entries,
+        max_bytes,
+    })
+}
+
+/// A TXT RRset at `owner` whose one string is 200 octets.
+fn text(owner: &str, ttl: u32) -> RecordSet {
+    rrset(
+        owner,
+        ttl,
+        vec![RData::TXT(TXT::new(vec!["x".repeat(200)]))],
+    )
+}
+
+/// Past its entry limit the cache keeps the entries that live longest.
+#[test]
+fn the_cache_holds_no_more_entries_than_its_limit() {
+    let mut cache = limited(3, usize::MAX);
+    for ttl in [40, 10, 50, 20, 30] {
+        let owner = format!("ttl{ttl}.example.");
+        cache.insert(at(0), positive(rrset(&owner, ttl, vec![a("192.0.2.1")])));
+    }
+    let kept: Vec<String> = cache
+        .entries(at(0))
+        .map(|(key, _)| key.name.to_string())
+        .collect();
+    assert_eq!(kept.len(), 3);
+    for ttl in [30, 40, 50] {
+        assert!(kept.contains(&format!("ttl{ttl}.example.")), "{kept:?}");
+    }
+}
+
+/// Past its byte limit the cache keeps what lives longest and fits.
+#[test]
+fn the_cache_holds_no_more_octets_than_its_limit() {
+    // Each RRset holds a 200-octet string and a few dozen octets more,
+    // so two fit in 500 octets and three do not.
+    let mut cache = limited(usize::MAX, 500);
+    for ttl in [40, 10, 50, 20] {
+        cache.insert(at(0), positive(text(&format!("ttl{ttl}.example."), ttl)));
+    }
+    let kept: Vec<String> = cache
+        .entries(at(0))
+        .map(|(key, _)| key.name.to_string())
+        .collect();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    for ttl in [40, 50] {
+        assert!(kept.contains(&format!("ttl{ttl}.example.")), "{kept:?}");
+    }
+}
+
+/// The records that support an entry count against the byte limit, as
+/// the entry's own do.
+#[test]
+fn an_entry_whose_proof_is_past_the_byte_limit_is_not_kept() {
+    let mut cache = limited(usize::MAX, 500);
+    let small = rrset("www.example.", 60, vec![a("192.0.2.80")]);
+    let proof = (0..3)
+        .map(|index| text(&format!("p{index}.example."), 60))
+        .collect();
+    cache.insert(
+        at(0),
+        Offer::Positive {
+            set: small.clone(),
+            rank: Rank::AuthAnswer,
+            validation: Validation::NotPerformed,
+            proof,
+            truncated: false,
+        },
+    );
+    assert!(
+        cache
+            .get(&key("www.example.", RecordType::A), at(0))
+            .is_none()
+    );
+    // Without the proof it fits.
+    cache.insert(at(0), positive(small));
+    assert!(
+        cache
+            .get(&key("www.example.", RecordType::A), at(0))
+            .is_some()
+    );
 }

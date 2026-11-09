@@ -22,6 +22,7 @@
 //! runs out, and then goes on charged to another tree it does work for,
 //! directly or through the lookups and checks that wait on it.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
@@ -145,14 +146,15 @@ pub(super) enum Outcome {
 impl Outcome {
     /// The RRsets an answer from this outcome carries, with the TTLs they
     /// had when found.
-    pub(super) fn records(&self) -> Vec<&RecordSet> {
-        match self {
-            Outcome::Data { sets, proof, .. } => sets.iter().chain(proof).collect(),
-            Outcome::Alias { cname, proof, .. } => std::iter::once(cname).chain(proof).collect(),
-            Outcome::Negative { soa, denial, .. } => soa.iter().chain(denial).collect(),
-            Outcome::TooLong { dname, .. } => vec![dname],
-            Outcome::Failure(_) => Vec::new(),
-        }
+    pub(super) fn records(&self) -> impl Iterator<Item = &RecordSet> {
+        let (first, rest): (&[RecordSet], &[RecordSet]) = match self {
+            Outcome::Data { sets, proof, .. } => (sets, proof),
+            Outcome::Alias { cname, proof, .. } => (std::slice::from_ref(cname), proof),
+            Outcome::Negative { soa, denial, .. } => (soa.as_slice(), denial),
+            Outcome::TooLong { dname, .. } => (std::slice::from_ref(dname), &[]),
+            Outcome::Failure(_) => (&[], &[]),
+        };
+        first.iter().chain(rest)
     }
 }
 
@@ -990,30 +992,34 @@ impl<V: Verify> Resolver<V> {
         if !self.config.aggressive_nsec {
             return None;
         }
-        let (zone, soa, cached) = self.cache.secure_nsec(&key.name, self.now)?;
+        let nsecs = self.cache.secure_nsec(&key.name, self.now)?;
         let name = Name::from(&key.name);
-        let zone_name = Name::from(zone);
+        let zone_name = Name::from(nsecs.zone);
         // The answer carries the records that prove it, and lives as long
-        // as they do (RFC 8198 §5.4).
-        let (kind, records) = match proof::nxdomain_nsecs(&name, &zone_name, &cached) {
+        // as they do (RFC 8198 §5.4). Only those are copied.
+        let (kind, records) = match proof::nxdomain_nsecs(&name, &zone_name, nsecs.live()) {
             Some(records) => (Negative::NxDomain, records),
             None => (
                 Negative::NoData,
-                proof::nodata_nsecs(&name, key.rtype, &zone_name, &cached)?,
+                proof::nodata_nsecs(&name, key.rtype, &zone_name, nsecs.live())?,
             ),
         };
+        let (soa, soa_ttl) = nsecs.soa();
         let ttl = records
             .iter()
-            .map(RecordSet::ttl)
-            .chain(std::iter::once(soa.ttl()))
+            .map(|nsec| nsecs.ttl_left(nsec))
+            .chain(std::iter::once(soa_ttl))
             .min()
             .unwrap_or(0);
         let outcome = Outcome::Negative {
             kind,
             name,
             qtype: key.rtype,
-            soa: Some(with_ttl(&soa, ttl)),
-            denial: records.iter().map(|set| with_ttl(set, ttl)).collect(),
+            soa: Some(with_ttl(soa, ttl)),
+            denial: records
+                .into_iter()
+                .map(|nsec| with_ttl(nsec.borrow(), ttl))
+                .collect(),
             zone: zone_name,
         };
         let subjects = subjects(&outcome);

@@ -1,15 +1,16 @@
 //! What a resolver remembers between questions: RRsets, negative answers,
 //! and failures, each until its TTL runs out.
 
-use std::collections::BTreeMap;
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use fictionet::stdlib::protocols::dns::EdeCode;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Record, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::time::Instant;
 
-use super::super::exchange::Generation;
 use super::super::zone::negative_ttl;
 
 /// What the cache holds an entry under: an owner name, a type, and a
@@ -155,6 +156,19 @@ impl Entry {
         match self {
             Entry::Positive { rank, .. } | Entry::Negative { rank, .. } => *rank,
             Entry::Failure { .. } => Rank::Glue,
+        }
+    }
+
+    /// The octets of the records the entry holds, by [`octets`].
+    fn bytes(&self) -> usize {
+        match self {
+            Entry::Positive { set, proof, .. } => {
+                octets(set) + proof.iter().map(octets).sum::<usize>()
+            }
+            Entry::Negative { soa, denial, .. } => {
+                octets(soa) + denial.iter().map(octets).sum::<usize>()
+            }
+            Entry::Failure { .. } => 0,
         }
     }
 }
@@ -315,21 +329,77 @@ pub struct Limits {
     /// How long expired data is kept past its TTL for serving stale
     /// (RFC 8767 §4), or zero to keep none.
     pub stale: Duration,
+    /// The most the cache holds at once: entries, each NSEC zone, and
+    /// each NSEC RRset count one.
+    pub max_entries: usize,
+    /// The most octets the cache holds at once: the records of every
+    /// entry, of what an entry was laid over, of the records that support
+    /// it, and of every NSEC zone, each as a message carries it with its
+    /// owner written out uncompressed.
+    pub max_bytes: usize,
 }
 
 /// The longest a failure that persists is kept (RFC 9520 §3.2: up to 5
 /// minutes), unless [`Limits::failure_ttl`] is longer.
 const MAX_FAILURE_TTL: Duration = Duration::from_secs(300);
 
-/// The validated NSEC records of one zone.
+/// The validated NSEC records of one zone, by owner in canonical order.
 #[derive(Clone, Debug)]
 struct SecureNsec {
     soa: RecordSet,
     soa_expires: Instant,
-    sets: BTreeMap<LowerName, (RecordSet, Instant)>,
+    /// The octets of `soa`.
+    soa_bytes: usize,
+    sets: BTreeMap<LowerName, Nsec>,
 }
 
-/// A stored entry and the generation that wrote it.
+/// A validated NSEC RRset and when it stops proving anything.
+#[derive(Clone, Debug)]
+pub(super) struct Nsec {
+    set: RecordSet,
+    expires: Instant,
+    /// The octets of `set`.
+    bytes: usize,
+}
+
+impl Borrow<RecordSet> for Nsec {
+    fn borrow(&self) -> &RecordSet {
+        &self.set
+    }
+}
+
+/// The validated NSEC records of the zone [`Cache::secure_nsec`] found,
+/// borrowed from the cache. Nothing is copied until an answer picks the
+/// records it carries.
+pub(super) struct ZoneNsecs<'a> {
+    /// The zone's apex.
+    pub(super) zone: &'a LowerName,
+    nsec: &'a SecureNsec,
+    now: Instant,
+}
+
+impl<'a> ZoneNsecs<'a> {
+    /// The zone's SOA RRset, and the TTL it has left.
+    pub(super) fn soa(&self) -> (&'a RecordSet, u32) {
+        (&self.nsec.soa, ttl_left(self.nsec.soa_expires, self.now))
+    }
+
+    /// The NSEC RRsets still live, by owner in canonical order.
+    pub(super) fn live(&self) -> impl Iterator<Item = &'a Nsec> + Clone + use<'a> {
+        let now = self.now;
+        self.nsec
+            .sets
+            .values()
+            .filter(move |nsec| now < nsec.expires)
+    }
+
+    /// The TTL `nsec`, one of [`live`](ZoneNsecs::live), has left.
+    pub(super) fn ttl_left(&self, nsec: &Nsec) -> u32 {
+        ttl_left(nsec.expires, self.now)
+    }
+}
+
+/// A stored entry, with what it was laid over.
 #[derive(Clone, Debug)]
 struct Stored {
     entry: Entry,
@@ -343,7 +413,51 @@ struct Stored {
     /// its parent reaches it, so this still finds the zone's servers
     /// (RFC 2181 §5.4.1, RFC 1034 §5.3.3).
     glue: Option<Entry>,
-    generation: Generation,
+    /// The octets of all three.
+    bytes: usize,
+}
+
+impl Stored {
+    fn new(entry: Entry, under: Option<Entry>, glue: Option<Entry>) -> Stored {
+        let bytes = [Some(&entry), under.as_ref(), glue.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(Entry::bytes)
+            .sum();
+        Stored {
+            entry,
+            under,
+            glue,
+            bytes,
+        }
+    }
+
+    /// When it is past any use at all: expired, past the stale window,
+    /// and for a failure, past the time a failure after it would count as
+    /// persisting, and the same for what it was laid over.
+    fn useless_at(&self, stale: Duration) -> Instant {
+        let persists = match self.entry {
+            Entry::Failure { until, lasts, .. } => until + lasts,
+            _ => self.entry.expires(),
+        };
+        let last = [self.under.as_ref(), self.glue.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(Entry::expires)
+            .fold(persists, Instant::max);
+        last + stale
+    }
+}
+
+/// Something the cache holds, in [`Cache::drops`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    /// The entry at a key.
+    Entry(Key),
+    /// An NSEC zone, by apex, with every RRset it holds.
+    Zone(LowerName),
+    /// One NSEC RRset: its zone's apex and its owner.
+    Nsec(LowerName, LowerName),
 }
 
 /// A resolver's cache, by owner name, type, and class.
@@ -385,47 +499,140 @@ struct Stored {
 ///   the entry of the type it answered, and is not kept at all when live
 ///   data or NODATA of higher rank, of any type, at the name or below it
 ///   shows the name exists.
-/// - Every entry records the generation that wrote it, and a new
-///   generation starts empty.
+///
+/// It holds at most [`Limits::max_entries`] things and
+/// [`Limits::max_bytes`] octets. Past either, what is soonest of no use
+/// goes first: data past any use, then live data that expires first.
+/// Data past any use is dropped as time passes, whether or not anything
+/// new arrives ([`expire`](Cache::expire)).
 #[derive(Clone, Debug)]
 pub struct Cache {
     limits: Limits,
-    generation: Generation,
     entries: BTreeMap<Key, Stored>,
     /// Validated NSEC records by zone, for synthesizing negative answers
     /// (RFC 8198).
     nsec: BTreeMap<LowerName, SecureNsec>,
-    /// How many entries there were after the last sweep of dead ones.
-    swept: usize,
+    /// Everything held, each entry, NSEC zone, and NSEC RRset once, by
+    /// when it is past any use, soonest first.
+    drops: BTreeSet<(Instant, Slot)>,
+    /// The octets of everything held.
+    bytes: usize,
 }
 
 impl Cache {
-    /// An empty cache in generation 0.
+    /// An empty cache.
     pub fn new(limits: Limits) -> Cache {
         Cache {
             limits,
-            generation: Generation(0),
             entries: BTreeMap::new(),
             nsec: BTreeMap::new(),
-            swept: 0,
+            drops: BTreeSet::new(),
+            bytes: 0,
         }
     }
 
-    /// The generation the cache serves.
-    pub fn generation(&self) -> Generation {
-        self.generation
-    }
-
-    /// Starts `generation`: nothing of the old one is served again.
-    pub fn advance(&mut self, generation: Generation) {
-        self.generation = generation;
+    /// Forgets everything, as a resolver does when its session changes:
+    /// nothing learned before is served again.
+    pub fn clear(&mut self) {
         self.entries.clear();
         self.nsec.clear();
-        self.swept = 0;
+        self.drops.clear();
+        self.bytes = 0;
+    }
+
+    /// Drops everything past any use at `now`: entries expired, past the
+    /// stale window, and for a failure, past the time a failure after it
+    /// would count as persisting; NSEC records expired, and NSEC zones
+    /// whose SOA expired or that hold no live records. Nothing dropped
+    /// could serve a read at `now` or later.
+    pub fn expire(&mut self, now: Instant) {
+        while let Some((at, _)) = self.drops.first()
+            && *at <= now
+        {
+            self.drop_first();
+        }
+    }
+
+    /// Drops what is soonest of no use until the cache is within its
+    /// limits.
+    fn fit(&mut self) {
+        while self.drops.len() > self.limits.max_entries || self.bytes > self.limits.max_bytes {
+            self.drop_first();
+        }
+    }
+
+    /// Drops what is soonest of no use.
+    fn drop_first(&mut self) {
+        let Some((_, slot)) = self.drops.first().cloned() else {
+            return;
+        };
+        match slot {
+            Slot::Entry(key) => {
+                self.take(&key);
+            }
+            Slot::Zone(zone) => self.drop_zone(&zone),
+            Slot::Nsec(zone, owner) => self.drop_nsec(&zone, &owner),
+        }
+    }
+
+    /// Stores `stored` at `key`, in place of what was there.
+    fn put(&mut self, key: Key, stored: Stored) {
+        self.take(&key);
+        self.bytes += stored.bytes;
+        self.drops.insert((
+            stored.useless_at(self.limits.stale),
+            Slot::Entry(key.clone()),
+        ));
+        self.entries.insert(key, stored);
+    }
+
+    /// Removes what is stored at `key`.
+    fn take(&mut self, key: &Key) -> Option<Stored> {
+        let stored = self.entries.remove(key)?;
+        self.bytes -= stored.bytes;
+        self.drops.remove(&(
+            stored.useless_at(self.limits.stale),
+            Slot::Entry(key.clone()),
+        ));
+        Some(stored)
+    }
+
+    /// Removes the NSEC zone at `apex`, with every RRset it holds.
+    fn drop_zone(&mut self, apex: &LowerName) {
+        let Some(zone) = self.nsec.remove(apex) else {
+            return;
+        };
+        self.bytes -= zone.soa_bytes;
+        self.drops
+            .remove(&(zone.soa_expires, Slot::Zone(apex.clone())));
+        for (owner, nsec) in zone.sets {
+            self.bytes -= nsec.bytes;
+            self.drops
+                .remove(&(nsec.expires, Slot::Nsec(apex.clone(), owner)));
+        }
+    }
+
+    /// Removes the NSEC RRset at `owner` in the zone at `apex`, and the
+    /// zone when that leaves it no records.
+    fn drop_nsec(&mut self, apex: &LowerName, owner: &LowerName) {
+        let Some(zone) = self.nsec.get_mut(apex) else {
+            return;
+        };
+        let Some(nsec) = zone.sets.remove(owner) else {
+            return;
+        };
+        let empty = zone.sets.is_empty();
+        self.bytes -= nsec.bytes;
+        self.drops
+            .remove(&(nsec.expires, Slot::Nsec(apex.clone(), owner.clone())));
+        if empty {
+            self.drop_zone(apex);
+        }
     }
 
     /// Offers `offer` at `now`, under the rules of [`Cache`].
     pub fn insert(&mut self, now: Instant, offer: Offer) {
+        self.expire(now);
         // An NXDOMAIN is kept under type ANY, for every type at the name,
         // and under the type it answered, whose entry it replaces.
         let asked = match &offer {
@@ -495,27 +702,12 @@ impl Cache {
             self.exists(&key, entry.rank(), now);
         }
         if let Some(asked) = asked {
-            let stored = Stored {
-                entry: entry.clone(),
-                under: None,
-                glue: glue(self, &asked),
-                generation: self.generation,
-            };
-            self.entries.insert(asked, stored);
+            let stored = Stored::new(entry.clone(), None, glue(self, &asked));
+            self.put(asked, stored);
         }
         let glue = glue(self, &key);
-        self.entries.insert(
-            key,
-            Stored {
-                entry,
-                under,
-                glue,
-                generation: self.generation,
-            },
-        );
-        if self.entries.len() >= 2 * self.swept.max(64) {
-            self.sweep(now);
-        }
+        self.put(key, Stored::new(entry, under, glue));
+        self.fit();
     }
 
     /// How long the failure cached for `key` lasts, when a resolution of
@@ -564,11 +756,9 @@ impl Cache {
             })
     }
 
-    /// What is stored for `key` in this generation.
+    /// What is stored for `key`.
     fn stored(&self, key: &Key) -> Option<&Stored> {
-        self.entries
-            .get(key)
-            .filter(|stored| stored.generation == self.generation)
+        self.entries.get(key)
     }
 
     /// An entry for `key` that expired at most [`Limits::stale`] before
@@ -579,7 +769,7 @@ impl Cache {
             .filter(|entry| now < entry.expires() + self.limits.stale)
     }
 
-    /// The data stored for `key` in this generation, live or not: the
+    /// The data stored for `key`, live or not: the
     /// entry, or what a failure was laid over.
     fn stored_data(&self, key: &Key) -> Option<&Entry> {
         let stored = self.stored(key)?;
@@ -689,41 +879,38 @@ impl Cache {
         secure_until: Option<Instant>,
         now: Instant,
     ) {
-        let generation = self.generation;
-        let Some(stored) = self.entries.get_mut(key) else {
+        // Taken out and put back, so that a shorter life is indexed.
+        let Some(mut stored) = self.take(key) else {
             return;
         };
-        if stored.generation != generation
-            || now >= stored.entry.expires()
-            || !checked.held_by(&stored.entry)
-        {
-            return;
-        }
-        match &mut stored.entry {
-            Entry::Positive {
-                validation,
-                expires,
-                ..
-            }
-            | Entry::Negative {
-                validation,
-                expires,
-                ..
-            } => {
-                *validation = result;
-                let cap = match result {
-                    Validation::Secure => secure_until,
-                    Validation::Bogus(_) | Validation::Indeterminate => {
-                        Some(now + self.limits.failure_ttl)
-                    }
-                    Validation::Insecure(_) | Validation::NotPerformed => None,
-                };
-                if let Some(cap) = cap {
-                    *expires = (*expires).min(cap);
+        if now < stored.entry.expires() && checked.held_by(&stored.entry) {
+            match &mut stored.entry {
+                Entry::Positive {
+                    validation,
+                    expires,
+                    ..
                 }
+                | Entry::Negative {
+                    validation,
+                    expires,
+                    ..
+                } => {
+                    *validation = result;
+                    let cap = match result {
+                        Validation::Secure => secure_until,
+                        Validation::Bogus(_) | Validation::Indeterminate => {
+                            Some(now + self.limits.failure_ttl)
+                        }
+                        Validation::Insecure(_) | Validation::NotPerformed => None,
+                    };
+                    if let Some(cap) = cap {
+                        *expires = (*expires).min(cap);
+                    }
+                }
+                Entry::Failure { .. } => {}
             }
-            Entry::Failure { .. } => {}
         }
+        self.put(key.clone(), stored);
     }
 
     /// Keeps `nsec`, NSEC RRsets that validated Secure with the zone's
@@ -747,52 +934,65 @@ impl Cache {
             at + seconds(soa.ttl()).min(self.limits.max_negative_ttl),
             soa_until,
         );
-        let entry = self.nsec.entry(zone).or_insert_with(|| SecureNsec {
+        if let Some(old) = self.nsec.get(&zone) {
+            self.bytes -= old.soa_bytes;
+            self.drops
+                .remove(&(old.soa_expires, Slot::Zone(zone.clone())));
+        }
+        let soa_bytes = octets(&soa);
+        self.bytes += soa_bytes;
+        self.drops.insert((soa_expires, Slot::Zone(zone.clone())));
+        let entry = self.nsec.entry(zone.clone()).or_insert_with(|| SecureNsec {
             soa: soa.clone(),
             soa_expires,
+            soa_bytes,
             sets: BTreeMap::new(),
         });
         entry.soa = soa;
         entry.soa_expires = soa_expires;
+        entry.soa_bytes = soa_bytes;
         for (set, until) in nsec {
             let set = normalized(set);
             let expires = capped(
                 at + seconds(set.ttl()).min(self.limits.max_negative_ttl),
                 *until,
             );
-            entry
-                .sets
-                .insert(LowerName::new(set.name()), (set, expires));
+            let owner = LowerName::new(set.name());
+            if let Some(old) = entry.sets.remove(&owner) {
+                self.bytes -= old.bytes;
+                self.drops
+                    .remove(&(old.expires, Slot::Nsec(zone.clone(), owner.clone())));
+            }
+            let bytes = octets(&set);
+            self.bytes += bytes;
+            self.drops
+                .insert((expires, Slot::Nsec(zone.clone(), owner.clone())));
+            entry.sets.insert(
+                owner,
+                Nsec {
+                    set,
+                    expires,
+                    bytes,
+                },
+            );
         }
+        if entry.sets.is_empty() {
+            self.drop_zone(&zone);
+        }
+        self.fit();
     }
 
     /// The deepest zone holding `name` with validated NSEC records live at
-    /// `now`: its apex, its SOA RRset with the TTL left, and those records
-    /// with theirs.
-    pub fn secure_nsec(
-        &self,
-        name: &LowerName,
-        now: Instant,
-    ) -> Option<(&LowerName, RecordSet, Vec<RecordSet>)> {
+    /// `now`, with its SOA RRset, borrowed.
+    pub(super) fn secure_nsec(&self, name: &LowerName, now: Instant) -> Option<ZoneNsecs<'_>> {
         let mut at = name.clone();
         loop {
-            if let Some((zone, entry)) = self.nsec.get_key_value(&at)
-                && now < entry.soa_expires
+            if let Some((zone, nsec)) = self.nsec.get_key_value(&at)
+                && now < nsec.soa_expires
             {
-                let sets: Vec<RecordSet> = entry
-                    .sets
-                    .values()
-                    .filter(|(_, expires)| now < *expires)
-                    .map(|(set, expires)| {
-                        let mut set = set.clone();
-                        set.set_ttl(ttl_left(*expires, now));
-                        set
-                    })
-                    .collect();
-                if !sets.is_empty() {
-                    let mut soa = entry.soa.clone();
-                    soa.set_ttl(ttl_left(entry.soa_expires, now));
-                    return Some((zone, soa, sets));
+                let found = ZoneNsecs { zone, nsec, now };
+                if found.live().next().is_some() {
+                    return Some(found);
                 }
             }
             if at.is_root() {
@@ -818,16 +1018,13 @@ impl Cache {
     pub fn entries(&self, now: Instant) -> impl Iterator<Item = (&Key, &Entry)> {
         self.entries
             .iter()
-            .filter(move |(_, stored)| {
-                stored.generation == self.generation && now < stored.entry.expires()
-            })
+            .filter(move |(_, stored)| now < stored.entry.expires())
             .map(|(key, stored)| (key, &stored.entry))
     }
 
     fn live(&self, key: &Key, now: Instant) -> Option<&Entry> {
         self.entries
             .get(key)
-            .filter(|stored| stored.generation == self.generation)
             .map(|stored| &stored.entry)
             .filter(|entry| now < entry.expires())
     }
@@ -841,7 +1038,6 @@ impl Cache {
             .take_while(|(other, _)| key.name.zone_of(&other.name))
             .any(|(other, stored)| {
                 other.class == key.class
-                    && stored.generation == self.generation
                     && now < stored.entry.expires()
                     && stored.entry.rank() > rank
                     && matches!(
@@ -871,7 +1067,7 @@ impl Cache {
                     .live(&key, now)
                     .is_some_and(|entry| entry.rank() <= rank)
                 {
-                    self.entries.remove(&key);
+                    self.take(&key);
                 }
             }
             if at.is_root() {
@@ -879,33 +1075,6 @@ impl Cache {
             }
             at = at.base_name();
         }
-    }
-
-    /// Drops entries past any use: expired, past the stale window, and
-    /// for a failure, past the time a failure after it would count as
-    /// persisting.
-    fn sweep(&mut self, now: Instant) {
-        let stale = self.limits.stale;
-        let generation = self.generation;
-        self.entries.retain(|_, stored| {
-            let persists = match stored.entry {
-                Entry::Failure { until, lasts, .. } => until + lasts,
-                _ => stored.entry.expires(),
-            };
-            let last = [stored.under.as_ref(), stored.glue.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(Entry::expires)
-                .fold(persists, Instant::max);
-            stored.generation == generation && now < last + stale
-        });
-        // Aggressive denial proofs are usable only with a live SOA and
-        // live NSEC records. They have no stale-serving path.
-        self.nsec.retain(|_, zone| {
-            zone.sets.retain(|_, (_, expires)| now < *expires);
-            now < zone.soa_expires && !zone.sets.is_empty()
-        });
-        self.swept = self.entries.len();
     }
 
     /// The entry an offer makes at `now`, or `None` when it may not be
@@ -1022,6 +1191,23 @@ pub(super) fn seconds(ttl: u32) -> Duration {
     }
 }
 
+/// The octets of `set`, as the cache counts them against
+/// [`Limits::max_bytes`]: every record and RRSIG as a message carries it,
+/// its owner written out without compression. A record that cannot be
+/// written counts its owner and its fixed fields (RFC 1035 §4.1.3).
+fn octets(set: &RecordSet) -> usize {
+    /// TYPE, CLASS, TTL, and RDLENGTH.
+    const FIXED: usize = 10;
+    set.records_without_rrsigs()
+        .chain(set.rrsigs())
+        .map(|record| {
+            record
+                .to_bytes()
+                .map_or(record.name.len() + FIXED, |bytes| bytes.len())
+        })
+        .sum()
+}
+
 /// `set` with its owner and every record's owner in lowercase, every
 /// record at the lowest TTL among them (RFC 2181 §5.2), duplicates
 /// collapsed (RFC 2181 §5), and its RRSIGs kept. The RRSIGs are an RRset
@@ -1062,17 +1248,119 @@ pub(super) fn normalized(set: &RecordSet) -> RecordSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::protocols::dns::rr::Name;
+    use fictionet::stdlib::protocols::dns::rr::rdata::A;
+    use fictionet::stdlib::protocols::dns::rr::{Name, RData};
 
-    #[test]
-    fn sweeping_reclaims_expired_denial_proofs_and_preserves_live_ones() {
-        let mut cache = Cache::new(Limits {
+    fn limits(max_entries: usize) -> Limits {
+        Limits {
             max_ttl: Duration::from_secs(100),
             max_negative_ttl: Duration::from_secs(100),
             failure_ttl: Duration::from_secs(1),
             stale: Duration::from_secs(100),
-        });
-        let at = |seconds| Instant::from_since_start(Duration::from_secs(seconds));
+            max_entries,
+            max_bytes: usize::MAX,
+        }
+    }
+
+    fn at(seconds: u64) -> Instant {
+        Instant::from_since_start(Duration::from_secs(seconds))
+    }
+
+    /// An A RRset at `owner` with one address, its TTL `ttl`.
+    fn address(owner: &str, ttl: u32) -> Offer {
+        let name = Name::from_ascii(owner).unwrap();
+        let mut set = RecordSet::with_ttl(name.clone(), RecordType::A, ttl);
+        set.insert(
+            Record::from_rdata(name, ttl, RData::A(A::new(192, 0, 2, 1))),
+            0,
+        );
+        Offer::Positive {
+            set,
+            rank: Rank::AuthAnswer,
+            validation: Validation::NotPerformed,
+            proof: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    /// An NSEC RRset at `owner` with one record.
+    fn nsec(owner: &str) -> RecordSet {
+        use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC};
+        let name = Name::from_ascii(owner).unwrap();
+        let next = Name::from_ascii(format!("next.{owner}")).unwrap();
+        let rdata = RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(next, [RecordType::A])));
+        let mut set = RecordSet::with_ttl(name.clone(), RecordType::NSEC, 100);
+        set.insert(Record::from_rdata(name, 100, rdata), 0);
+        set
+    }
+
+    #[test]
+    fn expired_entries_are_reclaimed_though_the_cache_stops_growing() {
+        let mut cache = Cache::new(limits(usize::MAX));
+        for index in 0..10 {
+            cache.insert(at(0), address(&format!("host{index}.example."), 1));
+        }
+        // One more entry long after the first ten expired and left the
+        // stale window: they are gone, though the cache did not grow.
+        cache.insert(at(200), address("late.example.", 50));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.drops.len(), 1);
+        // Time alone reclaims the last one.
+        cache.expire(at(400));
+        assert!(cache.entries.is_empty());
+        assert!(cache.drops.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn expired_denial_proofs_are_reclaimed_by_any_insert() {
+        let mut cache = Cache::new(limits(usize::MAX));
+        let soa = RecordSet::with_ttl(Name::from_ascii("example.").unwrap(), RecordType::SOA, 100);
+        cache.add_secure_nsec(&soa, Some(at(1)), &[(nsec("a.example."), None)], at(0));
+        assert!(!cache.nsec.is_empty());
+        cache.insert(at(2), address("host.example.", 50));
+        assert!(cache.nsec.is_empty());
+        assert_eq!(cache.drops.len(), 1);
+    }
+
+    #[test]
+    fn nsec_records_count_against_the_entry_limit_and_the_longest_lived_stay() {
+        let mut cache = Cache::new(limits(4));
+        let soa = RecordSet::with_ttl(Name::from_ascii("example.").unwrap(), RecordType::SOA, 100);
+        let owners: Vec<String> = (0..10).map(|index| format!("n{index}.example.")).collect();
+        let records: Vec<(RecordSet, Option<Instant>)> = owners
+            .iter()
+            .enumerate()
+            .map(|(index, owner)| (nsec(owner), Some(at(10 + index as u64))))
+            .collect();
+        cache.add_secure_nsec(&soa, Some(at(90)), &records, at(0));
+        assert!(cache.drops.len() <= 4);
+        let zone = &cache.nsec[&LowerName::new(soa.name())];
+        let kept: Vec<&LowerName> = zone.sets.keys().collect();
+        assert_eq!(kept.len(), 3);
+        for owner in &owners[7..] {
+            assert!(kept.contains(&&LowerName::new(&Name::from_ascii(owner).unwrap())));
+        }
+        // An entry counts against the same limit.
+        cache.insert(at(0), address("host.example.", 50));
+        assert!(cache.drops.len() <= 4);
+        assert!(
+            cache
+                .get(
+                    &Key::new(
+                        LowerName::new(&Name::from_ascii("host.example.").unwrap()),
+                        RecordType::A,
+                        DNSClass::IN,
+                    ),
+                    at(0),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn expiry_reclaims_expired_denial_proofs_and_preserves_live_ones() {
+        let mut cache = Cache::new(limits(usize::MAX));
         let set =
             |owner: &str, rtype| RecordSet::with_ttl(Name::from_ascii(owner).unwrap(), rtype, 100);
         for (zone, soa_until, proof_until) in [
@@ -1091,17 +1379,17 @@ mod tests {
             );
         }
         let before = cache.nsec.len();
-        cache.sweep(at(2));
+        cache.expire(at(2));
         assert!(cache.nsec.len() < before);
         assert!(!cache.nsec.is_empty());
         for zone in cache.nsec.values() {
             assert!(zone.soa_expires > at(2));
             assert!(!zone.sets.is_empty());
-            assert!(zone.sets.values().all(|(_, expires)| *expires > at(2)));
+            assert!(zone.sets.values().all(|nsec| nsec.expires > at(2)));
         }
         let live = LowerName::new(&Name::from_ascii("live.example.").unwrap());
         assert!(cache.secure_nsec(&live, at(2)).is_some());
-        cache.sweep(at(3));
+        cache.expire(at(3));
         assert!(cache.nsec.is_empty());
         assert!(cache.secure_nsec(&live, at(3)).is_none());
     }
