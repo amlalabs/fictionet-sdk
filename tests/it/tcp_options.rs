@@ -38,6 +38,96 @@ const ACK: u8 = 0x10;
 /// The listener's MPTCP key.
 const KEY: u64 = 0x0123_4567_89ab_cdef;
 
+#[test]
+fn acknowledging_idle_connections_reuses_refresh_storage() {
+    use fictionet::stdlib::layer::{
+        Admit, Chunk, Driver, MessageCommand, MuxCommand, MuxEvent, PacketCommand, PacketEvent,
+    };
+    use fictionet::stdlib::network::packet::{CheckedIpPacket, Origin};
+    use fictionet::stdlib::network::transport::TcpControl;
+    use fictionet::time::Instant;
+    use fictionet::{Seed, SeededEntropy};
+
+    let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
+    let tcp = tcp::TcpLayer::new(
+        ip(SERVER),
+        tcp::Options::default(),
+        &*entropy,
+        Instant::ZERO,
+    );
+    let mut stack = Driver::new(tcp, entropy, Budget::unlimited(), Instant::ZERO);
+    let packet = |port, seq, ack, flags| {
+        PacketEvent::Packet(
+            CheckedIpPacket::checked(
+                Chunk::new(segment(port, seq, ack, flags, &[]).0),
+                Origin::Arrived,
+            )
+            .unwrap(),
+        )
+    };
+    for control in [
+        TcpControl::Listen {
+            port: 80,
+            backlog: None,
+            answer: None,
+        },
+        TcpControl::Accept {
+            port: 80,
+            count: 100,
+        },
+    ] {
+        assert!(matches!(
+            stack.command(MuxCommand::control(MessageCommand::Send(control))),
+            Ok(Admit::Taken)
+        ));
+    }
+    let mut peers = Vec::new();
+    let mut children = Vec::new();
+    for port in 1234..1334 {
+        assert!(matches!(
+            stack.deliver(packet(port, 100, 0, SYN)),
+            Ok(Admit::Taken)
+        ));
+        stack.run().unwrap();
+        let mut ack = None;
+        stack.send_below(|command| {
+            if let PacketCommand::Send(bytes) = command {
+                ack = Some(seq_of(tcp_of(&Packet(bytes.to_vec()))).wrapping_add(1));
+            }
+            Admit::Taken
+        });
+        let ack = ack.unwrap();
+        assert!(matches!(
+            stack.deliver(packet(port, 101, ack, ACK)),
+            Ok(Admit::Taken)
+        ));
+        stack.run().unwrap();
+        stack.send_above(|event| {
+            if let MuxEvent::Opened(child, _, _) = event {
+                children.push(child);
+            }
+            Admit::Taken
+        });
+        peers.push((port, ack));
+    }
+    assert_eq!(children.len(), peers.len());
+    for _ in 0..3 {
+        let packets: Vec<_> = peers
+            .iter()
+            .map(|&(port, ack)| packet(port, 101, ack, ACK))
+            .collect();
+        for packet in packets {
+            assert!(matches!(stack.deliver(packet), Ok(Admit::Taken)));
+        }
+        let (_, allocated) = crate::common::alloc::allocations(|| stack.run().unwrap());
+        assert_eq!(allocated, 0, "observing an idle batch reuses its storage");
+        stack.send_above(|event| {
+            assert!(!matches!(event, MuxEvent::Child(..)));
+            Admit::Taken
+        });
+    }
+}
+
 fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
