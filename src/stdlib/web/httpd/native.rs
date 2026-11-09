@@ -710,8 +710,11 @@ impl Http1 {
             r.wants,
             date_header(self.date, env.now()),
         );
+        // Room for the head and the first piece of a body held in full: a
+        // streamed body has nothing to go with the head yet.
+        let first = body.full_len().min(PIECE);
         let Some(bound) = head_bound(&parts, &policy)
-            .and_then(|n| n.checked_add(PIECE + 2 * size_of::<usize>() + 4))
+            .and_then(|n| n.checked_add(first + 2 * size_of::<usize>() + 4))
         else {
             return self.over_budget(env);
         };
@@ -1180,6 +1183,9 @@ impl Job for Work {
                 };
                 *making = None;
                 let made = made.and_then(|mut response| {
+                    // A body all there now goes out with the head, without
+                    // work of its own.
+                    response.body_mut().settle(cx);
                     let charge =
                         normalize_body(response.body_mut(), &self.budget).ok_or_else(|| {
                             Error::msg("the response body exceeds the connection budget")
