@@ -71,7 +71,9 @@ use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, protocol};
 use fictionet::time::Instant;
 
 mod factory;
+mod framed;
 pub use factory::{Factory, Opening, Stack};
+pub use framed::{FrameError, Framed};
 
 /// Which network a packet belongs to: the world's own, or the network
 /// inside one tunnel.

@@ -40,6 +40,7 @@ mod listen;
 mod mail_codec;
 mod media_codec;
 mod messaging_codec;
+mod packet_composition;
 mod packets;
 mod protocol_primitives;
 mod resp_codec;

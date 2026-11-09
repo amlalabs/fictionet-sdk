@@ -504,3 +504,82 @@ fn a_tls_connection_that_only_writes_finishes_while_its_client_sends() {
     })
     .unwrap();
 }
+
+#[test]
+fn ip_tcp_tls_and_http_run_in_the_pure_packet_harness() {
+    use fictionet::stdlib::layer::{
+        Admit, ByteStream, Chunk, Env, Layer, StreamCommand, StreamEvent, Top,
+    };
+    use fictionet::stdlib::services::stack::Boxed;
+    use std::convert::Infallible;
+    use std::sync::Mutex;
+
+    struct Client {
+        tls: rustls::ClientConnection,
+        response: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Layer for Client {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = std::io::Error;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Self::Error> {
+            if let StreamEvent::Data(bytes) = event {
+                self.response
+                    .lock()
+                    .unwrap()
+                    .extend(decrypt(&mut self.tls, &bytes));
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Self::Error> {
+            match command {}
+        }
+        fn take_command(&mut self) -> Option<StreamCommand> {
+            let bytes = ciphertext(&mut self.tls);
+            (!bytes.is_empty()).then(|| StreamCommand::Write(Chunk::new(bytes)))
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    block_on(lab(Seed::from_u64(31), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let response = received.clone();
+        crate::packet_composition::exchange(
+            move || Boxed::new(https(config.clone(), handler())),
+            move || {
+                let mut tls = client(client_config.clone());
+                tls.writer()
+                    .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+                    .unwrap();
+                Boxed::new(Client {
+                    tls,
+                    response: response.clone(),
+                })
+            },
+            || received.lock().unwrap().ends_with(&page()),
+        );
+        let response = received.lock().unwrap();
+        let (head, body) = split_response(&response);
+        assert!(head.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(body, page());
+        Ok(())
+    }))
+    .unwrap();
+}

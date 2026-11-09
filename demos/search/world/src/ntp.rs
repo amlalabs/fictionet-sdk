@@ -291,6 +291,7 @@ mod tests {
             let mut socket = client.udp.bind(0)?;
             let to = SocketAddr::new(SERVER.into(), ntp::PORT);
             for second in [1_000, 1_064] {
+                socket.send_to(b"", to);
                 let asked = Timestamp::from_unix(second, 0);
                 socket.send_to(&Packet::client_request(asked).to_bytes()?, to);
                 let (bytes, from) = socket.recv(&fcx).await?;
