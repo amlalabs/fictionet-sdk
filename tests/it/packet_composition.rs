@@ -492,10 +492,56 @@ fn unchanged_application_runs_through_live_tcp_and_a_live_packet_tunnel() {
 
 #[test]
 fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
+    use fictionet::Interface;
     use fictionet::stdlib::network::ConnectionExt;
     use fictionet::stdlib::world::net::Net;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TimedDatagrams {
+        at: Instant,
+        fired: Arc<Mutex<Option<Instant>>>,
+    }
+    impl Layer for TimedDatagrams {
+        type Lower = Datagrams<SocketAddr>;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: DatagramEvent<SocketAddr>,
+        ) -> Result<Admit<DatagramEvent<SocketAddr>>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<(), Infallible> {
+            *self.fired.lock().unwrap() = Some(env.now());
+            Ok(())
+        }
+        fn deadline(&self) -> Option<(Instant, ())> {
+            self.fired
+                .lock()
+                .unwrap()
+                .is_none()
+                .then_some((self.at, ()))
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+        fn take_command(&mut self) -> Option<DatagramCommand<SocketAddr>> {
+            None
+        }
+    }
 
     struct Gate {
         at: Instant,
@@ -570,6 +616,8 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
             )
         });
         let address = Ipv4Addr::new(192, 0, 2, 1);
+        let application_at = cx.now() + Duration::from_millis(1);
+        let fired = Arc::new(Mutex::new(None));
         let (attach, attachments) = fictionet::attachments();
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()
@@ -577,13 +625,27 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
                 host.at(address)
                     .ip_factory(factory)
                     .tcp_stack(1234, |_| Echo::stack())
+                    .udp_stack(1234, Budget::new(64 * 1024), {
+                        let fired = fired.clone();
+                        move |_| TimedDatagrams {
+                            at: application_at,
+                            fired: fired.clone(),
+                        }
+                    })
             })
             .start(&cx, attachments)?;
-        let client = fictionet_test_support::sandbox::machine(
-            &cx,
-            attach.attach("client")?,
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let mut wire = attach.attach("client")?;
+        // Fill the host's reply queue while its IP layer refuses output.
+        // A held echo request must not hide the UDP application's deadline.
+        for sequence in 0..256 {
+            let mut request = Vec::new();
+            etherparse::PacketBuilder::ipv4([10, 0, 0, 2], address.octets(), 64)
+                .icmpv4_echo_request(1, sequence)
+                .write(&mut request, b"timer")?;
+            wire.send(fictionet::Packet(request));
+        }
+        let client =
+            fictionet_test_support::sandbox::machine(&cx, wire, Ipv4Addr::new(10, 0, 0, 2));
         let began = cx.now();
         let mut stream = client
             .tcp
@@ -599,6 +661,7 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         assert_eq!(&greeting, b"hello\n");
         assert!(blocked.load(Ordering::SeqCst));
         assert!(cx.now() >= began + delay);
+        assert_eq!(*fired.lock().unwrap(), Some(application_at));
         Ok(())
     });
 }

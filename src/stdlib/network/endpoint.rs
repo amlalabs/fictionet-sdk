@@ -52,7 +52,7 @@ pub(crate) async fn drive(
                 }
                 moved = true;
             }
-            ip.run().map_err(|e| fictionet::Error::msg(e.to_string()))?;
+            moved |= ip.run().map_err(|e| fictionet::Error::msg(e.to_string()))?;
             jobs.take(&mut ip);
             moved |= jobs
                 .poll(Some(&fcx), cx, |done| ip.complete(done))
@@ -78,14 +78,14 @@ pub(crate) async fn drive(
                 Admit::Taken
             });
             if let Some(packet) = held.take() {
-                moved = true;
+                let mut accepted = true;
                 match packet.transport() {
                     Transport::Tcp => {
                         if let Some(tcp) = &mut tcp
                             && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
                         {
                             held = Some(packet);
-                            moved = false;
+                            accepted = false;
                             transport = true;
                         }
                     }
@@ -96,7 +96,8 @@ pub(crate) async fn drive(
                     }
                     _ if outgoing.len() >= 128 => {
                         held = Some(packet);
-                        moved = false;
+                        accepted = false;
+                        transport = true;
                     }
                     _ => {
                         if let Some((addr, options)) = &ping
@@ -107,6 +108,7 @@ pub(crate) async fn drive(
                         }
                     }
                 }
+                moved |= accepted;
             }
             if held.is_none() && raw.is_none() && !closed {
                 match interface.poll_recv(&fcx, cx) {
