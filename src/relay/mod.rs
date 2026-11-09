@@ -16,4 +16,5 @@ mod wire;
 pub use wire::*;
 
 /// Unix `SOCK_SEQPACKET` sockets: the local transport.
+#[allow(unsafe_code, reason = "Unix sequenced packet socket system calls")]
 pub mod unix;

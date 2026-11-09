@@ -2558,6 +2558,14 @@ fn initial_sequence_numbers_tell_nothing_of_other_connections() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn mappings_reject_lengths_that_cannot_form_slices() {
+    for buffer in [0, isize::MAX as usize, usize::MAX] {
+        assert!(Pages::map(buffer).is_none());
+    }
+}
+
+#[test]
 fn options_set_the_buffers_of_every_connection() {
     assert_eq!(Options::default().buffer(1).buffer, MIN_BUFFER);
     assert_eq!(Options::default().buffer(usize::MAX).buffer, MAX_BUFFER);

@@ -26,3 +26,9 @@ libc = "0.2"
 default = ["raw-virtio"]
 raw-ethernet = ["fictionet-host/raw-ethernet"]
 raw-virtio = ["raw-ethernet", "fictionet-host/virtio-net"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -1326,15 +1326,18 @@ fn answer_hello(sock: &Path, answer: Vec<u8>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // Close-on-exec, so a child process that another test starts does not
         // keep the connection open.
-        // SAFETY: accept on the listener this thread owns.
-        let conn = unsafe {
-            OwnedFd::from_raw_fd(libc::accept4(
+        // SAFETY: the listener stays open; null address pointers request no peer address.
+        let fd = unsafe {
+            libc::accept4(
                 listener.as_raw_fd(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 libc::SOCK_CLOEXEC,
-            ))
+            )
         };
+        assert!(fd >= 0, "accept: {}", std::io::Error::last_os_error());
+        // SAFETY: accept4 succeeded and its fresh descriptor is transferred once.
+        let conn = unsafe { OwnedFd::from_raw_fd(fd) };
         fictionet::relay::unix::raise_buffers(conn.as_raw_fd());
         let mut buf = vec![0u8; fictionet::relay::MAX_MESSAGE];
         fictionet::relay::unix::recv(conn.as_raw_fd(), &mut buf, false).unwrap();

@@ -469,10 +469,12 @@ impl Netlink {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: socket returned a fresh descriptor, transferred exactly once.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         // SAFETY: an all-zero sockaddr_nl is valid and means "the kernel picks".
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: addr is initialized and the length matches its allocation.
         let r = unsafe {
             libc::bind(
                 fd.as_raw_fd(),
@@ -490,6 +492,7 @@ impl Netlink {
         // SAFETY: an all-zero sockaddr_nl with the family set addresses the kernel.
         let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: msg and kernel remain readable for their supplied lengths.
         let n = unsafe {
             libc::sendto(
                 self.fd.as_raw_fd(),

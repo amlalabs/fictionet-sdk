@@ -51,3 +51,9 @@ vhost-user-backend = "0.24"
 virtio-queue = "0.18"
 vm-memory = { version = "0.18", features = ["backend-mmap", "backend-atomic"] }
 vmm-sys-util = "0.15"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

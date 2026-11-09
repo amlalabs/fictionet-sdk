@@ -33,8 +33,8 @@ mod relay_benches {
             .counter(ItemsCount::new(n))
             .with_inputs(|| {
                 let mut fds = [0; 2];
-                // SAFETY: socketpair fills two descriptors, owned from here.
                 assert_eq!(
+                    // SAFETY: fds is writable for both returned descriptors.
                     unsafe {
                         libc::socketpair(
                             libc::AF_UNIX,
@@ -45,6 +45,7 @@ mod relay_benches {
                     },
                     0
                 );
+                // SAFETY: socketpair succeeded; each fresh descriptor is owned once.
                 let (a, b) =
                     unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
                 let reader = std::thread::spawn(move || {

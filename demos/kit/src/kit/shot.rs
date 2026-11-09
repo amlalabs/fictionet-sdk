@@ -3,7 +3,7 @@
 use fictionet::stdlib::codec::base64;
 use serde_json::{Value, json};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -333,18 +333,19 @@ impl Drop for AppWindow {
 /// fd 4. Both are first copied above 4, so neither is overwritten by the
 /// other, and a pipe that is already fd 3 or 4 loses its close-on-exec flag
 /// too, as `dup2` onto a different fd does.
-fn devtools_pipe(command: &mut Command, commands: RawFd, replies: RawFd) {
+/// Keep both descriptors open until spawning the command so their numbers
+/// cannot be reused. This function does not take their ownership.
+pub fn devtools_pipe(command: &mut Command, commands: RawFd, replies: RawFd) {
     // SAFETY: fcntl and dup2 are async-signal-safe; the fds are plain i32s
     // copied into the closure before the fork.
     unsafe {
         command.pre_exec(move || {
             let commands = libc::fcntl(commands, libc::F_DUPFD_CLOEXEC, 5);
+            if commands < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             let replies = libc::fcntl(replies, libc::F_DUPFD_CLOEXEC, 5);
-            if commands < 0
-                || replies < 0
-                || libc::dup2(commands, 3) < 0
-                || libc::dup2(replies, 4) < 0
-            {
+            if replies < 0 || libc::dup2(commands, 3) < 0 || libc::dup2(replies, 4) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -445,13 +446,9 @@ fn string_field(value: &Value, name: &str) -> io::Result<String> {
 
 /// A close-on-exec pipe, as (read, write).
 fn pipe() -> Option<(OwnedFd, OwnedFd)> {
-    let mut fds = [0 as RawFd; 2];
-    // SAFETY: fds is a valid two-int array.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-        return None;
-    }
-    // SAFETY: pipe2 returned two fresh, owned fds.
-    unsafe { Some((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))) }
+    std::io::pipe()
+        .ok()
+        .map(|(read, write)| (read.into(), write.into()))
 }
 
 /// Writes all the bytes, then a NUL terminator, to a DevTools pipe.

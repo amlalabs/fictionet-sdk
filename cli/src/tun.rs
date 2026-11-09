@@ -257,8 +257,7 @@ fn relay_packets(tun: RawFd, sock: RawFd) -> Result<Stats, Failure> {
                 revents: 0,
             },
         ];
-        // SAFETY: `fds` is valid for the call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        let r = crate::linux::poll(&mut fds, -1);
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -269,8 +268,7 @@ fn relay_packets(tun: RawFd, sock: RawFd) -> Result<Stats, Failure> {
 
         if fds[1].revents != 0
             && !world::read_packets(sock, &mut from_world, Some(BATCH), |p| {
-                // SAFETY: `p` is valid for reads of its length.
-                let w = unsafe { libc::write(tun, p.as_ptr().cast(), p.len()) };
+                let w = crate::linux::write(tun, p);
                 if w < 0 {
                     // A full queue drops the packet. So does a packet
                     // the kernel will not take (EINVAL: not IPv4 or
@@ -288,8 +286,7 @@ fn relay_packets(tun: RawFd, sock: RawFd) -> Result<Stats, Failure> {
         }
         if fds[0].revents & libc::POLLIN != 0 {
             for _ in 0..BATCH {
-                // SAFETY: `from_tun` is valid for writes of its length.
-                let n = unsafe { libc::read(tun, from_tun.as_mut_ptr().cast(), from_tun.len()) };
+                let n = crate::linux::read(tun, &mut from_tun);
                 if n < 0 {
                     let e = io::Error::last_os_error();
                     match e.kind() {

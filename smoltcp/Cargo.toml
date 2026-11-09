@@ -11,6 +11,7 @@ publish = false
 autoexamples = false
 
 [lints.rust]
+unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [dependencies]

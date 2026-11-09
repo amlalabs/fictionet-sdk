@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! The Search world's DNS, TLS, web pages and search engines.
 //!
 //! [`World`] joins public hostnames to certificates and an HTTP handler.

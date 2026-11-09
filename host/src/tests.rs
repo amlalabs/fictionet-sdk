@@ -131,6 +131,7 @@ fn upstream(
 
 /// A listener whose accept queue is full, so that connecting to it hangs:
 /// Linux drops a SYN that would overflow the queue.
+#[allow(unsafe_code, reason = "the test requires a zero length listen queue")]
 fn unanswered() -> (TcpListener, TcpStream, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     // SAFETY: listen takes no pointers; this only shortens the queue.

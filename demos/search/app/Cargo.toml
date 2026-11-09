@@ -23,3 +23,6 @@ url = { version = "2", features = ["serde"] }
 [[bin]]
 name = "search"
 path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

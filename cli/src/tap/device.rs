@@ -69,9 +69,7 @@ fn open_tap(vm_dev: &str) -> Result<(OwnedFd, String), Failure> {
     let mut ifr = [0u8; 40];
     ifr[..want.len()].copy_from_slice(want.as_bytes());
     ifr[16..18].copy_from_slice(&(IFF_TAP | linux::IFF_NO_PI).to_ne_bytes());
-    // SAFETY: `ifr` is as large as struct ifreq.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), linux::TUNSETIFF as _, ifr.as_mut_ptr()) } < 0 {
-        let e = io::Error::last_os_error();
+    if let Err(e) = linux::set_tun_interface(&fd, &mut ifr) {
         return Err(Failure::Error(format!(
             "creating the TAP device {want} (does attach have CAP_NET_ADMIN?): {e}"
         )));
@@ -213,6 +211,7 @@ fn lock_device(name: &str, index: u32) -> Result<OwnedFd, Failure> {
     if fd < 0 {
         return Err(err("making the device lock")(io::Error::last_os_error()));
     }
+    // SAFETY: socket succeeded and ownership of its fresh descriptor is transferred once.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let id = format!("attach-tap/{index}");
     // SAFETY: an all-zero sockaddr_un is valid.

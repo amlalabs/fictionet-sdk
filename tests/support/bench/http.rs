@@ -30,6 +30,8 @@ pub fn socket_path(tag: &str) -> std::path::PathBuf {
 }
 
 /// CPU time this process has used, user and system, in microseconds.
+// Process CPU accounting has no standard library equivalent.
+#[allow(unsafe_code)]
 fn cpu_us() -> u64 {
     let mut r = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage fills the struct it is given.

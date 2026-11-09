@@ -997,6 +997,8 @@ fn redact(value: &mut Value) {
 }
 
 #[cfg(test)]
+// Storage failure tests set resource limits in dedicated child processes.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -1361,6 +1363,7 @@ mod tests {
             rlim_cur: 0,
             rlim_max: 0,
         };
+        // SAFETY: rlimit storage is initialized and valid for each call.
         // This process is a dedicated test child. Limit and signal disposition
         // cannot affect other tests, the supervisor, or host network state.
         unsafe {
@@ -1375,6 +1378,7 @@ mod tests {
         assert!(files.put(b"{\"two\":22222}\n").is_err());
         assert_eq!(files.file.metadata().unwrap().len(), before);
         assert_eq!(files.size, before);
+        // SAFETY: original contains the initialized limit returned by getrlimit.
         unsafe {
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &original), 0);
         }

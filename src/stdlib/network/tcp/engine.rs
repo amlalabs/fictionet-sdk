@@ -542,13 +542,21 @@ pub(super) struct Pages {
 // SAFETY: `Pages` owns its mapping; the raw pointer is only an address.
 // Every access goes through the layer that owns it.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(unsafe_code, reason = "the owned mapping can move with its socket")]
 unsafe impl Send for Pages {}
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(
+    unsafe_code,
+    reason = "anonymous mapping ownership and buffer reclamation"
+)]
 impl Pages {
     /// Maps two buffers of `buffer` bytes, or `None` if the system says no.
     fn map(buffer: usize) -> Option<Pages> {
-        let len = 2 * buffer;
+        let len = buffer.checked_mul(2)?;
+        if len == 0 || len > isize::MAX as usize {
+            return None;
+        }
         // SAFETY: a fresh private anonymous mapping; no existing memory is
         // touched.
         let ptr = unsafe {
@@ -562,6 +570,11 @@ impl Pages {
             )
         };
         if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        if ptr.is_null() {
+            // SAFETY: mmap succeeded, but Rust slices cannot use a null address.
+            unsafe { libc::munmap(ptr, len) };
             return None;
         }
         // A huge page can span adjacent socket mappings and make a quiet
@@ -580,12 +593,12 @@ impl Pages {
 
     /// The receive and send halves.
     ///
-    /// SAFETY: the caller hands each half to exactly one socket, and
-    /// removes that socket before the `Pages` is dropped.
+    /// SAFETY: call only once for this mapping. The caller hands each half
+    /// to exactly one socket and removes it before dropping the `Pages`.
     unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
+        let half = self.len / 2;
         // SAFETY: the mapping is `len` bytes, readable and writable, and
         // the two halves do not overlap.
-        let half = self.len / 2;
         unsafe {
             (
                 std::slice::from_raw_parts_mut(self.ptr, half),
@@ -622,6 +635,7 @@ impl Pages {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(unsafe_code, reason = "release the owned anonymous mapping")]
 impl Drop for Pages {
     fn drop(&mut self) {
         // SAFETY: this unmaps exactly the mapping made in `map`, after the
@@ -636,6 +650,7 @@ impl Drop for Pages {
 pub(super) enum Pages {}
 
 #[cfg(target_arch = "wasm32")]
+#[allow(unsafe_code, reason = "matches the unreachable host mapping interface")]
 impl Pages {
     fn map(_buffer: usize) -> Option<Pages> {
         None
@@ -653,6 +668,10 @@ impl Pages {
 }
 
 /// A socket with two buffers of `buffer` bytes.
+#[allow(
+    unsafe_code,
+    reason = "lend mapped buffers to the socket until removal"
+)]
 pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Pages>) {
     let pages = Pages::map(buffer);
     let mut s = match &pages {
@@ -821,6 +840,7 @@ impl TcpLayer {
 
     /// Gives back the pages of every noted socket whose buffers are now
     /// empty. Sockets that still hold data stay noted.
+    #[allow(unsafe_code, reason = "reclaim empty mapped socket buffers")]
     pub(super) fn release_quiet(&mut self) {
         let dirty: Vec<Id> = self.dirty.iter().copied().collect();
         for h in dirty {

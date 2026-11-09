@@ -171,6 +171,7 @@ pub(crate) fn listen_with_ops(
     let listener = bind(&path)?;
     // SAFETY: plain syscalls; each fd is owned from here.
     let epoll = unsafe { OwnedFd::from_raw_fd(cvt(libc::epoll_create1(libc::EPOLL_CLOEXEC))?) };
+    // SAFETY: eventfd returns a fresh descriptor, checked before taking ownership.
     let wake_fd = unsafe {
         OwnedFd::from_raw_fd(cvt(libc::eventfd(
             0,

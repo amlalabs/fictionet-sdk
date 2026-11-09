@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Host tooling for demo images and offline web captures, and the
 //! verification of Fictionet's DNS, MPTCP and layer routing.
 
@@ -7,6 +9,8 @@ mod image;
 mod layer_verify;
 mod mptcp_verify;
 mod rawnic;
+// This module owns the host syscall boundary.
+#[allow(unsafe_code)]
 mod ssh_connect;
 mod web;
 mod workstation;

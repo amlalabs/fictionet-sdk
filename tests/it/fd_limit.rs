@@ -42,11 +42,16 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(
+        // SAFETY: limit is initialized writable storage for the complete output.
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
     let low = libc::rlimit {
         rlim_cur: 256.min(limit.rlim_max),
         rlim_max: limit.rlim_max,
     };
+    // SAFETY: low is an initialized rlimit; this test runs in its own child process.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
     let null = std::fs::File::open("/dev/null").unwrap();
     let mut filler: Vec<OwnedFd> = Vec::new();
@@ -62,7 +67,8 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     let used = threads::ticks(&stats)[0].1 - before;
 
     drop(filler);
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    // SAFETY: limit is the initialized value returned by getrlimit.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
     // Clock ticks are usually 10 ms: a spinning thread uses about 100.
     assert!(
         used < 20,
@@ -104,6 +110,7 @@ fn reconnects_reclaim_pending_sockets_without_world_polling() {
         rlim_max: 0,
     };
     assert_eq!(
+        // SAFETY: limit is writable for one complete rlimit.
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
         0
     );
@@ -111,10 +118,12 @@ fn reconnects_reclaim_pending_sockets_without_world_polling() {
         rlim_cur: 64.min(limit.rlim_cur),
         rlim_max: limit.rlim_max,
     };
+    // SAFETY: low is an initialized rlimit; this test runs in its own child process.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
     struct RestoreLimit(libc::rlimit);
     impl Drop for RestoreLimit {
         fn drop(&mut self) {
+            // SAFETY: self owns the initialized saved limit.
             assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
         }
     }
@@ -171,6 +180,7 @@ fn reconnects_reclaim_pending_sockets_without_world_polling() {
             // unread socket can report either EOF or a connection reset.
             unix::send(agent.as_raw_fd(), &Message::Packet(&[42]).encode(), false).unwrap();
             assert_eq!(
+                // SAFETY: agent owns a live socket and shutdown takes no pointers.
                 unsafe { libc::shutdown(agent.as_raw_fd(), libc::SHUT_WR) },
                 0
             );

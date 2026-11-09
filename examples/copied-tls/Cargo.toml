@@ -16,3 +16,6 @@ fictionet-test-support = { path = "../../tests/support" }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
+
+[lints.rust]
+unsafe_code = "forbid"

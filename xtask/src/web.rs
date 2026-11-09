@@ -17,14 +17,8 @@ pub enum Step {
 }
 
 fn space(path: &Path, additional: u64) -> Result {
-    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // The path is NUL terminated and statvfs initializes the output on success.
-    if unsafe { libc::statvfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let stats = unsafe { stats.assume_init() };
-    if stats.f_bavail * stats.f_frsize < RESERVE + additional {
+    let available = fictionet_host::filesystem::available_space(path)?;
+    if available < RESERVE + additional {
         return Err("offline web preparation must leave at least 60 GiB free".into());
     }
     Ok(())

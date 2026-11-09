@@ -9,7 +9,7 @@ use fictionet_test_support::{Done, ended_with_done, pattern};
 use std::future::poll_fn;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -35,6 +35,7 @@ impl Interface for Tun {
         self.rx.poll_recv(fcx, cx)
     }
     fn send(&mut self, packet: Packet) {
+        // SAFETY: packet owns all bytes passed to write and the descriptor stays open.
         unsafe {
             libc::write(
                 self.fd.as_raw_fd(),
@@ -46,17 +47,17 @@ impl Interface for Tun {
 }
 
 fn open_tun(name: &str) -> Tun {
-    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
-    assert!(
-        fd >= 0,
-        "open /dev/net/tun: {}",
-        std::io::Error::last_os_error()
-    );
-    let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")
+        .expect("open /dev/net/tun");
+    let fd = Arc::new(OwnedFd::from(file));
     let mut req = [0u8; 40];
     req[..name.len()].copy_from_slice(name.as_bytes());
     let flags = (libc::IFF_TUN | libc::IFF_NO_PI) as u16;
     req[16..18].copy_from_slice(&flags.to_ne_bytes());
+    // SAFETY: req is an initialized complete ifreq buffer for TUNSETIFF.
     let r = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, req.as_mut_ptr()) };
     assert!(
         r >= 0,
@@ -68,6 +69,7 @@ fn open_tun(name: &str) -> Tun {
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         loop {
+            // SAFETY: buf is writable for its length and reader keeps the fd open.
             let n = unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 return;

@@ -59,8 +59,7 @@ impl Link {
     /// tokio runtime; starts the writer task there.
     pub(crate) fn new(sock: OwnedFd) -> io::Result<Link> {
         let shared = Arc::new(Shared {
-            // SAFETY: the `OwnedFd` is open, and the `AsyncFd` owns it, so
-            // it stays open and keeps the same descriptor until dropped.
+            // SAFETY: the owned descriptor stays open with a stable number until deregistration.
             fd: unsafe { AsyncFd::register(sock)? },
             queue: Mutex::new(PacketQueue::default()),
             queued: Notify::new(),

@@ -12,6 +12,8 @@
 //! platform: the sandbox may reach attach's port and nothing else.
 
 mod http;
+// This module owns the host syscall boundary.
+#[allow(unsafe_code)]
 mod link;
 mod pump;
 mod socks5;

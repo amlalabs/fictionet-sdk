@@ -164,7 +164,8 @@ pub(crate) fn exit_on_signals(ready_file: Option<&std::path::Path>) {
         unsafe { libc::_exit(128 + sig) };
     }
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        // SAFETY: installs a handler that only calls _exit.
+        // SAFETY: the handler uses only initialized immutable storage, atomic
+        // loads and async-signal-safe syscalls, and exits without unwinding.
         unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
     }
 }

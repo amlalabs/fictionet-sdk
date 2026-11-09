@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Helpers shared by the tests and benchmarks of the SDK and the command,
 //! and by the example worlds' tests.
 

@@ -275,20 +275,11 @@ where
         .stderr(Stdio::null());
     // Separate pipes keep Chromium's command and reply I/O flags independent.
     // The browser has no IP network; host requests go through interception.
-    // SAFETY: only async-signal-safe descriptor operations run after fork.
-    unsafe {
-        command.pre_exec(move || {
-            let input = libc::fcntl(input_descriptor, libc::F_DUPFD_CLOEXEC, 5);
-            if input < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let output = libc::fcntl(output_descriptor, libc::F_DUPFD_CLOEXEC, 5);
-            if output < 0 || libc::dup2(input, 3) < 0 || libc::dup2(output, 4) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    fictionet_demo::kit::shot::devtools_pipe(
+        command.as_std_mut(),
+        input_descriptor,
+        output_descriptor,
+    );
     let mut browser = command.spawn()?;
     drop(commands);
     drop(replies);

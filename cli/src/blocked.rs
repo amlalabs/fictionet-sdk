@@ -103,6 +103,8 @@ fn classify(e: &std::io::Error) -> Outcome {
     }
 }
 
+// Creating an unconnected TCP socket distinguishes host limits from network policy.
+#[allow(unsafe_code)]
 fn probe(a: SocketAddr, start: Instant, deadline: Duration) -> Outcome {
     // A socket that cannot even be made says nothing about the network.
     let family = if a.is_ipv4() {

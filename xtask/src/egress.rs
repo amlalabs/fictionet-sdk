@@ -327,17 +327,16 @@ pub(super) fn prepare_tun(peer: Ipv4Addr) -> fictionet::Result<fictionet_host::t
         request.ifr_name[..6].copy_from_slice(&[
             b'e' as i8, b'g' as i8, b'r' as i8, b'e' as i8, b's' as i8, b's' as i8,
         ]);
-        let socket = libc::sockaddr_in {
-            sin_family: libc::AF_INET as u16,
-            sin_port: 0,
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes(address.octets()),
-            },
-            sin_zero: [0; 8],
+        let mut data = [0; 14];
+        // sockaddr stores the IPv4 port in the first two data bytes, then
+        // the four address bytes, followed by eight zero padding bytes.
+        for (byte, octet) in data[2..6].iter_mut().zip(address.octets()) {
+            *byte = octet as libc::c_char;
+        }
+        request.ifr_ifru.ifru_addr = libc::sockaddr {
+            sa_family: libc::AF_INET as libc::sa_family_t,
+            sa_data: data,
         };
-        // SAFETY: sockaddr and sockaddr_in have the same size on this Linux guest.
-        request.ifr_ifru.ifru_addr =
-            unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(socket) };
         // SAFETY: the control descriptor is live and request is a complete mutable ifreq.
         if unsafe { libc::ioctl(control.as_raw_fd(), operation, &mut request) } < 0 {
             return Err(io::Error::last_os_error().into());

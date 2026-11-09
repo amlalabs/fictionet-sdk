@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! The `fictionet` command. Its subcommands: `attach`, with the types
 //! `tun`, `tap`, `http_proxy` and `socks5`; `ready`, a probe for attach's ready
 //! file; `wait-blocked`, which waits until a pod's NetworkPolicy blocks its
@@ -18,8 +20,14 @@
 mod args;
 mod blocked;
 mod config;
+// Signal cleanup requires async-signal-safe syscalls.
+#[allow(unsafe_code)]
 mod lifecycle;
+// Linux device and descriptor operations live behind this safe boundary.
+#[allow(unsafe_code)]
 mod linux;
+// Route netlink sockets have no standard library transport.
+#[allow(unsafe_code)]
 mod netlink;
 mod proxy;
 mod tap;
