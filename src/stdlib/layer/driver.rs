@@ -67,33 +67,47 @@ impl<E> Observations<E> {
     }
 }
 
+impl<E> Observations<E> {
+    /// Makes room for one more kept report: doubles the slots up to the
+    /// limit, or adds one when the budget has no room to double. Whatever
+    /// the event itself retains is already charged, so growth never takes
+    /// the room it needs. Nothing changes when no slot fits.
+    fn grow(&mut self) -> bool {
+        let len = self.kept.len();
+        if len < self.kept.capacity() {
+            return true;
+        }
+        let slot = std::mem::size_of::<(E, Charge)>();
+        let doubled = len.saturating_mul(2).max(1).min(self.limit);
+        let reserved = [doubled, len + 1].into_iter().find(|&slots| {
+            let Some(wanted) = slots.checked_mul(slot) else {
+                return false;
+            };
+            match &mut self.storage {
+                Some(charge) => charge.set(wanted),
+                None => {
+                    self.storage = self.budget.charge(wanted);
+                    self.storage.is_some()
+                }
+            }
+        });
+        let Some(slots) = reserved else {
+            return false;
+        };
+        self.kept.reserve_exact(slots - len);
+        true
+    }
+}
+
 impl<E> Observe<E> for Observations<E> {
     fn observe(&mut self, event: E) {
-        let bytes = (self.heap_bytes)(&event);
-        let room = self.kept.len() < self.limit;
-        if room && let Some(bytes) = bytes {
-            if self.kept.len() == self.kept.capacity() {
-                let capacity = self
-                    .limit
-                    .min(self.budget.limit() / std::mem::size_of::<(E, Charge)>().max(1));
-                let wanted = capacity.saturating_mul(std::mem::size_of::<(E, Charge)>());
-                let reserved = match &mut self.storage {
-                    Some(charge) => charge.set(wanted),
-                    None => {
-                        self.storage = self.budget.charge(wanted);
-                        self.storage.is_some()
-                    }
-                };
-                if !reserved || capacity <= self.kept.len() {
-                    self.omitted = self.omitted.saturating_add(1);
-                    return;
-                }
-                self.kept.reserve_exact(capacity - self.kept.len());
-            }
-            if let Some(charge) = self.budget.charge(bytes) {
-                self.kept.push_back((event, charge));
-                return;
-            }
+        if self.kept.len() < self.limit
+            && let Some(bytes) = (self.heap_bytes)(&event)
+            && let Some(charge) = self.budget.charge(bytes)
+            && self.grow()
+        {
+            self.kept.push_back((event, charge));
+            return;
         }
         self.omitted = self.omitted.saturating_add(1);
     }
@@ -402,6 +416,23 @@ mod tests {
             Some((Instant::ZERO, ()))
         }
     }
+
+    #[test]
+    fn retention_leaves_room_for_the_event_before_growing() {
+        let slot = std::mem::size_of::<(Vec<u8>, Charge)>();
+        let mut reports = Observations::bounded(16, slot * 2, |v: &Vec<u8>| Some(v.capacity()));
+        reports.observe(vec![0; slot]);
+        assert_eq!(reports.iter().count(), 1);
+        assert_eq!(reports.omitted(), 0);
+        let used = reports.used();
+        reports.observe(vec![0; slot * 2]);
+        assert_eq!(reports.used(), used);
+        assert_eq!(reports.omitted(), 1);
+        drop(reports.drain().collect::<Vec<_>>());
+        reports.observe(vec![0; slot]);
+        assert_eq!(reports.iter().count(), 1);
+    }
+
     #[test]
     fn report_retention_counts_backing_capacity_and_omits_unknown_sizes() {
         let mut reports = Observations::bounded(2, 512, |bytes: &Vec<u8>| Some(bytes.capacity()));
