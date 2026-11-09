@@ -42,6 +42,7 @@ pub(crate) async fn drive(
         // pass: a wake, a packet for them, or a pass that left work or
         // filled the output queue.
         let mut dirty = true;
+        let mut drained = false;
         for turn in 0..64 {
             let mut moved = false;
             let mut more = false;
@@ -122,7 +123,12 @@ pub(crate) async fn drive(
                 }
                 moved |= accepted;
             }
-            if held.is_none() && raw.is_none() && !closed {
+            // Once the interface had nothing, it holds this task's waker
+            // and wakes it for the next packet, so it is not asked again in
+            // this poll.
+            if drained {
+                transport = true;
+            } else if held.is_none() && raw.is_none() && !closed {
                 match interface.poll_recv(&fcx, cx) {
                     Poll::Ready(Ok(packet)) => {
                         moved = true;
@@ -136,7 +142,10 @@ pub(crate) async fn drive(
                         closed = true;
                         raw = Some(PacketEvent::Ended);
                     }
-                    Poll::Pending => transport = true,
+                    Poll::Pending => {
+                        transport = true;
+                        drained = true;
+                    }
                 }
             }
             if let Some(event) = raw.take() {
