@@ -1475,6 +1475,9 @@ impl Http2 {
             ExchangeCommand::Head(head) if matches!(response.reply, Reply::Waiting) => {
                 self.response_head(env, id, *head);
             }
+            // Empty data frames nothing and spends no credit: it is not
+            // queued, so every queued chunk has bytes to send.
+            ExchangeCommand::Data(chunk) if body && chunk.is_empty() => {}
             ExchangeCommand::Data(chunk) if body && chunk.len() as u64 <= response.credit_bytes => {
                 let len = chunk.len() as u64;
                 if response.queue.push_back(chunk).is_err() {
@@ -1611,15 +1614,16 @@ impl Http2 {
         };
         let response = &mut stream.response;
         if let Some(front) = response.queue.front_mut() {
-            let n = sendable(front.len(), window, response.window, frame);
-            if n == 0 {
+            if response.window <= 0 {
                 // A stream window that opens schedules the stream again.
-                return if response.window > 0 {
-                    Sent::AwaitingWindow
-                } else {
-                    Sent::Nothing
-                };
+                return Sent::Nothing;
             }
+            if window <= 0 {
+                return Sent::AwaitingWindow;
+            }
+            // Both windows are open and the front has bytes (empty data is
+            // never queued), so the frame carries at least one.
+            let n = sendable(front.len(), window, response.window, frame);
             let payload = front.split_to(n);
             if front.is_empty() {
                 response.queue.pop_front();
@@ -3486,6 +3490,66 @@ mod tests {
                 "{output:?}"
             );
         }
+    }
+
+    /// A server whose streams each send `commands` once the request ends.
+    fn sending(
+        server: Http2,
+        commands: impl Fn() -> Vec<ExchangeCommand> + Send + 'static,
+    ) -> Harness<impl Layer<Lower = ByteStream, Error: std::fmt::Debug>> {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let server = Chain::new(
+            server,
+            Children::new(16, Http2::WINDOW, move |_, _, _| {
+                Some(Picky {
+                    stuck: false,
+                    body: Vec::new(),
+                    piece: 1,
+                    out: commands().into(),
+                })
+            }),
+        );
+        Harness::new(fictionet::Seed::from_u64(9), server)
+    }
+
+    fn head(end: bool) -> ExchangeCommand {
+        ExchangeCommand::Head(Box::new(ResponseHead {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            end,
+        }))
+    }
+
+    #[test]
+    fn an_empty_body_chunk_holds_up_nothing_behind_it() {
+        let mut harness = sending(Http2::new(Limits::default()), || {
+            vec![
+                head(false),
+                ExchangeCommand::Data(Chunk::new(Vec::new())),
+                ExchangeCommand::Data(Chunk::new(BODY.to_vec())),
+                ExchangeCommand::End,
+            ]
+        });
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        let output = frames(&harness.take_output());
+        let sent: Vec<u8> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 1 => Some(d.data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(sent, BODY);
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Data(d) if d.stream == 1 && d.flags & 1 != 0)),
+            "the stream ends: {output:?}"
+        );
     }
 
     /// The `Date` fields of the response heads on `stream` in `output`.
