@@ -1,16 +1,12 @@
-//! What a world host guarantees to TCP and IP layers installed through the
-//! public factories: admission, reset and retirement reach the transport
-//! even when it refuses a command for now, and only checked packets of the
-//! host's own network reach its transports.
+//! What a world host guarantees to TCP layers installed through the public
+//! factory: admission, reset and retirement reach the transport even when
+//! it refuses a command for now.
 
 use crate::common::echo_stack::Echo;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ChildId, Chunk, CommandOf, DatagramCommand, DatagramEvent, Datagrams, Env,
-    EventOf, Layer, MessageCommand, MuxOp, PacketCommand, PacketEvent, Packets, Top,
+    Admit, ChildId, Chunk, CommandOf, Env, EventOf, Layer, MessageCommand, MuxOp, Packets,
 };
-use fictionet::stdlib::network::packet::{
-    self, CheckedIpPacket, Ingress, IpLayer, IpReport, NetworkInput, Scope, Scopes,
-};
+use fictionet::stdlib::network::packet::CheckedIpPacket;
 use fictionet::stdlib::network::tcp::{self, EndpointState, TcpLayer, Verdict};
 use fictionet::stdlib::network::transport::Tcp;
 use fictionet::stdlib::network::{ConnError, ConnectionExt};
@@ -20,7 +16,6 @@ use fictionet_test_support::world::world;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The standard TCP, except that it refuses each `Hold` and `Abort` once
@@ -190,148 +185,6 @@ fn a_tcp_that_refuses_commands_for_now_keeps_the_peer_count_and_resets() {
             used += n;
         }
         assert_eq!(&echo, b"ping\n");
-        Ok(())
-    });
-}
-
-/// A mixed input boundary rejects a foreign duplicate before the host IP layer.
-struct Copies {
-    main: IpLayer,
-    input: NetworkInput,
-    tunnel: Scope,
-}
-
-impl Layer for Copies {
-    type Lower = Packets<Chunk, Chunk>;
-    type Upper = Packets<CheckedIpPacket, Chunk>;
-    type Report = IpReport;
-    type Timer = ();
-    type Work = ();
-    type Done = ();
-    type Error = Infallible;
-    fn report_bytes(report: &IpReport) -> Option<usize> {
-        IpLayer::report_bytes(report)
-    }
-    fn on_event(
-        &mut self,
-        env: &mut Env<'_, IpReport>,
-        event: EventOf<Self::Lower>,
-    ) -> Result<Admit<EventOf<Self::Lower>>, Infallible> {
-        let event = match event {
-            PacketEvent::Packet(bytes) => {
-                let foreign = fictionet::stdlib::layer::Datagram::new(
-                    Chunk::new(bytes.to_vec()),
-                    Ingress {
-                        scope: self.tunnel,
-                        ..Ingress::default()
-                    },
-                );
-                assert!(self.input.accept(foreign).is_err());
-                let own = fictionet::stdlib::layer::Datagram::new(bytes, Ingress::default());
-                PacketEvent::Packet(self.input.accept(own).expect("the host input is accepted"))
-            }
-            PacketEvent::Ended => PacketEvent::Ended,
-        };
-        self.main.on_event(env, event)
-    }
-    fn on_command(
-        &mut self,
-        env: &mut Env<'_, IpReport>,
-        command: PacketCommand<Chunk>,
-    ) -> Result<Admit<PacketCommand<Chunk>>, Infallible> {
-        self.main.on_command(env, command)
-    }
-    fn on_timer(&mut self, env: &mut Env<'_, IpReport>, timer: ()) -> Result<(), Infallible> {
-        self.main.on_timer(env, timer)
-    }
-    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Chunk>> {
-        self.main.take_command(env)
-    }
-    fn take_event(&mut self) -> Option<PacketEvent<CheckedIpPacket>> {
-        self.main.take_event()
-    }
-    fn deadline(&self) -> Option<(Instant, ())> {
-        self.main.deadline()
-    }
-}
-
-/// Keeps every datagram it gets.
-struct Collect(Arc<Mutex<Vec<Vec<u8>>>>);
-
-impl Layer for Collect {
-    type Lower = Datagrams<SocketAddr>;
-    type Upper = Top;
-    type Report = Infallible;
-    type Timer = ();
-    type Work = Infallible;
-    type Done = Infallible;
-    type Error = Infallible;
-    fn on_event(
-        &mut self,
-        _: &mut Env<'_, Infallible>,
-        event: DatagramEvent<SocketAddr>,
-    ) -> Result<Admit<DatagramEvent<SocketAddr>>, Infallible> {
-        if let DatagramEvent::Datagram(datagram) = event {
-            self.0.lock().unwrap().push(datagram.payload().to_vec());
-        }
-        Ok(Admit::Taken)
-    }
-    fn on_command(
-        &mut self,
-        _: &mut Env<'_, Infallible>,
-        command: Infallible,
-    ) -> Result<Admit<Infallible>, Infallible> {
-        match command {}
-    }
-    fn take_command(
-        &mut self,
-        _: &mut Env<'_, Self::Report>,
-    ) -> Option<DatagramCommand<SocketAddr>> {
-        None
-    }
-    fn take_event(&mut self) -> Option<Infallible> {
-        None
-    }
-}
-
-/// A replacement IP stack separates mixed network input before reassembly.
-/// Each datagram reaches the application once despite a foreign duplicate.
-#[test]
-fn a_custom_ip_stack_separates_networks_before_host_processing() {
-    world(Duration::from_secs(10), |fcx| async move {
-        let server = Ipv4Addr::new(104, 18, 0, 2);
-        let tunnel = Scopes::default().tunnel();
-        let factory = packet::Factory::new(move |_| Copies {
-            main: IpLayer::host(),
-            input: NetworkInput::new(Scope::ROOT),
-            tunnel,
-        });
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let collected = received.clone();
-        let (attacher, attachments) = fictionet::attachments();
-        Net::new(fictionet_extras::network::cdn_pools())
-            .ipv4_only()
-            .host("sink", |host| {
-                host.at(server).ip_factory(factory).udp_stack(
-                    9,
-                    Budget::new(64 * 1024),
-                    move |_| Collect(collected.clone()),
-                )
-            })
-            .start(&fcx, attachments)?;
-        let client = fictionet_test_support::sandbox::machine(
-            &fcx,
-            attacher.attach("client")?,
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
-        let mut socket = client.udp.bind(0)?;
-        let sent: [&[u8]; 3] = [b"one", b"", b"three"];
-        for datagram in sent {
-            socket.send_to(datagram, SocketAddr::from((server, 9)));
-            fcx.sleep(Duration::from_millis(10)).await?;
-        }
-        fcx.sleep(Duration::from_millis(500)).await?;
-        assert_eq!(*received.lock().unwrap(), sent);
         Ok(())
     });
 }

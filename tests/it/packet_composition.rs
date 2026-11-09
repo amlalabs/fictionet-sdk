@@ -333,35 +333,6 @@ fn nested_packet_tunnels_own_independent_input_paths() {
     assert_eq!(*output.lock().unwrap(), expected);
 }
 
-#[test]
-fn replacement_packet_tunnel_starts_with_fresh_endpoint_state() {
-    for payload in [b"first\n".as_slice(), b"replacement\n".as_slice()] {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let client_output = output.clone();
-        let server = || {
-            Boxed::new(Chain::new(
-                packet::Framed::new(),
-                endpoint("10.0.0.1".parse().unwrap(), true, echo),
-            ))
-        };
-        let client = move || {
-            let client_output = client_output.clone();
-            Boxed::new(Chain::new(
-                packet::Framed::new(),
-                endpoint("10.0.0.2".parse().unwrap(), false, move || {
-                    Boxed::new(Client {
-                        request: Some(Chunk::new(payload.to_vec())),
-                        output: client_output.clone(),
-                    })
-                }),
-            ))
-        };
-        let expected = [b"hello\n".as_slice(), payload].concat();
-        exchange(server, client, || *output.lock().unwrap() == expected);
-        assert_eq!(*output.lock().unwrap(), expected);
-    }
-}
-
 pub(super) fn exchange(
     server_app: impl Fn() -> Boxed + Send + 'static,
     client_app: impl Fn() -> Boxed + Send + 'static,

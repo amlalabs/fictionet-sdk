@@ -170,6 +170,9 @@ fn a_bound_socket_gets_each_datagram_whole_with_its_peer() {
     assert_eq!(seen(up(&mut d)), expected);
 }
 
+/// A packet whose IPv4 header checksum is wrong, and a good one labelled
+/// with a tunnel's network on input that carries both networks, reach no
+/// socket, though each carries a good UDP datagram for the bound port.
 #[test]
 fn malformed_and_foreign_host_packets_reach_no_socket() {
     let mut d = stack(Budget::unlimited());
@@ -178,18 +181,20 @@ fn malformed_and_foreign_host_packets_reach_no_socket() {
     let mut bad_header = datagram(peer, bound.local, b"observed");
     bad_header[10] ^= 1;
     arrive(&mut d, bad_header);
-    assert!(seen(up(&mut d)).is_empty());
     let input = NetworkInput::new(Scope::ROOT);
-    let foreign = Datagram::new(
-        Chunk::new(datagram(peer, bound.local, b"tunnel")),
-        Ingress {
-            scope: Scopes::default().tunnel(),
-            ..Ingress::default()
-        },
-    );
-    assert!(input.accept(foreign).is_err());
-    assert!(seen(up(&mut d)).is_empty());
-    arrive(&mut d, datagram(peer, bound.local, b"mine"));
+    let tunnel = Scopes::default().tunnel();
+    for (scope, payload) in [(tunnel, &b"tunnel"[..]), (Scope::ROOT, b"mine")] {
+        let labelled = Datagram::new(
+            Chunk::new(datagram(peer, bound.local, payload)),
+            Ingress {
+                scope,
+                ..Ingress::default()
+            },
+        );
+        if let Ok(raw) = input.accept(labelled) {
+            arrive(&mut d, raw.into_vec());
+        }
+    }
     assert!(matches!(d.command(child.grant(4)), Ok(Admit::Taken)));
     d.run().unwrap();
     assert_eq!(
