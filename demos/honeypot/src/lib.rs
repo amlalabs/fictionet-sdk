@@ -223,7 +223,6 @@ pub struct Honeypot {
     network: NetHandle,
     address: Ipv4Addr,
     address_v6: Option<Ipv6Addr>,
-    tokens: Arc<Tokens>,
     observer: Arc<Mutex<Observer>>,
 }
 
@@ -242,11 +241,6 @@ impl Honeypot {
         };
         self.network.add_host(host)?;
         Ok(())
-    }
-
-    /// How many open connections negotiated MPTCP.
-    pub fn mptcp_connections(&self) -> usize {
-        self.tokens.len()
     }
 
     /// How many source addresses the observer holds burst state for.
@@ -275,7 +269,6 @@ pub fn start(
         network: network.handle(),
         address: config.address,
         address_v6: config.address_v6,
-        tokens: tokens.clone(),
         observer: observer.clone(),
     };
     let (attacher, inner) = fictionet::attachments();

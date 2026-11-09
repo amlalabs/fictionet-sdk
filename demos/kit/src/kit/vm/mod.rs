@@ -135,17 +135,6 @@ impl Vm {
         })
     }
 
-    /// The VM child's peak resident memory, in MiB.
-    pub fn peak_rss_mib(&self) -> Option<u64> {
-        let pid = self.pid()?;
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("VmHWM:"))
-            .and_then(|v| v.trim().trim_end_matches(" kB").parse::<u64>().ok())
-            .map(|kb| kb >> 10)
-    }
-
     /// The last lines Cloud Hypervisor wrote to its stderr, for an error.
     pub fn ch_stderr_tail(&self) -> String {
         let log = std::fs::read_to_string(&self.stderr_log).unwrap_or_default();

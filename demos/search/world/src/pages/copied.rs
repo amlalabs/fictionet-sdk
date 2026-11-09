@@ -568,11 +568,6 @@ impl Pages {
         Ok(pages)
     }
 
-    /// The day the newest page Copied serves was copied.
-    pub fn copied_date(&self) -> Option<time::Date> {
-        Some(self.copied.as_ref()?.newest()?.date())
-    }
-
     /// How far Copied's clock is behind the host's: as many whole days as
     /// have passed since the newest page was copied, so the guest's clock
     /// and the sites' dates are on that page's day. It is fixed for each
@@ -590,15 +585,6 @@ impl Pages {
         let now = time::OffsetDateTime::now_utc();
         let seconds = (now - corpus.newest()?).whole_days() * 86_400;
         (seconds > 0).then(|| std::time::Duration::from_secs(seconds as u64))
-    }
-
-    /// The world's day as the active source shows it now, the day of the
-    /// guest's clock and of every answer's date: the host's day, or in
-    /// Copied mode the day [`copied_lag`](Self::copied_lag) behind it.
-    pub fn world_date(&self) -> String {
-        time::OffsetDateTime::from(self.session_now())
-            .date()
-            .to_string()
     }
 
     /// The time now on the session's clock: the host's, or in Copied mode

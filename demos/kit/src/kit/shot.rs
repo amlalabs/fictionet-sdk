@@ -31,19 +31,6 @@ pub fn canvas_painted(canvas: &str) -> String {
     )
 }
 
-/// The named host's workspace screen is visible, its status card is hidden,
-/// and its noVNC canvas contains at least sixteen colors.
-pub fn desktop_painted(host: &str) -> String {
-    let host = json!(host);
-    canvas_painted(&format!(
-        r#"(() => {{
-        const tile = [...document.querySelectorAll('.workspace-tile')].find(t => t.getAttribute('aria-label') === {host})
-            || document.querySelector('.demo-app .app-stage[data-kind="screen"]');
-        return tile?.querySelector('.console-card')?.hidden ? tile.querySelector('.screen-display canvas') : null;
-    }})()"#
-    ))
-}
-
 /// One page action and optional capture after a readiness condition.
 #[derive(Default)]
 pub struct Step<'a> {
