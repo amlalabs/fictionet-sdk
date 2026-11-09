@@ -54,6 +54,7 @@ web-proxy = []
 page = ["tokio", "dep:axum", "dep:serde", "dep:tokio-stream"]
 
 [lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
 # `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`;
 # `cargo kani` with `--cfg kani`, which adds the proofs in `verification/`.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(kani)"] }
@@ -175,3 +176,6 @@ required-features = ["web-proxy", "tokio"]
 [[test]]
 name = "mptcp_vectors"
 test = false
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

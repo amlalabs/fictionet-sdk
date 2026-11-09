@@ -307,6 +307,7 @@
 //! native HTTP/2 server keeps time.
 
 #![warn(missing_docs)]
+#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 #![cfg_attr(
     not(all(feature = "tokio", feature = "web-proxy")),
     allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
@@ -329,6 +330,7 @@ pub mod fuzzing;
 pub mod guide;
 mod interface;
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(unsafe_code, reason = "Linux listener and readiness system calls")]
 mod listen;
 mod packet_queue;
 #[cfg(not(target_arch = "wasm32"))]
@@ -338,6 +340,7 @@ pub use entropy::{Entropy, Seed, SeededEntropy};
 mod run;
 pub mod stdlib;
 pub mod sync;
+#[allow(unsafe_code, reason = "operating system entropy")]
 mod sys;
 pub mod time;
 mod timer;

@@ -184,6 +184,10 @@ mod tests {
     /// deadline: world code that measured a later time would see time run
     /// backwards.
     #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the regression requires intercepting a waker clone"
+    )]
     fn a_lab_clock_never_moves_back_for_a_deadline_set_from_another_thread() {
         use fictionet::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,6 +210,7 @@ mod tests {
         unsafe fn clone(data: *const ()) -> RawWaker {
             // SAFETY: `data` came from `Arc::into_raw` of a `Gate`.
             unsafe { Arc::increment_strong_count(data.cast::<Gate>()) };
+            // SAFETY: this waker still owns a count of the same live Gate.
             let gate = unsafe { &*data.cast::<Gate>() };
             if gate.hold.swap(false, Ordering::SeqCst) {
                 gate.entered.send(()).unwrap();
@@ -214,7 +219,9 @@ mod tests {
             RawWaker::new(data, &VTABLE)
         }
         unsafe fn wake(data: *const ()) {
+            // SAFETY: wake consumes this waker's count after borrowing it.
             unsafe { wake_by_ref(data) };
+            // SAFETY: this is the one count consumed by wake.
             unsafe { release(data) };
         }
         unsafe fn wake_by_ref(data: *const ()) {

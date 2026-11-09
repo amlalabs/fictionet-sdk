@@ -62,6 +62,7 @@ unsafe impl GlobalAlloc for RefusingAllocator {
         let ptr = if refuses(layout.size()) {
             std::ptr::null_mut()
         } else {
+            // SAFETY: GlobalAlloc callers supply a valid nonzero layout.
             unsafe { System.alloc(layout) }
         };
         record(
@@ -77,6 +78,7 @@ unsafe impl GlobalAlloc for RefusingAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         record(None, -(layout.size() as i128));
+        // SAFETY: ptr and layout are the live System allocation supplied by the caller.
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -85,6 +87,7 @@ unsafe impl GlobalAlloc for RefusingAllocator {
         let next = if refuses(size) {
             std::ptr::null_mut()
         } else {
+            // SAFETY: the caller guarantees a live allocation, matching layout and valid new size.
             unsafe { System.realloc(ptr, layout, size) }
         };
         record(

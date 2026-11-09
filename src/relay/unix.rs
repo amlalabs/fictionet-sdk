@@ -103,6 +103,7 @@ pub(crate) fn socket(nonblocking: bool) -> io::Result<OwnedFd> {
     }
     // SAFETY: plain syscall; the fd is owned from here.
     let fd = cvt(unsafe { libc::socket(libc::AF_UNIX, ty, 0) })?;
+    // SAFETY: socket returned a fresh descriptor and cvt checked for failure.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -132,6 +133,7 @@ pub fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
     } else {
         flags & !libc::O_NONBLOCK
     };
+    // SAFETY: F_SETFL takes an integer flag value and does not transfer ownership.
     cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) })?;
     Ok(())
 }
