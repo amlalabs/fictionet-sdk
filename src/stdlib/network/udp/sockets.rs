@@ -9,9 +9,9 @@ use fictionet::stdlib::layer::{
     EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
     PacketEvent, Packets, Slots,
 };
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::icmp;
 use fictionet::stdlib::network::ip::{self, Fields, protocol};
-use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::packet::{IpPacket, Scope, Sort};
 use fictionet::stdlib::network::transport::{Request, Udp, UdpBound, UdpControl, UdpNotice};
 

@@ -3236,12 +3236,8 @@ mod layer {
         };
         let packets = [
             IpPacket::observed(Chunk::new(syn.clone()), in_tunnel),
-            IpPacket::checked(
-                Chunk::new(syn.clone()),
-                Ingress::default(),
-                Origin::Arrived,
-            )
-            .unwrap(),
+            IpPacket::checked(Chunk::new(syn.clone()), Ingress::default(), Origin::Arrived)
+                .unwrap(),
             IpPacket::checked(Chunk::new(syn.clone()), in_tunnel, Origin::Arrived).unwrap(),
         ];
         assert_eq!(packets[0].sort(), Sort::Transport(Transport::Tcp));

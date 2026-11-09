@@ -148,10 +148,7 @@ fn encoded_len_without_the_ipv4_header() {
     let len: usize = kani::any();
     let v4: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
     if encoded_len(v4, v4, len).is_err() {
-        assert!(
-            len > 65_535 - 8,
-            "only a datagram past 16 bits is refused"
-        );
+        assert!(len > 65_535 - 8, "only a datagram past 16 bits is refused");
     }
 }
 
