@@ -138,6 +138,25 @@ struct Mapping {
     pointer: NonNull<u8>,
     length: usize,
 }
+
+macro_rules! mapping_access {
+    ($integer:ty, $read:ident, $write:ident) => {
+        fn $read(&self, offset: usize) -> $integer {
+            let pointer = self.address(offset, size_of::<$integer>(), align_of::<$integer>());
+            // SAFETY: address checks the live mapping's bounds and alignment.
+            // Every bit pattern is valid for this integer, including device data.
+            unsafe { pointer.cast::<$integer>().read_volatile() }
+        }
+
+        fn $write(&self, offset: usize, value: $integer) {
+            let pointer = self.address(offset, size_of::<$integer>(), align_of::<$integer>());
+            // SAFETY: address checks the live mapping's bounds and alignment.
+            // Volatile writes preserve the register's required access width.
+            unsafe { pointer.cast::<$integer>().write_volatile(value) }
+        }
+    };
+}
+
 impl Mapping {
     fn new(fd: RawFd, offset: u64, length: usize, anonymous: bool) -> io::Result<Self> {
         let offset =
@@ -161,34 +180,34 @@ impl Mapping {
         if pointer == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self {
-            pointer: NonNull::new(pointer.cast()).ok_or_else(|| invalid("null mapping"))?,
-            length,
-        })
+        let Some(pointer) = NonNull::new(pointer.cast()) else {
+            // SAFETY: mmap succeeded, but this owner requires a non-null address.
+            unsafe { libc::munmap(pointer, length) };
+            return Err(invalid("null mapping"));
+        };
+        Ok(Self { pointer, length })
     }
-    fn read<T: Copy>(&self, offset: usize) -> T {
-        assert!(offset + size_of::<T>() <= self.length);
-        assert!(offset.is_multiple_of(align_of::<T>()));
-        // SAFETY: The mapping bounds and alignment were checked above.
-        unsafe {
-            self.pointer
-                .as_ptr()
-                .add(offset)
-                .cast::<T>()
-                .read_volatile()
-        }
+
+    fn address(&self, offset: usize, width: usize, alignment: usize) -> *mut u8 {
+        assert!(
+            offset
+                .checked_add(width)
+                .is_some_and(|end| end <= self.length)
+        );
+        let pointer = self.pointer.as_ptr().wrapping_add(offset);
+        assert!(pointer.addr().is_multiple_of(alignment));
+        pointer
     }
-    fn write<T: Copy>(&self, offset: usize, value: T) {
-        assert!(offset + size_of::<T>() <= self.length);
-        assert!(offset.is_multiple_of(align_of::<T>()));
-        // SAFETY: The mapping bounds and alignment were checked above.
-        unsafe {
-            self.pointer
-                .as_ptr()
-                .add(offset)
-                .cast::<T>()
-                .write_volatile(value)
-        }
+
+    mapping_access!(u8, read_u8, write_u8);
+    mapping_access!(u16, read_u16, write_u16);
+    mapping_access!(u32, read_u32, write_u32);
+
+    fn write_u64(&self, offset: usize, value: u64) {
+        let pointer = self.address(offset, size_of::<u64>(), align_of::<u64>());
+        // SAFETY: address checks the live mapping's bounds and alignment.
+        // Volatile writes preserve the register's required access width.
+        unsafe { pointer.cast::<u64>().write_volatile(value) }
     }
 }
 impl Drop for Mapping {
@@ -236,17 +255,17 @@ impl Queue {
         }
     }
     fn publish(&mut self, dma: &Mapping, id: u16) {
-        dma.write(
+        dma.write_u16(
             self.avail + 4 + usize::from(self.next_avail % self.size) * 2,
             id.to_le(),
         );
         fence(Ordering::Release);
         self.next_avail = self.next_avail.wrapping_add(1);
-        dma.write(self.avail + 2, self.next_avail.to_le());
+        dma.write_u16(self.avail + 2, self.next_avail.to_le());
         fence(Ordering::SeqCst);
     }
     fn completion(&mut self, dma: &Mapping) -> io::Result<Option<(u16, usize)>> {
-        let produced = u16::from_le(dma.read(self.used + 2));
+        let produced = u16::from_le(dma.read_u16(self.used + 2));
         let pending = produced.wrapping_sub(self.next_used);
         if pending == 0 {
             return Ok(None);
@@ -256,8 +275,8 @@ impl Queue {
         }
         fence(Ordering::Acquire);
         let slot = self.used + 4 + usize::from(self.next_used % self.size) * 8;
-        let id = u32::from_le(dma.read(slot));
-        let length = u32::from_le(dma.read(slot + 4)) as usize;
+        let id = u32::from_le(dma.read_u32(slot));
+        let length = u32::from_le(dma.read_u32(slot + 4)) as usize;
         if id >= u32::from(self.size) || !self.busy[id as usize] {
             return Err(invalid("invalid used descriptor"));
         }
@@ -289,6 +308,24 @@ pub struct VirtioNet {
 // SAFETY: The driver exclusively owns its mappings and queue state. All device
 // access is serialized through its mutable API, and mappings are thread neutral.
 unsafe impl Send for VirtioNet {}
+
+macro_rules! common_read {
+    ($integer:ty, $name:ident, $read:ident) => {
+        fn $name(&self, offset: usize) -> $integer {
+            let (bar, offset) = self.common_register(offset);
+            bar.$read(offset)
+        }
+    };
+}
+
+macro_rules! common_write {
+    ($integer:ty, $name:ident, $write:ident) => {
+        fn $name(&self, offset: usize, value: $integer) {
+            let (bar, offset) = self.common_register(offset);
+            bar.$write(offset, value);
+        }
+    };
+}
 
 impl VirtioNet {
     /// Open a domain-qualified PCI address, such as `0000:00:03.0`.
@@ -424,30 +461,31 @@ impl VirtioNet {
             tx: Queue::new(1, DMA_SIZE / 2, 0),
             mac: [0; 6],
         };
-        driver.common_write(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_RESET);
-        if driver.common_read::<u8>(VIRTIO_PCI_COMMON_STATUS) != VIRTIO_CONFIG_S_RESET {
+        driver.common_write_u8(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_RESET);
+        if driver.common_read_u8(VIRTIO_PCI_COMMON_STATUS) != VIRTIO_CONFIG_S_RESET {
             return Err(invalid("virtio reset did not complete"));
         }
-        driver.common_write(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_ACKNOWLEDGE);
-        driver.common_write(VIRTIO_PCI_COMMON_STATUS, DRIVER_STARTED);
-        driver.common_write(VIRTIO_PCI_COMMON_DFSELECT, 1u32.to_le());
-        if u32::from_le(driver.common_read(VIRTIO_PCI_COMMON_DF)) & PLATFORM_FEATURES
+        driver.common_write_u8(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_ACKNOWLEDGE);
+        driver.common_write_u8(VIRTIO_PCI_COMMON_STATUS, DRIVER_STARTED);
+        driver.common_write_u32(VIRTIO_PCI_COMMON_DFSELECT, 1u32.to_le());
+        if u32::from_le(driver.common_read_u32(VIRTIO_PCI_COMMON_DF)) & PLATFORM_FEATURES
             != PLATFORM_FEATURES
         {
             return Err(invalid(
                 "virtio version one and platform DMA access are required",
             ));
         }
-        driver.common_write(VIRTIO_PCI_COMMON_DFSELECT, 0u32);
-        if u32::from_le(driver.common_read(VIRTIO_PCI_COMMON_DF)) & (1 << VIRTIO_NET_F_MAC) == 0 {
+        driver.common_write_u32(VIRTIO_PCI_COMMON_DFSELECT, 0u32);
+        if u32::from_le(driver.common_read_u32(VIRTIO_PCI_COMMON_DF)) & (1 << VIRTIO_NET_F_MAC) == 0
+        {
             return Err(invalid("virtio MAC feature is required"));
         }
-        driver.common_write(VIRTIO_PCI_COMMON_GFSELECT, 0u32);
-        driver.common_write(VIRTIO_PCI_COMMON_GF, (1u32 << VIRTIO_NET_F_MAC).to_le());
-        driver.common_write(VIRTIO_PCI_COMMON_GFSELECT, 1u32.to_le());
-        driver.common_write(VIRTIO_PCI_COMMON_GF, PLATFORM_FEATURES.to_le());
-        driver.common_write(VIRTIO_PCI_COMMON_STATUS, FEATURES_ACCEPTED);
-        if driver.common_read::<u8>(VIRTIO_PCI_COMMON_STATUS) & VIRTIO_CONFIG_S_FEATURES_OK == 0 {
+        driver.common_write_u32(VIRTIO_PCI_COMMON_GFSELECT, 0u32);
+        driver.common_write_u32(VIRTIO_PCI_COMMON_GF, (1u32 << VIRTIO_NET_F_MAC).to_le());
+        driver.common_write_u32(VIRTIO_PCI_COMMON_GFSELECT, 1u32.to_le());
+        driver.common_write_u32(VIRTIO_PCI_COMMON_GF, PLATFORM_FEATURES.to_le());
+        driver.common_write_u8(VIRTIO_PCI_COMMON_STATUS, FEATURES_ACCEPTED);
+        if driver.common_read_u8(VIRTIO_PCI_COMMON_STATUS) & VIRTIO_CONFIG_S_FEATURES_OK == 0 {
             return Err(invalid("virtio rejected features"));
         }
         let mut map = DmaMap {
@@ -467,15 +505,15 @@ impl VirtioNet {
         driver.tx = driver.configure_queue(1, DMA_SIZE / 2, multiplier)?;
         let mut stable = false;
         for _ in 0..100 {
-            let generation = driver.common_read::<u8>(VIRTIO_PCI_COMMON_CFGGENERATION);
+            let generation = driver.common_read_u8(VIRTIO_PCI_COMMON_CFGGENERATION);
             for (offset, byte) in driver.mac.iter_mut().enumerate() {
                 *byte = driver.bars[net.bar]
                     .as_ref()
                     .unwrap()
-                    .read(net.offset + offset);
+                    .read_u8(net.offset + offset);
             }
             fence(Ordering::Acquire);
-            if generation == driver.common_read::<u8>(VIRTIO_PCI_COMMON_CFGGENERATION) {
+            if generation == driver.common_read_u8(VIRTIO_PCI_COMMON_CFGGENERATION) {
                 stable = true;
                 break;
             }
@@ -485,8 +523,8 @@ impl VirtioNet {
         }
         for id in 0..driver.rx.size {
             let desc = driver.rx.desc + usize::from(id) * 16;
-            driver.dma.write(desc + 8, (BUFFER_SIZE as u32).to_le());
-            driver.dma.write(desc + 12, VRING_DESC_F_WRITE.to_le());
+            driver.dma.write_u32(desc + 8, (BUFFER_SIZE as u32).to_le());
+            driver.dma.write_u16(desc + 12, VRING_DESC_F_WRITE.to_le());
             driver.rx.busy[usize::from(id)] = true;
             driver.rx.publish(&driver.dma, id);
         }
@@ -498,7 +536,7 @@ impl VirtioNet {
             &command.to_le_bytes(),
             config_region.offset + PCI_COMMAND as u64,
         )?;
-        driver.common_write(VIRTIO_PCI_COMMON_STATUS, DRIVER_READY);
+        driver.common_write_u8(VIRTIO_PCI_COMMON_STATUS, DRIVER_READY);
         driver.kick(0, driver.rx.notify);
         Ok(driver)
     }
@@ -524,11 +562,11 @@ impl VirtioNet {
             ))
         } else {
             let offset = self.rx.buffers + usize::from(id) * BUFFER_SIZE;
-            if self.dma.read::<u8>(offset) != 0 || self.dma.read::<u8>(offset + 1) != 0 {
+            if self.dma.read_u8(offset) != 0 || self.dma.read_u8(offset + 1) != 0 {
                 Err(invalid("unexpected receive offload header"))
             } else {
                 for (index, byte) in frame[..length - HEADER_SIZE].iter_mut().enumerate() {
-                    *byte = self.dma.read(offset + HEADER_SIZE + index);
+                    *byte = self.dma.read_u8(offset + HEADER_SIZE + index);
                 }
                 Ok(Some(length - HEADER_SIZE))
             }
@@ -554,12 +592,12 @@ impl VirtioNet {
         };
         let offset = self.tx.buffers + id * BUFFER_SIZE;
         for index in 0..HEADER_SIZE {
-            self.dma.write(offset + index, 0u8);
+            self.dma.write_u8(offset + index, 0u8);
         }
         for (index, byte) in frame.iter().enumerate() {
-            self.dma.write(offset + HEADER_SIZE + index, *byte);
+            self.dma.write_u8(offset + HEADER_SIZE + index, *byte);
         }
-        self.dma.write(
+        self.dma.write_u32(
             self.tx.desc + id * 16 + 8,
             ((HEADER_SIZE + frame.len()) as u32).to_le(),
         );
@@ -576,34 +614,42 @@ impl VirtioNet {
         Ok(self.tx.busy.iter().all(|busy| !busy))
     }
 
-    fn common_read<T: Copy>(&self, offset: usize) -> T {
-        self.bars[self.common.bar]
-            .as_ref()
-            .unwrap()
-            .read(self.common.offset + offset)
+    fn common_register(&self, offset: usize) -> (&Mapping, usize) {
+        (
+            self.bars[self.common.bar].as_ref().unwrap(),
+            self.common
+                .offset
+                .checked_add(offset)
+                .expect("register offset overflow"),
+        )
     }
-    fn common_write<T: Copy>(&self, offset: usize, value: T) {
-        self.bars[self.common.bar]
-            .as_ref()
-            .unwrap()
-            .write(self.common.offset + offset, value);
-    }
+
+    common_read!(u8, common_read_u8, read_u8);
+    common_read!(u16, common_read_u16, read_u16);
+    common_read!(u32, common_read_u32, read_u32);
+    common_write!(u8, common_write_u8, write_u8);
+    common_write!(u16, common_write_u16, write_u16);
+    common_write!(u32, common_write_u32, write_u32);
+    common_write!(u64, common_write_u64, write_u64);
     fn kick(&self, queue: u16, offset: usize) {
-        self.bars[self.notify.bar]
-            .as_ref()
-            .unwrap()
-            .write(self.notify.offset + offset, queue.to_le());
+        self.bars[self.notify.bar].as_ref().unwrap().write_u16(
+            self.notify
+                .offset
+                .checked_add(offset)
+                .expect("notify offset overflow"),
+            queue.to_le(),
+        );
     }
     fn check_status(&self) -> io::Result<()> {
-        if self.common_read::<u8>(VIRTIO_PCI_COMMON_STATUS) != DRIVER_READY {
+        if self.common_read_u8(VIRTIO_PCI_COMMON_STATUS) != DRIVER_READY {
             Err(invalid("virtio device requires reset"))
         } else {
             Ok(())
         }
     }
     fn configure_queue(&self, index: u16, base: usize, multiplier: u32) -> io::Result<Queue> {
-        self.common_write(VIRTIO_PCI_COMMON_Q_SELECT, index.to_le());
-        let maximum = u16::from_le(self.common_read(VIRTIO_PCI_COMMON_Q_SIZE));
+        self.common_write_u16(VIRTIO_PCI_COMMON_Q_SELECT, index.to_le());
+        let maximum = u16::from_le(self.common_read_u16(VIRTIO_PCI_COMMON_Q_SIZE));
         if maximum == 0 {
             return Err(invalid("required virtio queue is unavailable"));
         }
@@ -611,7 +657,7 @@ impl VirtioNet {
         if !size.is_power_of_two() {
             return Err(invalid("invalid split queue size"));
         }
-        let notify = usize::from(u16::from_le(self.common_read(VIRTIO_PCI_COMMON_Q_NOFF)))
+        let notify = usize::from(u16::from_le(self.common_read_u16(VIRTIO_PCI_COMMON_Q_NOFF)))
             .checked_mul(multiplier as usize)
             .ok_or_else(|| invalid("notify offset overflow"))?;
         if notify
@@ -625,36 +671,36 @@ impl VirtioNet {
         if queue.buffers + usize::from(size) * BUFFER_SIZE > base + DMA_SIZE / 2 {
             return Err(invalid("queue exceeds DMA allocation"));
         }
-        self.common_write(VIRTIO_PCI_COMMON_Q_SIZE, size.to_le());
-        self.common_write(VIRTIO_PCI_COMMON_Q_MSIX, VIRTIO_MSI_NO_VECTOR.to_le());
-        self.common_write(
+        self.common_write_u16(VIRTIO_PCI_COMMON_Q_SIZE, size.to_le());
+        self.common_write_u16(VIRTIO_PCI_COMMON_Q_MSIX, VIRTIO_MSI_NO_VECTOR.to_le());
+        self.common_write_u64(
             VIRTIO_PCI_COMMON_Q_DESCLO,
             (IOVA + queue.desc as u64).to_le(),
         );
-        self.common_write(
+        self.common_write_u64(
             VIRTIO_PCI_COMMON_Q_AVAILLO,
             (IOVA + queue.avail as u64).to_le(),
         );
-        self.common_write(
+        self.common_write_u64(
             VIRTIO_PCI_COMMON_Q_USEDLO,
             (IOVA + queue.used as u64).to_le(),
         );
         self.dma
-            .write(queue.avail, VRING_AVAIL_F_NO_INTERRUPT.to_le());
+            .write_u16(queue.avail, VRING_AVAIL_F_NO_INTERRUPT.to_le());
         for id in 0..size {
-            self.dma.write(
+            self.dma.write_u64(
                 queue.desc + usize::from(id) * 16,
                 (IOVA + (queue.buffers + usize::from(id) * BUFFER_SIZE) as u64).to_le(),
             );
         }
         fence(Ordering::Release);
-        self.common_write(VIRTIO_PCI_COMMON_Q_ENABLE, 1u16.to_le());
+        self.common_write_u16(VIRTIO_PCI_COMMON_Q_ENABLE, 1u16.to_le());
         Ok(queue)
     }
 }
 impl Drop for VirtioNet {
     fn drop(&mut self) {
-        self.common_write(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_RESET);
+        self.common_write_u8(VIRTIO_PCI_COMMON_STATUS, VIRTIO_CONFIG_S_RESET);
         if let Some(device) = self.device.take() {
             let _ =
                 device.write_all_at(&0u16.to_le_bytes(), self.config_offset + PCI_COMMAND as u64);
@@ -842,6 +888,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mapping_access_preserves_integer_widths_and_checks_bounds() {
+        let memory = Mapping::new(-1, 0, 4096, true).unwrap();
+        memory.write_u8(0, 0xa5);
+        memory.write_u16(2, 0xb6c7);
+        memory.write_u32(4, 0xd8e9_f012);
+        memory.write_u64(8, 0x1234_5678_9abc_def0);
+        assert_eq!(memory.read_u8(0), 0xa5);
+        assert_eq!(memory.read_u16(2), 0xb6c7);
+        assert_eq!(memory.read_u32(4), 0xd8e9_f012);
+        for (offset, byte) in 0x1234_5678_9abc_def0u64
+            .to_ne_bytes()
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(memory.read_u8(8 + offset), byte);
+        }
+        for offset in [1, 4094, 4096, usize::MAX - 3] {
+            assert!(std::panic::catch_unwind(|| memory.read_u32(offset)).is_err());
+            assert!(std::panic::catch_unwind(|| memory.write_u32(offset, 0)).is_err());
+        }
+    }
+
+    #[test]
     fn split_queue_indices_wrap_without_losing_ownership() {
         let dma = Mapping::new(-1, 0, DMA_SIZE, true).unwrap();
         let mut queue = Queue::new(2, 0, 0);
@@ -850,9 +919,9 @@ mod tests {
             queue.busy[usize::from(id)] = true;
             queue.publish(&dma, id);
             let slot = queue.used + 4 + usize::from(queue.next_used % queue.size) * 8;
-            dma.write(slot, u32::from(id).to_le());
-            dma.write(slot + 4, 42u32.to_le());
-            dma.write(queue.used + 2, queue.next_used.wrapping_add(1).to_le());
+            dma.write_u32(slot, u32::from(id).to_le());
+            dma.write_u32(slot + 4, 42u32.to_le());
+            dma.write_u16(queue.used + 2, queue.next_used.wrapping_add(1).to_le());
             assert_eq!(queue.completion(&dma).unwrap(), Some((id, 42)));
             assert!(!queue.busy[usize::from(id)]);
             assert_eq!(queue.completion(&dma).unwrap(), None);
@@ -864,16 +933,16 @@ mod tests {
         let dma = Mapping::new(-1, 0, DMA_SIZE, true).unwrap();
         let mut queue = Queue::new(2, 0, 0);
         queue.busy[0] = true;
-        dma.write(queue.used + 2, 2u16.to_le());
+        dma.write_u16(queue.used + 2, 2u16.to_le());
         assert!(queue.completion(&dma).is_err());
-        dma.write(queue.used + 2, 1u16.to_le());
-        dma.write(queue.used + 4, 1u32.to_le());
+        dma.write_u16(queue.used + 2, 1u16.to_le());
+        dma.write_u32(queue.used + 4, 1u32.to_le());
         assert!(queue.completion(&dma).is_err());
-        dma.write(queue.used + 4, 0u32.to_le());
+        dma.write_u32(queue.used + 4, 0u32.to_le());
         assert!(queue.completion(&dma).unwrap().is_some());
         queue.busy[1] = true;
-        dma.write(queue.used + 2, 2u16.to_le());
-        dma.write(queue.used + 12, 0u32.to_le());
+        dma.write_u16(queue.used + 2, 2u16.to_le());
+        dma.write_u32(queue.used + 12, 0u32.to_le());
         assert!(queue.completion(&dma).is_err());
     }
 
