@@ -45,12 +45,15 @@ independent sibling admission.
 | `Children_without_muxchecksgeneration.cfg` | `Slots` ignore the generation: violates `NoStaleDelivery` |
 | `Children_without_keybywholeid.cfg` | `Children` keys children by slot: violates `NoStaleDelivery` |
 | `Children_large_command.cfg` | a command larger than the mux's window drains in legal prefixes: `CommandsGo` holds |
-| `Children_readiness.cfg` | retained receive credit, bounded empty events and jobs, urgent completion, and cancellation |
+| `Children_readiness.cfg` | retained receive credit, bounded empty events and jobs, urgent completion, cancellation, and `CreditReturns`: owed credit goes back to the mux |
 | `Children_without_urgent.cfg` | completion stays behind refused data: violates `CompletionProgress` |
 | `Children_without_workownership.cfg` | runtime polls work after its owner closes: violates `NoCancelledPoll` |
 | `Children_without_joblimit.cfg` | reset/reopen launches work past the job limit: violates `BoundedJobs` |
 | `Children_isolation.cfg` | a mux that sends whatever a child's place holds, a child in slot 1 that never takes an event, and connection traffic: `MuxNeverHeld`, `ConnectionProgress`, credit and item bounds |
 | `Children_without_isolate.cfg` | a full place hands the event back to the mux: violates `ConnectionProgress` |
+| `Children_without_wakeoncredit.cfg` | credit from the mux does not ready the child: violates `CommandsGo` |
+| `Children_without_keepwaiting.cfg` | a child whose command finds the queue full is not kept ready: violates `CommandsGo` |
+| `Children_without_wakeonrelease.cfg` | released payload does not ready its child: violates `CreditReturns` |
 
 Run one with TLC (JDK 11 or later):
 
