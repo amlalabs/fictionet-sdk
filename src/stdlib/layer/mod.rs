@@ -229,7 +229,7 @@ pub use children::{ChildReport, ChildWork, Children, Overrun};
 pub use choice::Later;
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
-pub use framed::{BoundedDecode, BoundedWire, Decoded, Framed, FramedError, Framing, Owned};
+pub use framed::{BoundedDecode, BoundedWire, BoundedWriter, WriteFailure, Decoded, Framed, FramedError, Framing, Owned};
 pub use harness::{Harness, Worker};
 pub use observed::{Direction, ObservedEvent, ObservedStream, Source, Termination};
 pub use packet::{PacketCommand, PacketEvent, Packets, Whole};

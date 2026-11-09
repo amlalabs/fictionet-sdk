@@ -221,6 +221,24 @@ impl Frame {
     }
 }
 
+impl Frame {
+    fn encode(&self, mut append: impl FnMut(&[u8])) -> Result<(), Error> {
+        let pdu = &self.pdu[..];
+        if pdu.is_empty() {
+            return Err(Error::EmptyPdu);
+        }
+        if pdu.len() > MAX_PDU {
+            return Err(Error::TooLong);
+        }
+        append(&self.transaction.to_be_bytes());
+        append(&[0, 0]);
+        append(&(pdu.len() as u16 + 1).to_be_bytes());
+        append(&[self.unit]);
+        append(pdu);
+        Ok(())
+    }
+}
+
 impl Wire for Frame {
     type ParseError = Error;
     type WriteError = Error;
@@ -241,19 +259,7 @@ impl Wire for Frame {
     /// a PDU over [`MAX_PDU`] bytes returns [`Error::TooLong`].
     /// Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let pdu = &self.pdu[..];
-        if pdu.is_empty() {
-            return Err(Error::EmptyPdu);
-        }
-        if pdu.len() > MAX_PDU {
-            return Err(Error::TooLong);
-        }
-        out.extend_from_slice(&self.transaction.to_be_bytes());
-        out.extend_from_slice(&[0, 0]);
-        out.extend_from_slice(&(pdu.len() as u16 + 1).to_be_bytes());
-        out.push(self.unit);
-        out.extend_from_slice(pdu);
-        Ok(())
+        self.encode(|bytes| out.extend_from_slice(bytes))
     }
 }
 
@@ -853,6 +859,12 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
 }
 
 impl fictionet::stdlib::layer::BoundedWire for Frame {
+    fn write_bounded(
+        &self,
+        out: &mut fictionet::stdlib::layer::BoundedWriter<'_>,
+    ) -> Result<(), Error> {
+        self.encode(|bytes| out.extend_from_slice(bytes))
+    }
     fn write_bound(&self) -> Result<usize, Error> {
         if self.pdu.is_empty() {
             return Err(Error::EmptyPdu);

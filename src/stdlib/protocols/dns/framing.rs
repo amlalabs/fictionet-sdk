@@ -101,6 +101,15 @@ impl core::fmt::Display for StreamMessageError {
 
 impl core::error::Error for StreamMessageError {}
 
+impl StreamMessage {
+    fn encode(&self, mut append: impl FnMut(&[u8])) -> Result<(), StreamMessageError> {
+        let len = u16::try_from(self.0.len()).map_err(|_| StreamMessageError::TooLong)?;
+        append(&len.to_be_bytes());
+        append(&self.0);
+        Ok(())
+    }
+}
+
 impl Wire for StreamMessage {
     type ParseError = StreamMessageError;
     type WriteError = StreamMessageError;
@@ -114,14 +123,17 @@ impl Wire for StreamMessage {
     }
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), StreamMessageError> {
-        let len = u16::try_from(self.0.len()).map_err(|_| StreamMessageError::TooLong)?;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&self.0);
-        Ok(())
+        self.encode(|bytes| out.extend_from_slice(bytes))
     }
 }
 
 impl BoundedWire for StreamMessage {
+    fn write_bounded(
+        &self,
+        out: &mut fictionet::stdlib::layer::BoundedWriter<'_>,
+    ) -> Result<(), StreamMessageError> {
+        self.encode(|bytes| out.extend_from_slice(bytes))
+    }
     fn write_bound(&self) -> Result<usize, StreamMessageError> {
         u16::try_from(self.0.len()).map_err(|_| StreamMessageError::TooLong)?;
         Ok(2 + self.0.len())

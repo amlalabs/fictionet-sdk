@@ -112,6 +112,13 @@ impl BoundedDecode for Steps {
     }
 }
 impl BoundedWire for Blob {
+    fn write_bounded(&self, out: &mut super::super::BoundedWriter<'_>) -> Result<(), Bad> {
+        let n = u8::try_from(self.0.len()).map_err(|_| Bad)?;
+        out.push(n);
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+
     fn write_bound(&self) -> Result<usize, Bad> {
         u8::try_from(self.0.len()).map_err(|_| Bad)?;
         Ok(1 + self.0.len())
@@ -503,6 +510,10 @@ fn encoding_is_not_called_without_its_reservation() {
         }
     }
     impl BoundedWire for Large {
+        fn write_bounded(&self, _: &mut super::super::BoundedWriter<'_>) -> Result<(), Bad> {
+            panic!("an unreserved writer must not run")
+        }
+
         fn write_bound(&self) -> Result<usize, Bad> {
             Ok(64)
         }
@@ -562,4 +573,25 @@ fn a_decoded_allocation_keeps_its_charge_outside_the_layer() {
     assert_eq!(budget.used(), value.charged());
     drop(value);
     assert_eq!(budget.used(), 0);
+}
+
+/// Any split of a short encoding either fits in the fixed destination or
+/// reports exhaustion. Writes after exhaustion cannot make it successful.
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_bounded_writer_refuses_every_encoding_past_its_capacity() {
+    let input: [u8; 4] = kani::any();
+    let length: usize = kani::any();
+    let cut: usize = kani::any();
+    kani::assume(length <= input.len() && cut <= length);
+    let mut storage = [0u8; 3];
+    let mut writer = super::super::BoundedWriter::new(&mut storage);
+    writer.extend_from_slice(&input[..cut]);
+    writer.extend_from_slice(&input[cut..length]);
+    let result = writer.finish();
+    assert_eq!(result.is_ok(), length <= storage.len());
+    if let Ok(written) = result {
+        assert_eq!(written, length);
+        assert_eq!(&storage[..written], &input[..length]);
+    }
 }
