@@ -58,7 +58,7 @@ impl Wire for HuffmanString {
 /// The length in bits of each symbol's Huffman code, 256 being the
 /// end-of-string code. The code is canonical, so the lengths fix the codes.
 #[rustfmt::skip]
-const HUFFMAN_LENGTHS: [u8; 257] = [
+static HUFFMAN_LENGTHS: [u8; 257] = [
     13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28,
     28, 28, 28, 6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12,
     10, 13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6, 15, 5, 6,
@@ -83,7 +83,7 @@ struct Huffman {
     symbols: [u16; 257],
 }
 
-const HUFFMAN: Huffman = build_huffman();
+static HUFFMAN: Huffman = build_huffman();
 
 const fn build_huffman() -> Huffman {
     let mut h = Huffman {
@@ -162,6 +162,14 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     decode_limited(bytes, MAX_STRING)
 }
 
+/// The symbol whose code is the low `len` bits of `code`, from one to 30
+/// bits, if one has that code.
+fn symbol(code: u32, len: usize) -> Option<u16> {
+    let h = &HUFFMAN;
+    let offset = code.checked_sub(h.first[len])?;
+    (offset < h.count[len]).then(|| h.symbols[usize::from(h.start[len]) + offset as usize])
+}
+
 /// Decodes a Huffman string with at most `limit` decoded octets.
 /// Refuses invalid codes, EOS, padding, and output above the limit.
 /// The caller bounds the encoded input. Allocation is bounded by the smaller
@@ -173,7 +181,6 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// # Ok::<(), fictionet::stdlib::protocols::huffman::Error>(())
 /// ```
 pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
-    let h = &HUFFMAN;
     let mut out = Vec::with_capacity((bytes.len().saturating_mul(8) / 5).min(limit));
     let (mut code, mut len) = (0u32, 0usize);
     for byte in bytes {
@@ -183,8 +190,7 @@ pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
             if len > 30 {
                 return Err(Error::InvalidCode);
             }
-            if code >= h.first[len] && code - h.first[len] < h.count[len] {
-                let sym = h.symbols[usize::from(h.start[len]) + (code - h.first[len]) as usize];
+            if let Some(sym) = symbol(code, len) {
                 if sym == 256 {
                     return Err(Error::InvalidCode);
                 }
@@ -203,6 +209,11 @@ pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
         Err(Error::InvalidCode)
     }
 }
+
+/// Bounded proofs that the decoder accepts exactly the code, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/hpack-grpc/kani/huffman.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {
@@ -307,6 +318,69 @@ mod tests {
         assert_eq!(decode_limited(&[0x1f], 0), Err(Error::TooLong));
         assert_eq!(decode_limited(&[0xff], 1), Err(Error::InvalidCode));
         assert_eq!(decode_limited(&[0x1f], usize::MAX).unwrap(), b"a");
+    }
+
+    /// The bits of `codes`, each `(code, length)`, then `pad` bits of
+    /// `padding` (its low bits), as whole bytes. The total must fill them.
+    fn pack(codes: &[(u32, u32)], pad: u32, padding: u32) -> Vec<u8> {
+        let (mut out, mut acc, mut bits) = (Vec::new(), 0u64, 0u32);
+        for &(code, len) in codes
+            .iter()
+            .chain([(padding & ((1 << pad) - 1), pad)].iter())
+        {
+            acc = (acc << len) | u64::from(code);
+            bits += len;
+            while bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+            acc &= (1 << bits) - 1;
+        }
+        assert_eq!(bits, 0);
+        out
+    }
+
+    fn code(symbol: usize) -> (u32, u32) {
+        (HUFFMAN.codes[symbol], u32::from(HUFFMAN_LENGTHS[symbol]))
+    }
+
+    // Every symbol in turn: these inputs take up to six bytes, past what the
+    // Kani harnesses in verification/hpack-grpc/kani/huffman.rs reach.
+
+    #[test]
+    fn eos_after_every_symbol_is_refused() {
+        let eos = code(256);
+        for symbol in 0..256 {
+            let first = code(symbol);
+            let pad = (8 - (first.1 + eos.1) % 8) % 8;
+            let bytes = pack(&[first, eos], pad, u32::MAX);
+            assert_eq!(decode(&bytes), Err(Error::InvalidCode), "{symbol}");
+            let pad = (8 - (2 * first.1 + eos.1) % 8) % 8;
+            let bytes = pack(&[first, eos, first], pad, u32::MAX);
+            assert_eq!(decode(&bytes), Err(Error::InvalidCode), "{symbol}");
+        }
+    }
+
+    #[test]
+    fn padding_after_every_symbol_is_at_most_seven_one_bits() {
+        for symbol in 0..=255u8 {
+            let first = code(usize::from(symbol));
+            let short = (8 - first.1 % 8) % 8;
+            // Padding to either of the next two byte boundaries, with every
+            // value its bits can take.
+            for pad in [short, short + 8] {
+                let ones = (1u32 << pad) - 1;
+                for padding in 0..=ones {
+                    let decoded = decode(&pack(&[first], pad, padding));
+                    let alone = decoded.as_deref() == Ok(&[symbol][..]);
+                    assert_eq!(
+                        alone,
+                        pad <= 7 && padding == ones,
+                        "{symbol} {pad} {padding}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

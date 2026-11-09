@@ -58,8 +58,12 @@ pub enum GrpcCommand {
 pub struct Grpc {
     content_type: ContentType,
     up: VecDeque<MessageEvent<GrpcEvent>>,
-    /// The bytes of a message not yet whole.
+    /// The bytes of a message not yet whole, after whole messages that
+    /// wait for the application to have room.
     partial: Vec<u8>,
+    /// Where the whole messages at the start of `partial`, their prefixes
+    /// checked, end.
+    checked: usize,
     charge: Option<Charge>,
     next: Option<ExchangeCommand>,
     /// A message that waits for the head to go first.
@@ -81,6 +85,7 @@ impl Grpc {
             content_type: ContentType::plain(),
             up: VecDeque::new(),
             partial: Vec::new(),
+            checked: 0,
             charge: opening.charge,
             next: None,
             message: None,
@@ -163,6 +168,7 @@ impl Grpc {
     fn fail(&mut self, status: Status) {
         self.read_over = true;
         self.partial = Vec::new();
+        self.checked = 0;
         if !self.finished {
             self.finish(status);
         }
@@ -221,6 +227,20 @@ impl Grpc {
             }
         }
         self.partial.drain(..at);
+        self.checked = self.checked.saturating_sub(at);
+        // The messages still waiting for the application are checked as
+        // their prefixes come, so a call that breaks the framing or declares
+        // too much ends then, not once the application has read the rest.
+        loop {
+            match grpc::prefix_len(&self.partial[self.checked..]) {
+                Ok(Some(len)) if len <= self.partial.len() - self.checked => self.checked += len,
+                Ok(_) => break,
+                Err(error) => {
+                    self.fail(error.to_status());
+                    return true;
+                }
+            }
+        }
         // With room left, every whole message is read: what remains is a
         // part of one.
         if self.client_ended && self.up.len() < WAITING {

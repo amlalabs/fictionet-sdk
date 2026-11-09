@@ -341,8 +341,16 @@ fictionet::prefixed! {
     }
 }
 
-// Shared prefix parsing. Only a complete, bounded body is copied.
-fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Error> {
+/// The length, prefix included, of the message at the start of `b`, read
+/// from its prefix alone with up to [`MAX_MESSAGE`] bytes of body. It is
+/// `Ok(None)` until the prefix is whole, and refuses what
+/// [`Message::parse_prefix`] refuses, without waiting for the body.
+pub(crate) fn prefix_len(b: &[u8]) -> Result<Option<usize>, Error> {
+    message_len(b, MAX_MESSAGE)
+}
+
+// The prefix's whole message length. A bad flag is refused at once.
+fn message_len(b: &[u8], limit: usize) -> Result<Option<usize>, Error> {
     let Some(&flag) = b.first() else {
         return Ok(None);
     };
@@ -357,13 +365,21 @@ fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Err
         Ok(n) if n <= limit => n,
         _ => return Err(Error::TooLarge { length, limit }),
     };
-    let end = HEADER_LEN
+    HEADER_LEN
         .checked_add(len)
-        .ok_or(Error::TooLarge { length, limit })?;
+        .map(Some)
+        .ok_or(Error::TooLarge { length, limit })
+}
+
+// Shared prefix parsing. Only a complete, bounded body is copied.
+fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Error> {
+    let Some(end) = message_len(b, limit)? else {
+        return Ok(None);
+    };
     Ok(b.get(HEADER_LEN..end).map(|data| {
         (
             Message {
-                compressed: flag == 1,
+                compressed: b[0] == 1,
                 data: data.to_vec(),
             },
             end,
@@ -1441,6 +1457,11 @@ pub mod harness {
         h.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect()
     }
 }
+
+/// Bounded proofs over message framing, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/hpack-grpc/kani/grpc.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {

@@ -725,6 +725,10 @@ impl Encoder {
     }
     /// Applies the peer's settings limit, capped at [`MAX_TABLE`].
     /// A reduction shrinks the table and queues the required size update.
+    /// Send the SETTINGS acknowledgment before the next block: the update
+    /// must follow it (RFC 7541 section 4.2). Sent before it, the update can
+    /// leave a decoder that follows the RFC, as [`Table`] does, waiting for
+    /// a reduction this encoder never sends again.
     pub fn set_settings_limit(&mut self, limit: usize) {
         let limit = limit.min(MAX_TABLE);
         self.table.settings = limit;
@@ -840,6 +844,11 @@ impl Encoder {
 fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 fictionet::codec_from!(Error, Trailing, |_| Error::Trailing);
+
+/// Bounded proofs over the table, the indexes and size updates, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/hpack-grpc/kani/hpack.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {
