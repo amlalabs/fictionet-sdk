@@ -186,7 +186,8 @@ impl<W: Job> Jobs<W> {
                     }
                 };
                 if !reserved {
-                    self.budget_failed = true;
+                    // Existing jobs can release storage or budget when polled.
+                    self.budget_failed = self.running.is_empty();
                     break;
                 }
                 if self.running.capacity() == 0 {
@@ -461,6 +462,7 @@ mod tests {
         ready: bool,
         returned: Arc<AtomicUsize>,
         extracted: usize,
+        remaining: Option<usize>,
     }
     impl Source {
         fn new() -> Self {
@@ -474,6 +476,7 @@ mod tests {
                 ready: false,
                 returned: Arc::default(),
                 extracted: 0,
+                remaining: None,
             }
         }
     }
@@ -506,6 +509,9 @@ mod tests {
             None
         }
         fn take_work(&mut self) -> Option<Self::Work> {
+            if let Some(remaining) = &mut self.remaining {
+                *remaining = remaining.checked_sub(1)?;
+            }
             self.extracted += 1;
             Some(self.owner.own(PendingJob {
                 polls: self.polls.clone(),
@@ -581,6 +587,32 @@ mod tests {
         let mut jobs = Jobs::new();
         assert!(!jobs.take(&mut driver));
         assert!(!jobs.budget_exhausted());
+        assert!(jobs.is_empty());
+        assert!(!jobs.take(&mut driver));
+        assert!(!jobs.budget_exhausted());
+        drop(jobs);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_full_job_reservation_keeps_existing_work_pollable() {
+        let budget = Budget::new(std::mem::size_of::<Running<OwnedWork<PendingJob>>>());
+        let mut driver = driver(budget.clone());
+        driver.layer_mut().remaining = Some(1);
+        let mut jobs = Jobs::new();
+        assert!(jobs.take(&mut driver));
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs.budget_exhausted());
+        assert!(!jobs.take(&mut driver));
+        assert!(!jobs.budget_exhausted());
+        assert_eq!(driver.layer().extracted, 1);
+        let mut cx = Context::from_waker(Waker::noop());
+        jobs.poll(None, &mut cx, |_| Ok::<_, Infallible>(()))
+            .unwrap();
+        assert_eq!(driver.layer().polls.load(Ordering::Relaxed), 1);
+        driver.layer().owner.cancel();
+        jobs.poll(None, &mut cx, |_| Ok::<_, Infallible>(()))
+            .unwrap();
         assert!(jobs.is_empty());
         assert!(!jobs.take(&mut driver));
         assert!(!jobs.budget_exhausted());
