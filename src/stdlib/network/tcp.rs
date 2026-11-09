@@ -1052,7 +1052,7 @@ impl PacketDriver {
     pub(crate) fn poll(
         &mut self,
         cx: &mut Context<'_>,
-        out: &mut Vec<Vec<u8>>,
+        out: &mut Vec<Chunk>,
         limit: usize,
     ) -> fictionet::Result<(bool, Option<Instant>)> {
         let (busy, deadline, refused, refusals) = {
@@ -1410,7 +1410,7 @@ impl Host {
     }
 
     /// Steps the transport and drains its output before yielding.
-    fn visit(&mut self, out: &mut Vec<Vec<u8>>, limit: usize) -> bool {
+    fn visit(&mut self, out: &mut Vec<Chunk>, limit: usize) -> bool {
         self.tick();
         let mut work_exhausted = false;
         for turn in 0..64 {
@@ -1426,7 +1426,7 @@ impl Host {
                 return Admit::Blocked(command);
             }
             if let PacketCommand::Send(packet) = command {
-                out.push(packet.into_vec());
+                out.push(packet);
             }
             Admit::Taken
         });

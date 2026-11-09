@@ -210,7 +210,7 @@ impl PacketDriver {
     pub(crate) fn poll(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        out: &mut Vec<Vec<u8>>,
+        out: &mut Vec<Chunk>,
         limit: usize,
     ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
         let (busy, deadline) = self.shared.with(|inner| {
@@ -257,7 +257,7 @@ struct Shared {
 
 struct Inner {
     driver: Driver<UdpLayer>,
-    output: Vec<Vec<u8>>,
+    output: Vec<Chunk>,
     wake: Option<Waker>,
     /// The sockets by port.
     sockets: BTreeMap<u16, Mailbox>,
@@ -391,7 +391,7 @@ impl Inner {
                     return Admit::Blocked(command);
                 }
                 if let PacketCommand::Send(bytes) = command {
-                    output.push(bytes.into_vec());
+                    output.push(bytes);
                     if let Some(waker) = wake.take() {
                         waker.wake();
                     }

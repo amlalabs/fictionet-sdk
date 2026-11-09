@@ -42,37 +42,6 @@ pub(crate) async fn drive(
             let mut moved = false;
             let mut more = false;
             let mut transport = false;
-            if let Some(packet) = held.take() {
-                moved = true;
-                match packet.transport() {
-                    Transport::Tcp => {
-                        if let Some(tcp) = &mut tcp
-                            && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
-                        {
-                            held = Some(packet);
-                            moved = false;
-                            transport = true;
-                        }
-                    }
-                    Transport::Udp => {
-                        if let Some(udp) = &mut udp {
-                            udp.deliver(packet);
-                        }
-                    }
-                    _ if outgoing.len() >= 128 => {
-                        held = Some(packet);
-                        moved = false;
-                    }
-                    _ => {
-                        if let Some((addr, options)) = &ping
-                            && let Some(reply) =
-                                options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
-                        {
-                            outgoing.push_back(PacketCommand::Send(Chunk::new(reply.0)));
-                        }
-                    }
-                }
-            }
             while let Some(command) = outgoing.pop_front() {
                 if let Admit::Blocked(command) = ip
                     .command(command)
@@ -108,6 +77,37 @@ pub(crate) async fn drive(
                 }
                 Admit::Taken
             });
+            if let Some(packet) = held.take() {
+                moved = true;
+                match packet.transport() {
+                    Transport::Tcp => {
+                        if let Some(tcp) = &mut tcp
+                            && let Admit::Blocked(PacketEvent::Packet(packet)) = tcp.deliver(packet)
+                        {
+                            held = Some(packet);
+                            moved = false;
+                            transport = true;
+                        }
+                    }
+                    Transport::Udp => {
+                        if let Some(udp) = &mut udp {
+                            udp.deliver(packet);
+                        }
+                    }
+                    _ if outgoing.len() >= 128 => {
+                        held = Some(packet);
+                        moved = false;
+                    }
+                    _ => {
+                        if let Some((addr, options)) = &ping
+                            && let Some(reply) =
+                                options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
+                        {
+                            outgoing.push_back(PacketCommand::Send(Chunk::new(reply.0)));
+                        }
+                    }
+                }
+            }
             if held.is_none() && raw.is_none() && !closed {
                 match interface.poll_recv(&fcx, cx) {
                     Poll::Ready(Ok(packet)) => {
@@ -153,11 +153,7 @@ pub(crate) async fn drive(
                     deadlines[2] = deadline;
                 }
                 moved |= !output.is_empty();
-                outgoing.extend(
-                    output
-                        .drain(..)
-                        .map(|packet| PacketCommand::Send(Chunk::new(packet))),
-                );
+                outgoing.extend(output.drain(..).map(PacketCommand::Send));
             }
             if !moved && !more {
                 break;
