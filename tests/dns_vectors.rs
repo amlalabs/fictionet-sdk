@@ -2637,6 +2637,9 @@ fn cache() {
             max_negative_ttl: max_ttl,
             failure_ttl: Duration::from_secs(number(limits_value, "failure_ttl")),
             stale: Duration::ZERO,
+            // The Lean cache has no capacity.
+            max_entries: usize::MAX,
+            max_bytes: usize::MAX,
         };
         let mut cache = Cache::new(limits);
         let mut rust = Vec::new();

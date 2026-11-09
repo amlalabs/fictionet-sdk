@@ -271,6 +271,8 @@ impl<V: Verify> Resolver<V> {
             stale: config
                 .serve_stale
                 .map_or(std::time::Duration::ZERO, |stale| stale.max_stale),
+            max_entries: config.max_cache_entries,
+            max_bytes: config.max_cache_bytes,
         };
         let mut local_order: Vec<usize> = (0..config.local.len()).collect();
         local_order.sort_by_key(|&index| {
@@ -987,6 +989,7 @@ impl<V: Verify> Resolver<V> {
 impl<V: Verify> Engine for Resolver<V> {
     fn handle(&mut self, input: Input, now: Instant, entropy: &dyn Entropy) {
         self.now = now;
+        self.cache.expire(now);
         for id in std::mem::take(&mut self.restart) {
             self.graph.hold(TreeId::of(id));
             self.step_asker(id, entropy);
