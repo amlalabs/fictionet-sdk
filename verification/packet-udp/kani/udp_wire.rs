@@ -122,3 +122,94 @@ fn ipv6_datagrams_roundtrip_and_one_bit_fails_the_checksum() {
         Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).into(),
     );
 }
+
+// Failing controls. Each harness below changes one thing, and must fail on
+// the assertion its comment names.
+
+/// Claims that `parse` reads every byte present, not the declared length.
+/// Must fail on "a datagram is every byte present".
+#[kani::proof]
+#[kani::unwind(13)]
+fn parse_without_the_declared_length() {
+    let bytes: [u8; MAX] = kani::any();
+    let n: usize = kani::any();
+    kani::assume(n <= MAX);
+    let bytes = &bytes[..n];
+    if let Some(d) = Datagram::parse(bytes) {
+        assert!(d.as_bytes() == bytes, "a datagram is every byte present");
+    }
+}
+
+/// Claims that over IPv4 only a datagram whose length would not fit 16
+/// bits is refused, leaving out the IPv4 header. Must fail on "only a
+/// datagram past 16 bits is refused".
+#[kani::proof]
+fn encoded_len_without_the_ipv4_header() {
+    let len: usize = kani::any();
+    let v4: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+    if encoded_len(v4, v4, len).is_err() {
+        assert!(
+            len > 65_535 - 8,
+            "only a datagram past 16 bits is refused"
+        );
+    }
+}
+
+/// A symbolic datagram as `roundtrip` encodes it: the buffer and its
+/// length.
+fn encoded(src: IpAddr, dst: IpAddr) -> ([u8; 11], usize) {
+    let payload: [u8; 3] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= 3);
+    let from = SocketAddr::new(src, kani::any());
+    let to = SocketAddr::new(dst, kani::any());
+    let mut out = [0u8; 11];
+    let n = encode(from, to, &payload[..len], &mut out).expect("a small datagram fits");
+    (out, n)
+}
+
+/// One flipped bit over IPv4 without RFC 768's exception: a flip that
+/// zeroes the checksum field reads as "no checksum". Must fail on "one
+/// flipped bit fails the checksum".
+#[kani::proof]
+#[kani::unwind(12)]
+fn ipv4_datagrams_without_the_zero_checksum_exception() {
+    let (src, dst): (IpAddr, IpAddr) = (
+        Ipv4Addr::new(192, 0, 2, 1).into(),
+        Ipv4Addr::new(198, 51, 100, 7).into(),
+    );
+    let (mut out, n) = encoded(src, dst);
+    let bit: usize = kani::any();
+    kani::assume(bit < n * 8);
+    kani::assume(bit / 8 != 4 && bit / 8 != 5);
+    out[bit / 8] ^= 1 << (bit % 8);
+    let d = Datagram::parse(&out[..n]).expect("the length is unchanged");
+    assert!(
+        !d.checksum_ok(src, dst),
+        "one flipped bit fails the checksum"
+    );
+}
+
+/// Two flipped bits over IPv6, at the same place in two 16-bit words: when
+/// one goes up and the other down, the ones'-complement sum cannot see
+/// them, which is why the proof claims only one. Must fail on "two flipped
+/// bits fail the checksum".
+#[kani::proof]
+#[kani::unwind(12)]
+fn ipv6_datagrams_with_two_flipped_bits() {
+    let (src, dst): (IpAddr, IpAddr) = (
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).into(),
+    );
+    let (mut out, n) = encoded(src, dst);
+    let bit: usize = kani::any();
+    kani::assume(bit < n * 8 && bit / 8 + 2 < n);
+    kani::assume(![4, 5].contains(&(bit / 8)) && ![4, 5].contains(&(bit / 8 + 2)));
+    out[bit / 8] ^= 1 << (bit % 8);
+    out[bit / 8 + 2] ^= 1 << (bit % 8);
+    let d = Datagram::parse(&out[..n]).expect("the length is unchanged");
+    assert!(
+        !d.checksum_ok(src, dst),
+        "two flipped bits fail the checksum"
+    );
+}

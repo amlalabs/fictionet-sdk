@@ -121,8 +121,8 @@ assertions on. Each harness runs on its own; the files are included as
 | `ipv4_reads_stay_inside_the_packet` | `kani/ip_header.rs` | for all IPv4 bytes up to 24, `parse` and `parse_truncated` give a payload from the header length to the total length (or the bytes present) | 0 of 489 failed |
 | `ipv4_check_requires_the_header_checksum` | `kani/ip_header.rs` | for all 24-byte IPv4 packets, `check` takes only a verifying header checksum and agrees with `parse`; `parse_whole` takes no fragment | 0 of 845 failed |
 | `ipv6_stripping_leaves_a_checked_packet` | `kani/ip_header.rs` | for all 56-byte IPv6 packets with 16 payload bytes starting with one or two 8-byte extension headers, a stripped packet is the original fixed header with the upper protocol (never an extension header) as next header, the upper bytes' length, and the upper bytes, which is what `parse_whole` reads with its upper header at 40; fragments are never stripped | 0 of 1,100 failed, 68 s |
-| `checked_ipv4_packets_are_host_packets` | `kani/packet.rs` | for all 48-byte IPv4 packets with a 20-byte header and every origin, `IpPacket::checked` takes exactly whole non-fragment packets under a non-observed origin, with the header `parse_whole` reads and the sort `Sort::of` names; otherwise it hands the bytes back; an observed copy is never checked | 0 of 1,667 failed, 57 s |
-| `checked_ipv6_packets_are_host_packets` | `kani/packet.rs` | the same for all 48-byte IPv6 packets, which must have no extension headers left | 0 of 1,665 failed, 126 s |
+| `checked_ipv4_packets_are_host_packets` | `kani/packet.rs` | for all 48-byte IPv4 packets with a 20-byte header and every origin, `IpPacket::checked` takes exactly whole non-fragment packets under a non-observed origin, with the header `parse_whole` reads and the sort `Sort::of` names; otherwise it hands the bytes back; an observed copy is never checked | 0 of 1,698 failed, 49 s |
+| `checked_ipv6_packets_are_host_packets` | `kani/packet.rs` | the same for all 48-byte IPv6 packets, which must have no extension headers left | 0 of 1,696 failed, 131 s |
 
 Earlier versions ran past the 12 GB memory cap: IPv4 reads over 28
 symbolic bytes of any header length, IPv6 stripping with headers of any
@@ -130,8 +130,28 @@ length or with `parse_whole` called on the stripped packet, and the
 checked-packet harnesses with an unwinding bound large enough for
 48-byte and 16-byte comparison loops. The harnesses were narrowed as
 their doc comments say: header lengths are held where noted, and bytes
-and addresses are compared at a symbolic index or as integers. The Kani
-harnesses have no failing controls; the TLA+ configs do.
+and addresses are compared at a symbolic index or as integers.
+
+### Kani failing controls
+
+Each harness has a failing control in the same file that changes one
+thing and must fail on the one assertion its comment names. Each failed
+on exactly that check, and the proofs passed, in the integration run
+(Kani 0.68.0, 10 GB cap); the checked-packet proofs now count 1,698 and
+1,696 checks, as `Sort` took the place of the packet's own transport enum.
+
+| Control | Covers | What it changes | Failed check |
+|---|---|---|---|
+| `parse_without_the_declared_length` | `parse_reads_exactly_the_declared_length` | claims `parse` reads every byte present | "a datagram is every byte present" (1 of 68) |
+| `encoded_len_without_the_ipv4_header` | `encoded_len_fits_one_ip_packet` | claims IPv4 refuses only what would not fit 16 bits, leaving out the IP header | "only a datagram past 16 bits is refused" (1 of 17) |
+| `ipv4_datagrams_without_the_zero_checksum_exception` | `ipv4_datagrams_roundtrip_and_one_bit_fails_the_checksum` | drops RFC 768's exception for a flip that zeroes the checksum field | "one flipped bit fails the checksum" (1 of 346) |
+| `ipv6_datagrams_with_two_flipped_bits` | `ipv6_datagrams_roundtrip_and_one_bit_fails_the_checksum` | flips the same bit in two 16-bit words, which the sum cannot see when they go opposite ways | "two flipped bits fail the checksum" (1 of 511) |
+| `checksum_without_the_end_around_carry` | `checksum_matches_rfc_1071` | compares with RFC 1071 less its end-around carry | "the sum without its carry" (1 of 198) |
+| `ipv4_truncated_reads_to_the_total_length` | `ipv4_reads_stay_inside_the_packet` | claims a truncated read ends at the total length | "the payload ends at the total length" (1 of 484) |
+| `ipv4_parse_without_the_header_checksum` | `ipv4_check_requires_the_header_checksum` | claims of `parse` what holds of `check` | "a header read has a verifying checksum" (1 of 642) |
+| `ipv6_stripping_keeping_the_payload_length` | `ipv6_stripping_leaves_a_checked_packet` | claims a stripped packet keeps the original payload length | "the payload length is the original's" (1 of 631) |
+| `checked_ipv4_packets_without_the_header_checksum` | `checked_ipv4_packets_are_host_packets` | claims `checked` hands back only bytes `parse` cannot read | "only unreadable IPv4 bytes are handed back" (1 of 1,424) |
+| `checked_ipv6_packets_with_extension_headers_left` | `checked_ipv6_packets_are_host_packets` | claims `checked` takes every packet `parse_whole` takes | "every whole IPv6 packet is checked" (1 of 1,422) |
 
 ## Executed Rust validation
 
@@ -151,8 +171,6 @@ them. `cargo clippy -p fictionet --lib --tests -- -D warnings` passed.
   the UDP layer's state; TLA+ and the unit tests cover those.
 - The UDP send side, ICMP port-unreachable answers and the `udp::endpoint`
   facade are not modeled.
-- `Scope::tunnel` still draws from a process-wide counter; Astra's point
-  that it must not become a replay identity is not addressed here.
 - The correspondence between the specs and the code is reviewed by hand,
   not a machine-checked refinement.
 
@@ -181,3 +199,6 @@ cargo kani -p fictionet --lib --harness parse_reads_exactly_the_declared_length
 Cap its memory (`systemd-run --user --scope -p MemoryMax=12G`), as this
 pass did: wider versions of these harnesses ran past that cap. Each
 harness takes under three minutes, compiling included.
+
+The controls run the same way, one at a time or with their proof, and
+must report `VERIFICATION:- FAILED` on the check named in the table above.

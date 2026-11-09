@@ -1,7 +1,7 @@
 //! Kani proofs over the IP packet envelope in
 //! `src/stdlib/network/packet.rs`: `IpPacket::checked`, `check` and `host`
-//! (lines 258-285), `IpPacket::observed` (231-246), `is_checked` (324-326)
-//! and `Transport::read` (155-184). Compiled only under `cargo kani`, as a
+//! (lines 262-299), `IpPacket::observed` (240-260), `is_checked` (335-340)
+//! and `Sort::read` (167-198). Compiled only under `cargo kani`, as a
 //! child module of `packet`, so every harness calls the production code.
 
 use super::*;
@@ -31,7 +31,7 @@ fn origin(choice: u8) -> Origin {
 /// host takes in with no IPv6 extension headers left, under any origin but
 /// `Observed`, and hands the bytes back otherwise. What it makes is
 /// checked, has the header `parse_whole` reads, and goes to the transport
-/// `Transport::of` names, which is TCP or UDP only for a TCP or UDP packet
+/// `Sort::of` names, which is TCP or UDP only for a TCP or UDP packet
 /// or an ICMP error. The same bytes observed are never checked.
 fn checked_is_a_host_packet(bytes: &[u8]) {
     // The same bytes, compared at a symbolic index: every index at once,
@@ -59,8 +59,8 @@ fn checked_is_a_host_packet(bytes: &[u8]) {
                 (h.protocol, &h.payload, h.fragment)
             );
             assert!(same(p.bytes()));
-            assert_eq!(p.transport(), Transport::of(bytes));
-            if matches!(p.transport(), Transport::Tcp | Transport::Udp) {
+            assert_eq!(p.sort(), Sort::of(bytes));
+            if matches!(p.sort(), Sort::Transport(_)) {
                 assert!(matches!(
                     h.protocol,
                     protocol::TCP | protocol::UDP | protocol::ICMP | protocol::ICMPV6
@@ -95,4 +95,52 @@ fn checked_ipv6_packets_are_host_packets() {
     let mut bytes: [u8; 48] = kani::any();
     bytes[0] = 0x60;
     checked_is_a_host_packet(&bytes);
+}
+
+// Failing controls. Each harness below changes one thing, and must fail on
+// the assertion its comment names.
+
+/// Claims that `checked` hands back only IPv4 bytes `parse` cannot read,
+/// leaving out the header checksum and fragments that the proof above
+/// says it refuses. Must fail on "only unreadable IPv4 bytes are handed
+/// back".
+#[kani::proof]
+#[kani::unwind(7)]
+fn checked_ipv4_packets_without_the_header_checksum() {
+    let mut bytes: [u8; 48] = kani::any();
+    bytes[0] = 0x45;
+    if IpPacket::checked(
+        Chunk::new(bytes.to_vec()),
+        Ingress::default(),
+        Origin::Arrived,
+    )
+    .is_err()
+    {
+        assert!(
+            Header::parse(&bytes).is_none(),
+            "only unreadable IPv4 bytes are handed back"
+        );
+    }
+}
+
+/// Claims that `checked` takes every IPv6 packet `parse_whole` takes,
+/// leaving out the extension headers that must be gone. Must fail on
+/// "every whole IPv6 packet is checked".
+#[kani::proof]
+#[kani::unwind(7)]
+fn checked_ipv6_packets_with_extension_headers_left() {
+    let mut bytes: [u8; 48] = kani::any();
+    bytes[0] = 0x60;
+    if IpPacket::checked(
+        Chunk::new(bytes.to_vec()),
+        Ingress::default(),
+        Origin::Arrived,
+    )
+    .is_err()
+    {
+        assert!(
+            Header::parse_whole(&bytes).is_none(),
+            "every whole IPv6 packet is checked"
+        );
+    }
 }
