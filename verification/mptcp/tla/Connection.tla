@@ -1,4 +1,31 @@
 ---------------------------- MODULE Connection ----------------------------
+(***************************************************************************)
+(* One MPTCP connection and one join at the listener in                    *)
+(* extras/src/linux/mptcp.rs (moved from demos/honeypot/src/mptcp.rs in    *)
+(* 5494f1ad1), with the first mapping DataLevel::new seeds in              *)
+(* src/stdlib/protocols/mptcp.rs.                                          *)
+(*                                                                         *)
+(*   Capable    complete and read_ack on the third ACK of an MP_CAPABLE    *)
+(*              handshake: Keys::Both on a pure ACK or Keys::Data with     *)
+(*              data count, anything else is plain TCP; DataLevel::new     *)
+(*              seeds a mapping for the data (ReceivedMapping::seeded)     *)
+(*   JoinSyn    answer_syn's MP_JOIN branch; Answers::syn saves a          *)
+(*              JoinCookie when the SYN gets a SYN cookie                  *)
+(*   Evict      JoinCookies::save writing over the slot, or take           *)
+(*   JoinAck    Answers::cookie, complete and answer_ack: Drop when        *)
+(*              nothing was kept (Completion::Join(None)), Refuse with     *)
+(*              MPTCP_SPECIFIC when the ACK has no MP_JOIN, with           *)
+(*              ADMINISTRATIVELY_PROHIBITED on a bad HMAC, Accept on a     *)
+(*              matching one. A cookie-answered join whose ACK carries no  *)
+(*              MP_JOIN is taken as plain TCP: Answers::cookie looks for   *)
+(*              the kept join only when the ACK has MP_JOIN, so complete   *)
+(*              sees a plain SYN cookie return (phase "plainCookie")       *)
+(*   FastClose  Dss::received's MP_FASTCLOSE check against the key         *)
+(*                                                                         *)
+(* Authenticate is the HMAC comparison in answer_ack, KeepCookie the join  *)
+(* cookie table, CheckFastClose the key comparison, ForbidJoinFallback the *)
+(* refusal of a join ACK without MP_JOIN.                                  *)
+(***************************************************************************)
 EXTENDS Naturals, FiniteSets
 CONSTANTS Authenticate, KeepCookie, CheckFastClose, ForbidJoinFallback
 VARIABLES phase, cookie, kept, authenticated, joined, reason, closeKey,
@@ -25,14 +52,18 @@ Evict == /\ phase = "join" /\ cookie /\ kept
 JoinAck(mac, option) ==
     /\ phase = "join"
     /\ LET have == (~cookie \/ kept \/ ~KeepCookie)
+           \* After a SYN cookie, an ACK without MP_JOIN is never looked up
+           \* as a join: the server takes it as plain TCP (Answers::cookie).
+           unseen == (cookie /\ ~option)
            accept == have /\ option /\ (mac \/ ~Authenticate)
-       IN /\ phase' = IF ~have THEN "dropped"
+       IN /\ phase' = IF unseen THEN "plainCookie"
+                       ELSE IF ~have THEN "dropped"
                        ELSE IF accept THEN "joined"
                        ELSE IF (~option /\ ~ForbidJoinFallback) THEN "plainJoin"
                        ELSE "refused"
           /\ joined' = accept
           /\ authenticated' = (mac /\ option /\ (~cookie \/ kept))
-          /\ reason' = IF accept \/ ~have THEN "none"
+          /\ reason' = IF accept \/ ~have \/ unseen THEN "none"
                         ELSE IF ~option THEN "mptcp" ELSE "prohibited"
     /\ UNCHANGED <<cookie, kept, closeKey, capableData, firstMapped>>
 FastClose(key) ==

@@ -1,21 +1,29 @@
 ----------------------------- MODULE UdpSockets -----------------------------
 (* The receive side of the UDP layer, `UdpLayer` in
-   src/stdlib/network/udp/sockets.rs: `bind` (lines 242-276) opens a child
-   on a free port, `take_in` (314-370) queues a datagram for the socket on
-   its port or refuses it, `socket_event` (373-400) hands a socket's next
+   src/stdlib/network/udp/sockets.rs: `bind` (lines 243-277) opens a child
+   on a free port, `take_in` (315-371) queues a datagram for the socket on
+   its port or refuses it, `socket_event` (374-401) hands a socket's next
    datagram up within the credit granted, or its end once the queue is
-   empty, `on_event` with `PacketEvent::Ended` (429-438) marks every
+   empty, `on_event` with `PacketEvent::Ended` (430-439) marks every
    socket ending, and `on_command` closes a socket by its handle
-   (`MuxOp::Close`, 479-481) or by its own end (`DatagramCommand::End`,
-   482-486, with `MuxEvent::Closed` from `take_event`, 519-527). `close`
-   (284-290) removes the socket's slot, with its queue, and frees the port.
+   (`MuxOp::Close`, 480-482) or by its own end (`DatagramCommand::End`,
+   483-487, with `MuxEvent::Closed` from `take_event`, 520-528). `close`
+   (285-291) removes the socket's slot, with its queue, and frees the port.
 
    Child ids are never reused: `Slots` gives each child a new generation
    (checked in verification/layer). A datagram's size is 0 (empty) or 1;
    it costs its size plus DatagramCost against Queue, as DATAGRAM_COST and
-   QUEUE do. Each arriving packet is of some network and is checked
-   (`IpPacket::is_checked`) or an observed copy. The send side and ICMP
-   answers are left out: neither moves a received datagram. *)
+   QUEUE do. A datagram that fits the queue is also charged to the layer's
+   budget (`env.budget().charge(cost)`, 358); when the budget has no room
+   it is dropped and reported like one for a full queue, so Arrive may
+   drop any datagram that fits. Each arriving packet is of some network
+   and is checked (`IpPacket::is_checked`) or an observed copy.
+
+   The code visits sockets in the order of its `ready` list (`wake`,
+   217-225) and gives a socket's send credit back (`MuxEvent::Credit`,
+   381-384) before its next datagram; the model lets any socket with an
+   event go next, which includes that order. The send side, that credit
+   and ICMP answers are left out: none moves a received datagram. *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
@@ -54,7 +62,8 @@ VARIABLES
     arrived,      \* how many arrived
     delivered,    \* <<c, d>>: datagram d went up on child c
     refused,      \* datagrams take_in did not queue: filtered or no socket
-    dropped,      \* datagrams dropped for a full queue (UdpReport::Dropped)
+    dropped,      \* datagrams dropped with a report (UdpReport::Dropped):
+                  \* a full queue, or no room in the budget
     discarded,    \* datagrams queued on a socket that then closed
     inputEnded,   \* UdpLayer::input_ended
     byEnd,        \* children closed by their own end
@@ -114,8 +123,9 @@ Bind(p) ==
                    inputEnded, byEnd, closedQ>>
     /\ UNCHANGED Seen
 
-\* A packet the IP layer sorted to UDP reaches take_in.
-Arrive(p, n, checked, size) ==
+\* A packet the IP layer sorted to UDP reaches take_in. `room` is whether
+\* the budget has room for the datagram (`env.budget().charge(cost)`).
+Arrive(p, n, checked, size, room) ==
     /\ ~inputEnded /\ arrived < MaxArrivals
     /\ LET d == arrived + 1
            c == portOf[p]
@@ -124,7 +134,7 @@ Arrive(p, n, checked, size) ==
            \* No property reads what a refused or dropped datagram was, so
            \* those are all recorded alike, which keeps the state space small.
            gone == filtered \/ c = NoChild
-                   \/ (KeepEmpty /\ sock[c].bytes + size + DatagramCost > Queue)
+                   \/ (KeepEmpty /\ (sock[c].bytes + size + DatagramCost > Queue \/ ~room))
        IN /\ arrived' = d
           /\ dg' = [dg EXCEPT ![d] = IF gone THEN Gone ELSE rec]
           /\ IF filtered \/ c = NoChild THEN
@@ -132,7 +142,7 @@ Arrive(p, n, checked, size) ==
                 /\ UNCHANGED <<sock, dropped>>
              ELSE IF ~KeepEmpty /\ size = 0 THEN
                 UNCHANGED <<sock, refused, dropped>>
-             ELSE IF sock[c].bytes + size + DatagramCost > Queue THEN
+             ELSE IF sock[c].bytes + size + DatagramCost > Queue \/ ~room THEN
                 /\ dropped' = dropped \cup {d}
                 /\ UNCHANGED <<sock, refused>>
              ELSE
@@ -217,7 +227,8 @@ TakeClosed ==
 
 Next ==
     \/ \E p \in Ports : Bind(p)
-    \/ \E p \in Ports, n \in Nets, ck \in BOOLEAN, sz \in {0, 1} : Arrive(p, n, ck, sz)
+    \/ \E p \in Ports, n \in Nets, ck \in BOOLEAN, sz \in {0, 1}, room \in BOOLEAN :
+          Arrive(p, n, ck, sz, room)
     \/ \E c \in Children : Grant(c) \/ Deliver(c) \/ EndEvent(c)
     \/ InputEnd
     \/ \E c \in Children, own \in BOOLEAN : Close(c, own)
@@ -242,8 +253,8 @@ NoCrossScope == \A pair \in delivered : dg[pair[2]].net = Mine
 OnlyChecked == \A pair \in delivered : dg[pair[2]].checked
 
 \* Every datagram that arrived, empty ones included, is in exactly one
-\* place: refused, dropped with a report, queued, gone up, or discarded
-\* with its socket.
+\* place: refused, dropped with a report (a full queue or no room in the
+\* budget), queued, gone up, or discarded with its socket.
 Accounted ==
     \A d \in 1..arrived :
         Cardinality({S \in {refused, dropped, Queued, Up, discarded} : d \in S}) = 1

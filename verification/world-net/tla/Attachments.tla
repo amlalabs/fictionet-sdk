@@ -17,12 +17,13 @@
    the sandbox when the transport opens the connection's child, before the
    application exists: the `budget` selector and `make` factory that
    `Machine::add` gives `tcp::Listener::attach` (src/stdlib/world/net/hosts.rs
-   1798-1820, `Hooks::sandbox_at` at 1807 and 1818). `abort_peers` is
+   1798-1867, `Hooks::sandbox_at` at 1807 and 1818). `abort_peers` is
    `Machines::abort_peers` (hosts.rs 1302), which reads the peers through the
-   transport's `EndpointState::peers` and sends `TcpControl::AbortPeers`
-   (`tcp::Endpoint::abort_peers`, src/stdlib/network/tcp.rs 1636); a
-   transport that refuses the command for now gets it again
-   (`Host::control`, tcp.rs 1382; world-layers/tla/Admission.tla). Closing
+   transport's `EndpointState::peers` (src/stdlib/network/tcp/factory.rs 35)
+   and sends `TcpControl::AbortPeers` (`tcp::Endpoint::abort_peers`,
+   src/stdlib/network/tcp.rs 1686); a transport that refuses the command for
+   now gets it again (`Host::control`, tcp.rs 1432;
+   world-layers/tla/Admission.tla). Closing
    an application does not end the modeled connection. Packet dispatch
    and protocol bytes are outside this model. *)
 EXTENDS Naturals, FiniteSets, Sequences

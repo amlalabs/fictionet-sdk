@@ -35,30 +35,48 @@
    answer the caller reads at once, go through `Host::request` and are
    never queued; they are not admission and are left out here.
 
-   Source lines (at the commit that adds this model):
+   Source lines (checked against main e2858ccc4):
      Open        hosts.rs 1798-1810 (`Listener::attach`, the `budget`
                  selector and `make`), 1345 `Peers::admit_transport`,
-                 1357 `Peers::enter`; children.rs 498 (budget chosen
-                 before storage), 516 (the factory); hosts.rs 243
+                 1357 `Peers::enter`; tcp/applications.rs 22-42 (the
+                 `Children` of the connections, with `close_finished`
+                 and the `budgets` selector); children.rs 870 (budget
+                 chosen before storage), 877-886 (a budget of zero
+                 cannot hold the receive window, so the child is
+                 refused), 888 (the factory); hosts.rs 242
                  (`StackAccept::stack`, the port's `Counted` limit)
-     Offer       tcp.rs 1382 `Host::control`, 1406
-                 `Host::offer_controls`, 1428 `Host::pump`; 2011
-                 `GoneWatch::reset`, 2032 `GoneWatch::hold_until_gone`
-     Finish      children.rs 221 `close_finished`, 454 (the close)
+     Offer       tcp.rs 1432 `Host::control`, 1456
+                 `Host::offer_controls`, 1478 `Host::pump`; 2063
+                 `GoneWatch::reset`, 2084 `GoneWatch::hold_until_gone`
+     Finish      children.rs 451 `close_finished`, 824 (the close)
      Retire,
      TakeHold,
-     TakeAbort   transport.rs `TcpControl::Hold` and `TcpControl::Abort`,
-                 the contract every TCP implements; tcp/engine.rs for the
-                 standard one (verification/tcp-layer)
+     TakeAbort   transport.rs 193-215 `TcpControl::Abort` and
+                 `TcpControl::Hold`, 292-296 `TcpNotice::Gone`, the
+                 contract every TCP implements; tcp/engine.rs for the
+                 standard one (verification/tcp-layer), whose `refuses`
+                 (2203) refuses a child's write only, never a control
      guard       hosts.rs 1376 `PeerGuard::drop`
-   Stopping the endpoint (tcp.rs 1551 `Shared::stop`) drops the queue
-   with the items it holds, as a stopped transport holds nothing; it is
-   not modeled.
+   Stopping the endpoint (tcp.rs 1603 `Shared::stop`) drops the queue
+   with the items it holds, `Host::control` (1433) drops a command given
+   to a stopped endpoint, and a transport that answers `Admit::Closed`
+   loses the command (1470), as a stopped transport holds nothing; none
+   of that is modeled.
 
    What is left out: the bytes, the handshake, which TCP state a closing
    connection is in (the tcp-layer and lifecycle models), and the
    attachment that carried the peer (`world-net/tla/Attachments.tla`). A
-   connection is one child of the transport, opened once. *)
+   connection is one child of the transport, opened once. The other
+   controls `Host::pump` queues (`Accept` for a listener, `Abort` for a
+   stray child, tcp.rs 1499-1505) share the queue with Hold and Abort:
+   they delay a command behind them, never drop it. An admitted child
+   that `Children` then refuses for its child limit or its sandbox
+   budget (children.rs 874-886) is closed, not reset, with its guard in
+   the transport's Hold; here every admitted connection is built. The
+   contract lets a transport release what Hold kept when the connection
+   is gone or when it is forgotten (transport.rs 294-295); the transport
+   here releases at gone, as the standard one does (tcp.rs 2029-2031),
+   so `NotHeldWhenGone` asks more of a replacement than the contract. *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS

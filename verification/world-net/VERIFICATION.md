@@ -1,6 +1,8 @@
 # Verification of the world network
 
-Branch `fv-net` off `8ccf47fae`. The area is the world network's
+Branch `fv-net` off `8ccf47fae`. The source lines named here and in the
+models were checked against `e2858ccc4` (`comp/fv-deep`) on November 9,
+2026. The area is the world network's
 attachment lifecycle (`src/stdlib/world/net/attachments.rs`) and the
 plumbing under it: the ready-slot scheduler (`src/stdlib/network/ports.rs`),
 the router's table (`src/stdlib/network/route.rs`), the packet queue
@@ -31,9 +33,9 @@ before and after the fix.
 | Config | Checks | Result |
 |---|---|---|
 | `Attachments_base` | `LeaseExclusive`, `ByAddrNamesLast`, `EntryWhileAlive`, `NoStaleConnections`, `AbortsOnlyOwn`, `Attribution`, `TableFollowsLeases`; liveness `StaleRoutesGo`, `DropsFinish` | passes: 11,046,773 states generated, 1,329,160 distinct, depth 36, 3 min 4 s |
-| `Attachments_resetsbyroute` (`OwnByRoutesTo = FALSE`: the code at `8ccf47fae`) | `AbortsOnlyOwn` | violated as expected, 1,117 states, 493 distinct: attach `r`, detach `r`, a host connects to a host, the route is re-edited, the router sees the old link close, and the reset takes the hosts' connection |
-| `Attachments_namesbyroute` (`OwnByRoutesTo = FALSE`) | `Attribution` | violated as expected, 19 states, 16 distinct, depth 3: with `r` attached a host's connection is put down to `r` |
-| `Attachments_forgetbyaddr` (`KeepByAddr = FALSE`) | `Attribution` | violated as expected, 2,140 states, 827 distinct, depth 7: forgetting a `by_addr` entry on detach puts an in-flight packet down to the route |
+| `Attachments_resetsbyroute` (`OwnByRoutesTo = FALSE`: the code at `8ccf47fae`) | `AbortsOnlyOwn` | violated as expected (2,410 states, 980 distinct on November 9, 2026; the count to the first violation varies between runs): attach `r`, detach `r`, a host connects to a host, the route is re-edited, the router sees the old link close, and the reset takes the hosts' connection |
+| `Attachments_namesbyroute` (`OwnByRoutesTo = FALSE`) | `Attribution` | violated as expected (35 states, 29 distinct, depth 4 on November 9, 2026): with `r` attached a host's connection is put down to `r` |
+| `Attachments_forgetbyaddr` (`KeepByAddr = FALSE`) | `Attribution` | violated as expected (2,556 states, 970 distinct, depth 8 on November 9, 2026): forgetting a `by_addr` entry on detach puts an in-flight packet down to the route |
 
 **`Ports.tla`**: `Ports::next`'s loop over the ready queue (`ReadyInner::push`
 and `pop`, `SlotWaker::wake_by_ref`), with the task's own waker, slots
@@ -66,7 +68,7 @@ other's receiver, as the code does.
 | Config | Checks | Result |
 |---|---|---|
 | `Cable_base` | `NothingForTheParked`, `ClosedAfterDrain`, `NoQueueForTheDropped`, `ClosedMeansDropped`; liveness `LearnsClosed` | passes: 325 states, 72 distinct, depth 7 |
-| `Cable_dropsilent` | `NothingForTheParked`, `LearnsClosed` | violated as expected, 18 states, 14 distinct |
+| `Cable_dropsilent` | `NothingForTheParked`, `LearnsClosed` | violated as expected. TLC stops at the first violation, `NothingForTheParked` after `Recv`, `Drop` (27 states, 19 distinct on November 9, 2026). Checked alone, `LearnsClosed` is violated too (317 states, 72 distinct) |
 
 ### Kani (over the production code)
 
@@ -80,7 +82,7 @@ included) and, where it needs one, any address or second prefix.
 |---|---|---|
 | `ipv4_contains_compares_the_prefix_bits` | `Prefix::contains` agrees with the first `len` bits for IPv4, never holds an IPv6 address; `mask` is those bits | passes, 0.3 s |
 | `ipv6_contains_compares_the_prefix_bits` | the same over 128 bits | passes, 0.8 s |
-| `canonical_keeps_what_the_prefix_holds` | `canonical` clears the host bits, clamps the length, is a fixed point, and keeps `contains`, `mask`, `network`, `last` and `size` | passes, 6.6 s |
+| `canonical_keeps_what_the_prefix_holds` | `canonical` clears the host bits, clamps the length and is a fixed point, for both families. For IPv4 it keeps `contains`, `mask`, `network`, `last`, `size`, and `broadcast`; for IPv6, `contains`, `last`, and `size` | passes, 6.6 s |
 | `overlap_is_a_shared_address` | `overlaps` holds exactly when some address is in both, is symmetric, never across families | passes, 3.6 s |
 | `ipv4_offsets_size_last_and_broadcast_agree` | `nth` is defined exactly below `size`, offset 0 is `network`, the last offset is `last`, `broadcast` is `last` up to /30 and nothing past it | passes, 1.8 s |
 | `ipv6_offsets_and_size_agree` | a /0 has no `size` and `nth` reaches every offset; otherwise `size` is 2^(128 - len) with `nth` defined exactly below it; no broadcast | passes, 4.3 s |
@@ -159,3 +161,34 @@ clippy with `-D warnings` and rustfmt are clean.
 - The `PacketQueue`, the ready queue's `push` and `pop`, and the `Table`
   code itself have no proof over the Rust: their TLA+ specs are models,
   tied to the functions by name, not the code.
+- The route the network starts with at `0.0.0.0/0` (and `::/0`), the
+  `unreachable` task that answers "host unreachable"
+  (`src/stdlib/world/net.rs` 706-751 and 1102-1136), is not in the model.
+  In the code the first routed attach moves the prefix and closes that
+  interface (`route.rs` 297-301), which ends the task, and nothing puts
+  it back. After the route's sandbox detaches, the prefix has no route at
+  all: packets for outside addresses are dropped at the router with no
+  ICMP answer, no `Unreachable` report, and no `Refusal::NoRoute`, where
+  before the attach they were answered. The model's `routePort = None`
+  stands for both states.
+- `Destinations::routes_to` is evaluated when a packet arrives or a route
+  detaches, against the machines then. The model's hosts are fixed. A host
+  placed through `Net::handle` at an address an outside peer was using
+  makes that peer a machine: its open connections through the route are
+  no longer the route's, so `Routed::drop` does not reset them.
+- `Ports.tla` has `add`, `close`, and `replace` into a free slot, between
+  polls. `replace` over an open slot, the extra source polled before the
+  queue, the deadline, the 64-packet budget, and cancellation are outside
+  it.
+- `Cable.tla` counts packets against `MaxQueued`. The code charges bytes
+  plus `PACKET_COST` against `Cable::limit` (`PacketQueue::fits`), and a
+  `pair()` has no limit. `End::drop` locks the two directions one after
+  the other. The model takes it as one step, which loses nothing: a send
+  or poll at the other end in between sees the state before or after, as
+  in the model. The name guard a cable carries for `Attacher` is outside
+  the model.
+- `Table.tla` has one address family. The code keys `lengths` by family
+  and length, and `best` ranges over the destination's family only.
+- `src/stdlib/network/link.rs` (`delay`, `bottleneck`, `filter`, and
+  `tap`) has no model. The links inside the network are cables
+  (`link` in `net.rs`, `pair_with_limit`).

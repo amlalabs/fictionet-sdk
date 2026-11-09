@@ -392,10 +392,13 @@ Advance(q) ==
           /\ LET recs == r.recs \cup {Used(r.qn, q[2], e, fetched)} IN
              IF CheckExpiry /\ \E u \in recs : ~u.fetched /\ ~Live(u)
              \* A link the cache gave ran out while the chase went on: follow the
-             \* chain again from the question, keeping the work done so far. A
-             \* link that came for this resolution serves it with the TTL it has
-             \* left, even 0: following again could only fetch it again.
-             THEN /\ res' = [res EXCEPT ![q] = [NewRes(q, r.payer) EXCEPT !.chain = r.chain]]
+             \* chain again from the question, keeping the work done so far (the
+             \* queries stay charged to their payers) but counting the aliases
+             \* afresh, as Resolver::answer_asker clears the pieces the alias
+             \* count is read from. A link that came for this resolution serves
+             \* it with the TTL it has left, even 0: following again could only
+             \* fetch it again.
+             THEN /\ res' = [res EXCEPT ![q] = NewRes(q, r.payer)]
                   /\ UNCHANGED <<waiting, ans>>
              ELSE Finish(q, Rcode(e.t), recs, FALSE)
           /\ UNCHANGED <<cache, spent, net>>

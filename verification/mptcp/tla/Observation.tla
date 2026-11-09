@@ -1,4 +1,32 @@
 ---------------------------- MODULE Observation ----------------------------
+(***************************************************************************)
+(* The honeypot's Observer in demos/honeypot/src/observe.rs.               *)
+(*                                                                         *)
+(* Spec (SYN counts and answers):                                          *)
+(*   Syn        Observer::syn: recent, pending, awaited (epoch is the      *)
+(*              SYN's time there, answers its count) and Source::syns      *)
+(*   Tick       Observer::expire's loop over `recent` (ExpireState)        *)
+(*   Answer     Observer::answered                                         *)
+(*   Cleanup    Observer::expire's loop over `pending` (MatchEpoch: only   *)
+(*              the entry whose time awaited still holds removes it)       *)
+(*   Open/Close the contract that a route keeps nothing per source:        *)
+(*              Routed::poll_recv in src/stdlib/world/net/attachments.rs   *)
+(*              inserts nothing, and the test                              *)
+(*              a_public_route_keeps_nothing_per_source checks it. Nothing *)
+(*              in the code corresponds to LastClose.                      *)
+(* SignalSpec (probe attempts), all in Observer::observe unless named:     *)
+(*   SignalSyn     the incoming SYN branch: a probe per attachment and     *)
+(*                 tuple with its current initial sequence; a SYN with a   *)
+(*                 new one removes the tuple's probe first; a repeat of a  *)
+(*                 probe with IPv4 options is an IpOptionsRetransmit, in   *)
+(*                 any phase                                               *)
+(*   SignalAnswer  the outgoing SYN-ACK matching the probe, before it      *)
+(*                 completed                                               *)
+(*   SignalAck     the ACK matching both sequences (Probe::completed)      *)
+(*   SignalData    `belongs` and Probe::payload                            *)
+(*   SignalClose   `closing` and Probe::report with ProbeEnd::Close        *)
+(*   SignalExpire  Observer::expire's probe loop, ProbeEnd::Expired        *)
+(***************************************************************************)
 EXTENDS Integers, FiniteSets, Sequences
 CONSTANTS Sources, Window, MaxTime, MaxSyns, ExpireState, LastClose, MatchEpoch
 VARIABLES now, recent, count, connections, routed, pending, epoch, answers
@@ -63,16 +91,23 @@ SignalSyn(s, sequence, options, capable, payload) ==
     /\ LET k == <<s, sequence>>
            p == probes[k]
            repeated == LiveProbe(p)
+           \* The code keeps one probe per tuple, with its current initial
+           \* sequence: a SYN with another one removes that probe first,
+           \* with no report, whether or not the new SYN starts a probe.
+           other == <<s, 1 - sequence>>
        IN /\ p.phase = "absent" \/ repeated
-          /\ probes' = [probes EXCEPT ![k] =
-               IF repeated THEN IF p.phase = "pending"
-                    THEN [p EXCEPT !.repeats = @ + 1, !.payload = (@ \/ payload)]
-                    ELSE [p EXCEPT !.payload = (@ \/ payload)]
-               ELSE IF options \/ capable
-                    THEN [EmptyProbe EXCEPT !.phase = "pending", !.sequence = sequence,
-                          !.at = now, !.initial = options, !.capable = capable, !.payload = payload]
-                    ELSE p]
-          /\ evidence' = IF repeated /\ p.initial /\ p.phase = "pending"
+          /\ probes' = [q \in ProbeKeys |->
+               IF q = k THEN
+                   IF repeated THEN IF p.phase = "pending"
+                        THEN [p EXCEPT !.repeats = @ + 1, !.payload = (@ \/ payload)]
+                        ELSE [p EXCEPT !.payload = (@ \/ payload)]
+                   ELSE IF options \/ capable
+                        THEN [EmptyProbe EXCEPT !.phase = "pending", !.sequence = sequence,
+                              !.at = now, !.initial = options, !.capable = capable, !.payload = payload]
+                        ELSE p
+               ELSE IF q = other /\ ~repeated /\ LiveProbe(probes[q]) THEN EmptyProbe
+               ELSE probes[q]]
+          /\ evidence' = IF repeated /\ p.initial
               THEN evidence \cup {[kind |-> "trigger", initial |-> p.initial,
                    previous |-> p.sequence, sequence |-> sequence, live |-> LiveProbe(p),
                    pending |-> p.phase = "pending", capable |-> p.capable,
@@ -80,7 +115,7 @@ SignalSyn(s, sequence, options, capable, payload) ==
     /\ syns' = syns + 1
     /\ UNCHANGED <<now, opened>>
 SignalAnswer(s, server) ==
-    /\ LiveProbe(probes[s])
+    /\ LiveProbe(probes[s]) /\ probes[s].phase = "pending"
     /\ probes' = [probes EXCEPT ![s].server = server]
     /\ UNCHANGED <<now, syns, evidence, opened>>
 SignalAck(s, sequence, acknowledgement, payload) ==
@@ -128,8 +163,7 @@ SignalNext ==
     /\ UNCHANGED <<recent, count, connections, routed, pending, epoch, answers>>
 SignalSpec == SignalInit /\ [][SignalNext]_vars
 TriggerEvidence == \A event \in evidence : event.kind = "trigger" =>
-    event.initial /\ event.previous = event.sequence /\
-    event.live /\ event.pending
+    event.initial /\ event.previous = event.sequence /\ event.live
 NoDataEvidence == \A event \in evidence : event.kind = "no_data" =>
     event.capable /\ ~event.payload
 HandshakeEvidence == \A event \in opened :
@@ -143,7 +177,8 @@ OtherAttemptsPreserved == [][
     \A s \in Sources, sequence \in 0..1,
     options \in BOOLEAN, capable \in BOOLEAN, payload \in BOOLEAN :
     SignalSyn(s, sequence, options, capable, payload) =>
-    \A k \in ProbeKeys \ {<<s, sequence>>} : probes'[k] = probes[k]]_vars
+    \A k \in ProbeKeys \ {<<s, sequence>>} :
+        probes'[k] = probes[k] \/ (k[1] = s /\ probes'[k] = EmptyProbe)]_vars
 CompletedSynNotReopened == [][
     syns < MaxSyns /\ now < MaxTime /\ syns' = syns + 1 =>
     \A s \in Sources, sequence \in 0..1,

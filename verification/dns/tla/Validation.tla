@@ -107,12 +107,14 @@ V(kind, why) == [kind |-> kind, why |-> why]
 DsKey(p) == CASE p = "DsA" -> "A" [] p = "DsB" -> "B" [] OTHER -> "none"
 
 (* The validator, walking down from the anchor. At zone i it holds the key *)
-(* the link above names. Below the anchor's zone, the DS set the parent    *)
-(* serves is fetched first, so an unreachable zone there is Indeterminate  *)
-(* before its algorithm is read (Check::delegation). The algorithm comes   *)
-(* from that DS set or the anchor, so an unsupported one makes the zone    *)
-(* Insecure before its DNSKEY set is fetched (RFC 4035 section 5.2,        *)
-(* RFC 9905 section 2).                                                    *)
+(* the link above names. The resolver fetches a zone's DS and DNSKEY sets  *)
+(* together (Resolver::link); the validator reads them in order. Below the *)
+(* anchor's zone it reads the DS set the parent served first              *)
+(* (Check::delegation), so an unreachable zone there is Indeterminate      *)
+(* before its algorithm is looked at. The algorithm comes from that DS set *)
+(* or the anchor, so an unsupported one makes the zone Insecure before its *)
+(* DNSKEY set is read (Check::dnskeys), whatever that fetch gave           *)
+(* (RFC 4035 section 5.2, RFC 9905 section 2).                             *)
 Unreachable == IF MissingAsInsecure THEN V("Insecure", "Missing") ELSE V("Indeterminate", "ede5")
 
 RECURSIVE Walk(_, _, _, _)

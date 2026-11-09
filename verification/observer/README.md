@@ -36,7 +36,12 @@ overlap segments, carry a RST, or end. The observer may evict the
 connection (`make_room`, `let_go` for the connection bound) or replace it
 on a new SYN, and the layer above may close the child. The header of
 `Observer.tla` maps each action to its function and its lines at
-`f0dceb76f`.
+`f0dceb76f`; every one of those lines still holds at `e2858ccc4` (the
+two later commits that touch the observer, `2de017e3a` and `3d4e3df9d`,
+moved none of them, and the profiling pass merged at `e2858ccc4` changed
+no observer file: `take_event` still serves `opened` first and then its
+`ready` children in turn, and `make_room` still evicts the child with the
+most waiting).
 
 `CutShortIncomplete` judges an end by what the capture showed, not by what
 the flow kept: the history variable `carried` is the end of the furthest
@@ -88,7 +93,13 @@ What the model leaves out: the 32-bit wrap and byte values (the Kani
 harnesses take them), the byte bound `Limits::buffered` (it acts as the
 segment bound does), credit (the child takes events in order when it
 likes), and which side opened. One connection at a time; the connection
-bound appears as eviction.
+bound appears as eviction. Two smaller differences from the code: `gap`
+in `flow.rs` joins a gap to the one just before it, while the model's
+`DrainFirst` appends a marker's gap unjoined, so the child may see two
+adjacent gap events where the code sends one (`Contiguous` holds either
+way); and `make_room` in the code also acts on a child whose connection
+was already let go, replacing its pending ends with `Evicted` ones, where
+the model's `MakeRoom` stops once the connection is detached.
 
 ## kani/Flow.rs
 

@@ -38,7 +38,7 @@ proof of the rule and the counterexample that shows why it is there.
 | | `EveryAcceptedAnswered` | liveness | every accepted query is answered unless its client goes |
 | Validation | `SecureImpliesChain` | invariant | Secure only with a valid chain from a configured anchor to the answer |
 | | `InsecureNeedsProof` | invariant | Insecure only with no covering anchor, or below a validated chain a signed no-DS proof, an opt-out cover, or a DS whose algorithm the policy does not admit, each from a DS set that was fetched |
-| | `UnreachableLinkIndeterminate` | invariant | a zone below a validated chain whose DS set cannot be fetched is Indeterminate, whatever that set would have said, as `Check::delegation` fetches it first |
+| | `UnreachableLinkIndeterminate` | invariant | a zone below a validated chain whose DS set cannot be fetched is Indeterminate, whatever that set would have said, as `Check::delegation` reads the DS fetch before `Check::dnskeys` reads the keys |
 | | `NoDowngrade` | invariant | a valid chain is always Secure |
 | | `IndeterminateOnlyUnreachable` | invariant | Indeterminate only when a zone could not be fetched |
 | | `AdOnlySecure` | invariant | AD only for Secure data with DO or AD in the query; never for NotPerformed, never because an upstream set it |
@@ -78,7 +78,8 @@ Configs:
 * **Exchanges:** `_base`, `_advance`, `_cancel`. Ablations: `_idonly`,
   `_flushonly`, `_cancelshared`.
 * **Validation:** `_paths`, `_skew`, `_unreachable`, `_policy`,
-  `_signers`, `_witnesses` (every reachability witness, each expected to fail), and
+  `_signers`, the six `_witness_*` (one reachability witness each, every
+  one expected to fail), and
   `_edits` (the witness that an edited zone of the world's own can be
   Secure). Ablations: `_trustupstreamad`, `_nopolicy`,
   `_missingasinsecure`, `_signerpeek`.
@@ -94,11 +95,14 @@ actions, never by a `CONSTRAINT`, so the liveness checks are sound:
   ablations, and one port and one ID elsewhere; each client asks a fixed
   script, one question at a time. The work
   and chain counters count with or without the bounds and stop one past
-  them, so in `_nobound` `WorkBounded` fails, and the loop repeats a state
-  and TLC reports the liveness violation as a lasso.
+  them, so in `_nobound` `WorkBounded` fails, and in
+  `_nobound_unanswered` (the same constants) the loop repeats a state and
+  TLC reports the liveness violation as a lasso. Every control names one
+  property, so TLC's first error is the one expected.
 * **Exchanges:** the clock by `MaxTime` 3, exchange identities by
-  `MaxExchanges` 4, generations by `MaxGeneration` 2 (1 in `_base` and
-  `_cancel`); one duplicate, one spoofed reply, one `Gone`.
+  `MaxExchanges` 4, generations by `MaxGeneration` 2 in `_advance` and
+  `_flushonly` and 1 in the other four configs; one duplicate, one spoofed
+  reply, one `Gone`.
 * **Validation:** no counters; the data dimensions are finite sets.
 
 ## Results
@@ -116,15 +120,15 @@ in `_concurrent` explores the same states as the invariants there.
 |---|---|---|---|---|---|---|
 | Resolution_base | the 11 invariants, `ReferralsDescend` | pass | 2749819 | 66 | 11-16 s | |
 | Resolution_base | `EveryQueryAnswered` | pass | 2749819 | 66 | 142 s | |
-| Resolution_concurrent | the 11 invariants, `ReferralsDescend` (symmetry) | pass | 4519385 | 59 | 19-20 s | |
-| Resolution_concurrent_live | `EveryQueryAnswered` | pass | 9038685 | 59 | 519 s | |
+| Resolution_concurrent | the 11 invariants, `ReferralsDescend` (symmetry) | pass | 4359020 | 59 | 19-20 s | |
+| Resolution_concurrent_live | `EveryQueryAnswered` | pending | pending: /home/souvik/Projects/amlalabs/.fictionet-comp-work/fvdeep-logs/dns-tla-Resolution_concurrent_live.log | pending | 519 s | |
 | Resolution_loop | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 12560 | 30 | 0-1 s | |
 | Resolution_rogue | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 36437 | 33 | 0-2 s | |
 | Resolution_edit | the 11 invariants, `ReferralsDescend` | pass | 468532 | 45 | 2 s | |
 | Resolution_edit | `EveryQueryAnswered` | pass | 468532 | 45 | 17 s | |
 | Resolution_nobailiwick | `NoPoison` | violated | 312 | 11 | 1 s | Ask, Advance, Serve, Receive (root's referral), Advance, Serve, Receive (tld's referral), Advance, Serve, Receive: alt.tld's answer for x.w.alt.tld carries www.sld.tld, which is cached |
 | Resolution_nobound | `WorkBounded` | violated | 5406 | 21 | 0 s | the loop's CNAME chase restarts past `MaxChain` |
-| Resolution_nobound | `EveryQueryAnswered` | violated | 38802 | lasso | 3 s | down to sld.tld and over to alt.tld, then round a lasso: the chain follows loop.sld.tld and loop.alt.tld from the cache forever, its counter stopped one past `MaxChain` |
+| Resolution_nobound_unanswered | `EveryQueryAnswered` | violated | 38802 | lasso | 3 s | down to sld.tld and over to alt.tld, then round a lasso: the chain follows loop.sld.tld and loop.alt.tld from the cache forever, its counter stopped one past `MaxChain` |
 | Resolution_cachetc | `CachedNegativeTrue` | violated | 33 | 6 | 0 s | Ask, Advance, Serve, Truncate, Receive: the truncated reply for cn.sld.tld, a CNAME, is cached as NODATA |
 | Resolution_noexpiry | `TtlSound` | violated | 5031 | 20 | 0 s | Ask cn.sld.tld; Advance, Serve, Receive three times down to sld.tld; Advance follows the CNAME; Advance, Serve, Receive, Advance for www.sld.tld; Ask www.sld.tld; Tick, Tick, Advance: the cache answers www.sld.tld after its two-second TTL ran out |
 | Resolution_failureasnegative | `FailureNeverNegative` | violated | 173 | 9 | 0 s | Ask, Advance, Lose, Timeout, Advance, Serve, Receive, Advance: the query to one root server is lost and times out, the other refuses, and the cached failure answers NXDOMAIN |
@@ -151,7 +155,7 @@ in `_concurrent` explores the same states as the invariants there.
 | Validation_unreachable | the 11 invariants | pass | 147456 | 1 | 0-1 s | |
 | Validation_policy | the 11 invariants | pass | 3456 | 1 | 0-1 s | |
 | Validation_signers | the 11 invariants | pass | 65536 | 1 | 0-1 s | |
-| Validation_witnesses | each of the 6 `Never...` forms, alone | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
+| Validation_witness_edited, _optout, _tld, _root, _unsigned, _noanchors | one `Never...` form each | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
 | Validation_edits | `NeverEditedWorldZoneSecure` | violated (reachable) | 1 | 1 | 1 s | a world zone signed with key B under anchor B, an RRset of it edited and signed again: Secure |
 | Validation_trustupstreamad | `AdOnlySecure` | violated | 1 | 1 | 0 s | no anchors configured (NotPerformed), the upstream reply has AD, the client gets AD |
 | Validation_nopolicy | `Sha1Insecure` | violated | 1 | 1 | 1 s | a chain of key A where sld's DS names algorithm 5: Secure |
@@ -176,7 +180,8 @@ General:
   edit's new values, spoofed, duplicate, and late replies delivered and
   ignored, SERVFAIL after both servers, answers after `Advance` and after
   another client's `Gone`. So no property holds only because its premise never
-  occurs. The Validation witnesses are kept as `_witnesses.cfg`.
+  occurs. The Validation witnesses are kept as the `_witness_*.cfg`
+  configs, one per form.
 
 Resolution:
 
@@ -239,16 +244,38 @@ Resolution:
   without it the resolver answered a cached CNAME whose TTL had already run
   out (`TtlSound`). The Rust resolver does the same: `Resolver::ran_out`
   looks at the cached pieces of an answer, and when one ran out while the
-  rest was resolved, the chain is followed again from the question, its
-  work so far still counted; a piece fetched for the question goes out
-  with TTL 0. `_nocountdown`, where a fetched record keeps the TTL it came
-  with, shows that `TtlSound` checks this.
+  rest was resolved, `Resolver::answer_asker` clears the pieces and the
+  chain is followed again from the question, its work so far still
+  counted (the tree's `sent`) but its aliases counted afresh, since the
+  alias count is the number of pieces; the model's restart keeps `spent`
+  and starts `chain` at 0 the same way. A piece fetched for the question
+  goes out with TTL 0. `_nocountdown`, where a fetched record keeps the
+  TTL it came with, shows that `TtlSound` checks this.
+* Rust asks one server address up to three times per transport before it
+  gives up on it (`TRIES` in `resolver/resolution.rs`, RFC 9520 section
+  3.1), each query charged to the work bound, and after a UDP timeout it
+  picks again among the servers not given up on, the same one included.
+  The model's one `Timeout` per server and transport stands for those
+  tries, charges one query, and the next query goes to a server not yet
+  tried.
+* Rust rejects an upward or sideways referral through the same rule that
+  drops out-of-bailiwick records: the authority section is kept only
+  within the zone the server was asked for, so an NS RRset for a zone that
+  is not strictly below it never counts as a referral (`answered` in
+  `resolver/resolution.rs`). The model keeps `ReferralsDescend`'s rule
+  apart from `CheckBailiwick`, so `_nobailiwick` removes less than
+  deleting that filter from the Rust would.
+* Rust keeps an NXDOMAIN under type ANY as well as under the type asked,
+  so it answers every type at the name (`Cache::nxdomain_above`); the
+  model keeps negatives under the name and type asked alone, and no script
+  asks a missing name for two types.
 * A failure after every server was tried is cached for `failure_ttl`
   (1 s) at the name the chain had reached. Rust caches a failure that
   persists twice as long as the one before it (RFC 9520 section 3.2);
   the model caches every failure for `failure_ttl`, and the Lean cache
   model checks the longer times. A resolution that reaches the
-  work bound answers SERVFAIL without caching, as `Resolution::send` leaves
+  work bound answers SERVFAIL without caching, as `Resolver::send` (in
+  `resolver/resolution.rs`) leaves
   a failure the bound caused out of the cache: the bound is one question's
   budget and says nothing of the servers. When the bound is reached just
   as the last server has been tried, the model, like Rust, answers SERVFAIL
@@ -280,7 +307,14 @@ Exchanges:
 * A server answers with the data of the session the exchange was sent in,
   and each reply carries that generation so `ObsoleteNeverPopulates` can be
   stated.
-* Generations start at 1, so `MaxGeneration` 2 allows one `Advance`.
+* The model's generations start at 1, so `MaxGeneration` 2 allows one
+  `Advance`. Rust's start at 0 (`Tokens::new`, `Namespace::new`); only
+  the order matters.
+* After a timeout the model counts the server as tried at once, and when
+  both are tried `GiveUp` answers SERVFAIL without a cache entry. Rust
+  gives a server up after three timeouts per transport (`TRIES`), may ask
+  the same server again before that, and caches the failure (`Entry::Failure`),
+  which `Resolution.tla` models.
 
 Validation:
 
@@ -291,14 +325,24 @@ Validation:
   world can sign its root and every zone with its own key B under its own
   anchor.
 * `alg[z]` is the algorithm the DS or the anchor names for `z`. An
-  algorithm outside the policy makes the zone Insecure before any fetch
-  (RFC 4035 section 5.2, RFC 9905 section 2). DS digest types and the NSEC3
+  algorithm outside the policy makes the zone Insecure whatever its DNSKEY
+  set holds: the resolver fetches the DS and DNSKEY sets of a zone together
+  (`Resolver::link`), and `Check::dnskeys` decides from the DS algorithms
+  before it reads the DNSKEY fetch (RFC 4035 section 5.2, RFC 9905 section
+  2). DS digest types and the NSEC3
   iteration limit are not modelled; Lean's policy model covers them.
 * Windows and the clock are three slots (past, now, future); skew is a
   clock that is not "now".
 * An unreachable zone is one whose DNSKEY or DS set cannot be fetched. If
   `sld` is unreachable the answer itself is missing, so the client gets
-  SERVFAIL even with CD.
+  SERVFAIL even with CD. One bit stands for both sets; Rust tells them
+  apart: a DS fetch that failed is Indeterminate (`Check::delegation`),
+  while a DNSKEY fetch that failed under a DS set whose algorithms the
+  policy does not validate is Insecure, since `Check::dnskeys` reads the
+  algorithms first. Rust is also Indeterminate when the chain it gathered
+  skips a cut or does not start at the anchor (`deeper_signer`,
+  `Check::zone_keys`); the model takes the resolver to gather the whole
+  path.
 * With CD=1 the client checks signatures itself, so `Resolver` does not
   validate a fresh answer: it is NotPerformed and gets AD=0. An answer from
   the cache keeps what an earlier query without CD established (`cached`),
@@ -327,15 +371,15 @@ Resolution:
 | Model | Rust |
 |---|---|
 | `cache[<<n, t>>]` | `Cache`, keyed by `(LowerName, RecordType, DNSClass)` |
-| entry `t` = `"a"` or `"cname"` | `Entry::Positive { set, rank, expires, validation }` |
+| entry `t` = `"a"` or `"cname"` | `Entry::Positive { set, rank, expires, validation, proof }` |
 | entry `t` = `"nx"` or `"nodata"` | `Entry::Negative { kind: Negative::NxDomain` or `NoData, .. }` |
 | entry `t` = `"fail"` | `Entry::Failure { why: FailureKind, cd, until, lasts }`, kept for `Config::failure_ttl`; Rust keeps a failure that persists longer. The model has no CD bit: `cd` says whether the failed queries set it, for a forwarder that relays a client's CD |
 | entry `rank` | `Rank::AuthAnswer` and `Rank::Glue` (two of the five ranks) |
 | entry `readAt + ttl` | `expires: Instant` |
-| entry `tried` of a failure | not stored: the model keeps what the failed resolution tried, since Rust writes `Entry::Failure` only after trying every address of the zone (RFC 9520 section 3.1) |
+| entry `tried` of a failure | not stored: the model keeps what the failed resolution tried, since on the paths the model covers Rust writes `Entry::Failure` only when `Resolver::plan` has no server of the zone left to ask (RFC 9520 section 3.1); `Resolver::fail` also caches a failure for a priming cycle and for a name no known cut holds, which the model has no way to reach |
 | a used record's `fetched` and `left` | `Piece::cached` (its negation) and the TTL `cache::ttl_left` renders |
 | `known` | the cached cuts the resolution starts from |
-| `res[q]` | one resolution in `resolver/resolution.rs`, for a name and type: `qn` the name the chain has reached, `zone` the closest cut, `out` the exchange outstanding (server, transport, port, ID), `tried` the addresses tried per transport (RFC 9520 section 3.1), `work` and `chain` against `Config::work` (`Work { queries, depth }`) |
+| `res[q]` | one client question being answered: the `Asker` in `resolver/mod.rs` with the `Lookup` in `resolver/resolution.rs` it waits on, one lookup per name the chain reaches. `qn` is `Asker::next_question`, `zone` the cut `Resolver::plan` asks (`Lookup::delegation` or the deepest cached NS RRset), `out` the `Exchange` under the lookup's token (`to`, `transport`, `id`, `question`, `deadline`), `tried` is `Lookup::tried`, the addresses given up on per transport (RFC 9520 section 3.1), `payer` is `Lookup::tree`, `spent` is the tree's `sent` against `Config::work.queries`, and `chain` is the number of alias pieces against `Config::work.depth` |
 | `waiting[q]` | the client queries waiting on one resolution, which they share |
 | `ans[c][q]` | `Action::Answer`, rendered for its client |
 | `Receive` | taking a reply that matches its exchange (`exchange::matching`): TC retries over TCP, answers stored in bailiwick only, referrals strictly below the cut, glue at glue rank |
@@ -365,8 +409,8 @@ Validation:
 | `anchor` | `Config::anchors`: `None` is `"none"`; `Anchors` covering another tree is `"elsewhere"` |
 | `PolicyAlgs` | `AlgorithmPolicy::validate`; `AlgorithmPolicy::iana()` admits no algorithm 5 or 7 |
 | `clock` | `WallClock::at(now)`, the `Session` clock |
-| `Walk`, `Validate` | `validate_rrset` and `validate_denial` |
-| result kinds | `Validation::{NotPerformed, Secure, Insecure(Insecure), Bogus(EdeCode), Indeterminate}`; reasons `Insecure::{ProvenNoDs, OptOutCovered, NoAnchor, UnsupportedAlgorithm}` and EDE codes 5, 6, 7, 8, 9, 12 |
+| `Walk`, `Validate` | `validate_rrset` and `validate_denial`, whose `Check::zone_keys` walks the chain with `Check::walk`, `Check::delegation`, and `Check::dnskeys`; `Resolver::check` gives NotPerformed with no anchors and an empty chain for an anchor elsewhere |
+| result kinds | `Validation::{NotPerformed, Secure, Insecure(Insecure), Bogus(EdeCode), Indeterminate}`; reasons `Insecure::{ProvenNoDs, OptOutCovered, NoAnchor, UnsupportedAlgorithm}` and EDE codes 5, 6, 7, 8, 9, 12. `Insecure::{UnsupportedDigest, Nsec3Iterations}` and the other EDE codes are not modelled |
 | `Established`, `Rendered` | what `Resolver` established (NotPerformed for a fresh answer under CD) and its front: AD, CD, SERVFAIL |
 | `ChainProblems` | `check_chain -> Vec<ChainProblem>` |
 | `impl1`, `impl2` | two `Sign` implementations |
