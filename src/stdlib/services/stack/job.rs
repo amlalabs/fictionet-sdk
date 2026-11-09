@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use fictionet::stdlib::layer::{Charge, ChildId, Driver, Layer, OwnedWork, Side, Worker};
+use fictionet::stdlib::layer::{
+    Charge, ChildId, ChildWork, Driver, Layer, OwnedWork, Side, Worker,
+};
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy};
 
@@ -70,6 +72,23 @@ impl<W: Job> Job for OwnedWork<W> {
     }
     fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Self::Done> {
         self.work.poll(fcx, cx)
+    }
+}
+
+/// A child's work wakes its child as well as the task polling it, so a
+/// layer that shares state with its work is visited when the work moves.
+impl<W: Job> Job for ChildWork<W> {
+    type Done = (ChildId, W::Done);
+    fn cancelled(&self) -> bool {
+        Job::cancelled(&self.work)
+    }
+    fn poll(&mut self, fcx: Option<&Cx>, cx: &mut Context<'_>) -> Poll<Self::Done> {
+        let waker = self.wake.waker(cx.waker());
+        let result = self.work.poll(fcx, &mut Context::from_waker(&waker));
+        if result.is_ready() {
+            self.finished = true;
+        }
+        result.map(|done| (self.id(), done))
     }
 }
 

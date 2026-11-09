@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::task::Context;
 
 use fictionet::Cx;
-use fictionet::stdlib::layer::{Admit, Budget, CommandOf, Driver, EventOf, Layer};
+use fictionet::stdlib::layer::{
+    Admit, Budget, Children, CommandOf, Credited, Driver, EventOf, Layer, Port, Top,
+};
 use fictionet::stdlib::services::stack::{Job, Jobs};
 use fictionet::time::Instant;
 
@@ -18,7 +20,27 @@ where
     pending: VecDeque<EventOf<L::Lower>>,
 }
 
-impl<L: Layer> Applications<L>
+/// Whether a layer has nothing open or queued, so that until an event comes
+/// a step would move nothing.
+pub(crate) trait Idle {
+    fn idle(&self) -> bool {
+        false
+    }
+}
+
+impl<B, K, O> Idle for Children<B, K, O>
+where
+    B: Layer<Upper = Top>,
+    EventOf<B::Lower>: Credited,
+    CommandOf<B::Lower>: Credited,
+    K: Port,
+{
+    fn idle(&self) -> bool {
+        self.is_idle()
+    }
+}
+
+impl<L: Layer + Idle> Applications<L>
 where
     L::Work: Job<Done = L::Done>,
     L::Error: std::fmt::Display,
@@ -33,33 +55,55 @@ where
         }
     }
 
+    /// With no application open, no work and nothing held, only a new event
+    /// can move anything.
+    pub(crate) fn idle(&self) -> bool {
+        self.pending.is_empty()
+            && self.jobs.is_empty()
+            && !self.driver.holds_output()
+            && self.driver.layer().idle()
+    }
+
     pub(crate) fn poll(
         &mut self,
         fcx: &Cx,
+        now: Instant,
         cx: &mut Context<'_>,
         mut events: impl FnMut(&mut VecDeque<EventOf<L::Lower>>),
         command: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
     ) -> fictionet::Result<bool> {
         let mut command = command;
-        self.driver.set_now(fcx.now());
-        // As in the stream runner, existing work observes transport wakeups
-        // before queued input ends its child lifetime. Work cancelled by that
-        // input is removed before the next poll.
-        let completed = self
-            .jobs
-            .poll(Some(fcx), cx, |done| self.driver.complete(done))
-            .map_err(|e| fictionet::Error::msg(e.to_string()))?;
+        if self.idle() {
+            events(&mut self.pending);
+            if self.pending.is_empty() {
+                return Ok(false);
+            }
+        }
+        self.driver.set_now(now);
         let mut exhausted = false;
         let mut intake = 64;
         let mut blocked = false;
+        // As in the stream runner, existing work observes transport wakeups
+        // before queued input ends its child lifetime. Work cancelled by that
+        // input is removed before the next poll. Work handed over in a turn
+        // is polled in the next, so what it finishes at once is answered
+        // before the transport sends what this poll wrote.
+        let mut poll_jobs = true;
         for turn in 0..64 {
+            let mut moved = false;
+            if poll_jobs {
+                moved |= self
+                    .jobs
+                    .poll(Some(fcx), cx, |done| self.driver.complete(done))
+                    .map_err(|e| fictionet::Error::msg(e.to_string()))?;
+            }
             if self.pending.is_empty() {
                 events(&mut self.pending);
             }
             self.driver
                 .run()
                 .map_err(|e| fictionet::Error::msg(e.to_string()))?;
-            let mut moved = self.driver.send_below(&mut command);
+            moved |= self.driver.send_below(&mut command);
             while intake > 0
                 && let Some(event) = self.pending.pop_front()
             {
@@ -80,27 +124,19 @@ where
                     }
                 }
             }
-            if !moved {
+            poll_jobs = self.jobs.take(&mut self.driver);
+            if self.jobs.budget_exhausted() {
+                return Err(fictionet::Error::msg("application work budget exhausted"));
+            }
+            if !(moved || poll_jobs) {
                 break;
             }
             exhausted = turn == 63;
         }
-        self.jobs.take(&mut self.driver);
-        let moved = self
-            .jobs
-            .poll(Some(fcx), cx, |done| self.driver.complete(done))
-            .map_err(|e| fictionet::Error::msg(e.to_string()))?;
-        if self.jobs.budget_exhausted() {
-            return Err(fictionet::Error::msg("application work budget exhausted"));
-        }
         if self.pending.is_empty() {
             events(&mut self.pending);
         }
-        Ok(completed
-            || exhausted
-            || moved
-            || (!self.pending.is_empty() && !blocked)
-            || self.driver.exhausted())
+        Ok(exhausted || (!self.pending.is_empty() && !blocked) || self.driver.exhausted())
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -120,6 +156,7 @@ mod tests {
         ready: bool,
         received: usize,
     }
+    impl Idle for Waiting {}
     impl Layer for Waiting {
         type Lower = Messages<(), ()>;
         type Upper = Top;
@@ -179,6 +216,7 @@ mod tests {
                 let mut source = VecDeque::from([MessageEvent::Message(())]);
                 let busy = applications.poll(
                     &cx,
+                    cx.now(),
                     &mut Context::from_waker(std::task::Waker::noop()),
                     |pending| std::mem::swap(pending, &mut source),
                     |_| Admit::Taken,
@@ -189,6 +227,7 @@ mod tests {
                 cx.sleep(delay).await?;
                 applications.poll(
                     &cx,
+                    cx.now(),
                     &mut Context::from_waker(std::task::Waker::noop()),
                     |pending| std::mem::swap(pending, &mut source),
                     |_| Admit::Taken,

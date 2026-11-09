@@ -1420,6 +1420,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "slab",
  "smoltcp",
  "tokio",
  "tokio-rustls",

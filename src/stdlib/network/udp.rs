@@ -200,9 +200,9 @@ pub(crate) struct PacketDriver {
 }
 
 impl PacketDriver {
-    pub(crate) fn deliver(&mut self, packet: IpPacket) {
+    pub(crate) fn deliver(&mut self, packet: IpPacket, now: fictionet::time::Instant) {
         self.shared.with(|inner| {
-            inner.driver.set_now(self.fcx.now());
+            inner.driver.set_now(now);
             inner.offer(PacketEvent::Packet(packet));
         });
     }
@@ -212,23 +212,51 @@ impl PacketDriver {
         cx: &mut std::task::Context<'_>,
         out: &mut Vec<Chunk>,
         limit: usize,
+        now: fictionet::time::Instant,
     ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
-        let (busy, deadline) = self.shared.with(|inner| {
-            inner.wake = Some(cx.waker().clone());
-            inner.driver.set_now(self.fcx.now());
+        // This task's own work needs no wake: what it leaves makes the walk
+        // busy instead.
+        let idle = self.applications.idle();
+        let (busy, deadline, parked) = self.shared.with(|inner| {
+            let parked = inner.wake.take();
+            inner.driver.set_now(now);
             inner.pump();
             let count = limit.saturating_sub(out.len()).min(inner.output.len());
             out.extend(inner.output.drain(..count));
-            (inner.driver.exhausted(), inner.driver.deadline())
+            // With no application and no event for one, the applications
+            // have nothing to do and the task's waker goes back at once.
+            let parked = if idle && inner.application_events.is_empty() {
+                inner.restore_wake(parked, cx);
+                None
+            } else {
+                Some(parked)
+            };
+            (inner.driver.exhausted(), inner.driver.deadline(), parked)
         });
-        let more = self.applications.poll(
-            &self.fcx,
-            cx,
-            |pending| std::mem::swap(pending, &mut self.shared.inner.lock().application_events),
-            |command| self.shared.with(|inner| inner.application_command(command)),
-        )?;
+        let mut offered = false;
+        let mut more = false;
+        if let Some(parked) = parked {
+            more = self.applications.poll(
+                &self.fcx,
+                now,
+                cx,
+                |pending| std::mem::swap(pending, &mut self.shared.inner.lock().application_events),
+                |command| {
+                    let admit = self.shared.with(|inner| inner.application_command(command));
+                    offered |= admit.moved();
+                    admit
+                },
+            )?;
+            self.shared.with(|inner| inner.restore_wake(parked, cx));
+        }
+        // A stack that used its allowance continues after the rest of the
+        // run has had a turn. New commands from the applications go out at
+        // once.
+        if busy {
+            cx.waker().wake_by_ref();
+        }
         Ok((
-            busy || more,
+            more || offered,
             [deadline, self.applications.deadline()]
                 .into_iter()
                 .flatten()
@@ -355,6 +383,17 @@ impl Inner {
             let _ = self.driver.command(command).expect("credit is kept");
         }
         self.pump();
+    }
+
+    /// Holds the endpoint task's waker again after the task's own poll,
+    /// keeping the one it had if that wakes the same task.
+    fn restore_wake(&mut self, parked: Option<std::task::Waker>, cx: &std::task::Context<'_>) {
+        if !self.stopped {
+            self.wake = Some(match parked {
+                Some(waker) if waker.will_wake(cx.waker()) => waker,
+                _ => cx.waker().clone(),
+            });
+        }
     }
 
     fn application_command(

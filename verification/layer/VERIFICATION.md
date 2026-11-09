@@ -611,6 +611,53 @@ cached JDK and jar, a 6 GiB heap under an 8 GiB limit, and state directories
 on the home volume. Model assumptions and exclusions remain in the
 individual verification reports.
 
+### Results after children are visited when ready
+
+`Children` no longer visits every child on every advance. A child joins
+a ready list when it opens, when an event, credit, a timer, a work result,
+handed-out work or a wake from its work reaches it, and when payload it
+holds is released outside a call into it; it stays while its visits move
+or find the mux's queue full. The model gives each child a `woken` flag
+with those rules, and `Advance` visits only woken children, in any order,
+since Rust visits them in the order they joined its list. The `turn`
+variable went with the old id-ordered sweep. `Wakes` names the three rules
+beyond events, timers and work, and each has a mutation that removes it.
+`CreditReturns` is new: credit a live child owes the mux goes back
+eventually. The timer heap and the slab keys are not modeled; the Rust
+test `child_timers_fire_in_time_order_as_children_rearm_and_close` checks
+the heap's order through re-arming and closing.
+
+TLC 2.19 with two workers, a 2 GiB heap and the 10 GiB work slice, on
+November 9, 2026. Every positive configuration passed with no states left
+on the queue, and every mutation violated the property it names; the
+counterexamples of the three new mutations and of `without_urgent` were
+read to check the reason.
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `Children_base.cfg` | 6,176,006 | 699,144 | all safety properties pass |
+| `Children_budget.cfg` | 6,509,830 | 699,144 | all safety properties pass |
+| `Children_refuse_base.cfg` | 10,687,510 | 1,523,224 | all safety properties pass |
+| `Children_stalled_base.cfg` | 1,177,164 | 127,444 | safety and control progress pass |
+| `Children_budget_stalled.cfg` | 1,250,904 | 127,444 | safety and control progress pass |
+| `Children_commands_base.cfg` | 2,204 | 478 | command credit and delivery pass |
+| `Children_large_command.cfg` | 851 | 191 | command credit and delivery pass |
+| `Children_readiness.cfg` | 76,122 | 10,619 | invariants, delivery, completion, cancellation and credit return pass |
+| `Children_refuse_full.cfg` | 83,193 | 10,035 | all configured properties pass |
+| `Children_isolation.cfg` | 9,102,183 | 543,490 | all configured properties pass, in 2 min 46 s |
+| `Children_without_checkoverrun.cfg` | 25 | 19 | expected `EventCredit` violation |
+| `Children_without_checkcommandcredit.cfg` | 20 | 16 | expected `CommandCredit` violation |
+| `Children_without_muxchecksgeneration.cfg` | 2,622 | 984 | expected `NoStaleDelivery` violation |
+| `Children_without_keybywholeid.cfg` | 800 | 348 | expected `NoStaleDelivery` violation |
+| `Children_without_urgent.cfg` | 54,191 | 8,510 | a live child's urgent completion stays pending around the cycle |
+| `Children_without_workownership.cfg` | 253 | 106 | expected `NoCancelledPoll` violation |
+| `Children_without_joblimit.cfg` | 836 | 274 | expected `BoundedJobs` violation |
+| `Children_without_isolate.cfg` | 185,940 | 26,717 | expected `ConnectionProgress` violation |
+| `Children_without_reserveforcontrol.cfg` | 1,903,788 | 200,468 | expected `ControlProgress` violation |
+| `Children_without_wakeoncredit.cfg` | 2,352 | 510 | expected `CommandsGo` violation: a command waits for credit that came |
+| `Children_without_keepwaiting.cfg` | 2,736 | 592 | expected `CommandsGo` violation: a command waits for room that came |
+| `Children_without_wakeonrelease.cfg` | 78,317 | 10,944 | expected `CreditReturns` violation |
+
 ## Native world applications
 
 On November 8, 2026, the native world TCP and UDP application routers were

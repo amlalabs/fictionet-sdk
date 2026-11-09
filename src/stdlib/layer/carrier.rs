@@ -4,6 +4,7 @@ use core::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::children::ChildWake;
 use fictionet::stdlib::layer::{Budget, Charge, CommandOf, EventOf, Port};
 
 // ---------------------------------------------------------------------------
@@ -146,19 +147,19 @@ impl core::fmt::Debug for Chunk {
 /// Receive credit returned when the owning payload is released. A carrier
 /// with retained data attaches this token to its backing storage.
 pub struct CreditReturn {
-    released: Arc<AtomicU64>,
+    child: Arc<ChildWake>,
     units: u64,
 }
 
 impl CreditReturn {
-    pub(crate) fn new(released: Arc<AtomicU64>, units: u64) -> Self {
-        Self { released, units }
+    pub(crate) fn new(child: Arc<ChildWake>, units: u64) -> Self {
+        Self { child, units }
     }
 }
 
 impl Drop for CreditReturn {
     fn drop(&mut self) {
-        self.released.fetch_add(self.units, Ordering::Relaxed);
+        self.child.release(self.units);
     }
 }
 

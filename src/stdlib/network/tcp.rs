@@ -1043,9 +1043,13 @@ pub(crate) struct PacketDriver {
 }
 
 impl PacketDriver {
-    pub(crate) fn deliver(&mut self, packet: IpPacket) -> Admit<PacketEvent<IpPacket>> {
+    pub(crate) fn deliver(
+        &mut self,
+        packet: IpPacket,
+        now: Instant,
+    ) -> Admit<PacketEvent<IpPacket>> {
         let mut host = self.shared.state.lock();
-        host.tick();
+        host.tcp.set_now(now);
         let result = host.tcp.deliver(PacketEvent::Packet(packet)).unwrap();
         host.pump();
         result
@@ -1056,36 +1060,64 @@ impl PacketDriver {
         cx: &mut Context<'_>,
         out: &mut Vec<Chunk>,
         limit: usize,
+        now: Instant,
     ) -> fictionet::Result<(bool, Option<Instant>)> {
-        let (busy, deadline, refused, refusals) = {
+        // This task's own commands below need no wake: what they leave for
+        // the engine makes the walk busy instead.
+        let (busy, deadline, refusals, parked) = {
             let mut host = self.shared.state.lock();
-            host.routes.driver = Some(cx.waker().clone());
-            let busy = host.visit(out, limit);
-            (
-                busy,
-                host.tcp.deadline(),
-                host.routes.refused.clone(),
-                std::mem::take(&mut host.routes.refusals),
-            )
+            let parked = host.routes.driver.take();
+            let busy = host.visit(out, limit, now);
+            let refusals = (!host.routes.refusals.is_empty())
+                .then(|| {
+                    let refused = host.routes.refused.clone()?;
+                    Some((refused, std::mem::take(&mut host.routes.refusals)))
+                })
+                .flatten();
+            // With no application and no event for one, the applications
+            // have nothing to do and the task's waker goes back at once.
+            let parked = if self.applications.idle() && host.routes.application_events.is_empty() {
+                host.routes.restore_driver(parked, cx);
+                None
+            } else {
+                Some(parked)
+            };
+            (busy, host.tcp.deadline(), refusals, parked)
         };
-        if let Some(refused) = refused {
+        if let Some((refused, refusals)) = refusals {
             for (peer, local) in refusals {
                 refused(peer, local);
             }
         }
-        let applications = self.applications.poll(
-            &self.fcx,
-            cx,
-            |pending| {
-                std::mem::swap(
-                    pending,
-                    &mut self.shared.state.lock().routes.application_events,
-                )
-            },
-            |command| self.shared.state.lock().offer(command),
-        )?;
+        let mut offered = false;
+        let mut applications = false;
+        if let Some(parked) = parked {
+            applications = self.applications.poll(
+                &self.fcx,
+                now,
+                cx,
+                |pending| {
+                    std::mem::swap(
+                        pending,
+                        &mut self.shared.state.lock().routes.application_events,
+                    )
+                },
+                |command| {
+                    let admit = self.shared.state.lock().submit(command);
+                    offered |= admit.moved();
+                    admit
+                },
+            )?;
+            self.shared.state.lock().routes.restore_driver(parked, cx);
+        }
+        // An engine that used its allowance or filled its output continues
+        // after the rest of the run has had a turn, as writers refill what
+        // it sent. New commands from the applications go out at once.
+        if busy {
+            cx.waker().wake_by_ref();
+        }
         Ok((
-            busy || applications,
+            applications || offered,
             [deadline, self.applications.deadline()]
                 .into_iter()
                 .flatten()
@@ -1319,6 +1351,17 @@ impl Routes {
         }
     }
 
+    /// Holds the endpoint task's waker again after the task's own poll,
+    /// keeping the one it had if that wakes the same task.
+    fn restore_driver(&mut self, parked: Option<Waker>, cx: &Context<'_>) {
+        if !self.stopped {
+            self.driver = Some(match parked {
+                Some(waker) if waker.will_wake(cx.waker()) => waker,
+                _ => cx.waker().clone(),
+            });
+        }
+    }
+
     /// Copies what came up for `id` into `buf`, if anything did.
     fn read(&mut self, id: ChildId, buf: &mut [u8]) -> Option<usize> {
         let link = self.links.get_mut(&id)?;
@@ -1369,6 +1412,12 @@ impl Host {
 
     fn offer(&mut self, command: Command) -> Admit<Command> {
         self.tick();
+        self.submit(command)
+    }
+
+    /// The same at the time the engine last read, as the endpoint's task
+    /// does within a walk.
+    fn submit(&mut self, command: Command) -> Admit<Command> {
         let taken = self.tcp.command(command).unwrap();
         self.pump();
         if self.engine_ref().busy() {
@@ -1462,8 +1511,8 @@ impl Host {
     }
 
     /// Steps the transport and drains its output before yielding.
-    fn visit(&mut self, out: &mut Vec<Chunk>, limit: usize) -> bool {
-        self.tick();
+    fn visit(&mut self, out: &mut Vec<Chunk>, limit: usize, now: Instant) -> bool {
+        self.tcp.set_now(now);
         let mut work_exhausted = false;
         for turn in 0..64 {
             let Some(()) = self.tcp.take_work() else {

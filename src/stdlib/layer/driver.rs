@@ -234,11 +234,8 @@ impl<L: Layer> Driver<L> {
         );
         self.exhausted = true;
         let mut moved = false;
+        // The depth is checked before the first step and after each one.
         for _ in 0..self.steps {
-            assert!(
-                self.layer.depth() <= super::MAX_DEPTH,
-                "composition is too deep"
-            );
             let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed);
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
             let mut step = false;
