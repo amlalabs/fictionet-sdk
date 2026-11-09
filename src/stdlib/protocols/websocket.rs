@@ -1006,14 +1006,7 @@ impl codec::Decode for Messages {
         }
         if let Some(p) = self.partial.as_mut() {
             if p.opcode == Opcode::Text {
-                let rest = p.data.get(p.checked..).unwrap_or_default();
-                match core::str::from_utf8(rest) {
-                    Ok(_) => p.checked = p.data.len(),
-                    Err(e) if e.error_len().is_some() || frame.fin => {
-                        return Err(Inner(Error::InvalidUtf8));
-                    }
-                    Err(e) => p.checked = p.checked.saturating_add(e.valid_up_to()),
-                }
+                validate_text(&p.data, &mut p.checked, frame.fin).map_err(Inner)?;
             }
             if frame.fin {
                 let data = core::mem::take(&mut p.data);
@@ -1028,6 +1021,16 @@ impl codec::Decode for Messages {
         }
         Ok(Step::Skip(used))
     }
+}
+
+fn validate_text(data: &[u8], checked: &mut usize, fin: bool) -> Result<(), Error> {
+    let rest = data.get(*checked..).unwrap_or_default();
+    match core::str::from_utf8(rest) {
+        Ok(_) => *checked = data.len(),
+        Err(e) if e.error_len().is_some() || fin => return Err(Error::InvalidUtf8),
+        Err(e) => *checked = checked.saturating_add(e.valid_up_to()),
+    }
+    Ok(())
 }
 
 /// A valid client upgrade request, as [`check_request`] reads it.

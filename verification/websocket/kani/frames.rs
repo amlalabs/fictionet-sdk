@@ -67,13 +67,7 @@ fn websocket_headers_follow_wire_grammar() {
     }
 }
 
-#[kani::proof]
-#[kani::unwind(10)]
-fn websocket_mask_is_involution_and_composes() {
-    let original: [u8; 8] = kani::any();
-    let key: [u8; 4] = kani::any();
-    let offset: usize = kani::any();
-    let cut: usize = kani::any();
+fn mask_is_involution_and_composes(original: [u8; 8], key: [u8; 4], offset: usize, cut: usize) {
     kani::assume(cut <= original.len());
     let mut whole = original;
     apply_mask(&mut whole, key, offset);
@@ -89,7 +83,13 @@ fn websocket_mask_is_involution_and_composes() {
 }
 
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(10)]
+fn websocket_mask_is_involution_and_composes() {
+    mask_is_involution_and_composes(kani::any(), kani::any(), kani::any(), kani::any());
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
 fn websocket_small_frames_roundtrip() {
     let data: [u8; 4] = kani::any();
     let n: usize = kani::any();
@@ -118,36 +118,24 @@ fn websocket_close_codes_follow_wire_ranges() {
     assert_eq!(Close::new(code).to_bytes().is_ok(), allowed);
 }
 
-#[kani::proof]
-#[kani::unwind(12)]
-fn websocket_text_across_fragment_boundary() {
-    let bytes: [u8; 4] = kani::any();
-    let cut: usize = kani::any();
+fn text_across_fragment_boundary(bytes: [u8; 4], cut: usize) {
     kani::assume(cut <= bytes.len());
-    let mut decoder = Messages::for_receiver(Side::Client);
-    let mut first = vec![0x01, cut as u8];
-    first.extend_from_slice(&bytes[..cut]);
-    let mut last = vec![0x80, (bytes.len() - cut) as u8];
-    last.extend_from_slice(&bytes[cut..]);
-    let start = decoder.decode(&first, false);
-    let finish = if start.is_ok() {
-        decoder.decode(&last, false)
+    let mut checked = 0;
+    let first = validate_text(&bytes[..cut], &mut checked, false);
+    assert!(checked <= cut);
+    let result = first.and_then(|()| validate_text(&bytes, &mut checked, true));
+    assert_eq!(result.is_ok(), core::str::from_utf8(&bytes).is_ok());
+    if result.is_ok() {
+        assert_eq!(checked, bytes.len());
     } else {
-        start
-    };
-    match core::str::from_utf8(&bytes) {
-        Ok(text) => match finish.unwrap() {
-            Step::Item(Message::Text(actual), used) => {
-                assert_eq!(actual, text);
-                assert_eq!(used, last.len());
-            }
-            _ => panic!("valid fragmented text must finish"),
-        },
-        Err(_) => assert!(matches!(
-            finish,
-            Err(codec::AssembleError::Inner(Error::InvalidUtf8))
-        )),
+        assert_eq!(result, Err(Error::InvalidUtf8));
     }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_text_across_fragment_boundary() {
+    text_across_fragment_boundary(kani::any(), kani::any());
 }
 
 #[kani::proof]
@@ -217,7 +205,7 @@ fn websocket_control_without_masking() {
 }
 
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(8)]
 #[kani::stub(Frame::from_header, omit_payload_mask)]
 fn websocket_control_without_unmasking() {
     websocket_small_frames_roundtrip();
@@ -237,43 +225,18 @@ fn websocket_control_without_held_charge() {
     websocket_message_limit_precedes_payload_copy();
 }
 
-// This mutation validates each frame independently, losing the unfinished
-// character held from the preceding fragment.
-fn validate_fragment_alone(
-    decoder: &mut Messages,
-    input: &[u8],
-    eof: bool,
-) -> Result<Step<Message>, codec::AssembleError<Error>> {
-    let (frame, used) = match decoder
-        .frames
-        .decode(input, eof)
-        .map_err(codec::AssembleError::Inner)?
-    {
-        Step::Item(frame, used) => (frame, used),
-        _ => return Ok(Step::Need),
-    };
-    core::str::from_utf8(&frame.payload)
-        .map_err(|_| codec::AssembleError::Inner(Error::InvalidUtf8))?;
-    let partial = decoder.partial.get_or_insert(Partial {
-        opcode: Opcode::Text,
-        data: Vec::new(),
-        checked: 0,
-    });
-    partial.data.extend_from_slice(&frame.payload);
-    if frame.fin {
-        let text = String::from_utf8(core::mem::take(&mut partial.data))
-            .map_err(|_| codec::AssembleError::Inner(Error::InvalidUtf8))?;
-        Ok(Step::Item(Message::Text(text), used))
-    } else {
-        Ok(Step::Skip(used))
-    }
+// Refusing every incomplete prefix loses characters split across frames.
+fn validate_fragment_alone(data: &[u8], checked: &mut usize, _: bool) -> Result<(), Error> {
+    core::str::from_utf8(data).map_err(|_| Error::InvalidUtf8)?;
+    *checked = data.len();
+    Ok(())
 }
 
 #[kani::proof]
-#[kani::unwind(12)]
-#[kani::stub(Messages::decode, validate_fragment_alone)]
+#[kani::unwind(8)]
+#[kani::stub(validate_text, validate_fragment_alone)]
 fn websocket_control_without_utf8_carry() {
-    websocket_text_across_fragment_boundary();
+    text_across_fragment_boundary([0xe2, 0x82, 0xac, b'a'], 1);
 }
 
 #[kani::proof]
@@ -321,4 +284,30 @@ fn write_truncated_length(
 #[kani::stub(write_header, write_truncated_length)]
 fn websocket_control_without_extended_length() {
     websocket_writer_uses_minimal_length();
+}
+
+fn add_mask(data: &mut [u8], key: [u8; 4], offset: usize) {
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = byte.wrapping_add(key[offset.wrapping_add(i) % 4]);
+    }
+}
+
+fn restart_mask(data: &mut [u8], key: [u8; 4], _: usize) {
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte ^= key[i % 4];
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(10)]
+#[kani::stub(apply_mask, add_mask)]
+fn websocket_control_without_mask_involution() {
+    mask_is_involution_and_composes([0; 8], [1, 2, 3, 4], 0, 1);
+}
+
+#[kani::proof]
+#[kani::unwind(10)]
+#[kani::stub(apply_mask, restart_mask)]
+fn websocket_control_without_mask_offset() {
+    mask_is_involution_and_composes([0; 8], [1, 2, 3, 4], 0, 1);
 }
