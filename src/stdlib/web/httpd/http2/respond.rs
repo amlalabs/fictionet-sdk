@@ -18,7 +18,7 @@ use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
-use super::super::response::{Asked, Dates, ResponsePolicy, error_response};
+use super::super::response::{Asked, ResponsePolicy, error_response};
 use super::super::{
     Body, Delivery, Exchange, Handler, Later, Limits, Observe, PIECE, Received, Reply, Reset, text,
 };
@@ -124,7 +124,9 @@ impl Responder {
     fn server(&self, mut connection: Http2) -> Http2Server {
         // The connection dates each head as it frames it, so its streams
         // share one header per second.
-        connection.dates = Dates::new(self.date);
+        if let Some(start) = self.date {
+            connection = connection.date(start);
+        }
         let shared = Arc::new(self.clone());
         let limit = (self.limits.streams as usize).min(4096);
         Chain::new(

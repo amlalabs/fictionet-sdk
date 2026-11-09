@@ -18,14 +18,52 @@ use super::native::{Http1, Upgraded};
 /// hand on to a tunnel or to HTTP/2, or HTTP/2 from the start.
 pub type Versions = Side<Switch<Http1, Upgraded>, Http2Server>;
 
-/// HTTP for one connection: over TLS, the version ALPN chose; without
-/// TLS, [`Detect`] until the version is known, then that version's server.
+/// HTTP for one connection, as [`http_for`](super::http_for) makes it: over
+/// TLS, the version ALPN chose; without TLS, [`Detect`] until the version
+/// is known, then that version's server.
 /// [`serve_connection`](super::serve_connection) runs it.
 pub type Http = Side<Versions, Switch<Detect, Versions>>;
 
 impl Successor<Versions> for Versions {
     fn succeed(versions: Versions) -> Versions {
         versions
+    }
+}
+
+/// Makes the server for the version [`Detect`] chose, once the client's
+/// first bytes chose it: a connection makes only the server it uses.
+///
+/// [`Detect::new`] takes one factory per version, any closures that make
+/// them. [`Servers`] is the pair [`http_for`](super::http_for) uses, both
+/// made from one handler and one set of options.
+pub trait MakeVersion: Sized {
+    /// HTTP/1, which may hand on to a tunnel or to HTTP/2.
+    fn http1(self) -> Switch<Http1, Upgraded>;
+    /// HTTP/2 from the start.
+    fn http2(self) -> Http2Server;
+
+    /// The server for one version: HTTP/2 with `h2`, else HTTP/1.
+    fn version(self, h2: bool) -> Versions {
+        if h2 {
+            Side::Upper(self.http2())
+        } else {
+            Side::Lower(self.http1())
+        }
+    }
+}
+
+/// One factory per version: only the chosen one runs.
+impl<H1, H2> MakeVersion for (H1, H2)
+where
+    H1: FnOnce() -> Switch<Http1, Upgraded>,
+    H2: FnOnce() -> Http2Server,
+{
+    fn http1(self) -> Switch<Http1, Upgraded> {
+        (self.0)()
+    }
+
+    fn http2(self) -> Http2Server {
+        (self.1)()
     }
 }
 
@@ -37,22 +75,60 @@ impl Successor<Versions> for Versions {
 /// differs from it chooses HTTP/1, as does the client's end inside it; the
 /// whole preface chooses HTTP/2. A client that has not chosen by the
 /// first-bytes deadline is closed with nothing written.
-pub struct Detect {
+///
+/// A copy of [`http_for`](super::http_for) composes it with servers of its
+/// own, each made only when the client chooses it:
+///
+/// ```
+/// use std::time::Duration;
+/// use fictionet::stdlib::layer::Switch;
+/// use fictionet::stdlib::web::httpd::{
+///     Body, Detect, Exchange, Handler, Http1, Reply, Responder, Versions,
+/// };
+///
+/// struct Hello;
+/// impl Handler for Hello {
+///     fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+///         Reply::Now(http::Response::new(Body::from("hello\n")))
+///     }
+/// }
+/// let detect = Detect::new(
+///     Duration::from_secs(10),
+///     || Http1::new(Hello).h2c().upgradable(),
+///     || Responder::new(Hello).http2(),
+/// );
+/// let http: Switch<_, Versions> = Switch::new(detect);
+/// # drop(http);
+/// ```
+pub struct Detect<S = Servers> {
     first: Vec<u8>,
     charge: Option<Charge>,
     timeout: Option<Duration>,
     deadline: Option<Instant>,
-    servers: Option<Servers>,
+    servers: Option<S>,
     chosen: Option<bool>,
     peer_ended: bool,
     out: Option<StreamCommand>,
     closed: bool,
 }
 
-impl Detect {
+impl<H1, H2> Detect<(H1, H2)>
+where
+    H1: FnOnce() -> Switch<Http1, Upgraded>,
+    H2: FnOnce() -> Http2Server,
+{
+    /// Reads the first bytes, for at most `timeout` from the first call,
+    /// then makes the version they chose: HTTP/1 with `http1`, HTTP/2 with
+    /// `http2`. The other factory never runs.
+    pub fn new(timeout: Duration, http1: H1, http2: H2) -> Self {
+        Self::with(timeout, (http1, http2))
+    }
+}
+
+impl<S: MakeVersion> Detect<S> {
     /// Reads the first bytes, for at most `timeout` from the first call,
     /// then makes the version they chose from `servers`.
-    pub(super) fn new(timeout: Duration, servers: Servers) -> Self {
+    pub fn with(timeout: Duration, servers: S) -> Self {
         Self {
             first: Vec::new(),
             charge: None,
@@ -77,7 +153,7 @@ impl Detect {
     }
 }
 
-impl Layer for Detect {
+impl<S: MakeVersion> Layer for Detect<S> {
     type Lower = ByteStream;
     type Upper = Top;
     type Report = Infallible;
@@ -199,7 +275,7 @@ fn scan(first: &mut Vec<u8>, bytes: &[u8]) -> (usize, Option<bool>) {
 #[path = "../../../../verification/http2-layer/kani/detect.rs"]
 mod proofs;
 
-impl Handoff for Detect {
+impl<S: MakeVersion> Handoff for Detect<S> {
     type Next = Versions;
 
     fn handover(&mut self) -> Option<Handover<Versions, ByteStream, Top>> {
@@ -221,7 +297,7 @@ impl Handoff for Detect {
         }
         self.closed = true;
         Some(Handover {
-            next: servers.make(h2),
+            next: servers.version(h2),
             below,
             above: Vec::new(),
         })

@@ -268,7 +268,7 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 /// installed them. Sharing one address does not add sites at another.
 /// Over TLS, ALPN offers `h2` and `http/1.1` with `std` alone.
 /// The default stack is `Chain<TlsLayer, Later<Boxed>>`; its application
-/// is `Http = Switch<Detect, Versions>`. HTTP/2 in turn composes
+/// is [`Http`](super::Http), from [`http_for`]. HTTP/2 in turn composes
 /// `Chain<Http2, Children<Respond, Top, Opening>>`. Replace the TLS factory
 /// with [`tls_layer`](Self::tls_layer), or negotiated applications with
 /// [`applications`](Self::applications).
@@ -383,7 +383,7 @@ impl Server {
     /// address and port selects the factory for every site sharing it;
     /// later sites still select their own certificates and applications.
     /// The default is `Chain<TlsLayer, Later<Boxed>>` through `Secure`.
-    /// The application box contains `Http = Switch<Detect, Versions>`;
+    /// The application box contains [`Http`](super::Http), from [`http_for`];
     /// HTTP/2 is `Chain<Http2, Children<Respond, Top, Opening>>`.
     pub fn tls_layer(mut self, factory: tls::Factory) -> Self {
         self.tls_layer = factory;
@@ -397,7 +397,7 @@ impl Server {
     /// another byte-stream application for another negotiated protocol.
     /// Each TLS site selects its own protocols and application, even when
     /// it shares routing, limits and the response observer with other sites.
-    /// The default is `Switch<Detect, Versions>`; HTTP/2 composes its multiplexed
+    /// The default is [`http_for`]; HTTP/2 composes its multiplexed
     /// streams with `Children` and the request handler.
     pub fn applications(
         mut self,

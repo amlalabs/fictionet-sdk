@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 
@@ -408,6 +408,15 @@ impl Http2 {
             upgrade: None,
             dates: Dates::new(None),
         }
+    }
+
+    /// Dates each response head that has no `Date` as it is framed:
+    /// `start`, the world's date and time at the start of the run, plus the
+    /// run's clock, one header per second shared by every stream. Without
+    /// it, responses carry no `Date`. See [Dates](super#dates).
+    pub fn date(mut self, start: SystemTime) -> Self {
+        self.dates = Dates::new(Some(start));
+        self
     }
 
     /// The connection an HTTP/1 `Upgrade: h2c` started: the client's
@@ -1475,6 +1484,9 @@ impl Http2 {
             ExchangeCommand::Head(head) if matches!(response.reply, Reply::Waiting) => {
                 self.response_head(env, id, *head);
             }
+            // Empty data frames nothing and spends no credit: it is not
+            // queued, so every queued chunk has bytes to send.
+            ExchangeCommand::Data(chunk) if body && chunk.is_empty() => {}
             ExchangeCommand::Data(chunk) if body && chunk.len() as u64 <= response.credit_bytes => {
                 let len = chunk.len() as u64;
                 if response.queue.push_back(chunk).is_err() {
@@ -1611,15 +1623,16 @@ impl Http2 {
         };
         let response = &mut stream.response;
         if let Some(front) = response.queue.front_mut() {
-            let n = sendable(front.len(), window, response.window, frame);
-            if n == 0 {
+            if response.window <= 0 {
                 // A stream window that opens schedules the stream again.
-                return if response.window > 0 {
-                    Sent::AwaitingWindow
-                } else {
-                    Sent::Nothing
-                };
+                return Sent::Nothing;
             }
+            if window <= 0 {
+                return Sent::AwaitingWindow;
+            }
+            // Both windows are open and the front has bytes (empty data is
+            // never queued), so the frame carries at least one.
+            let n = sendable(front.len(), window, response.window, frame);
             let payload = front.split_to(n);
             if front.is_empty() {
                 response.queue.pop_front();
@@ -3490,6 +3503,66 @@ mod tests {
         }
     }
 
+    /// A server whose streams each send `commands` once the request ends.
+    fn sending(
+        server: Http2,
+        commands: impl Fn() -> Vec<ExchangeCommand> + Send + 'static,
+    ) -> Harness<impl Layer<Lower = ByteStream, Error: std::fmt::Debug>> {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let server = Chain::new(
+            server,
+            Children::new(16, Http2::WINDOW, move |_, _, _| {
+                Some(Picky {
+                    stuck: false,
+                    body: Vec::new(),
+                    piece: 1,
+                    out: commands().into(),
+                })
+            }),
+        );
+        Harness::new(fictionet::Seed::from_u64(9), server)
+    }
+
+    fn head(end: bool) -> ExchangeCommand {
+        ExchangeCommand::Head(Box::new(ResponseHead {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            end,
+        }))
+    }
+
+    #[test]
+    fn an_empty_body_chunk_holds_up_nothing_behind_it() {
+        let mut harness = sending(Http2::new(Limits::default()), || {
+            vec![
+                head(false),
+                ExchangeCommand::Data(Chunk::new(Vec::new())),
+                ExchangeCommand::Data(Chunk::new(BODY.to_vec())),
+                ExchangeCommand::End,
+            ]
+        });
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        let output = frames(&harness.take_output());
+        let sent: Vec<u8> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 1 => Some(d.data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(sent, BODY);
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Data(d) if d.stream == 1 && d.flags & 1 != 0)),
+            "the stream ends: {output:?}"
+        );
+    }
+
     /// The `Date` fields of the response heads on `stream` in `output`.
     fn dates_on(stream: u32, output: &[u8]) -> Vec<Vec<u8>> {
         let mut blocks = wire::HeaderBlocks::with_limits(Default::default());
@@ -3509,6 +3582,30 @@ mod tests {
             }
         }
         dates
+    }
+
+    #[test]
+    fn a_connection_given_the_world_date_dates_the_heads_of_its_own_children() {
+        use fictionet::stdlib::web::httpd::date_header;
+        fn answer() -> Vec<ExchangeCommand> {
+            vec![head(true)]
+        }
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        let mut dated = sending(Http2::new(Limits::default()).date(start), answer);
+        let mut undated = sending(Http2::new(Limits::default()), answer);
+        for harness in [&mut dated, &mut undated] {
+            harness.push(&client_preface()).unwrap();
+            harness.advance(Duration::from_secs(5)).unwrap();
+            let mut encoder = hpack::Encoder::new(4096);
+            harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        }
+        let now = dated.driver().now();
+        let date = date_header(Some(start), now).unwrap();
+        assert_eq!(
+            dates_on(1, &dated.take_output()),
+            [date.as_bytes().to_vec()]
+        );
+        assert!(dates_on(1, &undated.take_output()).is_empty());
     }
 
     #[test]
