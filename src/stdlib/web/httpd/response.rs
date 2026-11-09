@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use http::header::{CONTENT_LENGTH, DATE};
-use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 
 use fictionet::Error;
 use fictionet::stdlib::protocols::http1::RequestHead;
@@ -14,14 +14,19 @@ use super::{BadGateway, Body, text};
 /// in full. Extensions and third-party allocation overhead are excluded.
 pub(super) fn request_held<B>(request: &Request<B>) -> usize {
     let uri = request.uri();
-    let headers = request.headers();
-    let slots = headers.capacity() + headers.len() - headers.keys_len();
     std::mem::size_of::<http::request::Parts>()
         + request.method().as_str().len()
         + uri.scheme_str().map_or(0, str::len)
         + uri.authority().map_or(0, |a| a.as_str().len())
         + uri.path_and_query().map_or(0, |p| p.as_str().len())
-        + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
+        + headers_held(request.headers())
+}
+
+/// What a header map holds beyond its inline value, counted as for
+/// [`request_held`].
+pub(super) fn headers_held(headers: &HeaderMap) -> usize {
+    let slots = headers.capacity() + headers.len() - headers.keys_len();
+    slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
         + headers
             .iter()
             .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
