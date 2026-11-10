@@ -13,12 +13,13 @@ mod layer_verify;
 mod mptcp_verify;
 #[cfg(feature = "host-tools")]
 mod rawnic;
-mod tls_verify;
-mod tls_verify_handshake;
 #[cfg(feature = "host-tools")]
 // This module owns the host syscall boundary.
 #[allow(unsafe_code)]
 mod ssh_connect;
+mod tls_verify;
+mod tls_verify_handshake;
+mod tls_verify_record;
 #[cfg(feature = "host-tools")]
 mod web;
 #[cfg(feature = "host-tools")]

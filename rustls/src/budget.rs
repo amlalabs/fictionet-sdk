@@ -290,6 +290,9 @@ pub(crate) const CONTROL_PAYLOAD: usize = 5;
 #[cfg(all(test, feature = "std"))]
 mod tests;
 
+#[cfg(all(test, feature = "std"))]
+mod record_trace;
+
 #[cfg(test)]
 pub(crate) mod testing {
     //! A budget for the crate's own tests.
