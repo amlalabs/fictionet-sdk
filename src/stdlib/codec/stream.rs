@@ -202,6 +202,11 @@ impl<D: Decode, S: Storage> Stream<D, S> {
     pub fn shrink(&mut self) {
         self.buf.shrink();
     }
+    /// As [`shrink`](Self::shrink), keeping capacity up to `keep` bytes:
+    /// see [`Buffer::shrink_to`].
+    pub fn shrink_to(&mut self, keep: usize) {
+        self.buf.shrink_to(keep);
+    }
     /// The retained terminal error, if one occurred.
     pub fn failed(&self) -> Option<&Fail<D::Error>> {
         self.failed.as_ref()

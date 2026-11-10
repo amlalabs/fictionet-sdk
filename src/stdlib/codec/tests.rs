@@ -2395,6 +2395,50 @@ fn shrinking_input_preserves_unread_offset_and_invalidates_spare() {
     assert_eq!(buffer.offset(), 4);
 }
 
+/// Shrinking to a floor gives back only capacity past it, or past the
+/// unread bytes when they are more, and keeps the unread bytes and the
+/// offset. Capacity at or under the floor stays.
+#[test]
+fn shrinking_to_a_floor_keeps_the_floor_and_the_unread_bytes() {
+    use fictionet::{Entropy, Seed, SeededEntropy};
+    let rng = SeededEntropy::new(Seed::from_u64(5));
+    for _ in 0..200 {
+        let limit = 1 + rng.random_below(64) as usize;
+        let floor = rng.random_below(2 * limit as u64 + 1) as usize;
+        let mut buffer = Buffer::new(limit);
+        let mut expected = Vec::new();
+        for _ in 0..rng.random_below(8) {
+            let bytes: Vec<u8> = (0..rng.random_below(limit as u64 + 1))
+                .map(|_| rng.random_below(256) as u8)
+                .collect();
+            let n = buffer.push(&bytes);
+            expected.extend_from_slice(&bytes[..n]);
+            let consumed = rng.random_below(buffer.len() as u64 + 1) as usize;
+            buffer.consume(consumed);
+            expected.drain(..consumed);
+        }
+        let (before, offset) = (buffer.allocated(), buffer.offset());
+        buffer.shrink_to(floor);
+        assert_eq!(buffer.unread(), expected.as_slice());
+        assert_eq!(buffer.offset(), offset);
+        if before <= floor {
+            assert_eq!(buffer.allocated(), before, "capacity under the floor went");
+            continue;
+        }
+        let kept = buffer.allocated();
+        assert!(kept >= floor.max(buffer.len()));
+        assert!(kept <= before);
+        // The capacity kept is room: input fills it without growing.
+        let fill = kept.min(limit).saturating_sub(buffer.len());
+        assert_eq!(buffer.push(&vec![0; fill]), fill);
+        assert_eq!(
+            buffer.allocated(),
+            kept,
+            "filling kept room grew the buffer"
+        );
+    }
+}
+
 #[test]
 fn demux_shrink_reclaims_partial_and_terminal_streams() {
     let mut demux = Demux::new(2, 8, |_: &u8| Lines::new(8, Ending::LfOrCrlf));
