@@ -16,14 +16,24 @@ use crate::lean_vectors::{Report, logged, scoped};
 
 /// The Kani harnesses `harnesses` of `package`'s library, with the
 /// allocation functions stubbed by their counting ones (`-Z stubbing`) and
-/// `malloc` under them (`-Z c-ffi`). Each harness must report
+/// `malloc` under them (`-Z c-ffi`), which tell a live allocation from a dangling pointer (`-Z mem-predicates`). Each harness must report
 /// `VERIFICATION:- SUCCESSFUL`.
 pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Result<Report> {
     let mut report = Report::new("kani");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = scoped(cargo, "16G");
     command.args([
-        "kani", "-p", package, "--lib", "-Z", "stubbing", "-Z", "c-ffi", "--exact",
+        "kani",
+        "-p",
+        package,
+        "--lib",
+        "-Z",
+        "stubbing",
+        "-Z",
+        "c-ffi",
+        "-Z",
+        "mem-predicates",
+        "--exact",
     ]);
     for harness in harnesses {
         command.arg("--harness").arg(harness);

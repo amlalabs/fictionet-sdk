@@ -388,6 +388,11 @@ def blockVectors (emit : Json → IO Unit) : G Unit := do
     let value := List.replicate (100 - 32 - 1 + extra) 118
     emit (fixedSession 100 [encodeInt 5 32 100 ++ writeRep (.literal (.literal ⟨false, [120]⟩) ⟨false, [97]⟩ .incremental),
       writeRep (.literal (.literal ⟨false, [121]⟩) ⟨false, value⟩ .incremental)])
+  -- At the server's settings, an entry as large as a string may be, after one
+  -- that fits: larger than the table, it empties it and is not added. The
+  -- replay's cost bound holds the decoder to its table's charge here.
+  emit (fixedSession 4096 [writeRep (.literal (.literal ⟨false, [120]⟩) ⟨false, [97]⟩ .incremental),
+    writeRep (.literal (.literal ⟨false, [121]⟩) ⟨false, List.replicate maxString 118⟩ .incremental)])
   -- Random sessions.
   for _ in [:600] do
     let settings ← pick [0, 1, 32, 64, 100, 256, 4096, 4096, 4096, 4096, maxTable, maxTable + 4]

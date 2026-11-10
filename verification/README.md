@@ -44,7 +44,7 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`ssh-layer`](ssh-layer/README.md) | the transport/authentication boundary, ordered key changes, completion ownership, channel lifecycle and the honeypot policy; conformance with RFC 4253 (ordering, NEWKEYS per direction, rekeys with data in flight, wrapping sequence numbers, strict KEX), RFC 8308 EXT_INFO, RFC 4252 (pipelined requests, no service before success) and RFC 4254 (open replies and reason codes, EOF and CLOSE, requests, windows), and no stall under the half-window adjustment policy against russh's bounded queues (`Transport.tla`, `Auth.tla`, `Close.tla`, `Window.tla`, `Adjust.tla`); window lemmas in Lean | `Transport.tla` traces replayed on the production transport with real crypto (`protocols/ssh/transport/replay.rs`); `Adjust.tla` searched exhaustively on the production `Channel`; other models named in their headers to `services/ssh`; Kani on the production arithmetic in `ssh.rs` | TLC per config; `cargo kani`; `lean lean/Adjust.lean` |
 | [`http`](http/README.md) | HTTP/1 pipelining and the switch to a tunnel (`Pipeline.tla`), HTTP/2 flow control and stream states (`Flow.tla`, `Streams.tla`), the tunnel's room and charges (`Tunnel.tla`); framing in Lean; no request smuggling between the HTTP/1 decoder and any RFC 9112 recipient (`request_agrees`, Lean); body decoding and request smuggling in Kani | `Gen.lean` vectors replayed by `tests/http1_vectors.rs` against `RequestEvents` and `ResponseEvents`, and `Request.lean` tied by `wire_framing_is_request` and `framing.json`; models named to `web/httpd/native.rs`, `http2.rs`, `stack/tunnel.rs`; Kani on the production decoder and `Reader` (memchr stubbed) | `cargo xtask http-verify lean` and `diff`; TLC per config; `cargo kani` |
 | [`http2-layer`](http2-layer/README.md) | the layer `Http2`: flow control with children (`Flow.tla`), stream and connection lifecycle (`Lifecycle.tla`), SETTINGS (`Settings.tla`), the h2c switch (`H2cSwitch.tla`); RFC 9113 specs written from the text (`StreamRules.tla`, `RfcFlow.tla`, `RfcGoaway.tla`) that `Http2` and `Session` refine (`H2Streams`, `SessionStreams`, `Http2Rfc`, `SessionRfc`, `Http2Refusal`); window arithmetic, `Session`'s windows, frame refusals and the preface scan in Kani | models named to `http2.rs`, `protocols/http2.rs`, `children.rs`, `switch.rs`, `detect.rs`; Kani on the production helpers | TLC per config; `cargo kani` |
-| [`hpack-grpc`](hpack-grpc/README.md) | Lean: RFC 7541 integers, Huffman with its padding and EOS rules, the dynamic table, size updates, and encoder-decoder round trips (34 theorems, standard axioms only); TLA+: encoder and decoder table sizes stay in step through SETTINGS and size updates (`HpackSync.tla`) | `Gen.lean` vectors replayed by `tests/hpack_vectors.rs`; `cargo xtask hpack-verify lean|vectors|diff`; model named to `hpack.rs` and `http2.rs` | `cargo xtask hpack-verify lean` and `diff`; TLC per config |
+| [`hpack-grpc`](hpack-grpc/README.md) | Lean: RFC 7541 integers, Huffman with its padding and EOS rules, the dynamic table, size updates, and encoder-decoder round trips (34 theorems, standard axioms only); TLA+: encoder and decoder table sizes stay in step through SETTINGS and size updates (`HpackSync.tla`); resources: neither table holds more than its charge at any moment, in TLA+, in counted Kani harnesses on the production insertion, and on every replayed block, whose copying stays linear | `Gen.lean` vectors replayed by `tests/hpack_vectors.rs`; `cargo xtask hpack-verify lean|vectors|diff`; model named to `hpack.rs` and `http2.rs` | `cargo xtask hpack-verify lean`, `diff` and `resources`; TLC per config |
 | [`websocket`](websocket/README.md) | message assembly, control frames and close (`Messages.tla`, `Echo.tla`); frame parsing and writing in Kani (29 harnesses) | models named to `websocket.rs`; Kani on the production functions with the stubs its README lists | TLC per config; `cargo kani` |
 | [`codec`](codec/README.md) | the stream demultiplexer (`Demux.tla`); the codec stream, buffers and limits in Kani (36 harnesses) | model named to `codec/demux.rs`; Kani through the public API, no stubs | TLC; `cargo kani` |
 | [`dissector`](dissector/README.md) | traffic dissection: stream reassembly with gaps (`Stream.tla`), HTTP/1 pairing (`Pairing.tla`), HPACK and TLS dissection | models named to `dissect/`; Kani on the production code | TLC per config; `cargo kani` |
@@ -92,7 +92,7 @@ layers:
    the standard library's allocation functions with ones that count. To
    use it, include the file at the crate root as `counting` (see its
    header). Write each harness as `counted_proof! { ... }` instead of
-   `#[kani::proof]`, and run it with `cargo kani -Z stubbing -Z c-ffi`.
+   `#[kani::proof]`, and run it with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
    Inside the harness, build the state inside `measure` so that the
    counter sees all of it. Take the charge the code pays (the area's
    `most_held()`, or whatever the code charges), then run one step on any
@@ -101,7 +101,13 @@ layers:
    (read `so_far()` before and after) are at most `per × input + fixed`.
    Name `per` and `fixed`, and say where each comes from. Never assert an
    exact count. The harness `the_counter_sees_every_allocation` fails if a
-   toolchain routes allocations around the stubs.
+   toolchain routes allocations around the stubs. Make every allocation
+   size and every collection length a constant on its path: use a choice
+   among a few fixed shapes, and a concrete loop over counts. Leave the
+   state undropped at the end (`mem::forget`). With symbolic sizes or
+   counts, or with the drop glue, the HPACK harnesses ran CBMC out of
+   16 GiB. A harness that still does not fit can be split into one per
+   count.
 3. **Replays: every step of a trace or vector run is costed.**
    `resources/alloc.rs` is the counting global allocator. It is the one
    `tests/it` uses, now shared. `resources/cost.rs` is the recorder.
@@ -200,6 +206,39 @@ judged against the wrong initial window while a smaller one waited for
 its ACK; and ended streams moved with an initial window change. The HPACK
 Lean model found no departure.
 
+The HPACK resource properties of 2026-11-10 (`hpack-grpc/README.md`)
+found three more ways a table held more than its charge for a moment,
+all now fixed:
+
+- `Encoder::write_block` still copied an entry and then evicted, the
+  decoder's bug that d914d14e9 fixed. It now does as the decoder does,
+  with a test that fails before the fix.
+- `Table::index` copied a literal or static name before the eviction
+  that made room. Only a name the dynamic table holds has to be read
+  first, and sharing it allocates nothing. Any other name is now copied
+  after the eviction.
+- `DynamicTable::most_held` left out the moment the entry slots double,
+  when the old and the new are both allocated. It now counts that moment.
+  The server's charge at 4096, 12,288 bytes, is unchanged: the most slots
+  that can double there are 64, and three times 64 is within the 256
+  already counted.
+
+Two are reported, not fixed. `Table::most_held()` understates a table's
+storage once its limit has fallen, because the entry slots it grew stay
+allocated. The server charges once at open and never lowers its own limit,
+so it is not affected.
+
+The other one came from porting `tests/hpack_vectors.rs` to the current
+`decode_block`. The test had not built since the buffers round
+(3d5e185a5). A block with two faults now reports a
+different one than the Lean model does. Since that round,
+`Representations` borrows strings without decoding them, so a truncated
+value, a bad index or an owed size reduction is reported before an
+invalid Huffman name. The model decodes as it parses and reports the
+Huffman error first. Both end the connection with `COMPRESSION_ERROR`;
+only `hpack::Error`'s kind differs. Seeds 4, 6, 7 and 8 of `hpack-verify
+diff` fail on it until the model or the code takes the other's order.
+
 ## Known gaps
 
 - **Reported, not fixed.** From the models and their audit, each with its
@@ -220,7 +259,13 @@ Lean model found no departure.
 - **`cargo kani -p fictionet` does not compile** at 3db7a847e:
   `verification/tls/kani/LayerProof.rs` and `verification/layer/kani/mod.rs`
   no longer match the code. The HTTP/2 harnesses were run with those two
-  modules switched off locally.
+  modules switched off locally. At d56ff61aa, after the buffers round,
+  four modules fail to compile: `layer/kani/mod.rs`,
+  `layer-runtime/kani/mod.rs` (`framed.rs`),
+  `world-layers/kani/dispatch.rs` and `http/kani/smuggling.rs`. The HPACK
+  resource harnesses were run in a scratch copy with those four switched
+  off. Until they are brought up to date, `cargo xtask hpack-verify
+  resources` fails at its Kani step.
 - **Kani in the audited areas was read, not rerun**, except where an
   area's README gives a date for its last run.
 - **`cargo kani` on the library does not compile at `3db7a847e`.** Two

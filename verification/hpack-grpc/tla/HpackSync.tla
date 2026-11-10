@@ -46,8 +46,20 @@
 (*                                                                         *)
 (* Each flag below is TRUE in the code; a *_without_<flag>.cfg sets one   *)
 (* FALSE and must violate the invariant its first comment line names.     *)
+(*                                                                         *)
+(* Resources (verification/resources/tla/Resources.tla). Each table's     *)
+(* storage is a store threaded through every eviction and insertion in    *)
+(* the code's order, so a transient inside a step shows. One unit is an   *)
+(* entry's size, as above; the entry slots, which DynamicTable::most_held *)
+(* adds, are the Kani harnesses' (kani/resources.rs). The decoder's       *)
+(* reservation is Table::most_held: the larger of its settings limit and  *)
+(* its maximum, raised when either rises (the server charges it when the  *)
+(* connection opens, Input::open in web/httpd/http2.rs, and never raises  *)
+(* its own limit). The encoder's is Encoder::most_held, its capacity.     *)
+(*   Table::index                            hpack.rs, after read_block   *)
+(*   Encoder::write_block                    the insertion at its end     *)
 (***************************************************************************)
-EXTENDS Integers, Sequences, FiniteSets
+EXTENDS Integers, Sequences, FiniteSets, Resources
 
 CONSTANTS
     Initial,          \* the table size both sides start with (4096)
@@ -67,7 +79,9 @@ CONSTANTS
     MinOnAck,         \* acknowledge_settings: the frame's minimum first
     CheckSettings,    \* read_block: an update above the settings is refused
     RequireReduction, \* read_block: a reduction owed must come first
-    UpdatesFirst      \* Representations: no update after a field
+    UpdatesFirst,     \* Representations: no update after a field
+    EvictFirst,       \* Table::index: evict to make room, then insert
+    EncEvictFirst     \* write_block: evict to make room, then insert
 
 None == -1
 Big == MaxTable + 100
@@ -88,6 +102,22 @@ Entries(t) == Static \o t
 \* DynamicTable::evict: the oldest entries leave until the rest fit.
 RECURSIVE Evict(_, _)
 Evict(t, c) == IF Sum(t) <= c THEN t ELSE Evict(SubSeq(t, 1, Len(t) - 1), c)
+
+\* Entry e added with incremental indexing to table t at capacity c, its
+\* storage s threaded through: [table, store]. With evictFirst (both ends
+\* now) an entry larger than c empties the table and is not added, and
+\* otherwise the oldest entries leave until it fits, then it goes in.
+\* Without it, it goes in first and the table is evicted after. The table
+\* that results is the same; only the storage on the way differs.
+AddEntry(t, s, e, c, evictFirst) ==
+    IF evictFirst
+    THEN IF Size(e) > c
+         THEN [table |-> <<>>, store |-> SetHeld(s, 0)]
+         ELSE LET kept == Evict(t, c - Size(e))
+              IN [table |-> <<e>> \o kept,
+                  store |-> Grow(SetHeld(s, Sum(kept)), Size(e))]
+    ELSE LET t1 == Evict(<<e>> \o t, c)
+         IN [table |-> t1, store |-> SetHeld(Grow(s, Size(e)), Sum(t1))]
 
 \* Blocks of one field, any of eight, or of two fields that are not never
 \* indexed (two fields let a block evict, or name, what it inserted itself).
@@ -111,12 +141,13 @@ AdvBlocks == {<<r>> : r \in AdvReps} \cup {<<r, q>> : r, q \in AdvReps}
 -----------------------------------------------------------------------------
 (* The Encoder.                                                            *)
 
-\* Encoder::resize
+\* Encoder::resize; a capacity that rises raises the charge.
 Resize(e, c) ==
     [e EXCEPT !.pending = IF ~MinPending \/ e.pending = None THEN c
                           ELSE Min2(e.pending, c),
               !.max = c,
-              !.table = Evict(e.table, c)]
+              !.table = Evict(e.table, c),
+              !.store = ReserveTo(SetHeld(e.store, Sum(Evict(e.table, c))), c)]
 
 \* Encoder::set_settings_limit
 EncLimit(e, l) ==
@@ -142,11 +173,15 @@ EncField(e, f) ==
        ELSE LET ix == IF f.never THEN "never"
                       ELSE IF e.max = 0 THEN "without" ELSE "inc"
                 ins == ~f.never /\ e.max # 0
-                t1 == IF ins THEN <<[name |-> f.name, value |-> f.value]>> \o e.table
-                      ELSE e.table
-                t2 == IF ins /\ EncEvict THEN Evict(t1, e.max) ELSE t1
+                new == [name |-> f.name, value |-> f.value]
+                added == IF ins /\ EncEvict
+                         THEN AddEntry(e.table, e.store, new, e.max, EncEvictFirst)
+                         ELSE IF ins
+                         THEN [table |-> <<new>> \o e.table,
+                               store |-> Grow(e.store, Size(new))]
+                         ELSE [table |-> e.table, store |-> e.store]
             IN [rep |-> Lit(named, f.name, f.value, ix),
-                enc |-> [e EXCEPT !.table = t2]]
+                enc |-> [e EXCEPT !.table = added.table, !.store = added.store]]
 
 RECURSIVE EncFields(_, _, _)
 EncFields(e, fs, reps) ==
@@ -165,9 +200,10 @@ EncBlock(e, fs) ==
 -----------------------------------------------------------------------------
 (* The decoder.                                                            *)
 
-\* Table::set_settings_limit
+\* Table::set_settings_limit; a limit that rises raises the charge.
 DecLimit(d, l) ==
     [d EXCEPT !.settings = Cap(l),
+              !.store = ReserveTo(d.store, Max2(Cap(l), d.max)),
               !.required = IF Cap(l) < d.max
                            THEN IF d.required = None THEN Cap(l)
                                 ELSE Min2(d.required, Cap(l))
@@ -188,7 +224,9 @@ DecRep(st, r) ==
         ELSE IF RequireReduction /\ st.dec.required # None /\ r.n > st.dec.required
              THEN Fail(st)
         ELSE [st EXCEPT !.dec = [st.dec EXCEPT !.required = None, !.max = r.n,
-                                               !.table = Evict(st.dec.table, r.n)],
+                                               !.table = Evict(st.dec.table, r.n),
+                                               !.store = SetHeld(st.dec.store,
+                                                   Sum(Evict(st.dec.table, r.n)))],
                         !.updates = st.updates + 1,
                         !.previous = r.n,
                         !.lowest = IF st.started THEN st.lowest ELSE Min2(st.lowest, r.n),
@@ -202,14 +240,14 @@ DecRep(st, r) ==
                                [name |-> x.name, value |-> x.value, never |-> FALSE])]
     ELSE IF r.n # 0 /\ ~InRange(st.dec.table, r.n) THEN Fail(st)
     ELSE LET nm == IF r.n = 0 THEN r.name ELSE Entries(st.dec.table)[r.n].name
-             t1 == IF r.indexing = "inc"
-                   THEN Evict(<<[name |-> nm, value |-> r.value]>> \o st.dec.table,
-                              st.dec.max)
-                   ELSE st.dec.table
+             added == IF r.indexing = "inc"
+                      THEN AddEntry(st.dec.table, st.dec.store,
+                                    [name |-> nm, value |-> r.value], st.dec.max, EvictFirst)
+                      ELSE [table |-> st.dec.table, store |-> st.dec.store]
          IN [st EXCEPT !.started = TRUE,
                        !.fields = Append(st.fields,
                            [name |-> nm, value |-> r.value, never |-> r.indexing = "never"]),
-                       !.dec = [st.dec EXCEPT !.table = t1]]
+                       !.dec = [st.dec EXCEPT !.table = added.table, !.store = added.store]]
 
 RECURSIVE DecReps(_, _)
 DecReps(st, reps) ==
@@ -223,7 +261,8 @@ DecBlock(d, reps) ==
         st2 == IF RequireReduction /\ st1.ok /\ st1.dec.required # None
                THEN Fail(st1) ELSE st1
     IN IF st2.ok THEN st2
-       ELSE [st2 EXCEPT !.dec = [st2.dec EXCEPT !.table = <<>>]]
+       ELSE [st2 EXCEPT !.dec = [st2.dec EXCEPT !.table = <<>>,
+                                                !.store = SetHeld(st2.dec.store, 0)]]
 
 -----------------------------------------------------------------------------
 
@@ -253,9 +292,11 @@ Init ==
     \* Encoder::new(EncoderInit): Table::default() at 4096, then
     \* set_settings_limit(EncoderInit) (hpack.rs lines 705-713); and
     \* Session::new.
-    /\ enc = EncLimit([table |-> <<>>, max |-> Initial, settings |-> Initial, pending |-> None],
+    /\ enc = EncLimit([table |-> <<>>, max |-> Initial, settings |-> Initial, pending |-> None,
+                       store |-> Store(Initial)],
                       EncoderInit)
-    /\ dec = [table |-> <<>>, max |-> Initial, settings |-> Initial, required |-> None]
+    /\ dec = [table |-> <<>>, max |-> Initial, settings |-> Initial, required |-> None,
+              store |-> Store(Initial)]
     /\ tableLimit = Initial
     /\ peerSize = Initial
     /\ pend = <<>>
@@ -321,7 +362,7 @@ EncCapacity(c) ==
 EncSend(fs) ==
     /\ ~Adversary
     /\ sent.blocks < MaxBlocks
-    /\ LET r == EncBlock(enc, fs)
+    /\ LET r == EncBlock([enc EXCEPT !.store = Begin(enc.store)], fs)
        IN /\ enc' = r.enc
           /\ toDec' = Append(toDec, Msg("block", r.reps, fs, r.enc.table, r.enc.max))
     /\ sent' = [sent EXCEPT !.blocks = @ + 1]
@@ -356,7 +397,7 @@ DecRead ==
     /\ toDec # <<>> /\ Head(toDec).kind = "block"
     /\ ~failed
     /\ LET m == Head(toDec)
-           st == DecBlock(dec, m.reps)
+           st == DecBlock([dec EXCEPT !.store = Begin(dec.store)], m.reps)
        IN /\ dec' = st.dec
           /\ failed' = ~st.ok
           /\ roundTrip' = (roundTrip /\ (Adversary \/ (st.ok /\ st.fields = m.fields)))
@@ -400,4 +441,11 @@ Settled == dec.required = None => dec.max <= dec.settings
 Reduced == reduced
 \* Every accepted block had its size updates before its fields.
 Ordered == ordered
+\* No moment of a step held more than the table's charge ...
+DecoderPaid == Paid(dec.store)
+EncoderPaid == Paid(enc.store)
+\* ... the charges stay within MAX_TABLE ...
+ChargedWithinLimit == WithinLimit(dec.store, MaxTable) /\ WithinLimit(enc.store, MaxTable)
+\* ... and each store holds what its table does.
+StoresTrack == Tracks(dec.store, Sum(dec.table)) /\ Tracks(enc.store, Sum(enc.table))
 =============================================================================

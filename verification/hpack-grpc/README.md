@@ -430,7 +430,194 @@ like the trailers (`HeaderBlocks::reserve`), the table untouched.
   and random byte strings up to 13 bytes. The theorems have no such
   bound.
 
-## The bug, fixed
+## Resource properties
+
+The method is in `verification/README.md`, "Resource properties". HPACK
+has all three layers. Each one fails on the decoder from before
+d914d14e9, which copied an entry's name and value and then evicted, and
+on the encoder from before its fix, which did the same. These checks
+found three bugs, now fixed (see "The bugs, fixed" below).
+
+```sh
+cargo xtask hpack-verify resources   # the Kani harnesses and the TLC configs below
+cargo xtask hpack-verify diff        # the vectors, each block costed
+```
+
+`resources` fails at its Kani step until four other areas' harnesses
+compile again (`verification/README.md`, "Known gaps"). The Kani runs
+below were made in a scratch copy with those four switched off.
+
+**What is charged.** The HTTP/2 server charges a connection's decoder
+table at `Table::most_held()` when the connection opens (`Input::open`,
+`web/httpd/http2.rs`). It never raises its own settings limit and never
+gives the charge back. `Encoder::most_held()` is the encoder's charge,
+while its capacity stays where it is.
+
+### TLA+
+
+`HpackSync.tla` threads each table's storage through every eviction and
+insertion, in the code's order (`AddEntry`, `Resize`). One unit is an
+entry's size. The entry slots are left to Kani. The decoder's reservation
+is the larger of its settings limit and its maximum, raised when either
+rises. The encoder's reservation is its capacity.
+
+| Property | States |
+| --- | --- |
+| `DecoderPaid`, `EncoderPaid` | no moment of a step held more than the table's charge |
+| `ChargedWithinLimit` | the charges stay within `MAX_TABLE` |
+| `StoresTrack` | each store holds what its table does |
+
+| Config | Result |
+| --- | --- |
+| `HpackSync_base` | passes, with the four above added: 23,562,398 states generated, 7,902,591 distinct, depth 12, 3 min 42 s |
+| `HpackSync_adversary_base` | passes: 79,219,058 generated, 27,628,238 distinct, depth 11, 6 min 9 s |
+| `HpackSync_server_base` | passes: 1,363,662 generated, 472,521 distinct, depth 11 |
+| `HpackSync_adversary_without_evictfirst` | the decoder inserts, then evicts: violates `DecoderPaid` (3 states). A block of two literals `a: v` with incremental indexing at maximum 4: the second goes in before the first leaves, peak 6 against a charge of 4 |
+| `HpackSync_without_encevictfirst` | the encoder inserts, then evicts: violates `EncoderPaid` (3 states). A block of `a: v` then `a:` at capacity 4: peak 5 against 4 |
+
+Every other control still violates the invariant its first line names.
+
+### Kani
+
+`kani/resources.rs`, compiled into `hpack.rs`, runs the production
+insertion with every allocation counted (`resources/kani/counting.rs`).
+The decoder's step is `Table::index`: what `read_block` does for a literal
+with incremental indexing, made a function of its own so a harness can
+call it. Harnesses on `decode_block` itself did not finish (see above).
+The encoder's step is `Encoder::encode_block_into` of one field.
+
+The tables hold zero to four entries, each empty (32 octets) or with a
+four-octet name and value (40 octets). Capacity and settings limit are any
+value up to 200. The new entry has a one-octet name and a four-octet value
+(37 octets), so it is larger than the table, or evicts all, some or none
+of the entries before it. With four entries it doubles the slots. Each
+length is a constant: with lengths and the entry count symbolic, CBMC ran
+out of 16 GiB.
+
+| Harness | Bound | Time |
+| --- | --- | --- |
+| `decoding_a_literal_name_stays_within_its_charge` | the most bytes live at once, counting the table from its first allocation, is at most `Table::most_held()` taken before the step; the step asks for at most the octets it reads + `name_copy()` + the slot term `most_held(c) - c` | 88.7 s |
+| `decoding_a_dynamic_name_stays_within_its_charge` | the same, the name the newest dynamic entry's (one to four entries) | 104.3 s |
+| `decoding_a_static_name_stays_within_its_charge` | the same, the name `:method` | 83.3 s |
+| `encoding_into_an_empty_table_stays_within_its_charge` and `_a_table_of_one` to `_four` | the same against `Encoder::most_held()`; one harness a count, as all five in one ran out of 16 GiB | 79.6 s, 121.8 s, 140.9 s, 159.6 s, 197.6 s |
+| `the_longest_static_name_is_counted` | `name_copy()`'s constant is at least every static name's length | 1.2 s |
+| `the_counter_sees_every_allocation` | the counter sees `Box`, `Vec` (grown, then shrunk to a boxed slice), `VecDeque` and `Arc` at their layouts' sizes, and all of it freed | 10.7 s |
+
+`name_copy()` is a shared name's header (two `usize` counts, padded to
+their alignment) and the longest static name. The slot term covers the
+one doubling of the slots a step can make. A reallocation counts as a new
+block of its full size, then the old one freed: for a moment both are
+live.
+
+| Mutation, in a scratch copy | Harness | Failed check |
+| --- | --- | --- |
+| `Table::index` as before d914d14e9: copy, insert, then evict | `decoding_a_literal_name_stays_within_its_charge` | `the table held more than its charge` (55.3 s) |
+| `Encoder::write_block` as before its fix: insert, then evict | `encoding_into_an_empty_table_stays_within_its_charge`, `encoding_into_a_table_of_one_stays_within_its_charge` | `the table held more than its charge` (109.7 s, 102.4 s) |
+
+The two code changes that came from these harnesses, a name copied after
+the eviction and `most_held` counting the slots' doubling, were found by
+the decoder harnesses failing on the code after d914d14e9 ("The bugs,
+fixed").
+
+### The replay
+
+`tests/hpack_vectors.rs` costs each step of every `blocks` and `encoder`
+session with `resources/cost.rs`. Steps are blocks decoded or encoded, and
+the encoder's settings and capacity changes, which free entries. The
+charge is the table's `most_held()`, held as the server holds it: taken
+when the session opens, raised when the bound rises, never given back.
+The head block a block decodes into is made before the step, as the
+server does, at `most_block`'s size. The linear bounds, with their
+constants in the test:
+
+- **Decoding a block of `len` bytes** asks for at most `(266/10)·len`
+  bytes plus twice the slot term. Literals decode to at most 8 octets
+  for every 5 bits. Each insertion takes at least 2 bytes of the block
+  and copies at most a name's header (23 bytes) and the longest static
+  name (27) besides.
+- **Encoding fields** asks for at most 23 bytes for each of their name
+  and value octets and one per field, plus twice `most_held()`.
+
+`cargo xtask hpack-verify diff` over seeds 1 to 8, at the commit that adds
+this section:
+
+| Seed | `blocks` steps, closest to the charge, closest to the linear bound | `encoder` steps, closest to the charge, closest to the linear bound |
+| --- | --- | --- |
+| 1 | 1,816; 4,380 of 12,288; 184 of 469 | 5,930; 182 of 192; 313 of 1,237 |
+| 2 | 1,796; 4,165 of 12,288; 171 of 624 | 5,611; 182 of 192; 144 of 336 |
+| 3 | 1,737; 4,427 of 12,288; 155 of 762 | 5,814; 182 of 192; 195 of 844 |
+| 4 | stops at a disagreeing error kind | 5,599; 182 of 192; 145 of 430 |
+| 5 | 1,850; 4,214 of 12,288; 294 of 2,461 | 5,733; 183 of 192; 152 of 336 |
+| 6 | stops at a disagreeing error kind | 5,696; 182 of 192; 155 of 496 |
+| 7 | stops at a disagreeing error kind | 5,674; 182 of 192; 299 of 1,344 |
+| 8 | stops at a disagreeing error kind | 5,878; 183 of 192; 153 of 591 |
+
+"Closest" is the step whose bytes came nearest its bound, as a share of
+the bound. The encoder's sessions come within 9 bytes of their charge
+because a capacity of 64 leaves little slack. Every encoder session
+decodes its blocks too, and those steps are counted in its column.
+
+A fixed session at the server's settings decodes an entry as large as a
+string may be, after one that fits. On the decoder from before d914d14e9
+that block held 65,713 bytes against a charge of 12,288 (seed 1). Without
+that session, no vector had an entry large enough to pass the charge. The
+encoder from before its fix held 230 bytes against 192 in seed 1's first
+encoder session.
+
+Seeds 4, 6, 7 and 8 stop at a `blocks` session whose error kind
+disagrees with the model. The cause is not resources (see "The bugs,
+fixed"). Their encoder sessions run in full; their `blocks` sessions are
+costed up to the one that disagrees.
+
+## The bugs, fixed
+
+The resource properties found three, each a moment when a table held
+more than its charge:
+
+- **The encoder copied an entry, then evicted.** `Encoder::write_block`
+  inserted a field it indexed and then evicted to its capacity. That is
+  the decoder's bug d914d14e9 fixed. A field larger than the table was
+  copied in full, only to be evicted at once. It now does as the decoder
+  does. Test: `an_encoder_entry_larger_than_the_table_is_not_copied_for_it`
+  in `tests/it/hpack_codec.rs`, which allocated the whole 60,000-octet
+  value before the fix. Model: `HpackSync_without_encevictfirst`. The
+  server's encoder has capacity 0, so the server never reached it.
+- **The decoder copied a new entry's name before evicting.** After
+  d914d14e9, `read_block` still copied a literal or static name before
+  the eviction that made room. Only a name in the dynamic table has to
+  be read first, because the eviction may remove its entry, and sharing
+  that name allocates nothing. With one 32-octet entry at capacity 37,
+  inserting a 37-octet entry held 168 bytes against a `most_held` of
+  165. `Table::index` now copies any other name after the eviction.
+- **`most_held` left out the slots' doubling.** The slots double through
+  a reallocation, which holds the old block and the new one for a
+  moment. With three 40-octet entries and an empty one at capacity 189
+  to 191, inserting a 37-octet entry held 512 bytes against 509 to 511.
+  `DynamicTable::most_held` now counts three times the most slots that
+  can double. Room is made before every insert, so they number fewer than
+  the entries that fit. The server's charge at 4096 is unchanged, 12,288
+  bytes.
+
+The last two were found by the Kani harnesses on the code after
+d914d14e9. A search over the same tables (every count, both shapes, every
+capacity and settings limit up to 200, a reallocation counted as moving)
+gave those cases and no others. After both fixes it gave none.
+
+Reported, not fixed:
+
+- `Table::most_held()` understates a table's storage once its limit has
+  fallen, because the slots it grew stay allocated. In seed 1's `blocks`
+  session 350, charged at `most_held()` afresh each block, the table held
+  256 bytes against 129. The server charges once at open and never lowers
+  its own limit.
+- A block with two faults reports a different `hpack::Error` from the
+  Lean model's. Since the buffers round, `Representations` borrows strings
+  without decoding them. So a truncated value, a bad index or an owed size
+  reduction comes before an invalid Huffman name, which the model reports
+  first. Both end the connection with `COMPRESSION_ERROR`. Seeds 4, 6, 7
+  and 8 of `hpack-verify diff` fail on it.
+
+The earlier one:
 
 **A gRPC prefix over the limit waited while the application was
 behind.** With `WAITING` messages queued for the application, the `Grpc`
@@ -447,6 +634,20 @@ or `INTERNAL` at once (commit 702d43d28). Test:
 the fix. Model: `GrpcCall_without_checkearly`.
 
 ## What the models and proofs leave out
+
+- The resource harnesses are bounded: up to four entries of two shapes,
+  one size of new entry, capacities up to 200, raw strings only (the
+  Huffman decoders are stubbed with functions that fail the proof if
+  reached), and only the insertion step. `HpackSync.tla` counts entries
+  by their RFC sizes and leaves the slots and a name's copy to Kani. The
+  replay's allocator counts a reallocation as made in place, so the
+  slots' doubling shows only in Kani.
+- The capture dissector's `PartialTable` is not costed. It decodes every
+  name and value into vectors of its own for display before its table
+  sees them, then inserts and evicts. So the entry is allocated whichever
+  order the table goes in, and the table's order changes no peak. Its
+  `held()` reports the table's RFC size, not its slots. Read from the
+  code, not checked.
 
 - `HpackSync.tla` has one direction, scaled sizes, a one-entry static
   table, two blocks of one or two fields, and two SETTINGS frames. Block

@@ -6,7 +6,7 @@
 //! from `malloc` and count it. Write a counted proof with [`counted_proof`]
 //! in place of `#[kani::proof]`, call the code inside [`measure`], and
 //! state the bound on the [`Cost`] it returns. Run it with
-//! `cargo kani -Z stubbing -Z c-ffi`.
+//! `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
 //!
 //! Include this file once per crate, at the crate root, as `counting`
 //! (the macro names its stubs by `crate::counting`):
@@ -23,14 +23,16 @@
 //! rest goes through `alloc`, `alloc_zeroed` and the private
 //! `realloc_nonnull` and `dealloc_nonnull` of `alloc::alloc`, the names in
 //! Kani 0.68's toolchain. A reallocation counts as a new allocation of its
-//! full new size, then a free of the old. A free is matched by its pointer
-//! against what the counter handed out, and gives back the size that was
-//! allocated; a pointer it never handed out is ignored. (With the stubs
-//! in place, Kani 0.68 hands `dealloc_nonnull` the dangling pointer of an
-//! empty boxed slice dropped from a collection, with a size that is not
-//! zero; the unstubbed code never frees it.) So frees of what was allocated
-//! before [`measure`] do not lower `live`: build what a proof measures
-//! inside it.
+//! full new size, then a free of the old. A free gives back its layout's
+//! size, which Rust guarantees is the size allocated. A pointer that is not
+//! a live allocation is skipped: with the stubs in place, Kani 0.68 hands
+//! `dealloc_nonnull` the dangling pointer of an empty boxed slice dropped
+//! from a collection, with a size that is not zero, which the unstubbed
+//! code never frees. Memory is never returned to CBMC, so every pointer the
+//! counter handed out stays one it can tell from a dangling one.
+//!
+//! Build what a proof measures inside [`measure`]: a free of something
+//! allocated before it fails the proof, as it would make `live` wrong.
 //!
 //! If a toolchain routes allocations around these names, the counter
 //! misses them; `the_counter_sees_every_allocation` below fails then.
@@ -43,9 +45,6 @@ use std::ptr::NonNull;
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
 }
-
-/// How many allocations one measured call can have live at once.
-const SLOTS: usize = 16;
 
 /// What a measured call allocated.
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,15 +65,11 @@ static mut COST: Cost = Cost {
     peak: 0,
     live: 0,
 };
-static mut HELD: [(*mut u8, usize); SLOTS] = [(std::ptr::null_mut(), 0); SLOTS];
 
 /// Runs `f` and returns what it allocated.
 pub fn measure<T>(f: impl FnOnce() -> T) -> (T, Cost) {
     // SAFETY: a Kani proof runs on one thread.
-    unsafe {
-        COST = Cost::default();
-        HELD = [(std::ptr::null_mut(), 0); SLOTS];
-    }
+    unsafe { COST = Cost::default() };
     let out = f();
     // SAFETY: as above.
     (out, unsafe { COST })
@@ -95,34 +90,23 @@ fn take(size: usize) -> *mut u8 {
         COST.live += size;
         COST.peak = COST.peak.max(COST.live);
         let ptr: *mut u8 = malloc(size).cast();
-        // The standard library never allocates zero bytes, and a failed
-        // allocation aborts: neither is a cost.
+        // A failed allocation aborts: it is not a cost.
         kani::assume(!ptr.is_null());
-        let mut i = 0;
-        while i < SLOTS {
-            if HELD[i].0.is_null() {
-                HELD[i] = (ptr, size);
-                break;
-            }
-            i += 1;
-        }
-        assert!(i < SLOTS, "more allocations live than the counter holds");
         ptr
     }
 }
 
-fn give(ptr: *mut u8) {
+fn give(ptr: *mut u8, size: usize) {
+    if !kani::mem::can_dereference(ptr) {
+        return;
+    }
     // SAFETY: a Kani proof runs on one thread.
     unsafe {
-        let mut i = 0;
-        while i < SLOTS {
-            if !HELD[i].0.is_null() && HELD[i].0 == ptr {
-                COST.live -= HELD[i].1;
-                HELD[i] = (std::ptr::null_mut(), 0);
-                return;
-            }
-            i += 1;
-        }
+        assert!(
+            COST.live >= size,
+            "a free of what was allocated before measure"
+        );
+        COST.live -= size;
     }
 }
 
@@ -140,8 +124,8 @@ pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
 }
 
 /// Stands for `alloc::alloc::dealloc_nonnull`.
-pub unsafe fn dealloc_nonnull(ptr: NonNull<u8>, _layout: Layout) {
-    give(ptr.as_ptr())
+pub unsafe fn dealloc_nonnull(ptr: NonNull<u8>, layout: Layout) {
+    give(ptr.as_ptr(), layout.size())
 }
 
 /// Stands for `alloc::alloc::realloc_nonnull`.
@@ -150,7 +134,7 @@ pub unsafe fn realloc_nonnull(ptr: NonNull<u8>, layout: Layout, size: usize) -> 
     // SAFETY: the old block holds `layout.size()` bytes and the new one
     // `size`; they are distinct objects.
     unsafe { std::ptr::copy_nonoverlapping(ptr.as_ptr(), new, layout.size().min(size)) };
-    give(ptr.as_ptr());
+    give(ptr.as_ptr(), layout.size());
     new
 }
 
