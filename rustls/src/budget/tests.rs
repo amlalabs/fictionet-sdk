@@ -12,11 +12,12 @@ use super::testing::Limit;
 use crate::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use crate::client::ClientConnection;
 use crate::crypto::ring::default_provider;
-use crate::enums::{AlertDescription, SignatureScheme};
-use crate::msgs::message::MAX_WIRE_SIZE;
+use crate::enums::{AlertDescription, ContentType, SignatureScheme};
+use crate::msgs::enums::AlertLevel;
+use crate::msgs::message::{HEADER_SIZE, MAX_WIRE_SIZE};
 use crate::server::{Acceptor, IntoConnectionError, ServerConnection};
 use crate::sync::Arc;
-use crate::vecbuf::{FIRST_PLACES, PLACE};
+use crate::vecbuf::{ALERT_ROOM, FIRST_PLACES, PLACE};
 use crate::version::{TLS12, TLS13};
 use crate::{
     ClientConfig, CommonState, DigitallySignedStruct, Error, ServerConfig, Side,
@@ -269,14 +270,15 @@ fn a_records_plaintext_stays_in_the_buffer_it_arrived_in() {
         client.writer().write_all(&message).unwrap();
         let wire = from_client(&mut client);
         let mut rest = &wire[..];
+        let idle = limit.used();
         assert_eq!(server.read_tls(&mut rest).unwrap(), wire.len());
-        let read = limit.used();
+        let read = limit.used() - idle;
         assert_eq!(read, wire.len(), "{version:?}: the buffer is the record");
 
-        limit.set_limit(read);
+        limit.set_limit(idle + read);
         server.process_new_packets().unwrap();
         assert!(server.wants_budget(), "{version:?}");
-        assert_eq!(limit.used(), read);
+        assert_eq!(limit.used(), idle + read);
         assert!(server.buffers_accounted());
         assert_eq!(
             server.reader().into_first_chunk().unwrap_err().kind(),
@@ -288,9 +290,9 @@ fn a_records_plaintext_stays_in_the_buffer_it_arrived_in() {
         assert!(!server.wants_budget(), "{version:?}");
         assert!(server.buffers_accounted());
         assert!(
-            limit.used() <= read + FIRST_PLACES * PLACE,
+            limit.used() <= idle + read + FIRST_PLACES * PLACE,
             "{version:?}: keeping the plaintext took {} bytes past its record",
-            limit.used() - read
+            limit.used() - idle - read
         );
         let (plaintext, charge) = server.reader().take_first_chunk().unwrap().into_parts();
         assert!(
@@ -300,13 +302,14 @@ fn a_records_plaintext_stays_in_the_buffer_it_arrived_in() {
         // It leaves in the record's buffer, with the record's charge.
         assert_eq!(plaintext.capacity(), read, "{version:?}");
         assert_eq!(charge.unwrap().bytes(), read, "{version:?}");
-        assert_eq!(server.buffers_held(), 0, "{version:?}");
+        assert_eq!(server.buffers_held(), ALERT_ROOM, "{version:?}");
     }
 }
 
 /// Once the handshake's flights are out, and again once an echo has gone
-/// both ways, the connection holds no buffer at all: the receive buffer,
-/// the queues and their places are freed, not just emptied.
+/// both ways, the connection holds no buffer: the receive buffer, the
+/// queues and their places are freed, not just emptied. It is charged only
+/// the room kept for its final alert.
 #[test]
 fn an_idle_connection_holds_no_buffer() {
     for version in [&TLS12, &TLS13] {
@@ -321,7 +324,7 @@ fn an_idle_connection_holds_no_buffer() {
         );
         assert_eq!(
             (server.buffers_held(), limit.used()),
-            (0, 0),
+            (ALERT_ROOM, ALERT_ROOM),
             "{version:?}: after the handshake"
         );
 
@@ -337,7 +340,7 @@ fn an_idle_connection_holds_no_buffer() {
         assert!(received(&mut client) == message, "{version:?}");
         assert_eq!(
             (server.buffers_held(), limit.used()),
-            (0, 0),
+            (ALERT_ROOM, ALERT_ROOM),
             "{version:?}: after an echo"
         );
     }
@@ -375,7 +378,7 @@ fn a_full_record_takes_one_buffer_of_its_size() {
         let (plaintext, _charge) = server.reader().take_first_chunk().unwrap().into_parts();
         assert!(plaintext == message, "{version:?}");
         assert_eq!(plaintext.capacity(), wire.len(), "{version:?}");
-        assert_eq!(server.buffers_held(), 0, "{version:?}");
+        assert_eq!(server.buffers_held(), ALERT_ROOM, "{version:?}");
     }
 }
 
@@ -397,6 +400,9 @@ fn a_junk_header_grows_no_buffer_past_itself() {
         let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
         let wire = [&header[..], &[0x42; 300]].concat();
         let mut rest = &wire[..];
+        // The room for the final alert, which the first read pays for:
+        // what reading takes past it is the record buffer.
+        assert!(server.keep_alert_room());
         let mut failed = false;
         let mut buffered = 0;
         for _ in 0..4 {
@@ -438,8 +444,9 @@ fn a_read_stops_at_the_end_of_the_record_arriving() {
     let second = from_client(&mut client);
     let wire = [first.clone(), second.clone()].concat();
     let mut rest = &wire[..];
+    let idle = limit.used();
     assert_eq!(server.read_tls(&mut rest).unwrap(), first.len());
-    assert_eq!(limit.used(), first.len());
+    assert_eq!(limit.used() - idle, first.len());
     let error = server.read_tls(&mut rest).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Other);
     assert_eq!(rest.len(), second.len());
@@ -510,21 +517,59 @@ fn a_flight_without_room_gives_the_hello_back_unchanged() {
     }
 }
 
+/// A `close_notify` goes out with the budget full: the room kept for the
+/// final alert pays for it, and the budget is charged no more for it.
 #[test]
-fn a_close_notify_without_room_is_not_queued_until_there_is_room() {
+fn a_close_notify_goes_out_with_the_budget_full() {
+    for version in [&TLS12, &TLS13] {
+        let limit = Limit::new(1 << 20);
+        let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
+        let mut client = client(version);
+        handshake(&mut server, &mut client);
+        let idle = limit.used();
+        limit.set_limit(idle);
+        assert!(server.send_close_notify(), "{version:?}");
+        assert!(server.wants_write(), "{version:?}");
+        assert!(limit.used() <= idle, "{version:?}");
+        assert!(server.buffers_accounted());
+        to_client(&mut server, &mut client);
+        let mut bytes = Vec::new();
+        assert_eq!(client.reader().read_to_end(&mut bytes).unwrap(), 0);
+    }
+}
+
+/// A hello that does not parse is answered with decode_error with the
+/// budget full: the room kept for the final alert since the first read
+/// pays for it, and nothing goes out after it.
+#[test]
+fn a_fatal_alert_goes_out_with_the_budget_full() {
     let limit = Limit::new(1 << 20);
-    let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
-    let mut client = client(&TLS13);
-    handshake(&mut server, &mut client);
+    let mut acceptor = Acceptor::with_budget(limit.clone());
+    // A ClientHello whose body is one byte: a record that frames, and a
+    // message that does not parse.
+    let hello = [0x16, 0x03, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00];
+    let mut rest = &hello[..];
+    assert_eq!(acceptor.read_tls(&mut rest).unwrap(), hello.len());
     limit.set_limit(limit.used());
-    assert!(!server.send_close_notify());
-    assert!(!server.wants_write());
-    limit.set_limit(1 << 20);
-    assert!(server.send_close_notify());
-    assert!(server.wants_write());
-    to_client(&mut server, &mut client);
-    let mut bytes = Vec::new();
-    assert_eq!(client.reader().read_to_end(&mut bytes).unwrap(), 0);
+    let Err((_, mut alert)) = acceptor.accept() else {
+        panic!("the hello was accepted");
+    };
+    assert!(!alert.is_empty(), "no alert was queued");
+
+    let mut sent = Vec::new();
+    alert.write_all(&mut sent).unwrap();
+    // One record, and it is a fatal decode_error alert.
+    let (header, payload) = sent.split_at(HEADER_SIZE);
+    assert_eq!(ContentType::from(header[0]), ContentType::Alert);
+    assert_eq!(
+        usize::from(u16::from_be_bytes([header[3], header[4]])),
+        payload.len()
+    );
+    assert_eq!(AlertLevel::from(payload[0]), AlertLevel::Fatal);
+    assert_eq!(
+        AlertDescription::from(payload[1]),
+        AlertDescription::DecodeError
+    );
 }
 
 #[test]

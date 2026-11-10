@@ -792,7 +792,9 @@ impl<Data> ConnectionCommon<Data> {
     /// to empty the incoming TLS data buffer.
     ///
     /// It reads no further than the end of the record arriving, into a buffer of exactly that
-    /// record's size, which is freed once the record is processed. Once a whole record is
+    /// record's size, which is freed once the record is processed. With a budget, the first
+    /// read also pays for the room the connection keeps for its final alert, and fails with
+    /// `ErrorKind::OutOfMemory`, reading nothing, while the budget has no room. Once a whole record is
     /// buffered it reads nothing more, failing with `ErrorKind::Other`, until
     /// [`process_new_packets()`] has taken it.
     ///
@@ -820,6 +822,15 @@ impl<Data> ConnectionCommon<Data> {
 
         if self.has_received_close_notify {
             return Ok(0);
+        }
+
+        // The connection's final alert must go out whatever the budget
+        // says when it is sent: its room is paid before the first byte.
+        if !self.core.common_state.keep_alert_room() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "no room for the final alert",
+            ));
         }
 
         let hs = &self.core.hs_deframer;

@@ -19,12 +19,16 @@ pub(crate) const FIRST_PLACES: usize = 4;
 /// The chunks of a queue, in order. The first is held in place, so a queue
 /// of one chunk allocates no places, and one that empties and fills again
 /// with a chunk at a time allocates nothing for them. The places of the
-/// chunks after it are allocated as they are needed.
+/// chunks after it are allocated as they are needed. The last chunk a
+/// queue ever takes, its connection's final alert, is held in place too,
+/// so it never needs a place.
 #[derive(Default)]
 struct Chunks {
-    /// Invariant: `None` only if `rest` is empty.
+    /// Invariant: `None` only if `rest` is empty and `last` is `None`.
     first: Option<Vec<u8>>,
     rest: VecDeque<Vec<u8>>,
+    /// The final alert, behind every other chunk.
+    last: Option<Vec<u8>>,
 }
 
 impl Chunks {
@@ -32,6 +36,8 @@ impl Chunks {
         self.first.is_none()
     }
 
+    /// The chunks that take a place or the first: all but the final alert
+    /// waiting behind them.
     fn len(&self) -> usize {
         usize::from(self.first.is_some()) + self.rest.len()
     }
@@ -58,15 +64,25 @@ impl Chunks {
     }
 
     fn push_back(&mut self, chunk: Vec<u8>) {
+        debug_assert!(self.last.is_none(), "a chunk after the final alert");
         match self.first {
             None => self.first = Some(chunk),
             Some(_) => self.rest.push_back(chunk),
         }
     }
 
+    /// Puts the final alert behind every chunk, without a place.
+    fn push_last(&mut self, chunk: Vec<u8>) {
+        debug_assert!(self.last.is_none(), "a second final alert");
+        match self.first {
+            None => self.first = Some(chunk),
+            Some(_) => self.last = Some(chunk),
+        }
+    }
+
     fn pop_front(&mut self) -> Option<Vec<u8>> {
         let first = self.first.take()?;
-        self.first = self.rest.pop_front();
+        self.first = self.rest.pop_front().or_else(|| self.last.take());
         Some(first)
     }
 
@@ -75,7 +91,7 @@ impl Chunks {
     }
 
     fn iter(&self) -> impl Iterator<Item = &Vec<u8>> {
-        self.first.iter().chain(&self.rest)
+        self.first.iter().chain(&self.rest).chain(&self.last)
     }
 }
 
@@ -103,7 +119,8 @@ pub(crate) struct ChunkVecBuffer {
     limit: Option<usize>,
 
     /// Invariant, with a budget: the chunks' capacities, the places, the
-    /// promised chunks and the reserve, in bytes.
+    /// promised chunks, the reserve and the room kept for the final alert,
+    /// in bytes.
     paid: Paid,
 
     /// Bytes paid for chunks not yet appended, and how many chunks.
@@ -112,7 +129,31 @@ pub(crate) struct ChunkVecBuffer {
 
     /// Room paid ahead, which the next payments take first.
     reserve: usize,
+
+    /// Room kept for the one final alert a connection sends.
+    alert_room: AlertRoom,
+
+    /// The final alert is queued: chunks appended after it are dropped.
+    ended: bool,
 }
+
+/// The room a queue keeps paid for its connection's final alert: a fatal
+/// alert or a `close_notify`, after which nothing more goes out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlertRoom {
+    /// Not paid for yet.
+    Unpaid,
+    /// Paid for and waiting: [`ALERT_ROOM`] bytes.
+    Kept,
+    /// Taken by the final alert, or given back.
+    Spent,
+}
+
+/// The most one alert record takes: a 5-byte header, the 2-byte alert,
+/// and the most a cipher adds (TLS 1.2 GCM's 8-byte explicit nonce and
+/// 16-byte tag; TLS 1.3 adds a type byte and a tag, 17 bytes). The final
+/// alert takes no place in the queue.
+pub(crate) const ALERT_ROOM: usize = 5 + 2 + 8 + 16;
 
 impl ChunkVecBuffer {
     pub(crate) fn new(limit: Option<usize>) -> Self {
@@ -124,6 +165,8 @@ impl ChunkVecBuffer {
             promised: 0,
             promised_chunks: 0,
             reserve: 0,
+            alert_room: AlertRoom::Unpaid,
+            ended: false,
         }
     }
 
@@ -208,6 +251,76 @@ impl ChunkVecBuffer {
         true
     }
 
+    /// Pays for the room the connection's final alert takes, once, so that
+    /// the alert goes out whatever the budget says when it is sent. `true`
+    /// once it is paid or was spent; `false`, changing nothing, if the
+    /// budget has no room.
+    #[must_use = "without the room an alert may go unsent"]
+    pub(crate) fn keep_alert_room(&mut self) -> bool {
+        if self.alert_room != AlertRoom::Unpaid {
+            return true;
+        }
+        if !self.paid.grow_by(ALERT_ROOM) {
+            return false;
+        }
+        self.alert_room = AlertRoom::Kept;
+        true
+    }
+
+    /// Whether the room for the final alert is kept and waiting.
+    pub(crate) fn keeps_alert_room(&self) -> bool {
+        self.alert_room == AlertRoom::Kept
+    }
+
+    /// Pays for the connection's final alert, a record of `len` bytes: a
+    /// fatal alert or a `close_notify`, after which nothing more goes out.
+    /// It takes no place in the queue, and is paid from the reserve and the
+    /// budget, or, if they have no room, from the room kept for it
+    /// ([`Self::keep_alert_room`]), which always holds an alert record.
+    /// Append it with [`Self::push_final_alert`].
+    #[must_use = "a refused payment must not be followed by the chunk"]
+    pub(crate) fn pay_final_alert(&mut self, len: usize) -> bool {
+        let from_reserve = cmp::min(self.reserve, len);
+        let need = len - from_reserve;
+        let kept = self.alert_room == AlertRoom::Kept;
+        // What of the room kept goes back: all of it if the budget paid,
+        // and what the alert did not take if the room paid.
+        let give_back = if self.paid.grow_by(need) {
+            if kept {
+                ALERT_ROOM
+            } else {
+                0
+            }
+        } else if kept && need <= ALERT_ROOM {
+            ALERT_ROOM - need
+        } else {
+            return false;
+        };
+        self.reserve -= from_reserve;
+        self.paid.shrink_by(give_back);
+        self.alert_room = AlertRoom::Spent;
+        self.promised += len;
+        true
+    }
+
+    /// Appends the final alert, paid for by [`Self::pay_final_alert`] as
+    /// `paid` bytes, behind every chunk queued. Chunks appended after it
+    /// are never sent ([`Self::push_paid`]).
+    #[must_use = "a dropped chunk was never queued"]
+    pub(crate) fn push_final_alert(&mut self, chunk: Vec<u8>, paid: usize) -> bool {
+        self.promised -= paid;
+        let capacity = chunk.capacity();
+        if capacity < paid {
+            self.paid.shrink_by(paid - capacity);
+        } else if capacity > paid && !self.paid.grow_by(capacity - paid) {
+            self.paid.shrink_by(paid);
+            return false;
+        }
+        self.chunks.push_last(chunk);
+        self.ended = true;
+        true
+    }
+
     /// Appends `chunk`, paid for by [`Self::pay`] as one chunk of `paid`
     /// bytes. A chunk whose allocation is smaller gives back the rest; one
     /// whose allocation is larger, which its maker said it would not be, is
@@ -215,6 +328,14 @@ impl ChunkVecBuffer {
     /// not fit.
     #[must_use = "a dropped chunk was never queued"]
     pub(crate) fn push_paid(&mut self, chunk: Vec<u8>, paid: usize) -> bool {
+        if self.ended {
+            // Nothing goes out after the final alert.
+            self.promised -= paid;
+            self.promised_chunks -= 1;
+            self.paid.shrink_by(paid);
+            self.release_idle_places();
+            return true;
+        }
         self.promised -= paid;
         self.promised_chunks -= 1;
         let capacity = chunk.capacity();
@@ -411,6 +532,10 @@ impl ChunkVecBuffer {
             + self.chunks.places() * PLACE
             + self.promised
             + self.reserve
+            + match self.alert_room {
+                AlertRoom::Kept => ALERT_ROOM,
+                AlertRoom::Unpaid | AlertRoom::Spent => 0,
+            }
     }
 
     /// Whether what is paid for is what is held, as the invariant says.

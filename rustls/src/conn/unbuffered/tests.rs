@@ -7,20 +7,25 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use std::io::{Read, Write};
 
+use crate::budget::testing::Limit;
 use crate::budget::tests::{client, from_client, server_config, TrustAnything};
 use crate::client::ClientConnection;
 use crate::crypto::ring::{cipher_suite, default_provider};
 use crate::crypto::CryptoProvider;
+use crate::enums::AlertDescription;
 use crate::msgs::message::HEADER_SIZE;
 use crate::server::{Acceptor, UnbufferedServerConnection};
 use crate::sync::Arc;
 use crate::unbuffered::{ConnectionState, UnbufferedStatus};
 use crate::version::{TLS12, TLS13};
-use crate::{ClientConfig, SupportedCipherSuite, SupportedProtocolVersion};
+use crate::{ClientConfig, Error, SupportedCipherSuite, SupportedProtocolVersion};
 
 /// A server that accepted the hello in `wire` on the unbuffered API.
 fn accept(wire: &[u8]) -> UnbufferedServerConnection {
-    let mut acceptor = Acceptor::default();
+    accept_with(Acceptor::default(), wire)
+}
+
+fn accept_with(mut acceptor: Acceptor, wire: &[u8]) -> UnbufferedServerConnection {
     let mut rest = wire;
     loop {
         acceptor.read_tls(&mut rest).unwrap();
@@ -89,8 +94,15 @@ fn to_client(client: &mut ClientConnection, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// A finished handshake between `client` and an unbuffered server.
-fn handshake(mut client: ClientConnection) -> (ClientConnection, UnbufferedServerConnection) {
-    let mut server = accept(&from_client(&mut client));
+fn handshake(client: ClientConnection) -> (ClientConnection, UnbufferedServerConnection) {
+    handshake_with(Acceptor::default(), client)
+}
+
+fn handshake_with(
+    acceptor: Acceptor,
+    mut client: ClientConnection,
+) -> (ClientConnection, UnbufferedServerConnection) {
+    let mut server = accept_with(acceptor, &from_client(&mut client));
     let mut incoming = Vec::new();
     for _ in 0..8 {
         let served = serve(&mut server, &mut incoming);
@@ -232,4 +244,41 @@ fn an_encode_state_dropped_unencoded_loses_nothing() {
         }
     }
     panic!("the handshake did not finish");
+}
+
+/// A record the server cannot decrypt is answered with bad_record_mac with
+/// the budget full: the room kept for the final alert pays for it, and the
+/// next call hands it over to be sent.
+#[test]
+fn a_fatal_alert_goes_out_with_the_budget_full() {
+    for version in [&TLS12, &TLS13] {
+        let limit = Limit::new(1 << 20);
+        let (mut client, mut server) =
+            handshake_with(Acceptor::with_budget(limit.clone()), client(version));
+        client.writer().write_all(b"tampered").unwrap();
+        let mut incoming = from_client(&mut client);
+        *incoming.last_mut().unwrap() ^= 1;
+
+        limit.set_limit(limit.used());
+        let status = server.process_tls_records(&mut incoming[..]);
+        assert_eq!(
+            status.state.unwrap_err(),
+            Error::DecryptError,
+            "{version:?}"
+        );
+        let served = serve(&mut server, &mut Vec::new());
+        assert!(!served.sent.is_empty(), "{version:?}: no alert was sent");
+
+        let mut rest = &served.sent[..];
+        client.read_tls(&mut rest).unwrap();
+        assert!(
+            rest.is_empty(),
+            "{version:?}: more than one record went out"
+        );
+        assert_eq!(
+            client.process_new_packets().unwrap_err(),
+            Error::AlertReceived(AlertDescription::BadRecordMac),
+            "{version:?}"
+        );
+    }
 }

@@ -72,6 +72,9 @@ pub struct CommonState {
     /// the budget refused the rest. Nothing more is queued, and the
     /// connection fails.
     output_unpaid: bool,
+    /// The record being made is the final alert: a fatal alert or a
+    /// `close_notify`, paid from the room kept for it if need be.
+    final_alert: bool,
     /// The room, in bytes and records, charged before each handshake
     /// message for the output it makes.
     pub(crate) handshake_room: (usize, usize),
@@ -114,6 +117,7 @@ impl CommonState {
             account: None,
             wants_budget: false,
             output_unpaid: false,
+            final_alert: false,
             handshake_room: (HANDSHAKE_ROOM, HANDSHAKE_RECORDS),
             protocol: Protocol::Tcp,
             quic: quic::Quic::default(),
@@ -579,7 +583,7 @@ impl CommonState {
         }
 
         let len = m.encoded_len(&self.record_layer);
-        if !self.sendable_tls.pay(len, 1) {
+        if !self.pay_record(len) {
             return false;
         }
         let em = self.record_layer.encrypt_outgoing(m).encode();
@@ -679,12 +683,35 @@ impl CommonState {
         true
     }
 
+    /// Pays for a record of `len` bytes about to be made: the final alert
+    /// from the room kept for it if need be, any other from the reserve
+    /// and the budget.
+    #[must_use = "an unpaid record must not be made"]
+    fn pay_record(&mut self, len: usize) -> bool {
+        match self.final_alert {
+            true => self.sendable_tls.pay_final_alert(len),
+            false => self.sendable_tls.pay(len, 1),
+        }
+    }
+
+    /// Sends `desc` as the connection's final alert at `level`: nothing
+    /// goes out after it.
+    fn send_final_alert(&mut self, level: AlertLevel, desc: AlertDescription) {
+        self.final_alert = true;
+        let m = Message::build_alert(level, desc);
+        self.send_msg(m, self.record_layer.is_encrypting());
+        self.final_alert = false;
+    }
+
     /// Queues `record`, paid for in `sendable_tls` as `paid` bytes, after a
     /// key update waiting to go first. `false` if it went unpaid after all.
     #[must_use = "an unpaid record was not sent"]
     fn queue_paid(&mut self, record: Vec<u8>, paid: usize) -> bool {
         self.perhaps_write_key_update();
-        self.sendable_tls.push_paid(record, paid)
+        match self.final_alert {
+            true => self.sendable_tls.push_final_alert(record, paid),
+            false => self.sendable_tls.push_paid(record, paid),
+        }
     }
 
     pub(crate) fn perhaps_write_key_update(&mut self) {
@@ -726,7 +753,7 @@ impl CommonState {
             let iter = self.message_fragmenter.fragment_message(msg);
             for m in iter {
                 let len = HEADER_SIZE + m.payload.len();
-                if !self.sendable_tls.pay(len, 1)
+                if !self.pay_record(len)
                     || !self.queue_paid(m.to_unencrypted_opaque().encode(), len)
                 {
                     self.output_unpaid = true;
@@ -822,8 +849,7 @@ impl CommonState {
         if self.sent_fatal_alert {
             return err.into();
         }
-        let m = Message::build_alert(AlertLevel::Fatal, desc);
-        self.send_msg(m, self.record_layer.is_encrypting());
+        self.send_final_alert(AlertLevel::Fatal, desc);
         self.sent_fatal_alert = true;
         err.into()
     }
@@ -834,14 +860,31 @@ impl CommonState {
     ///
     /// Does nothing if any `close_notify` or fatal alert was already sent.
     ///
-    /// Returns `false`, queuing nothing, if the connection's
-    /// [`BufferBudget`](crate::budget::BufferBudget) has no room for the
-    /// alert; call it again once it has. Without a budget it always queues.
+    /// With a [`BufferBudget`](crate::budget::BufferBudget), it is paid
+    /// from the budget, or from the room the connection keeps for its final
+    /// alert from its first read. Returns `false`, queuing nothing, only if
+    /// neither has room; call it again once there is. Without a budget it
+    /// always queues.
     ///
     /// [`Connection::write_tls`]: crate::Connection::write_tls
     #[must_use = "a close_notify the budget had no room for was not queued"]
     pub fn send_close_notify(&mut self) -> bool {
-        self.sent_fatal_alert || self.with_control_room(1, Self::queue_close_notify)
+        if self.sent_fatal_alert || self.with_control_room(1, Self::queue_close_notify) {
+            return true;
+        }
+        if !self.sendable_tls.keeps_alert_room() {
+            return false;
+        }
+        self.queue_close_notify();
+        true
+    }
+
+    /// Pays for the room the final alert takes, once, so that it goes out
+    /// whatever the budget says when it is sent. `false`, changing nothing,
+    /// if the budget has no room.
+    #[must_use = "without the room an alert may go unsent"]
+    pub(crate) fn keep_alert_room(&mut self) -> bool {
+        self.sendable_tls.keep_alert_room()
     }
 
     /// Queues a `close_notify`, paid for from the room charged for the
@@ -853,7 +896,7 @@ impl CommonState {
         debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
         self.sent_fatal_alert = true;
         self.has_sent_close_notify = true;
-        self.send_warning_alert_no_log(AlertDescription::CloseNotify);
+        self.send_final_alert(AlertLevel::Warning, AlertDescription::CloseNotify);
     }
 
     pub(crate) fn eager_send_close_notify(
