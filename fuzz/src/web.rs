@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fictionet::stdlib::web::Response;
-use http_body_util::{BodyExt, Limited};
 use rustls::pki_types::CertificateDer;
 
 use fictionet::stdlib::{services::tls, web};
@@ -37,11 +36,17 @@ impl web::httpd::Handler for Echo {
         web::httpd::Reply::Later(Box::new(move |_| {
             Box::pin(async move {
                 let parts = request.head.to_http()?;
-                let body = request.body;
-                let n = match Limited::new(body, 1 << 20).collect().await {
-                    Ok(b) => b.to_bytes().len() as i64,
-                    Err(_) => -1,
-                };
+                let mut body = request.body;
+                let mut n: i64 = 0;
+                while let Some(piece) = std::future::poll_fn(|cx| body.poll_next(cx)).await {
+                    match piece {
+                        Ok(piece) if n + piece.len() as i64 <= 1 << 20 => n += piece.len() as i64,
+                        _ => {
+                            n = -1;
+                            break;
+                        }
+                    }
+                }
                 let text = format!("{} {} {:?} {n}\n", parts.method, parts.uri, parts.version);
                 let big = parts.uri.path() == "/big";
                 let body = if big {

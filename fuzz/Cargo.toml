@@ -15,7 +15,6 @@ fictionet = { path = ".." }
 fictionet-cli = { path = "../cli" }
 fictionet-codegen-golden = { path = "../codegen/tests/golden" }
 http = "1"
-http-body-util = "0.1"
 libfuzzer-sys = "0.4"
 rustls = { package = "fictionet-rustls", path = "../rustls", default-features = false, features = ["std", "ring", "tls12"] }
 tower-service = "0.3"
