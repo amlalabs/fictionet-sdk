@@ -155,7 +155,30 @@ impl Budget {
         if *want.end() == 0 {
             return (*want.start() == 0).then_some(0);
         }
-        if let Some(taken) = self.try_take(&want) {
+        self.take_with(|room| {
+            let take = (*want.end()).min(room);
+            (take >= *want.start()).then_some(take)
+        })
+    }
+
+    /// Takes as many whole `unit`s of bytes as fit within `units`, or
+    /// nothing. Returns how many units it took.
+    fn take_units(&self, units: RangeInclusive<usize>, unit: usize) -> Option<usize> {
+        if unit == 0 || *units.end() == 0 {
+            // No bytes at all: always fits.
+            return Some(*units.end());
+        }
+        let taken = self.take_with(|room| {
+            let take = (*units.end()).min(room / unit);
+            (take >= *units.start()).then_some(take * unit)
+        })?;
+        Some(taken / unit)
+    }
+
+    /// Takes what `fits` says of the room left, or nothing when it says
+    /// nothing fits.
+    fn take_with(&self, fits: impl Fn(usize) -> Option<usize>) -> Option<usize> {
+        if let Some(taken) = self.try_take(&fits) {
             return Some(taken);
         }
         // No room. Count the refusal and mark the budget starved before
@@ -164,25 +187,21 @@ impl Budget {
         // sees the mark and wakes the runners.
         self.inner.refusals.fetch_add(1, Ordering::SeqCst);
         self.inner.starved.store(true, Ordering::SeqCst);
-        self.try_take(&want)
+        self.try_take(&fits)
     }
 
-    /// One pass over the count: the end of `want` if it fits, else what
-    /// room is left if that covers its start.
-    fn try_take(&self, want: &RangeInclusive<usize>) -> Option<usize> {
-        let fits = |used: usize| {
-            let room = self.inner.limit.saturating_sub(used);
-            let take = (*want.end()).min(room);
-            (take >= *want.start()).then_some(take)
-        };
+    /// One pass over the count: what `fits` says of the room left, if
+    /// anything.
+    fn try_take(&self, fits: &impl Fn(usize) -> Option<usize>) -> Option<usize> {
+        let room = |used: usize| self.inner.limit.saturating_sub(used);
         let before = self
             .inner
             .used
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                fits(used).map(|take| used + take)
+                fits(room(used)).map(|take| used + take)
             })
             .ok()?;
-        fits(before)
+        fits(room(before))
     }
 
     /// Gives back `bytes`, waking the runners if a charge was refused
@@ -253,6 +272,18 @@ impl Charge {
         }
         self.now = to;
         true
+    }
+
+    /// Grows by as many whole `unit`s of bytes as fit, at least
+    /// `units.start()` and at most `units.end()`, as a container grows by
+    /// places: twice as many if there is room, fewer if not. Returns how
+    /// many units it grew by, or `None`, changing nothing, if not even the
+    /// start fits.
+    #[must_use = "a refused growth must not be followed by the growth"]
+    pub fn grow_by_units(&mut self, units: RangeInclusive<usize>, unit: usize) -> Option<usize> {
+        let more = self.budget.take_units(units, unit)?;
+        self.now += more * unit;
+        Some(more)
     }
 
     /// Charges only `to` bytes, if that is less than now, giving back the
@@ -417,6 +448,29 @@ mod tests {
         assert_eq!(budget.used(), other.bytes() + 1);
         charge.shrink_to(held);
         assert_eq!(charge.bytes(), 1, "shrinking never grows");
+        drop((other, charge));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn growing_by_units_takes_whole_units_that_fit_or_nothing() {
+        let budget = Budget::new(64);
+        let other = budget.charge(30).unwrap();
+        let mut charge = budget.charge(6).unwrap();
+        let mark = budget.refusals();
+        let room = budget.limit() - budget.used();
+        let unit = 8;
+        // Asked for more units than fit: as many whole ones as fit, and
+        // no refusal, since the start fit.
+        let grew = charge.grow_by_units(1..=room, unit).unwrap();
+        assert_eq!(grew, room / unit);
+        assert_eq!(charge.bytes(), 6 + grew * unit);
+        assert!(budget.limit() - budget.used() < unit);
+        assert_eq!(budget.refusals(), mark, "taking fewer is not a refusal");
+        let (held, used) = (charge.bytes(), budget.used());
+        assert_eq!(charge.grow_by_units(1..=4, unit), None);
+        assert_ne!(budget.refusals(), mark, "nothing fitting is a refusal");
+        assert_eq!((charge.bytes(), budget.used()), (held, used));
         drop((other, charge));
         assert_eq!(budget.used(), 0);
     }

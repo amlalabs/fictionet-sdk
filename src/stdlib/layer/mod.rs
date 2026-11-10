@@ -226,7 +226,7 @@ pub(crate) use framed::tests as framed_echo;
 mod proofs;
 
 pub use budget::{Budget, Charge, OwnedWork, Refusals, WorkOwner};
-pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, Owned};
+pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, Owned, Place};
 
 /// Maximum supported composition depth, including erased layers.
 pub const MAX_DEPTH: usize = 32;
