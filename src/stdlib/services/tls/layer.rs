@@ -17,8 +17,7 @@ use super::HandshakeError;
 use super::budget::TlsBudget;
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, StreamCommand, StreamEvent,
-    Timers,
+    Admit, Budget, ByteStream, Charge, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
 };
 use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
@@ -32,6 +31,11 @@ const HEADER: usize = 5;
 /// section 6.2.3); TLS 1.3 allows less, 2^14 + 256 (RFC 8446 section 5.2).
 /// rustls refuses a header that says more.
 const BODY: usize = (1 << 14) + 2048;
+/// The most input held while a handshake message is joined: the records
+/// joined so far and the one arriving, headers included. rustls's buffered
+/// reader holds no more (`MAX_HANDSHAKE_SIZE`), and a message whose parts
+/// need more fails the connection.
+const JOINED: usize = 0xffff;
 /// The room kept from the first byte for the buffer the connection's final
 /// alert goes down in: a fatal alert or a `close_notify` record, or the
 /// acceptor's alert, all well under it.
@@ -626,8 +630,10 @@ impl TlsLayer {
 
     /// Takes `chunk` in as input: whole records are processed where they
     /// lie, and bytes that continue a record held are joined to it in one
-    /// buffer, paid for first, up to the end of that record. Returns what
-    /// is left of the chunk, which waits, or `None` once all of it is taken.
+    /// buffer, paid for first, up to the end of that record. A handshake
+    /// message whose parts need more than [`JOINED`] bytes fails the
+    /// connection. Returns what is left of the chunk, which waits, or
+    /// `None` once all of it is taken.
     fn take_input(
         &mut self,
         budget: &Budget,
@@ -640,7 +646,8 @@ impl TlsLayer {
             if self.failed || self.pending || self.above.is_some() {
                 return Ok(Some(chunk));
             }
-            let Some(input) = self.input.as_ref() else {
+            let joined = self.tls.as_ref().map_or(0, |tls| tls.joined());
+            let Some(input) = self.input.as_mut() else {
                 // Nothing held: the chunk itself, the one piece holding its
                 // backing, is the record buffer, paid for by this
                 // connection before it is taken.
@@ -651,18 +658,34 @@ impl TlsLayer {
                 self.pump(budget)?;
                 return Ok(None);
             };
-            let joined = self.tls.as_ref().map_or(0, |tls| tls.joined());
             let end = record_end(input, joined);
+            if joined != 0 && end > JOINED {
+                self.fail(HandshakeError::Failed(
+                    "a handshake message outgrew the most a message may be joined in".into(),
+                ));
+                continue;
+            }
             let take = end.saturating_sub(input.len()).min(chunk.len());
-            let Some(mut bytes) = ChargedBytes::with_capacity(budget, input.len() + take) else {
-                return Ok(Some(chunk));
-            };
-            bytes
-                .extend_within(input)
-                .and_then(|()| bytes.extend_within(&chunk[..take]))
-                .map_err(|_| HandshakeError::Failed("a record outgrew its buffer".into()))?;
+            // The rest of a record goes in after what is held, in place
+            // when the buffer has room. A new buffer has room for the
+            // whole record arriving, and while a message is being joined
+            // for twice what is held, so that joining a message from many
+            // records copies what is held a few times, not once a record.
+            if input.extend_within(&chunk[..take]).is_err() {
+                let room = match joined {
+                    0 => end,
+                    _ => end.max(input.len() * 2).min(JOINED),
+                };
+                let Some(mut bytes) = Chunk::block(budget, 0, room) else {
+                    return Ok(Some(chunk));
+                };
+                bytes
+                    .extend_within(input)
+                    .and_then(|()| bytes.extend_within(&chunk[..take]))
+                    .map_err(|_| HandshakeError::Failed("a record outgrew its buffer".into()))?;
+                *input = bytes;
+            }
             chunk.advance(take);
-            self.input = Some(bytes.into_chunk());
             self.pump(budget)?;
         }
     }

@@ -62,9 +62,9 @@ fn drain(h: &mut Harness<TlsLayer>, got: &mut Vec<u8>) {
     }
 }
 
-/// A layer and a client that finished their handshake, in `version`, on
-/// `budget`.
-fn connected(
+/// A layer that took a client's hello in `version`, on `budget`, and was
+/// given its config: the server's first flight is in its output.
+fn answered(
     cx: &Cx,
     version: &'static rustls::SupportedProtocolVersion,
     budget: &Budget,
@@ -89,11 +89,9 @@ fn connected(
         .with_no_client_auth();
     // Tests seal records rustls itself would not send with its keys.
     client_config.enable_secret_extraction = true;
-    let mut client = rustls::ClientConnection::new(
-        Arc::new(client_config),
-        "layer.example".try_into().unwrap(),
-    )
-    .unwrap();
+    let mut client =
+        rustls::ClientConnection::new(Arc::new(client_config), "layer.example".try_into().unwrap())
+            .unwrap();
     let mut h = Harness::with_budget(
         Seed::from_u64(7),
         TlsLayer::new(config.clone()),
@@ -102,6 +100,17 @@ fn connected(
     h.push(&from_client(&mut client)).unwrap();
     drop(h.work());
     h.complete(Some(config)).unwrap();
+    (client, h)
+}
+
+/// A layer and a client that finished their handshake, in `version`, on
+/// `budget`.
+fn connected(
+    cx: &Cx,
+    version: &'static rustls::SupportedProtocolVersion,
+    budget: &Budget,
+) -> (rustls::ClientConnection, Harness<TlsLayer>) {
+    let (mut client, mut h) = answered(cx, version, budget);
     for _ in 0..8 {
         let out = h.take_output();
         assert!(to_client(&mut client, &out).is_empty());
@@ -414,5 +423,51 @@ fn an_empty_record_hands_nothing_up() {
         drain(&mut h, &mut got);
         assert_eq!(got, b"beforeafter");
         assert!(h.layer().failure().is_none());
+    });
+}
+
+/// A handshake message sent a byte a record, each record in a chunk of
+/// its own, holds no more than the most a message may be joined in: the
+/// connection fails once its parts would need more, before the message is
+/// whole.
+#[test]
+fn a_message_joined_from_many_records_is_held_to_the_limit() {
+    lab_test(7, |cx| {
+        let budget = Budget::new(1 << 22);
+        let (_client, mut h) = answered(&cx, &rustls::version::TLS12, &budget);
+        let idle = budget.used();
+        // A client_key_exchange that says it is 60,000 bytes long, in
+        // plaintext records as the client's flight is in TLS 1.2.
+        let size: u32 = 60_000;
+        let message: Vec<u8> = [16]
+            .into_iter()
+            .chain(size.to_be_bytes()[1..].iter().copied())
+            .chain(std::iter::repeat_n(7, size as usize))
+            .collect();
+        // rustls's buffered reader joins a message in at most 64 KiB; a
+        // buffer that doubles toward it may be paid for twice that.
+        let most = 2 * 0xffff;
+        let mut failure = None;
+        let mut sent = 0;
+        for byte in &message {
+            sent += 1;
+            if let Err(error) = h.push(&[22, 3, 3, 0, 1, *byte]) {
+                failure = Some(error);
+                break;
+            }
+            let held = budget.used() - idle;
+            assert!(
+                held <= most,
+                "{held} bytes held after {sent} records of a message being joined"
+            );
+        }
+        assert!(
+            sent < message.len(),
+            "the connection took the whole message"
+        );
+        assert!(
+            matches!(failure, Some(HandshakeError::Failed(_))),
+            "{failure:?}"
+        );
     });
 }
