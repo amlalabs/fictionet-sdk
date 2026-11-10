@@ -289,3 +289,79 @@ impl EndpointState for TcpLayer {
         self.limit_isolated_peers(isolated);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fictionet::stdlib::layer::probe::{Call, Probe, Task};
+    use fictionet::stdlib::layer::{Driver, MAX_DEPTH, MessageCommand, MuxCommand};
+    use fictionet::stdlib::network::transport::TcpControl;
+    use fictionet::{Seed, SeededEntropy};
+
+    type Inner = Probe<Packets<CheckedIpPacket, Chunk>, Tcp>;
+
+    /// The probe holds no connections; the facade's queries never reach it
+    /// here.
+    impl EndpointState for Inner {
+        fn read_verdict(&mut self, _: ChildId) -> Verdict {
+            Verdict::Wait
+        }
+        fn write_verdict(&self, _: ChildId) -> Verdict {
+            Verdict::Wait
+        }
+        fn connect_verdict(&self, _: ChildId) -> Verdict {
+            Verdict::Wait
+        }
+        fn end_verdict(&self, _: ChildId) -> Option<ConnError> {
+            None
+        }
+        fn gone(&self, _: ChildId) -> bool {
+            false
+        }
+        fn peers(&self) -> BTreeSet<IpAddr> {
+            BTreeSet::new()
+        }
+        fn child_ids(&self) -> Vec<ChildId> {
+            Vec::new()
+        }
+        fn busy(&self) -> bool {
+            false
+        }
+        fn limit_isolated_peers(&mut self, _: Box<dyn Fn(IpAddr) -> bool + Send>) {}
+    }
+
+    #[test]
+    fn a_built_implementation_is_lent_one_level_less_and_the_stacks_waker() {
+        let (probe, notes) = Inner::new();
+        let mut driver = Driver::new(
+            Stack(Box::new(probe)),
+            Arc::new(SeededEntropy::new(Seed::from_u64(1))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let (task, waker) = Task::new();
+        driver.set_waker(&waker);
+        let _ = driver.deliver(PacketEvent::Ended).unwrap();
+        let unlisten = TcpControl::Unlisten { port: 80 };
+        let _ = driver
+            .command(MuxCommand::control(MessageCommand::Send(unlisten)))
+            .unwrap();
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        driver.complete(()).unwrap();
+        // The implementation sits one level below the stack, at the top.
+        let room = MAX_DEPTH - (Layer::depth(driver.layer()) - 1);
+        notes.assert_lent(
+            &[
+                Call::Event,
+                Call::Command,
+                Call::Timer,
+                Call::Advance,
+                Call::TakeCommand,
+                Call::Done,
+            ],
+            room,
+            &task,
+        );
+    }
+}

@@ -622,4 +622,39 @@ pub(super) mod tests {
             None
         }
     }
+
+    #[test]
+    fn the_application_is_lent_one_level_less_and_the_stacks_waker() {
+        use fictionet::stdlib::layer::probe::{Call, Probe, Task};
+        use fictionet::stdlib::layer::{Budget, Driver, MAX_DEPTH};
+        let (probe, notes) = Probe::<ByteStream, Top>::new();
+        let session = Session::new(probe, StreamLimits::default(), Instant::ZERO);
+        let mut driver = Driver::new(
+            session,
+            Arc::new(fictionet::SeededEntropy::new(Seed::from_u64(1))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let (task, waker) = Task::new();
+        driver.set_waker(&waker);
+        let _ = driver
+            .deliver(StreamEvent::Data(Chunk::unpaid(b"in".to_vec())))
+            .unwrap();
+        driver.run().unwrap();
+        assert!(driver.take_command().is_none());
+        driver.complete(()).unwrap();
+        // The application sits one level below the session, at the top.
+        let room = MAX_DEPTH - (driver.layer().depth() - 1);
+        notes.assert_lent(
+            &[
+                Call::Event,
+                Call::Timer,
+                Call::Advance,
+                Call::TakeCommand,
+                Call::Done,
+            ],
+            room,
+            &task,
+        );
+    }
 }

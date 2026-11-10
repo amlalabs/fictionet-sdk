@@ -221,6 +221,11 @@ mod route_trace;
 #[cfg(test)]
 pub(crate) use framed::tests as framed_echo;
 
+/// A layer that notes the environment it is lent, for the tests of
+/// layers that lend theirs to a part.
+#[cfg(test)]
+pub(crate) mod probe;
+
 #[cfg(kani)]
 #[path = "../../../verification/layer/kani/mod.rs"]
 mod proofs;
