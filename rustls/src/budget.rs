@@ -1,11 +1,14 @@
 //! Paying for the bytes a connection's buffers hold.
 //!
 //! A connection made with a [`BufferBudget`] charges it before any of its
-//! buffers grows: the records it has read and not yet processed, the
-//! plaintext it has decrypted and not yet handed over, the plaintext written
-//! before the handshake finished, and the records queued to send. Each buffer
-//! holds one [`BufferCharge`] that always covers its allocation, and gives
-//! back what it frees.
+//! buffers grows: the record arriving (or a handshake message being joined),
+//! the plaintext it has decrypted and not yet handed over, the plaintext
+//! written before the handshake finished, and the records queued to send.
+//! Each buffer holds one [`BufferCharge`] that always covers its allocation,
+//! and gives back what it frees. A record's plaintext stays in the buffer the
+//! record arrived in, which joins the plaintext queue with its charge
+//! ([`BufferCharge::absorb`]). Buffers are freed once empty, so an idle
+//! connection is charged nothing.
 //!
 //! A growth the budget refuses changes nothing, and the call that wanted it
 //! says so in a way that can be retried once memory frees:
@@ -69,6 +72,11 @@ pub trait BufferCharge: Send + Sync {
     /// when the bytes it pays for leave the buffer. The budget's total does
     /// not change. `None`, changing nothing, if this charge holds less.
     fn split(&mut self, bytes: usize) -> Option<Box<dyn BufferCharge>>;
+
+    /// Takes `other` into this charge, as when the bytes it pays for join
+    /// this buffer. The budget's total does not change. Gives `other` back
+    /// as its own type, still charged, if it is not a charge on this budget.
+    fn absorb(&mut self, other: Box<dyn BufferCharge>) -> Result<(), Box<dyn Any + Send>>;
 
     /// The charge as its own type, for the budget's owner to take back.
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
@@ -157,6 +165,18 @@ impl Paid {
     pub(crate) fn split(&mut self, bytes: usize) -> Option<Box<dyn BufferCharge>> {
         self.0.as_mut()?.split(bytes)
     }
+
+    /// Takes in the charge that pays for bytes joining this buffer.
+    /// `false` if it is not a charge on this buffer's budget: it is
+    /// dropped, giving its bytes back, and the bytes must go with it.
+    #[must_use = "bytes whose charge was refused must be dropped with it"]
+    pub(crate) fn absorb(&mut self, other: Option<Box<dyn BufferCharge>>) -> bool {
+        match (&mut self.0, other) {
+            (None, None) => true,
+            (Some(charge), Some(other)) => charge.absorb(other).is_ok(),
+            (_, _) => false,
+        }
+    }
 }
 
 impl fmt::Debug for Paid {
@@ -210,6 +230,8 @@ pub(crate) mod testing {
     struct Counts {
         used: AtomicUsize,
         limit: AtomicUsize,
+        /// The most `used` has been.
+        most: AtomicUsize,
     }
 
     impl Limit {
@@ -217,6 +239,7 @@ pub(crate) mod testing {
             Arc::new(Self {
                 counts: Arc::new(Counts {
                     used: AtomicUsize::new(0),
+                    most: AtomicUsize::new(0),
                     limit: AtomicUsize::new(limit),
                 }),
             })
@@ -224,6 +247,17 @@ pub(crate) mod testing {
 
         pub(crate) fn used(&self) -> usize {
             self.counts.used.load(Ordering::SeqCst)
+        }
+
+        /// The most charged at once since [`Self::reset_most`], reservations
+        /// held within a call included.
+        pub(crate) fn most(&self) -> usize {
+            self.counts.most.load(Ordering::SeqCst)
+        }
+
+        /// Starts counting [`Self::most`] from what is charged now.
+        pub(crate) fn reset_most(&self) {
+            self.counts.most.store(self.used(), Ordering::SeqCst);
         }
 
         pub(crate) fn set_limit(&self, limit: usize) {
@@ -265,6 +299,8 @@ pub(crate) mod testing {
                 .is_ok();
             if fits {
                 self.bytes = to;
+                let used = self.limit.used.load(Ordering::SeqCst);
+                self.limit.most.fetch_max(used, Ordering::SeqCst);
             }
             fits
         }
@@ -285,6 +321,15 @@ pub(crate) mod testing {
                 limit: self.limit.clone(),
                 bytes,
             }))
+        }
+
+        fn absorb(&mut self, other: Box<dyn BufferCharge>) -> Result<(), Box<dyn Any + Send>> {
+            let mut other = other.into_any().downcast::<Self>()?;
+            if !Arc::ptr_eq(&self.limit, &other.limit) {
+                return Err(other);
+            }
+            self.bytes += core::mem::take(&mut other.bytes);
+            Ok(())
         }
 
         fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {

@@ -34,6 +34,11 @@ impl BufferCharge for Charge {
         Charge::split(self, bytes).map(|charge| Box::new(charge) as Box<dyn BufferCharge>)
     }
 
+    fn absorb(&mut self, other: Box<dyn BufferCharge>) -> Result<(), Box<dyn Any + Send>> {
+        let other = other.into_any().downcast::<Charge>()?;
+        Charge::absorb(self, *other).map_err(|other| Box::new(other) as Box<dyn Any + Send>)
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
         self
     }
