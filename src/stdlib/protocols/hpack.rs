@@ -20,7 +20,7 @@
 //! # Ok::<(), fictionet::stdlib::protocols::hpack::Error>(())
 //! ```
 
-use fictionet::stdlib::codec::{Reader, Trailing, Truncated};
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated, most_places};
 
 use fictionet::stdlib::{
     codec::Wire,
@@ -543,6 +543,14 @@ impl DynamicTable {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+    /// The name and value octets of the largest retained entry.
+    pub fn largest(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .max()
+            .unwrap_or(0)
+    }
     /// Whether there are no retained entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -608,6 +616,40 @@ impl Block {
     }
 }
 
+fictionet::heap_of! {
+    Field { name, value, never_index }
+    Block { headers, more }
+}
+
+/// The most a block decoded from some number of encoded bytes can keep,
+/// from [`Table::most_block`]: a bound known before the block is decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockBound {
+    /// The most headers it keeps.
+    pub headers: usize,
+    /// The most name and value octets it keeps.
+    pub octets: usize,
+}
+impl BlockBound {
+    /// The most the block holds on the heap: the places of its list,
+    /// which grows by pushes, and its octets, each name and value copied
+    /// whole.
+    pub fn heap(&self) -> usize {
+        most_places::<Field>(self.headers)
+            .saturating_mul(size_of::<Field>())
+            .saturating_add(self.octets)
+    }
+}
+
+/// The octets of the largest entry in the static table.
+fn largest_static() -> usize {
+    STATIC_TABLE
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .max()
+        .unwrap_or(0)
+}
+
 /// An endpoint's complete dynamic table and acknowledged settings.
 /// Capture reconstruction uses the neutral [`Representations`] and [`DynamicTable`]
 /// primitives with its own incomplete evidence.
@@ -670,6 +712,30 @@ impl Table {
     /// The number of retained table entries.
     pub fn table_len(&self) -> usize {
         self.table.len()
+    }
+
+    /// The most a block of `len` encoded bytes keeps when
+    /// [`decode_block`](Self::decode_block) reads it with `limit`, as the
+    /// table is now. Every representation takes at least a byte, so there
+    /// are at most `len` of them, and each keeps at most one header. A
+    /// string literal decodes to at most eight octets for every five bits
+    /// it takes, the shortest Huffman code, so the block's literals come
+    /// to at most `8 * len / 5` octets. A reference keeps at most the
+    /// largest entry it can name: one in the static table, one in the
+    /// dynamic table now, or one the block inserts, whose name is a
+    /// literal or a name already there and whose value is a literal.
+    pub fn most_block(&self, len: usize, limit: usize) -> BlockBound {
+        let literals = len.saturating_mul(8) / 5;
+        let entry = largest_static()
+            .max(self.table.largest())
+            .saturating_add(literals.saturating_mul(2));
+        BlockBound {
+            headers: len.min(MAX_HEADERS),
+            octets: len
+                .saturating_mul(entry)
+                .saturating_add(literals)
+                .min(limit.min(MAX_DECODED)),
+        }
     }
 
     /// Reads one complete block, retaining at most `limit.min(MAX_DECODED)`
@@ -1518,5 +1584,54 @@ mod tests {
             .decode_block(&vec![0x82; MAX_BLOCK], 0)
             .unwrap();
         assert_eq!(block.more, MAX_BLOCK);
+    }
+
+    /// A decoded block keeps at most what [`Table::most_block`] said before
+    /// it was read: over blocks from an encoder that indexes fields and
+    /// refers back to them, under several limits, and over blocks of
+    /// one-byte references to the largest entry, which keep the most per
+    /// encoded byte.
+    #[test]
+    fn decoded_blocks_keep_at_most_their_bound() {
+        use fictionet::stdlib::codec::Heap;
+        use fictionet::{Entropy, Seed, SeededEntropy};
+        fn check(table: &mut Table, bytes: &[u8], limit: usize) -> Block {
+            let bound = table.most_block(bytes.len(), limit);
+            let block = table.decode_block(bytes, limit).unwrap();
+            assert!(block.headers.len() <= bound.headers);
+            assert!(
+                block.heap() <= bound.heap(),
+                "{} encoded bytes keep {}, more than the bound {}",
+                bytes.len(),
+                block.heap(),
+                bound.heap()
+            );
+            block
+        }
+        let rng = SeededEntropy::new(Seed::from_u64(11));
+        let mut encoder = Encoder::new(4096);
+        let mut table = Table::new(4096);
+        let values: Vec<Vec<u8>> = (0..8)
+            .map(|i| vec![b'a' + i as u8; rng.random_below(600) as usize])
+            .collect();
+        for round in 0..400 {
+            let fields: Vec<Field> = (0..rng.random_below(16))
+                .map(|_| {
+                    let name = format!("x-{}", rng.random_below(6));
+                    Field::new(name, &values[rng.random_below(8) as usize])
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            encoder.encode_block(&fields, &mut bytes).unwrap();
+            check(&mut table, &bytes, [64, 1024, MAX_DECODED][round % 3]);
+        }
+        // The newest dynamic entry is index 62: each byte 0xbe names it whole.
+        let mut bytes = Vec::new();
+        encoder
+            .encode_block(&[Field::new("x-big", vec![b'v'; 3000])], &mut bytes)
+            .unwrap();
+        check(&mut table, &bytes, MAX_DECODED);
+        let references = check(&mut table, &[0xbe; 20], MAX_DECODED);
+        assert_eq!(references.more, 0, "every reference was kept");
     }
 }

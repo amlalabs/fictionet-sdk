@@ -38,7 +38,7 @@
 
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
-    codec::{Decode, Fail, Step, Stream, Wire, be32},
+    codec::{Decode, Fail, Step, Storage, Stream, Wire, be32},
     protocols::hpack,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -1122,11 +1122,12 @@ pub enum Event {
     /// An extension frame that was ignored by connection state.
     Unknown(Unknown),
 }
+/// A block that waits for CONTINUATION. Its fragments so far are in the
+/// assembly storage.
 struct Pending {
     stream: u32,
     end: bool,
     promised: Option<u32>,
-    bytes: Vec<u8>,
 }
 struct HeaderFragment<'a> {
     bytes: &'a [u8],
@@ -1147,33 +1148,44 @@ pub struct BlockRead {
 /// Endpoint header assembly and HPACK decoding for one direction.
 /// Every returned field is complete. Oversized decoded lists still update
 /// the compression table and set [`hpack::Block::more`] for caller rejection.
-pub struct HeaderBlocks {
+///
+/// A block split into CONTINUATION frames is joined in storage `S`: a
+/// vector, or a container whose growth is paid for first, such as a
+/// layer's [`ChargedBytes`](fictionet::stdlib::layer::ChargedBytes). A
+/// block that arrives whole is decoded from its frame and needs none.
+pub struct HeaderBlocks<S = Vec<u8>> {
     table: hpack::Table,
     pending: Option<Pending>,
+    /// The fragments of the pending block, joined; empty, with nothing
+    /// allocated, between split blocks.
+    assembly: S,
     limit: usize,
     decoded: usize,
 }
 impl HeaderBlocks {
-    /// Storage needed while reading this frame, including an unfinished
-    /// block and the compression table. The assembly uses the same growth
-    /// rule, so callers can reserve this before reading.
-    pub fn read_bound(&self, frame: &Frame) -> usize {
-        let (fragment, last) = match frame {
-            Frame::Headers(f) => (f.fragment.len(), f.flags & 4 != 0),
-            Frame::PushPromise(f) => (f.fragment.len(), f.flags & 4 != 0),
-            Frame::Continuation(f) => (f.fragment.len(), f.flags & 4 != 0),
-            _ => return self.allocated(),
-        };
-        let (len, capacity) = self
-            .pending
-            .as_ref()
-            .map_or((0, 0), |p| (p.bytes.len(), p.bytes.capacity()));
-        let capacity = if last && len == 0 {
-            capacity
-        } else {
-            self.assembly_capacity(len, capacity, fragment)
-        };
-        self.table.most_held().saturating_add(capacity)
+    /// Bounds encoded block storage and retained decoded field bytes.
+    pub fn with_limits(limits: Limits) -> Self {
+        Self::in_storage(limits, Vec::new())
+    }
+}
+impl<S: Storage> HeaderBlocks<S> {
+    /// As [`with_limits`](HeaderBlocks::with_limits), joining split blocks
+    /// in `storage`, which grows only as far as it allows.
+    pub fn in_storage(limits: Limits, mut storage: S) -> Self {
+        let limits = limits.bounded();
+        storage.shrink_to(0);
+        Self {
+            table: hpack::Table::new(4096),
+            pending: None,
+            assembly: storage,
+            limit: limits.header_block,
+            decoded: limits.header_list,
+        }
+    }
+
+    /// The assembly storage, to see what pays for it.
+    pub fn storage(&self) -> &S {
+        &self.assembly
     }
 
     fn assembly_capacity(&self, len: usize, capacity: usize, fragment: usize) -> usize {
@@ -1185,27 +1197,73 @@ impl HeaderBlocks {
         }
     }
 
-    /// Bounds encoded block storage and retained decoded field bytes.
-    pub fn with_limits(limits: Limits) -> Self {
-        let limits = limits.bounded();
-        Self {
-            table: hpack::Table::new(4096),
-            pending: None,
-            limit: limits.header_block,
-            decoded: limits.header_list,
+    /// The joined length of the pending block.
+    fn joined(&self) -> usize {
+        if self.pending.is_some() {
+            self.assembly.bytes().len()
+        } else {
+            0
         }
     }
+
+    /// The fragment `frame` carries and whether it ends its block, if it
+    /// carries one.
+    fn fragment_of(frame: &Frame) -> Option<(&[u8], bool)> {
+        match frame {
+            Frame::Headers(f) => Some((&f.fragment, f.flags & 4 != 0)),
+            Frame::PushPromise(f) => Some((&f.fragment, f.flags & 4 != 0)),
+            Frame::Continuation(f) => Some((&f.fragment, f.flags & 4 != 0)),
+            _ => None,
+        }
+    }
+
+    /// Grows the assembly storage so that reading `frame` needs no more:
+    /// room for its fragment after the pending block's, when it has to be
+    /// joined to them. `false`, changing nothing, if the storage refuses.
+    /// A frame that needs no joining, or that reading will refuse, needs
+    /// no room.
+    #[must_use = "a refused reservation leaves no room for the fragment"]
+    pub fn reserve(&mut self, frame: &Frame) -> bool {
+        let Some((fragment, last)) = Self::fragment_of(frame) else {
+            return true;
+        };
+        let len = self.joined();
+        let needed = len.saturating_add(fragment.len());
+        if (len == 0 && last) || needed > self.limit || needed <= self.assembly.capacity() {
+            return true;
+        }
+        let target = self.assembly_capacity(len, self.assembly.capacity(), fragment.len());
+        self.assembly.grow_within(needed..=target)
+    }
+
+    /// The most the block `frame` ends keeps once decoded, as the table is
+    /// now: `None` if the frame does not end a block. A caller pays for
+    /// it before [`read_frame`](Self::read_frame) decodes the block.
+    pub fn most_block(&self, frame: &Frame) -> Option<hpack::BlockBound> {
+        let (fragment, last) = Self::fragment_of(frame)?;
+        last.then(|| {
+            self.table
+                .most_block(self.joined().saturating_add(fragment.len()), self.decoded)
+        })
+    }
+
+    /// The most the compression table holds while the settings limit stays
+    /// where it is: see [`hpack::Table::most_held`].
+    pub fn most_table(&self) -> usize {
+        self.table.most_held()
+    }
+
     /// Bytes retained by the compression table and an unfinished block.
     pub fn held(&self) -> usize {
-        self.table
-            .table_size()
-            .saturating_add(self.pending.as_ref().map_or(0, |p| p.bytes.len()))
+        self.table.table_size().saturating_add(self.joined())
     }
     /// Bytes allocated by the compression table and an unfinished block.
     pub fn allocated(&self) -> usize {
-        self.table
-            .held()
-            .saturating_add(self.pending.as_ref().map_or(0, |p| p.bytes.capacity()))
+        self.table.held().saturating_add(self.assembly.capacity())
+    }
+    /// Bytes allocated by the compression table.
+    pub fn table_held(&self) -> usize {
+        self.table.held()
     }
     /// The most [`allocated`](Self::allocated) reaches while the table's
     /// settings limit stays where it is: the table's own bound, and an
@@ -1277,7 +1335,8 @@ impl HeaderBlocks {
         let Some(fragment) = fragment else {
             return Ok(out);
         };
-        let mut pending = if h.kind == 9 {
+        let len = self.joined();
+        let pending = if h.kind == 9 {
             self.pending
                 .take()
                 .ok_or_else(|| protocol("CONTINUATION without a header block"))?
@@ -1286,45 +1345,45 @@ impl HeaderBlocks {
                 stream: h.stream,
                 end: out.end,
                 promised: fragment.promised,
-                bytes: Vec::new(),
             }
         };
         out.end = pending.end;
         out.promised = pending.promised;
-        if pending
-            .bytes
-            .len()
+        let Some(needed) = len
             .checked_add(fragment.bytes.len())
-            .is_none_or(|n| n > self.limit)
-        {
+            .filter(|&n| n <= self.limit)
+        else {
+            self.assembly.shrink_to(0);
             return Err(budget("header block exceeds limit"));
-        }
+        };
         // A complete block already lives in the frame. Only fragmented
         // blocks need storage to join their pieces.
-        let encoded = if pending.bytes.is_empty() && h.flags & 4 != 0 {
+        let encoded = if len == 0 && h.flags & 4 != 0 {
             fragment.bytes
         } else {
-            let bytes = &mut pending.bytes;
-            let needed = bytes.len() + fragment.bytes.len();
-            if needed > bytes.capacity() {
+            if needed > self.assembly.capacity() {
                 let target =
-                    self.assembly_capacity(bytes.len(), bytes.capacity(), fragment.bytes.len());
-                bytes
-                    .try_reserve_exact(target - bytes.len())
-                    .map_err(|_| budget("header allocation failed"))?;
+                    self.assembly_capacity(len, self.assembly.capacity(), fragment.bytes.len());
+                if !self.assembly.grow_within(needed..=target) {
+                    self.assembly.shrink_to(0);
+                    return Err(budget("header allocation failed"));
+                }
             }
-            bytes.extend_from_slice(fragment.bytes);
-            &bytes[..]
+            // Within the capacity, so this cannot fail.
+            let resized = self.assembly.resize_within(needed);
+            debug_assert!(resized, "the assembly has room for the fragment");
+            self.assembly.bytes_mut()[len..needed].copy_from_slice(fragment.bytes);
+            &self.assembly.bytes()[..needed]
         };
         if h.flags & 4 == 0 {
             self.pending = Some(pending);
-        } else {
-            out.block = Some(
-                self.table
-                    .decode_block(encoded, self.decoded)
-                    .map_err(|_| error(ErrorCode::CompressionError, "invalid HPACK block"))?,
-            );
+            return Ok(out);
         }
+        let decoded = self.table.decode_block(encoded, self.decoded);
+        // The block is decoded: its joined fragments go.
+        self.assembly.shrink_to(0);
+        out.block =
+            Some(decoded.map_err(|_| error(ErrorCode::CompressionError, "invalid HPACK block"))?);
         Ok(out)
     }
 }
@@ -2547,9 +2606,15 @@ mod tests {
                 let last = n == rest.len();
                 let frame = raw(kind, if last { 4 } else { 0 }, stream, &rest[..n]);
                 let header = FrameHeader::parse(&frame[..HEADER_LEN]).unwrap();
-                let bound = blocks.read_bound(&Frame::parse(&frame).unwrap());
+                let parsed = Frame::parse(&frame).unwrap();
+                let bound = blocks.most_block(&parsed);
+                assert!(blocks.reserve(&parsed));
+                let reserved = blocks.storage().capacity();
                 let read = blocks.read(header, &frame[HEADER_LEN..]);
-                assert!(blocks.allocated() <= bound);
+                assert!(
+                    blocks.storage().capacity() <= reserved,
+                    "reading took more storage than was reserved for it"
+                );
                 assert!(
                     blocks.allocated() <= most,
                     "{} > {most}",
@@ -2565,7 +2630,10 @@ mod tests {
                         break;
                     }
                     Ok(read) if last => {
-                        assert!(read.block.is_some());
+                        use fictionet::stdlib::codec::Heap;
+                        let block = read.block.unwrap();
+                        assert!(block.heap() <= bound.unwrap().heap());
+                        assert_eq!(blocks.storage().capacity(), 0, "the joined block stayed");
                         whole += 1;
                         break;
                     }

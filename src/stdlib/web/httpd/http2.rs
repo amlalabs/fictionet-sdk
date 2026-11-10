@@ -100,17 +100,23 @@ const KEEP: usize = 8;
 /// resets more than 20 streams the server has not taken in yet, loses the
 /// connection with `ENHANCE_YOUR_CALM`. Everything the connection holds is
 /// charged to its budget before it is allocated: the list of recent resets
-/// at its bound when the connection opens; input and header assembly from
-/// a shared frame-sized allowance, paying for growth beyond it; places in
-/// the lists of streams when streams are admitted; stream state, request
-/// heads and bodies, events for the children and output frames as they
-/// come. Past the budget, the connection sends GOAWAY with
-/// `ENHANCE_YOUR_CALM` and ends.
+/// and the HPACK table at their bounds when the connection opens, with
+/// input storage for the rest of one frame; input past that, and the
+/// joining of header blocks split into CONTINUATION frames, as they grow;
+/// request trailers at their bound before they are decoded; places in the
+/// lists of streams when streams are admitted; stream state, request heads
+/// and bodies, events for the children and output frames as they come. A
+/// header block without room to join or decode waits for memory. Past the
+/// budget otherwise, the connection sends GOAWAY with `ENHANCE_YOUR_CALM`
+/// and ends.
 pub struct Http2 {
     limits: Limits,
     phase: Phase,
     /// The chunk of input being read, all of one delivery.
     input: Option<Chunk>,
+    /// A header frame read from the input whose block waits for memory:
+    /// it is read again before any frame after it.
+    held: Option<Frame>,
     peer_ended: bool,
     codec: InputState,
     encoder: hpack::Encoder,
@@ -182,84 +188,107 @@ enum Phase {
     Closed,
 }
 
-/// The decoder and header assembly share their reservation: consumed wire
-/// input can give its storage back before a header block is decoded. Every
-/// allocating operation reserves its bound first. A frame-sized floor keeps
-/// input and control progress possible while streams exhaust the budget.
+/// The connection's input: frames read into storage that charges each
+/// growth before it allocates, header blocks split into CONTINUATION
+/// frames joined in storage of their own, and the HPACK table, charged at
+/// its bound once. One frame of input stays charged while the connection
+/// is open, so input and control frames go on while streams use up the
+/// budget: the table's bound, which it never passes, and the rest as
+/// input storage, kept between requests.
 struct InputState {
-    frames: codec::Stream<Inputs>,
-    headers: wire::HeaderBlocks,
-    storage: Option<Charge>,
+    frames: codec::Stream<Inputs, ChargedBytes>,
+    headers: wire::HeaderBlocks<ChargedBytes>,
+    /// What the HPACK table can hold: the server never raises its table
+    /// setting, so the table holds at most this.
+    table: Charge,
+    /// The input storage kept between requests: a frame, less the table.
+    floor: usize,
 }
 
 impl InputState {
-    fn new(limits: Limits) -> Self {
-        Self {
-            frames: codec::Stream::new(Inputs::client_side(wire::DEFAULT_FRAME_SIZE)),
-            headers: wire::HeaderBlocks::with_limits(wire::Limits {
+    /// Input on `budget` that holds nothing and has no floor: what it is
+    /// before the connection opens, on a budget with no room.
+    fn new(limits: Limits, budget: &Budget) -> Self {
+        let frames = codec::Stream::in_storage(
+            Inputs::client_side(wire::DEFAULT_FRAME_SIZE),
+            0,
+            ChargedBytes::new(budget),
+        );
+        let headers = wire::HeaderBlocks::in_storage(
+            wire::Limits {
                 header_list: limits.head.head,
                 header_block: limits.head.head,
                 ..wire::Limits::default()
-            }),
-            storage: None,
+            },
+            ChargedBytes::new(budget),
+        );
+        Self {
+            frames,
+            headers,
+            table: budget.charge(0).expect("nothing always fits"),
+            floor: 0,
         }
     }
 
-    fn open(&mut self, budget: &Budget) -> Option<()> {
-        self.storage = Some(budget.charge(self.frames.limit())?);
-        Some(())
+    /// The input of a connection opening on `budget`: the table charged at
+    /// its bound and the input storage at the floor. `None`, with nothing
+    /// charged, if the budget has no room for them.
+    fn open(limits: Limits, budget: &Budget) -> Option<Self> {
+        let mut input = Self::new(limits, budget);
+        input.table = budget.charge(input.headers.most_table())?;
+        input.floor = input.frames.limit().saturating_sub(input.table.bytes());
+        input
+            .frames
+            .storage_mut()
+            .grow_to(input.floor)
+            .then_some(input)
     }
 
+    /// Takes what it can of `bytes`: as many as the input has room for,
+    /// growing its storage if the budget allows, or else as many as fit in
+    /// the storage it has. `None` if it takes none because the budget
+    /// refused the growth.
     fn push(&mut self, bytes: &[u8]) -> Option<usize> {
-        let capacity = self.frames.allocated();
-        let bound = self.frames.capacity_for(bytes.len());
-        if !self
-            .storage
-            .as_mut()?
-            .grow_to(bound.saturating_add(self.headers.allocated()))
-        {
-            return None;
+        let n = self.frames.push(bytes);
+        if n > 0 || bytes.is_empty() || self.frames.buffered() >= self.frames.limit() {
+            return Some(n);
         }
-        let n = self
-            .frames
-            .push_with_budget(bytes, bound.saturating_sub(capacity));
-        self.release();
-        Some(n)
+        match self.frames.push_with_budget(bytes, 0) {
+            0 => None,
+            n => Some(n),
+        }
     }
 
-    fn read_headers(&mut self, frame: &Frame) -> Option<Result<wire::BlockRead, wire::Error>> {
-        let headers = self.headers.read_bound(frame);
-        let mut bound = self.frames.allocated().saturating_add(headers);
-        if bound > self.storage.as_ref()?.bytes() {
-            self.frames.shrink();
-            bound = self.frames.allocated().saturating_add(headers);
-        }
-        if !self.storage.as_mut()?.grow_to(bound) {
+    /// Reads a frame for its header block. `None`, with nothing read, if
+    /// the budget refuses what reading it needs: room to join its fragment
+    /// to a split block, or, when `trailers` holds the budget, the bound
+    /// of the trailers it ends, charged before they are decoded and
+    /// returned with them.
+    fn read_headers(
+        &mut self,
+        frame: &Frame,
+        trailers: Option<&Budget>,
+    ) -> Option<Result<(wire::BlockRead, Option<Charge>), wire::Error>> {
+        if !self.headers.reserve(frame) {
             return None;
         }
-        let result = self.headers.read_frame(frame);
-        self.release();
-        Some(result)
+        let charge = match (trailers, self.headers.most_block(frame)) {
+            (Some(budget), Some(bound)) => Some(budget.charge(most_trailers(bound))?),
+            _ => None,
+        };
+        let read = self.headers.read_frame(frame);
+        debug_assert!(
+            self.headers.table_held() <= self.table.bytes(),
+            "the HPACK table holds {} bytes, past its bound of {}",
+            self.headers.table_held(),
+            self.table.bytes()
+        );
+        Some(read.map(|read| (read, charge)))
     }
 
-    /// Gives back input storage past the frame-sized allowance. Storage
-    /// within the allowance stays: it is paid for either way, and keeping
-    /// it saves reallocating it for the next request.
+    /// Gives back input storage past the floor.
     fn trim(&mut self) {
-        if self.frames.allocated() > self.frames.limit() {
-            self.frames.shrink();
-            self.release();
-        }
-    }
-
-    fn release(&mut self) {
-        let held = self
-            .frames
-            .allocated()
-            .saturating_add(self.headers.allocated());
-        if let Some(storage) = self.storage.as_mut() {
-            storage.shrink_to(held.max(self.frames.limit()));
-        }
+        self.frames.shrink_to(self.floor);
     }
 }
 
@@ -420,7 +449,8 @@ impl Http2 {
             phase: Phase::Opening,
             input: None,
             peer_ended: false,
-            codec: InputState::new(limits),
+            codec: InputState::new(limits, &none),
+            held: None,
             encoder: hpack::Encoder::new(0),
             streams: BTreeMap::new(),
             children: None,
@@ -504,12 +534,12 @@ impl Http2 {
         self.streams.len()
     }
 
-    /// Reserves an input allowance, dates and the small queue floor.
+    /// Reserves the input, dates and the small queue floor.
     /// Admitting streams reserves their list places.
     fn hold(&mut self, budget: &Budget) -> Option<()> {
         // The server never raises its input frame size, and its encoder's
         // table stays empty.
-        self.codec.open(budget)?;
+        self.codec = InputState::open(self.limits, budget)?;
         self.dates_storage = Some(budget.charge(self.dates.held())?);
         // The list of recent resets is small and bounded, so it is paid
         // for at its bound: recording a reset never needs memory.
@@ -1088,10 +1118,13 @@ impl Http2 {
         Ok(HeadersOn::New)
     }
 
+    /// A header block read, with the charge for it when it is a request's
+    /// trailers, taken at their bound before the block was decoded.
     fn on_headers(
         &mut self,
         env: &mut Env<'_, Report>,
         read: wire::BlockRead,
+        paid: Option<Charge>,
     ) -> Result<(), wire::Error> {
         let Some(block) = read.block else {
             return Ok(());
@@ -1114,11 +1147,15 @@ impl Http2 {
             if stream.receive.content_remaining.is_some_and(|n| n != 0) {
                 return self.reset(env, id, ErrorCode::ProtocolError);
             }
+            let mut charge = paid.expect("trailers are paid for before they are decoded");
             let fields = trailer_map(block);
             let held = size_of::<RequestTrailers>() + headers_held(&fields);
-            let Some(charge) = env.budget().charge(held) else {
-                return self.reset(env, id, ErrorCode::EnhanceYourCalm);
-            };
+            debug_assert!(
+                held <= charge.bytes(),
+                "trailers hold {held} bytes, past their bound of {}",
+                charge.bytes()
+            );
+            charge.shrink_to(held);
             self.streams
                 .get_mut(&id)
                 .expect("an open stream")
@@ -1273,11 +1310,33 @@ impl Http2 {
         } else {
             self.continuations = 0;
         }
-        let Some(headers) = self.codec.read_headers(&frame) else {
-            self.over_budget(env);
+        self.dispatch(env, frame)
+    }
+
+    /// Whether a header block on stream `id` is the trailers of a request
+    /// already open.
+    fn trailers_on(&self, id: u32) -> bool {
+        !self.ignored(id) && self.streams.contains_key(&id)
+    }
+
+    /// Acts on a frame. A header frame whose block cannot be read for want
+    /// of memory is held, and read again once memory frees, before any
+    /// frame after it.
+    fn dispatch(&mut self, env: &mut Env<'_, Report>, frame: Frame) -> Result<(), wire::Error> {
+        let stream = match &frame {
+            Frame::Headers(h) => Some(h.stream),
+            Frame::Continuation(c) => Some(c.stream),
+            _ => None,
+        };
+        let trailers = stream.is_some_and(|id| self.trailers_on(id));
+        let Some(headers) = self
+            .codec
+            .read_headers(&frame, trailers.then_some(env.budget()))
+        else {
+            self.held = Some(frame);
             return Ok(());
         };
-        let headers = headers?;
+        let (headers, paid) = headers?;
         match frame {
             // A stream that depends on itself is a stream error (RFC 9113
             // section 5.3.1). Its block was decoded above, so HPACK stays in step.
@@ -1291,7 +1350,7 @@ impl Http2 {
                     }
                 }
             }
-            Frame::Headers(_) | Frame::Continuation(_) => self.on_headers(env, headers)?,
+            Frame::Headers(_) | Frame::Continuation(_) => self.on_headers(env, headers, paid)?,
             Frame::Data(data) => self.on_data(env, data)?,
             Frame::Settings(settings) => {
                 if settings.flags & 1 != 0 {
@@ -1454,6 +1513,16 @@ impl Http2 {
             {
                 return (moved, false);
             }
+            if let Some(frame) = self.held.take() {
+                if let Err(error) = self.dispatch(env, frame) {
+                    self.fail(env, error);
+                    return (true, false);
+                }
+                if self.held.is_some() {
+                    return (moved, false);
+                }
+                moved = true;
+            }
             if let Some(chunk) = &mut self.input {
                 let Some(n) = self.codec.push(chunk) else {
                     self.over_budget(env);
@@ -1473,6 +1542,9 @@ impl Http2 {
                     moved = true;
                     if let Err(error) = self.on_input(env, item) {
                         self.fail(env, error);
+                        return (true, false);
+                    }
+                    if self.held.is_some() {
                         return (true, false);
                     }
                 }
@@ -2345,9 +2417,29 @@ fn valid_trailers(block: &hpack::Block) -> bool {
         })
 }
 
+/// The most a request's trailers take while they are read from a block
+/// within `bound`: the decoded block, the map [`trailer_map`] builds from
+/// it, and the box they go up in, of which the map and the box stay.
+///
+/// The map is counted as [`headers_held`] counts it: its capacity and a
+/// place per repeated name, each the size of a name and a value, and its
+/// octets, at most the block's. Made for `n` fields, its capacity is
+/// under `2n`. It grows past that only when names collide in runs of
+/// 128, so only with 128 fields or more, and only while its index has
+/// fewer than five places per field, so its capacity stays under `8n`.
+fn most_trailers(bound: hpack::BlockBound) -> usize {
+    let fields = bound.headers;
+    let capacity = if fields < 128 { 2 * fields } else { 8 * fields };
+    (capacity + fields)
+        .saturating_mul(size_of::<(HeaderName, HeaderValue)>())
+        .saturating_add(bound.octets)
+        .saturating_add(bound.heap())
+        .saturating_add(size_of::<RequestTrailers>())
+}
+
 /// A checked trailer block as a map.
 fn trailer_map(block: hpack::Block) -> HeaderMap {
-    let mut map = HeaderMap::new();
+    let mut map = HeaderMap::with_capacity(block.headers.len());
     for h in block.headers {
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(&h.name),
@@ -3644,6 +3736,135 @@ mod tests {
         harness.push(&reset).unwrap();
         assert!(budget.used() < before + value.len());
         assert!(!harness.ended());
+    }
+
+    /// Trailers are paid for before they are decoded. With no room for
+    /// them the connection waits, resetting nothing, and reads them once
+    /// memory frees.
+    #[test]
+    fn trailers_without_room_wait_for_memory() {
+        let budget = Budget::new(4 << 20);
+        let mut harness = answering(BODY.to_vec(), BODY.len(), budget.clone());
+        harness.push(&client_preface()).unwrap();
+        harness.push(&headers_to(1, "/stuck")).unwrap();
+        harness.take_output();
+        let value = vec![b'v'; 4000];
+        let mut block = Vec::new();
+        hpack::Encoder::new(0)
+            .encode_block(
+                &[hpack::Field::new("x-trailer", value.as_slice())],
+                &mut block,
+            )
+            .unwrap();
+        let mut input = Vec::new();
+        write(
+            &wire::Headers {
+                stream: 1,
+                flags: 5,
+                fragment: block,
+                priority: None,
+                padding: None,
+            },
+            &mut input,
+        );
+        let before = budget.used();
+        let rest = budget.charge(budget.limit() - before).unwrap();
+        harness.push(&input).unwrap();
+        let resets = |output: &[u8]| {
+            frames(output)
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1))
+        };
+        assert!(!resets(&harness.take_output()), "the stream was reset");
+        assert!(!harness.ended());
+        drop(rest);
+        harness.settle().unwrap();
+        assert!(!resets(&harness.take_output()), "the stream was reset");
+        assert!(!harness.ended());
+        let held = budget.used() - before;
+        assert!(held >= value.len(), "the trailers were not read: {held}");
+    }
+
+    /// A header block split into CONTINUATION frames is joined in storage
+    /// charged as it grows. With no room for it the connection waits,
+    /// ending nothing, and reads the block once memory frees.
+    #[test]
+    fn a_split_block_without_room_waits_for_memory() {
+        let budget = Budget::new(4 << 20);
+        let mut harness = answering(BODY.to_vec(), BODY.len(), budget.clone());
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        let block = [0x83, 0x86, 0x84];
+        let mut input = Vec::new();
+        write(
+            &wire::Headers {
+                stream: 1,
+                flags: 1,
+                fragment: block[..2].to_vec(),
+                priority: None,
+                padding: None,
+            },
+            &mut input,
+        );
+        write(
+            &wire::Continuation {
+                stream: 1,
+                flags: 4,
+                fragment: block[2..].to_vec(),
+            },
+            &mut input,
+        );
+        let rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        harness.push(&input).unwrap();
+        let output = frames(&harness.take_output());
+        assert!(
+            !output.iter().any(|f| matches!(f, Frame::GoAway(_))),
+            "{output:?}"
+        );
+        assert!(!harness.ended());
+        drop(rest);
+        harness.settle().unwrap();
+        let output = frames(&harness.take_output());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Headers(h) if h.stream == 1)),
+            "the request was not answered: {output:?}"
+        );
+        assert!(!harness.ended());
+    }
+
+    /// The trailers' bound covers what reading them takes: the decoded
+    /// block, the map built from it, and its box. Over blocks of a few
+    /// fields and of many, with names repeated and not.
+    #[test]
+    fn trailers_hold_at_most_their_bound() {
+        use fictionet::stdlib::codec::Heap;
+        let mut encoder = hpack::Encoder::new(4096);
+        let mut table = hpack::Table::new(4096);
+        let shapes: [(usize, usize); 6] =
+            [(1, 1), (3, 3), (40, 7), (127, 127), (128, 128), (256, 9)];
+        for (round, &(fields, names)) in shapes.iter().cycle().take(60).enumerate() {
+            let fields: Vec<hpack::Field> = (0..fields)
+                .map(|i| {
+                    let value = vec![b'a' + (round % 26) as u8; (i * 7 + round) % 90];
+                    hpack::Field::new(format!("x-t{}", i % names), value)
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            encoder.encode_block(&fields, &mut bytes).unwrap();
+            let bound = table.most_block(bytes.len(), hpack::MAX_DECODED);
+            let block = table.decode_block(&bytes, hpack::MAX_DECODED).unwrap();
+            let decoded = block.heap();
+            let map = trailer_map(block);
+            let held = decoded + headers_held(&map) + size_of::<RequestTrailers>();
+            assert!(
+                held <= most_trailers(bound),
+                "{} fields hold {held}, more than the bound {}",
+                map.len(),
+                most_trailers(bound)
+            );
+        }
     }
 
     /// Every write the server queues for the transport after a request
