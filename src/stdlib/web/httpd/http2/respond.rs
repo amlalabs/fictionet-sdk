@@ -11,14 +11,16 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body::{Body as _, Frame};
 
-use fictionet::stdlib::layer::{Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top};
+use fictionet::stdlib::layer::{
+    Budget, Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top,
+};
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http2::{ErrorCode, Setting};
 use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
-use super::super::response::{Asked, ResponsePolicy, error_response};
+use super::super::response::{Asked, ResponsePolicy, error_response, request_held};
 use super::super::{
     Body, Delivery, Exchange, Handler, Later, Limits, Observe, PIECE, Received, Reply, Reset, text,
 };
@@ -106,19 +108,12 @@ impl Responder {
         request: Request<Body>,
     ) -> Http2Server {
         let (parts, body) = request.into_parts();
-        let mut head = Request::from_parts(parts, ());
-        *head.version_mut() = http::Version::HTTP_2;
+        let head = Request::from_parts(parts, ());
         let body = body
             .bytes()
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| Chunk::unpaid(bytes.to_vec()));
-        let opening = Opening {
-            request: Box::new(head),
-            ended: body.is_none(),
-            at: Instant::ZERO,
-            charge: None,
-        };
-        self.server(Http2::upgraded(self.limits, settings, opening, body))
+        self.server(Http2::upgraded(self.limits, settings, head, body))
     }
 
     fn server(&self, mut connection: Http2) -> Http2Server {
@@ -131,8 +126,8 @@ impl Responder {
         let limit = (self.limits.streams as usize).min(4096);
         Chain::new(
             connection,
-            Children::new(limit, Http2::WINDOW, move |_, opening, _| {
-                Some(Respond::new(shared.clone(), opening))
+            Children::new(limit, Http2::WINDOW, move |_, opening, budget| {
+                Respond::new(shared.clone(), opening, budget)
             }),
         )
     }
@@ -149,11 +144,14 @@ impl Responder {
 /// credit, then its trailers or its end. The response replaces the request
 /// in the budget; one the budget cannot hold gets `503`, and a streamed
 /// chunk it cannot hold resets this stream alone.
+///
+/// The handler takes an [`http::Request`], which [`Respond`] makes from
+/// the [`RequestHead`](super::RequestHead) the stream opened with as soon
+/// as it opens, charged first at the most it can hold: the head's block
+/// goes back to the connection then. A stream the budget has no room for
+/// is refused, and one whose authority or path the `http` crate does not
+/// take is reset with `PROTOCOL_ERROR`.
 pub struct Respond {
-    state: Box<State>,
-}
-
-struct State {
     responder: Arc<Responder>,
     head: Option<Request<()>>,
     /// What this exchange holds besides the request's body: the request's
@@ -196,33 +194,57 @@ enum Stage {
 }
 
 impl Respond {
-    fn new(responder: Arc<Responder>, opening: Opening) -> Respond {
+    /// The exchange `opening` starts, with its head made into an
+    /// [`http::Request`] in room charged to `budget` first. `None`, with
+    /// nothing made, when the budget has no room for it.
+    fn new(responder: Arc<Responder>, opening: Opening, budget: &Budget) -> Option<Respond> {
         let deadline = (!opening.ended).then(|| opening.at + responder.limits.body_timeout);
-        Respond {
-            state: Box::new(State {
-                responder,
-                head: Some(*opening.request),
-                charge: opening.charge,
-                body: None,
-                handed: None,
-                deadline,
-                ended: opening.ended,
-                stage: Stage::Collecting,
-                wants: Asked::Body,
-                delivery: None,
-                next: None,
-                rest: Bytes::new(),
-                generation: 0,
-                work: None,
-            }),
-        }
+        let mut charge = budget.charge(opening.head.most_http())?;
+        let head = opening.head.to_http();
+        let (stage, next) = match &head {
+            Some(request) => {
+                let held = request_held(request);
+                debug_assert!(
+                    held <= charge.bytes(),
+                    "a request head holds {held} bytes, past its bound of {}",
+                    charge.bytes()
+                );
+                charge.shrink_to(held);
+                (Stage::Collecting, None)
+            }
+            // A head the connection could check but `http` does not take
+            // is the client's error on this stream alone.
+            None => (
+                Stage::Done,
+                Some(ExchangeCommand::Reset(ErrorCode::ProtocolError)),
+            ),
+        };
+        Some(Respond {
+            responder,
+            head,
+            charge: Some(charge),
+            body: None,
+            handed: None,
+            deadline: deadline.filter(|_| next.is_none()),
+            ended: opening.ended,
+            stage,
+            wants: Asked::Body,
+            delivery: None,
+            next,
+            rest: Bytes::new(),
+            generation: 0,
+            work: None,
+        })
     }
-}
-
-impl State {
     /// Charges `bytes` in place of what is charged now. Returns whether it
     /// fits.
     fn hold(&mut self, env: &Env<'_, Infallible>, bytes: usize) -> bool {
+        // More than the whole budget never fits, and this exchange answers
+        // that itself (`503`): it is not asked for, so it is not taken for
+        // a need of the child's that no release could meet.
+        if bytes > env.budget().limit() {
+            return false;
+        }
         match &mut self.charge {
             Some(charge) if bytes < charge.bytes() => {
                 charge.shrink_to(bytes);
@@ -488,41 +510,40 @@ impl Layer for Respond {
         env: &mut Env<'_, Infallible>,
         event: ExchangeEvent,
     ) -> Result<fictionet::stdlib::layer::Admit<ExchangeEvent>, Infallible> {
-        let state = &mut *self.state;
-        let collecting = matches!(state.stage, Stage::Collecting) && !state.ended;
+        let collecting = matches!(self.stage, Stage::Collecting) && !self.ended;
         match event {
-            ExchangeEvent::Data(chunk) if collecting => state.collect(env, chunk),
+            ExchangeEvent::Data(chunk) if collecting => self.collect(env, chunk),
             // A body past its answer is dropped as it comes.
             ExchangeEvent::Data(_) => {}
             ExchangeEvent::Trailers(_) | ExchangeEvent::End if collecting => {
-                state.dispatch(env, Received::Complete);
+                self.dispatch(env, Received::Complete);
             }
             ExchangeEvent::Trailers(_) | ExchangeEvent::End => {}
             // The body limit comes before the budget, as it does for bytes
             // the connection could hold.
             ExchangeEvent::Overflow(dropped) if collecting => {
-                let past = state.collected() as u64 + dropped > state.responder.limits.body as u64;
+                let past = self.collected() as u64 + dropped > self.responder.limits.body as u64;
                 let received = if past {
                     Received::TooLarge
                 } else {
                     Received::Budget
                 };
-                state.dispatch(env, received);
+                self.dispatch(env, received);
             }
             ExchangeEvent::Overflow(_) => {}
             ExchangeEvent::Written(n) => {
-                if let Some(delivery) = &mut state.delivery {
+                if let Some(delivery) = &mut self.delivery {
                     delivery.written(n);
                 }
             }
             ExchangeEvent::Closed { why, written } => {
-                if let Some(mut delivery) = state.delivery.take() {
+                if let Some(mut delivery) = self.delivery.take() {
                     delivery.written(written);
                     delivery.end(why == Ending::Done);
                 }
-                state.stage = Stage::Done;
-                state.work = None;
-                state.next = None;
+                self.stage = Stage::Done;
+                self.work = None;
+                self.next = None;
             }
         }
         Ok(fictionet::stdlib::layer::Admit::Taken)
@@ -537,63 +558,60 @@ impl Layer for Respond {
     }
 
     fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
-        let state = &mut *self.state;
-        if state.deadline.is_none_or(|at| at > env.now()) {
+        if self.deadline.is_none_or(|at| at > env.now()) {
             return Ok(false);
         }
-        state.deadline = None;
-        if matches!(state.stage, Stage::Collecting) {
-            state.dispatch(env, Received::Timeout);
+        self.deadline = None;
+        if matches!(self.stage, Stage::Collecting) {
+            self.dispatch(env, Received::Timeout);
         }
         Ok(true)
     }
 
     fn on_done(&mut self, env: &mut Env<'_, Infallible>, done: Done) -> Result<(), Infallible> {
-        let state = &mut *self.state;
-        if done.generation != state.generation {
+        if done.generation != self.generation {
             return Ok(());
         }
         match done.answer {
-            Answer::Made(_) if !matches!(state.stage, Stage::Making) => {}
-            Answer::Made(Ok(response)) => state.made(env, response),
+            Answer::Made(_) if !matches!(self.stage, Stage::Making) => {}
+            Answer::Made(Ok(response)) => self.made(env, response),
             // An error on the stream's work resets it unanswered.
-            Answer::Made(Err(error)) if error.is::<Reset>() => state.reset(),
-            Answer::Made(Err(error)) => state.made(env, error_response(&error)),
-            Answer::Frame(..) if !matches!(state.stage, Stage::Polling) => {}
+            Answer::Made(Err(error)) if error.is::<Reset>() => self.reset(),
+            Answer::Made(Err(error)) => self.made(env, error_response(&error)),
+            Answer::Frame(..) if !matches!(self.stage, Stage::Polling) => {}
             Answer::Frame(body, Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
                     // The head is out, so a chunk the budget cannot hold
                     // resets this stream alone.
-                    let held = state.held();
-                    if !data.is_empty() && !state.hold(env, held + data.len()) {
-                        state.reset();
+                    let held = self.held();
+                    if !data.is_empty() && !self.hold(env, held + data.len()) {
+                        self.reset();
                     } else {
-                        state.rest = data;
-                        state.stage = Stage::Body(Some(body));
+                        self.rest = data;
+                        self.stage = Stage::Body(Some(body));
                     }
                 }
                 Err(frame) => match frame.into_trailers() {
-                    Ok(trailers) => state.stage = Stage::Ending(Some(Box::new(trailers))),
-                    Err(_) => state.stage = Stage::Body(Some(body)),
+                    Ok(trailers) => self.stage = Stage::Ending(Some(Box::new(trailers))),
+                    Err(_) => self.stage = Stage::Body(Some(body)),
                 },
             },
-            Answer::Frame(_, None) => state.stage = Stage::Ending(None),
-            Answer::Frame(_, Some(Err(_))) => state.reset(),
+            Answer::Frame(_, None) => self.stage = Stage::Ending(None),
+            Answer::Frame(_, Some(Err(_))) => self.reset(),
         }
         Ok(())
     }
 
     fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
-        let state = &mut *self.state;
-        if matches!(state.stage, Stage::Collecting) && state.ended && state.head.is_some() {
-            state.dispatch(env, Received::Complete);
+        if matches!(self.stage, Stage::Collecting) && self.ended && self.head.is_some() {
+            self.dispatch(env, Received::Complete);
             return Ok(true);
         }
-        Ok(state.respond(env))
+        Ok(self.respond(env))
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
-        self.state.next.take()
+        self.next.take()
     }
 
     fn take_event(&mut self) -> Option<Infallible> {
@@ -601,11 +619,11 @@ impl Layer for Respond {
     }
 
     fn take_work(&mut self) -> Option<Work> {
-        self.state.work.take()
+        self.work.take()
     }
 
     fn deadline(&self) -> Option<(Instant, ())> {
-        self.state.deadline.map(|at| (at, ()))
+        self.deadline.map(|at| (at, ()))
     }
 }
 

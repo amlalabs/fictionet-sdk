@@ -19,16 +19,9 @@ fn per_stream(output: &[Frame]) -> std::collections::BTreeMap<u32, Written> {
             stream.ended |= d.flags & 1 != 0;
             continue;
         }
-        let read = blocks.read_frame(frame).unwrap();
-        if let Some(block) = read.block {
+        if let Some((read, block)) = read_block(&mut blocks, frame) {
             let stream = streams.entry(read.stream).or_default();
-            stream.blocks.push(
-                block
-                    .headers
-                    .into_iter()
-                    .map(|h| (h.name, h.value))
-                    .collect(),
-            );
+            stream.blocks.push(block);
             stream.ended |= read.end;
         }
     }

@@ -152,8 +152,8 @@ pub use handlers::{
 
 pub use http2::{
     Ending, ExchangeCommand, ExchangeEvent, Grpc, GrpcCommand, GrpcEvent, Http2, Http2Server,
-    HttpExchange, Opening, Report as Http2Report, RequestTrailers, Respond, RespondWork, Responder,
-    ResponseHead, Timer as Http2Timer,
+    HttpExchange, Opening, Report as Http2Report, RequestHead as Http2RequestHead, RequestTrailers,
+    Respond, RespondWork, Responder, ResponseHead, Timer as Http2Timer,
 };
 pub use native::{
     Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer, Upgraded,

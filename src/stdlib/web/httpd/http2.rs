@@ -6,30 +6,34 @@
 //! [`Handler`](super::Handler) on one exchange; and [`Grpc`], gRPC calls on
 //! one exchange.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::time::{Duration, SystemTime};
 
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
+use http::{HeaderMap, HeaderValue, Request};
 
-use fictionet::stdlib::codec::{self, Fail, Wire};
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedDeque, ChargedVec, ChildId, Chunk,
-    Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Slots, StreamCommand, StreamEvent, Top,
+    Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Pool, Slots, StreamCommand, StreamEvent,
+    Top,
 };
+use fictionet::stdlib::protocols::fields::Fields;
 use fictionet::stdlib::protocols::hpack;
-use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
+use fictionet::stdlib::protocols::http2::{
+    self as wire, Begin, Control, ErrorCode, FrameHeader, Read,
+};
 use fictionet::time::Instant;
 
 use super::Limits;
-use super::response::{Dates, headers_held, request_held};
+use super::response::Dates;
 
 mod exchange;
 mod grpc;
 mod respond;
 
 pub use exchange::{
-    Ending, ExchangeCommand, ExchangeEvent, HttpExchange, Opening, RequestTrailers, ResponseHead,
+    Ending, ExchangeCommand, ExchangeEvent, HttpExchange, Opening, RequestHead, RequestTrailers,
+    ResponseHead,
 };
 pub use grpc::{Grpc, GrpcCommand, GrpcEvent};
 pub use respond::{Http2Server, Respond, Responder, Work as RespondWork};
@@ -66,19 +70,42 @@ const SEND_CREDIT: u64 = wire::DEFAULT_FRAME_SIZE as u64;
 const UP_LIMIT: usize = 64;
 /// How many output bytes wait for the transport before input pauses.
 const OUT_LIMIT: usize = 64 << 10;
-/// How many frames one advance reads.
-const FRAMES: usize = 16;
+/// How many steps of frames one advance reads: a frame is at least a
+/// beginning and an end, with its content or entries between.
+const STEPS: usize = 64;
 /// The bytes of the last GOAWAY, kept back from the start.
 const LAST_WORDS: usize = wire::HEADER_LEN + 8;
 /// The places each growing queue keeps while it is empty, held from the
 /// start, so ordinary requests do not allocate them again. A queue that
 /// grew past them gives the rest back once it drains.
 const KEEP: usize = 8;
+/// The bytes of a block a request's head is decoded into: most heads fit,
+/// and one that does not grows into a larger block, charged first.
+const HEAD_SLOT: usize = 2048;
+/// The head blocks the connection keeps free for the next requests and
+/// responses: a request's head, and a response's head and a short DATA
+/// frame that wait for the transport together.
+const HEADS_KEPT: usize = 2;
+/// The bytes of a block for a frame that carries no data: a control frame
+/// or a DATA frame's header.
+const SMALL_SLOT: usize = 32;
+/// Small blocks charged when the connection opens and kept: for control
+/// frames that must go out when the budget is full (SETTINGS and PING
+/// acknowledgments, WINDOW_UPDATE, RST_STREAM and GOAWAY), and for the
+/// DATA headers and WINDOW_UPDATEs one batch of input and output queues
+/// at once, so a steady exchange makes none.
+const CONTROL: usize = 8;
+/// What the connection keeps for its input while it is open: one frame.
+/// It is the HPACK table at its bound, a block for a request's head, and
+/// storage to join header blocks that come split across frames or pieces,
+/// so a head that fits in it is read when the budget is full. DATA needs
+/// none of it: its data goes up in the chunks it came in.
+const INPUT: usize = wire::HEADER_LEN + wire::DEFAULT_FRAME_SIZE;
 
 /// HTTP/2 for one connection: a [`Layer`] with an ordered byte stream below
 /// and one [`HttpExchange`] child per stream above ([`Mux`]).
 ///
-/// The connection owns everything the streams share: the frame decoder,
+/// The connection owns everything the streams share: the frame reader,
 /// HPACK in both directions, SETTINGS and their acknowledgment deadline,
 /// the wire's stream numbers and states, both levels of flow control,
 /// resets and their limits, PING and GOAWAY. A request whose head is valid
@@ -91,6 +118,14 @@ const KEEP: usize = 8;
 /// and leaves the others the connection's window. Response bytes go out
 /// within both of the client's windows.
 ///
+/// Input is read a step of a frame at a time from the chunks the transport
+/// delivers ([`wire::FrameReader`]), and nothing holds a whole frame: a
+/// DATA frame's data goes up as pieces of the chunks it came in, never
+/// copied, and a header block that came whole in one piece is decoded from
+/// where it lies. A request's head is decoded straight into one block
+/// ([`RequestHead`]), taken from blocks the connection keeps, so opening a
+/// stream allocates nothing once the connection has served one.
+///
 /// [`Responder::http2`] puts a [`Respond`] on each stream, answering with a
 /// [`Handler`](super::Handler); [`Grpc`] serves gRPC calls on a stream.
 ///
@@ -100,28 +135,50 @@ const KEEP: usize = 8;
 /// resets more than 20 streams the server has not taken in yet, loses the
 /// connection with `ENHANCE_YOUR_CALM`. Everything the connection holds is
 /// charged to its budget before it is allocated: the list of recent resets
-/// and the HPACK table at their bounds when the connection opens, with
-/// input storage for the rest of one frame; input past that, and the
-/// joining of header blocks split into CONTINUATION frames, as they grow;
+/// and the HPACK table at their bounds when the connection opens, with one
+/// block for request heads; the joining of header blocks split across
+/// frames or pieces as it grows; request heads as they are decoded;
 /// request trailers at their bound before they are decoded; places in the
-/// lists of streams when streams are admitted; stream state, request heads
-/// and bodies, events for the children and output frames as they come. A
-/// header block without room to join or decode waits for memory. Past the
-/// budget otherwise, the connection sends GOAWAY with `ENHANCE_YOUR_CALM`
-/// and ends.
+/// lists of streams when streams are admitted; stream state, events for
+/// the children and output frames as they come. DATA is paid for by
+/// whatever paid for the chunks it came in, and moves to the connection's
+/// budget as it goes up. A header block without room to join, or trailers
+/// without room to decode, wait for memory; a request head without room is
+/// refused with `REFUSED_STREAM`, and a body without room overflows its
+/// own stream alone. Past the budget otherwise, the connection sends
+/// GOAWAY with `ENHANCE_YOUR_CALM` and ends.
 pub struct Http2 {
     limits: Limits,
     phase: Phase,
     /// The chunk of input being read, all of one delivery.
     input: Option<Chunk>,
-    /// A header frame read from the input whose block waits for memory:
-    /// it is read again before any frame after it.
-    held: Option<Frame>,
+    /// A step read from the input whose handling waits for memory: it is
+    /// handled again before any step after it.
+    held: Option<Read>,
     peer_ended: bool,
     codec: InputState,
+    /// The frame being read, from its beginning to its end.
+    reading: Reading,
+    /// The header block being read, from its HEADERS to its last frame.
+    block: Option<Block>,
+    /// Blocks for request heads, response heads and short DATA frames,
+    /// kept between requests.
+    heads: Option<Pool>,
+    /// Blocks for control frames and DATA frame headers, with the control
+    /// reserve.
+    small: Option<Pool>,
+    /// A stream's two queues, empty, with their places, for the next
+    /// stream: made when the connection opens, and left by each stream
+    /// that ends while none waits.
+    spare: Option<(ChargedDeque<Chunk>, ChargedDeque<Chunk>)>,
+    /// A budget with no room, for blocks decoded only to keep HPACK in
+    /// step: whatever they hold is left out.
+    nothing: Budget,
     encoder: hpack::Encoder,
-    streams: BTreeMap<u32, Stream>,
-    children: Option<Slots<u32>>,
+    /// The open streams, each in a slot whose key is its child's id.
+    streams: Slots<Stream>,
+    /// The open streams' identifiers, ascending, with their children.
+    ids: ChargedVec<(u32, ChildId)>,
     /// Streams the server reset a moment ago, at most [`RESET_MAX`].
     resets: ChargedDeque<(u32, Instant)>,
     recv_window: i32,
@@ -172,8 +229,9 @@ pub struct Http2 {
     awaiting_window: ChargedDeque<u32>,
     dates_storage: Option<Charge>,
     last_words: Option<Charge>,
-    /// The request an HTTP/1 `Upgrade: h2c` brought, for stream 1.
-    upgrade: Option<(Opening, Option<Chunk>)>,
+    /// The request an HTTP/1 `Upgrade: h2c` brought, for stream 1, with
+    /// the whole body that came with it.
+    upgrade: Option<(Request<()>, Option<Chunk>)>,
     /// The `Date` headers of the responses: one made per second of the
     /// world's clock serves every stream framed in that second.
     dates: Dates,
@@ -188,32 +246,21 @@ enum Phase {
     Closed,
 }
 
-/// The connection's input: frames read into storage that charges each
-/// growth before it allocates, header blocks split into CONTINUATION
-/// frames joined in storage of their own, and the HPACK table, charged at
-/// its bound once. One frame of input stays charged while the connection
-/// is open, so input and control frames go on while streams use up the
-/// budget: the table's bound, which it never passes, and the rest as
-/// input storage, kept between requests.
+/// The connection's input: the frame reader, header blocks split across
+/// frames or pieces joined in storage of their own, and the HPACK table,
+/// charged at its bound once. Nothing here holds a frame.
 struct InputState {
-    frames: codec::Stream<Inputs, ChargedBytes>,
+    reader: wire::FrameReader,
     headers: wire::HeaderBlocks<ChargedBytes>,
     /// What the HPACK table can hold: the server never raises its table
     /// setting, so the table holds at most this.
     table: Charge,
-    /// The input storage kept between requests: a frame, less the table.
-    floor: usize,
 }
 
 impl InputState {
-    /// Input on `budget` that holds nothing and has no floor: what it is
-    /// before the connection opens, on a budget with no room.
+    /// Input on `budget` that holds nothing: what it is before the
+    /// connection opens, on a budget with no room.
     fn new(limits: Limits, budget: &Budget) -> Self {
-        let frames = codec::Stream::in_storage(
-            Inputs::client_side(wire::DEFAULT_FRAME_SIZE),
-            0,
-            ChargedBytes::new(budget),
-        );
         let headers = wire::HeaderBlocks::in_storage(
             wire::Limits {
                 header_list: limits.head.head,
@@ -223,78 +270,54 @@ impl InputState {
             ChargedBytes::new(budget),
         );
         Self {
-            frames,
+            reader: wire::FrameReader::client_side(wire::DEFAULT_FRAME_SIZE),
             headers,
-            table: budget.charge(0).expect("nothing always fits"),
-            floor: 0,
+            table: Charge::nothing(budget),
         }
     }
 
-    /// The input of a connection opening on `budget`: the table charged at
-    /// its bound and the input storage at the floor. `None`, with nothing
-    /// charged, if the budget has no room for them.
+    /// The input of a connection opening on `budget`: the table charged
+    /// at its bound, and storage to join split header blocks in, so that
+    /// with the block a request's head is decoded into ([`HEAD_SLOT`])
+    /// the input keeps one frame ([`INPUT`]) while the connection is open.
+    /// `None`, with nothing charged, if the budget has no room for them.
     fn open(limits: Limits, budget: &Budget) -> Option<Self> {
         let mut input = Self::new(limits, budget);
         input.table = budget.charge(input.headers.most_table())?;
-        input.floor = input.frames.limit().saturating_sub(input.table.bytes());
-        input
-            .frames
-            .storage_mut()
-            .grow_to(input.floor)
-            .then_some(input)
-    }
-
-    /// Takes what it can of `bytes`: as many as the input has room for,
-    /// growing its storage if the budget allows, or else as many as fit in
-    /// the storage it has. `None` if it takes none because the budget
-    /// refused the growth.
-    fn push(&mut self, bytes: &[u8]) -> Option<usize> {
-        let n = self.frames.push(bytes);
-        if n > 0 || bytes.is_empty() || self.frames.buffered() >= self.frames.limit() {
-            return Some(n);
-        }
-        match self.frames.push_with_budget(bytes, 0) {
-            0 => None,
-            n => Some(n),
-        }
-    }
-
-    /// Reads a frame for its header block. `None`, with nothing read, if
-    /// the budget refuses what reading it needs: room to join its fragment
-    /// to a split block, or, when `trailers` holds the budget, the bound
-    /// of the trailers it ends, charged before they are decoded and
-    /// returned with them.
-    fn read_headers(
-        &mut self,
-        frame: &Frame,
-        trailers: Option<&Budget>,
-    ) -> Option<Result<(wire::BlockRead, Option<Charge>), wire::Error>> {
-        if !self.headers.reserve(frame) {
-            return None;
-        }
-        let charge = match (trailers, self.headers.most_block(frame)) {
-            (Some(budget), Some(bound)) => Some(budget.charge(most_trailers(bound))?),
-            _ => None,
-        };
-        let read = self.headers.read_frame(frame);
-        debug_assert!(
-            self.headers.table_held() <= self.table.bytes(),
-            "the HPACK table holds {} bytes, past its bound of {}",
-            self.headers.table_held(),
-            self.table.bytes()
-        );
-        Some(read.map(|read| (read, charge)))
-    }
-
-    /// Gives back input storage past the floor.
-    fn trim(&mut self) {
-        self.frames.shrink_to(self.floor);
+        let floor = INPUT.saturating_sub(input.table.bytes() + HEAD_SLOT);
+        input.headers.keep(floor).then_some(input)
     }
 }
 
+/// The frame being read, between its [`Read::Begin`] and its
+/// [`Read::End`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reading {
+    /// No frame, or one whose content nothing takes.
+    Idle,
+    /// DATA whose data goes to stream `id`, and ends its request with
+    /// `end`.
+    Data { id: u32, end: bool },
+    /// A frame of the header block being read.
+    Block,
+    /// SETTINGS whose entries apply.
+    Settings,
+}
+
+/// A header block being read.
+struct Block {
+    stream: u32,
+    /// END_STREAM on the HEADERS that opened it.
+    end: bool,
+    /// The HEADERS made its stream depend on itself.
+    self_dependent: bool,
+    /// The block, when it came whole in one piece: it is decoded from
+    /// where it lies, with nothing joined.
+    whole: Option<Chunk>,
+}
+
 struct Stream {
-    child: ChildId,
-    _entry: Charge,
+    id: u32,
     /// A release has taken the stream in. A client reset of a stream not
     /// yet taken in counts toward the pending reset limit.
     accepted: bool,
@@ -357,7 +380,7 @@ enum RequestEnd {
     Open,
     /// The request ended, with these trailers if it had any. The child
     /// hears once its body and any overflow have gone up.
-    Ended(Option<Box<RequestTrailers>>),
+    Ended(Option<RequestTrailers>),
     /// The child heard the end.
     Told,
 }
@@ -438,6 +461,18 @@ enum HeadersOn {
     New,
 }
 
+/// Stream `id`, if it is open, and its child: found in `ids`, kept in
+/// `streams`.
+fn find<'a>(
+    ids: &ChargedVec<(u32, ChildId)>,
+    streams: &'a mut Slots<Stream>,
+    id: u32,
+) -> Option<(ChildId, &'a mut Stream)> {
+    let at = ids.binary_search_by_key(&id, |&(id, _)| id).ok()?;
+    let child = ids[at].1;
+    Some((child, streams.get_mut(child)?))
+}
+
 impl Http2 {
     /// The connection, with these limits.
     pub fn new(limits: Limits) -> Self {
@@ -451,9 +486,14 @@ impl Http2 {
             peer_ended: false,
             codec: InputState::new(limits, &none),
             held: None,
+            reading: Reading::Idle,
+            block: None,
+            heads: None,
+            small: None,
+            spare: None,
             encoder: hpack::Encoder::new(0),
-            streams: BTreeMap::new(),
-            children: None,
+            streams: Slots::new(0),
+            ids: ChargedVec::new(&none, 0),
             resets: ChargedDeque::new(&none, 0),
             recv_window: WINDOW,
             windowed_bytes: 0,
@@ -486,6 +526,7 @@ impl Http2 {
             last_words: None,
             upgrade: None,
             dates: Dates::new(None),
+            nothing: none,
         }
     }
 
@@ -499,12 +540,13 @@ impl Http2 {
     }
 
     /// The connection an HTTP/1 `Upgrade: h2c` started: the client's
-    /// `HTTP2-Settings` already apply, and its request is stream 1, with
-    /// the whole body that came with it. The client's preface comes next.
+    /// `HTTP2-Settings` already apply, and `request` is stream 1, with
+    /// `body`, the whole body that came with it. The client's preface
+    /// comes next.
     pub(super) fn upgraded(
         limits: Limits,
         settings: &[wire::Setting],
-        opening: Opening,
+        request: Request<()>,
         body: Option<Chunk>,
     ) -> Self {
         let mut h2 = Self::new(limits);
@@ -513,7 +555,7 @@ impl Http2 {
             let _ = h2.peer_setting(*setting);
         }
         h2.last_stream = 1;
-        h2.upgrade = Some((opening, body));
+        h2.upgrade = Some((request, body));
         h2
     }
 
@@ -534,8 +576,8 @@ impl Http2 {
         self.streams.len()
     }
 
-    /// Reserves the input, dates and the small queue floor.
-    /// Admitting streams reserves their list places.
+    /// Reserves the input, dates, the small queue floor and a block for
+    /// request heads. Admitting streams reserves their places.
     fn hold(&mut self, budget: &Budget) -> Option<()> {
         // The server never raises its input frame size, and its encoder's
         // table stays empty.
@@ -546,6 +588,8 @@ impl Http2 {
         self.resets = ChargedDeque::with_places(budget, RESET_MAX, RESET_MAX)?;
         // Each open stream is in each list of streams at most once.
         let streams = self.limits.streams as usize;
+        self.streams = Slots::with_places(budget, KEEP, streams)?;
+        self.ids = ChargedVec::with_places(budget, KEEP, streams)?;
         self.credit_due = ChargedVec::with_places(budget, KEEP, streams)?;
         self.touched = ChargedVec::with_places(budget, KEEP, streams)?;
         self.finished = ChargedVec::with_places(budget, KEEP, streams)?;
@@ -553,6 +597,24 @@ impl Http2 {
         self.awaiting_window = ChargedDeque::with_places(budget, KEEP, streams)?;
         self.up = ChargedDeque::with_places(budget, KEEP, usize::MAX)?;
         self.sent = ChargedDeque::with_places(budget, KEEP, usize::MAX)?;
+        // One head block, made now and given straight back, so the pool
+        // keeps it: each request takes it and gives it back, and its
+        // charge moves with it.
+        let heads = Pool::new(budget, HEAD_SLOT, HEADS_KEPT);
+        drop(heads.take(budget, 0)?);
+        self.heads = Some(heads);
+        // The control reserve, paid for now, so the connection can always
+        // answer: its blocks come back to it once the transport has them.
+        let small = Pool::new(budget, SMALL_SLOT, CONTROL);
+        if !small.reserve_control(budget, CONTROL) {
+            return None;
+        }
+        self.small = Some(small);
+        // The first stream's queues, with the places each keeps.
+        self.spare = Some((
+            ChargedDeque::with_places(budget, KEEP, usize::MAX)?,
+            ChargedDeque::with_places(budget, KEEP, usize::MAX)?,
+        ));
         Some(())
     }
 
@@ -564,44 +626,72 @@ impl Http2 {
             return;
         }
         self.last_words = env.budget().charge(LAST_WORDS);
-        self.children = Slots::with_budget(self.limits.streams as usize, env.budget());
-        if self.last_words.is_none() || self.children.is_none() {
+        if self.last_words.is_none() {
             return self.over_budget(env);
         }
-        let settings = wire::Settings {
-            flags: 0,
-            entries: vec![
-                wire::Setting {
-                    id: 3,
-                    value: self.limits.streams,
-                },
-                wire::Setting {
-                    id: 6,
-                    value: self.limits.head.head.min(u32::MAX as usize) as u32,
-                },
-            ],
-        };
-        if !self.control(env, wire::HEADER_LEN + 12, &settings) {
+        // SETTINGS_MAX_CONCURRENT_STREAMS and SETTINGS_MAX_HEADER_LIST_SIZE.
+        let mut settings = [0; 12];
+        settings[..6].copy_from_slice(&setting(3, self.limits.streams));
+        let list = self.limits.head.head.min(u32::MAX as usize) as u32;
+        settings[6..].copy_from_slice(&setting(6, list));
+        if !self.control(env, 4, 0, &settings) {
             return;
         }
         self.settings_deadline = Some(env.now() + self.limits.header_timeout);
-        if let Some((mut opening, body)) = self.upgrade.take() {
-            opening.at = env.now();
-            let ended = body.is_none();
-            let admitted = self.admit(env, 1, opening, None, ended).is_ok();
-            // The request came whole over HTTP/1: stream 1 is half closed
-            // from the client's side (RFC 7540 section 3.2).
-            if let Some(stream) = self.streams.get_mut(&1) {
-                stream.receive.closed = true;
+        if let Some((request, body)) = self.upgrade.take() {
+            self.open_upgraded(env, &request, body);
+        }
+    }
+
+    /// Opens stream 1 for the request an HTTP/1 `Upgrade: h2c` brought,
+    /// with its head written into a block charged as it is written. The
+    /// request came whole over HTTP/1: stream 1 is half closed from the
+    /// client's side (RFC 7540 section 3.2).
+    fn open_upgraded(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        request: &Request<()>,
+        body: Option<Chunk>,
+    ) {
+        let budget = env.budget();
+        let mut fields = Fields::new();
+        let uri = request.uri();
+        fields.push(budget, b":method", request.method().as_str().as_bytes());
+        fields.push(budget, b":scheme", b"http");
+        if let Some(authority) = uri.authority() {
+            fields.push(budget, b":authority", authority.as_str().as_bytes());
+        }
+        let path = uri.path_and_query().map_or("/", |p| p.as_str());
+        fields.push(budget, b":path", path.as_bytes());
+        for (name, value) in request.headers() {
+            if !connection_specific(name.as_str().as_bytes()) {
+                fields.push(budget, name.as_str().as_bytes(), value.as_bytes());
             }
-            if admitted && let Some(mut chunk) = body {
-                if chunk.repay(env.budget()) {
-                    self.deliver_body(env, 1, chunk, false);
-                } else {
-                    self.overflow(env, 1, chunk.len() as u64);
-                }
-                self.end_request(env, 1, None);
+        }
+        let ended = body.is_none();
+        let head = match request_head(fields, self.limits) {
+            Some(head) if head.fields().refused() == 0 => head,
+            _ => {
+                self.write_reset(env, 1, ErrorCode::RefusedStream);
+                return;
             }
+        };
+        let opening = Opening {
+            head,
+            ended,
+            at: env.now(),
+        };
+        let admitted = self.admit(env, 1, opening, ended).is_ok();
+        if let Some((_, stream)) = find(&self.ids, &mut self.streams, 1) {
+            stream.receive.closed = true;
+        }
+        if admitted && let Some(mut chunk) = body {
+            if chunk.repay(env.budget()) {
+                self.deliver_body(env, 1, chunk, false);
+            } else {
+                self.overflow(env, 1, chunk.len() as u64);
+            }
+            self.end_request(env, 1, None);
         }
     }
 
@@ -645,53 +735,81 @@ impl Http2 {
         true
     }
 
-    /// Writes a frame of `len` bytes. Past the budget, the connection ends.
-    /// Returns whether it was queued.
-    fn frame_for<W: Wire<WriteError = wire::Error>>(
+    /// A block for `len` bytes of output, charged to `budget` at its full
+    /// size: one of the connection's small blocks or head blocks when it
+    /// fits one, and an allocation of its own otherwise. A `control` block
+    /// the budget refuses comes from the control reserve while it lasts.
+    /// `None` when there is no room.
+    fn block(&self, budget: &Budget, len: usize, control: bool) -> Option<Chunk> {
+        if len <= SMALL_SLOT
+            && let Some(small) = &self.small
+        {
+            let taken = small.take(budget, 0);
+            return taken.or_else(|| control.then(|| small.take_control(0)).flatten());
+        }
+        if len <= HEAD_SLOT
+            && let Some(block) = self.heads.as_ref().and_then(|heads| heads.take(budget, 0))
+        {
+            return Some(block);
+        }
+        Chunk::with_room(budget, len)
+    }
+
+    /// Writes the frame `header` begins, with `payload`, into one block for
+    /// the transport: the frame of stream `header.stream` (0 for the
+    /// connection) that carries `body` bytes of its body and, with `end`,
+    /// its end. A `control` frame goes out whatever the budget says while
+    /// the control reserve lasts. Past the budget otherwise, the connection
+    /// ends. Returns whether it was queued.
+    fn frame(
         &mut self,
         env: &mut Env<'_, Report>,
-        len: usize,
-        frame: &W,
-        stream: u32,
+        header: FrameHeader,
+        payload: &[u8],
+        body: u64,
         end: bool,
+        control: bool,
     ) -> bool {
-        // A frame that does not fit the room charged for it ends the
-        // connection, as the budget does.
-        let Some(mut bytes) = ChargedBytes::with_capacity(env.budget(), len) else {
+        let len = wire::HEADER_LEN + payload.len();
+        let block = self.block(env.budget(), len, control);
+        let Some((mut block, head)) = block.zip(header.to_array().ok()) else {
             self.over_budget(env);
             return false;
         };
-        if bytes.fill(|bytes| frame.write(bytes)).is_err() {
-            self.over_budget(env);
-            return false;
-        }
-        debug_assert_eq!(bytes.len(), len);
-        self.queue(env, Chunk::from(bytes), stream, 0, end)
+        let written = block.extend_within(&head).and(block.extend_within(payload));
+        debug_assert!(written.is_ok(), "a block has room for its frame");
+        self.queue(env, block, header.stream, body, end)
     }
 
-    /// A connection frame.
-    fn control<W: Wire<WriteError = wire::Error>>(
+    /// A frame of the connection's own, of `kind` and `flags`, with
+    /// `payload`: one that goes out whatever the budget says while the
+    /// control reserve lasts.
+    fn control(&mut self, env: &mut Env<'_, Report>, kind: u8, flags: u8, payload: &[u8]) -> bool {
+        self.stream_control(env, kind, flags, 0, payload)
+    }
+
+    /// A control frame on `stream`.
+    fn stream_control(
         &mut self,
         env: &mut Env<'_, Report>,
-        len: usize,
-        frame: &W,
+        kind: u8,
+        flags: u8,
+        stream: u32,
+        payload: &[u8],
     ) -> bool {
-        self.frame_for(env, len, frame, 0, false)
+        let header = FrameHeader {
+            length: payload.len(),
+            kind,
+            flags,
+            stream,
+        };
+        self.frame(env, header, payload, 0, false, true)
     }
 
     fn goaway(&mut self, env: &mut Env<'_, Report>, code: ErrorCode, last: u32) {
         let last = last.min(self.goaway_last.unwrap_or(wire::MAX_WINDOW));
         self.goaway_last = Some(last);
-        self.control(
-            env,
-            LAST_WORDS,
-            &wire::GoAway {
-                flags: 0,
-                last_stream: last,
-                code: code as u32,
-                debug: Vec::new(),
-            },
-        );
+        self.control(env, 7, 0, &goaway_payload(last, code));
     }
 
     /// Ends the connection for `error`: GOAWAY, then the end.
@@ -710,6 +828,8 @@ impl Http2 {
         self.resets.clear();
         self.resets.shrink_to(0);
         self.input = None;
+        self.held = None;
+        self.block = None;
         // The end goes behind what is queued (see `take_command`).
         self.phase = Phase::Closing;
     }
@@ -720,7 +840,7 @@ impl Http2 {
         self.runnable.clear();
         self.awaiting_window.clear();
         self.credit_due.clear();
-        while let Some((&id, _)) = self.streams.first_key_value() {
+        while let Some(&(id, _)) = self.ids.first() {
             self.end_stream(id, Ending::Gone);
         }
     }
@@ -773,20 +893,8 @@ impl Http2 {
     /// Resets stream `id` and ignores its late frames for a while. Not an
     /// error of the client's: it does not count toward the reset limit.
     fn write_reset(&mut self, env: &mut Env<'_, Report>, id: u32, code: ErrorCode) {
-        if self.streams.contains_key(&id) {
-            self.end_stream(id, Ending::Reset(code));
-        }
-        self.frame_for(
-            env,
-            wire::HEADER_LEN + 4,
-            &wire::Reset {
-                stream: id,
-                flags: 0,
-                code: code as u32,
-            },
-            id,
-            false,
-        );
+        self.end_stream(id, Ending::Reset(code));
+        self.stream_control(env, 3, 0, id, &(code as u32).to_be_bytes());
         // A closed connection reads no more frames to ignore. The list has
         // places for its most, paid for at the start: once full, it
         // remembers no more.
@@ -818,25 +926,28 @@ impl Http2 {
         self.resets.iter().any(|(s, _)| *s == id)
     }
 
+    /// Whether stream `id` is open.
+    fn is_open(&self, id: u32) -> bool {
+        self.ids.binary_search_by_key(&id, |&(id, _)| id).is_ok()
+    }
+
     // -----------------------------------------------------------------------
     // Children
 
     /// Opens stream `id`'s child with `opening`, or refuses the stream
-    /// when its head and state do not fit the budget.
+    /// when its state does not fit the budget.
     fn admit(
         &mut self,
         env: &mut Env<'_, Report>,
         id: u32,
         mut opening: Opening,
-        remaining: Option<u64>,
         ended: bool,
     ) -> Result<(), wire::Error> {
-        let entry = env.budget().charge(size_of::<(u32, Stream)>());
-        let head = env.budget().charge(request_held(&opening.request));
         // Places for its first two events and, from now on, for the event
-        // that ends it.
+        // that ends it; and its place in every list of streams.
         let streams = self.streams.len() + 1;
         let room = self.up.reserve(2 + streams)
+            && self.ids.reserve(1)
             && self
                 .credit_due
                 .reserve(streams.saturating_sub(self.credit_due.len()))
@@ -852,49 +963,58 @@ impl Http2 {
             && self
                 .awaiting_window
                 .reserve(streams.saturating_sub(self.awaiting_window.len()));
-        let (Some(entry), Some(head), true) = (entry, head, room) else {
+        if !room {
             return self.reset(env, id, ErrorCode::RefusedStream);
+        }
+        // The stream's queues charge their storage as they grow: the pair
+        // the last stream left, or a new pair with none.
+        let (pending, queue) = self.spare.take().unwrap_or_else(|| {
+            let budget = env.budget();
+            (
+                ChargedDeque::new(budget, usize::MAX),
+                ChargedDeque::new(budget, usize::MAX),
+            )
+        });
+        let stream = Stream {
+            id,
+            accepted: false,
+            receive: Receive {
+                closed: ended,
+                content_remaining: opening.head.content_length(),
+                window: WINDOW,
+                credit_due: false,
+            },
+            delivery: Delivery {
+                pending,
+                windowed_bytes: 0,
+                unwindowed_bytes: 0,
+                credit_bytes: 0,
+                peak_credit_bytes: 0,
+                credited: false,
+                overflow: Overflow::None,
+                end: RequestEnd::Open,
+            },
+            response: Response {
+                window: self.initial,
+                credit_bytes: SEND_CREDIT,
+                queue,
+                queued_bytes: 0,
+                written_bytes: 0,
+                reply: Reply::Waiting,
+                turn: Turn::Idle,
+            },
         };
-        let Some(child) = self.children.as_mut().and_then(|c| c.insert(id).ok()) else {
+        // Its slot is charged as the slots grow; past the budget or the
+        // limit, the stream is refused.
+        let Ok(child) = self.streams.insert(stream) else {
             return self.reset(env, id, ErrorCode::RefusedStream);
         };
         let child_id = child.id();
-        opening.charge = Some(head);
+        // New streams come in ascending order, so the index stays sorted;
+        // its place was reserved above.
+        let indexed = self.ids.push((id, child_id)).is_ok();
+        debug_assert!(indexed, "the index has a place for every open stream");
         opening.ended = ended;
-        // The stream's queues charge their storage as they grow.
-        self.streams.insert(
-            id,
-            Stream {
-                child: child_id,
-                _entry: entry,
-                accepted: false,
-                receive: Receive {
-                    closed: ended,
-                    content_remaining: remaining,
-                    window: WINDOW,
-                    credit_due: false,
-                },
-                delivery: Delivery {
-                    pending: ChargedDeque::new(env.budget(), usize::MAX),
-                    windowed_bytes: 0,
-                    unwindowed_bytes: 0,
-                    credit_bytes: 0,
-                    peak_credit_bytes: 0,
-                    credited: false,
-                    overflow: Overflow::None,
-                    end: RequestEnd::Open,
-                },
-                response: Response {
-                    window: self.initial,
-                    credit_bytes: SEND_CREDIT,
-                    queue: ChargedDeque::new(env.budget(), usize::MAX),
-                    queued_bytes: 0,
-                    written_bytes: 0,
-                    reply: Reply::Waiting,
-                    turn: Turn::Idle,
-                },
-            },
-        );
         self.uncredited += 1;
         // The next release takes the stream in.
         self.credit_may_be_due(id);
@@ -922,7 +1042,7 @@ impl Http2 {
 
     /// Stream `id`'s receive credit may be due at the next release.
     fn credit_may_be_due(&mut self, id: u32) {
-        if let Some(stream) = self.streams.get_mut(&id) {
+        if let Some((_, stream)) = find(&self.ids, &mut self.streams, id) {
             due(&mut self.credit_due, id, &mut stream.receive);
         }
     }
@@ -930,7 +1050,7 @@ impl Http2 {
     /// Puts stream `id` in line to send, if it has a frame its window lets
     /// it send and is not in line already.
     fn schedule(&mut self, id: u32) {
-        if let Some(stream) = self.streams.get_mut(&id) {
+        if let Some((_, stream)) = find(&self.ids, &mut self.streams, id) {
             schedule(&mut self.runnable, id, &mut stream.response);
         }
     }
@@ -940,7 +1060,7 @@ impl Http2 {
     /// windows; the others are the body an `Upgrade: h2c` request brought
     /// over HTTP/1. Bytes the stream's queue cannot hold overflow.
     fn deliver_body(&mut self, env: &mut Env<'_, Report>, id: u32, chunk: Chunk, windowed: bool) {
-        let Some(stream) = self.streams.get_mut(&id) else {
+        let Some((_, stream)) = find(&self.ids, &mut self.streams, id) else {
             return;
         };
         let delivery = &mut stream.delivery;
@@ -960,7 +1080,7 @@ impl Http2 {
     /// `id`'s body: it drops them and the rest of the body, and the child
     /// hears so.
     fn overflow(&mut self, env: &mut Env<'_, Report>, id: u32, dropped: u64) {
-        if let Some(stream) = self.streams.get_mut(&id)
+        if let Some((_, stream)) = find(&self.ids, &mut self.streams, id)
             && matches!(stream.delivery.overflow, Overflow::None)
         {
             stream.delivery.overflow = Overflow::Dropped(dropped);
@@ -973,9 +1093,9 @@ impl Http2 {
         &mut self,
         env: &mut Env<'_, Report>,
         id: u32,
-        trailers: Option<Box<RequestTrailers>>,
+        trailers: Option<RequestTrailers>,
     ) {
-        if let Some(stream) = self.streams.get_mut(&id) {
+        if let Some((_, stream)) = find(&self.ids, &mut self.streams, id) {
             stream.delivery.end = RequestEnd::Ended(trailers);
         }
         self.forward(env, id);
@@ -987,10 +1107,9 @@ impl Http2 {
     /// the body, and need no credit. Past the budget, the connection ends.
     fn forward(&mut self, env: &mut Env<'_, Report>, id: u32) {
         let open = self.streams.len();
-        let Some(stream) = self.streams.get_mut(&id) else {
+        let Some((child, stream)) = find(&self.ids, &mut self.streams, id) else {
             return;
         };
-        let child = stream.child;
         let delivery = &mut stream.delivery;
         let mut moved = false;
         let mut refused = false;
@@ -1057,7 +1176,11 @@ impl Http2 {
 
     /// Stream `id` is over: its child hears why, and its number is free.
     fn end_stream(&mut self, id: u32, why: Ending) {
-        let Some(stream) = self.streams.remove(&id) else {
+        let Ok(at) = self.ids.binary_search_by_key(&id, |&(id, _)| id) else {
+            return;
+        };
+        let (_, child) = self.ids.remove(at).expect("a place found in the index");
+        let Some(stream) = self.streams.remove(child) else {
             return;
         };
         // What it held is dropped: its credit may be due.
@@ -1072,11 +1195,8 @@ impl Http2 {
             Turn::Runnable => self.runnable.retain(|&next| next != id),
             Turn::AwaitingWindow => self.awaiting_window.retain(|&next| next != id),
         }
-        if let Some(children) = &mut self.children {
-            children.remove(stream.child);
-        }
         let closed = MuxEvent::Child(
-            stream.child,
+            child,
             ExchangeEvent::Closed {
                 why,
                 written: stream.response.written_bytes,
@@ -1085,6 +1205,28 @@ impl Http2 {
         // The place kept for this stream's end since it opened takes it.
         let told = self.up.push_back(closed).is_ok();
         debug_assert!(told, "a place is kept for each open stream's end");
+        // Its queues, emptied and back to the places they keep, wait for
+        // the next stream, unless a pair with as many places waits already:
+        // one pair is kept, the one that saves the next stream the most.
+        let (mut pending, mut queue) = (stream.delivery.pending, stream.response.queue);
+        let places = |(pending, queue): &(ChargedDeque<Chunk>, ChargedDeque<Chunk>)| {
+            pending.places() + queue.places()
+        };
+        pending.clear();
+        queue.clear();
+        pending.shrink_to(KEEP);
+        queue.shrink_to(KEEP);
+        let pair = (pending, queue);
+        if self
+            .spare
+            .as_ref()
+            .is_none_or(|spare| places(spare) < places(&pair))
+        {
+            self.spare = Some(pair);
+        }
+        if self.streams.is_empty() {
+            self.streams.shrink_to(KEEP);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1103,7 +1245,7 @@ impl Http2 {
         if self.ignored(id) {
             return Ok(HeadersOn::Reset);
         }
-        if self.streams.contains_key(&id) {
+        if self.is_open(id) {
             return Ok(HeadersOn::Open);
         }
         if id <= self.last_stream {
@@ -1118,101 +1260,230 @@ impl Http2 {
         Ok(HeadersOn::New)
     }
 
-    /// A header block read, with the charge for it when it is a request's
-    /// trailers, taken at their bound before the block was decoded.
-    fn on_headers(
-        &mut self,
-        env: &mut Env<'_, Report>,
-        read: wire::BlockRead,
-        paid: Option<Charge>,
-    ) -> Result<(), wire::Error> {
-        let Some(block) = read.block else {
-            return Ok(());
-        };
-        let id = read.stream;
-        match self.headers_on(id)? {
-            HeadersOn::Reset => return Ok(()),
-            HeadersOn::Open => {}
-            HeadersOn::New => {
-                self.last_stream = id;
+    /// Handles one step of input. A step that waits for memory comes back,
+    /// to be handled again before anything after it.
+    fn step(&mut self, env: &mut Env<'_, Report>, read: Read) -> Result<Option<Read>, wire::Error> {
+        match read {
+            Read::Preface => {}
+            Read::Refused {
+                header,
+                error,
+                scope,
+                ..
+            } => self.refused(env, header, error, scope)?,
+            Read::Begin(begin) => self.begin(env, begin)?,
+            Read::Setting(setting) => {
+                if self.reading == Reading::Settings {
+                    self.peer_setting(setting)?;
+                }
             }
+            Read::Content(piece) => return Ok(self.content(env, piece)?.map(Read::Content)),
+            Read::End(header) => return self.end(env, header),
         }
-        if let Some(stream) = self.streams.get(&id) {
-            if stream.receive.closed {
-                return self.reset(env, id, ErrorCode::StreamClosed);
-            }
-            if !read.end || !valid_trailers(&block) {
-                return self.reset(env, id, ErrorCode::ProtocolError);
-            }
-            if stream.receive.content_remaining.is_some_and(|n| n != 0) {
-                return self.reset(env, id, ErrorCode::ProtocolError);
-            }
-            let mut charge = paid.expect("trailers are paid for before they are decoded");
-            let fields = trailer_map(block);
-            let held = size_of::<RequestTrailers>() + headers_held(&fields);
-            debug_assert!(
-                held <= charge.bytes(),
-                "trailers hold {held} bytes, past their bound of {}",
-                charge.bytes()
-            );
-            charge.shrink_to(held);
-            self.streams
-                .get_mut(&id)
-                .expect("an open stream")
-                .receive
-                .closed = true;
-            self.end_request(env, id, Some(Box::new(RequestTrailers { fields, charge })));
-            return Ok(());
-        }
-        if self.draining || self.streams.len() >= self.limits.streams as usize {
-            // A client can open streams before it reads our SETTINGS or GOAWAY,
-            // so, as in h2, these refusals do not count as errors.
-            self.write_reset(env, id, ErrorCode::RefusedStream);
-            return Ok(());
-        }
-        let list_size: usize = block
-            .headers
-            .iter()
-            .map(|h| h.name.len() + h.value.len() + 32)
-            .sum();
-        if block.more != 0
-            || block.headers.len() > self.limits.head.headers
-            || list_size > self.limits.head.head
-        {
-            let none = HeaderMap::new();
-            let head = HeadFields {
-                status: Some("431"),
-                headers: &none,
-                date: None,
-            };
-            if !self.header_block(env, id, head, true) {
-                return Ok(());
-            }
-            return self.reset(env, id, ErrorCode::RefusedStream);
-        }
-        let Some(request) = request(block, self.limits) else {
-            return self.reset(env, id, ErrorCode::ProtocolError);
-        };
-        let remaining = match content_length(request.headers()) {
-            Ok(n) => n,
-            Err(()) => return self.reset(env, id, ErrorCode::ProtocolError),
-        };
-        if read.end && remaining.is_some_and(|n| n != 0) {
-            return self.reset(env, id, ErrorCode::ProtocolError);
-        }
-        self.batch = true;
-        let opening = Opening {
-            request: Box::new(request),
-            ended: read.end,
-            at: env.now(),
-            charge: None,
-        };
-        self.admit(env, id, opening, remaining, read.end)
+        Ok(None)
     }
 
-    fn on_data(&mut self, env: &mut Env<'_, Report>, data: wire::Data) -> Result<(), wire::Error> {
-        let id = data.stream;
-        let size = data.data.len() + data.padding.as_ref().map_or(0, |p| p.len() + 1);
+    /// A frame the reader refused.
+    fn refused(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        header: FrameHeader,
+        error: wire::Error,
+        scope: wire::ErrorScope,
+    ) -> Result<(), wire::Error> {
+        if scope == wire::ErrorScope::Connection {
+            return Err(error);
+        }
+        // PRIORITY may name a stream in any state (RFC 9113 section 6.3),
+        // so a bad one resets just that stream. RST_STREAM may not name an
+        // idle stream (section 6.4), so there it ends the connection
+        // instead, as section 5.4.1 allows.
+        let priority = header.kind == 2;
+        let idle = header.stream > self.last_stream || header.stream & 1 == 0;
+        if !self.received_settings || self.codec.headers.pending() || (!priority && idle) {
+            Err(problem(
+                ErrorCode::ProtocolError,
+                "invalid frame on an idle stream or inside headers",
+            ))
+        } else if idle {
+            Err(error)
+        } else if self.ignored(header.stream) {
+            // The server reset this stream a moment ago, so it ignores the
+            // stream's late frames (section 5.1).
+            Ok(())
+        } else if priority || self.is_open(header.stream) {
+            self.reset(env, header.stream, error.code)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A frame begins: what it says is checked and acted on, and its
+    /// content, if any, has somewhere to go.
+    fn begin(&mut self, env: &mut Env<'_, Report>, begin: Begin) -> Result<(), wire::Error> {
+        self.reading = Reading::Idle;
+        if !self.received_settings
+            && !matches!(&begin, Begin::Settings { header } if header.flags & 1 == 0)
+        {
+            return Err(problem(
+                ErrorCode::ProtocolError,
+                "first frame is not SETTINGS",
+            ));
+        }
+        if matches!(begin, Begin::Continuation { .. }) {
+            self.continuations += 1;
+            let minimum = (self.limits.head.head / wire::DEFAULT_FRAME_SIZE).max(1);
+            if self.continuations > minimum.saturating_add(minimum >> 2).max(5) {
+                return Err(problem(
+                    ErrorCode::EnhanceYourCalm,
+                    "too many continuation frames",
+                ));
+            }
+        } else {
+            self.continuations = 0;
+            // A header block admits nothing but its own CONTINUATION
+            // until it ends (RFC 9113 section 6.10).
+            if self.codec.headers.pending() {
+                return Err(problem(
+                    ErrorCode::ProtocolError,
+                    "interleaved header block",
+                ));
+            }
+        }
+        match begin {
+            Begin::Data { header, len } => self.data(env, header, len)?,
+            Begin::Headers {
+                header,
+                priority,
+                len,
+            } => {
+                let read = self.codec.headers.begin(header, None, len)?;
+                self.block = Some(Block {
+                    stream: read.stream,
+                    end: read.end,
+                    self_dependent: priority.is_some_and(|p| p.stream == header.stream),
+                    whole: None,
+                });
+                self.reading = Reading::Block;
+            }
+            Begin::Continuation { header } => {
+                self.codec.headers.begin(header, None, header.length)?;
+                self.reading = Reading::Block;
+            }
+            Begin::PushPromise { .. } => {
+                return Err(problem(
+                    ErrorCode::ProtocolError,
+                    "client sent PUSH_PROMISE",
+                ));
+            }
+            Begin::Settings { header } if header.flags & 1 != 0 => {
+                if !self.awaiting_ack {
+                    return Err(problem(
+                        ErrorCode::ProtocolError,
+                        "unexpected SETTINGS acknowledgment",
+                    ));
+                }
+                self.awaiting_ack = false;
+                self.settings_deadline = None;
+            }
+            Begin::Settings { .. } => {
+                self.received_settings = true;
+                self.reading = Reading::Settings;
+            }
+            Begin::Control { control, .. } => self.on_control(env, control)?,
+        }
+        Ok(())
+    }
+
+    /// A frame of fixed fields only.
+    fn on_control(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        control: Control,
+    ) -> Result<(), wire::Error> {
+        match control {
+            Control::WindowUpdate(update) => {
+                if update.stream == 0 {
+                    self.send_window =
+                        grown(self.send_window, update.increment).ok_or_else(|| {
+                            problem(ErrorCode::FlowControlError, "connection window overflow")
+                        })?;
+                    if self.send_window > 0 {
+                        // The streams that waited for it take their turns again.
+                        while let Some(id) = self.awaiting_window.pop_front() {
+                            // It has a place there, as every open stream has.
+                            if let Some((_, stream)) = find(&self.ids, &mut self.streams, id) {
+                                stream.response.turn = if self.runnable.push_back(id).is_ok() {
+                                    Turn::Runnable
+                                } else {
+                                    Turn::Idle
+                                };
+                            }
+                        }
+                    }
+                } else if let Some((_, stream)) = find(&self.ids, &mut self.streams, update.stream)
+                {
+                    if let Some(n) = grown(stream.response.window, update.increment) {
+                        stream.response.window = n;
+                        schedule(&mut self.runnable, update.stream, &mut stream.response);
+                    } else {
+                        self.reset(env, update.stream, ErrorCode::FlowControlError)?;
+                    }
+                } else if update.stream > self.last_stream || update.stream & 1 == 0 {
+                    return Err(problem(
+                        ErrorCode::ProtocolError,
+                        "window update on idle stream",
+                    ));
+                }
+            }
+            Control::Reset(reset) => {
+                if reset.stream > self.last_stream || reset.stream & 1 == 0 {
+                    return Err(problem(ErrorCode::ProtocolError, "reset on idle stream"));
+                }
+                if find(&self.ids, &mut self.streams, reset.stream)
+                    .is_some_and(|(_, s)| !s.accepted)
+                {
+                    self.pending_resets += 1;
+                    if self.pending_resets > PENDING_RESET_MAX {
+                        return Err(problem(
+                            ErrorCode::EnhanceYourCalm,
+                            "too many pending request resets",
+                        ));
+                    }
+                }
+                let code = code_of(reset.code);
+                self.end_stream(reset.stream, Ending::Reset(code));
+            }
+            Control::Ping(ping) if ping.flags & 1 == 0 => {
+                self.control(env, 6, 1, &ping.opaque);
+            }
+            Control::Ping(ping) => {
+                if self.shutdown_ping == Some(ping.opaque) {
+                    self.shutdown_ping = None;
+                    self.draining = true;
+                    self.goaway(env, ErrorCode::NoError, self.last_stream);
+                }
+            }
+            Control::GoAway(_) => {
+                self.draining = true;
+                self.goaway(env, ErrorCode::NoError, self.last_stream);
+            }
+            Control::Priority(_) | Control::Unknown => {}
+        }
+        Ok(())
+    }
+
+    /// A DATA frame of `len` data bytes begins: it counts against both
+    /// receive windows whole, padding included, and its data goes to its
+    /// stream if the stream takes it.
+    fn data(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        header: FrameHeader,
+        len: usize,
+    ) -> Result<(), wire::Error> {
+        let id = header.stream;
+        let size = header.length;
         self.recv_window -= size as i32;
         if self.recv_window < 0 {
             return Err(problem(
@@ -1227,7 +1498,7 @@ impl Http2 {
         if self.ignored(id) {
             return Ok(());
         }
-        let Some(stream) = self.streams.get_mut(&id) else {
+        let Some((_, stream)) = find(&self.ids, &mut self.streams, id) else {
             if id > self.last_stream || id & 1 == 0 {
                 return Err(problem(ErrorCode::ProtocolError, "data on an idle stream"));
             }
@@ -1242,31 +1513,225 @@ impl Http2 {
         if receive.window < 0 {
             return self.reset(env, id, ErrorCode::FlowControlError);
         }
+        let end = header.flags & 1 != 0;
         if let Some(remaining) = &mut receive.content_remaining {
-            let Some(n) = remaining.checked_sub(data.data.len() as u64) else {
+            let Some(n) = remaining.checked_sub(len as u64) else {
                 return self.reset(env, id, ErrorCode::ProtocolError);
             };
             *remaining = n;
-            if data.flags & 1 != 0 && n != 0 {
+            if end && n != 0 {
                 return self.reset(env, id, ErrorCode::ProtocolError);
             }
         }
-        let end = data.flags & 1 != 0;
         receive.closed = end;
-        if !data.data.is_empty() && matches!(stream.delivery.overflow, Overflow::None) {
-            // The decoded body is paid for as the connection takes it in.
-            let mut chunk = Chunk::unpaid(data.data);
-            if chunk.repay(env.budget()) {
-                self.deliver_body(env, id, chunk, true);
-            } else {
-                // The body is the stream's alone to lose: its child
-                // answers, and the other streams go on.
-                self.overflow(env, id, chunk.len() as u64);
+        self.reading = Reading::Data { id, end };
+        Ok(())
+    }
+
+    /// The next bytes of the frame being read: DATA's data go to their
+    /// stream, a header block's fragment is kept where it lies or joined.
+    /// A piece that cannot be joined for want of memory comes back.
+    fn content(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        piece: Chunk,
+    ) -> Result<Option<Chunk>, wire::Error> {
+        match self.reading {
+            Reading::Data { id, .. } => {
+                let taking = find(&self.ids, &mut self.streams, id)
+                    .is_some_and(|(_, s)| matches!(s.delivery.overflow, Overflow::None));
+                if taking {
+                    // The body moves to the connection's budget as it goes
+                    // up: in place, when the budget already pays for it.
+                    let mut chunk = piece;
+                    if chunk.repay(env.budget()) {
+                        self.deliver_body(env, id, chunk, true);
+                    } else {
+                        // The body is the stream's alone to lose: its
+                        // child answers, and the other streams go on.
+                        self.overflow(env, id, chunk.len() as u64);
+                    }
+                }
             }
+            Reading::Block => {
+                if self.codec.headers.is_whole(piece.len()) {
+                    if let Some(block) = &mut self.block {
+                        block.whole = Some(piece);
+                    }
+                } else if !self.codec.headers.join(&piece)? {
+                    return Ok(Some(piece));
+                }
+            }
+            Reading::Idle | Reading::Settings => {}
         }
-        if end {
-            self.end_request(env, id, None);
+        Ok(None)
+    }
+
+    /// The frame being read ends. A header block it completes is decoded
+    /// and acted on; one without the memory it needs comes back.
+    fn end(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        header: FrameHeader,
+    ) -> Result<Option<Read>, wire::Error> {
+        match std::mem::replace(&mut self.reading, Reading::Idle) {
+            Reading::Data { id, end: true } => self.end_request(env, id, None),
+            Reading::Settings => {
+                // Every value is applied: now the acknowledgment (RFC 9113
+                // section 6.5.3).
+                self.control(env, 4, 1, &[]);
+            }
+            Reading::Block if self.codec.headers.end_frame() => {
+                if !self.complete_block(env)? {
+                    self.reading = Reading::Block;
+                    return Ok(Some(Read::End(header)));
+                }
+            }
+            Reading::Data { .. } | Reading::Block | Reading::Idle => {}
         }
+        Ok(None)
+    }
+
+    /// Decodes the header block that just ended and acts on it. Every
+    /// block is decoded, so HPACK stays in step: a request's head into a
+    /// block of the connection's, trailers into a block charged at their
+    /// bound first, and a block on a stream that takes none into nothing.
+    /// `false`, with nothing decoded, when trailers wait for memory.
+    fn complete_block(&mut self, env: &mut Env<'_, Report>) -> Result<bool, wire::Error> {
+        let Some(mut block) = self.block.take() else {
+            return Ok(true);
+        };
+        let id = block.stream;
+        let kept = !block.self_dependent && !self.ignored(id);
+        let encoded = block
+            .whole
+            .as_ref()
+            .map_or_else(|| self.codec.headers.joined_len(), |whole| whole.len());
+        let mut fields = if kept && self.is_open(id) {
+            let bound = self.codec.headers.most_block(encoded);
+            match Chunk::with_room(env.budget(), bound.bytes()) {
+                Some(room) => Fields::in_block(room),
+                None => {
+                    self.block = Some(block);
+                    return Ok(false);
+                }
+            }
+        } else if kept {
+            self.heads
+                .as_ref()
+                .and_then(|heads| heads.take(env.budget(), 0))
+                .map_or_else(Fields::new, Fields::in_block)
+        } else {
+            Fields::new()
+        };
+        let whole = block.whole.take();
+        let budget = if kept { env.budget() } else { &self.nothing };
+        self.codec
+            .headers
+            .decode(whole.as_deref(), &mut fields, budget)?;
+        drop(whole);
+        debug_assert!(
+            self.codec.headers.table_held() <= self.codec.table.bytes(),
+            "the HPACK table holds {} bytes, past its bound of {}",
+            self.codec.headers.table_held(),
+            self.codec.table.bytes()
+        );
+        self.on_block(env, block, fields)?;
+        Ok(true)
+    }
+
+    /// A header block decoded into `fields`: a request's head or its
+    /// trailers.
+    fn on_block(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        block: Block,
+        fields: Fields,
+    ) -> Result<(), wire::Error> {
+        let id = block.stream;
+        let on = self.headers_on(id)?;
+        if block.self_dependent {
+            // A stream that depends on itself is a stream error (RFC 9113
+            // section 5.3.1). Its block was decoded, so HPACK stays in step.
+            match on {
+                HeadersOn::Reset => {}
+                HeadersOn::Open => self.reset(env, id, ErrorCode::ProtocolError)?,
+                HeadersOn::New => {
+                    self.last_stream = id;
+                    self.reset(env, id, ErrorCode::ProtocolError)?;
+                }
+            }
+            return Ok(());
+        }
+        match on {
+            HeadersOn::Reset => return Ok(()),
+            HeadersOn::Open => return self.on_trailers(env, block, fields),
+            HeadersOn::New => self.last_stream = id,
+        }
+        if self.draining || self.streams.len() >= self.limits.streams as usize {
+            // A client can open streams before it reads our SETTINGS or GOAWAY,
+            // so, as in h2, these refusals do not count as errors.
+            self.write_reset(env, id, ErrorCode::RefusedStream);
+            return Ok(());
+        }
+        let list_size: usize = fields.iter().map(|(n, v)| n.len() + v.len() + 32).sum();
+        if fields.over() != 0
+            || fields.len() > self.limits.head.headers
+            || list_size > self.limits.head.head
+        {
+            let none = HeaderMap::new();
+            let head = HeadFields {
+                status: Some("431"),
+                headers: &none,
+                date: None,
+            };
+            if !self.header_block(env, id, head, true) {
+                return Ok(());
+            }
+            return self.reset(env, id, ErrorCode::RefusedStream);
+        }
+        if fields.refused() != 0 {
+            // The budget had no room for the head: the stream is refused,
+            // and the client may send it again.
+            return self.reset(env, id, ErrorCode::RefusedStream);
+        }
+        let Some(head) = request_head(fields, self.limits) else {
+            return self.reset(env, id, ErrorCode::ProtocolError);
+        };
+        if block.end && head.content_length().is_some_and(|n| n != 0) {
+            return self.reset(env, id, ErrorCode::ProtocolError);
+        }
+        self.batch = true;
+        let opening = Opening {
+            head,
+            ended: block.end,
+            at: env.now(),
+        };
+        self.admit(env, id, opening, block.end)
+    }
+
+    /// A header block on open stream `id`: its request's trailers.
+    fn on_trailers(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        block: Block,
+        fields: Fields,
+    ) -> Result<(), wire::Error> {
+        let id = block.stream;
+        let Some((_, stream)) = find(&self.ids, &mut self.streams, id) else {
+            return Ok(());
+        };
+        if stream.receive.closed {
+            return self.reset(env, id, ErrorCode::StreamClosed);
+        }
+        if !block.end || !valid_trailers(&fields) {
+            return self.reset(env, id, ErrorCode::ProtocolError);
+        }
+        if stream.receive.content_remaining.is_some_and(|n| n != 0) {
+            return self.reset(env, id, ErrorCode::ProtocolError);
+        }
+        stream.receive.closed = true;
+        self.end_request(env, id, Some(RequestTrailers::new(fields)));
         Ok(())
     }
 
@@ -1276,7 +1741,10 @@ impl Http2 {
             1 => self.encoder.set_settings_limit(setting.value as usize),
             4 => {
                 let initial = setting.value as i32;
-                for (&id, stream) in self.streams.iter_mut() {
+                for &(id, child) in self.ids.iter() {
+                    let Some(stream) = self.streams.get_mut(child) else {
+                        continue;
+                    };
                     stream.response.window = shifted(stream.response.window, self.initial, initial)
                         .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "initial window overflow")
@@ -1291,273 +1759,56 @@ impl Http2 {
         Ok(())
     }
 
-    fn on_frame(&mut self, env: &mut Env<'_, Report>, frame: Frame) -> Result<(), wire::Error> {
-        if !self.received_settings && !matches!(&frame, Frame::Settings(s) if s.flags & 1 == 0) {
-            return Err(problem(
-                ErrorCode::ProtocolError,
-                "first frame is not SETTINGS",
-            ));
-        }
-        if matches!(frame, Frame::Continuation(_)) {
-            self.continuations += 1;
-            let minimum = (self.limits.head.head / wire::DEFAULT_FRAME_SIZE).max(1);
-            if self.continuations > minimum.saturating_add(minimum >> 2).max(5) {
-                return Err(problem(
-                    ErrorCode::EnhanceYourCalm,
-                    "too many continuation frames",
-                ));
-            }
-        } else {
-            self.continuations = 0;
-        }
-        self.dispatch(env, frame)
-    }
-
-    /// Whether a header block on stream `id` is the trailers of a request
-    /// already open.
-    fn trailers_on(&self, id: u32) -> bool {
-        !self.ignored(id) && self.streams.contains_key(&id)
-    }
-
-    /// Acts on a frame. A header frame whose block cannot be read for want
-    /// of memory is held, and read again once memory frees, before any
-    /// frame after it.
-    fn dispatch(&mut self, env: &mut Env<'_, Report>, frame: Frame) -> Result<(), wire::Error> {
-        let stream = match &frame {
-            Frame::Headers(h) => Some(h.stream),
-            Frame::Continuation(c) => Some(c.stream),
-            _ => None,
-        };
-        let trailers = stream.is_some_and(|id| self.trailers_on(id));
-        let Some(headers) = self
-            .codec
-            .read_headers(&frame, trailers.then_some(env.budget()))
-        else {
-            self.held = Some(frame);
-            return Ok(());
-        };
-        let (headers, paid) = headers?;
-        match frame {
-            // A stream that depends on itself is a stream error (RFC 9113
-            // section 5.3.1). Its block was decoded above, so HPACK stays in step.
-            Frame::Headers(h) if h.priority.is_some_and(|p| p.stream == h.stream) => {
-                match self.headers_on(h.stream)? {
-                    HeadersOn::Reset => {}
-                    HeadersOn::Open => self.reset(env, h.stream, ErrorCode::ProtocolError)?,
-                    HeadersOn::New => {
-                        self.last_stream = h.stream;
-                        self.reset(env, h.stream, ErrorCode::ProtocolError)?;
-                    }
-                }
-            }
-            Frame::Headers(_) | Frame::Continuation(_) => self.on_headers(env, headers, paid)?,
-            Frame::Data(data) => self.on_data(env, data)?,
-            Frame::Settings(settings) => {
-                if settings.flags & 1 != 0 {
-                    if !self.awaiting_ack {
-                        return Err(problem(
-                            ErrorCode::ProtocolError,
-                            "unexpected SETTINGS acknowledgment",
-                        ));
-                    }
-                    self.awaiting_ack = false;
-                    self.settings_deadline = None;
-                } else {
-                    self.received_settings = true;
-                    for setting in settings.entries {
-                        self.peer_setting(setting)?;
-                    }
-                    // Every value is applied: now the acknowledgment (RFC
-                    // 9113 section 6.5.3).
-                    self.control(
-                        env,
-                        wire::HEADER_LEN,
-                        &wire::Settings {
-                            flags: 1,
-                            entries: Vec::new(),
-                        },
-                    );
-                }
-            }
-            Frame::WindowUpdate(update) => {
-                if update.stream == 0 {
-                    self.send_window =
-                        grown(self.send_window, update.increment).ok_or_else(|| {
-                            problem(ErrorCode::FlowControlError, "connection window overflow")
-                        })?;
-                    if self.send_window > 0 {
-                        // The streams that waited for it take their turns again.
-                        while let Some(id) = self.awaiting_window.pop_front() {
-                            // It has a place there, as every open stream has.
-                            if let Some(stream) = self.streams.get_mut(&id) {
-                                stream.response.turn = if self.runnable.push_back(id).is_ok() {
-                                    Turn::Runnable
-                                } else {
-                                    Turn::Idle
-                                };
-                            }
-                        }
-                    }
-                } else if let Some(stream) = self.streams.get_mut(&update.stream) {
-                    if let Some(n) = grown(stream.response.window, update.increment) {
-                        stream.response.window = n;
-                        schedule(&mut self.runnable, update.stream, &mut stream.response);
-                    } else {
-                        self.reset(env, update.stream, ErrorCode::FlowControlError)?;
-                    }
-                } else if update.stream > self.last_stream || update.stream & 1 == 0 {
-                    return Err(problem(
-                        ErrorCode::ProtocolError,
-                        "window update on idle stream",
-                    ));
-                }
-            }
-            Frame::Reset(reset) => {
-                if reset.stream > self.last_stream || reset.stream & 1 == 0 {
-                    return Err(problem(ErrorCode::ProtocolError, "reset on idle stream"));
-                }
-                if self.streams.get(&reset.stream).is_some_and(|s| !s.accepted) {
-                    self.pending_resets += 1;
-                    if self.pending_resets > PENDING_RESET_MAX {
-                        return Err(problem(
-                            ErrorCode::EnhanceYourCalm,
-                            "too many pending request resets",
-                        ));
-                    }
-                }
-                let code = code_of(reset.code);
-                self.end_stream(reset.stream, Ending::Reset(code));
-            }
-            Frame::Ping(ping) if ping.flags & 1 == 0 => {
-                self.control(
-                    env,
-                    wire::HEADER_LEN + 8,
-                    &wire::Ping {
-                        flags: 1,
-                        opaque: ping.opaque,
-                    },
-                );
-            }
-            Frame::Ping(ping) => {
-                if self.shutdown_ping == Some(ping.opaque) {
-                    self.shutdown_ping = None;
-                    self.draining = true;
-                    self.goaway(env, ErrorCode::NoError, self.last_stream);
-                }
-            }
-            Frame::GoAway(_) => {
-                self.draining = true;
-                self.goaway(env, ErrorCode::NoError, self.last_stream);
-            }
-            Frame::PushPromise(_) => {
-                return Err(problem(
-                    ErrorCode::ProtocolError,
-                    "client sent PUSH_PROMISE",
-                ));
-            }
-            Frame::Priority(_) | Frame::Unknown(_) => {}
-        }
-        Ok(())
-    }
-
-    fn on_input(&mut self, env: &mut Env<'_, Report>, item: Input) -> Result<(), wire::Error> {
-        match item {
-            Input::Frame(frame) => self.on_frame(env, frame),
-            Input::Refused {
-                scope: wire::ErrorScope::Connection,
-                error,
-                ..
-            } => Err(error),
-            Input::Refused {
-                header,
-                error,
-                scope: wire::ErrorScope::Stream,
-                ..
-            } => {
-                // PRIORITY may name a stream in any state (RFC 9113 section
-                // 6.3), so a bad one resets just that stream. RST_STREAM may
-                // not name an idle stream (section 6.4), so there it ends the
-                // connection instead, as section 5.4.1 allows.
-                let priority = header.kind == 2;
-                let idle = header.stream > self.last_stream || header.stream & 1 == 0;
-                if !self.received_settings || self.codec.headers.pending() || (!priority && idle) {
-                    Err(problem(
-                        ErrorCode::ProtocolError,
-                        "invalid frame on an idle stream or inside headers",
-                    ))
-                } else if idle {
-                    Err(error)
-                } else if self.ignored(header.stream) {
-                    // The server reset this stream a moment ago, so it
-                    // ignores the stream's late frames (section 5.1).
-                    Ok(())
-                } else if priority || self.streams.contains_key(&header.stream) {
-                    self.reset(env, header.stream, error.code)
-                } else {
-                    Ok(())
-                }
-            }
-            Input::Preface => Ok(()),
-        }
-    }
-
-    /// Reads input until a bounded number of frames is read, the children
-    /// or the transport fall behind, or no whole frame is left. Returns
-    /// whether anything moved, and whether all the input is read.
+    /// Reads input until a bounded number of steps is read, the children
+    /// or the transport fall behind, a step waits for memory, or the input
+    /// is used up. Returns whether anything moved, and whether all the
+    /// input is read.
     fn read(&mut self, env: &mut Env<'_, Report>) -> (bool, bool) {
         let mut moved = false;
-        for _ in 0..FRAMES {
+        for _ in 0..STEPS {
             if self.phase != Phase::Open
                 || self.up.len() >= UP_LIMIT
                 || self.unwritten_bytes >= OUT_LIMIT
             {
                 return (moved, false);
             }
-            if let Some(frame) = self.held.take() {
-                if let Err(error) = self.dispatch(env, frame) {
-                    self.fail(env, error);
-                    return (true, false);
-                }
-                if self.held.is_some() {
-                    return (moved, false);
-                }
-                moved = true;
-            }
-            if let Some(chunk) = &mut self.input {
-                let Some(n) = self.codec.push(chunk) else {
-                    self.over_budget(env);
-                    return (true, false);
-                };
-                chunk.advance(n);
-                if chunk.is_empty() {
-                    self.input = None;
-                }
-                moved |= n > 0;
-            }
-            if self.input.is_none() && self.peer_ended && !self.codec.frames.is_eof() {
-                self.codec.frames.end();
-            }
-            match self.codec.frames.next() {
-                Some(Ok(item)) => {
-                    moved = true;
-                    if let Err(error) = self.on_input(env, item) {
-                        self.fail(env, error);
-                        return (true, false);
-                    }
-                    if self.held.is_some() {
-                        return (true, false);
-                    }
-                }
-                Some(Err(fail)) => {
-                    let error = match fail {
-                        Fail::Protocol(error) => error,
-                        _ => problem(ErrorCode::ProtocolError, "truncated HTTP/2 frame"),
+            let (read, again) = match self.held.take() {
+                Some(read) => (read, true),
+                None => {
+                    let Some(input) = &mut self.input else {
+                        if self.peer_ended
+                            && let Err(error) = self.codec.reader.finish()
+                        {
+                            self.fail(env, error);
+                            return (true, false);
+                        }
+                        return (moved, true);
                     };
+                    match self.codec.reader.next(input) {
+                        Some(Ok(read)) => (read, false),
+                        Some(Err(error)) => {
+                            self.fail(env, error);
+                            return (true, false);
+                        }
+                        None => {
+                            // All of it is read: what went up shares it.
+                            self.input = None;
+                            continue;
+                        }
+                    }
+                }
+            };
+            match self.step(env, read) {
+                Ok(None) => moved = true,
+                Ok(Some(wait)) => {
+                    self.held = Some(wait);
+                    // A step that waits again moved nothing.
+                    return (moved || !again, false);
+                }
+                Err(error) => {
                     self.fail(env, error);
                     return (true, false);
                 }
-                None if self.input.is_some() => {}
-                None => return (moved, true),
             }
         }
         (moved, false)
@@ -1583,7 +1834,7 @@ impl Http2 {
         let mut next = 0;
         while let Some(&id) = self.credit_due.get(next) {
             next += 1;
-            let Some(stream) = self.streams.get_mut(&id) else {
+            let Some((_, stream)) = find(&self.ids, &mut self.streams, id) else {
                 continue;
             };
             stream.receive.credit_due = false;
@@ -1603,7 +1854,7 @@ impl Http2 {
                     // The connection is over: every stream has ended.
                     return true;
                 }
-                if let Some(stream) = self.streams.get_mut(&id) {
+                if let Some((_, stream)) = find(&self.ids, &mut self.streams, id) {
                     stream.receive.window += back as i32;
                 }
             }
@@ -1615,27 +1866,18 @@ impl Http2 {
     }
 
     fn window_update(&mut self, env: &mut Env<'_, Report>, stream: u32, increment: u32) -> bool {
-        self.control(
-            env,
-            wire::HEADER_LEN + 4,
-            &wire::WindowUpdate {
-                stream,
-                flags: 0,
-                increment,
-            },
-        )
+        let increment = increment & wire::MAX_WINDOW;
+        self.stream_control(env, 8, 0, stream, &increment.to_be_bytes())
     }
 
     // -----------------------------------------------------------------------
     // Responses
 
     fn on_child(&mut self, env: &mut Env<'_, Report>, child: ChildId, command: ExchangeCommand) {
-        let Some(&id) = self.children.as_ref().and_then(|c| c.get(child)) else {
+        let Some(stream) = self.streams.get_mut(child) else {
             return;
         };
-        let Some(stream) = self.streams.get_mut(&id) else {
-            return;
-        };
+        let id = stream.id;
         let response = &mut stream.response;
         let body = matches!(response.reply, Reply::Body);
         match command {
@@ -1680,18 +1922,18 @@ impl Http2 {
             date: date.as_ref(),
         };
         if self.header_block(env, id, fields, head.end)
-            && let Some(stream) = self.streams.get_mut(&id)
+            && let Some((_, stream)) = find(&self.ids, &mut self.streams, id)
         {
             stream.response.reply = if head.end { Reply::Ended } else { Reply::Body };
         }
     }
-
     /// Writes a header block on stream `id`, framed as HEADERS and
     /// CONTINUATION frames in one write. Its room is charged before
     /// anything is encoded, from a bound found without allocating, and the
-    /// block is encoded and framed in that room. Returns whether it went
-    /// out; past the budget, the connection ends, and one that cannot be
-    /// encoded resets the stream.
+    /// block is encoded and framed in that room: a head block of the
+    /// connection's when it fits one. Returns whether it went out; past the
+    /// budget, the connection ends, and one that cannot be encoded resets
+    /// the stream.
     fn header_block(
         &mut self,
         env: &mut Env<'_, Report>,
@@ -1708,24 +1950,28 @@ impl Http2 {
             self.write_reset(env, id, ErrorCode::InternalError);
             return false;
         };
-        let Some(mut out) = ChargedBytes::with_capacity(env.budget(), len) else {
+        let Some(mut block) = self.block(env.budget(), len, false) else {
             self.over_budget(env);
             return false;
         };
         // A zero-capacity table keeps response storage bounded while still
         // honoring the peer's required table-size updates.
         let encoder = &mut self.encoder;
-        let written = out.fill(|out| {
-            out.resize(wire::HEADER_LEN, 0);
-            encoder.encode_block(fields, out).map_err(|_| ())?;
-            frame_block(out, id, end, max).map_err(|_| ())
+        let mut framed = Err(());
+        block.fill(|room| {
+            let room = &mut room[..len];
+            framed = encoder
+                .encode_block_into(fields, &mut room[wire::HEADER_LEN..])
+                .map_err(|_| ())
+                .and_then(|encoded| frame_block(room, encoded, id, end, max).map_err(|_| ()));
+            *framed.as_ref().unwrap_or(&0)
         });
-        if written.is_err() {
-            drop(out);
+        if framed.is_err() {
+            drop(block);
             self.write_reset(env, id, ErrorCode::InternalError);
             return false;
         }
-        self.queue(env, Chunk::from(out), id, 0, end)
+        self.queue(env, block, id, 0, end)
     }
 
     /// Frames response bodies within both windows, a frame per stream in
@@ -1738,7 +1984,7 @@ impl Http2 {
             && self.phase == Phase::Open
             && let Some(id) = self.runnable.pop_front()
         {
-            let Some(stream) = self.streams.get_mut(&id) else {
+            let Some((_, stream)) = find(&self.ids, &mut self.streams, id) else {
                 continue;
             };
             stream.response.turn = Turn::Idle;
@@ -1750,7 +1996,7 @@ impl Http2 {
                 Sent::Nothing => {}
                 Sent::AwaitingWindow => {
                     // It has a place there, as every open stream has.
-                    if let Some(stream) = self.streams.get_mut(&id)
+                    if let Some((_, stream)) = find(&self.ids, &mut self.streams, id)
                         && self.awaiting_window.push_back(id).is_ok()
                     {
                         stream.response.turn = Turn::AwaitingWindow;
@@ -1765,7 +2011,7 @@ impl Http2 {
     fn send_one(&mut self, env: &mut Env<'_, Report>, id: u32) -> Sent {
         let frame = self.frame.min(wire::DEFAULT_FRAME_SIZE);
         let window = self.send_window;
-        let Some(stream) = self.streams.get_mut(&id) else {
+        let Some((_, stream)) = find(&self.ids, &mut self.streams, id) else {
             return Sent::Nothing;
         };
         let response = &mut stream.response;
@@ -1794,28 +2040,16 @@ impl Http2 {
             // the child's allocation, behind a header of its own: that is
             // where bulk bodies go, and a TLS record could not hold both.
             let whole = n < frame;
-            let len = wire::HEADER_LEN + if whole { n } else { 0 };
-            let header = wire::FrameHeader {
+            let header = FrameHeader {
                 length: n,
                 kind: 0,
                 flags: 0,
                 stream: id,
             };
-            let framed = ChargedBytes::with_capacity(env.budget(), len).and_then(|mut bytes| {
-                bytes.fill(|bytes| header.write(bytes)).ok()?;
-                if whole {
-                    bytes.extend_within(&payload).ok()?;
-                }
-                Some(bytes)
-            });
-            let Some(bytes) = framed else {
-                self.over_budget(env);
-                return Sent::Frame;
-            };
             let queued = if whole {
-                self.queue(env, Chunk::from(bytes), id, n as u64, false)
+                self.frame(env, header, &payload, n as u64, false, false)
             } else {
-                self.queue(env, Chunk::from(bytes), id, 0, false)
+                self.frame(env, header, &[], 0, false, false)
                     && self.queue_continuation(env, payload, id, n as u64)
             };
             if queued {
@@ -1825,18 +2059,13 @@ impl Http2 {
         }
         match std::mem::replace(&mut response.reply, Reply::Ended) {
             Reply::Ending(None) => {
-                self.frame_for(
-                    env,
-                    wire::HEADER_LEN,
-                    &wire::Data {
-                        stream: id,
-                        flags: 1,
-                        data: Vec::new(),
-                        padding: None,
-                    },
-                    id,
-                    true,
-                );
+                let header = FrameHeader {
+                    length: 0,
+                    kind: 0,
+                    flags: 1,
+                    stream: id,
+                };
+                self.frame(env, header, &[], 0, true, false);
                 Sent::Frame
             }
             Reply::Ending(Some(trailers)) => {
@@ -1858,14 +2087,13 @@ impl Http2 {
     /// Gives stream `id`'s child more credit for its body, as the bytes it
     /// sent go out.
     fn grant(&mut self, env: &mut Env<'_, Report>, id: u32) {
-        let Some(stream) = self.streams.get_mut(&id) else {
+        let Some((child, stream)) = find(&self.ids, &mut self.streams, id) else {
             return;
         };
         let response = &mut stream.response;
         let more = more_credit(response.credit_bytes, response.queued_bytes);
         if more > 0 && matches!(response.reply, Reply::Body) {
             response.credit_bytes += more;
-            let child = stream.child;
             self.push_up(env, MuxEvent::Credit(child, more));
         }
     }
@@ -1893,7 +2121,7 @@ impl Http2 {
             }
             // Each list has a place for every open stream, which it holds
             // at most once.
-            if let Some(stream) = self.streams.get_mut(&piece.stream) {
+            if let Some((_, stream)) = find(&self.ids, &mut self.streams, piece.stream) {
                 if piece.body > 0 {
                     stream.response.written_bytes += piece.body;
                     if !self.touched.contains(&piece.stream) {
@@ -1907,11 +2135,11 @@ impl Http2 {
         }
         for at in 0..self.touched.len() {
             let id = self.touched[at];
-            if let Some(stream) = self.streams.get(&id)
+            if let Some((child, stream)) = find(&self.ids, &mut self.streams, id)
                 && !self.finished.contains(&id)
             {
                 let written = ExchangeEvent::Written(stream.response.written_bytes);
-                let event = MuxEvent::Child(stream.child, written);
+                let event = MuxEvent::Child(child, written);
                 if !self.push_up(env, event) {
                     break;
                 }
@@ -1921,7 +2149,8 @@ impl Http2 {
         // list.
         for at in 0..self.finished.len() {
             let id = self.finished[at];
-            let open = self.streams.get(&id).is_some_and(|s| !s.receive.closed);
+            let open =
+                find(&self.ids, &mut self.streams, id).is_some_and(|(_, s)| !s.receive.closed);
             self.end_stream(id, Ending::Done);
             if open {
                 // The response is complete but the request is not: ask the
@@ -1966,8 +2195,8 @@ impl Layer for Http2 {
                 }
                 // One delivery at a time, read whole before the next, and
                 // none while the transport falls behind. The delivery keeps
-                // whatever charge it came with: the bytes are read from it
-                // into the frame buffer, charged before each growth.
+                // whatever charge it came with, and so does every piece of
+                // it that goes up as DATA: nothing is copied out of it.
                 if self.input.is_some() || self.unwritten_bytes >= OUT_LIMIT {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                 }
@@ -1988,6 +2217,8 @@ impl Layer for Http2 {
                 self.taken = 0;
                 self.unwritten_bytes = 0;
                 self.input = None;
+                self.held = None;
+                self.block = None;
                 self.resets.clear();
                 self.resets.shrink_to(0);
                 self.phase = Phase::Closed;
@@ -2020,15 +2251,14 @@ impl Layer for Http2 {
                 Ok(Admit::Taken)
             }
             MuxOp::Credit(child, units) | MuxOp::Window(child, units, _) => {
-                if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child)) {
-                    if let Some(stream) = self.streams.get_mut(&id) {
-                        let delivery = &mut stream.delivery;
-                        delivery.credit_bytes = delivery.credit_bytes.saturating_add(units);
-                        delivery.peak_credit_bytes =
-                            delivery.peak_credit_bytes.max(delivery.credit_bytes);
-                        self.uncredited -= usize::from(!delivery.credited);
-                        delivery.credited = true;
-                    }
+                if let Some(stream) = self.streams.get_mut(child) {
+                    let id = stream.id;
+                    let delivery = &mut stream.delivery;
+                    delivery.credit_bytes = delivery.credit_bytes.saturating_add(units);
+                    delivery.peak_credit_bytes =
+                        delivery.peak_credit_bytes.max(delivery.credit_bytes);
+                    self.uncredited -= usize::from(!delivery.credited);
+                    delivery.credited = true;
                     self.credit_may_be_due(id);
                     self.forward(env, id);
                     // The child read: credit for its stream may be due.
@@ -2044,9 +2274,8 @@ impl Layer for Http2 {
                 // that failed after it was taken is INTERNAL_ERROR. One
                 // they are done with is refused if its response never
                 // began, and reset if it had.
-                if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child))
-                    && let Some(stream) = self.streams.get(&id)
-                {
+                if let Some(stream) = self.streams.get(child) {
+                    let id = stream.id;
                     let code = match why {
                         Closing::Prohibited | Closing::ResourceShortage => ErrorCode::RefusedStream,
                         Closing::Failed => ErrorCode::InternalError,
@@ -2101,7 +2330,7 @@ impl Layer for Http2 {
             let opaque = env.entropy().random_u64().to_be_bytes();
             self.shutdown_ping = Some(opaque);
             self.goaway(env, ErrorCode::NoError, wire::MAX_WINDOW);
-            self.control(env, wire::HEADER_LEN + 8, &wire::Ping { flags: 0, opaque });
+            self.control(env, 6, 0, &opaque);
             moved = true;
         }
         let (read, drained) = self.read(env);
@@ -2129,13 +2358,8 @@ impl Layer for Http2 {
             self.close();
             moved = true;
         }
-        if self.input.is_none()
-            && !self.codec.headers.pending()
-            && self.streams.values().all(|stream| stream.receive.closed)
-        {
-            self.codec.trim();
-        }
         if self.streams.is_empty() {
+            self.ids.shrink_to(KEEP);
             self.credit_due.shrink_to(KEEP);
             self.touched.shrink_to(KEEP);
             self.finished.shrink_to(KEEP);
@@ -2186,6 +2410,20 @@ impl Layer for Http2 {
             .min()
             .map(|at| (at, Timer::Deadline))
     }
+}
+
+/// A SETTINGS entry as it is on the wire.
+fn setting(id: u16, value: u32) -> [u8; 6] {
+    let [i0, i1] = id.to_be_bytes();
+    let [v0, v1, v2, v3] = value.to_be_bytes();
+    [i0, i1, v0, v1, v2, v3]
+}
+
+/// A GOAWAY's payload: the last stream and the code, without debug bytes.
+fn goaway_payload(last: u32, code: ErrorCode) -> [u8; 8] {
+    let [l0, l1, l2, l3] = (last & wire::MAX_WINDOW).to_be_bytes();
+    let [c0, c1, c2, c3] = (code as u32).to_be_bytes();
+    [l0, l1, l2, l3, c0, c1, c2, c3]
 }
 
 fn problem(code: ErrorCode, reason: &'static str) -> wire::Error {
@@ -2239,20 +2477,32 @@ fn framed_len(block: usize, max: usize) -> Option<usize> {
     block.checked_add(frames.checked_mul(wire::HEADER_LEN)?)
 }
 
-/// Frames, in place, the header block that follows [`wire::HEADER_LEN`]
-/// bytes kept free at the start of `out`: a HEADERS frame with as much as
-/// a frame of `max` bytes carries, then CONTINUATION frames with the rest.
-/// The fragments move apart, last first, so each has its header in front
-/// of it; `out` grows by those headers, within the room [`framed_len`]
-/// counts.
-fn frame_block(out: &mut Vec<u8>, stream: u32, end: bool, max: usize) -> Result<(), wire::Error> {
-    let block = out.len() - wire::HEADER_LEN;
+/// Frames, in place, the header block of `block` bytes that follows
+/// [`wire::HEADER_LEN`] bytes kept free at the start of `out`: a HEADERS
+/// frame with as much as a frame of `max` bytes carries, then
+/// CONTINUATION frames with the rest. The fragments move apart, last
+/// first, so each has its header in front of it, within the room
+/// [`framed_len`] counts. Returns the framed length; `out` shorter than it
+/// is an error, with nothing moved.
+fn frame_block(
+    out: &mut [u8],
+    block: usize,
+    stream: u32,
+    end: bool,
+    max: usize,
+) -> Result<usize, wire::Error> {
     let first = block.min(max);
     let rest = block - first;
     let more = rest.div_ceil(max);
     // Where the rest starts before it moves.
     let start = wire::HEADER_LEN + first;
-    out.resize(out.len() + more * wire::HEADER_LEN, 0);
+    let framed = wire::HEADER_LEN + block + more * wire::HEADER_LEN;
+    if out.len() < framed {
+        return Err(problem(
+            ErrorCode::InternalError,
+            "no room to frame a header block",
+        ));
+    }
     for i in (0..more).rev() {
         let from = start + i * max;
         let len = max.min(rest - i * max);
@@ -2275,7 +2525,7 @@ fn frame_block(out: &mut Vec<u8>, stream: u32, end: bool, max: usize) -> Result<
         stream,
     };
     out[..wire::HEADER_LEN].copy_from_slice(&header.to_array()?);
-    Ok(())
+    Ok(framed)
 }
 
 /// The fields of a head or trailers as HTTP/2 carries them, borrowed: the
@@ -2291,10 +2541,10 @@ struct HeadFields<'a> {
 
 impl<'a> IntoIterator for HeadFields<'a> {
     type Item = hpack::FieldRef<'a>;
-    type IntoIter = Fields<'a>;
+    type IntoIter = HeadIter<'a>;
 
-    fn into_iter(self) -> Fields<'a> {
-        Fields {
+    fn into_iter(self) -> HeadIter<'a> {
+        HeadIter {
             status: self.status,
             headers: self.headers.iter(),
             date: self.date,
@@ -2303,13 +2553,13 @@ impl<'a> IntoIterator for HeadFields<'a> {
 }
 
 /// One pass over [`HeadFields`].
-struct Fields<'a> {
+struct HeadIter<'a> {
     status: Option<&'a str>,
     headers: http::header::Iter<'a, HeaderValue>,
     date: Option<&'a HeaderValue>,
 }
 
-impl<'a> Iterator for Fields<'a> {
+impl<'a> Iterator for HeadIter<'a> {
     type Item = hpack::FieldRef<'a>;
 
     fn next(&mut self) -> Option<hpack::FieldRef<'a>> {
@@ -2408,60 +2658,76 @@ pub(super) fn content_length(headers: &http::HeaderMap) -> Result<Option<u64>, (
     Ok(length)
 }
 
-fn valid_trailers(block: &hpack::Block) -> bool {
-    block.more == 0
-        && block.headers.iter().all(|h| {
-            !h.name.starts_with(b":")
-                && valid_name(&h.name)
-                && HeaderValue::from_bytes(&h.value).is_ok()
-        })
+/// Whether a block of trailers can end a request: whole, with no
+/// pseudo-fields, and every field one HTTP/2 carries.
+fn valid_trailers(fields: &Fields) -> bool {
+    fields.left_out() == 0
+        && fields
+            .iter()
+            .all(|(name, value)| !name.starts_with(b":") && valid_name(name) && valid_value(value))
 }
 
-/// The most a request's trailers take while they are read from a block
-/// within `bound`: the decoded block, the map [`trailer_map`] builds from
-/// it, and the box they go up in, of which the map and the box stay.
-///
-/// The map is counted as [`headers_held`] counts it: its capacity and a
-/// place per repeated name, each the size of a name and a value, and its
-/// octets, at most the block's. Made for `n` fields, its capacity is
-/// under `2n`. It grows past that only when names collide in runs of
-/// 128, so only with 128 fields or more, and only while its index has
-/// fewer than five places per field, so its capacity stays under `8n`.
-fn most_trailers(bound: hpack::BlockBound) -> usize {
-    let fields = bound.headers;
-    let capacity = if fields < 128 { 2 * fields } else { 8 * fields };
-    (capacity + fields)
-        .saturating_mul(size_of::<(HeaderName, HeaderValue)>())
-        .saturating_add(bound.octets)
-        .saturating_add(bound.heap())
-        .saturating_add(size_of::<RequestTrailers>())
+/// Fields that concern only one connection, which HTTP/2 does not carry
+/// (RFC 9113 section 8.2.2).
+fn connection_specific(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
+    )
 }
 
-/// A checked trailer block as a map.
-fn trailer_map(block: hpack::Block) -> HeaderMap {
-    let mut map = HeaderMap::with_capacity(block.headers.len());
-    for h in block.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(&h.name),
-            HeaderValue::from_bytes(&h.value),
-        ) {
-            map.append(name, value);
-        }
-    }
-    map
+/// A token character (RFC 9110 section 5.6.2).
+fn token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
+/// A field name HTTP/2 carries: a token, in lower case (RFC 9113 section
+/// 8.2.1), and not connection-specific.
 fn valid_name(name: &[u8]) -> bool {
-    !name.iter().any(u8::is_ascii_uppercase)
-        && HeaderName::from_bytes(name).is_ok()
-        && !matches!(
-            name,
-            b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
-        )
+    !name.is_empty()
+        && name
+            .iter()
+            .all(|&b| token_char(b) && !b.is_ascii_uppercase())
+        && !connection_specific(name)
 }
 
-fn request(block: hpack::Block, limits: Limits) -> Option<Request<()>> {
-    if block.more != 0 || block.headers.len() > limits.head.headers {
+/// A field value with no control characters but horizontal tab.
+fn valid_value(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&b| (b >= 0x20 && b != 0x7f) || b == b'\t')
+}
+
+/// A scheme's characters (RFC 3986 section 3.1), at most 64 of them.
+fn valid_scheme(scheme: &[u8]) -> bool {
+    (1..=64).contains(&scheme.len())
+        && scheme
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+}
+
+/// The length a `content-length` value gives, if it is one, and agrees
+/// with the length an earlier one gave.
+fn length_of(value: &[u8], before: Option<u64>) -> Option<u64> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let length = std::str::from_utf8(value).ok()?.parse().ok()?;
+    before
+        .is_none_or(|before| before == length)
+        .then_some(length)
+}
+
+/// A request's head, checked as RFC 9113 section 8.3 asks, from its
+/// fields: every one kept; pseudo-fields first, each known and once, in
+/// UTF-8; regular fields valid, in lower case and not connection-specific,
+/// `te` only as `trailers`, and `content-length` a number every time it
+/// comes. `:method` is a token; a CONNECT names an authority and no scheme
+/// or path, and any other method has a scheme and a path, which starts
+/// with `/`, or is `*` for OPTIONS. Nothing is allocated: what the head
+/// says is read from its block.
+fn request_head(fields: Fields, limits: Limits) -> Option<RequestHead> {
+    if fields.left_out() != 0 || fields.len() > limits.head.headers {
         return None;
     }
     let mut method = None;
@@ -2469,81 +2735,50 @@ fn request(block: hpack::Block, limits: Limits) -> Option<Request<()>> {
     let mut authority = None;
     let mut path = None;
     let mut regular = false;
-    let mut headers = http::HeaderMap::new();
-    let mut cookie: Option<Vec<u8>> = None;
-    let mut list_size = 0usize;
-    for h in block.headers {
-        let (name, value) = (h.name, h.value);
-        list_size = list_size.checked_add(name.len() + value.len() + 32)?;
-        if list_size > limits.head.head {
-            return None;
-        }
-        if name.starts_with(b":") {
+    let mut length = None;
+    for (name, value) in fields.iter() {
+        if let Some(pseudo) = name.strip_prefix(b":") {
             if regular {
                 return None;
             }
-            let target = match name.as_slice() {
-                b":method" => &mut method,
-                b":scheme" => &mut scheme,
-                b":authority" => &mut authority,
-                b":path" => &mut path,
+            let target = match pseudo {
+                b"method" => &mut method,
+                b"scheme" => &mut scheme,
+                b"authority" => &mut authority,
+                b"path" => &mut path,
                 _ => return None,
             };
-            if target.replace(String::from_utf8(value).ok()?).is_some() {
+            if std::str::from_utf8(value).is_err() || target.replace(value).is_some() {
                 return None;
             }
         } else {
             regular = true;
-            if !valid_name(&name) || (name == b"te" && value != b"trailers") {
+            if !valid_name(name) || !valid_value(value) || (name == b"te" && value != b"trailers") {
                 return None;
             }
-            // A client may split a cookie into several fields. They reach
-            // the application joined with "; " (RFC 9113 section 8.2.3).
-            if name == b"cookie"
-                && let Some(first) = headers.get(http::header::COOKIE)
-            {
-                let joined = cookie.get_or_insert_with(|| first.as_bytes().to_vec());
-                joined.extend_from_slice(b"; ");
-                joined.extend_from_slice(&value);
-            } else {
-                headers.append(
-                    HeaderName::from_bytes(&name).ok()?,
-                    HeaderValue::from_bytes(&value).ok()?,
-                );
+            if name == b"content-length" {
+                length = Some(length_of(value, length)?);
             }
         }
     }
-    if let Some(cookie) = cookie {
-        headers.insert(http::header::COOKIE, HeaderValue::from_bytes(&cookie).ok()?);
+    let method = method?;
+    if method.is_empty() || !method.iter().all(|&b| token_char(b)) {
+        return None;
     }
-    let method = Method::from_bytes(method?.as_bytes()).ok()?;
-    let mut uri = http::uri::Parts::default();
-    uri.authority = authority.map(|a| a.parse()).transpose().ok()?;
-    if method == Method::CONNECT {
-        if scheme.is_some() || path.is_some() || uri.authority.is_none() {
+    if method == b"CONNECT" {
+        if scheme.is_some() || path.is_some() || authority.is_none() {
             return None;
         }
     } else {
-        let scheme: http::uri::Scheme = scheme?.parse().ok()?;
-        if uri.authority.is_some() {
-            uri.scheme = Some(scheme);
-        }
         let path = path?;
-        if path.is_empty()
-            || (!path.starts_with('/') && !(method == Method::OPTIONS && path == "*"))
+        if !valid_scheme(scheme?)
+            || path.is_empty()
+            || (!path.starts_with(b"/") && !(method == b"OPTIONS" && path == b"*"))
         {
             return None;
         }
-        uri.path_and_query = Some(path.parse().ok()?);
     }
-    let mut request = Request::builder()
-        .method(method)
-        .uri(http::Uri::from_parts(uri).ok()?)
-        .version(Version::HTTP_2)
-        .body(())
-        .ok()?;
-    *request.headers_mut() = headers;
-    Some(request)
+    Some(RequestHead::new(fields, length))
 }
 
 /// Bounded proofs over the flow-control arithmetic, run with `cargo kani`.
@@ -2559,9 +2794,10 @@ mod tests {
     use fictionet::stdlib::layer::{Budget, Harness};
     use fictionet::stdlib::network::ConnInfo;
     use fictionet::stdlib::network::{ConnError, Connection};
+    use fictionet::stdlib::protocols::http2::Frame;
     use fictionet::stdlib::services::stack::Polling;
     use fictionet::sync::Mutex;
-    use http::StatusCode;
+    use http::{HeaderName, Method, StatusCode, Version};
     use std::collections::VecDeque;
     use std::future::{Future, poll_fn};
     use std::pin::pin;
@@ -2655,14 +2891,14 @@ mod tests {
                         }
                         let frame = Frame::parse(&output[consumed..end]).unwrap();
                         consumed = end;
-                        let read = blocks.read_frame(&frame).unwrap();
-                        if let Some(block) = read.block
-                            && let Some(status) = block
-                                .headers
-                                .into_iter()
-                                .find(|header| header.name == b":status")
+                        let mut fields = Fields::new();
+                        let read = blocks
+                            .read_frame(&frame, &mut fields, &Budget::unlimited())
+                            .unwrap();
+                        if read.complete
+                            && let Some(status) = fields.get(b":status")
                         {
-                            return Poll::Ready(status.value);
+                            return Poll::Ready(status.to_vec());
                         }
                     }
                     Poll::Pending
@@ -2930,6 +3166,168 @@ mod tests {
         }
     }
 
+    /// A child that keeps every body piece it is given.
+    struct Keeper(Arc<Mutex<Vec<Chunk>>>);
+
+    impl Layer for Keeper {
+        type Lower = HttpExchange;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: ExchangeEvent,
+        ) -> Result<Admit<ExchangeEvent>, Infallible> {
+            if let ExchangeEvent::Data(chunk) = event {
+                self.0.lock().push(chunk);
+            }
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
+            None
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// DATA goes up in the chunk it came in: every piece the child gets
+    /// shares the backing of the delivery that brought it, for frames
+    /// whole in one delivery and for frames split across deliveries, and
+    /// the pieces are the data, in order, padding left out.
+    #[test]
+    fn data_goes_up_in_the_chunks_it_came_in() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let budget = Budget::unlimited();
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let keeper = kept.clone();
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(8, Http2::WINDOW, move |_, _, _| {
+                Some(Keeper(keeper.clone()))
+            }),
+        );
+        let mut harness =
+            Harness::with_budget(fictionet::Seed::from_u64(3), server, budget.clone());
+        harness.push(&client_preface()).unwrap();
+        harness.push(&headers_without_end(1)).unwrap();
+        let mut bytes = Vec::new();
+        let first: Vec<u8> = (0..5000).map(|i| i as u8).collect();
+        write(
+            &wire::Data {
+                stream: 1,
+                flags: 8,
+                data: first.clone(),
+                padding: Some(vec![0; 7]),
+            },
+            &mut bytes,
+        );
+        let second = vec![b's'; 3000];
+        write(
+            &wire::Data {
+                stream: 1,
+                flags: 1,
+                data: second.clone(),
+                padding: None,
+            },
+            &mut bytes,
+        );
+        // Two deliveries, the second frame split between them.
+        let cut = bytes.len() - 1000;
+        let deliveries = [
+            Chunk::copy_of(&budget, &bytes[..cut]).unwrap(),
+            Chunk::copy_of(&budget, &bytes[cut..]).unwrap(),
+        ];
+        for delivery in &deliveries {
+            let taken = harness
+                .driver()
+                .deliver(StreamEvent::Data(delivery.clone()))
+                .unwrap();
+            assert!(matches!(taken, Admit::Taken));
+            harness.settle().unwrap();
+        }
+        let kept = kept.lock();
+        assert!(kept.len() >= 3, "{} pieces", kept.len());
+        for piece in kept.iter() {
+            assert!(
+                deliveries.iter().any(|delivery| piece.shares(delivery)),
+                "a piece of DATA was copied"
+            );
+        }
+        let got: Vec<u8> = kept
+            .iter()
+            .flat_map(|piece| piece.iter().copied())
+            .collect();
+        assert_eq!(got, [first, second].concat());
+    }
+
+    /// DATA of every size up to a frame, at a full budget, leaves the
+    /// connection open: nothing holds a frame, so none needs room. The
+    /// body the stream cannot take overflows that stream alone, and the
+    /// connection still answers a PING.
+    #[test]
+    fn data_at_a_full_budget_leaves_the_connection_open() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        for len in [1, 4 << 10, 10 << 10, wire::DEFAULT_FRAME_SIZE] {
+            let budget = Budget::new(1 << 22);
+            let server = Chain::new(
+                Http2::new(Limits::default()),
+                Children::new(8, Http2::WINDOW, |_, _, _| Some(Sink::reading(true))),
+            );
+            let mut harness =
+                Harness::with_budget(fictionet::Seed::from_u64(5), server, budget.clone());
+            harness.push(&client_preface()).unwrap();
+            harness.push(&headers_without_end(1)).unwrap();
+            harness.take_output();
+            let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
+            let mut input = Vec::new();
+            write(
+                &wire::Data {
+                    stream: 1,
+                    flags: 0,
+                    data: vec![b'd'; len],
+                    padding: None,
+                },
+                &mut input,
+            );
+            write(
+                &wire::Ping {
+                    flags: 0,
+                    opaque: *b"stillopn",
+                },
+                &mut input,
+            );
+            harness.push(&input).unwrap();
+            let output = frames(&harness.take_output());
+            assert!(
+                !output.iter().any(|f| matches!(f, Frame::GoAway(_))),
+                "{len} bytes: {output:?}"
+            );
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::Ping(p) if p.flags & 1 != 0)),
+                "{len} bytes: {output:?}"
+            );
+            assert!(!harness.ended());
+        }
+    }
+
     #[test]
     fn a_stalled_upgrade_body_holds_back_only_its_own_stream() {
         use fictionet::stdlib::layer::{Chain, Children};
@@ -2943,17 +3341,11 @@ mod tests {
             .version(Version::HTTP_2)
             .body(())
             .unwrap();
-        let opening = Opening {
-            request: Box::new(request),
-            ended: false,
-            at: Instant::ZERO,
-            charge: None,
-        };
         let body = Chunk::unpaid(vec![b'x'; 200_000]);
         let server = Chain::new(
-            Http2::upgraded(Limits::default(), &[], opening, Some(body)),
+            Http2::upgraded(Limits::default(), &[], request, Some(body)),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
-                Some(Sink::reading(opening.request.uri().path() != "/stall"))
+                Some(Sink::reading(opening.head.path() != Some(b"/stall")))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -3023,7 +3415,7 @@ mod tests {
         let server = Chain::new(
             Http2::new(Limits::default()),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
-                Some(Sink::reading(opening.request.uri().path() != "/stall"))
+                Some(Sink::reading(opening.head.path() != Some(b"/stall")))
             }),
         );
         let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
@@ -3303,7 +3695,7 @@ mod tests {
         /// The same, answering with `body` in commands of `piece` bytes.
         fn answering(opening: Opening, body: Vec<u8>, piece: usize) -> Self {
             let mut picky = Picky {
-                stuck: opening.request.uri().path() == "/stuck",
+                stuck: opening.head.path() == Some(b"/stuck"),
                 body,
                 piece,
                 out: VecDeque::new(),
@@ -3585,16 +3977,20 @@ mod tests {
         let head = wire::FrameHeader::parse(harness.output()).unwrap();
         assert_eq!(head.kind, 1, "the response's HEADERS go first");
         harness.allow(head.length + 4).unwrap();
-        // The budget runs out while a PING waits for its answer.
+        // The budget runs out, and then the control reserve, while PINGs
+        // wait for their answers: the answers past the reserve have no
+        // room.
         let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
         let mut ping = Vec::new();
-        write(
-            &wire::Ping {
-                flags: 0,
-                opaque: *b"overfull",
-            },
-            &mut ping,
-        );
+        for _ in 0..=CONTROL {
+            write(
+                &wire::Ping {
+                    flags: 0,
+                    opaque: *b"overfull",
+                },
+                &mut ping,
+            );
+        }
         harness.push(&ping).unwrap();
         harness.allow_all().unwrap();
         let output = whole_frames(harness.output()).expect("the output is whole frames");
@@ -3794,7 +4190,18 @@ mod tests {
         let mut harness = answering(BODY.to_vec(), BODY.len(), budget.clone());
         harness.push(&client_preface()).unwrap();
         harness.take_output();
-        let block = [0x83, 0x86, 0x84];
+        // A head larger than all the input the connection keeps, so the
+        // storage kept for joining split blocks cannot hold it.
+        let mut encoder = hpack::Encoder::new(4096);
+        encoder.set_huffman(false);
+        let fields = [
+            hpack::Field::new(":method", "GET"),
+            hpack::Field::new(":scheme", "http"),
+            hpack::Field::new(":path", "/"),
+            hpack::Field::new("x-pad", vec![b'p'; INPUT]),
+        ];
+        let mut block = Vec::new();
+        encoder.encode_block(&fields, &mut block).unwrap();
         let mut input = Vec::new();
         write(
             &wire::Headers {
@@ -3806,14 +4213,17 @@ mod tests {
             },
             &mut input,
         );
-        write(
-            &wire::Continuation {
-                stream: 1,
-                flags: 4,
-                fragment: block[2..].to_vec(),
-            },
-            &mut input,
-        );
+        let rest: Vec<&[u8]> = block[2..].chunks(wire::DEFAULT_FRAME_SIZE).collect();
+        for (i, fragment) in rest.iter().enumerate() {
+            write(
+                &wire::Continuation {
+                    stream: 1,
+                    flags: if i + 1 == rest.len() { 4 } else { 0 },
+                    fragment: fragment.to_vec(),
+                },
+                &mut input,
+            );
+        }
         let rest = budget.charge(budget.limit() - budget.used()).unwrap();
         harness.push(&input).unwrap();
         let output = frames(&harness.take_output());
@@ -3834,35 +4244,55 @@ mod tests {
         assert!(!harness.ended());
     }
 
-    /// The trailers' bound covers what reading them takes: the decoded
-    /// block, the map built from it, and its box. Over blocks of a few
-    /// fields and of many, with names repeated and not.
+    /// The request a child makes of a head holds at most the head's bound
+    /// for it, which the child charges before it makes the request: over
+    /// heads of a few fields and of many, with names repeated and not, and
+    /// with `cookie` split across fields, which the request joins.
     #[test]
-    fn trailers_hold_at_most_their_bound() {
-        use fictionet::stdlib::codec::Heap;
+    fn a_request_made_from_a_head_holds_at_most_its_bound() {
+        use super::super::response::request_held;
         let mut encoder = hpack::Encoder::new(4096);
         let mut table = hpack::Table::new(4096);
+        let limits = Limits {
+            head: crate::stdlib::protocols::http1::Limits {
+                headers: 1024,
+                head: 1 << 20,
+                ..Limits::default().head
+            },
+            ..Limits::default()
+        };
+        // A head has at most 256 fields; four are its pseudo-fields.
         let shapes: [(usize, usize); 6] =
-            [(1, 1), (3, 3), (40, 7), (127, 127), (128, 128), (256, 9)];
-        for (round, &(fields, names)) in shapes.iter().cycle().take(60).enumerate() {
-            let fields: Vec<hpack::Field> = (0..fields)
-                .map(|i| {
-                    let value = vec![b'a' + (round % 26) as u8; (i * 7 + round) % 90];
-                    hpack::Field::new(format!("x-t{}", i % names), value)
-                })
-                .collect();
+            [(1, 1), (3, 3), (40, 7), (127, 127), (128, 128), (252, 9)];
+        for (round, &(count, names)) in shapes.iter().cycle().take(60).enumerate() {
+            let mut fields = vec![
+                hpack::Field::new(":method", "GET"),
+                hpack::Field::new(":scheme", "https"),
+                hpack::Field::new(":authority", "example.test"),
+                hpack::Field::new(":path", "/a/b?c=d"),
+            ];
+            fields.extend((0..count).map(|i| {
+                let value = vec![b'a' + (round % 26) as u8; (i * 7 + round) % 90];
+                let name = if i % 5 == 4 {
+                    "cookie".to_owned()
+                } else {
+                    format!("x-t{}", i % names)
+                };
+                hpack::Field::new(name, value)
+            }));
             let mut bytes = Vec::new();
             encoder.encode_block(&fields, &mut bytes).unwrap();
-            let bound = table.most_block(bytes.len(), hpack::MAX_DECODED);
-            let block = table.decode_block(&bytes, hpack::MAX_DECODED).unwrap();
-            let decoded = block.heap();
-            let map = trailer_map(block);
-            let held = decoded + headers_held(&map) + size_of::<RequestTrailers>();
+            let mut block = Fields::new();
+            table
+                .decode_block(&bytes, &mut block, &Budget::unlimited(), hpack::MAX_DECODED)
+                .unwrap();
+            let head = request_head(block, limits).expect("a valid head");
+            let request = head.to_http().expect("a request http takes");
+            let held = request_held(&request);
             assert!(
-                held <= most_trailers(bound),
-                "{} fields hold {held}, more than the bound {}",
-                map.len(),
-                most_trailers(bound)
+                held <= head.most_http(),
+                "{count} fields hold {held}, more than the bound {}",
+                head.most_http()
             );
         }
     }
@@ -4103,15 +4533,16 @@ mod tests {
         let mut dates = Vec::new();
         for frame in frames(output) {
             let on = matches!(&frame, Frame::Headers(h) if h.stream == stream);
-            if let Some(block) = blocks.read_frame(&frame).unwrap().block
-                && on
-            {
+            let mut fields = Fields::new();
+            let read = blocks
+                .read_frame(&frame, &mut fields, &Budget::unlimited())
+                .unwrap();
+            if read.complete && on {
                 dates.extend(
-                    block
-                        .headers
-                        .into_iter()
-                        .filter(|field| field.name == b"date")
-                        .map(|field| field.value),
+                    fields
+                        .iter()
+                        .filter(|(name, _)| *name == b"date")
+                        .map(|(_, value)| value.to_vec()),
                 );
             }
         }
@@ -4205,25 +4636,22 @@ mod tests {
         harness.push(&client_preface()).unwrap();
         harness.take_output();
         let http = harness.layer();
-        // What an idle connection was charged before every queue was
-        // charged at its bound (47a901718): one frame of input, the
-        // places each queue keeps, the list of recent resets at its
-        // bound, the child slots, the dates and the final GOAWAY.
+        // What an idle connection is charged: one frame of input (the
+        // HPACK table at its bound, a head block, and storage to join
+        // split blocks in), the control reserve, the places the pools
+        // keep, the places each queue and list of streams keeps, the
+        // stream slots it keeps, the list of recent resets at its bound,
+        // the dates and the final GOAWAY.
+        let places = (HEADS_KEPT + CONTROL) * size_of::<Arc<()>>() + CONTROL * SMALL_SLOT;
         let resets = RESET_MAX * size_of::<(u32, Instant)>();
         let queues = KEEP
             * (size_of::<MuxEvent<HttpExchange, Top, Opening>>()
-                + size_of::<StreamCommand>()
                 + size_of::<Piece>()
-                + 5 * size_of::<u32>());
-        let slots_budget = Budget::unlimited();
-        let _slots =
-            Slots::<u32>::with_budget(http.limits.streams as usize, &slots_budget).unwrap();
-        let model = http.codec.frames.limit()
-            + resets
-            + queues
-            + slots_budget.used()
-            + http.dates.held()
-            + LAST_WORDS;
+                + 5 * size_of::<u32>()
+                + size_of::<(u32, ChildId)>()
+                + 2 * size_of::<Chunk>());
+        let slots = KEEP * (size_of::<(u64, Option<Stream>)>() + size_of::<u32>());
+        let model = INPUT + places + resets + queues + slots + http.dates.held() + LAST_WORDS;
         assert!(
             budget.used() <= model,
             "idle charge {} exceeds {model}",
@@ -4231,27 +4659,34 @@ mod tests {
         );
     }
 
-    /// Input storage within the frame-sized allowance is paid for whether
-    /// it is allocated or not, so a finished request leaves it allocated
-    /// and the next request reads into it without allocating again.
+    /// A request's head is decoded into a block the connection keeps, and
+    /// the block comes back when the child is done with the head: the
+    /// next request takes the same block, and what the connection is
+    /// charged between requests stays where it was.
     #[test]
-    fn input_storage_within_the_allowance_stays_between_requests() {
+    fn a_head_block_comes_back_for_the_next_request() {
         use fictionet::stdlib::layer::{Chain, Children};
+        let budget = Budget::unlimited();
         let server = Chain::new(
             Http2::new(Limits::default()),
-            Children::new(8, 1, |_, _, _| Some(Sink::reading(false))),
+            Children::new(8, Http2::WINDOW, |_, _, _| Some(Sink::reading(true))),
         );
-        let mut harness = Harness::new(fictionet::Seed::from_u64(6), server);
+        let mut harness =
+            Harness::with_budget(fictionet::Seed::from_u64(6), server, budget.clone());
         harness.push(&client_preface()).unwrap();
-        harness.push(&post(1, false)).unwrap();
         harness.take_output();
-        let http = harness.layer().lower();
-        let kept = http.codec.frames.allocated();
-        assert!(kept > 0, "the input storage was given back");
-        assert!(kept <= http.codec.frames.limit());
-        harness.push(&post(3, false)).unwrap();
-        harness.take_output();
-        assert_eq!(harness.layer().lower().codec.frames.allocated(), kept);
+        let heads = harness.layer().lower().heads.clone().expect("open");
+        let kept = heads.charged();
+        let mut encoder = hpack::Encoder::new(4096);
+        for stream in (1..12).step_by(2) {
+            harness.push(&get(&mut encoder, stream, "/")).unwrap();
+            harness.take_output();
+            // One block, back in the pool and paid for as it was: none
+            // was made for this request.
+            assert_eq!(heads.free(), 1, "the head block went back");
+            assert_eq!(heads.charged(), kept);
+        }
+        assert_eq!(harness.layer().lower().streams(), 6);
     }
 
     /// Input and assembly grow during a request and give their storage
@@ -4321,7 +4756,6 @@ mod tests {
         write(&data, &mut burst);
         harness.push(&burst).unwrap();
         let http = harness.layer().lower();
-        assert!(http.codec.frames.allocated() > http.codec.frames.limit());
         assert!(
             http.codec.headers.allocated() > 4096,
             "the table holds more than its settings limit"
@@ -4363,14 +4797,20 @@ mod tests {
         harness.take_output();
         let open = harness.layer().upper().ids().count();
         assert_eq!(open, 12);
+        // The budget runs out, and then the control reserve, while the
+        // transport takes nothing and PINGs wait for their answers.
         let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
         let mut ping = Vec::new();
         let overfull = wire::Ping {
             flags: 0,
             opaque: *b"overfull",
         };
-        write(&overfull, &mut ping);
+        for _ in 0..=CONTROL {
+            write(&overfull, &mut ping);
+        }
+        harness.withhold();
         harness.push(&ping).unwrap();
+        harness.allow_all().unwrap();
         let output = frames(&harness.take_output());
         assert!(
             matches!(output.last(), Some(Frame::GoAway(g))
@@ -4418,7 +4858,8 @@ mod tests {
             .collect();
         assert!(output.len() >= 3, "{} frames", output.len());
         let mut blocks = wire::HeaderBlocks::with_limits(wire::Limits::default());
-        let mut block = None;
+        let mut block = Fields::new();
+        let mut whole = false;
         for (i, frame) in output.iter().enumerate() {
             let last = i + 1 == output.len();
             let (flags, len) = match frame {
@@ -4428,9 +4869,12 @@ mod tests {
             };
             assert!(len <= wire::DEFAULT_FRAME_SIZE);
             assert_eq!(flags & 4 != 0, last, "END_HEADERS on the last frame only");
-            block = blocks.read_frame(frame).unwrap().block;
+            whole = blocks
+                .read_frame(frame, &mut block, &Budget::unlimited())
+                .unwrap()
+                .complete;
         }
-        let block = block.expect("the block is whole");
+        assert!(whole, "the block is whole");
         let mut expected = vec![(b":status".to_vec(), b"201".to_vec())];
         expected.extend(
             big()
@@ -4441,9 +4885,8 @@ mod tests {
                 }),
         );
         let got: Vec<_> = block
-            .headers
-            .into_iter()
-            .map(|f| (f.name, f.value))
+            .iter()
+            .map(|(name, value)| (name.to_vec(), value.to_vec()))
             .collect();
         assert_eq!(got, expected);
     }
@@ -4462,14 +4905,15 @@ mod tests {
             rng.fill_random(&mut block);
             let end = rng.random_below(2) == 0;
             let room = framed_len(block.len(), max).unwrap();
-            let mut out = Vec::with_capacity(room);
-            out.resize(wire::HEADER_LEN, 0);
-            out.extend_from_slice(&block);
-            let at = out.as_ptr();
-            frame_block(&mut out, 7, end, max).unwrap();
-            assert!(out.len() <= room);
-            assert_eq!(out.as_ptr(), at, "framed where it was encoded");
-            let frames = frames(&out);
+            let mut out = vec![0; room];
+            out[wire::HEADER_LEN..wire::HEADER_LEN + block.len()].copy_from_slice(&block);
+            let framed = frame_block(&mut out, block.len(), 7, end, max).unwrap();
+            assert!(framed <= room);
+            assert!(
+                frame_block(&mut out[..framed - 1], block.len(), 7, end, max).is_err(),
+                "room short of the frames is refused"
+            );
+            let frames = frames(&out[..framed]);
             let mut fragments = Vec::new();
             for (i, frame) in frames.iter().enumerate() {
                 let last = i + 1 == frames.len();

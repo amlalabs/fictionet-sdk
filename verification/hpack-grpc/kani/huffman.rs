@@ -1,6 +1,8 @@
 //! Kani proofs over the RFC 7541 Huffman code in
 //! src/stdlib/protocols/huffman.rs, which HPACK decodes every coded string
-//! with (`ReadFields::string` in hpack.rs calls `decode_limited`). Compiled
+//! with: every entry point, `decode_limited` and the `decode_into` and
+//! `decoded_len` that HPACK reads strings with, walks the codes in `walk`,
+//! which these harnesses reach through `decode_limited`. Compiled
 //! only under `cargo kani`, as a child module of huffman.rs, so each harness
 //! calls the production `symbol`, `encode`, `encoded_len` and
 //! `decode_limited`.

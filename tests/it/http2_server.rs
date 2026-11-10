@@ -307,16 +307,14 @@ fn connect_success_has_no_length_and_ends_the_stream() {
     let mut answered = false;
     for frame in &output {
         assert!(!matches!(frame, Frame::Data(_)), "{output:?}");
-        let read = blocks.read_frame(frame).unwrap();
-        let Some(block) = read.block else {
+        let Some((read, block)) = read_block(&mut blocks, frame) else {
             continue;
         };
         assert_eq!(read.stream, 1);
         assert!(read.end, "{output:?}");
         let fields: Vec<(&[u8], &[u8])> = block
-            .headers
             .iter()
-            .map(|h| (h.name.as_slice(), h.value.as_slice()))
+            .map(|(name, value)| (name.as_slice(), value.as_slice()))
             .collect();
         assert!(fields.contains(&(b":status", b"200")), "{fields:?}");
         assert!(
@@ -373,7 +371,7 @@ fn http2_framing_follows_the_rfcs_for_every_case() {
                         if known { "known" } else { "unknown" }
                     );
                     let mut blocks = http2::HeaderBlocks::with_limits(Default::default());
-                    let mut head: Option<(Vec<hpack::Field>, bool)> = None;
+                    let mut head: Option<(Pairs, bool)> = None;
                     let mut data = Vec::new();
                     let mut ended_by_data = false;
                     for frame in &output {
@@ -389,19 +387,18 @@ fn http2_framing_follows_the_rfcs_for_every_case() {
                             ended_by_data = frame.flags & 1 != 0;
                             continue;
                         }
-                        let read = blocks.read_frame(frame).unwrap();
-                        if let Some(block) = read.block {
+                        if let Some((read, block)) = read_block(&mut blocks, frame) {
                             assert_eq!(read.stream, 1, "{case}");
                             assert!(head.is_none(), "{case}");
-                            head = Some((block.headers, read.end));
+                            head = Some((block, read.end));
                         }
                     }
                     let (fields, end_on_headers) = head.expect(&case);
                     let field = |name: &[u8]| {
                         fields
                             .iter()
-                            .find(|f| f.name == name)
-                            .map(|f| String::from_utf8(f.value.clone()).unwrap())
+                            .find(|(field, _)| field == name)
+                            .map(|(_, value)| String::from_utf8(value.clone()).unwrap())
                     };
                     assert_eq!(field(b":status"), Some(status.to_string()), "{case}");
                     let length = field(b"content-length");
@@ -1193,12 +1190,11 @@ fn zero_stream_window_is_a_stream_error_and_large_headers_get_431() {
     let mut block = http2::HeaderBlocks::with_limits(Default::default());
     let mut status = None;
     for frame in &reply {
-        if let Some(decoded) = block.read_frame(frame).unwrap().block {
+        if let Some((_, decoded)) = read_block(&mut block, frame) {
             status = decoded
-                .headers
                 .into_iter()
-                .find(|h| h.name == b":status")
-                .map(|h| h.value);
+                .find(|(name, _)| name == b":status")
+                .map(|(_, value)| value);
         }
     }
     assert_eq!(status.as_deref(), Some(b"431".as_slice()));
@@ -1279,17 +1275,33 @@ fn statuses(output: &[Frame]) -> Vec<(u32, Vec<u8>)> {
     output
         .iter()
         .filter_map(|frame| {
-            let read = blocks.read_frame(frame).unwrap();
-            read.block.and_then(|block| {
-                block
-                    .headers
-                    .into_iter()
-                    .find(|h| h.name == b":status")
-                    .map(|h| h.value)
-                    .map(|value| (read.stream, value))
-            })
+            let (read, fields) = read_block(&mut blocks, frame)?;
+            fields
+                .into_iter()
+                .find(|(name, _)| name == b":status")
+                .map(|(_, value)| (read.stream, value))
         })
         .collect()
+}
+
+/// A header block's fields as owned names and values, in order.
+type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Reads `frame` into `blocks`: where its header block stands, and the
+/// block's fields as owned pairs, once it is whole.
+fn read_block(
+    blocks: &mut http2::HeaderBlocks,
+    frame: &Frame,
+) -> Option<(http2::BlockRead, Pairs)> {
+    let mut fields = fictionet::stdlib::protocols::fields::Fields::new();
+    let read = blocks
+        .read_frame(frame, &mut fields, &Budget::unlimited())
+        .unwrap();
+    let fields = fields
+        .iter()
+        .map(|(name, value)| (name.to_vec(), value.to_vec()))
+        .collect();
+    read.complete.then_some((read, fields))
 }
 
 #[test]
@@ -1400,7 +1412,8 @@ fn oversized_response_refuses_only_its_stream() {
     let output = frames(&push(&mut harness, &input));
     assert_eq!(
         statuses(&output),
-        [(1, b"200".to_vec()), (3, b"503".to_vec())]
+        [(1, b"200".to_vec()), (3, b"503".to_vec())],
+        "DEBUG {output:?}"
     );
     for id in [1, 3] {
         assert!(
@@ -1878,15 +1891,25 @@ fn connection_budget_exhaustion_sends_goaway() {
     );
     push(&mut harness, &preface());
     let _other = budget.charge(budget.limit() - budget.used()).unwrap();
-    let output = frames(&push(
-        &mut harness,
-        &http2::Ping {
-            flags: 0,
-            opaque: [0; 8],
-        }
-        .to_bytes()
-        .unwrap(),
-    ));
+    // A full budget still answers a PING, from what the connection keeps
+    // for control frames; PINGs past that, while the transport takes
+    // nothing, have no room.
+    let ping = http2::Ping {
+        flags: 0,
+        opaque: [0; 8],
+    }
+    .to_bytes()
+    .unwrap();
+    let answered = frames(&push(&mut harness, &ping));
+    assert!(
+        answered
+            .iter()
+            .any(|f| matches!(f, Frame::Ping(p) if p.flags & 1 != 0))
+    );
+    harness.withhold();
+    harness.push(&ping.repeat(16)).unwrap();
+    harness.allow_all().unwrap();
+    let output = frames(&harness.take_output());
     assert!(
         output
             .iter()

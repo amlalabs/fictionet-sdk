@@ -12,19 +12,14 @@
 
 use super::*;
 
-// Every string the representation harnesses below write is raw, so no
-// Huffman code runs. CBMC cannot see that from bytes at symbolic positions
-// and would unroll the Huffman decoder over every string; this stub stands
-// in for it, and reaching it fails the proof, so it hides nothing. The
-// Huffman code itself is proved in kani/huffman.rs.
+// Representations borrow their strings and decode none, so no Huffman
+// code runs in the representation harnesses below; the Huffman code is
+// proved in kani/huffman.rs.
 //
 // The same harnesses read integers through `prefix_int::proofs::rfc`, the
 // RFC 7541 model that `read_is_the_rfc_integer` proves `prefix_int::read`
 // equal to for every input at widths 1 to 8 (HPACK uses 4 to 7): the
 // iterator in `read` unrolls into formulas CBMC did not finish with.
-fn no_huffman_decode(_: &[u8], _: usize) -> Result<Vec<u8>, huffman::Error> {
-    panic!("a harness string was Huffman coded");
-}
 
 /// An entry with a name and a value of the given lengths. Contents do not
 /// matter to the table's arithmetic.
@@ -156,7 +151,7 @@ fn indexes_resolve_only_inside_the_tables() {
 /// indexed name; names and values are empty. The size or index `n` is at
 /// most 14, so every integer takes one byte and each kind has a
 /// fixed length (prefix_int.rs's harnesses cover longer integers).
-fn representation(out: &mut Vec<u8>, kind: u8, n: u64) -> Representation {
+fn representation(out: &mut Vec<u8>, kind: u8, n: u64) -> Representation<'static> {
     kani::assume(n <= 14);
     match kind {
         0 => {
@@ -171,8 +166,8 @@ fn representation(out: &mut Vec<u8>, kind: u8, n: u64) -> Representation {
         2 => {
             out.extend([0x40, 0, 0]);
             Representation::Literal {
-                name: Name::Literal(Vec::new()),
-                value: Vec::new(),
+                name: Name::Literal(Text::Raw(&[])),
+                value: Text::Raw(&[]),
                 indexing: Indexing::Incremental,
             }
         }
@@ -187,7 +182,7 @@ fn representation(out: &mut Vec<u8>, kind: u8, n: u64) -> Representation {
             out.push(0);
             Representation::Literal {
                 name: Name::Index(n),
-                value: Vec::new(),
+                value: Text::Raw(&[]),
                 indexing,
             }
         }
@@ -201,7 +196,6 @@ fn representation(out: &mut Vec<u8>, kind: u8, n: u64) -> Representation {
 /// one exactly, in order, until a size update follows a field; that one is
 /// `SizeUpdateOrder`, and nothing is read after it.
 #[kani::proof]
-#[kani::stub(crate::stdlib::protocols::huffman::decode_limited, no_huffman_decode)]
 #[kani::stub(
     crate::stdlib::protocols::prefix_int::read,
     crate::stdlib::protocols::prefix_int::proofs::rfc
@@ -239,7 +233,6 @@ fn size_updates_come_only_first() {
 /// `representation` writes, the literals without indexing and never
 /// indexed with an indexed name among them, reads back exactly.
 #[kani::proof]
-#[kani::stub(crate::stdlib::protocols::huffman::decode_limited, no_huffman_decode)]
 #[kani::stub(
     crate::stdlib::protocols::prefix_int::read,
     crate::stdlib::protocols::prefix_int::proofs::rfc

@@ -175,11 +175,10 @@ did not finish, or ran out of 10 GiB, on the symbolic form.
 | `the_prefix_is_read_exactly` | for any input of up to eight bytes and any limit: nothing is a message before the 5-byte prefix is whole, except that a flag above 1 is refused at the first byte; a big-endian length over the limit is refused from the prefix alone; a message is exactly the flag and the next `length` bytes; `message_len`, which the layer's early check calls, refuses the same prefixes with the same errors and gives `5 + length` without waiting for the body | 5.1 s |
 | `messages_write_and_read_back` | any message of up to three body bytes is written as its flag, its length big-endian and its body, after what the output held, and reads back as itself; a body over `MAX_MESSAGE` is refused, for every length | 8.3 s |
 
-The two `Representations` harnesses stub two functions.
-`huffman::decode_limited` becomes a function that panics: every string
-they write is raw, so reaching it fails the proof. `prefix_int::read`
+The two `Representations` harnesses stub one function: `prefix_int::read`
 becomes `rfc`, the model `read_is_the_rfc_integer` proves it equal to at
-widths 1 to 8 (HPACK uses 4 to 7).
+widths 1 to 8 (HPACK uses 4 to 7). `Representations` borrows each string
+and decodes none, so no Huffman code runs in them.
 
 Harnesses on `Table::decode_block` did not finish in ten minutes, even on
 a fixed one-byte block, so the decoder's size-update rules, the eviction

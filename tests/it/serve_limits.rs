@@ -566,9 +566,10 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
                     body: 9000,
                     ..Limits::default()
                 },
-                // Room for one read of the largest request and for a
-                // 7500-byte body once, but not for it twice: the body comes
-                // up charged and is copied into the request.
+                // Room for one read of the largest request and for an
+                // 8800-byte body once, but not for it twice: the body comes
+                // up in the chunks it was read in, charged as they were
+                // read, and is copied into the request.
                 budget: Some(Budget::new(idle + 16_000)),
                 ..HttpOptions::default()
             };
@@ -617,7 +618,7 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             let (status, body) = ask(http::Method::POST, "/echo", vec![b'a'; 1500]).await?;
             assert_eq!((status, body.len()), (200, 1500));
             // Within the limit, past the budget.
-            let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 7500]).await?;
+            let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 8800]).await?;
             assert_eq!(status, 503);
             // Past the limit.
             let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 9500]).await?;
@@ -859,10 +860,12 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             let second = send.send_request(metadata_request());
             fcx.idle().await?;
             assert_eq!(waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
-            // Leave room for the next request's bytes to arrive, but not for
-            // its head to be held.
+            // Leave room for the next request's bytes to arrive and for its
+            // head once, but not twice: the head is decoded into a block, and
+            // the request the handler takes is made from that block, each
+            // charged before it is made.
             let other = budget
-                .charge(budget.limit() - budget.used() - 4096)
+                .charge(budget.limit() - budget.used() - 2 * 4096)
                 .unwrap();
             let two = budget.used();
             assert!(two >= other.bytes() + 2 * 4096);
