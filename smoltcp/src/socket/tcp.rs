@@ -3009,6 +3009,7 @@ pub(crate) mod test {
 
     #[cfg(kani)]
     include!("../../../verification/tcp-port-zero/SocketProof.rs");
+    include!("tcp/rfc_vectors.rs");
 
     // =========================================================================================//
     // Constants
