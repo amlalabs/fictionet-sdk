@@ -352,3 +352,244 @@ closing and closed phases and checks ownership is returned intact.
 
 The unchanged `Lifecycle` baseline was rerun on November 9, 2026 and passed all
 configured invariants and liveness properties with 4,011,621 distinct states.
+
+## RFC 9113: flow control, SETTINGS and the end of a connection
+
+The models above follow the code. These follow the RFC: two spec modules
+written from the text of RFC 9113, and three models of the code that
+INSTANCE them and check that the code refines them. `RfcFlow.tla` holds
+the rules of flow control and SETTINGS for one direction of DATA (sections
+3.4, 5.1, 5.4.1, 6.5, 6.9, 6.9.1 and 6.9.2); `RfcGoaway.tla` the rules for
+an endpoint that ends a connection (sections 4.1, 5.4.1, 6.8 and 7). Each
+rule is a property of its own, so a control names the one rule it breaks.
+
+The code models are `Http2Rfc.tla` (the server layer `Http2`, both
+directions: the client's DATA against the server's receive windows and the
+credit it returns, and the server's DATA within the client's windows),
+`SessionRfc.tla` (the sans-I/O `Session` in `protocols/http2.rs`, which had
+no model), and `Http2Refusal.tla` (how `Http2` ends a connection it
+refuses). Every step of a code model carries the frame it read or wrote
+and what it did about it, and maps its state onto the spec's: the windows,
+which streams may still send, the initial window in force, the SETTINGS
+awaiting an ACK, and the frames queued. Each header names the source lines
+it follows, at the commit that adds this section on `comp/fv-h2-flow`.
+
+`Max` stands for 2^31 - 1 and every window, value and increment is a small
+integer near it: `Max` 4, initial windows of 2, increments that land on
+`Max` exactly and one past it, SETTINGS values that move a window below
+zero, to `Max`, and past it. The rules only compare windows with `Max`
+and add or subtract, so they mean the same at full scale; the Kani proofs
+(here and in `kani/flow.rs`) show the Rust arithmetic is exact over the
+whole range.
+
+`Session` reads one direction, from a sender A to a receiver B, and is
+given B's SETTINGS and WINDOW_UPDATE from the other direction. A applies a
+SETTINGS frame as it reads it, but DATA A sent before then may still use
+the larger window of an earlier value. So `Session` keeps two windows in
+one: the most A may send, which counts from the largest initial window A
+has not acknowledged away (`BoundCovers`), and A's own, which counts from
+the one announced last and is what an overflow is judged on.
+
+| Property | RFC 9113 | Rule |
+| --- | --- | --- |
+| `DataDebits` | 6.9, 6.9.1 | every DATA frame, padding and pad length byte included, counts against the connection window unless it ends the connection; one accepted counts against its stream too |
+| `ConnExcess` | 6.9.1 | DATA past the connection window is a connection FLOW_CONTROL_ERROR |
+| `NoFalseFlowError` | 6.9.1 | DATA within both windows is never refused for flow control |
+| `StreamExcessRefused` | 6.9.1 | DATA past a stream's window is refused (a MAY; `Http2` does it with RST_STREAM) |
+| `GrantWithinMax` | 6.9, 6.9.1 | credit written is never 0 and never takes a window past 2^31 - 1 |
+| `BoundCovers` | 6.5.3, 6.9.2 | the window DATA is judged by covers every window the sender may still hold |
+| `SendWithinWindows` | 4.2, 6.9.1 | DATA goes out within both windows and the frame size, on a stream that may send, and only while its window is positive |
+| `WindowUpdateZero` | 6.9 | an increment of 0 is a connection error on stream 0, a stream error on a stream |
+| `WindowUpdateIdle` | 5.1 | WINDOW_UPDATE on an idle stream is a connection error |
+| `ConnWindowUpdate` | 6.9.1 | the connection window grows by the increment; past 2^31 - 1 the connection fails |
+| `StreamWindowUpdate` | 6.9, 6.9.1 | a stream's window grows by the increment; past 2^31 - 1 the stream, not the connection, ends with RST_STREAM FLOW_CONTROL_ERROR; on a stream that can send no more it is no error |
+| `SettingsApplied` | 6.5.2, 6.5.3, 6.9.2 | values apply in order; a value no endpoint may announce, or an initial window that takes a stream that may still send past 2^31 - 1, fails the connection; otherwise every such stream moves by the change, below zero included, the connection window does not move, and unknown identifiers change nothing |
+| `SettingsAcked` | 6.5.3 | the ACK goes out once every value is applied, and only then |
+| `SettingsFrame` | 6.5 | SETTINGS on a stream is a PROTOCOL_ERROR; a length not a multiple of 6, or an ACK with a payload, a FRAME_SIZE_ERROR |
+| `AckHandling` | 6.5.3 | an awaited ACK settles the oldest SETTINGS; an unexpected one may be ignored or fail the connection |
+| `FirstFrameData`, `FirstFrameUpdate` | 3.4 | nothing before the client's first SETTINGS is acted on |
+| `ConnErrorGoaway` | 5.4.1 | a connection error is answered with GOAWAY carrying its code |
+| `TerminalLast` | 5.4.1 | no frame follows the GOAWAY that ends a connection for an error |
+| `RefusalSaysGoaway` | 5.4.1, 7 | a connection that ends for an error sends GOAWAY; load refused is ENHANCE_YOUR_CALM |
+| `WholeFrames` | 4.1 | frames go out whole: GOAWAY never lands inside a DATA frame queued as header and payload |
+| `LastNeverGrows` | 6.8 | each GOAWAY's last stream is at most the one before |
+| `LastCoversActed` | 6.8 | the last stream of the final GOAWAY covers every stream acted on, and not one whose header block was never read whole |
+| `NoStreamCarriedOn`, `NothingAfterEnd` | 6.8 | a connection that ends leaves no stream open in it and acts on no stream after |
+| `GoawayFits` | (the code's promise) | the GOAWAY of a refusal always has the place and the bytes kept for it |
+
+TLC reports the properties under their instance: `In!` (client to server)
+and `Out!` (server to client) in `Http2Rfc`, `R!` in the other two.
+
+| Config | Result |
+| --- | --- |
+| `Http2Rfc_base` (streams 1 and 3; up to five client frames; DATA of 0 to 2 bytes, unpadded or padded with 0 or 1 byte; increments 0, 1, 2 and 4; nine SETTINGS frames; a 2-unit response) | passes: 36,726,903 states generated, 6,368,221 distinct, depth 20, 5 min 49 s; every action taken |
+| `SessionRfc_base` (streams 1 and 3; six steps of A's frames and B's routed ones; seven SETTINGS frames, one of 4 then 1) | passes: 5,574,033 generated, 917,670 distinct, depth 7, 1 min 3 s |
+| `Http2Refusal_base` (streams 1 and 3; a budget of 4 units, `sent` keeping 2 places; six steps) | passes: 467,169 generated, 278,264 distinct, depth 27, 9 s |
+| `Http2Rfc_without_skipended` (the code before this branch) | violates `SettingsApplied` (7 states): stream 1's END_STREAM framed with its window at 3, SETTINGS [1, 4] takes it to 5 and fails the connection |
+| `Http2Rfc_without_shiftstreams` | violates `SettingsApplied` (4 states) |
+| `Http2Rfc_without_countpadding` | violates `DataDebits` (4 states): a DATA frame of its pad length byte alone costs nothing |
+| `Http2Rfc_without_checkconn` | violates `ConnExcess` (3 states) |
+| `Http2Rfc_without_checkstream` | violates `StreamExcessRefused` (6 states) |
+| `Http2Rfc_without_recvown` (DATA judged by the stream's send window) | violates `NoFalseFlowError` (5 states): after SETTINGS of 0, a byte within the receive window resets the stream |
+| `Http2Rfc_without_positivecredit` (`credit_back` without its `back > 0`) | violates `GrantWithinMax` (5 states): WINDOW_UPDATE with an increment of 0 |
+| `Http2Rfc_without_takeack` | violates `AckHandling` (3 states) |
+| `Http2Rfc_without_checkfirst` | violates `FirstFrameData` (2 states) |
+| `Http2Rfc_without_checkfirst_update` | violates `FirstFrameUpdate` (2 states) |
+| `Http2Rfc_without_framecap` | violates `SendWithinWindows` (5 states): 2 bytes in a frame of 1 |
+| `Http2Rfc_without_sendcheck` | violates `SendWithinWindows` (6 states): DATA on a window of 0 after SETTINGS of 0, which leaves it at -1 |
+| `Http2Rfc_without_zeroreset` | violates `WindowUpdateZero` (4 states) |
+| `Http2Rfc_without_checkidle` | violates `WindowUpdateIdle` (3 states) |
+| `Http2Rfc_without_checkconnoverflow` | violates `ConnWindowUpdate` (3 states) |
+| `Http2Rfc_without_checkoverflow` | violates `StreamWindowUpdate` (4 states): 2 + 4 taken as 6 |
+| `Http2Rfc_without_ackafterapply` (the code before 733f6c2c2) | violates `SettingsAcked` (5 states) |
+| `Http2Rfc_without_refusebadsettings` | violates `SettingsFrame` (3 states) |
+| `Http2Rfc_without_sendgoaway` | violates `ConnErrorGoaway` (2 states) |
+| `SessionRfc_without_streamoverflow` (the code before this branch) | violates `StreamWindowUpdate` (3 states): stream credit past 2^31 - 1 stops the direction |
+| `SessionRfc_without_latestcredit` (the code before this branch) | violates `StreamWindowUpdate` (4 states): after B announces 0, unacknowledged, credit of 3 is refused though A's window goes from 0 to 3 |
+| `SessionRfc_without_latestinitial` (the code before this branch) | violates `SettingsApplied` (5 states): after that credit, an empty SETTINGS stops the direction |
+| `SessionRfc_without_skipclosed` (the code before this branch) | violates `SettingsApplied` (5 states): stream 1, ended at 3, fails SETTINGS [4, 1] |
+| `SessionRfc_without_streamerrors` (the code before this branch) | violates `WindowUpdateZero` (3 states) |
+| `SessionRfc_without_envelope` | violates `BoundCovers` (3 states) |
+| `SessionRfc_without_dataenvelope` | violates `NoFalseFlowError` (4 states): after B announces 0, unacknowledged, a byte A may still send stops the direction |
+| `SessionRfc_without_countpadding` | violates `DataDebits` (3 states) |
+| `SessionRfc_without_checkconn` | violates `ConnExcess` (3 states) |
+| `SessionRfc_without_checkconncredit` | violates `ConnWindowUpdate` (2 states) |
+| `SessionRfc_without_ackfront` | violates `AckHandling` (5 states) |
+| `Http2Refusal_without_guard` (the code before this branch) | violates `TerminalLast` (4 states): the shutdown's GOAWAY runs past the budget, `over_budget` queues GOAWAY ENHANCE_YOUR_CALM, and the shutdown's PING follows it |
+| `Http2Refusal_without_reserve` | violates `GoawayFits` (3 states) |
+| `Http2Refusal_without_keeppayload` | violates `WholeFrames` (5 states): GOAWAY between a DATA header the transport took and its payload |
+| `Http2Refusal_without_minlast` | violates `LastNeverGrows` (4 states): a stream refused while draining raises `last_stream` past the GOAWAY before |
+| `Http2Refusal_without_lastwords` | violates `RefusalSaysGoaway` (3 states) |
+| `Http2Refusal_without_lastonread` | violates `LastCoversActed` (3 states): a header block cut off before its CONTINUATION is reported as maybe processed |
+| `Http2Refusal_without_endall` | violates `NoStreamCarriedOn` (3 states) |
+| `Http2Refusal_without_stopreading` | violates `NothingAfterEnd` (4 states) |
+
+The state counts in parentheses are trace lengths in the runs of
+2026-11-10, the initial state included. Each trace was read: each fails
+for the reason in its config's first line.
+
+### Kani: `Session`'s window arithmetic
+
+`kani/session.rs` is compiled into `protocols/http2.rs` under `cfg(kani)`
+and calls `credited` and `initial_fits`, the functions `Session` judges
+credit and initial windows with. The inputs are a credit (granted less
+sent), the largest unacknowledged initial window and the last announced,
+over their whole ranges.
+
+| Harness | Proves | Time |
+| --- | --- | --- |
+| `credit_counts_from_the_initial_window_announced_last` | credit of 1 to 2^31 - 1 is granted exactly when A's window stays within 2^31 - 1, and then the window grows by exactly the increment; covers A at exactly 2^31 - 1, one past it, and credit granted while the larger window passes 2^31 - 1 | 0.26 s |
+| `initial_windows_fail_exactly_past_the_maximum` | a SETTINGS frame whose initial windows reach at most `most` fails exactly when `most` plus the credit passes 2^31 - 1, whatever window it counts from | 0.10 s |
+
+Each reports `VERIFICATION:- SUCCESSFUL`, and each failed when its
+function was put back to the arithmetic before this branch (judging on the
+larger window). At 3db7a847e, `cargo kani -p fictionet` does not compile:
+`verification/tls/kani/LayerProof.rs` and `verification/layer/kani/mod.rs`
+no longer match the code (58 errors). These harnesses were run with those
+two `cfg(kani)` modules switched off locally; that change is not
+committed.
+
+### The departures, fixed
+
+Each has a test that failed before its fix and passes after.
+
+7. **The shutdown's PING followed the GOAWAY that ended the connection.**
+   When graceful shutdown's first GOAWAY ran past the budget,
+   `over_budget` queued GOAWAY ENHANCE_YOUR_CALM and closed, and `advance`
+   then queued the PING behind it. `push_piece` now queues nothing once
+   the connection is closing. Test:
+   `a_refusal_during_graceful_shutdown_writes_nothing_after_its_goaway`
+   (before: the output ended with the PING). Model:
+   `Http2Refusal_without_guard`.
+8. **An ended response failed the connection on an initial window
+   change.** `peer_setting` moved every stream it knew, including one
+   whose END_STREAM was framed but not yet written; with its window at
+   2^31 - 1, a larger initial window failed the whole connection with
+   FLOW_CONTROL_ERROR. Section 6.9.2 moves only streams that may still
+   send. Test: `an_initial_window_change_leaves_ended_responses_alone`
+   (before: GOAWAY FLOW_CONTROL_ERROR, no ACK). Model:
+   `Http2Rfc_without_skipended`.
+9. **`Session` stopped on stream errors.** Its `step` returned every
+   decoder refusal as its error, so WINDOW_UPDATE with an increment of 0
+   on a stream stopped the direction. A stream-scope refusal is now
+   `Event::StreamError`. Test: `a_zero_increment_on_a_stream_is_a_stream_error`.
+   Model: `SessionRfc_without_streamerrors`.
+10. **`Session` answered stream credit past 2^31 - 1 as a connection
+    error.** Section 6.9.1 ends the stream. `peer_window_update` now
+    returns `Credit`, and `Credit::StreamOverflow` leaves the window as it
+    was. Test: `a_stream_window_overflow_ends_only_the_stream`. Model:
+    `SessionRfc_without_streamoverflow`.
+11. **`Session` judged overflow on the wrong window.** It judged credit and
+    initial windows on the most A may send, not A's own window: with a
+    smaller initial window announced and not acknowledged, credit that
+    keeps A within 2^31 - 1 was refused, and after such credit even an
+    empty SETTINGS stopped the direction. Test:
+    `overflow_counts_from_the_initial_window_announced_last`. Models:
+    `SessionRfc_without_latestcredit`, `SessionRfc_without_latestinitial`.
+12. **`Session` moved ended streams on an initial window change.** One at
+    2^31 - 1 stopped the direction. Test:
+    `an_initial_window_change_leaves_ended_streams_alone`. Model:
+    `SessionRfc_without_skipclosed`.
+
+The tests are in `httpd::http2::tests` and `protocols::http2::tests`.
+
+### Kept on purpose
+
+- `Http2` ends without GOAWAY when the connection's storage does not fit
+  its budget at open: nothing is queued and the GOAWAY cannot be paid
+  for. Section 5.4.1 says SHOULD.
+- `Http2` treats an unexpected SETTINGS ACK as a connection
+  PROTOCOL_ERROR. RFC 9113 does not define it.
+- A SETTINGS value no endpoint may announce is refused by the decoder,
+  before the values ahead of it are applied. The connection fails either
+  way and nothing is acknowledged.
+- `Http2` resets a stream for DATA past its window; `Session` stops the
+  direction with FLOW_CONTROL_ERROR. Section 6.9.1 allows both.
+- `Session`'s window for DATA counts from the largest initial window in an
+  unacknowledged SETTINGS frame, values in the middle of a frame included,
+  so it can take DATA past any window A held. Refusing that DATA is a MAY.
+- `Http2` enforces its own SETTINGS_MAX_CONCURRENT_STREAMS before the
+  client acknowledges it, with RST_STREAM REFUSED_STREAM, which the client
+  may retry (section 5.1.2).
+- `Http2` ignores a zero increment on a stream that is closed, and resets
+  with FLOW_CONTROL_ERROR a stream whose END_STREAM is framed when credit
+  takes its window past 2^31 - 1. Neither is a connection error.
+
+### What these models leave out
+
+- `Http2Rfc` and `SessionRfc` model SETTINGS_INITIAL_WINDOW_SIZE,
+  SETTINGS_MAX_FRAME_SIZE (in `Http2Rfc`), ENABLE_PUSH and unknown
+  identifiers; HEADER_TABLE_SIZE is `hpack-grpc`. SETTINGS_TIMEOUT and the
+  h2c HTTP2-Settings are `Settings.tla`.
+- Stream states (RST_STREAM, reset streams' late frames, the reset list's
+  expiry, even streams, PRIORITY, CONTINUATION order) are `Lifecycle.tla`
+  and the sibling stream models. `Session` streams are never retired or
+  reset by the peer here, and A sends nothing on a stream it ended.
+- The children and their credit are `Flow.tla`: here each child reads all
+  it holds at once and its credit is a whole window.
+- Frames in flight between the endpoints: each model's peer acts on the
+  latest state, which `Session`'s two windows cover for DATA.
+- `Http2Refusal` counts the budget in units, a DATA payload costs none,
+  and every other allocation is `Squeeze` and `Elsewhere`; the order of
+  frames of different streams is not modeled.
+
+### After `comp/buf-h2` merges
+
+That branch reworks framing and HPACK. The spec modules follow the RFC and
+stay as they are. Check again:
+
+- every source line range in the headers of `Http2Rfc.tla`,
+  `SessionRfc.tla` and `Http2Refusal.tla`;
+- the decoder's `setting_valid`, the zero increment refusal and the
+  scopes `Inputs::decode` gives them, which the models take as given;
+- how `Http2` queues output: `push_piece`'s check of the phase, the two
+  places it reserves, `LAST_WORDS`, `finish`'s push into the kept place,
+  and `over_budget` keeping the payload of a DATA header the transport
+  took; `Http2Refusal`'s pieces assume a largest DATA frame is a header
+  piece and a payload piece;
+- `on_data`'s count of a padded frame (`data.len() + padding.len() + 1`);
+- `peer_setting`'s skip of streams whose reply is `Reply::Ended`;
+- `Session::step`'s stream-scope refusal arm and its `blocks.pending`
+  check, and `kani/session.rs`'s `#[path]` from `protocols/http2.rs`;
+- then rerun the three base configs, every control, both Kani harnesses,
+  and the six tests above.
