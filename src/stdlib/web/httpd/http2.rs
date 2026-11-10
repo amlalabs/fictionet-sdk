@@ -633,6 +633,11 @@ impl Http2 {
     }
 
     fn push_piece(&mut self, env: &mut Env<'_, Report>, piece: Piece) -> bool {
+        // Once the connection is closing, its last frame is queued: a
+        // GOAWAY for an error ends the connection (RFC 9113 section 5.4.1).
+        if self.phase != Phase::Open {
+            return false;
+        }
         let bytes = piece.bytes as usize;
         // A place stays free behind every piece for the last GOAWAY.
         if !self.sent.reserve(2) || self.sent.push_back(piece).is_err() {
@@ -1312,7 +1317,14 @@ impl Http2 {
             1 => self.encoder.set_settings_limit(setting.value as usize),
             4 => {
                 let initial = setting.value as i32;
-                for (&id, stream) in self.streams.iter_mut() {
+                // The change moves the windows of streams that may still
+                // send (RFC 9113 section 6.9.2). One whose END_STREAM is
+                // framed sends no more DATA, and its window is left alone.
+                let sending = self
+                    .streams
+                    .iter_mut()
+                    .filter(|(_, stream)| !matches!(stream.response.reply, Reply::Ended));
+                for (&id, stream) in sending {
                     stream.response.window = shifted(stream.response.window, self.initial, initial)
                         .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "initial window overflow")
@@ -3310,6 +3322,64 @@ mod tests {
         );
     }
 
+    /// A stream whose response has ended has no active send window: a
+    /// change of initial window that would take that window past 2^31 - 1
+    /// leaves it alone, and is no error (RFC 9113 section 6.9.2 applies the
+    /// change to streams open or half closed (remote) only).
+    #[test]
+    fn an_initial_window_change_leaves_ended_responses_alone() {
+        let mut harness = answering(BODY.to_vec(), BODY.len(), Budget::new(1 << 24));
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        // The response to stream 1 is framed to its END_STREAM, but the
+        // transport has not taken it yet: the stream is still known.
+        harness.withhold();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        // Its send window, raised to exactly 2^31 - 1.
+        let mut input = Vec::new();
+        write(
+            &wire::WindowUpdate {
+                stream: 1,
+                flags: 0,
+                increment: wire::MAX_WINDOW - (WINDOW as u32 - BODY.len() as u32),
+            },
+            &mut input,
+        );
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting {
+                    id: 4,
+                    value: WINDOW as u32 + 1,
+                }],
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        harness.allow_all().unwrap();
+        let output = frames(harness.output());
+        assert!(
+            !output.iter().any(|f| matches!(f, Frame::GoAway(_))),
+            "{output:?}"
+        );
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Settings(s) if s.flags & 1 != 0)),
+            "{output:?}"
+        );
+        let body: Vec<u8> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 1 => Some(d.data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(body, BODY);
+    }
+
     const BODY: &[u8] = b"hello";
 
     /// A stream's child installed in place of [`Respond`]: with a request
@@ -4481,6 +4551,41 @@ mod tests {
         );
         assert!(harness.ended());
         assert_eq!(harness.layer().upper().ids().count(), 0);
+    }
+
+    /// The budget runs out as graceful shutdown writes its first GOAWAY:
+    /// the connection ends with GOAWAY `ENHANCE_YOUR_CALM`, and the
+    /// shutdown's PING does not follow it (RFC 9113 section 5.4.1: GOAWAY
+    /// is the last frame of a connection that ends for an error).
+    #[test]
+    fn a_refusal_during_graceful_shutdown_writes_nothing_after_its_goaway() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let budget = Budget::new(1 << 24);
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(16, 1, |_, _, _| Some(Sink::reading(false))),
+        );
+        let mut harness =
+            Harness::with_budget(fictionet::Seed::from_u64(9), server, budget.clone());
+        harness.push(&client_preface()).unwrap();
+        let mut input = Vec::new();
+        for stream in (1..8).step_by(2) {
+            input.extend(headers_without_end(stream));
+        }
+        harness.push(&input).unwrap();
+        harness.take_output();
+        let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        harness.driver().layer_mut().lower_mut().graceful_shutdown();
+        harness.settle().unwrap();
+        let output = frames(&harness.take_output());
+        let last = output.iter().position(
+            |f| matches!(f, Frame::GoAway(g) if g.code == ErrorCode::EnhanceYourCalm as u32),
+        );
+        let Some(last) = last else {
+            panic!("no GOAWAY ENHANCE_YOUR_CALM: {output:?}");
+        };
+        assert_eq!(last + 1, output.len(), "{output:?}");
+        assert!(harness.ended());
     }
 
     /// A response head larger than several frames goes out as HEADERS and
