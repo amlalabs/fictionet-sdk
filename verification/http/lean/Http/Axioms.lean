@@ -30,3 +30,7 @@ import Http
 #print axioms Http.reader_no_body_is_bodiless
 #print axioms Http.http11_body_is_delimited
 #print axioms Http.not_modified_keeps_supplied_length
+#print axioms Http.BodyProof.request_agrees
+#print axioms Http.BodyProof.request_accepted
+#print axioms Http.Smuggling.head_agrees
+#print axioms Http.Smuggling.framing_agrees

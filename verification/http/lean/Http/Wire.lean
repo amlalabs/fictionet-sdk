@@ -448,52 +448,75 @@ structure Fields where
   close : Bool := false
   deriving DecidableEq, Repr
 
+/-- One list element of `content_length`: a decimal number, equal to the
+ones before it. -/
+def clStep (acc : Option Nat) (v : Bytes) : Except Error (Option Nat) :=
+  match decimal (trim v) with
+  | none => .error .contentLength
+  | some n => if acc.any (· != n) then .error .conflictingContentLength else .ok (some n)
+
 /-- `content_length`: each list element a decimal number, all equal. -/
 def contentLength (value : Bytes) (length : Option Nat) : Except Error (Option Nat) :=
-  (splitBy 44 value).foldlM (init := length) fun acc v =>
-    match decimal (trim v) with
-    | none => .error .contentLength
-    | some n => if acc.any (· != n) then .error .conflictingContentLength else .ok (some n)
+  (splitBy 44 value).foldlM clStep length
+
+/-- One list element of `transfer_encoding`. -/
+def teStep (r : Fields) (v : Bytes) : Except Error Fields :=
+  let v := trim v
+  if v.isEmpty then .ok r
+  else if r.chunked then .error .chunkedNotLast
+  else if !token v then .error .transferEncoding
+  else
+    let c := eqCI v (str "chunked")
+    .ok { r with transfer := true, chunked := c, unsupported := r.unsupported || !c }
 
 /-- `transfer_encoding`: each non-empty list element a token, none after
 `chunked`. -/
 def transferEncoding (value : Bytes) (v : Version) (r : Fields) : Except Error Fields :=
   if v == .h10 then .error .http10TransferEncoding
-  else
-    (splitBy 44 value).foldlM (init := r) fun r v =>
-      let v := trim v
-      if v.isEmpty then .ok r
-      else if r.chunked then .error .chunkedNotLast
-      else if !token v then .error .transferEncoding
-      else
-        let c := eqCI v (str "chunked")
-        .ok { r with transfer := true, chunked := c, unsupported := r.unsupported || !c }
+  else (splitBy 44 value).foldlM teStep r
+
+/-- One list element of the `connection` arm of `fields`. -/
+def connStep (st : Fields × Bool) (v : Bytes) : Except Error (Fields × Bool) :=
+  let v := trim v
+  if v.isEmpty then .ok st
+  else if !token v then .error .header
+  else .ok ({ st.1 with close := st.1.close || eqCI v (str "close") },
+    st.2 || eqCI v (str "keep-alive"))
 
 /-- The `connection` arm of `fields`: each non-empty element a token. -/
 def connection (value : Bytes) (st : Fields × Bool) : Except Error (Fields × Bool) :=
-  (splitBy 44 value).foldlM (init := st) fun (r, keep) v =>
-    let v := trim v
-    if v.isEmpty then .ok (r, keep)
-    else if !token v then .error .header
-    else .ok ({ r with close := r.close || eqCI v (str "close") }, keep || eqCI v (str "keep-alive"))
+  (splitBy 44 value).foldlM connStep st
+
+/-- A field line as `fields` checks it: `valid_field`. -/
+def validField (n value : Bytes) : Bool := token n && value.all fieldByte && trim value == value
+
+/-- One field of the loop in `fields`, with whether `keep-alive` was named. -/
+def fieldStep (v : Version) (st : Fields × Bool) (f : Bytes × Bytes) : Except Error (Fields × Bool) :=
+  if !validField f.1 f.2 then .error .header
+  else if eqCI f.1 (str "content-length") then
+    match contentLength f.2 st.1.length with
+    | .error e => .error e
+    | .ok l => .ok ({ st.1 with length := l }, st.2)
+  else if eqCI f.1 (str "transfer-encoding") then
+    match transferEncoding f.2 v st.1 with
+    | .error e => .error e
+    | .ok r => .ok (r, st.2)
+  else if eqCI f.1 (str "connection") then connection f.2 st
+  else .ok st
+
+def hasName (fs : List (Bytes × Bytes)) (name : String) : Bool :=
+  fs.any fun f => eqCI f.1 (str name)
 
 /-- `fields`. -/
-def fields (fs : List (Bytes × Bytes)) (v : Version) : Except Error Fields := do
-  let hasTe := fs.any fun (n, _) => eqCI n (str "transfer-encoding")
-  let hasCl := fs.any fun (n, _) => eqCI n (str "content-length")
-  if hasTe && hasCl then throw .transferEncodingAndContentLength
-  let (r, keep) ← fs.foldlM (init := (({} : Fields), false)) fun (r, keep) (n, value) => do
-    if !(token n && value.all fieldByte && trim value == value) then throw .header
-    if eqCI n (str "content-length") then
-      let l ← contentLength value r.length
-      pure ({ r with length := l }, keep)
-    else if eqCI n (str "transfer-encoding") then
-      let r ← transferEncoding value v r
-      pure (r, keep)
-    else if eqCI n (str "connection") then connection value (r, keep)
-    else pure (r, keep)
-  if hasTe && !r.transfer then throw .transferEncoding
-  pure { r with close := r.close || (v == .h10 && !keep) }
+def fields (fs : List (Bytes × Bytes)) (v : Version) : Except Error Fields :=
+  let hasTe := hasName fs "transfer-encoding"
+  if hasTe && hasName fs "content-length" then .error .transferEncodingAndContentLength
+  else
+    match fs.foldlM (fieldStep v) ({}, false) with
+    | .error e => .error e
+    | .ok (r, keep) =>
+      if hasTe && !r.transfer then .error .transferEncoding
+      else .ok { r with close := r.close || (v == .h10 && !keep) }
 
 /-- `request_framing`. -/
 def requestFraming (r : Fields) : Except Error Framing :=
@@ -705,29 +728,42 @@ def runBody (lim : Limits) (input : Bytes) (eof : Bool) (close : Bool) :
     | .done => ([.done pos], if close then .stop (.ended pos) else .next pos)
     | .finish => ([], .stop (.ended pos))
 
-/-- One request of `RequestEvents::scan_request` from the start of `input`:
-up to `MAX_EMPTY_LINES` empty lines, the head, the body. -/
-def request1 (lim : Limits) (input : Bytes) (eof : Bool) : List Event × MsgEnd :=
-  let rec go : Nat → Nat → Nat → List Event × MsgEnd
-    | 0, pos, _ => ([], .stop (.waiting pos))
+/-- How a request's head ends: the stream stops, or the head ends at offset
+`endAt` (the empty lines before it included) with its `Fields` and framing. -/
+inductive Start
+  | stop (s : Stop)
+  | head (endAt : Nat) (h : RequestHead) (r : Fields) (f : Framing)
+
+/-- The head part of `RequestEvents::scan_request` from the start of
+`input`: up to `MAX_EMPTY_LINES` empty lines, then the head. -/
+def requestStart (lim : Limits) (input : Bytes) (eof : Bool) : Start :=
+  let rec go : Nat → Nat → Nat → Start
+    | 0, pos, _ => .stop (.waiting pos)
     | fuel + 1, pos, empty =>
       let rest := input.drop pos
-      if rest == [13] then ([], .stop (needStop input pos eof))
+      if rest == [13] then .stop (needStop input pos eof)
       else if rest.take 2 == [13, 10] then
-        if empty ≥ maxEmptyLines then ([], .stop (.failed .startLine))
+        if empty ≥ maxEmptyLines then .stop (.failed .startLine)
         else go fuel (pos + 2) (empty + 1)
       else
         match readHead lim rest with
-        | .need => ([], .stop (needStop input pos eof))
-        | .err e => ([], .stop (.failed e))
+        | .need => .stop (needStop input pos eof)
+        | .err e => .stop (.failed e)
         | .done n =>
           match requestHead (rest.take n) with
-          | .error e => ([], .stop (.failed e))
-          | .ok (h, r, f) =>
-            let (s, close) := begin f (r.close || h.method == str "CONNECT")
-            let (evs, e) := runBody lim input eof close (input.length + 2) s (pos + n)
-            (.head h.method h.target h.version 0 (pos + n) :: evs, e)
+          | .error e => .stop (.failed e)
+          | .ok (h, r, f) => .head (pos + n) h r f
   go (maxEmptyLines + 2) 0 0
+
+/-- One request of `RequestEvents::scan_request` from the start of `input`:
+the head, then the body. Every CONNECT ends HTTP after its message. -/
+def request1 (lim : Limits) (input : Bytes) (eof : Bool) : List Event × MsgEnd :=
+  match requestStart lim input eof with
+  | .stop s => ([], .stop s)
+  | .head e h r f =>
+    let (s, close) := begin f (r.close || h.method == str "CONNECT")
+    let (evs, fin) := runBody lim input eof close (input.length + 2) s e
+    (.head h.method h.target h.version 0 e :: evs, fin)
 
 def Event.shift (k : Nat) : Event → Event
   | .head m t v st e => .head m t v st (e + k)
