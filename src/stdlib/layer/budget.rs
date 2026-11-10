@@ -57,7 +57,7 @@ struct Waiters {
     /// Each is woken once, by the first release after it registered that
     /// leaves room for the least refused charge. One whose owner dropped
     /// it leaves at the next registration.
-    waiting: Vec<Arc<WaiterInner>>,
+    waiting: Vec<Arc<dyn Waits>>,
     /// The count of refusals when a release last woke the runners.
     woken_at: u64,
 }
@@ -72,29 +72,84 @@ struct Waiters {
 /// registration or wake, so a list holds at most the waiters alive at
 /// the last registration.
 pub struct Waiter {
-    inner: Arc<WaiterInner>,
+    inner: Arc<dyn Waits>,
+    waker: Waker,
 }
 
-struct WaiterInner {
-    waker: Waker,
-    /// The owner dropped it.
+/// What the budget's list holds of a [`Waiter`].
+trait Waits: Send + Sync {
+    /// Wakes it, unless its owner dropped it.
+    fn wake(&self);
+    /// Its owner dropped it.
+    fn gone(&self) -> bool;
+    fn leave(&self);
+}
+
+/// A waiter's shared part: what waking it does, and whether its owner
+/// dropped it.
+struct Node<F> {
+    wake: F,
     gone: AtomicBool,
+}
+
+impl<F: Fn() + Send + Sync> Waits for Node<F> {
+    fn wake(&self) {
+        if !self.gone() {
+            (self.wake)();
+        }
+    }
+
+    fn gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
+    fn leave(&self) {
+        self.gone.store(true, Ordering::Release);
+    }
+}
+
+/// The waker of a waiter made by [`Waiter::from_fn`] is its node.
+impl<F: Fn() + Send + Sync + 'static> std::task::Wake for Node<F> {
+    fn wake(self: Arc<Self>) {
+        (self.wake)();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        (self.wake)();
+    }
 }
 
 impl Waiter {
     /// A waiter that wakes `waker`.
     pub fn new(waker: Waker) -> Waiter {
+        let wakes = waker.clone();
         Waiter {
-            inner: Arc::new(WaiterInner {
-                waker,
+            inner: Arc::new(Node {
+                wake: move || wakes.wake_by_ref(),
                 gone: AtomicBool::new(false),
             }),
+            waker,
+        }
+    }
+
+    /// A waiter that calls `wake` when woken, and whose
+    /// [`waker`](Self::waker) calls it too: one allocation for both, for an
+    /// owner that makes the waker only to wait with it, as a child of
+    /// [`Children`](super::Children) does.
+    pub fn from_fn(wake: impl Fn() + Send + Sync + 'static) -> Waiter {
+        let node = Arc::new(Node {
+            wake,
+            gone: AtomicBool::new(false),
+        });
+        Waiter {
+            waker: Waker::from(node.clone()),
+            inner: node,
         }
     }
 
     /// What it wakes.
     pub fn waker(&self) -> &Waker {
-        &self.inner.waker
+        &self.waker
     }
 }
 
@@ -106,19 +161,7 @@ impl std::fmt::Debug for Waiter {
 
 impl Drop for Waiter {
     fn drop(&mut self) {
-        self.inner.gone.store(true, Ordering::Release);
-    }
-}
-
-impl WaiterInner {
-    fn gone(&self) -> bool {
-        self.gone.load(Ordering::Acquire)
-    }
-
-    fn wake(&self) {
-        if !self.gone() {
-            self.waker.wake_by_ref();
-        }
+        self.inner.leave();
     }
 }
 

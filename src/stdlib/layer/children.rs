@@ -360,7 +360,7 @@ struct Kid<B: Layer> {
     /// Events the mux sent within credit that the layer has not taken.
     inbox: ChargedDeque<(EventOf<B::Lower>, bool)>,
     wake: Arc<ChildWake>,
-    /// Its [`Within`]: the waker its calls get, and what waits on its
+    /// Its waker ([`within`]): what its calls get, and what waits on its
     /// budget after a charge of its was refused.
     waiter: Waiter,
     /// Its places in the ready and work lists.
@@ -536,25 +536,16 @@ impl Wake for ChildWake {
 }
 
 /// A child's [`Env::waker`], and what its budget wakes when memory frees
-/// after a charge of the child's was refused: it queues the child, then
-/// wakes `around`, what the child runs in. Made once when the child opens,
-/// so every call gets the same one and the budget sees a child that waits
-/// again as the same waiter. It changes nothing in the child's wake, so it
-/// stays good while the child is open.
-struct Within {
-    child: Arc<ChildWake>,
-    around: Waker,
-}
-
-impl Wake for Within {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.child.notify();
-        self.around.wake_by_ref();
-    }
+/// after a charge of the child's was refused, in one allocation: it queues
+/// the child, then wakes `around`, what the child runs in. Made once when
+/// the child opens, so every call gets the same one and the budget sees a
+/// child that waits again as the same waiter. It changes nothing in the
+/// child's wake, so it stays good while the child is open.
+fn within(child: Arc<ChildWake>, around: Waker) -> Waiter {
+    Waiter::from_fn(move || {
+        child.notify();
+        around.wake_by_ref();
+    })
 }
 
 /// A child's work: its result goes back to the child, and a wake from it,
@@ -1052,10 +1043,7 @@ where
                 let place = self.places.kids.vacant_entry();
                 let key = place.key();
                 let wake = Arc::new(ChildWake::new(key, self.places.woken.clone()));
-                let waiter = Waiter::new(Waker::from(Arc::new(Within {
-                    child: wake.clone(),
-                    around: env.waker(),
-                })));
+                let waiter = within(wake.clone(), env.waker());
                 place.insert(Kid {
                     id,
                     handle: child,
