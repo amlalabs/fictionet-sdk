@@ -36,7 +36,8 @@ use std::time::Duration;
 use fictionet::stdlib::codec::{Stream, Wire};
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnectionExt, ip, tcp};
-use fictionet::stdlib::protocols::http1::{self, Header, RequestHead, Version};
+use fictionet::stdlib::protocols::http1::{self, Header, Version};
+use fictionet::stdlib::web::Head;
 use fictionet::{Cx, Error};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -848,7 +849,7 @@ async fn control(fcx: &Cx, operator: &tcp::Endpoint, kind: &str, body: Value) ->
     }
     headers.push(header("Content-Length", &bytes.len().to_string()));
     let request = http1::Request {
-        head: RequestHead::new(
+        head: Head::new(
             "POST",
             &format!("{}{kind}", hmi::CONTROL_PREFIX),
             Version::Http11,
@@ -870,7 +871,7 @@ async fn control(fcx: &Cx, operator: &tcp::Endpoint, kind: &str, body: Value) ->
 /// Reads the complete HMI view over the operator connection.
 async fn hmi_view(fcx: &Cx, operator: &tcp::Endpoint) -> Result<Value, Error> {
     let request = http1::Request {
-        head: RequestHead::new("GET", "/api/plant", Version::Http11, [("Host", hmi::NAME)]),
+        head: Head::new("GET", "/api/plant", Version::Http11, [("Host", hmi::NAME)]),
         body: Vec::new(),
     };
     let response = exchange(fcx, operator, &request).await?;

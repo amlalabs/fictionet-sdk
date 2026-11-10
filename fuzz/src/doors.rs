@@ -8,7 +8,8 @@ use std::task::{Context, Poll};
 use arbitrary::Arbitrary;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use fictionet::stdlib::protocols::http1::{RequestHead, ResponseHead};
+use fictionet::stdlib::protocols::http1::ResponseHead;
+use fictionet::stdlib::web::Head;
 use fictionet_cli::attach_proxy::Host;
 use fictionet_cli::attach_proxy::auth::{Token, base64_decode};
 use fictionet_cli::attach_proxy::dns;
@@ -37,7 +38,7 @@ pub fn http(data: &[u8]) {
                 let head = forward_head(&req);
                 let text = String::from_utf8_lossy(&head);
                 assert!(text.ends_with("Connection: close\r\n\r\n"));
-                match RequestHead::parse_lenient(&head) {
+                match Head::parse_lenient(&head) {
                     Ok(Some((_, n))) => assert_eq!(n, head.len()),
                     other => panic!("the forwarded head does not parse: {other:?}\n{text}"),
                 }

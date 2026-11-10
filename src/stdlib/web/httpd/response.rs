@@ -5,7 +5,6 @@ use http::header::{CONTENT_LENGTH, DATE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 
 use fictionet::Error;
-use fictionet::stdlib::protocols::http1::RequestHead;
 use fictionet::time::Instant;
 
 use super::{BadGateway, Body, text};
@@ -37,10 +36,6 @@ pub(super) fn headers_held(headers: &HeaderMap) -> usize {
 /// What a copy of a response head holds, counted as for [`request_held`].
 pub(super) fn response_held(parts: &http::response::Parts) -> usize {
     std::mem::size_of::<http::response::Parts>() + headers_held(&parts.headers)
-}
-
-pub(super) fn head_held(head: &RequestHead) -> usize {
-    head.held()
 }
 
 /// The response for a handler error: `502` for [`BadGateway`], else `500`.

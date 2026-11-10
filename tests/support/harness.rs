@@ -182,7 +182,7 @@ pub async fn request<C: fictionet::stdlib::network::Connection>(
         });
     }
     let request = http1::Request {
-        head: http1::RequestHead::new(
+        head: fictionet::stdlib::web::Head::new(
             method,
             path,
             http1::Version::Http11,

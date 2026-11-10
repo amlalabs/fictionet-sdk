@@ -542,6 +542,8 @@
 //! it](fictionet::stdlib#changing-a-protocol-by-copying-it).
 
 pub mod httpd;
+mod request;
+pub use request::Head;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;

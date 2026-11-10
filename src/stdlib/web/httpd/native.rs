@@ -9,25 +9,25 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::header::HOST;
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version};
+use http::{HeaderValue, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::codec::{Fail, Stream, base64};
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, CommandOf, Env, Handoff, Handover,
-    Layer, Owned, OwnedWork, Side, StreamCommand, StreamEvent, Successor, Switch, Timers, Top,
-    WorkOwner,
+    Layer, OwnedWork, Side, StreamCommand, StreamEvent, Successor, Switch, Timers, Top, WorkOwner,
 };
 use fictionet::stdlib::network::ConnInfo;
-use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError, RequestHead};
+use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError};
 use fictionet::stdlib::protocols::http2::{DEFAULT_FRAME_SIZE, MAX_WINDOW, Setting};
 use fictionet::stdlib::services::stack::{Job, Tunnel};
+use fictionet::stdlib::web::Head;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
-use super::response::{Asked, Dates, ResponsePolicy, head_held, request_held, response_held};
+use super::response::{Asked, Dates, ResponsePolicy, request_held, response_held};
 use super::sites::no_host;
 use super::{
     Body, Delivery, Exchange, Handler, Later, Limits, PIECE, Received, Reply, Reset, UpgradeHandler,
@@ -161,7 +161,7 @@ pub struct Http1 {
     after: ChargedBytes,
     phase: Phase,
     timers: Timers<Timer>,
-    head: Option<Owned<RequestHead>>,
+    head: Option<Head>,
     body: ChargedBytes,
     too_big: bool,
     responding: Option<Responding>,
@@ -271,24 +271,11 @@ impl Http1 {
             .upgraded(settings, request)
     }
 
-    /// Parsing copies head strings and grows a header vector geometrically.
-    /// A rejected head is boxed, cloned by Stream and copied for dispatch,
-    /// so reserve all three heads. Body events copy one configured block.
+    /// Head backings carry their reservations. Stream keeps a copy of a
+    /// rejected request box; head clones share their already paid backing.
+    /// Body events still copy one configured block.
     fn decode_reservation(&self) -> usize {
-        let head = self
-            .opts
-            .head
-            .head
-            .saturating_add(
-                self.opts
-                    .head
-                    .headers
-                    .saturating_mul(2)
-                    .max(4)
-                    .saturating_mul(size_of::<http1::Header>()),
-            )
-            .saturating_add(size_of::<http1::RejectedRequest>());
-        head.saturating_mul(3).max(self.opts.head.body_chunk)
+        (2 * size_of::<http1::RejectedRequest>()).max(self.opts.head.body_chunk)
     }
 
     /// Takes the first charge and starts waiting for the first head.
@@ -310,6 +297,11 @@ impl Http1 {
             }
             None => return self.over_budget(env),
         }
+        self.stream.decoder().storage(
+            env.budget().clone(),
+            fictionet::Pool::new(env.budget(), 2048, 4),
+            fictionet::Pool::new(env.budget(), 16384 + 64, 2),
+        );
         self.body = ChargedBytes::new(env.budget());
         self.after = ChargedBytes::new(env.budget());
         let at = self
@@ -384,11 +376,7 @@ impl Http1 {
                     };
                     self.push_out(out);
                 }
-                let Some(charge) = env.budget().charge(head_held(&head)) else {
-                    self.over_budget(env);
-                    return true;
-                };
-                self.head = Some(Owned::new(head, charge));
+                self.head = Some(head);
                 self.body.clear();
                 self.body.trim();
                 self.too_big = false;
@@ -446,7 +434,7 @@ impl Http1 {
         };
         let version = version_of(&head);
         let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method() != "CONNECT";
-        let Some(mut request) = to_request(&head, version, body) else {
+        let Ok(parts) = head.to_http() else {
             let date = self.dates.at(env.now());
             let Some(out) = simple_output(env, version, StatusCode::BAD_REQUEST, date) else {
                 return self.over_budget(env);
@@ -454,6 +442,7 @@ impl Http1 {
             self.push_out(out);
             return self.close(env, Closing::Failed);
         };
+        let mut request = Request::from_parts(parts, body);
         request.extensions_mut().insert(self.conn.clone());
 
         let wants = Asked::of(request.method());
@@ -549,6 +538,9 @@ impl Http1 {
 
     /// The request bytes failed to decode with `fail`.
     fn fail(&mut self, env: &mut Env<'_, Report>, fail: Fail<RequestError>) {
+        if matches!(&fail, Fail::Protocol(error) if error.reason() == http1::Error::Budget) {
+            return self.over_budget(env);
+        }
         if self.head.is_some() {
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error. Of the unread bytes, only body
@@ -576,10 +568,7 @@ impl Http1 {
             && rejected.head.header("host").is_none()
         {
             self.too_big = rejected.received_body_bytes > self.opts.body;
-            let Some(charge) = env.budget().charge(head_held(&rejected.head)) else {
-                return self.over_budget(env);
-            };
-            self.head = Some(Owned::new(rejected.head.clone(), charge));
+            self.head = Some(rejected.head.clone());
             self.dispatch(env, Body::empty(), true, Closing::Failed);
             env.report(Report::Failed(fail));
             return;
@@ -886,8 +875,9 @@ impl Layer for Http1 {
     fn report_bytes(report: &Report) -> Option<usize> {
         match report {
             Report::Work(_) => None,
-            Report::Failed(Fail::Protocol(RequestError::Rejected(request))) => {
-                Some(size_of::<http1::RejectedRequest>() + head_held(&request.head))
+            Report::Failed(Fail::Protocol(RequestError::Rejected(_))) => {
+                // The head backing carries its own reservation.
+                Some(size_of::<http1::RejectedRequest>())
             }
             Report::Failed(_) | Report::Closing(_) => Some(0),
         }
@@ -1303,25 +1293,11 @@ fn partial(bytes: Bytes, why: &'static str) -> Body {
     Body::new(Partial(Some(bytes), Some(why)))
 }
 
-fn version_of(head: &RequestHead) -> Version {
+fn version_of(head: &Head) -> Version {
     match head.version() {
         http1::Version::Http10 => Version::HTTP_10,
         http1::Version::Http11 => Version::HTTP_11,
     }
-}
-
-fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Request<Body>> {
-    let mut builder = Request::builder()
-        .method(head.method().as_bytes())
-        .uri(head.target())
-        .version(version);
-    let headers = builder.headers_mut()?;
-    for h in head.headers() {
-        let name = HeaderName::from_bytes(h.name.as_bytes()).ok()?;
-        let value = HeaderValue::from_bytes(h.value).ok()?;
-        headers.append(name, value);
-    }
-    builder.body(body).ok()
 }
 
 /// Error bodies are constructed under the same reservation as normal output.
