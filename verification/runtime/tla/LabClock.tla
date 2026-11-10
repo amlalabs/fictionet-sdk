@@ -24,7 +24,8 @@ VARIABLES
     entries,    \* State::entries: records with at, id and who
     nextId,     \* State::next_id
     nextSeq,    \* history: a counter of registrations, for the wake order
-    timer,      \* per owner: Timer::deadline (0 for none) and Timer::entry (0 for none)
+    timer,      \* per owner: Entry::at (deadline, 0 for none), Entry::id (entry, 0 for none)
+                \* and the deadline last polled for (wanted, 0 for none)
     seq,        \* per owner: the registration count when its entry was last set
     tstate,     \* per task: "fresh", "ready", "sleeping", "idle" or "done"
     ready,      \* Queue::ready
@@ -44,7 +45,7 @@ vars == <<now, entries, nextId, nextSeq, timer, seq, tstate, ready, turn, idle,
 Range(s) == {s[i] : i \in DOMAIN s}
 Queued(t) == t \in Range(ready) \/ t \in Range(turn)
 Max(a, b) == IF a >= b THEN a ELSE b
-NoTimer == [deadline |-> 0, entry |-> 0]
+NoTimer == [deadline |-> 0, entry |-> 0, wanted |-> 0]
 
 Init ==
     /\ now = 0
@@ -71,7 +72,7 @@ Init ==
 Add(w, at) ==
     /\ entries' = entries \cup {[at |-> at, id |-> nextId, who |-> w]}
     /\ nextId' = nextId + 1
-    /\ timer' = [timer EXCEPT ![w] = [deadline |-> at, entry |-> nextId]]
+    /\ timer' = [timer EXCEPT ![w] = [deadline |-> at, entry |-> nextId, wanted |-> at]]
     /\ seq' = [seq EXCEPT ![w] = nextSeq]
     /\ nextSeq' = nextSeq + 1
 
@@ -82,16 +83,24 @@ Reset(w, at) ==
         id == IF FreshIdOnReset THEN nextId ELSE old
     IN /\ entries' = {e \in entries : e.id # old} \cup {[at |-> at, id |-> id, who |-> w]}
        /\ nextId' = nextId + 1
-       /\ timer' = [timer EXCEPT ![w] = [deadline |-> at, entry |-> id]]
+       /\ timer' = [timer EXCEPT ![w] = [deadline |-> at, entry |-> id, wanted |-> at]]
        /\ seq' = [seq EXCEPT ![w] = nextSeq]
        /\ nextSeq' = nextSeq + 1
 
-\* Clock::update keeps the entry: only the waker changes.
-Update == UNCHANGED <<entries, nextId, timer, seq, nextSeq>>
+\* The entry stays where it is: at most its waker changes (Clock::update),
+\* and the timer notes the deadline it was polled for.
+Keep(w, at) ==
+    /\ timer' = [timer EXCEPT ![w].wanted = at]
+    /\ UNCHANGED <<entries, nextId, seq, nextSeq>>
 
-Register(w, at) ==
+\* Timer::poll_until with the clock read as `reading`: the same deadline,
+\* or a later one while the entry has yet to come, keeps the entry, which
+\* wakes the owner first; an earlier deadline, or one polled for once the
+\* entry's instant has passed, moves it.
+Register(w, at, reading) ==
     IF timer[w].entry = 0 THEN Add(w, at)
-    ELSE IF timer[w].deadline = at THEN Update
+    ELSE IF timer[w].deadline = at THEN Keep(w, at)
+    ELSE IF timer[w].deadline < at /\ reading < timer[w].deadline THEN Keep(w, at)
     ELSE Reset(w, at)
 
 \* Timer::clear: the entry goes, if it is still there.
@@ -119,14 +128,14 @@ BeginTurn ==
 \* instant with a new Timer, or waits for the run to go idle.
 Polling == phase = "turn" /\ turn # <<>>
 Current == Head(turn)
-Early == tstate[Current] = "sleeping" /\ now < timer[Current].deadline
+Early == tstate[Current] = "sleeping" /\ now < timer[Current].wanted
 Without == {e \in entries : e.id # timer[Current].entry}
 
 \* Woken before the deadline: Timer::poll_until keeps the entry.
 PollWait ==
     /\ Polling /\ Early
     /\ turn' = Tail(turn)
-    /\ Register(Current, timer[Current].deadline)
+    /\ Register(Current, timer[Current].wanted, now)
     /\ UNCHANGED <<now, tstate, ready, idle, idleWoken, phase, hphase, hseen, spurious, harms, wakeOk>>
 
 \* The task's wait is over, and it ends: its Timer is dropped.
@@ -156,12 +165,12 @@ PollSleep(d) ==
     /\ Polling /\ d > now
     /\ turn' = Tail(turn)
     /\ IF Early
-       THEN /\ d # timer[Current].deadline
-            /\ Reset(Current, d)
+       THEN /\ d # timer[Current].wanted
+            /\ Register(Current, d, now)
             /\ UNCHANGED tstate
        ELSE /\ tstate' = [tstate EXCEPT ![Current] = "sleeping"]
             /\ entries' = Without \cup {[at |-> d, id |-> nextId, who |-> Current]}
-            /\ timer' = [timer EXCEPT ![Current] = [deadline |-> d, entry |-> nextId]]
+            /\ timer' = [timer EXCEPT ![Current] = [deadline |-> d, entry |-> nextId, wanted |-> d]]
             /\ nextId' = nextId + 1
             /\ seq' = [seq EXCEPT ![Current] = nextSeq]
             /\ nextSeq' = nextSeq + 1
@@ -244,7 +253,7 @@ HarnessRead ==
 
 HarnessArm(at) ==
     /\ hphase = "read" /\ at > hseen /\ harms < MaxArms
-    /\ Register(Harness, at)
+    /\ Register(Harness, at, hseen)
     /\ hphase' = "armed"
     /\ harms' = harms + 1
     /\ UNCHANGED <<now, tstate, ready, turn, idle, idleWoken, phase, hseen, spurious, wakeOk>>

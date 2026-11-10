@@ -273,8 +273,6 @@ impl Cx {
     /// returns runs as its own task. The returned [`Task`] lets you wait for
     /// it with [`Task::join`]. Dropping the `Task` does not stop the work:
     /// the region owns it, not the handle.
-    /// The task's recorded parent is the current task in this run, if any.
-    /// Spawning from another run or outside a world task leaves no parent.
     ///
     /// If the region has completed, the returned task joins with
     /// [`JoinError::Cancelled`]. `work` is still called to construct the
@@ -531,19 +529,29 @@ impl Cx {
     /// Create the token with [`CancelWait::default`]. Call this method on
     /// each poll to update its waker. Registering it with another region,
     /// or from a task of this run, removes its previous registration.
+    /// Registering the waker that is registered already takes no lock.
     pub fn register_cancel(&self, waker: &Waker, wait: &mut CancelWait) -> bool {
-        if crate::run::is_current_task(&self.run, waker) {
+        if self.run.is_polling(waker) {
             wait.clear();
             return self.is_cancelled();
         }
-        match &wait.0 {
-            Some((region, key)) if Arc::ptr_eq(region, &self.region) => {
-                self.region.update_foreign(*key, waker)
+        match &mut wait.0 {
+            Some(registered) if Arc::ptr_eq(&registered.region, &self.region) => {
+                // A cancel that took the waker meanwhile set the flag first,
+                // so the check below sees it.
+                if !registered.waker.will_wake(waker) {
+                    self.region.update_foreign(registered.key, waker);
+                    registered.waker = waker.clone();
+                }
             }
             _ => {
                 wait.clear();
                 let key = self.region.add_foreign(waker);
-                wait.0 = Some((self.region.clone(), key));
+                wait.0 = Some(region::Registered {
+                    region: self.region.clone(),
+                    key,
+                    waker: waker.clone(),
+                });
             }
         }
         // Checked after adding, so a cancel in between is not missed.

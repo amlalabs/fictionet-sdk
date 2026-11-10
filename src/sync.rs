@@ -49,6 +49,69 @@ impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for Mutex<T> {
     }
 }
 
+/// The waker of one consumer that waits for producers, and a flag that says
+/// it is there, so that a producer finding the flag down takes no lock.
+///
+/// The consumer looks for work, [`park`](Parked::park)s when it found none,
+/// then looks once more before it returns `Pending`. A producer publishes
+/// its work, then calls [`wake`](Parked::wake). The two fences between
+/// those steps make the second look see the work, or the producer see the
+/// flag: no wake is lost. While work keeps coming, the consumer never parks
+/// and neither side locks.
+#[derive(Default)]
+pub(crate) struct Parked {
+    parked: std::sync::atomic::AtomicBool,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl Parked {
+    /// Leaves `waker` to be woken by the next [`wake`](Parked::wake). The
+    /// caller looks for work once more after this.
+    pub(crate) fn park(&self, waker: &std::task::Waker) {
+        use std::sync::atomic::{Ordering, fence};
+        let old = {
+            let mut slot = self.waker.lock();
+            let old = match &*slot {
+                Some(w) if w.will_wake(waker) => None,
+                _ => slot.replace(waker.clone()),
+            };
+            self.parked.store(true, Ordering::Relaxed);
+            old
+        };
+        // Dropped outside the lock: dropping a waker can run any code.
+        drop(old);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Wakes the parked consumer, if one is parked. The caller published
+    /// its work before this.
+    pub(crate) fn wake(&self) {
+        use std::sync::atomic::{Ordering, fence};
+        fence(Ordering::SeqCst);
+        if !self.parked.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(waker) = self.take() {
+            waker.wake();
+        }
+    }
+
+    /// Takes the parked waker without waking it.
+    pub(crate) fn take(&self) -> Option<std::task::Waker> {
+        let mut slot = self.waker.lock();
+        self.parked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        slot.take()
+    }
+
+    /// The lock that guards the waker, if it is free, for tests that hold
+    /// it to show a path never takes it.
+    #[cfg(test)]
+    pub(crate) fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, Option<std::task::Waker>>> {
+        self.waker.try_lock()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Mutex;

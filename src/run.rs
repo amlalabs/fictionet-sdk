@@ -1,20 +1,14 @@
 use fictionet::sync::Mutex;
-use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::JoinError;
 use crate::cx::{JoinState, Region, is_cancel};
 use crate::{Cx, Result, Seed};
-
-/// Run ids, unique in the process. They are only compared for equality,
-/// never recorded, serialized, ordered or hashed into anything a world
-/// sees, so they do not affect determinism.
-static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// Runs a world in real time, as one future that any executor can poll.
 ///
@@ -144,28 +138,18 @@ where
     let mut state = RunState {
         shared: shared.clone(),
         root: root.clone(),
-        slots: BTreeMap::new(),
+        tasks: Tasks::default(),
         turn: VecDeque::new(),
         incoming: Vec::new(),
-    };
-    let id = {
-        let mut queue = shared.queue.lock();
-        let id = queue.next_id;
-        queue.next_id += 1;
-        id
     };
     let cx = Cx {
         run: shared.clone(),
         region: root.clone(),
         job_lease: None,
     };
-    let future = {
-        let _guard = CurrentGuard::enter(shared.id, id, Waker::noop());
-        world(cx)
-    };
+    let future = world(cx);
     if root.try_start_task() {
         shared.queue.lock().incoming.push(NewTask {
-            id,
             future: Box::pin(future),
             region: root,
             join: Arc::new(JoinState::default()),
@@ -182,13 +166,15 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
     queue: Mutex<Queue>,
-    pub(crate) id: u64,
+    /// The waker of the task the run is polling now, as `Waker::data`
+    /// gives it, or null between polls.
+    current: AtomicPtr<()>,
 }
 
 #[derive(Default)]
 struct Queue {
     /// Tasks to poll in the next turn, in order.
-    ready: VecDeque<u64>,
+    ready: VecDeque<TaskKey>,
     /// Tasks spawned since the last turn.
     incoming: Vec<NewTask>,
     /// The waker of whatever polls the run.
@@ -200,7 +186,6 @@ struct Queue {
     wake_all: bool,
     /// The run was dropped.
     closed: bool,
-    next_id: u64,
     idle: BTreeMap<u64, Waker>,
     next_idle: u64,
     /// The last turn only ran the tasks an idle point woke, and they found
@@ -209,7 +194,6 @@ struct Queue {
 }
 
 struct NewTask {
-    id: u64,
     future: BoxFuture,
     region: Arc<Region>,
     join: Arc<JoinState>,
@@ -258,16 +242,20 @@ impl RunShared {
     }
 
     fn new(seed: Seed, mode: crate::RunMode) -> Arc<Self> {
-        let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
         Arc::new(Self {
             environment,
-            queue: Mutex::new(Queue {
-                next_id: 1,
-                ..Queue::default()
-            }),
-            id: run_id,
+            queue: Mutex::new(Queue::default()),
+            current: AtomicPtr::new(std::ptr::null_mut()),
         })
+    }
+
+    /// Whether `waker` is the waker of the task this run is polling right
+    /// now. Such a task needs no cancel registration: cancelling any
+    /// region polls every task of the run.
+    pub(crate) fn is_polling(&self, waker: &Waker) -> bool {
+        let current = self.current.load(Ordering::Relaxed);
+        !current.is_null() && std::ptr::eq(current, waker.data())
     }
 
     /// Adds a task. Gives the future back if the run is gone.
@@ -282,15 +270,11 @@ impl RunShared {
             if q.closed {
                 return Err(future);
             }
-            let id = q.next_id;
-            q.next_id += 1;
-            let task = NewTask {
-                id,
+            q.incoming.push(NewTask {
                 future,
                 region,
                 join,
-            };
-            q.incoming.push(task);
+            });
             if q.polling { None } else { q.outer.clone() }
         };
         if let Some(w) = outer {
@@ -299,13 +283,13 @@ impl RunShared {
         Ok(())
     }
 
-    fn schedule(&self, id: u64) {
+    fn schedule(&self, key: TaskKey) {
         let outer = {
             let mut q = self.queue.lock();
             if q.closed {
                 return;
             }
-            q.ready.push_back(id);
+            q.ready.push_back(key);
             if q.polling { None } else { q.outer.clone() }
         };
         if let Some(w) = outer {
@@ -332,7 +316,7 @@ impl RunShared {
 
 /// The waker of one task: puts the task back in the queue.
 struct TaskWaker {
-    id: u64,
+    key: TaskKey,
     /// The task is in `ready` already.
     queued: AtomicBool,
     run: Weak<RunShared>,
@@ -347,7 +331,7 @@ impl Wake for TaskWaker {
         if !self.queued.swap(true, Ordering::AcqRel)
             && let Some(run) = self.run.upgrade()
         {
-            run.schedule(self.id);
+            run.schedule(self.key);
         }
     }
 }
@@ -360,53 +344,149 @@ struct Slot {
     join: Arc<JoinState>,
 }
 
-/// A task number qualified by its run.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RunTask {
-    pub(crate) run: u64,
-    pub(crate) id: u64,
+/// Where a task lives in [`Tasks`]: its slot, and which of the slot's tasks
+/// it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskKey {
+    index: usize,
+    generation: u64,
 }
 
-#[derive(Clone, Copy)]
-struct CurrentTask {
-    task: RunTask,
-    waker: *const (),
+/// The live tasks of a run, each in a slot found by its index. A slot a
+/// task leaves is used again under the next generation, so a wake for the
+/// task that left finds nothing, and the table grows no further than the
+/// most tasks live at once. The live tasks are also linked in spawn order,
+/// the order a cancel polls them and a dropped run drops them.
+#[derive(Default)]
+struct Tasks {
+    entries: Vec<Entry>,
+    /// Slots with no task, the last freed on top.
+    free: Vec<usize>,
+    /// The oldest and newest live tasks.
+    first: Option<usize>,
+    last: Option<usize>,
 }
 
-thread_local! {
-    /// The run, task and waker being polled on this thread, if any.
-    static CURRENT: Cell<Option<CurrentTask>> = const { Cell::new(None) };
+struct Entry {
+    generation: u64,
+    task: Option<Slot>,
+    /// The live tasks spawned just before and just after this one.
+    before: Option<usize>,
+    after: Option<usize>,
 }
 
-/// Whether `waker` is the waker of the task of `run` that is being polled
-/// on this thread right now.
-pub(crate) fn is_current_task(run: &Arc<RunShared>, waker: &Waker) -> bool {
-    CURRENT.with(|c| {
-        c.get()
-            .is_some_and(|t| t.task.run == run.id && t.waker == waker.data())
-    })
-}
-
-/// Restores the current task when a poll ends, even by a panic.
-struct CurrentGuard {
-    previous: Option<CurrentTask>,
-}
-
-impl CurrentGuard {
-    fn enter(run: u64, id: u64, waker: &Waker) -> Self {
-        let current = CurrentTask {
-            task: RunTask { run, id },
-            waker: waker.data(),
+impl Tasks {
+    /// Puts a task in a free slot, after every live task, and returns its
+    /// key. `make` builds the task from its key.
+    fn insert(&mut self, make: impl FnOnce(TaskKey) -> Slot) -> TaskKey {
+        let index = match self.free.pop() {
+            Some(index) => index,
+            None => {
+                self.entries.push(Entry {
+                    generation: 0,
+                    task: None,
+                    before: None,
+                    after: None,
+                });
+                self.entries.len() - 1
+            }
         };
-        Self {
-            previous: CURRENT.with(|c| c.replace(Some(current))),
+        let key = TaskKey {
+            index,
+            generation: self.entries[index].generation,
+        };
+        let last = self.last.replace(index);
+        match last {
+            Some(last) => self.entries[last].after = Some(index),
+            None => self.first = Some(index),
         }
+        let entry = &mut self.entries[index];
+        entry.task = Some(make(key));
+        entry.before = last;
+        entry.after = None;
+        key
+    }
+
+    /// The live task `key` names, if it is still there.
+    fn get_mut(&mut self, key: TaskKey) -> Option<&mut Slot> {
+        self.entries
+            .get_mut(key.index)
+            .filter(|entry| entry.generation == key.generation)
+            .and_then(|entry| entry.task.as_mut())
+    }
+
+    /// Takes the live task `key` names out, and frees its slot for the next
+    /// generation.
+    fn remove(&mut self, key: TaskKey) -> Option<Slot> {
+        let entry = self
+            .entries
+            .get_mut(key.index)
+            .filter(|entry| entry.generation == key.generation)?;
+        let task = entry.task.take()?;
+        entry.generation += 1;
+        let (before, after) = (entry.before.take(), entry.after.take());
+        match before {
+            Some(before) => self.entries[before].after = after,
+            None => self.first = after,
+        }
+        match after {
+            Some(after) => self.entries[after].before = before,
+            None => self.last = before,
+        }
+        self.free.push(key.index);
+        Some(task)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    /// The live tasks' keys, in spawn order, to `each`.
+    fn for_each(&self, mut each: impl FnMut(TaskKey, &Slot)) {
+        let mut at = self.first;
+        while let Some(index) = at {
+            let entry = &self.entries[index];
+            let task = entry.task.as_ref().expect("a linked slot holds a task");
+            each(
+                TaskKey {
+                    index,
+                    generation: entry.generation,
+                },
+                task,
+            );
+            at = entry.after;
+        }
+    }
+
+    /// Takes the oldest live task out.
+    fn pop_first(&mut self) -> Option<Slot> {
+        let index = self.first?;
+        let key = TaskKey {
+            index,
+            generation: self.entries[index].generation,
+        };
+        self.remove(key)
     }
 }
 
-impl Drop for CurrentGuard {
+/// Notes in the run which task waker it is polling, and clears the note
+/// when the poll ends, even by a panic.
+struct Polling<'a>(&'a AtomicPtr<()>);
+
+impl<'a> Polling<'a> {
+    fn enter(current: &'a AtomicPtr<()>, waker: &Waker) -> Self {
+        // Relaxed is enough. The task's own poll reads it on this thread. A
+        // waker compared from another thread was made after any waker that
+        // once had its address was freed, which was after the store that
+        // cleared this, so the load cannot see a freed waker's address.
+        current.store(waker.data().cast_mut(), Ordering::Relaxed);
+        Polling(current)
+    }
+}
+
+impl Drop for Polling<'_> {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.replace(self.previous.take()));
+        self.0.store(std::ptr::null_mut(), Ordering::Relaxed);
     }
 }
 
@@ -414,12 +494,12 @@ impl Drop for CurrentGuard {
 struct RunState {
     shared: Arc<RunShared>,
     root: Arc<Region>,
-    /// Live tasks in spawn order, including when their futures are dropped.
-    slots: BTreeMap<u64, Slot>,
+    /// Live tasks, including when their futures are dropped.
+    tasks: Tasks,
     /// The tasks being polled in this turn. Swapped with the queue's
     /// `ready` at the start of each turn, so neither allocates again once
     /// both have grown to what the run needs.
-    turn: VecDeque<u64>,
+    turn: VecDeque<TaskKey>,
     /// Tasks spawned since the last turn, swapped out of the queue the same
     /// way.
     incoming: Vec<NewTask>,
@@ -438,53 +518,47 @@ impl RunState {
             q.polling = true;
             std::mem::swap(&mut q.incoming, &mut self.incoming);
             for new in self.incoming.drain(..) {
-                let task_waker = Arc::new(TaskWaker {
-                    id: new.id,
-                    queued: AtomicBool::new(true),
-                    run: Arc::downgrade(&self.shared),
-                });
-                let waker = Waker::from(task_waker.clone());
-                self.slots.insert(
-                    new.id,
+                let key = self.tasks.insert(|key| {
+                    let task_waker = Arc::new(TaskWaker {
+                        key,
+                        queued: AtomicBool::new(true),
+                        run: Arc::downgrade(&self.shared),
+                    });
                     Slot {
                         future: new.future,
+                        waker: Waker::from(task_waker.clone()),
                         task_waker,
-                        waker,
                         region: new.region,
                         join: new.join,
-                    },
-                );
-                q.ready.push_back(new.id);
+                    }
+                });
+                q.ready.push_back(key);
             }
             if std::mem::take(&mut q.wake_all) {
-                for &id in self.slots.keys() {
-                    if !self.slots[&id]
-                        .task_waker
-                        .queued
-                        .swap(true, Ordering::AcqRel)
-                    {
-                        q.ready.push_back(id);
+                self.tasks.for_each(|key, task| {
+                    if !task.task_waker.queued.swap(true, Ordering::AcqRel) {
+                        q.ready.push_back(key);
                     }
-                }
+                });
             }
             std::mem::swap(&mut q.ready, &mut turn);
             old
         };
         drop(old);
 
-        while let Some(id) = turn.pop_front() {
-            let Some(slot) = self.slots.get_mut(&id) else {
+        while let Some(key) = turn.pop_front() {
+            let Some(slot) = self.tasks.get_mut(key) else {
                 continue;
             };
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
-                let _guard = CurrentGuard::enter(self.shared.id, id, &slot.waker);
+                let _polling = Polling::enter(&self.shared.current, &slot.waker);
                 slot.future
                     .as_mut()
                     .poll(&mut Context::from_waker(&slot.waker))
             };
             if let Poll::Ready(result) = result {
-                let slot = self.slots.remove(&id).unwrap();
+                let slot = self.tasks.remove(key).expect("the task was just polled");
                 let Slot {
                     future,
                     region,
@@ -522,7 +596,7 @@ impl RunState {
         self.turn = turn;
         let mut q = self.shared.queue.lock();
         q.polling = false;
-        if self.slots.is_empty() && q.incoming.is_empty() {
+        if self.tasks.is_empty() && q.incoming.is_empty() {
             drop(q);
             return Poll::Ready(match self.root.take_error() {
                 Some(e) => Err(e),
@@ -562,6 +636,15 @@ impl RunState {
             drop(q);
             // Give the executor its turn too, then come back.
             cx.waker().wake_by_ref();
+        } else {
+            drop(q);
+            // In a browser, `block_on` holds the thread and polls the run over
+            // and over, so no `setTimeout` fires: the run fires its own
+            // timers as they come due.
+            #[cfg(target_arch = "wasm32")]
+            if self.shared.environment.clock.fire_due() {
+                cx.waker().wake_by_ref();
+            }
         }
         Poll::Pending
     }
@@ -576,27 +659,23 @@ impl Drop for RunState {
         };
         drop(outer);
         // The dropped work, as its region and joiner see it ending.
-        let ended: Vec<(Arc<Region>, Arc<JoinState>)> = incoming
+        let mut ended: Vec<(Arc<Region>, Arc<JoinState>)> = incoming
             .iter()
             .map(|t| (t.region.clone(), t.join.clone()))
-            .chain(
-                self.slots
-                    .values()
-                    .map(|s| (s.region.clone(), s.join.clone())),
-            )
             .collect();
+        self.tasks
+            .for_each(|_, s| ended.push((s.region.clone(), s.join.clone())));
         for task in incoming {
             let NewTask {
-                id: _,
                 future,
                 region,
                 join,
-                ..
             } = task;
             drop((future, region, join));
         }
-        // Task destructors run in ascending task ID order.
-        for (_id, slot) in std::mem::take(&mut self.slots) {
+        // Task destructors run in spawn order.
+        let mut tasks = std::mem::take(&mut self.tasks);
+        while let Some(slot) = tasks.pop_first() {
             let Slot {
                 future,
                 task_waker,
@@ -607,7 +686,7 @@ impl Drop for RunState {
             } = slot;
             drop((future, task_waker, waker, region, join));
         }
-        // Work spawned while the slots were dropped.
+        // Work spawned while the tasks were dropped.
         let late = std::mem::take(&mut self.shared.queue.lock().incoming);
         drop(late);
         // Every region of the run is cancelled before any of them sees its
@@ -628,7 +707,7 @@ impl Drop for RunState {
 mod tests {
     use super::*;
     use crate::time::ms;
-    use crate::{Cancelled, block_on};
+    use crate::{CancelWait, Cancelled, block_on};
 
     #[test]
     fn outer_waiter_replacement_and_close_release_wakers_outside_the_lock() {
@@ -650,7 +729,7 @@ mod tests {
             let mut state = RunState {
                 shared: shared.clone(),
                 root,
-                slots: BTreeMap::new(),
+                tasks: Tasks::default(),
                 turn: VecDeque::new(),
                 incoming: Vec::new(),
             };
@@ -737,6 +816,198 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the lab never jumped its clock while a task waited on idle");
         assert_eq!(out, Ok(()));
+    }
+
+    /// A splitmix64 step.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Inserts and removes at random, against a model that keeps the live
+    /// tasks in spawn order: a key finds its task while it lives and
+    /// nothing after, the live tasks go round in spawn order, and the table
+    /// never grows past the most tasks live at once.
+    #[test]
+    fn task_slots_match_a_spawn_order_model() {
+        let shared = RunShared::new(Seed::from_u64(0), crate::RunMode::Lab);
+        let root = Region::root(Arc::downgrade(&shared));
+        let slot = |key, n: u64| {
+            let task_waker = Arc::new(TaskWaker {
+                key,
+                queued: AtomicBool::new(false),
+                run: Weak::new(),
+            });
+            Slot {
+                // The future's output names the task, for the model.
+                future: Box::pin(async move { Err(crate::Error::msg(n.to_string())) }),
+                waker: Waker::from(task_waker.clone()),
+                task_waker,
+                region: root.clone(),
+                join: Arc::new(JoinState::default()),
+            }
+        };
+        let name = |task: &mut Slot| -> String {
+            let mut cx = Context::from_waker(Waker::noop());
+            match task.future.as_mut().poll(&mut cx) {
+                Poll::Ready(Err(e)) => e.to_string(),
+                _ => unreachable!("each test future is ready at once"),
+            }
+        };
+        for seed in 1..=8u64 {
+            let mut state = seed;
+            let mut tasks = Tasks::default();
+            // Live tasks in spawn order: (key, name).
+            let mut model: Vec<(TaskKey, u64)> = Vec::new();
+            let mut gone: Vec<TaskKey> = Vec::new();
+            let mut most = 0;
+            for n in 0..2_000u64 {
+                let r = next(&mut state);
+                if model.is_empty() || r % 5 < 3 {
+                    let key = tasks.insert(|key| slot(key, n));
+                    model.push((key, n));
+                } else {
+                    let (key, want) = model.remove((r >> 8) as usize % model.len());
+                    let mut task = tasks.remove(key).expect("a live key finds its task");
+                    assert_eq!(name(&mut task), want.to_string());
+                    assert!(tasks.remove(key).is_none());
+                    gone.push(key);
+                }
+                most = most.max(model.len());
+                assert!(tasks.entries.len() <= most, "seed {seed}");
+                for &key in &gone[gone.len().saturating_sub(8)..] {
+                    assert!(
+                        tasks.get_mut(key).is_none(),
+                        "seed {seed}: a stale key found a task"
+                    );
+                }
+                let mut order = Vec::new();
+                tasks.for_each(|key, _| order.push(key));
+                let want: Vec<TaskKey> = model.iter().map(|(key, _)| *key).collect();
+                assert_eq!(order, want, "seed {seed}");
+                assert_eq!(tasks.is_empty(), model.is_empty());
+            }
+            for (_, want) in model {
+                let mut task = tasks.pop_first().expect("a live task is left");
+                assert_eq!(name(&mut task), want.to_string());
+            }
+            assert!(tasks.is_empty());
+        }
+    }
+
+    /// Tasks that end free their slots, and the tasks spawned after reuse
+    /// them, so slot order and spawn order part. A wake kept from a task
+    /// that ended never polls the task in its slot now, and a cancel polls
+    /// the live tasks in spawn order.
+    #[test]
+    fn reused_slots_keep_wakes_apart_and_cancels_in_spawn_order() {
+        use fictionet::sync::Mutex;
+        block_on(lab(Seed::from_u64(0), |fcx| async move {
+            let kept = Arc::new(Mutex::new(Vec::<Waker>::new()));
+            for _ in 0..4 {
+                let kept = kept.clone();
+                let task = fcx.spawn(move |_| {
+                    std::future::poll_fn(move |cx| {
+                        kept.lock().push(cx.waker().clone());
+                        Poll::Ready(Ok(()))
+                    })
+                });
+                assert!(task.join(&fcx).await.is_ok());
+            }
+            let polls = Arc::new(Mutex::new(0usize));
+            let cancels = Arc::new(Mutex::new(Vec::<usize>::new()));
+            let (p, c) = (polls.clone(), cancels.clone());
+            fcx.region(move |inner| async move {
+                // Tasks 1 and 3 end at once; 6 and 7 take their slots.
+                let spawn = |n: usize| {
+                    let (polls, cancels) = (p.clone(), c.clone());
+                    inner.spawn(move |fcx| {
+                        std::future::poll_fn(move |_| {
+                            *polls.lock() += 1;
+                            if n == 1 || n == 3 {
+                                return Poll::Ready(Ok(()));
+                            }
+                            if fcx.is_cancelled() {
+                                cancels.lock().push(n);
+                                return Poll::Ready(Ok(()));
+                            }
+                            Poll::Pending
+                        })
+                    });
+                };
+                (0..6).for_each(spawn);
+                inner.yield_now().await?;
+                inner.yield_now().await?;
+                (6..8).for_each(spawn);
+                inner.yield_now().await?;
+                inner.yield_now().await?;
+                let before = *p.lock();
+                assert_eq!(before, 8, "each task was polled once");
+                for waker in kept.lock().iter() {
+                    waker.wake_by_ref();
+                }
+                inner.yield_now().await?;
+                inner.yield_now().await?;
+                assert_eq!(*p.lock(), before, "a stale wake polled a task");
+                inner.cancel();
+                Ok(())
+            })
+            .await?;
+            assert_eq!(*cancels.lock(), [0, 2, 4, 5, 6, 7]);
+            drop(polls);
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// The run itself knows which task it polls. A task registering its own
+    /// waker needs no cancel registration; any other waker, here a no-op
+    /// one and the waker of another run's task polled inside this one, is
+    /// registered. Between polls no waker counts as the task's, and the
+    /// task still hears a cancel.
+    #[test]
+    fn only_the_task_being_polled_skips_the_cancel_registration() {
+        block_on(lab(Seed::from_u64(0), |fcx| async move {
+            let mut wait = CancelWait::default();
+            let mut own = None;
+            std::future::poll_fn(|cx| {
+                assert!(!fcx.register_cancel(cx.waker(), &mut wait));
+                own = Some(cx.waker().clone());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fcx.region.foreign_waits(), 0);
+            let own = own.unwrap();
+            assert!(!fcx.run.is_polling(Waker::noop()));
+            assert!(!fcx.register_cancel(Waker::noop(), &mut wait));
+            assert_eq!(fcx.region.foreign_waits(), 1);
+            // Another run, polled inside this task, has its own task.
+            let outer = fcx.clone();
+            block_on(lab(Seed::from_u64(1), move |inner| async move {
+                std::future::poll_fn(|cx| {
+                    assert!(inner.run.is_polling(cx.waker()));
+                    assert!(!outer.run.is_polling(cx.waker()));
+                    Poll::Ready(())
+                })
+                .await;
+                Ok(())
+            }))?;
+            // The waker of this task, once this task is not being polled.
+            let checked = Arc::new(AtomicBool::new(false));
+            let seen = checked.clone();
+            let shared = fcx.run.clone();
+            let other = fcx.spawn(move |_| async move {
+                seen.store(!shared.is_polling(&own), Ordering::SeqCst);
+                Ok(())
+            });
+            assert!(other.join(&fcx).await.is_ok());
+            assert!(checked.load(Ordering::SeqCst));
+            Ok(())
+        }))
+        .unwrap();
     }
 
     /// `Cx::region` awaited outside the run is a wait on a `Cx` clone:

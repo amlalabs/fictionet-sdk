@@ -1,214 +1,187 @@
-//! The host wake driver for real runs: one helper thread
-//! per process that waits for each run's earliest logical deadline.
-//! Logical registrations and ordering belong to the run's clock.
+//! The host wake driver of a real run: it wakes the run's clock at the
+//! clock's earliest deadline. Each real clock owns its driver, and nothing
+//! is shared between runs. Logical registrations and their order belong to
+//! the clock.
 //!
-//! A browser has no threads to spare. There a JavaScript `setTimeout` is
-//! armed for the earliest deadline instead, and [`block_on`](crate::block_on)
-//! fires the timers itself while it waits.
+//! Natively the driver is one helper thread, started with the first
+//! deadline and ended when the clock is dropped. A browser has no threads
+//! to spare: there each deadline arms a JavaScript `setTimeout`, and a run
+//! polled by [`block_on`](crate::block_on), which holds the thread so no
+//! `setTimeout` can run, fires its due timers itself.
 
-use fictionet::sync::Mutex;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::Condvar;
-use std::sync::OnceLock;
 use std::task::Waker;
 
 use crate::sys::Instant;
 
-pub(crate) struct Timers {
-    state: Mutex<State>,
+/// Wakes `wake` at the deadline it was last given.
+pub(crate) struct Driver {
     #[cfg(not(target_arch = "wasm32"))]
-    changed: Condvar,
+    shared: std::sync::Arc<native::Shared>,
+    #[cfg(target_arch = "wasm32")]
+    wake: Waker,
 }
 
-struct State {
-    /// Deadlines in order. Entries whose id is no longer in `entries`, or
-    /// whose deadline is not that timer's deadline now, are stale and
-    /// skipped.
-    heap: BinaryHeap<Reverse<(Instant, u64)>>,
-    entries: HashMap<u64, (Instant, Waker)>,
-    next_id: u64,
-}
-
-pub(crate) fn timers() -> &'static Timers {
-    static TIMERS: OnceLock<&'static Timers> = OnceLock::new();
-    TIMERS.get_or_init(|| {
-        let timers: &'static Timers = Box::leak(Box::new(Timers {
-            state: Mutex::new(State {
-                heap: BinaryHeap::new(),
-                entries: HashMap::new(),
-                next_id: 0,
-            }),
-            #[cfg(not(target_arch = "wasm32"))]
-            changed: Condvar::new(),
-        }));
+impl Driver {
+    /// A driver that wakes `wake`. It holds no deadline and runs nothing
+    /// yet.
+    pub(crate) fn new(wake: Waker) -> Driver {
         #[cfg(not(target_arch = "wasm32"))]
-        std::thread::Builder::new()
-            .name("fictionet-timers".into())
-            .spawn(move || timers.thread())
-            .expect("failed to start the fictionet timer thread");
-        timers
-    })
-}
-
-impl Timers {
-    /// Wakes `waker` at `deadline`. Returns an id for `update` and `remove`.
-    pub(crate) fn add(&self, deadline: Instant, waker: Waker) -> u64 {
-        let mut state = self.state.lock();
-        let id = state.next_id;
-        state.next_id += 1;
-        let earliest = state.heap.peek().map(|Reverse((d, _))| *d);
-        state.heap.push(Reverse((deadline, id)));
-        state.entries.insert(id, (deadline, waker));
-        if state.heap.len() > 2 * state.entries.len() + 64 {
-            // Too many stale entries: rebuild from the live ones.
-            state.heap = state
-                .entries
-                .iter()
-                .map(|(id, (d, _))| Reverse((*d, *id)))
-                .collect();
-        }
-        drop(state);
-        if earliest.is_none_or(|e| deadline < e) {
-            self.earlier(deadline);
-        }
-        id
+        return Driver {
+            shared: native::Shared::new(wake),
+        };
+        #[cfg(target_arch = "wasm32")]
+        return Driver { wake };
     }
 
-    /// Moves timer `id` to `deadline`, with `waker`. A timer that has
-    /// fired already is added again, under the same id.
-    pub(crate) fn reset(&self, id: u64, deadline: Instant, waker: &Waker) {
-        let mut state = self.state.lock();
-        let earliest = state.heap.peek().map(|Reverse((d, _))| *d);
-        let old = match state.entries.get_mut(&id) {
-            Some((d, w)) => {
-                let old = (!w.will_wake(waker)).then(|| std::mem::replace(w, waker.clone()));
-                if *d == deadline {
-                    drop(state);
-                    drop(old);
+    /// Wakes the clock at `deadline`, in place of the deadline set before.
+    /// `None` takes the deadline away. The driver forgets a deadline once it
+    /// has woken the clock for it.
+    pub(crate) fn set(&self, deadline: Option<Instant>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        native::Shared::set(&self.shared, deadline);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(deadline) = deadline {
+            browser::arm(deadline, self.wake.clone());
+        }
+    }
+
+    /// The deadline the driver holds, if any.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.shared.state.lock().deadline
+    }
+
+    /// Forgets the deadline, as the driver does right before it wakes the
+    /// clock.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn forget(&self) {
+        self.shared.state.lock().deadline = None;
+    }
+
+    /// What the driver's thread holds, weakly: it is gone once the driver
+    /// is dropped and its thread has ended.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn thread(&self) -> std::sync::Weak<native::Shared> {
+        std::sync::Arc::downgrade(&self.shared)
+    }
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.shared.close();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod native {
+    use fictionet::sync::Mutex;
+    use std::sync::{Arc, Condvar};
+    use std::task::Waker;
+
+    use crate::sys::Instant;
+
+    /// What the clock and its driver's thread share.
+    pub(crate) struct Shared {
+        pub(super) state: Mutex<State>,
+        changed: Condvar,
+        /// How many times the thread has looked at its deadline.
+        #[cfg(test)]
+        pub(super) looks: std::sync::atomic::AtomicUsize,
+        wake: Waker,
+    }
+
+    pub(super) struct State {
+        pub(super) deadline: Option<Instant>,
+        /// The thread was started. It starts with the first deadline.
+        started: bool,
+        /// The clock is gone: the thread ends.
+        closed: bool,
+    }
+
+    impl Shared {
+        pub(super) fn new(wake: Waker) -> Arc<Shared> {
+            Arc::new(Shared {
+                state: Mutex::new(State {
+                    deadline: None,
+                    started: false,
+                    closed: false,
+                }),
+                changed: Condvar::new(),
+                #[cfg(test)]
+                looks: std::sync::atomic::AtomicUsize::new(0),
+                wake,
+            })
+        }
+
+        /// Only a deadline earlier than the one held, or one where none was,
+        /// notifies the thread: one that moved later or went is found when
+        /// the thread wakes for the old one, and every notify can cost the
+        /// thread a wake.
+        pub(super) fn set(this: &Arc<Shared>, deadline: Option<Instant>) {
+            let mut state = this.state.lock();
+            let earlier = match (state.deadline, deadline) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(held), Some(new)) => new < held,
+            };
+            state.deadline = deadline;
+            if deadline.is_some() && !state.started {
+                state.started = true;
+                let shared = this.clone();
+                std::thread::Builder::new()
+                    .name("fictionet-timer".into())
+                    .spawn(move || shared.run())
+                    .expect("failed to start a fictionet timer thread");
+            }
+            drop(state);
+            if earlier {
+                this.changed.notify_one();
+            }
+        }
+
+        pub(super) fn close(&self) {
+            self.state.lock().closed = true;
+            self.changed.notify_one();
+        }
+
+        /// The thread: waits for the deadline, forgets it, wakes the clock.
+        fn run(&self) {
+            let mut state = self.state.lock();
+            loop {
+                #[cfg(test)]
+                self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if state.closed {
                     return;
                 }
-                *d = deadline;
-                old
+                let now = Instant::now();
+                state = match state.deadline {
+                    Some(deadline) if deadline <= now => {
+                        state.deadline = None;
+                        drop(state);
+                        // Woken outside the lock: the clock sets the next
+                        // deadline from inside the wake.
+                        self.wake.wake_by_ref();
+                        self.state.lock()
+                    }
+                    Some(deadline) => {
+                        let wait = deadline.saturating_duration_since(now);
+                        self.changed
+                            .wait_timeout(state, wait)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
+                    }
+                    None => self.changed.wait(state).unwrap_or_else(|e| e.into_inner()),
+                };
             }
-            None => {
-                state.entries.insert(id, (deadline, waker.clone()));
-                None
-            }
-        };
-        // The entry at the old deadline is stale now: the thread skips
-        // heap entries whose deadline is not their timer's.
-        state.heap.push(Reverse((deadline, id)));
-        if state.heap.len() > 2 * state.entries.len() + 64 {
-            state.heap = state
-                .entries
-                .iter()
-                .map(|(id, (d, _))| Reverse((*d, *id)))
-                .collect();
-        }
-        drop(state);
-        drop(old);
-        if earliest.is_none_or(|e| deadline < e) {
-            self.earlier(deadline);
-        }
-    }
-
-    pub(crate) fn remove(&self, id: u64) {
-        let removed = self.state.lock().entries.remove(&id);
-        drop(removed);
-    }
-
-    /// The deadline timer `id` waits for, if it is set.
-    #[cfg(test)]
-    pub(crate) fn deadline(&self, id: u64) -> Option<Instant> {
-        self.state.lock().entries.get(&id).map(|(d, _)| *d)
-    }
-
-    /// Moves the wakeup earlier, to `deadline`.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn earlier(&self, _deadline: Instant) {
-        self.changed.notify_one();
-    }
-
-    /// Moves the wakeup earlier, to `deadline`.
-    #[cfg(target_arch = "wasm32")]
-    fn earlier(&self, deadline: Instant) {
-        browser::arm(deadline);
-    }
-
-    /// Wakes every timer that is due now. Returns the next deadline, if
-    /// any timer is left.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn fire(&self) -> Option<Instant> {
-        loop {
-            let mut due = Vec::new();
-            let next = self.state.lock().take_due(Instant::now(), &mut due);
-            if due.is_empty() {
-                return next;
-            }
-            // Woken outside the lock: waking can run any code.
-            for waker in due {
-                waker.wake();
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn thread(&self) {
-        let mut state = self.state.lock();
-        loop {
-            let now = Instant::now();
-            let mut due = Vec::new();
-            let next = state.take_due(now, &mut due);
-            if !due.is_empty() {
-                drop(state);
-                for waker in due {
-                    waker.wake();
-                }
-                state = self.state.lock();
-                continue;
-            }
-            state = match next {
-                Some(deadline) => {
-                    let wait = deadline.saturating_duration_since(now);
-                    self.changed
-                        .wait_timeout(state, wait)
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0
-                }
-                None => self.changed.wait(state).unwrap_or_else(|e| e.into_inner()),
-            };
         }
     }
 }
 
-impl State {
-    /// Moves the waker of every timer due at `now` into `due`. Returns the
-    /// next deadline, if any timer is left.
-    fn take_due(&mut self, now: Instant, due: &mut Vec<Waker>) -> Option<Instant> {
-        while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
-            // Stale: the timer is gone, or was moved to another deadline.
-            if self.entries.get(&id).is_none_or(|(d, _)| *d != deadline) {
-                self.heap.pop();
-                continue;
-            }
-            if deadline > now {
-                return Some(deadline);
-            }
-            self.heap.pop();
-            if let Some((_, waker)) = self.entries.remove(&id) {
-                due.push(waker);
-            }
-        }
-        None
-    }
-}
-
-/// The `setTimeout` that fires the timers in a browser.
+/// The `setTimeout` that wakes the clock in a browser.
 #[cfg(target_arch = "wasm32")]
 mod browser {
-    use std::cell::Cell;
+    use std::task::Waker;
 
     use wasm_bindgen::prelude::*;
 
@@ -217,30 +190,15 @@ mod browser {
     #[wasm_bindgen]
     extern "C" {
         #[wasm_bindgen(js_name = setTimeout)]
-        fn set_timeout(handler: &Closure<dyn FnMut()>, millis: f64) -> JsValue;
+        fn set_timeout(handler: &JsValue, millis: f64) -> JsValue;
     }
 
-    thread_local! {
-        /// The earliest deadline a `setTimeout` is armed for.
-        static ARMED: Cell<Option<Instant>> = const { Cell::new(None) };
-        static FIRE: Closure<dyn FnMut()> = Closure::new(fired);
-    }
-
-    /// Makes sure a `setTimeout` fires the timers by `deadline`.
-    pub(super) fn arm(deadline: Instant) {
-        if ARMED.get().is_some_and(|armed| armed <= deadline) {
-            return;
-        }
-        ARMED.set(Some(deadline));
+    /// Wakes `wake` at `deadline`. A timeout armed for a deadline that has
+    /// moved since wakes the clock early, and the clock arms the next one.
+    pub(super) fn arm(deadline: Instant, wake: Waker) {
         let wait = deadline.saturating_duration_since(Instant::now());
-        FIRE.with(|fire| set_timeout(fire, wait.as_secs_f64() * 1000.0));
-    }
-
-    fn fired() {
-        ARMED.set(None);
-        if let Some(next) = super::timers().fire() {
-            arm(next);
-        }
+        let fire = Closure::once_into_js(move || wake.wake());
+        set_timeout(&fire, wait.as_secs_f64() * 1000.0);
     }
 }
 
@@ -248,48 +206,88 @@ mod browser {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::task::Wake;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[derive(Default)]
-    struct WakeFlag(std::sync::atomic::AtomicBool);
-    impl Wake for WakeFlag {
+    struct Wakes(AtomicUsize);
+    impl std::task::Wake for Wakes {
         fn wake(self: Arc<Self>) {
-            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    #[test]
-    fn unchanged_deadline_replaces_waker_without_growing_heap() {
-        let timers = Timers {
-            state: Mutex::new(State {
-                heap: BinaryHeap::new(),
-                entries: HashMap::new(),
-                next_id: 0,
-            }),
-            changed: Condvar::new(),
-        };
-        let at = Instant::now() + std::time::Duration::from_secs(60);
-        let id = timers.add(at, Waker::noop().clone());
-        let flag = Arc::new(WakeFlag::default());
-        let waker = Waker::from(flag.clone());
-        timers.reset(id, at, &waker);
-        {
-            let mut state = timers.state.lock();
-            assert_eq!(state.heap.len(), 1);
-            assert!(state.entries[&id].1.will_wake(&waker));
-            state.heap.clear();
-            state.entries.remove(&id);
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < give_up, "{what}");
+            std::thread::sleep(Duration::from_millis(1));
         }
-        timers.reset(id, at, &waker);
-        let mut state = timers.state.lock();
-        assert_eq!(state.heap.len(), 1);
-        assert_eq!(state.entries[&id].0, at);
-        assert!(state.entries[&id].1.will_wake(&waker));
-        let mut due = Vec::new();
-        assert!(state.take_due(at, &mut due).is_none());
-        drop(state);
-        assert_eq!(due.len(), 1);
-        due.pop().unwrap().wake();
-        assert!(flag.0.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Each driver wakes its own clock at its own deadline, not before, and
+    /// forgets the deadline once it has; a deadline moved later is the one
+    /// it waits for.
+    #[test]
+    fn each_driver_wakes_its_own_clock_at_its_deadline() {
+        let wakes: Vec<Arc<Wakes>> = (0..2).map(|_| Arc::default()).collect();
+        let drivers: Vec<Driver> = wakes
+            .iter()
+            .map(|w| Driver::new(Waker::from(w.clone())))
+            .collect();
+        let start = Instant::now();
+        drivers[0].set(Some(start + Duration::from_secs(3600)));
+        drivers[0].set(Some(start + Duration::from_millis(20)));
+        drivers[1].set(Some(start + Duration::from_secs(3600)));
+        wait_for("the first driver never woke its clock", || {
+            wakes[0].0.load(Ordering::SeqCst) == 1
+        });
+        assert!(Instant::now() >= start + Duration::from_millis(20));
+        assert_eq!(drivers[0].deadline(), None);
+        assert_eq!(
+            wakes[1].0.load(Ordering::SeqCst),
+            0,
+            "the other driver woke early"
+        );
+        assert!(drivers[1].deadline().is_some());
+    }
+
+    /// A deadline moved later leaves the sleeping thread asleep; one moved
+    /// earlier wakes it.
+    #[test]
+    fn only_an_earlier_deadline_wakes_the_thread() {
+        let driver = Driver::new(Waker::noop().clone());
+        let start = Instant::now();
+        driver.set(Some(start + Duration::from_secs(3600)));
+        let looks = || driver.shared.looks.load(Ordering::SeqCst);
+        wait_for("the thread never started", || looks() >= 1);
+        // Holding the lock until the thread waits on it.
+        drop(driver.shared.state.lock());
+        let asleep = looks();
+        for i in 1..=1000 {
+            driver.set(Some(start + Duration::from_secs(3600 + i)));
+        }
+        driver.set(None);
+        assert!(
+            looks() <= asleep + 1,
+            "{} looks for 1,001 later or no deadlines",
+            looks() - asleep
+        );
+        driver.set(Some(start + Duration::from_secs(60)));
+        wait_for("an earlier deadline did not wake the thread", || {
+            looks() > asleep
+        });
+    }
+
+    /// Dropping the driver, as its clock is dropped, ends its thread.
+    #[test]
+    fn dropping_the_driver_ends_its_thread() {
+        let driver = Driver::new(Waker::noop().clone());
+        let thread = driver.thread();
+        driver.set(Some(Instant::now() + Duration::from_secs(3600)));
+        drop(driver);
+        wait_for("the driver's thread outlived its clock", || {
+            thread.upgrade().is_none()
+        });
     }
 }

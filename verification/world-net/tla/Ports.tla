@@ -1,78 +1,98 @@
 ------------------------------- MODULE Ports -------------------------------
 (* The ready-slot scheduling of src/stdlib/network/ports.rs: one task
-   serving many interfaces. `Ports::next` registers the task's waker in
-   `ReadyInner::task`, pops slots from `ReadyInner::slots` and polls each
-   with its own `SlotWaker`; an interface that has nothing registers that
-   waker and gives Pending. When the interface later has a packet, or its
-   peer closes, it wakes the slot waker, which queues the slot and wakes
-   the task (`SlotWaker::wake_by_ref`). `Ports::add`, `replace` and
+   serving many interfaces. Each slot has a bit in a bitmap (`Ready`) that
+   its `SlotWaker` sets with no lock. `Ports::serve` searches the bitmap
+   from the slot after the one served last (`cursor`), clears the bit it
+   finds and polls that slot with its slot waker; an interface that has
+   nothing keeps that waker and gives Pending. When the interface later
+   has a packet, or its peer closes, it wakes the slot waker, which sets
+   the slot's bit and then, as a second step, wakes the task if the task
+   is parked (`sync::Parked::wake`).
+
+   `Ports::next` serves; finding no bit, it parks the task's waker and
+   serves once more before it returns Pending. `Ports::add`, `replace` and
    `close` run between calls to `next`.
 
    The slots' interfaces are abstract: `data` says a slot has a packet,
-   `gone` that its peer closed. *)
-EXTENDS Naturals, Sequences, FiniteSets
+   `gone` that its peer closed. The bitmap is the set `bits`; its summary
+   words, which only speed the search, are left out. The fences in
+   `Parked::park` and `Parked::wake` make each step below atomic and the
+   steps of different threads interleave in one order, which is how TLC
+   runs them. *)
+EXTENDS Naturals, FiniteSets
 
 CONSTANTS
-    Slots,         \* the slot numbers
-    RegisterFirst, \* the task puts its waker in the queue before it drains
-                   \* the queue (Ports::next as written); FALSE: after
+    N,                \* the number of slots
+    RecheckAfterPark, \* next serves once more after parking (the code);
+                      \* FALSE: it returns Pending right after parking
     NoSlot
+
+Slots == 0..(N - 1)
 
 VARIABLES
     open,      \* slots that hold a port
     data,      \* slots whose interface has a packet waiting
     gone,      \* slots whose interface's peer closed
-    queue,     \* ReadyInner::slots, in order
+    bits,      \* the bitmap: slots whose bit is set
+    cursor,    \* where the next search starts
     armed,     \* slots whose interface holds the slot's waker
-    taskWaker, \* ReadyInner::task holds the task's waker
-    pc,        \* the task: "idle", "drain", "poll", "parking" or "parked"
+    notifying, \* slots whose waker set the bit and has yet to look at the
+               \* task's parked flag
+    parked,    \* the task's parked flag is up
+    taskWaker, \* the task's Parked holds its waker
+    pc,        \* the task: "idle", "serve", "poll", "parking" or "parked"
+    again,     \* the task is in the look after parking
     woken,     \* the task's waker was woken since it last began a poll
-    polling    \* the slot popped and about to be polled
+    polling    \* the slot found and about to be polled
 
-vars == <<open, data, gone, queue, armed, taskWaker, pc, woken, polling>>
-
-Range(s) == {s[i] : i \in DOMAIN s}
+vars == <<open, data, gone, bits, cursor, armed, notifying, parked, taskWaker,
+          pc, again, woken, polling>>
 
 Init ==
     /\ open = {} /\ data = {} /\ gone = {}
-    /\ queue = <<>> /\ armed = {}
-    /\ taskWaker = FALSE
-    /\ pc = "idle" /\ woken = FALSE
+    /\ bits = {} /\ cursor = 0 /\ armed = {} /\ notifying = {}
+    /\ parked = FALSE /\ taskWaker = FALSE
+    /\ pc = "idle" /\ again = FALSE /\ woken = FALSE
     /\ polling = NoSlot
 
-\* ReadyInner::push: at most once.
-Push(q, i) == IF i \in Range(q) THEN q ELSE Append(q, i)
+\* The first slot with its bit set at or after `from`, wrapping around.
+Dist(i, from) == IF i >= from THEN i - from ELSE i + N - from
+First(set, from) == CHOOSE i \in set : \A j \in set : Dist(i, from) <= Dist(j, from)
 
 -----------------------------------------------------------------------------
 \* The task is polled: at the start of next, or again after a wake.
 Begin ==
     /\ pc = "idle" \/ (pc = "parked" /\ woken)
-    /\ pc' = "drain"
+    /\ pc' = "serve"
+    /\ again' = FALSE
     /\ woken' = FALSE
-    /\ taskWaker' = IF RegisterFirst THEN TRUE ELSE taskWaker
-    /\ UNCHANGED <<open, data, gone, queue, armed, polling>>
+    /\ UNCHANGED <<open, data, gone, bits, cursor, armed, notifying, parked,
+                   taskWaker, polling>>
 
-\* ReadyInner::pop.
-Pop ==
-    /\ pc = "drain" /\ queue # <<>>
-    /\ polling' = Head(queue)
-    /\ queue' = Tail(queue)
+\* Ready::find and Ready::clear.
+Find ==
+    /\ pc = "serve" /\ bits # {}
+    /\ LET i == First(bits, cursor) IN
+       /\ polling' = i
+       /\ bits' = bits \ {i}
+       /\ cursor' = (i + 1) % N
     /\ pc' = "poll"
-    /\ UNCHANGED <<open, data, gone, armed, taskWaker, woken>>
+    /\ UNCHANGED <<open, data, gone, armed, notifying, parked, taskWaker,
+                   again, woken>>
 
-\* The popped slot is polled with its slot waker.
+\* The found slot is polled with its slot waker.
 Poll ==
     /\ pc = "poll"
     /\ LET i == polling IN
        /\ polling' = NoSlot
        /\ IF i \notin open THEN
-             \* A closed slot still in the queue: skipped.
-             /\ pc' = "drain"
-             /\ UNCHANGED <<open, data, gone, queue, armed>>
+             \* A closed slot whose bit was still set: skipped.
+             /\ pc' = "serve"
+             /\ UNCHANGED <<open, data, gone, bits, armed>>
           ELSE IF i \in data THEN
-             \* Ready(packet): the slot goes to the back, in case it has more.
+             \* Ready(packet): its bit is set again, in case it has more.
              /\ data' = data \ {i}
-             /\ queue' = Push(queue, i)
+             /\ bits' = bits \cup {i}
              /\ pc' = "idle"
              /\ UNCHANGED <<open, gone, armed>>
           ELSE IF i \in gone THEN
@@ -81,59 +101,75 @@ Poll ==
              /\ gone' = gone \ {i}
              /\ armed' = armed \ {i}
              /\ pc' = "idle"
-             /\ UNCHANGED <<data, queue>>
+             /\ UNCHANGED <<data, bits>>
           ELSE
              \* Pending: the interface holds the slot waker.
              /\ armed' = armed \cup {i}
-             /\ pc' = "drain"
-             /\ UNCHANGED <<open, data, gone, queue>>
-    /\ UNCHANGED <<taskWaker, woken>>
+             /\ pc' = "serve"
+             /\ UNCHANGED <<open, data, gone, bits>>
+    /\ UNCHANGED <<cursor, notifying, parked, taskWaker, again, woken>>
 
-\* The pop found the queue empty: the loop ends.
+\* The search found no bit set.
 Empty ==
-    /\ pc = "drain" /\ queue = <<>>
-    /\ pc' = "parking"
-    /\ UNCHANGED <<open, data, gone, queue, armed, taskWaker, woken, polling>>
+    /\ pc = "serve" /\ bits = {}
+    /\ pc' = IF again THEN "parked" ELSE "parking"
+    /\ UNCHANGED <<open, data, gone, bits, cursor, armed, notifying, parked,
+                   taskWaker, again, woken, polling>>
 
-\* The task returns Pending, after the sleep and cancel registrations.
+\* Parked::park: leave the task's waker, raise the flag; then serve once
+\* more.
 Park ==
     /\ pc = "parking"
-    /\ taskWaker' = IF RegisterFirst THEN taskWaker ELSE TRUE
-    /\ pc' = "parked"
-    /\ UNCHANGED <<open, data, gone, queue, armed, woken, polling>>
+    /\ taskWaker' = TRUE
+    /\ parked' = TRUE
+    /\ pc' = IF RecheckAfterPark THEN "serve" ELSE "parked"
+    /\ again' = TRUE
+    /\ UNCHANGED <<open, data, gone, bits, cursor, armed, notifying, woken,
+                   polling>>
 
-\* SlotWaker::wake_by_ref, when the interface at i holds the waker: the
-\* slot is queued and the task's waker taken and woken.
-Wake(i) ==
-    /\ queue' = IF i \in armed THEN Push(queue, i) ELSE queue
+\* SlotWaker::wake_by_ref, first step, when the interface at i holds the
+\* waker: the slot's bit is set.
+Mark(i) ==
+    /\ bits' = IF i \in armed THEN bits \cup {i} ELSE bits
+    /\ notifying' = IF i \in armed THEN notifying \cup {i} ELSE notifying
     /\ armed' = armed \ {i}
-    /\ woken' = (woken \/ (i \in armed /\ taskWaker))
-    /\ taskWaker' = (taskWaker /\ i \notin armed)
+
+\* SlotWaker::wake_by_ref, second step: Parked::wake.
+Notify(i) ==
+    /\ i \in notifying
+    /\ notifying' = notifying \ {i}
+    /\ woken' = woken \/ (parked /\ taskWaker)
+    /\ taskWaker' = IF parked THEN FALSE ELSE taskWaker
+    /\ parked' = FALSE
+    /\ UNCHANGED <<open, data, gone, bits, cursor, armed, pc, again, polling>>
 
 \* A packet reaches the interface at i. None does once its peer closed: a
 \* cable drops what is sent into a closed direction.
 Deliver(i) ==
     /\ i \in open /\ i \notin data /\ i \notin gone
     /\ data' = data \cup {i}
-    /\ Wake(i)
-    /\ UNCHANGED <<open, gone, pc, polling>>
+    /\ Mark(i)
+    /\ UNCHANGED <<open, gone, cursor, parked, taskWaker, pc, again, woken,
+                   polling>>
 
 \* The interface's peer closes.
 PeerClose(i) ==
     /\ i \in open /\ i \notin gone
     /\ gone' = gone \cup {i}
-    /\ Wake(i)
-    /\ UNCHANGED <<open, data, pc, polling>>
+    /\ Mark(i)
+    /\ UNCHANGED <<open, data, cursor, parked, taskWaker, pc, again, woken,
+                   polling>>
 
 \* Ports::add or Ports::replace into a free slot, between polls. The new
 \* port may already hold a packet.
 Add(i) ==
     /\ pc = "idle" /\ i \notin open
     /\ open' = open \cup {i}
-    /\ queue' = Push(queue, i)
+    /\ bits' = bits \cup {i}
     /\ \E d \in BOOLEAN : data' = IF d THEN data \cup {i} ELSE data \ {i}
     /\ gone' = gone \ {i}
-    /\ UNCHANGED <<armed, taskWaker, pc, woken, polling>>
+    /\ UNCHANGED <<cursor, armed, notifying, parked, taskWaker, pc, again,
+                   woken, polling>>
 
 \* Ports::close, between polls: the interface and its waker go.
 Close(i) ==
@@ -142,27 +178,36 @@ Close(i) ==
     /\ data' = data \ {i}
     /\ gone' = gone \ {i}
     /\ armed' = armed \ {i}
-    /\ UNCHANGED <<queue, taskWaker, pc, woken, polling>>
+    /\ UNCHANGED <<bits, cursor, notifying, parked, taskWaker, pc, again,
+                   woken, polling>>
 
-Task == Begin \/ Pop \/ Poll \/ Empty \/ Park
+Task == Begin \/ Find \/ Poll \/ Empty \/ Park
 
 Next ==
     \/ Task
-    \/ \E i \in Slots : Deliver(i) \/ PeerClose(i) \/ Add(i) \/ Close(i)
+    \/ \E i \in Slots : Deliver(i) \/ PeerClose(i) \/ Add(i) \/ Close(i) \/ Notify(i)
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Task)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Task) /\ \A i \in Slots : WF_vars(Notify(i))
 
 -----------------------------------------------------------------------------
-\* The queue holds each slot at most once.
-AtMostOnce == \A i, j \in DOMAIN queue : queue[i] = queue[j] => i = j
+TypeOK ==
+    /\ open \subseteq Slots /\ data \subseteq Slots /\ gone \subseteq Slots
+    /\ bits \subseteq Slots /\ armed \subseteq Slots /\ notifying \subseteq Slots
+    /\ cursor \in Slots
+    /\ pc \in {"idle", "serve", "poll", "parking", "parked"}
+
+\* The flag is up only with a waker behind it.
+FlagHasWaker == parked => taskWaker
 
 \* Every open slot is somewhere the task will find it: its interface holds
-\* the slot waker, it is queued, or it is being polled.
+\* the slot waker, its bit is set, or it is being polled.
 SlotIsSomewhere ==
-    \A i \in open : i \in armed \/ i \in Range(queue) \/ polling = i
+    \A i \in open : i \in armed \/ i \in bits \/ polling = i
 
-\* A parked task with its waker taken is woken.
-NoLostTask == pc = "parked" /\ ~taskWaker => woken
+\* A parked task with a bit set has a wake on its way: its waker is parked
+\* and a slot waker has yet to look at the flag.
+NoLostTask ==
+    pc = "parked" /\ ~woken /\ bits # {} => parked /\ notifying # {}
 
 \* A slot with a packet, or whose peer closed, is served: the task takes
 \* the packet or closes the slot, unless the caller closes it first.

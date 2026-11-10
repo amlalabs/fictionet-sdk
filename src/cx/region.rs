@@ -11,12 +11,26 @@ use crate::run::RunShared;
 /// Create an empty token with [`Default::default`]. Registering it with
 /// another region removes its waker from the previous region.
 #[derive(Default)]
-pub struct CancelWait(pub(super) Option<(Arc<Region>, u64)>);
+pub struct CancelWait(pub(super) Option<Registered>);
+
+/// Where a [`CancelWait`] is registered, and a clone of the waker it left
+/// there, so that registering the same waker again is a local comparison
+/// and takes no lock.
+pub(super) struct Registered {
+    pub(super) region: Arc<Region>,
+    pub(super) key: u64,
+    pub(super) waker: Waker,
+}
 
 impl CancelWait {
     pub(super) fn clear(&mut self) {
-        if let Some((region, key)) = self.0.take() {
-            let removed = region.state.lock().foreign.remove(&key);
+        if let Some(registered) = self.0.take() {
+            let removed = registered
+                .region
+                .state
+                .lock()
+                .foreign
+                .remove(&registered.key);
             drop(removed);
         }
     }
@@ -132,16 +146,10 @@ impl Region {
         key
     }
 
+    /// Puts `waker` in place of what registration `key` left. A key a
+    /// cancel took is put back: the caller sees the cancel next.
     pub(super) fn update_foreign(&self, key: u64, waker: &Waker) {
-        let mut state = self.state.lock();
-        if let Some(w) = state.foreign.get(&key)
-            && w.will_wake(waker)
-        {
-            return;
-        }
-        // A key a cancel took is put back: the caller sees the cancel next.
-        let old = state.foreign.insert(key, waker.clone());
-        drop(state);
+        let old = self.state.lock().foreign.insert(key, waker.clone());
         // Dropped outside the lock: dropping a waker can run any code.
         drop(old);
     }
@@ -233,6 +241,12 @@ impl Region {
 
     pub(crate) fn take_error(&self) -> Option<crate::Error> {
         self.state.lock().error.take()
+    }
+
+    /// How many wakers outside the run wait for a cancel here.
+    #[cfg(test)]
+    pub(crate) fn foreign_waits(&self) -> usize {
+        self.state.lock().foreign.len()
     }
 }
 
@@ -361,11 +375,16 @@ mod tests {
         for clear in [false, true] {
             let region = Region::root(Weak::new());
             let dropped = Arc::new(AtomicBool::new(false));
-            let key = region.add_foreign(&Waker::from(Arc::new(CheckDrop(
+            let waker = Waker::from(Arc::new(CheckDrop(
                 Arc::downgrade(&region),
                 dropped.clone(),
-            ))));
-            let mut wait = CancelWait(Some((region.clone(), key)));
+            )));
+            let key = region.add_foreign(&waker);
+            let mut wait = CancelWait(Some(Registered {
+                region: region.clone(),
+                key,
+                waker,
+            }));
             if clear {
                 wait.clear();
                 assert!(dropped.load(Ordering::SeqCst));
@@ -375,6 +394,78 @@ mod tests {
             assert!(dropped.load(Ordering::SeqCst));
             assert!(region.state.lock().foreign.is_empty());
         }
+    }
+
+    /// The `Cx` of a run polled once, with the run, which must stay alive.
+    fn outside_cx() -> (Cx, std::pin::Pin<Box<impl Future<Output = crate::Result>>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut world = Box::pin(run(fictionet::Seed::from_u64(0), move |fcx| async move {
+            tx.send(fcx.clone()).unwrap();
+            std::future::pending::<()>().await;
+            Ok(())
+        }));
+        assert!(
+            world
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        (rx.recv().unwrap(), world)
+    }
+
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A wait outside the run that registers the waker it registered
+    /// before takes no lock: it goes through with the region's lock held
+    /// elsewhere.
+    #[test]
+    fn an_unchanged_waker_registers_again_without_the_region_lock() {
+        let (fcx, world) = outside_cx();
+        let waker = Waker::from(Arc::new(Wakes::default()));
+        let mut wait = CancelWait::default();
+        assert!(!fcx.register_cancel(&waker, &mut wait));
+        let region = fcx.region.clone();
+        let held = region.state.lock();
+        let (done, finished) = std::sync::mpsc::channel();
+        let again = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                assert!(!fcx.register_cancel(&waker.clone(), &mut wait));
+            }
+            done.send(()).unwrap();
+            // Dropping the wait takes the lock: hand it back instead.
+            (fcx, wait)
+        });
+        let finished = finished.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        drop(again.join().unwrap());
+        drop(world);
+        assert_eq!(finished, Ok(()), "registering the same waker took the lock");
+    }
+
+    /// Whatever wakers a wait registers in turn, a cancel wakes the last
+    /// one once and none of the others.
+    #[test]
+    fn a_cancel_wakes_the_waker_registered_last_once() {
+        let (fcx, world) = outside_cx();
+        let counts: Vec<Arc<Wakes>> = (0..3).map(|_| Arc::default()).collect();
+        let wakers: Vec<Waker> = counts.iter().map(|c| Waker::from(c.clone())).collect();
+        let mut wait = CancelWait::default();
+        for i in [0, 0, 1, 1, 2, 0, 2, 2] {
+            assert!(!fcx.register_cancel(&wakers[i], &mut wait));
+        }
+        assert_eq!(fcx.region.state.lock().foreign.len(), 1);
+        fcx.cancel();
+        let woken: Vec<usize> = counts.iter().map(|c| c.0.load(Ordering::SeqCst)).collect();
+        assert_eq!(woken, [0, 0, 1]);
+        assert!(fcx.register_cancel(&wakers[2], &mut wait));
+        drop(wait);
+        drop(world);
     }
 
     #[test]

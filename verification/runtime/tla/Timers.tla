@@ -1,122 +1,105 @@
 ----------------------------- MODULE Timers -----------------------------
-\* The host wake driver of src/timer.rs: Timers::add, reset and remove,
-\* State::take_due with its stale heap entries, and Timers::thread, which
-\* sleeps on a Condvar until the earliest deadline. Each run's Clock::arm
-\* is one client, moving its one host entry to the run's earliest deadline;
-\* here the clients are abstract timer ids.
-EXTENDS Naturals, FiniteSets
+\* The host wake driver of a real run, src/timer.rs: each real Clock owns
+\* one Driver. Driver::set gives it the clock's earliest deadline, or none,
+\* and notifies its thread when that deadline is earlier than the one it
+\* held; the thread (native::Shared::run) sleeps on a
+\* Condvar until that deadline, forgets it and wakes the clock; dropping
+\* the clock closes the driver and the thread ends. The thread starts with
+\* the first deadline. Clock::arm calls set only when the earliest deadline
+\* changes, and again after a wake, since the driver forgot it.
+EXTENDS Naturals
 
 CONSTANTS
-    Ids,        \* the timers
-    MaxTime,    \* the last instant; deadlines are 1..MaxTime
-    StaleCheck, \* take_due skips a heap entry whose deadline is not its timer's
-    Notify      \* add and reset notify the thread of an earlier deadline
+    MaxTime,     \* the last instant; deadlines are 1..MaxTime
+    Notify,      \* Driver::set notifies the thread (the code)
+    CloseNotify  \* dropping the driver notifies the thread (the code)
 
 Deadlines == 1..MaxTime
 
 VARIABLES
     now,       \* the host clock
-    heap,      \* State::heap, as the set of its <<deadline, id>> pairs
-    entries,   \* State::entries: each timer's deadline, 0 when absent
-    thread,    \* "running" (holding the lock), "waking" (lock released, wakers running) or "sleeping"
+    deadline,  \* State::deadline, 0 for none
+    thread,    \* "unstarted", "running" (holding the lock), "waking" (lock
+               \* released, waking the clock), "sleeping" or "ended"
     planned,   \* the deadline the sleeping thread waits for, 0 for none
     notified,  \* Condvar::notify_one not yet consumed by a wait
-    early      \* history: a timer was fired before its deadline
+    closed     \* State::closed: the clock is gone
 
-vars == <<now, heap, entries, thread, planned, notified, early>>
-
-Live == {id \in Ids : entries[id] # 0}
-HeapMin == IF heap = {} THEN 0 ELSE (CHOOSE p \in heap : \A q \in heap : p[1] <= q[1])[1]
+vars == <<now, deadline, thread, planned, notified, closed>>
 
 Init ==
     /\ now = 0
-    /\ heap = {}
-    /\ entries = [id \in Ids |-> 0]
-    /\ thread = "running"
+    /\ deadline = 0
+    /\ thread = "unstarted"
     /\ planned = 0
     /\ notified = FALSE
-    /\ early = FALSE
+    /\ closed = FALSE
 
-\* The lock is free while the thread sleeps or wakes timers.
+\* The lock is free while the thread sleeps or wakes the clock.
 Unlocked == thread # "running"
 
-\* Timers::add and reset both push a heap entry and notify the thread when
-\* the deadline is earlier than the heap's top.
-Push(id, d) ==
-    /\ heap' = heap \cup {<<d, id>>}
-    /\ entries' = [entries EXCEPT ![id] = d]
-    /\ notified' = (notified \/ (Notify /\ (heap = {} \/ d < HeapMin)))
+\* Driver::set, from the clock. The first deadline starts the thread. Only
+\* an earlier deadline, or one where none was, notifies the thread.
+Earlier(d) == d # 0 /\ (deadline = 0 \/ d < deadline)
 
-\* Timers::add, for a timer that has no entry.
-Add(id, d) ==
-    /\ Unlocked /\ entries[id] = 0
-    /\ Push(id, d)
-    /\ UNCHANGED <<now, thread, planned, early>>
+Set(d) ==
+    /\ Unlocked /\ ~closed
+    /\ deadline' = d
+    /\ thread' = IF thread = "unstarted" /\ d # 0 THEN "running" ELSE thread
+    /\ notified' = (notified \/ (Notify /\ Earlier(d)))
+    /\ UNCHANGED <<now, planned, closed>>
 
-\* Timers::reset, to another deadline. The old heap entry stays and is
-\* stale. A timer that fired already is added again under its id.
-Reset(id, d) ==
-    /\ Unlocked /\ entries[id] # d
-    /\ Push(id, d)
-    /\ UNCHANGED <<now, thread, planned, early>>
+\* The clock is dropped, and its driver with it.
+Close ==
+    /\ Unlocked /\ ~closed
+    /\ closed' = TRUE
+    /\ notified' = (notified \/ CloseNotify)
+    /\ UNCHANGED <<now, deadline, thread, planned>>
 
-\* Timers::remove: only the entry goes; the heap keeps a stale pair.
-Remove(id) ==
-    /\ Unlocked /\ entries[id] # 0
-    /\ entries' = [entries EXCEPT ![id] = 0]
-    /\ UNCHANGED <<now, heap, thread, planned, notified, early>>
-
-\* State::take_due under the lock: stale pairs are dropped from the top of
-\* the heap, due timers are fired, and the next deadline is read. With
-\* timers due the thread releases the lock to wake them; otherwise it
-\* sleeps until the next deadline, or until notified.
-Stale(p) == entries[p[2]] # p[1]
-Dropped == IF StaleCheck THEN {p \in heap : Stale(p)} ELSE {}
-Kept == heap \ Dropped
-Due == {p \in Kept : p[1] <= now /\ entries[p[2]] # 0}
-
+\* The thread holds the lock: it ends once closed; with its deadline due it
+\* forgets it and releases the lock to wake the clock; otherwise it sleeps
+\* until the deadline, or until notified.
 ThreadRun ==
     /\ thread = "running"
-    /\ IF Due # {} THEN
-           /\ heap' = Kept \ Due
-           /\ entries' = [id \in Ids |-> IF \E p \in Due : p[2] = id THEN 0 ELSE entries[id]]
-           /\ early' = (early \/ \E p \in Due : entries[p[2]] > now)
+    /\ IF closed THEN
+           /\ thread' = "ended"
+           /\ UNCHANGED <<deadline, planned, notified>>
+       ELSE IF deadline # 0 /\ deadline <= now THEN
+           /\ deadline' = 0
            /\ thread' = "waking"
            /\ UNCHANGED <<planned, notified>>
        ELSE
-           /\ heap' = Kept
-           /\ planned' = IF Kept = {} THEN 0
-                         ELSE (CHOOSE p \in Kept : \A q \in Kept : p[1] <= q[1])[1]
+           /\ planned' = deadline
            /\ thread' = "sleeping"
            /\ notified' = FALSE   \* a wait consumes a notify that came before it
-           /\ UNCHANGED <<entries, early>>
-    /\ UNCHANGED now
+           /\ UNCHANGED deadline
+    /\ UNCHANGED <<now, closed>>
 
-\* The wakers were woken; the thread takes the lock again.
+\* The clock was woken; the thread takes the lock again.
 ThreadRelock ==
     /\ thread = "waking"
     /\ thread' = "running"
-    /\ UNCHANGED <<now, heap, entries, planned, notified, early>>
+    /\ UNCHANGED <<now, deadline, planned, notified, closed>>
 
 \* The wait returns: the deadline came, a notify came, or for no reason.
 ThreadWake ==
     /\ thread = "sleeping"
     /\ thread' = "running"
     /\ notified' = FALSE
-    /\ UNCHANGED <<now, heap, entries, planned, early>>
+    /\ UNCHANGED <<now, deadline, planned, closed>>
 
 Tick ==
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ UNCHANGED <<heap, entries, thread, planned, notified, early>>
+    /\ UNCHANGED <<deadline, thread, planned, notified, closed>>
 
 Next ==
-    \/ \E id \in Ids : \E d \in Deadlines : Add(id, d) \/ Reset(id, d)
-    \/ \E id \in Ids : Remove(id)
+    \/ \E d \in 0..MaxTime : Set(d)
+    \/ Close
     \/ ThreadRun \/ ThreadRelock \/ ThreadWake \/ Tick
 
 \* The thread runs when it holds the lock and takes it back after waking
-\* timers. It leaves its wait when its deadline has come or it was
+\* the clock. It leaves its wait when its deadline has come or it was
 \* notified; a spurious return is allowed but not relied on.
 Fairness ==
     /\ WF_vars(ThreadRun)
@@ -129,17 +112,20 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 ----------------------------------------------------------------------------
 \* Properties.
 
-\* No timer is woken before its deadline, whatever stale pairs the heap holds.
-NoEarlyFire == ~early
-
-\* The thread never sleeps past a live deadline: while it sleeps without a
-\* notify pending, every live timer is due no earlier than its planned wake.
+\* The thread never sleeps past the deadline it holds: while it sleeps with
+\* no notify pending, it waits for that deadline or an earlier one, and
+\* waits with no deadline only when it holds none.
 SleepIsSafe ==
-    (thread = "sleeping" /\ ~notified) =>
-        (Live = {} \/ (planned # 0 /\ \A id \in Live : entries[id] >= planned))
+    (thread = "sleeping" /\ ~notified /\ ~closed)
+        => (deadline = 0 \/ (planned # 0 /\ planned <= deadline))
 
-\* Every timer that is due is fired, or moved, or removed.
-DueTimersFire ==
-    \A id \in Ids : [](entries[id] # 0 /\ entries[id] <= now => <>(entries[id] = 0 \/ entries[id] > now))
+\* A deadline that has come is acted on: the clock is woken for it (the
+\* driver forgets it), or the clock moved or took it away.
+DueFires ==
+    [](deadline # 0 /\ deadline <= now /\ ~closed
+        => <>(deadline = 0 \/ deadline > now \/ closed))
+
+\* Once the clock is gone, its driver's thread ends, or never started.
+ThreadEnds == [](closed => <>(thread \in {"ended", "unstarted"}))
 
 =============================================================================

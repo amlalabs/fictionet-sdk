@@ -1,6 +1,9 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
 
-use crate::{Budget, Charge, PACKET_COST, Packet};
+use crate::{PACKET_COST, Packet};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{Budget, Charge};
 
 /// A packet FIFO. Each packet costs the memory it keeps alive (its
 /// backing's capacity) plus [`PACKET_COST`] for its place. A queue with a
@@ -8,6 +11,7 @@ use crate::{Budget, Charge, PACKET_COST, Packet};
 /// until it is taken out, and refuses whole a packet the budget has no room
 /// for; what to do with it is the caller's. A queue with no limit charges
 /// nothing.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct PacketQueue {
     /// Each packet, with its charge when the queue has a budget.
@@ -16,12 +20,13 @@ pub struct PacketQueue {
 }
 
 /// What a queued packet costs: the memory it keeps alive plus its place in
-/// the queue. `None` when that is past what a count can hold, which no
-/// budget has room for.
-fn cost(packet: &Packet) -> Option<usize> {
+/// the queue, for a [`PacketQueue`] and a limited cable alike. `None` when
+/// that is past what a count can hold, which no budget has room for.
+pub(crate) fn cost(packet: &Packet) -> Option<usize> {
     packet.chunk().capacity().checked_add(PACKET_COST)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PacketQueue {
     /// A queue whose packets hold at most `limit` bytes, counted as above,
     /// or with no limit.

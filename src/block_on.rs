@@ -1,8 +1,7 @@
 //! [`block_on`]: the executor for a world that needs no other.
 
 use std::future::Future;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 /// Runs `future` on the current thread, blocking until it finishes, and
 /// returns its output.
@@ -13,9 +12,9 @@ use std::task::{Context, Poll, Wake, Waker};
 /// [`run`](crate::run) inside the tokio runtime instead.
 ///
 /// In a browser (wasm32-unknown-unknown) a thread cannot sleep, and only
-/// the run's own timers can wake the future. There `block_on` fires the
-/// timers itself and spins while it waits for the next one, which holds
-/// the page's thread for as long as the world runs. It suits a test, a Web
+/// the run's own timers can wake the future. There `block_on` polls the
+/// future over and over, and the run fires each timer as it comes due,
+/// which holds the page's thread for as long as the world runs. It suits a test, a Web
 /// Worker or Node.js. A page hands [`run`](crate::run) to its event loop
 /// instead, for example with `wasm_bindgen_futures::spawn_local`, and the
 /// timers fire from `setTimeout`.
@@ -36,6 +35,9 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// Sleeps the thread while `future` waits.
 #[cfg(not(target_arch = "wasm32"))]
 fn park_on<F: Future>(future: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::Wake;
+
     struct Unpark(std::thread::Thread);
     impl Wake for Unpark {
         fn wake(self: Arc<Self>) {
@@ -58,37 +60,19 @@ fn park_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// Fires the run's timers while `future` waits.
+/// Polls `future` again and again: a run polled with nothing to do fires
+/// its own due timers.
 #[cfg(target_arch = "wasm32")]
 fn spin_on<F: Future>(future: F) -> F::Output {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    struct Woken(AtomicBool);
-    impl Wake for Woken {
-        fn wake(self: Arc<Self>) {
-            self.0.store(true, Ordering::Release);
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-    let woken = Arc::new(Woken(AtomicBool::new(false)));
-    let waker = Waker::from(woken.clone());
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut future = std::pin::pin!(future);
     loop {
         if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
             return output;
         }
-        // Nothing else runs in this thread while it waits, so only a timer
-        // coming due can wake the future.
-        while !woken.0.swap(false, Ordering::AcqRel) {
-            if crate::timer::timers().fire().is_none() && !woken.0.load(Ordering::Acquire) {
-                panic!(
-                    "block_on: the future waits for something that nothing in this thread can wake"
-                );
-            }
-            std::hint::spin_loop();
-        }
+        // Nothing else runs in this thread while it waits, and no
+        // `setTimeout` can fire, so a timer coming due is only seen by
+        // polling again.
+        std::hint::spin_loop();
     }
 }

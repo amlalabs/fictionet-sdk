@@ -37,16 +37,19 @@ before and after the fix.
 | `Attachments_namesbyroute` (`OwnByRoutesTo = FALSE`) | `Attribution` | violated as expected (35 states, 29 distinct, depth 4 on November 9, 2026): with `r` attached a host's connection is put down to `r` |
 | `Attachments_forgetbyaddr` (`KeepByAddr = FALSE`) | `Attribution` | violated as expected (2,556 states, 970 distinct, depth 8 on November 9, 2026): forgetting a `by_addr` entry on detach puts an in-flight packet down to the route |
 
-**`Ports.tla`**: `Ports::next`'s loop over the ready queue (`ReadyInner::push`
-and `pop`, `SlotWaker::wake_by_ref`), with the task's own waker, slots
-being added, closed and their peers closing. The constant `RegisterFirst`
-is whether `next` registers the task's waker before draining the queue, as
-the code does.
+**`Ports.tla`**: `Ports::next`'s search of the ready bitmap from after the
+slot served last (`Ready::find`, `Ready::clear`), `SlotWaker::wake_by_ref`
+setting a slot's bit and then waking the task if its parked flag is up,
+and the task parking its waker and serving once more before it returns
+Pending, with slots being added, closed and their peers closing. The
+constant `RecheckAfterPark` is whether `next` serves once more after
+parking, as the code does. The model was rewritten for the lock-free
+bitmap on branch `comp/buf-locks` and has not been run with TLC yet.
 
 | Config | Checks | Result |
 |---|---|---|
-| `Ports_base` | `AtMostOnce`, `SlotIsSomewhere`, `NoLostTask`; liveness `Served` | passes: 32,492 states, 7,338 distinct, depth 19 |
-| `Ports_registerlate` (`RegisterFirst = FALSE`) | `Served` | violated as expected, 15,987 states, 4,279 distinct: a slot woken between the empty check and the registration is queued while the task sleeps on |
+| `Ports_base` | `TypeOK`, `FlagHasWaker`, `SlotIsSomewhere`, `NoLostTask`; liveness `Served` | not run yet |
+| `Ports_norecheck` (`RecheckAfterPark = FALSE`) | `NoLostTask`, `Served` | not run yet; expected to fail: a slot woken between the empty search and the park finds the flag down while the task sleeps on |
 
 **`Table.tla`**: the router's `Table` (`routes`, `by_port`, `lengths`) under
 `Edit::Route` and `Event::Closed`, over the seven prefixes of a two-bit
@@ -61,14 +64,20 @@ an edit closes a port left with no prefix; `CountLengths` is whether
 | `Table_nolengths` | `BestIsLongest` | violated as expected, 2 states |
 
 **`Cable.tla`**: a cable's two ends (`cable::pair`, `End::send`,
-`End::poll_recv`, `End::drop`), each with a queue up to `MaxQueued` and a
-parked receiver. `DropWakesPeer` is whether dropping an end wakes the
-other's receiver, as the code does.
+`End::poll_recv`, `End::drop`), each direction a lock-free queue up to
+`MaxQueued` with the receiver's parked waker (`sync::Parked`). A send
+queues, then looks at the parked flag; a receiver that finds the queue
+empty parks, then looks once more before it returns Pending.
+`RecheckAfterPark` is whether it looks once more, and `DropWakesPeer`
+whether dropping an end wakes the other's parked receiver, as the code
+does. The model was rewritten for the lock-free cable on branch
+`comp/buf-locks` and has not been run with TLC yet.
 
 | Config | Checks | Result |
 |---|---|---|
-| `Cable_base` | `NothingForTheParked`, `ClosedAfterDrain`, `NoQueueForTheDropped`, `ClosedMeansDropped`; liveness `LearnsClosed` | passes: 325 states, 72 distinct, depth 7 |
-| `Cable_dropsilent` | `NothingForTheParked`, `LearnsClosed` | violated as expected. TLC stops at the first violation, `NothingForTheParked` after `Recv`, `Drop` (27 states, 19 distinct on November 9, 2026). Checked alone, `LearnsClosed` is violated too (317 states, 72 distinct) |
+| `Cable_base` | `TypeOK`, `FlagHasWaker`, `WakeIsComing`, `ClosedAfterDrain`, `NoQueueForTheDropped`, `ClosedMeansDropped`; liveness `WakeAfterPark`, `LearnsClosed` | not run yet |
+| `Cable_norecheck` (`RecheckAfterPark = FALSE`) | `WakeIsComing`, `WakeAfterPark` | not run yet; expected to fail: a packet sent between the receiver's look and its park finds the flag down |
+| `Cable_dropsilent` (`DropWakesPeer = FALSE`) | `WakeIsComing`, `LearnsClosed` | not run yet; expected to fail: the parked receiver at the other end never hears the close |
 
 ### Kani (over the production code)
 
@@ -178,14 +187,19 @@ clippy with `-D warnings` and rustfmt are clean.
   no longer the route's, so `Routed::drop` does not reset them.
 - `Ports.tla` has `add`, `close`, and `replace` into a free slot, between
   polls. `replace` over an open slot, the extra source polled before the
-  queue, the deadline, the 64-packet budget, and cancellation are outside
-  it.
+  bitmap, the deadline, the 64-packet budget, and cancellation are outside
+  it. The bitmap is a set: its summary words, which only let a search skip
+  idle words, are left out, and so is the order `Ready::clear` and
+  `SlotWaker` keep between a word and its summary bit. The randomized
+  test `every_waiting_port_is_served_within_one_turn_of_the_others` runs
+  the real bitmap across a word and a summary word.
 - `Cable.tla` counts packets against `MaxQueued`. The code charges bytes
-  plus `PACKET_COST` against `Cable::limit` (`PacketQueue::fits`), and a
-  `pair()` has no limit. `End::drop` locks the two directions one after
-  the other. The model takes it as one step, which loses nothing: a send
-  or poll at the other end in between sees the state before or after, as
-  in the model. The name guard a cable carries for `Attacher` is outside
+  plus `PACKET_COST` against `Cable::limit` with an atomic counter
+  (`Direction::reserve`), and a `pair()` has no limit. The model's steps
+  are atomic and interleave in one order; the code gets that order from
+  the two `SeqCst` fences in `Parked::park` and `Parked::wake`, which TLC
+  does not check. The `std::sync::mpsc` queue is taken as a correct
+  lock-free FIFO. The name guard a cable carries for `Attacher` is outside
   the model.
 - `Table.tla` has one address family. The code keys `lengths` by family
   and length, and `best` ranges over the destination's family only.
