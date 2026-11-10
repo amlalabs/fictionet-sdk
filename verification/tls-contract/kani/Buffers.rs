@@ -1,6 +1,6 @@
 //! Bounded buffer proofs for TLS and STARTTLS. These call the real Chunk
-//! methods from layer/carrier.rs:74-91. TLS advances partially admitted
-//! input at services/tls/layer.rs:371-391 and writes at :456-462. A switch
+//! methods from layer/carrier.rs:74-91. TLS hands back the part of a chunk
+//! it did not take (`TlsLayer::take_input`) and of a write (`on_command`). A switch
 //! transfers the remaining owned chunk, not its consumed prefix.
 //!
 //! Four arbitrary bytes and two arbitrary partial admissions include zero,

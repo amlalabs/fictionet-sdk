@@ -281,9 +281,14 @@ fn a_connect_inside_tls_hands_its_bytes_on_under_backpressure() {
         let plaintext = decrypt(&mut client, &wire);
         let answer = b"HTTP/1.1 200 OK\r\n\r\n";
         assert_eq!(&plaintext[..answer.len()], answer, "the answer comes first");
+        let back = &plaintext[answer.len()..];
         assert!(
-            plaintext[answer.len()..] == payload[..],
-            "every tunnel byte comes back once, in order"
+            back == payload,
+            "every tunnel byte comes back once, in order: {} of {} came back, the first \
+             difference at {:?}",
+            back.len(),
+            payload.len(),
+            back.iter().zip(&payload).position(|(a, b)| a != b)
         );
         Ok(())
     }))

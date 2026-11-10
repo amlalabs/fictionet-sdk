@@ -188,30 +188,22 @@ fn every_buffer_is_charged_what_it_holds_and_gives_it_back() {
                     assert_eq!(limit.used(), server.buffers_held());
                 }
                 let before = limit.used();
-                let (plaintext, charge) = match server.reader().take_first_chunk() {
-                    Ok(paid) => paid.into_parts(),
-                    Err(error) => {
-                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                        (Vec::new(), None)
-                    }
-                };
+                let mut plaintext = Vec::new();
+                if let Err(error) = server.reader().read_to_end(&mut plaintext) {
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                }
                 if plaintext.is_empty() {
                     if rest.is_empty() {
                         break;
                     }
                     continue;
                 }
-                // The plaintext leaves with its charge: the budget gets back
-                // only the queue's places, and then exactly the plaintext's
-                // allocation once it is dropped.
-                let charge = charge.unwrap();
-                assert_eq!(charge.bytes(), plaintext.capacity());
+                // Reading gives the plaintext's buffer back.
                 assert!(limit.used() <= before);
-                assert_eq!(limit.used(), server.buffers_held() + plaintext.capacity());
+                assert_eq!(limit.used(), server.buffers_held());
                 let written = server.writer().write(&plaintext).unwrap();
                 assert_eq!(written, plaintext.len());
                 assert!(server.buffers_accounted());
-                drop(charge);
                 assert_eq!(limit.used(), server.buffers_held());
                 echoed.extend_from_slice(&plaintext);
                 to_client(&mut server, &mut client);
@@ -294,14 +286,12 @@ fn a_records_plaintext_stays_in_the_buffer_it_arrived_in() {
             "{version:?}: keeping the plaintext took {} bytes past its record",
             limit.used() - idle - read
         );
-        let (plaintext, charge) = server.reader().take_first_chunk().unwrap().into_parts();
+        let mut plaintext = Vec::new();
+        server.reader().read_to_end(&mut plaintext).unwrap_err();
         assert!(
             plaintext == message,
             "{version:?}: the record waited intact"
         );
-        // It leaves in the record's buffer, with the record's charge.
-        assert_eq!(plaintext.capacity(), read, "{version:?}");
-        assert_eq!(charge.unwrap().bytes(), read, "{version:?}");
         assert_eq!(server.buffers_held(), ALERT_ROOM, "{version:?}");
     }
 }
@@ -375,9 +365,9 @@ fn a_full_record_takes_one_buffer_of_its_size() {
             "{version:?}: {most} bytes held for a {}-byte record",
             wire.len()
         );
-        let (plaintext, _charge) = server.reader().take_first_chunk().unwrap().into_parts();
+        let mut plaintext = Vec::new();
+        server.reader().read_to_end(&mut plaintext).unwrap_err();
         assert!(plaintext == message, "{version:?}");
-        assert_eq!(plaintext.capacity(), wire.len(), "{version:?}");
         assert_eq!(server.buffers_held(), ALERT_ROOM, "{version:?}");
     }
 }

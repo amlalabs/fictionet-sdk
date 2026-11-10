@@ -40,6 +40,10 @@ mod connection {
     use crate::vecbuf::ChunkVecBuffer;
 
     /// A QUIC client or server connection.
+    ///
+    /// A server connection is larger than a client one, as in
+    /// [`crate::Connection`]: the variants are kept inline rather than boxed.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug)]
     pub enum Connection {
         /// A client connection

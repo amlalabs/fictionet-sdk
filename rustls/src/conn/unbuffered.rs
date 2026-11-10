@@ -12,6 +12,7 @@ use crate::client::ClientConnectionData;
 use crate::enums::ContentType;
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
 use crate::msgs::deframer::buffers::Locator;
+use crate::msgs::deframer::record_end;
 use crate::server::ServerConnectionData;
 use crate::Error;
 
@@ -73,10 +74,30 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 break (buffer.pending_discard(), EncodeTlsData::new(self).into());
             }
 
+            // Room for the most output the next message can make, charged
+            // before it is taken, so that its processing, which cannot be
+            // undone, never runs out of room halfway. Without room the
+            // message waits where it is.
+            let filled = buffer.filled_mut();
+            let next = match record_end(filled, buffer_progress.processed()) {
+                Ok(end) => end <= filled.len(),
+                // The deframer refuses it, with an alert from the room kept
+                // for the final alert.
+                Err(_) => false,
+            };
+            // A connection that failed reads nothing more: what it queued
+            // still goes out.
+            let reading =
+                !self.core.common_state.has_received_close_notify && self.core.state.is_ok();
+            let unprocessed = reading && (self.core.hs_deframer.has_message_ready() || next);
+            if unprocessed && !self.core.common_state.reserve_step() {
+                break (buffer.pending_discard(), ConnectionState::BlockedBudget);
+            }
+
             // Where the bytes `deframe` is given start in `incoming_tls`.
             let base = buffer.pending_discard();
             let locator = Locator::new(buffer.filled_mut());
-            let deframer_output = if self.core.common_state.has_received_close_notify {
+            let deframer_output = if !reading {
                 None
             } else {
                 match self
@@ -85,6 +106,10 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 {
                     Err(err) => {
                         buffer.queue_discard(buffer_progress.take_discard());
+                        self.core.common_state.release_step();
+                        // A record that does not decrypt or frame fails the
+                        // connection, as a message that does not process does.
+                        self.core.state = Err(err.clone());
                         return UnbufferedStatus {
                             discard: buffer.pending_discard(),
                             state: Err(err),
@@ -105,6 +130,7 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         Err(e) => {
                             buffer.queue_discard(buffer_progress.take_discard());
                             self.core.state = Err(e.clone());
+                            self.core.common_state.release_step();
                             return UnbufferedStatus {
                                 discard: buffer.pending_discard(),
                                 state: Err(e),
@@ -116,6 +142,9 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                     .core
                     .process_msg(msg, state, None)
                     .and_then(|new| self.core.common_state.output_paid().map(|()| new));
+                // What the message made is paid from the room; the rest of
+                // the room goes back.
+                self.core.common_state.release_step();
                 match processed {
                     Ok(new) => state = new,
 
@@ -152,6 +181,14 @@ impl<Data> UnbufferedConnectionCommon<Data> {
             // Records that failed trial decryption are done with: they are
             // not tried again on the next call.
             buffer.queue_discard(buffer_progress.take_discard());
+            self.core.common_state.release_step();
+            // Once what a failed connection queued is out, it stays failed.
+            if let (false, Err(e)) = (self.wants_write, &self.core.state) {
+                return UnbufferedStatus {
+                    discard: buffer.pending_discard(),
+                    state: Err(e.clone()),
+                };
+            }
             if self.wants_write {
                 break (
                     buffer.pending_discard(),
@@ -265,6 +302,14 @@ pub enum ConnectionState<'c, 'i, Data> {
     /// was passed to [`UnbufferedConnectionCommon::process_tls_records`].
     BlockedHandshake,
 
+    /// The connection's [`BufferBudget`](crate::budget::BufferBudget) has no room for the
+    /// output the next message may make
+    ///
+    /// The message waits where it is: call
+    /// [`UnbufferedConnectionCommon::process_tls_records`] again, with the same buffer, once
+    /// the budget has room. A connection without a budget never reaches this state.
+    BlockedBudget,
+
     /// The handshake process has been completed.
     ///
     /// [`WriteTraffic::encrypt`] can be called on the enclosed object to encrypt application
@@ -321,6 +366,8 @@ impl<Data> fmt::Debug for ConnectionState<'_, '_, Data> {
             Self::TransmitTlsData(..) => f.debug_tuple("TransmitTlsData").finish(),
 
             Self::BlockedHandshake => f.debug_tuple("BlockedHandshake").finish(),
+
+            Self::BlockedBudget => f.debug_tuple("BlockedBudget").finish(),
 
             Self::WriteTraffic(..) => f.debug_tuple("WriteTraffic").finish(),
         }
@@ -465,6 +512,12 @@ impl<Data> WriteTraffic<'_, Data> {
             .encrypted_len(application_data_len)
     }
 
+    /// The bytes [`Self::queue_close_notify`] writes, records queued to go
+    /// before it included: the size an `outgoing_tls` buffer needs
+    pub fn close_notify_len(&self) -> usize {
+        self.conn.core.common_state.close_notify_len()
+    }
+
     /// Encrypts a close_notify warning alert in `outgoing_tls`
     ///
     /// Returns the number of bytes that were written into `outgoing_tls`, or an error if
@@ -528,6 +581,12 @@ impl<'c, Data> EncodeTlsData<'c, Data> {
     /// Whether [`Self::encode`] has nothing to write
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The bytes of every record queued to be encoded, this one included
+    /// until it is: what a buffer for all of them needs
+    pub fn queued_len(&self) -> usize {
+        self.conn.core.common_state.sendable_tls_len()
     }
 
     /// Encodes a handshake record into the `outgoing_tls` buffer

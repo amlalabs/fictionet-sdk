@@ -321,14 +321,22 @@ and writes other bytes leaves the earlier bytes sent and never confirmed.
 
 [`LayerProof.rs`](kani/LayerProof.rs) is compiled into `tls::layer` under
 `cfg(kani)` and calls the production code. rustls is too large for CBMC,
-so no harness builds a `ServerConnection`: each starts from an
-accounting state the code reaches after a write was accepted and its
-ciphertext produced. Kani does not run the output arm of `advance`, which
-sets the fence: it allocates a 16 KiB chunk, and with it in a harness
-CBMC passed the 10 GB cap twice (as the first and the only step of a
-schedule). Where the fence goes is checked in `Layer.tla` and by the
-existing test `ciphertext_completion_is_not_admission_and_close_follows_data`.
-The layer is given an `Entropy` that panics on any draw.
+so no harness builds a connection: each starts from an accounting state
+the code reaches after a write was accepted and sealed. Kani does not run
+`pump`, which seals the write and sets its ciphertext end (the fence):
+sealing is rustls's, and it allocates the record's buffer. Where the fence
+goes is checked in `Layer.tla` and by the existing test
+`ciphertext_completion_is_not_admission_and_close_follows_data`. The layer
+is given an `Entropy` that panics on any draw.
+
+On 2026-11-10 the layer moved to rustls's unbuffered API (stage S3 of the
+buffers design) and the harnesses were rewritten to its fields: the old
+`produced`, `delivered`, `pending_plaintext` with `fence`, and `credit` are
+`ciphertext_emitted`, `ciphertext_completed`, `plaintext_completion` (the
+write's plaintext bytes and its ciphertext end), and
+`completed_plaintext_bytes`. The properties are the same. The rewritten
+harnesses have not been run yet; the runs and mutations below are of the
+earlier layer.
 
 On the merged foundation the layer needs a way to pick its config. The
 harnesses build it with a picker that is never called (`fresh`), and keep

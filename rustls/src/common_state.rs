@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use pki_types::CertificateDer;
 
 use crate::budget::{
-    Account, Paid, PaidBytes, CONTROL_PAYLOAD, CONTROL_RECORDS, HANDSHAKE_RECORDS, HANDSHAKE_ROOM,
+    Account, Paid, CONTROL_PAYLOAD, CONTROL_RECORDS, HANDSHAKE_RECORDS, HANDSHAKE_ROOM,
 };
 use crate::conn::kernel::KernelState;
 use crate::crypto::SupportedKxGroup;
@@ -142,16 +142,6 @@ impl CommonState {
     /// [`Connection::write_tls`]: crate::Connection::write_tls
     pub fn sendable_tls_len(&self) -> usize {
         self.sendable_tls.len()
-    }
-
-    /// Takes the sole queued ciphertext chunk without copying if it is whole
-    /// and its allocation fits `max_capacity`, with the charge that pays for
-    /// it. Otherwise leaves output queued for [`Connection::write_tls`],
-    /// preserving coalescing and partial writes.
-    ///
-    /// [`Connection::write_tls`]: crate::Connection::write_tls
-    pub fn take_sendable_tls_chunk(&mut self, max_capacity: usize) -> Option<PaidBytes> {
-        self.sendable_tls.take_sole_whole_chunk(max_capacity)
     }
 
     /// Whether the last [`Connection::process_new_packets`] stopped before a
@@ -913,6 +903,17 @@ impl CommonState {
         self.send_msg(m, self.record_layer.is_encrypting());
     }
 
+    /// What [`Self::eager_send_close_notify`] writes: the records queued, a
+    /// key update waiting to go, and the alert unless a final alert went
+    /// already.
+    pub(crate) fn close_notify_len(&self) -> usize {
+        let alert = match self.sent_fatal_alert {
+            true => 0,
+            false => HEADER_SIZE + self.record_layer.encrypted_len(2),
+        };
+        self.encrypted_len(0) + alert
+    }
+
     /// What [`Self::write_plaintext`] writes for `len` bytes: the records
     /// queued before them, a key update waiting to go, and the records the
     /// bytes make.
@@ -1398,59 +1399,6 @@ pub(crate) type HandshakeFlightTls13<'a> = HandshakeFlight<'a, true>;
 
 const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
 pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
-
-#[cfg(all(test, feature = "std"))]
-mod ciphertext_ownership_tests {
-    use super::*;
-
-    #[test]
-    fn sole_whole_ciphertext_transfers_its_allocation() {
-        let mut state = CommonState::new(Side::Server);
-        assert!(state.take_sendable_tls_chunk(64).is_none());
-        let mut bytes = Vec::with_capacity(64);
-        bytes.extend_from_slice(&[1; 16]);
-        let pointer = bytes.as_ptr();
-        let capacity = bytes.capacity();
-        assert!(state.sendable_tls.pay(capacity, 1));
-        assert!(state.sendable_tls.push_paid(bytes, capacity));
-        assert!(state.take_sendable_tls_chunk(16).is_none());
-        assert_eq!(state.sendable_tls_len(), 16);
-        let (owned, _) = state
-            .take_sendable_tls_chunk(capacity)
-            .unwrap()
-            .into_parts();
-        assert_eq!(owned.as_ptr(), pointer);
-        assert_eq!(owned.capacity(), capacity);
-        assert_eq!(owned.len(), 16);
-        assert!(!state.wants_write());
-    }
-
-    #[test]
-    fn ineligible_ciphertext_stays_queued_for_bounded_coalescing() {
-        let mut state = CommonState::new(Side::Server);
-        assert!(state.sendable_tls.append_copy(&[1; 8]));
-        assert!(state.sendable_tls.append_copy(&[2; 8]));
-        assert!(state.take_sendable_tls_chunk(64).is_none());
-        let mut output = [0; 12];
-        assert_eq!(
-            state
-                .sendable_tls
-                .write_to(&mut output.as_mut_slice())
-                .unwrap(),
-            12
-        );
-        assert_eq!(state.sendable_tls_len(), 4);
-        assert!(state.take_sendable_tls_chunk(64).is_none());
-        let mut remainder = Vec::new();
-        assert_eq!(state.sendable_tls.write_to(&mut remainder).unwrap(), 4);
-        assert!(!state.wants_write());
-
-        assert!(state.sendable_tls.append_copy(&[3; 65]));
-        assert!(state.take_sendable_tls_chunk(64).is_none());
-        assert_eq!(state.sendable_tls_len(), 65);
-        assert_eq!(state.sendable_tls.write_to(&mut Vec::new()).unwrap(), 65);
-    }
-}
 
 #[cfg(all(test, feature = "std"))]
 mod dropped_record_tests {

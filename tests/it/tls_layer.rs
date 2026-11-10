@@ -130,6 +130,80 @@ fn client_hello_at_every_split_and_records_in_seeded_chunks() {
     .unwrap();
 }
 
+/// An echo through the layer, a record in and its plaintext written back,
+/// allocates at most the one buffer its reply is sealed in and the chunk
+/// around it: the record arriving is decrypted in the chunk that brought it
+/// and its plaintext goes up as a slice of it, with no allocation at all.
+/// Counted over many rounds as an inequality, so fewer passes.
+#[test]
+fn an_echoed_record_allocates_only_its_sealed_reply() {
+    use crate::common::alloc::allocations;
+    const ROUNDS: usize = 64;
+    /// The sealed reply's bytes and the shared header of the chunk around
+    /// them.
+    const PER_ROUND: usize = 2;
+    block_on(lab(Seed::from_u64(15), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let budget = Budget::new(1 << 20);
+        let (mut server, mut client) = handshake_charging(config, client_config, 1, budget.clone());
+        let mut made = 0;
+        for round in 0..ROUNDS {
+            let message = vec![round as u8; 100 + round * 37];
+            client.writer().write_all(&message)?;
+            let record = Chunk::copy_of(&budget, &client_output(&mut client)).unwrap();
+            let mut sent = Vec::new();
+            let ((), count) = allocations(|| {
+                assert!(matches!(
+                    server.driver().deliver(StreamEvent::Data(record)),
+                    Ok(Admit::Taken)
+                ));
+                server.driver().run().unwrap();
+                let mut up = None;
+                server.driver().send_above(|event| {
+                    if let StreamEvent::Data(chunk) = event {
+                        up = Some(chunk);
+                    }
+                    Admit::Taken
+                });
+                let up = up.expect("the record's plaintext went up");
+                assert!(matches!(
+                    server.driver().command(StreamCommand::Write(up)),
+                    Ok(Admit::Taken)
+                ));
+                server.driver().run().unwrap();
+                let mut written = 0;
+                server.driver().send_below(|command| {
+                    if let StreamCommand::Write(bytes) = command {
+                        written += bytes.len() as u64;
+                        crate::common::alloc::unmeasured(|| sent.extend_from_slice(&bytes));
+                    }
+                    Admit::Taken
+                });
+                assert!(matches!(
+                    server.driver().deliver(StreamEvent::Written(written)),
+                    Ok(Admit::Taken)
+                ));
+                server.driver().run().unwrap();
+                server.driver().send_above(|_| Admit::Taken);
+            });
+            made += count;
+            receive(&mut client, &sent);
+            let mut echoed = vec![0; message.len()];
+            client.reader().read_exact(&mut echoed)?;
+            assert_eq!(echoed, message);
+        }
+        eprintln!("{made} allocations for {ROUNDS} echoed records");
+        assert!(
+            made <= ROUNDS * PER_ROUND,
+            "{made} allocations for {ROUNDS} echoed records"
+        );
+        Ok(())
+    }))
+    .unwrap();
+}
+
 #[test]
 fn small_ciphertext_does_not_allocate_a_maximum_record() {
     block_on(lab(Seed::from_u64(14), |fcx| async move {
@@ -332,8 +406,11 @@ fn a_record_without_room_waits_and_its_plaintext_comes_when_memory_frees() {
     .unwrap();
 }
 
+/// A write without room for its record waits, and goes once memory frees.
+/// The end after it goes even with the budget full: its close_notify is
+/// paid from the room kept since the first byte.
 #[test]
-fn a_write_and_an_end_without_room_wait_for_memory() {
+fn a_write_without_room_waits_and_an_end_goes_with_the_budget_full() {
     block_on(lab(Seed::from_u64(23), |fcx| async move {
         let ca = Ca::new(&fcx, "Test CA")?;
         let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
@@ -346,9 +423,6 @@ fn a_write_and_an_end_without_room_wait_for_memory() {
         let Admit::Blocked(write) = server.driver().command(write)? else {
             panic!("a write was taken without room for its record");
         };
-        let Admit::Blocked(end) = server.driver().command(StreamCommand::End)? else {
-            panic!("an end was taken without room for its close_notify");
-        };
         server.settle()?;
         assert!(server.take_output().is_empty());
 
@@ -356,7 +430,11 @@ fn a_write_and_an_end_without_room_wait_for_memory() {
         assert!(matches!(server.driver().command(write)?, Admit::Taken));
         server.settle()?;
         receive(&mut client, &server.take_output());
-        assert!(matches!(server.driver().command(end)?, Admit::Taken));
+        let _others = fill(&budget);
+        assert!(matches!(
+            server.driver().command(StreamCommand::End)?,
+            Admit::Taken
+        ));
         server.settle()?;
         receive(&mut client, &server.take_output());
         let mut reply = Vec::new();

@@ -33,7 +33,6 @@ mod connection {
     use core::ops::{Deref, DerefMut};
     use std::io::{self, BufRead, Read};
 
-    use crate::budget::PaidBytes;
     use crate::common_state::{CommonState, IoState};
     use crate::error::Error;
     use crate::msgs::message::OutboundChunks;
@@ -42,6 +41,11 @@ mod connection {
     use crate::ConnectionCommon;
 
     /// A client or server connection.
+    ///
+    /// A server connection is larger than a client one: it keeps the early data
+    /// queue, and each queue keeps a slot for its final alert. Connections are few and
+    /// long-lived, so the variants are kept inline rather than boxed.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug)]
     pub enum Connection {
         /// A client connection
@@ -207,21 +211,6 @@ mod connection {
                 None => {
                     self.check_no_bytes_state()?;
                     Ok(&[])
-                }
-            }
-        }
-
-        /// Take the first chunk of plaintext data received from the peer, in the buffer
-        /// that holds it, so it is not copied out, with the charge that pays for it.
-        ///
-        /// Returns what [`Self::into_first_chunk`] would return, owned: empty bytes
-        /// mean the peer closed the session cleanly.
-        pub fn take_first_chunk(self) -> io::Result<PaidBytes> {
-            match self.received_plaintext.pop_paid() {
-                Some(chunk) => Ok(chunk),
-                None => {
-                    self.check_no_bytes_state()?;
-                    Ok(PaidBytes::new(Vec::new(), None))
                 }
             }
         }
@@ -963,6 +952,16 @@ impl<Data> UnbufferedConnectionCommon<Data> {
     /// Should be used with care as it exposes secret key material.
     pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
         self.core.dangerous_extract_secrets()
+    }
+
+    /// How many bytes at the front of the `incoming_tls` buffer hold a
+    /// handshake message being joined: processed, and still in use. The
+    /// next call must be given them again, unchanged, followed by the
+    /// record arriving; 0 when no message is being joined, and then a
+    /// buffer that starts at the record arriving may be given in their
+    /// place.
+    pub fn joined(&self) -> usize {
+        self.core.hs_deframer.progress().processed()
     }
 }
 

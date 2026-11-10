@@ -104,8 +104,8 @@ impl Chunks {
 /// chunk is paid for before it exists ([`Self::pay`]) and appended against
 /// that payment ([`Self::push_paid`]); the places of the queue are paid for
 /// as they grow; and room may be paid ahead for output a caller is about to
-/// make ([`Self::reserve`]). Chunks leaving give their bytes back, or take
-/// their charge with them ([`Self::pop_paid`]).
+/// make ([`Self::reserve`]). Chunks leaving give their bytes back. A record
+/// decrypted in its own buffer joins with its charge ([`Self::push_charged`]).
 pub(crate) struct ChunkVecBuffer {
     /// How many bytes have been consumed in the first chunk.
     ///
@@ -440,27 +440,6 @@ impl ChunkVecBuffer {
         first
     }
 
-    /// Take one of the chunks from this object, with the charge that pays
-    /// for it.
-    pub(crate) fn pop_paid(&mut self) -> Option<PaidBytes> {
-        let mut first = self.chunks.pop_front()?;
-        let prefix = mem::take(&mut self.prefix_used);
-        first.drain(0..prefix);
-        let charge = self.paid.split(first.capacity());
-        self.release_idle_places();
-        Some(PaidBytes::new(first, charge))
-    }
-
-    pub(crate) fn take_sole_whole_chunk(&mut self, max_capacity: usize) -> Option<PaidBytes> {
-        if self.prefix_used != 0
-            || self.chunks.len() != 1
-            || self.chunks.front()?.capacity() > max_capacity
-        {
-            return None;
-        }
-        self.pop_paid()
-    }
-
     #[cfg(read_buf)]
     /// Read data out of this object, writing it into `cursor`.
     pub(crate) fn read_buf(
@@ -749,7 +728,6 @@ mod tests {
         let account: Account = Some(limit.clone());
         let mut cvb = ChunkVecBuffer::paid_with(None, Paid::open(&account));
         let mut model = Vec::new();
-        let mut taken = Vec::new();
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = |n: u64| {
             seed ^= seed << 13;
@@ -809,19 +787,13 @@ mod tests {
                 }
                 _ => {
                     let places = cvb.chunks.places() * PLACE;
-                    if let Some(paid) = cvb.pop_paid() {
-                        let (bytes, charge) = paid.into_parts();
+                    if let Some(bytes) = cvb.pop() {
                         assert_eq!(&bytes[..], &model[..bytes.len()]);
                         model.drain(..bytes.len());
-                        assert_eq!(charge.as_ref().unwrap().bytes(), bytes.capacity());
-                        // The chunk's charge leaves with it; only places the
-                        // queue gave back leave the budget.
+                        // The chunk's bytes go back with the places the
+                        // queue gave back.
                         let freed = places - cvb.chunks.places() * PLACE;
-                        assert_eq!(limit.used(), used - freed);
-                        taken.push((bytes, charge));
-                        if taken.len() > 3 {
-                            taken.remove(0);
-                        }
+                        assert_eq!(limit.used(), used - bytes.capacity() - freed);
                     }
                     cvb.release_reserve();
                 }
@@ -833,7 +805,6 @@ mod tests {
             assert_eq!(cvb.len(), model.len());
             assert!(limit.used() <= 600);
         }
-        drop(taken);
         drop(cvb);
         assert_eq!(limit.used(), 0);
     }

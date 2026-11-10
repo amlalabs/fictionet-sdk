@@ -4,11 +4,15 @@
 //! buffers grows: the record arriving (or a handshake message being joined),
 //! the plaintext it has decrypted and not yet handed over, the plaintext
 //! written before the handshake finished, and the records queued to send.
-//! Each buffer holds one [`BufferCharge`] that always covers its allocation,
-//! and gives back what it frees. A record's plaintext stays in the buffer the
-//! record arrived in, which joins the plaintext queue with its charge: the
-//! queue's charge takes it in, and the budget's total does not move.
-//! Buffers are freed once empty, so an idle connection is charged nothing.
+//! Each buffer holds one charge that always covers its allocation, and gives
+//! back what it frees. A record's plaintext stays in the buffer the record
+//! arrived in, which joins the plaintext queue with its charge: the queue's
+//! charge takes it in, and the budget's total does not move. Buffers are
+//! freed once empty, so an idle connection holds none.
+//!
+//! The one charge an idle connection keeps is the room for its final alert,
+//! a fatal alert or a `close_notify`, paid before the first byte it reads:
+//! that alert goes out whatever the budget says when it is sent.
 //!
 //! A growth the budget refuses changes nothing, and the call that wanted it
 //! says so in a way that can be retried once memory frees:
@@ -20,9 +24,9 @@
 //!   message it cannot pay for, leaving it buffered, and
 //!   [`CommonState::wants_budget`] says so until a later call gets past it.
 //! - [`Writer`](crate::Writer) takes fewer bytes, perhaps none.
-//! - [`Accepted::into_connection`] gives the [`Accepted`] back.
-//! - [`CommonState::send_close_notify`] returns `false` and
-//!   [`ConnectionCommon::refresh_traffic_keys`] fails with
+//! - [`Accepted::into_connection`] and [`Accepted::into_unbuffered`] give the
+//!   [`Accepted`] back.
+//! - [`ConnectionCommon::refresh_traffic_keys`] fails with
 //!   [`Error::BudgetExhausted`], having queued nothing.
 //!
 //! The output rustls makes for a message it receives (a handshake flight, a
@@ -39,11 +43,11 @@
 //! [`CommonState::wants_budget`]: crate::CommonState::wants_budget
 //! [`CommonState::send_close_notify`]: crate::CommonState::send_close_notify
 //! [`Accepted::into_connection`]: crate::server::Accepted::into_connection
+//! [`Accepted::into_unbuffered`]: crate::server::Accepted::into_unbuffered
 //! [`Accepted`]: crate::server::Accepted
 //! [`Error::BudgetExhausted`]: crate::Error::BudgetExhausted
 
 use alloc::vec::Vec;
-use core::any::Any;
 use core::fmt;
 
 use crate::sync::Arc;
@@ -51,11 +55,9 @@ use crate::sync::Arc;
 /// Where a connection's buffers are paid from: a count of bytes that
 /// refuses to go past its limit.
 ///
-/// The connection holds what it takes in [`BufferCharge`]s, which give it
-/// back when dropped. The budget is an [`Any`], so its owner can recognize
-/// it in a charge that leaves the connection ([`BufferCharge::budget`]) and
-/// hold the bytes in a charge of its own type ([`BufferCharge::into_bytes`]).
-pub trait BufferBudget: Any + Send + Sync {
+/// The connection holds what it takes in charges of its own, which give it
+/// back when dropped.
+pub trait BufferBudget: Send + Sync {
     /// Takes `bytes`, if they fit. Refuses, changing nothing, if not.
     fn take(&self, bytes: usize) -> bool;
 
@@ -68,7 +70,7 @@ pub trait BufferBudget: Any + Send + Sync {
 /// Making, growing, splitting and dropping one allocates nothing: it is the
 /// budget and a count.
 #[must_use = "a charge that is dropped gives its bytes back"]
-pub struct BufferCharge {
+pub(crate) struct BufferCharge {
     budget: Arc<dyn BufferBudget>,
     bytes: usize,
 }
@@ -83,20 +85,8 @@ impl BufferCharge {
     }
 
     /// The bytes charged now.
-    pub fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         self.bytes
-    }
-
-    /// The budget it counts against.
-    pub fn budget(&self) -> &Arc<dyn BufferBudget> {
-        &self.budget
-    }
-
-    /// Ends this charge without giving its bytes back, and returns them, for
-    /// the budget's owner to hold in a charge of its own. The budget's total
-    /// does not change.
-    pub fn into_bytes(mut self) -> usize {
-        core::mem::take(&mut self.bytes)
     }
 
     /// Charges `to` bytes in all, if that is more than now. Refuses,
@@ -161,9 +151,9 @@ impl fmt::Debug for BufferCharge {
     }
 }
 
-/// Bytes taken out of a connection's buffer with the charge that pays for
-/// their allocation, so they leave without a copy.
-pub struct PaidBytes {
+/// Bytes moved from one of a connection's buffers to another with the
+/// charge that pays for their allocation, so they move without a copy.
+pub(crate) struct PaidBytes {
     bytes: Vec<u8>,
     charge: Option<BufferCharge>,
 }
@@ -173,14 +163,9 @@ impl PaidBytes {
         Self { bytes, charge }
     }
 
-    /// The bytes.
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     /// The bytes, and their charge: `None` for a connection without a
     /// budget, otherwise exactly their capacity.
-    pub fn into_parts(self) -> (Vec<u8>, Option<BufferCharge>) {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Option<BufferCharge>) {
         (self.bytes, self.charge)
     }
 }

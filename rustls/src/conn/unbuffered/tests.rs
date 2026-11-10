@@ -52,7 +52,12 @@ fn serve(server: &mut UnbufferedServerConnection, incoming: &mut Vec<u8>) -> Ser
     loop {
         let UnbufferedStatus { discard, state } = server.process_tls_records(&mut incoming[..]);
         let mut extra = 0;
-        let more = match state.unwrap() {
+        // A failed connection is done once what it queued is out.
+        let Ok(state) = state else {
+            incoming.drain(..discard);
+            return served;
+        };
+        let more = match state {
             ConnectionState::ReadTraffic(mut traffic) => {
                 let record = traffic.next_record().unwrap().unwrap();
                 assert!(traffic.next_record().is_none(), "one record a state");
@@ -246,11 +251,12 @@ fn an_encode_state_dropped_unencoded_loses_nothing() {
     panic!("the handshake did not finish");
 }
 
-/// A record the server cannot decrypt is answered with bad_record_mac with
-/// the budget full: the room kept for the final alert pays for it, and the
-/// next call hands it over to be sent.
+/// Without room for what a record may make, the record waits where it is,
+/// untouched, and nothing is charged: the next call with room processes it.
+/// A record the server cannot decrypt is then answered with bad_record_mac,
+/// and the connection stays failed, reading nothing more.
 #[test]
-fn a_fatal_alert_goes_out_with_the_budget_full() {
+fn a_record_waits_for_room_and_a_bad_one_is_answered_with_an_alert() {
     for version in [&TLS12, &TLS13] {
         let limit = Limit::new(1 << 20);
         let (mut client, mut server) =
@@ -258,8 +264,21 @@ fn a_fatal_alert_goes_out_with_the_budget_full() {
         client.writer().write_all(b"tampered").unwrap();
         let mut incoming = from_client(&mut client);
         *incoming.last_mut().unwrap() ^= 1;
+        let arrived = incoming.clone();
 
-        limit.set_limit(limit.used());
+        let idle = limit.used();
+        limit.set_limit(idle);
+        let status = server.process_tls_records(&mut incoming[..]);
+        assert_eq!(status.discard, 0, "{version:?}");
+        assert!(
+            matches!(status.state, Ok(ConnectionState::BlockedBudget)),
+            "{version:?}: {:?}",
+            status.state
+        );
+        assert!(incoming == arrived, "{version:?}: the record was touched");
+        assert_eq!(limit.used(), idle, "{version:?}");
+
+        limit.set_limit(1 << 20);
         let status = server.process_tls_records(&mut incoming[..]);
         assert_eq!(
             status.state.unwrap_err(),
@@ -268,6 +287,10 @@ fn a_fatal_alert_goes_out_with_the_budget_full() {
         );
         let served = serve(&mut server, &mut Vec::new());
         assert!(!served.sent.is_empty(), "{version:?}: no alert was sent");
+        assert!(
+            server.process_tls_records(&mut []).state.is_err(),
+            "{version:?}: the connection went on after it failed"
+        );
 
         let mut rest = &served.sent[..];
         client.read_tls(&mut rest).unwrap();
