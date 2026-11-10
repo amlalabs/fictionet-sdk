@@ -50,13 +50,18 @@ impl<L> Session<L> {
             memory: false,
         }
     }
+}
 
+impl<L: Layer> Session<L> {
+    /// What is under way. The application waits for memory when a charge
+    /// of its was refused, or when a part of it waits on a budget view of
+    /// its own (a child of [`Children`](fictionet::stdlib::layer::Children)).
     fn outstanding(&self) -> Outstanding {
         Outstanding {
             output: self.pending > 0,
             input: self.refused || self.event.is_some(),
             work: self.jobs.load(Ordering::Relaxed) > 0,
-            memory: self.memory,
+            memory: self.memory || self.layer.waits_for_memory(),
         }
     }
 
@@ -145,6 +150,9 @@ where
     }
     fn depth(&self) -> usize {
         1 + self.layer.depth()
+    }
+    fn waits_for_memory(&self) -> bool {
+        self.layer.waits_for_memory()
     }
     fn is_terminal(&self) -> bool {
         self.reset

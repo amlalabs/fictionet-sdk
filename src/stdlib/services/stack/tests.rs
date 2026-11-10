@@ -1938,8 +1938,8 @@ mod memory {
     use std::time::Duration;
 
     use fictionet::stdlib::layer::{
-        Admit, Budget, ByteStream, Charge, DatagramCommand, DatagramEvent, Datagrams, Env, Layer,
-        Starved, StreamCommand, StreamEvent, Top,
+        Admit, Budget, ByteStream, Chain, Charge, Children, DatagramCommand, DatagramEvent,
+        Datagrams, Env, Layer, Starved, StreamCommand, StreamEvent, Top,
     };
     use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket};
     use fictionet::sync::Mutex;
@@ -2300,6 +2300,131 @@ mod memory {
                 "the release woke the run, with no timer"
             );
             run.join(&fcx).await?;
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A [`Hungry`] child of `Children` that notes when it hears its input
+    /// end.
+    struct Listens {
+        hungry: Hungry,
+        heard: Got,
+    }
+
+    impl Layer for Listens {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn on_event(
+            &mut self,
+            env: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            if matches!(event, StreamEvent::Ended) {
+                self.heard.lock().get_or_insert(env.now());
+            }
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+
+        fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+            Ok(self.hungry.try_charge(env))
+        }
+
+        fn take_command(&mut self, _: &mut Env<'_, Infallible>) -> Option<StreamCommand> {
+            self.hungry.end().then_some(StreamCommand::End)
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// One [`Listens`] child under `Children`, over a byte stream.
+    fn listening(
+        got: Got,
+        heard: Got,
+    ) -> Chain<super::StreamChild, Children<Listens, Top, &'static str>> {
+        Chain::new(
+            super::StreamChild::new(),
+            Children::new(1, 1024, move |_, _, _| {
+                Some(Listens {
+                    hungry: Hungry::new(got.clone()),
+                    heard: heard.clone(),
+                })
+            }),
+        )
+    }
+
+    /// A child of `Children` asks through a view of its own, which the
+    /// runner's view does not see. While the child waits for memory the
+    /// connection is not waiting for its peer either: an idle limit far
+    /// shorter than the wait does not end the input before the release
+    /// that gets the child its memory, which wakes the run with no packet
+    /// or timer.
+    #[test]
+    fn a_child_waiting_for_memory_keeps_the_run_from_idling() {
+        run_waiting_child(listening);
+    }
+
+    /// Runs the stack `make` builds, whose child waits for memory, over a
+    /// silent connection, and checks when the child heard its input end.
+    /// Generic, as `serve_one` is, so the run's future is checked for
+    /// `Send` against the bounds rather than the concrete stack.
+    fn run_waiting_child<L>(make: impl FnOnce(Got, Got) -> L + Send + 'static)
+    where
+        L: Layer<Lower = ByteStream, Upper = Top> + Send + 'static,
+        L::Work: super::super::Job<Done = L::Done>,
+        L::Report: Send,
+        L::Error: core::fmt::Debug + Send,
+    {
+        block_on(lab(Seed::from_u64(10), move |fcx| async move {
+            let (budget, hog) = tight();
+            let got = Got::default();
+            let heard = Got::default();
+            // The release comes from another task; the run is this one.
+            let freed: Got = Got::default();
+            let (free_got, free_at) = (got.clone(), freed.clone());
+            let freer = fcx.spawn(move |fcx| async move {
+                let at = free_after_refusal(&fcx, hog, &free_got).await?;
+                *free_at.lock() = Some(at);
+                Ok(())
+            });
+            let limits = StreamLimits {
+                idle: Some(Duration::from_millis(10)),
+                write_timeout: None,
+            };
+            let stack = make(got.clone(), heard.clone());
+            let info = ConnInfo::default();
+            // Once the child is done the run idles out, as nothing more
+            // comes from the peer.
+            let end = stream(&fcx, Silent, &info, stack, budget, limits, |_| {}).await;
+            assert_eq!(end.ok(), Some(StreamEnd::Idle));
+            freer.join(&fcx).await?;
+            let freed = (*freed.lock()).expect("memory was freed");
+            assert_eq!(
+                *got.lock(),
+                Some(freed),
+                "the release woke the run, with no timer"
+            );
+            let ended = (*heard.lock()).expect("the idle limit ended the input");
+            assert!(
+                ended >= freed,
+                "the input ended at {ended:?}, while the child waited for memory until {freed:?}"
+            );
             Ok(())
         }))
         .unwrap();

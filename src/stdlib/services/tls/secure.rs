@@ -93,6 +93,10 @@ where
         self.refused || self.chain.is_terminal()
     }
 
+    fn waits_for_memory(&self) -> bool {
+        self.chain.waits_for_memory()
+    }
+
     fn on_event(
         &mut self,
         env: &mut Env<'_, Self::Report>,
@@ -264,6 +268,10 @@ impl<T: Negotiation> Layer for Driven<T> {
 
     fn is_terminal(&self) -> bool {
         self.tls.is_terminal()
+    }
+
+    fn waits_for_memory(&self) -> bool {
+        self.tls.waits_for_memory()
     }
 
     fn on_event(

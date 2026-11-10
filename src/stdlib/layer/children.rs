@@ -147,6 +147,8 @@ where
     armed: u64,
     limit: usize,
     window: u64,
+    /// How many children wait for memory (`Kid::memory`).
+    memory: usize,
     /// The children and the router's queues, with what pays for them.
     places: Places<B, K>,
 }
@@ -399,6 +401,9 @@ struct Kid<B: Layer> {
     credit: u64,
     /// A command of the layer's that waits for credit.
     outbox: Option<CommandOf<B::Lower>>,
+    /// Its budget refused a charge of its, and it has not been visited
+    /// since: it waits for the release that makes room for it.
+    memory: bool,
 }
 
 impl<B: Layer> Kid<B> {
@@ -681,6 +686,7 @@ where
             armed: 0,
             limit,
             window,
+            memory: 0,
             places: Places::new(),
         }
     }
@@ -729,7 +735,21 @@ where
         }
         let kid = self.places.kids.remove(key);
         kid.wake.close();
+        self.memory -= usize::from(kid.memory);
         Some(kid)
+    }
+
+    /// Notes whether child `key` waits for memory.
+    fn wait_memory(&mut self, key: usize, waits: bool) {
+        let kid = &mut self.places.kids[key];
+        if kid.memory != waits {
+            kid.memory = waits;
+            if waits {
+                self.memory += 1;
+            } else {
+                self.memory -= 1;
+            }
+        }
     }
 
     /// Child `key` was called: its layer may have work, its deadline is
@@ -900,6 +920,9 @@ where
     /// queue had no room for what it has to send.
     fn visit(&mut self, env: &mut Env<'_, ChildReport<B::Report, B::Error>>, key: usize) -> bool {
         self.ready.unlink(&mut self.places.kids, key);
+        // A visit is where a refused charge is tried again, so a wait for
+        // memory ends here, or begins again below.
+        self.wait_memory(key, false);
         let since = self.places.kids[key].budget.refusals();
         let Some((moved, waiting)) = self.visit_kid(env, key) else {
             return true;
@@ -910,6 +933,8 @@ where
             self.refuse(env, id, Closing::Failed);
             return true;
         }
+        let waits = kid.budget.refused_since(since);
+        self.wait_memory(key, waits);
         self.called(key, moved || waiting, false);
         moved
     }
@@ -1133,6 +1158,7 @@ where
                     owed: self.window,
                     credit: 0,
                     outbox: None,
+                    memory: false,
                 });
                 let at = self
                     .places
@@ -1196,6 +1222,7 @@ where
                         if !kid.inbox.reserve(1) || !event.reserve_receive(&kid.budget, &kid.window)
                         {
                             if kid.wait_for_memory(since, env.wakes()).is_none() {
+                                self.wait_memory(key, true);
                                 return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
                             }
                             self.refuse(env, id, Closing::Failed);
@@ -1281,6 +1308,9 @@ where
                 {
                     self.refuse(env, id, Closing::Failed);
                 } else {
+                    if self.places.kids[key].budget.refused_since(since) {
+                        self.wait_memory(key, true);
+                    }
                     self.called(key, true, true);
                 }
                 Ok(fired)
@@ -1319,6 +1349,9 @@ where
                 {
                     self.refuse(env, id, Closing::Failed);
                 } else {
+                    if self.places.kids[key].budget.refused_since(since) {
+                        self.wait_memory(key, true);
+                    }
                     self.called(key, true, false);
                 }
             }
@@ -1398,6 +1431,13 @@ where
             .map(|(_, kid)| kid.layer.depth())
             .max()
             .unwrap_or(0)
+    }
+
+    /// A child whose own view refused a charge waits for memory until its
+    /// next visit, which the release that makes room for it brings. A
+    /// child's own parts that wait on views of their own are not asked.
+    fn waits_for_memory(&self) -> bool {
+        self.memory > 0
     }
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
@@ -2257,6 +2297,7 @@ mod tests {
             .charge(sandbox.limit() - sandbox.used() - want + 1)
             .unwrap();
         // Rounds as a runner makes them, until nothing moves.
+        let quiet = driver.refusals();
         for _ in 0..4 {
             let since = driver.refusals();
             driver.run().unwrap();
@@ -2265,6 +2306,13 @@ mod tests {
         }
         let tries = driver.layer().child(id).unwrap().tries;
         assert!(tries > 0 && driver.layer().child(id).unwrap().held.is_none());
+        // The runner's own view saw no refusal; the router tells it that a
+        // child waits, so its idle limit stops all the same.
+        assert!(!driver.budget().refused_since(quiet));
+        assert!(
+            driver.layer().waits_for_memory(),
+            "the child's wait is told"
+        );
         driver.run().unwrap();
         assert_eq!(
             driver.layer().child(id).unwrap().tries,
@@ -2281,6 +2329,7 @@ mod tests {
         let child = driver.layer().child(id).unwrap();
         assert!(child.tries > tries, "the child is visited again");
         assert!(child.held.is_some(), "and gets its memory");
+        assert!(!driver.layer().waits_for_memory(), "and waits no more");
         let first = &child.wakers[0];
         assert!(
             child.wakers.iter().all(|w| w.will_wake(first)),

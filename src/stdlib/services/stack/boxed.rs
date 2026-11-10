@@ -147,6 +147,7 @@ impl<Lo: Port, Up: Port> Boxed<Lo, Up> {
 trait Erased<Lo: Port, Up: Port>: Send {
     fn depth(&self) -> usize;
     fn is_terminal(&self) -> bool;
+    fn waits_for_memory(&self) -> bool;
     fn on_event(
         &mut self,
         env: &mut Env<'_, BoxReport>,
@@ -196,6 +197,9 @@ where
     }
     fn is_terminal(&self) -> bool {
         Layer::is_terminal(self)
+    }
+    fn waits_for_memory(&self) -> bool {
+        Layer::waits_for_memory(self)
     }
 
     fn on_event(
@@ -288,6 +292,9 @@ impl<Lo: Port, Up: Port> Layer for Boxed<Lo, Up> {
     }
     fn is_terminal(&self) -> bool {
         self.inner.is_terminal()
+    }
+    fn waits_for_memory(&self) -> bool {
+        self.inner.waits_for_memory()
     }
 
     fn on_event(

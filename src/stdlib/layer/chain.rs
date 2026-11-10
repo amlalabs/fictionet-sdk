@@ -239,6 +239,10 @@ impl<A: Layer, B: Layer<Lower = A::Upper>> Layer for Chain<A, B> {
         self.upper.is_terminal()
     }
 
+    fn waits_for_memory(&self) -> bool {
+        self.lower.waits_for_memory() || self.upper.waits_for_memory()
+    }
+
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
         let lower = self.lower.deadline();
         let upper = self.upper.deadline();
