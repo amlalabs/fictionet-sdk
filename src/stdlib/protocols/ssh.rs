@@ -1197,6 +1197,27 @@ impl KexInit {
             .find(|c| server.contains(c))
     }
 
+    /// The most heap a KEXINIT parsed from a payload of `payload` bytes can
+    /// hold. Each name takes at least two of its list's bytes (itself and
+    /// the comma or the list's end), and becomes a `String` holding its
+    /// bytes in a vector that grows by doubling from four places, so it
+    /// has at most twice as many places as names, or four.
+    pub fn most_heap(payload: usize) -> usize {
+        let lists = payload.saturating_sub(KEXINIT_FIXED);
+        let names = lists / 2 + 10;
+        let places = 2 * names + 10 * 4;
+        places * size_of::<String>() + lists
+    }
+
+    /// The length of this KEXINIT as a payload.
+    fn encoded_len(&self) -> Result<usize, Error> {
+        self.lists()
+            .into_iter()
+            .try_fold(KEXINIT_FIXED, |len, (list, ok)| {
+                Ok(len.saturating_add(list_len(list, ok)?))
+            })
+    }
+
     /// The ten name-lists in wire order, each with the check its names
     /// must pass: algorithm names for the first eight, language tags for
     /// the last two.
@@ -1890,6 +1911,77 @@ mod tests {
             NameList(vec!["a".repeat(MAX_NAME); 600]).to_bytes(),
             Err(Error::Unwritable)
         );
+    }
+
+    /// A parsed KEXINIT holds no more heap than [`KexInit::most_heap`]
+    /// says, for lists of the shortest names, which cost the most per
+    /// byte, spread over one list or eight, and for names of mixed length.
+    #[test]
+    fn a_parsed_kexinit_holds_at_most_its_heap_bound() {
+        let heap = |kex: &KexInit| -> usize {
+            kex.lists()
+                .iter()
+                .map(|(names, _)| {
+                    names.capacity() * size_of::<String>()
+                        + names.iter().map(String::capacity).sum::<usize>()
+                })
+                .sum()
+        };
+        let room = MAX_PAYLOAD - KEXINIT_FIXED;
+        let fill = |lists: usize, lengths: &mut dyn FnMut() -> usize| {
+            let mut kex = KexInit::default();
+            let mut left = room;
+            let mut targets: Vec<&mut Vec<String>> = vec![
+                &mut kex.kex_algorithms,
+                &mut kex.server_host_key_algorithms,
+                &mut kex.encryption_client_to_server,
+                &mut kex.encryption_server_to_client,
+                &mut kex.mac_client_to_server,
+                &mut kex.mac_server_to_client,
+                &mut kex.compression_client_to_server,
+                &mut kex.compression_server_to_client,
+            ];
+            for list in targets.iter_mut().take(lists) {
+                let mut size = 0;
+                let share = room / lists;
+                loop {
+                    let name = lengths();
+                    let more = name + usize::from(!list.is_empty());
+                    if size + more > share || more > left {
+                        break;
+                    }
+                    list.push("a".repeat(name));
+                    size += more;
+                    left -= more;
+                }
+            }
+            kex
+        };
+        let mut seed = 7u64;
+        let mut mixed = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            1 + (seed >> 33) as usize % MAX_NAME
+        };
+        for kex in [
+            fill(1, &mut || 1),
+            fill(8, &mut || 1),
+            fill(8, &mut mixed),
+            fill(3, &mut || 2),
+        ] {
+            let payload = Message::KexInit(kex).to_bytes().unwrap();
+            let Message::KexInit(parsed) = Message::parse(&payload).unwrap() else {
+                panic!("a KEXINIT parses as one");
+            };
+            assert!(
+                heap(&parsed) <= KexInit::most_heap(payload.len()),
+                "{} bytes of KEXINIT hold {} bytes of heap, more than the bound {}",
+                payload.len(),
+                heap(&parsed),
+                KexInit::most_heap(payload.len())
+            );
+        }
     }
 
     #[test]
