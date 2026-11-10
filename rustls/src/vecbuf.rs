@@ -13,8 +13,71 @@ use crate::msgs::message::OutboundChunks;
 /// What one place in the queue of chunks takes.
 pub(crate) const PLACE: usize = size_of::<Vec<u8>>();
 
-/// The places a queue takes when it first needs any.
+/// The places a queue takes when it first needs any beyond its first chunk.
 pub(crate) const FIRST_PLACES: usize = 4;
+
+/// The chunks of a queue, in order. The first is held in place, so a queue
+/// of one chunk allocates no places, and one that empties and fills again
+/// with a chunk at a time allocates nothing for them. The places of the
+/// chunks after it are allocated as they are needed.
+#[derive(Default)]
+struct Chunks {
+    /// Invariant: `None` only if `rest` is empty.
+    first: Option<Vec<u8>>,
+    rest: VecDeque<Vec<u8>>,
+}
+
+impl Chunks {
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    /// How many chunks fit without allocating more places.
+    fn fit(&self) -> usize {
+        1 + self.rest.capacity()
+    }
+
+    /// The places allocated, each [`PLACE`] bytes.
+    fn places(&self) -> usize {
+        self.rest.capacity()
+    }
+
+    /// Allocates `places` places in all for the chunks after the first.
+    fn allocate_places(&mut self, places: usize) {
+        self.rest.reserve_exact(places - self.rest.len());
+    }
+
+    /// Frees the places, returning how many there were.
+    fn free_places(&mut self) -> usize {
+        debug_assert!(self.rest.is_empty());
+        mem::take(&mut self.rest).capacity()
+    }
+
+    fn push_back(&mut self, chunk: Vec<u8>) {
+        match self.first {
+            None => self.first = Some(chunk),
+            Some(_) => self.rest.push_back(chunk),
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<Vec<u8>> {
+        let first = self.first.take()?;
+        self.first = self.rest.pop_front();
+        Some(first)
+    }
+
+    fn front(&self) -> Option<&Vec<u8>> {
+        self.first.as_ref()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.first.iter().chain(&self.rest)
+    }
+}
 
 /// This is a byte buffer that is built from a deque of byte vectors.
 ///
@@ -34,7 +97,7 @@ pub(crate) struct ChunkVecBuffer {
     /// Invariant: 0 <= `prefix_used` < `chunks[0].len()`
     prefix_used: usize,
 
-    chunks: VecDeque<Vec<u8>>,
+    chunks: Chunks,
 
     /// The total upper limit (in bytes) of this object.
     limit: Option<usize>,
@@ -55,7 +118,7 @@ impl ChunkVecBuffer {
     pub(crate) fn new(limit: Option<usize>) -> Self {
         Self {
             prefix_used: 0,
-            chunks: VecDeque::new(),
+            chunks: Chunks::default(),
             limit,
             paid: Paid::default(),
             promised: 0,
@@ -112,8 +175,8 @@ impl ChunkVecBuffer {
     /// already promised, or `None` if they fit already.
     fn places_for(&self, chunks: usize) -> Option<usize> {
         let wanted = self.chunks.len() + self.promised_chunks + chunks;
-        let now = self.chunks.capacity();
-        (wanted > now).then(|| wanted.max(now * 2).max(FIRST_PLACES))
+        let now = self.chunks.places();
+        (wanted > self.chunks.fit()).then(|| (wanted - 1).max(now * 2).max(FIRST_PLACES))
     }
 
     /// The bytes `chunks` more chunks of `bytes` in all would take, places
@@ -121,7 +184,7 @@ impl ChunkVecBuffer {
     fn room_for(&self, bytes: usize, chunks: usize) -> usize {
         let places = self
             .places_for(chunks)
-            .map_or(0, |places| (places - self.chunks.capacity()) * PLACE);
+            .map_or(0, |places| (places - self.chunks.places()) * PLACE);
         bytes + places
     }
 
@@ -138,7 +201,7 @@ impl ChunkVecBuffer {
         }
         self.reserve -= from_reserve;
         if let Some(places) = places {
-            self.chunks.reserve_exact(places - self.chunks.len());
+            self.chunks.allocate_places(places);
         }
         self.promised += bytes;
         self.promised_chunks += chunks;
@@ -233,10 +296,9 @@ impl ChunkVecBuffer {
         if self.chunks.is_empty()
             && self.promised_chunks == 0
             && self.reserve == 0
-            && self.chunks.capacity() != 0
+            && self.chunks.places() != 0
         {
-            let places = self.chunks.capacity();
-            self.chunks = VecDeque::new();
+            let places = self.chunks.free_places();
             self.paid.shrink_by(places * PLACE);
         }
     }
@@ -285,8 +347,10 @@ impl ChunkVecBuffer {
         &mut self,
         mut cursor: core::io::BorrowedCursor<'_, u8>,
     ) -> io::Result<()> {
-        while !self.is_empty() && cursor.capacity() > 0 {
-            let chunk = &self.chunks[0][self.prefix_used..];
+        while cursor.capacity() > 0 {
+            let Some(chunk) = self.chunk() else {
+                break;
+            };
             let used = cmp::min(chunk.len(), cursor.capacity());
             cursor.append(&chunk[..used]);
             self.consume(used);
@@ -345,7 +409,7 @@ impl ChunkVecBuffer {
     #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.chunks.iter().map(Vec::capacity).sum::<usize>()
-            + self.chunks.capacity() * PLACE
+            + self.chunks.places() * PLACE
             + self.promised
             + self.reserve
     }
@@ -380,8 +444,11 @@ impl ChunkVecBuffer {
     pub(crate) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut offs = 0;
 
-        while offs < buf.len() && !self.is_empty() {
-            let used = (&self.chunks[0][self.prefix_used..]).read(&mut buf[offs..])?;
+        while offs < buf.len() {
+            let Some(mut chunk) = self.chunk() else {
+                break;
+            };
+            let used = chunk.read(&mut buf[offs..])?;
 
             self.consume(used);
             offs += used;
@@ -439,6 +506,27 @@ mod tests {
     use super::{ChunkVecBuffer, PLACE};
     use crate::budget::testing::Limit;
     use crate::budget::{Account, Paid, PaidBytes};
+
+    #[test]
+    fn a_queue_of_one_chunk_at_a_time_allocates_no_places() {
+        let limit = Limit::new(1000);
+        let account: Account = Some(limit.clone());
+        let mut cvb = ChunkVecBuffer::paid_with(None, Paid::open(&account));
+        for round in 0..3u8 {
+            assert!(cvb.append_copy(&[round; 10]));
+            assert_eq!(cvb.chunks.places(), 0, "round {round}");
+            assert_eq!(limit.used(), cvb.len(), "round {round}");
+            assert_eq!(cvb.pop(), Some(vec![round; 10]));
+            assert_eq!(limit.used(), 0, "round {round}");
+        }
+        assert!(cvb.append_copy(&[1; 10]));
+        assert!(cvb.append_copy(&[2; 10]));
+        assert_ne!(cvb.chunks.places(), 0, "a second chunk needs places");
+        assert!(cvb.accounted());
+        assert_eq!(cvb.pop(), Some(vec![1; 10]));
+        assert_eq!(cvb.pop(), Some(vec![2; 10]));
+        assert_eq!((cvb.held(), limit.used()), (0, 0));
+    }
 
     #[test]
     fn short_append_copy_with_limit() {
@@ -596,7 +684,7 @@ mod tests {
                     }
                 }
                 _ => {
-                    let places = cvb.chunks.capacity() * PLACE;
+                    let places = cvb.chunks.places() * PLACE;
                     if let Some(paid) = cvb.pop_paid() {
                         let (bytes, charge) = paid.into_parts();
                         assert_eq!(&bytes[..], &model[..bytes.len()]);
@@ -604,7 +692,7 @@ mod tests {
                         assert_eq!(charge.as_ref().unwrap().bytes(), bytes.capacity());
                         // The chunk's charge leaves with it; only places the
                         // queue gave back leave the budget.
-                        let freed = places - cvb.chunks.capacity() * PLACE;
+                        let freed = places - cvb.chunks.places() * PLACE;
                         assert_eq!(limit.used(), used - freed);
                         taken.push((bytes, charge));
                         if taken.len() > 3 {
