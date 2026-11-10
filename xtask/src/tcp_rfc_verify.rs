@@ -7,6 +7,12 @@
 //! | `tcp-rfc-verify lean` | `lake build`, then the axioms of every headline theorem |
 //! | `tcp-rfc-verify vectors [seed]` | the model's vectors, from `seed`, or from each of seeds 1 to 8 when left out |
 //! | `tcp-rfc-verify diff [seed]` | the vectors, then `rfc9293_arrival_vectors` in smoltcp against them, for each seed |
+//! | `tcp-rfc-verify trace` | `trace_against_rfc9293` in smoltcp logs the real socket for each of its seeds; TLC replays each log against `Rfc9293.tla` with `RfcTrace.tla`, and a copy of each log with one reply's acknowledgment number changed must fail |
+//!
+//! TLC runs as `$JAVA -Xmx2g -cp $TLA2TOOLS tlc2.TLC -workers 2` in a
+//! memory-capped scope. `TLA2TOOLS` names `tla2tools.jar`, and `JAVA` a
+//! Java 11 or later (`java` when unset). The logs, the specs beside them
+//! and TLC's output go to `traces/`.
 //!
 //! Everything is written under a fresh run directory in `tcp-rfc-verify/`
 //! in Cargo's target directory (`CARGO_TARGET_DIR`, or `target/`): Lean's
@@ -40,7 +46,12 @@ pub fn run(args: &[String]) -> Result {
             report
         }
         ["diff", seed @ ..] if seed.len() <= 1 => diff(&paths, &seeds_of(seed)?)?,
-        _ => return Err("expected tcp-rfc-verify lean, vectors [seed] or diff [seed]".into()),
+        ["trace"] => trace(&paths)?,
+        _ => {
+            return Err(
+                "expected tcp-rfc-verify lean, vectors [seed], diff [seed] or trace".into(),
+            );
+        }
     };
     report.print();
     report.result()
@@ -64,6 +75,8 @@ struct Paths {
     root: PathBuf,
     /// `verification/tcp-rfc/lean`.
     lean: PathBuf,
+    /// `verification/tcp-rfc/tla`.
+    tla: PathBuf,
     /// The run directory in `tcp-rfc-verify/` in Cargo's target directory.
     out: PathBuf,
 }
@@ -86,6 +99,7 @@ impl Paths {
             .unwrap_or_else(|| root.join("target"));
         Ok(Paths {
             lean: root.join("verification").join("tcp-rfc").join("lean"),
+            tla: root.join("verification").join("tcp-rfc").join("tla"),
             out: crate::verification_run(&target.join("tcp-rfc-verify"))?,
             root,
         })
@@ -324,6 +338,123 @@ fn diff(paths: &Paths, seeds: &[u64]) -> Result<Report> {
             ));
         } else if !passed && counts.iter().all(|line| line.ends_with(", 0 disagree")) {
             report.fail(format!("seed {seed}: cargo test failed; see {log}"));
+        }
+    }
+    Ok(report)
+}
+
+/// TLC on `module` with the config of the same name, from `dir`.
+fn tlc(paths: &Paths, dir: &Path, module: &str) -> Result<String> {
+    let jar = std::env::var_os("TLA2TOOLS").ok_or("TLA2TOOLS must name tla2tools.jar")?;
+    let java = std::env::var_os("JAVA").unwrap_or_else(|| "java".into());
+    let (text, _) = logged(
+        scoped(java, "3G")
+            .arg("-Xmx2g")
+            .arg("-cp")
+            .arg(jar)
+            .args(["tlc2.TLC", "-workers", "2", "-metadir"])
+            .arg(paths.out.join("states").join(module))
+            .args([
+                "-config",
+                &format!("{module}.cfg"),
+                &format!("{module}.tla"),
+            ])
+            .current_dir(dir),
+        &dir.join(format!("{module}.out")),
+    )?;
+    Ok(text)
+}
+
+/// The log `text` with the acknowledgment number of its first ACK reply
+/// moved one on, modulo `n`, and the module renamed `mutant`.
+fn mutate(text: &str, name: &str, mutant: &str, n: u64) -> Option<String> {
+    let at = text.find("out |-> AckOut(")? + "out |-> AckOut(".len();
+    let close = at + text[at..].find(')')?;
+    let (seq, ack) = text[at..close].split_once(", ")?;
+    let ack: u64 = ack.parse().ok()?;
+    let changed = format!("{}{seq}, {}{}", &text[..at], (ack + 1) % n, &text[close..]);
+    Some(changed.replacen(&format!("MODULE {name} "), &format!("MODULE {mutant} "), 1))
+}
+
+/// The real socket's logs, each replayed against `Rfc9293.tla`, and each
+/// with one reply changed, which must not replay.
+fn trace(paths: &Paths) -> Result<Report> {
+    let traces = paths.out.join("traces");
+    std::fs::create_dir_all(&traces)?;
+    let mut report = Report::new("trace");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let (text, passed) = logged(
+        scoped(cargo, "8G")
+            .args([
+                "test",
+                "-p",
+                "smoltcp",
+                "--lib",
+                "--",
+                "--ignored",
+                "--exact",
+                "socket::tcp::test::rfc_trace::trace_against_rfc9293",
+                "--nocapture",
+            ])
+            .env("TCP_RFC_TRACE_DIR", &traces)
+            .current_dir(&paths.root),
+        &paths.out.join("trace.out"),
+    )?;
+    if !passed {
+        report.fail("trace_against_rfc9293 failed; see trace.out".to_string());
+        return Ok(report);
+    }
+    report.pass(format!(
+        "logged: {}",
+        text.lines()
+            .filter(|line| line.starts_with("seed "))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ));
+    for spec in ["Rfc9293.tla", "RfcTrace.tla"] {
+        std::fs::copy(paths.tla.join(spec), traces.join(spec))?;
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&traces)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|file| {
+            file.strip_suffix(".cfg")
+                .filter(|stem| stem.starts_with("Trace"))
+                .map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        report.fail("trace_against_rfc9293 wrote no logs".to_string());
+    }
+    for name in &names {
+        let out = tlc(paths, &traces, name)?;
+        if out.contains("Model checking completed. No error has been found.") {
+            report.pass(format!("{name}: replayed to the end"));
+        } else {
+            report.fail(format!("{name}: does not replay; see traces/{name}.out"));
+        }
+        let log = std::fs::read_to_string(traces.join(format!("{name}.tla")))?;
+        let config = std::fs::read_to_string(traces.join(format!("{name}.cfg")))?;
+        let n: u64 = config
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("N = "))
+            .and_then(|n| n.parse().ok())
+            .ok_or("a trace config sets N")?;
+        let mutant = name.replacen("Trace", "Mutant", 1);
+        let Some(changed) = mutate(&log, name, &mutant, n) else {
+            report.fail(format!("{name}: has no ACK reply to change"));
+            continue;
+        };
+        std::fs::write(traces.join(format!("{mutant}.tla")), changed)?;
+        std::fs::write(traces.join(format!("{mutant}.cfg")), config)?;
+        let out = tlc(paths, &traces, &mutant)?;
+        if out.contains("Deadlock reached") {
+            report.pass(format!("{mutant}: one reply changed, refused"));
+        } else {
+            report.fail(format!(
+                "{mutant}: replayed with a changed reply; see traces/{mutant}.out"
+            ));
         }
     }
     Ok(report)

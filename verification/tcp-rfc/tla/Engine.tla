@@ -5,20 +5,20 @@
 (*                                                                         *)
 (* Lines are smoltcp/src/socket/tcp.rs at the head of comp/fv-tcp:         *)
 (*   Process        `process`, from the repeated-SYN test to the reply     *)
-(*                  (1857-2330): every branch below names its arm          *)
-(*   AckSyn         `acknowledges_syn` (2352)                              *)
+(*                  (1852-2355): every branch below names its arm          *)
+(*   AckSyn         `acknowledges_syn` (2374)                              *)
 (*   InWindow       `segment_in_window` (1812-1840)                        *)
 (*   WinEnd         `receive_window_end` (1121-1127)                       *)
 (*   Remember       `remember_window` (1129-1137), called by `ack_reply`   *)
-(*                  (1711) and by `dispatch` for every segment (2908)      *)
+(*                  (1711) and by `dispatch` for every segment (2925)      *)
 (*   NotAccepted    `accepts` (1780) and the interface's answer for no     *)
 (*                  socket, `rst_reply` (smoltcp/src/iface/interface/      *)
 (*                  tcp.rs 36-41, socket/tcp.rs 1667)                      *)
 (*   Close, Abort   `close` (1407), `abort` (1460)                         *)
 (*   Listen, Connect `listen` (1313), `connect` (1361) through `reset`     *)
-(*   Transmit       `dispatch`'s advance of `local_seq_max` (2881)         *)
-(*   Expire         `forget_connection` from `dispatch` (2654)             *)
-(* SeqNumber's order (smoltcp/src/wire/tcp.rs 94-99) is CLt and friends:   *)
+(*   Transmit       `dispatch`'s advance of `local_seq_max` (2898)         *)
+(*   Expire         `forget_connection` from `dispatch` (2671)             *)
+(* SeqNumber's order (smoltcp/src/wire/tcp.rs 94-98) is CLt and friends:   *)
 (* the wrapping difference as a signed number, with no order at all at     *)
 (* exactly half the space.                                                 *)
 (*                                                                         *)
@@ -148,7 +148,7 @@ InWindow(s, ws, we) ==
 RECURSIVE Run(_, _)
 Run(S, i) == IF i \in S THEN 1 + Run(S, i + 1) ELSE 0
 
-\* After the state match: the ACK, the text, the reply (2187-2330).
+\* After the state match: the ACK, the text, the reply (2200-2355).
 \* st1 is the state the match chose; rsn1, rfin1 what it did to them.
 Finish(s, st1, rsn1, rfin1, ackLen, ws, payOff, payLen, probe) ==
   LET oldAck == s.ack # None /\ CLt(s.ack, una)
@@ -191,12 +191,12 @@ Process(s) ==
       ss == s.seq
       seEnd == Add(s.seq, s.len)       \* segment_end: text only
   IN
-  CASE \* 1857: a repeated SYN in SYN-RECEIVED, with the Linux setting.
+  CASE \* 1852: a repeated SYN in SYN-RECEIVED, with the Linux setting.
        RepeatSynAck /\ state = "SynReceived" /\ s.ctl = "SYN" /\ s.ack = None
          /\ Add(s.seq, 1) = rsn -> Drop
-       \* 1867: a SYN in any state but LISTEN and SYN-SENT.
+       \* 1862: a SYN in any state but LISTEN and SYN-SENT.
     [] s.ctl = "SYN" /\ state \notin {"Listen", "SynSent"} -> Challenge
-       \* 1882-1934: the ACK checks.
+       \* 1876-1945: the ACK checks.
     [] state = "SynSent" /\ s.ctl = "RST" /\ s.ack = None -> Drop
     [] state = "SynSent" /\ s.ctl = "RST" /\ ~AckSyn(s.ack) -> Drop
     [] state = "SynSent" /\ s.ctl = "SYN" /\ s.ack # None /\ ~AckSyn(s.ack) ->
@@ -211,10 +211,10 @@ Process(s) ==
     [] s.ctl # "RST" /\ state \notin {"Listen", "SynSent", "SynReceived"}
          /\ (IF FixUnorderedAck THEN ~CLe(s.ack, smax)
              ELSE CGe(s.ack, una) /\ CGt(s.ack, smax)) -> Challenge
-       \* 1947: a RST not exactly at RCV.NXT.
+       \* 1950: a RST not exactly at RCV.NXT.
     [] s.ctl = "RST" /\ state # "SynSent" /\ ss # ws ->
          IF CLe(ws, ss) /\ CLt(ss, we) THEN Challenge ELSE Drop
-       \* 1961-2003: outside the window.
+       \* 1961-2005: outside the window.
     [] s.ctl # "RST" /\ state \notin {"Listen", "SynSent"}
          /\ ~InWindow(s, ws, we) ->
          IF (IF FixBareFin THEN s.len + CtlLen(s) > 0 ELSE s.len > 0)
@@ -232,7 +232,7 @@ Process(s) ==
                        THEN D(s.ack, txStart) ELSE 0
            ackOfFin == sentFin /\ rawLen = txlen + 1
            ackLen == IF ackOfFin THEN rawLen - 1 ELSE rawLen
-           \* 2030: a FIN past a gap or past the window is ignored; with the
+           \* 2045: a FIN past a gap or past the window is ignored; with the
            \* fix, so is a FIN after the peer's FIN.
            ctl == IF s.ctl = "FIN"
                      /\ (CLt(ws, ss) \/ CGt(seEnd, we) \/ (FixSecondFin /\ rfin))
@@ -240,7 +240,7 @@ Process(s) ==
            go(st1, rsn1, rfin1) ==
              Finish(s, st1, rsn1, rfin1, ackLen, ws, payOff, payLen, probe)
        IN
-       CASE \* 2039-2058: RST.
+       CASE \* 2057-2078: RST.
             ctl = "RST" /\ state = "Listen" -> Drop
          [] ctl = "RST" /\ state = "SynReceived" /\ passive ->
               /\ state' = "Listen" /\ rxlen' = 0 /\ rfin' = FALSE
@@ -251,7 +251,7 @@ Process(s) ==
               state' = "Closed" /\ out' = NoOut
               /\ UNCHANGED <<passive, una, smax, txlen, cbsa, rsn, rxlen, winEnd,
                              asm, rfin, synWin, hq, panicked>>
-            \* 2061: LISTEN takes a SYN. The ISS is 0.
+            \* 2081: LISTEN takes a SYN. The ISS is 0.
          [] state = "Listen" /\ ctl = "SYN" ->
               /\ una' = 0 /\ smax' = 0 /\ rsn' = Add(s.seq, 1)
               /\ state' = "SynReceived" /\ out' = NoOut
@@ -259,7 +259,7 @@ Process(s) ==
                              synWin, hq, panicked>>
          [] state = "SynReceived" /\ ctl = "NONE" -> go("Established", rsn, rfin)
          [] state = "SynReceived" /\ ctl = "FIN" -> go("CloseWait", Add(rsn, 1), TRUE)
-            \* 2090: SYN-SENT takes the peer's SYN.
+            \* 2110: SYN-SENT takes the peer's SYN.
          [] state = "SynSent" /\ ctl = "SYN" ->
               LET r1 == Add(s.seq, 1) IN
               /\ rsn' = r1
