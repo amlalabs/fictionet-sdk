@@ -1154,6 +1154,37 @@ pub struct HeaderBlocks {
     decoded: usize,
 }
 impl HeaderBlocks {
+    /// Storage needed while reading this frame, including an unfinished
+    /// block and the compression table. The assembly uses the same growth
+    /// rule, so callers can reserve this before reading.
+    pub fn read_bound(&self, frame: &Frame) -> usize {
+        let (fragment, last) = match frame {
+            Frame::Headers(f) => (f.fragment.len(), f.flags & 4 != 0),
+            Frame::PushPromise(f) => (f.fragment.len(), f.flags & 4 != 0),
+            Frame::Continuation(f) => (f.fragment.len(), f.flags & 4 != 0),
+            _ => return self.allocated(),
+        };
+        let (len, capacity) = self
+            .pending
+            .as_ref()
+            .map_or((0, 0), |p| (p.bytes.len(), p.bytes.capacity()));
+        let capacity = if last && len == 0 {
+            capacity
+        } else {
+            self.assembly_capacity(len, capacity, fragment)
+        };
+        self.table.most_held().saturating_add(capacity)
+    }
+
+    fn assembly_capacity(&self, len: usize, capacity: usize, fragment: usize) -> usize {
+        let needed = len.saturating_add(fragment).min(self.limit);
+        if needed > capacity {
+            needed.max(capacity.saturating_mul(2)).min(self.limit)
+        } else {
+            capacity
+        }
+    }
+
     /// Bounds encoded block storage and retained decoded field bytes.
     pub fn with_limits(limits: Limits) -> Self {
         let limits = limits.bounded();
@@ -1268,22 +1299,29 @@ impl HeaderBlocks {
         {
             return Err(budget("header block exceeds limit"));
         }
-        // Storage doubles, but never past the block limit.
-        let bytes = &mut pending.bytes;
-        let needed = bytes.len() + fragment.bytes.len();
-        if needed > bytes.capacity() {
-            let target = needed.max(bytes.capacity() * 2).min(self.limit);
-            bytes
-                .try_reserve_exact(target - bytes.len())
-                .map_err(|_| budget("header allocation failed"))?;
-        }
-        bytes.extend_from_slice(fragment.bytes);
+        // A complete block already lives in the frame. Only fragmented
+        // blocks need storage to join their pieces.
+        let encoded = if pending.bytes.is_empty() && h.flags & 4 != 0 {
+            fragment.bytes
+        } else {
+            let bytes = &mut pending.bytes;
+            let needed = bytes.len() + fragment.bytes.len();
+            if needed > bytes.capacity() {
+                let target =
+                    self.assembly_capacity(bytes.len(), bytes.capacity(), fragment.bytes.len());
+                bytes
+                    .try_reserve_exact(target - bytes.len())
+                    .map_err(|_| budget("header allocation failed"))?;
+            }
+            bytes.extend_from_slice(fragment.bytes);
+            &bytes[..]
+        };
         if h.flags & 4 == 0 {
             self.pending = Some(pending);
         } else {
             out.block = Some(
                 self.table
-                    .decode_block(&pending.bytes, self.decoded)
+                    .decode_block(encoded, self.decoded)
                     .map_err(|_| error(ErrorCode::CompressionError, "invalid HPACK block"))?,
             );
         }
@@ -2509,7 +2547,9 @@ mod tests {
                 let last = n == rest.len();
                 let frame = raw(kind, if last { 4 } else { 0 }, stream, &rest[..n]);
                 let header = FrameHeader::parse(&frame[..HEADER_LEN]).unwrap();
+                let bound = blocks.read_bound(&Frame::parse(&frame).unwrap());
                 let read = blocks.read(header, &frame[HEADER_LEN..]);
+                assert!(blocks.allocated() <= bound);
                 assert!(
                     blocks.allocated() <= most,
                     "{} > {most}",

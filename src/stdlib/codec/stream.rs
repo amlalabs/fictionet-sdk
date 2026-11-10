@@ -94,6 +94,12 @@ impl<D: Decode> Stream<D> {
     pub fn push(&mut self, bytes: &[u8]) -> usize {
         self.push_with_budget(bytes, usize::MAX)
     }
+    /// Input capacity needed for the next push, including retained spare
+    /// storage. Reserve it before calling `push_with_budget`.
+    pub fn capacity_for(&mut self, additional: usize) -> usize {
+        self.sync_limit();
+        self.buf.capacity_for(additional)
+    }
     /// Adds what fits while growing input storage by at most `growth` bytes.
     /// Existing capacity is reused. After EOF or completion, drops new bytes.
     #[must_use = "bytes past the returned count were not taken"]

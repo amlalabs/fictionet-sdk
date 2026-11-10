@@ -140,6 +140,24 @@ impl Buffer {
         true
     }
 
+    /// Capacity needed to append this many bytes, after the same compaction
+    /// and bounded growth used by `push`. Existing capacity is retained.
+    pub fn capacity_for(&self, additional: usize) -> usize {
+        let end = if self.start >= self.len() {
+            self.len()
+        } else {
+            self.end
+        };
+        let needed = end.saturating_add(additional.min(self.room()));
+        if needed <= self.allocated() {
+            self.allocated()
+        } else {
+            needed
+                .max(self.allocated().saturating_mul(2))
+                .min(self.most_allocated())
+        }
+    }
+
     /// Appends what fits and returns the accepted count. Compacts only
     /// when the consumed prefix is at least half of committed storage.
     /// Returns zero if allocation fails. Invalidates any prior spare offer.
