@@ -312,10 +312,13 @@ of which the 29 named in the table above are listed in `Ip/Axioms.lean`; each
 rests on `propext`, `Quot.sound` and `Classical.choice` or fewer.
 `inv_empty` shows the empty table keeps the invariant, and `cut_witness`
 that `Cut` is met by a real cut, so the premises of `complete` are not
-empty. With seed 1, `reassembly.json` holds 654 cases and 12,407 steps
-(688 whole packets, 9,386 waiting, 2,206 discarded, none refused, 127
-timer steps) with 27 first fragments kept for answers (16 IPv4, 11
-IPv6), and `Reassembly` agrees with the model on every step.
+empty. With seed 1, `reassembly.json` holds 654 cases and 13,808 steps
+(2,298 whole packets, 9,337 waiting, 2,050 discarded, none refused, 123
+timer steps) with 23 first fragments kept for answers (11 IPv4, 12
+IPv6), and `Reassembly` agrees with the model on every step; seeds 2 and
+3 agree too. About one IPv4 source in five is the limited broadcast or a
+multicast address, which `arrived4` (with `Header.badSource`, RFC 1122
+section 3.2.1.3) does not read as a fragment, as `v4_checked` does not.
 
 The one finding that needed a fix was the missing ICMP Time Exceeded
 (above); `packet::tests::a_timed_out_ipv4_packet_is_answered_when_fragment_zero_came`

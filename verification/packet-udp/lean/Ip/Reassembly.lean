@@ -1,5 +1,6 @@
 import Lean
 import Ip.Checksum
+import Ip.Header
 
 /-! Fragment reassembly (RFC 791 section 3.2, RFC 815, RFC 8200 section 4.5,
 RFC 5722, RFC 6946).
@@ -378,13 +379,14 @@ def be32 (b : List Nat) (i : Nat) : Nat := be16 b i * 65536 + be16 b (i + 2)
 def slice (b : List Nat) (i j : Nat) : List Nat := (b.drop i).take (j - i)
 
 /-- An IPv4 fragment (`v4_checked`, then `arrived`): a whole header with a
-verifying checksum (RFC 1122 section 3.2.1.2) and "more fragments" or an
+verifying checksum (RFC 1122 section 3.2.1.2), from a source a host may hear
+from (section 3.2.1.3, `Header.badSource`), and "more fragments" or an
 offset set. -/
 def arrived4 (b : List Nat) : Option Frag :=
   let ihl := b.getD 0 0 % 16 * 4
   let total := be16 b 2
   if b.length < 20 ∨ ihl < 20 ∨ b.length < ihl ∨ total < ihl ∨ b.length < total then none
-  else if Checksum.checksum (b.take ihl) ≠ 0 then none
+  else if Checksum.checksum (b.take ihl) ≠ 0 ∨ Header.badSource (slice b 12 16) = true then none
   else
     let flags := be16 b 6
     if flags % 16384 = 0 then none
@@ -3280,6 +3282,12 @@ structure Family where
 in later ones when `copy`. "Don't fragment" and the reserved bit are random. -/
 def v4Family (id : Nat) : Rng Family := do
   let src ← bytes 4
+  -- Now and then a source a host must not hear from (RFC 1122 section
+  -- 3.2.1.3): the limited broadcast address, or a multicast one.
+  let src ← match ← below 12 with
+    | 0 => pure [255, 255, 255, 255]
+    | 1 => pure ((224 + src.getD 0 0 % 16) :: src.drop 1)
+    | _ => pure src
   let dst ← bytes 4
   let proto ← pick [17, 6, 1, 99]
   let tos ← below 256
