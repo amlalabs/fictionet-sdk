@@ -1011,7 +1011,9 @@ impl Http2 {
                 .awaiting_window
                 .reserve(streams.saturating_sub(self.awaiting_window.len()));
         if !room {
-            return self.reset(env, id, ErrorCode::RefusedStream);
+            // No room in the budget: refused, not the client's error.
+            self.write_reset(env, id, ErrorCode::RefusedStream);
+            return Ok(());
         }
         // The stream's queues charge their storage as they grow: the pair
         // the last stream left, or a new pair with none.
@@ -1054,7 +1056,10 @@ impl Http2 {
         // Its slot is charged as the slots grow; past the budget or the
         // limit, the stream is refused.
         let Ok(child) = self.streams.insert(stream) else {
-            return self.reset(env, id, ErrorCode::RefusedStream);
+            // Past the budget or the limit: refused, not the client's
+            // error.
+            self.write_reset(env, id, ErrorCode::RefusedStream);
+            return Ok(());
         };
         let child_id = child.id();
         // New streams come in ascending order, so the index stays sorted;
@@ -1748,8 +1753,9 @@ impl Http2 {
         }
         if fields.refused() != 0 {
             // The budget had no room for the head: the stream is refused,
-            // and the client may send it again.
-            return self.reset(env, id, ErrorCode::RefusedStream);
+            // and the client may send it again. Not the client's error.
+            self.write_reset(env, id, ErrorCode::RefusedStream);
+            return Ok(());
         }
         let Some(head) = request_head(fields, self.limits) else {
             return self.reset(env, id, ErrorCode::ProtocolError);
@@ -3388,6 +3394,60 @@ mod tests {
             );
             assert!(!harness.ended());
         }
+    }
+
+    /// Streams refused because the budget has no room are not the
+    /// client's errors: however many there are, the connection stays
+    /// open, and each is refused so that the client may send it again.
+    #[test]
+    fn streams_refused_for_memory_are_not_counted_as_errors() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let budget = Budget::new(1 << 22);
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(8, Http2::WINDOW, |_, _, _| Some(Sink::reading(true))),
+        );
+        let mut harness =
+            Harness::with_budget(fictionet::Seed::from_u64(5), server, budget.clone());
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        // POST / with one field longer than a pooled head block, not
+        // indexed: decoding it needs a block the budget has no room for.
+        let mut block = vec![0x83, 0x86, 0x84, 0x00, 5];
+        block.extend_from_slice(b"x-big");
+        block.extend_from_slice(&[0x7f, 0xb9, 0x16]); // 127 + 2873 = 3000
+        block.extend_from_slice(&[b'a'; 3000]);
+        let streams = 2 * ERROR_RESET_MAX as u32;
+        let mut refused = 0;
+        for stream in (1..2 * streams).step_by(2) {
+            let mut input = Vec::new();
+            write(
+                &wire::Headers {
+                    stream,
+                    flags: 5,
+                    fragment: block.clone(),
+                    priority: None,
+                    padding: None,
+                },
+                &mut input,
+            );
+            harness.push(&input).unwrap();
+            let output = frames(&harness.take_output());
+            assert!(
+                !output.iter().any(|f| matches!(f, Frame::GoAway(_))),
+                "stream {stream}: {output:?}"
+            );
+            refused += output
+                .iter()
+                .filter(|f| {
+                    matches!(f, Frame::Reset(r) if r.stream == stream
+                        && r.code == ErrorCode::RefusedStream as u32)
+                })
+                .count();
+        }
+        assert_eq!(refused, streams as usize, "every stream refused once");
+        assert!(!harness.ended());
     }
 
     #[test]
