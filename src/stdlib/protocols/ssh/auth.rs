@@ -5,7 +5,7 @@
 //! depends on the active method; use [`Message::parse_with_method`] to decode it.
 
 use super::{Error, MAX_NAME, MAX_PAYLOAD, Reader};
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Heap, HeapBound, Wire, most_list_places};
 
 /// SHA256 fingerprint of an SSH encoded public key, before display encoding.
 pub fn public_key_fingerprint(key: &[u8]) -> [u8; 32] {
@@ -86,6 +86,39 @@ impl Method {
     }
 }
 
+fictionet::heap_of! { Request { user, service, method } }
+
+impl Heap for Method {
+    fn heap(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Password {
+                password,
+                new_password,
+            } => password.heap() + new_password.heap(),
+            Self::PublicKey {
+                algorithm,
+                key,
+                signature,
+            } => algorithm.heap() + key.heap() + signature.heap(),
+            Self::KeyboardInteractive {
+                language,
+                submethods,
+            } => language.heap() + submethods.heap(),
+            Self::Other { name, data } => name.heap() + data.heap(),
+        }
+    }
+}
+
+/// Each field, the method's name among them while it is read, is a copy
+/// of distinct bytes of the payload, made whole: together at most the
+/// payload's length.
+impl HeapBound for Request {
+    fn most_heap(len: usize) -> usize {
+        len
+    }
+}
+
 impl Wire for Request {
     type ParseError = Error;
     type WriteError = Error;
@@ -141,7 +174,7 @@ impl Wire for Request {
     }
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut w = Payload::new(50);
+        let mut w = Payload::new(out, 50)?;
         w.string(self.user.as_bytes())?;
         w.name(&self.service)?;
         w.name(self.method.name())?;
@@ -186,11 +219,23 @@ impl Wire for Request {
                 w.raw(data)?;
             }
         }
-        w.finish(out)
+        w.finish();
+        Ok(())
     }
 }
 
 impl Request {
+    /// The most [`verify_public_key`](Self::verify_public_key) allocates
+    /// for a request of `raw` bytes and a session identifier of
+    /// `session_id` bytes, all of it freed before it returns: the request
+    /// parsed again (its [`HeapBound`]), the signed data (the identifier
+    /// and less than the request), and the signature padded to the
+    /// modulus, which lies within the request. What `ring` allocates to
+    /// check an RSA signature is its own.
+    pub fn most_verify_heap(raw: usize, session_id: usize) -> usize {
+        Self::most_heap(raw) + (4 + session_id + raw) + raw
+    }
+
     /// Verify an Ed25519 or RSA SHA256 or SHA512 proof over the session
     /// identifier and exact received request prefix. A probe, unsupported algorithm, mismatched
     /// request or invalid signature returns false. Malformed key or signature
@@ -408,6 +453,58 @@ impl Message {
     }
 }
 
+fictionet::heap_of! { Prompt { text, echo } }
+
+impl Heap for Message {
+    fn heap(&self) -> usize {
+        match self {
+            Self::Request(request) => request.heap(),
+            Self::Failure {
+                methods,
+                partial_success: _,
+            } => methods.heap(),
+            Self::Success => 0,
+            Self::Banner { message, language }
+            | Self::PasswordChange {
+                prompt: message,
+                language,
+            } => message.heap() + language.heap(),
+            Self::PublicKeyOk { algorithm, key } => algorithm.heap() + key.heap(),
+            Self::InfoRequest {
+                name,
+                instruction,
+                language,
+                prompts,
+            } => name.heap() + instruction.heap() + language.heap() + prompts.heap(),
+            Self::InfoResponse(responses) => responses.heap(),
+        }
+    }
+}
+
+/// A message parsed as [`Message::parse`] parses it. Its strings copy
+/// distinct bytes of the payload, made whole: at most the payload's
+/// length. A FAILURE's name-list also has places for its names, each
+/// taking at least two bytes, in a vector grown by pushes; a challenge
+/// or its answers have places for their prompts or answers, at most one
+/// per five or four bytes left, allocated for exactly their count.
+impl HeapBound for Message {
+    fn most_heap(len: usize) -> usize {
+        len + most_list_places::<String>(len + 1, 2)
+            .max(len / 5 * size_of::<Prompt>())
+            .max(len / 4 * size_of::<Vec<u8>>())
+    }
+    fn most_heap_of(payload: &[u8]) -> usize {
+        let len = payload.len();
+        match payload.first() {
+            Some(51) => len + most_list_places::<String>(len + 1, 2),
+            Some(52) => 0,
+            Some(60) => len + len / 5 * size_of::<Prompt>(),
+            Some(61) => len + len / 4 * size_of::<Vec<u8>>(),
+            _ => len,
+        }
+    }
+}
+
 impl Wire for Message {
     type ParseError = Error;
     type WriteError = Error;
@@ -418,35 +515,20 @@ impl Wire for Message {
     }
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut w = Payload::new(match self {
+        let number = match self {
             Self::Request(request) => return request.write(out),
-            Self::Failure { .. } => 51,
+            Self::Failure {
+                methods,
+                partial_success,
+            } => return write_failure(methods.iter().map(String::as_str), *partial_success, out),
             Self::Success => 52,
             Self::Banner { .. } => 53,
             Self::PublicKeyOk { .. } | Self::PasswordChange { .. } | Self::InfoRequest { .. } => 60,
             Self::InfoResponse(_) => 61,
-        });
+        };
+        let mut w = Payload::new(out, number)?;
         match self {
-            Self::Request(_) => unreachable!(),
-            Self::Failure {
-                methods,
-                partial_success,
-            } => {
-                let mut size = 0usize;
-                for method in methods {
-                    if !super::is_name(method.as_bytes()) {
-                        return Err(Error::Unwritable);
-                    }
-                    size = size
-                        .checked_add(method.len() + 1)
-                        .ok_or(Error::Unwritable)?;
-                    if size > MAX_PAYLOAD {
-                        return Err(Error::Unwritable);
-                    }
-                }
-                w.string(methods.join(",").as_bytes())?;
-                w.byte(u8::from(*partial_success))?;
-            }
+            Self::Request(_) | Self::Failure { .. } => unreachable!(),
             Self::Success => (),
             Self::Banner { message, language } => {
                 w.string(message.as_bytes())?;
@@ -482,7 +564,8 @@ impl Wire for Message {
                 }
             }
         }
-        w.finish(out)
+        w.finish();
+        Ok(())
     }
 }
 
@@ -510,20 +593,77 @@ pub(super) fn rest(r: &mut Reader<'_>) -> Vec<u8> {
     data
 }
 
-pub(super) struct Payload(Vec<u8>);
-
-impl Payload {
-    pub(super) fn new(number: u8) -> Self {
-        Self(vec![number])
-    }
-    pub(super) fn raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if bytes.len() > MAX_PAYLOAD - self.0.len() {
+/// Appends one FAILURE (51) naming `methods`, as [`Message::Failure`]
+/// writes it, from names it does not own, so a caller that names its
+/// methods by static strings writes it into its own room without building
+/// a vector of strings first. `out` is unchanged on error.
+pub fn write_failure<'a>(
+    methods: impl Iterator<Item = &'a str> + Clone,
+    partial_success: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let mut size = 0usize;
+    for method in methods.clone() {
+        if !super::is_name(method.as_bytes()) {
             return Err(Error::Unwritable);
         }
-        self.0
+        size = size
+            .checked_add(method.len() + 1)
+            .ok_or(Error::Unwritable)?;
+        if size > MAX_PAYLOAD {
+            return Err(Error::Unwritable);
+        }
+    }
+    let mut w = Payload::new(out, 51)?;
+    // The names and the commas between them.
+    w.uint32(size.saturating_sub(1) as u32)?;
+    for (i, method) in methods.enumerate() {
+        if i > 0 {
+            w.byte(b',')?;
+        }
+        w.raw(method.as_bytes())?;
+    }
+    w.byte(u8::from(partial_success))?;
+    w.finish();
+    Ok(())
+}
+
+/// A payload written in place at the end of `out`, at most
+/// [`MAX_PAYLOAD`] bytes of it. Dropped before [`finish`](Self::finish),
+/// as on an error, it takes back what it wrote, so `out` is unchanged.
+pub(super) struct Payload<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+    finished: bool,
+}
+
+impl Drop for Payload<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.out.truncate(self.start);
+        }
+    }
+}
+
+impl<'a> Payload<'a> {
+    pub(super) fn new(out: &'a mut Vec<u8>, number: u8) -> Result<Self, Error> {
+        let start = out.len();
+        let mut payload = Self {
+            out,
+            start,
+            finished: false,
+        };
+        payload.byte(number)?;
+        Ok(payload)
+    }
+    pub(super) fn raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len() > MAX_PAYLOAD - (self.out.len() - self.start) {
+            return Err(Error::Unwritable);
+        }
+        self.out
             .try_reserve_exact(bytes.len())
             .map_err(|_| Error::Unwritable)?;
-        self.0.extend_from_slice(bytes);
+        self.out.extend_from_slice(bytes);
         Ok(())
     }
     pub(super) fn byte(&mut self, byte: u8) -> Result<(), Error> {
@@ -551,11 +691,9 @@ impl Payload {
         }
         self.uint32(count as u32)
     }
-    pub(super) fn finish(self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.try_reserve_exact(self.0.len())
-            .map_err(|_| Error::Unwritable)?;
-        out.extend_from_slice(&self.0);
-        Ok(())
+    /// Keeps what was written.
+    pub(super) fn finish(mut self) {
+        self.finished = true;
     }
 }
 
@@ -563,9 +701,104 @@ impl Payload {
 mod tests {
     use super::*;
     use fictionet::stdlib::{
-        codec::Lcg,
+        codec::{Lcg, assert_heap_bound},
         test_support::{mutate, rounds},
     };
+
+    /// Random requests with every method, at every size the generator
+    /// reaches.
+    fn requests(g: &mut Lcg) -> Vec<Vec<u8>> {
+        let mut requests = Vec::new();
+        for _ in 0..200 {
+            let max = 1 + g.index(4000);
+            for method in [
+                Method::None,
+                Method::Password {
+                    password: g.bytes(max),
+                    new_password: g.coin().then(|| g.bytes(max)),
+                },
+                Method::PublicKey {
+                    algorithm: "ssh-ed25519".into(),
+                    key: g.bytes(max),
+                    signature: g.coin().then(|| g.bytes(max)),
+                },
+                Method::KeyboardInteractive {
+                    language: g.text(20),
+                    submethods: g.text(max),
+                },
+                Method::Other {
+                    name: "extension@example.com".into(),
+                    data: g.bytes(max),
+                },
+            ] {
+                let request = Request {
+                    user: g.text(max),
+                    service: "ssh-connection".into(),
+                    method,
+                };
+                requests.push(request.to_bytes().unwrap());
+            }
+        }
+        requests
+    }
+
+    /// Each parsed request and message holds at most its type's bound:
+    /// random ones, and lists of the shortest items, which cost the most
+    /// per byte: names of one letter, empty prompts and empty answers, as
+    /// many as a payload holds and fewer.
+    #[test]
+    fn parsed_authentication_messages_hold_at_most_their_bound() {
+        let mut g = Lcg::new(0x68656170);
+        let requests = requests(&mut g);
+        assert_heap_bound(&requests, Request::parse);
+        let mut messages = requests;
+        for count in [0, 1, 2, 3, 4, 5, 100, 1000, 6550, 8190] {
+            let failure = Message::Failure {
+                methods: vec!["a".into(); 2 * count],
+                partial_success: false,
+            };
+            let challenge = Message::InfoRequest {
+                name: String::new(),
+                instruction: String::new(),
+                language: String::new(),
+                prompts: vec![
+                    Prompt {
+                        text: String::new(),
+                        echo: false,
+                    };
+                    count.min(6550)
+                ],
+            };
+            let answers = Message::InfoResponse(vec![Vec::new(); count]);
+            for message in [failure, challenge, answers] {
+                messages.push(message.to_bytes().unwrap());
+            }
+        }
+        for _ in 0..200 {
+            for message in [
+                Message::Success,
+                Message::Banner {
+                    message: g.text(2000),
+                    language: g.text(20),
+                },
+                Message::InfoRequest {
+                    name: g.text(50),
+                    instruction: g.text(200),
+                    language: g.text(20),
+                    prompts: (0..g.index(40))
+                        .map(|_| Prompt {
+                            text: g.text(200),
+                            echo: g.coin(),
+                        })
+                        .collect(),
+                },
+                Message::InfoResponse((0..g.index(40)).map(|_| g.bytes(200)).collect()),
+            ] {
+                messages.push(message.to_bytes().unwrap());
+            }
+        }
+        assert_heap_bound(&messages, Message::parse);
+    }
 
     #[test]
     fn randomized_authentication_roundtrips() {
@@ -654,6 +887,15 @@ mod tests {
         }
     }
 
+    /// Fields written as a payload writes them, without its number.
+    fn fields(write: impl FnOnce(&mut Payload<'_>) -> Result<(), Error>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut w = Payload::new(&mut out, 0).unwrap();
+        write(&mut w).unwrap();
+        w.finish();
+        out.split_off(1)
+    }
+
     #[test]
     fn randomized_signed_request_roundtrips() {
         use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -662,29 +904,32 @@ mod tests {
             let mut seed = [0; 32];
             g.fill(&mut seed);
             let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
-            let mut key = Payload::new(0);
-            key.name("ssh-ed25519").unwrap();
-            key.string(pair.public_key().as_ref()).unwrap();
+            let key = fields(|w| {
+                w.name("ssh-ed25519")?;
+                w.string(pair.public_key().as_ref())
+            });
             let session_id = g.bytes(64);
             let mut request = Request {
                 user: g.text(100),
                 service: "ssh-connection".into(),
                 method: Method::PublicKey {
                     algorithm: "ssh-ed25519".into(),
-                    key: key.0[1..].to_vec(),
+                    key,
                     signature: Some(Vec::new()),
                 },
             };
-            let mut signed = Payload::new(0);
-            signed.string(&session_id).unwrap();
             let prefix = request.to_bytes().unwrap();
-            signed.raw(&prefix[..prefix.len() - 4]).unwrap();
-            let signature = pair.sign(&signed.0[1..]);
-            let mut signature_blob = Payload::new(0);
-            signature_blob.name("ssh-ed25519").unwrap();
-            signature_blob.string(signature.as_ref()).unwrap();
+            let signed = fields(|w| {
+                w.string(&session_id)?;
+                w.raw(&prefix[..prefix.len() - 4])
+            });
+            let signature = pair.sign(&signed);
+            let blob = fields(|w| {
+                w.name("ssh-ed25519")?;
+                w.string(signature.as_ref())
+            });
             if let Method::PublicKey { signature, .. } = &mut request.method {
-                *signature = Some(signature_blob.0[1..].to_vec());
+                *signature = Some(blob);
             }
             let bytes = request.to_bytes().unwrap();
             let parsed = Request::parse(&bytes).unwrap();
