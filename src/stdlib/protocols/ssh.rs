@@ -1198,15 +1198,15 @@ impl KexInit {
     }
 
     /// The most heap a KEXINIT parsed from a payload of `payload` bytes can
-    /// hold. Each name takes at least two of its list's bytes (itself and
-    /// the comma or the list's end), and becomes a `String` holding its
-    /// bytes in a vector that grows by doubling from four places, so it
-    /// has at most twice as many places as names, or four.
+    /// hold, boxed. Each name takes at least two of its list's bytes
+    /// (itself and the comma or the list's end), and becomes a `String`
+    /// holding its bytes in a vector that grows by doubling from four
+    /// places, so it has at most twice as many places as names, or four.
     pub fn most_heap(payload: usize) -> usize {
         let lists = payload.saturating_sub(KEXINIT_FIXED);
         let names = lists / 2 + 10;
         let places = 2 * names + 10 * 4;
-        places * size_of::<String>() + lists
+        size_of::<KexInit>() + places * size_of::<String>() + lists
     }
 
     /// The length of this KEXINIT as a payload.
