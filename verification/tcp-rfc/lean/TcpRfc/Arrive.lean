@@ -182,6 +182,10 @@ def Departures.smoltcp : Departures :=
 
 /-! ## The segments each departure is about -/
 
+/-- How far before RCV.NXT the segment starts: zero when it starts at
+    RCV.NXT. -/
+def back (t : Tcb) (s : Segment) : Nat := dist s.seq t.rcvNxt
+
 /-- SYN-RECEIVED or synchronized: the states of 3.10.7.4. -/
 def otherState (t : Tcb) : Bool := t.state == .synReceived || t.state.synchronized
 
@@ -211,7 +215,7 @@ def emptyRightEdgeCase (t : Tcb) (s : Segment) : Bool :=
 
 /-- The FIN of `s` comes in order and sits at RCV.NXT+RCV.WND. -/
 def finEdgeCase (t : Tcb) (s : Segment) : Bool :=
-  otherState t && s.ctl == .fin && dist s.seq t.rcvNxt + t.rcvWnd == s.text
+  otherState t && s.ctl == .fin && back t s + t.rcvWnd == s.text
 
 def synTextCase (t : Tcb) (s : Segment) : Bool :=
   t.state == .synSent && s.ctl == .syn && s.ack.isSome && s.text != 0
@@ -221,9 +225,8 @@ def synTextCase (t : Tcb) (s : Segment) : Bool :=
 def ackOf (t : Tcb) : Reply := .ack t.sndNxt t.rcvNxt
 def challengeOf (t : Tcb) : Reply := .challenge t.sndNxt t.rcvNxt
 
-/-- How far before RCV.NXT the segment starts: zero when it starts at
-    RCV.NXT. -/
-def back (t : Tcb) (s : Segment) : Nat := dist s.seq t.rcvNxt
+/-- An ACK when `c` holds, else nothing. -/
+def ackIf (c : Bool) (seq ack : Seq) : Reply := if c then .ack seq ack else .none
 
 /-- The segment starts at or before RCV.NXT and its text reaches it: the
     "idealized segment that begins at RCV.NXT" once trimmed. -/
@@ -272,6 +275,34 @@ def synSentArrive (d : Departures) (t : Tcb) (s : Segment) : Tcb × Reply :=
       ({ t with state := .synReceived, irs := s.seq, rcvNxt := r }, .synAck t.iss r)
     else (t, .none)
 
+/-- The state after the ACK processing of FIN-WAIT-1, CLOSING and
+    LAST-ACK (3.10.7.4, fifth). -/
+def ackState (st1 : State) (finAcked : Bool) : State :=
+  match st1 with
+  | .finWait1 => if finAcked then .finWait2 else .finWait1
+  | .closing => if finAcked then .timeWait else .closing
+  | .lastAck => if finAcked then .closed else .lastAck
+  | x => x
+
+/-- The state after the peer's FIN (3.10.7.4, eighth). -/
+def finState (st2 : State) (finAcked : Bool) : State :=
+  match st2 with
+  | .finWait1 => if finAcked then .timeWait else .closing
+  | .finWait2 => .timeWait
+  | _ => .closeWait
+
+/-- Text octets taken: those from RCV.NXT up to the segment's end or the
+    window's, when the segment is `ord`, in order in a state that takes
+    text (3.10.7.4, seventh). -/
+def taken (ord : Bool) (t : Tcb) (s : Segment) : Nat :=
+  if ord then min (s.text - back t s) t.rcvWnd else 0
+
+/-- Whether the segment's FIN is taken: it is in order and lies inside the
+    window, or at its right edge with `finAtRightEdge` (eighth). -/
+def finIn (d : Departures) (ord : Bool) (t : Tcb) (s : Segment) : Bool :=
+  ord && s.ctl == .fin &&
+    (decide (s.text - back t s < t.rcvWnd) || (d.finAtRightEdge && finEdgeCase t s))
+
 /-- The fifth check on, for an acceptable segment whose ACK `a` is not
     ahead of SND.NXT. `st1` is the state after SYN-RECEIVED's ACK; `zw`
     marks text at the left edge of a closed window, which counts for its
@@ -281,46 +312,38 @@ def proceed (d : Departures) (t : Tcb) (s : Segment) (a : Seq) (st1 : State) (zw
   let newAck := ltLe t.sndUna a t.sndNxt
   let una1 := if newAck then a else t.sndUna
   let finAcked := t.finSent && newAck && a == t.sndNxt
-  let st2 := match st1 with
-    | .finWait1 => if finAcked then State.finWait2 else .finWait1
-    | .closing => if finAcked then .timeWait else .closing
-    | .lastAck => if finAcked then .closed else .lastAck
-    | x => x
+  let st2 := ackState st1 finAcked
   -- Closed-window text is unacceptable and answered by the first check,
   -- with the numbers from before the step, even when its ACK closes.
   if st2 == .closed then
-    ({ t with state := .closed, sndUna := una1 }, if zw then ackOf t else .none)
+    ({ t with state := .closed, sndUna := una1 }, ackIf zw t.sndNxt t.rcvNxt)
   else
     let takes := !zw && !t.peerFin && st2.takesText
     let ord := takes && inOrder t s
-    -- The FIN's offset from RCV.NXT: the new text before it.
-    let p := s.text - back t s
-    let taken := if ord then min p t.rcvWnd else 0
-    let finIn := ord && s.ctl == .fin &&
-      (decide (p < t.rcvWnd) || (d.finAtRightEdge && finEdgeCase t s))
-    let moved := taken + (if finIn then 1 else 0)
+    let n := taken ord t s
+    let f := finIn d ord t s
+    let moved := n + (if f then 1 else 0)
     let r1 := adv t.rcvNxt moved
-    let st3 := if finIn then
-        (match st2 with
-         | .finWait1 => if finAcked then State.timeWait else .closing
-         | .finWait2 => .timeWait
-         | _ => .closeWait)
-      else st2
-    let t' := { t with state := st3, sndUna := una1, rcvNxt := r1,
-                       rcvWnd := t.rcvWnd - taken, peerFin := t.peerFin || finIn }
-    let reply :=
-      if zw || moved != 0 || (takes && s.text != 0) then Reply.ack t.sndNxt r1 else .none
-    (t', reply)
+    let t' := { t with state := if f then finState st2 finAcked else st2, sndUna := una1,
+                       rcvNxt := r1, rcvWnd := t.rcvWnd - n, peerFin := t.peerFin || f }
+    (t', ackIf (zw || moved != 0 || (takes && s.text != 0)) t.sndNxt r1)
+
+/-- The first check's acceptability test with the departures that widen
+    it. RFC 5961 section 3.2 judges a RST by its sequence number alone. -/
+def accepted (d : Departures) (t : Tcb) (s : Segment) : Bool :=
+  acceptable t.rcvNxt t.rcvWnd s.seq (if s.ctl == .rst then 0 else s.len) ||
+    (d.emptyAckAtRightEdge && emptyRightEdgeCase t s) ||
+    (d.finAtRightEdge && finEdgeCase t s && t.rcvWnd == 0 && s.text == 0)
+
+/-- Text at the left edge of a closed window: "special allowance should be
+    made to accept valid ACKs" (3.10.7.4, first check). -/
+def zeroWindowText (t : Tcb) (s : Segment) : Bool :=
+  t.rcvWnd == 0 && s.seq == t.rcvNxt && s.text != 0
 
 /-- 3.10.7.4 from the first check on. -/
 def checks (d : Departures) (t : Tcb) (s : Segment) : Tcb × Reply :=
-  -- RFC 5961 section 3.2 judges a RST by its sequence number alone.
-  let acc := acceptable t.rcvNxt t.rcvWnd s.seq (if s.ctl == .rst then 0 else s.len) ||
-    (d.emptyAckAtRightEdge && emptyRightEdgeCase t s) ||
-    (d.finAtRightEdge && finEdgeCase t s && t.rcvWnd == 0 && s.text == 0)
-  let zw := t.rcvWnd == 0 && s.seq == t.rcvNxt && s.text != 0
   -- First: the sequence number.
-  if !acc && !zw then
+  if !accepted d t s && !zeroWindowText t s then
     if s.ctl == .rst then (t, .none)
     else if d.rateLimitEmptyOutOfWindow && emptyOutOfWindowCase t s then (t, challengeOf t)
     else (t, ackOf t)
@@ -334,9 +357,10 @@ def checks (d : Departures) (t : Tcb) (s : Segment) : Tcb × Reply :=
     | none => (t, .none)
     | some a =>
       if t.state == .synReceived then
-        if ltLe t.sndUna a t.sndNxt then proceed d t s a .established zw else (t, .rst a)
+        if ltLe t.sndUna a t.sndNxt then proceed d t s a .established (zeroWindowText t s)
+        else (t, .rst a)
       else if decide (ahead a t.sndNxt) then (t, challengeOf t)
-      else proceed d t s a t.state zw
+      else proceed d t s a t.state (zeroWindowText t s)
 
 /-- SYN-RECEIVED and the synchronized states, with the departures that
     come before the first check. -/
