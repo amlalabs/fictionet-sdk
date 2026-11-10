@@ -616,7 +616,8 @@ Other kinds of port:
 
 - `tcp_stack_with(port, limits, max_conns, make)`: the same, with
   `StreamLimits` for the idle and write limits, and a cap on the
-  connections served at once (`tcp_stack` uses `DEFAULT_MAX_CONNS`, 64).
+  connections served at once to each sandbox (`tcp_stack` uses
+  `DEFAULT_MAX_CONNS`, 64).
 - `udp_stack(port, budget, make)`: one stack for the port, a layer over
   `Datagrams`, which gets every datagram whole with its sender's address
   and sends each datagram it gives to the address it names, so it can

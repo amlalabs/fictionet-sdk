@@ -13,7 +13,7 @@ use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::{
     Denied, EmptyApex, Fact, Node, Revision, Transparent, View, ZoneData, additional_targets,
 };
-use fictionet::stdlib::services::stack::{self, Boxed, Counted, Job, StreamEnd, StreamLimits};
+use fictionet::stdlib::services::stack::{self, Boxed, Job, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::{self, CertifiedKey, HandshakeError};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -23,7 +23,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -220,7 +219,8 @@ impl PreparedShare {
     }
 }
 
-/// The connections a port served with [`Host::tcp_stack`] serves at once.
+/// The connections a port served with [`Host::tcp_stack`] serves at once
+/// to each sandbox.
 pub const DEFAULT_MAX_CONNS: usize = 64;
 
 /// Serves a layer stack made fresh for each connection.
@@ -228,7 +228,50 @@ struct StackAccept<M> {
     make: M,
     max_conns: usize,
     limits: StreamLimits,
-    open: Arc<AtomicUsize>,
+    open: Shares,
+}
+
+/// The connections a port serves at once, counted for each sandbox apart,
+/// by its id: one that holds all it may, for as long as it likes, leaves
+/// every other sandbox its own. Peers that are no sandbox, such as a
+/// route's, count together.
+#[derive(Clone, Default)]
+struct Shares(Arc<Mutex<HashMap<u64, usize>>>);
+
+impl Shares {
+    /// Counts one more connection from `info`'s sandbox, unless it already
+    /// has `max` open. The count lasts as long as the guard.
+    fn enter(&self, info: &ConnInfo, max: usize) -> Option<Share> {
+        let sandbox = info.sandbox.as_ref().map_or(0, |sandbox| sandbox.id);
+        let mut open = self.0.lock();
+        let count = open.entry(sandbox).or_default();
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(Share {
+            shares: self.clone(),
+            sandbox,
+        })
+    }
+}
+
+/// One connection counted in its sandbox's share until it is dropped.
+struct Share {
+    shares: Shares,
+    sandbox: u64,
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        let mut open = self.shares.0.lock();
+        if let Entry::Occupied(mut count) = open.entry(self.sandbox) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
 }
 
 impl<L, M> PortServer for StackAccept<M>
@@ -241,7 +284,7 @@ where
     M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
 {
     fn stack(&self, fcx: &Cx, opening: &Opening) -> PortStack {
-        let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
+        let Some(guard) = self.open.enter(&opening.info, self.max_conns) else {
             return PortStack::Refused;
         };
         opening.socket.hold_until_gone(Box::new(guard));
@@ -257,7 +300,7 @@ where
         fcx: Cx,
         arrival: Arrival,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let Some(guard) = Counted::enter(&self.open, self.max_conns) else {
+        let Some(guard) = self.open.enter(&arrival.info, self.max_conns) else {
             arrival.socket.reset();
             return Box::pin(async {});
         };
@@ -493,9 +536,11 @@ impl Host {
     /// [`ConnInfo`], which numbers it and names its sandbox.
     /// It attaches to the transport child with the default [`StreamLimits`],
     /// charging the sandbox's budget, at most [`DEFAULT_MAX_CONNS`] at
-    /// once. Past that, a new connection is reset as soon as it is
-    /// accepted, and each counts until its socket is gone. A connection the
-    /// stack resets is reset.
+    /// once from each sandbox, so a sandbox that holds all of its own
+    /// leaves the others theirs; peers that are no sandbox share one count.
+    /// Past that, a new connection is reset as soon as it is accepted, and
+    /// each counts until its socket is gone. A connection the stack resets
+    /// is reset.
     /// Across all services, a machine's native TCP application router holds
     /// at most 4096 live children, the bound of
     /// [`fictionet::stdlib::layer::Children`]. Closing transport sockets
@@ -513,8 +558,8 @@ impl Host {
     }
 
     /// The same with these limits and at most `max_conns` connections at
-    /// once, subject to the machine's application-router bound documented
-    /// on [`Host::tcp_stack`].
+    /// once from each sandbox, subject to the machine's application-router
+    /// bound documented on [`Host::tcp_stack`].
     pub fn tcp_stack_with<L, M>(
         self,
         port: u16,
@@ -536,7 +581,7 @@ impl Host {
                 make,
                 max_conns,
                 limits,
-                open: Arc::default(),
+                open: Shares::default(),
             },
         )
     }
@@ -567,7 +612,7 @@ impl Host {
             make,
             max_conns: DEFAULT_MAX_CONNS,
             limits: StreamLimits::default(),
-            open: Arc::default(),
+            open: Shares::default(),
         };
         self.tls_accept(port, sni, certificate_for, accept)
     }
@@ -2128,6 +2173,7 @@ impl Layer for ObservedTls {
 mod tests {
     use super::super::{Net, TEST_POOLS};
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// The TLS stack inside the observer runs one level below it, with the
     /// stack's own waker, in every call that reaches it.
@@ -2250,7 +2296,7 @@ mod tests {
                     },
                     max_conns: 1,
                     limits: StreamLimits::default(),
-                    open: Arc::default(),
+                    open: Shares::default(),
                 });
                 let opening = |socket: Arc<Custom>| Opening {
                     info: ConnInfo::default(),
@@ -2268,6 +2314,54 @@ mod tests {
                 first.reset();
                 assert!(application(&cx, opening(Arc::new(Custom::default())), accept).is_some());
                 assert_eq!(builds.load(Ordering::Relaxed), 2);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// A sandbox that holds every connection a port serves it, for as
+    /// long as it likes, leaves every other sandbox its own: the cap
+    /// counts each sandbox apart, and a sandbox's count frees as its
+    /// sockets go.
+    #[test]
+    fn a_sandbox_at_its_cap_leaves_the_others_theirs() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(74),
+            |cx| async move {
+                let accept = Arc::new(StackAccept {
+                    make: |_: &ConnInfo| stack::Tunnel::new(|_, _| async {}),
+                    max_conns: 2,
+                    limits: StreamLimits::default(),
+                    open: Shares::default(),
+                });
+                let from = |id| {
+                    ConnInfo::default().from_sandbox(Some(super::super::Sandbox {
+                        id,
+                        name: Arc::from("sandbox"),
+                        addr: None,
+                        addr_v6: None,
+                    }))
+                };
+                let serves = |id, socket: Arc<Custom>| {
+                    let opening = Opening {
+                        info: from(id),
+                        socket,
+                        budget: None,
+                        limits: Limits::default(),
+                    };
+                    application(&cx, opening, accept.clone()).is_some()
+                };
+                let held: Vec<Arc<Custom>> = (0..2).map(|_| Arc::default()).collect();
+                for socket in &held {
+                    assert!(serves(1, socket.clone()));
+                }
+                assert!(!serves(1, Arc::default()), "past the first sandbox's cap");
+                for socket in (0..2).map(|_| Arc::default()) {
+                    assert!(serves(2, socket), "another sandbox refused");
+                }
+                held[0].reset();
+                assert!(serves(1, Arc::default()), "a freed place not given back");
                 Ok(())
             },
         ))

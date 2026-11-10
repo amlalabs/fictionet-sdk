@@ -131,7 +131,8 @@
 //!   trailing IP payload bytes are ignored when checking the checksum.
 //!   A peer address may have 256 connections open at once across the
 //!   network ([`Limits::connections_per_peer`]); past that, new ones are
-//!   reset. Each port has its own cap too ([`Host::tcp_stack_with`]).
+//!   reset. Each port has its own cap too, for each sandbox apart
+//!   ([`Host::tcp_stack_with`]).
 //! - **Budgets.** Service-layer holdings for one sandbox are charged to
 //!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
 //!   says otherwise. A connection that would pass it is closed. The stack
