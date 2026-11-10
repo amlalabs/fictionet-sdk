@@ -386,6 +386,7 @@ mod tests {
         let budget = Budget::new(1024);
         let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), budget.clone());
         let prefix = ((budget.limit() + 1) as u32).to_be_bytes();
+        let mark = budget.refusals();
         let Admit::Blocked(StreamEvent::Data(bytes)) = stack
             .driver()
             .deliver(StreamEvent::Data(Chunk::unpaid(prefix.to_vec())))
@@ -397,5 +398,9 @@ mod tests {
         assert!(stack.layer().body.is_none());
         assert_eq!(stack.layer().prefix_len, 0);
         assert_eq!(budget.used(), 0);
+        // A body larger than the whole limit can never be paid: the runner
+        // reads the refusal as starved and ends the tunnel.
+        let starved = budget.starved_since(mark).expect("a need over the limit");
+        assert!(starved.need > starved.limit);
     }
 }

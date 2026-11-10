@@ -1,22 +1,5 @@
 # Layer runtime: what was modeled, proved and found
 
-## Framed memory backpressure
-
-These harnesses drive the real framing layers and their budgeted storage.
-They have been authored or updated but have not been run in this pass.
-
-| Harness | Property | Status |
-| --- | --- | --- |
-| `encoding_is_not_called_without_its_reservation` | A refused reservation returns the send as blocked without calling the encoder or retaining an output allocation. | Updated, not run |
-| `a_refused_write_keeps_its_value_and_writes_once_after_release` | A symbolic value is returned unchanged on refusal, then encoded once after release; output remains charged and all charges return on drop. | Authored, not run |
-| `a_refused_packet_keeps_its_value_and_writes_once_after_release` | A symbolic packet is returned unchanged on refusal, then framed once after release; its length and payload agree with the input and all charges return on drop. | Authored, not run |
-
-Behavioral tests cover repeated write refusals, retained allocation identity,
-charge conservation, retry after release, and packet input across every cut
-of the length prefix. Outputs are compared with the offered values.
-
-## Earlier verification
-
 This pass covers the code of branch `comp/b3-ports`: `layer::Framed`
 (`src/stdlib/layer/framed.rs`), the runners `services::stack::stream` and
 `services::stack::datagrams` (then `src/stdlib/services/stack.rs`) behind
@@ -443,7 +426,9 @@ real `Stream`, `Buffer`, `Budget`, `Charge`, `Chunk` and `Driver`.
 | `every_charge_comes_back_*`, 10 harnesses | under budgets of 0, 6, 8, 13 and 14 bytes: two bytes from the peer and a value from above, either of which the budget may refuse, then two steps in ten orders (end, reset, end from above, taken event, taken write, its delivery): a refusal takes no byte; the budget holds exactly what `Framed` and the chunk in flight are charged, never past its limit; a written value is charged at least its length; nothing is left once they are dropped | all 10 verified, 2 to 9 s each |
 | `units_come_up_in_order_and_the_rest_is_handed_back_odd_first_cut_3` | a three-byte unit (payload any) and a one-byte one in two pushes, then the end: each comes up once, in order, then `Ended` | verified, 3 s |
 | `a_decoder_failure_comes_up_once_then_ended_first_*`, 7 harnesses | against any steps of `Steps`, through any three of input, end, reset and taken events and three more taken events: no item after a failure; a failure comes up once with `Ended` right after; nothing after `Ended`; once either came up, input is over, and input offered after its end is refused as `Closed` and changes nothing | all 7 verified under 10 GiB; exact cases below |
-| `encoding_is_not_called_without_its_reservation` | a value whose bound exceeds the budget is returned as `Blocked`; the writer (which panics if entered) never runs, and the budget holds nothing | updated for backpressure, not rerun |
+| `encoding_is_not_called_without_its_reservation` | a value whose `write_bound` is 64, under any budget below 64: `Framed::on_command` hands the value back as `Blocked`, the writer (which panics if entered) never runs, and the budget holds nothing | verified before writes waited for memory, when the answer was an error; not yet run since |
+| `a_refused_write_keeps_its_value_and_writes_once_after_release` | any two-byte value, under a budget the rest of which is held: the send comes back `Blocked` with the value unchanged and nothing more charged; once the hold is dropped the same value is taken, written once, its bytes charged at least their length, and every charge comes back on drop | not yet run |
+| `a_refused_packet_keeps_its_value_and_writes_once_after_release` | the same for `network::packet::Framed`: any two-byte packet comes back unchanged while the budget is held, then is framed once after the release with a length that agrees with it, and every charge comes back on drop | not yet run |
 | `a_decoded_allocation_keeps_its_charge_outside_the_layer` | a decoder whose item allocates one byte, under a budget of 8: the item comes up `Owned` with a charge of at least its capacity, the charge stays in the budget after the layer is dropped, and leaves with the item | verified (the readiness pass, 1 to 3 s) |
 
 Before Bug 1's fix, the charge harnesses fail (see the mutations below).

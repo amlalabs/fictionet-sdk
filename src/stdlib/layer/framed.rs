@@ -575,6 +575,41 @@ pub(crate) mod tests {
         }
     }
 
+    /// A reply the protocol above sends while the budget is full stays in
+    /// the chain; once memory frees, running the stack writes it, once, with
+    /// no one sending it again.
+    #[test]
+    fn a_reply_without_room_is_written_once_when_memory_frees() {
+        let budget = Budget::new(1 << 16);
+        let mut h = Harness::with_budget(Seed::from_u64(10), stack(), budget.clone());
+        let before = frames(2);
+        h.push(&wire(&before)).unwrap();
+        assert_eq!(read(h.output()), before, "the echo answers with room");
+        let late = Frame {
+            transaction: 99,
+            unit: 1,
+            pdu: vec![0x03; 9],
+        };
+        let reply = Owned::new(late.clone(), budget.charge(late.pdu.capacity()).unwrap());
+        let held = budget.charge(budget.limit() - budget.used()).unwrap();
+        let mark = budget.refusals();
+        h.driver().layer_mut().upper_mut().reply = Some(reply);
+        for _ in 0..3 {
+            h.settle().unwrap();
+            assert_eq!(read(h.output()), before, "nothing is written without room");
+        }
+        assert!(budget.refused_since(mark), "the runner is told to wait");
+        assert_eq!(budget.starved_since(mark), None, "the reply fits the limit");
+        drop(held);
+        h.settle().unwrap();
+        h.settle().unwrap();
+        let mut sent = before;
+        sent.push(late);
+        assert_eq!(read(h.output()), sent);
+        drop(h);
+        assert_eq!(budget.used(), 0);
+    }
+
     #[test]
     fn output_is_reserved_before_the_writer_runs() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -610,12 +645,17 @@ pub(crate) mod tests {
             fictionet::time::Instant::ZERO,
         );
         let value = Owned::new(Large, budget.charge(0).unwrap());
+        let mark = budget.refusals();
         assert!(matches!(
             d.command(MessageCommand::Send(value)),
             Ok(Admit::Blocked(MessageCommand::Send(_)))
         ));
         assert!(!WROTE.load(Ordering::Relaxed));
         assert_eq!(budget.used(), 0);
+        // No release can make room for more than the limit: the runner
+        // reads that as starved and ends the connection instead of waiting.
+        let starved = budget.starved_since(mark).expect("a need over the limit");
+        assert!(starved.need > starved.limit);
     }
 
     #[test]
