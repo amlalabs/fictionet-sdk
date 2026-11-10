@@ -946,3 +946,324 @@ fn a_challenge_keeps_its_request_charged_until_answered() {
     let signed_in = layer.user.as_ref().expect("authenticated");
     assert_eq!(budget.used(), before + Heap::heap(&**signed_in));
 }
+
+/// RFC 4254 section 5.3: a channel stays open for the peer until it has
+/// our CLOSE. What it sent before that (data, a request, EOF) arrives
+/// after we closed. It is dropped, nothing is answered on the closed
+/// channel, and the connection and its other channels go on.
+#[test]
+fn what_the_peer_sent_before_our_close_arrived_is_dropped() {
+    let mut layer = layer();
+    let budget = Budget::unlimited();
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    layer.user = Some(guest(&budget));
+    take(
+        &mut layer,
+        wire::Message::ChannelOpen {
+            sender: 3,
+            window: 1024,
+            max_packet: 1024,
+            kind: wire::OpenKind::Session,
+        },
+        &mut env,
+    )
+    .unwrap();
+    let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
+        panic!("opening missing")
+    };
+    let channel = layer.channels.get_mut(child.id()).unwrap();
+    channel.confirmed = true;
+    channel.receive = 1024;
+    channel.advertised = 1024;
+    assert!(
+        layer
+            .on_command(&mut env, child.send(ChannelCommand::Close))
+            .unwrap()
+            .moved()
+    );
+    assert!(layer.take_urgent().is_some());
+    assert!(layer.take_command(&mut env).is_some(), "our CLOSE");
+    let late = [
+        wire::Message::Data {
+            recipient: 0,
+            data: b"late".to_vec(),
+        },
+        wire::Message::ExtendedData {
+            recipient: 0,
+            kind: 1,
+            data: b"late".to_vec(),
+        },
+        wire::Message::ChannelRequest {
+            recipient: 0,
+            want_reply: true,
+            request: wire::SessionRequest::WindowChange(wire::Dimensions {
+                columns: 80,
+                rows: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+            }),
+        },
+        wire::Message::Eof(0),
+    ];
+    for message in late {
+        take(&mut layer, message, &mut env).expect("the peer had not seen our CLOSE");
+    }
+    assert!(layer.take_event().is_none(), "nothing reaches the retired child");
+    assert!(
+        layer.take_command(&mut env).is_none(),
+        "nothing is answered on a closed channel"
+    );
+    take(&mut layer, wire::Message::Close(0), &mut env).unwrap();
+    assert!(!layer.channels.contains(child.id()));
+    assert!(layer.take_command(&mut env).is_none(), "CLOSE was sent once");
+}
+
+/// Rejects every attempt after a delay.
+struct Slow;
+impl Handler for Slow {
+    type Session = tests::NoSession;
+    fn authenticate(&self, _: &Context<'_>, _: &AuthAttempt<'_>) -> AuthDecision {
+        AuthDecision::Reject {
+            methods: vec![AuthMethod::Password],
+            partial_success: false,
+            delay: Duration::from_secs(1),
+        }
+    }
+    fn open(&self, _: &Context<'_>, _: &SessionRequest, _: &mut Output) -> Option<Self::Session> {
+        None
+    }
+}
+
+/// RFC 4252 section 5: a client may send several requests without
+/// waiting for the replies, and the server answers each in turn. A
+/// request that arrives while an earlier failure waits out its delay
+/// waits behind it; it does not end the connection.
+#[test]
+fn a_request_sent_before_the_last_failure_waits_for_it() {
+    let mut layer = Ssh::with_transport(
+        Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        )),
+        Arc::new(Slow),
+        Arc::new(ConnInfo::default()),
+        Packets(transport::Negotiated {
+            kex: String::new(),
+            host: String::new(),
+            incoming: String::new(),
+            outgoing: String::new(),
+        }),
+    );
+    let budget = Budget::new(4 << 20);
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    assert!(layer.reserve(&budget) && layer.room(&budget));
+    layer.started = true;
+    for (sequence, payload) in [service_request(), password("guest"), password("guest")]
+        .into_iter()
+        .enumerate()
+    {
+        let decoded = Owned::new(payload.clone(), budget.charge(payload.capacity()).unwrap());
+        assert!(
+            layer
+                .pending_packets
+                .push_back((sequence as u32, decoded))
+                .is_ok()
+        );
+    }
+    let mut replies = Vec::new();
+    let mut step = |layer: &mut Ssh<Slow, Packets>, env: &mut Env<'_, Ended>| {
+        let progressed = layer.advance(env).expect("the connection goes on");
+        while let Some(StreamCommand::Write(bytes)) = layer.take_command(env) {
+            replies.push(bytes.to_vec()[0]);
+        }
+        progressed
+    };
+    while step(&mut layer, &mut env) {}
+    assert_eq!(layer.pending_packets.len(), 1, "the second request waits");
+    let mut later = Env::new(
+        Instant::ZERO + Duration::from_secs(1),
+        &entropy,
+        &budget,
+        &mut observations,
+    );
+    assert!(layer.on_timer(&mut later, Timer::Failure).unwrap());
+    while step(&mut layer, &mut later) {}
+    assert_eq!(layer.pending_packets.len(), 0);
+    let mut last = Env::new(
+        Instant::ZERO + Duration::from_secs(2),
+        &entropy,
+        &budget,
+        &mut observations,
+    );
+    assert!(layer.on_timer(&mut last, Timer::Failure).unwrap());
+    while step(&mut layer, &mut last) {}
+    assert_eq!(
+        replies,
+        [ssh::msg::SERVICE_ACCEPT, 51, 51],
+        "a failure for each request, in order"
+    );
+    assert!(!layer.is_terminal());
+}
+
+/// `verification/ssh-layer/tla/Adjust.tla` at full scale, on the
+/// production `Channel`. A peer sends one 64 KiB window in 1 KiB packets;
+/// over every order of the connection taking a packet
+/// (`consume_receive`), the child taking one (the credit `on_command`
+/// adds back) and an adjustment going out while `adjustment` says one is
+/// due, the peer is told of new room at most 7 times (floor(log2 64) + 1),
+/// and some order reaches 7. Room is never owed while the peer has none
+/// left without an adjustment being due, and the peer is never told of
+/// room the child's credit does not back. With 1 reply and 64 echoes,
+/// 72 messages fit russh's 100 per channel.
+#[test]
+fn a_full_window_brings_at_most_seven_adjustments_in_any_order() {
+    use std::collections::HashMap;
+    const UNIT: usize = 1024;
+    let units = WINDOW as usize / UNIT;
+    fn most(
+        channel: &Channel,
+        consumed: usize,
+        held: usize,
+        units: usize,
+        seen: &mut HashMap<(usize, usize, u32), usize>,
+    ) -> usize {
+        let key = (consumed, held, channel.advertised);
+        if let Some(&n) = seen.get(&key) {
+            return n;
+        }
+        assert!(u64::from(channel.advertised) <= channel.receive);
+        assert_eq!(channel.receive, WINDOW as u64 - (held * UNIT) as u64);
+        if channel.advertised == 0 && channel.receive > 0 {
+            assert!(channel.adjustment().is_some(), "room owed and none told");
+        }
+        let mut best = 0;
+        if consumed < units && channel.advertised > 0 {
+            let mut next = clone(channel);
+            next.consume_receive(UNIT).unwrap();
+            best = best.max(most(&next, consumed + 1, held + 1, units, seen));
+        }
+        if held > 0 {
+            let mut next = clone(channel);
+            next.receive += UNIT as u64;
+            best = best.max(most(&next, consumed, held - 1, units, seen));
+        }
+        if let Some(bytes) = channel.adjustment() {
+            let mut next = clone(channel);
+            next.advertised += bytes;
+            best = best.max(1 + most(&next, consumed, held, units, seen));
+        }
+        seen.insert(key, best);
+        best
+    }
+    fn clone(c: &Channel) -> Channel {
+        Channel {
+            wire: c.wire,
+            peer: c.peer,
+            window: c.window,
+            max_packet: c.max_packet,
+            granted: c.granted,
+            receive: c.receive,
+            advertised: c.advertised,
+            accepted: c.accepted,
+            confirmed: c.confirmed,
+            eof: c.eof,
+            sent_eof: c.sent_eof,
+            closed: c.closed,
+        }
+    }
+    // Confirmed as progress confirms: advertised is the credit lent.
+    let channel = Channel {
+        wire: 0,
+        peer: 0,
+        window: WINDOW,
+        max_packet: PACKET,
+        granted: 0,
+        receive: WINDOW as u64,
+        advertised: WINDOW,
+        accepted: true,
+        confirmed: true,
+        eof: false,
+        sent_eof: false,
+        closed: false,
+    };
+    let mut seen = HashMap::new();
+    assert_eq!(most(&channel, 0, 0, units, &mut seen), 7);
+}
+
+/// Accepts only a public key whose signature verified.
+struct Verifying;
+impl Handler for Verifying {
+    type Session = tests::NoSession;
+    fn authenticate(&self, _: &Context<'_>, attempt: &AuthAttempt<'_>) -> AuthDecision {
+        if attempt.signature_verified {
+            return AuthDecision::Accept;
+        }
+        AuthDecision::Reject {
+            methods: vec![AuthMethod::PublicKey],
+            partial_success: false,
+            delay: Duration::ZERO,
+        }
+    }
+    fn open(&self, _: &Context<'_>, _: &SessionRequest, _: &mut Output) -> Option<Self::Session> {
+        None
+    }
+}
+
+/// RFC 4252 section 7: a signature that is not correct fails the request
+/// with USERAUTH_FAILURE; the client may go on to another key or method.
+#[test]
+fn a_signature_that_does_not_verify_is_answered_with_failure() {
+    let mut layer = Ssh::with_transport(
+        Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        )),
+        Arc::new(Verifying),
+        Arc::new(ConnInfo::default()),
+        Packets(transport::Negotiated {
+            kex: String::new(),
+            host: String::new(),
+            incoming: String::new(),
+            outgoing: String::new(),
+        }),
+    );
+    let budget = Budget::new(4 << 20);
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    assert!(layer.reserve(&budget) && layer.room(&budget));
+    layer.started = true;
+    let string = |parts: &[&[u8]]| {
+        let mut out = Vec::new();
+        for part in parts {
+            ssh::SshString(part.to_vec()).write(&mut out).unwrap();
+        }
+        out
+    };
+    let forged = userauth(
+        "guest",
+        auth::Method::PublicKey {
+            algorithm: "ssh-ed25519".into(),
+            key: string(&[b"ssh-ed25519", &[1; 32]]),
+            signature: Some(string(&[b"ssh-ed25519", &[2; 64]])),
+        },
+    );
+    let mut replies = Vec::new();
+    for payload in [service_request(), forged, password("guest")] {
+        // Room for the reply, as each step makes sure of first.
+        assert!(layer.room(&budget));
+        assert!(matches!(
+            layer.packet(0, &payload, &mut env).expect("the connection goes on"),
+            Handled::Done
+        ));
+        while let Some(StreamCommand::Write(bytes)) = layer.take_command(&mut env) {
+            replies.push(bytes.to_vec()[0]);
+        }
+    }
+    assert_eq!(replies, [ssh::msg::SERVICE_ACCEPT, 51, 51]);
+    assert!(layer.user.is_none() && !layer.is_terminal());
+}
