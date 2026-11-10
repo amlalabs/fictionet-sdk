@@ -1,65 +1,86 @@
 use std::collections::VecDeque;
 
-use crate::{PACKET_COST, Packet};
+use crate::{Budget, Charge, PACKET_COST, Packet};
 
-/// A packet FIFO that charges each packet's retained allocation (its
-/// vector's capacity) plus [`PACKET_COST`]. Capacity limits and the policy
-/// for rejected packets belong to the caller.
-#[derive(Default)]
+/// A packet FIFO whose packets are charged to a [`Budget`]: each one the
+/// memory it keeps alive (its backing's capacity) plus [`PACKET_COST`] for
+/// its place, held from when it is queued until it is taken out. A packet
+/// the budget has no room for is refused whole; what to do with it is the
+/// caller's.
 pub struct PacketQueue {
-    packets: VecDeque<Packet>,
+    packets: VecDeque<(Packet, Charge)>,
+    budget: Budget,
+    /// What the queued packets are charged, in all.
     bytes: usize,
 }
 
-/// What a queued packet costs: the memory it retains plus its place in the
-/// queue. Admission and release both use this.
-fn charge(packet: &Packet) -> Option<usize> {
+/// What a queued packet costs: the memory it keeps alive plus its place in
+/// the queue. `None` when that is past what a count can hold, which no
+/// budget has room for.
+fn cost(packet: &Packet) -> Option<usize> {
     packet.chunk().capacity().checked_add(PACKET_COST)
 }
 
+impl Default for PacketQueue {
+    /// A queue with no limit.
+    fn default() -> Self {
+        PacketQueue::new(None)
+    }
+}
+
 impl PacketQueue {
-    /// Whether `packet` fits beside the queued packets within `limit`. Every
-    /// packet fits when `limit` is `None`, unless the total charge would
-    /// overflow.
-    pub fn fits(&self, packet: &Packet, limit: Option<usize>) -> bool {
-        self.admit(packet, limit).is_some()
+    /// A queue whose packets hold at most `limit` bytes, counted as above,
+    /// or with no limit.
+    pub fn new(limit: Option<usize>) -> Self {
+        PacketQueue::on(&Budget::new(limit.unwrap_or(usize::MAX)))
     }
 
-    /// The queue's total charge with `packet` added, if it fits.
-    fn admit(&self, packet: &Packet, limit: Option<usize>) -> Option<usize> {
-        let total = charge(packet)?.checked_add(self.bytes)?;
-        limit.is_none_or(|limit| total <= limit).then_some(total)
+    /// A queue whose packets count against `budget`, beside whatever else
+    /// it pays for.
+    pub fn on(budget: &Budget) -> Self {
+        PacketQueue {
+            packets: VecDeque::new(),
+            budget: budget.clone(),
+            bytes: 0,
+        }
     }
 
-    /// Adds a packet if it [`fits`](Self::fits) within `limit`. Returns the
-    /// queued packet, or the original packet if full.
-    pub fn try_push(&mut self, packet: Packet, limit: Option<usize>) -> Result<&Packet, Packet> {
-        let Some(total) = self.admit(&packet, limit) else {
+    /// Whether the budget has room for `packet` now.
+    pub fn fits(&self, packet: &Packet) -> bool {
+        let room = self.budget.limit().saturating_sub(self.budget.used());
+        cost(packet).is_some_and(|cost| cost <= room)
+    }
+
+    /// Queues `packet`, charging the budget first. Returns the queued
+    /// packet, or the packet itself, with nothing charged, if the budget
+    /// has no room.
+    pub fn try_push(&mut self, packet: Packet) -> Result<&Packet, Packet> {
+        let Some(charge) = cost(&packet).and_then(|cost| self.budget.charge(cost)) else {
             return Err(packet);
         };
-        self.bytes = total;
-        self.packets.push_back(packet);
-        Ok(self.packets.back().expect("just queued"))
+        self.bytes += charge.bytes();
+        self.packets.push_back((packet, charge));
+        Ok(&self.packets.back().expect("just queued").0)
     }
 
-    /// Removes the oldest packet and releases its charge.
+    /// Takes out the oldest packet and gives back its charge.
     pub fn pop(&mut self) -> Option<Packet> {
-        let packet = self.packets.pop_front()?;
-        self.bytes -= charge(&packet).expect("admitted packets have a charge");
+        let (packet, charge) = self.packets.pop_front()?;
+        self.bytes -= charge.bytes();
         Some(packet)
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl PacketQueue {
-    /// The total charge of the queued packets, including [`PACKET_COST`].
+    /// What the queued packets are charged, including [`PACKET_COST`].
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// Borrows the oldest packet without releasing its charge.
+    /// Borrows the oldest packet without giving back its charge.
     pub fn front(&self) -> Option<&Packet> {
-        self.packets.front()
+        self.packets.front().map(|(packet, _)| packet)
     }
 
     /// The number of queued packets.
@@ -72,7 +93,7 @@ impl PacketQueue {
         self.packets.is_empty()
     }
 
-    /// Drops every queued packet and releases their charges.
+    /// Drops every queued packet and gives back their charges.
     pub fn clear(&mut self) {
         self.packets.clear();
         self.bytes = 0;
@@ -82,56 +103,77 @@ impl PacketQueue {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::Chunk;
 
     #[test]
     fn retained_capacity_is_admitted_and_released() {
-        let mut queue = PacketQueue::default();
         let mut bytes = Vec::with_capacity(4096);
         bytes.push(1);
         let capacity = bytes.capacity();
-        let packet = queue
-            .try_push(Packet::new(bytes), Some(PACKET_COST + 1))
-            .unwrap_err();
+        let mut queue = PacketQueue::new(Some(PACKET_COST + 1));
+        let packet = queue.try_push(Packet::new(bytes)).unwrap_err();
         assert!(queue.is_empty());
-        assert!(queue.try_push(packet, Some(PACKET_COST + capacity)).is_ok());
+        let budget = Budget::new(PACKET_COST + capacity);
+        let mut queue = PacketQueue::on(&budget);
+        assert!(queue.try_push(packet).is_ok());
         assert_eq!(queue.bytes(), PACKET_COST + capacity);
+        assert_eq!(budget.used(), queue.bytes());
         assert_eq!(queue.pop().unwrap().chunk().capacity(), capacity);
-        assert_eq!(queue.bytes(), 0);
+        assert_eq!((queue.bytes(), budget.used()), (0, 0));
+    }
+
+    #[test]
+    fn a_shared_budget_limits_the_queue_with_everything_else_it_pays_for() {
+        let budget = Budget::new(2 * (PACKET_COST + 1));
+        let mut queue = PacketQueue::on(&budget);
+        assert!(queue.try_push(Packet::new(vec![1])).is_ok());
+        let other = budget.charge(PACKET_COST + 1).unwrap();
+        let refused = Packet::new(vec![2]);
+        assert!(!queue.fits(&refused));
+        assert_eq!(queue.try_push(refused.clone()), Err(refused.clone()));
+        assert_eq!(budget.used(), 2 * (PACKET_COST + 1));
+        drop(other);
+        assert!(queue.try_push(refused).is_ok());
+        queue.clear();
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
     fn unrepresentable_charges_never_fit() {
-        let mut queue = PacketQueue::default();
-        assert!(queue.try_push(Packet::new(vec![1]), None).is_ok());
-        queue.bytes = usize::MAX - PACKET_COST;
+        let budget = Budget::unlimited();
+        let mut queue = PacketQueue::on(&budget);
+        assert!(queue.try_push(Packet::new(vec![1])).is_ok());
+        let held = budget
+            .charge(usize::MAX - budget.used() - PACKET_COST)
+            .unwrap();
         let packet = Packet::new(vec![2]);
-        assert!(!queue.fits(&packet, Some(usize::MAX)));
-        assert!(!queue.fits(&packet, None));
-        assert_eq!(queue.try_push(packet.clone(), None), Err(packet));
+        assert!(!queue.fits(&packet));
+        assert_eq!(queue.try_push(packet.clone()), Err(packet));
         assert_eq!(queue.len(), 1);
+        drop(held);
     }
 
     #[test]
     fn exact_capacity_rejection_and_drain_preserve_order_and_charges() {
-        let mut queue = PacketQueue::default();
         let limit = 2 * PACKET_COST + 3;
-        assert!(queue.try_push(Packet::new(vec![1]), Some(limit)).is_ok());
-        assert!(queue.try_push(Packet::new(vec![2, 3]), Some(limit)).is_ok());
+        let mut queue = PacketQueue::new(Some(limit));
+        assert!(queue.try_push(Packet::new(vec![1])).is_ok());
+        assert!(queue.try_push(Packet::new(vec![2, 3])).is_ok());
         assert_eq!(queue.bytes(), limit);
         assert_eq!(queue.len(), 2);
         assert!(!queue.is_empty());
         assert_eq!(queue.front(), Some(&Packet::new(vec![1])));
 
         let rejected = Packet::new(vec![4]);
-        assert_eq!(queue.try_push(rejected.clone(), Some(limit)), Err(rejected));
+        assert_eq!(queue.try_push(rejected.clone()), Err(rejected));
         assert_eq!(queue.bytes(), limit);
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.pop(), Some(Packet::new(vec![1])));
         assert_eq!(queue.bytes(), PACKET_COST + 2);
-        assert!(queue.fits(&Packet::new(vec![5]), Some(limit)));
-        assert!(!queue.fits(&Packet::new(vec![5, 6]), Some(limit)));
-        assert!(queue.fits(&Packet::new(vec![5, 6]), None));
-        assert!(queue.try_push(Packet::new(vec![5]), Some(limit)).is_ok());
+        assert!(queue.fits(&Packet::new(vec![5])));
+        assert!(!queue.fits(&Packet::new(vec![5, 6])));
+        assert!(PacketQueue::default().fits(&Packet::new(vec![5, 6])));
+        assert!(queue.try_push(Packet::new(vec![5])).is_ok());
         assert_eq!(queue.pop(), Some(Packet::new(vec![2, 3])));
         assert_eq!(queue.bytes(), PACKET_COST + 1);
         assert_eq!(queue.pop(), Some(Packet::new(vec![5])));
@@ -144,25 +186,22 @@ mod tests {
 
     #[test]
     fn empty_packets_are_charged_and_oversized_packets_leave_room() {
-        let mut queue = PacketQueue::default();
+        let mut queue = PacketQueue::new(Some(0));
         assert_eq!(
-            queue.try_push(Packet::new(vec![]), Some(0)),
+            queue.try_push(Packet::new(vec![])),
             Err(Packet::new(vec![]))
         );
+        let mut queue = PacketQueue::new(Some(PACKET_COST));
         assert_eq!(
-            queue.try_push(Packet::new(vec![1]), Some(PACKET_COST)),
+            queue.try_push(Packet::new(vec![1])),
             Err(Packet::new(vec![1]))
         );
         assert_eq!(queue.bytes(), 0);
         assert!(queue.is_empty());
-        assert!(
-            queue
-                .try_push(Packet::new(vec![]), Some(PACKET_COST))
-                .is_ok()
-        );
+        assert!(queue.try_push(Packet::new(vec![])).is_ok());
         assert_eq!(queue.bytes(), PACKET_COST);
         assert_eq!(
-            queue.try_push(Packet::new(vec![]), Some(PACKET_COST)),
+            queue.try_push(Packet::new(vec![])),
             Err(Packet::new(vec![]))
         );
         assert_eq!(queue.pop(), Some(Packet::new(vec![])));
@@ -171,23 +210,31 @@ mod tests {
 
     #[test]
     fn clearing_and_taking_release_all_charges() {
-        let mut queue = PacketQueue::default();
+        let budget = Budget::new(PACKET_COST + 1);
+        let mut queue = PacketQueue::on(&budget);
         for _ in 0..2 {
-            assert!(queue.try_push(Packet::new(vec![1, 2]), None).is_ok());
-            assert!(queue.try_push(Packet::new(vec![]), None).is_ok());
-            assert_eq!(queue.bytes(), 2 * PACKET_COST + 2);
+            assert!(queue.try_push(Packet::new(vec![])).is_ok());
             queue.clear();
-            assert_eq!(queue.bytes(), 0);
+            assert_eq!((queue.bytes(), budget.used()), (0, 0));
             assert_eq!(queue.pop(), None);
             assert!(queue.is_empty());
         }
-        let limit = Some(PACKET_COST + 1);
-        assert!(queue.try_push(Packet::new(vec![3]), limit).is_ok());
+        assert!(queue.try_push(Packet::new(vec![3])).is_ok());
         let mut taken = std::mem::take(&mut queue);
         assert_eq!(queue.bytes(), 0);
         assert!(queue.is_empty());
         assert_eq!(taken.bytes(), PACKET_COST + 1);
         assert_eq!(taken.pop(), Some(Packet::new(vec![3])));
-        assert!(queue.try_push(Packet::new(vec![4]), limit).is_ok());
+        assert!(queue.try_push(Packet::new(vec![4])).is_ok());
+    }
+
+    #[test]
+    fn a_packet_in_a_shared_backing_costs_the_memory_it_keeps() {
+        let mut bytes = Chunk::unpaid(vec![7; 1000]);
+        let head = bytes.split_to(10);
+        let mut queue = PacketQueue::new(Some(PACKET_COST + 999));
+        let packet = queue.try_push(Packet::from_chunk(head)).unwrap_err();
+        assert_eq!(packet.len(), 10, "a slice keeps its whole backing alive");
+        drop(bytes);
     }
 }

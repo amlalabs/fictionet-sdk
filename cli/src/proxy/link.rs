@@ -61,7 +61,7 @@ impl Link {
         let shared = Arc::new(Shared {
             // SAFETY: the owned descriptor stays open with a stable number until deregistration.
             fd: unsafe { AsyncFd::register(sock)? },
-            queue: Mutex::new(PacketQueue::default()),
+            queue: Mutex::new(PacketQueue::new(Some(QUEUE_BUDGET))),
             queued: Notify::new(),
             closed: AtomicBool::new(false),
             why: Mutex::new(None),
@@ -126,7 +126,7 @@ impl Shared {
                 }
             }
         }
-        if q.try_push(packet, Some(QUEUE_BUDGET)).is_err() {
+        if q.try_push(packet).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }

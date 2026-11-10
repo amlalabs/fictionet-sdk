@@ -12,7 +12,7 @@ use crate::attach::NameGuard;
 use crate::cx::CancelWait;
 use crate::relay::unix::cvt;
 use crate::relay::{self, Message, PacketQueue, unix};
-use crate::{Attacher, Attachment, Cx, Packet, RecvError};
+use crate::{Attacher, Attachment, Budget, Chunk, Cx, Packet, Pool, RecvError};
 
 /// Where a world listens for attachments.
 ///
@@ -364,8 +364,8 @@ impl ConnSlot {
 }
 
 /// The packets of one connection that wait for room, oldest first.
-#[derive(Default)]
 struct OutQueue {
+    /// Holds at most [`QUEUE_LIMIT`].
     queue: PacketQueue,
     /// The connection is registered for writability.
     want_out: bool,
@@ -374,6 +374,17 @@ struct OutQueue {
     /// Packets dropped because the connection and the queue were full, or
     /// the connection closed.
     dropped: u64,
+}
+
+impl OutQueue {
+    fn new() -> OutQueue {
+        OutQueue {
+            queue: PacketQueue::new(Some(QUEUE_LIMIT)),
+            want_out: false,
+            closed: false,
+            dropped: 0,
+        }
+    }
 }
 
 /// A connection in its handshake, owned by the helper thread.
@@ -609,13 +620,16 @@ fn handshake_step(
         token,
         waker: Mutex::new(None),
         name: Mutex::new(Some(guard)),
-        out: Mutex::new(OutQueue::default()),
+        out: Mutex::new(OutQueue::new()),
     });
     shared.conns.lock().insert(token, slot.clone());
+    let memory = Budget::unlimited();
     let link = SocketLink {
         listen: shared.clone(),
         token,
         slot,
+        pool: Pool::new(&memory, PACKET_SLOT, POOLED),
+        memory,
         buf: vec![0u8; relay::MAX_MESSAGE + 1],
         budget: BUDGET,
         closed: false,
@@ -632,11 +646,26 @@ const BUDGET: u32 = 64;
 /// [`crate::PACKET_COST`] for each. Past that, packets are dropped.
 const QUEUE_LIMIT: usize = 32 << 20;
 
+/// The bytes of a block a packet from attach is read into: its tag and an
+/// MTU of 1500, with room to spare. A longer packet spills into the link's
+/// own buffer and is copied out whole.
+const PACKET_SLOT: usize = 2048;
+
+/// The most blocks a link keeps for reuse.
+const POOLED: usize = 16;
+
 /// The connection behind an [`Attachment`] made by [`listen`].
 pub(crate) struct SocketLink {
     listen: Arc<ListenShared>,
     token: u64,
     slot: Arc<ConnSlot>,
+    /// The blocks packets are read into. A packet goes to the world in its
+    /// block, which comes back here when the world drops it.
+    pool: Pool,
+    /// What the blocks are paid from until the world takes them in, which
+    /// charges its own budget instead.
+    memory: Budget,
+    /// Where a packet longer than a block is read past the block.
     buf: Vec<u8>,
     /// Packets left in this turn.
     budget: u32,
@@ -683,10 +712,31 @@ impl SocketLink {
         let fd = self.slot.fd.as_raw_fd();
         let mut registered = false;
         loop {
-            match unix::recv(fd, &mut self.buf, true) {
-                Ok(n) if (1..=relay::MAX_MESSAGE).contains(&n) && self.buf[0] == relay::PACKET => {
+            let mut block = self
+                .pool
+                .take(&self.memory, 0)
+                .expect("an unlimited budget never refuses");
+            let room = block.room();
+            let mut got = Ok(0);
+            block.fill(|head| {
+                got = unix::recv_parts(fd, head, &mut self.buf, true);
+                got.as_ref().map_or(0, |&n| n.min(room))
+            });
+            match got {
+                Ok(n) if (1..=relay::MAX_MESSAGE).contains(&n) && block[0] == relay::PACKET => {
                     self.budget -= 1;
-                    return Poll::Ready(Ok(Packet::new(self.buf[1..n].to_vec())));
+                    let packet = if n <= room {
+                        // The packet stays in the block it was read into,
+                        // past its tag.
+                        block.advance(1);
+                        block
+                    } else {
+                        let mut whole = Vec::with_capacity(n - 1);
+                        whole.extend_from_slice(&block[1..]);
+                        whole.extend_from_slice(&self.buf[..n - room]);
+                        Chunk::unpaid(whole)
+                    };
+                    return Poll::Ready(Ok(Packet::from_chunk(packet)));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if registered {
@@ -738,7 +788,7 @@ impl SocketLink {
                 }
             }
         }
-        if out.queue.try_push(packet, Some(QUEUE_LIMIT)).is_err() {
+        if out.queue.try_push(packet).is_err() {
             out.dropped += 1;
             return;
         }
@@ -944,6 +994,36 @@ mod tests {
         world.join().unwrap();
         assert_eq!(FAILURES.load(Ordering::SeqCst), 1);
         assert!(attacher.reserve("agent").is_ok(), "name must be released");
+    }
+
+    /// A packet from attach reaches the world in the block it was read
+    /// into, which comes back to the link when the world drops it; a
+    /// packet longer than a block arrives whole.
+    #[test]
+    fn packets_from_attach_arrive_in_the_blocks_they_were_read_into() {
+        let (attacher, mut attachments) = attachments();
+        let listening = listen(socket("pooled"), attacher).unwrap();
+        let client = Client::hello(&listening.path, "agent");
+        assert_eq!(client.recv(), [relay::ACCEPT]);
+        let short: Vec<u8> = (0..1400).map(|i| i as u8).collect();
+        let long: Vec<u8> = (0..3 * PACKET_SLOT).map(|i| (i * 7) as u8).collect();
+        for bytes in [&short, &short, &long] {
+            unix::send_parts(client.0.as_raw_fd(), &[&[relay::PACKET], bytes], false).unwrap();
+        }
+        block_on(run(Seed::from_u64(0), move |fcx| async move {
+            let mut agent = attachments.get(&fcx, "agent").await?;
+            let first = agent.recv(&fcx).await?;
+            assert_eq!(first, short[..]);
+            assert_eq!(first.chunk().capacity(), PACKET_SLOT, "not copied out");
+            let at = first.as_ptr().addr();
+            drop(first);
+            let second = agent.recv(&fcx).await?;
+            assert_eq!(second, short[..]);
+            assert_eq!(second.as_ptr().addr(), at, "the same block, read into again");
+            assert_eq!(agent.recv(&fcx).await?, long[..]);
+            Ok(())
+        }))
+        .unwrap();
     }
 
     #[test]

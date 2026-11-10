@@ -51,11 +51,10 @@ pub fn pair_with_limit(limit: usize) -> (End, End) {
 fn make(guard: Option<Box<dyn Send>>, limit: Option<usize>) -> (End, End) {
     let cable = Arc::new(Cable {
         dirs: [
-            Mutex::new(Direction::default()),
-            Mutex::new(Direction::default()),
+            Mutex::new(Direction::new(limit)),
+            Mutex::new(Direction::new(limit)),
         ],
         guard: Mutex::new(guard),
-        limit,
     });
     (
         End {
@@ -77,18 +76,26 @@ struct Cable {
     dirs: [Mutex<Direction>; 2],
     /// Dropped when the first end is dropped.
     guard: Mutex<Option<Box<dyn Send>>>,
-    /// The most bytes each queue may hold, if limited.
-    limit: Option<usize>,
 }
 
 /// One direction of a cable: a queue with one sender and one receiver.
-#[derive(Default)]
 struct Direction {
+    /// Holds at most the cable's limit, if it has one.
     queue: PacketQueue,
     /// The receiver waiting for a packet, if any.
     waker: Option<Waker>,
     /// One end was dropped.
     closed: bool,
+}
+
+impl Direction {
+    fn new(limit: Option<usize>) -> Direction {
+        Direction {
+            queue: PacketQueue::new(limit),
+            waker: None,
+            closed: false,
+        }
+    }
 }
 
 /// One of the two connected [`Interface`]s made by [`pair`].
@@ -136,7 +143,7 @@ impl Interface for End {
             if dir.closed {
                 return;
             }
-            if dir.queue.try_push(packet, self.cable.limit).is_err() {
+            if dir.queue.try_push(packet).is_err() {
                 return;
             }
             dir.waker.take()

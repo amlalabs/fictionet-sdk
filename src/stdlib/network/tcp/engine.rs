@@ -22,9 +22,9 @@ use std::sync::Weak;
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedVec, Child, ChildId, Chunk, Closing,
-    CommandOf, Env, EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp,
-    PacketCommand, PacketEvent, Packets, Slots, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, Child, ChildId, Chunk, Closing, CommandOf,
+    Env, EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
+    PacketEvent, Packets, Pool, Slots, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::packet::{CheckedIpPacket, Sort};
@@ -178,58 +178,31 @@ impl Sequences {
 
 /// The packets going into and out of smoltcp.
 ///
-/// A packet's buffer is kept once smoltcp has read it, and the next packet
-/// smoltcp sends is written into it: in a steady exchange, the buffers the
-/// peer's packets arrived in carry the answers, and the engine allocates
-/// none. The kept buffers are bounded in number and size.
+/// smoltcp reads a packet where it arrived, in the chunk the layer below
+/// handed up, and writes each packet it sends into a block of the engine's
+/// [`Pool`]. A block goes back to that pool when whoever took the packet
+/// last drops it, so in a steady exchange the engine sends in the same
+/// blocks again and allocates none. Every block the engine holds is paid
+/// from the pool's control reserve, which covers as many as the output
+/// allowance lets it hold; one leaving the engine keeps its payment, and
+/// the reserve is charged back up before the layer below takes it.
 #[derive(Default)]
 pub(super) struct Dev {
-    pub(super) rx: Option<Vec<u8>>,
+    pub(super) rx: Option<Chunk>,
     /// What smoltcp sent since the endpoint last looked at its packets.
-    pub(super) tx: Vec<Vec<u8>>,
+    pub(super) tx: Vec<Chunk>,
     /// Packets the endpoint has looked at, for the layer below to take.
-    out: VecDeque<Vec<u8>>,
-    /// Buffers of packets smoltcp has read, for the packets it sends.
-    spare: Spare,
-    /// The buffer of the packet smoltcp is reading, once it is done.
-    read: Option<Vec<u8>>,
+    out: VecDeque<Chunk>,
+    /// Where smoltcp's packets are written, once the engine's storage is
+    /// reserved.
+    pool: Option<Pool>,
+    /// The packet smoltcp is reading, until it is done.
+    read: Option<Chunk>,
 }
 
-/// The pool of packet buffers an engine keeps: those of the packets it has
-/// read, emptied, for the packets it sends. Bounded in number and size, so
-/// an engine holds at most `PACKETS * MTU` of them.
-#[derive(Default)]
-struct Spare(Option<ChargedVec<Vec<u8>>>);
-
-impl Spare {
-    /// How many buffers it keeps.
-    const PACKETS: usize = EGRESS_PACKETS;
-
-    /// Keeps a buffer, if there is room for one of its size.
-    fn keep(&mut self, mut buffer: Vec<u8>) {
-        if buffer.capacity() <= MTU
-            && let Some(buffers) = &mut self.0
-        {
-            buffer.clear();
-            let _ = buffers.push(buffer);
-        }
-    }
-
-    /// A zeroed buffer of `len` bytes: a kept one when there is one.
-    fn take(&mut self, len: usize) -> Vec<u8> {
-        let mut buffer = self
-            .0
-            .as_mut()
-            .and_then(ChargedVec::pop)
-            .unwrap_or_default();
-        // Resizing a small reused vector geometrically could exceed the MTU.
-        if buffer.capacity() < len {
-            buffer.reserve_exact(len - buffer.len());
-        }
-        buffer.resize(len, 0);
-        buffer
-    }
-}
+/// The bytes of one of the engine's packet blocks: room for a header in
+/// front of an MTU of packet, and slack.
+const PACKET_SLOT: usize = 2048;
 
 impl Dev {
     /// Whether the output allowance is used up: smoltcp may not send
@@ -238,22 +211,22 @@ impl Dev {
         self.tx.len() + self.out.len() >= EGRESS_PACKETS
     }
 
-    /// Takes back the buffer of the packet smoltcp read, or did not read.
+    /// Lets go of the packet smoltcp read, or did not read: its block goes
+    /// back to the pool it came from, if it came from one.
     fn reclaim(&mut self) {
-        if let Some(buffer) = self.read.take().or_else(|| self.rx.take()) {
-            self.spare.keep(buffer);
-        }
+        self.read = None;
+        self.rx = None;
     }
 }
 
 pub(super) struct Rx<'a> {
-    bytes: Vec<u8>,
-    read: &'a mut Option<Vec<u8>>,
+    bytes: Chunk,
+    read: &'a mut Option<Chunk>,
 }
 
 pub(super) struct Tx<'a> {
-    tx: &'a mut Vec<Vec<u8>>,
-    spare: &'a mut Spare,
+    tx: &'a mut Vec<Chunk>,
+    pool: Option<&'a Pool>,
 }
 
 impl RxToken for Rx<'_> {
@@ -265,10 +238,31 @@ impl RxToken for Rx<'_> {
 }
 
 impl TxToken for Tx<'_> {
+    /// smoltcp writes every byte of the `len` it asks for (the IP and TCP
+    /// headers, the options in full and the payload), so a block's old
+    /// bytes are never sent.
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut buf = self.spare.take(len);
-        let r = f(&mut buf);
-        self.tx.push(buf);
+        let r;
+        let packet = match self.pool.and_then(|pool| pool.take_control(0)) {
+            Some(mut block) if block.room() >= len => {
+                let mut wrote = None;
+                block.fill(|room| {
+                    wrote = Some(f(&mut room[..len]));
+                    len
+                });
+                r = wrote.expect("the engine alone holds a block it just took");
+                block
+            }
+            // Before the engine reserved its storage, as when a test feeds
+            // it directly, there is no pool: the packet is a vector of its
+            // own, paid for by the layer below when it takes it.
+            _ => {
+                let mut bytes = vec![0; len];
+                r = f(&mut bytes);
+                Chunk::unpaid(bytes)
+            }
+        };
+        self.tx.push(packet);
         r
     }
 }
@@ -282,16 +276,15 @@ impl Device for Dev {
             return None;
         }
         let bytes = self.rx.take()?;
-        let Dev {
-            tx, spare, read, ..
-        } = self;
-        Some((Rx { bytes, read }, Tx { tx, spare }))
+        let Dev { tx, pool, read, .. } = self;
+        let pool = pool.as_ref();
+        Some((Rx { bytes, read }, Tx { tx, pool }))
     }
 
     fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
         (!self.full()).then_some(Tx {
             tx: &mut self.tx,
-            spare: &mut self.spare,
+            pool: self.pool.as_ref(),
         })
     }
 
@@ -1021,8 +1014,12 @@ impl TcpLayer {
     /// routing grows on the same budget; its high water mark remains paid until
     /// the engine drops, including empty hash buckets and reusable socket slots.
     fn storage_bytes(places: usize) -> Option<usize> {
-        let fixed =
-            2 * UP_ROOM * size_of::<Up>() + 2 * EGRESS_PACKETS * (MTU + size_of::<Vec<u8>>());
+        // The output queues' places, and the packets the engine builds
+        // itself (resets and handshake answers), an MTU each at most. The
+        // packets smoltcp writes are paid from the pool's control reserve.
+        let fixed = 2 * UP_ROOM * size_of::<Up>()
+            + EGRESS_PACKETS * MTU
+            + 2 * EGRESS_PACKETS * size_of::<Chunk>();
         // Include socket scheduling, child slots, connection and listener indexes,
         // and the terminal events a batch of socket removals can produce.
         // Four times the entries covers geometric vector/hash capacity and tree
@@ -1046,12 +1043,19 @@ impl TcpLayer {
             .storage
             .get_or_insert_with(|| budget.charge(0).unwrap());
         let places = STORAGE_FLOOR;
-        let spare_bytes = Spare::PACKETS * size_of::<Vec<u8>>();
-        if !charge.grow_to(Self::storage_bytes(places).unwrap() + spare_bytes) {
+        let before = charge.bytes();
+        if !charge.grow_to(Self::storage_bytes(places).unwrap()) {
             return false;
         }
-        let spare = ChargedVec::from_charge(charge.split(spare_bytes).unwrap());
-        self.dev.spare = Spare(Some(spare));
+        let pool = self
+            .dev
+            .pool
+            .get_or_insert_with(|| Pool::new(charge.budget(), PACKET_SLOT, EGRESS_PACKETS));
+        if !pool.reserve_control(charge.budget(), EGRESS_PACKETS) {
+            // Both or neither: the storage goes back until the reserve fits.
+            charge.shrink_to(before);
+            return false;
+        }
         self.up.reserve_exact(UP_ROOM);
         self.urgent.reserve_exact(UP_ROOM);
         self.dev.tx.reserve_exact(EGRESS_PACKETS);
@@ -1264,7 +1268,7 @@ impl TcpLayer {
 
     /// Records the sequence number of an outgoing SYN, for ICMP checks, or
     /// of a SYN-ACK, for the connection's [`Handshake`].
-    pub(super) fn sent(&mut self, packet: &mut Vec<u8>) {
+    pub(super) fn sent(&mut self, packet: &mut Chunk) {
         let Some(ip) = Header::parse_whole(packet) else {
             return;
         };
@@ -1314,8 +1318,13 @@ impl TcpLayer {
                 }
                 _ => {}
             }
-            if c.ecn && t[13] & 0x04 == 0 && (t[13] & 0x12 == 0x12 || c.congestion_echo) {
-                let t = &mut packet[ip.payload.clone()];
+            // The engine alone holds what it is about to send.
+            if c.ecn
+                && t[13] & 0x04 == 0
+                && (t[13] & 0x12 == 0x12 || c.congestion_echo)
+                && let Some(bytes) = packet.get_mut()
+            {
+                let t = &mut bytes[ip.payload.clone()];
                 t[13] |= 0x40;
                 t[16..18].fill(0);
                 let sum = transport_checksum(local.ip(), remote.ip(), TCP, t);
@@ -1330,10 +1339,16 @@ impl TcpLayer {
             let Ok(length) = u16::try_from(packet.len() + header_len - ip.payload.start) else {
                 return;
             };
-            packet.splice(20..ip.payload.start, bytes);
-            packet[0] = 0x40 | (header_len / 4) as u8;
-            packet[2..4].copy_from_slice(&length.to_be_bytes());
-            fictionet::stdlib::network::ip::set_header_checksum(&mut packet[..header_len]);
+            // The header grows, so the packet is written again with the new
+            // options in place of the old.
+            let mut rebuilt = Vec::with_capacity(packet.len() + bytes.len());
+            rebuilt.extend_from_slice(&packet[..20]);
+            rebuilt.extend_from_slice(&bytes);
+            rebuilt.extend_from_slice(&packet[ip.payload.start..]);
+            rebuilt[0] = 0x40 | (header_len / 4) as u8;
+            rebuilt[2..4].copy_from_slice(&length.to_be_bytes());
+            fictionet::stdlib::network::ip::set_header_checksum(&mut rebuilt[..header_len]);
+            *packet = Chunk::unpaid(rebuilt);
         }
     }
 
@@ -1407,7 +1422,7 @@ impl TcpLayer {
         entropy: &dyn Entropy,
         budget: &Budget,
         now: smoltcp::time::Instant,
-        packet: Vec<u8>,
+        packet: Chunk,
     ) -> bool {
         // Whatever the packet is, it may be answered directly.
         self.work = true;
@@ -1458,9 +1473,9 @@ impl TcpLayer {
             {
                 let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
                 let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
-                self.dev
-                    .tx
-                    .push(Arrived::of(src, dst, t, repr.payload.len()).reset(&[]));
+                self.dev.tx.push(Chunk::unpaid(
+                    Arrived::of(src, dst, t, repr.payload.len()).reset(&[]),
+                ));
             }
             return false;
         };
@@ -1707,7 +1722,7 @@ impl TcpLayer {
             .backlog_per_peer
             .is_some_and(|limit| l.per_peer.get(&src.ip()).is_some_and(|&n| n >= limit));
         if l.ready.len() >= l.backlog && self.settings.reset_full_queue {
-            self.dev.tx.push(arrived.reset(&[]));
+            self.dev.tx.push(Chunk::unpaid(arrived.reset(&[])));
             return None;
         }
         if l.ready.len() >= l.backlog
@@ -1735,12 +1750,12 @@ impl TcpLayer {
             Some(SynAnswer::Refuse(refusal)) => {
                 // Options that cannot be sent leave a plain RST.
                 let options = encode(&refusal).unwrap_or_default();
-                self.dev.tx.push(arrived.reset(&options));
+                self.dev.tx.push(Chunk::unpaid(arrived.reset(&options)));
                 return None;
             }
         };
         let Some(encoded) = encode(&added) else {
-            self.dev.tx.push(arrived.reset(&[]));
+            self.dev.tx.push(Chunk::unpaid(arrived.reset(&[])));
             return None;
         };
         let ipv4_reply = if dst.is_ipv4() {
@@ -1752,7 +1767,7 @@ impl TcpLayer {
             Ipv4Reply::default()
         };
         if encode_ipv4_options(&ipv4_reply.options).is_err() {
-            self.dev.tx.push(arrived.reset(&[]));
+            self.dev.tx.push(Chunk::unpaid(arrived.reset(&[])));
             return None;
         }
         if cookie {
@@ -1815,7 +1830,7 @@ impl TcpLayer {
             } else {
                 reply
             };
-            self.dev.tx.push(reply);
+            self.dev.tx.push(Chunk::unpaid(reply));
             return None;
         }
         if l.idle.is_empty() {
@@ -1976,7 +1991,7 @@ impl TcpLayer {
             AckAnswer::Refuse(refusal) => {
                 // Options that cannot be sent leave a plain RST.
                 let options = encode(&refusal).unwrap_or_default();
-                self.dev.tx.push(arrived.reset(&options));
+                self.dev.tx.push(Chunk::unpaid(arrived.reset(&options)));
             }
             AckAnswer::Drop => {}
         }
@@ -2821,7 +2836,7 @@ impl Layer for TcpLayer {
         // a whole window of data got one ACK. The sender's slow start grows
         // by one segment per ACK, so its window then grew by one segment
         // per round trip. Pure ACKs are still handled as a batch.
-        let bytes = packet.into_bytes().into_vec();
+        let bytes = packet.into_bytes();
         if self.ingress(env.entropy(), env.budget(), now, bytes) {
             self.iface
                 .poll_egress(now, &mut self.dev, &mut self.sockets.set);
@@ -2928,11 +2943,20 @@ impl Layer for TcpLayer {
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
         let full = self.dev.full();
+        // A block leaves with its payment, so the reserve that paid for it
+        // is charged back up first, to the budget that pays for the storage;
+        // without room the packet waits here and the runner waits for memory.
+        if !self.dev.out.is_empty()
+            && let (Some(pool), Some(storage)) = (&self.dev.pool, &self.storage)
+            && !pool.refill(storage.budget())
+        {
+            return None;
+        }
         match self.dev.out.pop_front() {
             Some(packet) => {
                 // Room again: smoltcp may have more to send.
                 self.work |= full;
-                Some(PacketCommand::Send(Chunk::unpaid(packet)))
+                Some(PacketCommand::Send(packet))
             }
             None if self.stopped && self.dev.tx.is_empty() && !self.ended => {
                 self.ended = true;

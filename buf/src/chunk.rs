@@ -517,6 +517,12 @@ impl Deref for Chunk {
     }
 }
 
+impl AsRef<[u8]> for Chunk {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 impl PartialEq for Chunk {
     /// Equal bytes, wherever they are and whatever pays for them.
     fn eq(&self, other: &Chunk) -> bool {

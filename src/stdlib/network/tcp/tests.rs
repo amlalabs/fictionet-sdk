@@ -223,7 +223,7 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
             &fcx,
             &Budget::unlimited(),
             smol_now(&fcx),
-            segment(peer, local, 100, 0, 2).into_vec(),
+            Chunk::unpaid(segment(peer, local, 100, 0, 2).into_vec()),
         );
         let accepted = st.by_tuple[&(local, peer)];
         assert_eq!(OFFSETS.load(Ordering::Relaxed), 1);
@@ -248,7 +248,7 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
             &fcx,
             &Budget::unlimited(),
             smol_now(&fcx),
-            segment(peer, local, 100, 0, 2).into_vec(),
+            Chunk::unpaid(segment(peer, local, 100, 0, 2).into_vec()),
         );
         assert!(
             st.sockets
@@ -286,7 +286,7 @@ fn a_syn_for_a_reset_connection_still_held_is_not_taken_by_a_listener() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, 0, 4).into_vec(),
+            Chunk::unpaid(segment(peer, local, 101, 0, 4).into_vec()),
         );
         assert_eq!(st.get(h).state(), TcpState::Closed);
         assert_eq!(st.by_tuple[&(local, peer)], h);
@@ -309,7 +309,7 @@ fn a_syn_for_a_reset_connection_still_held_is_not_taken_by_a_listener() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 9000, 0, 2).into_vec(),
+            Chunk::unpaid(segment(peer, local, 9000, 0, 2).into_vec()),
         );
         assert!(
             idle.iter().all(|&i| st.get(i).state() == TcpState::Listen),
@@ -354,7 +354,7 @@ fn receive_credit_survives_a_full_event_queue() {
             &fcx,
             &Budget::unlimited(),
             now,
-            data_segment(peer, local, 101, ack, 16, &[1; 100]).into_vec(),
+            Chunk::unpaid(data_segment(peer, local, 101, ack, 16, &[1; 100]).into_vec()),
         );
         st.refresh_all(&Budget::unlimited());
         let child_handle = st
@@ -408,7 +408,7 @@ fn a_declined_timer_recomputes_the_remaining_deadline() {
             &fcx,
             &Budget::unlimited(),
             smol_now(&fcx),
-            data_segment(peer, local, 101, ack, 16, &[7]).into_vec(),
+            Chunk::unpaid(data_segment(peer, local, 101, ack, 16, &[7]).into_vec()),
         );
         let budget = Budget::unlimited();
         let mut observations = fictionet::stdlib::layer::Observations::new(0);
@@ -508,7 +508,7 @@ fn budget_read(release_after_poll: bool) {
             &fcx,
             &Budget::unlimited(),
             now,
-            data_segment(peer, local, 101, ack, 16, &payload).into_vec(),
+            Chunk::unpaid(data_segment(peer, local, 101, ack, 16, &payload).into_vec()),
         );
         st.refresh_all(&Budget::unlimited());
         let child_handle = st
@@ -596,7 +596,7 @@ fn bytes_come_up_in_the_window_their_receiver_lent() {
         let payload = vec![7; MTU / 2];
         let segment = |seq| data_segment(peer, local, seq, ack, 16, &payload).into_vec();
         let engine = Budget::unlimited();
-        st.ingress(&fcx, &engine, now, segment(101));
+        st.ingress(&fcx, &engine, now, Chunk::unpaid(segment(101)));
         st.refresh_all(&engine);
         let handle = st
             .up
@@ -636,7 +636,12 @@ fn bytes_come_up_in_the_window_their_receiver_lent() {
         // although the endpoint still has the connection.
         drop(window);
         assert_eq!(sandbox.used(), 0);
-        st.ingress(&fcx, &engine, now, segment(101 + payload.len() as u32));
+        st.ingress(
+            &fcx,
+            &engine,
+            now,
+            Chunk::unpaid(segment(101 + payload.len() as u32)),
+        );
         let grant = handle.grant(payload.len() as u64);
         assert!(matches!(st.on_command(&mut env, grant), Ok(Admit::Taken)));
         let chunk = data(&mut st);
@@ -682,7 +687,7 @@ fn engine_storage_belongs_to_the_first_environment_until_drop() {
     ))
     .unwrap();
     let paid = first.used();
-    assert!(paid >= 2 * UP_ROOM * size_of::<Up>() + Spare::PACKETS * MTU);
+    assert!(paid >= 2 * UP_ROOM * size_of::<Up>() + EGRESS_PACKETS * PACKET_SLOT);
     tcp.advance(&mut Env::new(
         Instant::ZERO,
         &entropy,
@@ -692,36 +697,32 @@ fn engine_storage_belongs_to_the_first_environment_until_drop() {
     .unwrap();
     assert_eq!(first.used(), paid);
     assert_eq!(second.used(), 0);
-    for size in [2 * MTU, MTU + 1, MTU / 2, MTU] {
-        for _ in 0..2 * Spare::PACKETS {
-            tcp.dev.spare.keep(Vec::with_capacity(size));
-            let buffers = tcp.dev.spare.0.as_ref().unwrap();
-            assert!(buffers.len() <= Spare::PACKETS);
-            assert!(buffers.iter().all(|buffer| buffer.capacity() <= MTU));
-            let held: usize = buffers.iter().map(Vec::capacity).sum();
-            assert!(held <= Spare::PACKETS * MTU);
-            assert!(held + buffers.charged() <= first.used());
-        }
+    // The reserve pays for as many blocks as the engine may hold, and they
+    // come back to its pool paid as before, round after round.
+    let pool = tcp.dev.pool.clone().expect("reserved with the storage");
+    for _ in 0..3 {
+        let blocks: Vec<Chunk> = (0..EGRESS_PACKETS)
+            .map(|_| {
+                pool.take_control(0)
+                    .expect("the reserve covers the allowance")
+            })
+            .collect();
+        assert!(blocks.iter().all(|block| block.charged() == PACKET_SLOT));
+        assert_eq!(first.used(), paid, "blocks from the reserve cost no more");
+        drop(blocks);
+        assert_eq!(pool.free(), EGRESS_PACKETS);
+        assert_eq!(first.used(), paid);
     }
-    assert_eq!(first.used(), paid);
-    drop(tcp);
+    drop((tcp, pool));
     assert_eq!(first.used(), 0);
 }
 
-#[test]
-fn spare_packet_buffers_never_retain_more_than_the_mtu() {
-    let budget = Budget::unlimited();
-    let mut spare = Spare(Some(ChargedVec::from_charge(
-        budget
-            .charge(Spare::PACKETS * size_of::<Vec<u8>>())
-            .unwrap(),
-    )));
-    spare.keep(Vec::with_capacity(MTU + 1));
-    assert!(spare.take(MTU).capacity() <= MTU);
-    spare.keep(Vec::with_capacity(3 * MTU / 4));
-    let packet = spare.take(MTU);
-    assert!(packet.capacity() <= MTU);
-    assert_eq!(packet.len(), MTU);
+/// What the engine's pool charges for its control reserve.
+fn engine_reserve() -> usize {
+    let probe = Budget::unlimited();
+    let pool = Pool::new(&probe, PACKET_SLOT, EGRESS_PACKETS);
+    assert!(pool.reserve_control(&probe, EGRESS_PACKETS));
+    probe.used()
 }
 
 #[test]
@@ -767,8 +768,7 @@ fn control_notices_stop_admission_until_the_event_queue_drains() {
 fn refused_engine_storage_keeps_the_first_budget_and_allocates_nothing() {
     use fictionet::{SeededEntropy, stdlib::layer::Observations};
     let entropy = SeededEntropy::new(Seed::from_u64(1));
-    let fixed =
-        TcpLayer::storage_bytes(STORAGE_FLOOR).unwrap() + Spare::PACKETS * size_of::<Vec<u8>>();
+    let fixed = TcpLayer::storage_bytes(STORAGE_FLOOR).unwrap() + engine_reserve();
     let first = Budget::new(fixed);
     let second = Budget::unlimited();
     let held = first.charge(1).unwrap();
@@ -921,7 +921,7 @@ fn the_native_tcp_runner_wakes_and_reads_after_another_owner_releases_memory() {
                 &fcx,
                 &Budget::unlimited(),
                 smol_now(&fcx),
-                data_segment(peer, local, 101, ack, 16, &payload).into_vec(),
+                Chunk::unpaid(data_segment(peer, local, 101, ack, 16, &payload).into_vec()),
             );
             host.conns.get_mut(&h).unwrap().recv_credit = payload.len() as u64;
             (child, host.tcp.budget().clone())
@@ -970,7 +970,7 @@ fn receive_refresh_rotates_after_the_event_queue_fills() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                data_segment(peer, local, 101, ack, 16, &[1; 100]).into_vec(),
+                Chunk::unpaid(data_segment(peer, local, 101, ack, 16, &[1; 100]).into_vec()),
             );
             connections.push((h, child, ack));
         }
@@ -994,7 +994,10 @@ fn receive_refresh_rotates_after_the_event_queue_fills() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    data_segment(peers[0], local, 201, connections[0].2, 16, &[2; 100]).into_vec(),
+                    Chunk::unpaid(
+                        data_segment(peers[0], local, 201, connections[0].2, 16, &[2; 100])
+                            .into_vec(),
+                    ),
                 );
             }
         }
@@ -1012,7 +1015,9 @@ fn transmit_batches_retain_descriptor_capacity() {
         let peer = "10.0.0.2:1234".parse()?;
         let local = "10.0.0.1:80".parse()?;
         for n in 0..8 {
-            host.dev.tx.push(segment(local, peer, n, 0, 4).into_vec());
+            host.dev
+                .tx
+                .push(Chunk::unpaid(segment(local, peer, n, 0, 4).into_vec()));
         }
         let capacity = host.dev.tx.capacity();
         host.flush_transmit();
@@ -1036,7 +1041,7 @@ fn device_output_yields_and_preserves_waiting_input() {
         dev.transmit(now).unwrap().consume(MTU, |_| {});
     }
     assert!(dev.transmit(now).is_none());
-    dev.rx = Some(vec![1, 2, 3]);
+    dev.rx = Some(Chunk::unpaid(vec![1, 2, 3]));
     assert!(dev.receive(now).is_none());
     assert_eq!(dev.rx.as_deref(), Some([1, 2, 3].as_slice()));
     dev.tx.clear();
@@ -1060,7 +1065,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 100, 0, 2).into_vec(),
+            Chunk::unpaid(segment(peer, local, 100, 0, 2).into_vec()),
         );
         let syn_ack = egress(&mut st, now);
         let t = Header::parse_whole(&syn_ack[0])
@@ -1071,7 +1076,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, ack, 16).into_vec(),
+            Chunk::unpaid(segment(peer, local, 101, ack, 16).into_vec()),
         );
         st.housekeeping();
         let h = st
@@ -1129,7 +1134,7 @@ fn established(
         &NO_DRAWS,
         &Budget::unlimited(),
         now,
-        segment(peer, local, 100, 0, 2).into_vec(),
+        Chunk::unpaid(segment(peer, local, 100, 0, 2).into_vec()),
     );
     let syn_ack = egress(st, now);
     let t = Header::parse_whole(&syn_ack[0])
@@ -1140,7 +1145,7 @@ fn established(
         &NO_DRAWS,
         &Budget::unlimited(),
         now,
-        segment(peer, local, 101, ack, 16).into_vec(),
+        Chunk::unpaid(segment(peer, local, 101, ack, 16).into_vec()),
     );
     st.housekeeping();
     let l = st.listeners.get_mut(&local.port()).unwrap();
@@ -1165,7 +1170,12 @@ fn time_wait(
         0x11
     );
     let peer_fin = segment(peer, local, 101, ack.wrapping_add(1), 0x11);
-    st.ingress(&NO_DRAWS, &Budget::unlimited(), now, peer_fin.to_vec());
+    st.ingress(
+        &NO_DRAWS,
+        &Budget::unlimited(),
+        now,
+        Chunk::unpaid(peer_fin.to_vec()),
+    );
     assert_eq!(st.get(h).state(), TcpState::TimeWait);
     st.orphan(h, false);
     (h, peer_fin)
@@ -1236,7 +1246,12 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         // orphan timeout for sockets that have not reached TIME-WAIT.
         for seconds in [239, 478, 717, 956, 1195, 1434, 1673] {
             let retry = now + smoltcp::time::Duration::from_secs(seconds);
-            st.ingress(&fcx, &Budget::unlimited(), retry, fin.to_vec());
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                retry,
+                Chunk::unpaid(fin.to_vec()),
+            );
             let packets = egress(st, retry);
             assert_eq!(packets.len(), 1);
             let t = Header::parse_whole(&packets[0])
@@ -1298,7 +1313,12 @@ fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
         st.sock(recent).close();
         assert_eq!(egress(&mut st, later).len(), 1);
         let fin = segment(recent_peer, local, 101, ack.wrapping_add(1), 0x11);
-        st.ingress(&fcx, &Budget::unlimited(), later, fin.to_vec());
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            later,
+            Chunk::unpaid(fin.to_vec()),
+        );
         assert_eq!(st.get(recent).state(), TcpState::TimeWait);
         st.orphan(recent, false);
         egress(&mut st, later);
@@ -1612,7 +1632,7 @@ fn egress(st: &mut TcpLayer, now: smoltcp::time::Instant) -> Vec<Vec<u8>> {
     for p in &mut packets {
         st.sent(p);
     }
-    packets
+    packets.into_iter().map(Chunk::into_vec).collect()
 }
 
 #[test]
@@ -1651,7 +1671,7 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                fragmentation_needed.to_vec(),
+                Chunk::unpaid(fragmentation_needed.to_vec()),
             );
             assert_eq!(st.get(h).state(), TcpState::SynSent, "fragmentation needed");
             let error = icmp::host_unreachable(&syn, "10.0.0.254".parse().unwrap())
@@ -1718,7 +1738,7 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
                     let sum = checksum(&p[20..]);
                     p[22..24].copy_from_slice(&sum.to_be_bytes());
                 }
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 assert_eq!(st.get(h).state(), TcpState::SynSent, "{fault}");
             }
             // A truncated quote must contain all eight identity bytes.
@@ -1728,7 +1748,7 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
                 let sum = checksum(&message);
                 message[2..4].copy_from_slice(&sum.to_be_bytes());
                 let p = ip::packet(peer.ip(), local.ip(), ICMP, &message);
-                st.ingress(&fcx, &Budget::unlimited(), now, p.to_vec());
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p.to_vec()));
                 assert_eq!(st.get(h).state(), TcpState::SynSent, "quote length {len}");
             }
             // Also accept the minimum quote with IPv4 options.
@@ -1746,10 +1766,10 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
                 let sum = checksum(&valid[20..]);
                 valid[22..24].copy_from_slice(&sum.to_be_bytes());
             }
-            st.ingress(&fcx, &Budget::unlimited(), now, valid);
+            st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(valid));
             assert_eq!(st.get(h).state(), TcpState::Closed);
             assert_eq!(st.closed_reason(h), ConnError::Unreachable(1));
-            previous = Some(error);
+            previous = Some(Chunk::unpaid(error));
             st.remove_conn(h);
         }
         drop(st);
@@ -1773,7 +1793,7 @@ fn syn_rst_does_not_prepare_a_listening_socket() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 7, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(peer, local, 7, 0, 0x02).into_vec()),
         );
         egress(&mut st, now);
         assert!(st.listeners[&80].idle.is_empty());
@@ -1783,7 +1803,7 @@ fn syn_rst_does_not_prepare_a_listening_socket() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(other, local, 7, 0, 0x06).into_vec(),
+            Chunk::unpaid(segment(other, local, 7, 0, 0x06).into_vec()),
         );
         assert_eq!(st.sockets.set.iter().count(), count);
         assert!(st.listeners[&80].idle.is_empty());
@@ -1839,7 +1859,7 @@ fn rejected_syn_acks(established: bool) {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs, ack, 0x12).into_vec(),
+                    Chunk::unpaid(segment(peer, local, irs, ack, 0x12).into_vec()),
                 );
                 egress(&mut st, now);
                 assert_eq!(st.get(h).state(), TcpState::Established);
@@ -1885,7 +1905,7 @@ fn rejected_syn_acks(established: bool) {
                 } else if fault == "ip" {
                     p[10] ^= 1;
                 }
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 assert_eq!(st.get(h).state(), before, "{fault}");
                 assert_eq!(st.get(h).recv_queue(), 0, "{fault}");
                 assert!(!st.get(h).has_pending_recv(), "{fault}");
@@ -1897,7 +1917,7 @@ fn rejected_syn_acks(established: bool) {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs, ack, 0x12).into_vec(),
+                    Chunk::unpaid(segment(peer, local, irs, ack, 0x12).into_vec()),
                 );
                 egress(&mut st, now);
             }
@@ -1911,7 +1931,7 @@ fn rejected_syn_acks(established: bool) {
                 let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
                 p.extend_from_slice(&expected[begin..begin + 4]);
                 fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 egress(&mut st, now);
                 st.release_quiet();
             }
@@ -1936,7 +1956,7 @@ fn rejected_syn_acks(established: bool) {
                 p.extend_from_slice(b"ignored");
                 fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
                 // RFC 9293 section 3.10.7.3 accepts RST with an acceptable ACK in SYN-SENT.
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 assert_eq!(st.get(h).state(), TcpState::Closed);
                 assert_eq!(st.closed_reason(h), ConnError::Reset);
                 assert_eq!(st.get(h).recv_queue(), 0, "flags");
@@ -1971,7 +1991,7 @@ fn simultaneous_open_records_the_accepted_syn_origin() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, u32::MAX, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(peer, local, u32::MAX, 0, 0x02).into_vec()),
         );
         assert_eq!(st.get(h).state(), TcpState::SynReceived);
         let packets = egress(&mut st, now);
@@ -2024,7 +2044,7 @@ fn a_rejected_ack_does_not_free_send_buffer() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 102, 100, 0x10).into_vec(),
+            Chunk::unpaid(segment(peer, local, 102, 100, 0x10).into_vec()),
         );
         let packets = egress(&mut st, now);
         assert_eq!(packets.len(), 1);
@@ -2043,7 +2063,7 @@ fn a_rejected_ack_does_not_free_send_buffer() {
             if corrupt {
                 p[36] ^= 1;
             }
-            st.ingress(&fcx, &Budget::unlimited(), now, p);
+            st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
             assert_eq!(st.get(h).send_queue(), 8);
             assert_eq!(st.get(h).recv_queue(), 0);
             let packets = egress(&mut st, now);
@@ -2061,7 +2081,7 @@ fn a_rejected_ack_does_not_free_send_buffer() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, start.wrapping_add(4), 0x10).into_vec(),
+            Chunk::unpaid(segment(peer, local, 101, start.wrapping_add(4), 0x10).into_vec()),
         );
         assert_eq!(st.get(h).send_queue(), 4);
         drop(st);
@@ -2096,7 +2116,7 @@ fn unread_bytes_outlive_time_wait() {
             let mut last = segment(peer, local, 101, ack.wrapping_add(1), 0x19).into_vec();
             last.extend_from_slice(b"last words");
             fix_lengths(&mut last, 20, peer.ip(), local.ip());
-            st.ingress(&fcx, &Budget::unlimited(), now, last);
+            st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(last));
             assert_eq!(st.get(h).state(), TcpState::TimeWait);
             assert_eq!(st.get(h).recv_queue(), 10);
             egress(&mut st, now);
@@ -2151,7 +2171,7 @@ fn client_advertised_window_uses_negotiated_scale() {
                 p.extend_from_slice(&[1, 3, 3, 7]);
                 fix_lengths(&mut p, 20, peer.ip(), local.ip());
             }
-            st.ingress(&fcx, &Budget::unlimited(), now, p);
+            st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
             assert_eq!(st.get(h).state(), TcpState::Established);
             let packets = egress(&mut st, now);
             let t = Header::parse_whole(&packets[0])
@@ -2187,7 +2207,7 @@ fn legitimate_rounded_window_recovery() {
             syn[32] = 6 << 4;
             syn.extend_from_slice(&[1, 3, 3, 7]);
             fix_lengths(&mut syn, 20, peer.ip(), local.ip());
-            st.ingress(&fcx, &Budget::unlimited(), now, syn);
+            st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(syn));
             let syn_ack = egress(&mut st, now).remove(0);
             let t = Header::parse_whole(&syn_ack).unwrap().payload(&syn_ack);
             let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
@@ -2209,7 +2229,7 @@ fn legitimate_rounded_window_recovery() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, origin, start, 0x10).into_vec(),
+                Chunk::unpaid(segment(peer, local, origin, start, 0x10).into_vec()),
             );
             st.sock(h).set_ack_delay(None);
             assert_eq!(st.sock(h).send_slice(b"abcdefgh").unwrap(), 8);
@@ -2240,12 +2260,17 @@ fn legitimate_rounded_window_recovery() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    incoming(begin, (begin + 1024).min(BUFFER), start),
+                    Chunk::unpaid(incoming(begin, (begin + 1024).min(BUFFER), start)),
                 );
                 egress(&mut st, now);
             }
             assert_eq!(st.get(h).recv_queue(), 0);
-            st.ingress(&fcx, &Budget::unlimited(), now, incoming(0, 1, start));
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(incoming(0, 1, start)),
+            );
             let sent = egress(&mut st, now);
             let t = Header::parse_whole(sent.last().unwrap())
                 .unwrap()
@@ -2261,14 +2286,14 @@ fn legitimate_rounded_window_recovery() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, edge, start.wrapping_add(9), 0x10).into_vec(),
+                Chunk::unpaid(segment(peer, local, edge, start.wrapping_add(9), 0x10).into_vec()),
             );
             assert_eq!(st.get(h).send_queue(), 8);
             st.ingress(
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, edge, start.wrapping_add(4), 0x10).into_vec(),
+                Chunk::unpaid(segment(peer, local, edge, start.wrapping_add(4), 0x10).into_vec()),
             );
             assert_eq!(
                 st.get(h).send_queue(),
@@ -2279,7 +2304,7 @@ fn legitimate_rounded_window_recovery() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                incoming(1, 2, start.wrapping_add(4)),
+                Chunk::unpaid(incoming(1, 2, start.wrapping_add(4))),
             );
             assert_eq!(
                 st.get(h).recv_queue(),
@@ -2325,7 +2350,7 @@ fn ack_window_boundary(irs: u32) {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, irs, 0, 0x02).into_vec(),
+                Chunk::unpaid(segment(peer, local, irs, 0, 0x02).into_vec()),
             );
             let syn_ack = egress(&mut st, now).remove(0);
             let t = Header::parse_whole(&syn_ack).unwrap().payload(&syn_ack);
@@ -2337,7 +2362,7 @@ fn ack_window_boundary(irs: u32) {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, rcv_nxt, start, 0x10).into_vec(),
+                Chunk::unpaid(segment(peer, local, rcv_nxt, start, 0x10).into_vec()),
             );
             let h = st.by_tuple[&(local, peer)];
             assert_eq!(st.get(h).state(), TcpState::Established);
@@ -2354,12 +2379,12 @@ fn ack_window_boundary(irs: u32) {
                 let mut p = segment(peer, local, rcv_nxt, start, 0x10).into_vec();
                 p[34..36].copy_from_slice(&0u16.to_be_bytes());
                 fix_lengths(&mut p, 20, peer.ip(), local.ip());
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 egress(&mut st, now);
             }
             for seq in [rcv_nxt.wrapping_add(10_000_000), edge.wrapping_add(1), edge] {
                 let p = segment(peer, local, seq, start.wrapping_add(4), 0x10).into_vec();
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 let accepted = seq == edge;
                 assert_eq!(
                     st.get(h).send_queue(),
@@ -2399,7 +2424,7 @@ fn sack_ack_ahead_without_advertised_window_is_unchanged() {
         p[34..36].copy_from_slice(&456u16.to_be_bytes());
         p.extend_from_slice(&[5, 10, 0, 0, 0, 104, 0, 0, 0, 105, 0, 0]);
         fix_lengths(&mut p, 20, peer.ip(), local.ip());
-        st.ingress(&fcx, &Budget::unlimited(), now, p);
+        st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
         assert!(!st.by_tuple.contains_key(&(local, peer)));
         let packets = egress(&mut st, now);
         assert_eq!(packets.len(), 1);
@@ -2431,7 +2456,7 @@ fn sack_acks_preserve_zero_window_changes() {
             syn[32] = 6 << 4;
             syn.extend_from_slice(&[4, 2, 0, 0]);
             fix_lengths(&mut syn, 20, peer.ip(), local.ip());
-            st.ingress(&fcx, &Budget::unlimited(), now, syn);
+            st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(syn));
             let packets = egress(&mut st, now);
             let t = Header::parse_whole(&packets[0])
                 .unwrap()
@@ -2447,7 +2472,7 @@ fn sack_acks_preserve_zero_window_changes() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, 8, start, 16).into_vec(),
+                Chunk::unpaid(segment(peer, local, 8, start, 16).into_vec()),
             );
             let h = st.by_tuple[&(local, peer)];
             let ack = |window: u16, sack: bool| {
@@ -2463,7 +2488,12 @@ fn sack_acks_preserve_zero_window_changes() {
                 fix_lengths(&mut p, 20, peer.ip(), local.ip());
                 p
             };
-            st.ingress(&fcx, &Budget::unlimited(), now, ack(old, false));
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(ack(old, false)),
+            );
             assert_eq!(st.sock(h).send_slice(b"abcdefgh").unwrap(), 8);
             let packets = egress(&mut st, now);
             assert_eq!(packets.len(), usize::from(old != 0));
@@ -2479,7 +2509,7 @@ fn sack_acks_preserve_zero_window_changes() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    ack(if win == 456 { win - i } else { win }, true),
+                    Chunk::unpaid(ack(if win == 456 { win - i } else { win }, true)),
                 );
                 let packets = egress(&mut st, now);
                 let sends = old == 0 && i == 0 || old != 0 && win != 0 && i == 2;
@@ -2526,7 +2556,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs, 0, 2).into_vec(),
+                    Chunk::unpaid(segment(peer, local, irs, 0, 2).into_vec()),
                 );
                 let packets = egress(&mut st, now);
                 let t = Header::parse_whole(&packets[0])
@@ -2537,7 +2567,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, origin, start, 16).into_vec(),
+                    Chunk::unpaid(segment(peer, local, origin, start, 16).into_vec()),
                 );
                 let h = st.by_tuple[&(local, peer)];
                 st.sock(h).set_ack_delay(None);
@@ -2556,13 +2586,23 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                     fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
                     p
                 };
-                st.ingress(&fcx, &Budget::unlimited(), now, incoming(0, 19, false));
+                st.ingress(
+                    &fcx,
+                    &Budget::unlimited(),
+                    now,
+                    Chunk::unpaid(incoming(0, 19, false)),
+                );
                 egress(&mut st, now);
                 let mut prefix = [0; 19];
                 assert_eq!(st.sock(h).recv_slice(&mut prefix).unwrap(), 19);
                 assert_eq!(prefix, expected[..19]);
                 // A duplicate elicits the window opened by the read.
-                st.ingress(&fcx, &Budget::unlimited(), now, incoming(0, 19, false));
+                st.ingress(
+                    &fcx,
+                    &Budget::unlimited(),
+                    now,
+                    Chunk::unpaid(incoming(0, 19, false)),
+                );
                 egress(&mut st, now);
                 let edge = 19 + MIN_BUFFER;
                 let begin = edge.checked_add_signed(offset as isize).unwrap();
@@ -2570,12 +2610,12 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                 let mut bad = p.clone();
                 let tcp_at = Header::parse_whole(&bad).unwrap().payload.start;
                 bad[tcp_at + 16] ^= 1;
-                st.ingress(&fcx, &Budget::unlimited(), now, bad);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(bad));
                 assert!(egress(&mut st, now).is_empty());
                 assert_eq!(st.get(h).recv_queue(), 0);
                 assert!(!st.get(h).has_pending_recv());
                 assert!(!st.conns[&h].fin);
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 assert_eq!(st.get(h).recv_queue(), 0);
                 assert_eq!(st.get(h).has_pending_recv(), keep != 0);
                 assert_eq!(st.get(h).state(), TcpState::Established);
@@ -2596,7 +2636,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                         &fcx,
                         &Budget::unlimited(),
                         now,
-                        incoming(at, (at + 1024).min(gap_end), false),
+                        Chunk::unpaid(incoming(at, (at + 1024).min(gap_end), false)),
                     );
                     egress(&mut st, now);
                 }
@@ -2610,7 +2650,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    incoming(edge, begin + 20, true),
+                    Chunk::unpaid(incoming(edge, begin + 20, true)),
                 );
                 let packets = egress(&mut st, now);
                 assert_eq!(packets.len(), 1);
@@ -2673,7 +2713,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                 syn.extend_from_slice(&[1, 3, 3, 7]);
                 fix_lengths(&mut syn, tcp_at, peer.ip(), local.ip());
                 let mut st = server.shared.lock();
-                st.ingress(&fcx, &Budget::unlimited(), now, syn);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(syn));
                 let packets = egress(&mut st, now);
                 let t = Header::parse_whole(&packets[0])
                     .unwrap()
@@ -2684,7 +2724,9 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs.wrapping_add(1), start, 0x10).into_vec(),
+                    Chunk::unpaid(
+                        segment(peer, local, irs.wrapping_add(1), start, 0x10).into_vec(),
+                    ),
                 );
                 st.housekeeping();
                 egress(&mut st, now);
@@ -2706,7 +2748,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                 p.extend_from_slice(&expected[begin..end]);
                 fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
                 let mut st = server.shared.lock();
-                st.ingress(&fcx, &Budget::unlimited(), now, p);
+                st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 egress(&mut st, now);
             };
             let ahead = if read_as_received {
@@ -2777,7 +2819,12 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
         };
         let start = {
             let mut st = server.shared.lock();
-            st.ingress(&fcx, &Budget::unlimited(), now, incoming(7, 0, 0x02, 8));
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(incoming(7, 0, 0x02, 8)),
+            );
             let packets = egress(&mut st, now);
             let t = Header::parse_whole(&packets[0])
                 .unwrap()
@@ -2785,7 +2832,12 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             assert_eq!(t[13], 0x12);
             let start = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
             // The peer closes its send half before reading the reply.
-            st.ingress(&fcx, &Budget::unlimited(), now, incoming(8, start, 0x11, 8));
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(incoming(8, start, 0x11, 8)),
+            );
             st.housekeeping();
             egress(&mut st, now);
             start
@@ -2811,7 +2863,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             &fcx,
             &Budget::unlimited(),
             now,
-            incoming(9, start.wrapping_add(4), 0x10, 0),
+            Chunk::unpaid(incoming(9, start.wrapping_add(4), 0x10, 0)),
         );
         assert_eq!(st.get(h).send_queue(), data.len() - 4);
         egress(&mut st, now);
@@ -2819,7 +2871,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             &fcx,
             &Budget::unlimited(),
             now,
-            incoming(9, start.wrapping_add(4), 0x10, 32768),
+            Chunk::unpaid(incoming(9, start.wrapping_add(4), 0x10, 32768)),
         );
         let sent = egress(&mut st, now);
         drop(st);
@@ -2842,7 +2894,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             &fcx,
             &Budget::unlimited(),
             now,
-            incoming(9, end, 0x10, 32768),
+            Chunk::unpaid(incoming(9, end, 0x10, 32768)),
         );
         let sent = egress(&mut st, now);
         assert!(
@@ -2856,7 +2908,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
             &fcx,
             &Budget::unlimited(),
             now,
-            incoming(9, end.wrapping_add(1), 0x10, 32768),
+            Chunk::unpaid(incoming(9, end.wrapping_add(1), 0x10, 32768)),
         );
         assert_eq!(st.get(h).state(), TcpState::Closed);
         drop(st);
@@ -2953,7 +3005,7 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer(port), local, 7, 0, 0x02).into_vec(),
+                    Chunk::unpaid(segment(peer(port), local, 7, 0, 0x02).into_vec()),
                 );
                 egress(&mut st, now);
             }
@@ -2961,7 +3013,7 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer(9000), local, 0, 0, 0x02).into_vec(),
+                Chunk::unpaid(segment(peer(9000), local, 0, 0, 0x02).into_vec()),
             );
             let packets = egress(&mut st, now);
             assert_eq!(packets.len(), 1);
@@ -2975,7 +3027,7 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer(9000), local, 1, iss.wrapping_add(1), 0x10).into_vec(),
+                Chunk::unpaid(segment(peer(9000), local, 1, iss.wrapping_add(1), 0x10).into_vec()),
             );
             assert_eq!(st.listeners[&80].ready.len(), 1);
         }
@@ -3022,7 +3074,7 @@ fn kept_handshakes_complete_only_while_the_backlog_has_room() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer(port), local, 0, 0, 0x02).into_vec(),
+                    Chunk::unpaid(segment(peer(port), local, 0, 0, 0x02).into_vec()),
                 );
                 iss.insert(port, syn_ack_iss(egress(&mut st, now)));
             }
@@ -3032,11 +3084,26 @@ fn kept_handshakes_complete_only_while_the_backlog_has_room() {
                 "the third SYN got a cookie"
             );
             // The cookie's ACK and one kept ACK fill the backlog.
-            st.ingress(&fcx, &Budget::unlimited(), now, ack(1002, iss[&1002]));
-            st.ingress(&fcx, &Budget::unlimited(), now, ack(1000, iss[&1000]));
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(ack(1002, iss[&1002])),
+            );
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(ack(1000, iss[&1000])),
+            );
             assert_eq!(st.listeners[&80].ready.len(), 2);
             // The other kept ACK finds no room: its handshake stays open.
-            st.ingress(&fcx, &Budget::unlimited(), now, ack(1001, iss[&1001]));
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(ack(1001, iss[&1001])),
+            );
             let l = &st.listeners[&80];
             assert!(
                 l.ready.len() <= l.backlog,
@@ -3053,7 +3120,12 @@ fn kept_handshakes_complete_only_while_the_backlog_has_room() {
         {
             // The peer answers the SYN-ACK sent again.
             let mut st = server.shared.lock();
-            st.ingress(&fcx, &Budget::unlimited(), now, ack(1001, iss[&1001]));
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                Chunk::unpaid(ack(1001, iss[&1001])),
+            );
             assert_eq!(st.listeners[&80].ready.len(), 2);
             assert!(st.listeners[&80].embryonic.is_empty());
         }
@@ -3766,26 +3838,26 @@ fn a_handshake_reset_in_one_batch_does_not_lend_its_socket_to_another_peer() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(first, local, 100, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(first, local, 100, 0, 0x02).into_vec()),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(first, local, 101, 0, 0x04).into_vec(),
+            Chunk::unpaid(segment(first, local, 101, 0, 0x04).into_vec()),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 500, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(second, local, 500, 0, 0x02).into_vec()),
         );
         let isn = syn_ack_to(&egress(&mut st, now), second);
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 501, isn.wrapping_add(1), 0x10).into_vec(),
+            Chunk::unpaid(segment(second, local, 501, isn.wrapping_add(1), 0x10).into_vec()),
         );
         st.housekeeping();
         for (&h, c) in &st.conns {
@@ -3828,26 +3900,26 @@ fn a_handshake_restarted_in_one_batch_is_not_reported_reset() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 100, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(peer, local, 100, 0, 0x02).into_vec()),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, 0, 0x04).into_vec(),
+            Chunk::unpaid(segment(peer, local, 101, 0, 0x04).into_vec()),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 300, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(peer, local, 300, 0, 0x02).into_vec()),
         );
         let isn = syn_ack_to(&egress(&mut st, now), peer);
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 301, isn.wrapping_add(1), 0x10).into_vec(),
+            Chunk::unpaid(segment(peer, local, 301, isn.wrapping_add(1), 0x10).into_vec()),
         );
         st.housekeeping();
         let h = *st.listeners[&80]
@@ -3891,7 +3963,7 @@ fn bytes_after_the_peers_fin_are_not_read() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, ack, 0x11).into_vec(),
+            Chunk::unpaid(segment(peer, local, 101, ack, 0x11).into_vec()),
         );
         assert_eq!(st.get(h).state(), TcpState::CloseWait);
         egress(&mut st, now);
@@ -3904,7 +3976,7 @@ fn bytes_after_the_peers_fin_are_not_read() {
         let mut late = segment(peer, local, 102, ack, 0x18).into_vec();
         late.extend_from_slice(b"late");
         fix_lengths(&mut late, 20, peer.ip(), local.ip());
-        st.ingress(&fcx, &Budget::unlimited(), now, late);
+        st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(late));
         assert_eq!(
             st.get(h).recv_queue(),
             0,
@@ -3942,7 +4014,7 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 7, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(peer, local, 7, 0, 0x02).into_vec()),
         );
         assert_eq!(st.get(h).state(), TcpState::SynReceived);
         egress(&mut st, now);
@@ -3959,7 +4031,7 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 8, iss.wrapping_add(1), 0x10).into_vec(),
+            Chunk::unpaid(segment(peer, local, 8, iss.wrapping_add(1), 0x10).into_vec()),
         );
         assert_eq!(
             st.get(h).state(),
@@ -3998,13 +4070,13 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
         syn[32] = 6 << 4;
         syn.extend_from_slice(&[2, 4, 0x05, 0xb4]);
         fix_lengths(&mut syn, 20, first.ip(), local.ip());
-        st.ingress(&fcx, &Budget::unlimited(), now, syn);
+        st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(syn));
         egress(&mut st, now);
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(first, local, 101, 0, 0x04).into_vec(),
+            Chunk::unpaid(segment(first, local, 101, 0, 0x04).into_vec()),
         );
         st.housekeeping();
         let spare = st.listeners[&80].idle.clone();
@@ -4014,14 +4086,14 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 500, 0, 0x02).into_vec(),
+            Chunk::unpaid(segment(second, local, 500, 0, 0x02).into_vec()),
         );
         let isn = syn_ack_to(&egress(&mut st, now), second);
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 501, isn.wrapping_add(1), 0x10).into_vec(),
+            Chunk::unpaid(segment(second, local, 501, isn.wrapping_add(1), 0x10).into_vec()),
         );
         st.housekeeping();
         let h = *st.listeners[&80]
@@ -4234,6 +4306,42 @@ mod layer {
             "the server may write"
         );
         (server, client, accepted, connecting)
+    }
+
+    /// What smoltcp sends goes out in a block of the engine's pool, paid
+    /// for whole, and a block whose last holder dropped it is the one the
+    /// engine sends in next.
+    #[test]
+    fn the_engine_sends_in_blocks_that_come_back_to_its_pool() {
+        let mut client = stack(CLIENT, 2, Budget::unlimited());
+        let remote: SocketAddr = format!("{SERVER}:80").parse().unwrap();
+        let mut first = None;
+        for request in [7, 8] {
+            control(
+                &mut client,
+                TcpControl::Connect {
+                    request: Request(request),
+                    remote,
+                },
+            );
+            let _ = client.run();
+            let mut syns = Vec::new();
+            client.send_below(|command| {
+                if let PacketCommand::Send(packet) = command {
+                    syns.push(packet);
+                }
+                Admit::Taken
+            });
+            let [syn] = <[Chunk; 1]>::try_from(syns).expect("one SYN for each connection");
+            assert_eq!(tcp_flags(&syn), Some(0x02));
+            assert_eq!((syn.charged(), syn.capacity()), (PACKET_SLOT, PACKET_SLOT));
+            let at = syn.as_ptr();
+            if let Some(before) = first {
+                assert_eq!(at, before, "the block came back and went out again");
+            }
+            first = Some(at);
+            drop(syn);
+        }
     }
 
     #[test]
@@ -4501,8 +4609,7 @@ mod layer {
     #[test]
     fn buffers_that_do_not_fit_the_budget_are_refused_before_a_socket() {
         let remote: SocketAddr = format!("{SERVER}:80").parse().unwrap();
-        let fixed =
-            TcpLayer::storage_bytes(STORAGE_FLOOR).unwrap() + Spare::PACKETS * size_of::<Vec<u8>>();
+        let fixed = TcpLayer::storage_bytes(STORAGE_FLOOR).unwrap() + engine_reserve();
         // Engine storage fits, but two socket buffers do not.
         let mut client = stack(CLIENT, 2, Budget::new(fixed + MIN_BUFFER));
         control(

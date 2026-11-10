@@ -187,6 +187,47 @@ pub fn send_parts(fd: RawFd, parts: &[&[u8]], nonblocking: bool) -> io::Result<(
     }
 }
 
+/// Receives one datagram into `first`, and what does not fit there into
+/// `rest`, in one call. Returns its length as [`recv`] does, counting
+/// both parts: `Ok(0)` means the other side closed, and a datagram longer
+/// than both together is cut to fit them. So a reader can take most
+/// datagrams into a buffer of its own and still read the rare long one.
+pub fn recv_parts(
+    fd: RawFd,
+    first: &mut [u8],
+    rest: &mut [u8],
+    nonblocking: bool,
+) -> io::Result<usize> {
+    let mut iov = [
+        libc::iovec {
+            iov_base: first.as_mut_ptr().cast(),
+            iov_len: first.len(),
+        },
+        libc::iovec {
+            iov_base: rest.as_mut_ptr().cast(),
+            iov_len: rest.len(),
+        },
+    ];
+    // SAFETY: an all-zero msghdr is valid; the iovecs point into `first`
+    // and `rest`, each valid for writes of its length.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iov.as_mut_ptr();
+    msg.msg_iovlen = iov.len() as _;
+    let flags = if nonblocking { libc::MSG_DONTWAIT } else { 0 };
+    loop {
+        // SAFETY: `msg` and the buffers it points into are valid for the
+        // call.
+        let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 /// Receives one datagram into `buf`. `Ok(0)` means the other side
 /// closed. A datagram longer than `buf` is cut to `buf.len()` bytes,
 /// so callers pass [`MAX_MESSAGE`] + 1 bytes. A length above

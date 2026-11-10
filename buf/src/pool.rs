@@ -62,6 +62,29 @@ impl State {
         self.floor.max(free * slot)
     }
 
+    /// Pays for the free list's `most` places through `budget`, a view of
+    /// the pool's budget, and makes them, once. Refuses, changing nothing,
+    /// when the budget has no room or is another budget.
+    fn reserve_places(&mut self, budget: &Budget, most: usize) -> bool {
+        if self.free.capacity() >= most {
+            return true;
+        }
+        let want = most * size_of::<Arc<Backing>>();
+        let short = want.saturating_sub(self.places.bytes());
+        if !budget.same(self.places.budget()) {
+            return false;
+        }
+        let Some(charge) = budget.charge(short) else {
+            return false;
+        };
+        if self.places.absorb(charge).is_err() {
+            return false;
+        }
+        let more = most - self.free.len();
+        self.free.reserve_exact(more);
+        true
+    }
+
     /// What `paid` holds past what it must, split off to go back once the
     /// lock is let go.
     fn surplus(&mut self, slot: usize) -> Option<Charge> {
@@ -179,9 +202,20 @@ impl Pool {
             return false;
         };
         let mut state = self.shared.state.lock();
-        let before = std::mem::replace(&mut state.floor, floor);
+        let (floor_before, paid_before) = (state.floor, state.paid.bytes());
+        state.floor = floor;
         if !Self::top_up(&mut state, budget, self.shared.slot) {
-            state.floor = before;
+            state.floor = floor_before;
+            return false;
+        }
+        // The reserve's blocks come back to the free list, so its places
+        // are paid for now too; without room for them the top-up goes back.
+        if !state.reserve_places(budget, self.shared.most) {
+            state.floor = floor_before;
+            let topped = state.paid.bytes() - paid_before;
+            let undone = state.paid.split(topped);
+            drop(state);
+            drop(undone);
             return false;
         }
         let surplus = state.surplus(self.shared.slot);
@@ -240,13 +274,8 @@ impl PoolShared {
         if state.free.len() >= self.most {
             return;
         }
-        if state.free.capacity() < self.most {
-            let places = self.most * size_of::<Arc<Backing>>();
-            if !state.places.grow_to(places) {
-                return;
-            }
-            let more = self.most - state.free.len();
-            state.free.reserve_exact(more);
+        if !state.reserve_places(&self.budget, self.most) {
+            return;
         }
         let (paid, stale) = match reservation {
             Some(Reservation::Own(charge))

@@ -523,10 +523,9 @@ fn the_control_reserve_pays_for_control_blocks_when_the_budget_is_full() {
     let budget = Budget::new(256);
     let pool = Pool::new(&budget, 32, 4);
     assert!(pool.reserve_control(&budget, 2));
-    assert_eq!(budget.used(), 64);
-    // The first backing back pays for the free list's places.
-    drop(pool.take_control(0).unwrap());
+    // Two slots, and the free list's places, all charged at once.
     assert_eq!(budget.used(), pool.charged());
+    assert_eq!(pool.charged(), 64 + 4 * size_of::<usize>());
     let hog = budget.charge(budget.limit() - budget.used()).unwrap();
     assert!(pool.take(&budget, 0).is_none(), "data waits for memory");
     let first = pool.take_control(0).unwrap();
@@ -570,6 +569,12 @@ fn a_reserve_the_budget_cannot_pay_changes_nothing() {
         "the caller's view sees the refusal"
     );
     assert_eq!(budget.used(), 0);
+    assert!(pool.take_control(0).is_none());
+    // Room for the slots but not for the places: the slots go back too.
+    let tight = Budget::new(2 * 32 + 1);
+    let pool = Pool::new(&tight, 32, 2);
+    assert!(!pool.reserve_control(&tight, 2));
+    assert_eq!((tight.used(), pool.charged()), (0, 0));
     assert!(pool.take_control(0).is_none());
 }
 
