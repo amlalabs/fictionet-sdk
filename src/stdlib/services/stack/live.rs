@@ -91,11 +91,14 @@ where
         budget: Budget,
         limits: StreamLimits,
     ) -> Live<L, C> {
-        let buf = read_buffer(&budget);
+        // The runner's own charges go through the stack's view, so the
+        // refusals it reads after a round are all of the stack's.
+        let driver = Driver::new(stack, Arc::new(fcx.clone()), budget, fcx.now());
+        let buf = read_buffer(driver.budget());
         Live {
             conn,
-            jobs: Jobs::new(&budget),
-            driver: Driver::new(stack, Arc::new(fcx.clone()), budget, fcx.now()),
+            jobs: Jobs::new(driver.budget()),
+            driver,
             stopped: buf.is_none().then_some(StreamEnd::Budget),
             buf,
             input: None,
