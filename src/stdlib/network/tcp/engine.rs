@@ -21,8 +21,8 @@ use core::convert::Infallible;
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, Child, ChildId, Chunk, CommandOf, Env,
-    EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedVec, Child, ChildId, Chunk, CommandOf,
+    Env, EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
     PacketEvent, Packets, Slots, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::Transport;
@@ -40,6 +40,8 @@ mod tests;
 const UP_ROOM: usize = 64;
 /// The most bytes one data event carries.
 const DATA_MAX: usize = 64 * 1024;
+/// Initial socket and listener places, grown together before admitting more.
+const STORAGE_FLOOR: usize = 4;
 
 /// An event for the layer above.
 type Up = MuxEvent<ByteStream, Messages<TcpNotice, TcpControl>, TcpOpening>;
@@ -194,28 +196,35 @@ pub(super) struct Dev {
 
 /// The pool of packet buffers an engine keeps: those of the packets it has
 /// read, emptied, for the packets it sends. Bounded in number and size, so
-/// an engine holds at most `PACKETS * BYTES` of them.
+/// an engine holds at most `PACKETS * MTU` of them.
 #[derive(Default)]
-struct Spare(Vec<Vec<u8>>);
+struct Spare(Option<ChargedVec<Vec<u8>>>);
 
 impl Spare {
     /// How many buffers it keeps.
     const PACKETS: usize = EGRESS_PACKETS;
 
-    /// The largest buffer it keeps.
-    const BYTES: usize = 16 * 1024;
-
     /// Keeps a buffer, if there is room for one of its size.
     fn keep(&mut self, mut buffer: Vec<u8>) {
-        if self.0.len() < Self::PACKETS && buffer.capacity() <= Self::BYTES {
+        if buffer.capacity() <= MTU
+            && let Some(buffers) = &mut self.0
+        {
             buffer.clear();
-            self.0.push(buffer);
+            let _ = buffers.push(buffer);
         }
     }
 
     /// A zeroed buffer of `len` bytes: a kept one when there is one.
     fn take(&mut self, len: usize) -> Vec<u8> {
-        let mut buffer = self.0.pop().unwrap_or_default();
+        let mut buffer = self
+            .0
+            .as_mut()
+            .and_then(ChargedVec::pop)
+            .unwrap_or_default();
+        // Resizing a small reused vector geometrically could exceed the MTU.
+        if buffer.capacity() < len {
+            buffer.reserve_exact(len - buffer.len());
+        }
         buffer.resize(len, 0);
         buffer
     }
@@ -469,9 +478,10 @@ pub(super) const COMPACT_SLOTS: usize = 256;
 /// Each socket's receive and send buffers are charged to the [`Env`]'s
 /// budget before the socket is made: a SYN or a cookie that does not fit
 /// is dropped, and a connect fails as refused. Data coming up is charged as
-/// it is copied out. Listener, handshake and TIME-WAIT state are fixed
-/// engine state bounded by the backlog and TIME-WAIT limits. Answers,
-/// segment-option callbacks and the cookie codec run inside the endpoint
+/// it is copied out, taking as much as the budget permits. Packet storage
+/// and event queues are reserved on the first environment's budget; socket
+/// and listener bookkeeping reserves further capacity there before growth.
+/// Answers, segment-option callbacks and the cookie codec run inside the endpoint
 /// and their allocations are not measured.
 pub struct TcpLayer {
     pub(super) addr: IpAddr,
@@ -534,6 +544,12 @@ pub struct TcpLayer {
     saturated: bool,
     /// The end went to the layer below.
     ended: bool,
+    /// How many sockets and listeners `storage` pays routing for; 0 until
+    /// the first budget paid the fixed storage.
+    storage_places: usize,
+    /// The fixed storage and routing, charged to the first budget the
+    /// engine sees. Last, so it is given back after what it pays for.
+    storage: Option<Charge>,
 }
 
 /// One listening port.
@@ -919,6 +935,8 @@ impl TcpLayer {
         iface.set_ignore_malformed_options(options.settings.ignore_malformed_options);
         iface.set_reset_closed_ports(options.settings.closed_port == ClosedPort::Reset);
         TcpLayer {
+            storage: None,
+            storage_places: 0,
             addr,
             iface,
             sockets: Sockets::new(),
@@ -967,8 +985,71 @@ impl TcpLayer {
     }
 
     /// Charges the buffers of one more socket, or `None` if they do not fit.
-    fn reserve(&self, budget: &Budget) -> Option<Charge> {
+    fn reserve(&mut self, budget: &Budget) -> Option<Charge> {
+        if !self.reserve_storage(budget) || !self.make_room() {
+            return None;
+        }
         budget.charge(2 * self.buffer)
+    }
+
+    /// Packet buffers and event queues have fixed limits. Socket and listener
+    /// routing grows on the same budget; its high water mark remains paid until
+    /// the engine drops, including empty hash buckets and reusable socket slots.
+    fn storage_bytes(places: usize) -> Option<usize> {
+        let fixed =
+            2 * UP_ROOM * size_of::<Up>() + 2 * EGRESS_PACKETS * (MTU + size_of::<Vec<u8>>());
+        // Include socket scheduling, child slots, connection and listener indexes,
+        // and the terminal events a batch of socket removals can produce.
+        // Four times the entries covers geometric vector/hash capacity and tree
+        // nodes, including a replacement socket set during compaction.
+        let entry = size_of::<Option<stcp::Socket<'static>>>()
+            + size_of::<Conn>()
+            + size_of::<Listen>()
+            + size_of::<Charge>()
+            + size_of::<Arc<Pages>>()
+            + size_of::<(SocketAddr, SocketAddr)>()
+            + 4 * size_of::<Up>()
+            + 32 * size_of::<usize>();
+        places.checked_mul(4 * entry)?.checked_add(fixed)
+    }
+
+    fn reserve_storage(&mut self, budget: &Budget) -> bool {
+        if self.storage_places != 0 {
+            return true;
+        }
+        let charge = self
+            .storage
+            .get_or_insert_with(|| budget.charge(0).unwrap());
+        let places = STORAGE_FLOOR;
+        let spare_bytes = Spare::PACKETS * size_of::<Vec<u8>>();
+        if !charge.grow_to(Self::storage_bytes(places).unwrap() + spare_bytes) {
+            return false;
+        }
+        let spare = charge.split(spare_bytes).unwrap().into_vec();
+        self.dev.spare = Spare(Some(spare));
+        self.up.reserve_exact(UP_ROOM);
+        self.urgent.reserve_exact(UP_ROOM);
+        self.dev.tx.reserve_exact(EGRESS_PACKETS);
+        self.dev.out.reserve_exact(EGRESS_PACKETS);
+        self.storage_places = places;
+        true
+    }
+
+    fn make_room(&mut self) -> bool {
+        if self.sockets.handles.len() + self.listeners.len() < self.storage_places {
+            return true;
+        }
+        let Some(places) = self.storage_places.checked_mul(2) else {
+            return false;
+        };
+        let Some(bytes) = Self::storage_bytes(places) else {
+            return false;
+        };
+        if !self.storage.as_mut().unwrap().grow_to(bytes) {
+            return false;
+        }
+        self.storage_places = places;
+        true
     }
 
     /// Adds a socket made by [`new_socket`], drawing its IPv4
@@ -1446,18 +1527,6 @@ impl TcpLayer {
         }
         // The options of an ACK that may complete a handshake.
         let completing = (before == Some(TcpState::SynReceived)).then(|| segment_options(t));
-        // A listening socket in an earlier slot must not take a SYN for
-        // a tuple that already belongs to a connection.
-        let mut idle = Vec::new();
-        if syn
-            && !ack
-            && handle.is_some()
-            && let Some(listener) = self.listeners.get(&dst.port())
-        {
-            for &id in &listener.idle {
-                idle.push((id, self.sockets.remove(id)));
-            }
-        }
         self.dev.rx = Some(packet);
         if let Some(h) = handle {
             self.iface.poll_ingress_targeted(
@@ -1472,9 +1541,6 @@ impl TcpLayer {
         }
         let consumed = self.dev.rx.is_none();
         self.dev.reclaim();
-        for (id, socket) in idle {
-            self.sockets.insert(id, socket);
-        }
         if let Some(h) = handle {
             if let Some(c) = self.conns.get_mut(&h)
                 && c.ecn
@@ -2203,7 +2269,7 @@ impl TcpLayer {
         let mut moved = false;
         while c.recv_credit > 0 && s.can_recv() && self.up.len() < UP_ROOM {
             let n = (c.recv_credit as usize).min(s.recv_queue()).min(DATA_MAX);
-            let Some(mut bytes) = ChargedBytes::with_capacity(budget, n) else {
+            let Some(mut bytes) = ChargedBytes::with_capacity_within(budget, 1..=n) else {
                 break;
             };
             // Copied straight out of the socket's ring, which may hand the
@@ -2356,6 +2422,9 @@ impl TcpLayer {
                 if self.listeners.contains_key(&port) || self.ports.contains_key(&port) {
                     return self.notice(TcpNotice::ListenFailed { port });
                 }
+                if !self.make_room() {
+                    return self.notice(TcpNotice::ListenFailed { port });
+                }
                 let backlog = backlog.map_or(self.backlog, |n| n.clamp(1, MAX_BACKLOG));
                 self.listeners.insert(
                     port,
@@ -2505,14 +2574,21 @@ impl TcpLayer {
             }
         }
         self.refresh_all(env.budget());
+        self.schedule(now);
+        self.primed = false;
+        self.stepped = Some(env.now());
+    }
+
+    fn schedule(&mut self, now: smoltcp::time::Instant) {
+        if self.dirty.is_empty() {
+            self.next_release = None;
+        }
         let at = self.iface.poll_at(now, &mut self.sockets.set);
         self.next = [at, self.next_release, self.next_expiry()]
             .into_iter()
             .flatten()
             .min()
             .map(unsmol);
-        self.primed = false;
-        self.stepped = Some(env.now());
     }
 
     fn flush_transmit(&mut self) {
@@ -2688,7 +2764,10 @@ impl Layer for TcpLayer {
         if self.stopped {
             return Ok(Admit::Closed(PacketEvent::Packet(packet)));
         }
-        if self.dev.full() || self.up.len() >= UP_ROOM {
+        if !self.reserve_storage(env.budget()) {
+            return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
+        }
+        if self.dev.full() || self.up.len() >= UP_ROOM || self.urgent.len() >= UP_ROOM {
             return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
         }
         if packet.sort() != Sort::Transport(Transport::Tcp) {
@@ -2714,10 +2793,26 @@ impl Layer for TcpLayer {
         env: &mut Env<'_, ()>,
         command: CommandOf<Self::Upper>,
     ) -> Result<Admit<CommandOf<Self::Upper>>, Infallible> {
+        if !self.reserve_storage(env.budget()) {
+            return Ok(Admit::Blocked(command));
+        }
         match self.refuses(command.op()) {
             Some(true) => return Ok(Admit::Closed(command)),
             Some(false) => return Ok(Admit::Blocked(command)),
             None => {}
+        }
+        // The commands that can repeat without end each add an event: a
+        // control its answer to `up`, a write its completion to `urgent`.
+        // Each waits for room in that queue alone, so a write never waits
+        // behind events the layer above refused. The rest add a bounded
+        // number per child.
+        let full = match command.op() {
+            MuxOp::Control(MessageCommand::Send(_)) => self.up.len() >= UP_ROOM,
+            MuxOp::Child(_, StreamCommand::Write(_)) => self.urgent.len() >= UP_ROOM,
+            _ => false,
+        };
+        if full {
+            return Ok(Admit::Blocked(command));
         }
         match command.into_op() {
             MuxOp::Control(MessageCommand::Send(control)) => self.control(env, control),
@@ -2762,18 +2857,27 @@ impl Layer for TcpLayer {
     }
 
     fn on_timer(&mut self, env: &mut Env<'_, ()>, (): ()) -> Result<bool, Infallible> {
+        if !self.reserve_storage(env.budget()) {
+            return Ok(false);
+        }
         // A step at this time already ran and found nothing to send yet;
         // another would find the same, so the timer is declined.
         if self.work || self.stepped != Some(env.now()) {
             self.work = true;
             return Ok(true);
         }
+        self.schedule(smol(env.now()));
         Ok(false)
     }
 
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
-        if !self.work {
+        if !self.reserve_storage(env.budget()) {
             return Ok(false);
+        }
+        if !self.work {
+            let before = (self.up.len(), self.urgent.len());
+            self.refresh_all(env.budget());
+            return Ok(before != (self.up.len(), self.urgent.len()));
         }
         self.step(env);
         Ok(true)

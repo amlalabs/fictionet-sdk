@@ -363,6 +363,34 @@ fn a_release_after_a_refusal_wakes_once() {
 // ---------------------------------------------------------------------------
 // Charged containers (src/stdlib/layer/charged.rs)
 
+/// Splitting a reservation into vector places neither charges twice nor
+/// permits growth beyond the whole items that were reserved.
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_charge_becomes_bounded_vector_places() {
+    let limit: u8 = kani::any();
+    for bytes in [0, 3, 5] {
+        let budget = Budget::new(limit as usize);
+        let Some(charge) = budget.charge(bytes) else {
+            assert!(bytes > limit as usize);
+            assert_eq!(budget.used(), 0);
+            continue;
+        };
+        let mut vector = charge.into_vec::<u16>();
+        let places = bytes / size_of::<u16>();
+        assert_eq!(vector.places(), places);
+        assert_eq!(budget.used(), places * size_of::<u16>());
+        for _ in 0..places {
+            let item: u16 = kani::any();
+            assert!(vector.push(item).is_ok());
+        }
+        assert!(vector.push(0).is_err());
+        assert_eq!(vector.charged(), budget.used());
+        drop(vector);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
 /// Bytes made from a charge are charged their capacity after every call:
 /// made, grown, written past their room by a writer that is undone, written
 /// within it, and trimmed, over every `u8` limit and byte. A growth the

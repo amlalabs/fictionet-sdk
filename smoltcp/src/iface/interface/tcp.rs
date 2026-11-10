@@ -13,19 +13,23 @@ impl InterfaceInner {
         }
         let packet = TcpPacket::new_checked(payload).ok()?;
         let tcp = TcpRepr::parse_with(&packet, &src, &dst, self.ignore_malformed_options).ok()?;
-        if let Some(target) = self.ingress_target
-            && let Some(socket) = sockets.try_get(target)
-            && socket.state() != crate::socket::tcp::State::Listen
-            && socket.accepts(self, &ip, &tcp)
-        {
-            return sockets
-                .get_mut(target)
-                .process(self, &ip, &tcp, packet.options());
-        }
-        let accepted = sockets
-            .iter()
-            .find(|(_, socket)| socket.accepts(self, &ip, &tcp))
-            .map(|(handle, _)| handle);
+        // The connection that owns the tuple: the segment is its or no
+        // socket's.
+        let owner = self.ingress_target.filter(|&target| {
+            sockets
+                .try_get(target)
+                .is_some_and(|socket| socket.state() != crate::socket::tcp::State::Listen)
+        });
+        let accepted = match owner {
+            Some(target) => sockets
+                .get(target)
+                .accepts(self, &ip, &tcp)
+                .then_some(target),
+            None => sockets
+                .iter()
+                .find(|(_, socket)| socket.accepts(self, &ip, &tcp))
+                .map(|(handle, _)| handle),
+        };
         if let Some(handle) = accepted {
             return sockets
                 .get_mut(handle)
