@@ -18,6 +18,17 @@ reassembly. The Kani harnesses in `kani/packet.rs` were rewritten for
 `CheckedIpPacket`. None of these has been run since that change; the
 results are those of the earlier code.
 
+The exception is the checksum, IPv4 header and UDP wire harnesses and
+their seven controls, rerun one at a time on 2026-11-10 (Kani 0.68.0, 8 GB
+cap) after that change and after the source address and UDP family fixes
+in `lean/README.md`; their rows below say so. Every proof passed and every
+control failed on exactly its named check. At that commit the crate does
+not compile under `cfg(kani)`, because the harnesses in
+`verification/layer/kani` and `verification/tls/kani` no longer match
+their code, so the rerun turned those two modules off in a scratch copy
+of the tree. The Lean proofs in `lean/` cover the same functions for all
+lengths (see its "Checksum, header and UDP" section).
+
 | Bug | Found by | Fix | Test |
 |---|---|---|---|
 | One IP layer fed two networks put their fragments together: the reassembly key has addresses, identification and protocol but no network, so a tunnel's first fragment and the world's last made one packet. | `Reassembly_unbound` | First each `IpLayer` dropped packets labelled with another network. Now each endpoint owns its `IpLayer` and its input, and input carrying several networks goes through `NetworkInput`, which passes on only one network's packets, before reassembly. | `packet::tests::inner_and_outer_fragments_with_one_key_stay_apart` |
@@ -144,13 +155,13 @@ assertions on. Each harness runs on its own; the files are included as
 
 | Harness | File | What it proves | Result |
 |---|---|---|---|
-| `parse_reads_exactly_the_declared_length` | `kani/udp_wire.rs` | for all bytes up to 12, `Datagram::parse` takes exactly a length field in 8..=len and reads that many bytes, empty payloads included | 0 of 188 checks failed |
-| `encoded_len_fits_one_ip_packet` | `kani/udp_wire.rs` | for every `usize` length, `encoded_len` refuses mixed families and accepts exactly what fits one IPv4 or IPv6 packet, so the 16-bit length never wraps | 0 of 100 failed |
-| `ipv4_datagrams_roundtrip_and_one_bit_fails_the_checksum` | `kani/udp_wire.rs` | any ports, payloads of 0 to 3 bytes: `encode` then `parse` give the ports and payload back, the checksum field is nonzero and verifies, and any one flipped bit outside the length field fails it, except a flip that zeroes an IPv4 checksum field (RFC 768's "no checksum") | 0 of 454 failed, 32 s |
-| `ipv6_datagrams_roundtrip_and_one_bit_fails_the_checksum` | `kani/udp_wire.rs` | the same over IPv6, where a zero field is never accepted | 0 of 454 failed, 32 s |
-| `checksum_matches_rfc_1071` | `kani/ip_header.rs` | for all bytes up to 9, `ip::checksum` equals RFC 1071 written plainly | 0 of 200 failed, 58 s |
-| `ipv4_reads_stay_inside_the_packet` | `kani/ip_header.rs` | for all IPv4 bytes up to 24, `parse` and `parse_truncated` give a payload from the header length to the total length (or the bytes present) | 0 of 489 failed |
-| `ipv4_check_requires_the_header_checksum` | `kani/ip_header.rs` | for all 24-byte IPv4 packets, `check` takes only a verifying header checksum and agrees with `parse`; `parse_whole` takes no fragment | 0 of 845 failed |
+| `parse_reads_exactly_the_declared_length` | `kani/udp_wire.rs` | for all bytes up to 12, `Datagram::parse` takes exactly a length field in 8..=len and reads that many bytes, empty payloads included | 0 of 188 checks failed (rerun 2026-11-10) |
+| `encoded_len_fits_one_ip_packet` | `kani/udp_wire.rs` | for every `usize` length, `encoded_len` refuses mixed families and accepts exactly what fits one IPv4 or IPv6 packet, so the 16-bit length never wraps | 0 of 100 failed (rerun 2026-11-10) |
+| `ipv4_datagrams_roundtrip_and_one_bit_fails_the_checksum` | `kani/udp_wire.rs` | any ports, payloads of 0 to 3 bytes: `encode` then `parse` give the ports and payload back, the checksum field is nonzero and verifies, and any one flipped bit outside the length field fails it, except a flip that zeroes an IPv4 checksum field (RFC 768's "no checksum") | 0 of 454 failed, 43 s (rerun 2026-11-10) |
+| `ipv6_datagrams_roundtrip_and_one_bit_fails_the_checksum` | `kani/udp_wire.rs` | the same over IPv6, where a zero field is never accepted | 0 of 454 failed, 57 s (rerun 2026-11-10) |
+| `checksum_matches_rfc_1071` | `kani/ip_header.rs` | for all bytes up to 9, `ip::checksum` equals RFC 1071 written plainly | 0 of 200 failed, 76 s (rerun 2026-11-10) |
+| `ipv4_reads_stay_inside_the_packet` | `kani/ip_header.rs` | for all IPv4 bytes up to 24, `parse` and `parse_truncated` give a payload from the header length to the total length (or the bytes present) | 0 of 495 failed (rerun 2026-11-10) |
+| `ipv4_check_requires_the_header_checksum` | `kani/ip_header.rs` | for all 24-byte IPv4 packets, `check` takes only a verifying header checksum and agrees with `parse`; `parse_whole` takes no fragment | 0 of 874 failed (rerun 2026-11-10) |
 | `ipv6_stripping_leaves_a_checked_packet` | `kani/ip_header.rs` | for all 56-byte IPv6 packets with 16 payload bytes starting with one or two 8-byte extension headers, a stripped packet is the original fixed header with the upper protocol (never an extension header) as next header, the upper bytes' length, and the upper bytes, read off the stripped bytes (`parse_whole` is not called on them; see below); fragments are never stripped | 0 of 1,100 failed, 68 s |
 | `checked_ipv4_packets_are_host_packets` | `kani/packet.rs` | for all 48-byte IPv4 packets with a 20-byte header and every origin, `CheckedIpPacket::checked` takes exactly whole non-fragment packets, with the header `parse_whole` reads and the sort `Sort::of` names; otherwise it hands the bytes back. The recorded run was of `IpPacket::checked`, which also refused an observed origin; an observed copy is now its own type | 0 of 1,698 failed, 49 s |
 | `checked_ipv6_packets_are_host_packets` | `kani/packet.rs` | the same for all 48-byte IPv6 packets, which must have no extension headers left | 0 of 1,696 failed, 131 s |
@@ -178,8 +189,8 @@ on exactly that check, and the proofs passed, in the integration run
 | `ipv4_datagrams_without_the_zero_checksum_exception` | `ipv4_datagrams_roundtrip_and_one_bit_fails_the_checksum` | drops RFC 768's exception for a flip that zeroes the checksum field | "one flipped bit fails the checksum" (1 of 346) |
 | `ipv6_datagrams_with_two_flipped_bits` | `ipv6_datagrams_roundtrip_and_one_bit_fails_the_checksum` | flips the same bit in two 16-bit words, which the sum cannot see when they go opposite ways | "two flipped bits fail the checksum" (1 of 511) |
 | `checksum_without_the_end_around_carry` | `checksum_matches_rfc_1071` | compares with RFC 1071 less its end-around carry | "the sum without its carry" (1 of 198) |
-| `ipv4_truncated_reads_to_the_total_length` | `ipv4_reads_stay_inside_the_packet` | claims a truncated read ends at the total length | "the payload ends at the total length" (1 of 484) |
-| `ipv4_parse_without_the_header_checksum` | `ipv4_check_requires_the_header_checksum` | claims of `parse` what holds of `check` | "a header read has a verifying checksum" (1 of 642) |
+| `ipv4_truncated_reads_to_the_total_length` | `ipv4_reads_stay_inside_the_packet` | claims a truncated read ends at the total length | "the payload ends at the total length" (1 of 490 in the 2026-11-10 rerun) |
+| `ipv4_parse_without_the_header_checksum` | `ipv4_check_requires_the_header_checksum` | claims of `parse` what holds of `check` | "a header read has a verifying checksum" (1 of 648 in the 2026-11-10 rerun) |
 | `ipv6_stripping_keeping_the_payload_length` | `ipv6_stripping_leaves_a_checked_packet` | claims a stripped packet keeps the original payload length | "the payload length is the original's" (1 of 631) |
 | `checked_ipv4_packets_without_the_header_checksum` | `checked_ipv4_packets_are_host_packets` | claims `checked` hands back only bytes `parse` cannot read | "only unreadable IPv4 bytes are handed back" (1 of 1,424) |
 | `checked_ipv6_packets_with_extension_headers_left` | `checked_ipv6_packets_are_host_packets` | claims `checked` takes every packet `parse_whole` takes | "every whole IPv6 packet is checked" (1 of 1,422) |
