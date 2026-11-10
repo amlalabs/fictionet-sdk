@@ -683,3 +683,19 @@ Seven Rust regressions failed with the old drain order and passed after both
 runners drained those reports before returning. The final worker-storage
 backpressure change passed its targeted Rust tests; formal reruns stopped at
 the user's request before that change.
+
+## Framed reservation harnesses on main `3db7a847e` (November 10, 2026)
+
+Three harnesses in `kani/framed.rs` were run alone, as
+`cargo kani -p fictionet -Z stubbing --exact --harness stdlib::layer::framed::proofs::framed::<name>`,
+under an 8 GB memory cap without swap:
+
+| Harness | Result |
+| --- | --- |
+| `encoding_is_not_called_without_its_reservation` | out of memory, 153 s |
+| `a_refused_write_keeps_its_value_and_writes_once_after_release` | out of memory, 144 s |
+| `a_refused_packet_keeps_its_value_and_writes_once_after_release` | out of memory, 145 s |
+
+No check failed. Each charges a budget, and CBMC runs out of memory on
+the budget's release and wake path, as recorded in
+`verification/layer/VERIFICATION.md` under "Kani on main `3db7a847e`".
