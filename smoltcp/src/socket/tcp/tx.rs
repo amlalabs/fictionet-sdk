@@ -24,6 +24,9 @@ pub const HEADROOM: usize = 120;
 /// a block with [`HEADROOM`]. When [`SEGMENTS`] chunks are held, the two
 /// neighbors with the fewest bytes are joined first. Blocks the store
 /// makes are charged to its budget, and a refusal refuses the write.
+/// Compaction allocates only the combined bytes; admission detaches
+/// excessive pinned slack before another write can exceed the window
+/// plus the bounded slack of its packet slots.
 #[derive(Debug)]
 pub(crate) struct TxStore {
     capacity: usize,
@@ -117,14 +120,46 @@ impl TxStore {
         }
         let gathered = short
             .then(|| {
-                let mut block = Chunk::block(&self.budget, HEADROOM, HEADROOM + SLOT)?;
+                let mut block = Chunk::block(&self.budget, HEADROOM, SLOT)?;
                 block.extend_within(&chunk).ok()?;
                 Some(block)
             })
             .flatten();
-        self.queued += chunk.len();
-        self.gathering = gathered.is_some();
-        self.chunks.push_back(gathered.unwrap_or(chunk));
+        // A small view must not pin an arbitrarily large application
+        // backing. Normal packet slots and whole writes stay untouched.
+        let gathering = gathered.is_some();
+        let bounded = match gathered {
+            Some(block) => Some(block),
+            None if chunk.capacity().saturating_sub(chunk.len()) >= SLOT => {
+                let Some(copy) = Chunk::copy_of(&self.budget, &chunk) else {
+                    return Err(chunk);
+                };
+                Some(copy)
+            }
+            None => None,
+        };
+        let incoming = bounded.as_ref().unwrap_or(&chunk).capacity();
+        let bound = self.capacity.saturating_add(SLOT + SEGMENTS * (SLOT - 1));
+        // A partial acknowledgement can leave a small view at the front
+        // of a large backing. Reclaim that slack before admitting enough
+        // new bytes to exceed the retention bound; ACK itself never needs
+        // to allocate or refuse.
+        while self.held().saturating_add(incoming) > bound {
+            let Some(held) = self.chunks.iter_mut().max_by_key(|c| c.capacity() - c.len()) else {
+                return Err(chunk);
+            };
+            let Some(copy) = Chunk::copy_of(&self.budget, held) else {
+                return Err(chunk);
+            };
+            *held = copy;
+        }
+        let mut kept = bounded.unwrap_or(chunk);
+        if kept.charged() == 0 && !kept.repay(&self.budget) {
+            return Err(kept);
+        }
+        self.queued += kept.len();
+        self.gathering = gathering;
+        self.chunks.push_back(kept);
         Ok(())
     }
 
@@ -133,7 +168,10 @@ impl TxStore {
         let i = (1..self.chunks.len())
             .min_by_key(|&i| self.chunks[i - 1].len() + self.chunks[i].len())
             .ok_or(super::rx::Full)?;
-        join_pair(&self.budget, HEADROOM, self.chunks.range_mut(i - 1..=i))?;
+        let len = self.chunks[i - 1].len() + self.chunks[i].len();
+        // Compaction must not increase retained capacity on a write that
+        // may still be refused. These combined chunks need no spare room.
+        join_pair(&self.budget, 0, len, self.chunks.range_mut(i - 1..=i))?;
         drop(self.chunks.remove(i));
         Ok(())
     }
@@ -156,7 +194,7 @@ impl TxStore {
         match self.locate(offset) {
             Some((i, at)) => {
                 let chunk = &self.chunks[i];
-                &chunk[at..chunk.len().min(at + len)]
+                &chunk[at..chunk.len().min(at.saturating_add(len))]
             }
             None => &[],
         }
@@ -168,12 +206,13 @@ impl TxStore {
         let (i, at) = self.locate(offset)?;
         let gathering = self.gathering && i + 1 == self.chunks.len();
         let chunk = &mut self.chunks[i];
-        let range = at..chunk.len().min(at + len);
+        let range = at..chunk.len().min(at.saturating_add(len));
         let writable_tail = gathering && chunk.room() > 0;
         (!range.is_empty()).then_some(Piece {
             chunk,
             range,
             writable_tail,
+            probe: false,
         })
     }
 
@@ -203,9 +242,15 @@ pub struct Piece<'a> {
     chunk: &'a mut Chunk,
     range: Range<usize>,
     writable_tail: bool,
+    pub(super) probe: bool,
 }
 
 impl Piece<'_> {
+    /// This byte probes a closed receive window and uses control storage.
+    pub fn is_probe(&self) -> bool {
+        self.probe
+    }
+
     /// The payload's bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.chunk[self.range.clone()]

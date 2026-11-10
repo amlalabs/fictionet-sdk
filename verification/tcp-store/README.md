@@ -22,7 +22,28 @@ reads, writes and acknowledgements, at windows of 4 KiB, 64 KiB and
 the same assembler after every step, with the stores' bounds on chunks and
 memory.
 
-None of these has been run yet. To run one:
+The receive regressions also exercise descending overlaps from large
+packet backings and refusal while preparing more than one detached piece.
+Ordinary packet-sized contributions of at least 128 bytes are retained
+without copying. A clipped view with more than one packet slot of unused
+backing is detached so it cannot pin arbitrary reassembly storage.
+
+Transmit compaction keeps only the combined payload capacity. Admission
+reclaims excessive backing retained after partial acknowledgements before
+accepting more bytes; refusal keeps the offered chunk and the queued byte
+stream intact. The tested bound is the send window plus one slot plus
+64 times the maximum pinned slack of a packet slot. Tests retain an
+earlier emitted packet during reclamation and check that its bytes do not
+change. An active short-write tail stays unique while its outgoing pieces
+are copied, allowing later writes to gather while packets are in flight.
+
+The socket regression refuses a payload carrying FIN, checks that neither
+EOF nor its sequence number is accepted, then frees memory and delivers
+the retransmission. Established and locally closing states are covered.
+
+The receive Kani harnesses allow unwinding the fixed array of pending
+pieces as well as their symbolic stream operations. The harnesses have
+been written but not run. To run one:
 
 ```sh
 cargo kani -p smoltcp --harness rx_insert_keeps_retained_equal_to_the_union_of_accepted_ranges

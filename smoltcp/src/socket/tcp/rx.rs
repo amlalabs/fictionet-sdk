@@ -26,7 +26,8 @@ pub(crate) struct Full;
 /// Bytes the application may read (`ready`, in order) and bytes received
 /// out of order (`waiting`, by offset from the first byte not yet ready).
 /// Each is a chunk of the segment it arrived in, so a segment of at least
-/// [`SMALL`] bytes is kept with no copy while a chunk is free. The window
+/// [`SMALL`] bytes is kept with no copy while a chunk is free, unless its
+/// clipped view would pin more than a slot of unused backing. The window
 /// is the capacity less the bytes ready and unread, as a ring's was;
 /// bytes waiting out of order do not shrink it, and are bounded by it.
 ///
@@ -136,15 +137,24 @@ impl RxStore {
         } else {
             payload
         };
-        let mut at = offset;
-        loop {
-            let gap = self.gaps(at, end).next();
-            let Some((start, stop)) = gap else {
-                return Ok(());
+        // A clipped contribution from an overlapping jumbo packet must not
+        // pin the whole reassembly allocation. Prepare every needed copy
+        // before changing the ranges, so a refusal keeps all input out.
+        let mut pending: [Option<(usize, Chunk)>; SEGMENTS] = [const { None }; SEGMENTS];
+        for (place, (start, stop)) in pending.iter_mut().zip(self.gaps(offset, end)) {
+            let range = start - offset..stop - offset;
+            let piece = if payload.capacity().saturating_sub(range.len()) > SLOT {
+                Chunk::copy_of(&self.budget, &payload[range]).ok_or(Full)?
+            } else {
+                payload.slice(range)
             };
-            self.place(start, payload.slice(start - offset..stop - offset));
-            at = stop;
+            *place = Some((start, piece));
         }
+        for place in &mut pending[..pieces] {
+            let (start, piece) = place.take().expect("every gap was prepared");
+            self.place(start, piece);
+        }
+        Ok(())
     }
 
     /// The ranges within `start..end` that no waiting chunk holds.
@@ -200,17 +210,17 @@ impl RxStore {
             let ((a, x), (b, y)) = (&self.waiting[i - 1], &self.waiting[i]);
             (a + x.len() == *b).then_some((x.len() + y.len(), Side::Waiting(i)))
         });
-        let Some((_, side)) = ready.chain(waiting).min_by_key(|(len, _)| *len) else {
+        let Some((len, side)) = ready.chain(waiting).min_by_key(|(len, _)| *len) else {
             return Err(Full);
         };
         match side {
             Side::Ready(i) => {
-                join_pair(&self.budget, 0, self.ready.range_mut(i - 1..=i))?;
+                join_pair(&self.budget, 0, SLOT.max(2 * len), self.ready.range_mut(i - 1..=i))?;
                 drop(self.ready.remove(i));
             }
             Side::Waiting(i) => {
                 let pair = self.waiting.range_mut(i - 1..=i).map(|(_, c)| c);
-                join_pair(&self.budget, 0, pair)?;
+                join_pair(&self.budget, 0, SLOT.max(2 * len), pair)?;
                 drop(self.waiting.remove(i));
             }
         }
@@ -298,33 +308,23 @@ enum Side {
 
 /// Gathers the second of two neighboring chunks onto the first, which then
 /// holds both: in place when the first has room no other piece shares,
-/// otherwise in a new block with `headroom` that takes its place. The
+/// otherwise in a new block with `headroom` followed by `capacity` bytes
+/// that takes its place. The capacity must hold both pieces. The
 /// caller drops the second after. Refuses, changing nothing, when the
 /// budget refuses the block.
 pub(crate) fn join_pair<'a>(
     budget: &Budget,
     headroom: usize,
+    capacity: usize,
     mut pair: impl Iterator<Item = &'a mut Chunk>,
 ) -> Result<(), Full> {
     let (first, second) = (pair.next().expect("two"), pair.next().expect("two"));
     if first.extend_within(second).is_err() {
-        *first = joined(budget, headroom, first, second).ok_or(Full)?;
+        let mut block = Chunk::block(budget, headroom, headroom + capacity).ok_or(Full)?;
+        block.extend_within(first).expect("the first piece fits");
+        block.extend_within(second).expect("both pieces fit");
+        *first = block;
     }
     Ok(())
 }
 
-/// `first` then `second` in a new block with `headroom`, room for twice
-/// their bytes and at least a slot, charged to `budget`. `None` when the
-/// budget refuses.
-pub(crate) fn joined(
-    budget: &Budget,
-    headroom: usize,
-    first: &Chunk,
-    second: &Chunk,
-) -> Option<Chunk> {
-    let len = first.len() + second.len();
-    let mut block = Chunk::block(budget, headroom, headroom + SLOT.max(2 * len))?;
-    block.extend_within(first).ok()?;
-    block.extend_within(second).ok()?;
-    Some(block)
-}

@@ -11,6 +11,8 @@ enum Step {
     Verified,
     /// `make_mut` changed a byte.
     Edit,
+    /// `get_mut` changed a uniquely held packet.
+    EditUnique,
     /// `header_mut` changed a byte of the IP header.
     HeaderEdit,
     /// It was cloned, or taken apart into its chunk and made again.
@@ -21,7 +23,8 @@ enum Step {
 /// cloning and taking the chunk out and back, a flag is set only if the
 /// stack set it and no later edit could have changed what it covers: any
 /// `make_mut` clears both flags, `header_mut` clears `ip_header` and keeps
-/// `transport`, and moving the packet keeps both. Equality ignores flags,
+/// `transport`, and rebuilding a packet from its chunk clears both.
+/// `get_mut` clears both when it returns writable bytes. Equality ignores flags,
 /// and an edit that changed a byte changes the bytes compared.
 #[kani::proof]
 #[kani::unwind(5)]
@@ -32,10 +35,11 @@ fn checksum_flags_clear_on_any_byte_change() {
     let mut ip_header = false;
     let mut transport = false;
     for _ in 0..3 {
-        let step = match kani::any::<u8>() % 4 {
+        let step = match kani::any::<u8>() % 5 {
             0 => Step::Verified,
             1 => Step::Edit,
             2 => Step::HeaderEdit,
+            3 => Step::EditUnique,
             _ => Step::Moved,
         };
         match step {
@@ -67,12 +71,20 @@ fn checksum_flags_clear_on_any_byte_change() {
                 packet.header_mut(&budget).unwrap()[0] = value;
                 ip_header = false;
             }
+            Step::EditUnique => {
+                let shared = kani::any::<bool>().then(|| packet.clone());
+                if let Some(bytes) = packet.get_mut() {
+                    bytes[0] = kani::any();
+                    (ip_header, transport) = (false, false);
+                }
+                drop(shared);
+            }
             Step::Moved => {
                 if kani::any() {
                     packet = packet.clone();
                 } else {
-                    let flags = packet.checksums();
-                    packet = Packet::verified(packet.into_chunk(), flags);
+                    packet = Packet::from_chunk(packet.into_chunk());
+                    (ip_header, transport) = (false, false);
                 }
             }
         }

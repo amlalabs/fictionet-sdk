@@ -32,7 +32,7 @@ fn segment(at: usize, len: usize) -> Chunk {
 /// holds, waiting or taken, are exactly those of the union of the two
 /// ranges, each the stream's byte at its offset, never a second copy.
 #[kani::proof]
-#[kani::unwind(8)]
+#[kani::unwind(66)]
 #[kani::solver(minisat)]
 fn rx_insert_keeps_retained_equal_to_the_union_of_accepted_ranges() {
     let mut store = RxStore::new(WINDOW, Budget::unlimited());
@@ -60,7 +60,7 @@ fn rx_insert_keeps_retained_equal_to_the_union_of_accepted_ranges() {
 /// Whatever is committed and read, in any amounts, the window is the
 /// capacity less the bytes ready and unread, as the ring's was.
 #[kani::proof]
-#[kani::unwind(8)]
+#[kani::unwind(66)]
 #[kani::solver(minisat)]
 fn rx_window_is_capacity_minus_unread() {
     let mut store = RxStore::new(WINDOW, Budget::unlimited());

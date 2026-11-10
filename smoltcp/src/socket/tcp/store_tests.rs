@@ -21,7 +21,80 @@ fn rx_bound(capacity: usize) -> usize {
 
 /// The same for sending, where every block the store makes has headroom.
 fn tx_bound(capacity: usize) -> usize {
-    2 * capacity + SEGMENTS * (HEADROOM + SLOT.max(MSS))
+    capacity + SLOT + SEGMENTS * (SLOT - 1)
+}
+
+#[test]
+fn transmit_compaction_stays_within_one_window_of_payload() {
+    let capacity = 1024 * 1024;
+    let mut store = TxStore::new(capacity, Budget::unlimited());
+    for _ in 0..2 * SEGMENTS {
+        store.push(paid(&vec![0; capacity / (2 * SEGMENTS)])).unwrap();
+        assert!(store.held() <= tx_bound(capacity));
+    }
+}
+
+#[test]
+fn a_partial_ack_does_not_pin_an_extra_window_on_the_next_write() {
+    let capacity = 1024 * 1024;
+    let mut store = TxStore::new(capacity, Budget::unlimited());
+    let bytes: Vec<_> = (0..capacity).map(byte).collect();
+    let mut chunk = Chunk::block(&Budget::unlimited(), HEADROOM, HEADROOM + bytes.len()).unwrap();
+    chunk.extend_within(&bytes).unwrap();
+    store.push(chunk).unwrap();
+    let packet = store.piece(0, capacity).unwrap().in_place(40, |p| p[..40].fill(0)).unwrap();
+    store.ack(capacity - SMALL);
+    store.push(paid(&bytes[..capacity - SMALL])).unwrap();
+    assert!(store.held() <= tx_bound(capacity));
+    assert_eq!(store.bytes(0, SMALL), &bytes[capacity - SMALL..]);
+    let mut offset = SMALL;
+    while offset < capacity {
+        let piece = store.bytes(offset, MSS);
+        assert_eq!(piece, &bytes[offset - SMALL..offset - SMALL + piece.len()]);
+        offset += piece.len();
+    }
+    assert_eq!(&packet[40..], bytes);
+}
+
+#[test]
+fn writes_refused_for_retention_keep_ownership_and_bytes() {
+    let capacity = 1024 * 1024;
+    let budget = Budget::new(capacity);
+    let mut store = TxStore::new(capacity, budget.clone());
+    store.push(paid(&vec![1; capacity])).unwrap();
+    store.ack(capacity - SMALL);
+    let blocked = budget.charge(budget.limit()).unwrap();
+    let write = paid(&vec![2; capacity - SMALL]);
+    let original = write.clone();
+    let refused = store.push(write).unwrap_err();
+    assert!(refused.shares(&original));
+    assert_eq!(store.len(), SMALL);
+    assert_eq!(store.bytes(0, SMALL), &[1; SMALL]);
+    drop(blocked);
+    store.push(refused).unwrap();
+    assert!(store.held() <= tx_bound(capacity));
+}
+
+#[test]
+fn unpaid_writes_are_charged_before_retention() {
+    let budget = Budget::new(0);
+    let mut store = TxStore::new(4 * SLOT, budget);
+    let write = Chunk::unpaid(vec![1; SMALL]);
+    let original = write.clone();
+    let refused = store.push(write).unwrap_err();
+    assert!(refused.shares(&original));
+    assert!(store.is_empty());
+}
+
+#[test]
+fn a_piece_request_can_extend_past_the_address_space() {
+    let mut store = TxStore::new(SLOT, Budget::unlimited());
+    let bytes: Vec<_> = (0..SMALL).map(byte).collect();
+    store.push(paid(&bytes)).unwrap();
+    for offset in 1..bytes.len() {
+        assert_eq!(store.bytes(offset, usize::MAX), &bytes[offset..]);
+        assert_eq!(store.piece(offset, usize::MAX).unwrap().bytes(), &bytes[offset..]);
+    }
 }
 
 /// `bytes` paid for by a budget of their own, as a segment comes from the
@@ -271,6 +344,45 @@ fn what_the_store_keeps_is_paid_for() {
         store.commit(chunk);
     }
     while store.pop(usize::MAX).is_some() {}
+    assert_eq!(budget.used(), 0);
+}
+
+/// Overlapping packets clipped at the window's edge must not each pin a
+/// large reassembly allocation for the few new bytes they contribute.
+#[test]
+fn clipped_waiting_pieces_do_not_pin_large_packets() {
+    for piece_length in [1, SMALL, 2 * SMALL] {
+        let capacity = 2 * SMALL * SEGMENTS;
+        let mut store = RxStore::new(capacity, Budget::unlimited());
+        for count in 1..=SEGMENTS {
+            let length = count * piece_length;
+            let offset = capacity - length;
+            let bytes: Vec<_> = (offset..offset + 32 * SLOT).map(byte).collect();
+            let packet = paid(&bytes);
+            store.insert(offset, &packet.slice(0..length)).unwrap();
+            assert!(store.held() <= rx_bound(capacity));
+            assert!(store.descriptors() <= SEGMENTS);
+            for (at, kept) in store.waiting() {
+                assert!(kept.iter().enumerate().all(|(i, &b)| b == byte(at + i)));
+            }
+        }
+        assert_eq!(store.waiting().map(|(_, bytes)| bytes.len()).sum::<usize>(), SEGMENTS * piece_length);
+    }
+}
+
+/// Detaching several new pieces is atomic if the budget fits the first
+/// copy but refuses another one from the same overlapping segment.
+#[test]
+fn a_refused_detachment_keeps_all_waiting_bytes_unchanged() {
+    let budget = Budget::new(2);
+    let mut store = RxStore::new(16, budget.clone());
+    store.insert(2, &paid(&[byte(2)])).unwrap();
+    let before: Vec<_> = store.waiting().map(|(at, bytes)| (at, bytes.to_vec())).collect();
+    let bytes: Vec<_> = (0..2 * SLOT).map(byte).collect();
+    let packet = paid(&bytes);
+    assert!(store.insert(0, &packet.slice(0..4)).is_err());
+    let after: Vec<_> = store.waiting().map(|(at, bytes)| (at, bytes.to_vec())).collect();
+    assert_eq!(after, before);
     assert_eq!(budget.used(), 0);
 }
 
