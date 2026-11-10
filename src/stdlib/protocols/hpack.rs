@@ -254,6 +254,37 @@ impl Field {
         }
     }
 }
+
+/// A header field to encode, borrowed from wherever its octets live, so
+/// encoding a block copies nothing before it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldRef<'a> {
+    /// Name octets, at most [`MAX_STRING`].
+    pub name: &'a [u8],
+    /// Value octets, at most [`MAX_STRING`].
+    pub value: &'a [u8],
+    /// Keep the field out of every table.
+    pub never_index: bool,
+}
+impl<'a> FieldRef<'a> {
+    /// A field with this name and value, which a table may keep.
+    pub fn new(name: &'a [u8], value: &'a [u8]) -> Self {
+        Self {
+            name,
+            value,
+            never_index: false,
+        }
+    }
+}
+impl<'a> From<&'a Field> for FieldRef<'a> {
+    fn from(field: &'a Field) -> Self {
+        Self {
+            name: &field.name,
+            value: &field.value,
+            never_index: field.never_index,
+        }
+    }
+}
 impl Wire for Field {
     type ParseError = Error;
     type WriteError = Error;
@@ -426,7 +457,7 @@ pub struct Entry<'a> {
 /// Consumers supply the capacity and track whether older entries are known.
 #[derive(Clone, Debug, Default)]
 pub struct DynamicTable {
-    entries: VecDeque<(Arc<[u8]>, Vec<u8>)>,
+    entries: VecDeque<Slot>,
     size: usize,
 }
 impl DynamicTable {
@@ -474,7 +505,14 @@ impl DynamicTable {
 
     /// Inserts a known field. Call [`Self::evict`] with the consumer's capacity.
     pub fn insert(&mut self, name: Arc<[u8]>, value: Vec<u8>) {
+        // The value keeps exactly its own octets.
+        let value = value.into_boxed_slice();
         self.size += name.len() + value.len() + ENTRY_OVERHEAD;
+        if self.entries.len() == self.entries.capacity() {
+            // The slots double, from four, so [`Self::most_held`] bounds
+            // them.
+            self.entries.reserve_exact(self.entries.capacity().max(4));
+        }
         self.entries.push_front((name, value));
     }
 
@@ -511,14 +549,32 @@ impl DynamicTable {
     }
     /// Allocated dynamic-table storage, including entry slots and string capacity.
     pub fn held(&self) -> usize {
-        self.entries.capacity() * std::mem::size_of::<(Arc<[u8]>, Vec<u8>)>()
+        self.entries.capacity() * size_of::<Slot>()
             + self
                 .entries
                 .iter()
-                .map(|(name, value)| name.len() + value.capacity())
+                .map(|(name, value)| name.len() + value.len())
                 .sum::<usize>()
     }
+    /// The most [`held`](Self::held) reaches while each insert is followed
+    /// by an [`evict`](Self::evict) to at most `capacity`. What stays fits
+    /// `capacity`: at most `capacity / ENTRY_OVERHEAD` entries, whose
+    /// octets come to at most `capacity`. The slots grow only when an
+    /// insert finds them all full, so they double from at most that many
+    /// entries, or start at four.
+    pub fn most_held(capacity: usize) -> usize {
+        let entries = capacity / ENTRY_OVERHEAD;
+        entries
+            .saturating_mul(2)
+            .max(4)
+            .saturating_mul(size_of::<Slot>())
+            .saturating_add(capacity)
+    }
 }
+
+/// One dynamic table entry: its name, which entries may share, and its
+/// value.
+type Slot = (Arc<[u8]>, Box<[u8]>);
 
 /// The retained complete fields of one decoded endpoint header block.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -604,6 +660,12 @@ impl Table {
     /// Allocated dynamic-table storage, including spare entry slots.
     pub fn held(&self) -> usize {
         self.table.held()
+    }
+    /// The most [`held`](Self::held) reaches while neither the settings
+    /// limit nor the table's capacity rises above what it is now: the
+    /// peer can raise the capacity to the settings limit at any block.
+    pub fn most_held(&self) -> usize {
+        DynamicTable::most_held(self.settings.max(self.max))
     }
     /// The number of retained table entries.
     pub fn table_len(&self) -> usize {
@@ -723,6 +785,12 @@ impl Encoder {
     pub fn held(&self) -> usize {
         self.table.held()
     }
+    /// The most [`held`](Self::held) reaches while the table's capacity
+    /// stays at most what it is now: it rises only by
+    /// [`set_capacity`](Self::set_capacity).
+    pub fn most_held(&self) -> usize {
+        DynamicTable::most_held(self.table.max)
+    }
     /// Applies the peer's settings limit, capped at [`MAX_TABLE`].
     /// A reduction shrinks the table and queues the required size update.
     /// Send the SETTINGS acknowledgment before the next block: the update
@@ -755,21 +823,17 @@ impl Encoder {
     /// strings above [`MAX_STRING`], or total name and value bytes above
     /// [`MAX_DECODED`], with [`Error::Unwritable`]. Both output and table stay
     /// unchanged on error. Field order and never-indexed flags are preserved.
-    pub fn encode_block(&mut self, fields: &[Field], out: &mut Vec<u8>) -> Result<(), Error> {
-        if fields.len() > MAX_HEADERS {
-            return Err(Error::Unwritable);
-        }
-        let mut size = 0usize;
-        for field in fields {
-            size = size
-                .checked_add(field.name.len())
-                .and_then(|n| n.checked_add(field.value.len()))
-                .ok_or(Error::Unwritable)?;
-            if field.name.len() > MAX_STRING || field.value.len() > MAX_STRING || size > MAX_DECODED
-            {
-                return Err(Error::Unwritable);
-            }
-        }
+    ///
+    /// `fields` is read twice, to check them and then to write them, so it
+    /// is anything that can be gone through again: a slice of [`Field`]s,
+    /// or a cheap view of fields that live elsewhere, borrowed as
+    /// [`FieldRef`]s, so nothing is copied before the block is written.
+    pub fn encode_block<'a, I>(&mut self, fields: I, out: &mut Vec<u8>) -> Result<(), Error>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Into<FieldRef<'a>>,
+    {
+        checked(fields.clone())?;
         // Length checks and fixed prefixes cover all fallible writes below.
         let pending_min = self.pending_min;
         let start = out.len();
@@ -782,7 +846,39 @@ impl Encoder {
             }
         }
     }
-    fn write_block(&mut self, fields: &[Field], out: &mut Vec<u8>) -> Result<(), Error> {
+    /// The most bytes [`encode_block`](Self::encode_block) appends for
+    /// `fields` now, found without writing: any size update still owed,
+    /// and each field as a literal with a new name behind the largest
+    /// index the block can reach, its strings without Huffman coding,
+    /// which is used only when shorter. `None` if `encode_block` would
+    /// refuse the fields.
+    pub fn block_bound<'a, I>(&self, fields: I) -> Option<usize>
+    where
+        I: IntoIterator,
+        I::Item: Into<FieldRef<'a>>,
+    {
+        let (count, strings) = checked(fields).ok()?;
+        let updates = self.pending_min.map_or(0, |min| {
+            let capacity = self.table.max;
+            prefix_int::len(5, min as u64)
+                + if capacity != min {
+                    prefix_int::len(5, capacity as u64)
+                } else {
+                    0
+                }
+        });
+        // Each field the block writes may add an entry before the next.
+        let index = STATIC_TABLE.len() + self.table.table.len() + count;
+        count
+            .checked_mul(prefix_int::len(4, index as u64))?
+            .checked_add(strings)?
+            .checked_add(updates)
+    }
+    fn write_block<'a, I>(&mut self, fields: I, out: &mut Vec<u8>) -> Result<(), Error>
+    where
+        I: IntoIterator,
+        I::Item: Into<FieldRef<'a>>,
+    {
         if let Some(min) = self.pending_min.take() {
             put_integer(out, 5, 0x20, min as u64)?;
             let capacity = self.table.max;
@@ -791,6 +887,7 @@ impl Encoder {
             }
         }
         for field in fields {
+            let field: FieldRef<'_> = field.into();
             let entries = STATIC_TABLE
                 .iter()
                 .map(|(n, v)| (n.as_bytes(), v.as_bytes()))
@@ -799,7 +896,7 @@ impl Encoder {
                         .table
                         .entries
                         .iter()
-                        .map(|(n, v)| (n.as_ref(), v.as_slice())),
+                        .map(|(n, v)| (n.as_ref(), v.as_ref())),
                 );
             let mut name_index = 0;
             let mut exact = None;
@@ -827,18 +924,49 @@ impl Encoder {
             };
             put_integer(out, prefix, flags, name_index as u64)?;
             if name_index == 0 {
-                put_string(out, &field.name, self.huffman)?;
+                put_string(out, field.name, self.huffman)?;
             }
-            put_string(out, &field.value, self.huffman)?;
+            put_string(out, field.value, self.huffman)?;
             if !field.never_index && self.table.max != 0 {
                 self.table
                     .table
-                    .insert(field.name.as_slice().into(), field.value.clone());
+                    .insert(field.name.into(), field.value.to_vec());
                 self.table.table.evict(self.table.max);
             }
         }
         Ok(())
     }
+}
+
+/// Checks fields an encoder would write: at most [`MAX_HEADERS`], no
+/// string above [`MAX_STRING`], and at most [`MAX_DECODED`] name and value
+/// bytes in all. Returns how many there are, and the most bytes their
+/// strings take written, length prefixes included.
+fn checked<'a, I>(fields: I) -> Result<(usize, usize), Error>
+where
+    I: IntoIterator,
+    I::Item: Into<FieldRef<'a>>,
+{
+    let (mut count, mut size, mut strings) = (0usize, 0usize, 0usize);
+    for field in fields {
+        let field: FieldRef<'_> = field.into();
+        count += 1;
+        size = size
+            .checked_add(field.name.len())
+            .and_then(|n| n.checked_add(field.value.len()))
+            .ok_or(Error::Unwritable)?;
+        if count > MAX_HEADERS
+            || field.name.len() > MAX_STRING
+            || field.value.len() > MAX_STRING
+            || size > MAX_DECODED
+        {
+            return Err(Error::Unwritable);
+        }
+        for string in [field.name, field.value] {
+            strings += prefix_int::len(7, string.len() as u64) + string.len();
+        }
+    }
+    Ok((count, strings))
 }
 
 fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
@@ -1065,6 +1193,70 @@ mod tests {
                 assert_eq!(encoder.table_size(), size);
             }
         }
+    }
+
+    /// Random blocks through an encoder and a decoder that share settings:
+    /// every block is within the bound found before it was written, a
+    /// block of borrowed fields is the same as one of owned fields, and
+    /// neither table holds more than its bound.
+    #[test]
+    fn blocks_and_tables_stay_within_their_bounds() {
+        use fictionet::{Entropy, Seed, SeededEntropy};
+        let names: [&[u8]; 5] = [b":status", b"content-type", b"x-a", b"set-cookie", b"date"];
+        let mut widest = 0;
+        for seed in 0..32 {
+            let rng = SeededEntropy::new(Seed::from_u64(seed));
+            let below = |n: usize| rng.random_below(n as u64) as usize;
+            let settings = [0, 64, 256, 4096][below(4)];
+            let mut encoder = Encoder::new(settings);
+            encoder.set_huffman(below(2) == 0);
+            let mut decoder = Table::new(settings);
+            let (encoder_most, decoder_most) = (encoder.most_held(), decoder.most_held());
+            let mut values: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..64 {
+                let mut fields = Vec::new();
+                for _ in 0..below(12) {
+                    let name = if below(4) == 0 {
+                        let mut name = vec![0; below(40)];
+                        rng.fill_random(&mut name);
+                        name
+                    } else {
+                        names[below(names.len())].to_vec()
+                    };
+                    let value = if !values.is_empty() && below(2) == 0 {
+                        values[below(values.len())].clone()
+                    } else {
+                        let text = below(2) == 0;
+                        let mut value = vec![0; below(300)];
+                        rng.fill_random(&mut value);
+                        if text {
+                            value.iter_mut().for_each(|b| *b = b'a' + *b % 26);
+                        }
+                        values.push(value.clone());
+                        value
+                    };
+                    let mut field = Field::new(name, value);
+                    field.never_index = below(8) == 0;
+                    fields.push(field);
+                }
+                let bound = encoder.block_bound(&fields).unwrap();
+                let borrowed: Vec<FieldRef<'_>> = fields.iter().map(FieldRef::from).collect();
+                let mut twin = encoder.clone();
+                let mut out = Vec::new();
+                encoder.encode_block(&fields, &mut out).unwrap();
+                let mut again = Vec::new();
+                twin.encode_block(borrowed.iter().copied(), &mut again)
+                    .unwrap();
+                assert_eq!(again, out, "borrowed fields encode as owned ones do");
+                assert!(out.len() <= bound, "{} past its bound {bound}", out.len());
+                widest = widest.max(out.len());
+                let block = decoder.decode_block(&out, MAX_DECODED).unwrap();
+                assert_eq!(block.headers, fields);
+                assert!(encoder.held() <= encoder_most);
+                assert!(decoder.held() <= decoder_most);
+            }
+        }
+        assert!(widest > 1000, "some blocks were large");
     }
 
     #[test]
