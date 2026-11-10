@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::SystemTime;
 
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::network::{Connection, ConnectionExt, tcp};
 use fictionet::stdlib::services::tls::{self, ServerConfig};
 use fictionet::time::ms;
@@ -255,7 +256,9 @@ mod contract {
     async fn connected(fcx: &Cx, server: bool) -> (Box<dyn Connection>, Arc<Mutex<Peer>>) {
         let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let (ca, leaf) = certs::issue(fcx, "Test CA", &["secret.test"]).unwrap();
-        let config = leaf.server_config(fcx, start).unwrap();
+        let config = leaf
+            .server_config(fcx, start, &Budget::unlimited())
+            .unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(ca.cert_der()).unwrap();
         let client_config =

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::protocols::asn1::{BitString, Oid, StringKind, Writer};
 use fictionet::stdlib::services::keys::{Key, KeyKind};
 use fictionet::stdlib::{protocols::x509, services::tls};
@@ -374,18 +375,21 @@ impl Leaf {
         })
     }
 
-    /// Builds a TLS server configuration using the run's clock and randomness.
+    /// Builds a TLS server configuration using the run's clock and
+    /// randomness, its [`session_store`](tls::session_store) paid for from
+    /// `sessions`, the budget of whatever keeps the configuration.
     pub fn server_config(
         self,
         fcx: &Cx,
         start: SystemTime,
+        sessions: &Budget,
     ) -> Result<Arc<tls::ServerConfig>, Error> {
-        Ok(Arc::new(
-            tls::config_builder(fcx, start)
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(self.chain, self.key)?,
-        ))
+        let mut config = tls::config_builder(fcx, start)
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(self.chain, self.key)?;
+        config.session_storage = tls::session_store(sessions)?;
+        Ok(Arc::new(config))
     }
 }
 
@@ -628,7 +632,7 @@ mod tests {
                     assert!(verify("other.test", 1_800_000_000).is_err());
                     assert!(verify("example.test", 2_100_000_000).is_err());
                     *output.lock() = leaf.chain[0].to_vec();
-                    leaf.server_config(&fcx, SystemTime::UNIX_EPOCH)?;
+                    leaf.server_config(&fcx, SystemTime::UNIX_EPOCH, &Budget::unlimited())?;
                     Ok(())
                 },
             ))

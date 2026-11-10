@@ -35,11 +35,13 @@ fn copied() -> tls::Factory {
     tls::Factory::new(|opening| {
         fictionet_copied_tls::TlsLayer::selecting(move |cx, hello| {
             let selected = (opening.select)(cx, hello.server_name().map(str::to_owned));
-            let cx = opening.cx.clone();
+            let (cx, budget) = (opening.cx.clone(), opening.budget.clone());
             async move {
                 let selected = selected.await?;
                 Some(Arc::new(
-                    selected.rustls_config(&cx, SystemTime::UNIX_EPOCH).ok()?,
+                    selected
+                        .rustls_config(&cx, SystemTime::UNIX_EPOCH, &budget)
+                        .ok()?,
                 ))
             }
         })

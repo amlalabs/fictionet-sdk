@@ -80,7 +80,7 @@ fn connected(
     let config = ca
         .issue(cx, &["layer.example"], validity)
         .unwrap()
-        .server_config(cx, start)
+        .server_config(cx, start, &Budget::unlimited())
         .unwrap();
     let client_config = Arc::new(
         super::super::client_config_builder(cx, start)

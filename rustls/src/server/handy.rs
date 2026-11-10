@@ -96,14 +96,39 @@ mod cache {
     /// most 255 bytes, encodes in less.
     pub const SLOT_VALUE: usize = 1024;
 
-    /// One session: its key and its encoding, in place.
-    struct Slot {
-        key: [u8; SLOT_KEY],
+    /// How much of a slot holds a session, and when it was put.
+    #[derive(Clone, Copy)]
+    struct Held {
         key_len: u8,
-        value: [u8; SLOT_VALUE],
         value_len: u16,
         /// When it was put, to drop the oldest first; 0 while free.
         put: u64,
+    }
+
+    /// The slots: keys, encodings and what each holds, side by side, so
+    /// the keys and encodings are zeroed memory the system hands out
+    /// untouched, and a slot's pages are written only once a session is
+    /// put in it.
+    struct Slots {
+        keys: Vec<[u8; SLOT_KEY]>,
+        values: Vec<[u8; SLOT_VALUE]>,
+        held: Vec<Held>,
+        clock: u64,
+    }
+
+    impl Slots {
+        /// The slot holding a session under `key`.
+        fn find(&self, key: &[u8]) -> Option<usize> {
+            (0..self.held.len()).find(|&slot| {
+                let held = self.held[slot];
+                held.put != 0 && self.keys[slot][..usize::from(held.key_len)] == *key
+            })
+        }
+
+        /// The encoding in `slot`.
+        fn value(&self, slot: usize) -> Vec<u8> {
+            self.values[slot][..usize::from(self.held[slot].value_len)].to_vec()
+        }
     }
 
     /// Sessions in slots made and paid for once, when the store is made: a
@@ -112,41 +137,39 @@ mod cache {
     /// it is gone. A session whose key or encoding does not fit a slot is
     /// not kept. When every slot is taken, the oldest session goes.
     pub struct ServerSessionSlots {
-        slots: Mutex<(Vec<Slot>, u64)>,
+        slots: Mutex<Slots>,
         _paid: crate::budget::Paid,
     }
 
     impl ServerSessionSlots {
         /// A store for `size` sessions, paid for by `budget` now and for
-        /// its life: `size` slots of [`SLOT_KEY`] and [`SLOT_VALUE`] bytes.
-        /// `None`, making nothing, if the budget has no room.
+        /// its life: `size` slots of [`SLOT_KEY`] and [`SLOT_VALUE`] bytes
+        /// and what each holds. `None`, making nothing, if the budget has
+        /// no room.
         #[cfg(feature = "std")]
         pub fn with_budget(
             size: usize,
             budget: Arc<dyn crate::budget::BufferBudget>,
         ) -> Option<Arc<Self>> {
+            let slot = SLOT_KEY + SLOT_VALUE + size_of::<Held>();
             let mut paid = crate::budget::Paid::open(&Some(budget));
-            if !paid.grow_by(size.checked_mul(size_of::<Slot>())?) {
+            if !paid.grow_by(size.checked_mul(slot)?) {
                 return None;
             }
-            let mut slots = Vec::with_capacity(size);
-            slots.extend((0..size).map(|_| Slot {
-                key: [0; SLOT_KEY],
+            let free = Held {
                 key_len: 0,
-                value: [0; SLOT_VALUE],
                 value_len: 0,
                 put: 0,
-            }));
+            };
             Some(Arc::new(Self {
-                slots: Mutex::new((slots, 0)),
+                slots: Mutex::new(Slots {
+                    keys: alloc::vec![[0; SLOT_KEY]; size],
+                    values: alloc::vec![[0; SLOT_VALUE]; size],
+                    held: alloc::vec![free; size],
+                    clock: 0,
+                }),
                 _paid: paid,
             }))
-        }
-
-        fn find<'a>(slots: &'a mut [Slot], key: &[u8]) -> Option<&'a mut Slot> {
-            slots
-                .iter_mut()
-                .find(|slot| slot.put != 0 && &slot.key[..usize::from(slot.key_len)] == key)
         }
     }
 
@@ -155,40 +178,37 @@ mod cache {
             if key.len() > SLOT_KEY || value.len() > SLOT_VALUE {
                 return false;
             }
-            let mut guard = self.slots.lock().unwrap();
-            let (slots, clock) = &mut *guard;
-            *clock += 1;
-            let now = *clock;
-            let slot = match slots
-                .iter()
-                .position(|slot| slot.put != 0 && slot.key[..usize::from(slot.key_len)] == key[..])
-            {
-                Some(found) => &mut slots[found],
-                // A free slot, or the oldest.
-                None => match slots.iter_mut().min_by_key(|slot| slot.put) {
-                    Some(slot) => slot,
-                    None => return false,
-                },
+            let mut slots = self.slots.lock().unwrap();
+            slots.clock += 1;
+            let put = slots.clock;
+            // The slot already under this key, a free slot, or the oldest.
+            let Some(slot) = slots
+                .find(&key)
+                .or_else(|| (0..slots.held.len()).min_by_key(|&slot| slots.held[slot].put))
+            else {
+                return false;
             };
-            slot.key[..key.len()].copy_from_slice(&key);
-            slot.key_len = key.len() as u8;
-            slot.value[..value.len()].copy_from_slice(&value);
-            slot.value_len = value.len() as u16;
-            slot.put = now;
+            slots.keys[slot][..key.len()].copy_from_slice(&key);
+            slots.values[slot][..value.len()].copy_from_slice(&value);
+            slots.held[slot] = Held {
+                key_len: key.len() as u8,
+                value_len: value.len() as u16,
+                put,
+            };
             true
         }
 
         fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-            let mut guard = self.slots.lock().unwrap();
-            let slot = Self::find(&mut guard.0, key)?;
-            Some(slot.value[..usize::from(slot.value_len)].to_vec())
+            let slots = self.slots.lock().unwrap();
+            let slot = slots.find(key)?;
+            Some(slots.value(slot))
         }
 
         fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
-            let mut guard = self.slots.lock().unwrap();
-            let slot = Self::find(&mut guard.0, key)?;
-            slot.put = 0;
-            Some(slot.value[..usize::from(slot.value_len)].to_vec())
+            let mut slots = self.slots.lock().unwrap();
+            let slot = slots.find(key)?;
+            slots.held[slot].put = 0;
+            Some(slots.value(slot))
         }
 
         fn can_cache(&self) -> bool {

@@ -278,7 +278,7 @@ pub(crate) const RECORD_OVERHEAD: usize = 5 + 8 + 16;
 /// into records of at most `fragment` bytes of payload.
 pub(crate) fn handshake_room(more: usize, fragment: usize) -> (usize, usize) {
     let payload = HANDSHAKE_ROOM + more;
-    let records = HANDSHAKE_RECORDS + payload.div_ceil(fragment);
+    let records = HANDSHAKE_RECORDS + (payload + fragment - 1) / fragment;
     (payload + records * RECORD_OVERHEAD, records)
 }
 

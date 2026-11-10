@@ -100,6 +100,9 @@ struct Oracle {
     fixed: i128,
     /// What the budget does not count for this stack by design.
     slack: i128,
+    /// What may stay allocated once the stack is dropped: `slack`, unless
+    /// [`Oracle::nothing_left`] says nothing.
+    left: Option<i128>,
     /// The most the stack held past its charge and `fixed`.
     worst: i128,
     most_used: usize,
@@ -114,6 +117,7 @@ impl Oracle {
             held: 0,
             fixed: 0,
             slack: SLACK,
+            left: None,
             worst: i128::MIN,
             most_used: 0,
             checks: 0,
@@ -124,6 +128,13 @@ impl Oracle {
     /// [`SLACK`].
     fn slack(mut self, bytes: i128) -> Oracle {
         self.slack = bytes;
+        self
+    }
+
+    /// Allows nothing to stay allocated once the stack is dropped: for a
+    /// stack whose state outside the connection is made before it starts.
+    fn nothing_left(mut self) -> Oracle {
+        self.left = Some(0);
         self
     }
 
@@ -180,7 +191,7 @@ impl Oracle {
             self.held,
         );
         assert!(
-            self.held <= self.slack,
+            self.held <= self.left.unwrap_or(self.slack),
             "{}: {} bytes stayed allocated after the stack was dropped",
             self.stack,
             self.held
@@ -423,7 +434,7 @@ fn tls_bulk_holds_no_heap_its_budget_does_not_cover() {
         let budget = Budget::new(256 << 10);
         // rustls's own buffers are charged to the same budget: nothing
         // the connection holds is allowed for.
-        let mut oracle = Oracle::new("TLS", &budget).slack(TLS_SLACK);
+        let mut oracle = Oracle::new("TLS", &budget).slack(TLS_SLACK).nothing_left();
         let mut h = oracle.step(|| {
             Harness::with_budget(
                 Seed::from_u64(12),
