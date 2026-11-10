@@ -1919,7 +1919,8 @@ fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
         assert!(
             output
                 .iter()
-                .any(|f| matches!(f, Frame::Reset(r) if r.code == 7))
+                .any(|f| matches!(f, Frame::Reset(r) if r.code == 7)),
+            "reset attempt {n}: {output:?}"
         );
         assert_eq!(harness.ended(), n == 1024);
         if n == 1024 {
@@ -1930,6 +1931,37 @@ fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
             );
         }
     }
+}
+
+#[test]
+fn protocol_errors_use_reserved_output_when_the_budget_is_full() {
+    let budget = fictionet::stdlib::layer::Budget::new(h2_input() + 1024);
+    let mut harness = budgeted(
+        Responder::new(fictionet_test_support::handler(|_, _| {
+            http::Response::new(Bytes::new())
+        })),
+        budget.clone(),
+    );
+    push(&mut harness, &preface());
+    let _other = budget.charge(budget.limit() - budget.used()).unwrap();
+    let mut invalid = http2::FrameHeader {
+        length: 4,
+        kind: 8,
+        flags: 0,
+        stream: 0,
+    }
+    .to_array()
+    .unwrap()
+    .to_vec();
+    invalid.extend_from_slice(&[0; 4]);
+    let output = frames(&push(&mut harness, &invalid));
+    assert!(
+        output
+            .iter()
+            .any(|frame| matches!(frame, Frame::GoAway(goaway)
+        if goaway.code == http2::ErrorCode::ProtocolError as u32))
+    );
+    assert!(harness.ended());
 }
 
 #[test]

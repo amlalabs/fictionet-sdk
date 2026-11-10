@@ -99,9 +99,9 @@ const KEEP: usize = 8;
 /// that makes the server reset more than 1024 streams for its errors, or
 /// resets more than 20 streams the server has not taken in yet, loses the
 /// connection with `ENHANCE_YOUR_CALM`. Everything the connection holds is
-/// charged to its budget before it is allocated: what has a bound, input
-/// storage, HPACK state, the list of recent resets and the lists of
-/// streams, at its bound when the connection opens; stream state, request
+/// charged to its budget before it is allocated: input and header assembly
+/// share a frame-sized allowance and pay for growth beyond it; stream
+/// lists when streams are admitted; stream state, request
 /// heads and bodies, events for the children and output frames as they
 /// come. Past the budget, the connection sends GOAWAY with
 /// `ENHANCE_YOUR_CALM` and ends.
@@ -111,8 +111,7 @@ pub struct Http2 {
     /// The chunk of input being read, all of one delivery.
     input: Option<Chunk>,
     peer_ended: bool,
-    frames: codec::Stream<Inputs>,
-    headers: wire::HeaderBlocks,
+    codec: InputState,
     encoder: hpack::Encoder,
     streams: BTreeMap<u32, Stream>,
     children: Option<Slots<u32>>,
@@ -164,10 +163,7 @@ pub struct Http2 {
     runnable: ChargedDeque<u32>,
     /// Streams whose next frame waits for the connection's send window.
     awaiting_window: ChargedDeque<u32>,
-    /// What the frame decoder, header assembly, HPACK in both directions
-    /// and the `Date` headers may hold, charged at their bounds when the
-    /// connection opens.
-    bounded: Option<Charge>,
+    dates_storage: Option<Charge>,
     last_words: Option<Charge>,
     /// The request an HTTP/1 `Upgrade: h2c` brought, for stream 1.
     upgrade: Option<(Opening, Option<Chunk>)>,
@@ -183,6 +179,83 @@ enum Phase {
     /// The end is queued behind the output.
     Closing,
     Closed,
+}
+
+/// The decoder and header assembly share their reservation: consumed wire
+/// input can give its storage back before a header block is decoded. Every
+/// allocating operation reserves its bound first. A frame-sized floor keeps
+/// input and control progress possible while streams exhaust the budget.
+struct InputState {
+    frames: codec::Stream<Inputs>,
+    headers: wire::HeaderBlocks,
+    storage: Option<Charge>,
+}
+
+impl InputState {
+    fn new(limits: Limits) -> Self {
+        Self {
+            frames: codec::Stream::new(Inputs::client_side(wire::DEFAULT_FRAME_SIZE)),
+            headers: wire::HeaderBlocks::with_limits(wire::Limits {
+                header_list: limits.head.head,
+                header_block: limits.head.head,
+                ..wire::Limits::default()
+            }),
+            storage: None,
+        }
+    }
+
+    fn open(&mut self, budget: &Budget) -> Option<()> {
+        self.storage = Some(budget.charge(self.frames.limit())?);
+        Some(())
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Option<usize> {
+        let capacity = self.frames.allocated();
+        let bound = self.frames.capacity_for(bytes.len());
+        if !self
+            .storage
+            .as_mut()?
+            .grow_to(bound.saturating_add(self.headers.allocated()))
+        {
+            return None;
+        }
+        let n = self
+            .frames
+            .push_with_budget(bytes, bound.saturating_sub(capacity));
+        self.release();
+        Some(n)
+    }
+
+    fn read_headers(&mut self, frame: &Frame) -> Option<Result<wire::BlockRead, wire::Error>> {
+        let headers = self.headers.read_bound(frame);
+        let mut bound = self.frames.allocated().saturating_add(headers);
+        if bound > self.storage.as_ref()?.bytes() {
+            self.frames.shrink();
+            bound = self.frames.allocated().saturating_add(headers);
+        }
+        if !self.storage.as_mut()?.grow_to(bound) {
+            return None;
+        }
+        let result = self.headers.read_frame(frame);
+        self.release();
+        Some(result)
+    }
+
+    fn trim(&mut self) {
+        self.frames.shrink();
+        self.release();
+    }
+
+    fn release(&mut self) {
+        let held = self
+            .frames
+            .allocated()
+            .saturating_add(self.headers.allocated());
+        self.storage
+            .as_mut()
+            .unwrap()
+            .shrink_to(held.max(self.frames.limit()));
+    }
 }
 
 struct Stream {
@@ -342,12 +415,7 @@ impl Http2 {
             phase: Phase::Opening,
             input: None,
             peer_ended: false,
-            frames: codec::Stream::new(Inputs::client_side(wire::DEFAULT_FRAME_SIZE)),
-            headers: wire::HeaderBlocks::with_limits(wire::Limits {
-                header_list: limits.head.head,
-                header_block: limits.head.head,
-                ..wire::Limits::default()
-            }),
+            codec: InputState::new(limits),
             encoder: hpack::Encoder::new(0),
             streams: BTreeMap::new(),
             children: None,
@@ -379,7 +447,7 @@ impl Http2 {
             finished: ChargedVec::new(&none, 0),
             runnable: ChargedDeque::new(&none, 0),
             awaiting_window: ChargedDeque::new(&none, 0),
-            bounded: None,
+            dates_storage: None,
             last_words: None,
             upgrade: None,
             dates: Dates::new(None),
@@ -431,29 +499,21 @@ impl Http2 {
         self.streams.len()
     }
 
-    /// Charges what the connection holds from the start: its bounded state
-    /// at its bounds, the list of recent resets and the lists of streams
-    /// at theirs, all the places they can need, and the places the growing
-    /// queues keep. `None` if the budget has no room; what was charged by
-    /// then is held until the connection is dropped.
+    /// Reserves an input allowance, dates and the small queue floor.
+    /// Admitting streams reserves their list places.
     fn hold(&mut self, budget: &Budget) -> Option<()> {
-        // The server never raises its frame size or its HPACK table size,
-        // and its encoder's table stays empty, so these bounds stay.
-        let bounded = self
-            .frames
-            .most_allocated()
-            .saturating_add(self.headers.most_allocated())
-            .saturating_add(self.encoder.most_held())
-            .saturating_add(self.dates.held());
-        self.bounded = Some(budget.charge(bounded)?);
-        self.resets = ChargedDeque::with_places(budget, RESET_MAX, RESET_MAX)?;
+        // The server never raises its input frame size, and its encoder's
+        // table stays empty.
+        self.codec.open(budget)?;
+        self.dates_storage = Some(budget.charge(self.dates.held())?);
+        self.resets = ChargedDeque::with_places(budget, KEEP, RESET_MAX)?;
         // Each open stream is in each list of streams at most once.
         let streams = self.limits.streams as usize;
-        self.credit_due = ChargedVec::with_places(budget, streams, streams)?;
-        self.touched = ChargedVec::with_places(budget, streams, streams)?;
-        self.finished = ChargedVec::with_places(budget, streams, streams)?;
-        self.runnable = ChargedDeque::with_places(budget, streams, streams)?;
-        self.awaiting_window = ChargedDeque::with_places(budget, streams, streams)?;
+        self.credit_due = ChargedVec::with_places(budget, KEEP, streams)?;
+        self.touched = ChargedVec::with_places(budget, KEEP, streams)?;
+        self.finished = ChargedVec::with_places(budget, KEEP, streams)?;
+        self.runnable = ChargedDeque::with_places(budget, KEEP, streams)?;
+        self.awaiting_window = ChargedDeque::with_places(budget, KEEP, streams)?;
         self.up = ChargedDeque::with_places(budget, KEEP, usize::MAX)?;
         self.sent = ChargedDeque::with_places(budget, KEEP, usize::MAX)?;
         Some(())
@@ -600,8 +660,7 @@ impl Http2 {
     /// Ends the connection for `error`: GOAWAY, then the end.
     fn fail(&mut self, env: &mut Env<'_, Report>, error: wire::Error) {
         env.report(Report::Failed(error));
-        self.goaway(env, error.code, self.last_stream);
-        self.close();
+        self.finish(error.code);
     }
 
     /// Ends the connection once what is queued is written. Every exchange
@@ -646,13 +705,19 @@ impl Http2 {
         for piece in self.sent.drain(first + keep..) {
             self.unwritten_bytes -= piece.bytes as usize;
         }
+        self.finish(ErrorCode::EnhanceYourCalm);
+    }
+
+    /// Terminal errors use the reserved final frame, so a refusal already
+    /// queued for a stream does not lose its place to another allocation.
+    fn finish(&mut self, code: ErrorCode) {
         if let Some(charge) = self.last_words.take() {
             let goaway = wire::GoAway {
                 flags: 0,
                 last_stream: self
                     .last_stream
                     .min(self.goaway_last.unwrap_or(wire::MAX_WINDOW)),
-                code: ErrorCode::EnhanceYourCalm as u32,
+                code: code as u32,
                 debug: Vec::new(),
             };
             let mut bytes = charge.into_bytes();
@@ -685,11 +750,17 @@ impl Http2 {
             id,
             false,
         );
-        // A closed connection reads no more frames to ignore. The list has
-        // places for its most, paid for at the start: once full, it
-        // remembers no more.
-        if self.phase == Phase::Open && !self.ignored(id) {
-            let _ = self.resets.push_back((id, env.now() + RESET_LIFETIME));
+        // A closed connection reads no more frames to ignore. Once the
+        // bounded list is full, it remembers no more.
+        if self.phase == Phase::Open
+            && !self.ignored(id)
+            && self.resets.len() < RESET_MAX
+            && self
+                .resets
+                .push_back((id, env.now() + RESET_LIFETIME))
+                .is_err()
+        {
+            self.over_budget(env);
         }
     }
 
@@ -733,7 +804,23 @@ impl Http2 {
         let head = env.budget().charge(request_held(&opening.request));
         // Places for its first two events and, from now on, for the event
         // that ends it.
-        let room = self.up.reserve(3 + self.streams.len());
+        let streams = self.streams.len() + 1;
+        let room = self.up.reserve(2 + streams)
+            && self
+                .credit_due
+                .reserve(streams.saturating_sub(self.credit_due.len()))
+            && self
+                .touched
+                .reserve(streams.saturating_sub(self.touched.len()))
+            && self
+                .finished
+                .reserve(streams.saturating_sub(self.finished.len()))
+            && self
+                .runnable
+                .reserve(streams.saturating_sub(self.runnable.len()))
+            && self
+                .awaiting_window
+                .reserve(streams.saturating_sub(self.awaiting_window.len()));
         let (Some(entry), Some(head), true) = (entry, head, room) else {
             return self.reset(env, id, ErrorCode::RefusedStream);
         };
@@ -1185,7 +1272,11 @@ impl Http2 {
         } else {
             self.continuations = 0;
         }
-        let headers = self.headers.read_frame(&frame)?;
+        let Some(headers) = self.codec.read_headers(&frame) else {
+            self.over_budget(env);
+            return Ok(());
+        };
+        let headers = headers?;
         match frame {
             // A stream that depends on itself is a stream error (RFC 9113
             // section 5.3.1). Its block was decoded above, so HPACK stays in step.
@@ -1329,7 +1420,7 @@ impl Http2 {
                 // connection instead, as section 5.4.1 allows.
                 let priority = header.kind == 2;
                 let idle = header.stream > self.last_stream || header.stream & 1 == 0;
-                if !self.received_settings || self.headers.pending() || (!priority && idle) {
+                if !self.received_settings || self.codec.headers.pending() || (!priority && idle) {
                     Err(problem(
                         ErrorCode::ProtocolError,
                         "invalid frame on an idle stream or inside headers",
@@ -1363,17 +1454,20 @@ impl Http2 {
                 return (moved, false);
             }
             if let Some(chunk) = &mut self.input {
-                let n = self.frames.push(chunk);
+                let Some(n) = self.codec.push(chunk) else {
+                    self.over_budget(env);
+                    return (true, false);
+                };
                 chunk.advance(n);
                 if chunk.is_empty() {
                     self.input = None;
                 }
                 moved |= n > 0;
             }
-            if self.input.is_none() && self.peer_ended && !self.frames.is_eof() {
-                self.frames.end();
+            if self.input.is_none() && self.peer_ended && !self.codec.frames.is_eof() {
+                self.codec.frames.end();
             }
-            match self.frames.next() {
+            match self.codec.frames.next() {
                 Some(Ok(item)) => {
                     moved = true;
                     if let Err(error) = self.on_input(env, item) {
@@ -1800,7 +1894,7 @@ impl Layer for Http2 {
                 // One delivery at a time, read whole before the next, and
                 // none while the transport falls behind. The delivery keeps
                 // whatever charge it came with: the bytes are read from it
-                // into the frame buffer, which is held at its bound.
+                // into the frame buffer, charged before each growth.
                 if self.input.is_some() || self.unwritten_bytes >= OUT_LIMIT {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                 }
@@ -1909,6 +2003,7 @@ impl Layer for Http2 {
             self.resets.pop_front();
             forgot = true;
         }
+        self.resets.shrink_to(KEEP.max(self.resets.len()));
         Ok(forgot)
     }
 
@@ -1953,6 +2048,19 @@ impl Layer for Http2 {
             // connection ends with no GOAWAY.
             self.close();
             moved = true;
+        }
+        if self.input.is_none()
+            && !self.codec.headers.pending()
+            && self.streams.values().all(|stream| stream.receive.closed)
+        {
+            self.codec.trim();
+        }
+        if self.streams.is_empty() {
+            self.credit_due.shrink_to(KEEP);
+            self.touched.shrink_to(KEEP);
+            self.finished.shrink_to(KEEP);
+            self.runnable.shrink_to(KEEP);
+            self.awaiting_window.shrink_to(KEEP);
         }
         Ok(moved)
     }
@@ -3768,11 +3876,45 @@ mod tests {
         .unwrap();
     }
 
-    /// The frame decoder's input, header assembly and the HPACK table
-    /// grow to their bounds, and the connection is charged nothing past
-    /// what it was charged when it opened: they were paid for then.
     #[test]
-    fn state_at_its_bounds_was_paid_for_when_the_connection_opened() {
+    fn idle_connection_does_not_reserve_unused_input_and_stream_lists() {
+        let budget = Budget::unlimited();
+        let mut harness = Harness::with_budget(
+            fictionet::Seed::from_u64(6),
+            Http2::new(Limits::default()),
+            budget.clone(),
+        );
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        let http = harness.layer();
+        let queues = KEEP
+            * (size_of::<MuxEvent<HttpExchange, Top, Opening>>()
+                + size_of::<StreamCommand>()
+                + size_of::<Piece>()
+                + 5 * size_of::<u32>());
+        let slots_budget = Budget::unlimited();
+        let _slots =
+            Slots::<u32>::with_budget(http.limits.streams as usize, &slots_budget).unwrap();
+        let model = http.codec.frames.limit()
+            + queues
+            + slots_budget.used()
+            + http.dates.held()
+            + LAST_WORDS;
+        eprintln!(
+            "idle HTTP/2 charge: {}; previous-layout model: {model}",
+            budget.used()
+        );
+        assert!(
+            budget.used() <= model,
+            "idle charge {} exceeds {model}",
+            budget.used()
+        );
+    }
+
+    /// Input and assembly grow during a request and give their storage
+    /// back when it ends. The persistent table stays within its reservation.
+    #[test]
+    fn grown_state_returns_to_the_idle_reservation() {
         use fictionet::stdlib::layer::{Chain, Children};
         let budget = Budget::unlimited();
         let server = Chain::new(
@@ -3836,9 +3978,9 @@ mod tests {
         write(&data, &mut burst);
         harness.push(&burst).unwrap();
         let http = harness.layer().lower();
-        assert!(http.frames.allocated() > http.frames.limit());
+        assert!(http.codec.frames.allocated() > http.codec.frames.limit());
         assert!(
-            http.headers.allocated() > 4096,
+            http.codec.headers.allocated() > 4096,
             "the table holds more than its settings limit"
         );
         // The client gives up on the stream: what it held goes.
