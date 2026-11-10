@@ -1,6 +1,7 @@
 //! A byte stream carrying whole packets with a four-byte big-endian length.
 
 use core::convert::Infallible;
+use fictionet::Packet;
 use fictionet::stdlib::layer::{
     Admit, ByteStream, ChargedBytes, Chunk, Env, Layer, PacketCommand, PacketEvent, Packets,
     StreamCommand, StreamEvent,
@@ -26,7 +27,7 @@ pub struct Framed {
     /// The packet being read, in room for exactly the length its prefix
     /// gave, paid for before it was allocated.
     body: Option<ChargedBytes>,
-    packet: Option<PacketEvent<Chunk>>,
+    packet: Option<PacketEvent<Packet>>,
     output: Option<StreamCommand>,
     ended: bool,
     output_end: bool,
@@ -60,7 +61,7 @@ impl Framed {
 
 impl Layer for Framed {
     type Lower = ByteStream;
-    type Upper = Packets<Chunk, Chunk>;
+    type Upper = Packets<Packet, Packet>;
     type Report = Infallible;
     type Timer = ();
     type Work = Infallible;
@@ -133,7 +134,7 @@ impl Layer for Framed {
         if body.room() == 0
             && let Some(body) = self.body.take()
         {
-            self.packet = Some(PacketEvent::Packet(Chunk::from(body)));
+            self.packet = Some(PacketEvent::Packet(Packet::from_chunk(Chunk::from(body))));
             self.prefix_len = 0;
         }
         Ok(if bytes.is_empty() {
@@ -146,8 +147,8 @@ impl Layer for Framed {
     fn on_command(
         &mut self,
         env: &mut Env<'_, Infallible>,
-        command: PacketCommand<Chunk>,
-    ) -> Result<Admit<PacketCommand<Chunk>>, FrameError> {
+        command: PacketCommand<Packet>,
+    ) -> Result<Admit<PacketCommand<Packet>>, FrameError> {
         if self.output_end {
             return Ok(Admit::Closed(command));
         }
@@ -179,7 +180,7 @@ impl Layer for Framed {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.output.take()
     }
-    fn take_event(&mut self) -> Option<PacketEvent<Chunk>> {
+    fn take_event(&mut self) -> Option<PacketEvent<Packet>> {
         self.packet.take()
     }
 }
@@ -196,7 +197,9 @@ mod tests {
             let expected: Vec<_> = (0..len).collect();
             let budget = Budget::new(4096);
             let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), budget.clone());
-            let packet = Chunk::from(ChargedBytes::copy_of(&budget, &expected).unwrap());
+            let packet = Packet::from_chunk(Chunk::from(
+                ChargedBytes::copy_of(&budget, &expected).unwrap(),
+            ));
             let pointer = packet.as_ptr();
             let paid = budget.used();
             let held = budget.charge(budget.limit() - paid).unwrap();
@@ -277,7 +280,7 @@ mod tests {
             stack.settle().unwrap();
             let Admit::Closed(PacketCommand::Send(packet)) = stack
                 .driver()
-                .command(PacketCommand::Send(Chunk::unpaid(b"late".to_vec())))
+                .command(PacketCommand::Send(Packet::new(b"late".to_vec())))
                 .unwrap()
             else {
                 panic!("output has ended");
@@ -310,7 +313,7 @@ mod tests {
         assert!(
             stack
                 .driver()
-                .command(PacketCommand::Send(Chunk::unpaid(b"first".to_vec())))
+                .command(PacketCommand::Send(Packet::new(b"first".to_vec())))
                 .unwrap()
                 .moved()
         );
@@ -318,11 +321,11 @@ mod tests {
         assert!(
             stack
                 .driver()
-                .command(PacketCommand::Send(Chunk::unpaid(b"second".to_vec())))
+                .command(PacketCommand::Send(Packet::new(b"second".to_vec())))
                 .unwrap()
                 .moved()
         );
-        let third = PacketCommand::Send(Chunk::unpaid(b"third".to_vec()));
+        let third = PacketCommand::Send(Packet::new(b"third".to_vec()));
         let Admit::Blocked(third) = stack.driver().command(third).unwrap() else {
             panic!("both output places are occupied");
         };

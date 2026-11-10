@@ -79,6 +79,16 @@ impl Whole for Chunk {
     }
 }
 
+impl Whole for fictionet::Packet {
+    fn len(&self) -> usize {
+        fictionet::Packet::len(self)
+    }
+
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        self.repay(budget)
+    }
+}
+
 impl<M> Whole for Datagram<M> {
     fn len(&self) -> usize {
         self.payload().len()

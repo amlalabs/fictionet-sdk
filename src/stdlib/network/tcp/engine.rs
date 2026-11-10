@@ -4,7 +4,7 @@
 //! [`TcpLayer`] owns everything one machine's TCP keeps: the smoltcp
 //! context and socket set, the listeners with their backlogs and SYN
 //! cookies, the handshake answers and segment options a listener supplies,
-//! the buffers and their pages, keepalive, retransmission and TIME-WAIT,
+//! the chunks each connection retains, keepalive, retransmission and TIME-WAIT,
 //! the orphans of closed connections, and what a closed port or a SYN from
 //! port 0 gets. Its time and entropy come from the [`Env`] of each call; it
 //! never polls an interface, sleeps, spawns a task or wakes one.
@@ -16,15 +16,16 @@
 //! [`Children`](fictionet::stdlib::layer::Children).
 
 use super::*;
+use fictionet::{Checksums, Packet};
 
 use core::convert::Infallible;
 use std::sync::Weak;
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, Child, ChildId, Chunk, Closing, CommandOf,
-    Env, EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
-    PacketEvent, Packets, Pool, Slots, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Charge, Child, ChildId, Chunk, Closing, CommandOf, Env, EventOf,
+    Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand, PacketEvent,
+    Packets, Pool, Slots, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::packet::{CheckedIpPacket, Sort};
@@ -189,9 +190,9 @@ impl Sequences {
 #[derive(Default)]
 pub(super) struct Output {
     /// What smoltcp sent since the endpoint last looked at its packets.
-    pub(super) tx: Vec<Chunk>,
+    pub(super) tx: Vec<Packet>,
     /// Packets the endpoint has looked at, for the layer below to take.
-    out: VecDeque<Chunk>,
+    out: VecDeque<Packet>,
     /// Where smoltcp's packets are written, once the engine's storage is
     /// reserved.
     pool: Option<Pool>,
@@ -210,17 +211,31 @@ impl Output {
         self.tx.len() + self.out.len() >= EGRESS_PACKETS
     }
 
-    /// Write the IP and TCP headers and payload into a charged packet block.
-    fn emit(&mut self, ip: smoltcp::wire::IpRepr, tcp: TcpRepr<'_>) -> Result<(), ()> {
+    /// Writes one segment: the IP and TCP headers in front of `piece`, the
+    /// payload the socket retains, or of the payload `tcp` carries itself.
+    /// A piece that is all of a chunk the socket alone holds, with room for
+    /// the headers in front, goes out as that chunk, with no copy; any
+    /// other is copied after the headers into a block of the pool. The
+    /// sums are computed here, so the packet is marked verified.
+    fn emit(
+        &mut self,
+        ip: smoltcp::wire::IpRepr,
+        tcp: TcpRepr<'_>,
+        piece: Option<stcp::Piece<'_>>,
+    ) -> Result<(), ()> {
         if self.full() {
             return Err(());
         }
         assert!(!IpAddr::from(ip.dst_addr()).is_unspecified());
-        if ip.buffer_len() > MTU {
+        let len = ip.buffer_len();
+        if len > MTU {
             return Ok(());
         }
-        let len = ip.buffer_len();
-        let fill = |bytes: &mut [u8]| {
+        let payload = piece.as_ref().map_or(0, stcp::Piece::len);
+        let header = len - payload;
+        // Writes the headers, and the sums over them and the payload that
+        // follows them in `bytes`.
+        let headers = |bytes: &mut [u8]| {
             ip.emit(&mut *bytes);
             tcp.emit(
                 &mut TcpPacket::new_unchecked(&mut bytes[ip.header_len()..]),
@@ -228,22 +243,43 @@ impl Output {
                 &ip.dst_addr(),
             );
         };
-        let packet = match self.pool.as_ref().and_then(|pool| pool.take_control(0)) {
+        let packet = match piece {
+            Some(mut piece) => match piece.in_place(header, headers) {
+                Some(packet) => packet,
+                None => self.block(len, |bytes| {
+                    bytes[header..].copy_from_slice(piece.bytes());
+                    headers(bytes);
+                }),
+            },
+            None => self.block(len, headers),
+        };
+        let checksums = Checksums {
+            ip_header: true,
+            transport: true,
+        };
+        self.tx.push(Packet::verified(packet, checksums));
+        Ok(())
+    }
+
+    /// A packet of `len` bytes that `write` writes every one of, in a block
+    /// from the pool's control reserve, or, before the engine reserved its
+    /// storage, as when a test feeds it directly, in a vector of its own
+    /// that the layer below pays for when it takes it.
+    fn block(&self, len: usize, write: impl FnOnce(&mut [u8])) -> Chunk {
+        match self.pool.as_ref().and_then(|pool| pool.take_control(0)) {
             Some(mut block) if block.room() >= len => {
                 block.fill(|room| {
-                    fill(&mut room[..len]);
+                    write(&mut room[..len]);
                     len
                 });
                 block
             }
             _ => {
                 let mut bytes = vec![0; len];
-                fill(&mut bytes);
+                write(&mut bytes);
                 Chunk::unpaid(bytes)
             }
-        };
-        self.tx.push(packet);
-        Ok(())
+        }
     }
 }
 
@@ -286,7 +322,7 @@ struct Slot {
 /// once and keeps its slots. Transport changes and application credit
 /// share the socket set's retained queue.
 pub(super) struct Sockets {
-    set: SocketSet<'static>,
+    set: SocketSet,
     /// One per slot of `set`, empty slots included.
     slots: Vec<Slot>,
     /// How many slots hold a socket.
@@ -305,7 +341,7 @@ impl Sockets {
         }
     }
 
-    fn add(&mut self, socket: stcp::Socket<'static>) -> Id {
+    fn add(&mut self, socket: stcp::Socket) -> Id {
         let slot = self.set.add(socket);
         if slot.index() == self.slots.len() {
             self.slots.push(Slot::default());
@@ -335,7 +371,7 @@ impl Sockets {
 
     /// Removes the socket of `id` and its connection, if it still has one.
     /// The slot's next socket gets the next generation.
-    fn remove(&mut self, id: Id) -> stcp::Socket<'static> {
+    fn remove(&mut self, id: Id) -> stcp::Socket {
         let entry = self.slot_mut(id).expect("a live socket");
         entry.used = false;
         entry.conn = None;
@@ -360,11 +396,11 @@ impl Sockets {
         id.slot
     }
 
-    fn get(&self, id: Id) -> &stcp::Socket<'static> {
+    fn get(&self, id: Id) -> &stcp::Socket {
         self.set.get(self.handle(id))
     }
 
-    fn get_mut(&mut self, id: Id) -> &mut stcp::Socket<'static> {
+    fn get_mut(&mut self, id: Id) -> &mut stcp::Socket {
         assert!(self.contains(id), "a live socket");
         self.set.get_mut(id.slot)
     }
@@ -391,7 +427,7 @@ impl Sockets {
     }
 
     /// The socket of `id` and its connection, together.
-    fn socket_and_conn(&mut self, id: Id) -> (&mut stcp::Socket<'static>, &mut Conn) {
+    fn socket_and_conn(&mut self, id: Id) -> (&mut stcp::Socket, &mut Conn) {
         assert!(self.contains(id), "a live socket");
         let conn = self.slots[id.slot.index()]
             .conn
@@ -479,7 +515,7 @@ impl std::hash::Hasher for IdHasher {
     }
 }
 
-/// One machine's TCP as a layer: `Packets<CheckedIpPacket, Chunk>` below, the
+/// One machine's TCP as a layer: `Packets<CheckedIpPacket, Packet>` below, the
 /// [`Tcp`] mux above. See the [module docs](super).
 ///
 /// The endpoint owns the input path and supplies checked packets sorted to TCP.
@@ -516,32 +552,32 @@ impl std::hash::Hasher for IdHasher {
 /// # Time, entropy and memory
 ///
 /// [`Layer::deadline`] is the earliest retransmission, keepalive,
-/// handshake, orphan, TIME-WAIT or page release the endpoint waits for.
+/// handshake, orphan or TIME-WAIT the endpoint waits for.
 /// The endpoint draws from the [`Env`]'s entropy only for each new socket's
 /// IPv4 identification, when [`Settings::ipv4_id`] asks for it, and for its
 /// keys and first ephemeral port when it is made.
 ///
-/// Each socket's receive and send buffers are charged to the [`Env`]'s
-/// budget before the socket is made: a SYN or a cookie that does not fit
-/// is dropped, and a connect fails as refused. Data coming up is charged as
-/// it is copied out, taking as much as the budget permits. Packet storage
-/// and event queues are reserved on the first environment's budget; socket
-/// and listener bookkeeping reserves further capacity there before growth.
+/// Each socket's places for the chunks it retains are charged to the
+/// [`Env`]'s budget before the socket is made: a SYN or a cookie that does
+/// not fit is dropped, and a connect fails as refused. A socket keeps the
+/// chunks segments arrived in, with the payment they came with, and bytes
+/// that came unpaid are charged to the budget it was made with as they
+/// arrive, or not taken. Data comes up in those chunks, and writes are kept
+/// as the chunks they came in. The endpoint copies a byte to gather short
+/// pieces, and to send one in a packet of its own when its chunk has no
+/// room for the headers in front, or a packet sent before still holds it.
+/// Packet storage and event queues are reserved on the first environment's
+/// budget; socket and listener bookkeeping reserves further capacity there
+/// before growth.
 /// Answers, segment-option callbacks and the cookie codec run inside the endpoint
 /// and their allocations are not measured.
 pub struct TcpLayer {
     pub(super) addr: IpAddr,
     pub(super) context: TcpContext,
     pub(super) sockets: Sockets,
-    /// Reclamation handles. Each socket also owns its mapping.
-    pub(super) pages: HashMap<Id, Arc<Pages>, ById>,
-    /// What each socket's buffers are charged to the budget, given back
-    /// when the socket goes.
+    /// What each socket's places for retained chunks are charged to the
+    /// budget, given back when the socket goes.
     reserved: HashMap<Id, Charge, ById>,
-    /// Sockets whose buffers may hold pages that could be given back.
-    pub(super) dirty: HashSet<Id, ById>,
-    /// When `dirty` is next looked at.
-    next_release: Option<smoltcp::time::Instant>,
     pub(super) output: Output,
     /// Listener maintenance in ascending port order.
     pub(super) listeners: BTreeMap<u16, Listen>,
@@ -758,219 +794,15 @@ impl Conn {
     }
 }
 
-/// Copies what `socket` received into `into`, up to its capacity, straight
-/// out of the socket's ring, which may hand the bytes over in two pieces,
-/// into memory nothing zeroed first.
-fn recv_into(socket: &mut stcp::Socket<'static>, into: &mut Vec<u8>) {
-    while into.len() < into.capacity() && socket.can_recv() {
-        let took = socket
-            .recv(|data| {
-                let take = data.len().min(into.capacity() - into.len());
-                into.extend_from_slice(&data[..take]);
-                (take, take)
-            })
-            .unwrap_or(0);
-        if took == 0 {
-            break;
-        }
-    }
-}
-
-/// A socket's two buffers, in an anonymous mapping of their own.
-///
-/// smoltcp buffers are fixed slices. Taking them from the heap would keep
-/// their pages after the connection goes quiet or closes: the allocator
-/// zeroes fresh chunks (so even an idle connection costs its full 512
-/// KiB) and keeps freed memory. With a mapping of its own, a page costs
-/// memory only once it is written, the pages of an empty buffer can be
-/// given back while the connection stays open ([`Pages::release`]), and
-/// closing returns all of it.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-pub(super) struct Pages {
-    ptr: *mut u8,
-    len: usize,
-}
-
-// SAFETY: `Pages` owns its mapping; the raw pointer is only an address.
-// Every access goes through the layer that owns it.
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(unsafe_code, reason = "the owned mapping can move with its socket")]
-unsafe impl Send for Pages {}
-
-// SAFETY: shared handles do not expose bytes. The two exclusive halves
-// lend disjoint slices, and reclamation requires exclusive socket access.
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(unsafe_code, reason = "shared ownership of disjoint mapped buffers")]
-unsafe impl Sync for Pages {}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-struct MappedHalf {
-    pages: Arc<Pages>,
-    start: usize,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(
-    unsafe_code,
-    reason = "borrow the owned half for the current buffer access"
-)]
-impl AsRef<[u8]> for MappedHalf {
-    fn as_ref(&self) -> &[u8] {
-        // SAFETY: construction creates exactly two nonoverlapping halves.
-        // The owner keeps the mapping live for this borrow.
-        unsafe { std::slice::from_raw_parts(self.pages.ptr.add(self.start), self.pages.len / 2) }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(
-    unsafe_code,
-    reason = "borrow the owned half for the current buffer access"
-)]
-impl AsMut<[u8]> for MappedHalf {
-    fn as_mut(&mut self) -> &mut [u8] {
-        // SAFETY: this unique half is exclusively borrowed, its owner is
-        // live, and the other half cannot address these bytes.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.pages.ptr.add(self.start), self.pages.len / 2)
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(
-    unsafe_code,
-    reason = "anonymous mapping ownership and buffer reclamation"
-)]
-impl Pages {
-    /// Maps two buffers of `buffer` bytes, or `None` if the system says no.
-    fn map(buffer: usize) -> Option<Pages> {
-        let len = buffer.checked_mul(2)?;
-        if len == 0 || len > isize::MAX as usize {
-            return None;
-        }
-        // SAFETY: a fresh private anonymous mapping; no existing memory is
-        // touched.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return None;
-        }
-        if ptr.is_null() {
-            // SAFETY: mmap succeeded, but Rust slices cannot use a null address.
-            unsafe { libc::munmap(ptr, len) };
-            return None;
-        }
-        // A huge page can span adjacent socket mappings and make a quiet
-        // connection pay for another connection's buffers. Keep these
-        // independently reclaimable buffers on ordinary pages.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            // SAFETY: this is the complete, freshly allocated mapping.
-            libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE);
-        }
-        Some(Pages {
-            ptr: ptr.cast(),
-            len,
-        })
-    }
-
-    fn socket(buffer: usize) -> Option<(stcp::Socket<'static>, Arc<Pages>)> {
-        let pages = Arc::new(Self::map(buffer)?);
-        let rx = MappedHalf {
-            pages: pages.clone(),
-            start: 0,
-        };
-        let tx = MappedHalf {
-            pages: pages.clone(),
-            start: buffer,
-        };
-        let socket = stcp::Socket::new(
-            stcp::SocketBuffer::new_owned(rx),
-            stcp::SocketBuffer::new_owned(tx),
-        );
-        Some((socket, pages))
-    }
-
-    /// Gives the pages of both halves back to the system. They read as
-    /// zeros after, and cost memory again only once written.
-    ///
-    /// SAFETY: the socket that owns the halves must be exclusively borrowed and
-    /// must hold nothing in them: no bytes to read, none to send or
-    /// resend, and an empty receive assembler. Check `recv_queue`,
-    /// `send_queue`, and `has_pending_recv`. No buffer slices may be borrowed
-    /// during reclamation.
-    unsafe fn release(&self) {
-        // SAFETY: the range is this mapping. MADV_DONTNEED on a private
-        // anonymous mapping only makes its pages read as zeros, and the
-        // caller has checked that the socket holds no data in them.
-        unsafe { libc::madvise(self.ptr.cast(), self.len, libc::MADV_DONTNEED) };
-    }
-
-    /// How many of the pages are in memory now.
-    #[cfg(test)]
-    pub(super) fn resident(&self) -> usize {
-        let page = 4096;
-        let mut v = vec![0u8; self.len.div_ceil(page)];
-        // SAFETY: `v` has one byte per page of the mapping.
-        unsafe { libc::mincore(self.ptr.cast(), self.len, v.as_mut_ptr().cast()) };
-        v.iter().filter(|b| *b & 1 != 0).count()
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(unsafe_code, reason = "release the owned anonymous mapping")]
-impl Drop for Pages {
-    fn drop(&mut self) {
-        // SAFETY: this unmaps exactly the mapping made in `map`, after all
-        // owning halves and reclamation handles have been dropped.
-        unsafe { libc::munmap(self.ptr.cast(), self.len) };
-    }
-}
-
-/// A browser has no `mmap`, so there every socket's buffers come from the
-/// heap and no `Pages` is ever made.
-#[cfg(target_arch = "wasm32")]
-pub(super) enum Pages {}
-
-#[cfg(target_arch = "wasm32")]
-#[allow(unsafe_code, reason = "matches the unreachable host mapping interface")]
-impl Pages {
-    fn socket(_buffer: usize) -> Option<(stcp::Socket<'static>, Arc<Pages>)> {
-        None
-    }
-
-    /// SAFETY: as on a host; no `Pages` exists to call it on.
-    unsafe fn release(&self) {
-        match *self {}
-    }
-}
-
-/// A socket with two buffers of `buffer` bytes.
-pub(super) fn new_socket(buffer: usize) -> (stcp::Socket<'static>, Option<Arc<Pages>>) {
-    let (mut s, pages) = match Pages::socket(buffer) {
-        Some((socket, pages)) => (socket, Some(pages)),
-        None => (
-            stcp::Socket::new(
-                stcp::SocketBuffer::new(vec![0; buffer]),
-                stcp::SocketBuffer::new(vec![0; buffer]),
-            ),
-            None,
-        ),
-    };
+/// A socket whose receive window and send buffer are `buffer` bytes each.
+/// It keeps the chunks segments and writes come in, not rings, so an idle
+/// connection holds no buffer; the blocks it makes to gather short pieces
+/// are charged to `budget`.
+pub(super) fn new_socket(buffer: usize, budget: &Budget) -> stcp::Socket {
+    let mut s = stcp::Socket::new(buffer, buffer, budget.clone());
     s.set_tsval_generator(Some(|now| (now.total_micros() / 1000) as u32));
     s.set_nagle_enabled(false);
-    (s, pages)
+    s
 }
 
 /// What a read, write or connect on a child would get now, for the async
@@ -1006,10 +838,7 @@ impl TcpLayer {
             addr,
             context,
             sockets: Sockets::new(),
-            pages: HashMap::default(),
             reserved: HashMap::default(),
-            dirty: HashSet::default(),
-            next_release: None,
             output,
             listeners: BTreeMap::new(),
             by_tuple: HashMap::new(),
@@ -1049,12 +878,13 @@ impl TcpLayer {
         self.addr
     }
 
-    /// Charges the buffers of one more socket, or `None` if they do not fit.
+    /// Charges the places for the chunks one more socket retains, or `None`
+    /// if they do not fit.
     fn reserve(&mut self, budget: &Budget) -> Option<Charge> {
         if !self.reserve_storage(budget) || !self.make_room() {
             return None;
         }
-        budget.charge(2 * self.buffer)
+        budget.charge(stcp::PLACES)
     }
 
     /// Packet buffers and event queues have fixed limits. Socket and listener
@@ -1066,16 +896,15 @@ impl TcpLayer {
         // packets smoltcp writes are paid from the pool's control reserve.
         let fixed = 2 * UP_ROOM * size_of::<Up>()
             + EGRESS_PACKETS * MTU
-            + 2 * EGRESS_PACKETS * size_of::<Chunk>();
+            + 2 * EGRESS_PACKETS * size_of::<Packet>();
         // Include socket scheduling, child slots, connection and listener indexes,
         // and the terminal events a batch of socket removals can produce.
         // Four times the entries covers geometric vector/hash capacity and tree
         // nodes.
-        let entry = size_of::<Option<stcp::Socket<'static>>>()
+        let entry = size_of::<Option<stcp::Socket>>()
             + size_of::<Slot>()
             + size_of::<Listen>()
             + size_of::<Charge>()
-            + size_of::<Arc<Pages>>()
             + size_of::<(SocketAddr, SocketAddr)>()
             + 4 * size_of::<Up>()
             + 32 * size_of::<usize>();
@@ -1130,11 +959,7 @@ impl TcpLayer {
 
     /// Adds a socket made by [`new_socket`], drawing its IPv4
     /// identification from `entropy` when the settings ask for it.
-    pub(super) fn add_socket(
-        &mut self,
-        entropy: &dyn Entropy,
-        (mut s, pages): (stcp::Socket<'static>, Option<Arc<Pages>>),
-    ) -> Id {
+    pub(super) fn add_socket(&mut self, entropy: &dyn Entropy, mut s: stcp::Socket) -> Id {
         s.set_settings(self.settings.socket);
         if let Some(id) = self.settings.ipv4_id {
             s.set_ipv4_identification(id(entropy));
@@ -1155,50 +980,21 @@ impl TcpLayer {
                 SocketAddr::from(remote).ip(),
             ));
         }
-        let h = self.sockets.add(s);
-        if let Some(p) = pages {
-            self.pages.insert(h, p);
-        }
-        h
+        self.sockets.add(s)
     }
 
-    /// Removes a socket, then unmaps its buffers and gives back their charge.
+    /// Removes a socket, with the chunks it retains, and gives back the
+    /// charge for their places.
     pub(super) fn remove_socket(&mut self, h: Id) {
         self.sockets.remove(h);
-        self.pages.remove(&h);
         self.reserved.remove(&h);
-        self.dirty.remove(&h);
     }
 
-    /// Notes that a socket's buffers may have pages to give back later.
-    fn soiled(&mut self, h: Id) {
-        if self.pages.contains_key(&h) {
-            self.dirty.insert(h);
-        }
-    }
-
-    /// Gives back the pages of every noted socket whose buffers are now
-    /// empty. Sockets that still hold data stay noted.
-    #[allow(unsafe_code, reason = "reclaim empty mapped socket buffers")]
-    pub(super) fn release_quiet(&mut self) {
-        let dirty: Vec<Id> = self.dirty.iter().copied().collect();
-        for h in dirty {
-            let s = self.get(h);
-            let (rq, sq) = (s.recv_queue(), s.send_queue());
-            if rq == 0 && sq == 0 && !s.has_pending_recv() {
-                // SAFETY: the socket holds nothing in its buffers, as just
-                // checked: nothing to read or send, and nothing out of order.
-                unsafe { self.pages[&h].release() };
-                self.dirty.remove(&h);
-            }
-        }
-    }
-
-    pub(super) fn sock(&mut self, h: Id) -> &mut stcp::Socket<'static> {
+    pub(super) fn sock(&mut self, h: Id) -> &mut stcp::Socket {
         self.sockets.get_mut(h)
     }
 
-    pub(super) fn get(&self, h: Id) -> &stcp::Socket<'static> {
+    pub(super) fn get(&self, h: Id) -> &stcp::Socket {
         self.sockets.get(h)
     }
 
@@ -1313,7 +1109,7 @@ impl TcpLayer {
 
     /// Records the sequence number of an outgoing SYN, for ICMP checks, or
     /// of a SYN-ACK, for the connection's [`Handshake`].
-    pub(super) fn sent(&mut self, packet: &mut Chunk) {
+    pub(super) fn sent(&mut self, packet: &mut Packet) {
         let Some(ip) = Header::parse_whole(packet) else {
             return;
         };
@@ -1363,12 +1159,13 @@ impl TcpLayer {
                 }
                 _ => {}
             }
-            // The engine alone holds what it is about to send.
-            if c.ecn
-                && t[13] & 0x04 == 0
-                && (t[13] & 0x12 == 0x12 || c.congestion_echo)
-                && let Some(bytes) = packet.get_mut()
-            {
+            // A segment sent in place shares its bytes with the chunk the
+            // socket keeps, so the flag goes on a copy of its own.
+            if c.ecn && t[13] & 0x04 == 0 && (t[13] & 0x12 == 0x12 || c.congestion_echo) {
+                if packet.get_mut().is_none() {
+                    *packet = Packet::new(packet.to_vec());
+                }
+                let bytes = packet.get_mut().expect("a packet of its own");
                 let t = &mut bytes[ip.payload.clone()];
                 t[13] |= 0x40;
                 t[16..18].fill(0);
@@ -1393,7 +1190,7 @@ impl TcpLayer {
             rebuilt[0] = 0x40 | (header_len / 4) as u8;
             rebuilt[2..4].copy_from_slice(&length.to_be_bytes());
             fictionet::stdlib::network::ip::set_header_checksum(&mut rebuilt[..header_len]);
-            *packet = Chunk::unpaid(rebuilt);
+            *packet = Packet::new(rebuilt);
         }
     }
 
@@ -1430,6 +1227,7 @@ impl TcpLayer {
                 &ip.src.into(),
                 &ip.dst.into(),
                 self.settings.ignore_malformed_options,
+                TcpSum::Check,
             )
             .is_err()
         {
@@ -1467,10 +1265,17 @@ impl TcpLayer {
         entropy: &dyn Entropy,
         budget: &Budget,
         now: smoltcp::time::Instant,
-        packet: Chunk,
+        packet: Packet,
     ) -> bool {
         // Whatever the packet is, it may be answered directly.
         self.work = true;
+        // A segment a stack in this process wrote or checked, unchanged
+        // since, needs no second check of its sum.
+        let sum = match packet.checksums().transport {
+            true => TcpSum::Verified,
+            false => TcpSum::Check,
+        };
+        let packet = packet.into_chunk();
         let addr = self.addr;
         let Some(ip) = Header::parse_whole(&packet) else {
             return false;
@@ -1502,6 +1307,7 @@ impl TcpLayer {
             &ip.src.into(),
             &ip.dst.into(),
             self.settings.ignore_malformed_options,
+            sum,
         ) else {
             // A valid header with an unreadable option suffix gets the reset
             // suggested by RFC 9293 section 3.1. Parsing the prefix still
@@ -1513,12 +1319,13 @@ impl TcpLayer {
                     &ip.src.into(),
                     &ip.dst.into(),
                     true,
+                    sum,
                 )
                 && t[13] & 4 == 0
             {
                 let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
                 let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
-                self.output.tx.push(Chunk::unpaid(
+                self.output.tx.push(Packet::new(
                     Arrived::of(src, dst, t, repr.payload.len()).reset(&[]),
                 ));
             }
@@ -1635,12 +1442,18 @@ impl TcpLayer {
                     .find(|(_, socket)| socket.accepts(cx, &ip_repr, &repr))
                     .map(|(h, _)| h),
             };
+            // The payload as a piece of the packet's chunk: the socket keeps
+            // it as it is.
+            let tcp = TcpPacket::new_unchecked(t);
+            let start = ip.payload.start + usize::from(tcp.header_len());
+            let payload = packet.slice(start..start + repr.payload.len());
             let reply = match accepted {
                 Some(h) => self.sockets.set.get_mut(h).process(
                     cx,
                     &ip_repr,
                     &repr,
-                    TcpPacket::new_unchecked(t).options(),
+                    tcp.options(),
+                    &payload,
                 ),
                 None if self.settings.closed_port == ClosedPort::Reset && !rst => {
                     Some(stcp::Socket::rst_reply(&ip_repr, &repr))
@@ -1648,7 +1461,9 @@ impl TcpLayer {
                 None => None,
             };
             if let Some((ip, tcp)) = reply {
-                self.output.emit(ip, tcp).expect("output room was checked");
+                self.output
+                    .emit(ip, tcp, None)
+                    .expect("output room was checked");
             }
         }
         if let Some(h) = handle {
@@ -1665,11 +1480,7 @@ impl TcpLayer {
             if before == Some(TcpState::SynReceived) {
                 self.touched.push(h);
             }
-            let s = self.get(h);
-            let after = s.state();
-            if consumed && data && (s.recv_queue() != 0 || s.has_pending_recv()) {
-                self.soiled(h);
-            }
+            let after = self.get(h).state();
             let c = self.sockets.conn_mut(h).unwrap();
             if (rst || after == TcpState::Closed)
                 && before != Some(after)
@@ -1792,7 +1603,7 @@ impl TcpLayer {
             .backlog_per_peer
             .is_some_and(|limit| l.per_peer.get(&src.ip()).is_some_and(|&n| n >= limit));
         if l.ready.len() >= l.backlog && self.settings.reset_full_queue {
-            self.output.tx.push(Chunk::unpaid(arrived.reset(&[])));
+            self.output.tx.push(Packet::new(arrived.reset(&[])));
             return None;
         }
         if l.ready.len() >= l.backlog
@@ -1820,12 +1631,12 @@ impl TcpLayer {
             Some(SynAnswer::Refuse(refusal)) => {
                 // Options that cannot be sent leave a plain RST.
                 let options = encode(&refusal).unwrap_or_default();
-                self.output.tx.push(Chunk::unpaid(arrived.reset(&options)));
+                self.output.tx.push(Packet::new(arrived.reset(&options)));
                 return None;
             }
         };
         let Some(encoded) = encode(&added) else {
-            self.output.tx.push(Chunk::unpaid(arrived.reset(&[])));
+            self.output.tx.push(Packet::new(arrived.reset(&[])));
             return None;
         };
         let ipv4_reply = if dst.is_ipv4() {
@@ -1837,7 +1648,7 @@ impl TcpLayer {
             Ipv4Reply::default()
         };
         if encode_ipv4_options(&ipv4_reply.options).is_err() {
-            self.output.tx.push(Chunk::unpaid(arrived.reset(&[])));
+            self.output.tx.push(Packet::new(arrived.reset(&[])));
             return None;
         }
         if cookie {
@@ -1900,15 +1711,15 @@ impl TcpLayer {
             } else {
                 reply
             };
-            self.output.tx.push(Chunk::unpaid(reply));
+            self.output.tx.push(Packet::new(reply));
             return None;
         }
         if l.idle.is_empty() {
             // The listening socket that takes the SYN keeps its buffers for
             // the connection: they are charged before it is made.
             let charge = self.reserve(budget)?;
-            let mut s = new_socket(self.buffer);
-            s.0.listen(dst.port()).expect("a new socket can listen");
+            let mut s = new_socket(self.buffer, budget);
+            s.listen(dst.port()).expect("a new socket can listen");
             let h = self.add_socket(entropy, s);
             self.reserved.insert(h, charge);
             self.listeners.get_mut(&dst.port()).unwrap().idle.push(h);
@@ -1972,9 +1783,9 @@ impl TcpLayer {
         let Some(charge) = self.reserve(budget) else {
             return false;
         };
-        let mut s = new_socket(self.buffer);
-        s.0.listen(dst.port()).expect("a new socket can listen");
-        s.0.accept_syn_cookie(dst.into(), src.into(), irs, iss, kept.mss, now);
+        let mut s = new_socket(self.buffer, budget);
+        s.listen(dst.port()).expect("a new socket can listen");
+        s.accept_syn_cookie(dst.into(), src.into(), irs, iss, kept.mss, now);
         let h = self.add_socket(entropy, s);
         self.reserved.insert(h, charge);
         self.sockets.get_mut(h).restore_cookie_options(
@@ -2062,7 +1873,7 @@ impl TcpLayer {
             AckAnswer::Refuse(refusal) => {
                 // Options that cannot be sent leave a plain RST.
                 let options = encode(&refusal).unwrap_or_default();
-                self.output.tx.push(Chunk::unpaid(arrived.reset(&options)));
+                self.output.tx.push(Packet::new(arrived.reset(&options)));
             }
             AckAnswer::Drop => {}
         }
@@ -2348,7 +2159,7 @@ impl TcpLayer {
 
     /// Brings the child of `h` up to date: its connect's outcome, its
     /// write credit, the data it may read, and its end or reset.
-    fn refresh(&mut self, budget: &Budget, h: Id) {
+    fn refresh(&mut self, h: Id) {
         let Some(c) = self.sockets.conn(h) else {
             return;
         };
@@ -2378,33 +2189,18 @@ impl TcpLayer {
         let (s, c) = self.sockets.socket_and_conn(h);
         let mut moved = false;
         while c.recv_credit > 0 && s.can_recv() && self.up.len() < UP_ROOM {
-            let n = (c.recv_credit as usize).min(s.recv_queue()).min(DATA_MAX);
-            // In the window the layer above lent, which paid for every
-            // byte its credit lets come up. Otherwise charged to the
-            // endpoint's budget, taking as much as it has room for.
-            let chunk = match c.window.as_ref().and_then(Weak::upgrade) {
-                Some(window) => {
-                    let mut bytes = Vec::with_capacity(n);
-                    recv_into(s, &mut bytes);
-                    Chunk::in_window(bytes, window)
-                }
-                None => {
-                    let Some(mut bytes) = ChargedBytes::with_capacity_within(budget, 1..=n) else {
-                        break;
-                    };
-                    bytes
-                        .fill(|into| {
-                            recv_into(s, into);
-                            Ok::<_, Infallible>(())
-                        })
-                        .expect("a receive stops at the capacity");
-                    Chunk::from(bytes)
-                }
-            };
-            let got = chunk.len();
-            if got == 0 {
+            let n = (c.recv_credit as usize).min(DATA_MAX);
+            // The chunk the bytes arrived in, or a piece of it, with the
+            // payment it came with. In the window the layer above lent,
+            // which paid for every byte its credit lets come up, it moves
+            // into that window instead.
+            let Ok(Some(mut chunk)) = s.pop(n) else {
                 break;
+            };
+            if let Some(window) = c.window.as_ref().and_then(Weak::upgrade) {
+                chunk.move_into_window(window);
             }
+            let got = chunk.len();
             c.recv_credit -= got as u64;
             self.up
                 .push_back(MuxEvent::Child(id, StreamEvent::Data(chunk)));
@@ -2417,7 +2213,7 @@ impl TcpLayer {
         if s.can_recv() {
             return;
         }
-        let end = match s.recv_slice(&mut []) {
+        let end = match s.pop(0) {
             Ok(_) => false,
             Err(stcp::RecvError::Finished) => true,
             Err(stcp::RecvError::InvalidState) => c.fin && !c.rst,
@@ -2453,7 +2249,7 @@ impl TcpLayer {
     }
 
     /// Brings changed children up to date, rotating after the last served child.
-    fn refresh_all(&mut self, budget: &Budget) {
+    fn refresh_all(&mut self) {
         let count = self.sockets.prepare_refresh();
         for _ in 0..count {
             if self.up.len() >= UP_ROOM {
@@ -2462,7 +2258,7 @@ impl TcpLayer {
             let Some(h) = self.sockets.next() else {
                 break;
             };
-            self.refresh(budget, h);
+            self.refresh(h);
             self.sockets.acknowledge(h);
             if self
                 .sockets
@@ -2507,8 +2303,8 @@ impl TcpLayer {
             return failed(self, ConnError::Refused);
         };
         let local = SocketAddr::new(addr, port);
-        let mut s = new_socket(self.buffer);
-        if s.0.connect(&mut self.context, remote, local).is_err() {
+        let mut s = new_socket(self.buffer, env.budget());
+        if s.connect(&mut self.context, remote, local).is_err() {
             return failed(self, ConnError::Refused);
         }
         let h = self.add_socket(env.entropy(), s);
@@ -2641,7 +2437,7 @@ impl TcpLayer {
 
     /// Lets `units` more bytes come up for child `id`, in `window` from now
     /// on if the layer above lent one.
-    fn credit(&mut self, env: &Env<'_, ()>, id: ChildId, units: u64, window: Option<Weak<Charge>>) {
+    fn credit(&mut self, id: ChildId, units: u64, window: Option<Weak<Charge>>) {
         let Some(h) = self.open_socket(id) else {
             return;
         };
@@ -2651,7 +2447,7 @@ impl TcpLayer {
             c.window = window;
         }
         self.sockets.mark(h);
-        self.refresh_all(env.budget());
+        self.refresh_all();
     }
 
     /// The socket of child `id`, while the layer above holds the child.
@@ -2670,7 +2466,7 @@ impl TcpLayer {
     }
 
     /// One step: everything smoltcp has to send, the orphans and
-    /// handshakes, the pages to give back, and every child's events.
+    /// handshakes, and every child's events.
     fn step(&mut self, env: &Env<'_, ()>) {
         let now = smol(env.now());
         // What this step changes, such as a socket it lets go, asks for
@@ -2682,20 +2478,7 @@ impl TcpLayer {
         self.housekeeping();
         self.saturated = self.output.full();
         self.flush_transmit();
-        if self.dirty.is_empty() {
-            self.next_release = None;
-        } else {
-            match self.next_release {
-                Some(at) if at <= now => {
-                    self.release_quiet();
-                    self.next_release =
-                        (!self.dirty.is_empty()).then(|| now + RELEASE_EVERY.into());
-                }
-                Some(_) => {}
-                None => self.next_release = Some(now + RELEASE_EVERY.into()),
-            }
-        }
-        self.refresh_all(env.budget());
+        self.refresh_all();
         self.schedule(now);
         self.primed = false;
         self.stepped = Some(env.now());
@@ -2710,15 +2493,14 @@ impl TcpLayer {
             let Some(handle) = self.sockets.set.next_ready() else {
                 break;
             };
-            let sent =
-                self.sockets
-                    .set
-                    .get_mut(handle)
-                    .dispatch(&mut self.context, |_, (ip, tcp)| {
-                        self.output.emit(ip, tcp)?;
-                        emitted = true;
-                        Ok::<_, ()>(())
-                    });
+            let sent = self.sockets.set.get_mut(handle).dispatch(
+                &mut self.context,
+                |_, (ip, tcp, piece)| {
+                    self.output.emit(ip, tcp, piece)?;
+                    emitted = true;
+                    Ok::<_, ()>(())
+                },
+            );
             self.sockets.set.dispatched(handle, sent.is_err());
             if sent.is_err() {
                 return emitted;
@@ -2729,13 +2511,10 @@ impl TcpLayer {
     }
 
     fn schedule(&mut self, now: smoltcp::time::Instant) {
-        if self.dirty.is_empty() {
-            self.next_release = None;
-        }
         self.context.set_now(now);
         self.sockets.set.schedule(&mut self.context);
         let at = self.sockets.set.next_deadline();
-        self.next = [at, self.next_release, self.next_expiry()]
+        self.next = [at, self.next_expiry()]
             .into_iter()
             .flatten()
             .min()
@@ -2777,7 +2556,7 @@ impl TcpLayer {
         if s.can_recv() {
             return Verdict::Wait;
         }
-        match s.recv_slice(&mut []) {
+        match s.pop(0) {
             Ok(_) => Verdict::Wait,
             Err(stcp::RecvError::Finished) => Verdict::Done,
             Err(stcp::RecvError::InvalidState) if fin && !rst => Verdict::Done,
@@ -2883,7 +2662,7 @@ impl TcpLayer {
 }
 
 impl Layer for TcpLayer {
-    type Lower = Packets<CheckedIpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, Packet>;
     type Upper = Tcp;
     type Report = ();
     type Timer = ();
@@ -2932,8 +2711,8 @@ impl Layer for TcpLayer {
         // a whole window of data got one ACK. The sender's slow start grows
         // by one segment per ACK, so its window then grew by one segment
         // per round trip. Pure ACKs are still handled as a batch.
-        let bytes = packet.into_bytes();
-        if self.ingress(env.entropy(), env.budget(), now, bytes) {
+        let packet = packet.into_packet();
+        if self.ingress(env.entropy(), env.budget(), now, packet) {
             self.egress(now);
         }
         Ok(Admit::Taken)
@@ -2970,12 +2749,18 @@ impl Layer for TcpLayer {
             MuxOp::Control(MessageCommand::End) => {}
             MuxOp::Child(id, StreamCommand::Write(chunk)) => {
                 let h = self.open_socket(id).expect("admitted");
-                let n = self.sock(h).send_slice(&chunk).unwrap_or(0);
+                let n = chunk.len();
+                // The socket keeps the chunk itself until it is
+                // acknowledged. One it has no memory to make room for
+                // waits for memory, as any refused charge does.
+                if let Err((_, chunk)) = self.sock(h).push(chunk) {
+                    let write = MuxOp::Child(id, StreamCommand::Write(chunk));
+                    return Ok(Admit::Blocked(MuxCommand::from_op(write)));
+                }
                 let c = self.sockets.conn_mut(h).unwrap();
                 c.send_granted = c.send_granted.saturating_sub(n as u64);
                 self.urgent
                     .push_back(MuxEvent::Child(id, StreamEvent::Written(n as u64)));
-                self.soiled(h);
                 self.work = true;
             }
             MuxOp::Child(id, StreamCommand::End) => {
@@ -2990,8 +2775,8 @@ impl Layer for TcpLayer {
                 let h = self.open_socket(id).expect("admitted");
                 self.abort(h);
             }
-            MuxOp::Credit(id, units) => self.credit(env, id, units, None),
-            MuxOp::Window(id, units, window) => self.credit(env, id, units, Some(window)),
+            MuxOp::Credit(id, units) => self.credit(id, units, None),
+            MuxOp::Window(id, units, window) => self.credit(id, units, Some(window)),
             MuxOp::Close(id, why) => {
                 // TCP's only way to say why is how it closes. A connection
                 // the receiver never took, past its limit, refused by the
@@ -3029,7 +2814,7 @@ impl Layer for TcpLayer {
         }
         if !self.work {
             let before = (self.up.len(), self.urgent.len());
-            self.refresh_all(env.budget());
+            self.refresh_all();
             return Ok(before != (self.up.len(), self.urgent.len()));
         }
         self.step(env);

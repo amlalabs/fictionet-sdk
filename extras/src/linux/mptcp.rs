@@ -75,6 +75,7 @@ use std::task::{Context, Poll, Waker};
 
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::layer::{Budget, Chunk};
 use fictionet::stdlib::network::tcp::{
     AckAnswer, Answer, Handshake, Kept, Received, SegmentVerdict, Segments, Sent, Syn, SynAnswer,
     TcpOption,
@@ -694,9 +695,22 @@ impl Segments for Dss {
         self.verdict(acknowledge)
     }
 
-    fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) -> SegmentVerdict {
+    /// The data level reorders subflow bytes into data sequence order, so
+    /// what the application reads is what it hands back, in a block of its
+    /// own charged to `budget`. Bytes it hands back unchanged stay where
+    /// they are. A subflow with no memory for the block is reset.
+    fn arrived(&mut self, seq: u32, data: &mut Chunk, budget: &Budget) -> SegmentVerdict {
+        let mut out = Vec::new();
         if let Some(level) = &mut self.level {
-            level.arrived(seq, data, out);
+            level.arrived(seq, data, &mut out);
+        }
+        if out[..] != data[..] {
+            match budget.charge(out.capacity()) {
+                Some(charge) => {
+                    *data = Chunk::paid(out, charge).expect("charged for its capacity");
+                }
+                None => return SegmentVerdict::Reset(self.reset()),
+            }
         }
         self.verdict(false)
     }

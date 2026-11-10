@@ -1,5 +1,6 @@
 //! The UDP layer: a machine's sockets over whole IP packets.
 
+use fictionet::Packet;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
@@ -388,7 +389,7 @@ impl UdpLayer {
 }
 
 impl Layer for UdpLayer {
-    type Lower = Packets<CheckedIpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, Packet>;
     type Upper = Udp;
     type Report = UdpReport;
     type Timer = ();
@@ -500,7 +501,7 @@ impl Layer for UdpLayer {
             socket.owed += 1;
             self.wake(id);
         }
-        Some(PacketCommand::Send(packet))
+        Some(PacketCommand::Send(Packet::from_chunk(packet)))
     }
 
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>> {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::layer::{Admit, Budget, ChargedBytes, Driver, PacketCommand};
 use fictionet::stdlib::network::ip;
-use fictionet::{Seed, SeededEntropy};
+use fictionet::{Packet, Seed, SeededEntropy};
 use fictionet_custom_ip::HopLimit;
 
 #[test]
@@ -28,7 +28,7 @@ fn rewriting_a_packet_keeps_its_reservation_until_delivery() {
             fictionet::time::Instant::ZERO,
         );
         assert!(matches!(
-            driver.command(PacketCommand::Send(chunk)),
+            driver.command(PacketCommand::Send(Packet::from_chunk(chunk))),
             Ok(Admit::Taken)
         ));
         assert_eq!(budget.used(), capacity);
@@ -37,7 +37,7 @@ fn rewriting_a_packet_keeps_its_reservation_until_delivery() {
             let PacketCommand::Send(chunk) = command else {
                 panic!("packet expected")
             };
-            assert_eq!(chunk.charged(), capacity);
+            assert_eq!(chunk.chunk().charged(), capacity);
             assert_eq!(budget.used(), capacity);
             assert!(ip::Header::parse_whole(&chunk).is_some());
             delivered = true;
@@ -70,7 +70,7 @@ fn a_shared_packet_waits_for_copy_budget_without_losing_ownership() {
         fictionet::time::Instant::ZERO,
     );
     assert!(matches!(
-        driver.command(PacketCommand::Send(chunk)),
+        driver.command(PacketCommand::Send(Packet::from_chunk(chunk))),
         Ok(Admit::Taken)
     ));
     assert!(!driver.send_below(|_| panic!("an unreserved copy cannot be delivered")));
@@ -81,7 +81,7 @@ fn a_shared_packet_waits_for_copy_budget_without_losing_ownership() {
             panic!("packet expected")
         };
         assert_eq!(chunk[8], 37);
-        assert!(chunk.charged() >= chunk.len());
+        assert!(chunk.chunk().charged() >= chunk.len());
         Admit::Taken
     }));
     assert_eq!(budget.used(), 0);

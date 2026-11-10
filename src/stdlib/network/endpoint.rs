@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use fictionet::stdlib::layer::{Admit, Budget, Driver, PacketCommand, PacketEvent};
-use fictionet::{Cx, Interface, Packet};
+use fictionet::{Cx, Interface};
 
 use super::Transport;
 use super::packet::{CheckedIpPacket, Factory, Opening, Sort, Stack};
@@ -141,7 +141,7 @@ pub(crate) async fn drive(
                         if let Some((addr, options)) = &ping
                             && let Some(reply) = options.echo_reply(packet.bytes(), *addr)
                         {
-                            outgoing.push_back(PacketCommand::Send(reply.into_chunk()));
+                            outgoing.push_back(PacketCommand::Send(reply));
                         }
                     }
                 }
@@ -156,7 +156,7 @@ pub(crate) async fn drive(
                 match interface.poll_recv(&fcx, cx) {
                     Poll::Ready(Ok(packet)) => {
                         moved = true;
-                        raw = Some(PacketEvent::Packet(packet.into_chunk()));
+                        raw = Some(PacketEvent::Packet(packet));
                     }
                     Poll::Ready(Err(_)) => {
                         moved = true;
@@ -232,7 +232,7 @@ pub(crate) async fn drive(
 fn send_below(ip: &mut Driver<Stack>, interface: &mut impl Interface) -> bool {
     ip.send_below(|command| {
         if let PacketCommand::Send(bytes) = command {
-            interface.send(Packet::from_chunk(bytes));
+            interface.send(bytes);
         }
         Admit::Taken
     })

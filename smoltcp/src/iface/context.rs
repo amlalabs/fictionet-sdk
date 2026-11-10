@@ -17,12 +17,6 @@ pub struct Context {
     pub(crate) now: Instant,
     pub(crate) initial_seq: InitialSeq,
     pub(crate) ip_addr: IpAddress,
-    #[cfg(test)]
-    pub(crate) ignore_malformed_options: bool,
-    #[cfg(test)]
-    pub(crate) reset_closed_ports: bool,
-    #[cfg(test)]
-    pub(crate) ingress_target: Option<super::SocketHandle>,
 }
 
 impl Context {
@@ -33,12 +27,6 @@ impl Context {
             now,
             initial_seq: config.initial_seq,
             ip_addr: config.ip_addr,
-            #[cfg(test)]
-            ignore_malformed_options: false,
-            #[cfg(test)]
-            reset_closed_ports: true,
-            #[cfg(test)]
-            ingress_target: None,
         }
     }
     /// Advance the endpoint's explicit simulation clock.
@@ -56,9 +44,5 @@ impl Context {
     }
     pub fn has_ip_addr(&self, addr: impl Into<IpAddress>) -> bool {
         self.ip_addr == addr.into()
-    }
-    #[cfg(test)]
-    pub(crate) fn set_ip_addr(&mut self, addr: IpAddress) {
-        self.ip_addr = addr;
     }
 }

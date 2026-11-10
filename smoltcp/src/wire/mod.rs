@@ -16,8 +16,6 @@ use core::fmt;
 
 pub(crate) use self::ip::Protocol as IpProtocol;
 pub use self::ip::Repr as IpRepr;
-#[cfg(test)]
-pub(crate) use self::ip::Version as IpVersion;
 pub use self::ip::{
     Address as IpAddress, Endpoint as IpEndpoint, ListenEndpoint as IpListenEndpoint,
 };
@@ -36,7 +34,8 @@ pub(crate) use self::ipv6::{
 };
 pub use self::tcp::{
     OPTIONS_MAX_LEN as TCP_OPTIONS_MAX_LEN, OptionLayout, OptionOrder, Packet as TcpPacket,
-    Repr as TcpRepr, SeqNumber as TcpSeqNumber, TcpOption, TcpOptions, TcpTimestampGenerator,
+    Repr as TcpRepr, SeqNumber as TcpSeqNumber, Sum as TcpSum, TcpOption, TcpOptions,
+    TcpTimestampGenerator,
 };
 
 pub(crate) use self::tcp::{Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, TcpTimestampRepr};

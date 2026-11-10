@@ -50,13 +50,6 @@ impl Packet {
     }
 
     /// A chunk whose sums this crate computed or checked just now.
-    #[cfg_attr(
-        not(any(test, kani)),
-        expect(
-            dead_code,
-            reason = "the TCP engine marks what it emits once its packets reach an interface whole"
-        )
-    )]
     pub(crate) fn verified(bytes: Chunk, checksums: Checksums) -> Packet {
         Packet { bytes, checksums }
     }
@@ -84,6 +77,24 @@ impl Packet {
     /// What a stack verified of the bytes, unchanged since.
     pub fn checksums(&self) -> Checksums {
         self.checksums
+    }
+
+    /// Makes `budget` pay for the bytes, as [`Chunk::repay`] does. Bytes it
+    /// copies to do so are the same bytes, so what was verified of them
+    /// stays. A refusal changes nothing.
+    #[must_use = "bytes a budget refused to pay for are not admitted"]
+    pub fn repay(&mut self, budget: &Budget) -> bool {
+        self.bytes.repay(budget)
+    }
+
+    /// The bytes to change in place, when this packet alone holds them, as
+    /// [`Chunk::get_mut`] gives them: charges nothing and clears both
+    /// checksum flags. `None`, changing nothing, when they are shared.
+    pub(crate) fn get_mut(&mut self) -> Option<&mut [u8]> {
+        let Packet { bytes, checksums } = self;
+        let bytes = bytes.get_mut()?;
+        *checksums = Checksums::default();
+        Some(bytes)
     }
 
     /// The bytes to change, in place when this packet alone holds them and

@@ -367,12 +367,9 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
         let admit = match ports.next(&fcx, ip.deadline(), |_| Poll::Pending).await? {
             Event::Packet(0, packet) => {
                 ip.set_now(fcx.now());
-                let raw = packet.into_chunk();
-                ip.deliver(PacketEvent::Packet(raw))?.map(drop)
+                ip.deliver(PacketEvent::Packet(packet))?.map(drop)
             }
-            Event::Packet(_, packet) => ip
-                .command(PacketCommand::Send(packet.into_chunk()))?
-                .map(drop),
+            Event::Packet(_, packet) => ip.command(PacketCommand::Send(packet))?.map(drop),
             Event::Timer => {
                 ip.set_now(fcx.now());
                 Admit::Taken
@@ -389,7 +386,7 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
         ip.run()?;
         ip.send_below(|command| {
             if let PacketCommand::Send(bytes) = command {
-                ports.send(0, Packet::from_chunk(bytes));
+                ports.send(0, bytes);
             }
             Admit::Taken
         });
@@ -401,7 +398,7 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
                     Sort::Icmp => 3,
                     Sort::Other(_) => 4,
                 };
-                ports.send(to, Packet::from_chunk(packet.into_bytes()));
+                ports.send(to, packet.into_packet());
             }
             Admit::Taken
         });

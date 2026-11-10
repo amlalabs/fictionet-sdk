@@ -4,7 +4,7 @@
 
 use crate::common::echo_stack::Echo;
 use fictionet::stdlib::layer::{
-    Admit, ChildId, Chunk, CommandOf, Env, EventOf, Layer, MessageCommand, MuxOp, Packets,
+    Admit, ChildId, CommandOf, Env, EventOf, Layer, MessageCommand, MuxOp, Packets,
 };
 use fictionet::stdlib::network::packet::CheckedIpPacket;
 use fictionet::stdlib::network::tcp::{self, EndpointState, TcpLayer, Verdict};
@@ -26,7 +26,7 @@ struct Hesitant {
 }
 
 impl Layer for Hesitant {
-    type Lower = Packets<CheckedIpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, fictionet::Packet>;
     type Upper = Tcp;
     type Report = ();
     type Timer = ();

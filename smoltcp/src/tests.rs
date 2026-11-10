@@ -1,100 +1,13 @@
-use std::collections::VecDeque;
-
-use crate::iface::*;
-pub(crate) mod phy;
+use crate::iface::{Config, Context};
 use crate::time::Instant;
-use crate::wire::*;
-use phy::{Device, DeviceCapabilities};
+use crate::wire::Ipv4Address;
 
-pub(crate) fn setup<'a>() -> (Interface, SocketSet<'a>, TestingDevice) {
-    let mut device = TestingDevice::new();
-    let iface = setup_with_device(&mut device);
-    (iface, SocketSet::default(), device)
-}
-
-fn setup_with_device(device: &mut impl Device) -> Interface {
-    // The tests' sockets start every connection at the same number.
+/// The context the tests' sockets share: host 192.168.1.1 with an MTU of
+/// 1500, every connection starting at the same sequence number.
+pub(crate) fn context() -> Context {
     let config = Config {
         initial_seq: Box::new(|_, _, _| crate::socket::tcp::test::LOCAL_SEQ.0 as u32),
         ip_addr: Ipv4Address::new(192, 168, 1, 1).into(),
     };
-    Interface::new(config, device, Instant::ZERO)
-}
-
-/// A testing device.
-#[derive(Debug)]
-pub(crate) struct TestingDevice {
-    pub(crate) tx_queue: VecDeque<Vec<u8>>,
-    pub(crate) rx_queue: VecDeque<Vec<u8>>,
-    max_transmission_unit: usize,
-}
-
-impl TestingDevice {
-    /// Create a test device with empty receive and transmit queues.
-    pub(crate) fn new() -> Self {
-        TestingDevice {
-            tx_queue: VecDeque::new(),
-            rx_queue: VecDeque::new(),
-            max_transmission_unit: 1500,
-        }
-    }
-}
-
-impl Device for TestingDevice {
-    type RxToken<'a> = RxToken;
-    type TxToken<'a> = TxToken<'a>;
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        DeviceCapabilities {
-            max_transmission_unit: self.max_transmission_unit,
-        }
-    }
-
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.rx_queue.pop_front().map(move |buffer| {
-            let rx = RxToken { buffer };
-            let tx = TxToken {
-                queue: &mut self.tx_queue,
-            };
-            (rx, tx)
-        })
-    }
-
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(TxToken {
-            queue: &mut self.tx_queue,
-        })
-    }
-}
-
-#[doc(hidden)]
-pub(crate) struct RxToken {
-    buffer: Vec<u8>,
-}
-
-impl phy::RxToken for RxToken {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        f(&self.buffer)
-    }
-}
-
-#[doc(hidden)]
-#[derive(Debug)]
-pub(crate) struct TxToken<'a> {
-    queue: &'a mut VecDeque<Vec<u8>>,
-}
-
-impl<'a> phy::TxToken for TxToken<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        let mut buffer = vec![0; len];
-        let result = f(&mut buffer);
-        self.queue.push_back(buffer);
-        result
-    }
+    Context::new(config, 1500, Instant::ZERO)
 }
