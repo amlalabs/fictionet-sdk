@@ -100,6 +100,23 @@ pub fn write(out: &mut Vec<u8>, prefix: u8, flags: u8, value: u64) -> Result<(),
     Ok(())
 }
 
+/// How many bytes [`write`] appends for `value` behind a `prefix`-bit
+/// prefix, without writing them. A width outside one through eight is
+/// read as eight, the shortest form; [`write`] refuses it.
+pub fn len(prefix: u8, value: u64) -> usize {
+    let max = mask(prefix).map_or(u64::from(u8::MAX), u64::from);
+    if value < max {
+        return 1;
+    }
+    let mut rest = value - max;
+    let mut n = 2;
+    while rest >= 128 {
+        rest >>= 7;
+        n += 1;
+    }
+    n
+}
+
 /// An RFC 7541 integer with a prefix width from one to eight bits.
 ///
 /// This shared wire form accepts all `u64` values. Enclosing protocols apply
@@ -154,6 +171,22 @@ pub(crate) mod proofs;
 mod tests {
     use super::*;
     use fictionet::stdlib::test_support::hex;
+
+    #[test]
+    fn len_counts_what_write_appends() {
+        use fictionet::{Entropy, Seed, SeededEntropy};
+        let rng = SeededEntropy::new(Seed::from_u64(11));
+        for prefix in 1..=8 {
+            for shift in 0..64 {
+                let value = rng.random_u64() >> shift;
+                for value in [value, (1 << prefix) - 2, (1 << prefix) - 1, u64::MAX] {
+                    let mut out = Vec::new();
+                    write(&mut out, prefix, 0, value).unwrap();
+                    assert_eq!(len(prefix, value), out.len(), "{prefix} {value}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn prefix_reads_and_failed_writes_preserve_their_boundaries() {
