@@ -35,6 +35,19 @@ theorem eq_ok_of_isOk {ε α : Type} [BEq α] [LawfulBEq α] {x : Except ε α} 
   · rw [beq_iff_eq.mp h]
   · cases h
 
+/-- Whether a computation failed with `e`. -/
+def isErr {ε α : Type} [BEq ε] (x : Except ε α) (e : ε) : Bool :=
+  match x with
+  | .error b => b == e
+  | .ok _ => false
+
+theorem eq_err_of_isErr {ε α : Type} [BEq ε] [LawfulBEq ε] {x : Except ε α} {e : ε} (h : isErr x e = true) :
+    x = .error e := by
+  unfold isErr at h
+  split at h
+  · rw [beq_iff_eq.mp h]
+  · cases h
+
 /-! ## Labels used below -/
 
 def EX : Label := [101, 120, 97, 109, 112, 108, 101]
@@ -111,8 +124,16 @@ example : decode [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 192, 12, 0, 1, 0, 1] ≠ .
 def loopMsg : Bytes := [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 192, 12, 0, 1, 0, 1]
 
 #print axioms decode_rejects_forward_pointer
-example : readName 5 loopMsg loopMsg.length 12 = .error .forwardPointer :=
-  decode_rejects_forward_pointer 4 loopMsg _ 12 192 12 (by decide) (by decide +kernel) (by decide +kernel)
+example : readName 5 loopMsg loopMsg.length 12 12 = .error .forwardPointer :=
+  decode_rejects_forward_pointer 4 loopMsg _ 12 12 192 12 (by decide) (by decide +kernel) (by decide +kernel)
+    (by decide) (by decide)
+
+/-- A question whose name is a label holding a zero octet, then a pointer to that octet: an earlier octet
+of the same name, which is no prior occurrence of a name. -/
+def selfMsg : Bytes := [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 0, 192, 13, 0, 1, 0, 1]
+
+example : readName 5 selfMsg selfMsg.length 12 15 = .error .forwardPointer :=
+  decode_rejects_forward_pointer 4 selfMsg _ 12 15 192 13 (by decide) (by decide +kernel) (by decide +kernel)
     (by decide) (by decide)
 
 #print axioms compress_only_rfc1035_types
@@ -124,6 +145,74 @@ example : (encRData true 40 [([EX, COM], 12)] 16 (.names [] [[EX, COM]] [])).1 =
 example : (encRData true 7 [([EX, COM], 12)] 99 (.octets [2, 3, 4])).1 = slice [1, 2, 3, 4, 5] 1 3 :=
   (unknown_rdata_verbatim [1, 2, 3, 4, 5] 99 1 3 (.octets [2, 3, 4]) true 7 _ rfl
     (eq_ok_of_isOk (by decide +kernel))).2
+
+theorem msg_octets : Octets (encode true msg) := by unfold Octets; decide +kernel
+
+#print axioms decode_wf
+example : msg.WF := decode_wf (encode true msg) msg_octets msg (decode_encode true msg msg_wf)
+
+#print axioms decode_reencode
+example : decode (encode false msg) = .ok msg :=
+  decode_reencode (encode true msg) msg_octets msg (decode_encode true msg msg_wf) false
+
+#print axioms respondHeader_fields
+/-- A reply to a query with ID 77 and RD and CD set copies both bits and the ID. -/
+example : (respondHeader ⟨77, 272⟩ 4 false false).id = 77 ∧ (respondHeader ⟨77, 272⟩ 4 false false).rd = true ∧
+    (respondHeader ⟨77, 272⟩ 4 false false).cd = true := by
+  obtain ⟨h1, -, -, -, -, h6, -, -, -, h10, -⟩ := respondHeader_fields ⟨77, 272⟩ 4 false false
+  exact ⟨h1, h6.trans (by decide), h10.trans (by decide)⟩
+
+/-- A response: QR set. -/
+def responseBytes : Bytes := [0, 1, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+#print axioms parse_response_silent
+example : parse responseBytes true = .silent := parse_response_silent _ _ 1 32768 (by decide) (by decide) (by decide)
+
+/-- `a. IN A` with ID 1 and OPCODE 3, which no RFC assigns. -/
+def opcode3 : Bytes := [0, 1, 24, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 97, 0, 0, 1, 0, 1]
+theorem opcode3_notimp : parse opcode3 true = .reject ⟨4, respondHeader ⟨1, 6144⟩ 4 false false, none⟩ := by
+  decide +kernel
+
+#print axioms parse_reject_header
+example : check ⟨1, 6144⟩ opcode3 true = .error (4, none) := by
+  obtain ⟨id, fl, h0, h2, -, -, hc⟩ := parse_reject_header _ _ _ opcode3_notimp
+  have : id = 1 := by simpa [opcode3, rd16] using h0.symm
+  have : fl = 6144 := by simpa [opcode3, rd16] using h2.symm
+  subst_vars; exact hc
+
+/-- `a. IN A` with ID 1, RD, and an OPT record of payload 100. -/
+def goodQuery : Bytes := [0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 97, 0, 0, 1, 0, 1, 0, 0, 41, 0, 100, 0, 0, 0, 0, 0, 0]
+theorem goodQuery_checked : check ⟨1, 256⟩ goodQuery true =
+    .ok ⟨⟨1, 256⟩, ⟨[[97]], 1, 1⟩, some ⟨512, 0, false, false⟩⟩ := eq_ok_of_isOk (by decide +kernel)
+
+#print axioms check_request
+/-- The payload of 100 is read as 512 (RFC 6891 §6.2.5). -/
+example : ∀ e, (some ⟨512, 0, false, false⟩ : Option EdnsIn) = some e → e.version = 0 ∧ 512 ≤ e.payload := by
+  obtain ⟨m, -, -, -, -, -, -, -, -, h, -⟩ := check_request _ _ _ _ goodQuery_checked
+  exact h
+
+/-- `opcode3` with an OPT record: its NOTIMP carries an OPT. -/
+def opcode3Opt : Bytes := [0, 1, 24, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 97, 0, 0, 1, 0, 1, 0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]
+def opcode3OptMsg : Message :=
+  ⟨⟨1, 6144⟩, [⟨[[97]], 1, 1⟩], [], [], [⟨[], 41, 1232, 0, .octets []⟩]⟩
+
+#print axioms check_opt_iff
+example : (some 0 : Option Nat).isSome =
+    (opcode3OptMsg.answer ++ opcode3OptMsg.authority ++ opcode3OptMsg.additional).any optRR :=
+  check_opt_iff ⟨1, 6144⟩ opcode3Opt true opcode3OptMsg (eq_ok_of_isOk (by decide +kernel)) 4 (some 0)
+    (eq_err_of_isErr (by decide +kernel))
+
+#print axioms unframe_frame
+example : unframe (frame [1, 2, 3] ++ [9]) = some ([1, 2, 3], 5) := unframe_frame _ _ (by decide)
+
+#print axioms unframe_none_iff
+/-- A length of 5 with one octet after it asks for more. -/
+example : unframe [0, 5, 1] = none :=
+  (unframe_none_iff _).mpr fun a b rest h => by simp only [List.cons.injEq] at h; obtain ⟨rfl, rfl, rfl⟩ := h; decide
+
+#print axioms unframeAll_frames
+example : unframeAll (([[1], [2, 3]].map frame).flatten ++ [0]) = ([[1], [2, 3]], [0]) :=
+  unframeAll_frames _ _ (by decide) (by decide)
 
 end Wire
 
@@ -164,6 +253,15 @@ example : (plan resp .udp512).tc = false := by
 #print axioms additional_drop_no_tc
 example : (plan resp .udp512).tc = (plan { resp with additional := resp.additional.take resp.required } .udp512).tc :=
   (additional_drop_no_tc resp .udp512).1
+
+#print axioms forRequest_size
+/-- A requestor offering 100 octets gets 512. -/
+example : (Limit.forRequest false (some 100) 1232).size ≤ 512 :=
+  ((forRequest_size false (some 100) 1232).2.2.2 rfl 100 rfl).1
+
+#print axioms fit_within_request
+example : (fit resp (Limit.forRequest false none 1232)).1.length ≤ 512 :=
+  fit_within_request resp false none 1232 resp_base
 
 end Fit
 
@@ -235,6 +333,12 @@ example : ∃ r, answer zone qSub .all = .response r ∧ r.rcode = .noerror ∧ 
 example : ∃ r, answer zone qSub .all = .response r ∧ r.aa = false ∧ r.answer = [] ∧ r.authority = [subNs] ∧
     r.rcode = .noerror :=
   referral_aa_false zone qSub .all (by decide +kernel) sub_below (by decide)
+
+#print axioms referral_glue_first
+/-- The referral to `sub` requires its in-domain glue, `ns1.sub.example.com. A`. -/
+example : ∃ r sib, answer zone qSub .all = .response r ∧ r.additional = subGlue ++ sib ∧ r.required = 1 :=
+  have ⟨r, sib, h1, h2, h3⟩ := referral_glue_first zone qSub .all (by decide +kernel) sub_below (by decide)
+  ⟨r, sib, h1, by rw [h2]; rfl, by rw [h3]; rfl⟩
 
 #print axioms negative_has_soa
 example : negSoa zone.soa ∈ [negSoa zone.soa] := negative_has_soa zone qNx .all nx_answer (Or.inl rfl)
@@ -352,6 +456,20 @@ example : ∃ p ∈ st.pending, p.token = good.token ∧ good.source = p.tuple.t
 example : (advance st 3).1.pending = [] ∧ (advance st 3).1.cache = [] ∧ (advance st 3).2 = [⟨2, 4⟩] :=
   have h := advance_clears true st 3 (by decide)
   ⟨h.2.1, h.2.2.1, h.2.2.2.2.1⟩
+
+#print axioms duplicate_ignored
+example : onReply true (onReply true st good).1 good = ((onReply true st good).1, .ignored) :=
+  duplicate_ignored true st good good rfl (by decide)
+
+/-- Two exchanges outstanding at once, and a reply to each. -/
+def tup2 : Tuple := { tup with qname := [MAIL, EX, COM] }
+def st2 : State := { st with pending := ⟨⟨2, 5⟩, tup2⟩ :: st.pending }
+def good2 : Reply := { good with token := ⟨2, 5⟩, qname := [MAIL, EX, COM] }
+
+#print axioms replies_commute
+example : (onReply true (onReply true st2 good).1 good2).1.pending =
+    (onReply true (onReply true st2 good2).1 good).1.pending :=
+  (replies_commute true st2 good good2 (by decide)).2.2
 
 end Exchange
 

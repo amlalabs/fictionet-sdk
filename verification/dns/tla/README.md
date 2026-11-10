@@ -77,7 +77,12 @@ Configs:
   `_cachebounded`, `_nocountdown`, `_noid`, `_noport`, `_notype`,
   `_cachebyname`, `_sharedbound`.
 * **Exchanges:** `_base`, `_advance`, `_cancel`. Ablations: `_idonly`,
-  `_flushonly`, `_cancelshared`.
+  `_flushonly`, `_cancelshared`, `_notoken` (a reply matched on its
+  source, ID, and question without its token: a late reply to an
+  exchange of the old generation completes the new generation's exchange
+  to the same server, so the token, the query's port and generation, is
+  what `ObsoleteNeverPopulates` rests on; RFC 5452 section 9.1 asks for
+  the destination port as well as the ID and question).
 * **Validation:** `_paths`, `_skew`, `_unreachable`, `_policy`,
   `_signers`, the six `_witness_*` (one reachability witness each, every
   one expected to fail), and
@@ -102,8 +107,8 @@ actions, never by a `CONSTRAINT`, so the liveness checks are sound:
   property, so TLC's first error is the one expected.
 * **Exchanges:** the clock by `MaxTime` 3, exchange identities by
   `MaxExchanges` 4, generations by `MaxGeneration` 2 in `_advance` and
-  `_flushonly` and 1 in the other four configs; one duplicate, one spoofed
-  reply, one `Gone`.
+  `_flushonly` and `_notoken` and 1 in the other four configs; one
+  duplicate, one spoofed reply, one `Gone`.
 * **Validation:** no counters; the data dimensions are finite sets.
 
 ## Results
@@ -151,6 +156,15 @@ in `_concurrent` explores the same states as the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
+| Exchanges_notoken | `ObsoleteNeverPopulates` | violated | 1109 | 7 | 0 s | Query, Send (to s1), Serve, Advance, Send (to s1 again, in generation 2), Deliver: the generation-1 reply matches the new exchange on source, ID, and question, and its data is cached |
+
+Rerun on 2026-11-10 after `NoToken` was added (TLC 2.19, `-Xmx2g`, `-workers 2` for the passing configs and
+`-workers 1` for the controls): `_base` (every property together) 66914 distinct states, depth 19, 4 s;
+`_cancel` (every property together) 853762, depth 23, 65 s; `_advance` with its three invariants,
+`MatchRequiresTuple`, and `DuplicateHarmless` 4564834, depth 28, 40 s; the four controls fail on their
+property with the counts above. With `NoToken` false the specs' state spaces are the ones before, as the
+counts show. `_advance`'s `EveryAcceptedAnswered` was not rerun: under the 3 GB cap TLC's liveness check of
+its 4.5 million states was stopped, and the row above is from the earlier run with `-Xmx6g`.
 | Validation_paths | the 11 invariants | pass | 124416 | 1 | 1-2 s | |
 | Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
 | Validation_unreachable | the 11 invariants | pass | 147456 | 1 | 0-1 s | |

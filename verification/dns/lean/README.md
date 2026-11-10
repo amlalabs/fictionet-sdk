@@ -12,7 +12,7 @@ resolver. It also holds an executable Lean reference that writes test vectors fo
 ```sh
 cd verification/dns/lean
 lake build                       # every proof, Dns/Axioms.lean, and the generator; fails on any error
-lake exe gen <dir> <seed>        # writes <dir>/{names,wire,fit,respond,zone,partial,signed,policy,chain,cache,resolver}.json
+lake exe gen <dir> <seed>        # writes <dir>/{names,wire,fit,respond,zone,partial,signed,policy,chain,cache,resolver,framing}.json
 ```
 
 `lake build` prints the axioms of every headline theorem from `Dns/Axioms.lean`. Each line must list only
@@ -26,11 +26,11 @@ gives the same files.
 | File | What it models | Headline theorems |
 |---|---|---|
 | `Dns/Name.lean` | labels as octet lists, the ASCII fold, the canonical order of RFC 4034 §6.1, "at or below", the 255-octet limit | `fold_idem`, `eqCI_iff_fold_eq`, `canon_total`, `canon_lt_trans`, `below_trans`, `wire_len_le_255` |
-| `Dns/Wire.lean` | header, questions, records, name compression; `decode`, `encode`, `parse`, `respondHeader` | `decode_encode`, `decode_terminates`, `decode_rejects_forward_pointer`, `compress_only_rfc1035_types`, `unknown_rdata_verbatim` |
-| `Dns/Fit.lean` | `fit : Resp → Limit → Bytes × Bool` over whole RRsets | `fit_size_le`, `fit_whole_rrsets`, `fit_keeps_opt`, `tc_iff_required_dropped`, `additional_drop_no_tc` |
-| `Dns/Zone.lean` | nodes, cuts, glue, empty non-terminals, wildcards, CNAME, DNAME; `answer`; the builder | `nxdomain_iff`, `ent_is_nodata`, `referral_iff_below_cut`, `referral_aa_false`, `negative_has_soa`, `neg_ttl_min`, `answer_in_zone`, `wildcard_blocked_by_node`, `dname_yx_iff_long`, `builder_rejects_iff` |
+| `Dns/Wire.lean` | header, questions, records, name compression; `decode`, `encode`, `parse` and `check`, `respondHeader`; stream framing (`frame`, `unframe`) | `decode_encode`, `decode_terminates`, `decode_rejects_forward_pointer`, `decode_wf`, `decode_reencode`, `compress_only_rfc1035_types`, `unknown_rdata_verbatim`, `respondHeader_fields`, `parse_response_silent`, `parse_reject_header`, `check_request`, `check_opt_iff`, `unframe_frame`, `unframe_none_iff`, `unframeAll_frames` |
+| `Dns/Fit.lean` | `fit : Resp → Limit → Bytes × Bool` over whole RRsets | `fit_size_le`, `fit_whole_rrsets`, `fit_keeps_opt`, `tc_iff_required_dropped`, `additional_drop_no_tc`, `forRequest_size`, `fit_within_request` |
+| `Dns/Zone.lean` | nodes, cuts, glue, empty non-terminals, wildcards, CNAME, DNAME; `answer`; the builder | `nxdomain_iff`, `ent_is_nodata`, `referral_iff_below_cut`, `referral_aa_false`, `referral_glue_first`, `negative_has_soa`, `neg_ttl_min`, `answer_in_zone`, `wildcard_blocked_by_node`, `dname_yx_iff_long`, `builder_rejects_iff` |
 | `Dns/Partial.lean` | views with present, absent, and unknown facts; `answerPartial`; `Lazy` zones | `answer_partial_sound`, `agreeing_zone_exists`, `unknown_never_negative`, `lazy_view_one_revision` |
-| `Dns/Exchange.lean` | tokens, generations, the matching rule of the step contract | `obsolete_ignored`, `match_requires_tuple`, `advance_clears` |
+| `Dns/Exchange.lean` | tokens, generations, the matching rule of the step contract | `obsolete_ignored`, `match_requires_tuple`, `advance_clears`, `duplicate_ignored`, `replies_commute` |
 | `Dns/Dnssec.lean` | keys, DS, RRSIGs, NSEC and NSEC3 as records; `class SigScheme` and a concrete symbolic instance; the validator; offline signing with complete chains; online covering records | `secure_sound`, `secure_complete`, `insecure_needs_proof`, `insecure_complete`, `optout_wildcard_insecure`, `optout_never_secure_denial`, `nsec_cover_sound`, `white_lie_covers_only_qname`, `cover_unknown_is_unknown`, `signed_answers_validate` |
 | `Dns/Policy.lean` | the IANA registry rows RFC 9904 and RFC 9905 set; `iana` derived from them | `sha1_never_secure`, `unsupported_is_insecure_not_bogus`, `not_performed_never_ad`, `iana_matches_registry` |
 | `Dns/Records.lean` | providers and signers as functions to published records; `Signed<D>` over any facts | `lazy_agrees_complete`, `signer_agnostic`, `validate_records_only` |
@@ -52,7 +52,16 @@ What each theorem says:
 | `wire_len_le_255` | a name the label-by-label check accepts fits in 255 octets and is valid, and folding keeps its length |
 | `decode_encode` | decoding inverts encoding for every well-formed message, with or without compression |
 | `decode_terminates` | the decoder never runs out of steps: the fuel it gives each name, quadratic in the message length, always suffices |
-| `decode_rejects_forward_pointer` | a compression pointer that does not point strictly before itself is rejected |
+| `decode_rejects_forward_pointer` | a compression pointer that does not point strictly before the part of the name that holds it (the name's first octet, or the target of the pointer that led there) is rejected: forward pointers, pointers to themselves, and pointers into their own name's labels (RFC 1035 §4.1.4, "a prior occurrence") |
+| `decode_wf` | every message the decoder returns from octets is well formed: names of labels of 1 to 63 octets and at most 255 octets (RFC 1035 §2.3.4, §3.1), even when reached through pointers; numbers within their fields; RDATA of the RFC 1035 name types in its type's layout; sections within their 16-bit counts (§4.1.1) |
+| `decode_reencode` | a decoded message written again, with or without compression, decodes to itself: compression is transparent (§4.1.4) |
+| `respondHeader_fields` | a reply header copies the query's ID, OPCODE, RD, and CD, sets QR, clears RA, Z, and AD, and carries the reply's AA, TC, and RCODE (RFC 1035 §4.1.1, RFC 4035 §3.2) |
+| `parse_response_silent` | a message with QR set gets no reply (RFC 1035 §4.1.1) |
+| `parse_reject_header` | every rejection's header is the reply header to the query's, and the query was not a response |
+| `check_request` | a request is a QUERY (other opcodes get NOTIMP) with exactly one question (RFC 9619), not of a meta-type, not AXFR over UDP, with at most one OPT record (RFC 6891 §6.1.1) of version 0 (§6.1.3) and payload at least 512 (§6.2.5), EDNS present exactly when the query has an OPT, and unsigned |
+| `check_opt_iff` | a rejection of a query that decodes carries an OPT record exactly when the query has one (RFC 6891 §7): FORMERR for a misplaced or unreadable TSIG included |
+| `unframe_frame`, `unframe_none_iff` | a stream message reads back after its two-octet length; the reader asks for more exactly when the length or the message is not all there (RFC 1035 §4.2.2, RFC 7766 §8) |
+| `unframeAll_frames` | a stream of framed messages reads back as exactly those messages, in order, with an incomplete last one left waiting |
 | `compress_only_rfc1035_types` | names written earlier change a record's RDATA octets, and enter the table, only for the RFC 1035 name-bearing types |
 | `unknown_rdata_verbatim` | RDATA of any other type decodes to its exact octets and is written back identically, anywhere |
 | `fit_size_le` | when header, question, and OPT fit at all, the output is within the limit |
@@ -60,10 +69,13 @@ What each theorem says:
 | `fit_keeps_opt` | the OPT record is always the output's last record |
 | `tc_iff_required_dropped` | TC is set exactly when an answer, authority, or required additional RRset was dropped |
 | `additional_drop_no_tc` | optional additional data never changes TC or what is kept of the answer and authority |
+| `forRequest_size` | the limit is 65535 on a stream (RFC 1035 §4.2.2), 512 over UDP without EDNS (§4.2.1), and with EDNS at least 512 and at most the larger of 512 and the requestor's payload, and of 512 and the server's (RFC 6891 §6.2.3, §6.2.5) |
+| `fit_within_request` | a reply fitted to its request's limit is no longer than the request can take |
 | `nxdomain_iff` | NXDOMAIN with an empty answer exactly when nothing above diverts the walk, no node is at or below the name, and no wildcard is at its closest encloser |
 | `ent_is_nodata` | an empty non-terminal answers NODATA with the SOA |
 | `referral_iff_below_cut` | NOERROR with no answer and AA=0 exactly when the name is at or below the highest cut on its path (other than DS at the cut) or matches a wildcard that is a cut |
 | `referral_aa_false` | a referral has AA=0, no answer, and the cut's NS set in authority |
+| `referral_glue_first` | a referral puts the cut's in-domain glue for its NS targets first in the additional section and counts exactly it as required, so `fit` sets TC when it does not fit (RFC 9471 §3.1) and drops sibling glue without TC (§3.2) |
 | `negative_has_soa` | NXDOMAIN and NODATA carry the zone's SOA in authority |
 | `neg_ttl_min` | that SOA's TTL is min(SOA TTL, MINIMUM) |
 | `answer_in_zone` | in a well-formed zone, every owner in every section is at or below the apex |
@@ -77,6 +89,8 @@ What each theorem says:
 | `obsolete_ignored` | a reply bearing a token of another generation is ignored and changes nothing |
 | `match_requires_tuple` | a reply changes state only if its token is outstanding and current and it matches address, transport, ID, QNAME, QCLASS, and QTYPE; otherwise state is unchanged |
 | `advance_clears` | after a session change nothing is outstanding, the cache is empty, every old token is abandoned, and every old reply is ignored |
+| `duplicate_ignored` | once a reply is taken, any later reply bearing its token, a copy or a forgery, is ignored and changes nothing (RFC 5452 §9.1) |
+| `replies_commute` | replies to two outstanding exchanges may arrive in either order: whether each is taken, and what stays outstanding, is the same (RFC 7766 §6.2.1.1) |
 | `secure_sound` | Secure means authentic: the RRset's type and records (with its original TTL, or as the wildcard it was expanded from) were signed with the private key of a key vouched for from an anchor, by the zone the RRset is in. `Vouched` walks the anchor's DS, the DNSKEY sets their keys signed, and the DS sets the parents signed, each signature in the chain made by a vouched key's holder |
 | `secure_complete` | every properly signed chain (`SecureChain`: the anchored DNSKEY set signed by a key the anchor names, each link's DS set signed by the zone above and naming a SEP key that signed the link's DNSKEY set, and an RRSIG over the RRset by the last zone) validates Secure; `secure_iff` is both directions |
 | `insecure_needs_proof` | Insecure only with a proof (`InsecureCase`): no anchor at or above the name; the anchor's DS set wholly unsupported; or, below a secure prefix, a link whose parent proved there is no DS (an NSEC or NSEC3 at the cut with NS and without DS and SOA, an opt-out cover of the next closer name of the closest provable encloser, or NSEC3 iterations above the limit) or signed a DS set the policy wholly does not support; or a trusted chain to the RRset's zone and a wildcard expansion that only an opt-out NSEC3 backs (`OptOutChain`). A failed fetch never makes an answer Insecure |
@@ -143,6 +157,7 @@ form `\# <length> <hex>`. Octets are lowercase hex.
 | `policy.json` | `algorithm`, `digest`, `policy`: the string `iana` for `Policy.iana`, which the test reads as Rust's `AlgorithmPolicy::iana`, or a random one (`validate`, `digests`, `max_nsec3_iterations`) | `treatment`: `supported`, `unsupported_algorithm`, or `unsupported_digest` |
 | `chain.json` | `tree`: the parent and the child `sub`, each with `zone`, `keys`, `window`, `denial`; `time`; `policy` | `problems`: `ds_mismatch`, `no_ds_proof_missing` (with `parent`, `child`), `window_closed` (`apex`, `time`), `unsupported_algorithm` (`apex`, `algorithm`) |
 | `cache.json` | `limits` (`max_ttl`, `failure_ttl`); `ops`: `offer` (positive, negative, or failure, with time; a positive or negative one with its validation, `sig_expires`, and `original_ttl`), `advance`, `serve` (key and time) | `served`: for each `serve` in order, `null` or the served positive RRset with its TTL counted down and its validation, the negative with its SOA, or the failure |
+| `framing.json` | `bytes`: messages after their two-octet lengths, sometimes with part of one more, or other octets; `cuts`: where the stream is split into chunks | `messages` (each in hex) and `rest` (how many octets are left), from `unframeAll` |
 | `resolver.json` | `zones` (a root and some of `test.`, `example.`, `sub.example.`, each server at an address of its own), `hints`, `work`, `any`, `questions`, `losses` (one per query sent, in order; `true` is lost), `dead` (servers that never answer) | `answers` (a response per question; a question past the script uses no loss), `dead_answers` (a response per question with the `dead` servers never answering and work to spare), `lossy_answers` (per question, under the loss script with work to spare, the `response` and the servers its losses made it give up on, `gone`), and the final `cache` (each item with its rank: a cut's NS set, glue, or a question and its answer) |
 
 Symbolic keys and signatures in `signed.json` and `chain.json`. A key is a number below 256. Its DNSKEY's
@@ -167,12 +182,21 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   sizes come from this compressor: a differential test comparing `kept` must either use the same choices or
   treat a case whose RRsets fit only under one compressor as a size difference, not a logic difference.
 - **The decoder** gives each name `length² + length + 256` steps and proves that is enough. Octets after the
-  last record are ignored. A name that reads past the end of its RDATA is rejected.
+  last record are ignored. A name that reads past the end of its RDATA is rejected. A pointer must point
+  before the start of the part of the name that holds it, and the name it points to must end before that
+  start: hickory's rule (`read_inner`), which Rust's `request::name_end` now follows too. The model's earlier
+  rule, a pointer before its own position, let a pointer land on an octet of its own name's labels; the
+  backward pointers `Gen.lean` now writes would have shown hickory and the opaque reader of
+  `Request::parse` disagreeing on such names.
 - **`parse`** answers FORMERR without an OPT when the message does not decode, and FORMERR with an OPT when the
   fault is in an OPT record (one that does not read, one outside the additional section, a second OPT, an owner
-  other than the root, or options that do not split). A TSIG record that is not the last record, or whose RDATA
-  does not read, is FORMERR without an OPT; a TSIG record last in the additional section gets NOTAUTH, after the
-  EDNS version check (RFC 8945 §5.2, §5.2.1). The BADKEY TSIG record of that reply is not modelled.
+  other than the root, or options that do not split). A TSIG record that is not the last record of the
+  additional section (RFC 8945 §5.1), or whose RDATA does not read, is FORMERR, with an OPT when the query has
+  one (RFC 6891 §7); a TSIG record last in the additional section gets NOTAUTH, after the EDNS version check
+  (RFC 8945 §5.2, §5.2.1). The BADKEY TSIG record of that reply is not modelled. A payload size below 512 is
+  read as 512 (RFC 6891 §6.2.5), as hickory reads it. A message that does not decode at all gets an OPT only
+  when the record that stops it is an OPT, even if an OPT read before it: the records after a fault cannot
+  be delimited, and RFC 6891 §7 is read as applying to OPT records the server can read.
   Header fields and the question are not echoed in the model; `respond.json` checks the RCODE, flags, and the
   OPT's presence and version.
 - **Fit** treats each RRset as a list of records with the same owner and type, and measures candidates by
