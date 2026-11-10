@@ -168,7 +168,7 @@
 //!    [`Admit::Closed`] instead of taking and dropping.
 //! 9. **A refused charge waits for memory.** It leaves the layer ready to
 //!    try again on its next [`advance`](Layer::advance), and the runner
-//!    wakes the stack when memory frees ([`Budget::wake_when_freed`]).
+//!    wakes the stack when memory frees ([`Driver::wake_when_freed`]).
 //!
 //! Every entry point is synchronous: it never awaits, reads a socket, reads
 //! a clock, or starts a task. The time, the entropy and the budget come in
