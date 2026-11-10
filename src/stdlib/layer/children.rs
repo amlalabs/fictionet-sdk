@@ -1,5 +1,7 @@
 use super::carrier::CreditLease;
 use super::charged::charge_places;
+use super::env::Wakes;
+use std::cell::OnceCell;
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -362,7 +364,7 @@ struct Kid<B: Layer> {
     wake: Arc<ChildWake>,
     /// Its waker ([`within`]): what its calls get, and what waits on its
     /// budget after a charge of its was refused.
-    waiter: Waiter,
+    waiter: ChildWaker,
     /// Its places in the ready and work lists.
     links: [Link; 2],
     /// Its deadline after its last call, the arming number that orders it
@@ -391,9 +393,13 @@ impl<B: Layer> Kid<B> {
     /// `since`: if a charge was refused meanwhile, the child is visited
     /// again once its budget has room for it (rule 9). Its budget may not
     /// be the stack's, which the runner above waits on, so the router
-    /// waits on it for the child.
-    fn wait_for_memory(&self, since: Refusals) {
-        self.budget.wake_when_freed(&self.waiter, since);
+    /// waits on it for the child, with the waiter made from `around`, what
+    /// the child runs in.
+    fn wait_for_memory(&self, since: Refusals, around: Wakes<'_>) {
+        if self.budget.refusals() != since {
+            let waiter = self.waiter.waiter(|| around.waker());
+            self.budget.wake_when_freed(waiter, since);
+        }
     }
 }
 
@@ -536,16 +542,37 @@ impl Wake for ChildWake {
 }
 
 /// A child's [`Env::waker`], and what its budget wakes when memory frees
-/// after a charge of the child's was refused, in one allocation: it queues
-/// the child, then wakes `around`, what the child runs in. Made once when
-/// the child opens, so every call gets the same one and the budget sees a
-/// child that waits again as the same waiter. It changes nothing in the
-/// child's wake, so it stays good while the child is open.
-fn within(child: Arc<ChildWake>, around: Waker) -> Waiter {
-    Waiter::from_fn(move || {
-        child.notify();
-        around.wake_by_ref();
-    })
+/// after a charge of the child's was refused, one waiter for both: it
+/// queues the child, then wakes what the child runs in. It is made the
+/// first time a call asks for the waker or the child waits for memory, so
+/// a child that does neither costs nothing for it, and then kept, so every
+/// call gets the same waker and the budget sees a child that waits again
+/// as the same waiter. It changes nothing in the child's wake, so it stays
+/// good while the child is open.
+pub(super) struct ChildWaker {
+    child: Arc<ChildWake>,
+    made: OnceCell<Waiter>,
+}
+
+impl ChildWaker {
+    fn new(child: Arc<ChildWake>) -> ChildWaker {
+        ChildWaker {
+            child,
+            made: OnceCell::new(),
+        }
+    }
+
+    /// The waiter, made now to wake `around`'s waker if there is none yet.
+    pub(super) fn waiter(&self, around: impl FnOnce() -> Waker) -> &Waiter {
+        self.made.get_or_init(|| {
+            let child = self.child.clone();
+            let around = around();
+            Waiter::from_fn(move || {
+                child.notify();
+                around.wake_by_ref();
+            })
+        })
+    }
 }
 
 /// A child's work: its result goes back to the child, and a wake from it,
@@ -853,7 +880,7 @@ where
         let Some((moved, waiting)) = self.visit_kid(env, key) else {
             return true;
         };
-        self.places.kids[key].wait_for_memory(since);
+        self.places.kids[key].wait_for_memory(since, env.wakes());
         self.called(key, moved || waiting, false);
         moved
     }
@@ -870,7 +897,7 @@ where
         let report = move |e| ChildReport::Event(id, e);
         // Until `take_released` below. A closed child takes nothing more.
         kid.wake.enter();
-        let mut moved = match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
+        let mut moved = match env.scoped_child(&kid.budget, &kid.waiter, report, |env| {
             kid.layer.advance(env)
         }) {
             Ok(moved) => moved,
@@ -880,7 +907,7 @@ where
             }
         };
         if let Some(event) = kid.urgent.take() {
-            match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
+            match env.scoped_child(&kid.budget, &kid.waiter, report, |env| {
                 kid.layer.on_event(env, event)
             }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => moved = true,
@@ -893,7 +920,7 @@ where
         }
         if let Some((event, retained)) = kid.inbox.pop_front() {
             let cost = event.credit();
-            match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
+            match env.scoped_child(&kid.budget, &kid.waiter, report, |env| {
                 kid.layer.on_event(env, event)
             }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => {
@@ -919,7 +946,7 @@ where
             }
         }
         if kid.outbox.is_none() {
-            kid.outbox = env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
+            kid.outbox = env.scoped_child(&kid.budget, &kid.waiter, report, |env| {
                 kid.layer.take_command(env)
             });
             moved |= kid.outbox.is_some();
@@ -1043,7 +1070,7 @@ where
                 let place = self.places.kids.vacant_entry();
                 let key = place.key();
                 let wake = Arc::new(ChildWake::new(key, self.places.woken.clone()));
-                let waiter = within(wake.clone(), env.waker());
+                let waiter = ChildWaker::new(wake.clone());
                 place.insert(Kid {
                     id,
                     handle: child,
@@ -1084,7 +1111,7 @@ where
                         kid.owner.cancel();
                         if let Err(error) = env.scoped_child(
                             &kid.budget,
-                            kid.waiter.waker(),
+                            &kid.waiter,
                             |event| ChildReport::Event(id, event),
                             |env| kid.layer.on_event(env, event),
                         ) {
@@ -1187,7 +1214,7 @@ where
         let result = kid.wake.call(|| {
             env.scoped_child(
                 &kid.budget,
-                kid.waiter.waker(),
+                &kid.waiter,
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_timer(env, timer),
             )
@@ -1196,7 +1223,7 @@ where
         // due at the same time, so theirs fire first.
         match result {
             Ok(fired) => {
-                self.places.kids[key].wait_for_memory(since);
+                self.places.kids[key].wait_for_memory(since, env.wakes());
                 self.called(key, true, true);
                 Ok(fired)
             }
@@ -1221,14 +1248,14 @@ where
         let result = kid.wake.call(|| {
             env.scoped_child(
                 &kid.budget,
-                kid.waiter.waker(),
+                &kid.waiter,
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_done(env, done),
             )
         });
         match result {
             Ok(()) => {
-                self.places.kids[key].wait_for_memory(since);
+                self.places.kids[key].wait_for_memory(since, env.wakes());
                 self.called(key, true, false);
             }
             Err(e) => self.fail(env, id, e),

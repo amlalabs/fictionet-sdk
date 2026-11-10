@@ -4,6 +4,8 @@ use fictionet::Entropy;
 use fictionet::stdlib::layer::{Budget, Layer, MAX_DEPTH};
 use fictionet::time::Instant;
 
+use super::children::ChildWaker;
+
 /// Somewhere a layer's reports go. The driver keeps a bounded number of
 /// them and counts the ones it had no room for ([`Observations`]).
 ///
@@ -43,12 +45,31 @@ pub struct Env<'a, E> {
     /// The most nested layer calls the layer called with this environment
     /// may make, its own included.
     room: usize,
-    /// What gets the layer called again: the driver's waker for the top of
-    /// a stack, a child's own for a child of
-    /// [`Children`](super::Children), which queues it for a visit and then
-    /// wakes what it runs in, and a waker of nothing outside a driver. Each
-    /// is made once by its owner, so every call gets the same one.
-    waker: &'a Waker,
+    /// What gets the layer called again.
+    wakes: Wakes<'a>,
+}
+
+/// What gets a layer called again ([`Env::waker`]). Each waker is made
+/// once by its owner, so every call gets the same one.
+#[derive(Clone, Copy)]
+pub(super) enum Wakes<'a> {
+    /// The driver's waker for the top of a stack, or a waker of nothing
+    /// outside a driver.
+    Made(&'a Waker),
+    /// A child of [`Children`](super::Children)'s own, which queues it for
+    /// a visit and then wakes what it runs in, the second. It is made the
+    /// first time it is asked for.
+    Child(&'a ChildWaker, &'a Wakes<'a>),
+}
+
+impl Wakes<'_> {
+    /// The waker, made now if it is a child's that has none yet.
+    pub(super) fn waker(&self) -> Waker {
+        match *self {
+            Wakes::Made(waker) => waker.clone(),
+            Wakes::Child(child, around) => child.waiter(|| around.waker()).waker().clone(),
+        }
+    }
 }
 
 impl<'a, E> Env<'a, E> {
@@ -68,7 +89,7 @@ impl<'a, E> Env<'a, E> {
             observing: observer.interested(),
             observer,
             room: MAX_DEPTH,
-            waker: Waker::noop(),
+            wakes: Wakes::Made(Waker::noop()),
         }
     }
 
@@ -96,7 +117,7 @@ impl<'a, E> Env<'a, E> {
             observing: observer.interested(),
             observer,
             room: MAX_DEPTH,
-            waker: stack,
+            wakes: Wakes::Made(stack),
         }
     }
 
@@ -108,7 +129,13 @@ impl<'a, E> Env<'a, E> {
     /// stays good for as long as the layer runs in this stack, so a layer
     /// may keep the first one it gets.
     pub fn waker(&self) -> Waker {
-        self.waker.clone()
+        self.wakes.waker()
+    }
+
+    /// What gets this layer called again, for a router that makes its
+    /// children's wakers from it.
+    pub(super) fn wakes(&self) -> Wakes<'_> {
+        self.wakes
     }
 
     /// The run's time, read by the driver before this call.
@@ -173,27 +200,28 @@ impl<'a, E> Env<'a, E> {
         wrap: impl FnMut(P) -> E,
         body: impl FnOnce(&mut Env<'_, P>) -> R,
     ) -> R {
-        let waker = self.waker;
-        self.scope(budget, waker, wrap, body)
+        let wakes = self.wakes;
+        self.scope(budget, wakes, wrap, body)
     }
 
     /// Runs a call into a child of [`Children`](super::Children), as
-    /// [`scoped_in`](Self::scoped_in) does, with the child's own `waker`,
+    /// [`scoped_in`](Self::scoped_in) does, with the child's own waker,
     /// which gets the child visited.
     pub(super) fn scoped_child<P, R>(
         &mut self,
         budget: &Budget,
-        waker: &Waker,
+        child: &ChildWaker,
         wrap: impl FnMut(P) -> E,
         body: impl FnOnce(&mut Env<'_, P>) -> R,
     ) -> R {
-        self.scope(budget, waker, wrap, body)
+        let around = self.wakes;
+        self.scope(budget, Wakes::Child(child, &around), wrap, body)
     }
 
     fn scope<P, R>(
         &mut self,
         budget: &Budget,
-        waker: &Waker,
+        wakes: Wakes<'_>,
         wrap: impl FnMut(P) -> E,
         body: impl FnOnce(&mut Env<'_, P>) -> R,
     ) -> R {
@@ -208,7 +236,7 @@ impl<'a, E> Env<'a, E> {
             observer: &mut wrapped,
             observing: self.observing,
             room: self.room.saturating_sub(1),
-            waker,
+            wakes,
         };
         body(&mut env)
     }
