@@ -13,7 +13,11 @@ bytes split anywhere, with the application behind), and Kani proofs of the
 parsers and the table arithmetic the models take as given. Each model's
 header and each harness file name the source they follow. Every property
 has a configuration or a broken copy of the code that must fail it, and
-each failure was read to check it fails for the stated reason.
+each failure was read to check it fails for the stated reason. A Lean 4
+model of HPACK as RFC 7541 states it, with unbounded sizes, proves the
+rules the Kani harnesses could not reach (the decoder's size updates,
+eviction after insertion, encode-then-decode round trips) and writes
+vectors that a Rust test replays on the code (see "Lean" below).
 
 ## Running
 
@@ -190,7 +194,8 @@ controls) and the tests in `hpack.rs` (`size_updates_and_settings_reductions`,
 `constructors_require_the_initial_reduction`,
 `rfc_c5_c6_response_sequences_evict_entries`,
 `zero_capacity_and_oversized_entry_clear_the_table`, and the RFC 7541
-Appendix C examples).
+Appendix C examples). The Lean model below proves them for unbounded
+sizes and holds `decode_block` to that model with vectors.
 
 The Huffman code (`HUFFMAN_LENGTHS`, from which `build_huffman` derives
 the canonical codes) was compared, symbol by symbol, with h2 0.4.20's
@@ -229,6 +234,202 @@ failed for that break:
 The two exhaustive tests fail the same way: with eight bits of padding
 accepted, `padding_after_every_symbol_is_at_most_seven_one_bits` fails;
 with the EOS check removed, `eos_after_every_symbol_is_refused` fails.
+
+## Lean: the RFC model and the Rust replay
+
+`lean/` is a Lean 4 project (core only, no Mathlib, toolchain
+`leanprover/lean4:v4.35.0`). It is an executable model of RFC 7541 with
+theorems about it, and a generator of vectors that
+`tests/hpack_vectors.rs` replays on the Rust code. The model keeps the
+Rust code's resource bounds as named constants, so the vectors compare
+exact results, error kinds included; each bound is listed under
+"Departures" below.
+
+```sh
+cargo xtask hpack-verify lean        # lake build, then the axioms of every headline theorem
+cargo xtask hpack-verify diff [seed] # vectors from seed (or 1 to 8), then the Rust test on them
+```
+
+Lake is `$LAKE` or `lake`. Each command runs in its own scope in
+`fictionet-work.slice`, Lean and the generator at 6 GiB, cargo at 8 GiB.
+Vectors go to `hpack-verify/run-*/vectors/<seed>/` in Cargo's target
+directory and are never committed (nor is `.lake/`).
+
+### Theorems
+
+`Hpack/Axioms.lean` prints the axioms of the 34 headline theorems; each
+rests on `propext`, `Quot.sound` and `Classical.choice` at most, and none
+on `sorryAx`. The three tree facts are decided by the kernel
+(`decide +kernel`), which adds no axiom.
+
+| Module | Theorem | Proves |
+| --- | --- | --- |
+| `Int` | `decode_encode` | Section 5.1: every value below 2^64, behind every prefix width from 1 to 8 and any flags above the prefix, reads back as itself, using exactly the bytes written, whatever follows |
+| `Int` | `encode_length`, `encode_bytes` | the encoding takes at most 11 bytes, each a byte, and the first keeps the flags |
+| `Int` | `decode_ignores_flags` | the bits above the prefix never change what is read |
+| `Int` | `decode_complete` | a complete section 5.1 integer is accepted, with its value and length, exactly when the value is below 2^64 and it takes at most 11 bytes; otherwise it is an overflow. So the bound is exactly where Rust refuses |
+| `Int` | `decode_truncated` | input that ends inside an integer is never accepted; it is `truncated` exactly when one more final byte would make an accepted integer, and an overflow when it is past the bound already |
+| `Huffman` | `paths_ok`, `leaves_ok`, `ones_ok` | the tree of Appendix B's codes (taken row by row from the RFC text): each code leads to its symbol, every leaf is a symbol reached by its own code, 1 to 29 one bits stay inside the tree and 30 reach EOS |
+| `Huffman` | `decode_encode_huffman` | Section 5.2: any octets, encoded, decode to themselves within any limit at least their length |
+| `Huffman` | `decode_exact` | the decoder accepts exactly the codes of at most `limit` octets followed by fewer than eight one bits, and nothing else |
+| `Huffman` | `padding_too_long` | padding of eight or more one bits is an error |
+| `Huffman` | `padding_not_ones` | bits left inside a code that are not all ones, so not the start of EOS, are an error |
+| `Huffman` | `eos_refused` | EOS in a string is an error, wherever it is and whatever follows |
+| `Huffman` | `too_long` | more octets than the limit are refused as too long |
+| `Table` | `insert_is_rfc` | adding an entry first and evicting after, as `DynamicTable` does, is section 4.4's insertion (evict to make room, then add; an entry larger than the capacity empties the table) |
+| `Table` | `evict_fit`, `insert_exact` | section 4.1 and 4.4: after eviction or insertion the size is the exact sum of name + value + 32 over the entries, and within the capacity |
+| `Table` | `insert_first`, `fit_longest` | an entry that fits goes first, and only the fewest oldest entries are evicted to make room |
+| `Table` | `insert_oversized` | section 4.4: an entry larger than the capacity empties the table and is not added |
+| `Table` | `lookup_some`, `lookup_insert` | section 2.3.3: index 0 and every index past both tables name nothing, every index from 1 to the end of the dynamic table names an entry; after an insertion, 62 is the new entry and each kept older entry moves up one |
+| `Rules` | `parse_write` | section 6: any well-formed representations (both string codings, all five kinds), size updates first, written one after another, read back as themselves |
+| `Rules` | `parse_updates_first` | section 4.2: whatever the bytes, every size update read comes before every field; an update after a field ends the block with `SizeUpdateOrder` |
+| `Rules` | `decode_reduced` | section 4.2: with a reduction owed, a block is accepted only if it starts with a size update at or below it |
+| `Rules` | `acks_then_block` | after acknowledged SETTINGS limits below the table's maximum, the next accepted block starts with a size update at or below each of them, so at or below the least |
+| `Rules` | `decode_updates` | section 6.3: each size update is at or below the acknowledged settings limit; and Rust's rule: at most two, the second at least the first |
+| `Rules` | `decode_state` | after any accepted block the table's size is the exact sum and within its maximum, the maximum is the old one or an update's at or below the settings limit, and no reduction is owed |
+| `RoundTrip` | `inStep_new`, `inStep_settings`, `inStep_capacity` | an encoder and the decoder at the other end start in step, and stay in step through SETTINGS limits (applied by the encoder on arrival and the decoder on the acknowledgment, which goes out before the next block) and capacities the encoder chooses |
+| `RoundTrip` | `block_round_trip` | sections 2.2, 4.2 and 6: from ends in step, any block the encoder writes, for any policy (exact references, name references, indexing, Huffman per string) whose Huffman strings fit `MAX_STRING`, decodes to exactly its fields with their never-indexed flags, and leaves the ends in step with nothing owed |
+| `RoundTrip` | `rustPolicy_wf` | the choice `Encoder::encode_block` makes is such a policy |
+
+The round trip's hypotheses are met by real values: `inStep_new` gives
+ends in step, `rustPolicy_wf` a policy, and the generator runs that
+encoder against that decoder.
+
+Writing `decode_truncated` found a mistake in the first model, not in
+Rust: ten continuation bytes that all continue are an overflow in Rust's
+loop before it looks for an eleventh byte, and the model first said
+`truncated`.
+
+### How the model is tied to Rust
+
+`Gen.lean` writes six kinds of vectors from a seed; every expected value is
+computed by the model. `tests/hpack_vectors.rs` (`HPACK_VECTORS`) runs the
+Rust code on each case and compares:
+
+| Kind | Rust called | Compared with the model |
+| --- | --- | --- |
+| `int_decode` | `prefix_int::read` | value and length, or `Truncated` / `Overflow` |
+| `int_encode` | `prefix_int::write` | the bytes (the encoding is canonical) |
+| `huffman_encode` | `huffman::encode`, `encoded_len` | the bytes and their count |
+| `huffman_decode` | `huffman::decode_limited` | the octets, or `InvalidCode` / `TooLong` |
+| `blocks` | `Table::new`, `set_settings_limit`, `decode_block` | per block: the kept fields with never-indexed flags and `Block::more`, or the error kind (each `hpack::Error` that `decode_block` returns has one); the table's entries newest first (read through a copy of the table that decodes a block naming every dynamic index), `table_size` and `table_capacity` |
+| `encoder` | `Encoder::new`, `set_settings_limit`, `set_capacity`, `set_huffman`, `encode_block`, `table_size`, and a `Table` acknowledging the same limits | the bytes of each block, `Unwritable` with nothing written, whether a capacity is refused, the table size, and the fields the decoder reads back |
+
+Which model function stands for which Rust function:
+
+| Lean | Rust |
+| --- | --- |
+| `decodeInt`, `encodeInt` | `prefix_int::read`, `prefix_int::write` |
+| `Huffman.decode`, `encode` | `huffman::decode_limited`, `huffman::encode` (the code is `HUFFMAN_LENGTHS` with `build_huffman`) |
+| `Dyn.evict`, `Dyn.insert`, `lookup`, `resolveName` | `DynamicTable::evict`, `insert`, `get`, `name` |
+| `readInt`, `readStr`, `readRep`, `parseBlock` | `ReadFields::integer`, `ReadFields::string`, `Representations` |
+| `Decoder.new`, `Decoder.ack`, `applyRep`, `decodeBlock` | `Table::new`, `Table::set_settings_limit`, `Table::read_block`, `Table::decode_block` |
+| `retain` | `Block::keep` |
+| `Encoder.new`, `setSettings`, `setCapacity`, `resize` | `Encoder::new`, `set_settings_limit`, `set_capacity`, `resize` |
+| `Encoder.updates`, `chooseRep` with `rustPolicy`, `writeStr`, `writable` | `Encoder::write_block`, `put_string`, `checked` |
+
+The blocks kind runs sessions: a settings limit from 0 to past
+`MAX_TABLE`, then up to 12 steps, each an acknowledged limit or a block.
+Three blocks in four follow the rules (size updates that pay what is owed,
+references in range when the block starts); the rest break a rule now and
+then (an index just past the table, 0, or far past it, up to 2^42; an update above the
+settings, above what is owed, decreasing, three of them, or after a
+field; a Huffman string of random bytes) and may be cut short, have a
+byte changed, or have bytes added. A session stops at its first error, as
+the connection does. Strings are names and values from the static table,
+random octets of up to 40, texts of 100 to 1,500, and texts of 2,000 to
+5,000 octets, which make the table evict. Fixed sessions add RFC 7541
+Appendix C.3 to C.6 (wire bytes from the RFC, results from the model) and
+every bound at and past its edge: a Huffman string that decodes to
+`MAX_STRING` + 1 octets, a raw length of `MAX_STRING` + 1, a block of
+`MAX_BLOCK` and `MAX_BLOCK` + 1 bytes, an index and a size update at
+2^64 - 1 and 2^64, an update to `MAX_TABLE` + 1, an entry exactly the
+capacity and one octet more, and references past `MAX_DECODED` octets and
+past `MAX_HEADERS` headers. The integer kind takes every first byte at
+every width, and around every mask and power of two up to 2^70 the
+encoding, flagged, with bytes after, cut at every length, and padded with
+up to four zero groups (nonminimal, up to past 11 bytes). The Huffman kind
+takes every symbol with each padding of 0 to 16 bits that fills a byte,
+each padding bit in turn made zero, EOS before and after the symbol,
+runs of 1 to 5 bytes of ones, and random strings under limits around
+their length, with padding a byte too long, a bit flipped, and EOS
+between two symbols. The encoder kind runs 400 sessions of up to 16
+steps: settings limits, capacities (some above the settings), Huffman on
+and off, and blocks of up to 11 fields (one in 50 with 257 fields, one in
+100 with a value of `MAX_STRING` + 1 octets), values repeated so later
+fields find their entries.
+
+With the model's two-update rule broken on purpose, the blocks kind fails
+on the first session that sends three updates.
+
+`cargo xtask hpack-verify diff` over seeds 1 to 8, at commit e85df19c7:
+
+| Kind | Cases per seed | Over 8 seeds | Disagree |
+| --- | --- | --- | --- |
+| `int_decode` | 27,231 | 217,848 | 0 |
+| `int_encode` | 5,200 | 41,600 | 0 |
+| `huffman_encode` | 514 | 4,112 | 0 |
+| `huffman_decode` | 8,294 to 8,323 | 66,444 | 0 |
+| `blocks` | 618 sessions | 4,944 sessions: 10,906 accepted blocks, 2,430 acknowledged limits, every error kind `decode_block` returns | 0 |
+| `encoder` | 400 sessions | 3,200 sessions (seed 1 alone: 2,581 blocks, 413 settings limits, 252 capacities, 103 refused blocks) | 0 |
+
+A seed's vectors take about two minutes to write and the Rust test under
+a second to read.
+
+### Departures from RFC 7541
+
+None changes what a conforming peer sees; each is a documented bound,
+modelled as that bound, and the vectors check Rust keeps to it exactly.
+
+- **At most two size updates in a block, the second at least the first**
+  (`Error::SizeUpdateOrder`). Section 4.2 has an encoder signal the least
+  size and then the final one, so a conforming encoder sends at most two,
+  nondecreasing; it does not ask a decoder to refuse others.
+- **`MAX_STRING` (65,536 octets) on each string, encoded and decoded.** A
+  Huffman string whose coded length is over it is refused even if it
+  would decode shorter.
+- **`MAX_BLOCK` (262,144 bytes) on an encoded block.**
+- **`MAX_TABLE` (65,536) caps the settings limit.** A size update above it
+  is `TableSize` even if a larger SETTINGS_HEADER_TABLE_SIZE was
+  announced. The module says a server must announce at most `MAX_TABLE`;
+  the capture dissector, which decodes other endpoints' traffic, would
+  refuse a table above 65,536 that a peer allowed.
+- **Integers fit 64 bits and 11 bytes** (`IntegerOverflow`); section 5.1
+  leaves the limit to the implementation.
+- **`MAX_HEADERS` (256) and `MAX_DECODED` (65,536 octets) on what a block
+  keeps.** Fields past them still change the table and are counted in
+  `Block::more` for the caller to refuse; they are not an HPACK error.
+
+No Rust code departs from the RFC otherwise, so nothing was fixed. The
+recent budget changes were read for one case the task named: a block
+refused for its heap bound. `Http2::read_headers` charges request
+trailers at `Table::most_block`'s bound before `decode_block` runs; if the
+budget refuses, the frame is held and read again once memory frees, and
+the table was never touched. A block that does not decode ends the
+connection with `COMPRESSION_ERROR` (`HeaderBlocks::read_fragment`), so
+`decode_block` leaving the maximum and the owed reduction changed after
+an error (it clears only the entries) never meets another block. A
+header block past the block limit ends the connection with
+`ENHANCE_YOUR_CALM` before any decoding (`HeaderBlocks::read_fragment`),
+and one without room to join its CONTINUATION fragments waits for memory
+like the trailers (`HeaderBlocks::reserve`), the table untouched.
+
+### What the Lean model leaves out
+
+- HTTP/2 framing: `HeaderBlocks` (CONTINUATION assembly, the block
+  limit, the budget) and `Session`'s SETTINGS bookkeeping
+  (`apply_peer`, `acknowledge_settings`). The model's `Decoder.ack` is
+  `Table::set_settings_limit`; the order of the acknowledgment and later
+  blocks is `HpackSync.tla`'s, and `block_round_trip` assumes the
+  acknowledgment goes out before the next block, as the server does.
+- The bounds `Table::most_block`, `most_held`, `held` and
+  `Encoder::block_bound`, and the wire forms `Field` and `StringLiteral`.
+- The capture dissector's `PartialTable`.
+- The vectors are finite: the settings limits and capacities come from
+  fixed lists and small random sizes, sessions are up to 12 (blocks) or 16
+  (encoder) steps, blocks up to 24 fields, strings up to 5,000 octets,
+  and random byte strings up to 13 bytes. The theorems have no such
+  bound.
 
 ## The bug, fixed
 
