@@ -3,7 +3,7 @@ use super::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use fictionet::stdlib::layer::{Budget, Child, Driver};
+use fictionet::stdlib::layer::{Budget, Child, Closing, Driver};
 use fictionet::stdlib::network::ip;
 use fictionet::stdlib::network::packet::{Capture, Ingress, Scopes};
 use fictionet::time::Instant;
@@ -1013,7 +1013,7 @@ fn closing_an_old_child_cannot_detach_its_replacement() {
     let replacement = tcp.up(200, 0x02, b"new");
     let id = replacement.opened[0].0;
     assert_ne!(first.opened[0].0, id);
-    assert!(tcp.tcp.command(old.close()).unwrap().moved());
+    assert!(tcp.tcp.command(old.close(Closing::Done)).unwrap().moved());
     tcp.grant = true;
     assert!(
         tcp.tcp
@@ -1035,7 +1035,7 @@ fn a_child_closed_from_above_gets_nothing_more() {
     let mut tcp = watch();
     tcp.up(100, 2, b"");
     let child = tcp.handles.pop().unwrap();
-    assert!(tcp.tcp.command(child.close()).is_ok());
+    assert!(tcp.tcp.command(child.close(Closing::Done)).is_ok());
     let after = tcp.up(101, 0x18, b"ignored");
     assert!(after.events.is_empty() && after.opened.is_empty());
     assert_eq!(after.late(), 7);

@@ -67,7 +67,10 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Reader as ByteReader, Step, Truncated, Wire};
+use fictionet::stdlib::codec::{
+    Decode, Heap, HeapBound, Reader as ByteReader, Step, Truncated, Wire, most_list_places,
+    most_places,
+};
 
 pub mod auth;
 pub mod connection;
@@ -212,6 +215,8 @@ pub struct Identification {
     software: String,
     comments: Option<String>,
 }
+
+fictionet::heap_of! { Identification { proto, software, comments } }
 
 impl Identification {
     /// A version line, if the parts are allowed and fit in
@@ -1197,18 +1202,6 @@ impl KexInit {
             .find(|c| server.contains(c))
     }
 
-    /// The most heap a KEXINIT parsed from a payload of `payload` bytes can
-    /// hold, boxed. Each name takes at least two of its list's bytes
-    /// (itself and the comma or the list's end), and becomes a `String`
-    /// holding its bytes in a vector that grows by doubling from four
-    /// places, so it has at most twice as many places as names, or four.
-    pub fn most_heap(payload: usize) -> usize {
-        let lists = payload.saturating_sub(KEXINIT_FIXED);
-        let names = lists / 2 + 10;
-        let places = 2 * names + 10 * 4;
-        size_of::<KexInit>() + places * size_of::<String>() + lists
-    }
-
     /// The length of this KEXINIT as a payload.
     fn encoded_len(&self) -> Result<usize, Error> {
         self.lists()
@@ -1234,6 +1227,40 @@ impl KexInit {
             (&self.languages_client_to_server, is_tag),
             (&self.languages_server_to_client, is_tag),
         ]
+    }
+}
+
+fictionet::heap_of! {
+    KexInit {
+        cookie,
+        kex_algorithms,
+        server_host_key_algorithms,
+        encryption_client_to_server,
+        encryption_server_to_client,
+        mac_client_to_server,
+        mac_server_to_client,
+        compression_client_to_server,
+        compression_server_to_client,
+        languages_client_to_server,
+        languages_server_to_client,
+        first_kex_packet_follows,
+        reserved,
+    }
+}
+
+/// A KEXINIT parsed from a payload of `len` bytes, as [`Message::parse`]
+/// parses it.
+impl HeapBound for KexInit {
+    /// Each name takes at least two of its list's bytes (itself and the
+    /// comma or the list's end), so the ten lists hold at most
+    /// `(lists + 10) / 2` names together. Each list grew by pushes, so it
+    /// has at most twice its names in places, or the four a short list
+    /// starts with ([`most_places`]). The names hold their bytes.
+    fn most_heap(len: usize) -> usize {
+        let lists = len.saturating_sub(KEXINIT_FIXED);
+        most_list_places::<String>(lists + 10, 2)
+            + 10 * most_places::<String>(1) * size_of::<String>()
+            + lists
     }
 }
 
@@ -1296,6 +1323,43 @@ impl Message {
             Message::KexInit(_) => msg::KEXINIT,
             Message::NewKeys => msg::NEWKEYS,
             Message::Other { number, .. } => *number,
+        }
+    }
+}
+
+impl Heap for Message {
+    fn heap(&self) -> usize {
+        match self {
+            Message::Disconnect {
+                reason: _,
+                description,
+                language,
+            }
+            | Message::Debug {
+                always_display: _,
+                message: description,
+                language,
+            } => description.heap() + language.heap(),
+            Message::Ignore(data) | Message::Other { number: _, data } => data.heap(),
+            Message::Unimplemented(_) | Message::NewKeys => 0,
+            Message::ServiceRequest(name) | Message::ServiceAccept(name) => name.heap(),
+            Message::KexInit(kex) => kex.heap(),
+        }
+    }
+}
+
+/// Every kind but KEXINIT copies distinct bytes of its payload into its
+/// strings, each copied whole, so it holds at most the payload's length;
+/// a KEXINIT holds what [`KexInit`]'s bound says.
+impl HeapBound for Message {
+    fn most_heap(len: usize) -> usize {
+        len.max(KexInit::most_heap(len))
+    }
+    fn most_heap_of(payload: &[u8]) -> usize {
+        match payload.first() {
+            Some(&msg::KEXINIT) => KexInit::most_heap(payload.len()),
+            Some(&(msg::UNIMPLEMENTED | msg::NEWKEYS)) => 0,
+            _ => payload.len(),
         }
     }
 }
@@ -1475,7 +1539,7 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, assert_heap_bound, pump};
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{
         assert_write, chunks, decode_all, decode_chunks, mutate,
@@ -1913,22 +1977,12 @@ mod tests {
         );
     }
 
-    /// A parsed KEXINIT holds no more heap than [`KexInit::most_heap`]
-    /// says, for lists of the shortest names, which cost the most per
-    /// byte, spread over one list or eight, and for names of mixed length.
-    #[test]
-    fn a_parsed_kexinit_holds_at_most_its_heap_bound() {
-        let heap = |kex: &KexInit| -> usize {
-            kex.lists()
-                .iter()
-                .map(|(names, _)| {
-                    names.capacity() * size_of::<String>()
-                        + names.iter().map(String::capacity).sum::<usize>()
-                })
-                .sum()
-        };
-        let room = MAX_PAYLOAD - KEXINIT_FIXED;
-        let fill = |lists: usize, lengths: &mut dyn FnMut() -> usize| {
+    /// KEXINIT payloads of every size up to the largest: lists of the
+    /// shortest names, which cost the most per byte, spread over one list
+    /// or all ten, names of mixed length, and one name in each list, where
+    /// each list's first places cost the most.
+    fn kexinit_payloads() -> Vec<Vec<u8>> {
+        let fill = |room: usize, lists: usize, lengths: &mut dyn FnMut() -> usize| {
             let mut kex = KexInit::default();
             let mut left = room;
             let mut targets: Vec<&mut Vec<String>> = vec![
@@ -1940,6 +1994,8 @@ mod tests {
                 &mut kex.mac_server_to_client,
                 &mut kex.compression_client_to_server,
                 &mut kex.compression_server_to_client,
+                &mut kex.languages_client_to_server,
+                &mut kex.languages_server_to_client,
             ];
             for list in targets.iter_mut().take(lists) {
                 let mut size = 0;
@@ -1955,33 +2011,61 @@ mod tests {
                     left -= more;
                 }
             }
-            kex
+            Message::KexInit(kex).to_bytes().unwrap()
         };
-        let mut seed = 7u64;
-        let mut mixed = move || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            1 + (seed >> 33) as usize % MAX_NAME
-        };
-        for kex in [
-            fill(1, &mut || 1),
-            fill(8, &mut || 1),
-            fill(8, &mut mixed),
-            fill(3, &mut || 2),
-        ] {
-            let payload = Message::KexInit(kex).to_bytes().unwrap();
-            let Message::KexInit(parsed) = Message::parse(&payload).unwrap() else {
-                panic!("a KEXINIT parses as one");
-            };
-            assert!(
-                heap(&parsed) <= KexInit::most_heap(payload.len()),
-                "{} bytes of KEXINIT hold {} bytes of heap, more than the bound {}",
-                payload.len(),
-                heap(&parsed),
-                KexInit::most_heap(payload.len())
-            );
+        let mut g = Lcg::new(7);
+        let largest = MAX_PAYLOAD - KEXINIT_FIXED;
+        let mut payloads = Vec::new();
+        for room in [0, 1, 10, 19, 20, 64, 1000, largest / 3, largest] {
+            for lists in [1, 3, 8, 10] {
+                payloads.push(fill(room, lists, &mut || 1));
+                payloads.push(fill(room, lists, &mut || 2));
+                payloads.push(fill(room, lists, &mut || 1 + g.index(MAX_NAME)));
+            }
         }
+        payloads
+    }
+
+    /// A parsed KEXINIT holds at most its type's bound, boxed or not, and
+    /// so does every transport message: the [`HeapBound`] law, checked
+    /// first on KEXINIT, the message whose bound was once a constant.
+    #[test]
+    fn parsed_transport_messages_hold_at_most_their_bound() {
+        let kexinit = |payload: &[u8]| match Message::parse(payload)? {
+            Message::KexInit(kex) => Ok(kex),
+            _ => Err(Error::Unwritable),
+        };
+        let payloads = kexinit_payloads();
+        assert_heap_bound(&payloads, kexinit);
+        assert_heap_bound(&payloads, |payload| kexinit(payload).map(Box::new));
+        let mut g = Lcg::new(5);
+        let mut messages = payloads;
+        for _ in 0..200 {
+            for message in [
+                Message::Disconnect {
+                    reason: DisconnectReason::ByApplication,
+                    description: g.text(MAX_TEXT / 2),
+                    language: g.text(20),
+                },
+                Message::Ignore(g.bytes(MAX_DATA)),
+                Message::Unimplemented(g.next() as u32),
+                Message::Debug {
+                    always_display: g.coin(),
+                    message: g.text(300),
+                    language: g.text(20),
+                },
+                Message::ServiceRequest("ssh-userauth".into()),
+                Message::ServiceAccept("ssh-connection".into()),
+                Message::NewKeys,
+                Message::Other {
+                    number: 50,
+                    data: g.bytes(300),
+                },
+            ] {
+                messages.push(message.to_bytes().unwrap());
+            }
+        }
+        assert_heap_bound(&messages, Message::parse);
     }
 
     #[test]

@@ -800,7 +800,7 @@ impl Layer for Observer {
                     }
                 }
             }
-            MuxOp::Close(child) => {
+            MuxOp::Close(child, _) => {
                 if let Some(output) = self.outputs.children.remove(child) {
                     self.outputs.waiting = self.outputs.waiting.saturating_sub(output.weight);
                     self.detach(output.key, child);

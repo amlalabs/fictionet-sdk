@@ -149,10 +149,12 @@ impl Job for Infallible {
 
 /// The work a stack handed over that has not finished, in the order it
 /// was handed over. Its places are charged to the stack's budget, each
-/// before the work that goes in it is taken from the stack.
+/// before the work that goes in it is taken from the stack. A place the
+/// budget refuses, the first included, leaves the work with the stack:
+/// the refusal is recorded in the stack's view, so its runner waits for
+/// memory and takes the work once a place fits.
 pub(crate) struct Jobs<W> {
     running: ChargedDeque<Running<W>>,
-    budget_failed: bool,
 }
 
 // The job count and intake are engine limits, independent of carrier credit.
@@ -179,12 +181,7 @@ impl<W: Job> Jobs<W> {
     pub(crate) fn new(budget: &Budget) -> Jobs<W> {
         Jobs {
             running: ChargedDeque::new(budget, JOBS),
-            budget_failed: false,
         }
-    }
-
-    pub(crate) fn budget_exhausted(&self) -> bool {
-        self.budget_failed
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -200,16 +197,13 @@ impl<W: Job> Jobs<W> {
     pub(crate) fn take<L: Layer<Work = W>>(&mut self, driver: &mut Driver<L>) -> bool {
         let mut took = false;
         for _ in 0..INTAKE {
-            if self.budget_failed {
-                break;
-            }
             // The place first: work taken from the stack cannot go back.
             // The place made while idle stays, so work can be checked even
             // when the layer holds the rest of its budget.
             let Some(place) = self.running.place() else {
-                // Full, or no room for a place. Existing jobs can release
-                // storage or budget when polled.
-                self.budget_failed = self.running.is_empty();
+                // Full, or no room for a place: existing jobs free places
+                // as they finish, and a refused place is the round's
+                // refusal, which has the runner wait for memory.
                 break;
             };
             let Some(work) = driver.take_work() else {
@@ -374,10 +368,6 @@ where
         moved |= jobs.poll(self.fcx.as_ref(), &mut cx, |done| driver.complete(done))?;
         // Work that woke itself while it was polled has more to do.
         Ok(moved || self.woken.0.load(Ordering::Relaxed))
-    }
-
-    fn budget_exhausted(&self) -> bool {
-        self.jobs.as_ref().is_some_and(Jobs::budget_exhausted)
     }
 
     fn running(&self) -> usize {
@@ -589,12 +579,15 @@ mod tests {
             budget.clone(),
             Instant::ZERO,
         );
-        let mut jobs = Jobs::new(&budget);
+        let mut jobs = Jobs::new(driver.budget());
+        let mark = driver.refusals();
         assert!(!jobs.take(&mut driver));
-        assert!(!jobs.budget_exhausted());
         assert!(jobs.is_empty());
         assert!(!jobs.take(&mut driver));
-        assert!(!jobs.budget_exhausted());
+        assert!(
+            !driver.budget().refused_since(mark),
+            "one place is enough to check an idle layer"
+        );
         drop(jobs);
         assert_eq!(budget.used(), 0);
     }
@@ -604,12 +597,10 @@ mod tests {
         let budget = Budget::new(std::mem::size_of::<Running<OwnedWork<PendingJob>>>());
         let mut driver = driver(budget.clone());
         driver.layer_mut().remaining = Some(1);
-        let mut jobs = Jobs::new(&budget);
+        let mut jobs = Jobs::new(driver.budget());
         assert!(jobs.take(&mut driver));
         assert_eq!(jobs.len(), 1);
-        assert!(!jobs.budget_exhausted());
         assert!(!jobs.take(&mut driver));
-        assert!(!jobs.budget_exhausted());
         assert_eq!(driver.layer().extracted, 1);
         let mut cx = Context::from_waker(Waker::noop());
         jobs.poll(None, &mut cx, |_| Ok::<_, Infallible>(()))
@@ -620,19 +611,53 @@ mod tests {
             .unwrap();
         assert!(jobs.is_empty());
         assert!(!jobs.take(&mut driver));
-        assert!(!jobs.budget_exhausted());
         drop(jobs);
         assert_eq!(budget.used(), 0);
     }
 
+    /// A table without room for its first place leaves the work with the
+    /// stack and records the refusal in the stack's view, so the runner
+    /// waits for memory instead of ending; once memory frees, the work is
+    /// taken.
     #[test]
-    fn exhausted_job_storage_never_launches_work() {
+    fn a_refused_first_place_waits_for_memory() {
+        let budget = Budget::new(64 * std::mem::size_of::<Running<OwnedWork<PendingJob>>>());
+        let hog = budget.charge(budget.limit()).unwrap();
+        let mut driver = driver(budget.clone());
+        let mut jobs = Jobs::new(driver.budget());
+        let mark = driver.refusals();
+        assert!(!jobs.take(&mut driver));
+        assert!(jobs.is_empty());
+        assert_eq!(driver.layer().extracted, 0, "the work stays with the stack");
+        assert!(driver.budget().refused_since(mark), "the runner waits");
+        assert_eq!(
+            driver.budget().starved_since(mark),
+            None,
+            "a release can make room"
+        );
+
+        drop(hog);
+        assert!(
+            jobs.take(&mut driver),
+            "the work is taken once memory frees"
+        );
+        assert!(!jobs.is_empty());
+        assert_eq!(jobs.len(), driver.layer().extracted);
+        assert_eq!(driver.layer().drops.load(Ordering::Relaxed), 0);
+    }
+
+    /// A place larger than the whole limit can never be paid for: the
+    /// stack's view records it starved, for its runner to end on, and no
+    /// work is ever taken.
+    #[test]
+    fn a_place_past_the_limit_starves() {
         let mut driver = driver(Budget::new(0));
         let mut jobs = Jobs::new(driver.budget());
+        let mark = driver.refusals();
         assert!(!jobs.take(&mut driver));
-        assert!(jobs.budget_exhausted());
         assert!(jobs.is_empty());
-        assert!(!jobs.take(&mut driver));
+        let starved = driver.budget().starved_since(mark).expect("starved");
+        assert!(starved.need > starved.limit);
         assert_eq!(driver.layer().extracted, 0);
         assert_eq!(driver.layer().polls.load(Ordering::Relaxed), 0);
         assert_eq!(driver.layer().drops.load(Ordering::Relaxed), 0);

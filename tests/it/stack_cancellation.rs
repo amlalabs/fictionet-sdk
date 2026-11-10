@@ -476,7 +476,6 @@ fn terminal_run(
         let took = fcx.now().since_start() - started.since_start();
         let result = result.map_err(|e| match e {
             StackError::Layer(e) => StackError::Layer(fictionet::ErrorChain(&e).to_string()),
-            StackError::Budget => StackError::Budget,
             StackError::Cancelled => StackError::Cancelled,
         });
         assert!(!fcx.is_cancelled(), "the caller's region is untouched");

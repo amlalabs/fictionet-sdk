@@ -57,7 +57,7 @@ use std::task::{Poll, Waker};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::layer::{
-    self, Admit, Budget, Child, ChildId, Chunk, DatagramCommand, DatagramEvent, Driver,
+    self, Admit, Budget, Child, ChildId, Chunk, Closing, DatagramCommand, DatagramEvent, Driver,
     MessageCommand, MessageEvent, MuxCommand, MuxEvent, PacketCommand, PacketEvent,
 };
 use fictionet::stdlib::network::icmp;
@@ -799,7 +799,7 @@ impl Drop for Socket {
         self.shared.with(|inner| {
             if let Some(mailbox) = inner.sockets.remove(&port) {
                 inner.ports.remove(&mailbox.child.id());
-                inner.command(mailbox.child.close());
+                inner.command(mailbox.child.close(Closing::Done));
             }
         });
     }

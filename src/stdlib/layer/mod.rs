@@ -232,13 +232,13 @@ pub(crate) mod probe;
 #[path = "../../../verification/layer/kani/mod.rs"]
 mod proofs;
 
-pub use budget::{Budget, Charge, OwnedWork, Refusals, Waiter, WorkOwner};
+pub use budget::{Budget, Charge, OwnedWork, Refusals, Starved, Waiter, WorkOwner};
 pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, FIRST_PLACES, Owned, Place};
 
 /// Maximum supported composition depth, including erased layers.
 pub const MAX_DEPTH: usize = 32;
 pub use carrier::{
-    ByteStream, Child, ChildId, Chunk, CreditLease, Credited, Datagram, DatagramCommand,
+    ByteStream, Child, ChildId, Chunk, Closing, CreditLease, Credited, Datagram, DatagramCommand,
     DatagramEvent, Datagrams, MessageCommand, MessageEvent, Messages, Mux, MuxCommand, MuxEvent,
     MuxOp, Slots, StreamCommand, StreamEvent,
 };

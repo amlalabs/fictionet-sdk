@@ -177,6 +177,32 @@ impl<S: Storage> Buffer<S> {
         }
     }
 
+    /// Gives back capacity past `keep` bytes, or past the unread bytes if
+    /// they are more, preserving the unread bytes and offset. Capacity at
+    /// or under `keep` stays, so storage kept for reuse is not given back.
+    pub fn shrink_to(&mut self, keep: usize) {
+        if self.allocated() <= keep {
+            return;
+        }
+        let n = self.len();
+        self.buf.bytes_mut().copy_within(self.start..self.end, 0);
+        // The storage keeps only initialized bytes, so the room kept is
+        // initialized first. The capacity is more than `keep`: it fits.
+        let kept = n.max(keep);
+        if self.buf.bytes().len() < kept {
+            let resized = self.buf.resize_within(kept);
+            debug_assert!(resized, "the capacity holds what is kept");
+        }
+        self.buf.shrink_to(kept);
+        self.start = 0;
+        self.end = n;
+        self.offered = 0;
+        #[cfg(test)]
+        {
+            self.moved = self.moved.saturating_add(n);
+        }
+    }
+
     fn compact(&mut self) {
         self.offered = 0;
         if self.start >= self.len() && self.start != 0 {

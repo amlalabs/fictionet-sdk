@@ -325,8 +325,9 @@ fn transfer_within_one_budget_never_raises_used() {
 /// release that leaves room for the refused charge, once: a release that
 /// leaves less wakes nothing, a later one wakes it no more, and asking
 /// again before memory frees adds no second wake. A charge past the limit
-/// is never woken for. Asking when nothing was refused wakes nothing. Over
-/// every `u8` limit, request and release.
+/// is never woken for. Asking when nothing was refused wakes nothing, and
+/// a runner asking through another view of the budget, which was not
+/// refused, is never woken. Over every `u8` limit, request and release.
 #[kani::proof]
 #[kani::unwind(4)]
 fn a_release_after_a_refusal_wakes_once() {
@@ -343,16 +344,21 @@ fn a_release_after_a_refusal_wakes_once() {
 
     let limit: u8 = kani::any();
     let budget = Budget::new(limit as usize);
+    let (view, other) = (budget.view(), budget.view());
     let mut held = budget.charge(limit as usize).unwrap();
     let count = Arc::new(Count(AtomicUsize::new(0)));
+    let bystander = Arc::new(Count(AtomicUsize::new(0)));
     let waiter = Waiter::new(Waker::from(count.clone()));
-    let mark = budget.refusals();
-    budget.wake_when_freed(&waiter, mark);
+    let unrefused = Waiter::new(Waker::from(bystander.clone()));
+    let (mark, other_mark) = (view.refusals(), other.refusals());
+    view.wake_when_freed(&waiter, mark);
     let more: u8 = kani::any();
     kani::assume(more > 0);
-    assert!(budget.charge(more as usize).is_none());
-    budget.wake_when_freed(&waiter, mark);
-    budget.wake_when_freed(&waiter, mark);
+    assert!(view.charge(more as usize).is_none());
+    view.wake_when_freed(&waiter, mark);
+    view.wake_when_freed(&waiter, mark);
+    // The other view was not refused: its runner waits for nothing.
+    other.wake_when_freed(&unrefused, other_mark);
     assert_eq!(count.0.load(Ordering::Relaxed), 0);
     let keep: u8 = kani::any();
     kani::assume(keep < limit);
@@ -364,6 +370,77 @@ fn a_release_after_a_refusal_wakes_once() {
     );
     drop(held);
     assert_eq!(count.0.load(Ordering::Relaxed), usize::from(more <= limit));
+    assert_eq!(bystander.0.load(Ordering::Relaxed), 0);
+}
+
+/// Two views of one budget, a charge held through one and a charge of any
+/// size asked through the other: the asking view records a refusal
+/// exactly when the charge does not fit, and the holding view and the
+/// budget's own handle record none. Over every `u8` limit and size.
+#[kani::proof]
+#[kani::unwind(4)]
+fn a_view_records_only_its_own_refusals() {
+    let limit: u8 = kani::any();
+    let budget = Budget::new(limit as usize);
+    let (holder, asker) = (budget.view(), budget.view());
+    let size: u8 = kani::any();
+    kani::assume(size <= limit);
+    let held = holder.charge(size as usize).unwrap();
+    let marks = [&budget, &holder, &asker].map(Budget::refusals);
+    let need: u8 = kani::any();
+    let charged = asker.charge(need as usize);
+    let fits = need <= limit - size;
+    assert_eq!(charged.is_some(), fits);
+    assert_eq!(asker.refused_since(marks[2]), !fits);
+    assert!(asker.clone().refused_since(marks[2]) == !fits);
+    assert!(!holder.refused_since(marks[1]));
+    assert!(!budget.refused_since(marks[0]));
+    drop((held, charged));
+    assert_eq!(budget.used(), 0);
+}
+
+/// A refused charge is starved exactly when it needs more than the limit,
+/// with that need and the limit, and its runner is never woken for it, not
+/// even when every byte comes back. Over every `u8` limit, holding and
+/// need.
+#[kani::proof]
+#[kani::unwind(4)]
+fn starved_is_a_need_over_the_limit_and_never_wakes() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let limit: u8 = kani::any();
+    let budget = Budget::new(limit as usize);
+    let view = budget.view();
+    let size: u8 = kani::any();
+    kani::assume(size <= limit);
+    let held = budget.charge(size as usize).unwrap();
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waiter = Waiter::new(Waker::from(count.clone()));
+    let mark = view.refusals();
+    let need: u16 = kani::any();
+    kani::assume(usize::from(need) > usize::from(limit - size));
+    assert!(view.charge(need as usize).is_none());
+    let over = usize::from(need) > usize::from(limit);
+    assert_eq!(
+        view.starved_since(mark),
+        over.then_some(Starved {
+            need: need as usize,
+            limit: limit as usize,
+        })
+    );
+    view.wake_when_freed(&waiter, mark);
+    drop(held);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(count.0.load(Ordering::Relaxed), usize::from(!over));
 }
 
 // ---------------------------------------------------------------------------

@@ -22,9 +22,9 @@ use std::sync::Weak;
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedVec, Child, ChildId, Chunk, CommandOf,
-    Env, EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
-    PacketEvent, Packets, Slots, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedVec, Child, ChildId, Chunk, Closing,
+    CommandOf, Env, EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp,
+    PacketCommand, PacketEvent, Packets, Slots, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::packet::{CheckedIpPacket, Sort};
@@ -2882,9 +2882,17 @@ impl Layer for TcpLayer {
             }
             MuxOp::Credit(id, units) => self.credit(env, id, units, None),
             MuxOp::Window(id, units, window) => self.credit(env, id, units, Some(window)),
-            MuxOp::Close(id) => {
+            MuxOp::Close(id, why) => {
+                // TCP's only way to say why is how it closes. A connection
+                // the receiver never took, past its limit, refused by the
+                // application or for want of memory, is reset, as Linux
+                // resets a connection still in the accept queue of a
+                // listener that closes. One it took closes as a process's
+                // socket does when the process is done or dies: a FIN, or
+                // a reset if bytes it never read are left.
                 if let Some(h) = self.open_socket(id) {
-                    self.orphan(h, false);
+                    let refused = matches!(why, Closing::Prohibited | Closing::ResourceShortage);
+                    self.orphan(h, refused);
                 }
             }
         }

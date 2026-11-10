@@ -5,7 +5,9 @@ use super::*;
 use core::convert::Infallible;
 use std::sync::Arc;
 
-use fictionet::stdlib::layer::{Budget, Chain, Child, Children, Driver, MuxCommand, Side, Top};
+use fictionet::stdlib::layer::{
+    Budget, Chain, Child, Children, Closing, Driver, MuxCommand, Side, Top,
+};
 use fictionet::stdlib::network::ip::Header;
 use fictionet::stdlib::network::packet::{Ingress, IpLayer, NetworkInput, Scope, Scopes};
 use fictionet::time::Instant;
@@ -393,7 +395,7 @@ fn binding_zero_takes_free_ephemeral_ports_and_a_taken_port_fails() {
     assert_ne!(again.id(), id);
     assert_eq!(bound.local.port(), 53);
     // So does a handle's close, with nothing more to say.
-    command(&mut d, again.close());
+    command(&mut d, again.close(Closing::Done));
     assert_eq!(seen(up(&mut d)), []);
     assert!(!d.layer().upper().is_bound(53));
 }

@@ -129,9 +129,6 @@ where
                 }
             }
             poll_jobs = self.jobs.take(&mut self.driver);
-            if self.jobs.budget_exhausted() {
-                return Err(fictionet::Error::msg("application work budget exhausted"));
-            }
             if !(moved || poll_jobs) {
                 break;
             }

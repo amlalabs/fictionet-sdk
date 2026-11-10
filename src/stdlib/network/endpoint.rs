@@ -101,11 +101,6 @@ pub(crate) async fn drive(
             moved |= jobs
                 .poll(Some(&fcx), cx, |done| ip.complete(done))
                 .map_err(|e| fictionet::Error::msg(e.to_string()))?;
-            if jobs.budget_exhausted() {
-                return Poll::Ready(Err(fictionet::Error::msg(
-                    "packet stack work budget exhausted",
-                )));
-            }
             moved |= send_below(&mut ip, &mut interface);
             moved |= ip.send_above(|event| {
                 if held.is_some() {

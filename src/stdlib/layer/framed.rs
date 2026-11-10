@@ -126,6 +126,8 @@ pub type Framing<D, O> = Messages<Decoded<D>, Owned<O>>;
 ///
 /// Going down, each value is written whole, after the ones before.
 /// [`MessageCommand::End`] ends the direction after them.
+/// If its output reservation cannot be paid, the send is returned unchanged
+/// as [`Admit::Blocked`], without invoking the encoder.
 ///
 /// The decoder's buffer is a [`ChargedBytes`]: it grows only as the
 /// connection's [`Budget`](super::Budget) pays for it, charged before it
@@ -268,8 +270,9 @@ where
                 let bound = value
                     .write_bound()
                     .map_err(|e| FramedError::Write(WriteFailure::Value(e)))?;
-                let mut bytes =
-                    ChargedBytes::with_capacity(env.budget(), bound).ok_or(FramedError::Budget)?;
+                let Some(mut bytes) = ChargedBytes::with_capacity(env.budget(), bound) else {
+                    return Ok(Admit::Blocked(MessageCommand::Send(value)));
+                };
                 let filled = bytes.fill(|out| {
                     out.resize(bound, 0);
                     let mut writer = BoundedWriter::new(out);
@@ -343,8 +346,6 @@ where
 
 /// Why [`Framed`] gave up on its connection.
 pub enum FramedError<O: Wire> {
-    /// The connection's budget had no room for a written value.
-    Budget,
     /// The protocol above sent a value its wire format cannot hold.
     Write(WriteFailure<O::WriteError>),
 }
@@ -352,7 +353,6 @@ pub enum FramedError<O: Wire> {
 impl<O: Wire> core::fmt::Debug for FramedError<O> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FramedError::Budget => f.write_str("Budget"),
             FramedError::Write(e) => f.debug_tuple("Write").field(&format_args!("{e}")).finish(),
         }
     }
@@ -361,7 +361,6 @@ impl<O: Wire> core::fmt::Debug for FramedError<O> {
 impl<O: Wire> core::fmt::Display for FramedError<O> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FramedError::Budget => f.write_str("the connection's budget has no room"),
             FramedError::Write(_) => f.write_str("a value could not be written"),
         }
     }
@@ -370,7 +369,6 @@ impl<O: Wire> core::fmt::Display for FramedError<O> {
 impl<O: Wire> core::error::Error for FramedError<O> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            FramedError::Budget => None,
             FramedError::Write(e) => Some(e),
         }
     }
@@ -540,6 +538,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn writes_wait_for_memory_without_losing_or_repeating_values() {
+        for frame in frames(16) {
+            let budget = Budget::new(4096);
+            let mut h = Harness::with_budget(
+                Seed::from_u64(8),
+                Framed::<_, Frame>::new(Frames::<Frame>::new()),
+                budget.clone(),
+            );
+            let value = Owned::new(frame.clone(), budget.charge(frame.pdu.capacity()).unwrap());
+            let pointer = value.pdu.as_ptr();
+            let charged = value.charged();
+            let held = budget.charge(budget.limit() - budget.used()).unwrap();
+            let mut command = MessageCommand::Send(value);
+            for _ in 0..3 {
+                let Admit::Blocked(MessageCommand::Send(value)) =
+                    h.driver().command(command).unwrap()
+                else {
+                    panic!("a write without room must wait");
+                };
+                assert_eq!(*value, frame);
+                assert_eq!(value.pdu.as_ptr(), pointer);
+                assert_eq!(value.charged(), charged);
+                assert_eq!(budget.used(), held.bytes() + charged);
+                command = MessageCommand::Send(value);
+                h.settle().unwrap();
+                assert!(h.output().is_empty());
+            }
+            drop(held);
+            assert!(matches!(h.driver().command(command).unwrap(), Admit::Taken));
+            h.settle().unwrap();
+            h.settle().unwrap();
+            assert_eq!(read(h.output()), vec![frame]);
+            drop(h);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    /// A reply the protocol above sends while the budget is full stays in
+    /// the chain; once memory frees, running the stack writes it, once, with
+    /// no one sending it again.
+    #[test]
+    fn a_reply_without_room_is_written_once_when_memory_frees() {
+        let budget = Budget::new(1 << 16);
+        let mut h = Harness::with_budget(Seed::from_u64(10), stack(), budget.clone());
+        let before = frames(2);
+        h.push(&wire(&before)).unwrap();
+        assert_eq!(read(h.output()), before, "the echo answers with room");
+        let late = Frame {
+            transaction: 99,
+            unit: 1,
+            pdu: vec![0x03; 9],
+        };
+        let reply = Owned::new(late.clone(), budget.charge(late.pdu.capacity()).unwrap());
+        let held = budget.charge(budget.limit() - budget.used()).unwrap();
+        // The stack charges through its driver's view of the budget.
+        let mark = h.driver().refusals();
+        h.driver().layer_mut().upper_mut().reply = Some(reply);
+        for _ in 0..3 {
+            h.settle().unwrap();
+            assert_eq!(read(h.output()), before, "nothing is written without room");
+        }
+        let view = h.driver().budget();
+        assert!(view.refused_since(mark), "the runner is told to wait");
+        assert_eq!(view.starved_since(mark), None, "the reply fits the limit");
+        drop(held);
+        h.settle().unwrap();
+        h.settle().unwrap();
+        let mut sent = before;
+        sent.push(late);
+        assert_eq!(read(h.output()), sent);
+        drop(h);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn output_is_reserved_before_the_writer_runs() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static WROTE: AtomicBool = AtomicBool::new(false);
@@ -574,12 +647,21 @@ pub(crate) mod tests {
             fictionet::time::Instant::ZERO,
         );
         let value = Owned::new(Large, budget.charge(0).unwrap());
+        // The stack charges through its driver's view of the budget.
+        let mark = d.refusals();
         assert!(matches!(
             d.command(MessageCommand::Send(value)),
-            Err(FramedError::Budget)
+            Ok(Admit::Blocked(MessageCommand::Send(_)))
         ));
         assert!(!WROTE.load(Ordering::Relaxed));
         assert_eq!(budget.used(), 0);
+        // No release can make room for more than the limit: the runner
+        // reads that as starved and ends the connection instead of waiting.
+        let starved = d
+            .budget()
+            .starved_since(mark)
+            .expect("a need over the limit");
+        assert!(starved.need > starved.limit);
     }
 
     #[test]

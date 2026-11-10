@@ -719,10 +719,26 @@ pub enum MuxOp<C: Port, K: Port> {
     /// child and its bytes, whatever the mux holds. A mux with no use for
     /// it takes the credit alone.
     Window(ChildId, u64, Weak<Charge>),
-    /// Close the child at once, as a reset does.
-    Close(ChildId),
+    /// Close the child at once, as a reset does, for the cause the
+    /// receiver gives. The mux tells its peer that cause in the protocol's
+    /// own terms and guesses none.
+    Close(ChildId, Closing),
     /// A connection control command.
     Control(CommandOf<K>),
+}
+
+/// Why a child is closed, as the receiver decided it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closing {
+    /// The receiver is done with it.
+    Done,
+    /// Never taken: past the receiver's limit on children, or the
+    /// application said no.
+    Prohibited,
+    /// Never taken: no memory for it now. The peer may try again.
+    ResourceShortage,
+    /// Taken, then given up on: its layer failed or it broke its limits.
+    Failed,
 }
 
 impl<C: Port, K: Port> MuxCommand<C, K> {
@@ -748,7 +764,7 @@ impl<C: Port, K: Port> core::fmt::Debug for MuxCommand<C, K> {
             MuxOp::Child(..) => "Child",
             MuxOp::Credit(..) => "Credit",
             MuxOp::Window(..) => "Window",
-            MuxOp::Close(_) => "Close",
+            MuxOp::Close(..) => "Close",
             MuxOp::Control(_) => "Control",
         })
     }
@@ -801,9 +817,10 @@ impl Child {
         MuxCommand(MuxOp::Window(self.id, units, Arc::downgrade(window)))
     }
 
-    /// Closes the child at once, giving up the handle.
-    pub fn close<C: Port, K: Port>(self) -> MuxCommand<C, K> {
-        MuxCommand(MuxOp::Close(self.id))
+    /// Closes the child at once, for the cause `why`, giving up the
+    /// handle.
+    pub fn close<C: Port, K: Port>(self, why: Closing) -> MuxCommand<C, K> {
+        MuxCommand(MuxOp::Close(self.id, why))
     }
 }
 

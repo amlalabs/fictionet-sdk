@@ -228,7 +228,6 @@ impl From<StackError<HandshakeError>> for HandshakeError {
     fn from(e: StackError<HandshakeError>) -> HandshakeError {
         match e {
             StackError::Layer(e) => e,
-            StackError::Budget => HandshakeError::Failed("input memory budget exhausted".into()),
             StackError::Cancelled => HandshakeError::Cancelled,
         }
     }
@@ -241,7 +240,10 @@ fn ended(end: StreamEnd) -> HandshakeError {
         StreamEnd::Conn(e) => e.into(),
         StreamEnd::Reset => HandshakeError::Conn(ConnError::Reset),
         StreamEnd::Finished | StreamEnd::Idle => HandshakeError::Closed,
-        StreamEnd::Budget => HandshakeError::Failed("no budget for the TLS input".into()),
+        StreamEnd::Budget(starved) => HandshakeError::Failed(format!(
+            "the handshake needs {} bytes, more than the budget's limit of {}",
+            starved.need, starved.limit
+        )),
     }
 }
 

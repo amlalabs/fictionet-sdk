@@ -15,11 +15,11 @@ use std::time::Duration;
 
 use super::stack;
 use crate::Cx;
-use crate::stdlib::codec::Wire;
+use crate::stdlib::codec::{Heap, Wire, parse_paid};
 use crate::stdlib::layer::{
     Admit, Budget, ByteStream, Chain, Charge, ChargedBytes, ChargedDeque, ChildId, Children,
-    Chunk as Bytes, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand,
-    StreamEvent, Timers, Top, WriteFailure,
+    Chunk as Bytes, Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots,
+    StreamCommand, StreamEvent, Timers, Top, WriteFailure,
 };
 use crate::stdlib::protocols::ssh::transport::{HostKey, TransportError};
 use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
@@ -39,28 +39,6 @@ const WINDOW: u32 = 65536;
 const PACKET: u32 = 32000;
 const OUTPUT_LIMIT: usize = 256 * 1024;
 const MAX_AUTH_REQUESTS: u32 = 1024;
-/// The connection layer's own state, charged once: the authentication
-/// fields (account names, a challenge and its request, a delayed failure),
-/// each from one packet, and the copies an outgoing message makes before
-/// it is encoded.
-const STATE: usize = 6 * ssh::MAX_PAYLOAD;
-/// What parsing a packet other than channel data may allocate, per byte of
-/// its payload: name lists, terminal modes and keyboard-interactive answers
-/// parse into small values of up to 12 heap bytes per byte (a vector place
-/// for each name, mode or answer of at least two, five or four bytes, in
-/// vectors that may have doubled), and the observer gets copies.
-const PARSE: usize = 64;
-/// What the request of a CHANNEL_REQUEST holds while its channel takes it.
-const REQUEST: usize = 2 * ssh::MAX_PAYLOAD;
-
-/// Why a channel open is refused (RFC 4254 section 5.1).
-#[derive(Clone, Copy, Debug)]
-enum Refusal {
-    /// Past the channel limit, or refused by the application.
-    Prohibited,
-    /// No memory for the channel now; the connection goes on.
-    ResourceShortage,
-}
 
 /// An authentication method from RFCs 4252 and 4256.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -576,8 +554,9 @@ pub enum Ended {
     Failed,
     /// The idle deadline expired.
     Idle,
-    /// The connection held more than its [`Budget`] allows.
-    Budget,
+    /// The connection needed more than its [`Budget`]'s whole limit. A
+    /// charge that only finds no room now waits for memory instead.
+    Budget(crate::stdlib::layer::Starved),
     /// Reading or writing failed: the client reset the connection, or TLS
     /// broke ([`crate::stdlib::network::ConnError::Broken`]).
     Conn(crate::stdlib::network::ConnError),
@@ -594,7 +573,7 @@ impl Ended {
             Ended::Closed => "closed",
             Ended::Failed => "failed",
             Ended::Idle => "idle",
-            Ended::Budget => "budget",
+            Ended::Budget(_) => "budget",
             Ended::Conn(crate::stdlib::network::ConnError::Reset) => "reset",
             Ended::Conn(crate::stdlib::network::ConnError::Broken) => "broken",
             Ended::Conn(crate::stdlib::network::ConnError::TimedOut) => "timed_out",
@@ -675,7 +654,7 @@ impl<H: Handler> Server<H> {
             let end = match result {
                 Ok(stack::StreamEnd::Finished) => protocol_end,
                 Ok(stack::StreamEnd::Idle) => Ended::Idle,
-                Ok(stack::StreamEnd::Budget) | Err(stack::StackError::Budget) => Ended::Budget,
+                Ok(stack::StreamEnd::Budget(starved)) => Ended::Budget(starved),
                 Ok(stack::StreamEnd::Conn(error)) => Ended::Conn(error),
                 Ok(stack::StreamEnd::Reset) => {
                     Ended::Conn(crate::stdlib::network::ConnError::Reset)
@@ -838,11 +817,14 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     started: bool,
     ended: bool,
     end_sent: bool,
-    /// [`STATE`], from the connection's first step.
-    state: Option<Charge>,
+    /// Whether the channel table and the queues are paid for.
+    reserved: bool,
     /// What goes down next, written into room for four packets that was
     /// paid for before it was allocated.
     out: Option<ChargedBytes>,
+    /// Room to encode one outgoing payload before the transport seals it,
+    /// paid for with the output's room.
+    payload: Option<ChargedBytes>,
     out_child: Option<(ChildId, u64)>,
     flights: ChargedDeque<Flight>,
     up: ChargedDeque<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>,
@@ -850,13 +832,21 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     next_channel: u32,
     credit_turn: Option<ChildId>,
     control: ConnectionControl,
-    user: Option<String>,
-    auth_user: Option<String>,
+    /// The authenticated account, charged for what it holds.
+    user: Option<Owned<String>>,
+    /// The account the client authenticates as, until it has, charged
+    /// for what it holds.
+    auth_user: Option<Owned<String>>,
     service_requested: bool,
     attempts: u32,
     auth_requests: u32,
-    challenge: Option<(auth::Request, usize)>,
-    failure: Option<Vec<u8>>,
+    /// The request a keyboard-interactive challenge answers, with what
+    /// parsing it was charged, and how many answers it wants.
+    challenge: Option<(Owned<auth::Request>, usize)>,
+    /// A failure waiting out its delay: the methods the handler named, in
+    /// the vector its decision allocated (the caller's, like the rest of a
+    /// policy callback's values), and whether one factor succeeded.
+    failure: Option<(Vec<AuthMethod>, bool)>,
     failure_ready: bool,
     /// Application packets the transport decoded, each with the charge
     /// that paid for it, waiting to be parsed.
@@ -879,16 +869,30 @@ fn fill<T, R, E>(
     }
 }
 
-/// What processing an application packet allocates before it is done with
-/// it, charged before the packet is parsed. Channel data is parsed, copied
-/// once for the observer, and kept as the channel's input: three copies. A
-/// channel request also keeps the request it parses ([`REQUEST`]).
-fn packet_charge(payload: &[u8]) -> usize {
-    match payload.first() {
-        Some(94 | 95) => 3 * payload.len(),
-        Some(98) => PARSE * payload.len() + REQUEST,
-        _ => PARSE * payload.len(),
+/// Seals `payload` into one packet in the output, which the step made
+/// sure has room for one ([`Ssh::room`]).
+fn seal<T: PacketTransport>(
+    out: &mut Option<ChargedBytes>,
+    transport: &mut T,
+    payload: &[u8],
+) -> Result<(), Error> {
+    if out.as_ref().is_none_or(|out| out.room() < ssh::MAX_PACKET) {
+        return Err(TransportError::State.into());
     }
+    fill(out, transport, |transport, out| {
+        transport.write_packet(payload, out)
+    })?
+    .map_err(Error::Protocol)
+}
+
+/// What became of an application packet.
+#[must_use]
+enum Handled {
+    /// It was taken.
+    Done,
+    /// What it takes was refused before anything changed: it waits,
+    /// unparsed, for memory (layer rule 9).
+    Waiting,
 }
 
 /// SSH with one synchronous application adapter on every scoped channel.
@@ -921,8 +925,9 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             started: false,
             ended: false,
             end_sent: false,
-            state: None,
+            reserved: false,
             out: None,
+            payload: None,
             out_child: None,
             flights: ChargedDeque::new(&Budget::unlimited(), 128),
             up: ChargedDeque::new(&Budget::unlimited(), 8),
@@ -970,16 +975,14 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             now,
         }
     }
-    /// Charges the connection's fixed storage once, all of it or none: its
-    /// [`STATE`], the channel table and its queues. `false` leaves nothing
-    /// charged, to try again once memory frees (layer rule 9).
+    /// Charges the connection's fixed storage once, all of it or none: the
+    /// channel table and its queues. `false` leaves nothing charged, to
+    /// try again once memory frees (layer rule 9). What authentication
+    /// keeps is charged as it is kept, each value for what it holds.
     fn reserve(&mut self, budget: &Budget) -> bool {
-        if self.state.is_some() {
+        if self.reserved {
             return true;
         }
-        let Some(state) = budget.charge(STATE) else {
-            return false;
-        };
         let Some(channels) = Slots::with_budget(self.config.max_channels, budget) else {
             return false;
         };
@@ -996,18 +999,22 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         self.flights = flights;
         self.pending_packets = pending_packets;
         self.up = up;
-        self.state = Some(state);
+        self.reserved = true;
         true
     }
-    /// Makes sure of room for what a step writes, four packets, paid for
-    /// before it is allocated. `false` when the budget has none now: the
-    /// step waits for memory (layer rule 9). A step writes only into an
-    /// empty output, so the room is all there.
+    /// Makes sure of room for what a step writes, four packets, and for
+    /// encoding each payload before it is sealed, paid for before it is
+    /// allocated. `false` when the budget has none now: the step waits for
+    /// memory (layer rule 9). A step writes only into an empty output, so
+    /// the room is all there.
     fn room(&mut self, budget: &Budget) -> bool {
         if self.out.is_none() {
             self.out = ChargedBytes::with_capacity(budget, 4 * ssh::MAX_PACKET);
         }
-        self.out.is_some()
+        if self.payload.is_none() {
+            self.payload = ChargedBytes::with_capacity(budget, ssh::MAX_PAYLOAD);
+        }
+        self.out.is_some() && self.payload.is_some()
     }
     /// Whether output waits to go down.
     fn out_pending(&self) -> bool {
@@ -1032,19 +1039,24 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             .push_back(event)
             .map_err(|_| TransportError::State.into())
     }
-    fn write(&mut self, payload: &[u8]) -> Result<(), Error> {
-        if self
-            .out
-            .as_ref()
-            .is_none_or(|out| out.room() < ssh::MAX_PACKET)
-        {
-            return Err(TransportError::State.into());
-        }
-        self.written(|transport, out| transport.write_packet(payload, out))?
-            .map_err(Error::Protocol)
-    }
     fn send(&mut self, message: &impl Wire<WriteError = ssh::Error>) -> Result<(), Error> {
-        self.write(&message.to_bytes()?)
+        self.send_with(|payload| message.write(payload))
+    }
+    /// Encodes one payload with `encode` into the room paid for it, and
+    /// seals it into the output. A payload past [`ssh::MAX_PAYLOAD`] is
+    /// one the writers refuse, so it fails the connection.
+    fn send_with(
+        &mut self,
+        encode: impl FnOnce(&mut Vec<u8>) -> Result<(), ssh::Error>,
+    ) -> Result<(), Error> {
+        let payload = self.payload.as_mut().ok_or(TransportError::State)?;
+        payload.clear();
+        match payload.fill(encode) {
+            Ok(()) => {}
+            Err(WriteFailure::Value(error)) => return Err(error.into()),
+            Err(WriteFailure::Bound) => return Err(TransportError::State.into()),
+        }
+        seal(&mut self.out, &mut self.transport, payload)
     }
     fn close(&mut self, env: &mut Env<'_, Ended>, reason: Ended) {
         if !self.ended {
@@ -1069,43 +1081,104 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             .find(|id| self.channels.get(*id).unwrap().wire == wire)
             .ok_or_else(|| TransportError::State.into())
     }
-    fn authentication(&mut self, payload: &[u8], env: &mut Env<'_, Ended>) -> Result<(), Error> {
+    /// The session identifier, once the first exchange settled it.
+    fn session_id(&self) -> Option<&[u8]> {
+        match self.transport.state() {
+            TransportState::Established { session_id, .. }
+            | TransportState::Rekeying { session_id } => Some(session_id),
+            TransportState::Pending => None,
+        }
+    }
+    /// A USERAUTH_REQUEST, or the answers to a challenge. What it takes is
+    /// paid for before anything changes: its parse, the observer's copies
+    /// of the request and the answers, the account names kept while and
+    /// once it authenticates, the method's name, the banner's copy, and
+    /// what checking a signature allocates. Refused, it waits unparsed.
+    fn authentication(
+        &mut self,
+        payload: &[u8],
+        env: &mut Env<'_, Ended>,
+    ) -> Result<Handled, Error> {
         if !self.service_requested || self.failure.is_some() {
             return Err(TransportError::State.into());
         }
+        let budget = env.budget().clone();
+        let (request, responses) = if payload.first() == Some(&61) {
+            let Some(parsed) = parse_paid(&budget, payload, auth::Message::parse) else {
+                return Ok(Handled::Waiting);
+            };
+            let (auth::Message::InfoResponse(responses), charge) = parsed?.into_parts() else {
+                return Err(TransportError::State.into());
+            };
+            (None, Some(Owned::new(responses, charge)))
+        } else {
+            let Some(parsed) = parse_paid(&budget, payload, auth::Request::parse) else {
+                return Ok(Handled::Waiting);
+            };
+            (Some(parsed?), None)
+        };
+        let pending = request
+            .as_deref()
+            .or(self.challenge.as_ref().map(|(request, _)| &**request))
+            .ok_or(TransportError::State)?;
+        let banner = match (&self.auth_user, &self.config.banner) {
+            (None, Some(banner)) => banner.len(),
+            _ => 0,
+        };
+        let verifying = match &pending.method {
+            auth::Method::PublicKey {
+                signature: Some(_), ..
+            } => auth::Request::most_verify_heap(
+                payload.len(),
+                self.session_id().map_or(0, <[u8]>::len),
+            ),
+            _ => 0,
+        };
+        let need = pending.heap()
+            + responses.as_deref().map_or(0, Heap::heap)
+            + 2 * pending.user.len()
+            + pending.method.name().len()
+            + banner
+            + verifying;
+        let Some(mut paid) = budget.charge(need) else {
+            return Ok(Handled::Waiting);
+        };
         self.auth_requests = self.auth_requests.saturating_add(1);
         if self.auth_requests > MAX_AUTH_REQUESTS {
             return Err(TransportError::State.into());
         }
-        let (request, responses) = if payload.first() == Some(&61) {
-            let auth::Message::InfoResponse(responses) = auth::Message::parse(payload)? else {
-                return Err(TransportError::State.into());
-            };
-            self.handler.observe(
-                &self.context(env.now()),
-                &Event::AuthenticationResponses(responses.clone()),
-            );
-            let (request, count) = self.challenge.take().ok_or(TransportError::State)?;
-            if responses.len() != count {
-                return Err(TransportError::State.into());
+        let (request, responses) = match responses {
+            Some(responses) => {
+                self.handler.observe(
+                    &self.context(env.now()),
+                    &Event::AuthenticationResponses((*responses).clone()),
+                );
+                let (request, count) = self.challenge.take().ok_or(TransportError::State)?;
+                if responses.len() != count {
+                    return Err(TransportError::State.into());
+                }
+                (request, Some(responses))
             }
-            (request, Some(responses))
-        } else {
-            self.challenge = None;
-            (auth::Request::parse(payload)?, None)
+            None => {
+                self.challenge = None;
+                (request.ok_or(TransportError::State)?, None)
+            }
         };
         if request.service != "ssh-connection" {
             return Err(TransportError::State.into());
         }
         if self
             .auth_user
-            .as_ref()
-            .is_some_and(|user| user != &request.user)
+            .as_deref()
+            .is_some_and(|user| *user != request.user)
         {
             return Err(TransportError::State.into());
         }
         if self.auth_user.is_none() {
-            self.auth_user = Some(request.user.clone());
+            let name = paid
+                .split(request.user.len())
+                .ok_or(TransportError::State)?;
+            self.auth_user = Some(Owned::new(request.user.clone(), name));
             if let Some(message) = &self.config.banner {
                 self.send(&auth::Message::Banner {
                     message: message.clone(),
@@ -1114,27 +1187,19 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             }
         }
         let verified = request
-            .verify_public_key(
-                match self.transport.state() {
-                    TransportState::Established { session_id, .. }
-                    | TransportState::Rekeying { session_id } => Some(session_id),
-                    TransportState::Pending => None,
-                }
-                .ok_or(TransportError::State)?,
-                payload,
-            )
+            .verify_public_key(self.session_id().ok_or(TransportError::State)?, payload)
             .unwrap_or(false);
         self.handler.observe(
             &self.context(env.now()),
             &Event::Authentication {
-                request: request.clone(),
+                request: (*request).clone(),
                 verified,
             },
         );
         let attempt = AuthAttempt {
             request: &request,
             signature_verified: verified,
-            responses: responses.as_deref(),
+            responses: responses.as_ref().map(|responses| responses.as_slice()),
         };
         let decision = self
             .handler
@@ -1162,16 +1227,21 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         }
         match decision {
             AuthDecision::Accept if probe => {
+                let (request, _parsed) = request.into_parts();
                 if let auth::Method::PublicKey { algorithm, key, .. } = request.method {
                     self.send(&auth::Message::PublicKeyOk { algorithm, key })?;
                 }
             }
             AuthDecision::Accept => {
                 self.send(&auth::Message::Success)?;
-                self.user = Some(request.user.clone());
+                let name = paid
+                    .split(request.user.len())
+                    .ok_or(TransportError::State)?;
+                self.user = Some(Owned::new(request.user.clone(), name));
                 self.auth_user = None;
                 self.challenge = None;
                 self.timers.cancel(&Timer::Login);
+                let (request, _parsed) = request.into_parts();
                 self.handler.observe(
                     &self.context(env.now()),
                     &Event::Authenticated {
@@ -1190,15 +1260,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 {
                     self.attempts = self.attempts.saturating_add(1);
                 }
-                let failure = auth::Message::Failure {
-                    methods: methods.into_iter().map(|m| m.name().to_owned()).collect(),
-                    partial_success,
-                }
-                .to_bytes()?;
                 if delay.is_zero() {
-                    self.write(&failure)?;
+                    self.send_with(|out| {
+                        auth::write_failure(methods.iter().map(|m| m.name()), partial_success, out)
+                    })?;
                 } else {
-                    self.failure = Some(failure);
+                    self.failure = Some((methods, partial_success));
                     self.failure_ready = false;
                     self.timers.set(Timer::Failure, env.now() + delay);
                 }
@@ -1221,19 +1288,44 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 self.challenge = Some((request, count));
             }
         }
-        Ok(())
+        Ok(Handled::Done)
     }
 
+    /// Parses a connection message, paid for before it is parsed, and
+    /// takes it. Refused, it waits unparsed.
+    fn connection(&mut self, payload: &[u8], env: &mut Env<'_, Ended>) -> Result<Handled, Error> {
+        let Some(message) = parse_paid(env.budget(), payload, wire::Message::parse) else {
+            return Ok(Handled::Waiting);
+        };
+        self.connection_message(message?, env)
+    }
+
+    /// Takes a parsed connection message with what it was charged. The
+    /// observer's copy is paid for before anything changes, and for
+    /// channel data the observer's copy of the bytes and the channel's
+    /// own: refused, the message waits. What the message holds moves on
+    /// with its charge: a channel request to its channel, an opening's
+    /// kind to the opening.
     fn connection_message(
         &mut self,
-        message: wire::Message,
-        paid: &mut Charge,
+        message: Owned<wire::Message>,
         env: &mut Env<'_, Ended>,
-    ) -> Result<(), Error> {
+    ) -> Result<Handled, Error> {
+        let copies = message.heap()
+            + match &*message {
+                wire::Message::Data { data, .. } | wire::Message::ExtendedData { data, .. } => {
+                    2 * data.len()
+                }
+                _ => 0,
+            };
+        let Some(mut paid) = env.budget().charge(copies) else {
+            return Ok(Handled::Waiting);
+        };
         self.handler.observe(
             &self.context(env.now()),
-            &Event::Connection(message.clone()),
+            &Event::Connection((*message).clone()),
         );
+        let (message, mut parsed) = message.into_parts();
         match message {
             wire::Message::GlobalRequest {
                 want_reply,
@@ -1264,22 +1356,27 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     return Err(TransportError::State.into());
                 }
                 if self.channels.len() == self.config.max_channels || max_packet == 0 {
-                    return self.refuse(sender, Refusal::Prohibited);
+                    self.refuse(sender, Closing::Prohibited)?;
+                    return Ok(Handled::Done);
                 }
-                // A channel the budget cannot hold now is refused; the
-                // connection and its other channels go on.
-                let Some(charge) = env.budget().charge(ssh::MAX_PAYLOAD * 2) else {
-                    return self.refuse(sender, Refusal::ResourceShortage);
-                };
+                // The opening holds the kind, charged with the message,
+                // and a copy of the account name. A channel the budget
+                // cannot hold now is refused; the connection and its
+                // other channels go on.
+                let user = self.user.as_deref().ok_or(TransportError::State)?;
+                if !parsed.grow_to(parsed.bytes() + user.len()) {
+                    self.refuse(sender, Closing::ResourceShortage)?;
+                    return Ok(Handled::Done);
+                }
                 let wire = self.next_channel;
                 self.next_channel = wire.checked_add(1).ok_or(TransportError::State)?;
                 let opening = Owned::new(
                     channel::Opening {
-                        user: self.user.clone().ok_or(TransportError::State)?,
+                        user: user.clone(),
                         channel: wire,
                         kind,
                     },
-                    charge,
+                    parsed,
                 );
                 let child = self
                     .channels
@@ -1313,13 +1410,13 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     .ok_or(TransportError::State)?;
             }
             wire::Message::Data { recipient, data } => {
-                self.input(env, paid, recipient, None, data)?
+                self.input(env, &mut paid, recipient, None, data)?
             }
             wire::Message::ExtendedData {
                 recipient,
                 kind,
                 data,
-            } => self.input(env, paid, recipient, Some(kind), data)?,
+            } => self.input(env, &mut paid, recipient, Some(kind), data)?,
             wire::Message::ChannelRequest {
                 recipient,
                 want_reply,
@@ -1329,12 +1426,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 if self.channels.get(id).unwrap().closed {
                     return Err(TransportError::State.into());
                 }
-                let charge = paid.split(REQUEST).ok_or(TransportError::State)?;
+                // All the message holds is the request's.
                 self.raise(MuxEvent::Child(
                     id,
                     ChannelEvent::Request {
                         want_reply,
-                        request: Owned::new(request, charge),
+                        request: Owned::new(request, parsed),
                     },
                 ))?;
             }
@@ -1370,12 +1467,19 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             }
             _ => return Err(TransportError::State.into()),
         }
-        Ok(())
+        Ok(Handled::Done)
     }
-    fn refuse(&mut self, peer: u32, why: Refusal) -> Result<(), Error> {
+    /// Refuses the peer's channel `peer`, not yet confirmed, telling it
+    /// `why` as RFC 4254 section 5.1 spells it: prohibited (1) past the
+    /// channel limit or when the application says no or is done before
+    /// taking it, resource shortage (4) when there is no memory for it
+    /// now, and connect failed (2) when it was taken and failed before it
+    /// could be confirmed.
+    fn refuse(&mut self, peer: u32, why: Closing) -> Result<(), Error> {
         let (reason, description) = match why {
-            Refusal::Prohibited => (1, "Channel refused"),
-            Refusal::ResourceShortage => (4, "Resource shortage"),
+            Closing::Prohibited | Closing::Done => (1, "Channel refused"),
+            Closing::ResourceShortage => (4, "Resource shortage"),
+            Closing::Failed => (2, "Channel failed"),
         };
         self.send(&wire::Message::ChannelOpenFailure {
             recipient: peer,
@@ -1384,6 +1488,8 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             language: String::new(),
         })
     }
+    /// Channel data: the observer's copy and the channel's, both paid for
+    /// in `paid` before the message was taken.
     fn input(
         &mut self,
         env: &Env<'_, Ended>,
@@ -1404,7 +1510,6 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 },
             );
         }
-        // The channel's copy, paid for with the packet before it was parsed.
         let mut kept = paid
             .split(data.len())
             .ok_or(TransportError::State)?
@@ -1421,36 +1526,42 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         ))?;
         Ok(())
     }
+    /// Takes one application packet, or leaves it untouched to wait for
+    /// memory: each kind is parsed with [`parse_paid`], its type's bound
+    /// charged before the parse and shrunk to what it holds after.
     fn packet(
         &mut self,
         sequence: u32,
         payload: &[u8],
-        paid: &mut Charge,
         env: &mut Env<'_, Ended>,
-    ) -> Result<(), Error> {
+    ) -> Result<Handled, Error> {
         if self.control.requested() != Requested::Open {
             return match payload.first() {
-                Some(93) => self.connection_message(wire::Message::parse(payload)?, paid, env),
+                Some(93) => self.connection(payload, env),
                 Some(97) => {
                     self.close(env, Ended::Closed);
-                    Ok(())
+                    Ok(Handled::Done)
                 }
-                _ => Ok(()),
+                _ => Ok(Handled::Done),
             };
         }
         if self.user.is_none()
             && (self.attempts >= self.config.max_attempts
                 || self.auth_requests >= MAX_AUTH_REQUESTS)
         {
-            return self.disconnect(
+            self.disconnect(
                 env,
                 ssh::DisconnectReason::NoMoreAuthMethodsAvailable,
                 "Too many authentication failures",
-            );
+            )?;
+            return Ok(Handled::Done);
         }
         match payload.first().copied().ok_or(TransportError::State)? {
             5 if self.user.is_none() && !self.service_requested => {
-                let ssh::Message::ServiceRequest(service) = ssh::Message::parse(payload)? else {
+                let Some(parsed) = parse_paid(env.budget(), payload, ssh::Message::parse) else {
+                    return Ok(Handled::Waiting);
+                };
+                let (ssh::Message::ServiceRequest(service), _parsed) = parsed?.into_parts() else {
                     return Err(TransportError::State.into());
                 };
                 if service != "ssh-userauth" {
@@ -1459,14 +1570,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 self.send(&ssh::Message::ServiceAccept(service))?;
                 self.service_requested = true;
             }
-            50 | 61 if self.user.is_none() => self.authentication(payload, env)?,
+            50 | 61 if self.user.is_none() => return self.authentication(payload, env),
             50 if self.user.is_some() => {}
-            80..=82 | 90..=100 if self.user.is_some() => {
-                self.connection_message(wire::Message::parse(payload)?, paid, env)?
-            }
+            80..=82 | 90..=100 if self.user.is_some() => return self.connection(payload, env),
             _ => self.send(&ssh::Message::Unimplemented(sequence))?,
         }
-        Ok(())
+        Ok(Handled::Done)
     }
     /// One step. Storage a step needs that the budget cannot pay for now
     /// makes it wait for memory, changing nothing (layer rule 9): the fixed
@@ -1506,8 +1615,10 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 if !self.room(env.budget()) {
                     return Ok(false);
                 }
-                if let Some(failure) = self.failure.take() {
-                    self.write(&failure)?;
+                if let Some((methods, partial_success)) = self.failure.take() {
+                    self.send_with(|out| {
+                        auth::write_failure(methods.iter().map(|m| m.name()), partial_success, out)
+                    })?;
                 }
                 self.failure_ready = false;
                 return Ok(true);
@@ -1528,18 +1639,21 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 return Ok(true);
             }
             if !self.pending_packets.is_empty() {
-                // What the packet takes is paid before it is parsed.
-                // Refused, it waits unparsed.
-                let charge = packet_charge(&self.pending_packets.front().unwrap().1);
-                let Some(mut paid) = env.budget().charge(charge) else {
-                    return Ok(false);
-                };
                 if !self.room(env.budget()) {
                     return Ok(false);
                 }
+                // A packet whose parse or copies the budget refuses goes
+                // back to the front, unparsed and unchanged.
                 let (sequence, payload) = self.pending_packets.pop_front().unwrap();
-                self.packet(sequence, &payload, &mut paid, env)?;
-                return Ok(true);
+                return match self.packet(sequence, &payload, env)? {
+                    Handled::Done => Ok(true),
+                    Handled::Waiting => {
+                        self.pending_packets
+                            .push_front((sequence, payload))
+                            .map_err(|_| TransportError::State)?;
+                        Ok(false)
+                    }
+                };
             }
             let eligible = |id: &ChildId| {
                 let channel = self.channels.get(*id).unwrap();
@@ -1742,6 +1856,20 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         {
             return Ok(Admit::Blocked(command));
         }
+        // Channel output is copied twice before it is sealed, into its
+        // message and for the observer. Both copies are paid for first,
+        // and held until the command is done.
+        let copies = match command.op() {
+            MuxOp::Child(
+                _,
+                ChannelCommand::Stream(StreamCommand::Write(data))
+                | ChannelCommand::Extended { data, .. },
+            ) => 2 * data.len(),
+            _ => 0,
+        };
+        let Some(_copies) = env.budget().charge(copies) else {
+            return Ok(Admit::Blocked(command));
+        };
         match command.into_op() {
             MuxOp::Control(never) => match never {},
             MuxOp::Credit(id, units) | MuxOp::Window(id, units, _) => {
@@ -1753,7 +1881,10 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         .ok_or(TransportError::State)?;
                 }
             }
-            MuxOp::Close(id) => {
+            MuxOp::Close(id, why) => {
+                // A confirmed channel closes, whatever the cause: CLOSE
+                // carries none. One not yet confirmed is refused with the
+                // receiver's cause.
                 if let Some(channel) = self.channels.get_mut(id)
                     && !channel.closed
                 {
@@ -1763,7 +1894,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         self.send(&wire::Message::Close(peer))?;
                     } else {
                         self.channels.remove(id);
-                        self.refuse(peer, Refusal::Prohibited)?;
+                        self.refuse(peer, why)?;
                         self.raise(MuxEvent::Closed(id))?;
                     }
                 }
@@ -1790,7 +1921,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                             if self.next_channel == wire + 1 {
                                 self.next_channel = wire;
                             }
-                            self.refuse(peer, Refusal::Prohibited)?;
+                            self.refuse(peer, Closing::Prohibited)?;
                             self.raise(MuxEvent::Closed(id))?;
                         }
                     }
@@ -2067,7 +2198,7 @@ mod tests {
                         Err(_) => break,
                     }
                 }
-                harness.layer().user.clone()
+                harness.layer().user.as_deref().cloned()
             });
             let mut client = russh::client::connect_stream(
                 Arc::new(russh::client::Config::default()),

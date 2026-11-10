@@ -274,3 +274,85 @@ fn syslog_allocation_refusal_leaves_output_unchanged() {
     );
     assert_eq!(out, [42]);
 }
+
+/// SSH authentication and connection messages are written in place: into
+/// room already there they allocate nothing, so a writer that encodes
+/// into a buffer it paid for pays for every byte. A message that cannot
+/// be written leaves what the buffer held.
+#[test]
+fn ssh_messages_write_in_place_into_room_already_there() {
+    use fictionet::stdlib::protocols::ssh::{self, MAX_PAYLOAD, auth, connection};
+    /// Writes into a buffer with room for any payload, counting the
+    /// allocations the write makes.
+    fn in_room(write: impl FnOnce(&mut Vec<u8>) -> Result<(), ssh::Error>) {
+        let mut out = Vec::with_capacity(MAX_PAYLOAD + 1);
+        out.push(42);
+        let (written, stats) = measuring(|| write(&mut out));
+        written.unwrap();
+        assert_eq!(stats.allocations, 0, "a write into room allocates nothing");
+        assert_eq!(out[0], 42);
+        assert!(out.len() > 1);
+    }
+    let failure = auth::Message::Failure {
+        methods: vec!["publickey".into(), "password".into()],
+        partial_success: true,
+    };
+    let challenge = auth::Message::InfoRequest {
+        name: "name".into(),
+        instruction: "answer".into(),
+        language: String::new(),
+        prompts: vec![
+            auth::Prompt {
+                text: "Password: ".into(),
+                echo: false,
+            };
+            3
+        ],
+    };
+    let terminal = connection::Message::ChannelRequest {
+        recipient: 1,
+        want_reply: true,
+        request: connection::SessionRequest::Pty {
+            terminal: "xterm".into(),
+            dimensions: connection::Dimensions::default(),
+            modes: vec![
+                connection::TerminalMode {
+                    opcode: 53,
+                    value: 1,
+                };
+                40
+            ],
+        },
+    };
+    let data = connection::Message::Data {
+        recipient: 1,
+        data: vec![7; 1000],
+    };
+    in_room(|out| failure.write(out));
+    in_room(|out| auth::write_failure(["password"].into_iter(), false, out));
+    in_room(|out| challenge.write(out));
+    in_room(|out| terminal.write(out));
+    in_room(|out| data.write(out));
+    for unwritable in [
+        auth::Message::Failure {
+            methods: vec!["no,commas".into()],
+            partial_success: false,
+        },
+        auth::Message::PublicKeyOk {
+            algorithm: "has space".into(),
+            key: vec![1; 8],
+        },
+    ] {
+        let mut out = vec![42];
+        assert!(unwritable.write(&mut out).is_err());
+        assert_eq!(out, [42], "a refused write leaves what was there");
+    }
+    let too_many = connection::Message::ChannelRequest {
+        recipient: 1,
+        want_reply: false,
+        request: connection::SessionRequest::Exec(vec![b'x'; MAX_PAYLOAD]),
+    };
+    let mut out = vec![42];
+    assert!(too_many.write(&mut out).is_err());
+    assert_eq!(out, [42], "a payload over the limit leaves what was there");
+}

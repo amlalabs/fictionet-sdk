@@ -16,8 +16,9 @@ use fictionet::stdlib::layer::{
 /// Holds at most one packet in each direction, plus a partial length prefix.
 /// Packets may be empty. Lengths above 65,575 bytes (a full IPv6 packet)
 /// and truncated frames fail the tunnel. Buffered bytes are budgeted before
-/// allocation. Backpressure retains input ownership, including when a read
-/// contains several frames.
+/// allocation. A refused reservation returns the offered input or output
+/// unchanged as [`Admit::Blocked`]. Backpressure retains input ownership,
+/// including when a read contains several frames.
 #[derive(Default)]
 pub struct Framed {
     prefix: [u8; 4],
@@ -38,8 +39,6 @@ pub enum FrameError {
     TooLong,
     /// Input ended inside a length prefix or packet.
     Truncated,
-    /// The packet's storage does not fit the allocation budget.
-    Budget,
 }
 
 impl core::fmt::Display for FrameError {
@@ -47,7 +46,6 @@ impl core::fmt::Display for FrameError {
         f.write_str(match self {
             Self::TooLong => "packet frame is too long",
             Self::Truncated => "packet frame is truncated",
-            Self::Budget => "packet frame exceeds its memory budget",
         })
     }
 }
@@ -104,28 +102,33 @@ impl Layer for Framed {
             self.packet = Some(PacketEvent::Ended);
             return Ok(Admit::Taken);
         };
-        if self.prefix_len < 4 {
-            let count = (4 - self.prefix_len).min(bytes.len());
-            self.prefix[self.prefix_len..self.prefix_len + count].copy_from_slice(&bytes[..count]);
+        let count = (4 - self.prefix_len).min(bytes.len());
+        let mut prefix = self.prefix;
+        prefix[self.prefix_len..self.prefix_len + count].copy_from_slice(&bytes[..count]);
+        if self.prefix_len + count < 4 {
+            self.prefix = prefix;
             self.prefix_len += count;
-            bytes.advance(count);
-            if self.prefix_len < 4 {
-                return Ok(Admit::Taken);
-            }
+            return Ok(Admit::Taken);
         }
-        let size = u32::from_be_bytes(self.prefix) as usize;
+        let size = u32::from_be_bytes(prefix) as usize;
         if size > 65_575 {
             return Err(FrameError::TooLong);
         }
         let body = match &mut self.body {
             Some(body) => body,
-            None => self
-                .body
-                .insert(ChargedBytes::with_capacity(env.budget(), size).ok_or(FrameError::Budget)?),
+            None => {
+                let Some(body) = ChargedBytes::with_capacity(env.budget(), size) else {
+                    return Ok(Admit::Blocked(StreamEvent::Data(bytes)));
+                };
+                self.body.insert(body)
+            }
         };
+        self.prefix = prefix;
+        self.prefix_len = 4;
+        bytes.advance(count);
         let count = body.room().min(bytes.len());
         body.extend_within(&bytes[..count])
-            .map_err(|_| FrameError::Budget)?;
+            .expect("the input fits in the reserved body");
         bytes.advance(count);
         if body.room() == 0
             && let Some(body) = self.body.take()
@@ -156,12 +159,14 @@ impl Layer for Framed {
                 if packet.len() > 65_575 {
                     return Err(FrameError::TooLong);
                 }
-                let mut frame = ChargedBytes::with_capacity(env.budget(), packet.len() + 4)
-                    .ok_or(FrameError::Budget)?;
+                let Some(mut frame) = ChargedBytes::with_capacity(env.budget(), packet.len() + 4)
+                else {
+                    return Ok(Admit::Blocked(PacketCommand::Send(packet)));
+                };
                 frame
                     .extend_within(&(packet.len() as u32).to_be_bytes())
                     .and_then(|()| frame.extend_within(&packet))
-                    .map_err(|_| FrameError::Budget)?;
+                    .expect("the prefix and packet fit in the reserved frame");
                 StreamCommand::Write(Chunk::from_bytes(frame))
             }
             PacketCommand::End => {
@@ -184,6 +189,81 @@ mod tests {
     use super::*;
     use fictionet::Seed;
     use fictionet::stdlib::layer::{Budget, Harness};
+
+    #[test]
+    fn writes_wait_for_memory_without_losing_or_repeating_packets() {
+        for len in 0..32 {
+            let expected: Vec<_> = (0..len).collect();
+            let budget = Budget::new(4096);
+            let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), budget.clone());
+            let packet = Chunk::from_bytes(ChargedBytes::copy_of(&budget, &expected).unwrap());
+            let pointer = packet.as_ptr();
+            let paid = budget.used();
+            let held = budget.charge(budget.limit() - paid).unwrap();
+            let mut command = PacketCommand::Send(packet);
+            for _ in 0..3 {
+                let Admit::Blocked(PacketCommand::Send(packet)) =
+                    stack.driver().command(command).unwrap()
+                else {
+                    panic!("a packet without room must wait");
+                };
+                assert_eq!(&*packet, expected);
+                assert_eq!(packet.as_ptr(), pointer);
+                assert_eq!(budget.used(), held.bytes() + paid);
+                command = PacketCommand::Send(packet);
+                stack.settle().unwrap();
+                assert!(stack.output().is_empty());
+            }
+            drop(held);
+            assert!(matches!(
+                stack.driver().command(command).unwrap(),
+                Admit::Taken
+            ));
+            stack.settle().unwrap();
+            stack.settle().unwrap();
+            let output = stack.output();
+            let size = u32::from_be_bytes(output[..4].try_into().unwrap()) as usize;
+            assert_eq!(size, expected.len());
+            assert_eq!(&output[4..], expected);
+            drop(stack);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn input_waits_for_memory_at_every_prefix_cut() {
+        let expected: Vec<_> = (0..32).collect();
+        let wire: Vec<_> = (expected.len() as u32)
+            .to_be_bytes()
+            .into_iter()
+            .chain(expected.iter().copied())
+            .collect();
+        for cut in 0..=4 {
+            let budget = Budget::new(4096);
+            let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), budget.clone());
+            let held = budget.charge(budget.limit()).unwrap();
+            stack.push(&wire[..cut]).unwrap();
+            stack.push(&wire[cut..]).unwrap();
+            assert_eq!(budget.used(), held.bytes());
+            assert!(stack.layer().packet.is_none());
+            assert!(stack.layer().body.is_none());
+            drop(held);
+            stack.settle().unwrap();
+            let mut received = Vec::new();
+            stack.driver().send_above(|event| {
+                if let PacketEvent::Packet(packet) = event {
+                    received.push(packet.into_vec());
+                }
+                Admit::Taken
+            });
+            stack.settle().unwrap();
+            assert_eq!(received, vec![expected.clone()]);
+            assert!(stack.layer().packet.is_none());
+            assert_eq!(stack.unread(), 0);
+            drop(stack);
+            assert_eq!(budget.used(), 0);
+        }
+    }
 
     #[test]
     fn end_and_reset_refuse_later_packets() {
@@ -303,7 +383,29 @@ mod tests {
             stack.push(&u32::MAX.to_be_bytes()),
             Err(FrameError::TooLong)
         );
-        let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), Budget::new(1024));
-        assert_eq!(stack.push(&2048u32.to_be_bytes()), Err(FrameError::Budget));
+        let budget = Budget::new(1024);
+        let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), budget.clone());
+        let prefix = ((budget.limit() + 1) as u32).to_be_bytes();
+        // The stack charges through its driver's view of the budget.
+        let mark = stack.driver().refusals();
+        let Admit::Blocked(StreamEvent::Data(bytes)) = stack
+            .driver()
+            .deliver(StreamEvent::Data(Chunk::unpaid(prefix.to_vec())))
+            .unwrap()
+        else {
+            panic!("memory refusal leaves the input with its sender");
+        };
+        assert_eq!(&*bytes, &prefix);
+        assert!(stack.layer().body.is_none());
+        assert_eq!(stack.layer().prefix_len, 0);
+        assert_eq!(budget.used(), 0);
+        // A body larger than the whole limit can never be paid: the runner
+        // reads the refusal as starved and ends the tunnel.
+        let starved = stack
+            .driver()
+            .budget()
+            .starved_since(mark)
+            .expect("a need over the limit");
+        assert!(starved.need > starved.limit);
     }
 }

@@ -29,7 +29,7 @@ use super::{
     Error, Identification, KexInit, Line, Lines, MAX_NAME, MAX_PACKET, MAX_PAYLOAD,
     MAX_VERSION_LINE, Message, Mpint, Packet, Reader, put_string,
 };
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Heap, HeapBound, Step, Wire};
 
 const CIPHERS: &[&str] = &[
     "chacha20-poly1305@openssh.com",
@@ -46,13 +46,42 @@ const STRICT_CLIENT: &str = "kex-strict-c-v00@openssh.com";
 const STRICT_SERVER: &str = "kex-strict-s-v00@openssh.com";
 const KEY_BYTES: u64 = 1 << 30;
 const KEY_PACKETS: u64 = 1 << 30;
-/// What an ECDH_INIT allocates and frees besides its transcript: the two
-/// version texts, the server's share and the shared secret, the signature,
-/// the reply that carries it, the four derived keys and EXT_INFO: together
-/// under 10 KiB with the largest host key this transport takes (RSA, 8192
-/// bits, whose signature and reply vectors may have doubled while they
-/// grew). The RSA signer's own working memory is the `rsa` crate's.
-const EXCHANGE: usize = 16 << 10;
+/// The one extension EXT_INFO names, and its value.
+const SERVER_SIG_ALGS: (&[u8], &[u8]) =
+    (b"server-sig-algs", b"ssh-ed25519,rsa-sha2-512,rsa-sha2-256");
+/// An EXT_INFO payload: its number, the count of extensions, and the one
+/// extension's name and value.
+const EXT_INFO_LEN: usize = 1 + 4 + 4 + SERVER_SIG_ALGS.0.len() + 4 + SERVER_SIG_ALGS.1.len();
+
+/// The sizes a key exchange method works with: the server's share, the
+/// raw shared secret, and the hash.
+struct Group {
+    share: usize,
+    secret: usize,
+    hash: &'static digest::Algorithm,
+}
+
+impl Group {
+    /// The method's sizes, or `None` for one this transport does not run.
+    fn of(kex: &str) -> Option<Group> {
+        let (share, secret, hash) = match kex {
+            "curve25519-sha256" | "curve25519-sha256@libssh.org" => (32, 32, &digest::SHA256),
+            "ecdh-sha2-nistp256" => (65, 32, &digest::SHA256),
+            "ecdh-sha2-nistp384" => (97, 48, &digest::SHA384),
+            _ => return None,
+        };
+        Some(Group {
+            share,
+            secret,
+            hash,
+        })
+    }
+
+    /// The shared secret as an mpint: its length, a sign byte, the bytes.
+    fn encoded_secret(&self) -> usize {
+        4 + 1 + self.secret
+    }
+}
 
 /// A fatal framing, cryptographic, negotiation or state failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +191,25 @@ impl HostKey {
         }
     }
 
+    /// The length of a raw signature: Ed25519's 64 bytes, or as many as
+    /// the RSA modulus has.
+    fn raw_signature_len(&self) -> usize {
+        match &self.key {
+            HostSecret::Ed25519(_) => 64,
+            HostSecret::Rsa(key) => key.size(),
+        }
+    }
+
+    /// The length of a signature blob for `algorithm`: the algorithm's
+    /// name and the raw signature, each as a string.
+    fn signature_len(&self, algorithm: &str) -> usize {
+        4 + algorithm.len() + 4 + self.raw_signature_len()
+    }
+
+    /// Signs `message` as a blob of [`signature_len`](Self::signature_len)
+    /// bytes, allocated for exactly those. The raw signature is a second
+    /// allocation, freed before this returns; an RSA signer's working
+    /// memory is the `rsa` crate's.
     fn sign(
         &self,
         algorithm: &str,
@@ -191,7 +239,7 @@ impl HostKey {
             }
             _ => return Err(TransportError::Algorithm),
         };
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(4 + algorithm.len() + 4 + signature.len());
         put_string(&mut out, algorithm.as_bytes());
         put_string(&mut out, &signature);
         Ok(out)
@@ -400,9 +448,9 @@ impl Transport {
         let ours = self.proposal.encoded_len().unwrap_or(MAX_PAYLOAD);
         let names = 4 * MAX_NAME;
         let key = std::mem::size_of::<aead::LessSafeKey>();
-        identification_heap(&self.identification)
+        self.identification.heap()
             + MAX_VERSION_LINE
-            + proposal_heap(&self.proposal)
+            + self.proposal.heap()
             + names
             + digest::MAX_OUTPUT_LEN
             + 2 * key
@@ -411,30 +459,68 @@ impl Transport {
 
     /// The most [`handle`](Self::handle) allocates for `payload` and frees
     /// before it returns, beyond the payload itself and what
-    /// [`most_held`](Self::most_held) bounds: a KEXINIT's parsed lists, an
-    /// ECDH_INIT's transcript and the rest of the exchange ([`EXCHANGE`]),
-    /// or the strings of a transport message. Charge it before handling.
+    /// [`most_held`](Self::most_held) bounds: a KEXINIT's parsed lists,
+    /// boxed for an observer or not ([`KexInit`]'s [`HeapBound`]), an
+    /// ECDH_INIT's exchange ([`exchange_scratch`](Self::exchange_scratch)),
+    /// or the strings of a transport message ([`Message`]'s bound). Other
+    /// packets are handed up whole, allocating nothing. Charge it before
+    /// handling.
     pub fn scratch(&self, payload: &[u8]) -> usize {
         match payload.first() {
-            Some(20) => KexInit::most_heap(payload.len()),
-            Some(30) => {
-                let proposals = match &self.exchange {
-                    Exchange::Share { server, client, .. } => server.len() + client.len(),
-                    _ => 0,
-                };
-                // The transcript, allocated at its exact length: seven
-                // strings, the client's share among them within the
-                // payload, and the encoded secret. Its copies of the
-                // server's share and the secret come within EXCHANGE.
-                7 * 4
-                    + 2 * MAX_VERSION_LINE
-                    + proposals
-                    + self.host_key.public_key().len()
-                    + payload.len()
-                    + EXCHANGE
-            }
-            _ => payload.len(),
+            Some(&super::msg::KEXINIT) => Box::<KexInit>::most_heap(payload.len()),
+            Some(30) => self.exchange_scratch(payload),
+            Some(1..=4) => Message::most_heap_of(payload),
+            _ => 0,
         }
+    }
+
+    /// What answering the ECDH_INIT `payload` allocates, all of it at
+    /// once at most, from the sizes the exchange works with: the two
+    /// version texts; the server's share, the raw secret and the encoded
+    /// one; the transcript; the raw signature and its blob; the two keys
+    /// derived at a time; the reply; and EXT_INFO. Each is allocated for
+    /// exactly its size. Outside an exchange, or for a method this
+    /// transport does not run, the payload is refused before anything is
+    /// allocated. An RSA signer's own working memory is the `rsa` crate's,
+    /// not counted here.
+    fn exchange_scratch(&self, payload: &[u8]) -> usize {
+        let Exchange::Share {
+            server,
+            client,
+            algorithms,
+            ..
+        } = &self.exchange
+        else {
+            return 0;
+        };
+        let (Some(group), Some(peer)) = (Group::of(&algorithms.kex), &self.peer) else {
+            return 0;
+        };
+        let texts = peer.len() + self.identification.len();
+        let host = self.host_key.public_key().len();
+        // Seven strings, the client's share among them within the
+        // payload, and the encoded secret.
+        let transcript = 7 * 4
+            + texts
+            + client.len()
+            + server.len()
+            + host
+            + payload.len()
+            + group.share
+            + group.encoded_secret();
+        let signature = self.host_key.signature_len(&algorithms.host);
+        let keys = derived_len(group.hash, 64) + derived_len(group.hash, 12);
+        let reply = 1 + 3 * 4 + host + group.share + signature;
+        texts
+            + group.share
+            + group.secret
+            + group.encoded_secret()
+            + transcript
+            + self.host_key.raw_signature_len()
+            + signature
+            + keys
+            + reply
+            + EXT_INFO_LEN
     }
 
     /// Whether a direction is close enough to its key limit to initiate rekey.
@@ -705,7 +791,10 @@ impl Transport {
             Direction::encrypted(&algorithms.incoming, &derive(b'C', 64), &derive(b'A', 12))?;
         let outgoing =
             Direction::encrypted(&algorithms.outgoing, &derive(b'D', 64), &derive(b'B', 12))?;
-        let mut reply = vec![31];
+        let mut reply = Vec::with_capacity(
+            1 + 3 * 4 + self.host_key.public_key().len() + server_public.len() + signature.len(),
+        );
+        reply.push(31);
         put_string(&mut reply, self.host_key.public_key());
         put_string(&mut reply, &server_public);
         put_string(&mut reply, &signature);
@@ -719,10 +808,11 @@ impl Transport {
         self.outgoing = outgoing;
         self.outgoing.sequence = sequence;
         if !self.established && self.ext_info {
-            let mut extension = vec![7];
+            let mut extension = Vec::with_capacity(EXT_INFO_LEN);
+            extension.push(7);
             extension.extend_from_slice(&1u32.to_be_bytes());
-            put_string(&mut extension, b"server-sig-algs");
-            put_string(&mut extension, b"ssh-ed25519,rsa-sha2-512,rsa-sha2-256");
+            put_string(&mut extension, SERVER_SIG_ALGS.0);
+            put_string(&mut extension, SERVER_SIG_ALGS.1);
             self.send(&extension, out)?;
         }
         self.negotiated = Some(algorithms);
@@ -783,9 +873,9 @@ impl Decode for Transport {
             Cipher::Gcm { .. } => std::mem::size_of::<aead::LessSafeKey>(),
             _ => 0,
         };
-        identification_heap(&self.identification)
-            + self.peer.as_ref().map_or(0, identification_heap)
-            + proposal_heap(&self.proposal)
+        self.identification.heap()
+            + self.peer.heap()
+            + self.proposal.heap()
             + self.negotiated.as_ref().map_or(0, |algorithms| {
                 algorithms.kex.capacity()
                     + algorithms.host.capacity()
@@ -828,20 +918,6 @@ impl Decode for Transport {
         }
         self.incoming.read(input)
     }
-}
-
-fn identification_heap(id: &Identification) -> usize {
-    id.proto.capacity() + id.software.capacity() + id.comments.as_ref().map_or(0, String::capacity)
-}
-
-fn proposal_heap(kex: &KexInit) -> usize {
-    kex.lists()
-        .iter()
-        .map(|(names, _)| {
-            names.capacity() * std::mem::size_of::<String>()
-                + names.iter().map(String::capacity).sum::<usize>()
-        })
-        .sum()
 }
 
 fn version_text(id: &Identification) -> Result<Vec<u8>, Error> {
@@ -922,13 +998,13 @@ fn shared_secret(
         _ => return Err(TransportError::Algorithm),
     };
     // SSH interprets the X25519 result as a network-order unsigned integer too.
-    let mut encoded = Zeroizing::new(Vec::new());
     let first = shared
         .iter()
         .position(|&byte| byte != 0)
         .unwrap_or(shared.len());
     let significant = &shared[first..];
     let sign = usize::from(significant.first().is_some_and(|&byte| byte >= 128));
+    let mut encoded = Zeroizing::new(Vec::with_capacity(4 + sign + significant.len()));
     encoded.extend_from_slice(&((significant.len() + sign) as u32).to_be_bytes());
     if sign != 0 {
         encoded.push(0);
@@ -937,6 +1013,14 @@ fn shared_secret(
     Ok((public, encoded, hash))
 }
 
+/// The allocation a key of `length` bytes derived with `hash` takes: the
+/// whole hash outputs that reach `length`, at least one.
+fn derived_len(hash: &'static digest::Algorithm, length: usize) -> usize {
+    length.div_ceil(hash.output_len()).max(1) * hash.output_len()
+}
+
+/// A key of `length` bytes (RFC 4253 section 7.2), in an allocation of
+/// [`derived_len`] bytes.
 fn derive_key(
     hash: &'static digest::Algorithm,
     secret: &[u8],
@@ -951,7 +1035,8 @@ fn derive_key(
     let mut first = base.clone();
     first.update(&[letter]);
     first.update(session_id);
-    let mut key = Zeroizing::new(first.finish().as_ref().to_vec());
+    let mut key = Zeroizing::new(Vec::with_capacity(derived_len(hash, length)));
+    key.extend_from_slice(first.finish().as_ref());
     while key.len() < length {
         let mut next = base.clone();
         next.update(&key);

@@ -42,7 +42,8 @@ pub(crate) enum Halt {
 /// byte flushed once as [`StreamEvent::Written`], polls the stack's work
 /// and gives back what finished, fires the stack's due timers, and keeps
 /// the limits. Then it waits for whichever of those can move next, or, if
-/// the budget refused a charge in the last round, for memory to free.
+/// the budget refused a charge in the last round, for memory to free; the
+/// idle limit does not count while it waits for memory.
 /// Bytes read are paid for before the stack sees them; without room to
 /// pay, the read buffer that already paid for them goes with them, and the
 /// next read waits for memory to pay for a new buffer, leaving the bytes
@@ -57,9 +58,9 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     conn: C,
     driver: Driver<L>,
     jobs: Jobs<L::Work>,
-    /// The read buffer, [`READ`] bytes paid for: `None` once it went to
-    /// the stack with bytes there was no room to pay a copy of, until the
-    /// budget has room for a new one.
+    /// The read buffer, [`READ`] bytes paid for: `None` before the first
+    /// read and once it went to the stack with bytes there was no room to
+    /// pay a copy of, until the budget has room for a new one.
     buf: Option<ChargedBytes>,
     /// Read and not yet taken by the stack.
     input: Option<StreamEvent>,
@@ -71,6 +72,11 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     lifetime: Lifetime,
     /// Armed for the next deadline, and moved as it moves.
     timer: Option<Timer>,
+    /// The budget refused the stack a charge in the last round that
+    /// settled: the stack waits for memory, and the release that makes
+    /// room wakes it. The same refusal that registers the wake stops the
+    /// idle clock, so the two never disagree.
+    memory: bool,
     /// How the run ended, once it has.
     stopped: Option<StreamEnd>,
 }
@@ -82,8 +88,8 @@ where
     C: Connection,
 {
     /// Runs `stack` over `conn` in the world of `fcx`, charging `budget`.
-    /// A budget without room for the read buffer at the start never runs
-    /// the stack: the run ends with [`StreamEnd::Budget`].
+    /// Nothing is charged yet: the first poll pays for the read buffer, or
+    /// waits for memory to, as every later poll does.
     pub(super) fn new(
         fcx: &Cx,
         conn: C,
@@ -91,18 +97,21 @@ where
         budget: Budget,
         limits: StreamLimits,
     ) -> Live<L, C> {
-        let buf = read_buffer(&budget);
+        // The runner's own charges go through the stack's view, so the
+        // refusals it reads after a round are all of the stack's.
+        let driver = Driver::new(stack, Arc::new(fcx.clone()), budget, fcx.now());
         Live {
             conn,
-            jobs: Jobs::new(&budget),
-            driver: Driver::new(stack, Arc::new(fcx.clone()), budget, fcx.now()),
-            stopped: buf.is_none().then_some(StreamEnd::Budget),
-            buf,
+            jobs: Jobs::new(driver.budget()),
+            driver,
+            stopped: None,
+            buf: None,
             input: None,
             unflushed: 0,
             unreported: 0,
             lifetime: Lifetime::new(limits),
             timer: None,
+            memory: false,
         }
     }
 
@@ -128,6 +137,7 @@ where
             output: self.writing(),
             input: self.input.is_some(),
             work: !self.jobs.is_empty(),
+            memory: self.memory,
         }
     }
 
@@ -156,7 +166,8 @@ where
     /// now: `Pending` once it waits, with `cx` woken when something can
     /// move again. `Ready` when reading or writing the connection failed
     /// ([`Halt::Conn`]), or when the run ended: the stack reset the
-    /// connection or gave up on it, the budget ran out, or a write stalled.
+    /// connection or gave up on it, a charge needed more than the budget's
+    /// whole limit, or a write stalled.
     /// After it ended it keeps answering the same.
     ///
     /// `above` takes the stack's events for what is above it, and `report`
@@ -244,9 +255,6 @@ where
                 .poll(Some(fcx), cx, |done| driver.complete(done))
                 .map_err(StackError::Layer)?;
             moved |= self.jobs.take(&mut self.driver);
-            if self.jobs.budget_exhausted() {
-                return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
-            }
             if self.unreported > 0
                 && !matches!(
                     self.driver
@@ -357,11 +365,19 @@ where
             if let Some(e) = read_failed {
                 return Poll::Ready(Ok(Halt::Conn(e)));
             }
+            // The one refusal that ends the run: a need no release can ever
+            // meet, from the stack or from the runner's own read buffer or
+            // table of work. Every other one waits for memory below.
+            if let Some(starved) = self.driver.budget().starved_since(refusals) {
+                return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget(starved)))));
+            }
             if moved {
                 continue;
             }
 
-            // The limits, as of now.
+            // The limits, as of now. A charge refused in this round has the
+            // stack wait for memory below, and that wait is not idle.
+            self.memory = self.driver.budget().refused_since(refusals);
             self.lifetime.settle(now, self.outstanding());
             match self.lifetime.due(now) {
                 Some(Expiry::Stalled) => {

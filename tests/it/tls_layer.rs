@@ -261,7 +261,7 @@ fn a_flight_without_room_waits_for_memory_and_then_goes() {
         assert!(server.work().is_some());
 
         let others = fill(&budget);
-        let refusals = budget.refusals();
+        let refusals = server.driver().refusals();
         let (completed, held) =
             crate::common::alloc::left_allocated(|| server.complete(Some(config)));
         completed?;
@@ -276,7 +276,7 @@ fn a_flight_without_room_waits_for_memory_and_then_goes() {
         assert!(server.layer().failure().is_none());
         // The refusal is counted, so the runner asks to be woken when
         // memory frees.
-        assert_ne!(budget.refusals(), refusals);
+        assert!(server.driver().budget().refused_since(refusals));
 
         drop(others);
         server.settle()?;
