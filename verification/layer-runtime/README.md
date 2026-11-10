@@ -763,3 +763,65 @@ was not measured. The stage reports name two candidates: the
 reallocation that gives back a chunk's spare capacity on admission, and
 the HTTP/1 handoff bytes that are now copied. TCP bulk is unchanged in
 instructions, allocations and packets.
+
+## HTTP storage follow-up
+
+The HTTP work on `comp/bfix-http` through `6962c63f5` removes the idle
+reservation increase and the two extra allocations per HTTP/1 request.
+The counting allocator identified both allocations: an owner for an empty
+HTTP/1 request body, and a maximum-record TLS output buffer discarded when
+rustls handed over its own ciphertext allocation. Empty charged buffers
+now become empty shared bytes without an owner allocation; nonempty shared
+bytes retain their charge. TLS reserves output credit first and allocates
+a buffer only for output that needs copying.
+
+HTTP/2 decoder input and header assembly now own a shared reservation.
+They reserve growth before allocating and return consumed input storage
+before header decoding when needed. The initial allowance remains one
+input frame, so tight budgets still permit parsing and stream refusals.
+Stream lists grow at admission, preserving a completion place for every
+admitted stream, and shrink to their small floor when idle. Reset history
+grows within its existing count limit and releases expired storage.
+Complete header blocks are decoded directly from their frame; fragmented
+blocks reserve their assembly growth. Terminal errors use the reserved
+final GOAWAY, preserving queued stream refusals and the original error code
+even when no further allocation can be charged.
+
+The isolated idle-connection test measured 116,979 bytes charged before
+and 19,786 after. Its model of the earlier layout allows 19,850; the test
+compares against that model, not a pinned byte count. The existing test
+that fills decoder and HPACK storage still returns to the idle charge.
+
+Both benchmark builds used `cargo bench --bench runtime --no-run` with
+the required scoped memory limit, six build jobs and the dedicated target
+directory. These used the plain bench profile, without frame-pointer or
+line-table overrides. The printed executable ran as
+`perf stat -e instructions:u <executable> --bench http`, also in the memory
+scope. Each process ran Divan's three samples for each HTTP version.
+Instruction totals below cover the whole process, including all three
+samples; they are not directly comparable to the preceding profiled rows.
+Times and allocation counts are medians of those samples.
+
+| Workload | Starting code | After |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 116.52 G | 117.47 G |
+| HTTP/1 elapsed time | 1.173 s | 1.090 s |
+| HTTP/2 elapsed time | 1.793 s | 1.702 s |
+| HTTP/1 allocations | 5,854,742 | 5,654,740 |
+| HTTP/2 allocations | 9,097,059 | 8,797,044 |
+
+HTTP/1 is back to the previous table's rounded 5.65 M level: about two
+fewer allocations per measured request. The exact count above preserves
+the distinction between that rounded baseline and 5,650,000. HTTP/2 saves
+about three allocations per request. Total instructions rise 0.8 percent;
+elapsed times carry scheduling noise and are secondary to that count.
+
+Validation included the focused native HTTP/1 and TLS tests, 76 final
+codec/container/HTTP/2 unit tests, and 76 final HTTP/2, gRPC, service-budget
+and allocation-oracle integration tests. The empty-owner, small-ciphertext,
+complete-header-copy, idle-reservation and full-budget protocol-error
+regressions were observed failing before their fixes and passing after.
+Existing budget and lifecycle assertions were retained. Workspace checking,
+clippy for fictionet with warnings denied, formatting and fictionet
+documentation generation passed. Full suites and Kani, TLA+ and Lean were
+not run, as requested.
