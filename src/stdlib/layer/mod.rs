@@ -232,7 +232,7 @@ pub(crate) mod probe;
 #[path = "../../../verification/layer/kani/mod.rs"]
 mod proofs;
 
-pub use budget::{Budget, Charge, OwnedWork, Refusals, Waiter, WorkOwner};
+pub use budget::{Budget, Charge, OwnedWork, Refusals, Starved, Waiter, WorkOwner};
 pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, FIRST_PLACES, Owned, Place};
 
 /// Maximum supported composition depth, including erased layers.

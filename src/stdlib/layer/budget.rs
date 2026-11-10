@@ -26,6 +26,15 @@ use fictionet::sync::Mutex;
 /// layer tries again. A release too small for it wakes nothing, so memory
 /// that comes and goes in small amounts does not keep a runner busy.
 ///
+/// Each asker keeps its own record of refusals on the shared count: a
+/// stack, or one child of a stack, asks through a [`view`](Budget::view)
+/// of the budget, and clones of a view share its record. The record says
+/// whether the asker's charge was refused since a round began
+/// ([`refused_since`](Budget::refused_since)), and whether it needed more
+/// than the whole limit, which no release can ever meet
+/// ([`starved_since`](Budget::starved_since)). A refusal through one view
+/// is invisible to another.
+///
 /// The [stack runners](fictionet::stdlib::services::stack) charge each
 /// connection its read buffer, the bytes read but not yet taken, and the
 /// table of the stack's work; each layer charges what it holds, such as a
@@ -33,6 +42,7 @@ use fictionet::sync::Mutex;
 #[derive(Clone)]
 pub struct Budget {
     inner: Arc<BudgetInner>,
+    view: Arc<View>,
 }
 
 struct BudgetInner {
@@ -43,23 +53,31 @@ struct BudgetInner {
     /// tries a last time, and cleared by the first release that leaves
     /// that much room, which wakes the runners. So room freed after a
     /// refusal wakes someone once it is enough for the smallest refused
-    /// charge, and not before.
+    /// charge, and not before. A charge past the limit never lowers it:
+    /// no room is ever enough for that one.
     wanted: AtomicUsize,
-    /// How many charges found no room at first. Counted before the last
-    /// try, so a runner that compares it across its round never misses a
-    /// refusal of its own.
-    refusals: AtomicU64,
-    waiters: Mutex<Waiters>,
+    /// How many times a release woke the runners. Changed only with
+    /// `waiters` locked, so a runner that asks with a mark taken before a
+    /// wake sees it.
+    wakes: AtomicU64,
+    /// The runners waiting for memory. Each is woken once, by the first
+    /// release after it registered that leaves room for the least refused
+    /// charge. One whose owner dropped it leaves at the next registration.
+    waiters: Mutex<Vec<Arc<dyn Waits>>>,
 }
 
-/// The runners waiting for memory, and when they were last woken.
-struct Waiters {
-    /// Each is woken once, by the first release after it registered that
-    /// leaves room for the least refused charge. One whose owner dropped
-    /// it leaves at the next registration.
-    waiting: Vec<Arc<dyn Waits>>,
-    /// The count of refusals when a release last woke the runners.
-    woken_at: u64,
+/// One asker's record on a shared count: a stack's, or one child's.
+#[derive(Default)]
+struct View {
+    /// How many charges through this view found no room at first. Counted
+    /// before the last try, so a runner that compares it across its round
+    /// never misses a refusal of its own.
+    refused: AtomicU64,
+    /// `refused` as of the last refusal whose need was more than the
+    /// limit, or 0 if there was none.
+    starved: AtomicU64,
+    /// What that refusal needed.
+    need: AtomicUsize,
 }
 
 /// What a budget wakes when memory frees after a refusal: a stack, or one
@@ -165,10 +183,25 @@ impl Drop for Waiter {
     }
 }
 
-/// A point in a budget's count of refused charges. A runner takes one
-/// before a round and hands it to [`Budget::wake_when_freed`] after.
+/// Where an asker's refusals and the budget's wakes stood. A runner takes
+/// one before a round ([`Budget::refusals`]) and, after it, asks whether
+/// its view was refused or starved since and hands it to
+/// [`Budget::wake_when_freed`].
+#[derive(Clone, Copy, Debug)]
+pub struct Refusals {
+    refused: u64,
+    wakes: u64,
+}
+
+/// A need no release can ever meet: a charge through a view needed more
+/// than the budget's whole limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Refusals(u64);
+pub struct Starved {
+    /// The bytes the refused charge needed at least.
+    pub need: usize,
+    /// The budget's limit.
+    pub limit: usize,
+}
 
 impl std::fmt::Debug for Budget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -187,12 +220,21 @@ impl Budget {
                 used: AtomicUsize::new(0),
                 limit,
                 wanted: AtomicUsize::new(0),
-                refusals: AtomicU64::new(0),
-                waiters: Mutex::new(Waiters {
-                    waiting: Vec::new(),
-                    woken_at: 0,
-                }),
+                wakes: AtomicU64::new(0),
+                waiters: Mutex::new(Vec::new()),
             }),
+            view: Arc::default(),
+        }
+    }
+
+    /// The same limit and count, with a record of refusals of its own:
+    /// for a stack or a child, so that what its runner reads is its own.
+    /// Charges made through it, and the containers that hold them, report
+    /// their refusals to it; clones of it share its record.
+    pub fn view(&self) -> Budget {
+        Budget {
+            inner: self.inner.clone(),
+            view: Arc::default(),
         }
     }
 
@@ -231,36 +273,55 @@ impl Budget {
         })
     }
 
-    /// Where the count of refused charges stands. A runner takes this
-    /// before a round of its stack, to hand to
+    /// Where this view's refusals and the budget's wakes stand. A runner
+    /// takes this before a round of its stack, to read and to hand to
     /// [`wake_when_freed`](Self::wake_when_freed) after it.
     pub fn refusals(&self) -> Refusals {
-        Refusals(self.inner.refusals.load(Ordering::SeqCst))
+        Refusals {
+            refused: self.view.refused.load(Ordering::SeqCst),
+            wakes: self.inner.wakes.load(Ordering::SeqCst),
+        }
     }
 
-    /// Wakes `waiter` once memory frees after a charge refused since
-    /// `since`: once a release leaves room for the least that a charge
-    /// refused since the last wake needed. A runner calls this after each
-    /// round, with what [`refusals`](Self::refusals) said before it; a
-    /// layer never does, though a layer that runs others, as
+    /// Whether a charge through this view was refused since `since`.
+    pub fn refused_since(&self, since: Refusals) -> bool {
+        self.view.refused.load(Ordering::SeqCst) != since.refused
+    }
+
+    /// The need of the last charge through this view that needed more
+    /// than the limit since `since`, if one did. No release can ever make
+    /// room for it.
+    pub fn starved_since(&self, since: Refusals) -> Option<Starved> {
+        let starved = self.view.starved.load(Ordering::SeqCst);
+        (starved > since.refused).then(|| Starved {
+            need: self.view.need.load(Ordering::SeqCst),
+            limit: self.inner.limit,
+        })
+    }
+
+    /// Wakes `waiter` once memory frees after a charge through this view
+    /// refused since `since`: once a release leaves room for the least
+    /// that a charge refused since the last wake needed. A runner calls
+    /// this after each round, with what [`refusals`](Self::refusals) said
+    /// before it; a layer never does, though a layer that runs others, as
     /// [`Children`](super::Children) does, calls it for each of them.
-    /// When nothing was refused since, it does nothing. When memory was
-    /// freed after the refusal already, or there is room now, it wakes
-    /// `waiter` at once. A refusal on another connection of the same
-    /// budget also counts, which can cost a poll for nothing, but only
-    /// when memory freed was enough for that refusal.
+    /// When nothing was refused through this view since, it does nothing,
+    /// whatever other views were refused. When a release woke the runners
+    /// since `since`, or there is room now, it wakes `waiter` at once.
+    /// When the view was [starved](Self::starved_since) since, it does
+    /// nothing: no release can help, and the runner ends instead.
     pub fn wake_when_freed(&self, waiter: &Waiter, since: Refusals) {
-        if self.inner.refusals.load(Ordering::SeqCst) == since.0 {
+        if !self.refused_since(since) || self.starved_since(since).is_some() {
             return;
         }
-        let mut waiters = self.inner.waiters.lock();
+        let mut waiting = self.inner.waiters.lock();
         let wanted = self.inner.wanted.load(Ordering::SeqCst);
-        if waiters.woken_at > since.0 || wanted == 0 || self.room() >= wanted {
-            drop(waiters);
+        let woken = self.inner.wakes.load(Ordering::SeqCst) != since.wakes;
+        if woken || wanted == 0 || self.room() >= wanted {
+            drop(waiting);
             waiter.inner.wake();
             return;
         }
-        let waiting = &mut waiters.waiting;
         waiting.retain(|w| !w.gone());
         if !waiting.iter().any(|w| Arc::ptr_eq(w, &waiter.inner)) {
             waiting.push(waiter.inner.clone());
@@ -306,11 +367,18 @@ impl Budget {
         if let Some(taken) = self.try_take(&fits) {
             return Some(taken);
         }
-        // No room. Count the refusal and note what it needs before trying
-        // once more: a release that frees room after the first try either
-        // comes before this try, which then takes the room, or sees the
-        // need and wakes the runners once there is room for it.
-        self.inner.refusals.fetch_add(1, Ordering::SeqCst);
+        let refused = self.view.refused.fetch_add(1, Ordering::SeqCst) + 1;
+        if need > self.inner.limit {
+            // No release can ever leave room for it: the view records it,
+            // for its runner to end on, and no one is woken for it.
+            self.view.need.store(need, Ordering::SeqCst);
+            self.view.starved.store(refused, Ordering::SeqCst);
+            return None;
+        }
+        // No room. The refusal is counted; note what it needs before
+        // trying once more: a release that frees room after the first try
+        // either comes before this try, which then takes the room, or sees
+        // the need and wakes the runners once there is room for it.
         let _ = self
             .inner
             .wanted
@@ -352,9 +420,9 @@ impl Budget {
             return;
         }
         let waiting = {
-            let mut waiters = self.inner.waiters.lock();
-            waiters.woken_at = self.inner.refusals.load(Ordering::SeqCst);
-            std::mem::take(&mut waiters.waiting)
+            let mut waiting = self.inner.waiters.lock();
+            self.inner.wakes.fetch_add(1, Ordering::SeqCst);
+            std::mem::take(&mut *waiting)
         };
         for waiter in waiting {
             waiter.wake();
@@ -567,7 +635,7 @@ mod tests {
         assert_eq!(budget.used(), budget.limit());
         let mark = budget.refusals();
         assert!(budget.charge_within(1..=3).is_none());
-        assert_ne!(budget.refusals(), mark, "a refusal is counted");
+        assert!(budget.refused_since(mark), "a refusal is counted");
         assert_eq!(budget.used(), budget.limit());
         drop(second);
         let third = budget.charge_within(1..=3).unwrap();
@@ -612,10 +680,10 @@ mod tests {
         assert_eq!(grew, room / unit);
         assert_eq!(charge.bytes(), 6 + grew * unit);
         assert!(budget.limit() - budget.used() < unit);
-        assert_eq!(budget.refusals(), mark, "taking fewer is not a refusal");
+        assert!(!budget.refused_since(mark), "taking fewer is not a refusal");
         let (held, used) = (charge.bytes(), budget.used());
         assert_eq!(charge.grow_by_units(1..=4, unit), None);
-        assert_ne!(budget.refusals(), mark, "nothing fitting is a refusal");
+        assert!(budget.refused_since(mark), "nothing fitting is a refusal");
         assert_eq!((charge.bytes(), budget.used()), (held, used));
         drop((other, charge));
         assert_eq!(budget.used(), 0);
@@ -749,7 +817,7 @@ mod tests {
     /// owner dropped it is never woken and leaves at the next registration.
     #[test]
     fn a_kept_waiter_waits_once_and_a_dropped_one_leaves() {
-        let waiting = |budget: &Budget| budget.inner.waiters.lock().waiting.len();
+        let waiting = |budget: &Budget| budget.inner.waiters.lock().len();
         let budget = Budget::new(8);
         let held = budget.charge(8).unwrap();
         let (a, b) = (Arc::new(Count::default()), Arc::new(Count::default()));
@@ -766,5 +834,105 @@ mod tests {
         drop(held);
         assert_eq!((a.woken(), b.woken()), (0, 1));
         assert_eq!(waiting(&budget), 0);
+    }
+
+    /// Views share the limit and the count, but each keeps its own record
+    /// of refusals: a charge, a growth or a container refused through one
+    /// view is seen by that view and its clones only, and a runner whose
+    /// view was not refused waits for nothing.
+    #[test]
+    fn a_view_records_only_its_own_refusals() {
+        let budget = Budget::new(16);
+        let (a, b) = (budget.view(), budget.view());
+        assert!(a.same(&b) && a.same(&budget));
+        let mut grows = b.charge(0).unwrap();
+        let held = a.charge(budget.limit()).unwrap();
+        assert_eq!((a.used(), b.used(), budget.used()), (16, 16, 16));
+        let marks = [&budget, &a, &b].map(Budget::refusals);
+        let refusals = |marks: [Refusals; 3]| {
+            [&budget, &a, &b]
+                .iter()
+                .zip(marks)
+                .map(|(view, mark)| view.refused_since(mark))
+                .collect::<Vec<_>>()
+        };
+        assert!(b.charge(1).is_none());
+        assert_eq!(refusals(marks), [false, false, true]);
+        assert!(
+            b.clone().refused_since(marks[2]),
+            "a clone shares the record"
+        );
+        let marks = [&budget, &a, &b].map(Budget::refusals);
+        assert!(
+            !grows.grow_to(1),
+            "a charge grows through the view it came from"
+        );
+        assert_eq!(refusals(marks), [false, false, true]);
+        let marks = [&budget, &a, &b].map(Budget::refusals);
+        assert!(super::super::ChargedBytes::with_capacity(&a, 4).is_none());
+        assert_eq!(refusals(marks), [false, true, false]);
+
+        let (count_a, count_b) = (Arc::new(Count::default()), Arc::new(Count::default()));
+        let (wake_a, wake_b) = (waiter(&count_a), waiter(&count_b));
+        let since = [&a, &b].map(Budget::refusals);
+        assert!(b.charge(1).is_none());
+        a.wake_when_freed(&wake_a, since[0]);
+        b.wake_when_freed(&wake_b, since[1]);
+        drop(held);
+        assert_eq!((count_a.woken(), count_b.woken()), (0, 1));
+    }
+
+    /// A need past the whole limit is starved: the view says so with the
+    /// need and the limit, a need that may still fit is not, a mark taken
+    /// after it no longer sees it, and no release wakes its runner.
+    #[test]
+    fn a_need_past_the_limit_is_starved_and_never_wakes() {
+        let budget = Budget::new(16);
+        let view = budget.view();
+        let mut held = view.charge(10).unwrap();
+        let mark = view.refusals();
+        assert!(view.charge(8).is_none());
+        assert!(view.refused_since(mark));
+        assert_eq!(view.starved_since(mark), None, "room may still free for it");
+        let need = budget.limit() + 1;
+        assert!(view.charge(need).is_none());
+        let starved = Starved {
+            need,
+            limit: budget.limit(),
+        };
+        assert_eq!(view.starved_since(mark), Some(starved));
+        assert_eq!(budget.starved_since(budget.refusals()), None);
+        let later = view.refusals();
+        assert_eq!(
+            view.starved_since(later),
+            None,
+            "a later mark does not see it"
+        );
+        // A growth by whole units needs its start.
+        assert_eq!(held.grow_by_units(3..=5, 8), None);
+        let starved = Starved {
+            need: 24,
+            ..starved
+        };
+        assert_eq!(view.starved_since(later), Some(starved));
+
+        let count = Arc::new(Count::default());
+        let waker = waiter(&count);
+        let mark = view.refusals();
+        assert!(view.charge(need + 4).is_none());
+        view.wake_when_freed(&waker, mark);
+        held.shrink_to(0);
+        assert_eq!(budget.used(), 0);
+        view.wake_when_freed(&waker, mark);
+        assert_eq!(count.woken(), 0, "no release can meet it");
+        // A mark taken after it is free of it: a refusal within the limit
+        // waits and is woken as usual.
+        let hog = budget.charge(budget.limit()).unwrap();
+        let since = view.refusals();
+        assert!(view.charge(4).is_none());
+        view.wake_when_freed(&waker, since);
+        assert_eq!(count.woken(), 0);
+        drop(hog);
+        assert_eq!(count.woken(), 1);
     }
 }

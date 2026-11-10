@@ -396,7 +396,7 @@ impl<B: Layer> Kid<B> {
     /// waits on it for the child, with the waiter made from `around`, what
     /// the child runs in.
     fn wait_for_memory(&self, since: Refusals, around: Wakes<'_>) {
-        if self.budget.refusals() != since {
+        if self.budget.refused_since(since) {
             let waiter = self.waiter.waiter(|| around.waker());
             self.budget.wake_when_freed(waiter, since);
         }

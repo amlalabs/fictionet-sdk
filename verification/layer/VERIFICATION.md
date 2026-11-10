@@ -895,9 +895,24 @@ sequences over symbolic `u8` sizes, and have not been run:
 | `charged_bytes_capacity_is_its_charge` | for three fixed sizes, bytes are charged their capacity after being made, grown, overrun by a writer that is undone, written and trimmed; a growth without room is refused and everything comes back on drop |
 | `a_refused_growth_changes_nothing` | a refused growth leaves a charge, bytes (their allocation included) and a queue as they were, with the count unchanged |
 
+Each asker now charges through its own view of a budget (`Budget::view`),
+which records its refusals and whether one needed more than the whole limit
+(`Starved`). Two harnesses were written for the views, in the same style, and
+`a_release_after_a_refusal_wakes_once` gained a second view whose runner is
+never woken. None has been run:
+
+| Harness | Proves |
+| --- | --- |
+| `a_view_records_only_its_own_refusals` | a charge through one view of a budget, while another view holds part of it, is refused exactly when it does not fit, and only the asking view (and its clones) records the refusal |
+| `starved_is_a_need_over_the_limit_and_never_wakes` | a refused charge is starved exactly when its need passes the limit, with that need and the limit, and its runner is never woken for it, even when every byte comes back; a refused need within the limit is woken once memory returns |
+
 The model test `random_calls_keep_cover_sum_order_return_move_and_wake` in
-`charged.rs` runs 64 seeded sequences of 400 random calls on two budgets and
-checks every invariant after each call. Each of these changes made it fail,
+`charged.rs` runs 64 seeded sequences of 400 random calls on two budgets, each
+charged through two views, and checks every invariant after each call,
+including that a refusal is seen by the charging view only, that a view is
+starved exactly when a need past the limit was refused through it, and that a
+starved view's runner and a runner whose view was not refused are never
+woken. Each of these changes made it fail,
 along with the named unit test: a release that wakes nobody
 (`a_release_after_a_refusal_wakes_each_waiting_runner_once`), a repay that
 trims before it pays (`a_refused_repay_reallocates_and_releases_nothing`), and

@@ -873,13 +873,18 @@ mod tests {
     //!   once; a release that leaves less wakes none; and a runner that
     //!   asks after memory was freed, or while there is room, is woken at
     //!   once.
+    //! - Views: each budget is charged through two views. A refusal is
+    //!   seen only by the view that charged; a runner whose view was not
+    //!   refused waits for nothing; a view is starved exactly when a need
+    //!   since its mark passed the limit, and a starved view's runner is
+    //!   never woken for it.
 
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Wake, Waker};
 
-    use fictionet::stdlib::layer::{Refusals, Waiter};
+    use fictionet::stdlib::layer::{Refusals, Starved, Waiter};
     use fictionet::{Entropy, Seed, SeededEntropy};
 
     #[test]
@@ -925,12 +930,30 @@ mod tests {
     /// What the model knows of one budget's waiting runners.
     #[derive(Default)]
     struct Waits {
-        refusals: u64,
-        /// The least a charge refused since the last wake needed; 0 if
-        /// none was refused.
+        /// The least a charge within the limit refused since the last
+        /// wake needed; 0 if none was refused.
         wanted: usize,
-        woken_at: u64,
+        /// How many times a release woke the runners.
+        wakes: u64,
         waiting: Vec<usize>,
+    }
+
+    /// What the model knows of one view's refusals.
+    #[derive(Clone, Copy, Default)]
+    struct Record {
+        refused: u64,
+        /// `refused` as of the last refusal past the limit, or 0.
+        starved: u64,
+        /// What that refusal needed.
+        need: usize,
+    }
+
+    /// A mark a runner took before a round, and what the model knew then.
+    #[derive(Clone, Copy)]
+    struct Mark {
+        real: Refusals,
+        record: Record,
+        wakes: u64,
     }
 
     enum Item {
@@ -985,10 +1008,12 @@ mod tests {
         }
     }
 
-    /// Something held, and the budget that pays for it.
+    /// Something held, the budget that pays for it, and the view of that
+    /// budget its growth asks through.
     struct Held {
         item: Item,
         payer: usize,
+        view: usize,
     }
 
     /// What one call did that the counts alone do not show.
@@ -996,8 +1021,9 @@ mod tests {
     struct Acted {
         /// The call refused, or found nothing to act on.
         refused: bool,
-        /// The budget a refused charge was on, and the bytes it needed.
-        need: Option<(usize, usize)>,
+        /// The budget a refused charge was on, the view it asked through,
+        /// and the bytes it needed.
+        need: Option<(usize, usize, usize)>,
         /// The budget a charge was given back to although the call charged
         /// more on it overall: a chunk paid for whole, then trimmed.
         trimmed: Option<usize>,
@@ -1015,16 +1041,27 @@ mod tests {
         moved_in_place: usize,
         moved_by_copy: usize,
         overruns: usize,
+        /// Refusals of a need past the limit.
+        starved: usize,
+        /// Runners that asked after their view starved, and were not woken.
+        starved_asked: usize,
+        /// Runners that asked through a view that was not refused while
+        /// the other view of the budget was.
+        asked_unrefused: usize,
     }
 
     struct Model {
         rng: SeededEntropy,
         budgets: [Budget; 2],
+        /// Two views of each budget, each with its own record.
+        askers: [[Budget; 2]; 2],
+        records: [[Record; 2]; 2],
         held: Vec<Held>,
         waits: [Waits; 2],
         runners: Vec<Runner>,
-        /// A mark a runner took before an earlier round, to ask with later.
-        stale: [Option<(Refusals, u64)>; 2],
+        /// A mark a runner took through a view before an earlier round, to
+        /// ask with later.
+        stale: [Option<(usize, Mark)>; 2],
         reached: Reached,
     }
 
@@ -1043,9 +1080,12 @@ mod tests {
                     }
                 })
                 .collect();
+            let askers = [0, 1].map(|b| [budgets[b].view(), budgets[b].view()]);
             Model {
                 rng,
                 budgets,
+                askers,
+                records: Default::default(),
                 held: Vec::new(),
                 waits: Default::default(),
                 runners,
@@ -1087,54 +1127,55 @@ mod tests {
             })
         }
 
-        fn add(&mut self, item: Item, payer: usize) {
-            self.held.push(Held { item, payer });
+        fn add(&mut self, item: Item, payer: usize, view: usize) {
+            self.held.push(Held { item, payer, view });
         }
 
         fn act(&mut self) -> Acted {
-            let budget = self.below(2);
+            let (budget, view) = (self.below(2), self.below(2));
+            let asker = self.askers[budget][view].clone();
             let refused = |done: bool| Acted {
                 refused: !done,
                 ..Acted::default()
             };
-            // A call on budget `payer` that needed `need` bytes of it.
-            let charging = |done: bool, payer: usize, need: usize| Acted {
+            // A call on budget `payer`, through its view `view`, that
+            // needed `need` bytes of it.
+            let charging = |done: bool, payer: usize, view: usize, need: usize| Acted {
                 refused: !done,
-                need: (!done).then_some((payer, need)),
+                need: (!done).then_some((payer, view, need)),
                 ..Acted::default()
             };
-            match self.below(23) {
+            match self.below(24) {
                 0 | 1 => {
                     let n = self.below(96);
                     let fits = n <= self.room(budget);
-                    let made = ChargedBytes::with_capacity(&self.budgets[budget], n);
+                    let made = ChargedBytes::with_capacity(&asker, n);
                     assert_eq!(made.is_some(), fits);
                     let done = made.is_some();
                     if let Some(bytes) = made {
                         assert_eq!(bytes.capacity(), n);
-                        self.add(Item::Bytes(bytes), budget);
+                        self.add(Item::Bytes(bytes), budget, view);
                     }
-                    charging(done, budget, n)
+                    charging(done, budget, view, n)
                 }
                 2 => {
                     let start = self.below(64);
                     let end = start + self.below(64);
                     let room = self.room(budget);
-                    let made =
-                        ChargedBytes::with_capacity_within(&self.budgets[budget], start..=end);
+                    let made = ChargedBytes::with_capacity_within(&asker, start..=end);
                     assert_eq!(made.is_some(), start <= room);
                     let done = made.is_some();
                     if let Some(bytes) = made {
                         assert_eq!(bytes.capacity(), end.min(room));
-                        self.add(Item::Bytes(bytes), budget);
+                        self.add(Item::Bytes(bytes), budget, view);
                     }
-                    charging(done, budget, start)
+                    charging(done, budget, view, start)
                 }
                 3 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
                         return refused(false);
                     };
-                    let payer = self.held[at].payer;
+                    let (payer, view) = (self.held[at].payer, self.held[at].view);
                     let to = self.below(128);
                     let room = self.room(payer);
                     let Item::Bytes(bytes) = &mut self.held[at].item else {
@@ -1147,7 +1188,7 @@ mod tests {
                     if grew {
                         assert!(bytes.capacity() >= to);
                     }
-                    charging(grew, payer, more)
+                    charging(grew, payer, view, more)
                 }
                 4 | 5 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
@@ -1215,15 +1256,16 @@ mod tests {
                         let most = 1 + self.below(12);
                         let places = self.below(2 * most);
                         let fits = places.min(most) * size_of::<u64>() <= self.room(budget);
-                        let made = ChargedDeque::with_places(&self.budgets[budget], places, most);
+                        let made = ChargedDeque::with_places(&asker, places, most);
                         assert_eq!(made.is_some(), fits);
                         let done = made.is_some();
                         if let Some(deque) = made {
-                            self.add(Item::Deque(deque), budget);
+                            self.add(Item::Deque(deque), budget, view);
                         }
-                        return charging(done, budget, places.min(most) * size_of::<u64>());
+                        let need = places.min(most) * size_of::<u64>();
+                        return charging(done, budget, view, need);
                     };
-                    let payer = self.held[at].payer;
+                    let (payer, view) = (self.held[at].payer, self.held[at].view);
                     let room = self.room(payer);
                     let item = self.rng.random_u64();
                     let front = self.below(2) == 0;
@@ -1256,7 +1298,7 @@ mod tests {
                         }
                         Err(back) => assert_eq!(back, item),
                     }
-                    charging(pushed.is_ok(), payer, size_of::<u64>())
+                    charging(pushed.is_ok(), payer, view, size_of::<u64>())
                 }
                 10 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Deque(_))) else {
@@ -1291,14 +1333,14 @@ mod tests {
                 11 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::List(_))) else {
                         let most = 1 + self.below(12);
-                        let made = ChargedVec::with_places(&self.budgets[budget], 0, most);
+                        let made = ChargedVec::with_places(&asker, 0, most);
                         let done = made.is_some();
                         if let Some(list) = made {
-                            self.add(Item::List(list), budget);
+                            self.add(Item::List(list), budget, view);
                         }
                         return refused(done);
                     };
-                    let payer = self.held[at].payer;
+                    let (payer, view) = (self.held[at].payer, self.held[at].view);
                     let room = self.room(payer);
                     let item = self.rng.random_u64() as u32;
                     let shrink = self.below(4) == 0;
@@ -1328,24 +1370,21 @@ mod tests {
                         assert_eq!(list.places(), if full { grown } else { places });
                         assert_eq!(list.last(), Some(&item));
                     }
-                    charging(pushed.is_ok(), payer, size_of::<u32>())
+                    charging(pushed.is_ok(), payer, view, size_of::<u32>())
                 }
                 12 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Map(_))) else {
                         let limit = self.below(6);
                         let fits =
                             BoundedMap::<u16, u64>::storage(limit).unwrap() <= self.room(budget);
-                        let made = BoundedMap::new(&self.budgets[budget], limit);
+                        let made = BoundedMap::new(&asker, limit);
                         assert_eq!(made.is_some(), fits);
                         let done = made.is_some();
                         if let Some(map) = made {
-                            self.add(Item::Map(map), budget);
+                            self.add(Item::Map(map), budget, view);
                         }
-                        return charging(
-                            done,
-                            budget,
-                            BoundedMap::<u16, u64>::storage(limit).unwrap(),
-                        );
+                        let need = BoundedMap::<u16, u64>::storage(limit).unwrap();
+                        return charging(done, budget, view, need);
                     };
                     let key = self.below(8) as u16;
                     let value = self.rng.random_u64();
@@ -1364,19 +1403,19 @@ mod tests {
                 13 => {
                     let n = self.below(64);
                     let fits = n <= self.room(budget);
-                    let made = self.budgets[budget].charge(n);
+                    let made = asker.charge(n);
                     assert_eq!(made.is_some(), fits);
                     let done = made.is_some();
                     if let Some(charge) = made {
-                        self.add(Item::Charge(charge), budget);
+                        self.add(Item::Charge(charge), budget, view);
                     }
-                    charging(done, budget, n)
+                    charging(done, budget, view, n)
                 }
                 14 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Charge(_))) else {
                         return refused(false);
                     };
-                    let payer = self.held[at].payer;
+                    let (payer, view) = (self.held[at].payer, self.held[at].view);
                     let room = self.room(payer);
                     let to = self.below(96);
                     let Item::Charge(charge) = &mut self.held[at].item else {
@@ -1391,13 +1430,13 @@ mod tests {
                     let grew = charge.grow_to(to);
                     assert_eq!(grew, to <= was || to - was <= room);
                     assert_eq!(charge.bytes(), if grew { was.max(to) } else { was });
-                    charging(grew, payer, to.saturating_sub(was))
+                    charging(grew, payer, view, to.saturating_sub(was))
                 }
                 15 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Charge(_))) else {
                         return refused(false);
                     };
-                    let payer = self.held[at].payer;
+                    let (payer, view) = (self.held[at].payer, self.held[at].view);
                     let part = self.below(48);
                     let Item::Charge(charge) = &mut self.held[at].item else {
                         unreachable!()
@@ -1408,7 +1447,7 @@ mod tests {
                     let done = split.is_some();
                     if let Some(split) = split {
                         assert_eq!(split.bytes() + charge.bytes(), was);
-                        self.add(Item::Charge(split), payer);
+                        self.add(Item::Charge(split), payer, view);
                     }
                     refused(done)
                 }
@@ -1419,7 +1458,7 @@ mod tests {
                     let from = self.held[at].payer;
                     let to = self.below(2);
                     let (room, before) = (self.room(to), [0, 1].map(|b| self.budgets[b].used()));
-                    let target = self.budgets[to].clone();
+                    let target = self.askers[to][view].clone();
                     let Item::Charge(charge) = &mut self.held[at].item else {
                         unreachable!()
                     };
@@ -1433,14 +1472,15 @@ mod tests {
                         assert_eq!(after[from], before[from] - bytes);
                         assert_eq!(after[to], before[to] + bytes);
                         self.held[at].payer = to;
+                        self.held[at].view = view;
                     }
-                    charging(moved, to, bytes)
+                    charging(moved, to, view, bytes)
                 }
                 21 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Deque(_))) else {
                         return refused(false);
                     };
-                    let payer = self.held[at].payer;
+                    let (payer, view) = (self.held[at].payer, self.held[at].view);
                     let room = self.room(payer);
                     let additional = self.below(24);
                     let Item::Deque(deque) = &mut self.held[at].item else {
@@ -1468,11 +1508,8 @@ mod tests {
                         }
                         assert_eq!(deque.len(), wanted);
                     }
-                    charging(
-                        reserved,
-                        payer,
-                        wanted.saturating_sub(places) * size_of::<u64>(),
-                    )
+                    let need = wanted.saturating_sub(places) * size_of::<u64>();
+                    charging(reserved, payer, view, need)
                 }
                 17 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
@@ -1485,7 +1522,7 @@ mod tests {
                     let (len, charged) = (bytes.len(), bytes.charged());
                     let chunk = bytes.into_chunk();
                     assert_eq!((chunk.len(), chunk.charged()), (len, charged));
-                    self.add(Item::Chunk(chunk, true), held.payer);
+                    self.add(Item::Chunk(chunk, true), held.payer, held.view);
                     refused(true)
                 }
                 18 => {
@@ -1494,7 +1531,7 @@ mod tests {
                     else {
                         return refused(false);
                     };
-                    let payer = self.held[at].payer;
+                    let (payer, view) = (self.held[at].payer, self.held[at].view);
                     let Item::Chunk(chunk, whole) = &mut self.held[at].item else {
                         unreachable!()
                     };
@@ -1503,7 +1540,7 @@ mod tests {
                     let prefix = chunk.split_to(n);
                     *whole = false;
                     assert_eq!(prefix.charged(), charged, "pieces name one charge");
-                    self.add(Item::Chunk(prefix, false), payer);
+                    self.add(Item::Chunk(prefix, false), payer, view);
                     refused(true)
                 }
                 19 | 20 => {
@@ -1514,7 +1551,7 @@ mod tests {
                     let shared = self.shared(at);
                     let room = self.room(to);
                     let before = [0, 1].map(|b| self.budgets[b].used());
-                    let target = self.budgets[to].clone();
+                    let target = self.askers[to][view].clone();
                     let Item::Chunk(chunk, whole) = &mut self.held[at].item else {
                         unreachable!()
                     };
@@ -1538,7 +1575,8 @@ mod tests {
                         return refused(repaid);
                     }
                     if !repaid {
-                        return charging(false, to, if in_place { capacity } else { bytes.len() });
+                        let need = if in_place { capacity } else { bytes.len() };
+                        return charging(false, to, view, need);
                     }
                     assert!(
                         after[to] - before[to] <= capacity,
@@ -1546,6 +1584,7 @@ mod tests {
                     );
                     *whole = true;
                     self.held[at].payer = to;
+                    self.held[at].view = view;
                     if in_place {
                         self.reached.moved_in_place += 1;
                     } else {
@@ -1556,6 +1595,12 @@ mod tests {
                         trimmed: (in_place && bytes.len() < capacity).then_some(to),
                         need: None,
                     }
+                }
+                22 => {
+                    // More than the whole limit: refused whatever is held.
+                    let n = asker.limit() + 1 + self.below(64);
+                    assert!(asker.charge(n).is_none());
+                    charging(false, budget, view, n)
                 }
                 _ => {
                     if self.held.is_empty() {
@@ -1576,19 +1621,26 @@ mod tests {
         }
 
         /// Asks runner `runner` to be woken when memory frees on `budget`,
-        /// with a mark it took before a round.
-        fn ask(&mut self, budget: usize, runner: usize, (mark, counted): (Refusals, u64)) {
+        /// through its view `view`, with a mark it took before a round.
+        /// Only a refusal through that view since the mark counts, and
+        /// one past the limit wakes nothing.
+        fn ask(&mut self, budget: usize, view: usize, runner: usize, mark: Mark) {
             let room = self.room(budget);
+            let record = self.records[budget][view];
             let waits = &mut self.waits[budget];
-            if waits.refusals != counted {
-                if waits.woken_at > counted || waits.wanted == 0 || room >= waits.wanted {
+            let refused = record.refused != mark.record.refused;
+            let starved = record.starved > mark.record.refused;
+            if refused && starved {
+                self.reached.starved_asked += 1;
+            } else if refused {
+                if waits.wakes != mark.wakes || waits.wanted == 0 || room >= waits.wanted {
                     self.runners[runner].woken += 1;
                     self.reached.woken_at_once += 1;
                 } else if !waits.waiting.contains(&runner) {
                     waits.waiting.push(runner);
                 }
             }
-            self.budgets[budget].wake_when_freed(&self.runners[runner].waiter, mark);
+            self.askers[budget][view].wake_when_freed(&self.runners[runner].waiter, mark.real);
         }
 
         /// Memory came back to `budget`: once there is room for the least
@@ -1608,11 +1660,17 @@ mod tests {
                 self.reached.woken_after_waiting += 1;
             }
             waits.wanted = 0;
-            waits.woken_at = waits.refusals;
+            waits.wakes += 1;
         }
 
         fn step(&mut self) {
-            let marks = [0, 1].map(|b| (self.budgets[b].refusals(), self.waits[b].refusals));
+            let marks = [0, 1].map(|b| {
+                [0, 1].map(|v| Mark {
+                    real: self.askers[b][v].refusals(),
+                    record: self.records[b][v],
+                    wakes: self.waits[b].wakes,
+                })
+            });
             let used = [0, 1].map(|b| self.budgets[b].used());
             let shapes: Vec<_> = self.held.iter().map(|held| held.item.shape()).collect();
             let acted = self.act();
@@ -1622,40 +1680,74 @@ mod tests {
                 assert_eq!([0, 1].map(|b| self.budgets[b].used()), used);
             }
             for b in 0..2 {
-                let refused = self.budgets[b].refusals() != marks[b].0;
-                let released = self.budgets[b].used() < used[b] || acted.trimmed == Some(b);
-                assert!(!(refused && released), "one call refused and released");
-                if refused {
-                    let Some((on, need)) = acted.need else {
-                        panic!("a call the model thought fit was refused");
-                    };
-                    assert_eq!(on, b, "refused on the budget it charged");
-                    let waits = &mut self.waits[b];
-                    waits.refusals += 1;
-                    if waits.wanted == 0 || need < waits.wanted {
-                        waits.wanted = need;
+                let limit = self.budgets[b].limit();
+                let mut refusing = None;
+                for v in 0..2 {
+                    let mark = marks[b][v];
+                    if self.askers[b][v].refused_since(mark.real) {
+                        let Some((on, by, need)) = acted.need else {
+                            panic!("a call the model thought fit was refused");
+                        };
+                        assert_eq!((on, by), (b, v), "refused through the view that charged");
+                        let record = &mut self.records[b][v];
+                        record.refused += 1;
+                        if need > limit {
+                            record.starved = record.refused;
+                            record.need = need;
+                            self.reached.starved += 1;
+                        } else {
+                            let waits = &mut self.waits[b];
+                            if waits.wanted == 0 || need < waits.wanted {
+                                waits.wanted = need;
+                            }
+                        }
+                        self.reached.refusals += 1;
+                        refusing = Some(v);
                     }
-                    self.reached.refusals += 1;
+                    let record = self.records[b][v];
+                    let starved = (record.starved > mark.record.refused).then_some(Starved {
+                        need: record.need,
+                        limit,
+                    });
+                    assert_eq!(
+                        self.askers[b][v].starved_since(mark.real),
+                        starved,
+                        "starved exactly when a need since passed the limit"
+                    );
                 }
+                let released = self.budgets[b].used() < used[b] || acted.trimmed == Some(b);
+                assert!(
+                    !(refusing.is_some() && released),
+                    "one call refused and released"
+                );
                 if released {
                     self.released(b);
                 }
-                if refused && self.below(2) == 0 {
-                    let runner = self.below(self.runners.len());
-                    self.ask(b, runner, marks[b]);
+                if let Some(v) = refusing {
+                    if self.below(2) == 0 {
+                        let runner = self.below(self.runners.len());
+                        self.ask(b, v, runner, marks[b][v]);
+                    }
+                    if self.below(4) == 0 {
+                        self.stale[b] = Some((v, marks[b][v]));
+                    }
+                    // The other view was not refused: its runner waits
+                    // for nothing.
+                    if self.below(4) == 0 {
+                        let runner = self.below(self.runners.len());
+                        self.ask(b, 1 - v, runner, marks[b][1 - v]);
+                        self.reached.asked_unrefused += 1;
+                    }
                 }
-                if refused && self.below(4) == 0 {
-                    self.stale[b] = Some(marks[b]);
-                }
-                if let Some(mark) = self.stale[b]
+                if let Some((v, mark)) = self.stale[b]
                     && self.below(8) == 0
                 {
                     let runner = self.below(self.runners.len());
-                    self.ask(b, runner, mark);
+                    self.ask(b, v, runner, mark);
                 }
-                if !refused && self.below(16) == 0 {
-                    let runner = self.below(self.runners.len());
-                    self.ask(b, runner, marks[b]);
+                if refusing.is_none() && self.below(16) == 0 {
+                    let (v, runner) = (self.below(2), self.below(self.runners.len()));
+                    self.ask(b, v, runner, marks[b][v]);
                 }
             }
             self.check();
@@ -1723,7 +1815,13 @@ mod tests {
             reached.moved_in_place += r.moved_in_place;
             reached.moved_by_copy += r.moved_by_copy;
             reached.overruns += r.overruns;
+            reached.starved += r.starved;
+            reached.starved_asked += r.starved_asked;
+            reached.asked_unrefused += r.asked_unrefused;
         }
+        assert!(reached.starved > 0);
+        assert!(reached.starved_asked > 0);
+        assert!(reached.asked_unrefused > 0);
         assert!(reached.refusals > 0);
         assert!(reached.released_too_little > 0);
         assert!(reached.woken_after_waiting > 0);
@@ -1831,7 +1929,7 @@ mod tests {
         let mark = budget.refusals();
         // Full, and doubling does not fit: no place more fits either.
         assert_eq!(deque.push_back(4), Err(4));
-        assert_ne!(budget.refusals(), mark);
+        assert!(budget.refused_since(mark));
         let other = Budget::new(6 * size);
         let mut deque = ChargedDeque::<u64>::new(&other, 64);
         for i in 0..4 {
@@ -1842,7 +1940,7 @@ mod tests {
         assert!(deque.push_back(4).is_ok());
         assert_eq!(deque.places(), 6);
         assert_eq!(deque.charged(), other.used());
-        assert_eq!(other.refusals(), mark, "growing less is not a refusal");
+        assert!(!other.refused_since(mark), "growing less is not a refusal");
         drop((deque, other));
         assert_eq!(budget.used(), 4 * size);
     }
