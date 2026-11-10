@@ -108,7 +108,10 @@ impl Request {
         if bytes.len() < HEADER || bytes[2] & 0x80 != 0 {
             return Parsed::Silent;
         }
-        let message = match Message::from_vec(bytes).map_err(|_| opaque(bytes)) {
+        let read = Message::from_vec(bytes)
+            .ok()
+            .filter(|_| layouts_hold(bytes));
+        let message = match read.ok_or_else(|| opaque(bytes)) {
             Ok(message) | Err(Ok(message)) => message,
             Err(Err(Fault { in_opt })) => return Parsed::Reject(unparsed(bytes, in_opt)),
         };
@@ -409,6 +412,35 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
     Ok(message)
 }
 
+/// Whether every record of the message has the RDATA layout its type
+/// asks for, read as [`record`] reads it. hickory reads the RDATA of the
+/// RFC 1035 name types it has no type for (MD, MF, MB, MG, MR, MINFO) as
+/// octets, so it takes such a record whose RDATA holds no name; RFC 3597
+/// §4 has the names of these types read inside their RDATA, as of every
+/// type that may hold compressed names.
+fn layouts_hold(bytes: &[u8]) -> bool {
+    let mut decoder = BinDecoder::new(bytes);
+    let Ok(header) = Header::read(&mut decoder) else {
+        return false;
+    };
+    for _ in 0..header.counts.queries {
+        if Query::read(&mut decoder).is_err() {
+            return false;
+        }
+    }
+    let counts = header.counts;
+    let records =
+        u32::from(counts.answers) + u32::from(counts.authorities) + u32::from(counts.additionals);
+    let mut at = decoder.index();
+    (0..records).all(|_| match record(bytes, at) {
+        Ok((_, end)) => {
+            at = end;
+            true
+        }
+        Err(_) => false,
+    })
+}
+
 /// The NOTAUTH reply to a query signed with `tsig`, from a server that
 /// holds no TSIG keys: the key is unknown to it, so the reply carries a
 /// TSIG record with error BADKEY and no MAC, and is itself unsigned
@@ -693,6 +725,23 @@ mod tests {
         good[7] = 1;
         good.extend_from_slice(&[0xc0, 12, 0, 2, 0, 1, 0, 0, 1, 44, 0, 2, 0xc0, 12]);
         accepted(&good, Transport::Udp);
+    }
+
+    #[test]
+    fn a_name_type_record_that_holds_no_name_gets_formerr() {
+        // One answer record of type MF (RFC 1035 §3.3.5), whose RDATA must
+        // be a name, holding a label that runs past the RDATA's end.
+        let mut bytes = query(|m| {
+            m.set_edns(edns(0, false));
+        });
+        let opt = bytes.split_off(bytes.len() - 11);
+        bytes[7] = 1;
+        bytes.extend_from_slice(&[0xc0, 12, 0, 4, 0, 1, 0, 0, 1, 44, 0, 3, 1, 2, 3]);
+        bytes.extend_from_slice(&opt);
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        // The fault is not in the OPT record, and the message does not read.
+        assert!(reply.edns.is_none());
     }
 
     #[test]
