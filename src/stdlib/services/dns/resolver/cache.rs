@@ -2,12 +2,15 @@
 //! and failures, each until its TTL runs out.
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::time::Duration;
 
+use fictionet::stdlib::layer::{BoundedMap, Budget, Charge};
 use fictionet::stdlib::protocols::dns::EdeCode;
 use fictionet::stdlib::protocols::dns::dnssec::Validation;
-use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Record, RecordSet, RecordType};
+use fictionet::stdlib::protocols::dns::rr::{
+    DNSClass, LowerName, Name, Record, RecordSet, RecordType,
+};
 use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::time::Instant;
 
@@ -159,15 +162,11 @@ impl Entry {
         }
     }
 
-    /// The octets of the records the entry holds, by [`octets`].
-    fn bytes(&self) -> usize {
+    /// The heap the entry holds past its own struct, by [`rrset_heap`].
+    fn heap(&self) -> usize {
         match self {
-            Entry::Positive { set, proof, .. } => {
-                octets(set) + proof.iter().map(octets).sum::<usize>()
-            }
-            Entry::Negative { soa, denial, .. } => {
-                octets(soa) + denial.iter().map(octets).sum::<usize>()
-            }
+            Entry::Positive { set, proof, .. } => rrset_heap(set) + rrsets_heap(proof),
+            Entry::Negative { soa, denial, .. } => rrset_heap(soa) + rrsets_heap(denial),
             Entry::Failure { .. } => 0,
         }
     }
@@ -317,7 +316,8 @@ pub(super) fn same_rrsets(a: &[RecordSet], b: &[RecordSet]) -> bool {
 }
 
 /// The limits on what the cache keeps, from the resolver's
-/// [`Config`](super::Config).
+/// [`Config`](super::Config). The memory it holds is bounded by the
+/// [`Budget`] it is made with ([`Cache::new`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The longest any data is kept (RFC 8767 §4: at most 604800 seconds).
@@ -330,36 +330,31 @@ pub struct Limits {
     /// (RFC 8767 §4), or zero to keep none.
     pub stale: Duration,
     /// The most the cache holds at once: entries, each NSEC zone, and
-    /// each NSEC RRset count one.
+    /// each NSEC RRset count one. The budget pays for the room to hold
+    /// them all when the cache is made ([`Cache::storage`]).
     pub max_entries: usize,
-    /// The most octets the cache holds at once: the records of every
-    /// entry, of what an entry was laid over, of the records that support
-    /// it, and of every NSEC zone, each as a message carries it with its
-    /// owner written out uncompressed.
-    pub max_bytes: usize,
 }
 
 /// The longest a failure that persists is kept (RFC 9520 §3.2: up to 5
 /// minutes), unless [`Limits::failure_ttl`] is longer.
 const MAX_FAILURE_TTL: Duration = Duration::from_secs(300);
 
-/// The validated NSEC records of one zone, by owner in canonical order.
-#[derive(Clone, Debug)]
-struct SecureNsec {
+/// The SOA RRset of a zone whose validated NSEC records the cache holds.
+#[derive(Debug)]
+struct Zone {
     soa: RecordSet,
     soa_expires: Instant,
-    /// The octets of `soa`.
-    soa_bytes: usize,
-    sets: BTreeMap<LowerName, Nsec>,
+    /// Pays for its heap, by [`Cache::add_secure_nsec`].
+    _charge: Charge,
 }
 
 /// A validated NSEC RRset and when it stops proving anything.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct Nsec {
     set: RecordSet,
     expires: Instant,
-    /// The octets of `set`.
-    bytes: usize,
+    /// Pays for its heap, by [`Cache::add_secure_nsec`].
+    _charge: Charge,
 }
 
 impl Borrow<RecordSet> for Nsec {
@@ -368,28 +363,45 @@ impl Borrow<RecordSet> for Nsec {
     }
 }
 
+/// The validated NSEC RRsets, by their zone's apex and their owner.
+type Nsecs = BoundedMap<(LowerName, LowerName), Box<Nsec>>;
+
+/// The NSEC RRsets `nsecs` holds for the zone at `apex`, by owner in
+/// canonical order.
+fn zone_records<'a>(
+    nsecs: &'a Nsecs,
+    apex: &'a LowerName,
+) -> impl Iterator<Item = (&'a (LowerName, LowerName), &'a Nsec)> + Clone + use<'a> {
+    // The root sorts before every name.
+    let first = (apex.clone(), LowerName::new(&Name::root()));
+    nsecs
+        .range((Bound::Included(first), Bound::Unbounded))
+        .take_while(move |((zone, _), _)| zone == apex)
+        .map(|(key, nsec)| (key, &**nsec))
+}
+
 /// The validated NSEC records of the zone [`Cache::secure_nsec`] found,
 /// borrowed from the cache. Nothing is copied until an answer picks the
 /// records it carries.
 pub(super) struct ZoneNsecs<'a> {
     /// The zone's apex.
     pub(super) zone: &'a LowerName,
-    nsec: &'a SecureNsec,
+    soa: &'a Zone,
+    nsecs: &'a Nsecs,
     now: Instant,
 }
 
 impl<'a> ZoneNsecs<'a> {
     /// The zone's SOA RRset, and the TTL it has left.
     pub(super) fn soa(&self) -> (&'a RecordSet, u32) {
-        (&self.nsec.soa, ttl_left(self.nsec.soa_expires, self.now))
+        (&self.soa.soa, ttl_left(self.soa.soa_expires, self.now))
     }
 
     /// The NSEC RRsets still live, by owner in canonical order.
     pub(super) fn live(&self) -> impl Iterator<Item = &'a Nsec> + Clone + use<'a> {
         let now = self.now;
-        self.nsec
-            .sets
-            .values()
+        zone_records(self.nsecs, self.zone)
+            .map(|(_, nsec)| nsec)
             .filter(move |nsec| now < nsec.expires)
     }
 
@@ -400,7 +412,7 @@ impl<'a> ZoneNsecs<'a> {
 }
 
 /// A stored entry, with what it was laid over.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Stored {
     entry: Entry,
     /// The expired data a failure was laid over, which may still be
@@ -413,40 +425,36 @@ struct Stored {
     /// its parent reaches it, so this still finds the zone's servers
     /// (RFC 2181 §5.4.1, RFC 1034 §5.3.3).
     glue: Option<Entry>,
-    /// The octets of all three.
-    bytes: usize,
+    /// Pays for its heap, by [`Cache::put`].
+    _charge: Charge,
 }
 
 impl Stored {
-    fn new(entry: Entry, under: Option<Entry>, glue: Option<Entry>) -> Stored {
-        let bytes = [Some(&entry), under.as_ref(), glue.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(Entry::bytes)
-            .sum();
-        Stored {
-            entry,
-            under,
-            glue,
-            bytes,
-        }
-    }
-
-    /// When it is past any use at all: expired, past the stale window,
-    /// and for a failure, past the time a failure after it would count as
-    /// persisting, and the same for what it was laid over.
+    /// When it is past any use, by [`useless_at`].
     fn useless_at(&self, stale: Duration) -> Instant {
-        let persists = match self.entry {
-            Entry::Failure { until, lasts, .. } => until + lasts,
-            _ => self.entry.expires(),
-        };
-        let last = [self.under.as_ref(), self.glue.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(Entry::expires)
-            .fold(persists, Instant::max);
-        last + stale
+        useless_at(
+            &self.entry,
+            [self.under.as_ref(), self.glue.as_ref()],
+            stale,
+        )
     }
+}
+
+/// When `entry`, stored over `laid_over`, is past any use at all:
+/// expired, past the stale window, and for a failure, past the time a
+/// failure after it would count as persisting, and the same for what it
+/// was laid over.
+fn useless_at(entry: &Entry, laid_over: [Option<&Entry>; 2], stale: Duration) -> Instant {
+    let persists = match entry {
+        Entry::Failure { until, lasts, .. } => *until + *lasts,
+        _ => entry.expires(),
+    };
+    let last = laid_over
+        .into_iter()
+        .flatten()
+        .map(Entry::expires)
+        .fold(persists, Instant::max);
+    last + stale
 }
 
 /// Something the cache holds, in [`Cache::drops`].
@@ -458,6 +466,39 @@ enum Slot {
     Zone(LowerName),
     /// One NSEC RRset: its zone's apex and its owner.
     Nsec(LowerName, LowerName),
+}
+
+impl Slot {
+    /// The heap of the names a thing is held under, by estimate: each
+    /// name's octets, once in its store's key and once in its place in
+    /// [`Cache::drops`].
+    fn heap(&self) -> usize {
+        let names = match self {
+            Slot::Entry(key) => key.name.len(),
+            Slot::Zone(apex) => apex.len(),
+            Slot::Nsec(apex, owner) => apex.len() + owner.len(),
+        };
+        2 * names
+    }
+}
+
+/// A place in [`Cache::drops`]: when a thing is past any use, and which.
+type Place = (Instant, Slot);
+
+/// Puts `value` under `key` in `store`, and `place` in `drops`, which has
+/// a place free: [`Cache::room`] made one, or taking the value out freed
+/// it. A store holds no more than `drops` does, so it has a place too;
+/// were either full, neither would keep the value.
+fn hold<K: Ord + Clone, V>(
+    store: &mut BoundedMap<K, V>,
+    drops: &mut BoundedMap<Place, ()>,
+    key: K,
+    value: V,
+    place: Place,
+) {
+    if store.insert(key.clone(), value).is_ok() && drops.insert(place, ()).is_err() {
+        store.remove(&key);
+    }
 }
 
 /// A resolver's cache, by owner name, type, and class.
@@ -500,44 +541,72 @@ enum Slot {
 ///   data or NODATA of higher rank, of any type, at the name or below it
 ///   shows the name exists.
 ///
-/// It holds at most [`Limits::max_entries`] things and
-/// [`Limits::max_bytes`] octets. Past either, what is soonest of no use
-/// goes first: data past any use, then live data that expires first.
+/// It holds at most [`Limits::max_entries`] things, and its memory is
+/// charged to its [`Budget`]: the room for that many things when it is
+/// made ([`storage`](Cache::storage)), and the heap of each thing, by
+/// estimate, before it is stored. When either has no room, what is
+/// soonest of no use goes first: data past any use, then live data that
+/// expires first. Something that would itself go first is not stored.
 /// Data past any use is dropped as time passes, whether or not anything
 /// new arrives ([`expire`](Cache::expire)).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Cache {
     limits: Limits,
-    entries: BTreeMap<Key, Stored>,
-    /// Validated NSEC records by zone, for synthesizing negative answers
-    /// (RFC 8198).
-    nsec: BTreeMap<LowerName, SecureNsec>,
+    /// What its memory is charged to.
+    budget: Budget,
+    entries: BoundedMap<Key, Box<Stored>>,
+    /// The SOA RRsets of the zones with validated NSEC records, by apex,
+    /// for synthesizing negative answers (RFC 8198).
+    zones: BoundedMap<LowerName, Box<Zone>>,
+    /// The validated NSEC RRsets of those zones.
+    nsecs: Nsecs,
     /// Everything held, each entry, NSEC zone, and NSEC RRset once, by
     /// when it is past any use, soonest first.
-    drops: BTreeSet<(Instant, Slot)>,
-    /// The octets of everything held.
-    bytes: usize,
+    drops: BoundedMap<Place, ()>,
 }
 
 impl Cache {
-    /// An empty cache.
-    pub fn new(limits: Limits) -> Cache {
-        Cache {
+    /// The bytes a cache of at most `max_entries` things charges when it
+    /// is made: the room to hold that many entries, NSEC zones, NSEC
+    /// RRsets, and places in its index of what goes first, since any one
+    /// kind may take them all. `None` if that overflows.
+    pub fn storage(max_entries: usize) -> Option<usize> {
+        [
+            BoundedMap::<Key, Box<Stored>>::storage(max_entries)?,
+            BoundedMap::<LowerName, Box<Zone>>::storage(max_entries)?,
+            Nsecs::storage(max_entries)?,
+            BoundedMap::<Place, ()>::storage(max_entries)?,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
+
+    /// An empty cache, its memory charged to `budget`. `None` if the
+    /// budget has no room for [`storage`](Cache::storage).
+    pub fn new(limits: Limits, budget: &Budget) -> Option<Cache> {
+        let max = limits.max_entries;
+        Some(Cache {
             limits,
-            entries: BTreeMap::new(),
-            nsec: BTreeMap::new(),
-            drops: BTreeSet::new(),
-            bytes: 0,
-        }
+            budget: budget.clone(),
+            entries: BoundedMap::new(budget, max)?,
+            zones: BoundedMap::new(budget, max)?,
+            nsecs: BoundedMap::new(budget, max)?,
+            drops: BoundedMap::new(budget, max)?,
+        })
+    }
+
+    /// The budget its memory is charged to.
+    pub fn budget(&self) -> &Budget {
+        &self.budget
     }
 
     /// Forgets everything, as a resolver does when its session changes:
     /// nothing learned before is served again.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.nsec.clear();
+        self.zones.clear();
+        self.nsecs.clear();
         self.drops.clear();
-        self.bytes = 0;
     }
 
     /// Drops everything past any use at `now`: entries expired, past the
@@ -546,17 +615,35 @@ impl Cache {
     /// whose SOA expired or that hold no live records. Nothing dropped
     /// could serve a read at `now` or later.
     pub fn expire(&mut self, now: Instant) {
-        while self.drops.first().is_some_and(|(at, _)| *at <= now) {
+        while self
+            .drops
+            .first_key_value()
+            .is_some_and(|((at, _), ())| *at <= now)
+        {
             self.drop_first();
         }
     }
 
-    /// Drops what is soonest of no use until the cache is within its
-    /// limits.
-    fn fit(&mut self) {
-        while (self.drops.len() > self.limits.max_entries || self.bytes > self.limits.max_bytes)
-            && self.drop_first()
-        {}
+    /// Makes room for one more thing, held at `place` with `bytes` of
+    /// heap: drops what is sooner of no use until the index has a place
+    /// free and the budget has the bytes, and charges them. `None` when
+    /// dropping everything sooner of no use leaves too little room: the
+    /// thing would go first itself, so it is not stored.
+    fn room(&mut self, place: &Place, bytes: usize) -> Option<Charge> {
+        loop {
+            if self.drops.len() < self.drops.limit()
+                && let Some(charge) = self.budget.charge(bytes)
+            {
+                return Some(charge);
+            }
+            let sooner = self
+                .drops
+                .first_key_value()
+                .is_some_and(|(first, ())| first < place);
+            if !sooner || !self.drop_first() {
+                return None;
+            }
+        }
     }
 
     /// Drops what is soonest of no use, or returns false when nothing is
@@ -564,7 +651,7 @@ impl Cache {
     /// call takes one place off and the loops over it end, whatever the
     /// stores behind it hold.
     fn drop_first(&mut self) -> bool {
-        let Some((_, slot)) = self.drops.pop_first() else {
+        let Some(((_, slot), ())) = self.drops.pop_first() else {
             return false;
         };
         match slot {
@@ -577,21 +664,38 @@ impl Cache {
         true
     }
 
-    /// Stores `stored` at `key`, in place of what was there.
-    fn put(&mut self, key: Key, stored: Stored) {
+    /// Stores `entry` at `key`, laid over `under` and `glue`, in place of
+    /// what was there, if [`room`](Cache::room) can be made for it. Its
+    /// charge covers the box it is stored in, the heap of all three
+    /// entries ([`rrset_heap`]), and the names it is held under.
+    fn put(&mut self, key: Key, entry: Entry, under: Option<Entry>, glue: Option<Entry>) {
         self.take(&key);
-        self.bytes += stored.bytes;
-        self.drops.insert((
-            stored.useless_at(self.limits.stale),
+        let place = (
+            useless_at(&entry, [under.as_ref(), glue.as_ref()], self.limits.stale),
             Slot::Entry(key.clone()),
-        ));
-        self.entries.insert(key, stored);
+        );
+        let bytes = size_of::<Stored>()
+            + [Some(&entry), under.as_ref(), glue.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(Entry::heap)
+                .sum::<usize>()
+            + place.1.heap();
+        let Some(charge) = self.room(&place, bytes) else {
+            return;
+        };
+        let stored = Box::new(Stored {
+            entry,
+            under,
+            glue,
+            _charge: charge,
+        });
+        hold(&mut self.entries, &mut self.drops, key, stored, place);
     }
 
     /// Removes what is stored at `key`.
-    fn take(&mut self, key: &Key) -> Option<Stored> {
+    fn take(&mut self, key: &Key) -> Option<Box<Stored>> {
         let stored = self.entries.remove(key)?;
-        self.bytes -= stored.bytes;
         self.drops.remove(&(
             stored.useless_at(self.limits.stale),
             Slot::Entry(key.clone()),
@@ -599,35 +703,42 @@ impl Cache {
         Some(stored)
     }
 
-    /// Removes the NSEC zone at `apex`, with every RRset it holds.
-    fn drop_zone(&mut self, apex: &LowerName) {
-        let Some(zone) = self.nsec.remove(apex) else {
-            return;
-        };
-        self.bytes -= zone.soa_bytes;
+    /// Removes the SOA RRset of the NSEC zone at `apex`, leaving its
+    /// RRsets.
+    fn take_zone(&mut self, apex: &LowerName) -> Option<Box<Zone>> {
+        let zone = self.zones.remove(apex)?;
         self.drops
             .remove(&(zone.soa_expires, Slot::Zone(apex.clone())));
-        for (owner, nsec) in zone.sets {
-            self.bytes -= nsec.bytes;
-            self.drops
-                .remove(&(nsec.expires, Slot::Nsec(apex.clone(), owner)));
+        Some(zone)
+    }
+
+    /// Removes the NSEC RRset at `key`, its zone's apex and its owner,
+    /// leaving the zone.
+    fn take_nsec(&mut self, key: &(LowerName, LowerName)) -> Option<Box<Nsec>> {
+        let nsec = self.nsecs.remove(key)?;
+        let (apex, owner) = key.clone();
+        self.drops.remove(&(nsec.expires, Slot::Nsec(apex, owner)));
+        Some(nsec)
+    }
+
+    /// Removes the NSEC zone at `apex`, with every RRset it holds.
+    fn drop_zone(&mut self, apex: &LowerName) {
+        self.take_zone(apex);
+        loop {
+            let first = zone_records(&self.nsecs, apex).next();
+            let Some(key) = first.map(|(key, _)| key.clone()) else {
+                return;
+            };
+            self.take_nsec(&key);
         }
     }
 
     /// Removes the NSEC RRset at `owner` in the zone at `apex`, and the
     /// zone when that leaves it no records.
     fn drop_nsec(&mut self, apex: &LowerName, owner: &LowerName) {
-        let Some(zone) = self.nsec.get_mut(apex) else {
-            return;
-        };
-        let Some(nsec) = zone.sets.remove(owner) else {
-            return;
-        };
-        let empty = zone.sets.is_empty();
-        self.bytes -= nsec.bytes;
-        self.drops
-            .remove(&(nsec.expires, Slot::Nsec(apex.clone(), owner.clone())));
-        if empty {
+        if self.take_nsec(&(apex.clone(), owner.clone())).is_some()
+            && zone_records(&self.nsecs, apex).next().is_none()
+        {
             self.drop_zone(apex);
         }
     }
@@ -704,12 +815,11 @@ impl Cache {
             self.exists(&key, entry.rank(), now);
         }
         if let Some(asked) = asked {
-            let stored = Stored::new(entry.clone(), None, glue(self, &asked));
-            self.put(asked, stored);
+            let glue = glue(self, &asked);
+            self.put(asked, entry.clone(), None, glue);
         }
         let glue = glue(self, &key);
-        self.put(key, Stored::new(entry, under, glue));
-        self.fit();
+        self.put(key, entry, under, glue);
     }
 
     /// How long the failure cached for `key` lasts, when a resolution of
@@ -760,7 +870,7 @@ impl Cache {
 
     /// What is stored for `key`.
     fn stored(&self, key: &Key) -> Option<&Stored> {
-        self.entries.get(key)
+        self.entries.get(key).map(|stored| &**stored)
     }
 
     /// An entry for `key` that expired at most [`Limits::stale`] before
@@ -881,7 +991,8 @@ impl Cache {
         secure_until: Option<Instant>,
         now: Instant,
     ) {
-        // Taken out and put back, so that a shorter life is indexed.
+        // Taken out and put back with its charge, in the place taking it
+        // out freed, so that a shorter life is indexed.
         let Some(mut stored) = self.take(key) else {
             return;
         };
@@ -912,7 +1023,17 @@ impl Cache {
                 Entry::Failure { .. } => {}
             }
         }
-        self.put(key.clone(), stored);
+        let place = (
+            stored.useless_at(self.limits.stale),
+            Slot::Entry(key.clone()),
+        );
+        hold(
+            &mut self.entries,
+            &mut self.drops,
+            key.clone(),
+            stored,
+            place,
+        );
     }
 
     /// Keeps `nsec`, NSEC RRsets that validated Secure with the zone's
@@ -928,7 +1049,7 @@ impl Cache {
         nsec: &[(RecordSet, Option<Instant>)],
         at: Instant,
     ) {
-        let zone = LowerName::new(soa.name());
+        let apex = LowerName::new(soa.name());
         let soa = normalized(soa);
         let capped =
             |expires: Instant, until: Option<Instant>| until.map_or(expires, |u| expires.min(u));
@@ -936,52 +1057,48 @@ impl Cache {
             at + seconds(soa.ttl()).min(self.limits.max_negative_ttl),
             soa_until,
         );
-        if let Some(old) = self.nsec.get(&zone) {
-            self.bytes -= old.soa_bytes;
-            self.drops
-                .remove(&(old.soa_expires, Slot::Zone(zone.clone())));
-        }
-        let soa_bytes = octets(&soa);
-        self.bytes += soa_bytes;
-        self.drops.insert((soa_expires, Slot::Zone(zone.clone())));
-        let entry = self.nsec.entry(zone.clone()).or_insert_with(|| SecureNsec {
-            soa: soa.clone(),
-            soa_expires,
-            soa_bytes,
-            sets: BTreeMap::new(),
-        });
-        entry.soa = soa;
-        entry.soa_expires = soa_expires;
-        entry.soa_bytes = soa_bytes;
+        // The zone's old SOA leaves while its records go in, so making
+        // room for them never drops the zone for holding none. The new
+        // SOA goes in after them, in a place of its own.
+        self.take_zone(&apex);
         for (set, until) in nsec {
             let set = normalized(set);
             let expires = capped(
                 at + seconds(set.ttl()).min(self.limits.max_negative_ttl),
                 *until,
             );
-            let owner = LowerName::new(set.name());
-            if let Some(old) = entry.sets.remove(&owner) {
-                self.bytes -= old.bytes;
-                self.drops
-                    .remove(&(old.expires, Slot::Nsec(zone.clone(), owner.clone())));
-            }
-            let bytes = octets(&set);
-            self.bytes += bytes;
-            self.drops
-                .insert((expires, Slot::Nsec(zone.clone(), owner.clone())));
-            entry.sets.insert(
-                owner,
-                Nsec {
-                    set,
-                    expires,
-                    bytes,
-                },
-            );
+            let key = (apex.clone(), LowerName::new(set.name()));
+            self.take_nsec(&key);
+            let place = (expires, Slot::Nsec(key.0.clone(), key.1.clone()));
+            let bytes = size_of::<Nsec>() + rrset_heap(&set) + place.1.heap();
+            let Some(charge) = self.room(&place, bytes) else {
+                continue;
+            };
+            let nsec = Box::new(Nsec {
+                set,
+                expires,
+                _charge: charge,
+            });
+            hold(&mut self.nsecs, &mut self.drops, key, nsec, place);
         }
-        if entry.sets.is_empty() {
-            self.drop_zone(&zone);
+        // The records prove nothing without the SOA, so they go when it
+        // finds no room, or when room for it took them all.
+        let held = |cache: &Cache| zone_records(&cache.nsecs, &apex).next().is_some();
+        let place = (soa_expires, Slot::Zone(apex.clone()));
+        let bytes = size_of::<Zone>() + rrset_heap(&soa) + place.1.heap();
+        if held(self)
+            && let Some(charge) = self.room(&place, bytes)
+            && held(self)
+        {
+            let zone = Box::new(Zone {
+                soa,
+                soa_expires,
+                _charge: charge,
+            });
+            hold(&mut self.zones, &mut self.drops, apex, zone, place);
+        } else {
+            self.drop_zone(&apex);
         }
-        self.fit();
     }
 
     /// The deepest zone holding `name` with validated NSEC records live at
@@ -989,10 +1106,15 @@ impl Cache {
     pub(super) fn secure_nsec(&self, name: &LowerName, now: Instant) -> Option<ZoneNsecs<'_>> {
         let mut at = name.clone();
         loop {
-            if let Some((zone, nsec)) = self.nsec.get_key_value(&at)
-                && now < nsec.soa_expires
+            if let Some((zone, soa)) = self.zones.get_key_value(&at)
+                && now < soa.soa_expires
             {
-                let found = ZoneNsecs { zone, nsec, now };
+                let found = ZoneNsecs {
+                    zone,
+                    soa,
+                    nsecs: &self.nsecs,
+                    now,
+                };
                 if found.live().next().is_some() {
                     return Some(found);
                 }
@@ -1193,21 +1315,33 @@ pub(super) fn seconds(ttl: u32) -> Duration {
     }
 }
 
-/// The octets of `set`, as the cache counts them against
-/// [`Limits::max_bytes`]: every record and RRSIG as a message carries it,
-/// its owner written out without compression. A record that cannot be
-/// written counts its owner and its fixed fields (RFC 1035 §4.1.3).
-fn octets(set: &RecordSet) -> usize {
+/// The heap `set` holds past its own struct, as the cache charges it to
+/// its budget, by estimate: its owner's octets and, for every record and
+/// RRSIG, its place in the set's vectors and its octets as a message
+/// carries it, owner written out without compression, which covers the
+/// owner's and the data's heap. A record that cannot be written counts
+/// its owner and its fixed fields (RFC 1035 §4.1.3). Spare capacity in
+/// the vectors and the allocator's rounding are not counted.
+fn rrset_heap(set: &RecordSet) -> usize {
     /// TYPE, CLASS, TTL, and RDLENGTH.
     const FIXED: usize = 10;
-    set.records_without_rrsigs()
+    let records: usize = set
+        .records_without_rrsigs()
         .chain(set.rrsigs())
         .map(|record| {
-            record
-                .to_bytes()
-                .map_or(record.name.len() + FIXED, |bytes| bytes.len())
+            size_of::<Record>()
+                + record
+                    .to_bytes()
+                    .map_or(record.name.len() + FIXED, |bytes| bytes.len())
         })
-        .sum()
+        .sum();
+    set.name().len() + records
+}
+
+/// The heap `sets` holds, by estimate: the vector's places, and each
+/// set's heap by [`rrset_heap`].
+fn rrsets_heap(sets: &Vec<RecordSet>) -> usize {
+    sets.capacity() * size_of::<RecordSet>() + sets.iter().map(rrset_heap).sum::<usize>()
 }
 
 /// `set` with its owner and every record's owner in lowercase, every
@@ -1250,8 +1384,9 @@ pub(super) fn normalized(set: &RecordSet) -> RecordSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::protocols::dns::rr::RData;
     use fictionet::stdlib::protocols::dns::rr::rdata::A;
-    use fictionet::stdlib::protocols::dns::rr::{Name, RData};
+    use fictionet::{Entropy, Seed, SeededEntropy};
 
     fn limits(max_entries: usize) -> Limits {
         Limits {
@@ -1260,22 +1395,42 @@ mod tests {
             failure_ttl: Duration::from_secs(1),
             stale: Duration::from_secs(100),
             max_entries,
-            max_bytes: usize::MAX,
         }
+    }
+
+    /// A cache of at most `max_entries` things, on a budget with room for
+    /// its index and `room` bytes more.
+    fn cache_with_room(max_entries: usize, room: usize) -> Cache {
+        let budget = Budget::new(Cache::storage(max_entries).unwrap() + room);
+        Cache::new(limits(max_entries), &budget).unwrap()
+    }
+
+    /// A cache that only its count of things limits.
+    fn cache(max_entries: usize) -> Cache {
+        Cache::new(limits(max_entries), &Budget::unlimited()).unwrap()
     }
 
     fn at(seconds: u64) -> Instant {
         Instant::from_since_start(Duration::from_secs(seconds))
     }
 
-    /// An A RRset at `owner` with one address, its TTL `ttl`.
-    fn address(owner: &str, ttl: u32) -> Offer {
-        let name = Name::from_ascii(owner).unwrap();
-        let mut set = RecordSet::with_ttl(name.clone(), RecordType::A, ttl);
-        set.insert(
-            Record::from_rdata(name, ttl, RData::A(A::new(192, 0, 2, 1))),
-            0,
-        );
+    fn name(text: &str) -> Name {
+        Name::from_ascii(text).unwrap()
+    }
+
+    /// The key of the A RRset at `owner`.
+    fn key_a(owner: &str) -> Key {
+        Key::new(LowerName::new(&name(owner)), RecordType::A, DNSClass::IN)
+    }
+
+    /// An A RRset at `owner` with `count` addresses, its TTL `ttl`.
+    fn addresses(owner: &str, ttl: u32, count: u8) -> Offer {
+        let owner = name(owner);
+        let mut set = RecordSet::with_ttl(owner.clone(), RecordType::A, ttl);
+        for index in 0..count {
+            let data = RData::A(A::new(192, 0, 2, index));
+            set.insert(Record::from_rdata(owner.clone(), ttl, data), 0);
+        }
         Offer::Positive {
             set,
             rank: Rank::AuthAnswer,
@@ -1285,20 +1440,268 @@ mod tests {
         }
     }
 
+    /// An A RRset at `owner` with one address, its TTL `ttl`.
+    fn address(owner: &str, ttl: u32) -> Offer {
+        addresses(owner, ttl, 1)
+    }
+
     /// An NSEC RRset at `owner` with one record.
     fn nsec(owner: &str) -> RecordSet {
         use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSSECRData, NSEC};
-        let name = Name::from_ascii(owner).unwrap();
-        let next = Name::from_ascii(format!("next.{owner}")).unwrap();
+        let next = name(&format!("next.{owner}"));
         let rdata = RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(next, [RecordType::A])));
-        let mut set = RecordSet::with_ttl(name.clone(), RecordType::NSEC, 100);
-        set.insert(Record::from_rdata(name, 100, rdata), 0);
+        let mut set = RecordSet::with_ttl(name(owner), RecordType::NSEC, 100);
+        set.insert(Record::from_rdata(name(owner), 100, rdata), 0);
         set
+    }
+
+    /// An SOA RRset at `zone` with no records, its TTL `ttl`.
+    fn soa(zone: &str, ttl: u32) -> RecordSet {
+        RecordSet::with_ttl(name(zone), RecordType::SOA, ttl)
+    }
+
+    /// The records and RRSIGs in every RRset `entry` holds.
+    fn records_of(entry: &Entry) -> usize {
+        let sets: Vec<&RecordSet> = match entry {
+            Entry::Positive { set, proof, .. } => std::iter::once(set).chain(proof).collect(),
+            Entry::Negative { soa, denial, .. } => std::iter::once(soa).chain(denial).collect(),
+            Entry::Failure { .. } => Vec::new(),
+        };
+        sets.iter()
+            .map(|set| set.records_without_rrsigs().count() + set.rrsigs().len())
+            .sum()
+    }
+
+    /// What the budget must hold for what `cache` holds now: the room
+    /// for its index, and the heap of each thing by the estimate it is
+    /// charged.
+    fn charged_for(cache: &Cache) -> usize {
+        let entries = cache.entries.iter().map(|(key, stored)| {
+            size_of::<Stored>()
+                + [
+                    Some(&stored.entry),
+                    stored.under.as_ref(),
+                    stored.glue.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(Entry::heap)
+                .sum::<usize>()
+                + Slot::Entry(key.clone()).heap()
+        });
+        let zones = cache.zones.iter().map(|(apex, zone)| {
+            size_of::<Zone>() + rrset_heap(&zone.soa) + Slot::Zone(apex.clone()).heap()
+        });
+        let nsecs = cache.nsecs.iter().map(|((apex, owner), nsec)| {
+            size_of::<Nsec>()
+                + rrset_heap(&nsec.set)
+                + Slot::Nsec(apex.clone(), owner.clone()).heap()
+        });
+        Cache::storage(cache.limits.max_entries).unwrap()
+            + entries.sum::<usize>()
+            + zones.sum::<usize>()
+            + nsecs.sum::<usize>()
+    }
+
+    /// What holds after every call:
+    ///
+    /// - Sum: the budget's count is within its limit.
+    /// - Cover and Return: the budget holds the index's room and each
+    ///   thing's heap for exactly what the cache holds, nothing for what
+    ///   it dropped.
+    /// - The heap is counted, not the octets a message carries: each
+    ///   entry is charged at least its box and its records' places.
+    /// - Each thing held has one place in the index, at the time it is
+    ///   of no use, and the index holds no more than the limit.
+    /// - Each NSEC zone holds records, and each record has its zone.
+    fn check(cache: &Cache) {
+        let budget = cache.budget();
+        assert!(budget.used() <= budget.limit());
+        assert_eq!(budget.used(), charged_for(cache));
+        let storage = Cache::storage(cache.limits.max_entries).unwrap();
+        let floor: usize = cache
+            .entries
+            .iter()
+            .map(|(_, stored)| {
+                let records: usize = [
+                    Some(&stored.entry),
+                    stored.under.as_ref(),
+                    stored.glue.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(records_of)
+                .sum();
+                size_of::<Stored>() + records * size_of::<Record>()
+            })
+            .sum();
+        assert!(budget.used() - storage >= floor);
+        let held = cache.entries.len() + cache.zones.len() + cache.nsecs.len();
+        assert_eq!(cache.drops.len(), held);
+        assert!(held <= cache.limits.max_entries);
+        for ((at, slot), ()) in cache.drops.iter() {
+            let useless = match slot {
+                Slot::Entry(key) => cache
+                    .entries
+                    .get(key)
+                    .map(|stored| stored.useless_at(cache.limits.stale)),
+                Slot::Zone(apex) => cache.zones.get(apex).map(|zone| zone.soa_expires),
+                Slot::Nsec(apex, owner) => cache
+                    .nsecs
+                    .get(&(apex.clone(), owner.clone()))
+                    .map(|nsec| nsec.expires),
+            };
+            assert_eq!(useless, Some(*at), "{slot:?}");
+        }
+        for (apex, _) in cache.zones.iter() {
+            assert!(zone_records(&cache.nsecs, apex).next().is_some());
+        }
+        for ((apex, _), _) in cache.nsecs.iter() {
+            assert!(cache.zones.get(apex).is_some());
+        }
+    }
+
+    /// Random calls on caches with little room, checked after each, and
+    /// every byte given back when the cache goes.
+    #[test]
+    fn the_budget_pays_for_the_index_and_every_thing_held() {
+        for seed in 0..64 {
+            let rng = SeededEntropy::new(Seed::from_u64(seed));
+            let below = |n: usize| rng.random_below(n as u64) as usize;
+            let max_entries = 4 + below(28);
+            let mut cache = cache_with_room(max_entries, 2_000 + below(30_000));
+            let budget = cache.budget().clone();
+            let mut now = 0;
+            for _ in 0..300 {
+                let zone = format!("z{}.example.", below(3));
+                let owner = format!("h{}.{zone}", below(6));
+                let ttl = 1 + below(60) as u32;
+                let until = |most: usize| Some(at(now + below(most) as u64));
+                match below(10) {
+                    0..=3 => cache.insert(at(now), addresses(&owner, ttl, 1 + below(4) as u8)),
+                    4 => cache.insert(
+                        at(now),
+                        Offer::Failure {
+                            key: key_a(&owner),
+                            why: FailureKind::Unknown,
+                            cd: false,
+                            follows: None,
+                        },
+                    ),
+                    5 => cache.insert(
+                        at(now),
+                        Offer::Negative {
+                            key: key_a(&owner),
+                            kind: [Negative::NxDomain, Negative::NoData][below(2)],
+                            soa: Some(soa(&zone, ttl)),
+                            rank: Rank::AuthAnswer,
+                            denial: Vec::new(),
+                            validation: Validation::NotPerformed,
+                            truncated: false,
+                        },
+                    ),
+                    6 => {
+                        let records: Vec<(RecordSet, Option<Instant>)> = (0..1 + below(4))
+                            .map(|_| (nsec(&format!("n{}.{zone}", below(8))), until(60)))
+                            .collect();
+                        cache.add_secure_nsec(&soa(&zone, 100), until(80), &records, at(now));
+                    }
+                    7 => {
+                        let key = key_a(&owner);
+                        if let Some(Entry::Positive { set, .. }) = cache.get(&key, at(now)) {
+                            let checked = Checked::Rrset(set.clone());
+                            let result = Validation::Secure;
+                            cache.validated(&key, &checked, result, until(30), at(now));
+                        }
+                    }
+                    8 => {
+                        now += below(40) as u64;
+                        cache.expire(at(now));
+                    }
+                    _ => {
+                        if below(8) == 0 {
+                            cache.clear();
+                        }
+                    }
+                }
+                check(&cache);
+            }
+            drop(cache);
+            assert_eq!(budget.used(), 0, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn with_no_room_what_is_soonest_of_no_use_goes_first() {
+        // One entry's charge, on a cache with room to spare. Every owner
+        // below has as many octets.
+        let mut roomy = cache(8);
+        let empty = roomy.budget().used();
+        roomy.insert(at(0), address("host0.example.", 10));
+        let one = roomy.budget().used() - empty;
+        // Room for three entries, not four.
+        let mut cache = cache_with_room(8, 3 * one + one / 2);
+        for (index, ttl) in [(0, 10), (1, 20), (2, 30)] {
+            cache.insert(at(0), address(&format!("host{index}.example."), ttl));
+        }
+        let held = |cache: &Cache, index: usize| {
+            let key = key_a(&format!("host{index}.example."));
+            cache.get(&key, at(0)).is_some()
+        };
+        assert!((0..3).all(|index| held(&cache, index)));
+        let full = cache.budget().used();
+        // An entry that would go first itself is not stored, and nothing
+        // goes for it.
+        cache.insert(at(0), address("host3.example.", 5));
+        assert!(!held(&cache, 3));
+        assert!((0..3).all(|index| held(&cache, index)));
+        assert_eq!(cache.budget().used(), full);
+        // One that lasts longer takes the room of the one that expires
+        // first.
+        cache.insert(at(0), address("host4.example.", 50));
+        assert!(held(&cache, 4));
+        assert!(!held(&cache, 0));
+        assert!(held(&cache, 1) && held(&cache, 2));
+        check(&cache);
+    }
+
+    #[test]
+    fn an_entry_is_charged_for_the_heap_of_its_records() {
+        let mut cache = cache(8);
+        let empty = cache.budget().used();
+        cache.insert(at(0), addresses("one.example.", 10, 1));
+        let one = cache.budget().used() - empty;
+        assert!(one >= size_of::<Stored>() + size_of::<Record>());
+        cache.insert(at(0), addresses("all.example.", 10, 4));
+        let four = cache.budget().used() - empty - one;
+        assert!(four >= one + 3 * size_of::<Record>());
+        check(&cache);
+        cache.expire(at(1000));
+        assert_eq!(cache.budget().used(), empty);
+    }
+
+    #[test]
+    fn a_cache_is_made_only_with_room_for_its_index() {
+        let storage = Cache::storage(16).unwrap();
+        assert!(storage > 0);
+        assert!(Cache::storage(usize::MAX).is_none());
+        let short = Budget::new(storage - 1);
+        assert!(Cache::new(limits(16), &short).is_none());
+        assert_eq!(short.used(), 0, "a cache not made holds nothing");
+        let exact = Budget::new(storage);
+        let mut cache = Cache::new(limits(16), &exact).unwrap();
+        assert_eq!(exact.used(), storage);
+        // Nothing more fits, so nothing is stored.
+        cache.insert(at(0), address("host.example.", 10));
+        assert!(cache.get(&key_a("host.example."), at(0)).is_none());
+        check(&cache);
+        drop(cache);
+        assert_eq!(exact.used(), 0);
     }
 
     #[test]
     fn expired_entries_are_reclaimed_though_the_cache_stops_growing() {
-        let mut cache = Cache::new(limits(usize::MAX));
+        let mut cache = cache(64);
         for index in 0..10 {
             cache.insert(at(0), address(&format!("host{index}.example."), 1));
         }
@@ -1311,45 +1714,55 @@ mod tests {
         cache.expire(at(400));
         assert!(cache.entries.is_empty());
         assert!(cache.drops.is_empty());
-        assert_eq!(cache.bytes, 0);
+        assert_eq!(cache.budget().used(), Cache::storage(64).unwrap());
     }
 
     /// Dropping takes a place off the index before what it names, so a
-    /// place whose entry is gone, or an index that runs out while bytes
-    /// still count, cannot keep `expire` or `fit` turning.
+    /// place whose entry is gone, or an index that runs out while the
+    /// budget is still short, cannot keep `expire` or `room` turning.
     #[test]
     fn dropping_ends_when_the_index_and_the_stores_disagree() {
-        let mut cache = Cache::new(limits(usize::MAX));
+        let mut cache = cache(64);
         cache.insert(at(0), address("host.example.", 50));
-        let key = cache.entries.keys().next().cloned().unwrap();
-        let stored = cache.entries.remove(&key).unwrap();
-        cache.bytes -= stored.bytes;
+        let key = cache
+            .entries
+            .iter()
+            .next()
+            .map(|(key, _)| key.clone())
+            .unwrap();
+        cache.entries.remove(&key);
         cache.expire(at(400));
         assert!(cache.drops.is_empty());
 
-        let mut cache = Cache::new(limits(usize::MAX));
+        let mut roomy = self::cache(8);
+        let empty = roomy.budget().used();
+        roomy.insert(at(0), address("host.example.", 50));
+        let one = roomy.budget().used() - empty;
+        let mut cache = cache_with_room(8, one);
         cache.insert(at(0), address("host.example.", 50));
         cache.drops.clear();
-        cache.limits.max_bytes = 0;
-        cache.fit();
-        assert!(cache.drops.is_empty());
+        cache.insert(at(0), address("other.example.", 100));
+        assert!(cache.get(&key_a("other.example."), at(0)).is_none());
+        assert!(cache.budget().used() <= cache.budget().limit());
     }
 
     #[test]
     fn expired_denial_proofs_are_reclaimed_by_any_insert() {
-        let mut cache = Cache::new(limits(usize::MAX));
-        let soa = RecordSet::with_ttl(Name::from_ascii("example.").unwrap(), RecordType::SOA, 100);
+        let mut cache = cache(64);
+        let soa = soa("example.", 100);
         cache.add_secure_nsec(&soa, Some(at(1)), &[(nsec("a.example."), None)], at(0));
-        assert!(!cache.nsec.is_empty());
+        assert!(!cache.zones.is_empty());
         cache.insert(at(2), address("host.example.", 50));
-        assert!(cache.nsec.is_empty());
+        assert!(cache.zones.is_empty());
+        assert!(cache.nsecs.is_empty());
         assert_eq!(cache.drops.len(), 1);
+        check(&cache);
     }
 
     #[test]
     fn nsec_records_count_against_the_entry_limit_and_the_longest_lived_stay() {
-        let mut cache = Cache::new(limits(4));
-        let soa = RecordSet::with_ttl(Name::from_ascii("example.").unwrap(), RecordType::SOA, 100);
+        let mut cache = cache(4);
+        let soa = soa("example.", 100);
         let owners: Vec<String> = (0..10).map(|index| format!("n{index}.example.")).collect();
         let records: Vec<(RecordSet, Option<Instant>)> = owners
             .iter()
@@ -1358,34 +1771,26 @@ mod tests {
             .collect();
         cache.add_secure_nsec(&soa, Some(at(90)), &records, at(0));
         assert!(cache.drops.len() <= 4);
-        let zone = &cache.nsec[&LowerName::new(soa.name())];
-        let kept: Vec<&LowerName> = zone.sets.keys().collect();
+        let apex = LowerName::new(soa.name());
+        let kept: Vec<&LowerName> = zone_records(&cache.nsecs, &apex)
+            .map(|((_, owner), _)| owner)
+            .collect();
         assert_eq!(kept.len(), 3);
         for owner in &owners[7..] {
-            assert!(kept.contains(&&LowerName::new(&Name::from_ascii(owner).unwrap())));
+            assert!(kept.contains(&&LowerName::new(&name(owner))));
         }
+        check(&cache);
         // An entry counts against the same limit.
         cache.insert(at(0), address("host.example.", 50));
         assert!(cache.drops.len() <= 4);
-        assert!(
-            cache
-                .get(
-                    &Key::new(
-                        LowerName::new(&Name::from_ascii("host.example.").unwrap()),
-                        RecordType::A,
-                        DNSClass::IN,
-                    ),
-                    at(0),
-                )
-                .is_some()
-        );
+        assert!(cache.get(&key_a("host.example."), at(0)).is_some());
+        check(&cache);
     }
 
     #[test]
     fn expiry_reclaims_expired_denial_proofs_and_preserves_live_ones() {
-        let mut cache = Cache::new(limits(usize::MAX));
-        let set =
-            |owner: &str, rtype| RecordSet::with_ttl(Name::from_ascii(owner).unwrap(), rtype, 100);
+        let mut cache = cache(64);
+        let set = |owner: &str, rtype| RecordSet::with_ttl(name(owner), rtype, 100);
         for (zone, soa_until, proof_until) in [
             ("soa-expired.example.", at(1), at(3)),
             ("proof-expired.example.", at(3), at(1)),
@@ -1401,19 +1806,21 @@ mod tests {
                 at(0),
             );
         }
-        let before = cache.nsec.len();
+        let before = cache.zones.len();
         cache.expire(at(2));
-        assert!(cache.nsec.len() < before);
-        assert!(!cache.nsec.is_empty());
-        for zone in cache.nsec.values() {
+        assert!(cache.zones.len() < before);
+        assert!(!cache.zones.is_empty());
+        for (apex, zone) in cache.zones.iter() {
             assert!(zone.soa_expires > at(2));
-            assert!(!zone.sets.is_empty());
-            assert!(zone.sets.values().all(|nsec| nsec.expires > at(2)));
+            assert!(zone_records(&cache.nsecs, apex).next().is_some());
+            assert!(zone_records(&cache.nsecs, apex).all(|(_, nsec)| nsec.expires > at(2)));
         }
-        let live = LowerName::new(&Name::from_ascii("live.example.").unwrap());
+        check(&cache);
+        let live = LowerName::new(&name("live.example."));
         assert!(cache.secure_nsec(&live, at(2)).is_some());
         cache.expire(at(3));
-        assert!(cache.nsec.is_empty());
+        assert!(cache.zones.is_empty());
+        assert!(cache.nsecs.is_empty());
         assert!(cache.secure_nsec(&live, at(3)).is_none());
     }
 }

@@ -90,9 +90,12 @@ pub struct Config {
     /// NSEC records, and each NSEC RRset count one. Past it, what is
     /// soonest of no use goes first.
     pub max_cache_entries: usize,
-    /// The most octets of records the cache holds at once, each record as
-    /// a message carries it, owner uncompressed. Past it, what is soonest
-    /// of no use goes first.
+    /// The most memory the cache holds at once, in bytes: the limit of the
+    /// budget it is charged to. That pays for the room to hold
+    /// `max_cache_entries` things when the cache is made
+    /// ([`Cache::storage`](super::Cache::storage)), which it must cover,
+    /// and for the heap of each thing, by estimate, before it is stored.
+    /// Past it, what is soonest of no use goes first.
     pub max_cache_bytes: usize,
     /// Serving expired data when resolution fails or is slow (RFC 8767),
     /// or `None` to never serve it.
@@ -239,7 +242,7 @@ impl Config {
     /// client question may send 200 queries and follow 11 aliases, a
     /// server's round trips are remembered for 600 seconds, only the
     /// servers with the quickest wait are chosen among, a band of 0, and
-    /// the cache holds at most 100000 things and 16 MiB of records. With
+    /// the cache holds at most 100000 things in 256 MiB of memory. With
     /// the 1-second floor, every server that replies within a second has
     /// that wait, so the choice spreads over them all.
     pub fn new() -> Config {
@@ -266,7 +269,7 @@ impl Config {
             max_ttl: Duration::from_secs(604800),
             max_negative_ttl: Duration::from_secs(10800),
             max_cache_entries: 100_000,
-            max_cache_bytes: 16 << 20,
+            max_cache_bytes: 256 << 20,
             serve_stale: None,
             rd0_from_cache: true,
             ede: true,

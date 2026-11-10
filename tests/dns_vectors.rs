@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG};
 use fictionet::stdlib::protocols::dns::dnssec::{
@@ -2637,11 +2638,11 @@ fn cache() {
             max_negative_ttl: max_ttl,
             failure_ttl: Duration::from_secs(number(limits_value, "failure_ttl")),
             stale: Duration::ZERO,
-            // The Lean cache has no capacity.
-            max_entries: usize::MAX,
-            max_bytes: usize::MAX,
+            // The Lean cache has no capacity. A case offers at most a
+            // dozen things, far fewer than this holds.
+            max_entries: 1024,
         };
-        let mut cache = Cache::new(limits);
+        let mut cache = Cache::new(limits, &Budget::unlimited()).expect("an unlimited budget");
         let mut rust = Vec::new();
         for op in list(input, "ops") {
             let now = at(number(op, "time"));

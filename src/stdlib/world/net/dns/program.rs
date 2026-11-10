@@ -179,8 +179,11 @@ impl<A: Authority> Program for Authoritative<A> {
 ///
 /// Each machine has one engine, and so one cache, by default.
 /// [`partition`](Self::partition) gives each machine one engine per key
-/// instead. TCP connections are kept open and pipelined as
-/// [`Authoritative`] keeps them.
+/// instead. Each engine's cache is charged to a budget of its own, of
+/// [`max_cache_bytes`](Config::max_cache_bytes), which the world's
+/// resolver owns: no sandbox pays for what the cache holds. TCP
+/// connections are kept open and pipelined as [`Authoritative`] keeps
+/// them.
 pub struct Recursive {
     config: Config,
     clock: WallClock,
