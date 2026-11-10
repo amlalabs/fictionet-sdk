@@ -51,7 +51,9 @@ struct BudgetInner {
     /// The least that a charge refused since the runners were last woken
     /// needed, or 0 if none was refused. Lowered before the refused charge
     /// tries a last time, and cleared by the first release that leaves
-    /// that much room, which wakes the runners. So room freed after a
+    /// that much room, which wakes the runners, or by the first runner
+    /// that asks to be woken and finds that much room already there, when
+    /// the release came before the need was noted. So room freed after a
     /// refusal wakes someone once it is enough for the smallest refused
     /// charge, and not before. A charge past the limit never lowers it:
     /// no room is ever enough for that one.
@@ -317,8 +319,36 @@ impl Budget {
         let mut waiting = self.inner.waiters.lock();
         let wanted = self.inner.wanted.load(Ordering::SeqCst);
         let woken = self.inner.wakes.load(Ordering::SeqCst) != since.wakes;
-        if woken || wanted == 0 || self.room() >= wanted {
+        if woken || wanted == 0 {
             drop(waiting);
+            waiter.inner.wake();
+            return;
+        }
+        if self.room() >= wanted {
+            // There is room for the least refused need, and no release
+            // woke anyone for it: the release that made the room freed its
+            // bytes before that need was noted, and its charge then took
+            // room on its last try, leaving the need behind. That release
+            // owed a wake; it happens here, as `release` does it. Without
+            // it the need stays noted with room for it, and every runner
+            // refused meanwhile, whatever it needs, is woken at once each
+            // time it asks, in a loop, until something else is released
+            // (`verification/layer/tla/BudgetWake.tla`, `NoSpin`).
+            let owed = self
+                .inner
+                .wanted
+                .compare_exchange(wanted, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            let others = if owed {
+                self.inner.wakes.fetch_add(1, Ordering::SeqCst);
+                std::mem::take(&mut *waiting)
+            } else {
+                Vec::new()
+            };
+            drop(waiting);
+            for other in others {
+                other.wake();
+            }
             waiter.inner.wake();
             return;
         }
@@ -841,6 +871,35 @@ mod tests {
         drop(held);
         assert_eq!(budget.used(), 0);
         assert_eq!(count.woken(), 0);
+    }
+
+    /// A need noted after the release that made room for it, by a charge
+    /// that then took the room on its last try, wakes the next runner that
+    /// asks once, and then that runner waits for room for its own need: it
+    /// is not woken at once each time it asks.
+    ///
+    /// The state is the one `BudgetWake.tla`'s counterexample reaches with
+    /// threads: `b`'s charge of 1 finds no room while 3 are held, the holder
+    /// gives all 3 back before `b` notes its need (so the release wakes no
+    /// one), and `b` takes 1 on its last try. One thread cannot interleave
+    /// so, so the test notes the need itself.
+    #[test]
+    fn a_need_noted_after_its_release_wakes_once_and_not_in_a_loop() {
+        let budget = Budget::new(3);
+        let (b, c) = (budget.view(), budget.view());
+        let held = b.charge(1).unwrap();
+        budget.inner.wanted.store(1, Ordering::SeqCst);
+        let count = Arc::new(Count::default());
+        let waker = waiter(&count);
+        for _ in 0..4 {
+            let mark = c.refusals();
+            assert!(c.charge(budget.limit()).is_none());
+            c.wake_when_freed(&waker, mark);
+        }
+        assert_eq!(count.woken(), 1, "woken once, then waiting for its need");
+        drop(held);
+        assert_eq!(count.woken(), 2, "the release that leaves room wakes it");
+        assert!(c.charge(budget.limit()).is_some());
     }
 
     /// A waiter that asks again adds nothing to the list, and one whose
