@@ -11,7 +11,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body::{Body as _, Frame};
 
-use fictionet::stdlib::layer::{Chain, Charge, Children, Chunk, Env, Layer, Top};
+use fictionet::stdlib::layer::{Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top};
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http2::{ErrorCode, Setting};
 use fictionet::stdlib::services::stack::Job;
@@ -156,10 +156,14 @@ pub struct Respond {
 struct State {
     responder: Arc<Responder>,
     head: Option<Request<()>>,
-    /// What this exchange holds: the request's head and body, then the
-    /// response's head and the body bytes not yet sent.
+    /// What this exchange holds besides the request's body: the request's
+    /// head, then the response's head and the body bytes not yet sent.
     charge: Option<Charge>,
-    body: Vec<u8>,
+    /// The request's body as it is collected, which carries its charge.
+    body: Option<ChargedBytes>,
+    /// The charge of the request's body once it is handed to the handler,
+    /// held until the response replaces it.
+    handed: Option<Charge>,
     deadline: Option<Instant>,
     /// The request ended before it was answered.
     ended: bool,
@@ -199,7 +203,8 @@ impl Respond {
                 responder,
                 head: Some(*opening.request),
                 charge: opening.charge,
-                body: Vec::new(),
+                body: None,
+                handed: None,
                 deadline,
                 ended: opening.ended,
                 stage: Stage::Collecting,
@@ -235,18 +240,34 @@ impl State {
         self.charge.as_ref().map_or(0, Charge::bytes)
     }
 
-    /// The request's body grows by `chunk`.
+    /// The bytes of the request's body collected so far.
+    fn collected(&self) -> usize {
+        self.body.as_ref().map_or(0, |body| body.len())
+    }
+
+    /// The request's body grows by `chunk`, into room charged before it is
+    /// allocated.
     fn collect(&mut self, env: &mut Env<'_, Infallible>, chunk: Chunk) {
         let limits = self.responder.limits;
-        if self.body.len().saturating_add(chunk.len()) > limits.body {
+        let len = self.collected();
+        if len.saturating_add(chunk.len()) > limits.body {
             return self.dispatch(env, Received::TooLarge);
         }
-        let growth = (self.body.len() + chunk.len()).saturating_sub(self.body.capacity());
-        let held = self.held();
-        if !self.hold(env, held + growth) || self.body.try_reserve_exact(chunk.len()).is_err() {
-            return self.dispatch(env, Received::Budget);
+        let room = match &mut self.body {
+            Some(body) => body.grow_to(len + chunk.len()),
+            None => {
+                self.body = ChargedBytes::with_capacity(env.budget(), chunk.len());
+                self.body.is_some()
+            }
+        };
+        if !room
+            || self
+                .body
+                .as_mut()
+                .is_none_or(|body| body.extend_within(&chunk).is_err())
+        {
+            self.dispatch(env, Received::Budget);
         }
-        self.body.extend_from_slice(&chunk);
     }
 
     /// Answers the request: with the handler for a whole one, or with the
@@ -258,7 +279,14 @@ impl State {
         self.deadline = None;
         let responder = self.responder.clone();
         let (parts, ()) = head.into_parts();
-        let mut request = Request::from_parts(parts, Body::from(std::mem::take(&mut self.body)));
+        let body = match self.body.take().map(ChargedBytes::into_parts) {
+            Some((body, charge)) => {
+                self.handed = Some(charge);
+                body
+            }
+            None => Vec::new(),
+        };
+        let mut request = Request::from_parts(parts, Body::from(body));
         request.extensions_mut().insert(responder.conn.clone());
         self.wants = Asked::of(request.method());
         let now = env.now();
@@ -306,6 +334,8 @@ impl State {
     /// cannot hold gets `503` instead, so it does not end the connection's
     /// other streams.
     fn made(&mut self, env: &Env<'_, Infallible>, response: Response<Body>) {
+        // The handler is done with the request's body.
+        self.handed = None;
         let delivery = self.delivery.as_ref().map_or(0, |d| d.held);
         let response = if self.hold(env, response_held(&response) + delivery) {
             response
@@ -471,7 +501,7 @@ impl Layer for Respond {
             // The body limit comes before the budget, as it does for bytes
             // the connection could hold.
             ExchangeEvent::Overflow(dropped) if collecting => {
-                let past = state.body.len() as u64 + dropped > state.responder.limits.body as u64;
+                let past = state.collected() as u64 + dropped > state.responder.limits.body as u64;
                 let received = if past {
                     Received::TooLarge
                 } else {
