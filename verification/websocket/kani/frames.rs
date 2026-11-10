@@ -722,7 +722,10 @@ fn writer_bounds_control_payload(opcode: Opcode, fin: bool, len: usize) {
     assert!(result.is_ok() == (fin && len <= MAX_CONTROL_PAYLOAD));
 }
 
-// One harness per control opcode, at 125 and 126 bytes, with any FIN.
+// Ping and Pong at 125 and 126 bytes in one harness each, and Close at
+// 126. Any FIN. A 125-byte Close needs its 123-byte reason checked as
+// UTF-8, which runs CBMC out of memory under the 8 GiB cap, so it has no
+// harness.
 macro_rules! control_size_case {
     ($name:ident, $opcode:expr) => {
         #[kani::proof]
@@ -736,7 +739,12 @@ macro_rules! control_size_case {
 }
 control_size_case!(websocket_writer_bounds_control_payload_ping, Opcode::Ping);
 control_size_case!(websocket_writer_bounds_control_payload_pong, Opcode::Pong);
-control_size_case!(websocket_writer_bounds_control_payload_close, Opcode::Close);
+
+#[kani::proof]
+#[kani::unwind(130)]
+fn websocket_writer_bounds_control_payload_close_126() {
+    writer_bounds_control_payload(Opcode::Close, kani::any(), 126);
+}
 
 #[kani::proof]
 #[kani::unwind(130)]
@@ -775,10 +783,11 @@ fn fragments_follow_rfc(message: Message, body: &[u8], max: usize, mask: Option<
     assert!(joined.as_slice() == body);
 }
 
-// One harness per message kind, with any payload bytes and any fragment
-// size up to 4 (0 is clamped to 1). Text and binary take 0 or 3 bytes,
-// Ping and Pong 3. Unmasked: masking is proved by the mask and
-// small-frame harnesses.
+// One harness per message kind. Empty text and binary messages and
+// three-byte control messages take any fragment size up to 4 (0 is
+// clamped to 1). Three-byte binary messages, which split into several
+// frames, take each fragment size from 1 to 3 in a harness of their own.
+// Unmasked: masking is proved by the mask and small-frame harnesses.
 fn any_fragment_size() -> usize {
     let max: usize = kani::any();
     kani::assume(max <= 4);
@@ -791,32 +800,35 @@ fn websocket_fragments_follow_rfc_text_empty() {
     fragments_follow_rfc(Message::Text(String::new()), &[], any_fragment_size(), None);
 }
 
+macro_rules! split_case {
+    ($name:ident, $max:expr) => {
+        #[kani::proof]
+        #[kani::unwind(8)]
+        fn $name() {
+            let data: [u8; 3] = kani::any();
+            fragments_follow_rfc(Message::Binary(data.to_vec()), &data, $max, None);
+        }
+    };
+}
+split_case!(websocket_fragments_follow_rfc_binary_three_by_one, 1);
+split_case!(websocket_fragments_follow_rfc_binary_three_by_two, 2);
+split_case!(websocket_fragments_follow_rfc_binary_three_by_three, 3);
+
+// Text splits like binary (to_frames takes the text's bytes). The text
+// case that matters is a split inside a character (5.6): "€" is three
+// bytes, split one byte per frame. Any fragment size here runs CBMC out
+// of memory under the 8 GiB cap.
 #[kani::proof]
 #[kani::unwind(8)]
-fn websocket_fragments_follow_rfc_text_three() {
-    let data: [u8; 3] = kani::any();
-    let Ok(text) = String::from_utf8(data.to_vec()) else {
-        return;
-    };
-    fragments_follow_rfc(Message::Text(text), &data, any_fragment_size(), None);
+fn websocket_fragments_follow_rfc_text_split_character() {
+    let euro = "€";
+    fragments_follow_rfc(Message::Text(euro.to_string()), euro.as_bytes(), 1, None);
 }
 
 #[kani::proof]
 #[kani::unwind(8)]
 fn websocket_fragments_follow_rfc_binary_empty() {
     fragments_follow_rfc(Message::Binary(Vec::new()), &[], any_fragment_size(), None);
-}
-
-#[kani::proof]
-#[kani::unwind(8)]
-fn websocket_fragments_follow_rfc_binary_three() {
-    let data: [u8; 3] = kani::any();
-    fragments_follow_rfc(
-        Message::Binary(data.to_vec()),
-        &data,
-        any_fragment_size(),
-        None,
-    );
 }
 
 #[kani::proof]
