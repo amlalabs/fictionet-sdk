@@ -36,6 +36,10 @@ stream intact. The tested bound is the send window plus one slot plus
 earlier emitted packet during reclamation and check that its bytes do not
 change. An active short-write tail stays unique while its outgoing pieces
 are copied, allowing later writes to gather while packets are in flight.
+That tail uses the whole slot for payload, with no unused header reserve.
+The socket receives its endpoint's shared packet pool explicitly. Short
+receive and transmit gathering blocks come from that pool; repeated
+gather, consume, and release tests check backing reuse and charge balance.
 
 The socket regression refuses a payload carrying FIN, checks that neither
 EOF nor its sequence number is accepted, then frees memory and delivers
@@ -50,3 +54,21 @@ cargo kani -p smoltcp --harness rx_insert_keeps_retained_equal_to_the_union_of_a
 ```
 
 Run Cargo under `systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0`.
+
+`../tcp-layer/Stores.tla` models receive, transmit, and control slots as
+finite sets. With no control packet held by the wire, full data storage
+must still permit an ACK. Its switches describe the two ways to lose
+that property: data spending the control reserve, and queued data hiding
+an ACK. It does not assert that a sender can allocate another control
+packet while every control backing is retained on the wire. The pool and
+driver tests cover waking when a backing returns. This model and its
+configuration have not been run.
+
+The final targeted validation passes 49 store and socket tests, 14 engine
+tests, and six packet composition and world-layer integration tests. The
+overlapping-fragment exchange that exhausted a 60-second process timeout
+now completes in 0.01 seconds with its original delivery loop. The two
+randomized ring comparisons each cover 48 seeds and 3,000 operations per
+seed. Gathering reuse is checked over 64 cycles in each direction.
+Workspace checks, strict clippy on the touched crates, and formatting
+checks pass. No throughput or per-request allocation benchmark was run.

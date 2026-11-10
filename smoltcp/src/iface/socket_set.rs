@@ -138,7 +138,10 @@ impl SocketSet {
     pub fn schedule(&mut self, cx: &mut Context) {
         while let Some(handle) = self.dirty.pop_front() {
             self.pending[handle.0].dirty = false;
-            let at = match self.get(handle).poll_at(cx) {
+            let at = match self
+                .get(handle)
+                .poll_at(cx, crate::socket::tcp::DispatchMode::All)
+            {
                 PollAt::Ingress => {
                     self.ready.remove(&handle);
                     None

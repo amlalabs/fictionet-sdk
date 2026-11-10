@@ -2,14 +2,15 @@
 //! in an index, and one segment per ready socket each pass, rotating past
 //! the last one served when the output fills.
 
-use fictionet_buf::Budget;
+use fictionet_buf::{Budget, Pool};
 
 use super::*;
-use crate::socket::tcp::Socket;
+use crate::socket::tcp::{DispatchMode, Socket};
 use crate::wire::Ipv4Address;
 
 fn socket() -> Socket {
-    Socket::new(64, 64, Budget::unlimited())
+    let pool = Pool::new(&Budget::unlimited(), 2048, 64);
+    Socket::new(64, 64, Budget::unlimited(), &pool)
 }
 
 const LOCAL: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 4242);
@@ -25,13 +26,15 @@ fn egress(sockets: &mut SocketSet, cx: &mut Context, now: Instant, room: usize) 
         let Some(handle) = sockets.next_ready() else {
             break;
         };
-        let result = sockets.get_mut(handle).dispatch(cx, |_, (_, tcp, _)| {
-            if sent.len() == room {
-                return Err(());
-            }
-            sent.push(tcp.dst_port);
-            Ok(())
-        });
+        let result = sockets
+            .get_mut(handle)
+            .dispatch(cx, DispatchMode::All, |_, (_, tcp, _)| {
+                if sent.len() == room {
+                    return Err(());
+                }
+                sent.push(tcp.dst_port);
+                Ok(())
+            });
         sockets.dispatched(handle, result.is_err());
         if result.is_err() {
             return sent;
@@ -46,7 +49,7 @@ fn check(sockets: &mut SocketSet, cx: &mut Context, now: Instant) {
     cx.set_now(now);
     let expected = sockets
         .iter()
-        .filter_map(|(_, socket)| match socket.poll_at(cx) {
+        .filter_map(|(_, socket)| match socket.poll_at(cx, DispatchMode::All) {
             PollAt::Ingress => None,
             PollAt::Time(at) => Some(at),
             PollAt::Now => Some(Instant::ZERO),

@@ -5,13 +5,58 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use fictionet_buf::{Budget, Chunk};
+use fictionet_buf::{Budget, Chunk, Pool};
 
 use super::rx::{RxStore, SEGMENTS, SLOT, SMALL};
 use super::tx::{HEADROOM, TxStore};
 use crate::storage::{Assembler, RingBuffer};
 
 const MSS: usize = 1460;
+
+fn pool() -> Pool {
+    Pool::new(&Budget::unlimited(), SLOT, SEGMENTS)
+}
+
+#[test]
+fn receive_gathering_recycles_its_backing() {
+    gathering_recycles(true);
+}
+
+#[test]
+fn transmit_gathering_recycles_its_backing() {
+    gathering_recycles(false);
+}
+
+fn gathering_recycles(receive: bool) {
+    let budget = Budget::unlimited();
+    let pool = Pool::new(&budget, SLOT, 4);
+    let mut rx = RxStore::new(SLOT, budget.clone(), &pool);
+    let mut tx = TxStore::new(SLOT, budget.clone(), &pool);
+    let mut previous = None;
+    for round in 0..64 {
+        let bytes: Vec<_> = (0..31).map(|i| byte(round + i)).collect();
+        let pointer = if receive {
+            rx.insert(0, &paid(&bytes)).unwrap();
+            let chunk = rx.take_contiguous().unwrap();
+            rx.commit(chunk);
+            let read = rx.pop(SLOT).unwrap();
+            assert_eq!(&*read, bytes);
+            read.as_ptr()
+        } else {
+            tx.push(paid(&bytes)).unwrap();
+            assert_eq!(tx.bytes(0, SLOT), bytes);
+            let pointer = tx.bytes(0, SLOT).as_ptr();
+            tx.ack(bytes.len());
+            pointer
+        };
+        assert!(pool.free() > 0);
+        assert_eq!(budget.used(), pool.charged());
+        if let Some(before) = previous {
+            assert_eq!(pointer, before, "the whole gathering backing is reused");
+        }
+        previous = Some(pointer);
+    }
+}
 
 /// What a store may keep alive receiving with `capacity`: twice the window
 /// in gathered blocks, and a slot or a segment for each chunk it keeps.
@@ -27,9 +72,11 @@ fn tx_bound(capacity: usize) -> usize {
 #[test]
 fn transmit_compaction_stays_within_one_window_of_payload() {
     let capacity = 1024 * 1024;
-    let mut store = TxStore::new(capacity, Budget::unlimited());
+    let mut store = TxStore::new(capacity, Budget::unlimited(), &pool());
     for _ in 0..2 * SEGMENTS {
-        store.push(paid(&vec![0; capacity / (2 * SEGMENTS)])).unwrap();
+        store
+            .push(paid(&vec![0; capacity / (2 * SEGMENTS)]))
+            .unwrap();
         assert!(store.held() <= tx_bound(capacity));
     }
 }
@@ -37,12 +84,16 @@ fn transmit_compaction_stays_within_one_window_of_payload() {
 #[test]
 fn a_partial_ack_does_not_pin_an_extra_window_on_the_next_write() {
     let capacity = 1024 * 1024;
-    let mut store = TxStore::new(capacity, Budget::unlimited());
+    let mut store = TxStore::new(capacity, Budget::unlimited(), &pool());
     let bytes: Vec<_> = (0..capacity).map(byte).collect();
     let mut chunk = Chunk::block(&Budget::unlimited(), HEADROOM, HEADROOM + bytes.len()).unwrap();
     chunk.extend_within(&bytes).unwrap();
     store.push(chunk).unwrap();
-    let packet = store.piece(0, capacity).unwrap().in_place(40, |p| p[..40].fill(0)).unwrap();
+    let packet = store
+        .piece(0, capacity)
+        .unwrap()
+        .in_place(40, |p| p[..40].fill(0))
+        .unwrap();
     store.ack(capacity - SMALL);
     store.push(paid(&bytes[..capacity - SMALL])).unwrap();
     assert!(store.held() <= tx_bound(capacity));
@@ -60,7 +111,7 @@ fn a_partial_ack_does_not_pin_an_extra_window_on_the_next_write() {
 fn writes_refused_for_retention_keep_ownership_and_bytes() {
     let capacity = 1024 * 1024;
     let budget = Budget::new(capacity);
-    let mut store = TxStore::new(capacity, budget.clone());
+    let mut store = TxStore::new(capacity, budget.clone(), &pool());
     store.push(paid(&vec![1; capacity])).unwrap();
     store.ack(capacity - SMALL);
     let blocked = budget.charge(budget.limit()).unwrap();
@@ -78,7 +129,7 @@ fn writes_refused_for_retention_keep_ownership_and_bytes() {
 #[test]
 fn unpaid_writes_are_charged_before_retention() {
     let budget = Budget::new(0);
-    let mut store = TxStore::new(4 * SLOT, budget);
+    let mut store = TxStore::new(4 * SLOT, budget, &pool());
     let write = Chunk::unpaid(vec![1; SMALL]);
     let original = write.clone();
     let refused = store.push(write).unwrap_err();
@@ -88,12 +139,15 @@ fn unpaid_writes_are_charged_before_retention() {
 
 #[test]
 fn a_piece_request_can_extend_past_the_address_space() {
-    let mut store = TxStore::new(SLOT, Budget::unlimited());
+    let mut store = TxStore::new(SLOT, Budget::unlimited(), &pool());
     let bytes: Vec<_> = (0..SMALL).map(byte).collect();
     store.push(paid(&bytes)).unwrap();
     for offset in 1..bytes.len() {
         assert_eq!(store.bytes(offset, usize::MAX), &bytes[offset..]);
-        assert_eq!(store.piece(offset, usize::MAX).unwrap().bytes(), &bytes[offset..]);
+        assert_eq!(
+            store.piece(offset, usize::MAX).unwrap().bytes(),
+            &bytes[offset..]
+        );
     }
 }
 
@@ -130,7 +184,7 @@ struct Receiver {
 impl Receiver {
     fn new(capacity: usize, edits: bool) -> Receiver {
         Receiver {
-            store: RxStore::new(capacity, Budget::unlimited()),
+            store: RxStore::new(capacity, Budget::unlimited(), &pool()),
             ring: RingBuffer::new(vec![0; capacity]),
             store_holes: Assembler::new(),
             ring_holes: Assembler::new(),
@@ -297,7 +351,7 @@ fn a_slow_reader_s_window_fits_in_bounded_chunks() {
 /// bytes there, the store keeps the first copy.
 #[test]
 fn overlapping_bytes_keep_the_first_copy() {
-    let mut store = RxStore::new(64, Budget::unlimited());
+    let mut store = RxStore::new(64, Budget::unlimited(), &pool());
     store.insert(2, &Chunk::unpaid(b"XY".to_vec())).unwrap();
     store.insert(0, &Chunk::unpaid(b"abcdef".to_vec())).unwrap();
     let mut read = Vec::new();
@@ -311,7 +365,7 @@ fn overlapping_bytes_keep_the_first_copy() {
 /// copied, while chunks are free; shorter ones are gathered.
 #[test]
 fn a_segment_is_kept_without_a_copy() {
-    let mut store = RxStore::new(64 * 1024, Budget::unlimited());
+    let mut store = RxStore::new(64 * 1024, Budget::unlimited(), &pool());
     let segment = paid(&[7; MSS]);
     store.insert(0, &segment).unwrap();
     let kept = store.take_contiguous().unwrap();
@@ -332,7 +386,7 @@ fn a_segment_is_kept_without_a_copy() {
 #[test]
 fn what_the_store_keeps_is_paid_for() {
     let budget = Budget::new(SMALL);
-    let mut store = RxStore::new(64 * 1024, budget.clone());
+    let mut store = RxStore::new(64 * 1024, budget.clone(), &pool());
     store.insert(0, &paid(&[1; MSS])).unwrap();
     assert_eq!(budget.used(), 0);
     assert!(store.insert(MSS, &Chunk::unpaid(vec![2; MSS])).is_err());
@@ -353,7 +407,7 @@ fn what_the_store_keeps_is_paid_for() {
 fn clipped_waiting_pieces_do_not_pin_large_packets() {
     for piece_length in [1, SMALL, 2 * SMALL] {
         let capacity = 2 * SMALL * SEGMENTS;
-        let mut store = RxStore::new(capacity, Budget::unlimited());
+        let mut store = RxStore::new(capacity, Budget::unlimited(), &pool());
         for count in 1..=SEGMENTS {
             let length = count * piece_length;
             let offset = capacity - length;
@@ -366,7 +420,10 @@ fn clipped_waiting_pieces_do_not_pin_large_packets() {
                 assert!(kept.iter().enumerate().all(|(i, &b)| b == byte(at + i)));
             }
         }
-        assert_eq!(store.waiting().map(|(_, bytes)| bytes.len()).sum::<usize>(), SEGMENTS * piece_length);
+        assert_eq!(
+            store.waiting().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+            SEGMENTS * piece_length
+        );
     }
 }
 
@@ -375,13 +432,19 @@ fn clipped_waiting_pieces_do_not_pin_large_packets() {
 #[test]
 fn a_refused_detachment_keeps_all_waiting_bytes_unchanged() {
     let budget = Budget::new(2);
-    let mut store = RxStore::new(16, budget.clone());
+    let mut store = RxStore::new(16, budget.clone(), &pool());
     store.insert(2, &paid(&[byte(2)])).unwrap();
-    let before: Vec<_> = store.waiting().map(|(at, bytes)| (at, bytes.to_vec())).collect();
+    let before: Vec<_> = store
+        .waiting()
+        .map(|(at, bytes)| (at, bytes.to_vec()))
+        .collect();
     let bytes: Vec<_> = (0..2 * SLOT).map(byte).collect();
     let packet = paid(&bytes);
     assert!(store.insert(0, &packet.slice(0..4)).is_err());
-    let after: Vec<_> = store.waiting().map(|(at, bytes)| (at, bytes.to_vec())).collect();
+    let after: Vec<_> = store
+        .waiting()
+        .map(|(at, bytes)| (at, bytes.to_vec()))
+        .collect();
     assert_eq!(after, before);
     assert_eq!(budget.used(), 0);
 }
@@ -391,7 +454,7 @@ fn a_refused_detachment_keeps_all_waiting_bytes_unchanged() {
 #[test]
 fn a_refused_block_refuses_the_segment() {
     let budget = Budget::new(0);
-    let mut store = RxStore::new(1 << 20, budget);
+    let mut store = RxStore::new(1 << 20, budget, &pool());
     for i in 0..SEGMENTS {
         let piece = paid(&[i as u8; SMALL]);
         store.insert(1 + SMALL * i, &piece).unwrap();
@@ -410,7 +473,7 @@ fn sending_matches_the_ring() {
     for seed in 0..48 {
         let mut rng = StdRng::seed_from_u64(seed);
         let capacity = [4096, 65536, 256 * 1024][seed as usize % 3];
-        let mut store = TxStore::new(capacity, Budget::unlimited());
+        let mut store = TxStore::new(capacity, Budget::unlimited(), &pool());
         let mut ring = RingBuffer::new(vec![0; capacity]);
         let mut written = 0usize;
         let mut acked = 0usize;
@@ -472,7 +535,7 @@ fn sending_matches_the_ring() {
 /// is dropped, the next is in place again.
 #[test]
 fn a_unique_chunk_is_sent_in_place_and_a_shared_one_is_not() {
-    let mut store = TxStore::new(64 * 1024, Budget::unlimited());
+    let mut store = TxStore::new(64 * 1024, Budget::unlimited(), &pool());
     let mut chunk = Chunk::block(&Budget::unlimited(), HEADROOM, HEADROOM + 1000).unwrap();
     chunk.extend_within(&[3; 1000]).unwrap();
     store.push(chunk).unwrap();
@@ -514,7 +577,7 @@ fn a_unique_chunk_is_sent_in_place_and_a_shared_one_is_not() {
             .in_place(header, |_| ())
             .is_none()
     );
-    let mut tight = TxStore::new(64 * 1024, Budget::unlimited());
+    let mut tight = TxStore::new(64 * 1024, Budget::unlimited(), &pool());
     tight.push(Chunk::unpaid(vec![1; 500])).unwrap();
     assert!(
         tight
@@ -529,7 +592,7 @@ fn a_unique_chunk_is_sent_in_place_and_a_shared_one_is_not() {
 /// order, until it is acknowledged.
 #[test]
 fn many_writes_fit_in_bounded_chunks() {
-    let mut store = TxStore::new(1 << 20, Budget::unlimited());
+    let mut store = TxStore::new(1 << 20, Budget::unlimited(), &pool());
     let mut model = Vec::new();
     for i in 0..400 {
         let bytes: Vec<u8> = (0..SMALL + i).map(|j| byte(model.len() + j)).collect();
@@ -551,28 +614,30 @@ fn many_writes_fit_in_bounded_chunks() {
 /// the packet is in flight, so subsequent short writes can share the tail.
 #[test]
 fn short_writes_gather_while_packets_are_in_flight() {
-    let mut store = TxStore::new(4 * SLOT, Budget::unlimited());
-    let mut packets = Vec::new();
-    let mut expected = Vec::new();
-    for i in 0..SEGMENTS {
-        let bytes = vec![byte(i); 7];
-        let offset = expected.len();
-        store.push(paid(&bytes)).unwrap();
-        expected.extend_from_slice(&bytes);
-        let mut piece = store.piece(offset, bytes.len()).unwrap();
-        let packet = piece
-            .in_place(40, |packet| packet[..40].fill(0))
-            .unwrap_or_else(|| paid(piece.bytes()));
-        packets.push(packet);
-        assert!(store.descriptors() <= expected.len().div_ceil(SLOT));
+    for length in [7, SMALL / 2] {
+        let mut store = TxStore::new(4 * SLOT, Budget::unlimited(), &pool());
+        let mut packets = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..SEGMENTS {
+            let bytes = vec![byte(i); length];
+            let offset = expected.len();
+            store.push(paid(&bytes)).unwrap();
+            expected.extend_from_slice(&bytes);
+            let mut piece = store.piece(offset, bytes.len()).unwrap();
+            let packet = piece
+                .in_place(40, |packet| packet[..40].fill(0))
+                .unwrap_or_else(|| paid(piece.bytes()));
+            packets.push(packet);
+            assert!(store.descriptors() <= expected.len().div_ceil(SLOT));
+        }
+        let mut actual = Vec::new();
+        while actual.len() < store.len() {
+            actual.extend_from_slice(store.bytes(actual.len(), MSS));
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(
+            packets.iter().map(|p| p.len()).sum::<usize>(),
+            expected.len()
+        );
     }
-    let mut actual = Vec::new();
-    while actual.len() < store.len() {
-        actual.extend_from_slice(store.bytes(actual.len(), MSS));
-    }
-    assert_eq!(actual, expected);
-    assert_eq!(
-        packets.iter().map(|p| p.len()).sum::<usize>(),
-        expected.len()
-    );
 }

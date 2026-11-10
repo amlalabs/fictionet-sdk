@@ -6,6 +6,10 @@ use fictionet::stdlib::network::ip::{set_header_checksum, transport_checksum};
 use fictionet::stdlib::test_support::rounds;
 use fictionet::{InterfaceExt, Packet, Seed, block_on, lab, pair, run};
 
+fn pool() -> Pool {
+    Pool::new(&Budget::unlimited(), PACKET_SLOT, EGRESS_PACKETS)
+}
+
 /// Byte-slice reads and writes on a socket, over the chunks it takes and
 /// gives, as the tests were written.
 trait Bytes {
@@ -239,7 +243,7 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
         });
         let mut idle = Vec::new();
         for _ in 0..8 {
-            let mut socket = new_socket(MIN_BUFFER, &Budget::unlimited());
+            let mut socket = new_socket(MIN_BUFFER, &Budget::unlimited(), &pool());
             socket.listen(local.port()).unwrap();
             idle.push(st.add_socket(&fcx, socket));
         }
@@ -324,7 +328,7 @@ fn a_syn_for_a_reset_connection_still_held_is_not_taken_by_a_listener() {
         assert_eq!(st.by_tuple[&(local, peer)], h);
         let mut idle = Vec::new();
         for _ in 0..4 {
-            let mut socket = new_socket(MIN_BUFFER, &Budget::unlimited());
+            let mut socket = new_socket(MIN_BUFFER, &Budget::unlimited(), &pool());
             socket.listen(local.port()).unwrap();
             idle.push(st.add_socket(&fcx, socket));
         }
@@ -1043,7 +1047,14 @@ fn transmit_batches_retain_descriptor_capacity() {
 
 #[test]
 fn output_yields_until_queued_packets_are_drained() {
-    let mut output = Output::default();
+    let budget = Budget::unlimited();
+    let pool = Pool::new(&budget, PACKET_SLOT, EGRESS_PACKETS);
+    assert!(pool.reserve_control(&budget, EGRESS_PACKETS));
+    let mut output = Output {
+        pool: Some(pool),
+        budget: Some(budget),
+        ..Output::default()
+    };
     let local = "10.0.0.1:80".parse().unwrap();
     let peer = "10.0.0.2:1234".parse().unwrap();
     let packet = segment(local, peer, 13, 29, 0x10);
@@ -1067,6 +1078,221 @@ fn output_yields_until_queued_packets_are_drained() {
     output.tx.clear();
     assert!(output.emit(ip.clone(), tcp, None).is_ok());
     assert!(!output.full());
+}
+
+#[test]
+fn a_reserved_ack_leaves_while_the_data_budget_is_full() {
+    use fictionet::{SeededEntropy, stdlib::layer::Observations};
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let budget = Budget::new(1024 * 1024);
+    let mut observed = Observations::new(0);
+    let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let peer = "10.0.0.2:1234".parse().unwrap();
+    let mut layer = TcpLayer::new(local.ip(), Options::default(), &entropy, Instant::ZERO);
+    assert!(layer.reserve_storage(&budget));
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    let packet = segment(local, peer, 13, 29, 0x10);
+    let ip = smoltcp::wire::IpRepr::parse(&packet).unwrap();
+    let wire = TcpPacket::new_unchecked(&packet[ip.header_len()..]);
+    let tcp = TcpRepr::parse(&wire, &ip.src_addr(), &ip.dst_addr()).unwrap();
+    layer.output.emit(ip, tcp, None).unwrap();
+    layer.flush_transmit();
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observed);
+    let Some(PacketCommand::Send(ack)) = layer.take_command(&mut env) else {
+        panic!("a reserved ACK must not wait for more data memory");
+    };
+    assert!(ack.checksums().transport);
+    assert!(ack.chunk().charged() >= ack.len());
+    assert!(budget.used() <= budget.limit());
+    drop((ack, held, layer));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn data_packets_cannot_spend_the_control_reserve() {
+    let budget = Budget::new(1024 * 1024);
+    let pool = Pool::new(&budget, PACKET_SLOT, EGRESS_PACKETS);
+    assert!(pool.reserve_control(&budget, EGRESS_PACKETS));
+    let mut output = Output {
+        pool: Some(pool),
+        budget: Some(budget.clone()),
+        ..Output::default()
+    };
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    assert!(output.block(100, false, |bytes| bytes.fill(0)).is_none());
+    let mut controls = Vec::new();
+    for _ in 0..EGRESS_PACKETS {
+        controls.push(output.block(40, true, |bytes| bytes.fill(0)).unwrap());
+    }
+    assert!(controls.iter().all(|block| block.charged() >= block.len()));
+    assert!(output.block(40, true, |bytes| bytes.fill(0)).is_none());
+    assert!(budget.used() <= budget.limit());
+    drop((controls, held, output));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn returning_a_control_block_wakes_and_retries_the_engine() {
+    use fictionet::{SeededEntropy, stdlib::layer::Driver};
+    let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
+    let budget = Budget::new(1024 * 1024);
+    let tcp = TcpLayer::new(
+        "10.0.0.1".parse().unwrap(),
+        Options::default(),
+        &*entropy,
+        Instant::ZERO,
+    );
+    let mut driver = Driver::new(tcp, entropy, budget.clone(), Instant::ZERO);
+    assert!(matches!(
+        driver.command(MuxCommand::control(MessageCommand::Send(
+            TcpControl::Connect {
+                request: Request(0),
+                remote: "10.0.0.2:80".parse().unwrap(),
+            }
+        ))),
+        Ok(Admit::Taken)
+    ));
+    let pool = driver.layer().output.pool.clone().unwrap();
+    let mut held_controls: Vec<_> = (0..EGRESS_PACKETS)
+        .map(|_| pool.take_control(0).unwrap())
+        .collect();
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    driver.run().unwrap();
+    assert!(!driver.exhausted());
+    assert!(driver.take_command().is_none());
+    assert!(!driver.woken());
+    assert!(driver.deadline().is_none_or(|at| at > Instant::ZERO));
+    drop(held_controls.pop());
+    assert_eq!(budget.used(), budget.limit());
+    assert!(
+        driver.woken(),
+        "a returned block is work even without a budget release"
+    );
+    driver.run().unwrap();
+    let Some(PacketCommand::Send(packet)) = driver.take_command() else {
+        panic!("the pending SYN must retry after its control block returns");
+    };
+    assert!(packet.checksums().transport);
+    drop((packet, held_controls, held, pool, driver));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn a_pending_ack_passes_data_waiting_for_packet_memory() {
+    use fictionet::{SeededEntropy, stdlib::layer::Observations};
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let budget = Budget::new(1024 * 1024);
+    let mut observed = Observations::new(0);
+    let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let peer = "10.0.0.2:1234".parse().unwrap();
+    let mut layer = TcpLayer::new(local.ip(), Options::default(), &entropy, Instant::ZERO);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observed);
+    assert!(matches!(
+        layer.on_command(
+            &mut env,
+            MuxCommand::control(MessageCommand::Send(TcpControl::Listen {
+                port: local.port(),
+                backlog: None,
+                answer: None,
+            }))
+        ),
+        Ok(Admit::Taken)
+    ));
+    let now = smol(Instant::ZERO);
+    let (h, seq) = established(&mut layer, now, local, peer);
+    let outgoing = vec![9; 400];
+    layer
+        .sock(h)
+        .push(Chunk::copy_of(&Budget::unlimited(), &outgoing).unwrap())
+        .unwrap();
+    layer.sock(h).set_ack_delay(None);
+    let incoming = vec![3; 200];
+    layer.ingress(
+        &entropy,
+        &budget,
+        now,
+        data_segment(peer, local, 101, seq, 0x10, &incoming),
+    );
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    layer.advance(&mut env).unwrap();
+    let Some(PacketCommand::Send(ack)) = layer.take_command(&mut env) else {
+        panic!("the receive acknowledgement must pass the blocked data");
+    };
+    let ip = smoltcp::wire::IpRepr::parse(&ack).unwrap();
+    let wire = TcpPacket::new_unchecked(&ack[ip.header_len()..]);
+    let acknowledged = u32::from_be_bytes(
+        ack[ip.header_len() + 8..ip.header_len() + 12]
+            .try_into()
+            .unwrap(),
+    );
+    let ack = TcpRepr::parse(&wire, &ip.src_addr(), &ip.dst_addr()).unwrap();
+    assert!(ack.payload.is_empty());
+    assert_eq!(acknowledged, 101 + incoming.len() as u32);
+    assert_eq!(layer.get(h).send_queue(), outgoing.len());
+    assert!(layer.deadline().is_none_or(|(at, _)| at > Instant::ZERO));
+    drop(held);
+    layer.advance(&mut env).unwrap();
+    let Some(PacketCommand::Send(data)) = layer.take_command(&mut env) else {
+        panic!("data must retry once packet memory is available");
+    };
+    let ip = smoltcp::wire::IpRepr::parse(&data).unwrap();
+    let wire = TcpPacket::new_unchecked(&data[ip.header_len()..]);
+    let data = TcpRepr::parse(&wire, &ip.src_addr(), &ip.dst_addr()).unwrap();
+    assert_eq!(data.payload, &outgoing);
+}
+
+#[test]
+fn one_released_control_payment_wakes_the_engine_without_recycling() {
+    use fictionet::{SeededEntropy, stdlib::layer::Driver};
+    let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
+    let budget = Budget::new(1024 * 1024);
+    let tcp = TcpLayer::new(
+        "10.0.0.1".parse().unwrap(),
+        Options::default(),
+        &*entropy,
+        Instant::ZERO,
+    );
+    let mut driver = Driver::new(tcp, entropy, budget.clone(), Instant::ZERO);
+    assert!(matches!(
+        driver.command(MuxCommand::control(MessageCommand::Send(
+            TcpControl::Connect {
+                request: Request(0),
+                remote: "10.0.0.2:80".parse().unwrap(),
+            }
+        ))),
+        Ok(Admit::Taken)
+    ));
+    let pool = driver.layer().output.pool.clone().unwrap();
+    let mut controls: Vec<_> = (0..EGRESS_PACKETS)
+        .map(|_| pool.take_control(0).unwrap())
+        .collect();
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    let before = driver.refusals();
+    driver.run().unwrap();
+    driver.wake_when_freed(before);
+    assert!(!driver.exhausted());
+    assert!(driver.take_command().is_none());
+    assert!(!driver.woken());
+    // Handoff releases one payment without returning a backing. A block
+    // freed on a contended recycle has the same budget effect.
+    let recipient = Budget::unlimited();
+    let control = controls.last_mut().unwrap();
+    let payment = control.charged();
+    assert!(control.repay(&recipient));
+    assert_eq!(budget.limit() - budget.used(), payment);
+    assert_eq!(pool.free(), 0);
+    assert!(
+        driver.woken(),
+        "one slot suffices for the pending control packet"
+    );
+    driver.run().unwrap();
+    let Some(PacketCommand::Send(packet)) = driver.take_command() else {
+        panic!("the pending SYN must not wait for the whole reserve to refill");
+    };
+    assert!(packet.checksums().transport);
+    drop((packet, controls, held, pool, driver));
+    assert_eq!(budget.used(), 0);
+    assert_eq!(recipient.used(), 0);
 }
 
 #[test]
@@ -1518,7 +1744,7 @@ fn abort_peers_wakes_connections_in_socket_order() {
         {
             let mut st = ep.shared.lock();
             for port in [9000, 80, 443, 22, 8080] {
-                let id = st.add_socket(&fcx, new_socket(MIN_BUFFER, &Budget::unlimited()));
+                let id = st.add_socket(&fcx, new_socket(MIN_BUFFER, &Budget::unlimited(), &pool()));
                 let conn = Conn::new(
                     "10.0.0.1:80".parse().unwrap(),
                     SocketAddr::new("10.0.0.2".parse().unwrap(), port),
@@ -1566,7 +1792,8 @@ fn the_socket_slab_reuses_slots_and_forgets_stale_ids() {
                     let lowest_free = (0..)
                         .find(|&i| !live.keys().any(|id| id.slot.index() == i))
                         .unwrap();
-                    let id = st.add_socket(&fcx, new_socket(MIN_BUFFER, &Budget::unlimited()));
+                    let id =
+                        st.add_socket(&fcx, new_socket(MIN_BUFFER, &Budget::unlimited(), &pool()));
                     assert_eq!(id.slot.index(), lowest_free, "the lowest free slot");
                     let with_conn = fcx.random_below(2) == 0;
                     if with_conn {
@@ -1849,7 +2076,7 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
             // (RFC 6528).
             let now = smol_now(&fcx) + smoltcp::time::Duration::from_millis(attempt as u64);
             st.context.set_now(now);
-            let mut socket = new_socket(MIN_BUFFER, &Budget::unlimited());
+            let mut socket = new_socket(MIN_BUFFER, &Budget::unlimited(), &pool());
             socket.connect(&mut st.context, peer, local).unwrap();
             let h = st.add_socket(&fcx, socket);
             st.sockets
@@ -2040,7 +2267,7 @@ fn rejected_syn_acks(established: bool) {
             );
             let now = smol_now(&fcx);
             let mut st = ep.shared.lock();
-            let mut s = new_socket(MIN_BUFFER, &Budget::unlimited());
+            let mut s = new_socket(MIN_BUFFER, &Budget::unlimited(), &pool());
             s.connect(&mut st.context, peer, local).unwrap();
             let h = st.add_socket(&fcx, s);
             st.sockets
@@ -2136,7 +2363,7 @@ fn rejected_syn_acks(established: bool) {
             assert_eq!(&got, expected);
             if !established {
                 let local = SocketAddr::new(local.ip(), local.port() + 1);
-                let mut s = new_socket(MIN_BUFFER, &Budget::unlimited());
+                let mut s = new_socket(MIN_BUFFER, &Budget::unlimited(), &pool());
                 s.connect(&mut st.context, peer, local).unwrap();
                 let h = st.add_socket(&fcx, s);
                 st.sockets
@@ -2177,7 +2404,7 @@ fn simultaneous_open_records_the_accepted_syn_origin() {
         let ep = endpoint(&fcx, side, local.ip());
         let now = smol_now(&fcx);
         let mut st = ep.shared.lock();
-        let mut s = new_socket(MIN_BUFFER, &Budget::unlimited());
+        let mut s = new_socket(MIN_BUFFER, &Budget::unlimited(), &pool());
         s.connect(&mut st.context, peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
         st.sockets
@@ -2344,7 +2571,7 @@ fn client_advertised_window_uses_negotiated_scale() {
             let ep = endpoint(&fcx, side, local.ip());
             let now = smol_now(&fcx);
             let mut st = ep.shared.lock();
-            let mut socket = new_socket(BUFFER, &Budget::unlimited());
+            let mut socket = new_socket(BUFFER, &Budget::unlimited(), &pool());
             socket.connect(&mut st.context, peer, local).unwrap();
             let h = st.add_socket(&fcx, socket);
             st.sockets
@@ -4358,7 +4585,7 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
         let ep = endpoint(&fcx, side, local.ip());
         let now = smol_now(&fcx);
         let mut st = ep.shared.lock();
-        let mut s = new_socket(MIN_BUFFER, &Budget::unlimited());
+        let mut s = new_socket(MIN_BUFFER, &Budget::unlimited(), &pool());
         s.connect(&mut st.context, peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
         st.sockets

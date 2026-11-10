@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use fictionet_buf::{Budget, Chunk};
+use fictionet_buf::{Budget, Chunk, Pool};
 
 /// The most chunks one direction of a connection retains: what it is
 /// charged for when it opens.
@@ -47,16 +47,18 @@ pub(crate) struct RxStore {
     /// calls: bytes at offset 0 are contiguous and become ready.
     waiting: VecDeque<(usize, Chunk)>,
     budget: Budget,
+    pool: Pool,
 }
 
 impl RxStore {
-    pub(crate) fn new(capacity: usize, budget: Budget) -> RxStore {
+    pub(crate) fn new(capacity: usize, budget: Budget, pool: &Pool) -> RxStore {
         RxStore {
             capacity,
             unread: 0,
             ready: VecDeque::with_capacity(SEGMENTS),
             waiting: VecDeque::with_capacity(SEGMENTS),
             budget,
+            pool: pool.clone(),
         }
     }
 
@@ -215,7 +217,12 @@ impl RxStore {
         };
         match side {
             Side::Ready(i) => {
-                join_pair(&self.budget, 0, SLOT.max(2 * len), self.ready.range_mut(i - 1..=i))?;
+                join_pair(
+                    &self.budget,
+                    0,
+                    SLOT.max(2 * len),
+                    self.ready.range_mut(i - 1..=i),
+                )?;
                 drop(self.ready.remove(i));
             }
             Side::Waiting(i) => {
@@ -256,7 +263,7 @@ impl RxStore {
         {
             return;
         }
-        let gathered = Chunk::block(&self.budget, 0, SLOT).and_then(|mut block| {
+        let gathered = self.pool.take(&self.budget, 0).and_then(|mut block| {
             block.extend_within(&chunk).ok()?;
             Some(block)
         });
@@ -327,4 +334,3 @@ pub(crate) fn join_pair<'a>(
     }
     Ok(())
 }
-

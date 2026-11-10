@@ -11,10 +11,14 @@
 
 use super::rx::RxStore;
 use super::tx::TxStore;
-use fictionet_buf::{Budget, Chunk};
+use fictionet_buf::{Budget, Chunk, Pool};
 
 /// The window of the stores the harnesses build.
 const WINDOW: usize = 6;
+
+fn pool() -> Pool {
+    Pool::new(&Budget::unlimited(), super::rx::SLOT, 0)
+}
 
 /// The byte at stream offset `at`: every copy of a byte carries the same.
 fn byte(at: usize) -> u8 {
@@ -35,7 +39,7 @@ fn segment(at: usize, len: usize) -> Chunk {
 #[kani::unwind(66)]
 #[kani::solver(minisat)]
 fn rx_insert_keeps_retained_equal_to_the_union_of_accepted_ranges() {
-    let mut store = RxStore::new(WINDOW, Budget::unlimited());
+    let mut store = RxStore::new(WINDOW, Budget::unlimited(), &pool());
     let mut held = [false; WINDOW];
     for _ in 0..2 {
         let at: usize = kani::any();
@@ -63,7 +67,7 @@ fn rx_insert_keeps_retained_equal_to_the_union_of_accepted_ranges() {
 #[kani::unwind(66)]
 #[kani::solver(minisat)]
 fn rx_window_is_capacity_minus_unread() {
-    let mut store = RxStore::new(WINDOW, Budget::unlimited());
+    let mut store = RxStore::new(WINDOW, Budget::unlimited(), &pool());
     let mut unread = 0usize;
     for _ in 0..2 {
         let len: usize = kani::any();
@@ -92,7 +96,7 @@ fn rx_window_is_capacity_minus_unread() {
 #[kani::unwind(8)]
 #[kani::solver(minisat)]
 fn tx_ack_releases_exactly_the_acked_bytes() {
-    let mut store = TxStore::new(WINDOW, Budget::unlimited());
+    let mut store = TxStore::new(WINDOW, Budget::unlimited(), &pool());
     let first: usize = kani::any();
     let second: usize = kani::any();
     kani::assume(first >= 1 && second >= 1 && first + second <= WINDOW);
@@ -121,7 +125,7 @@ fn tx_ack_releases_exactly_the_acked_bytes() {
 #[kani::unwind(8)]
 #[kani::solver(minisat)]
 fn a_piece_never_spans_two_chunks() {
-    let mut store = TxStore::new(WINDOW, Budget::unlimited());
+    let mut store = TxStore::new(WINDOW, Budget::unlimited(), &pool());
     let first: usize = kani::any();
     let second: usize = kani::any();
     kani::assume(first >= 1 && second >= 1 && first + second <= WINDOW);

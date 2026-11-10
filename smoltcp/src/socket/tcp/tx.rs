@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use fictionet_buf::{Budget, Chunk};
+use fictionet_buf::{Budget, Chunk, Pool};
 
 use super::rx::{SEGMENTS, SLOT, SMALL, join_pair};
 
@@ -21,7 +21,7 @@ pub const HEADROOM: usize = 120;
 /// by bytes, as a ring's was: a write fits when the capacity less what is
 /// queued holds all of it. Writes shorter than [`SMALL`] are appended to
 /// the last chunk when it has room no other piece shares, or gathered into
-/// a block with [`HEADROOM`]. When [`SEGMENTS`] chunks are held, the two
+/// a packet-sized block. When [`SEGMENTS`] chunks are held, the two
 /// neighbors with the fewest bytes are joined first. Blocks the store
 /// makes are charged to its budget, and a refusal refuses the write.
 /// Compaction allocates only the combined bytes; admission detaches
@@ -36,16 +36,18 @@ pub(crate) struct TxStore {
     /// not share its backing while it still has room for another write.
     gathering: bool,
     budget: Budget,
+    pool: Pool,
 }
 
 impl TxStore {
-    pub(crate) fn new(capacity: usize, budget: Budget) -> TxStore {
+    pub(crate) fn new(capacity: usize, budget: Budget, pool: &Pool) -> TxStore {
         TxStore {
             capacity,
             queued: 0,
             chunks: VecDeque::with_capacity(SEGMENTS),
             gathering: false,
             budget,
+            pool: pool.clone(),
         }
     }
 
@@ -120,7 +122,9 @@ impl TxStore {
         }
         let gathered = short
             .then(|| {
-                let mut block = Chunk::block(&self.budget, HEADROOM, SLOT)?;
+                // Active tails are copied on send, so header space here
+                // would only reduce how many short writes fit together.
+                let mut block = self.pool.take(&self.budget, 0)?;
                 block.extend_within(&chunk).ok()?;
                 Some(block)
             })
@@ -145,7 +149,11 @@ impl TxStore {
         // new bytes to exceed the retention bound; ACK itself never needs
         // to allocate or refuse.
         while self.held().saturating_add(incoming) > bound {
-            let Some(held) = self.chunks.iter_mut().max_by_key(|c| c.capacity() - c.len()) else {
+            let Some(held) = self
+                .chunks
+                .iter_mut()
+                .max_by_key(|c| c.capacity() - c.len())
+            else {
                 return Err(chunk);
             };
             let Some(copy) = Chunk::copy_of(&self.budget, held) else {

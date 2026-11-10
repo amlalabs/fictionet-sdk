@@ -7,7 +7,8 @@
 //! the chunks each connection retains, keepalive, retransmission and TIME-WAIT,
 //! the orphans of closed connections, and what a closed port or a SYN from
 //! port 0 gets. Its time and entropy come from the [`Env`] of each call; it
-//! never polls an interface, sleeps, spawns a task or wakes one.
+//! never polls an interface, sleeps, or spawns a task. Resource availability
+//! wakes its owner through the explicit environment's waker.
 //!
 //! The async [`Endpoint`](super::Endpoint) runs one of these behind its
 //! handles: its task feeds packets in and sends packets out, and its
@@ -183,10 +184,9 @@ impl Sequences {
 /// handed up, and writes each packet it sends into a block of the engine's
 /// [`Pool`]. A block goes back to that pool when whoever took the packet
 /// last drops it, so in a steady exchange the engine sends in the same
-/// blocks again and allocates none. Every block the engine holds is paid
-/// from the pool's control reserve, which covers as many as the output
-/// allowance lets it hold; one leaving the engine keeps its payment, and
-/// the reserve is charged back up before the layer below takes it.
+/// blocks again and allocates none. Data blocks are charged on admission;
+/// control blocks have their own reserve, so a full data budget cannot
+/// prevent an acknowledgement from leaving.
 #[derive(Default)]
 pub(super) struct Output {
     /// What smoltcp sent since the endpoint last looked at its packets.
@@ -196,8 +196,16 @@ pub(super) struct Output {
     /// Where smoltcp's packets are written, once the engine's storage is
     /// reserved.
     pool: Option<Pool>,
-    /// Packets went out since the reserve was last charged back up.
-    short: bool,
+    /// The original owner pays for data and replenishes control blocks.
+    budget: Option<Budget>,
+    /// Acquired before processing input that may need an immediate reply.
+    reply: Option<Chunk>,
+    /// A data allocation retried after memory becomes available.
+    data: Option<Chunk>,
+    waiting_control: bool,
+    waiting_data: bool,
+    /// Gets the engine visited when an outstanding control block returns.
+    task: Option<Waker>,
 }
 
 /// The bytes of one of the engine's packet blocks: room for a header in
@@ -246,12 +254,14 @@ impl Output {
         let packet = match piece {
             Some(mut piece) => match piece.in_place(header, headers) {
                 Some(packet) => packet,
-                None => self.block(len, |bytes| {
-                    bytes[header..].copy_from_slice(piece.bytes());
-                    headers(bytes);
-                }),
+                None => self
+                    .block(len, piece.is_probe(), |bytes| {
+                        bytes[header..].copy_from_slice(piece.bytes());
+                        headers(bytes);
+                    })
+                    .ok_or(())?,
             },
-            None => self.block(len, headers),
+            None => self.block(len, true, headers).ok_or(())?,
         };
         let checksums = Checksums {
             ip_header: true,
@@ -261,25 +271,55 @@ impl Output {
         Ok(())
     }
 
-    /// A packet of `len` bytes that `write` writes every one of, in a block
-    /// from the pool's control reserve, or, before the engine reserved its
-    /// storage, as when a test feeds it directly, in a vector of its own
-    /// that the layer below pays for when it takes it.
-    fn block(&self, len: usize, write: impl FnOnce(&mut [u8])) -> Chunk {
-        match self.pool.as_ref().and_then(|pool| pool.take_control(0)) {
-            Some(mut block) if block.room() >= len => {
-                block.fill(|room| {
-                    write(&mut room[..len]);
-                    len
-                });
-                block
-            }
-            _ => {
-                let mut bytes = vec![0; len];
-                write(&mut bytes);
-                Chunk::unpaid(bytes)
+    /// Keeps room for a reply before the socket consumes an incoming
+    /// segment: processing may advance acknowledgement state immediately.
+    fn reserve_reply(&mut self) -> bool {
+        if self.reply.is_none()
+            && let (Some(pool), Some(budget)) = (&self.pool, &self.budget)
+        {
+            self.reply = pool.take_control(0).or_else(|| pool.take(budget, 0));
+            while self.reply.is_none()
+                && self
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| pool.wait_control(task))
+            {
+                self.reply = pool.take_control(0);
             }
         }
+        self.waiting_control = self.reply.is_none();
+        !self.waiting_control
+    }
+
+    fn reserve_data(&mut self) -> bool {
+        if self.data.is_none()
+            && let (Some(pool), Some(budget)) = (&self.pool, &self.budget)
+        {
+            self.data = pool.take(budget, 0);
+        }
+        self.waiting_data = self.data.is_none();
+        !self.waiting_data
+    }
+
+    /// A paid packet, with every byte written before it is exposed. Data
+    /// never spends the reserve needed for replies and window updates.
+    fn block(&mut self, len: usize, control: bool, write: impl FnOnce(&mut [u8])) -> Option<Chunk> {
+        let mut block = if control {
+            if !self.reserve_reply() {
+                return None;
+            }
+            self.reply.take()?
+        } else {
+            if !self.reserve_data() {
+                return None;
+            }
+            self.data.take()?
+        };
+        block.fill(|room| {
+            write(&mut room[..len]);
+            len
+        })?;
+        Some(block)
     }
 }
 
@@ -798,8 +838,8 @@ impl Conn {
 /// It keeps the chunks segments and writes come in, not rings, so an idle
 /// connection holds no buffer; the blocks it makes to gather short pieces
 /// are charged to `budget`.
-pub(super) fn new_socket(buffer: usize, budget: &Budget) -> stcp::Socket {
-    let mut s = stcp::Socket::new(buffer, buffer, budget.clone());
+pub(super) fn new_socket(buffer: usize, budget: &Budget, pool: &Pool) -> stcp::Socket {
+    let mut s = stcp::Socket::new(buffer, buffer, budget.clone(), pool);
     s.set_tsval_generator(Some(|now| (now.total_micros() / 1000) as u32));
     s.set_nagle_enabled(false);
     s
@@ -893,10 +933,12 @@ impl TcpLayer {
     fn storage_bytes(places: usize) -> Option<usize> {
         // The output queues' places, and the packets the engine builds
         // itself (resets and handshake answers), an MTU each at most. The
-        // packets smoltcp writes are paid from the pool's control reserve.
+        // Control packets use the pool's reserve; data blocks pay on
+        // admission. The two pending blocks have fixed descriptor places.
         let fixed = 2 * UP_ROOM * size_of::<Up>()
             + EGRESS_PACKETS * MTU
-            + 2 * EGRESS_PACKETS * size_of::<Packet>();
+            + 2 * EGRESS_PACKETS * size_of::<Packet>()
+            + 2 * size_of::<Option<Chunk>>();
         // Include socket scheduling, child slots, connection and listener indexes,
         // and the terminal events a batch of socket removals can produce.
         // Four times the entries covers geometric vector/hash capacity and tree
@@ -932,6 +974,7 @@ impl TcpLayer {
             charge.shrink_to(before);
             return false;
         }
+        self.output.budget = Some(charge.budget().clone());
         self.up.reserve_exact(UP_ROOM);
         self.urgent.reserve_exact(UP_ROOM);
         self.output.tx.reserve_exact(EGRESS_PACKETS);
@@ -1267,6 +1310,9 @@ impl TcpLayer {
         now: smoltcp::time::Instant,
         packet: Packet,
     ) -> bool {
+        if !self.reserve_storage(budget) || !self.output.reserve_reply() {
+            return false;
+        }
         // Whatever the packet is, it may be answered directly.
         self.work = true;
         // A segment a stack in this process wrote or checked, unchanged
@@ -1718,7 +1764,11 @@ impl TcpLayer {
             // The listening socket that takes the SYN keeps its buffers for
             // the connection: they are charged before it is made.
             let charge = self.reserve(budget)?;
-            let mut s = new_socket(self.buffer, budget);
+            let mut s = new_socket(
+                self.buffer,
+                budget,
+                self.output.pool.as_ref().expect("reserved storage"),
+            );
             s.listen(dst.port()).expect("a new socket can listen");
             let h = self.add_socket(entropy, s);
             self.reserved.insert(h, charge);
@@ -1783,7 +1833,11 @@ impl TcpLayer {
         let Some(charge) = self.reserve(budget) else {
             return false;
         };
-        let mut s = new_socket(self.buffer, budget);
+        let mut s = new_socket(
+            self.buffer,
+            budget,
+            self.output.pool.as_ref().expect("reserved storage"),
+        );
         s.listen(dst.port()).expect("a new socket can listen");
         s.accept_syn_cookie(dst.into(), src.into(), irs, iss, kept.mss, now);
         let h = self.add_socket(entropy, s);
@@ -2303,7 +2357,11 @@ impl TcpLayer {
             return failed(self, ConnError::Refused);
         };
         let local = SocketAddr::new(addr, port);
-        let mut s = new_socket(self.buffer, env.budget());
+        let mut s = new_socket(
+            self.buffer,
+            env.budget(),
+            self.output.pool.as_ref().expect("reserved storage"),
+        );
         if s.connect(&mut self.context, remote, local).is_err() {
             return failed(self, ConnError::Refused);
         }
@@ -2495,12 +2553,28 @@ impl TcpLayer {
             };
             let sent = self.sockets.set.get_mut(handle).dispatch(
                 &mut self.context,
+                stcp::DispatchMode::All,
                 |_, (ip, tcp, piece)| {
                     self.output.emit(ip, tcp, piece)?;
                     emitted = true;
                     Ok::<_, ()>(())
                 },
             );
+            // Data may wait for memory while a reserved ACK or probe can
+            // still leave. A control pass never advances unsent data.
+            let sent = if sent.is_err() && self.output.waiting_data && !self.output.full() {
+                self.sockets.set.get_mut(handle).dispatch(
+                    &mut self.context,
+                    stcp::DispatchMode::Control,
+                    |_, (ip, tcp, piece)| {
+                        self.output.emit(ip, tcp, piece)?;
+                        emitted = true;
+                        Ok::<_, ()>(())
+                    },
+                )
+            } else {
+                sent
+            };
             self.sockets.set.dispatched(handle, sent.is_err());
             if sent.is_err() {
                 return emitted;
@@ -2513,7 +2587,27 @@ impl TcpLayer {
     fn schedule(&mut self, now: smoltcp::time::Instant) {
         self.context.set_now(now);
         self.sockets.set.schedule(&mut self.context);
-        let at = self.sockets.set.next_deadline();
+        let at = if self.output.waiting_control {
+            // The pool's availability wake retries control work. An
+            // already due emission deadline would only spin meanwhile.
+            None
+        } else if self.output.waiting_data {
+            // Keep ACK and probe timers while data waits for memory;
+            // unsent data alone must not make the deadline immediate.
+            self.sockets
+                .set
+                .iter()
+                .filter_map(|(_, socket)| {
+                    match socket.poll_at(&mut self.context, stcp::DispatchMode::Control) {
+                        smoltcp::socket::PollAt::Ingress => None,
+                        smoltcp::socket::PollAt::Time(at) => Some(at),
+                        smoltcp::socket::PollAt::Now => Some(now),
+                    }
+                })
+                .min()
+        } else {
+            self.sockets.set.next_deadline()
+        };
         self.next = [at, self.next_expiry()]
             .into_iter()
             .flatten()
@@ -2526,7 +2620,6 @@ impl TcpLayer {
         for p in &mut sent {
             self.sent(p);
         }
-        self.output.short |= !sent.is_empty();
         self.output.out.extend(sent.drain(..));
         self.output.tx = sent;
     }
@@ -2683,6 +2776,7 @@ impl Layer for TcpLayer {
         env: &mut Env<'_, ()>,
         event: EventOf<Self::Lower>,
     ) -> Result<Admit<EventOf<Self::Lower>>, Infallible> {
+        self.output.task = Some(env.waker());
         let packet = match event {
             PacketEvent::Ended => {
                 if !self.stopped {
@@ -2699,6 +2793,9 @@ impl Layer for TcpLayer {
             return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
         }
         if self.output.full() || self.up.len() >= UP_ROOM || self.urgent.len() >= UP_ROOM {
+            return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
+        }
+        if !self.output.reserve_reply() {
             return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
         }
         if packet.sort() != Sort::Transport(Transport::Tcp) {
@@ -2809,8 +2906,14 @@ impl Layer for TcpLayer {
     }
 
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
+        self.output.task = Some(env.waker());
         if !self.reserve_storage(env.budget()) {
             return Ok(false);
+        }
+        if self.output.waiting_control && self.output.reserve_reply()
+            || self.output.waiting_data && self.output.reserve_data()
+        {
+            self.work = true;
         }
         if !self.work {
             let before = (self.up.len(), self.urgent.len());
@@ -2823,19 +2926,6 @@ impl Layer for TcpLayer {
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
         let full = self.output.full();
-        // A block leaves with its payment, so the reserve that paid for it
-        // is charged back up first, to the budget that pays for the storage;
-        // without room the packet waits here and the runner waits for memory.
-        // One top-up covers every block the engine holds then, so it is
-        // done once for each batch smoltcp wrote.
-        if self.output.short && !self.output.out.is_empty() {
-            if let (Some(pool), Some(storage)) = (&self.output.pool, &self.storage)
-                && !pool.refill(storage.budget())
-            {
-                return None;
-            }
-            self.output.short = false;
-        }
         match self.output.out.pop_front() {
             Some(packet) => {
                 // Room again: smoltcp may have more to send.
