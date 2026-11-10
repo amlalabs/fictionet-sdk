@@ -12,7 +12,7 @@ use rustls::server::{Accepted, AcceptedAlert, Acceptor, ServerConnection};
 use super::HandshakeError;
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
+    Admit, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
 };
 use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
@@ -109,8 +109,8 @@ impl Job for Pick {
 /// A failure remains available while its alert drains, allowing the carrier to
 /// report the original TLS failure even if sending the alert also fails.
 ///
-/// The budget covers this adapter's hello snapshot and transferred byte
-/// buffers. Rustls owns its protocol and cryptographic allocations separately;
+/// The budget covers this adapter's hello snapshot, the room it keeps for
+/// its next output record, and transferred byte buffers. Rustls owns its protocol and cryptographic allocations separately;
 /// its buffer limits and read readiness bound streaming input and output, but
 /// are not a byte-exact heap limit for handshake state or user configurations.
 pub struct TlsLayer {
@@ -122,7 +122,7 @@ pub struct TlsLayer {
     work: bool,
     deadline: Timers<()>,
     initialized: bool,
-    output_reserve: Option<Charge>,
+    output_reserve: Option<ChargedBytes>,
     alert: Option<AcceptedAlert>,
     reject: bool,
     first_byte: Option<u8>,
@@ -286,9 +286,12 @@ impl TlsLayer {
         self.completed_plaintext_bytes = 0;
     }
 
+    /// Makes room for the next output, the largest record, before anything
+    /// that can produce it. `false`, with nothing allocated, if the budget
+    /// has no room.
     fn reserve_output(&mut self, env: &Env<'_, ()>) -> bool {
         if self.output_reserve.is_none() {
-            self.output_reserve = env.budget().charge(RECORD);
+            self.output_reserve = ChargedBytes::with_capacity(env.budget(), RECORD);
         }
         self.output_reserve.is_some()
     }
@@ -570,50 +573,38 @@ impl Layer for TlsLayer {
             if !self.reserve_output(env) {
                 return Ok(false);
             }
-            let mut charge = self.output_reserve.take().unwrap();
+            let mut output = self.output_reserve.take().unwrap();
             // The reservation holds the largest record, so a single whole
-            // record goes down in the buffer rustls encrypted it into.
-            // Anything else is written into room for exactly what is to go,
-            // up to the reservation: several records coalesced, the rest
-            // of a split record, the rejection, or the alert, whose size is
-            // not known ahead. Either way the reservation then shrinks to
-            // the allocation it covers.
+            // record goes down in the buffer rustls encrypted it into, paid
+            // for by the reservation's charge. Anything else is written
+            // into the reservation, which takes no more than it holds:
+            // several records coalesced, the rest of a split record, the
+            // rejection, or the alert. Either way what goes down is charged
+            // what its allocation holds, and the rest goes back.
             let owned = if self.reject || self.alert.is_some() {
                 None
             } else {
                 self.tls
                     .as_mut()
                     .unwrap()
-                    .take_sendable_tls_chunk(charge.bytes())
+                    .take_sendable_tls_chunk(output.capacity())
             };
             let bytes = if let Some(record) = owned {
-                Chunk::adopt(record, charge).map_err(|_| {
+                let (_, room) = output.into_parts();
+                Chunk::adopt(record, room).map_err(|_| {
                     HandshakeError::Failed("ciphertext outgrew its reservation".to_owned())
                 })?
             } else {
-                let room = if self.reject {
-                    UNRECOGNIZED_NAME.len()
-                } else if self.alert.is_some() {
-                    charge.bytes()
-                } else {
-                    self.tls
-                        .as_ref()
-                        .unwrap()
-                        .sendable_tls_len()
-                        .min(charge.bytes())
-                };
-                charge.shrink_to(room);
-                let mut bytes = charge.into_bytes();
                 let result = if self.reject {
-                    bytes.write(UNRECOGNIZED_NAME.as_slice())
+                    output.write_all(&UNRECOGNIZED_NAME)
                 } else if let Some(alert) = self.alert.as_mut() {
-                    alert.write(&mut bytes)
+                    alert.write(&mut output).map(drop)
                 } else {
-                    self.tls.as_mut().unwrap().write_tls(&mut bytes)
+                    self.tls.as_mut().unwrap().write_tls(&mut output).map(drop)
                 };
                 result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
-                bytes.trim();
-                Chunk::from_bytes(bytes)
+                output.trim();
+                output.into_chunk()
             };
             self.reject = false;
             if bytes.is_empty() {
