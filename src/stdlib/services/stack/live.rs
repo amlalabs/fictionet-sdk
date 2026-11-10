@@ -1,8 +1,9 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, Driver, EventOf, Layer, StreamCommand,
+    Admit, Budget, ByteStream, ChargedBytes, Chunk, Driver, EventOf, Layer, StreamCommand,
     StreamEvent,
 };
 use fictionet::stdlib::network::{ConnError, Connection, Read};
@@ -13,7 +14,7 @@ use super::lifetime::{Expiry, Lifetime, Outstanding};
 use super::{Job, StackError, StreamEnd, StreamLimits};
 
 /// How big each read is. The buffer is charged to the connection's budget
-/// for as long as the connection runs.
+/// before anything is read into it, and kept from read to read.
 pub(super) const READ: usize = 16 * 1024;
 
 /// How many rounds one poll makes before it lets the rest of the world
@@ -41,8 +42,11 @@ pub(crate) enum Halt {
 /// byte flushed once as [`StreamEvent::Written`], polls the stack's work
 /// and gives back what finished, fires the stack's due timers, and keeps
 /// the limits. Then it waits for whichever of those can move next, or, if
-/// the budget refused a charge in the last round, for memory to free. The
-/// stack stays synchronous:
+/// the budget refused a charge in the last round, for memory to free.
+/// Bytes read are paid for before the stack sees them; without room to
+/// pay, the read buffer that already paid for them goes with them, and the
+/// next read waits for memory to pay for a new buffer, leaving the bytes
+/// in the connection meanwhile. The stack stays synchronous:
 /// this only translates readiness, so it behaves the same here as in a
 /// [`Harness`](fictionet::stdlib::layer::Harness).
 ///
@@ -53,9 +57,10 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     conn: C,
     driver: Driver<L>,
     jobs: Jobs<L::Work>,
-    /// The read buffer's charge; `None` if the budget had no room for it.
-    buffer: Option<Charge>,
-    buf: Vec<u8>,
+    /// The read buffer, [`READ`] bytes paid for: `None` once it went to
+    /// the stack with bytes there was no room to pay a copy of, until the
+    /// budget has room for a new one.
+    buf: Option<ChargedBytes>,
     /// Read and not yet taken by the stack.
     input: Option<StreamEvent>,
     /// Taken by the connection and not yet flushed.
@@ -77,6 +82,8 @@ where
     C: Connection,
 {
     /// Runs `stack` over `conn` in the world of `fcx`, charging `budget`.
+    /// A budget without room for the read buffer at the start never runs
+    /// the stack: the run ends with [`StreamEnd::Budget`].
     pub(super) fn new(
         fcx: &Cx,
         conn: C,
@@ -84,23 +91,18 @@ where
         budget: Budget,
         limits: StreamLimits,
     ) -> Live<L, C> {
-        let buffer = budget.charge(READ);
+        let buf = read_buffer(&budget);
         Live {
             conn,
             jobs: Jobs::new(&budget),
             driver: Driver::new(stack, Arc::new(fcx.clone()), budget, fcx.now()),
-            buf: if buffer.is_some() {
-                vec![0; READ]
-            } else {
-                Vec::new()
-            },
-            buffer,
+            stopped: buf.is_none().then_some(StreamEnd::Budget),
+            buf,
             input: None,
             unflushed: 0,
             unreported: 0,
             lifetime: Lifetime::new(limits),
             timer: None,
-            stopped: None,
         }
     }
 
@@ -169,10 +171,6 @@ where
         if let Some(end) = self.stopped {
             return Poll::Ready(Ok(Halt::End(end)));
         }
-        if self.buffer.is_none() {
-            // The stack never runs.
-            return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
-        }
         let polled = self.step(fcx, cx, above, report);
         if let Poll::Ready(Err(StackError::Layer(_))) = &polled {
             // A stack that gave up has nothing more to say.
@@ -210,30 +208,28 @@ where
             let mut read_failed = None;
             let mut moved = false;
             if self.input.is_none() && !self.lifetime.input_over() {
-                match self.conn.poll_read_owned(fcx, cx, &mut self.buf) {
-                    Poll::Ready(Ok(Read::Copied(0))) => self.input = Some(StreamEvent::Ended),
-                    Poll::Ready(Ok(read)) => {
-                        // Charge first, then copy out of the read buffer, or
-                        // move what the connection handed over to this budget.
-                        let budget = self.driver.budget();
-                        let chunk = match read {
-                            Read::Copied(n) => {
-                                ChargedBytes::copy_of(budget, &self.buf[..n]).map(Chunk::from_bytes)
-                            }
-                            Read::Owned(mut chunk) => chunk.repay(budget).then_some(chunk),
-                        };
-                        let Some(chunk) = chunk else {
-                            self.broken(ConnError::Reset, above, report)?;
-                            return Poll::Ready(Ok(Halt::End(self.stop(StreamEnd::Budget))));
-                        };
-                        self.input = Some(StreamEvent::Data(chunk));
-                        self.lifetime.took_input();
+                // A read buffer that went to the stack is paid for again
+                // before the next read. Without room, the bytes stay in
+                // the connection, and the round's refusal gets the stack
+                // woken when memory frees.
+                if self.buf.is_none() {
+                    self.buf = read_buffer(self.driver.budget());
+                }
+                if let Some(buf) = &mut self.buf {
+                    match self.conn.poll_read_owned(fcx, cx, buf) {
+                        Poll::Ready(Ok(Read::Copied(0))) => {
+                            self.input = Some(StreamEvent::Ended);
+                        }
+                        Poll::Ready(Ok(read)) => {
+                            self.input = Some(StreamEvent::Data(self.pay(read)));
+                            self.lifetime.took_input();
+                        }
+                        Poll::Ready(Err(ConnError::Cancelled)) => {
+                            return Poll::Ready(Err(StackError::Cancelled));
+                        }
+                        Poll::Ready(Err(e)) => read_failed = Some(e),
+                        Poll::Pending => {}
                     }
-                    Poll::Ready(Err(ConnError::Cancelled)) => {
-                        return Poll::Ready(Err(StackError::Cancelled));
-                    }
-                    Poll::Ready(Err(e)) => read_failed = Some(e),
-                    Poll::Pending => {}
                 }
                 moved |= self.input.is_some();
             }
@@ -415,6 +411,43 @@ where
         Poll::Pending
     }
 
+    /// The bytes `read` brought, paid for by the stack's budget before the
+    /// stack sees them: a copy out of the read buffer charged first, or the
+    /// chunk the connection handed over moved onto the budget. When the
+    /// budget has no room for that, the read buffer, which paid for its
+    /// bytes already, goes on with them, cut to their size, and the next
+    /// read waits for a new one.
+    fn pay(&mut self, read: Read) -> Chunk {
+        let budget = self.driver.budget();
+        let mut buf = match read {
+            Read::Copied(n) => match ChargedBytes::copy_of(budget, &self.held()[..n]) {
+                Some(copy) => return copy.into_chunk(),
+                None => {
+                    let mut buf = self.buf.take().expect("read into the buffer");
+                    buf.truncate(n);
+                    buf
+                }
+            },
+            Read::Owned(mut chunk) => {
+                if chunk.repay(budget) {
+                    return chunk;
+                }
+                // Never longer than the buffer.
+                let mut buf = self.buf.take().expect("read with the buffer");
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                buf.truncate(chunk.len());
+                buf
+            }
+        };
+        buf.trim();
+        buf.into_chunk()
+    }
+
+    /// The read buffer, while it is here.
+    fn held(&self) -> &[u8] {
+        self.buf.as_deref().expect("read into the buffer")
+    }
+
     /// Gives up on the connection, which failed with `e`: the stack hears
     /// that it is gone and says what it still has to say above, and the run
     /// ends with [`StreamEnd::Conn`].
@@ -444,4 +477,16 @@ where
         }
         Ok(end)
     }
+}
+
+/// A read buffer of [`READ`] bytes, charged to `budget` before it is
+/// allocated, or `None` if the budget has no room for it.
+fn read_buffer(budget: &Budget) -> Option<ChargedBytes> {
+    let mut buf = ChargedBytes::with_capacity(budget, READ)?;
+    buf.fill(|bytes| {
+        bytes.resize(bytes.capacity(), 0);
+        Ok::<_, Infallible>(())
+    })
+    .expect("filling to the capacity never grows it");
+    Some(buf)
 }

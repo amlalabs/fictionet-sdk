@@ -190,6 +190,14 @@ impl Deref for ChargedBytes {
     }
 }
 
+/// The bytes written can change in place, as a read into them does; their
+/// length and capacity cannot.
+impl DerefMut for ChargedBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
+
 impl std::fmt::Debug for ChargedBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChargedBytes")

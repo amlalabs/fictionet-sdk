@@ -103,10 +103,10 @@ pub enum StreamEnd {
     Idle,
     /// The stack reset the connection. Whoever owns the socket resets it.
     Reset,
-    /// The budget had no room for the connection's read buffer, so the
-    /// stack never ran, for its work slots, or for bytes it read.
-    /// When input allocation fails the stack hears
-    /// [`StreamEvent::Reset`](fictionet::stdlib::layer::StreamEvent::Reset).
+    /// The budget had no room for the connection's read buffer at the
+    /// start, so the stack never ran, or for a single place in its table
+    /// of work. Bytes read later that the budget has no room for wait for
+    /// memory instead.
     Budget,
     /// Reading or writing failed: the peer reset the connection, or it
     /// stopped reading ([`ConnError::TimedOut`]). The stack heard
