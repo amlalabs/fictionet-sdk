@@ -42,8 +42,9 @@ use fictionet::{Cx, End, Interface, Packet};
 /// is full is dropped, as a real link drops what its buffer cannot hold.
 /// That is about 21,000 full-size packets: with a 100 ms delay, a direction
 /// fills only above about 320 MB/s. The returned end also holds at most
-/// 32 MiB each way, counted the same way, while it waits to be read, and
-/// drops what is sent past that. Without these limits, a sandbox that sends without pause, or a
+/// 32 MiB each way while it waits to be read, counting each packet's
+/// buffer, its capacity rather than its length, plus 64 bytes, and drops
+/// what is sent past that. Without these limits, a sandbox that sends without pause, or a
 /// world that never reads the returned end, would grow the world's memory
 /// without end.
 ///
@@ -232,8 +233,9 @@ struct Queue {
 const LINK_STORE: usize = 32 << 20;
 
 /// The most each direction of the interface returned by [`delay`],
-/// [`bottleneck`] and [`filter`] holds while it waits to be read, counted
-/// the same way. Past that, packets sent into it are dropped. TCP puts up
+/// [`bottleneck`] and [`filter`] holds while it waits to be read, each
+/// packet counted as its buffer's capacity plus 64 bytes. Past that,
+/// packets sent into it are dropped. TCP puts up
 /// to a window of packets into it at once, so it is as large as the
 /// windows of a hundred connections with the default buffers.
 const LINK_OUTPUT: usize = 32 << 20;
