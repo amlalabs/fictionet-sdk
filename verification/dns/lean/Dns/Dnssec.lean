@@ -104,6 +104,44 @@ class SigScheme where
 
 variable {S : SigScheme}
 
+/-! ### Key tags (RFC 4034 Appendix B)
+
+The symbolic scheme's `keyTag` is the key's number. The real key tag is a function of the DNSKEY RDATA, which
+`keyTagOf` computes and `keytag.json` holds Rust's `key_tag` to. -/
+
+/-- The DNSKEY RDATA on the wire: flags, protocol 3, algorithm, and the public key (RFC 4034 §2.1). -/
+def dnskeyRdata (flags alg : Nat) (pub : Bytes) : Bytes := [flags / 256 % 256, flags % 256, 3, alg % 256] ++ pub
+
+/-- The sum of RFC 4034 Appendix B: octets at even offsets from the start of the RDATA are high octets, at odd
+offsets low ones. -/
+def tagSum : Nat → Bytes → Nat
+  | _, [] => 0
+  | i, b :: bs => (if i % 2 = 0 then b * 256 else b) + tagSum (i + 1) bs
+
+/-- The key tag of a DNSKEY (RFC 4034 Appendix B): the sum with its carries above 16 bits folded in once, kept
+to 16 bits. For algorithm 1, the third-to-last and second-to-last octets of the RDATA, the end of the modulus
+(RFC 4034 Appendix B.1 as RFC 6840 §5.5 corrects it). -/
+def keyTagOf (flags alg : Nat) (pub : Bytes) : Nat :=
+  let rd := dnskeyRdata flags alg pub
+  if alg % 256 = 1 then
+    match rd.reverse with
+    | _ :: y :: x :: _ => x * 256 + y
+    | _ => 0
+  else
+    let ac := tagSum 0 rd
+    (ac + ac / 65536 % 65536) % 65536
+
+/-- An algorithm 1 key's tag is the most significant 16 of the least significant 24 bits of its modulus, which
+ends the public key: its third-to-last and second-to-last octets (RFC 6840 §5.5). -/
+theorem keyTag_alg1 (flags : Nat) (pre : Bytes) (x y z : Nat) :
+    keyTagOf flags 1 (pre ++ [x, y, z]) = x * 256 + y := by
+  simp [keyTagOf, dnskeyRdata, List.reverse_append]
+
+/-- Every other key tag is a 16-bit value. -/
+theorem keyTag_lt {flags alg : Nat} (pub : Bytes) (h : alg % 256 ≠ 1) : keyTagOf flags alg pub < 65536 := by
+  simp only [keyTagOf, h, ↓reduceIte]
+  exact Nat.mod_lt _ (by decide)
+
 /-- An RRSIG: the covered fields and the signature. -/
 structure Rrsig (S : SigScheme) where
   hdr : Header
@@ -232,8 +270,24 @@ def nsec3s (ps : List Payload) : List Nsec3 := ps.filterMap fun
 
 /-! ## Signatures -/
 
-/-- The validity window holds at `t` (RFC 4034 §3.1.5, RFC 4035 §5.3.1). -/
-def windowOk (t : Nat) (h : Header) : Bool := h.inception ≤ t && t ≤ h.expiration
+/-- `a` is before `b` in serial number arithmetic with 32 bits (RFC 1982 §3.2), which RRSIG times use
+(RFC 4034 §3.1.5): both are read modulo 2^32, and `a` is before `b` when `b` is less than 2^31 ahead of it,
+around the wrap. Values exactly 2^31 apart are unordered. -/
+def serialLt (a b : Nat) : Bool :=
+  (a % 4294967296 < b % 4294967296 && b % 4294967296 - a % 4294967296 < 2147483648) ||
+    (b % 4294967296 < a % 4294967296 && a % 4294967296 - b % 4294967296 > 2147483648)
+
+/-- `a` is `b` or before it, in serial number arithmetic (RFC 1982 §3.2). -/
+def serialLe (a b : Nat) : Bool := a % 4294967296 == b % 4294967296 || serialLt a b
+
+/-- The validity window from `inception` to `expiration` holds at `t`: both ends included, compared as serial
+numbers (RFC 4034 §3.1.5, RFC 4035 §5.3.1). The expiration must not be before the inception; Rust reports a
+window that breaks this with EDE 25. -/
+def serialWindow (inception expiration t : Nat) : Bool :=
+  serialLe inception expiration && serialLe inception t && serialLe t expiration
+
+/-- The RRSIG's validity window holds at `t` (RFC 4034 §3.1.5, RFC 4035 §5.3.1). -/
+def windowOk (t : Nat) (h : Header) : Bool := serialWindow h.inception h.expiration t
 
 /-- The labels an RRSIG over records owned by `o` counts: a leading `*` is not counted (RFC 4034 §3.1.3). -/
 def labelsOf : Name → Nat
@@ -279,9 +333,9 @@ bad (6). -/
 def failure (t : Nat) (keys : List Key) : List (Rrsig S) → Ede
   | [] => .rrsigsMissing
   | r :: _ =>
-    if r.hdr.expiration < r.hdr.inception then .expiredBeforeValid
-    else if r.hdr.expiration < t then .expired
-    else if t < r.hdr.inception then .notYetValid
+    if !serialLe r.hdr.inception r.hdr.expiration then .expiredBeforeValid
+    else if !serialLe t r.hdr.expiration then .expired
+    else if !serialLe r.hdr.inception t then .notYetValid
     else if !keys.any (names r) then .dnskeyMissing
     else .bogus
 
@@ -1452,10 +1506,74 @@ structure Signer (S : SigScheme) where
 /-- The signer that holds the private key `p`. -/
 def Signer.ofPriv (p : S.Priv) (alg : Nat) (sep : Bool) : Signer S := ⟨⟨S.pub p, alg, sep⟩, S.sign p⟩
 
+/-- A signing window, in seconds since 1970. Its RRSIGs carry both ends modulo 2^32 (RFC 4034 §3.1.5). -/
 structure Window where
   inception : Nat
   expiration : Nat
 deriving DecidableEq, Repr
+
+/-- The window holds at `t`, as the RRSIGs made over it see it (`serialWindow`). -/
+def Window.holds (w : Window) (t : Nat) : Bool := serialWindow w.inception w.expiration t
+
+theorem serialLt_mod (a b : Nat) : serialLt (a % 4294967296) (b % 4294967296) = serialLt a b := by
+  simp only [serialLt, Nat.mod_mod]
+
+theorem serialLe_mod (a b : Nat) : serialLe (a % 4294967296) (b % 4294967296) = serialLe a b := by
+  simp only [serialLe, serialLt_mod, Nat.mod_mod]
+
+theorem serialWindow_mod (a b t : Nat) :
+    serialWindow (a % 4294967296) (b % 4294967296) t = serialWindow a b t := by
+  have h1 := serialLe_mod a b
+  simp only [serialWindow]
+  rw [h1]
+  have e2 : serialLe (a % 4294967296) t = serialLe a t := by
+    simp only [serialLe, serialLt, Nat.mod_mod]
+  have e3 : serialLe t (b % 4294967296) = serialLe t b := by
+    simp only [serialLe, serialLt, Nat.mod_mod]
+  rw [e2, e3]
+
+/-! ### Serial number arithmetic on windows (RFC 4034 §3.1.5, RFC 1982) -/
+
+/-- A window shorter than 2^31 seconds, about 68 years, holds at every second from its inception to its
+expiration, wherever 2^32 falls between them: serial arithmetic agrees with the order of the seconds there
+(RFC 4034 §3.1.5). -/
+theorem window_linear {inc exp t : Nat} (h1 : inc ≤ t) (h2 : t ≤ exp) (hlen : exp - inc < 2147483648) :
+    (⟨inc, exp⟩ : Window).holds t = true := by
+  simp only [Window.holds, serialWindow, serialLe, serialLt, Bool.and_eq_true, Bool.or_eq_true,
+    beq_iff_eq, decide_eq_true_eq]
+  omega
+
+/-- The check is the same for a window and a time all moved by the same number of seconds: a window across
+the wrap of the 32-bit field holds exactly when the same window away from it does (RFC 4034 §3.1.5,
+RFC 1982 §3.2). -/
+theorem window_wraps (inc exp t k : Nat) :
+    (⟨inc + k, exp + k⟩ : Window).holds (t + k) = (⟨inc, exp⟩ : Window).holds t := by
+  have lt : ∀ a b, serialLt (a + k) (b + k) = serialLt a b := by
+    intro a b
+    apply Bool.eq_iff_iff.mpr
+    simp only [serialLt, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq]
+    omega
+  have le : ∀ a b, serialLe (a + k) (b + k) = serialLe a b := by
+    intro a b
+    apply Bool.eq_iff_iff.mpr
+    simp only [serialLe, Bool.or_eq_true, beq_iff_eq, lt]
+    constructor <;> rintro (h | h) <;> first | exact Or.inr h | (left; omega)
+  simp only [Window.holds, serialWindow, le]
+
+/-- Two values exactly 2^31 apart are unordered (RFC 1982 §3.2): neither is at or before the other. So a time
+2^31 seconds from either end of a window is outside it, and a window 2^31 seconds long holds at no time. -/
+theorem window_half_unordered (a : Nat) :
+    serialLe a (a + 2147483648) = false ∧ serialLe (a + 2147483648) a = false ∧
+      ∀ t, (⟨a, a + 2147483648⟩ : Window).holds t = false := by
+  have h1 : serialLe a (a + 2147483648) = false := by
+    simp only [serialLe, serialLt, Bool.or_eq_false_iff, Bool.and_eq_false_iff, beq_eq_false_iff_ne,
+      decide_eq_false_iff_not]
+    omega
+  refine ⟨h1, ?_, fun t => ?_⟩
+  · simp only [serialLe, serialLt, Bool.or_eq_false_iff, Bool.and_eq_false_iff, beq_eq_false_iff_ne,
+      decide_eq_false_iff_not]
+    omega
+  · simp only [Window.holds, serialWindow, h1, Bool.false_and]
 
 /-- How a signed zone denies: NSEC, or NSEC3 with an empty salt and iterations 0 (RFC 9276 §3.1). -/
 inductive Denial where
@@ -1468,7 +1586,8 @@ of the signer's DNSKEY. -/
 def sigsBy (ss : List (Signer S)) (apex : Name) (w : Window) (labels ttl : Nat) (d : Payload) :
     List (Rrsig S) :=
   ss.map fun s =>
-    let h : Header := ⟨s.dnskey.alg, apex, labels, ttl, w.inception, w.expiration, S.keyTag s.dnskey⟩
+    let h : Header := ⟨s.dnskey.alg, apex, labels, ttl, w.inception % 4294967296, w.expiration % 4294967296,
+      S.keyTag s.dnskey⟩
     ⟨h, s.sign ⟨h, d⟩⟩
 
 /-- The signers of the DNSKEY set: the SEP keys, or every key when none has the bit. -/
@@ -2298,7 +2417,7 @@ the policy validates, and an open window. One such algorithm is enough for a pat
 structure SignsWell (sz : SignedZone S) (P : AlgorithmPolicy) (t : Nat) : Prop where
   honest : ∀ s ∈ sz.signers, s.Honest
   dataAlg : ∃ s ∈ dataSigners sz.signers, P.validate.contains s.dnskey.alg = true
-  window : sz.window.inception ≤ t ∧ t ≤ sz.window.expiration
+  window : sz.window.holds t = true
 
 /-- A DS record the policy supports names an algorithm it validates. -/
 theorem validates_of_supported {P : AlgorithmPolicy} {alg dt : Nat} (h : P.treat alg dt = .supported) :
@@ -2310,8 +2429,10 @@ theorem validates_of_supported {P : AlgorithmPolicy} {alg dt : Nat} (h : P.treat
 
 theorem SignsWell.windowOk {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)
     (a : Nat) (sg : Name) (lb tt tg : Nat) :
-    windowOk t ⟨a, sg, lb, tt, sz.window.inception, sz.window.expiration, tg⟩ = true := by
-  simp [Dnssec.windowOk, hw.window.1, hw.window.2]
+    windowOk t ⟨a, sg, lb, tt, sz.window.inception % 4294967296, sz.window.expiration % 4294967296, tg⟩ =
+      true := by
+  simp only [Dnssec.windowOk, serialWindow_mod]
+  exact hw.window
 
 /-- A signed zone's SEP keys sign its DNSKEY set, so a supported DS record that names one makes the whole set
 trusted. -/

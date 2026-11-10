@@ -667,7 +667,8 @@ example : ∃ e ∈ cache1.entries, ∃ s₀ r, e.key = wwwKey ∧ e.body = .pos
   served_ttl_le_original (s := { wwwTxt with ttl := 250 }) cache1_timed (by decide +kernel)
 
 #print axioms expired_never_served
-example : ∃ e ∈ cache1.entries, e.key = wwwKey ∧ e.generation = cache1.generation ∧ 150 < e.expires :=
+example : ∃ e ∈ cache1.entries, e.generation = cache1.generation ∧ 150 < e.expires ∧
+    (e.key = wwwKey ∨ ∃ m, under wwwKey.name m = true ∧ e.key = ⟨m, anyType⟩ ∧ e.body.isNx = true) :=
   expired_never_served (s := .positive { wwwTxt with ttl := 250 } .secure) (by decide +kernel)
 
 #print axioms rrsig_caps_ttl
@@ -679,21 +680,55 @@ example : ∀ e, entryFor 100 limits 0 (.positive wwwTxt .authAnswer .secure (so
 def cache2 : Cache := insert 100 limits ⟨0, []⟩ (.failure wwwKey .noReachableAuthority none)
 
 #print axioms failure_never_negative
-example : ∀ kind soa v, serve 110 cache2 wwwKey ≠ some (.negative kind soa v) :=
+example : serve 110 cache2 wwwKey = some (.failure .noReachableAuthority) :=
   (failure_never_negative (insert_unique (c := ⟨0, []⟩) (by simp [Unique]))
     (e := ⟨wwwKey, .failure .noReachableAuthority, 100, 130, 30, 0⟩)
-    (by decide) rfl rfl).1
+    (by decide) rfl rfl).2 (by decide) (by decide)
 
-#print axioms rank_monotone
-/-- The same TXT records offered as glue at time 120 change nothing. -/
-example : insert 120 limits cache1 (.positive wwwTxt .glue .notPerformed none none false) = cache1 :=
-  rank_monotone cache1_unique (e := ⟨wwwKey, .positive wwwTxt .authAnswer .secure, 100, 400, 300, 0⟩)
-    (by decide +kernel) rfl (by decide)
-    (fun e h => by
-      simp only [entryFor] at h
-      split at h
-      · cases h
-      · cases h; decide)
+/-- An NXDOMAIN for `x.example.com.`, validated Secure, cached at time 100. -/
+def nopeKey : Cache.Key := ⟨[LX, EX, COM], 1⟩
+def soaSet : RRset := ⟨[EX, COM], 6, 300, [.soa [NS, EX, COM] [HOST, EX, COM] 1 7200 3600 1209600 300]⟩
+def cache3 : Cache := insert 100 limits ⟨0, []⟩ (.negative nopeKey .nxDomain (some soaSet) .authAnswer none .secure
+  none none false)
+def nxEntry : Entry := ⟨⟨[LX, EX, COM], anyType⟩, .negative .nxDomain soaSet .authAnswer .secure, 100, 400, 300, 0⟩
+
+theorem cache3_unique : Unique cache3 := insert_unique (c := ⟨0, []⟩) (by simp [Unique])
+
+#print axioms nxdomain_every_type
+/-- It answers `x.example.com.` for MX too. -/
+example : serve 150 cache3 ⟨[LX, EX, COM], 15⟩ = some (render 150 nxEntry) :=
+  nxdomain_every_type cache3_unique (by decide +kernel) rfl (by decide) rfl 15
+
+#print axioms nxdomain_below
+/-- And every name below it. -/
+example : ∃ e' ∈ cache3.entries, e'.body.isNx = true ∧
+    serve 150 cache3 ⟨[WWW, LX, EX, COM], 1⟩ = some (render 150 e') :=
+  nxdomain_below cache3_unique (e := nxEntry) (by decide +kernel) rfl (by decide) rfl rfl _ (by decide)
+
+#print axioms data_ends_nxdomain
+/-- An A record at `www.x.example.com.` ends it: no NXDOMAIN of its rank or below is left at or above that name. -/
+def wwwX : RRset := ⟨[WWW, LX, EX, COM], 1, 300, [.a [192, 0, 2, 7]]⟩
+example : ∀ x ∈ (insert 160 limits cache3 (.positive wwwX .authAnswer .notPerformed none none false)).entries,
+    live (insert 160 limits cache3 (.positive wwwX .authAnswer .notPerformed none none false)) 160 x = true →
+    under [WWW, LX, EX, COM] x.key.name = true → x.body.isNx = true → Rank.authAnswer.level < x.body.rank.level :=
+  data_ends_nxdomain (e := ⟨⟨[WWW, LX, EX, COM], 1⟩, .positive wwwX .authAnswer .notPerformed, 160, 460, 300, 0⟩)
+    (by decide +kernel) rfl (by decide +kernel)
+
+/-- And indeed none is left at all. -/
+example : (insert 160 limits cache3 (.positive wwwX .authAnswer .notPerformed none none false)).entries.all
+    (·.body.isNx = false) := by decide +kernel
+
+#print axioms nodata_keyed_by_type
+/-- A NODATA for `www.example.com.` TXT. -/
+def cache4 : Cache := insert 100 limits ⟨0, []⟩ (.negative wwwKey .noData (some soaSet) .authAnswer none .secure
+  none none false)
+
+example : ∃ e ∈ cache4.entries, e.key = wwwKey ∧ live cache4 150 e = true ∧
+    ∃ soa₀ r, e.body = .negative .noData soa₀ r .secure :=
+  nodata_keyed_by_type (soa := { soaSet with ttl := 250 }) (by decide +kernel)
+
+/-- It answers nothing for another type at the name. -/
+example : serve 150 cache4 ⟨[WWW, EX, COM], 1⟩ = none := by decide +kernel
 
 end Cache
 
@@ -757,5 +792,52 @@ example : ∀ r st' ls', run net .all config state0 qWww [false, true] = some (r
   fun _ _ _ h => glue_never_served net_wf cache0_ok h
 
 end Resolver
+
+/-! ## Signature windows, key tags, and QNAME minimisation -/
+
+section Audit
+open Dnssec Resolver
+
+#print axioms window_linear
+/-- A window that starts 50 seconds before 2^32 and ends 50 seconds after holds 10 seconds after the wrap. -/
+example : (⟨4294967246, 4294967346⟩ : Window).holds 4294967306 = true :=
+  window_linear (by decide) (by decide) (by decide)
+
+#print axioms window_wraps
+/-- The same window and time moved back below 2^32. -/
+example : (⟨4294967246, 4294967346⟩ : Window).holds 4294967306 = (⟨100, 200⟩ : Window).holds 160 :=
+  window_wraps 100 200 160 4294967146
+
+#print axioms window_half_unordered
+/-- A window 2^31 seconds long holds at no time, not even its inception. -/
+example : (⟨100, 100 + 2147483648⟩ : Window).holds 100 = false := (window_half_unordered 100).2.2 100
+
+/-- A time more than 2^31 seconds past the expiration reads as before the inception: not yet valid. -/
+example : failure (S := Sch) (200 + 2147483649) []
+    [⟨⟨13, [], 0, 0, 100, 200, 0⟩, ((0 : Nat), ⟨⟨13, [], 0, 0, 100, 200, 0⟩, .keys [] []⟩)⟩] = .notYetValid := by
+  decide
+
+#print axioms keyTag_alg1
+example : keyTagOf 257 1 [3, 1, 0, 1, 0xab, 0xcd, 0xef] = 0xab * 256 + 0xcd :=
+  keyTag_alg1 257 [3, 1, 0, 1] 0xab 0xcd 0xef
+
+#print axioms keyTag_lt
+example : keyTagOf 257 8 (List.replicate 300 255) < 65536 := keyTag_lt _ (by decide)
+
+#print axioms minimise_shows_more
+/-- Under the bounds RFC 9156 §2.3 recommends, the first query below `com.` for a name of six labels shows two. -/
+example : (⟨10, 4⟩ : Resolver.Minimise).next 1 6 0 = some 2 := by decide
+
+example : ∀ l, (⟨10, 4⟩ : Resolver.Minimise).next 1 6 0 = some l → 1 < l ∧ l < 6 :=
+  fun _ h => ⟨(minimise_shows_more h).1, (minimise_shows_more h).2.1⟩
+
+#print axioms run_ends
+/-- A name of 40 labels below the root takes nine minimised queries, showing 1, 2, 3, 4, 10, 16, 22, 28, and 34
+labels, then the whole question. -/
+example : (⟨10, 4⟩ : Resolver.Minimise).run 40 40 0 0 = [1, 2, 3, 4, 10, 16, 22, 28, 34] := by decide
+
+example : ((⟨10, 4⟩ : Resolver.Minimise).run 40 40 0 0).length ≤ 10 := (run_ends _ 40 0).1
+
+end Audit
 
 end Dns.Examples

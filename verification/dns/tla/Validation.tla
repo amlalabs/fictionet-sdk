@@ -16,7 +16,8 @@
 (*   signer[z]  the key zone z is signed with: A, B, or none (unsigned)    *)
 (*   proof[z]   what z's parent says about z: a DS naming key A or B, a    *)
 (*              signed no-DS proof, an NSEC3 opt-out cover with a closest- *)
-(*              encloser proof, an NSEC denying the name, or nothing       *)
+(*              encloser proof, an NSEC denying the name, an NSEC that     *)
+(*              matches the name but lacks the NS bit, or nothing          *)
 (*   window[z]  when z's signatures are valid: past, now, or future        *)
 (*   alg[z]     the algorithm the DS (or the anchor) names for z:          *)
 (*              supported, SHA-1 based (5 or 7), or unknown                *)
@@ -39,7 +40,8 @@
 (* Ablation flags: PolicyAlgs is the policy value (adding "sha1" accepts   *)
 (* algorithm 5), TrustUpstreamAd copies an upstream AD bit,                *)
 (* MissingAsInsecure reads a failed fetch as Insecure, SignerPeek lets the *)
-(* validator skip a check for records from signer A.                       *)
+(* validator skip a check for records from signer A, and CheckNsBit FALSE  *)
+(* takes a matching NSEC without the NS bit as a no-DS proof.              *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -49,7 +51,8 @@ CONSTANTS
     PolicyAlgs,        \* the algorithms AlgorithmPolicy.validate admits
     TrustUpstreamAd,   \* ablation: AD from upstream reaches the client
     MissingAsInsecure, \* ablation: a failed fetch is Insecure
-    SignerPeek         \* ablation: the validator reads the signer implementation
+    SignerPeek,        \* ablation: the validator reads the signer implementation
+    CheckNsBit         \* FALSE is the ablation: a no-DS proof needs no NS bit
 
 Path == <<"root", "tld", "sld">>
 Zones == {"root", "tld", "sld"}
@@ -139,6 +142,13 @@ Walk(r, impl, i, expect) ==
                 \* A covering NSEC proves no delegation, so the proof stays
                 \* unproven (Nsecs::no_ds, from_proof).
                 [] p = "Nsec"           -> V("Bogus", "ede12")
+                \* A signed NSEC that matches the child's name but lacks the
+                \* NS bit shows the name is no delegation, so it proves no
+                \* unsigned delegation there (RFC 6840 section 4.4,
+                \* Nsecs::no_ds and Nsec3s::no_ds). An attacker can replay
+                \* one from a name that is not a cut.
+                [] p = "NsecNoNs"       ->
+                     IF CheckNsBit THEN V("Bogus", "ede12") ELSE V("Insecure", "ProvenNoDs")
                 [] p = "Nothing"        -> V("Bogus", "ede12")   \* no DS and no denial
 
 Validate(r, impl) ==
@@ -241,7 +251,7 @@ RecordsOnly ==
 (* changed after signing is SignatureInvalid.                              *)
 ChainProblems ==
     { <<"DsMismatch", c>> : c \in {c \in Children : proof[c] \in {"DsA", "DsB"} /\ signer[c] # DsKey(proof[c])} }
-    \cup { <<"NoDsProofMissing", c>> : c \in {c \in Children : proof[c] \in {"Nsec", "Nothing"}} }
+    \cup { <<"NoDsProofMissing", c>> : c \in {c \in Children : proof[c] \in {"Nsec", "NsecNoNs", "Nothing"}} }
     \cup { <<"WindowClosed", z>> : z \in {z \in Zones : signer[z] # "none" /\ window[z] # "now"} }
     \cup { <<"UnsupportedAlgorithm", z>> : z \in {z \in Zones : signer[z] # "none" /\ alg[z] \notin PolicyAlgs} }
     \cup { <<"SignatureInvalid", z>> : z \in {z \in Zones : signer[z] # "none" /\ Stale(1, z)} }

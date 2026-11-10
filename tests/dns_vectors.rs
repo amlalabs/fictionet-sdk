@@ -2547,8 +2547,9 @@ fn served_lines(set: &RecordSet, ttl: u64) -> Vec<String> {
 }
 
 /// What the cache serves for `key` at `now`, as `cache.json` writes it:
-/// an NXDOMAIN at the name first, as the resolver looks (RFC 8020), then
-/// the entry under the key itself.
+/// an NXDOMAIN at the name, or a Secure one above it, first, as
+/// `Resolver::cached` looks (RFC 2308 §5, RFC 8020 §2), then the entry
+/// under the key itself.
 fn served(cache: &Cache, key: &Key, now: Instant) -> String {
     let left = |expires: Instant| {
         expires
@@ -2558,7 +2559,6 @@ fn served(cache: &Cache, key: &Key, now: Instant) -> String {
     };
     let entry = cache
         .nxdomain_above(&key.name, key.class, now)
-        .filter(|(at, _)| **at == key.name)
         .map(|(_, entry)| entry)
         .or_else(|| cache.get(key, now));
     match entry {
@@ -3267,5 +3267,58 @@ fn resolver() {
             )?;
         }
         Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------
+// keytag.json: dnssec::key_tag
+// ---------------------------------------------------------------------
+
+/// The key tag of each vector's DNSKEY RDATA, by RFC 4034 Appendix B with
+/// the correction of RFC 6840 §5.5 for algorithm 1.
+#[test]
+fn keytag() {
+    each_case("keytag", |case, _| {
+        let input = field(case, "input");
+        let algorithm = hickory_proto::dnssec::Algorithm::from_u8(number(input, "algorithm") as u8);
+        let key = DNSKEY::with_flags(
+            number(input, "flags") as u16,
+            PublicKeyBuf::new(unhex(text(input, "public_key")), algorithm),
+        );
+        same(
+            "key tag",
+            number(field(case, "expected"), "tag"),
+            u64::from(key_tag(&key)),
+        )
+    });
+}
+
+// ---------------------------------------------------------------------
+// minimise.json: resolver::Minimise
+// ---------------------------------------------------------------------
+
+/// How many labels the next minimised query shows (RFC 9156 §2.3), or the
+/// whole question.
+#[test]
+fn minimise() {
+    use fictionet::stdlib::services::dns::resolver::Minimise;
+    each_case("minimise", |case, _| {
+        let input = field(case, "input");
+        let bounds = Minimise {
+            max_queries: number(input, "max_queries") as u8,
+            one_label: number(input, "one_label") as u8,
+        };
+        let rust = bounds.next_labels(
+            number(input, "known") as usize,
+            number(input, "total") as usize,
+            number(input, "steps") as u8,
+        );
+        same(
+            "labels",
+            field(case, "expected")
+                .get("labels")
+                .and_then(Value::as_u64),
+            rust.map(|labels| labels as u64),
+        )
     });
 }
