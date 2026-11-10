@@ -7,9 +7,10 @@ use super::StreamLimits;
 /// moves the bytes and reports what happened; this decides.
 ///
 /// The idle limit counts while the stream waits for the peer: input is
-/// open and none is held, no output is held, and no work runs. It starts
-/// again each time the stream begins to wait. The write limit counts while
-/// output is held, from the last byte that went out.
+/// open and none is held, no output is held, no work runs, and the stream
+/// does not wait for memory. It starts again each time the stream begins
+/// to wait. The write limit counts while output is held, from the last
+/// byte that went out, whether or not the stream also waits for memory.
 pub(super) struct Lifetime {
     limits: StreamLimits,
     /// When the idle limit started counting, while the stream waits.
@@ -22,7 +23,7 @@ pub(super) struct Lifetime {
 }
 
 /// What a stream still has under way, as its adapter sees it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Outstanding {
     /// Output the transport has not taken.
     pub(super) output: bool,
@@ -30,6 +31,10 @@ pub(super) struct Outstanding {
     pub(super) input: bool,
     /// Work the application handed over that has not finished.
     pub(super) work: bool,
+    /// The stream waits for memory: the budget refused a charge in the
+    /// round that settles, and the release that makes room for it wakes
+    /// the stream. Time spent so is not spent waiting for the peer.
+    pub(super) memory: bool,
 }
 
 /// A limit that ran out.
@@ -99,14 +104,16 @@ impl Lifetime {
     }
 
     /// Starts or stops each limit's clock for what is `outstanding` as of
-    /// `now`.
+    /// `now`. Waiting for memory stops the idle clock as work does; the
+    /// write clock does not hear of it, since a peer that does not read is
+    /// not a memory problem.
     pub(super) fn settle(&mut self, now: Instant, outstanding: Outstanding) {
         if outstanding.output {
             self.stalled_since.get_or_insert(now);
             self.idle_from = None;
         } else {
             self.stalled_since = None;
-            if self.input_over || outstanding.input || outstanding.work {
+            if self.input_over || outstanding.input || outstanding.work || outstanding.memory {
                 self.idle_from = None;
             } else {
                 self.idle_from.get_or_insert(now);
@@ -156,3 +163,117 @@ impl Lifetime {
             && !outstanding.work
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use fictionet::{Entropy, Seed, SeededEntropy};
+
+    use super::*;
+
+    /// What a random step does to a lifetime.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        Settle(Outstanding),
+        TookInput,
+        Wrote,
+        Interrupt,
+    }
+
+    fn any_step(rng: &SeededEntropy) -> Step {
+        match rng.random_below(8) {
+            0 => Step::TookInput,
+            1 => Step::Wrote,
+            2 => Step::Interrupt,
+            _ => Step::Settle(Outstanding {
+                output: rng.random_below(4) == 0,
+                input: rng.random_below(4) == 0,
+                work: rng.random_below(4) == 0,
+                memory: rng.random_below(3) == 0,
+            }),
+        }
+    }
+
+    fn apply(lifetime: &mut Lifetime, now: Instant, step: Step) {
+        match step {
+            Step::Settle(outstanding) => lifetime.settle(now, outstanding),
+            Step::TookInput => lifetime.took_input(),
+            Step::Wrote => lifetime.wrote(),
+            Step::Interrupt => lifetime.interrupt(),
+        }
+    }
+
+    /// Random steps at random times, against a model of when the stream
+    /// was last busy. After every step: the idle deadline is never earlier
+    /// than an idle limit after the first settle that found the stream
+    /// quiet since its last busy one, busy being any of output, input,
+    /// work or memory; a settle that finds it waiting for memory leaves no
+    /// idle deadline; and a twin that sees the same steps without memory
+    /// has the same write deadline at every step, so memory never moves it.
+    #[test]
+    fn the_idle_deadline_never_falls_inside_a_wait_for_memory() {
+        let mut waits = 0;
+        for seed in 0..256 {
+            let rng = SeededEntropy::new(Seed::from_u64(seed));
+            let limits = StreamLimits {
+                idle: Some(Duration::from_millis(1 + rng.random_below(50))),
+                write_timeout: Some(Duration::from_millis(1 + rng.random_below(50))),
+            };
+            let idle = limits.idle.unwrap();
+            let mut lifetime = Lifetime::new(limits);
+            let mut twin = Lifetime::new(limits);
+            let mut now = Instant::ZERO;
+            let mut quiet_from: Option<Instant> = None;
+            for _ in 0..64 {
+                now = now + Duration::from_millis(rng.random_below(30));
+                let step = any_step(&rng);
+                apply(&mut lifetime, now, step);
+                let twin_step = match step {
+                    Step::Settle(outstanding) => Step::Settle(Outstanding {
+                        memory: false,
+                        ..outstanding
+                    }),
+                    other => other,
+                };
+                apply(&mut twin, now, twin_step);
+                if let Step::Settle(o) = step {
+                    if o.output || o.input || o.work || o.memory {
+                        quiet_from = None;
+                    } else {
+                        quiet_from.get_or_insert(now);
+                    }
+                    if o.memory && !o.output {
+                        waits += 1;
+                        assert_eq!(
+                            lifetime.deadline(),
+                            None,
+                            "seed {seed}: an idle deadline while waiting for memory"
+                        );
+                    }
+                }
+                if let Some((at, Expiry::Idle)) = lifetime.deadline() {
+                    let quiet = quiet_from.expect("an idle deadline only while quiet");
+                    assert!(
+                        at >= quiet + idle,
+                        "seed {seed}: the idle deadline {at:?} is within the limit of {quiet:?}"
+                    );
+                }
+                let stalled = |l: &Lifetime| {
+                    l.deadline()
+                        .filter(|(_, expiry)| *expiry == Expiry::Stalled)
+                };
+                assert_eq!(
+                    stalled(&lifetime),
+                    stalled(&twin),
+                    "seed {seed}: memory moved the write deadline"
+                );
+            }
+        }
+        assert!(waits > 0, "the steps waited for memory");
+    }
+}
+
+#[cfg(kani)]
+#[path = "../../../../verification/layer-runtime/kani/lifetime.rs"]
+mod proofs;

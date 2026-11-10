@@ -2112,6 +2112,41 @@ mod memory {
         .unwrap();
     }
 
+    /// A stack that waits for memory is not waiting for its peer: an idle
+    /// limit far shorter than the wait does not end its input, and the
+    /// release, with no packet or timer, gets it run at once.
+    #[test]
+    fn a_stack_waiting_for_memory_is_not_idle() {
+        block_on(lab(Seed::from_u64(7), |fcx| async move {
+            let (budget, hog) = tight();
+            let got = Got::default();
+            let stack = Hungry::new(got.clone());
+            let run = fcx.spawn(move |fcx| async move {
+                let limits = StreamLimits {
+                    idle: Some(Duration::from_millis(10)),
+                    write_timeout: None,
+                };
+                let info = ConnInfo::default();
+                let end = stream(&fcx, Silent, &info, stack, budget, limits, |_| {}).await;
+                assert_eq!(
+                    end.ok(),
+                    Some(StreamEnd::Finished),
+                    "the idle limit never ran while the stack waited for memory"
+                );
+                Ok(())
+            });
+            let freed = free_after_refusal(&fcx, hog, &got).await?;
+            assert_eq!(
+                *got.lock(),
+                Some(freed),
+                "the release woke the run, with no timer"
+            );
+            run.join(&fcx).await?;
+            Ok(())
+        }))
+        .unwrap();
+    }
+
     #[test]
     fn a_datagram_stack_refused_memory_runs_again_when_it_frees() {
         block_on(lab(Seed::from_u64(6), |fcx| async move {

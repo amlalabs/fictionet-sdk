@@ -42,7 +42,8 @@ pub(crate) enum Halt {
 /// byte flushed once as [`StreamEvent::Written`], polls the stack's work
 /// and gives back what finished, fires the stack's due timers, and keeps
 /// the limits. Then it waits for whichever of those can move next, or, if
-/// the budget refused a charge in the last round, for memory to free.
+/// the budget refused a charge in the last round, for memory to free; the
+/// idle limit does not count while it waits for memory.
 /// Bytes read are paid for before the stack sees them; without room to
 /// pay, the read buffer that already paid for them goes with them, and the
 /// next read waits for memory to pay for a new buffer, leaving the bytes
@@ -71,6 +72,11 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     lifetime: Lifetime,
     /// Armed for the next deadline, and moved as it moves.
     timer: Option<Timer>,
+    /// The budget refused the stack a charge in the last round that
+    /// settled: the stack waits for memory, and the release that makes
+    /// room wakes it. The same refusal that registers the wake stops the
+    /// idle clock, so the two never disagree.
+    memory: bool,
     /// How the run ended, once it has.
     stopped: Option<StreamEnd>,
 }
@@ -106,6 +112,7 @@ where
             unreported: 0,
             lifetime: Lifetime::new(limits),
             timer: None,
+            memory: false,
         }
     }
 
@@ -131,6 +138,7 @@ where
             output: self.writing(),
             input: self.input.is_some(),
             work: !self.jobs.is_empty(),
+            memory: self.memory,
         }
     }
 
@@ -364,7 +372,9 @@ where
                 continue;
             }
 
-            // The limits, as of now.
+            // The limits, as of now. A charge refused in this round has the
+            // stack wait for memory below, and that wait is not idle.
+            self.memory = self.driver.budget().refused_since(refusals);
             self.lifetime.settle(now, self.outstanding());
             match self.lifetime.due(now) {
                 Some(Expiry::Stalled) => {
