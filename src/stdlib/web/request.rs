@@ -99,18 +99,23 @@ impl Head {
     pub(crate) fn in_block(
         mut block: Chunk,
         method: &str,
-        target: &str,
+        target: &[&str],
         version: Version,
     ) -> Result<Self, Error> {
-        if !block.is_empty() || method.len().saturating_add(target.len()) > block.room() {
+        let length = target
+            .iter()
+            .try_fold(method.len(), |len, part| len.checked_add(part.len()));
+        if !block.is_empty() || length.is_none_or(|length| length > block.room()) {
             return Err(Error::HeadTooLong);
         }
         block
             .extend_within(method.as_bytes())
             .map_err(|_| Error::HeadTooLong)?;
-        block
-            .extend_within(target.as_bytes())
-            .map_err(|_| Error::HeadTooLong)?;
+        for part in target {
+            block
+                .extend_within(part.as_bytes())
+                .map_err(|_| Error::HeadTooLong)?;
+        }
         let start = block.len();
         Ok(Self {
             block,
@@ -381,7 +386,7 @@ mod tests {
             let mut head = Head::in_block(
                 pool.take(&budget, 0).unwrap(),
                 "POST",
-                "/path?q=yes",
+                &["/path", "?", "q=yes"],
                 Version::Http11,
             )
             .unwrap();
@@ -416,8 +421,13 @@ mod tests {
     fn a_full_head_block_refuses_another_record_without_changing_fields() {
         let budget = Budget::new(1 << 20);
         let pool = Pool::new(&budget, 2048, 2);
-        let mut head =
-            Head::in_block(pool.take(&budget, 0).unwrap(), "GET", "/", Version::Http11).unwrap();
+        let mut head = Head::in_block(
+            pool.take(&budget, 0).unwrap(),
+            "GET",
+            &["/"],
+            Version::Http11,
+        )
+        .unwrap();
         head.push("Host", b"example.test").unwrap();
         let room = head.block.room();
         let length = (0..room)
@@ -442,8 +452,13 @@ mod tests {
     fn shared_head_storage_cannot_be_extended() {
         let budget = Budget::new(4096);
         let pool = Pool::new(&budget, 2048, 1);
-        let mut head =
-            Head::in_block(pool.take(&budget, 0).unwrap(), "GET", "/", Version::Http11).unwrap();
+        let mut head = Head::in_block(
+            pool.take(&budget, 0).unwrap(),
+            "GET",
+            &["/"],
+            Version::Http11,
+        )
+        .unwrap();
         head.push("Host", b"example.test").unwrap();
         let copy = head.clone();
         assert_eq!(head.push("X", b"value"), Err(Error::HeadTooLong));

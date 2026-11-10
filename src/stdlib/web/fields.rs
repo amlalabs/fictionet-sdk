@@ -22,7 +22,11 @@ impl Fields {
             count += 1;
         }
         Self {
-            block: Chunk::unpaid(bytes),
+            block: if bytes.is_empty() {
+                Chunk::default()
+            } else {
+                Chunk::unpaid(bytes)
+            },
             count,
         }
     }

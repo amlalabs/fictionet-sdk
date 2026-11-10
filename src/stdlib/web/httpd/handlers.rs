@@ -128,7 +128,7 @@ pub(super) fn status_only(status: StatusCode) -> Response {
 #[derive(Clone)]
 pub struct Responses {
     budget: fictionet::Budget,
-    pool: fictionet::Pool,
+    pool: Option<fictionet::Pool>,
 }
 
 impl Responses {
@@ -139,22 +139,39 @@ impl Responses {
     pub(crate) fn pooled(budget: &fictionet::Budget, pool: fictionet::Pool) -> Self {
         Self {
             budget: budget.clone(),
-            pool,
+            pool: Some(pool),
+        }
+    }
+    pub(crate) fn unpooled(budget: &fictionet::Budget) -> Self {
+        Self {
+            budget: budget.clone(),
+            pool: None,
         }
     }
     /// An empty field block. Refusal leaves the budget unchanged.
     pub fn fields(&self) -> Option<crate::stdlib::web::Fields> {
-        crate::stdlib::web::Fields::in_block(self.pool.take(&self.budget, 0)?).ok()
+        let block = match &self.pool {
+            Some(pool) => pool.take(&self.budget, 0)?,
+            None => {
+                let charge = self.budget.charge(2048)?;
+                fictionet::Chunk::paid(vec![0; 2048], charge)
+                    .expect("reserved fields")
+                    .slice(0..0)
+            }
+        };
+        crate::stdlib::web::Fields::in_block(block).ok()
     }
     /// Copies bytes into a charged block, reusing small backings.
     pub fn body(&self, bytes: &[u8]) -> Option<Body> {
         if bytes.is_empty() {
             return Some(Body::empty());
         }
-        let mut block = if bytes.len() <= self.pool.slot() {
-            self.pool.take(&self.budget, 0)?
+        let mut block = if let Some(pool) = &self.pool
+            && bytes.len() <= pool.slot()
+        {
+            pool.take(&self.budget, 0)?
         } else {
-            crate::stdlib::layer::ChargedBytes::with_capacity(&self.budget, bytes.len())?.into()
+            return Some(Body::Full(fictionet::Chunk::copy_of(&self.budget, bytes)?));
         };
         block.extend_within(bytes).ok()?;
         Some(Body::Full(block))
@@ -176,6 +193,47 @@ pub fn text(storage: &Responses, status: StatusCode, body: &str) -> Response {
     response.status = status;
     response.fields = fields;
     response
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn response_storage_preserves_bodies_across_pool_sizes_and_refuses_without_room() {
+        for pooled in [false, true] {
+            let budget = fictionet::Budget::new(1 << 20);
+            let storage = if pooled {
+                Responses::new(&budget)
+            } else {
+                Responses::unpooled(&budget)
+            };
+            for length in [0, 1, 2048, 2049, 8192] {
+                let bytes = "x".repeat(length);
+                let response = text(&storage, StatusCode::OK, &bytes);
+                assert_eq!(response.status, StatusCode::OK);
+                assert_eq!(response.body.bytes().unwrap().as_ref(), bytes.as_bytes());
+                assert_eq!(response.fields.iter().count(), 1);
+                drop(response);
+                assert_eq!(
+                    budget.used(),
+                    storage.pool.as_ref().map_or(0, |p| p.charged())
+                );
+            }
+            drop(storage);
+            assert_eq!(budget.used(), 0);
+            let budget = fictionet::Budget::new(0);
+            let storage = if pooled {
+                Responses::new(&budget)
+            } else {
+                Responses::unpooled(&budget)
+            };
+            let response = text(&storage, StatusCode::OK, "unavailable");
+            assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response.body.bytes().unwrap().is_empty());
+            assert_eq!(budget.used(), 0);
+        }
+    }
 }
 
 /// Runs a protocol after an HTTP/1 response that hands the connection on is

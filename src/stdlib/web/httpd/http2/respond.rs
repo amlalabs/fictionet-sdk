@@ -274,9 +274,21 @@ impl State {
         let responder = self.responder.clone();
         let (parts, ()) = head.into_parts();
         let body = self.body.take().map(Chunk::from).unwrap_or_default();
-        let target = parts.uri.to_string();
+        let uri = &parts.uri;
+        let target = [
+            uri.scheme_str().unwrap_or(""),
+            if uri.scheme().is_some() { "://" } else { "" },
+            uri.authority().map_or("", |a| a.as_str()),
+            uri.path(),
+            if uri.query().is_some() { "?" } else { "" },
+            uri.query().unwrap_or(""),
+        ];
         let size = parts.headers.iter().fold(
-            parts.method.as_str().len().checked_add(target.len()),
+            target
+                .iter()
+                .try_fold(parts.method.as_str().len(), |len, part| {
+                    len.checked_add(part.len())
+                }),
             |size, (name, value)| {
                 size?.checked_add(crate::stdlib::web::Head::record_size(
                     name.as_str().len(),
@@ -284,9 +296,14 @@ impl State {
                 )?)
             },
         );
-        let Some(block) =
-            size.and_then(|size| fictionet::Pool::new(env.budget(), size, 0).take(env.budget(), 0))
-        else {
+        let Some(block) = size.and_then(|size| {
+            let charge = env.budget().charge(size)?;
+            Some(
+                Chunk::paid(vec![0; size], charge)
+                    .expect("reserved head")
+                    .slice(0..0),
+            )
+        }) else {
             self.reset();
             return;
         };
@@ -317,7 +334,7 @@ impl State {
         self.wants = Asked::of(request.head.method());
         let now = env.now();
         self.delivery = Delivery::new(&responder.observe, &request, &responder.conn, now, received);
-        let responses = super::super::Responses::new(env.budget());
+        let responses = super::super::Responses::unpooled(env.budget());
         let reply = match received {
             Received::Complete => responder.handler.call(
                 request,
@@ -345,7 +362,7 @@ impl State {
             )),
         };
         match reply {
-            Reply::Now(response) => self.made(env, response),
+            Reply::Now(response) => self.made(env, response, false),
             Reply::Later(later) => {
                 // Only work still making its response holds the request.
                 self.generation += 1;
@@ -364,7 +381,7 @@ impl State {
     /// The response replaces the request in the budget. One the budget
     /// cannot hold gets `503` instead, so it does not end the connection's
     /// other streams.
-    fn made(&mut self, env: &Env<'_, Infallible>, mut response: Response) {
+    fn made(&mut self, env: &Env<'_, Infallible>, mut response: Response, settle: bool) {
         let delivery = self.delivery.as_ref().map_or(0, |d| d.held);
         let fits = self.hold(env, response_held(&response) + delivery);
         // Response admission uses the head's account: this owner handles
@@ -374,7 +391,7 @@ impl State {
             .charge
             .as_ref()
             .map_or_else(|| env.budget().clone(), |charge| charge.budget().clone());
-        let settled = if fits && matches!(response.body, Body::Stream(_)) {
+        let settled = if fits && settle && matches!(response.body, Body::Stream(_)) {
             let waker = env.waker();
             response
                 .body
@@ -388,7 +405,7 @@ impl State {
             response
         } else {
             drop(response);
-            let mut response = over_budget(&super::super::Responses::new(&budget));
+            let mut response = over_budget(&super::super::Responses::unpooled(&budget));
             if !self.hold(env, response_held(&response) + delivery)
                 || !response.fields.admit(&budget)
                 || !response.body.admit(&budget)
@@ -606,12 +623,13 @@ impl Layer for Respond {
         }
         match done.answer {
             Answer::Made(_) if !matches!(state.stage, Stage::Making) => {}
-            Answer::Made(Ok(response)) => state.made(env, response),
+            Answer::Made(Ok(response)) => state.made(env, response, true),
             // An error on the stream's work resets it unanswered.
             Answer::Made(Err(error)) if error.is::<Reset>() => state.reset(),
             Answer::Made(Err(error)) => state.made(
                 env,
-                error_response(&super::super::Responses::new(env.budget()), &error),
+                error_response(&super::super::Responses::unpooled(env.budget()), &error),
+                false,
             ),
             Answer::Frame(..) if !matches!(state.stage, Stage::Polling) => {}
             Answer::Frame(body, Some(Ok(mut chunk))) => {

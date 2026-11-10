@@ -586,8 +586,11 @@ impl RequestStream {
             } else if need <= large.slot() {
                 large.take(budget, 0)
             } else {
-                fictionet::stdlib::layer::ChargedBytes::with_capacity(budget, need)
-                    .map(fictionet::Chunk::from)
+                budget.charge(need).map(|charge| {
+                    fictionet::Chunk::paid(vec![0; need], charge)
+                        .expect("reserved input")
+                        .slice(0..0)
+                })
             }) else {
                 return 0;
             };
@@ -696,6 +699,54 @@ mod retained_input_tests {
         drop(small);
         drop(large);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn heads_larger_than_the_pool_class_survive_fragmentation() {
+        let value = "x".repeat(6000);
+        let wire = format!(
+            "GET / HTTP/1.1\r\nHost: a\r\n{}\r\n",
+            format!("X-Field: {value}\r\n").repeat(4)
+        );
+        for piece in [4096, 10000, wire.len()] {
+            let budget = Budget::new(1 << 20);
+            let small = Pool::new(&budget, 2048, 4);
+            let large = Pool::new(&budget, 16384 + 64, 2);
+            let mut decoder = RequestEvents::new();
+            decoder.storage(budget.clone(), small, large);
+            let mut stream = RequestStream::new(decoder);
+            let mut head = None;
+            let mut complete = false;
+            for part in wire.as_bytes().chunks(piece) {
+                let mut input = Chunk::unpaid(part.to_vec());
+                assert_eq!(stream.push(&mut input), part.len());
+                drop(input);
+                while let Some(event) = stream.next() {
+                    match event.unwrap() {
+                        Event::Head(value) => {
+                            assert!(head.replace(value).is_none());
+                        }
+                        Event::Done => {
+                            assert!(!complete);
+                            complete = true;
+                        }
+                        Event::Body(_) => panic!("bodyless request"),
+                    }
+                }
+            }
+            assert!(complete);
+            let head = head.unwrap();
+            assert!(
+                head.fields()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(b"x-field"))
+                    .map(|(_, bytes)| bytes)
+                    .eq(std::iter::repeat_n(value.as_bytes(), 4))
+            );
+            drop(stream);
+            assert_eq!(budget.used(), head.held());
+            drop(head);
+            assert_eq!(budget.used(), 0);
+        }
     }
 }
 
@@ -2256,7 +2307,7 @@ fn request_syntax_in(
         .checked_add(method.len())
         .and_then(|n| n.checked_add(target.len()))
         .ok_or(Error::HeadTooLong)?;
-    let mut head = Head::in_block(block(size)?, method, target, version)?;
+    let mut head = Head::in_block(block(size)?, method, &[target], version)?;
     split_head(b, lenient, |name, value| {
         head.push(
             std::str::from_utf8(name.of(b)).map_err(|_| Error::Header)?,
