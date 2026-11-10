@@ -452,6 +452,8 @@ pub enum UnavailableReason {
     NoCaptures,
     NoSearchKey,
     NoModelKey,
+    /// The host lets the world copy only what searches allow.
+    SearchedOnly,
 }
 impl Availability {
     fn new(available: bool, reason: UnavailableReason) -> Self {
@@ -1072,7 +1074,14 @@ async fn open_console(
     pieces::upgrade(upgrade, console, screen).await
 }
 fn world_state(pages: &Pages, source: Source, session: Session) -> WorldState {
-    let live = Availability::new(pages.live_available(), UnavailableReason::NoSearchKey);
+    let live_depth =
+        Availability::new(pages.live_depth_available(), UnavailableReason::NoSearchKey);
+    let live = match live_depth {
+        Availability::Available => {
+            Availability::new(pages.live_available(), UnavailableReason::SearchedOnly)
+        }
+        unavailable => unavailable,
+    };
     // A Copied session's day is the day its pages were copied.
     let lag = pages
         .copied_lag()
@@ -1083,13 +1092,12 @@ fn world_state(pages: &Pages, source: Source, session: Session) -> WorldState {
         session,
         copied: Availability::new(pages.has_copied(), UnavailableReason::NoCaptures),
         live,
-        live_depth: live,
-        edited: if !pages.live_available() {
-            Availability::Unavailable {
-                reason: UnavailableReason::NoSearchKey,
+        live_depth,
+        edited: match live {
+            Availability::Available => {
+                Availability::new(pages.edited_available(), UnavailableReason::NoModelKey)
             }
-        } else {
-            Availability::new(pages.edited_available(), UnavailableReason::NoModelKey)
+            unavailable => unavailable,
         },
         date: (time::OffsetDateTime::now_utc() - lag).date().to_string(),
         scenario: pages.scenario(),

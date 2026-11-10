@@ -47,6 +47,15 @@ CLAUDE_CODE_OAUTH_TOKEN_FILE=/path/to/claude-oauth-token \
   demos/downloads/cloudimage
 ```
 
+Or run it with an Anthropic API key in `ANTHROPIC_API_KEY` and no token file.
+An API key is for a demo other people use: the page then offers Live-Depth
+only, since Live and Edited copy any URL the guest asks for. The guest's
+Claude Code signs in the way the image was built: with an API key when
+`ANTHROPIC_API_KEY` is set and `CLAUDE_CODE_OAUTH_TOKEN_FILE` is not, and
+otherwise with a subscription token. Build the image with the same variables
+set as the demo; the build reads neither credential. Without the copied
+corpus on disk, the demo starts without Copied.
+
 The image build makes the workstation's root certificate, the key of its `ops`
 admin account and a placeholder Claude credential once, bakes them into the
 image, and keeps the private halves beside `search-workstation.qcow2`, readable
@@ -191,8 +200,9 @@ Interactive provider sign-in, guest token refresh and API key creation stay
 closed throughout the run. This app provides no tokenless
 Claude sign-in flow.
 
-The host reads `CLAUDE_CODE_OAUTH_TOKEN_FILE` at startup. The guest receives a
-placeholder OAuth token; the gateway substitutes the real token only when
+The host reads `CLAUDE_CODE_OAUTH_TOKEN_FILE`, or else `ANTHROPIC_API_KEY`, at
+startup. The guest receives a placeholder of the same kind, approved in Claude
+Code's settings; the gateway substitutes the real credential only when
 forwarding an admitted Anthropic request. The long-lived token does not refresh
 inside the guest. Account provisioning and any refreshable credentials belong
 on the host. Startup checks and host-token policy reads are answered locally.

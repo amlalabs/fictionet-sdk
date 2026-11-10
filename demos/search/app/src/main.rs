@@ -4,10 +4,11 @@ mod guest;
 use fictionet_search_demo::{network, page};
 
 use fictionet_demo::kit;
+use fictionet_extras::models::ClaudeLogin;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use web_world::{
     Ca, World,
-    pages::{Pages, Seed},
+    pages::{LiveWeb, Pages, Seed},
 };
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -24,19 +25,18 @@ fn downloads() -> Result<PathBuf> {
     Ok(folder.into())
 }
 
-fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
+/// The guest's Claude Code credential kind decides who the demo is for. A
+/// subscription token is the owner's own; an API key serves other people,
+/// who get only the pages their searches allow.
+fn app_pages(seed: Seed, downloads: &std::path::Path, login: Option<ClaudeLogin>) -> Result<Pages> {
     use web_world::pages::model::Model;
     let model = if std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()) {
         Some(Model::openrouter()?)
     } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()) {
         Some(Model::anthropic()?)
-    } else if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
-        let value = std::fs::read_to_string(path)
-            .map_err(|_| "Cannot read the host Claude OAuth token file")?;
-        let secret =
-            fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
+    } else if login == Some(ClaudeLogin::Subscription) {
         Some(Model::claude_token(
-            fictionet_extras::models::Key::claude_token(secret)?,
+            fictionet_extras::models::Key::claude_token(ClaudeLogin::Subscription.host_secret()?)?,
         ))
     } else {
         None
@@ -49,7 +49,11 @@ fn app_pages(seed: Seed, downloads: &std::path::Path) -> Result<Pages> {
         pages = pages.with_editor(model);
     }
     if std::env::var("EXA_API_KEY").is_ok_and(|key| !key.is_empty()) {
-        pages = pages.with_live_search(downloads)?;
+        let web = match login {
+            Some(ClaudeLogin::ApiKey) => LiveWeb::SearchedOnly,
+            Some(ClaudeLogin::Subscription) | None => LiveWeb::Any,
+        };
+        pages = pages.with_live_search(downloads, web)?;
     }
     Ok(pages)
 }
@@ -80,24 +84,30 @@ async fn main() -> Result {
     let roots = Arc::new(fictionet_extras::zscaler::Roots::from_pem(&read_baked(
         baked.trust_root(),
     )?)?);
-    // The guest's Claude Code reaches Anthropic with this token through the
-    // gateway; the editor uses an API key of its own.
-    let claude_token = if let Some(path) = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE") {
-        let value = std::fs::read_to_string(path)
-            .map_err(|_| "Cannot read the host Claude OAuth token file")?;
-        let secret =
-            fictionet_extras::models::Secret::new("Claude OAuth token", value.trim().into())?;
-        Some(fictionet_extras::models::Credential::claude_token(
-            secret,
-            read_baked(baked.placeholder())?,
-        )?)
-    } else {
-        None
+    // The guest's Claude Code reaches Anthropic with this credential through
+    // the gateway; the editor uses an API key of its own when it has one.
+    let login = ClaudeLogin::of_host();
+    let claude_token = match login {
+        Some(login) => {
+            let placeholder = read_baked(baked.placeholder())?;
+            if ClaudeLogin::of(&placeholder) != Some(login) {
+                return Err(format!(
+                    "The workstation image was built for another Claude sign-in than the host's {login:?}; rebuild it with cargo xtask-host search-image <downloads> and the same credential set"
+                )
+                .into());
+            }
+            Some(fictionet_extras::models::Credential::claude(
+                login,
+                login.host_secret()?,
+                placeholder,
+            )?)
+        }
+        None => None,
     };
     let mut seed = Seed::builtin(SEED)?;
     let today = time::OffsetDateTime::now_utc().date();
     seed.date = today.to_string();
-    let pages = Arc::new(app_pages(seed.clone(), &downloads)?);
+    let pages = Arc::new(app_pages(seed.clone(), &downloads, login)?);
     let output = downloads.join("search");
     std::fs::create_dir_all(&output)?;
     let (page, (observations, commands)) = page::Page::new(pages.clone());

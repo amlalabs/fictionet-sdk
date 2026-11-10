@@ -297,15 +297,87 @@ pub fn start(
             }
         })?;
     Ok(Backend {
-        socket,
+        socket: Some(socket),
         thread: Some(thread),
         stop,
     })
 }
 
-/// Owns the listener and joins its worker when the VM disconnects.
+/// Starts moving frames between the kit's TAP device `tap`, which the
+/// kernel redirects to and from the VM's, and `to_world`/`rx`, until the
+/// backend is dropped. Each read is one Ethernet frame.
+pub fn start_tap(
+    tap: std::os::fd::OwnedFd,
+    to_world: Sender<Vec<u8>>,
+    rx: RxQueue,
+) -> std::io::Result<Backend> {
+    let (exit, stop) = new_event_consumer_and_notifier(EventFlag::NONBLOCK)?;
+    let thread = thread::Builder::new()
+        .name("fictionet-tap".to_string())
+        .spawn(move || {
+            use std::io::{Read, Write};
+            use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent};
+            const TAP: u64 = 0;
+            const RX: u64 = 1;
+            const EXIT: u64 = 2;
+            let mut tap = std::fs::File::from(tap);
+            let Ok(epoll) = Epoll::new() else { return };
+            for (fd, token) in [
+                (tap.as_raw_fd(), TAP),
+                (rx.notify.as_raw_fd(), RX),
+                (exit.as_raw_fd(), EXIT),
+            ] {
+                if epoll
+                    .ctl(
+                        ControlOperation::Add,
+                        fd,
+                        EpollEvent::new(EventSet::IN, token),
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let mut buf = vec![0u8; 65_536];
+            let mut events = [EpollEvent::default(); 3];
+            loop {
+                let ready = match epoll.wait(-1, &mut events) {
+                    Ok(ready) => ready,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                };
+                for event in &events[..ready] {
+                    match event.data() {
+                        EXIT => return,
+                        TAP => {
+                            if let Ok(n) = tap.read(&mut buf)
+                                && n > 0
+                                && n <= MAX_FRAME
+                            {
+                                let _ = to_world.try_send(buf[..n].to_vec());
+                            }
+                        }
+                        _ => {
+                            while rx.notify.read().is_ok() {}
+                            while let Some(frame) = rx.frames.lock().unwrap().pop_front() {
+                                // A frame the device refuses (while it is down) is dropped.
+                                let _ = tap.write(&frame);
+                            }
+                        }
+                    }
+                }
+            }
+        })?;
+    Ok(Backend {
+        socket: None,
+        thread: Some(thread),
+        stop,
+    })
+}
+
+/// Owns the listener or TAP device and joins its worker when the VM goes.
 pub struct Backend {
-    socket: std::path::PathBuf,
+    socket: Option<std::path::PathBuf>,
     thread: Option<thread::JoinHandle<()>>,
     stop: EventNotifier,
 }
@@ -313,7 +385,9 @@ pub struct Backend {
 impl Drop for Backend {
     fn drop(&mut self) {
         // Wake accept when boot failed before the VMM connected.
-        let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+        if let Some(socket) = &self.socket {
+            let _ = std::os::unix::net::UnixStream::connect(socket);
+        }
         let _ = self.stop.notify();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

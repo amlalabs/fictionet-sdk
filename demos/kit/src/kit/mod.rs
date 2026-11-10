@@ -659,6 +659,9 @@ impl GuestHandle {
 /// Owns every process, bridge, and temporary file of a run.
 pub struct Run {
     ownership: Option<vm::Ownership>,
+    /// The demo's name.
+    name: String,
+    vmm: vm::Vmm,
     guests: Vec<GuestHandle>,
     fcx: Arc<Mutex<Option<Cx>>>,
     world: Option<JoinHandle<fictionet::Result>>,
@@ -844,12 +847,19 @@ struct Prepared {
     backends: Vec<BackendInput>,
 }
 
-fn check_downloads<P: Software>(downloads: &Path, guests: &[Guest<P>]) -> io::Result<()> {
-    for file in [
-        "cloud-hypervisor",
+fn check_downloads<P: Software>(
+    downloads: &Path,
+    guests: &[Guest<P>],
+    vmm: vm::Vmm,
+) -> io::Result<()> {
+    let monitor: &[&str] = match vmm {
+        vm::Vmm::CloudHypervisor => &["cloud-hypervisor"],
+        vm::Vmm::Nitro => &[vm::nitro::FIRECRACKER, vm::nitro::JAILER],
+    };
+    for file in monitor.iter().chain(&[
         "ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
         "ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
-    ] {
+    ]) {
         if !downloads.join(file).is_file() {
             return Err(io::Error::other(format!(
                 "missing {}",
@@ -895,6 +905,8 @@ fn prepare<P: Software + Into<Boot>>(
     let setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut run = Run {
         ownership: None,
+        name: name.to_owned(),
+        vmm: vm::Vmm::CloudHypervisor,
         guests: Vec::new(),
         setup: setup.clone(),
         mirror: Arc::default(),
@@ -959,14 +971,18 @@ where
 {
     let downloads = downloads.as_ref();
     let ownership = vm::Ownership::acquire(name)?;
-    check_downloads(downloads, &guests)?;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .map_err(|error| io::Error::other(format!("/dev/kvm is not usable: {error}")))?;
+    let vmm = vm::Vmm::of_host();
+    check_downloads(downloads, &guests, vmm)?;
+    if vmm == vm::Vmm::CloudHypervisor {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .map_err(|error| io::Error::other(format!("/dev/kvm is not usable: {error}")))?;
+    }
     let (mut run, mut prepared) = prepare(name, guests)?;
     run.ownership = Some(ownership);
+    run.vmm = vmm;
     ready(run.guests.iter().map(GuestHandle::console).collect());
     let backends = std::mem::take(&mut prepared.backends);
     let result = async {
@@ -1096,7 +1112,10 @@ impl Run {
                     )
                 }
             };
-            vm::disk::write_overlay(&r.overlay, &std::fs::canonicalize(image)?, 10 << 30)?;
+            // A Nitro Sandbox boots a raw copy of the image, made as it starts.
+            if self.vmm == vm::Vmm::CloudHypervisor {
+                vm::disk::write_overlay(&r.overlay, &std::fs::canonicalize(image)?, 10 << 30)?;
+            }
             identities.push(identity);
         }
         Ok(identities)
@@ -1106,13 +1125,45 @@ impl Run {
         self.boot = Instant::now();
         for (guest, (tx, queue)) in self.guests.iter_mut().zip(backends) {
             let r = &guest.resources;
-            guest.backend = Some(net::start(&r.socket, r.mac, tx, queue)?);
             let mac = r.mac.map(|b| format!("{b:02x}")).join(":");
+            let vmlinuz = downloads.join("ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic");
+            let initrd = downloads.join("ubuntu-24.04-server-cloudimg-amd64-initrd-generic");
+            let cmdline = "root=LABEL=cloudimg-rootfs ro console=ttyS0,115200n8 net.ifnames=0";
+            if self.vmm == vm::Vmm::Nitro {
+                let image = guest.guest.software.image().ok_or_else(|| {
+                    io::Error::other("a Nitro Sandbox boots prepared images only")
+                })?;
+                let id = format!("{}-{}", self.name, guest.name());
+                let (sandbox, tap) = vm::nitro::network(&id, MTU)
+                    .map_err(|e| io::Error::other(format!("{}: {e}", guest.name())))?;
+                guest.backend = Some(net::start_tap(tap, tx, queue)?);
+                let baked = image::Baked::new(downloads, image);
+                let config = vm::nitro::Config {
+                    downloads,
+                    vmlinuz: &vmlinuz,
+                    initrd: &initrd,
+                    cmdline,
+                    image: baked.image(),
+                    vcpus: guest.guest.vcpus,
+                    memory_mib: guest.guest.memory_mib,
+                    mac: &mac,
+                };
+                let vm = vm::nitro::start(
+                    &config,
+                    sandbox,
+                    &r.dir,
+                    self.ownership.as_ref().expect("owned run"),
+                )
+                .map_err(|e| io::Error::other(format!("{}: {e}", guest.name())))?;
+                guest.vm = Some(vm);
+                continue;
+            }
+            guest.backend = Some(net::start(&r.socket, r.mac, tx, queue)?);
             let config = vm::Config {
                 cloud_hypervisor: &downloads.join("cloud-hypervisor"),
-                vmlinuz: &downloads.join("ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic"),
-                initrd: &downloads.join("ubuntu-24.04-server-cloudimg-amd64-initrd-generic"),
-                cmdline: "root=LABEL=cloudimg-rootfs ro console=ttyS0,115200n8 net.ifnames=0",
+                vmlinuz: &vmlinuz,
+                initrd: &initrd,
+                cmdline,
                 overlay: &r.overlay,
                 seed: guest
                     .guest

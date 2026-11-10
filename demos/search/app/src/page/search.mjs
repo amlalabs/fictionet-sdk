@@ -803,7 +803,7 @@ function showWorld(next) {
     const availability = world[control.dataset.source];
     control.disabled = starting || availability.kind !== 'available';
     control.setAttribute('aria-pressed', String(control.dataset.source === world.source));
-    control.title = { no_captures: 'No captures', no_search_key: 'No search key', no_model_key: 'No model key' }[availability.reason] || '';
+    control.title = { no_captures: 'No captures', no_search_key: 'No search key', no_model_key: 'No model key', searched_only: 'Not on this host' }[availability.reason] || '';
   }
 }
 $('world-toggle').onclick = () => { $('world-menu').hidden = !$('world-menu').hidden; $('world-toggle').setAttribute('aria-expanded', String(!$('world-menu').hidden)); };
