@@ -26,8 +26,8 @@ use ring::{
 use rsa::traits::PublicKeyParts;
 
 use super::{
-    Error, Identification, KexInit, Line, Lines, MAX_PACKET, MAX_PAYLOAD, Message, Mpint, Packet,
-    Reader, put_string,
+    Error, Identification, KexInit, Line, Lines, MAX_NAME, MAX_PACKET, MAX_PAYLOAD,
+    MAX_VERSION_LINE, Message, Mpint, Packet, Reader, put_string,
 };
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
@@ -46,6 +46,13 @@ const STRICT_CLIENT: &str = "kex-strict-c-v00@openssh.com";
 const STRICT_SERVER: &str = "kex-strict-s-v00@openssh.com";
 const KEY_BYTES: u64 = 1 << 30;
 const KEY_PACKETS: u64 = 1 << 30;
+/// What an ECDH_INIT allocates and frees besides its transcript: the two
+/// version texts, the server's share and the shared secret, the signature,
+/// the reply that carries it, the four derived keys and EXT_INFO: together
+/// under 10 KiB with the largest host key this transport takes (RSA, 8192
+/// bits, whose signature and reply vectors may have doubled while they
+/// grew). The RSA signer's own working memory is the `rsa` crate's.
+const EXCHANGE: usize = 16 << 10;
 
 /// A fatal framing, cryptographic, negotiation or state failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,7 +263,8 @@ pub struct Transport {
     lines: Lines,
     rng: Option<ChaCha20Rng>,
     proposal: KexInit,
-    client_kex: Option<KexInit>,
+    /// Whether the client's first proposal asked for EXT_INFO.
+    ext_info: bool,
     exchange: Exchange,
     negotiated: Option<Negotiated>,
     incoming: Direction,
@@ -291,7 +299,7 @@ impl Transport {
             lines: Lines::new(),
             rng: None,
             proposal,
-            client_kex: None,
+            ext_info: false,
             exchange: Exchange::Idle,
             negotiated: None,
             incoming: Direction::plain(),
@@ -365,10 +373,6 @@ impl Transport {
         Ok(())
     }
 
-    /// The most recently received client proposal, for world observations.
-    pub fn client_kex(&self) -> Option<&KexInit> {
-        self.client_kex.as_ref()
-    }
     /// Algorithms installed by the latest exchange. Available once the server
     /// has sent NEWKEYS; use `is_established` and `is_rekeying` to check completion.
     pub fn negotiated(&self) -> Option<&Negotiated> {
@@ -386,6 +390,53 @@ impl Transport {
     pub fn is_rekeying(&self) -> bool {
         !matches!(self.exchange, Exchange::Idle)
     }
+    /// The most [`held`](Decode::held) can reach from now on: what does not
+    /// change once started (the identification and proposal of ours), and
+    /// the most the peer can make the transport hold: its identification,
+    /// the names an exchange settles on, the session identifier, the keys
+    /// of both directions, and the largest exchange state, both proposals
+    /// with their names. A caller charges this once, after starting.
+    pub fn most_held(&self) -> usize {
+        let ours = self.proposal.encoded_len().unwrap_or(MAX_PAYLOAD);
+        let names = 4 * MAX_NAME;
+        let key = std::mem::size_of::<aead::LessSafeKey>();
+        identification_heap(&self.identification)
+            + MAX_VERSION_LINE
+            + proposal_heap(&self.proposal)
+            + names
+            + digest::MAX_OUTPUT_LEN
+            + 2 * key
+            + (ours + MAX_PAYLOAD + names).max(std::mem::size_of::<Direction>() + key)
+    }
+
+    /// The most [`handle`](Self::handle) allocates for `payload` and frees
+    /// before it returns, beyond the payload itself and what
+    /// [`most_held`](Self::most_held) bounds: a KEXINIT's parsed lists, an
+    /// ECDH_INIT's transcript and the rest of the exchange ([`EXCHANGE`]),
+    /// or the strings of a transport message. Charge it before handling.
+    pub fn scratch(&self, payload: &[u8]) -> usize {
+        match payload.first() {
+            Some(20) => KexInit::most_heap(payload.len()),
+            Some(30) => {
+                let proposals = match &self.exchange {
+                    Exchange::Share { server, client, .. } => server.len() + client.len(),
+                    _ => 0,
+                };
+                // The transcript, allocated at its exact length: seven
+                // strings, the client's share among them within the
+                // payload, and the encoded secret. Its copies of the
+                // server's share and the secret come within EXCHANGE.
+                7 * 4
+                    + 2 * MAX_VERSION_LINE
+                    + proposals
+                    + self.host_key.public_key().len()
+                    + payload.len()
+                    + EXCHANGE
+            }
+            _ => payload.len(),
+        }
+    }
+
     /// Whether a direction is close enough to its key limit to initiate rekey.
     pub fn needs_rekey(&self) -> bool {
         [&self.incoming, &self.outgoing]
@@ -421,7 +472,15 @@ impl Transport {
             .as_mut()
             .ok_or(TransportError::Unseeded)?
             .fill_bytes(&mut self.proposal.cookie);
-        let payload = Message::KexInit(self.proposal.clone()).to_bytes()?;
+        // The proposal is lent to the message, not copied: the encoded
+        // payload is all this allocates.
+        let message = Message::KexInit(std::mem::take(&mut self.proposal));
+        let payload = message.to_bytes();
+        let Message::KexInit(proposal) = message else {
+            unreachable!("the message was built as a KEXINIT")
+        };
+        self.proposal = proposal;
+        let payload = payload?;
         self.send(&payload, out)?;
         self.exchange = Exchange::Proposal(payload);
         Ok(())
@@ -570,11 +629,11 @@ impl Transport {
             if self.strict && sequence != 0 {
                 return Err(TransportError::State);
             }
+            self.ext_info = client.kex_algorithms.iter().any(|s| s == "ext-info-c");
         }
         let skip_guess = client.first_kex_packet_follows
             && (client.kex_algorithms.first() != Some(&kex)
                 || client.server_host_key_algorithms.first() != Some(&host));
-        self.client_kex = Some(client);
         self.exchange = Exchange::Share {
             server,
             client: payload.to_vec(),
@@ -604,9 +663,19 @@ impl Transport {
         reader.finish()?;
         let rng = self.rng.as_mut().ok_or(TransportError::Unseeded)?;
         let (server_public, secret, hash) = shared_secret(&algorithms.kex, client_public, rng)?;
-        let mut transcript = Zeroizing::new(Vec::new());
         let peer = version_text(self.peer.as_ref().ok_or(TransportError::State)?)?;
         let ours = version_text(&self.identification)?;
+        let mut transcript = Zeroizing::new(Vec::with_capacity(
+            7 * 4
+                + peer.len()
+                + ours.len()
+                + client.len()
+                + server.len()
+                + self.host_key.public_key().len()
+                + client_public.len()
+                + server_public.len()
+                + secret.len(),
+        ));
         put_string(&mut transcript, &peer);
         put_string(&mut transcript, &ours);
         put_string(&mut transcript, &client);
@@ -649,12 +718,7 @@ impl Transport {
         };
         self.outgoing = outgoing;
         self.outgoing.sequence = sequence;
-        if !self.established
-            && self
-                .client_kex
-                .as_ref()
-                .is_some_and(|kex| kex.kex_algorithms.iter().any(|s| s == "ext-info-c"))
-        {
+        if !self.established && self.ext_info {
             let mut extension = vec![7];
             extension.extend_from_slice(&1u32.to_be_bytes());
             put_string(&mut extension, b"server-sig-algs");
@@ -715,28 +779,13 @@ impl Decode for Transport {
         MAX_PACKET + 16
     }
     fn held(&self) -> usize {
-        let identification = |id: &Identification| {
-            id.proto.capacity()
-                + id.software.capacity()
-                + id.comments.as_ref().map_or(0, String::capacity)
-        };
-        let proposal = |kex: &KexInit| {
-            kex.lists()
-                .iter()
-                .map(|(names, _)| {
-                    names.capacity() * std::mem::size_of::<String>()
-                        + names.iter().map(String::capacity).sum::<usize>()
-                })
-                .sum::<usize>()
-        };
         let direction = |d: &Direction| match d.cipher {
             Cipher::Gcm { .. } => std::mem::size_of::<aead::LessSafeKey>(),
             _ => 0,
         };
-        identification(&self.identification)
-            + self.peer.as_ref().map_or(0, identification)
-            + proposal(&self.proposal)
-            + self.client_kex.as_ref().map_or(0, proposal)
+        identification_heap(&self.identification)
+            + self.peer.as_ref().map_or(0, identification_heap)
+            + proposal_heap(&self.proposal)
             + self.negotiated.as_ref().map_or(0, |algorithms| {
                 algorithms.kex.capacity()
                     + algorithms.host.capacity()
@@ -779,6 +828,20 @@ impl Decode for Transport {
         }
         self.incoming.read(input)
     }
+}
+
+fn identification_heap(id: &Identification) -> usize {
+    id.proto.capacity() + id.software.capacity() + id.comments.as_ref().map_or(0, String::capacity)
+}
+
+fn proposal_heap(kex: &KexInit) -> usize {
+    kex.lists()
+        .iter()
+        .map(|(names, _)| {
+            names.capacity() * std::mem::size_of::<String>()
+                + names.iter().map(String::capacity).sum::<usize>()
+        })
+        .sum()
 }
 
 fn version_text(id: &Identification) -> Result<Vec<u8>, Error> {
@@ -1003,33 +1066,43 @@ impl Direction {
         let padding = 4 + (block - (offset + payload.len() + 4) % block) % block;
         let length = 1 + payload.len() + padding;
         self.check_limit(length + 4)?;
-        let mut packet = vec![0; 4 + length];
-        packet[..4].copy_from_slice(&(length as u32).to_be_bytes());
-        packet[4] = padding as u8;
-        packet[5..5 + payload.len()].copy_from_slice(payload);
-        rng.fill_bytes(&mut packet[5 + payload.len()..]);
-        match &self.cipher {
-            Cipher::Plain => {}
+        let tag = if encrypted { 16 } else { 0 };
+        out.try_reserve(4 + length + tag)
+            .map_err(|_| Error::Unwritable)?;
+        // The packet is built and sealed where it goes, in `out`: nothing
+        // else is allocated for it.
+        let start = out.len();
+        out.extend_from_slice(&(length as u32).to_be_bytes());
+        out.push(padding as u8);
+        out.extend_from_slice(payload);
+        out.resize(start + 4 + length, 0);
+        rng.fill_bytes(&mut out[start + 5 + payload.len()..]);
+        let packet = &mut out[start..];
+        let sealed = match &self.cipher {
+            Cipher::Plain => Ok(None),
             Cipher::Chacha { seal, .. } => {
                 let mut tag = [0; 16];
-                seal.seal_in_place(self.sequence, &mut packet, &mut tag);
-                packet.extend_from_slice(&tag);
+                seal.seal_in_place(self.sequence, packet, &mut tag);
+                Ok(Some(tag))
             }
             Cipher::Gcm { key, nonce } => {
                 let (head, body) = packet.split_at_mut(4);
-                let tag = key
-                    .seal_in_place_separate_tag(
-                        aead::Nonce::assume_unique_for_key(*nonce),
-                        aead::Aad::from(head),
-                        body,
-                    )
-                    .map_err(|_| TransportError::Crypto)?;
-                packet.extend_from_slice(tag.as_ref());
+                key.seal_in_place_separate_tag(
+                    aead::Nonce::assume_unique_for_key(*nonce),
+                    aead::Aad::from(head),
+                    body,
+                )
+                .map(|tag| Some(tag.as_ref().try_into().expect("16-byte GCM tag")))
+            }
+        };
+        match sealed {
+            Ok(Some(tag)) => out.extend_from_slice(&tag),
+            Ok(None) => {}
+            Err(_) => {
+                out.truncate(start);
+                return Err(TransportError::Crypto);
             }
         }
-        out.try_reserve(packet.len())
-            .map_err(|_| Error::Unwritable)?;
-        out.extend_from_slice(&packet);
         self.advance(length + 4);
         Ok(())
     }
@@ -1056,6 +1129,8 @@ impl Direction {
         let Some(input) = input.get(..total) else {
             return Ok(Step::Need);
         };
+        // An encrypted packet is opened in the one vector that then holds
+        // its payload: nothing else is allocated for it.
         let payload = match &self.cipher {
             Cipher::Plain => Packet::parse(input)?.payload,
             Cipher::Chacha { open, .. } => {
@@ -1063,10 +1138,9 @@ impl Direction {
                 let tag = input[length + 4..]
                     .try_into()
                     .map_err(|_| TransportError::Crypto)?;
-                let body = open
-                    .open_in_place(self.sequence, &mut packet, tag)
+                open.open_in_place(self.sequence, &mut packet, tag)
                     .map_err(|_| TransportError::Crypto)?;
-                unpad(body)?
+                unpad(packet, 4)?
             }
             Cipher::Gcm { key, nonce } => {
                 let mut packet = input[4..].to_vec();
@@ -1076,8 +1150,10 @@ impl Direction {
                         aead::Aad::from(head),
                         &mut packet,
                     )
-                    .map_err(|_| TransportError::Crypto)?;
-                unpad(body)?
+                    .map_err(|_| TransportError::Crypto)?
+                    .len();
+                packet.truncate(body);
+                unpad(packet, 0)?
             }
         };
         if payload.is_empty() {
@@ -1092,16 +1168,21 @@ impl Direction {
     }
 }
 
-fn unpad(body: &[u8]) -> Result<Vec<u8>, TransportError> {
+/// The payload of an opened packet whose body (padding length, payload,
+/// padding) starts at `at`, in place in the packet's own vector.
+fn unpad(mut packet: Vec<u8>, at: usize) -> Result<Vec<u8>, TransportError> {
+    let body = &packet[at..];
     let padding = *body.first().ok_or(Error::Empty)?;
     if padding < 4 || usize::from(padding) + 1 >= body.len() {
         return Err(Error::Padding(padding).into());
     }
-    let payload = &body[1..body.len() - usize::from(padding)];
-    if payload.len() > MAX_PAYLOAD {
-        return Err(Error::PayloadTooLong(payload.len() as u32).into());
+    let payload = body.len() - 1 - usize::from(padding);
+    if payload > MAX_PAYLOAD {
+        return Err(Error::PayloadTooLong(payload as u32).into());
     }
-    Ok(payload.to_vec())
+    packet.truncate(at + 1 + payload);
+    packet.drain(..at + 1);
+    Ok(packet)
 }
 
 #[cfg(test)]

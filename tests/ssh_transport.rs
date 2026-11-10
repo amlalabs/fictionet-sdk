@@ -25,14 +25,11 @@ struct RestrictedTransport {
     exchanges: Arc<Mutex<Exchanges>>,
 }
 impl PacketTransport for RestrictedTransport {
-    fn resident_bytes(&self) -> usize {
-        self.inner.resident_bytes()
-    }
     fn start(&mut self, seed: [u8; 32], out: &mut Vec<u8>) -> Result<(), TransportError> {
         self.inner.start(seed, out)
     }
-    fn push(&mut self, bytes: &[u8]) -> usize {
-        self.inner.push(bytes)
+    fn push(&mut self, budget: &Budget, bytes: &[u8]) -> usize {
+        self.inner.push(budget, bytes)
     }
     fn end(&mut self) {
         self.inner.end();
@@ -60,14 +57,23 @@ impl PacketTransport for RestrictedTransport {
     fn poll_ready(&self) -> bool {
         self.inner.poll_ready()
     }
-    fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure> {
-        let event = self.inner.poll(out)?;
-        if let Some(Event::Observed(Observation::Proposal(proposal))) = &event
-            && proposal
-                .kex_algorithms
-                .first()
-                .is_some_and(|name| name == "ecdh-sha2-nistp384")
-        {
+    fn poll(
+        &mut self,
+        budget: &Budget,
+        out: &mut Vec<u8>,
+        observe: &mut dyn FnMut(Observation),
+    ) -> Result<Option<Event>, Failure> {
+        let mut disallowed = false;
+        let event = self.inner.poll(budget, out, &mut |observation| {
+            if let Observation::Proposal(proposal) = &observation {
+                disallowed |= proposal
+                    .kex_algorithms
+                    .first()
+                    .is_some_and(|name| name == "ecdh-sha2-nistp384");
+            }
+            observe(observation);
+        })?;
+        if disallowed {
             self.exchanges.lock().unwrap().refused += 1;
             return Err(TransportError::Algorithm.into());
         }

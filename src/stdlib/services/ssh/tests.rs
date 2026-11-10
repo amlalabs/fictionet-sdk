@@ -4,20 +4,22 @@ use crate::stdlib::layer::Observations;
 // A packet boundary with completed negotiation, for connection-layer tests.
 struct Packets(transport::Negotiated);
 impl PacketTransport for Packets {
-    fn resident_bytes(&self) -> usize {
-        0
-    }
     fn start(&mut self, _: [u8; 32], _: &mut Vec<u8>) -> Result<(), TransportError> {
         Ok(())
     }
-    fn push(&mut self, bytes: &[u8]) -> usize {
+    fn push(&mut self, _: &Budget, bytes: &[u8]) -> usize {
         bytes.len()
     }
     fn end(&mut self) {}
     fn poll_ready(&self) -> bool {
         false
     }
-    fn poll(&mut self, _: &mut Vec<u8>) -> Result<Option<transport::Event>, transport::Failure> {
+    fn poll(
+        &mut self,
+        _: &Budget,
+        _: &mut Vec<u8>,
+        _: &mut dyn FnMut(transport::Observation),
+    ) -> Result<Option<transport::Event>, transport::Failure> {
         Ok(None)
     }
     fn state(&self) -> TransportState<'_> {
@@ -64,6 +66,17 @@ fn layer() -> Ssh<tests::Observed, Packets> {
     )
 }
 
+/// Processes `payload` as the layer does, paid for first.
+fn paid(
+    layer: &mut Ssh<tests::Observed, Packets>,
+    sequence: u32,
+    payload: &[u8],
+    env: &mut Env<'_, Ended>,
+) -> Result<(), Error> {
+    let mut paid = env.budget().charge(packet_charge(payload)).unwrap();
+    layer.packet(sequence, payload, &mut paid, env)
+}
+
 #[test]
 fn local_close_retires_the_child_before_peer_acknowledgment() {
     let mut layer = layer();
@@ -80,6 +93,7 @@ fn local_close_retires_the_child_before_peer_acknowledgment() {
                 max_packet: 1024,
                 kind: wire::OpenKind::Session,
             },
+            &mut budget.charge(0).unwrap(),
             &mut env,
         )
         .unwrap();
@@ -106,7 +120,11 @@ fn local_close_retires_the_child_before_peer_acknowledgment() {
     );
     assert!(layer.take_command(&mut env).is_none());
     layer
-        .connection_message(wire::Message::Close(0), &mut env)
+        .connection_message(
+            wire::Message::Close(0),
+            &mut budget.charge(0).unwrap(),
+            &mut env,
+        )
         .unwrap();
     assert!(!layer.channels.contains(child.id()));
     assert!(layer.take_command(&mut env).is_none());
@@ -128,6 +146,7 @@ fn local_eof_is_sent_once() {
                 max_packet: 1024,
                 kind: wire::OpenKind::Session,
             },
+            &mut budget.charge(0).unwrap(),
             &mut env,
         )
         .unwrap();
@@ -162,7 +181,7 @@ fn authentication_and_reserved_capacity_precede_confirmation() {
     let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
     let mut observations = Observations::new(8);
     let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
-    layer.reserve(&env).unwrap();
+    assert!(layer.reserve(&budget) && layer.room(&budget));
     layer.started = true;
     let open = wire::Message::ChannelOpen {
         sender: 3,
@@ -172,12 +191,13 @@ fn authentication_and_reserved_capacity_precede_confirmation() {
     }
     .to_bytes()
     .unwrap();
-    layer.packet(0, &open, &mut env).unwrap();
+    paid(&mut layer, 0, &open, &mut env).unwrap();
     assert!(layer.take_event().is_none());
     assert!(layer.channels.is_empty());
     layer.take_command(&mut env);
+    assert!(layer.room(&budget));
     layer.user = Some("guest".into());
-    layer.packet(1, &open, &mut env).unwrap();
+    paid(&mut layer, 1, &open, &mut env).unwrap();
     let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
         panic!("opening missing")
     };
@@ -223,6 +243,7 @@ fn partial_wire_completions_credit_each_child_write_once() {
                 max_packet: 1024,
                 kind: wire::OpenKind::Session,
             },
+            &mut budget.charge(0).unwrap(),
             &mut env,
         )
         .unwrap();
@@ -287,6 +308,7 @@ fn control_disconnects_while_channel_commands_wait() {
                 max_packet: 1024,
                 kind: wire::OpenKind::Session,
             },
+            &mut budget.charge(0).unwrap(),
             &mut env,
         )
         .unwrap();
@@ -295,7 +317,8 @@ fn control_disconnects_while_channel_commands_wait() {
     };
     layer.channels.get_mut(child.id()).unwrap().confirmed = true;
     // Output not yet handed to the byte stream holds back channel commands.
-    layer.write(&env, b"pending").unwrap();
+    assert!(layer.room(&budget));
+    layer.write(b"pending").unwrap();
     let write = child.send(ChannelCommand::Stream(StreamCommand::Write(Bytes::unpaid(
         b"data".to_vec(),
     ))));
@@ -321,7 +344,7 @@ fn control_drain_reads_only_window_adjustments_and_closes() {
     let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
     let mut observations = Observations::new(8);
     let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
-    layer.reserve(&env).unwrap();
+    assert!(layer.reserve(&budget) && layer.room(&budget));
     layer.started = true;
     layer.user = Some("guest".into());
     let open = |sender| {
@@ -334,7 +357,7 @@ fn control_drain_reads_only_window_adjustments_and_closes() {
         .to_bytes()
         .unwrap()
     };
-    layer.packet(0, &open(3), &mut env).unwrap();
+    paid(&mut layer, 0, &open(3), &mut env).unwrap();
     let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
         panic!("opening missing")
     };
@@ -345,27 +368,104 @@ fn control_drain_reads_only_window_adjustments_and_closes() {
     let (number, window) = (channel.wire, channel.window);
 
     control.drain();
-    layer.packet(1, &open(4), &mut env).unwrap();
+    paid(&mut layer, 1, &open(4), &mut env).unwrap();
     assert!(layer.take_event().is_none());
     assert_eq!(layer.channels.ids().count(), 1);
     let data = wire::Message::Data {
         recipient: number,
         data: b"after hangup".to_vec(),
     };
-    layer
-        .packet(2, &data.to_bytes().unwrap(), &mut env)
-        .unwrap();
+    paid(&mut layer, 2, &data.to_bytes().unwrap(), &mut env).unwrap();
     assert!(layer.take_event().is_none());
     let adjust = wire::Message::WindowAdjust {
         recipient: number,
         bytes: 10,
     };
-    layer
-        .packet(3, &adjust.to_bytes().unwrap(), &mut env)
-        .unwrap();
+    paid(&mut layer, 3, &adjust.to_bytes().unwrap(), &mut env).unwrap();
     assert!(layer.channels.get(child.id()).unwrap().window > window);
     assert!(!layer.is_terminal());
     let close = wire::Message::Close(number).to_bytes().unwrap();
-    layer.packet(4, &close, &mut env).unwrap();
+    paid(&mut layer, 4, &close, &mut env).unwrap();
     assert!(layer.is_terminal());
+}
+
+fn open(sender: u32) -> Vec<u8> {
+    wire::Message::ChannelOpen {
+        sender,
+        window: 1024,
+        max_packet: 1024,
+        kind: wire::OpenKind::Session,
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+/// A channel the budget cannot hold now is refused for resource shortage,
+/// without taking a channel number. The connection goes on and opens the
+/// next channel once memory frees.
+#[test]
+fn a_channel_without_memory_is_refused_and_the_connection_goes_on() {
+    let mut layer = layer();
+    let budget = Budget::new(4 << 20);
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    assert!(layer.reserve(&budget) && layer.room(&budget));
+    layer.started = true;
+    layer.user = Some("guest".into());
+    // The packet is paid for; everything else is held elsewhere.
+    let mut packet = budget.charge(packet_charge(&open(3))).unwrap();
+    let elsewhere = budget.charge(budget.limit() - budget.used()).unwrap();
+    layer.packet(0, &open(3), &mut packet, &mut env).unwrap();
+    assert!(layer.take_event().is_none());
+    assert!(layer.channels.is_empty());
+    assert!(!layer.is_terminal());
+    // The packet transport writes payloads as they are.
+    let Some(StreamCommand::Write(reply)) = layer.take_command(&mut env) else {
+        panic!("refusal missing")
+    };
+    assert!(matches!(
+        wire::Message::parse(&reply).unwrap(),
+        wire::Message::ChannelOpenFailure {
+            recipient: 3,
+            reason: 4,
+            ..
+        }
+    ));
+    drop((packet, elsewhere));
+    assert!(layer.room(&budget));
+    paid(&mut layer, 1, &open(4), &mut env).unwrap();
+    let Some(MuxEvent::Opened(_, opening, _)) = layer.take_event() else {
+        panic!("opening missing")
+    };
+    assert_eq!(opening.channel, 0);
+}
+
+/// A decoded packet the budget cannot pay to process waits, unparsed and
+/// unchanged, and goes on once memory frees: the connection does not fail
+/// for want of memory.
+#[test]
+fn a_packet_without_memory_waits_for_it() {
+    let mut layer = layer();
+    let budget = Budget::new(4 << 20);
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    assert!(layer.reserve(&budget) && layer.room(&budget));
+    layer.started = true;
+    layer.user = Some("guest".into());
+    let payload = open(3);
+    let decoded = Owned::new(payload.clone(), budget.charge(payload.capacity()).unwrap());
+    assert!(layer.pending_packets.push_back((0, decoded)).is_ok());
+    let elsewhere = budget.charge(budget.limit() - budget.used()).unwrap();
+    let used = budget.used();
+    assert!(!layer.advance(&mut env).unwrap());
+    assert_eq!(layer.pending_packets.len(), 1);
+    assert!(layer.take_event().is_none());
+    assert!(!layer.is_terminal());
+    assert_eq!(budget.used(), used);
+    drop(elsewhere);
+    assert!(layer.advance(&mut env).unwrap());
+    assert_eq!(layer.pending_packets.len(), 0);
+    assert!(matches!(layer.take_event(), Some(MuxEvent::Opened(..))));
 }

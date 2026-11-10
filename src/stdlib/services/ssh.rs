@@ -39,6 +39,28 @@ const WINDOW: u32 = 65536;
 const PACKET: u32 = 32000;
 const OUTPUT_LIMIT: usize = 256 * 1024;
 const MAX_AUTH_REQUESTS: u32 = 1024;
+/// The connection layer's own state, charged once: the authentication
+/// fields (account names, a challenge and its request, a delayed failure),
+/// each from one packet, and the copies an outgoing message makes before
+/// it is encoded.
+const STATE: usize = 6 * ssh::MAX_PAYLOAD;
+/// What parsing a packet other than channel data may allocate, per byte of
+/// its payload: name lists, terminal modes and keyboard-interactive answers
+/// parse into small values of up to 12 heap bytes per byte (a vector place
+/// for each name, mode or answer of at least two, five or four bytes, in
+/// vectors that may have doubled), and the observer gets copies.
+const PARSE: usize = 64;
+/// What the request of a CHANNEL_REQUEST holds while its channel takes it.
+const REQUEST: usize = 2 * ssh::MAX_PAYLOAD;
+
+/// Why a channel open is refused (RFC 4254 section 5.1).
+#[derive(Clone, Copy, Debug)]
+enum Refusal {
+    /// Past the channel limit, or refused by the application.
+    Prohibited,
+    /// No memory for the channel now; the connection goes on.
+    ResourceShortage,
+}
 
 /// An authentication method from RFCs 4252 and 4256.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -659,9 +681,6 @@ impl<H: Handler> Server<H> {
                     Ended::Conn(crate::stdlib::network::ConnError::Reset)
                 }
                 Err(stack::StackError::Cancelled) => Ended::Cancelled,
-                Err(stack::StackError::Layer(crate::stdlib::layer::Side::Lower(Error::Budget))) => {
-                    Ended::Budget
-                }
                 Err(stack::StackError::Layer(_)) => Ended::Failed,
             };
             handler.observe(
@@ -705,13 +724,13 @@ where
     }
 }
 
-/// Why the SSH connection layer could not continue.
+/// Why the SSH connection layer could not continue. Storage the budget
+/// cannot pay for is never one: the connection waits for memory, and a
+/// channel it cannot hold is refused.
 #[derive(Debug)]
 pub enum Error {
     /// Invalid protocol traffic or cryptographic state.
     Protocol(TransportError),
-    /// The connection could not reserve bounded protocol storage.
-    Budget,
 }
 impl From<TransportError> for Error {
     fn from(error: TransportError) -> Self {
@@ -727,7 +746,6 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol(error) => error.fmt(f),
-            Self::Budget => f.write_str("SSH storage exceeds the memory budget"),
         }
     }
 }
@@ -785,6 +803,17 @@ impl Channel {
         self.window -= bytes as u32;
         Ok(())
     }
+
+    /// The window adjustment to send now, if one is due: everything the
+    /// channel can take beyond what the peer was told, once that is at
+    /// least what the peer has left. The peer then hears of new room about
+    /// once per half window it uses, as OpenSSH tells it, and never runs
+    /// dry while room is owed: at zero left, any room owed is due.
+    fn adjustment(&self) -> Option<u32> {
+        let owed = self.receive.saturating_sub(u64::from(self.advertised));
+        let owed = owed.min(u64::from(u32::MAX - self.advertised)) as u32;
+        (owed > 0 && owed >= self.advertised).then_some(owed)
+    }
 }
 
 struct Flight {
@@ -796,7 +825,10 @@ struct Flight {
 /// Authentication and connection requests remain with the parent. Attach
 /// [`Children`] directly for another channel application, or use [`Self::sessions`].
 /// Host configuration and synchronous policy callback allocations belong to the
-/// caller. Bounded transport parsing storage is reserved before decoding.
+/// caller. Everything else is paid for before it is allocated: the transport
+/// pays for its own buffers, and each packet is paid for before it is parsed.
+/// Storage the budget cannot pay for now waits for memory, or refuses the
+/// channel that asked for it; it never fails the connection.
 pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     config: Arc<Config>,
     handler: Arc<H>,
@@ -806,6 +838,7 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     started: bool,
     ended: bool,
     end_sent: bool,
+    /// [`STATE`], from the connection's first step.
     state: Option<Charge>,
     /// What goes down next, written into room for four packets that was
     /// paid for before it was allocated.
@@ -825,7 +858,37 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     challenge: Option<(auth::Request, usize)>,
     failure: Option<Vec<u8>>,
     failure_ready: bool,
-    pending_packets: ChargedDeque<(u32, ChargedBytes)>,
+    /// Application packets the transport decoded, each with the charge
+    /// that paid for it, waiting to be parsed.
+    pending_packets: ChargedDeque<(u32, Owned<Vec<u8>>)>,
+}
+
+/// Runs `write` with the transport and the output, which the step made
+/// sure of first ([`Ssh::room`]). A writer that grows the output past the
+/// room paid for fails the connection; its own result comes back as it was.
+fn fill<T, R, E>(
+    out: &mut Option<ChargedBytes>,
+    transport: &mut T,
+    write: impl FnOnce(&mut T, &mut Vec<u8>) -> Result<R, E>,
+) -> Result<Result<R, E>, Error> {
+    let out = out.as_mut().ok_or(TransportError::State)?;
+    match out.fill(|out| write(transport, out)) {
+        Ok(written) => Ok(Ok(written)),
+        Err(WriteFailure::Value(error)) => Ok(Err(error)),
+        Err(WriteFailure::Bound) => Err(TransportError::State.into()),
+    }
+}
+
+/// What processing an application packet allocates before it is done with
+/// it, charged before the packet is parsed. Channel data is parsed, copied
+/// once for the observer, and kept as the channel's input: three copies. A
+/// channel request also keeps the request it parses ([`REQUEST`]).
+fn packet_charge(payload: &[u8]) -> usize {
+    match payload.first() {
+        Some(94 | 95) => 3 * payload.len(),
+        Some(98) => PARSE * payload.len() + REQUEST,
+        _ => PARSE * payload.len(),
+    }
 }
 
 /// SSH with one synchronous application adapter on every scoped channel.
@@ -907,68 +970,55 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             now,
         }
     }
-    fn observe_transport(&self, observation: &transport::Observation, now: Instant) {
-        let event = match observation {
-            transport::Observation::Version(version) => Event::Version(version.clone()),
-            transport::Observation::Proposal(proposal) => Event::KexInit(proposal.as_ref().clone()),
+    /// Charges the connection's fixed storage once, all of it or none: its
+    /// [`STATE`], the channel table and its queues. `false` leaves nothing
+    /// charged, to try again once memory frees (layer rule 9).
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        if self.state.is_some() {
+            return true;
+        }
+        let Some(state) = budget.charge(STATE) else {
+            return false;
         };
-        self.handler.observe(&self.context(now), &event);
+        let Some(channels) = Slots::with_budget(self.config.max_channels, budget) else {
+            return false;
+        };
+        let Some(flights) = ChargedDeque::with_places(budget, 128, 128) else {
+            return false;
+        };
+        let Some(pending_packets) = ChargedDeque::with_places(budget, 128, 128) else {
+            return false;
+        };
+        let Some(up) = ChargedDeque::with_places(budget, 8, 8) else {
+            return false;
+        };
+        self.channels = channels;
+        self.flights = flights;
+        self.pending_packets = pending_packets;
+        self.up = up;
+        self.state = Some(state);
+        true
     }
-    fn resident_bytes(&self) -> usize {
-        self.transport.resident_bytes() + 6 * ssh::MAX_PAYLOAD
-    }
-    fn scratch(&mut self) -> Result<(), Error> {
-        // A name list may expand a two-byte wire name into a String and its
-        // allocation. Parsing and observation can temporarily hold several copies.
-        let charge = self.state.as_mut().ok_or(TransportError::State)?;
-        if charge.grow_to(charge.bytes() + 64 * ssh::MAX_PACKET) {
-            Ok(())
-        } else {
-            Err(Error::Budget)
+    /// Makes sure of room for what a step writes, four packets, paid for
+    /// before it is allocated. `false` when the budget has none now: the
+    /// step waits for memory (layer rule 9). A step writes only into an
+    /// empty output, so the room is all there.
+    fn room(&mut self, budget: &Budget) -> bool {
+        if self.out.is_none() {
+            self.out = ChargedBytes::with_capacity(budget, 4 * ssh::MAX_PACKET);
         }
-    }
-    fn reserve(&mut self, env: &Env<'_, Ended>) -> Result<(), Error> {
-        if self.state.is_none() {
-            // Authentication retains bounded request fields and challenge state.
-            let bytes = self.resident_bytes();
-            let charge = env.budget().charge(bytes).ok_or(Error::Budget)?;
-            self.channels =
-                Slots::with_budget(self.config.max_channels, env.budget()).ok_or(Error::Budget)?;
-            self.flights =
-                ChargedDeque::with_places(env.budget(), 128, 128).ok_or(Error::Budget)?;
-            self.pending_packets =
-                ChargedDeque::with_places(env.budget(), 128, 128).ok_or(Error::Budget)?;
-            self.up = ChargedDeque::with_places(env.budget(), 8, 8).ok_or(Error::Budget)?;
-            self.state = Some(charge);
-        }
-        Ok(())
+        self.out.is_some()
     }
     /// Whether output waits to go down.
     fn out_pending(&self) -> bool {
         self.out.as_ref().is_some_and(|out| !out.is_empty())
     }
-    /// Runs `write` with the transport and the output. A writer that
-    /// grows the output past the room paid for fails the connection; its
-    /// own result comes back as it was.
+    /// Runs `write` with the transport and the output.
     fn written<R, E>(
         &mut self,
-        env: &Env<'_, Ended>,
         write: impl FnOnce(&mut T, &mut Vec<u8>) -> Result<R, E>,
     ) -> Result<Result<R, E>, Error> {
-        if self.out.is_none() {
-            self.out = Some(
-                ChargedBytes::with_capacity(env.budget(), 4 * ssh::MAX_PACKET)
-                    .ok_or(Error::Budget)?,
-            );
-        }
-        let (Some(out), transport) = (self.out.as_mut(), &mut self.transport) else {
-            return Err(TransportError::State.into());
-        };
-        match out.fill(|out| write(transport, out)) {
-            Ok(written) => Ok(Ok(written)),
-            Err(WriteFailure::Value(error)) => Ok(Err(error)),
-            Err(WriteFailure::Bound) => Err(TransportError::State.into()),
-        }
+        fill(&mut self.out, &mut self.transport, write)
     }
     /// Queues `event` for the channels. Events are raised only while fewer
     /// than four wait, and a step stops raising at four, so the queue's
@@ -982,23 +1032,19 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             .push_back(event)
             .map_err(|_| TransportError::State.into())
     }
-    fn write(&mut self, env: &Env<'_, Ended>, payload: &[u8]) -> Result<(), Error> {
+    fn write(&mut self, payload: &[u8]) -> Result<(), Error> {
         if self
             .out
             .as_ref()
-            .is_some_and(|out| out.room() < ssh::MAX_PACKET)
+            .is_none_or(|out| out.room() < ssh::MAX_PACKET)
         {
             return Err(TransportError::State.into());
         }
-        self.written(env, |transport, out| transport.write_packet(payload, out))?
+        self.written(|transport, out| transport.write_packet(payload, out))?
             .map_err(Error::Protocol)
     }
-    fn send(
-        &mut self,
-        env: &Env<'_, Ended>,
-        message: &impl Wire<WriteError = ssh::Error>,
-    ) -> Result<(), Error> {
-        self.write(env, &message.to_bytes()?)
+    fn send(&mut self, message: &impl Wire<WriteError = ssh::Error>) -> Result<(), Error> {
+        self.write(&message.to_bytes()?)
     }
     fn close(&mut self, env: &mut Env<'_, Ended>, reason: Ended) {
         if !self.ended {
@@ -1013,9 +1059,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         reason: ssh::DisconnectReason,
         description: &str,
     ) -> Result<(), Error> {
-        self.written(env, |transport, out| {
-            transport.disconnect(reason, description, out)
-        })??;
+        self.written(|transport, out| transport.disconnect(reason, description, out))??;
         self.close(env, Ended::Closed);
         Ok(())
     }
@@ -1063,13 +1107,10 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         if self.auth_user.is_none() {
             self.auth_user = Some(request.user.clone());
             if let Some(message) = &self.config.banner {
-                self.send(
-                    env,
-                    &auth::Message::Banner {
-                        message: message.clone(),
-                        language: String::new(),
-                    },
-                )?;
+                self.send(&auth::Message::Banner {
+                    message: message.clone(),
+                    language: String::new(),
+                })?;
             }
         }
         let verified = request
@@ -1122,11 +1163,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         match decision {
             AuthDecision::Accept if probe => {
                 if let auth::Method::PublicKey { algorithm, key, .. } = request.method {
-                    self.send(env, &auth::Message::PublicKeyOk { algorithm, key })?;
+                    self.send(&auth::Message::PublicKeyOk { algorithm, key })?;
                 }
             }
             AuthDecision::Accept => {
-                self.send(env, &auth::Message::Success)?;
+                self.send(&auth::Message::Success)?;
                 self.user = Some(request.user.clone());
                 self.auth_user = None;
                 self.challenge = None;
@@ -1155,7 +1196,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 }
                 .to_bytes()?;
                 if delay.is_zero() {
-                    self.write(env, &failure)?;
+                    self.write(&failure)?;
                 } else {
                     self.failure = Some(failure);
                     self.failure_ready = false;
@@ -1171,15 +1212,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     return Err(TransportError::State.into());
                 }
                 let count = prompts.len();
-                self.send(
-                    env,
-                    &auth::Message::InfoRequest {
-                        name,
-                        instruction,
-                        language: String::new(),
-                        prompts,
-                    },
-                )?;
+                self.send(&auth::Message::InfoRequest {
+                    name,
+                    instruction,
+                    language: String::new(),
+                    prompts,
+                })?;
                 self.challenge = Some((request, count));
             }
         }
@@ -1189,6 +1227,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
     fn connection_message(
         &mut self,
         message: wire::Message,
+        paid: &mut Charge,
         env: &mut Env<'_, Ended>,
     ) -> Result<(), Error> {
         self.handler.observe(
@@ -1205,13 +1244,10 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     .global_request(&self.context(env.now()), &request)
                     .filter(|data| data.len() < ssh::MAX_PAYLOAD);
                 if want_reply {
-                    self.send(
-                        env,
-                        &match response {
-                            Some(data) => wire::Message::RequestSuccess(data),
-                            None => wire::Message::RequestFailure,
-                        },
-                    )?;
+                    self.send(&match response {
+                        Some(data) => wire::Message::RequestSuccess(data),
+                        None => wire::Message::RequestFailure,
+                    })?;
                 }
             }
             wire::Message::ChannelOpen {
@@ -1228,14 +1264,15 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     return Err(TransportError::State.into());
                 }
                 if self.channels.len() == self.config.max_channels || max_packet == 0 {
-                    return self.refuse(env, sender);
+                    return self.refuse(sender, Refusal::Prohibited);
                 }
+                // A channel the budget cannot hold now is refused; the
+                // connection and its other channels go on.
+                let Some(charge) = env.budget().charge(ssh::MAX_PAYLOAD * 2) else {
+                    return self.refuse(sender, Refusal::ResourceShortage);
+                };
                 let wire = self.next_channel;
                 self.next_channel = wire.checked_add(1).ok_or(TransportError::State)?;
-                let charge = env
-                    .budget()
-                    .charge(ssh::MAX_PAYLOAD * 2)
-                    .ok_or(Error::Budget)?;
                 let opening = Owned::new(
                     channel::Opening {
                         user: self.user.clone().ok_or(TransportError::State)?,
@@ -1275,12 +1312,14 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     .checked_add(bytes)
                     .ok_or(TransportError::State)?;
             }
-            wire::Message::Data { recipient, data } => self.input(env, recipient, None, data)?,
+            wire::Message::Data { recipient, data } => {
+                self.input(env, paid, recipient, None, data)?
+            }
             wire::Message::ExtendedData {
                 recipient,
                 kind,
                 data,
-            } => self.input(env, recipient, Some(kind), data)?,
+            } => self.input(env, paid, recipient, Some(kind), data)?,
             wire::Message::ChannelRequest {
                 recipient,
                 want_reply,
@@ -1290,10 +1329,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 if self.channels.get(id).unwrap().closed {
                     return Err(TransportError::State.into());
                 }
-                let charge = env
-                    .budget()
-                    .charge(ssh::MAX_PAYLOAD * 2)
-                    .ok_or(Error::Budget)?;
+                let charge = paid.split(REQUEST).ok_or(TransportError::State)?;
                 self.raise(MuxEvent::Child(
                     id,
                     ChannelEvent::Request {
@@ -1325,7 +1361,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 let id = self.id(recipient)?;
                 let channel = self.channels.remove(id).unwrap();
                 if !channel.closed {
-                    self.send(env, &wire::Message::Close(channel.peer))?;
+                    self.send(&wire::Message::Close(channel.peer))?;
                 }
                 self.raise(MuxEvent::Child(
                     id,
@@ -1336,20 +1372,22 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         }
         Ok(())
     }
-    fn refuse(&mut self, env: &Env<'_, Ended>, peer: u32) -> Result<(), Error> {
-        self.send(
-            env,
-            &wire::Message::ChannelOpenFailure {
-                recipient: peer,
-                reason: 1,
-                description: "Channel refused".into(),
-                language: String::new(),
-            },
-        )
+    fn refuse(&mut self, peer: u32, why: Refusal) -> Result<(), Error> {
+        let (reason, description) = match why {
+            Refusal::Prohibited => (1, "Channel refused"),
+            Refusal::ResourceShortage => (4, "Resource shortage"),
+        };
+        self.send(&wire::Message::ChannelOpenFailure {
+            recipient: peer,
+            reason,
+            description: description.into(),
+            language: String::new(),
+        })
     }
     fn input(
         &mut self,
         env: &Env<'_, Ended>,
+        paid: &mut Charge,
         recipient: u32,
         kind: Option<u32>,
         data: Vec<u8>,
@@ -1366,11 +1404,14 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 },
             );
         }
-        // The decoded payload is paid for as the connection takes it in.
-        let mut data = Bytes::unpaid(data);
-        if !data.repay(env.budget()) {
-            return Err(Error::Budget);
-        }
+        // The channel's copy, paid for with the packet before it was parsed.
+        let mut kept = paid
+            .split(data.len())
+            .ok_or(TransportError::State)?
+            .into_bytes();
+        kept.extend_within(&data)
+            .map_err(|_| TransportError::State)?;
+        let data = Bytes::from_bytes(kept);
         self.raise(MuxEvent::Child(
             id,
             match kind {
@@ -1384,11 +1425,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         &mut self,
         sequence: u32,
         payload: &[u8],
+        paid: &mut Charge,
         env: &mut Env<'_, Ended>,
     ) -> Result<(), Error> {
         if self.control.requested() != Requested::Open {
             return match payload.first() {
-                Some(93) => self.connection_message(wire::Message::parse(payload)?, env),
+                Some(93) => self.connection_message(wire::Message::parse(payload)?, paid, env),
                 Some(97) => {
                     self.close(env, Ended::Closed);
                     Ok(())
@@ -1414,20 +1456,29 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 if service != "ssh-userauth" {
                     return Err(TransportError::State.into());
                 }
-                self.send(env, &ssh::Message::ServiceAccept(service))?;
+                self.send(&ssh::Message::ServiceAccept(service))?;
                 self.service_requested = true;
             }
             50 | 61 if self.user.is_none() => self.authentication(payload, env)?,
             50 if self.user.is_some() => {}
             80..=82 | 90..=100 if self.user.is_some() => {
-                self.connection_message(wire::Message::parse(payload)?, env)?
+                self.connection_message(wire::Message::parse(payload)?, paid, env)?
             }
-            _ => self.send(env, &ssh::Message::Unimplemented(sequence))?,
+            _ => self.send(&ssh::Message::Unimplemented(sequence))?,
         }
         Ok(())
     }
+    /// One step. Storage a step needs that the budget cannot pay for now
+    /// makes it wait for memory, changing nothing (layer rule 9): the fixed
+    /// storage first, and room for output before each action that writes.
     fn progress(&mut self, env: &mut Env<'_, Ended>) -> Result<bool, Error> {
+        if !self.ended && !self.reserve(env.budget()) {
+            return Ok(false);
+        }
         if self.control.requested() == Requested::Disconnect && !self.ended {
+            if !self.room(env.budget()) {
+                return Ok(false);
+            }
             self.disconnect(
                 env,
                 ssh::DisconnectReason::ByApplication,
@@ -1438,11 +1489,13 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         if self.ended || self.out_pending() || self.up.len() >= 4 || self.flights.len() >= 120 {
             return Ok(false);
         }
-        self.reserve(env)?;
         if !self.started {
+            if !self.room(env.budget()) {
+                return Ok(false);
+            }
             let mut seed = [0; 32];
             env.entropy().fill_random(&mut seed);
-            self.written(env, |transport, out| transport.start(seed, out))??;
+            self.written(|transport, out| transport.start(seed, out))??;
             self.timers
                 .set(Timer::Login, env.now() + self.config.login_grace);
             self.started = true;
@@ -1450,8 +1503,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         }
         if matches!(self.transport.state(), TransportState::Established { .. }) {
             if self.failure_ready {
+                if !self.room(env.budget()) {
+                    return Ok(false);
+                }
                 if let Some(failure) = self.failure.take() {
-                    self.write(env, &failure)?;
+                    self.write(&failure)?;
                 }
                 self.failure_ready = false;
                 return Ok(true);
@@ -1461,6 +1517,9 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 && (self.attempts >= self.config.max_attempts
                     || self.auth_requests >= MAX_AUTH_REQUESTS)
             {
+                if !self.room(env.budget()) {
+                    return Ok(false);
+                }
                 self.disconnect(
                     env,
                     ssh::DisconnectReason::NoMoreAuthMethodsAvailable,
@@ -1468,9 +1527,18 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 )?;
                 return Ok(true);
             }
-            if let Some((sequence, payload)) = self.pending_packets.pop_front() {
-                self.scratch()?;
-                self.packet(sequence, &payload, env)?;
+            if !self.pending_packets.is_empty() {
+                // What the packet takes is paid before it is parsed.
+                // Refused, it waits unparsed.
+                let charge = packet_charge(&self.pending_packets.front().unwrap().1);
+                let Some(mut paid) = env.budget().charge(charge) else {
+                    return Ok(false);
+                };
+                if !self.room(env.budget()) {
+                    return Ok(false);
+                }
+                let (sequence, payload) = self.pending_packets.pop_front().unwrap();
+                self.packet(sequence, &payload, &mut paid, env)?;
                 return Ok(true);
             }
             let eligible = |id: &ChildId| {
@@ -1479,7 +1547,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     && !channel.closed
                     && (!channel.confirmed && channel.receive > 0
                         || channel.confirmed
-                            && (channel.receive > channel.advertised as u64
+                            && (channel.adjustment().is_some()
                                 || channel.granted == 0 && channel.window > 0 && !channel.sent_eof))
             };
             let id = self
@@ -1489,6 +1557,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 .find(|id| self.credit_turn.is_none_or(|turn| *id > turn))
                 .or_else(|| self.channels.ids().find(eligible));
             if let Some(id) = id {
+                let channel = self.channels.get(id).unwrap();
+                let credit = channel.confirmed && channel.adjustment().is_none();
+                if !credit && !self.room(env.budget()) {
+                    return Ok(false);
+                }
                 self.credit_turn = Some(id);
                 let channel = self.channels.get_mut(id).unwrap();
                 let peer = channel.peer;
@@ -1497,28 +1570,19 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     channel.advertised = channel.receive.min(WINDOW as u64) as u32;
                     let window = channel.advertised;
                     let wire = channel.wire;
-                    self.send(
-                        env,
-                        &wire::Message::ChannelOpenConfirmation {
-                            recipient: peer,
-                            sender: wire,
-                            window,
-                            max_packet: PACKET,
-                            data: Vec::new(),
-                        },
-                    )?;
-                } else if channel.receive > channel.advertised as u64 {
-                    let bytes = (channel.receive - channel.advertised as u64)
-                        .min(u32::MAX as u64 - channel.advertised as u64)
-                        as u32;
+                    self.send(&wire::Message::ChannelOpenConfirmation {
+                        recipient: peer,
+                        sender: wire,
+                        window,
+                        max_packet: PACKET,
+                        data: Vec::new(),
+                    })?;
+                } else if let Some(bytes) = channel.adjustment() {
                     channel.advertised += bytes;
-                    self.send(
-                        env,
-                        &wire::Message::WindowAdjust {
-                            recipient: peer,
-                            bytes,
-                        },
-                    )?;
+                    self.send(&wire::Message::WindowAdjust {
+                        recipient: peer,
+                        bytes,
+                    })?;
                 } else {
                     let units = channel.window.min(channel.max_packet) as u64;
                     channel.granted = units;
@@ -1527,19 +1591,32 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 return Ok(true);
             }
             if self.transport.needs_rekey() {
-                self.written(env, |transport, out| transport.rekey(out))??;
+                if !self.room(env.budget()) {
+                    return Ok(false);
+                }
+                self.written(|transport, out| transport.rekey(out))??;
                 return Ok(true);
             }
         }
-        if !self.transport.poll_ready() {
+        if !self.transport.poll_ready() || !self.room(env.budget()) {
             return Ok(false);
         }
-        self.scratch()?;
-        let event = match self.written(env, |transport, out| transport.poll(out))? {
+        let (handler, connection, now) = (&self.handler, &self.connection, env.now());
+        let mut observe = |observation| {
+            let event = match observation {
+                transport::Observation::Version(version) => Event::Version(version),
+                transport::Observation::Proposal(proposal) => Event::KexInit(*proposal),
+            };
+            handler.observe(&Context { connection, now }, &event);
+        };
+        let polled = fill(&mut self.out, &mut self.transport, |transport, out| {
+            transport.poll(env.budget(), out, &mut observe)
+        })?;
+        let event = match polled {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(false),
             Err(transport::Failure::Framing(_)) => {
-                self.written(env, |transport, out| {
+                self.written(|transport, out| {
                     transport.disconnect(
                         ssh::DisconnectReason::ProtocolError,
                         "Invalid SSH packet",
@@ -1549,22 +1626,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 self.close(env, Ended::Failed);
                 return Ok(true);
             }
-            Err(transport::Failure::Protocol { error, observation }) => {
-                if let Some(observation) = observation {
-                    self.observe_transport(&observation, env.now());
-                }
-                return Err(error.into());
-            }
+            Err(transport::Failure::Protocol(error)) => return Err(error.into()),
         };
-        match &event {
-            transport::Event::Observed(observation) => {
-                self.observe_transport(observation, env.now())
-            }
-            transport::Event::End => {
-                self.close(env, Ended::Eof);
-                return Ok(true);
-            }
-            _ => {}
+        if let transport::Event::End = event {
+            self.close(env, Ended::Eof);
+            return Ok(true);
         }
         if let transport::Event::Packet { sequence, payload } = event {
             if payload.first() == Some(&1) {
@@ -1579,10 +1645,9 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             if self.pending_packets.len() >= 128 || held + payload.len() > OUTPUT_LIMIT {
                 return Err(TransportError::State.into());
             }
-            let kept = ChargedBytes::copy_of(env.budget(), &payload).ok_or(Error::Budget)?;
             self.pending_packets
-                .push_back((sequence, kept))
-                .map_err(|_| Error::Budget)?;
+                .push_back((sequence, payload))
+                .map_err(|_| TransportError::State)?;
         }
         Ok(true)
     }
@@ -1604,16 +1669,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
     type Error = Error;
     fn advance(&mut self, env: &mut Env<'_, Ended>) -> Result<bool, Error> {
         self.control.watch(env);
-        let result = self.progress(env);
-        let bytes = self.resident_bytes();
-        if let Some(charge) = &mut self.state {
-            if bytes < charge.bytes() {
-                charge.shrink_to(bytes);
-            } else if !charge.grow_to(bytes) {
-                return Err(Error::Budget);
-            }
-        }
-        result
+        self.progress(env)
     }
     fn on_event(
         &mut self,
@@ -1625,8 +1681,10 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                 if self.ended {
                     return Ok(Admit::Closed(StreamEvent::Data(data)));
                 }
-                self.reserve(env)?;
-                let n = self.transport.push(&data);
+                if !self.reserve(env.budget()) {
+                    return Ok(Admit::Blocked(StreamEvent::Data(data)));
+                }
+                let n = self.transport.push(env.budget(), &data);
                 data.advance(n);
                 if !data.is_empty() {
                     return Ok(if n == 0 {
@@ -1680,6 +1738,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
             || self.up.len() >= 4
             || !matches!(self.transport.state(), TransportState::Established { .. })
             || self.flights.len() >= 120
+            || !self.room(env.budget())
         {
             return Ok(Admit::Blocked(command));
         }
@@ -1701,10 +1760,10 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                     channel.closed = true;
                     let peer = channel.peer;
                     if channel.confirmed {
-                        self.send(env, &wire::Message::Close(peer))?;
+                        self.send(&wire::Message::Close(peer))?;
                     } else {
                         self.channels.remove(id);
-                        self.refuse(env, peer)?;
+                        self.refuse(peer, Refusal::Prohibited)?;
                         self.raise(MuxEvent::Closed(id))?;
                     }
                 }
@@ -1731,7 +1790,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                             if self.next_channel == wire + 1 {
                                 self.next_channel = wire;
                             }
-                            self.refuse(env, peer)?;
+                            self.refuse(peer, Refusal::Prohibited)?;
                             self.raise(MuxEvent::Closed(id))?;
                         }
                     }
@@ -1747,24 +1806,21 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                             return Err(TransportError::State.into());
                         }
                         channel.sent_eof = true;
-                        self.send(env, &wire::Message::Eof(peer))?;
+                        self.send(&wire::Message::Eof(peer))?;
                     }
                     ChannelCommand::Stream(StreamCommand::Reset) | ChannelCommand::Close => {
                         self.channels.get_mut(id).unwrap().closed = true;
-                        self.send(env, &wire::Message::Close(peer))?;
+                        self.send(&wire::Message::Close(peer))?;
                         self.raise(MuxEvent::Child(
                             id,
                             ChannelEvent::Stream(StreamEvent::Reset),
                         ))?;
                     }
-                    ChannelCommand::Reply(accepted) => self.send(
-                        env,
-                        &if accepted {
-                            wire::Message::ChannelSuccess(peer)
-                        } else {
-                            wire::Message::ChannelFailure(peer)
-                        },
-                    )?,
+                    ChannelCommand::Reply(accepted) => self.send(&if accepted {
+                        wire::Message::ChannelSuccess(peer)
+                    } else {
+                        wire::Message::ChannelFailure(peer)
+                    })?,
                     ChannelCommand::Request {
                         want_reply,
                         request,
@@ -1779,14 +1835,11 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                                 },
                             );
                         }
-                        self.send(
-                            env,
-                            &wire::Message::ChannelRequest {
-                                recipient: peer,
-                                want_reply,
-                                request,
-                            },
-                        )?;
+                        self.send(&wire::Message::ChannelRequest {
+                            recipient: peer,
+                            want_reply,
+                            request,
+                        })?;
                     }
                     ChannelCommand::Hangup => self.close(env, Ended::Closed),
                 }
@@ -1844,11 +1897,13 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         let fired = self.timers.fire(&timer, env.now());
         if fired {
             match timer {
-                Timer::Login => self.disconnect(
+                Timer::Login if self.room(env.budget()) => self.disconnect(
                     env,
                     ssh::DisconnectReason::ByApplication,
                     "Login grace time exceeded",
                 )?,
+                // Without memory to say why, the connection closes all the same.
+                Timer::Login => self.close(env, Ended::Closed),
                 Timer::Failure => self.failure_ready = true,
             }
         }
@@ -1876,20 +1931,17 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 data: bytes.clone(),
             },
         );
-        self.send(
-            env,
-            &match kind {
-                Some(kind) => wire::Message::ExtendedData {
-                    recipient: peer,
-                    kind,
-                    data: bytes,
-                },
-                None => wire::Message::Data {
-                    recipient: peer,
-                    data: bytes,
-                },
+        self.send(&match kind {
+            Some(kind) => wire::Message::ExtendedData {
+                recipient: peer,
+                kind,
+                data: bytes,
             },
-        )?;
+            None => wire::Message::Data {
+                recipient: peer,
+                data: bytes,
+            },
+        })?;
         self.out_child = Some((id, data.len() as u64));
         Ok(())
     }
@@ -2086,9 +2138,11 @@ mod tests {
         }
     }
 
+    /// A connection whose budget has no room waits, holding nothing, and
+    /// starts once memory frees: no room is never a protocol failure.
     #[test]
-    fn exhausted_storage_is_distinct_from_invalid_protocol_traffic() {
-        let budget = Budget::new(0);
+    fn a_connection_without_memory_waits_and_starts_once_memory_frees() {
+        let budget = Budget::new(1 << 20);
         let config = Arc::new(Config::new(
             Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
             ssh::Identification::new("2.0", "test", None).unwrap(),
@@ -2103,7 +2157,16 @@ mod tests {
             layer,
             budget.clone(),
         );
-        assert!(matches!(harness.settle(), Err(Error::Budget)));
+        let elsewhere = budget.charge(budget.limit()).unwrap();
+        harness.settle().unwrap();
+        harness.push(b"SSH-2.0-client\r\n").unwrap();
+        assert!(harness.take_output().is_empty());
+        assert!(!harness.ended());
+        assert_eq!(budget.used(), elsewhere.bytes());
+        drop(elsewhere);
+        harness.settle().unwrap();
+        assert!(!harness.take_output().is_empty());
+        assert!(!harness.ended());
         drop(harness);
         assert_eq!(budget.used(), 0);
     }
@@ -2352,6 +2415,143 @@ mod tests {
                 ]
             );
             assert_eq!(budget.used(), 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A client that counts the window adjustments it receives.
+    struct Adjustments(Arc<std::sync::atomic::AtomicUsize>);
+    impl russh::client::Handler for Adjustments {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn window_adjusted(
+            &mut self,
+            _: russh::ChannelId,
+            _: u32,
+            _: &mut russh::client::Session,
+        ) -> Result<(), Self::Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Opens `channels` echo channels; with all of them open, each in turn
+    /// sends a full receive window before it reads anything back. Returns
+    /// the window adjustments the client received.
+    async fn full_windows(seed: u64, channels: usize) -> usize {
+        let config = Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        ));
+        let programs = Arc::new(Mutex::new(Vec::new()));
+        let layer = Ssh::new(
+            config,
+            Arc::new(Echo(programs)),
+            Arc::new(ConnInfo::default()),
+        )
+        .sessions();
+        let budget = Budget::new(32 << 20);
+        let mut harness = crate::stdlib::layer::Harness::with_budget(
+            crate::Seed::from_u64(seed),
+            layer,
+            budget.clone(),
+        );
+        let (client, mut server) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(async move {
+            harness.settle().unwrap();
+            server.write_all(&harness.take_output()).await.unwrap();
+            let mut input = [0; 8192];
+            loop {
+                let n = server.read(&mut input).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                harness.push(&input[..n]).unwrap();
+                server.write_all(&harness.take_output()).await.unwrap();
+                if harness.ended() {
+                    break;
+                }
+            }
+        });
+        let adjustments = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client,
+            Adjustments(adjustments.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            client
+                .authenticate_password("guest", "secret")
+                .await
+                .unwrap()
+                .success()
+        );
+        let mut open = Vec::new();
+        for _ in 0..channels {
+            let channel = client.channel_open_session().await.unwrap();
+            channel.exec(true, b"echo".to_vec()).await.unwrap();
+            open.push(channel);
+        }
+        let block = [b'w'; 1024];
+        for channel in &mut open {
+            for _ in 0..WINDOW as usize / block.len() {
+                channel.data(&block[..]).await.unwrap();
+            }
+            channel.eof().await.unwrap();
+            let mut received = 0;
+            let mut exit = None;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Data { data } => received += data.len(),
+                    russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(received, WINDOW as usize);
+            assert_eq!(exit, Some(7));
+        }
+        client
+            .disconnect(russh::Disconnect::ByApplication, "done", "")
+            .await
+            .unwrap();
+        drop(client);
+        task.await.unwrap();
+        assert_eq!(budget.used(), 0);
+        adjustments.load(Ordering::Relaxed)
+    }
+
+    /// A client that sends a channel's whole window before reading, with
+    /// other channels open, gets its echo, exit status and close. The peer
+    /// hears of new room about once per half window it used, not once per
+    /// packet the server consumed: a client that buffers a bounded number
+    /// of messages per channel (russh, 100) stalled behind one adjustment
+    /// per kilobyte.
+    #[tokio::test]
+    async fn full_windows_on_open_channels_finish_with_an_adjustment_per_half_window() {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for seed in 0..16 {
+                for channels in [4, 1] {
+                    let adjustments = full_windows(seed, channels).await;
+                    // One per half window each channel's peer used, and a
+                    // last one that tops the window up once it is done.
+                    let most = channels * (WINDOW as usize / (WINDOW as usize / 2) + 1);
+                    assert!(
+                        adjustments <= most,
+                        "{channels} channels got {adjustments} window adjustments, more than {most}"
+                    );
+                }
+            }
         })
         .await
         .unwrap();

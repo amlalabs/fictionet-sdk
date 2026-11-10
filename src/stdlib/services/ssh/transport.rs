@@ -10,7 +10,7 @@
 
 use super::Config;
 use crate::stdlib::codec::{Stream, Wire};
-use crate::stdlib::layer::Budget;
+use crate::stdlib::layer::{Budget, Charge, Owned};
 use crate::stdlib::network::ConnInfo;
 use crate::stdlib::protocols::ssh::transport::Transport;
 pub use crate::stdlib::protocols::ssh::transport::{Negotiated, TransportError};
@@ -35,7 +35,7 @@ pub struct Opening<'a> {
     pub login_deadline: Instant,
 }
 
-/// Peer metadata observed before transport negotiation accepts or rejects it.
+/// Peer metadata, observed before transport negotiation accepts or rejects it.
 #[derive(Clone, Debug)]
 pub enum Observation {
     /// Peer identification, including unsupported versions.
@@ -45,31 +45,24 @@ pub enum Observation {
 }
 
 /// A terminal receive failure. Framing failures permit a protocol disconnect;
-/// negotiation failures stop immediately, preserving any peer observation.
+/// negotiation failures stop immediately. Peer metadata seen before either
+/// was already observed.
 #[derive(Debug)]
 pub enum Failure {
     /// Invalid packet framing, authentication tag or truncated input.
     Framing(TransportError),
     /// A decoded message failed transport negotiation or policy.
-    Protocol {
-        /// Fatal transport error.
-        error: TransportError,
-        /// Peer metadata retained even when negotiation fails.
-        observation: Option<Observation>,
-    },
+    Protocol(TransportError),
 }
 impl From<TransportError> for Failure {
     fn from(error: TransportError) -> Self {
-        Self::Protocol {
-            error,
-            observation: None,
-        }
+        Self::Protocol(error)
     }
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Framing(error) | Self::Protocol { error, .. } => error.fmt(f),
+            Self::Framing(error) | Self::Protocol(error) => error.fmt(f),
         }
     }
 }
@@ -78,8 +71,6 @@ impl std::error::Error for Failure {}
 /// An event after transport processing, never an unverified encrypted packet.
 #[derive(Debug)]
 pub enum Event {
-    /// Peer metadata from this transport step.
-    Observed(Observation),
     /// Both directions installed keys. Session identity remains stable on rekey.
     Established {
         /// True after a subsequent exchange, false after the initial exchange.
@@ -89,8 +80,9 @@ pub enum Event {
     Packet {
         /// Incoming packet sequence number.
         sequence: u32,
-        /// Message number followed by its fields.
-        payload: Vec<u8>,
+        /// Message number followed by its fields, with the charge that paid
+        /// for its allocation before it was made.
+        payload: Owned<Vec<u8>>,
     },
     /// A transport message was consumed without an application event.
     Progress,
@@ -125,24 +117,33 @@ pub enum State<'a> {
 /// Implementations obey SSH's MAX_PACKET and MAX_PAYLOAD limits. Each output
 /// operation appends at most four MAX_PACKET bytes; `write_packet` appends at
 /// most one MAX_PACKET and must encode the entire payload synchronously.
-/// `resident_bytes` bounds all retained input and transport state before any
-/// allocation. Temporary parsing space is bounded by 64 MAX_PACKET bytes.
-/// Shared configuration belongs to the factory; connection storage belongs to
-/// this bound. Implementations must not allocate beyond these reservations.
+///
+/// A transport pays for what it holds itself, from the budget that `push`
+/// and `poll` hand it, before it allocates: its input buffer, its own state,
+/// and what a packet takes while it is decoded and handled. A payload it
+/// hands up carries the charge that paid for it. A refused charge changes
+/// nothing (layer rule 9): `push` takes no more than the room already paid
+/// for, and `poll` gives no event and keeps any decoded packet for the next
+/// poll, which the runner makes once memory frees. Shared configuration
+/// belongs to the factory.
 pub trait PacketTransport: Send + 'static {
-    /// Reserved input and retained transport storage, excluding output.
-    fn resident_bytes(&self) -> usize;
     /// Start once with fresh connection entropy.
     fn start(&mut self, seed: [u8; 32], out: &mut Vec<u8>) -> Result<(), TransportError>;
     /// Accept only the returned prefix; the caller retains the suffix.
-    fn push(&mut self, bytes: &[u8]) -> usize;
+    fn push(&mut self, budget: &Budget, bytes: &[u8]) -> usize;
     /// Mark EOF; poll must still process buffered packets or report truncation.
     fn end(&mut self);
     /// Whether polling can consume input, emit an event, or finish after EOF.
-    /// False lets the caller avoid reserving packet scratch space while idle.
     fn poll_ready(&self) -> bool;
-    /// None means more input is required. Output belongs exclusively to caller.
-    fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure>;
+    /// None means more input or more memory is required. Output belongs
+    /// exclusively to the caller. Peer metadata goes to `observe` as it is
+    /// decoded, before negotiation accepts or rejects it.
+    fn poll(
+        &mut self,
+        budget: &Budget,
+        out: &mut Vec<u8>,
+        observe: &mut dyn FnMut(Observation),
+    ) -> Result<Option<Event>, Failure>;
     /// Current negotiation state and stable session identity.
     fn state(&self) -> State<'_>;
     /// Whether key limits require a new exchange before further output.
@@ -164,30 +165,41 @@ pub trait PacketTransport: Send + 'static {
 pub struct StandardTransport {
     stream: Stream<Transport>,
     proposal: Option<ssh::KexInit>,
+    /// The input buffer's allocation, paid for before it grows.
+    input: Option<Charge>,
+    /// The protocol state, charged once at the most it can reach
+    /// ([`Transport::most_held`]) before the first packet is decoded.
+    state: Option<Charge>,
+    /// A decoded packet whose handling the budget could not pay for yet,
+    /// and the charge for what it holds.
+    held_back: Option<(TransportEvent, Charge)>,
 }
 impl StandardTransport {
     /// Create the standard transport from server configuration.
     pub fn new(config: &Config) -> Self {
-        Self {
-            stream: Stream::new(Transport::new(
+        Self::with_stream(
+            Stream::new(Transport::new(
                 config.host_key.clone(),
                 config.identification.clone(),
             )),
-            proposal: config.proposal.clone(),
-        }
+            config.proposal.clone(),
+        )
     }
     /// Wrap a separately configured standard codec, for transport extensions.
     pub fn from_transport(transport: Transport) -> Self {
+        Self::with_stream(Stream::new(transport), None)
+    }
+    fn with_stream(stream: Stream<Transport>, proposal: Option<ssh::KexInit>) -> Self {
         Self {
-            stream: Stream::new(transport),
-            proposal: None,
+            stream,
+            proposal,
+            input: None,
+            state: None,
+            held_back: None,
         }
     }
 }
 impl PacketTransport for StandardTransport {
-    fn resident_bytes(&self) -> usize {
-        self.stream.limit() + self.stream.held()
-    }
     fn start(&mut self, seed: [u8; 32], out: &mut Vec<u8>) -> Result<(), TransportError> {
         let transport = self.stream.decoder();
         transport.seed(seed)?;
@@ -196,8 +208,24 @@ impl PacketTransport for StandardTransport {
         }
         transport.start_identification(out)
     }
-    fn push(&mut self, bytes: &[u8]) -> usize {
-        self.stream.push(bytes)
+    fn push(&mut self, budget: &Budget, bytes: &[u8]) -> usize {
+        if self.input.is_none() {
+            self.input = budget.charge(0);
+        }
+        let Some(input) = &mut self.input else {
+            return 0;
+        };
+        // Room for the buffer's largest allocation is paid for before it
+        // grows; afterwards the charge comes back to what it holds. Without
+        // that room, only what already fits is taken.
+        let growth = if input.grow_to(self.stream.most_allocated()) {
+            usize::MAX
+        } else {
+            input.bytes().saturating_sub(self.stream.allocated())
+        };
+        let taken = self.stream.push_with_budget(bytes, growth);
+        input.shrink_to(self.stream.allocated());
+        taken
     }
     fn end(&mut self) {
         self.stream.end();
@@ -223,6 +251,11 @@ impl PacketTransport for StandardTransport {
         self.stream.get_ref().needs_rekey()
     }
     fn rekey(&mut self, out: &mut Vec<u8>) -> Result<(), TransportError> {
+        // Only an established transport rekeys, and it has decoded packets,
+        // so its state is charged.
+        if self.state.is_none() {
+            return Err(TransportError::State);
+        }
         self.stream.decoder().rekey(out)
     }
     fn write_packet(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), TransportError> {
@@ -237,50 +270,192 @@ impl PacketTransport for StandardTransport {
         self.stream.decoder().disconnect(reason, description, out)
     }
     fn poll_ready(&self) -> bool {
-        self.stream.buffered() > 0 || self.stream.is_eof()
+        self.stream.buffered() > 0 || self.stream.is_eof() || self.held_back.is_some()
     }
-    fn poll(&mut self, out: &mut Vec<u8>) -> Result<Option<Event>, Failure> {
-        let Some(event) = self.stream.next() else {
-            return Ok(self.stream.is_done().then_some(Event::End));
+    fn poll(
+        &mut self,
+        budget: &Budget,
+        out: &mut Vec<u8>,
+        observe: &mut dyn FnMut(Observation),
+    ) -> Result<Option<Event>, Failure> {
+        if self.state.is_none() {
+            let Some(state) = budget.charge(self.stream.get_ref().most_held()) else {
+                return Ok(None);
+            };
+            self.state = Some(state);
+        }
+        let (event, mut charge) = match self.held_back.take() {
+            Some(held) => held,
+            None => {
+                // Decoding copies one packet, or one version line, out of
+                // the input buffer: no more than is buffered, nor than a
+                // packet. That copy is paid for first.
+                let copy = self.stream.buffered().min(ssh::MAX_PACKET + 16);
+                let Some(charge) = budget.charge(copy) else {
+                    return Ok(None);
+                };
+                let Some(event) = self.stream.next() else {
+                    return Ok(self.stream.is_done().then_some(Event::End));
+                };
+                let event = event.map_err(|fail| {
+                    Failure::Framing(match fail {
+                        crate::stdlib::codec::Fail::Protocol(error) => error,
+                        _ => TransportError::State,
+                    })
+                })?;
+                (event, charge)
+            }
         };
-        let event = event.map_err(|error| {
-            Failure::Framing(match error {
-                crate::stdlib::codec::Fail::Protocol(error) => error,
-                _ => TransportError::State,
-            })
-        })?;
-        let observation = match &event {
-            TransportEvent::Version(version) => Some(Observation::Version(version.clone())),
+        // What the packet holds and what handling it takes, paid before
+        // anything is parsed or changed. Refused, the packet waits.
+        let need = match &event {
+            // The line, and the observer's copy.
+            TransportEvent::Version(_) => 2 * ssh::MAX_VERSION_LINE,
+            TransportEvent::Packet { payload, .. } => {
+                payload.capacity() + self.stream.get_ref().scratch(payload)
+            }
+        };
+        if !charge.grow_to(need) {
+            self.held_back = Some((event, charge));
+            return Ok(None);
+        }
+        charge.shrink_to(need);
+        match &event {
+            TransportEvent::Version(version) => observe(Observation::Version(version.clone())),
+            // The observer's parse is gone before negotiation parses again.
             TransportEvent::Packet { payload, .. } if payload.first() == Some(&20) => {
                 let ssh::Message::KexInit(proposal) =
                     ssh::Message::parse(payload).map_err(TransportError::from)?
                 else {
                     return Err(TransportError::State.into());
                 };
-                Some(Observation::Proposal(Box::new(proposal)))
+                observe(Observation::Proposal(Box::new(proposal)));
             }
-            _ => None,
-        };
+            TransportEvent::Packet { .. } => {}
+        }
         let sequence = match &event {
             TransportEvent::Packet { sequence, .. } => *sequence,
-            _ => 0,
+            TransportEvent::Version(_) => 0,
         };
         let transport = self.stream.decoder();
         let established = transport.is_established();
         let exchanging = transport.is_rekeying();
-        let payload = transport
-            .handle(event, out)
-            .map_err(|error| Failure::Protocol {
-                error,
-                observation: observation.clone(),
-            })?;
-        let event = if let Some(payload) = payload {
-            Event::Packet { sequence, payload }
-        } else if exchanging && !transport.is_rekeying() && transport.is_established() {
-            Event::Established { rekey: established }
-        } else {
-            observation.map_or(Event::Progress, Event::Observed)
+        let event = match transport.handle(event, out)? {
+            Some(payload) => {
+                let paid = charge
+                    .split(payload.capacity())
+                    .ok_or(TransportError::State)?;
+                Event::Packet {
+                    sequence,
+                    payload: Owned::new(payload, paid),
+                }
+            }
+            None if exchanging && !transport.is_rekeying() && transport.is_established() => {
+                Event::Established { rekey: established }
+            }
+            None => Event::Progress,
         };
         Ok(Some(event))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stdlib::protocols::ssh::transport::HostKey;
+    use std::sync::Arc;
+
+    /// What the transport holds is paid for: the input buffer's charge is
+    /// what it has allocated, and the state's charge covers the protocol
+    /// state.
+    fn covered(transport: &StandardTransport) {
+        assert_eq!(
+            transport.input.as_ref().map_or(0, Charge::bytes),
+            transport.stream.allocated()
+        );
+        if let Some(state) = &transport.state {
+            assert!(state.bytes() >= transport.stream.held());
+        }
+    }
+
+    /// With no room in its budget the transport takes no input and decodes
+    /// nothing, changing nothing; a packet decoded whose handling does not
+    /// fit waits whole. Once memory frees, each goes on.
+    #[test]
+    fn without_memory_the_transport_waits_and_changes_nothing() {
+        let host = Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap());
+        let config = Config::new(
+            host.clone(),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        );
+        let mut transport = StandardTransport::new(&config);
+        let mut out = Vec::new();
+        transport.start([3; 32], &mut out).unwrap();
+        let version = ssh::Identification::new("2.0", "client", None)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        // A proposal the server can take: its own algorithms.
+        let proposal = Transport::new(host, config.identification.clone())
+            .proposal()
+            .clone();
+        let kexinit = ssh::Packet::new(ssh::Message::KexInit(proposal).to_bytes().unwrap())
+            .to_bytes()
+            .unwrap();
+        let input = [version, kexinit.clone()].concat();
+        let budget = Budget::new(1 << 20);
+
+        let elsewhere = budget.charge(budget.limit()).unwrap();
+        assert_eq!(transport.push(&budget, &input), 0);
+        assert_eq!(budget.used(), elsewhere.bytes());
+        drop(elsewhere);
+        assert_eq!(transport.push(&budget, &input), input.len());
+        covered(&transport);
+
+        let mut observed = Vec::new();
+        let elsewhere = budget.charge(budget.limit() - budget.used()).unwrap();
+        let used = budget.used();
+        assert!(
+            transport
+                .poll(&budget, &mut out, &mut |o| observed.push(o))
+                .unwrap()
+                .is_none()
+        );
+        assert!(observed.is_empty());
+        assert_eq!(transport.stream.buffered(), input.len());
+        assert_eq!(budget.used(), used);
+        drop(elsewhere);
+        assert!(matches!(
+            transport.poll(&budget, &mut out, &mut |o| observed.push(o)),
+            Ok(Some(Event::Progress))
+        ));
+        assert!(matches!(observed[..], [Observation::Version(_)]));
+        covered(&transport);
+
+        // Room to decode the proposal, but not to parse it: it waits.
+        let elsewhere = budget
+            .charge(budget.limit() - budget.used() - kexinit.len())
+            .unwrap();
+        assert!(
+            transport
+                .poll(&budget, &mut out, &mut |o| observed.push(o))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(observed.len(), 1);
+        assert!(transport.poll_ready());
+        drop(elsewhere);
+        assert!(matches!(
+            transport.poll(&budget, &mut out, &mut |o| observed.push(o)),
+            Ok(Some(Event::Progress))
+        ));
+        assert!(matches!(
+            observed[..],
+            [Observation::Version(_), Observation::Proposal(_)]
+        ));
+        assert!(!transport.poll_ready());
+        covered(&transport);
+        drop(transport);
+        assert_eq!(budget.used(), 0);
     }
 }

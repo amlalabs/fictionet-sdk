@@ -705,10 +705,15 @@ async fn ssh_channels_hold_no_heap_their_budget_does_not_cover() {
     use fictionet::stdlib::services::ssh;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     const CHANNELS: usize = 4;
-    const PER_CHANNEL: usize = 32 << 10;
+    // The server's whole receive window.
+    const PER_CHANNEL: usize = 64 << 10;
     tokio::time::timeout(Duration::from_secs(60), async {
         let (client_side, mut server) = tokio::io::duplex(1 << 20);
-        let budget = Budget::new(4 << 20);
+        // Near the most the connection holds, about 1.42 MiB with four
+        // channels open, each in turn sending a full window. Storage the
+        // budget refuses waits for memory, or refuses a channel; none of
+        // it fails the connection.
+        let budget = Budget::new(3 << 19);
         let server_budget = budget.clone();
         // Set once the client is authenticated: the server's state from
         // then on is its fixed state.
