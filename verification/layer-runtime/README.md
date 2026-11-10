@@ -723,3 +723,43 @@ The runs of each build repeated to within 0.05 percent. Together the
 changes take 0.47 percent off; the `Env` and waker changes alone take
 0.18 percent. That is less than the 2.6 percent the review fixes added,
 so most of that cost is not in building environments or in the wake flag.
+
+## The budget redesign merge of November 9, 2026 (`comp/budget-integ`)
+
+The budget redesign (each charge one value with what it pays for, the
+charged containers, the runner wake, and the HTTP/2, TCP, TLS, HTTP/1,
+SSH, `Children` and DNS cache stages) was merged into `main` at
+46a161ab8. This compares `main` before it (47a901718) with `main` after
+it (46a161ab8).
+
+The method is the one of the performance pass: the bench profile with
+frame pointers and line tables, each build in a target directory of its
+own, each bench process under `perf stat -e instructions:u`. Each build
+ran three times, with the builds interleaved, and the table gives the
+median. Instruction counts repeated to within 0.1 percent.
+
+| Workload | Before (47a901718) | After (46a161ab8) |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 40.82 G | 40.52 G |
+| HTTP/1, 101,010 requests | 1.119 s | 1.157 s |
+| HTTP/2, 101,010 requests | 1.763 s | 1.754 s |
+| HTTP/1 allocations | 5.65 M | 5.85 M |
+| HTTP/2 allocations | 10.00 M | 9.10 M |
+| TCP bulk process, instructions | 4.82 G | 4.82 G |
+| TCP, one connection, 32 MiB | 33.04 ms | 32.49 ms |
+| TCP, ten connections, 4 MiB each | 49.48 ms | 47.80 ms |
+| TCP, one hundred connections, 1 MiB each | 213.1 ms | 212.5 ms |
+| TCP allocations, one connection | 88,857 | 88,856 |
+| TCP allocations, ten connections | 128,728 | 128,727 |
+| TCP allocations, one hundred connections | 479,874 | 479,872 |
+| Packets sent, one hundred connections | 109,400 | 109,400 |
+
+The HTTP bench runs 0.7 percent fewer instructions. HTTP/2 makes about
+nine fewer allocations per request: its queues are charged when the
+connection opens and keep their places, and the response head is encoded
+into one buffer from borrowed fields. HTTP/1 makes about two more
+allocations per request (200,030 over the run). Which change adds them
+was not measured. The stage reports name two candidates: the
+reallocation that gives back a chunk's spare capacity on admission, and
+the HTTP/1 handoff bytes that are now copied. TCP bulk is unchanged in
+instructions, allocations and packets.
