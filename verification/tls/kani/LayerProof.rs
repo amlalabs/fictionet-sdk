@@ -93,7 +93,11 @@ fn a_completion_credits_the_pending_write_once_at_its_fence() {
     let mut env = Env::new(Instant::ZERO, &NoEntropy, &budget, &mut observed);
     let mut layer = accounting();
     let (produced, delivered) = (layer.ciphertext_emitted, layer.ciphertext_completed);
-    let (waiting, fenced, credit) = (pending(&layer), fence(&layer), layer.completed_plaintext_bytes);
+    let (waiting, fenced, credit) = (
+        pending(&layer),
+        fence(&layer),
+        layer.completed_plaintext_bytes,
+    );
     let n: u64 = kani::any();
 
     let result = layer.on_event(&mut env, StreamEvent::Written(n));
