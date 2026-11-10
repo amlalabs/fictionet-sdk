@@ -1,6 +1,8 @@
 //! A server connection paid from a budget: every buffer charged what it
 //! holds, and each refusal changing nothing until the budget has room.
 
+mod record_vectors;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use std::io::{self, Read, Write};
@@ -13,7 +15,7 @@ use crate::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerC
 use crate::client::ClientConnection;
 use crate::crypto::ring::default_provider;
 use crate::enums::{AlertDescription, SignatureScheme};
-use crate::msgs::message::MAX_WIRE_SIZE;
+use crate::msgs::message::{HEADER_SIZE, MAX_WIRE_SIZE};
 use crate::server::{Acceptor, IntoConnectionError, ServerConnection};
 use crate::sync::Arc;
 use crate::vecbuf::{FIRST_PLACES, PLACE};
@@ -505,4 +507,93 @@ fn output_with_neither_room_nor_budget_fails_rather_than_overruns() {
     assert_eq!(common.output_paid(), Ok(()));
     assert!(common.wants_write());
     assert!(common.sendable_tls.accounted());
+}
+
+/// A record of content type `typ` whose header says `len` and whose body
+/// is that many zero bytes.
+fn record(typ: u8, len: usize) -> Vec<u8> {
+    let mut bytes = vec![typ, 3, 3];
+    bytes.extend_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+    bytes.resize(HEADER_SIZE + len, 0);
+    bytes
+}
+
+/// Gives `server` all of `wire`, a record at a time, and returns what
+/// processing it ends with.
+fn process_all(server: &mut ServerConnection, wire: &[u8]) -> Result<(), Error> {
+    let mut rest = wire;
+    while !rest.is_empty() {
+        assert!(server.read_tls(&mut rest).unwrap() > 0);
+        server.process_new_packets()?;
+    }
+    Ok(())
+}
+
+/// A server past the handshake of `version`.
+fn connected(version: &'static SupportedProtocolVersion) -> ServerConnection {
+    let mut server = ServerConnection::with_budget(server_config(), Limit::new(1 << 20)).unwrap();
+    handshake(&mut server, &mut client(version));
+    assert!(!server.is_handshaking());
+    server
+}
+
+#[test]
+fn an_unprotected_record_longer_than_2_14_is_a_record_overflow() {
+    let mut server = ServerConnection::with_budget(server_config(), Limit::new(1 << 20)).unwrap();
+    let error = process_all(&mut server, &record(22, (1 << 14) + 1)).unwrap_err();
+    assert_eq!(error, Error::PeerSentOversizedRecord);
+    assert!(server.wants_write(), "no record_overflow alert queued");
+}
+
+#[test]
+fn a_tls13_record_longer_than_2_14_plus_256_is_refused_before_decryption() {
+    let mut server = connected(&TLS13);
+    let error = process_all(&mut server, &record(23, (1 << 14) + 257)).unwrap_err();
+    assert_eq!(error, Error::PeerSentOversizedRecord);
+
+    // One byte shorter is a record the server tries to decrypt.
+    let mut server = connected(&TLS13);
+    let error = process_all(&mut server, &record(23, (1 << 14) + 256)).unwrap_err();
+    assert_eq!(error, Error::DecryptError);
+}
+
+#[test]
+fn an_unprotected_change_cipher_spec_in_tls13_is_held_to_2_14() {
+    let mut server = connected(&TLS13);
+    let error = process_all(&mut server, &record(20, (1 << 14) + 1)).unwrap_err();
+    assert_eq!(error, Error::PeerSentOversizedRecord);
+}
+
+#[test]
+fn a_tls12_record_may_be_2_14_plus_2048_long_and_no_longer() {
+    let mut server = connected(&TLS12);
+    let error = process_all(&mut server, &record(23, (1 << 14) + 2048)).unwrap_err();
+    assert_eq!(error, Error::DecryptError);
+
+    let mut server = connected(&TLS12);
+    let error = process_all(&mut server, &record(23, (1 << 14) + 2049)).unwrap_err();
+    assert_eq!(error, Error::PeerSentOversizedRecord);
+}
+
+#[test]
+fn an_unknown_record_type_is_an_unexpected_message() {
+    // An unassigned type, and heartbeat, which rustls does not implement.
+    for typ in [99, 24] {
+        let mut server =
+            ServerConnection::with_budget(server_config(), Limit::new(1 << 20)).unwrap();
+        process_all(&mut server, &record(typ, 1)).unwrap_err();
+        let mut alert = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut alert).unwrap();
+        }
+        // One unprotected alert record: type, version, length, then the
+        // alert's level and description.
+        assert_eq!(alert.len(), HEADER_SIZE + 2, "type {typ}");
+        assert_eq!(alert[0], u8::from(crate::ContentType::Alert));
+        assert_eq!(
+            AlertDescription::from(alert[HEADER_SIZE + 1]),
+            AlertDescription::UnexpectedMessage,
+            "type {typ}"
+        );
+    }
 }

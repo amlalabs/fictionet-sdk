@@ -38,6 +38,7 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`runtime`](runtime/README.md) | the runtime's state machines: executor, job context, regions, timers and the lab clock | each locked section of `src/run.rs`, `src/cx/*.rs` and `src/timer.rs` is one step; `JobContext.tla` was brought to the code (the cancellation guards it never had are gone) | TLC per config |
 | [`lifecycle`](lifecycle/README.md) | one TCP connection's life, from handshake to retirement (`Conn.tla`) | model named to `tcp/engine.rs` and the handles in `tcp.rs` | TLC per config |
 | [`tls`](tls/README.md) | the server TLS layer under `Driver` and `Harness` (`Layer.tla`), write cancellation in the live connection (`Write.tla`); the layer's write accounting in Kani; the provider draws entropy only from what it was given | models named to `services/tls/layer.rs` and `stack/open.rs`; Kani on the production layer | TLC per config; `cargo kani` |
+| [`tls-rfc`](tls-rfc/README.md) | the vendored rustls against RFC 8446 and RFC 5246/7627: the server handshake (`Handshake.tla`, refined by `ServerHs.tla`), the record layer with the budget's refusals (`Record.tla`, refined by `RecordCode.tla`): plaintext only after authentication, no nonce used twice, no gap on the wire, key update order, refusals change nothing; Lean: record checks before decryption and nonce use (16 theorems, standard axioms only) | `hs_trace.rs` handshakes and `record_trace.rs` schedules replayed by `HandshakeTrace.tla` and `RecordTrace.tla`; `Gen.lean` vectors replayed by `record_vectors` and `nonce_vectors` in rustls's tests | `cargo xtask tls-verify handshake-trace`, `record-trace`, `lean`, `vectors`; TLC per config |
 | [`tls-contract`](tls-contract/README.md) | what a replacement TLS must keep: ordered owned plaintext, sticky failure, stable negotiated metadata; STARTTLS (`Starttls.tla`); encrypted DNS request order | models follow the named Rust transitions; two `EncryptedDns_*_request_order` configs are documented expected failures | TLC per config |
 | [`ssh-layer`](ssh-layer/README.md) | the transport/authentication boundary, ordered key changes, completion ownership, channel lifecycle and the honeypot policy; conformance with RFC 4253 (ordering, NEWKEYS per direction, rekeys with data in flight, wrapping sequence numbers, strict KEX), RFC 8308 EXT_INFO, RFC 4252 (pipelined requests, no service before success) and RFC 4254 (open replies and reason codes, EOF and CLOSE, requests, windows), and no stall under the half-window adjustment policy against russh's bounded queues (`Transport.tla`, `Auth.tla`, `Close.tla`, `Window.tla`, `Adjust.tla`); window lemmas in Lean | `Transport.tla` traces replayed on the production transport with real crypto (`protocols/ssh/transport/replay.rs`); `Adjust.tla` searched exhaustively on the production `Channel`; other models named in their headers to `services/ssh`; Kani on the production arithmetic in `ssh.rs` | TLC per config; `cargo kani`; `lean lean/Adjust.lean` |
 | [`http`](http/README.md) | HTTP/1 pipelining and the switch to a tunnel (`Pipeline.tla`), HTTP/2 flow control and stream states (`Flow.tla`, `Streams.tla`), the tunnel's room and charges (`Tunnel.tla`); framing in Lean; body decoding and request smuggling in Kani | models named to `web/httpd/native.rs`, `http2.rs`, `stack/tunnel.rs`; Kani on the production decoder and `Reader` (memchr stubbed); the Lean `Request.lean` rules have no Rust tie | TLC per config; `cargo kani`; `lake build` in `http/lean` |
@@ -81,6 +82,19 @@ unanswered behind the challenge-ACK rate limit; SYN-SENT dropped a bad ACK
 with PSH or FIN without a RST; text held past the peer's FIN was read
 before the end of the stream; a second FIN dropped the ACK beside it; and
 TIME-WAIT left a closed window's segment unanswered.
+
+The TLS audit of 2026-11-10 (`tls-rfc`) found and fixed, in the vendored
+rustls, each with a test that fails before: a record lost after
+encryption that left the connection sending after the hole, and a record
+under new keys sent without the KeyUpdate before it (both needing an
+encrypter that over-allocates); record sizes and alerts that departed
+from RFC 8446 §5 and RFC 5246 §6.2 (unprotected records up to 2^14 + 2047,
+oversize TLS 1.3 records decrypted, a legal 2^14 + 2048 TLS 1.2 record
+refused, decode_error where record_overflow or unexpected_message is
+named); and EndOfEarlyData taken without ending its record, so a Finished
+in the same record went under the early keys (RFC 8446 §5.1, upstream
+too). Departures left as they are, and what to re-check after the move to
+rustls's unbuffered API, are in its README.
 
 And two found by reading a model's abstractions or a harness against the
 code: an NXDOMAIN's copy under the type it answered outlived the entry
@@ -134,10 +148,12 @@ Lean model found no departure.
 - **The trace check covers data only.** `RouteTrace.tla` replays bytes
   through `Chain`, `Switch` and `Driver`; the urgent path (`Written`,
   `Reset`), ends of input, timers and work are checked by `Route_urgent`
-  and the unit tests, not by replay. `ssh-layer`'s `Transport.tla` traces
-  are replayed on the production SSH transport. No other model has a trace check or
-  reference vectors yet: the Lean vectors tie DNS, MPTCP and HPACK; the TLA+
-  models elsewhere are hand-written descriptions checked by reading.
+  and the unit tests, not by replay. Besides it, `ssh-layer`'s
+  `Transport.tla` traces are replayed on the production SSH transport and
+  `tls-rfc` has trace checks (handshakes and record-layer schedules of the
+  vendored rustls); Lean vectors tie DNS, MPTCP, HPACK and the TLS record
+  checks; the TLA+ models elsewhere are hand-written descriptions checked
+  by reading.
 - **Property-based tests of the tricky parts were not written in this
   pass**: byte-stream splits and coalescing through each layer and
   `Chain`, `Switch` handoff of unread bytes under random chunking,

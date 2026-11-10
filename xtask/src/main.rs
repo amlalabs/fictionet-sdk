@@ -20,6 +20,9 @@ mod rawnic;
 #[allow(unsafe_code)]
 mod ssh_connect;
 mod tcp_rfc_verify;
+mod tls_verify;
+mod tls_verify_handshake;
+mod tls_verify_record;
 #[cfg(feature = "host-tools")]
 mod web;
 #[cfg(feature = "host-tools")]
@@ -55,6 +58,9 @@ fn main() -> Result {
     }
     if task == "layer-verify" {
         return layer_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "tls-verify" {
+        return tls_verify::run(&args.collect::<Vec<_>>());
     }
     if !matches!(
         task.as_str(),

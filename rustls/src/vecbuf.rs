@@ -215,7 +215,6 @@ impl ChunkVecBuffer {
     /// not fit.
     #[must_use = "a dropped chunk was never queued"]
     pub(crate) fn push_paid(&mut self, chunk: Vec<u8>, paid: usize) -> bool {
-        debug_assert_eq!(chunk.capacity(), paid);
         self.promised -= paid;
         self.promised_chunks -= 1;
         let capacity = chunk.capacity();

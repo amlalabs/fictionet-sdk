@@ -562,8 +562,15 @@ impl CommonState {
     /// Pays for the record `m` makes, from the room reserved for output
     /// first, then encrypts and queues it. `false`, encrypting nothing, if
     /// the budget has no room for it.
+    ///
+    /// A record that cannot be queued once encrypted has taken its sequence
+    /// number: the peer cannot decrypt anything after it, so the connection
+    /// fails (`output_unpaid`) and nothing more is encrypted.
     #[must_use = "an unpaid record was not sent"]
     fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
+        if self.output_unpaid {
+            return false;
+        }
         // Alerts are always sendable -- never quashed by a PreEncryptAction.
         if m.typ != ContentType::Alert && !self.check_pre_encrypt_action(0) {
             return true;
@@ -574,7 +581,11 @@ impl CommonState {
             return false;
         }
         let em = self.record_layer.encrypt_outgoing(m).encode();
-        self.queue_paid(em, len)
+        if !self.queue_paid(em, len) {
+            self.output_unpaid = true;
+            return false;
+        }
+        true
     }
 
     /// Take the remedial action needed before encrypting the record `add` records after the next.
@@ -671,6 +682,13 @@ impl CommonState {
     #[must_use = "an unpaid record was not sent"]
     fn queue_paid(&mut self, record: Vec<u8>, paid: usize) -> bool {
         self.perhaps_write_key_update();
+        if self.output_unpaid {
+            // The key update before it was dropped: a record under the new
+            // keys must not go without it. Its payment is given back.
+            drop(record);
+            let _ = self.sendable_tls.push_paid(Vec::new(), paid);
+            return false;
+        }
         self.sendable_tls.push_paid(record, paid)
     }
 
@@ -1324,8 +1342,13 @@ const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
 pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
 
 #[cfg(all(test, feature = "std"))]
+mod nonce_vectors;
+
+#[cfg(all(test, feature = "std"))]
 mod ciphertext_ownership_tests {
     use super::*;
+    use crate::crypto::cipher::MessageEncrypter;
+    use crate::msgs::message::{OutboundOpaqueMessage, PrefixedPayload};
 
     #[test]
     fn sole_whole_ciphertext_transfers_its_allocation() {
@@ -1373,5 +1396,91 @@ mod ciphertext_ownership_tests {
         assert!(state.take_sendable_tls_chunk(64).is_none());
         assert_eq!(state.sendable_tls_len(), 65);
         assert_eq!(state.sendable_tls.write_to(&mut Vec::new()).unwrap(), 65);
+    }
+
+    /// An encrypter whose records of type `typ` come in allocations larger
+    /// than the length it reports, which `push_paid` must charge again.
+    struct Overallocating {
+        typ: ContentType,
+    }
+
+    impl MessageEncrypter for Overallocating {
+        fn encrypt(
+            &mut self,
+            msg: OutboundPlainMessage<'_>,
+            _seq: u64,
+        ) -> Result<OutboundOpaqueMessage, Error> {
+            let extra = if msg.typ == self.typ { 64 } else { 0 };
+            let mut payload = PrefixedPayload::with_capacity(msg.payload.len() + extra);
+            payload.extend_from_chunks(&msg.payload);
+            Ok(OutboundOpaqueMessage::new(msg.typ, msg.version, payload))
+        }
+
+        fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+            payload_len
+        }
+    }
+
+    /// A record encrypted and then refused by the budget took a sequence
+    /// number the peer will expect next. Nothing may go after that hole
+    /// (RFC 8446 section 5.3): the connection fails instead.
+    #[test]
+    fn a_record_dropped_after_encryption_fails_the_connection() {
+        let limit = crate::budget::testing::Limit::new(1 << 20);
+        let mut state = CommonState::new(Side::Server);
+        state.pay_from(Some(limit.clone()));
+        state.record_layer.set_message_encrypter(
+            Box::new(Overallocating {
+                typ: ContentType::ApplicationData,
+            }),
+            u64::MAX,
+        );
+        state.may_send_application_data = true;
+
+        let data = [7; 10];
+        limit.set_limit(limit.used() + HEADER_SIZE + data.len());
+        let sent = state.send_plain_non_buffering(data[..].into(), Limit::No, false);
+        assert_eq!(sent, 0);
+        assert_eq!(state.record_layer.write_seq(), 1);
+        assert_eq!(state.output_paid(), Err(Error::BudgetExhausted));
+
+        limit.set_limit(1 << 20);
+        state.send_plain_non_buffering(data[..].into(), Limit::No, false);
+        assert!(!state.wants_write(), "a record went out after the hole");
+        assert_eq!(state.record_layer.write_seq(), 1);
+    }
+
+    /// A key update notification that cannot be queued fails the
+    /// connection, and the record that would follow it under the new keys
+    /// is not queued without it (RFC 8446 section 4.6.3).
+    #[test]
+    fn a_record_never_goes_without_the_key_update_before_it() {
+        let limit = crate::budget::testing::Limit::new(1 << 20);
+        let mut state = CommonState::new(Side::Server);
+        state.pay_from(Some(limit.clone()));
+        state.record_layer.set_message_encrypter(
+            Box::new(Overallocating {
+                typ: ContentType::Handshake,
+            }),
+            u64::MAX,
+        );
+        state.may_send_application_data = true;
+
+        state.enqueue_key_update_notification();
+        assert_eq!(state.output_paid(), Ok(()));
+        assert!(!state.wants_write());
+
+        // Room for the record and the places of a queue of two chunks, but
+        // not for the larger allocation the key update came in.
+        let data = [7; 10];
+        let places = crate::vecbuf::FIRST_PLACES * crate::vecbuf::PLACE;
+        limit.set_limit(limit.used() + HEADER_SIZE + data.len() + places);
+        assert_eq!(
+            state.send_plain_non_buffering(data[..].into(), Limit::No, false),
+            0
+        );
+        assert_eq!(state.output_paid(), Err(Error::BudgetExhausted));
+        assert!(!state.wants_write(), "a record went without its key update");
+        assert!(state.sendable_tls.accounted());
     }
 }

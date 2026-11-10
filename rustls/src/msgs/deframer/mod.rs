@@ -56,7 +56,11 @@ impl<'a> Iterator for DeframerIter<'a> {
                         return None;
                     }
                     MessageError::InvalidEmptyPayload => InvalidMessage::InvalidEmptyPayload,
-                    MessageError::MessageTooLarge => InvalidMessage::MessageTooLarge,
+                    // record_overflow (RFC 8446 section 5.2, RFC 5246
+                    // section 7.2.2), not decode_error.
+                    MessageError::MessageTooLarge => {
+                        return Some(Err(Error::PeerSentOversizedRecord));
+                    }
                     MessageError::InvalidContentType => InvalidMessage::InvalidContentType,
                     MessageError::UnknownProtocolVersion => InvalidMessage::UnknownProtocolVersion,
                 };
@@ -174,7 +178,7 @@ mod tests {
         let mut iter = DeframerIter::new(&mut buffer);
         assert_eq!(
             iter.next().unwrap().err(),
-            Some(Error::InvalidMessage(InvalidMessage::MessageTooLarge))
+            Some(Error::PeerSentOversizedRecord)
         );
     }
 
