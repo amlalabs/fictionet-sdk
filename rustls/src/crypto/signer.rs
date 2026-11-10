@@ -119,6 +119,10 @@ impl ResolvesServerCert for SingleCertAndKey {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.0.clone())
     }
+
+    fn most_chain(&self) -> Option<usize> {
+        Some(self.0.flight_bytes())
+    }
 }
 
 /// A packaged-together certificate chain, matching `SigningKey` and
@@ -194,6 +198,12 @@ impl CertifiedKey {
     /// The end-entity certificate.
     pub fn end_entity_cert(&self) -> Result<&CertificateDer<'_>, Error> {
         self.cert.first().ok_or(Error::NoCertificatesPresented)
+    }
+
+    /// The bytes this chain and its OCSP response take in a server's
+    /// flight: what [`ResolvesServerCert::most_chain`] bounds.
+    pub fn flight_bytes(&self) -> usize {
+        crate::budget::chain_bytes(&self.cert, self.ocsp.as_deref())
     }
 }
 

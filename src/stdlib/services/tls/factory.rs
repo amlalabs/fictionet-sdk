@@ -60,11 +60,18 @@ pub struct Selected {
 impl Selected {
     /// Builds a rustls configuration from the selected material. This is
     /// an adapter for rustls layers; another implementation reads the DER
-    /// material directly. Clock and randomness come from the run.
+    /// material directly. Clock and randomness come from the run. Its
+    /// [`session_store`](super::session_store) is paid for from `sessions`,
+    /// the budget of whatever keeps the configuration, once; fails with
+    /// [`rustls::Error::BudgetExhausted`] if that has no room. The
+    /// configuration bounds its handshake output
+    /// ([`ServerConfig::most_connection`](super::ServerConfig::most_connection)),
+    /// so a connection's handshake waits for memory and never fails for it.
     pub fn rustls_config(
         &self,
         cx: &Cx,
         start: SystemTime,
+        sessions: &Budget,
     ) -> Result<super::ServerConfig, rustls::Error> {
         let mut config = super::config_builder(cx, start)
             .with_safe_default_protocol_versions()?
@@ -74,6 +81,7 @@ impl Selected {
                 self.certificate.key.clone_key(),
             )?;
         config.alpn_protocols = self.alpn.clone();
+        config.session_storage = super::session_store(sessions)?;
         Ok(config)
     }
 }
@@ -125,10 +133,20 @@ struct CachedConfig {
     config: Arc<super::ServerConfig>,
 }
 
-#[derive(Default)]
-struct Configs(VecDeque<CachedConfig>);
+struct Configs {
+    entries: VecDeque<CachedConfig>,
+    /// What the configurations' session stores are paid from.
+    sessions: Budget,
+}
 
 impl Configs {
+    fn new(sessions: Budget) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            sessions,
+        }
+    }
+
     fn get(
         &mut self,
         cx: &Cx,
@@ -136,26 +154,28 @@ impl Configs {
         start: SystemTime,
         configure: &dyn Fn(&mut super::ServerConfig),
     ) -> Result<Arc<super::ServerConfig>, rustls::Error> {
-        self.0
+        self.entries
             .retain(|entry| !entry.cx.is_cancelled() && entry.certificate.strong_count() != 0);
         let certificate = Arc::downgrade(&selected.certificate);
-        if let Some(index) = self.0.iter().position(|entry| {
+        if let Some(index) = self.entries.iter().position(|entry| {
             Arc::ptr_eq(&entry.cx.run, &cx.run)
                 && Weak::ptr_eq(&entry.certificate, &certificate)
                 && entry.alpn == selected.alpn
         }) {
-            let entry = self.0.remove(index).expect("cache entry exists");
+            let entry = self.entries.remove(index).expect("cache entry exists");
             let config = entry.config.clone();
-            self.0.push_back(entry);
+            self.entries.push_back(entry);
             return Ok(config);
         }
-        let mut config = selected.rustls_config(cx, start)?;
+        if self.entries.len() == CONFIG_CACHE_LIMIT {
+            // Before the new one is paid for, so its store can use what
+            // the oldest gives back.
+            self.entries.pop_front();
+        }
+        let mut config = selected.rustls_config(cx, start, &self.sessions)?;
         configure(&mut config);
         let config = Arc::new(config);
-        if self.0.len() == CONFIG_CACHE_LIMIT {
-            self.0.pop_front();
-        }
-        self.0.push_back(CachedConfig {
+        self.entries.push_back(CachedConfig {
             cx: cx.clone(),
             certificate,
             alpn: selected.alpn.clone(),
@@ -204,13 +224,18 @@ impl Factory {
     /// certificate identity and ALPN. Reuse the certificate's `Arc` to resume;
     /// changing material or protocols starts fresh session state. `configure`
     /// runs only when a configuration is built, not on cache hits. Eviction
-    /// may cause a later connection to perform a full handshake.
+    /// may cause a later connection to perform a full handshake. Each
+    /// configuration's session store is paid for from `sessions` once, when
+    /// it is built, so the sessions connections leave hold nothing they
+    /// allocated; a configuration `sessions` has no room for is not built,
+    /// and the name is refused.
     pub fn rustls(
         start: SystemTime,
+        sessions: Budget,
         configure: impl Fn(&mut super::ServerConfig) + Send + Sync + 'static,
     ) -> Self {
         let configure = Arc::new(configure);
-        let cache = Arc::new(Mutex::new(Configs::default()));
+        let cache = Arc::new(Mutex::new(Configs::new(sessions)));
         Self::new(move |opening| {
             let (configure, cache) = (configure.clone(), cache.clone());
             TlsLayer::selecting(move |cx, hello| {
@@ -248,7 +273,7 @@ impl Default for Factory {
     /// authentication. Resumption ticket lifetimes follow elapsed run time.
     /// Use [`Factory::rustls`] to set a world date for certificate validation.
     fn default() -> Self {
-        Self::rustls(UNIX_EPOCH, |_| {})
+        Self::rustls(UNIX_EPOCH, Budget::unlimited(), |_| {})
     }
 }
 
@@ -278,7 +303,7 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(92),
             |cx| async move {
-                let mut cache = Configs::default();
+                let mut cache = Configs::new(Budget::unlimited());
                 let mut selected = Selected {
                     certificate: certificate(&cx),
                     alpn: vec![b"first".to_vec()],
@@ -305,7 +330,7 @@ mod tests {
                     &rotated.session_storage
                 ));
                 assert_eq!(
-                    cache.0.len(),
+                    cache.entries.len(),
                     1,
                     "expired certificate entries leave the cache"
                 );
@@ -320,7 +345,7 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(93),
             |cx| async move {
-                let mut cache = Configs::default();
+                let mut cache = Configs::new(Budget::unlimited());
                 let mut selected = Selected {
                     certificate: certificate(&cx),
                     alpn: vec![vec![0]],
@@ -332,7 +357,7 @@ mod tests {
                     selected.alpn = vec![vec![protocol as u8]];
                     cache.get(&cx, &selected, UNIX_EPOCH, &|_| {})?;
                 }
-                assert_eq!(cache.0.len(), CONFIG_CACHE_LIMIT);
+                assert_eq!(cache.entries.len(), CONFIG_CACHE_LIMIT);
                 selected.alpn = vec![vec![1]];
                 assert!(Arc::ptr_eq(
                     &touched,
@@ -348,7 +373,48 @@ mod tests {
                     &touched,
                     &cache.get(&cx, &selected, UNIX_EPOCH, &|_| {})?
                 ));
-                assert_eq!(cache.0.len(), CONFIG_CACHE_LIMIT);
+                assert_eq!(cache.entries.len(), CONFIG_CACHE_LIMIT);
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
+    /// A configuration's session store is charged to the cache's budget
+    /// once, when the configuration is built, and given back when the last
+    /// holder drops it; a budget without room for it builds nothing. The
+    /// configuration bounds its handshake output.
+    #[test]
+    fn a_configurations_sessions_are_paid_once_by_its_keeper() {
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(96),
+            |cx| async move {
+                let store = super::super::SESSIONS
+                    * (rustls::server::SLOT_KEY + rustls::server::SLOT_VALUE);
+                let selected = Selected {
+                    certificate: certificate(&cx),
+                    alpn: vec![b"first".to_vec()],
+                };
+
+                let tight = Budget::new(store / 2);
+                let mut cache = Configs::new(tight.clone());
+                assert!(cache.get(&cx, &selected, UNIX_EPOCH, &|_| {}).is_err());
+                assert_eq!(tight.used(), 0);
+
+                let budget = Budget::new(4 * store);
+                let mut cache = Configs::new(budget.clone());
+                let config = cache.get(&cx, &selected, UNIX_EPOCH, &|_| {})?;
+                let paid = budget.used();
+                assert!(paid >= store);
+                assert!(config.most_connection().is_some());
+                cache.get(&cx, &selected, UNIX_EPOCH, &|_| {
+                    panic!("cached config rebuilt")
+                })?;
+                assert_eq!(budget.used(), paid, "a hit pays again");
+                drop(cache);
+                assert_eq!(budget.used(), paid, "the config's holder still has it");
+                drop(config);
+                assert_eq!(budget.used(), 0);
                 Ok(())
             },
         ))
@@ -360,7 +426,7 @@ mod tests {
         fictionet::block_on(fictionet::lab(
             fictionet::Seed::from_u64(94),
             |cx| async move {
-                let mut cache = Configs::default();
+                let mut cache = Configs::new(Budget::unlimited());
                 let selected = Selected {
                     certificate: certificate(&cx),
                     alpn: Vec::new(),
@@ -411,7 +477,8 @@ mod tests {
                     parsed.tbs.issuer,
                     x509::Certificate::parse(&ca.cert_der())?.tbs.subject
                 );
-                let mut configured = selected.rustls_config(&cx, UNIX_EPOCH)?;
+                let mut configured =
+                    selected.rustls_config(&cx, UNIX_EPOCH, &Budget::unlimited())?;
                 assert_eq!(configured.alpn_protocols, selected.alpn);
                 configured.alpn_protocols.clear();
                 assert_eq!(certificate.chain, chain);

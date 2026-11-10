@@ -99,6 +99,35 @@ impl<'a> OutboundChunks<'a> {
         }
     }
 
+    /// Copies all bytes into `out`, which is exactly as long. Panics if it
+    /// is not.
+    pub fn copy_to_slice(&self, out: &mut [u8]) {
+        assert_eq!(
+            out.len(),
+            self.len(),
+            "a copy into a slice of another length"
+        );
+        match *self {
+            Self::Single(chunk) => out.copy_from_slice(chunk),
+            Self::Multiple { chunks, start, end } => {
+                let mut size = 0;
+                let mut written = 0;
+                for chunk in chunks.iter() {
+                    let psize = size;
+                    let len = chunk.len();
+                    size += len;
+                    if size <= start || psize >= end {
+                        continue;
+                    }
+                    let start = start.saturating_sub(psize);
+                    let end = if end - psize < len { end - psize } else { len };
+                    out[written..written + end - start].copy_from_slice(&chunk[start..end]);
+                    written += end - start;
+                }
+            }
+        }
+    }
+
     /// Split self in two, around an index
     /// Works similarly to `split_at` in the core library, except it doesn't panic if out of bound
     pub fn split_at(&self, mid: usize) -> (Self, Self) {
@@ -187,11 +216,9 @@ impl OutboundOpaqueMessage {
     }
 
     pub fn encode(self) -> Vec<u8> {
-        let length = self.payload.len() as u16;
+        let length = self.payload.len();
         let mut encoded_payload = self.payload.0;
-        encoded_payload[0] = self.typ.into();
-        encoded_payload[1..3].copy_from_slice(&self.version.to_array());
-        encoded_payload[3..5].copy_from_slice(&(length).to_be_bytes());
+        write_header(&mut encoded_payload, self.typ, self.version, length);
         encoded_payload
     }
 
@@ -206,6 +233,19 @@ impl OutboundOpaqueMessage {
             payload: Payload::Owned(self.payload.as_ref().to_vec()),
         }
     }
+}
+
+/// Writes a record's header for a payload of `length` bytes into the first
+/// [`HEADER_SIZE`] bytes of `record`.
+pub(crate) fn write_header(
+    record: &mut [u8],
+    typ: ContentType,
+    version: ProtocolVersion,
+    length: usize,
+) {
+    record[0] = typ.into();
+    record[1..3].copy_from_slice(&version.to_array());
+    record[3..5].copy_from_slice(&(length as u16).to_be_bytes());
 }
 
 #[derive(Clone, Debug)]

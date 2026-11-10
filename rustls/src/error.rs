@@ -249,6 +249,7 @@ pub enum PeerMisbehaved {
     AttemptedDowngradeToTls12WhenTls13IsSupported,
     BadCertChainExtensions,
     CipherSuiteDifferedOnRetry,
+    DataAfterClientHello,
     DisallowedEncryptedExtension,
     DuplicateClientHelloExtensions,
     DuplicateEncryptedExtensions,

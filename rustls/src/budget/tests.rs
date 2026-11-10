@@ -1,6 +1,7 @@
 //! A server connection paid from a budget: every buffer charged what it
 //! holds, and each refusal changing nothing until the budget has room.
 
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use std::io::{self, Read, Write};
@@ -12,18 +13,22 @@ use super::testing::Limit;
 use crate::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use crate::client::ClientConnection;
 use crate::crypto::ring::default_provider;
-use crate::enums::{AlertDescription, SignatureScheme};
-use crate::msgs::message::MAX_WIRE_SIZE;
+use crate::enums::{AlertDescription, ContentType, SignatureScheme};
+use crate::msgs::enums::AlertLevel;
+use crate::msgs::message::{HEADER_SIZE, MAX_WIRE_SIZE};
+use crate::server::danger::{ClientCertVerified, ClientCertVerifier};
 use crate::server::{Acceptor, IntoConnectionError, ServerConnection};
 use crate::sync::Arc;
-use crate::vecbuf::{FIRST_PLACES, PLACE};
+use crate::vecbuf::{ALERT_ROOM, FIRST_PLACES, PLACE};
 use crate::version::{TLS12, TLS13};
+use crate::DistinguishedName;
 use crate::{
     ClientConfig, CommonState, DigitallySignedStruct, Error, ServerConfig, Side,
     SupportedProtocolVersion,
 };
 
-fn server_config() -> Arc<ServerConfig> {
+/// The test CA's RSA server chain and its key.
+fn chain_and_key() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     let chain = vec![
         CertificateDer::from(&include_bytes!("../../test-ca/rsa-2048/end.der")[..]),
         CertificateDer::from(&include_bytes!("../../test-ca/rsa-2048/inter.der")[..]),
@@ -31,6 +36,11 @@ fn server_config() -> Arc<ServerConfig> {
     let key =
         PrivateKeyDer::from_pem_reader(&mut &include_bytes!("../../test-ca/rsa-2048/end.key")[..])
             .unwrap();
+    (chain, key)
+}
+
+pub(crate) fn server_config() -> Arc<ServerConfig> {
+    let (chain, key) = chain_and_key();
     Arc::new(
         ServerConfig::builder_with_provider(Arc::new(default_provider()))
             .with_safe_default_protocol_versions()
@@ -44,7 +54,7 @@ fn server_config() -> Arc<ServerConfig> {
 /// The client trusts any server: these tests are about the server's
 /// buffers, not its certificate.
 #[derive(Debug)]
-struct TrustAnything;
+pub(crate) struct TrustAnything;
 
 impl ServerCertVerifier for TrustAnything {
     fn verify_server_cert(
@@ -83,7 +93,7 @@ impl ServerCertVerifier for TrustAnything {
     }
 }
 
-fn client(version: &'static SupportedProtocolVersion) -> ClientConnection {
+pub(crate) fn client(version: &'static SupportedProtocolVersion) -> ClientConnection {
     let config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[version])
         .unwrap()
@@ -98,7 +108,7 @@ fn client(version: &'static SupportedProtocolVersion) -> ClientConnection {
 }
 
 /// What `client` has to send.
-fn from_client(client: &mut ClientConnection) -> Vec<u8> {
+pub(crate) fn from_client(client: &mut ClientConnection) -> Vec<u8> {
     let mut wire = Vec::new();
     while client.wants_write() {
         client.write_tls(&mut wire).unwrap();
@@ -187,30 +197,22 @@ fn every_buffer_is_charged_what_it_holds_and_gives_it_back() {
                     assert_eq!(limit.used(), server.buffers_held());
                 }
                 let before = limit.used();
-                let (plaintext, charge) = match server.reader().take_first_chunk() {
-                    Ok(paid) => paid.into_parts(),
-                    Err(error) => {
-                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                        (Vec::new(), None)
-                    }
-                };
+                let mut plaintext = Vec::new();
+                if let Err(error) = server.reader().read_to_end(&mut plaintext) {
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                }
                 if plaintext.is_empty() {
                     if rest.is_empty() {
                         break;
                     }
                     continue;
                 }
-                // The plaintext leaves with its charge: the budget gets back
-                // only the queue's places, and then exactly the plaintext's
-                // allocation once it is dropped.
-                let charge = charge.unwrap();
-                assert_eq!(charge.bytes(), plaintext.capacity());
+                // Reading gives the plaintext's buffer back.
                 assert!(limit.used() <= before);
-                assert_eq!(limit.used(), server.buffers_held() + plaintext.capacity());
+                assert_eq!(limit.used(), server.buffers_held());
                 let written = server.writer().write(&plaintext).unwrap();
                 assert_eq!(written, plaintext.len());
                 assert!(server.buffers_accounted());
-                drop(charge);
                 assert_eq!(limit.used(), server.buffers_held());
                 echoed.extend_from_slice(&plaintext);
                 to_client(&mut server, &mut client);
@@ -269,14 +271,15 @@ fn a_records_plaintext_stays_in_the_buffer_it_arrived_in() {
         client.writer().write_all(&message).unwrap();
         let wire = from_client(&mut client);
         let mut rest = &wire[..];
+        let idle = limit.used();
         assert_eq!(server.read_tls(&mut rest).unwrap(), wire.len());
-        let read = limit.used();
+        let read = limit.used() - idle;
         assert_eq!(read, wire.len(), "{version:?}: the buffer is the record");
 
-        limit.set_limit(read);
+        limit.set_limit(idle + read);
         server.process_new_packets().unwrap();
         assert!(server.wants_budget(), "{version:?}");
-        assert_eq!(limit.used(), read);
+        assert_eq!(limit.used(), idle + read);
         assert!(server.buffers_accounted());
         assert_eq!(
             server.reader().into_first_chunk().unwrap_err().kind(),
@@ -288,25 +291,24 @@ fn a_records_plaintext_stays_in_the_buffer_it_arrived_in() {
         assert!(!server.wants_budget(), "{version:?}");
         assert!(server.buffers_accounted());
         assert!(
-            limit.used() <= read + FIRST_PLACES * PLACE,
+            limit.used() <= idle + read + FIRST_PLACES * PLACE,
             "{version:?}: keeping the plaintext took {} bytes past its record",
-            limit.used() - read
+            limit.used() - idle - read
         );
-        let (plaintext, charge) = server.reader().take_first_chunk().unwrap().into_parts();
+        let mut plaintext = Vec::new();
+        server.reader().read_to_end(&mut plaintext).unwrap_err();
         assert!(
             plaintext == message,
             "{version:?}: the record waited intact"
         );
-        // It leaves in the record's buffer, with the record's charge.
-        assert_eq!(plaintext.capacity(), read, "{version:?}");
-        assert_eq!(charge.unwrap().bytes(), read, "{version:?}");
-        assert_eq!(server.buffers_held(), 0, "{version:?}");
+        assert_eq!(server.buffers_held(), ALERT_ROOM, "{version:?}");
     }
 }
 
 /// Once the handshake's flights are out, and again once an echo has gone
-/// both ways, the connection holds no buffer at all: the receive buffer,
-/// the queues and their places are freed, not just emptied.
+/// both ways, the connection holds no buffer: the receive buffer, the
+/// queues and their places are freed, not just emptied. It is charged only
+/// the room kept for its final alert.
 #[test]
 fn an_idle_connection_holds_no_buffer() {
     for version in [&TLS12, &TLS13] {
@@ -321,7 +323,7 @@ fn an_idle_connection_holds_no_buffer() {
         );
         assert_eq!(
             (server.buffers_held(), limit.used()),
-            (0, 0),
+            (ALERT_ROOM, ALERT_ROOM),
             "{version:?}: after the handshake"
         );
 
@@ -337,7 +339,7 @@ fn an_idle_connection_holds_no_buffer() {
         assert!(received(&mut client) == message, "{version:?}");
         assert_eq!(
             (server.buffers_held(), limit.used()),
-            (0, 0),
+            (ALERT_ROOM, ALERT_ROOM),
             "{version:?}: after an echo"
         );
     }
@@ -372,10 +374,57 @@ fn a_full_record_takes_one_buffer_of_its_size() {
             "{version:?}: {most} bytes held for a {}-byte record",
             wire.len()
         );
-        let (plaintext, _charge) = server.reader().take_first_chunk().unwrap().into_parts();
+        let mut plaintext = Vec::new();
+        server.reader().read_to_end(&mut plaintext).unwrap_err();
         assert!(plaintext == message, "{version:?}");
-        assert_eq!(plaintext.capacity(), wire.len(), "{version:?}");
-        assert_eq!(server.buffers_held(), 0, "{version:?}");
+        assert_eq!(server.buffers_held(), ALERT_ROOM, "{version:?}");
+    }
+}
+
+/// A header no record may have (an unknown content type, a version that is
+/// not 3.x, a length past the most a record carries) grows the buffer no
+/// further than the header itself, however long it says the record is, and
+/// the connection fails on it.
+#[test]
+fn a_junk_header_grows_no_buffer_past_itself() {
+    use crate::msgs::message::HEADER_SIZE;
+    let junk: [[u8; HEADER_SIZE]; 4] = [
+        [0x99, 0x03, 0x03, 0x00, 0xff],
+        [0x16, 0x7f, 0x00, 0x00, 0xff],
+        [0x17, 0x03, 0x03, 0xff, 0xff],
+        [0x16, 0x03, 0x03, 0x00, 0x00],
+    ];
+    for header in junk {
+        let limit = Limit::new(1 << 20);
+        let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
+        let wire = [&header[..], &[0x42; 300]].concat();
+        let mut rest = &wire[..];
+        // The room for the final alert, which the first read pays for:
+        // what reading takes past it is the record buffer.
+        assert!(server.keep_alert_room());
+        let mut failed = false;
+        let mut buffered = 0;
+        for _ in 0..4 {
+            // What reading takes: the record buffer and nothing else.
+            let before = limit.used();
+            limit.reset_most();
+            match server.read_tls(&mut rest) {
+                Ok(n) => buffered += n,
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{header:?}");
+                    failed = true;
+                }
+            }
+            assert!(
+                limit.most() - before <= HEADER_SIZE,
+                "{header:?}: the buffer grew by {} bytes",
+                limit.most() - before
+            );
+            assert!(buffered <= HEADER_SIZE, "{header:?}: read {buffered} bytes");
+            failed |= server.process_new_packets().is_err();
+            assert!(server.buffers_accounted());
+        }
+        assert!(failed, "{header:?}: the connection went on");
     }
 }
 
@@ -394,8 +443,9 @@ fn a_read_stops_at_the_end_of_the_record_arriving() {
     let second = from_client(&mut client);
     let wire = [first.clone(), second.clone()].concat();
     let mut rest = &wire[..];
+    let idle = limit.used();
     assert_eq!(server.read_tls(&mut rest).unwrap(), first.len());
-    assert_eq!(limit.used(), first.len());
+    assert_eq!(limit.used() - idle, first.len());
     let error = server.read_tls(&mut rest).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Other);
     assert_eq!(rest.len(), second.len());
@@ -466,21 +516,211 @@ fn a_flight_without_room_gives_the_hello_back_unchanged() {
     }
 }
 
+/// A `close_notify` goes out with the budget full: the room kept for the
+/// final alert pays for it, and the budget is charged no more for it.
 #[test]
-fn a_close_notify_without_room_is_not_queued_until_there_is_room() {
+fn a_close_notify_goes_out_with_the_budget_full() {
+    for version in [&TLS12, &TLS13] {
+        let limit = Limit::new(1 << 20);
+        let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
+        let mut client = client(version);
+        handshake(&mut server, &mut client);
+        let idle = limit.used();
+        limit.set_limit(idle);
+        assert!(server.send_close_notify(), "{version:?}");
+        assert!(server.wants_write(), "{version:?}");
+        assert!(limit.used() <= idle, "{version:?}");
+        assert!(server.buffers_accounted());
+        to_client(&mut server, &mut client);
+        let mut bytes = Vec::new();
+        assert_eq!(client.reader().read_to_end(&mut bytes).unwrap(), 0);
+    }
+}
+
+/// A hello that does not parse is answered with decode_error with the
+/// budget full: the room kept for the final alert since the first read
+/// pays for it, and nothing goes out after it.
+#[test]
+fn a_fatal_alert_goes_out_with_the_budget_full() {
     let limit = Limit::new(1 << 20);
-    let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
-    let mut client = client(&TLS13);
-    handshake(&mut server, &mut client);
+    let mut acceptor = Acceptor::with_budget(limit.clone());
+    // A ClientHello whose body is one byte: a record that frames, and a
+    // message that does not parse.
+    let hello = [0x16, 0x03, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00];
+    let mut rest = &hello[..];
+    assert_eq!(acceptor.read_tls(&mut rest).unwrap(), hello.len());
     limit.set_limit(limit.used());
-    assert!(!server.send_close_notify());
-    assert!(!server.wants_write());
-    limit.set_limit(1 << 20);
-    assert!(server.send_close_notify());
-    assert!(server.wants_write());
-    to_client(&mut server, &mut client);
-    let mut bytes = Vec::new();
-    assert_eq!(client.reader().read_to_end(&mut bytes).unwrap(), 0);
+    let Err((_, mut alert)) = acceptor.accept() else {
+        panic!("the hello was accepted");
+    };
+    assert!(!alert.is_empty(), "no alert was queued");
+
+    let mut sent = Vec::new();
+    alert.write_all(&mut sent).unwrap();
+    // One record, and it is a fatal decode_error alert.
+    let (header, payload) = sent.split_at(HEADER_SIZE);
+    assert_eq!(ContentType::from(header[0]), ContentType::Alert);
+    assert_eq!(
+        usize::from(u16::from_be_bytes([header[3], header[4]])),
+        payload.len()
+    );
+    assert_eq!(AlertLevel::from(payload[0]), AlertLevel::Fatal);
+    assert_eq!(
+        AlertDescription::from(payload[1]),
+        AlertDescription::DecodeError
+    );
+}
+
+/// Offers client authentication without requiring it, naming many CAs, so
+/// its certificate request is larger than a record. The client in these
+/// tests sends no certificate, so nothing is verified.
+#[derive(Debug)]
+struct ManyAuthorities(Vec<DistinguishedName>);
+
+impl ClientCertVerifier for ManyAuthorities {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.0
+    }
+
+    fn verify_client_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        Err(Error::General("the client sends no certificate".into()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::General("the client sends no certificate".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::General("the client sends no certificate".into()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Runs a handshake with `config` on a budget of `start` bytes that grows
+/// by a little each time the server can neither read nor write, as memory
+/// another connection frees would. The server may wait for room, but never
+/// fails: returns the error if it does.
+fn handshake_on_a_growing_budget(
+    config: &Arc<ServerConfig>,
+    version: &'static SupportedProtocolVersion,
+    start: usize,
+) -> Result<(), Error> {
+    const STEP: usize = 512;
+    let limit = Limit::new(start);
+    let mut room = start;
+    let mut server = ServerConnection::with_budget(config.clone(), limit.clone())?;
+    let mut client = client(version);
+    let mut wire = Vec::new();
+    for _ in 0..10_000 {
+        wire.extend(from_client(&mut client));
+        if wire.is_empty()
+            && !client.is_handshaking()
+            && !server.is_handshaking()
+            && !server.wants_write()
+        {
+            return Ok(());
+        }
+        let mut moved = false;
+        if !wire.is_empty() {
+            let mut rest = &wire[..];
+            match server.read_tls(&mut rest) {
+                Ok(read) => {
+                    moved |= read > 0;
+                    wire.drain(..read);
+                }
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::OutOfMemory),
+            }
+        }
+        server.process_new_packets()?;
+        assert!(server.buffers_accounted());
+        if server.wants_write() {
+            to_client(&mut server, &mut client);
+            moved = true;
+        }
+        if !moved {
+            room += STEP;
+            limit.set_limit(room);
+        }
+    }
+    panic!("{version:?}: the handshake from {start} bytes never finished");
+}
+
+/// A server whose config bounds its handshake output (here: a chain, many
+/// CA names, many tickets, small records) waits for room for all of it
+/// before each handshake message, so however little its budget has when
+/// the handshake starts, it never fails for memory: the output a message
+/// makes never needs more than was charged for it.
+#[test]
+fn a_bounded_config_never_fails_its_handshake_for_memory() {
+    let plain = server_config();
+    let names = (0..200u8)
+        .map(|n| DistinguishedName::from(vec![n; 150]))
+        .collect();
+    let authorities = {
+        let (chain, key) = chain_and_key();
+        Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(Arc::new(ManyAuthorities(names)))
+                .with_single_cert(chain, key)
+                .unwrap(),
+        )
+    };
+    let tickets = {
+        let mut config = (*plain).clone();
+        config.send_tls13_tickets = 400;
+        Arc::new(config)
+    };
+    let small_records = {
+        let mut config = (*plain).clone();
+        config.max_fragment_size = Some(512);
+        Arc::new(config)
+    };
+    let mut failures = Vec::new();
+    for (what, config) in [
+        ("a chain", &plain),
+        ("many CA names", &authorities),
+        ("many tickets", &tickets),
+        ("small records", &small_records),
+    ] {
+        let most = config.most_connection().expect("the config is bounded");
+        for version in [&TLS12, &TLS13] {
+            let failed = (0..2 * most).step_by(most / 16).find_map(|start| {
+                handshake_on_a_growing_budget(config, version, start)
+                    .err()
+                    .map(|error| (start, error))
+            });
+            if let Some((start, error)) = failed {
+                failures.push(format!("{what}, {version:?}, from {start} bytes: {error}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]

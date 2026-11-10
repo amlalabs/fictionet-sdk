@@ -695,7 +695,9 @@ impl State<ServerConnectionData> for ExpectClientHello {
         let (client_hello, sig_schemes) =
             process_client_hello(&m, self.previous_hello.is_some(), cx)?;
         // The message is taken already, so a flight the budget has no room
-        // for fails the connection here.
+        // for fails the connection here. A config that bounds its flight
+        // (`ServerConfig::most_connection`) had the room charged before the
+        // message was taken, so this never fails for it.
         self.with_certified_key(&sig_schemes, client_hello, &m, cx)
             .unwrap_or(Err(Error::BudgetExhausted))
     }

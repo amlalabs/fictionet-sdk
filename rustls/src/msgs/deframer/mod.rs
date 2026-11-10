@@ -42,6 +42,46 @@ impl<'a> DeframerIter<'a> {
     }
 }
 
+/// Where the record that starts at `from` in `buffer` ends: once its 5-byte
+/// header is there, checked as the deframer checks it, the end it says;
+/// before that, the end of the header. So a reader grows no further than a
+/// header it has checked allows.
+///
+/// Fails on a header no record may have: an unknown content type, a
+/// version that is not 3.x, an empty record that may not be empty, or a
+/// length past the most a record may carry.
+pub(crate) fn record_end(buffer: &[u8], from: usize) -> Result<usize, Error> {
+    let rest = buffer.get(from..).unwrap_or_default();
+    match read_header(rest) {
+        Some(Ok(len)) => Ok(from + HEADER_SIZE + usize::from(len)),
+        Some(Err(err)) => Err(err),
+        None => Ok(from + HEADER_SIZE),
+    }
+}
+
+/// The length a record's header at the start of `bytes` says, `None` while
+/// the header is incomplete, or why it is no record's header.
+fn read_header(bytes: &[u8]) -> Option<Result<u16, Error>> {
+    let mut reader = Reader::init(bytes);
+    match read_opaque_message_header(&mut reader) {
+        Ok((_, _, len)) => Some(Ok(len)),
+        Err(MessageError::TooShortForHeader | MessageError::TooShortForLength) => None,
+        Err(err) => Some(Err(invalid_header(err).into())),
+    }
+}
+
+fn invalid_header(err: MessageError) -> InvalidMessage {
+    match err {
+        MessageError::TooShortForHeader | MessageError::TooShortForLength => {
+            InvalidMessage::MessageTooShort
+        }
+        MessageError::InvalidEmptyPayload => InvalidMessage::InvalidEmptyPayload,
+        MessageError::MessageTooLarge => InvalidMessage::MessageTooLarge,
+        MessageError::InvalidContentType => InvalidMessage::InvalidContentType,
+        MessageError::UnknownProtocolVersion => InvalidMessage::UnknownProtocolVersion,
+    }
+}
+
 impl<'a> Iterator for DeframerIter<'a> {
     type Item = Result<InboundOpaqueMessage<'a>, Error>;
 
@@ -50,18 +90,10 @@ impl<'a> Iterator for DeframerIter<'a> {
 
         let (typ, version, len) = match read_opaque_message_header(&mut reader) {
             Ok(header) => header,
-            Err(err) => {
-                let err = match err {
-                    MessageError::TooShortForHeader | MessageError::TooShortForLength => {
-                        return None;
-                    }
-                    MessageError::InvalidEmptyPayload => InvalidMessage::InvalidEmptyPayload,
-                    MessageError::MessageTooLarge => InvalidMessage::MessageTooLarge,
-                    MessageError::InvalidContentType => InvalidMessage::InvalidContentType,
-                    MessageError::UnknownProtocolVersion => InvalidMessage::UnknownProtocolVersion,
-                };
-                return Some(Err(err.into()));
+            Err(MessageError::TooShortForHeader | MessageError::TooShortForLength) => {
+                return None;
             }
+            Err(err) => return Some(Err(invalid_header(err).into())),
         };
 
         let end = HEADER_SIZE + len as usize;

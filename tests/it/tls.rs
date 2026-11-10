@@ -248,6 +248,7 @@ pub(crate) fn server_config(fcx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Ar
         .with_single_cert(chain, key)
         .unwrap();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config.session_storage = tls::session_store(&fictionet::Budget::unlimited()).unwrap();
     Arc::new(config)
 }
 

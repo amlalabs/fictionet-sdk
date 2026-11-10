@@ -157,6 +157,27 @@ pub trait MessageEncrypter: Send + Sync {
     /// Return the length of the ciphertext that results from encrypting plaintext of
     /// length `payload_len`
     fn encrypted_payload_len(&self, payload_len: usize) -> usize;
+
+    /// Encrypts `msg` with `seq` as [`Self::encrypt`] does, writing the whole
+    /// record, its 5-byte header included, into `record`, which is exactly
+    /// `5 + self.encrypted_payload_len(msg.payload.len())` bytes long.
+    ///
+    /// The provided method encrypts into an allocation of its own and copies
+    /// the record out, failing if its length is not `record`'s. An encrypter
+    /// that can seal in place overrides it to allocate nothing.
+    fn encrypt_into(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        record: &mut [u8],
+    ) -> Result<(), Error> {
+        let encoded = self.encrypt(msg, seq)?.encode();
+        if encoded.len() != record.len() {
+            return Err(Error::EncryptError);
+        }
+        record.copy_from_slice(&encoded);
+        Ok(())
+    }
 }
 
 impl dyn MessageEncrypter {

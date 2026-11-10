@@ -4,9 +4,11 @@ use core::ops::Range;
 #[cfg(feature = "std")]
 use std::io;
 
+#[cfg(feature = "std")]
+use super::record_end;
 use crate::budget::{Paid, PaidBytes};
 #[cfg(feature = "std")]
-use crate::msgs::message::{HEADER_SIZE, MAX_WIRE_SIZE};
+use crate::msgs::message::MAX_WIRE_SIZE;
 
 /// Conversion from a slice within a larger buffer into
 /// a `Range` offset within.
@@ -129,6 +131,24 @@ impl BufferProgress {
     #[inline]
     pub(crate) fn add_processed(&mut self, processed: usize) {
         self.processed += processed;
+    }
+
+    /// Passes over `skipped` bytes of records that failed trial decryption:
+    /// processed, and to be removed. Nothing before them may still be in
+    /// use, as a handshake message being joined would be: trial decryption
+    /// ends at the first handshake message, and fails if one is being
+    /// joined.
+    #[inline]
+    pub(crate) fn skip(&mut self, skipped: usize) {
+        if skipped == 0 {
+            return;
+        }
+        debug_assert_eq!(
+            self.discard, self.processed,
+            "records skipped behind bytes still in use"
+        );
+        self.add_processed(skipped);
+        self.add_discard(skipped);
     }
 
     #[inline]
@@ -267,11 +287,12 @@ impl DeframerVecBuffer {
     /// joined, which end at `joined`, and after them at most one record:
     /// the one arriving. It grows to exactly what that record takes, paid
     /// for before it grows: its header first, then the rest once the header
-    /// says how long the record is.
+    /// says how long the record is and is checked to be a record's header.
     ///
     /// Fails, having read nothing, with [`io::ErrorKind::OutOfMemory`] if
     /// the buffer must grow and the budget has no room,
-    /// [`io::ErrorKind::InvalidData`] if it holds the most it may, and
+    /// [`io::ErrorKind::InvalidData`] if it holds the most it may or the
+    /// record arriving has a header no record may have, and
     /// [`io::ErrorKind::Other`] if a whole record is buffered: it must be
     /// processed first.
     pub(crate) fn read(
@@ -322,13 +343,13 @@ impl DeframerVecBuffer {
             false => MAX_WIRE_SIZE,
         };
 
-        let end = self.arriving_end(joined).ok_or(NoRoom::Waiting)?;
+        let end = self.arriving_end(joined)?;
         if self.used >= allow_max {
             return Err(NoRoom::Full);
         }
 
-        // A record whose header claims more than may be buffered is read up
-        // to the limit; processing it fails on the header.
+        // A record that would take a message being joined past the most it
+        // may hold is read up to the limit; processing it fails then.
         let need = Ord::min(end, allow_max);
         if need != self.buf.len() && !self.resize(need) {
             return Err(NoRoom::Unpaid);
@@ -338,15 +359,14 @@ impl DeframerVecBuffer {
     }
 
     /// Where the record arriving after `from` ends, or where its header
-    /// does while that is incomplete. `None` if the record after `from` is
-    /// whole: it waits to be processed.
-    fn arriving_end(&self, from: usize) -> Option<usize> {
-        let rest = self.filled().get(from..).unwrap_or_default();
-        let Some(header) = rest.get(..HEADER_SIZE) else {
-            return Some(from + HEADER_SIZE);
-        };
-        let end = from + HEADER_SIZE + usize::from(u16::from_be_bytes([header[3], header[4]]));
-        (end > self.used).then_some(end)
+    /// does while that is incomplete. The header is checked as soon as it
+    /// is whole, so a header no record may have grows nothing past itself.
+    fn arriving_end(&self, from: usize) -> Result<usize, NoRoom> {
+        let end = record_end(self.filled(), from).map_err(|_| NoRoom::Invalid)?;
+        match end > self.used {
+            true => Ok(end),
+            false => Err(NoRoom::Waiting),
+        }
     }
 
     /// Append `bytes` to the end of this buffer.
@@ -375,6 +395,9 @@ enum NoRoom {
     Unpaid,
     /// A whole record is buffered, waiting to be processed.
     Waiting,
+    /// The record arriving has a header no record may have: processing
+    /// fails on it.
+    Invalid,
 }
 
 #[cfg(feature = "std")]
@@ -390,6 +413,7 @@ impl From<NoRoom> for io::Error {
                 io::ErrorKind::Other,
                 "a received record waits for process_new_packets",
             ),
+            NoRoom::Invalid => Self::new(io::ErrorKind::InvalidData, "invalid record header"),
         }
     }
 }

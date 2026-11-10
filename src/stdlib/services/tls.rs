@@ -75,7 +75,9 @@ mod secure;
 #[path = "../../../verification/tls-contract/kani/Buffers.rs"]
 mod contract_buffers;
 
-pub use provider::{client_config_builder, config_builder, crypto_provider};
+pub use provider::{
+    SESSIONS, client_config_builder, config_builder, crypto_provider, session_store,
+};
 
 pub use budget::TlsBudget;
 pub use factory::{

@@ -33,7 +33,6 @@ mod connection {
     use core::ops::{Deref, DerefMut};
     use std::io::{self, BufRead, Read};
 
-    use crate::budget::PaidBytes;
     use crate::common_state::{CommonState, IoState};
     use crate::error::Error;
     use crate::msgs::message::OutboundChunks;
@@ -42,6 +41,11 @@ mod connection {
     use crate::ConnectionCommon;
 
     /// A client or server connection.
+    ///
+    /// A server connection is larger than a client one: it keeps the early data
+    /// queue, and each queue keeps a slot for its final alert. Connections are few and
+    /// long-lived, so the variants are kept inline rather than boxed.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug)]
     pub enum Connection {
         /// A client connection
@@ -207,21 +211,6 @@ mod connection {
                 None => {
                     self.check_no_bytes_state()?;
                     Ok(&[])
-                }
-            }
-        }
-
-        /// Take the first chunk of plaintext data received from the peer, in the buffer
-        /// that holds it, so it is not copied out, with the charge that pays for it.
-        ///
-        /// Returns what [`Self::into_first_chunk`] would return, owned: empty bytes
-        /// mean the peer closed the session cleanly.
-        pub fn take_first_chunk(self) -> io::Result<PaidBytes> {
-            match self.received_plaintext.pop_paid() {
-                Some(chunk) => Ok(chunk),
-                None => {
-                    self.check_no_bytes_state()?;
-                    Ok(PaidBytes::new(Vec::new(), None))
                 }
             }
         }
@@ -792,7 +781,9 @@ impl<Data> ConnectionCommon<Data> {
     /// to empty the incoming TLS data buffer.
     ///
     /// It reads no further than the end of the record arriving, into a buffer of exactly that
-    /// record's size, which is freed once the record is processed. Once a whole record is
+    /// record's size, which is freed once the record is processed. With a budget, the first
+    /// read also pays for the room the connection keeps for its final alert, and fails with
+    /// `ErrorKind::OutOfMemory`, reading nothing, while the budget has no room. Once a whole record is
     /// buffered it reads nothing more, failing with `ErrorKind::Other`, until
     /// [`process_new_packets()`] has taken it.
     ///
@@ -820,6 +811,15 @@ impl<Data> ConnectionCommon<Data> {
 
         if self.has_received_close_notify {
             return Ok(0);
+        }
+
+        // The connection's final alert must go out whatever the budget
+        // says when it is sent: its room is paid before the first byte.
+        if !self.core.common_state.keep_alert_room() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "no room for the final alert",
+            ));
         }
 
         let hs = &self.core.hs_deframer;
@@ -900,6 +900,24 @@ impl<Data> ConnectionCommon<Data> {
             + common.sendable_tls.held()
     }
 
+    /// Whether bytes it read are still buffered, unprocessed or in use.
+    #[cfg(feature = "std")]
+    pub(crate) fn holds_input(&self) -> bool {
+        !self.deframer_buffer.filled().is_empty() || self.core.hs_deframer.is_active()
+    }
+
+    /// The connection without its buffers, to go on through the unbuffered
+    /// API, whose caller holds the bytes it receives. Holds no input
+    /// ([`Self::holds_input`]): its buffers are dropped, giving back their
+    /// charge. Plaintext written before is dropped too; a connection made
+    /// from an `Accepted` has none.
+    #[cfg(feature = "std")]
+    pub(crate) fn into_unbuffered(self) -> UnbufferedConnectionCommon<Data> {
+        debug_assert!(self.deframer_buffer.filled().is_empty());
+        debug_assert!(self.sendable_plaintext.is_empty());
+        UnbufferedConnectionCommon::from(self.core)
+    }
+
     /// Pays for every buffer of this connection from `budget`. The buffers
     /// are still empty: this is part of making the connection.
     pub(crate) fn pay_from(mut self, budget: Arc<dyn BufferBudget>) -> Self {
@@ -934,6 +952,16 @@ impl<Data> UnbufferedConnectionCommon<Data> {
     /// Should be used with care as it exposes secret key material.
     pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
         self.core.dangerous_extract_secrets()
+    }
+
+    /// How many bytes at the front of the `incoming_tls` buffer hold a
+    /// handshake message being joined: processed, and still in use. The
+    /// next call must be given them again, unchanged, followed by the
+    /// record arriving; 0 when no message is being joined, and then a
+    /// buffer that starts at the record arriving may be given in their
+    /// place.
+    pub fn joined(&self) -> usize {
+        self.core.hs_deframer.progress().processed()
     }
 }
 
@@ -1135,15 +1163,15 @@ impl<Data> ConnectionCore<Data> {
             let mut iter = DeframerIter::new(&mut buffer[buffer_progress.processed()..]);
 
             let (message, processed) = loop {
+                // The records before this one in `iter` failed trial
+                // decryption: they are done with.
+                let skipped = iter.bytes_consumed();
                 let message = match iter.next().transpose() {
                     Ok(Some(message)) => message,
                     Ok(None) => {
-                        // Records that failed trial decryption are done
-                        // with: the record after them is read only once
-                        // they leave the buffer.
-                        let skipped = iter.bytes_consumed();
-                        buffer_progress.add_processed(skipped);
-                        buffer_progress.add_discard(skipped);
+                        // The record after them is read only once they
+                        // leave the buffer.
+                        buffer_progress.skip(skipped);
                         return Ok(None);
                     }
                     Err(err) => return Err(self.handle_deframe_error(err, state)),
@@ -1177,10 +1205,13 @@ impl<Data> ConnectionCore<Data> {
                 // application data that is kept, before the record is
                 // decrypted, which cannot be undone. The plaintext itself
                 // stays in the buffer the record arrived in, already paid
-                // for. The record stays where it is if there is no room.
+                // for. The record stays where it is if there is no room;
+                // those skipped before it go, so that they are not tried,
+                // and counted against the early data allowance, again.
                 if self.common_state.record_layer.is_decrypting()
                     && !self.common_state.reserve_plaintext()
                 {
+                    buffer_progress.skip(skipped);
                     return Ok(None);
                 }
 

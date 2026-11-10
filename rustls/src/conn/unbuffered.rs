@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
+use core::ops::Range;
 use core::{fmt, mem};
 #[cfg(feature = "std")]
 use std::error::Error as StdError;
@@ -11,6 +12,7 @@ use crate::client::ClientConnectionData;
 use crate::enums::ContentType;
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
 use crate::msgs::deframer::buffers::Locator;
+use crate::msgs::deframer::record_end;
 use crate::server::ServerConnectionData;
 use crate::Error;
 
@@ -50,6 +52,16 @@ impl<Data> UnbufferedConnectionCommon<Data> {
         let mut buffer = DeframerSliceBuffer::new(incoming_tls);
         let mut buffer_progress = self.core.hs_deframer.progress();
 
+        // Output that went unpaid fails the connection: a record after the
+        // one lost would leave a gap the peer refuses.
+        if let Err(e) = self.core.common_state.output_paid() {
+            self.core.state = Err(e.clone());
+            return UnbufferedStatus {
+                discard: 0,
+                state: Err(e),
+            };
+        }
+
         let (discard, state) = loop {
             if early_data_available(self) {
                 break (
@@ -58,22 +70,34 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 );
             }
 
-            if !self.core.common_state.received_plaintext.is_empty() {
-                break (
-                    buffer.pending_discard(),
-                    ReadTraffic::new(self, incoming_tls).into(),
-                );
+            if !self.core.common_state.sendable_tls.is_empty() {
+                break (buffer.pending_discard(), EncodeTlsData::new(self).into());
             }
 
-            if let Some(chunk) = self.core.common_state.sendable_tls.pop() {
-                break (
-                    buffer.pending_discard(),
-                    EncodeTlsData::new(self, chunk).into(),
-                );
+            // Room for the most output the next message can make, charged
+            // before it is taken, so that its processing, which cannot be
+            // undone, never runs out of room halfway. Without room the
+            // message waits where it is.
+            let filled = buffer.filled_mut();
+            let next = match record_end(filled, buffer_progress.processed()) {
+                Ok(end) => end <= filled.len(),
+                // The deframer refuses it, with an alert from the room kept
+                // for the final alert.
+                Err(_) => false,
+            };
+            // A connection that failed reads nothing more: what it queued
+            // still goes out.
+            let reading =
+                !self.core.common_state.has_received_close_notify && self.core.state.is_ok();
+            let unprocessed = reading && (self.core.hs_deframer.has_message_ready() || next);
+            if unprocessed && !self.core.common_state.reserve_step() {
+                break (buffer.pending_discard(), ConnectionState::BlockedBudget);
             }
 
+            // Where the bytes `deframe` is given start in `incoming_tls`.
+            let base = buffer.pending_discard();
             let locator = Locator::new(buffer.filled_mut());
-            let deframer_output = if self.core.common_state.has_received_close_notify {
+            let deframer_output = if !reading {
                 None
             } else {
                 match self
@@ -82,6 +106,10 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 {
                     Err(err) => {
                         buffer.queue_discard(buffer_progress.take_discard());
+                        self.core.common_state.release_step();
+                        // A record that does not decrypt or frame fails the
+                        // connection, as a message that does not process does.
+                        self.core.state = Err(err.clone());
                         return UnbufferedStatus {
                             discard: buffer.pending_discard(),
                             state: Err(err),
@@ -93,14 +121,16 @@ impl<Data> UnbufferedConnectionCommon<Data> {
 
             if let Some(msg) = deframer_output {
                 // Application data is decrypted in place: where its plaintext is.
-                let plaintext =
-                    (msg.typ == ContentType::ApplicationData).then(|| locator.locate(msg.payload));
+                let plaintext = (msg.typ == ContentType::ApplicationData)
+                    .then(|| locator.locate(msg.payload))
+                    .map(|range| base + range.start..base + range.end);
                 let mut state =
                     match mem::replace(&mut self.core.state, Err(Error::HandshakeNotComplete)) {
                         Ok(state) => state,
                         Err(e) => {
                             buffer.queue_discard(buffer_progress.take_discard());
                             self.core.state = Err(e.clone());
+                            self.core.common_state.release_step();
                             return UnbufferedStatus {
                                 discard: buffer.pending_discard(),
                                 state: Err(e),
@@ -108,24 +138,13 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         }
                     };
 
-                let processed = self.core.process_msg(msg, state, None).and_then(|new| {
-                    // The caller owns the buffer the record arrived in, so the
-                    // plaintext kept is a copy.
-                    let kept = mem::take(&mut self.core.common_state.plaintext_kept);
-                    let (true, Some(plaintext)) = (kept, plaintext) else {
-                        return Ok(new);
-                    };
-                    let bytes = &buffer.filled_mut()[plaintext];
-                    match self
-                        .core
-                        .common_state
-                        .received_plaintext
-                        .append_with(bytes.len(), || bytes.to_vec())
-                    {
-                        true => Ok(new),
-                        false => Err(Error::BudgetExhausted),
-                    }
-                });
+                let processed = self
+                    .core
+                    .process_msg(msg, state, None)
+                    .and_then(|new| self.core.common_state.output_paid().map(|()| new));
+                // What the message made is paid from the room; the rest of
+                // the room goes back.
+                self.core.common_state.release_step();
                 match processed {
                     Ok(new) => state = new,
 
@@ -138,11 +157,39 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         };
                     }
                 }
+                self.core.state = Ok(state);
+
+                // The state took the record's plaintext: it stays where it was
+                // decrypted, in the caller's buffer, and goes to the caller as
+                // a range of it. The record is discarded once it is handled.
+                let kept = mem::take(&mut self.core.common_state.plaintext_kept);
+                if let (true, Some(payload)) = (kept, plaintext) {
+                    let record = AppDataRecord {
+                        discard: buffer_progress.take_discard(),
+                        payload,
+                    };
+                    break (
+                        buffer.pending_discard(),
+                        ReadTraffic::new(self, incoming_tls, record).into(),
+                    );
+                }
 
                 buffer.queue_discard(buffer_progress.take_discard());
+                continue;
+            }
 
-                self.core.state = Ok(state);
-            } else if self.wants_write {
+            // Records that failed trial decryption are done with: they are
+            // not tried again on the next call.
+            buffer.queue_discard(buffer_progress.take_discard());
+            self.core.common_state.release_step();
+            // Once what a failed connection queued is out, it stays failed.
+            if let (false, Err(e)) = (self.wants_write, &self.core.state) {
+                return UnbufferedStatus {
+                    discard: buffer.pending_discard(),
+                    state: Err(e.clone()),
+                };
+            }
+            if self.wants_write {
                 break (
                     buffer.pending_discard(),
                     TransmitTlsData { conn: self }.into(),
@@ -255,6 +302,14 @@ pub enum ConnectionState<'c, 'i, Data> {
     /// was passed to [`UnbufferedConnectionCommon::process_tls_records`].
     BlockedHandshake,
 
+    /// The connection's [`BufferBudget`](crate::budget::BufferBudget) has no room for the
+    /// output the next message may make
+    ///
+    /// The message waits where it is: call
+    /// [`UnbufferedConnectionCommon::process_tls_records`] again, with the same buffer, once
+    /// the budget has room. A connection without a budget never reaches this state.
+    BlockedBudget,
+
     /// The handshake process has been completed.
     ///
     /// [`WriteTraffic::encrypt`] can be called on the enclosed object to encrypt application
@@ -312,53 +367,55 @@ impl<Data> fmt::Debug for ConnectionState<'_, '_, Data> {
 
             Self::BlockedHandshake => f.debug_tuple("BlockedHandshake").finish(),
 
+            Self::BlockedBudget => f.debug_tuple("BlockedBudget").finish(),
+
             Self::WriteTraffic(..) => f.debug_tuple("WriteTraffic").finish(),
         }
     }
 }
 
-/// Application data is available
+/// An application data record was decrypted where it arrived, in the
+/// `incoming_tls` buffer: its plaintext is a range of that buffer.
 pub struct ReadTraffic<'c, 'i, Data> {
-    conn: &'c mut UnbufferedConnectionCommon<Data>,
-    // for forwards compatibility; to support in-place decryption in the future
-    _incoming_tls: &'i mut [u8],
-
-    // owner of the latest chunk obtained in `next_record`, as borrowed by
-    // `AppDataRecord`
-    chunk: Option<Vec<u8>>,
+    _conn: &'c mut UnbufferedConnectionCommon<Data>,
+    incoming_tls: &'i [u8],
+    record: Option<AppDataRecord>,
 }
 
 impl<'c, 'i, Data> ReadTraffic<'c, 'i, Data> {
-    fn new(conn: &'c mut UnbufferedConnectionCommon<Data>, _incoming_tls: &'i mut [u8]) -> Self {
+    fn new(
+        conn: &'c mut UnbufferedConnectionCommon<Data>,
+        incoming_tls: &'i [u8],
+        record: AppDataRecord,
+    ) -> Self {
         Self {
-            conn,
-            _incoming_tls,
-            chunk: None,
+            _conn: conn,
+            incoming_tls,
+            record: Some(record),
         }
     }
 
-    /// Decrypts and returns the next available app-data record
-    // TODO deprecate in favor of `Iterator` implementation, which requires in-place decryption
-    pub fn next_record(&mut self) -> Option<Result<AppDataRecord<'_>, Error>> {
-        self.chunk = self.conn.core.common_state.received_plaintext.pop();
-        self.chunk.as_ref().map(|chunk| {
-            Ok(AppDataRecord {
-                discard: 0,
-                payload: chunk,
-            })
-        })
+    /// The record decrypted, once: its plaintext is at
+    /// [`AppDataRecord::payload`] in the `incoming_tls` buffer, already
+    /// authenticated. `None` once it was taken; call
+    /// [`UnbufferedConnectionCommon::process_tls_records`] again for the next.
+    pub fn next_record(&mut self) -> Option<Result<AppDataRecord, Error>> {
+        self.record.take().map(Ok)
     }
 
-    /// Returns the payload size of the next app-data record *without* decrypting it
+    /// The plaintext of a record [`Self::next_record`] returned, as a slice
+    /// of the `incoming_tls` buffer.
+    pub fn payload(&self, record: &AppDataRecord) -> &[u8] {
+        &self.incoming_tls[record.payload.clone()]
+    }
+
+    /// Returns the payload size of the record not yet taken
     ///
-    /// Returns `None` if there are no more app-data records
+    /// Returns `None` if it was taken, or is empty
     pub fn peek_len(&self) -> Option<NonZeroUsize> {
-        self.conn
-            .core
-            .common_state
-            .received_plaintext
-            .peek()
-            .and_then(|ch| NonZeroUsize::new(ch.len()))
+        self.record
+            .as_ref()
+            .and_then(|record| NonZeroUsize::new(record.payload.len()))
     }
 }
 
@@ -386,16 +443,11 @@ impl<'c, 'i> ReadEarlyData<'c, 'i, ServerConnectionData> {
         }
     }
 
-    /// decrypts and returns the next available app-data record
-    // TODO deprecate in favor of `Iterator` implementation, which requires in-place decryption
-    pub fn next_record(&mut self) -> Option<Result<AppDataRecord<'_>, Error>> {
+    /// Returns the next early data record's plaintext, which the connection
+    /// kept apart from the `incoming_tls` buffer
+    pub fn next_record(&mut self) -> Option<Result<&[u8], Error>> {
         self.chunk = self.conn.pop_early_data();
-        self.chunk.as_ref().map(|chunk| {
-            Ok(AppDataRecord {
-                discard: 0,
-                payload: chunk,
-            })
-        })
+        self.chunk.as_deref().map(Ok)
     }
 
     /// returns the payload size of the next app-data record *without* decrypting it
@@ -408,16 +460,19 @@ impl<'c, 'i> ReadEarlyData<'c, 'i, ServerConnectionData> {
     }
 }
 
-/// A decrypted application-data record
-pub struct AppDataRecord<'i> {
-    /// Number of additional bytes to discard
+/// A decrypted application-data record, decrypted where it arrived
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppDataRecord {
+    /// Number of additional bytes to discard: the record's own
     ///
     /// This number MUST be added to the value of [`UnbufferedStatus::discard`] *prior* to the
     /// discard operation. See [`UnbufferedStatus::discard`] for more details
     pub discard: usize,
 
-    /// The payload of the app-data record
-    pub payload: &'i [u8],
+    /// Where the record's plaintext is in the `incoming_tls` buffer passed
+    /// to the [`UnbufferedConnectionCommon::process_tls_records`] call that
+    /// returned it, counted from its start before any discard
+    pub payload: Range<usize>,
 }
 
 /// Allows encrypting app-data
@@ -444,6 +499,23 @@ impl<Data> WriteTraffic<'_, Data> {
             .core
             .common_state
             .write_plaintext(application_data.into(), outgoing_tls)
+    }
+
+    /// The bytes [`Self::encrypt`] writes for `application_data_len` bytes,
+    /// records queued to go before them included: the size an
+    /// `outgoing_tls` buffer needs. A key update the write itself starts
+    /// adds to it, and `encrypt` then says how much in its error.
+    pub fn encrypted_len(&self, application_data_len: usize) -> usize {
+        self.conn
+            .core
+            .common_state
+            .encrypted_len(application_data_len)
+    }
+
+    /// The bytes [`Self::queue_close_notify`] writes, records queued to go
+    /// before it included: the size an `outgoing_tls` buffer needs
+    pub fn close_notify_len(&self) -> usize {
+        self.conn.core.common_state.close_notify_len()
     }
 
     /// Encrypts a close_notify warning alert in `outgoing_tls`
@@ -474,17 +546,47 @@ impl<Data> WriteTraffic<'_, Data> {
 }
 
 /// A handshake record must be encoded
+///
+/// The record stays queued in the connection until [`Self::encode`] takes
+/// it: dropping this state without encoding loses nothing, and the next
+/// [`UnbufferedConnectionCommon::process_tls_records`] call offers it again.
 pub struct EncodeTlsData<'c, Data> {
     conn: &'c mut UnbufferedConnectionCommon<Data>,
-    chunk: Option<Vec<u8>>,
+    encoded: bool,
 }
 
 impl<'c, Data> EncodeTlsData<'c, Data> {
-    fn new(conn: &'c mut UnbufferedConnectionCommon<Data>, chunk: Vec<u8>) -> Self {
+    fn new(conn: &'c mut UnbufferedConnectionCommon<Data>) -> Self {
         Self {
             conn,
-            chunk: Some(chunk),
+            encoded: false,
         }
+    }
+
+    /// The bytes [`Self::encode`] writes, before it has: the size an
+    /// `outgoing_tls` buffer needs
+    pub fn len(&self) -> usize {
+        match self.encoded {
+            true => 0,
+            false => self
+                .conn
+                .core
+                .common_state
+                .sendable_tls
+                .chunk()
+                .map_or(0, <[u8]>::len),
+        }
+    }
+
+    /// Whether [`Self::encode`] has nothing to write
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes of every record queued to be encoded, this one included
+    /// until it is: what a buffer for all of them needs
+    pub fn queued_len(&self) -> usize {
+        self.conn.core.common_state.sendable_tls_len()
     }
 
     /// Encodes a handshake record into the `outgoing_tls` buffer
@@ -492,23 +594,24 @@ impl<'c, Data> EncodeTlsData<'c, Data> {
     /// Returns the number of bytes that were written into `outgoing_tls`, or an error if
     /// the provided buffer is too small. In the error case, `outgoing_tls` is not modified
     pub fn encode(&mut self, outgoing_tls: &mut [u8]) -> Result<usize, EncodeError> {
-        let Some(chunk) = self.chunk.take() else {
+        if self.encoded {
             return Err(EncodeError::AlreadyEncoded);
-        };
-
-        let required_size = chunk.len();
-
-        if required_size > outgoing_tls.len() {
-            self.chunk = Some(chunk);
-            Err(InsufficientSizeError { required_size }.into())
-        } else {
-            let written = chunk.len();
-            outgoing_tls[..written].copy_from_slice(&chunk);
-
-            self.conn.wants_write = true;
-
-            Ok(written)
         }
+
+        let required_size = self.len();
+        if required_size > outgoing_tls.len() {
+            return Err(InsufficientSizeError { required_size }.into());
+        }
+
+        let sendable_tls = &mut self.conn.core.common_state.sendable_tls;
+        let chunk = sendable_tls
+            .pop()
+            .expect("a record is queued while this state lives");
+        outgoing_tls[..required_size].copy_from_slice(&chunk);
+        self.encoded = true;
+        self.conn.wants_write = true;
+
+        Ok(required_size)
     }
 }
 
@@ -603,3 +706,6 @@ pub struct InsufficientSizeError {
     /// buffer must be at least this size
     pub required_size: usize,
 }
+
+#[cfg(all(test, feature = "std"))]
+mod tests;

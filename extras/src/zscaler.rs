@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::protocols::asn1::StringKind::{Ia5, Printable, Utf8};
 use fictionet::stdlib::protocols::asn1::{Oid, StringKind};
 use fictionet::stdlib::protocols::x509::{self, ExtensionValue, GeneralName, KeyUsage, oid};
@@ -334,15 +335,18 @@ impl Zscaler {
 
     /// A rustls server configuration for a site at `names`: the chain from
     /// [`issue`](Self::issue) and its key, with the run's clock for
-    /// validity checks.
+    /// validity checks, its session store paid for from `sessions` (see
+    /// [`Leaf::server_config`]).
     pub fn server_config(
         &self,
         fcx: &Cx,
         names: &[&str],
         now: SystemTime,
+        sessions: &Budget,
     ) -> Result<Arc<tls::ServerConfig>> {
         let now_unix = i64::try_from(now.duration_since(SystemTime::UNIX_EPOCH)?.as_secs())?;
-        self.issue(fcx, names, now_unix)?.server_config(fcx, now)
+        self.issue(fcx, names, now_unix)?
+            .server_config(fcx, now, sessions)
     }
 }
 

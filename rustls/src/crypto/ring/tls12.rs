@@ -11,7 +11,8 @@ use crate::enums::{CipherSuite, SignatureScheme};
 use crate::error::Error;
 use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
 use crate::msgs::message::{
-    InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
+    write_header, InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage,
+    PrefixedPayload, HEADER_SIZE,
 };
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets, SupportedCipherSuite};
 use crate::tls12::Tls12CipherSuite;
@@ -306,6 +307,36 @@ impl MessageEncrypter for GcmMessageEncrypter {
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
         payload_len + GCM_EXPLICIT_NONCE_LEN + self.enc_key.algorithm().tag_len()
     }
+
+    /// Seals the record where it is written: the plaintext is copied into
+    /// `record` once, and nothing is allocated.
+    fn encrypt_into(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        record: &mut [u8],
+    ) -> Result<(), Error> {
+        let len = msg.payload.len();
+        let total_len = self.encrypted_payload_len(len);
+        if record.len() != HEADER_SIZE + total_len {
+            return Err(Error::EncryptError);
+        }
+        let (header, body) = record.split_at_mut(HEADER_SIZE);
+        write_header(header, msg.typ, msg.version, total_len);
+        let (explicit, rest) = body.split_at_mut(GCM_EXPLICIT_NONCE_LEN);
+        let (plain, tag) = rest.split_at_mut(len);
+
+        let nonce = Nonce::new(&self.iv, seq).0;
+        explicit.copy_from_slice(&nonce[4..]);
+        msg.payload.copy_to_slice(plain);
+        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, len));
+        let sealed = self
+            .enc_key
+            .seal_in_place_separate_tag(aead::Nonce::assume_unique_for_key(nonce), aad, plain)
+            .map_err(|_| Error::EncryptError)?;
+        tag.copy_from_slice(sealed.as_ref());
+        Ok(())
+    }
 }
 
 /// The RFC7905/RFC7539 ChaCha20Poly1305 construction.
@@ -384,6 +415,34 @@ impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
         payload_len + self.enc_key.algorithm().tag_len()
+    }
+
+    /// Seals the record where it is written: the plaintext is copied into
+    /// `record` once, and nothing is allocated.
+    fn encrypt_into(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        record: &mut [u8],
+    ) -> Result<(), Error> {
+        let len = msg.payload.len();
+        let total_len = self.encrypted_payload_len(len);
+        if record.len() != HEADER_SIZE + total_len {
+            return Err(Error::EncryptError);
+        }
+        let (header, body) = record.split_at_mut(HEADER_SIZE);
+        write_header(header, msg.typ, msg.version, total_len);
+        let (plain, tag) = body.split_at_mut(len);
+        msg.payload.copy_to_slice(plain);
+
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.enc_offset, seq).0);
+        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, len));
+        let sealed = self
+            .enc_key
+            .seal_in_place_separate_tag(nonce, aad, plain)
+            .map_err(|_| Error::EncryptError)?;
+        tag.copy_from_slice(sealed.as_ref());
+        Ok(())
     }
 }
 

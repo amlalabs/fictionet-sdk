@@ -4,11 +4,15 @@
 //! buffers grows: the record arriving (or a handshake message being joined),
 //! the plaintext it has decrypted and not yet handed over, the plaintext
 //! written before the handshake finished, and the records queued to send.
-//! Each buffer holds one [`BufferCharge`] that always covers its allocation,
-//! and gives back what it frees. A record's plaintext stays in the buffer the
-//! record arrived in, which joins the plaintext queue with its charge: the
-//! queue's charge takes it in, and the budget's total does not move.
-//! Buffers are freed once empty, so an idle connection is charged nothing.
+//! Each buffer holds one charge that always covers its allocation, and gives
+//! back what it frees. A record's plaintext stays in the buffer the record
+//! arrived in, which joins the plaintext queue with its charge: the queue's
+//! charge takes it in, and the budget's total does not move. Buffers are
+//! freed once empty, so an idle connection holds none.
+//!
+//! The one charge an idle connection keeps is the room for its final alert,
+//! a fatal alert or a `close_notify`, paid before the first byte it reads:
+//! that alert goes out whatever the budget says when it is sent.
 //!
 //! A growth the budget refuses changes nothing, and the call that wanted it
 //! says so in a way that can be retried once memory frees:
@@ -20,18 +24,21 @@
 //!   message it cannot pay for, leaving it buffered, and
 //!   [`CommonState::wants_budget`] says so until a later call gets past it.
 //! - [`Writer`](crate::Writer) takes fewer bytes, perhaps none.
-//! - [`Accepted::into_connection`] gives the [`Accepted`] back.
-//! - [`CommonState::send_close_notify`] returns `false` and
-//!   [`ConnectionCommon::refresh_traffic_keys`] fails with
+//! - [`Accepted::into_connection`] and [`Accepted::into_unbuffered`] give the
+//!   [`Accepted`] back.
+//! - [`ConnectionCommon::refresh_traffic_keys`] fails with
 //!   [`Error::BudgetExhausted`], having queued nothing.
 //!
 //! The output rustls makes for a message it receives (a handshake flight, a
 //! key update, an alert) cannot be refused halfway through, since the
 //! handshake state has moved on by then. So before each message the
 //! connection charges room for the most that message can make, and the output
-//! is paid from that room. Output that outgrows its room is charged directly;
-//! if that is refused too, the output is dropped and the connection fails
-//! with [`Error::BudgetExhausted`] rather than hold bytes nothing pays for.
+//! is paid from that room. A server whose config bounds what its flight,
+//! CA names and tickets take ([`ServerConfig::most_connection`]) charges
+//! room for all of it, so its output never outgrows the room. Without that
+//! bound, output that outgrows its room is charged directly; if that is
+//! refused too, the output is dropped and the connection fails with
+//! [`Error::BudgetExhausted`] rather than hold bytes nothing pays for.
 //!
 //! [`ConnectionCommon::read_tls`]: crate::ConnectionCommon::read_tls
 //! [`ConnectionCommon::process_new_packets`]: crate::ConnectionCommon::process_new_packets
@@ -39,11 +46,12 @@
 //! [`CommonState::wants_budget`]: crate::CommonState::wants_budget
 //! [`CommonState::send_close_notify`]: crate::CommonState::send_close_notify
 //! [`Accepted::into_connection`]: crate::server::Accepted::into_connection
+//! [`Accepted::into_unbuffered`]: crate::server::Accepted::into_unbuffered
 //! [`Accepted`]: crate::server::Accepted
 //! [`Error::BudgetExhausted`]: crate::Error::BudgetExhausted
+//! [`ServerConfig::most_connection`]: crate::ServerConfig::most_connection
 
 use alloc::vec::Vec;
-use core::any::Any;
 use core::fmt;
 
 use crate::sync::Arc;
@@ -51,11 +59,9 @@ use crate::sync::Arc;
 /// Where a connection's buffers are paid from: a count of bytes that
 /// refuses to go past its limit.
 ///
-/// The connection holds what it takes in [`BufferCharge`]s, which give it
-/// back when dropped. The budget is an [`Any`], so its owner can recognize
-/// it in a charge that leaves the connection ([`BufferCharge::budget`]) and
-/// hold the bytes in a charge of its own type ([`BufferCharge::into_bytes`]).
-pub trait BufferBudget: Any + Send + Sync {
+/// The connection holds what it takes in charges of its own, which give it
+/// back when dropped.
+pub trait BufferBudget: Send + Sync {
     /// Takes `bytes`, if they fit. Refuses, changing nothing, if not.
     fn take(&self, bytes: usize) -> bool;
 
@@ -68,7 +74,7 @@ pub trait BufferBudget: Any + Send + Sync {
 /// Making, growing, splitting and dropping one allocates nothing: it is the
 /// budget and a count.
 #[must_use = "a charge that is dropped gives its bytes back"]
-pub struct BufferCharge {
+pub(crate) struct BufferCharge {
     budget: Arc<dyn BufferBudget>,
     bytes: usize,
 }
@@ -83,20 +89,8 @@ impl BufferCharge {
     }
 
     /// The bytes charged now.
-    pub fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         self.bytes
-    }
-
-    /// The budget it counts against.
-    pub fn budget(&self) -> &Arc<dyn BufferBudget> {
-        &self.budget
-    }
-
-    /// Ends this charge without giving its bytes back, and returns them, for
-    /// the budget's owner to hold in a charge of its own. The budget's total
-    /// does not change.
-    pub fn into_bytes(mut self) -> usize {
-        core::mem::take(&mut self.bytes)
     }
 
     /// Charges `to` bytes in all, if that is more than now. Refuses,
@@ -161,9 +155,9 @@ impl fmt::Debug for BufferCharge {
     }
 }
 
-/// Bytes taken out of a connection's buffer with the charge that pays for
-/// their allocation, so they leave without a copy.
-pub struct PaidBytes {
+/// Bytes moved from one of a connection's buffers to another with the
+/// charge that pays for their allocation, so they move without a copy.
+pub(crate) struct PaidBytes {
     bytes: Vec<u8>,
     charge: Option<BufferCharge>,
 }
@@ -173,14 +167,9 @@ impl PaidBytes {
         Self { bytes, charge }
     }
 
-    /// The bytes.
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     /// The bytes, and their charge: `None` for a connection without a
     /// budget, otherwise exactly their capacity.
-    pub fn into_parts(self) -> (Vec<u8>, Option<BufferCharge>) {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Option<BufferCharge>) {
         (self.bytes, self.charge)
     }
 }
@@ -265,18 +254,47 @@ impl fmt::Debug for Paid {
 }
 
 /// The room charged before a handshake message is processed, for the output
-/// it makes: one full record, enough for every handshake flight except a
-/// certificate chain larger than that, whose own size is added once it is
-/// known.
+/// it makes: one full record, enough for every handshake message whose size
+/// the config does not set. What the config sets (a certificate chain, the
+/// CA names of a certificate request, tickets) is added by
+/// [`handshake_room`].
 pub(crate) const HANDSHAKE_ROOM: usize = crate::msgs::message::MAX_WIRE_SIZE;
 
-/// How many records a handshake message's output is counted as, for the
-/// places of the queue they wait in. A server's largest flight in TLS 1.3 is
-/// ServerHello, ChangeCipherSpec, EncryptedExtensions, CertificateRequest,
-/// Certificate, CertificateVerify and Finished; tickets follow the client's
-/// Finished. Records a long certificate chain takes beyond one are added once
-/// its size is known.
+/// How many messages one received handshake message's output is made of,
+/// each of which may end in a record of its own. A server's largest flight
+/// in TLS 1.3 is ServerHello, ChangeCipherSpec, EncryptedExtensions,
+/// CertificateRequest, Certificate, CertificateVerify and Finished; tickets
+/// follow the client's Finished, in one flight.
 pub(crate) const HANDSHAKE_RECORDS: usize = 8;
+
+/// The most a record adds to its payload: the 5-byte header and the most a
+/// cipher adds (TLS 1.2 GCM's 8-byte explicit nonce and 16-byte tag; TLS
+/// 1.3 adds a type byte and a tag, 17 bytes).
+pub(crate) const RECORD_OVERHEAD: usize = 5 + 8 + 16;
+
+/// The room, in bytes and records, for the output of one received handshake
+/// message: [`HANDSHAKE_ROOM`] for the messages whose size the config does
+/// not set, and `more` bytes of the messages whose size it does, all cut
+/// into records of at most `fragment` bytes of payload.
+pub(crate) fn handshake_room(more: usize, fragment: usize) -> (usize, usize) {
+    let payload = HANDSHAKE_ROOM + more;
+    let records = HANDSHAKE_RECORDS + (payload + fragment - 1) / fragment;
+    (payload + records * RECORD_OVERHEAD, records)
+}
+
+/// The bytes a certificate chain and its OCSP response take in the
+/// server's Certificate (and, in TLS 1.2, CertificateStatus) message.
+pub(crate) fn chain_bytes(chain: &[pki_types::CertificateDer<'_>], ocsp: Option<&[u8]>) -> usize {
+    /// A certificate entry's 24-bit length and 16-bit extensions length.
+    const ENTRY: usize = 3 + 2;
+    /// The status_request extension around an OCSP response.
+    const STATUS: usize = 4 + 1 + 3;
+    chain
+        .iter()
+        .map(|cert| cert.as_ref().len() + ENTRY)
+        .sum::<usize>()
+        + ocsp.map_or(0, |ocsp| ocsp.len() + STATUS)
+}
 
 /// The most records one message received after the handshake makes: a
 /// close_notify when the peer's records use up the read keys, a key update,
@@ -288,7 +306,7 @@ pub(crate) const CONTROL_RECORDS: usize = 3;
 pub(crate) const CONTROL_PAYLOAD: usize = 5;
 
 #[cfg(all(test, feature = "std"))]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) mod testing {

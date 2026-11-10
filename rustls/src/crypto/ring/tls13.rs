@@ -11,7 +11,8 @@ use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
 use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
 use crate::error::Error;
 use crate::msgs::message::{
-    InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
+    write_header, InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage,
+    PrefixedPayload, HEADER_SIZE,
 };
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets, SupportedCipherSuite};
 use crate::tls13::Tls13CipherSuite;
@@ -229,6 +230,42 @@ impl MessageEncrypter for Tls13MessageEncrypter {
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
         payload_len + 1 + self.enc_key.algorithm().tag_len()
+    }
+
+    /// Seals the record where it is written: the plaintext and its inner
+    /// content type are copied into `record` once, and nothing is allocated.
+    fn encrypt_into(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        record: &mut [u8],
+    ) -> Result<(), Error> {
+        let len = msg.payload.len();
+        let total_len = self.encrypted_payload_len(len);
+        if record.len() != HEADER_SIZE + total_len {
+            return Err(Error::EncryptError);
+        }
+        let (header, body) = record.split_at_mut(HEADER_SIZE);
+        // All TLS 1.3 application data records use TLSv1_2 (0x0303) as the legacy record
+        // protocol version, see https://www.rfc-editor.org/rfc/rfc8446#section-5.1
+        write_header(
+            header,
+            ContentType::ApplicationData,
+            ProtocolVersion::TLSv1_2,
+            total_len,
+        );
+        let (inner, tag) = body.split_at_mut(len + 1);
+        msg.payload.copy_to_slice(&mut inner[..len]);
+        inner[len] = msg.typ.into();
+
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let aad = aead::Aad::from(make_tls13_aad(total_len));
+        let sealed = self
+            .enc_key
+            .seal_in_place_separate_tag(nonce, aad, inner)
+            .map_err(|_| Error::EncryptError)?;
+        tag.copy_from_slice(sealed.as_ref());
+        Ok(())
     }
 }
 

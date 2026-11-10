@@ -10,11 +10,15 @@ use rustls::crypto::{
     SupportedKxGroup,
 };
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer, UnixTime};
+use rustls::server::ServerSessionSlots;
 use rustls::sign::{Signer, SigningKey};
 use rustls::time_provider::TimeProvider;
 use rustls::{ConfigBuilder, NamedGroup, SignatureAlgorithm, SignatureScheme, WantsVersions};
 
+use fictionet::stdlib::layer::Budget;
 use fictionet::{Cx, Entropy};
+
+use super::TlsBudget;
 
 /// Starts a rustls server config whose time and randomness come from `fcx`.
 ///
@@ -60,6 +64,20 @@ pub fn config_builder(fcx: &Cx, start: SystemTime) -> ConfigBuilder<ServerConfig
         start,
     };
     ServerConfig::builder_with_details(Arc::new(provider), Arc::new(clock))
+}
+
+/// How many sessions a server config's [`session_store`] keeps for
+/// resumption, as rustls's own store does. The oldest goes first.
+pub const SESSIONS: usize = 256;
+
+/// The session store for a server config, made and paid for from `owner`
+/// once, for the config's life: [`SESSIONS`] slots, into which a
+/// connection's sessions are copied. A connection that stores, finds or
+/// takes a session leaves nothing allocated once it is gone. Fails with
+/// [`rustls::Error::BudgetExhausted`] if `owner` has no room.
+pub fn session_store(owner: &Budget) -> Result<Arc<ServerSessionSlots>, rustls::Error> {
+    ServerSessionSlots::with_budget(SESSIONS, TlsBudget::of(owner))
+        .ok_or(rustls::Error::BudgetExhausted)
 }
 
 /// Starts a rustls client config using the same clock and randomness as [`config_builder`].
