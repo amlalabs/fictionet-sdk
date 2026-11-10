@@ -87,7 +87,7 @@ fn smol_now(fcx: &Cx) -> smoltcp::time::Instant {
 /// Hands over `h`, a connection a test took out of its accept queue by
 /// hand, to the endpoint's handles, as an accept would.
 fn accept_by_hand(ep: &Endpoint, host: &mut Host, h: Id) -> TcpConnection {
-    let port = host.conns[&h].local.port();
+    let port = host.conn(h).local.port();
     host.adopt(h);
     host.pump();
     host.accepted(&ep.shared, port)
@@ -231,7 +231,7 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
             .sockets
             .set
             .changed()
-            .map(|slot| st.sockets.ids[slot.index()].unwrap())
+            .map(|slot| st.sockets.id_of(slot))
             .collect();
         assert_eq!(changed, [accepted]);
         assert_eq!(accepted, idle[0]);
@@ -254,7 +254,7 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
             st.sockets
                 .set
                 .changed()
-                .all(|slot| { st.sockets.ids[slot.index()] == Some(accepted) })
+                .all(|slot| { st.sockets.id_of(slot) == accepted })
         );
         assert_eq!(st.by_tuple[&(local, peer)], accepted);
         assert!(
@@ -319,7 +319,7 @@ fn a_syn_for_a_reset_connection_still_held_is_not_taken_by_a_listener() {
             st.sockets
                 .set
                 .changed()
-                .all(|slot| st.sockets.ids[slot.index()] == Some(h)),
+                .all(|slot| st.sockets.id_of(slot) == h),
             "only the connection that owns the tuple may change"
         );
         assert_eq!(st.by_tuple[&(local, peer)], h);
@@ -417,7 +417,7 @@ fn a_declined_timer_recomputes_the_remaining_deadline() {
         assert!(st.deadline().is_some());
         st.remove_conn(h);
         assert!(!st.on_timer(&mut env, ()).unwrap());
-        assert!(st.sockets.handles.is_empty());
+        assert!(st.sockets.len() == 0);
         assert!(st.next_expiry().is_none());
         assert!(st.deadline().is_none());
         drop(st);
@@ -561,7 +561,7 @@ fn budget_read(release_after_poll: bool) {
         let count: usize = received.iter().map(|bytes| bytes.len()).sum();
         assert!(count > 0 && count <= room);
         assert_eq!(st.get(h).recv_queue() + count, payload.len());
-        assert_eq!(st.conns[&h].recv_credit as usize + count, payload.len());
+        assert_eq!(st.conn(h).recv_credit as usize + count, payload.len());
         assert_eq!(budget.used(), elsewhere.bytes() + count);
         assert!(
             received
@@ -923,7 +923,7 @@ fn the_native_tcp_runner_wakes_and_reads_after_another_owner_releases_memory() {
                 smol_now(&fcx),
                 Chunk::unpaid(data_segment(peer, local, 101, ack, 16, &payload).into_vec()),
             );
-            host.conns.get_mut(&h).unwrap().recv_credit = payload.len() as u64;
+            host.sockets.conn_mut(h).unwrap().recv_credit = payload.len() as u64;
             (child, host.tcp.budget().clone())
         };
         let mut elsewhere = budget.charge(budget.limit() - budget.used()).unwrap();
@@ -965,7 +965,7 @@ fn receive_refresh_rotates_after_the_event_queue_fills() {
         for peer in peers {
             let (h, ack) = established(&mut st, now, local, peer);
             let child = st.adopt(h);
-            st.conns.get_mut(&h).unwrap().recv_credit = 200;
+            st.sockets.conn_mut(h).unwrap().recv_credit = 200;
             st.ingress(
                 &fcx,
                 &Budget::unlimited(),
@@ -1094,7 +1094,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
         st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set);
         st.housekeeping();
         assert!(
-            st.conns.contains_key(&h),
+            st.sockets.conn(h).is_some(),
             "unsent reset must keep its socket"
         );
         st.dev.tx.clear();
@@ -1105,7 +1105,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
             .payload(&packets[0]);
         assert_eq!(t[13] & 4, 4);
         st.housekeeping();
-        assert!(!st.conns.contains_key(&h));
+        assert!(!st.sockets.conn(h).is_some());
         Ok(())
     }))
     .unwrap();
@@ -1220,7 +1220,7 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         st.housekeeping();
         st.pump();
         assert!(
-            st.conns.contains_key(&h),
+            st.sockets.conn(h).is_some(),
             "full egress must retain TIME-WAIT"
         );
         assert_eq!(Arc::strong_count(&held), 1);
@@ -1262,12 +1262,12 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         let before = now + smoltcp::time::Duration::from_secs(1912);
         assert!(egress(st, before).is_empty());
         st.housekeeping();
-        assert!(st.conns.contains_key(&h));
+        assert!(st.sockets.conn(h).is_some());
         let expiry = now + smoltcp::time::Duration::from_secs(1913);
         assert!(egress(st, expiry).is_empty());
         st.housekeeping();
-        assert!(!st.conns.contains_key(&h));
-        assert!(!st.sockets.handles.contains_key(&h));
+        assert!(!st.sockets.conn(h).is_some());
+        assert!(!st.sockets.contains(h));
         assert!(!st.pages.contains_key(&h));
         assert!(!st.by_tuple.contains_key(&(local, peer)));
         assert!(!st.orphans.contains(&h));
@@ -1325,15 +1325,15 @@ fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
         st.housekeeping();
         assert_eq!(st.orphans.len(), MAX_TIME_WAIT);
         assert_eq!(st.time_wait.len(), MAX_TIME_WAIT);
-        assert!(st.conns.contains_key(&kept));
-        assert!(st.conns.contains_key(&recent));
-        assert!(!st.conns.contains_key(&dropped[0]));
-        assert!(!st.sockets.handles.contains_key(&dropped[0]));
+        assert!(st.sockets.conn(kept).is_some());
+        assert!(st.sockets.conn(recent).is_some());
+        assert!(!st.sockets.conn(dropped[0]).is_some());
+        assert!(!st.sockets.contains(dropped[0]));
         assert!(
             !st.by_tuple
                 .contains_key(&(local, SocketAddr::new(peer, 1002)))
         );
-        assert!(dropped[1..].iter().all(|h| st.conns.contains_key(h)));
+        assert!(dropped[1..].iter().all(|h| st.sockets.conn(*h).is_some()));
         // Eviction itself emits nothing. Normal expiry frees the rest.
         assert!(egress(&mut st, later).is_empty());
         let expiry = later + smoltcp::time::Duration::from_secs(240);
@@ -1341,8 +1341,8 @@ fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
         st.housekeeping();
         assert!(st.orphans.is_empty());
         assert!(st.time_wait.is_empty());
-        assert_eq!(st.conns.len(), 1);
-        assert!(st.conns.contains_key(&kept));
+        assert_eq!(st.sockets.conns().count(), 1);
+        assert!(st.sockets.conn(kept).is_some());
         Ok(())
     }))
     .unwrap();
@@ -1408,7 +1408,7 @@ fn local_reset_wakes_watches_before_rst_egress() {
                 st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set);
                 st.housekeeping();
                 assert!(
-                    st.conns.contains_key(&h),
+                    st.sockets.conn(h).is_some(),
                     "unsent reset must keep its socket"
                 );
                 assert!(st.get(h).remote_endpoint().is_some());
@@ -1420,12 +1420,12 @@ fn local_reset_wakes_watches_before_rst_egress() {
                     .payload(&packets[0]);
                 assert_eq!(t[13] & 4, 4);
                 st.housekeeping();
-                assert_eq!(st.conns.contains_key(&h), conn.is_some());
+                assert_eq!(st.sockets.conn(h).is_some(), conn.is_some());
             }
             drop(conn);
             let mut st = server.shared.lock();
             st.housekeeping();
-            assert!(!st.conns.contains_key(&h));
+            assert!(!st.sockets.conn(h).is_some());
             drop(st);
             fcx.cancel();
             Ok(())
@@ -1469,7 +1469,7 @@ fn stop_wakes_watches_with_retained_connection() {
         ));
         {
             let st = server.shared.lock();
-            assert!(st.conns.contains_key(&st.socket_of(conn.id)));
+            assert!(st.sockets.conn(st.socket_of(conn.id)).is_some());
         }
         fcx.cancel();
         Ok(())
@@ -1518,7 +1518,7 @@ fn abort_peers_wakes_connections_in_socket_order() {
                     SocketAddr::new("10.0.0.2".parse().unwrap(), port),
                     Side::Server,
                 );
-                st.conns.insert(id, conn);
+                st.sockets.insert_conn(id, conn);
                 let child = st.adopt(id);
                 st.routes
                     .watches
@@ -1536,52 +1536,244 @@ fn abort_peers_wakes_connections_in_socket_order() {
     .unwrap();
 }
 
+/// The socket slab against a model, over random adds and removes, with
+/// and without connections. A new socket takes the lowest free slot; the
+/// id of a removed socket finds neither a socket nor a connection, even
+/// once a new socket holds its slot; the slab never has more slots than
+/// the most sockets held at once; and the connections and the refresh
+/// both go in slot order.
 #[test]
-fn compaction_keeps_socket_id_scan_order() {
-    block_on(run(fictionet::Seed::random(), |fcx| async move {
-        let (_raw, side) = pair();
-        let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
-        let mut st = ep.shared.lock();
-        let mut ids = Vec::new();
-        for _ in 0..COMPACT_SLOTS {
-            ids.push(st.add_socket(&fcx, new_socket(MIN_BUFFER)));
+fn the_socket_slab_reuses_slots_and_forgets_stale_ids() {
+    for seed in 0..4 {
+        block_on(run(Seed::from_u64(seed), |fcx| async move {
+            let (_raw, side) = pair();
+            let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let mut st = ep.shared.lock();
+            let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            // The model: the live ids with whether each has a connection,
+            // and every id that was removed.
+            let mut live: BTreeMap<Id, bool> = BTreeMap::new();
+            let mut gone: Vec<Id> = Vec::new();
+            let mut most = 0;
+            for _ in 0..300 {
+                if live.is_empty() || fcx.random_below(5) < 3 {
+                    let lowest_free = (0..)
+                        .find(|&i| !live.keys().any(|id| id.slot.index() == i))
+                        .unwrap();
+                    let id = st.add_socket(&fcx, new_socket(MIN_BUFFER));
+                    assert_eq!(id.slot.index(), lowest_free, "the lowest free slot");
+                    let with_conn = fcx.random_below(2) == 0;
+                    if with_conn {
+                        let peer = SocketAddr::new("10.0.0.2".parse().unwrap(), 1000);
+                        st.sockets
+                            .insert_conn(id, Conn::new(local, peer, Side::Server));
+                    }
+                    assert!(live.insert(id, with_conn).is_none(), "ids are never reused");
+                    assert!(!gone.contains(&id), "ids are never reused");
+                } else {
+                    let at = fcx.random_below(live.len() as u64) as usize;
+                    let id = *live.keys().nth(at).unwrap();
+                    live.remove(&id);
+                    st.remove_socket(id);
+                    gone.push(id);
+                }
+                most = most.max(live.len());
+                assert_eq!(st.sockets.len(), live.len());
+                assert!(st.sockets.slots.len() <= most);
+                for (&id, &with_conn) in &live {
+                    assert!(st.sockets.contains(id));
+                    assert_eq!(st.sockets.conn(id).is_some(), with_conn);
+                }
+                for &id in &gone {
+                    assert!(!st.sockets.contains(id));
+                    assert!(st.sockets.conn(id).is_none());
+                    assert!(st.sockets.conn_mut(id).is_none());
+                }
+                let conns: Vec<Id> = st.sockets.conns().map(|(id, _)| id).collect();
+                let expected: Vec<Id> = live
+                    .iter()
+                    .filter(|(_, c)| **c)
+                    .map(|(&id, _)| id)
+                    .collect();
+                assert_eq!(conns, expected, "connections in slot order");
+            }
+            // Every live socket changed: a refresh starting after one of
+            // them visits the later ones in slot order, then wraps.
+            let ids: Vec<Id> = live.keys().copied().collect();
+            for &id in &ids {
+                st.sockets.mark(id);
+            }
+            let split = ids.len() / 2;
+            st.sockets.after = Some(ids[split]);
+            assert_eq!(st.sockets.prepare_refresh(), ids.len());
+            let expected = ids[split + 1..].iter().chain(&ids[..=split]);
+            for &id in expected {
+                assert_eq!(st.sockets.next(), Some(id));
+                st.sockets.acknowledge(id);
+            }
+            assert_eq!(st.sockets.pending(), 0);
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+}
+
+/// What one world saw, in order: every packet each endpoint sent, and
+/// what its applications saw.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Seen {
+    /// Whether the server sent it, and its bytes.
+    packets: Vec<(bool, Vec<u8>)>,
+    events: Vec<Seeing>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Seeing {
+    /// The server accepted a connection from this client port.
+    Accepted(u16),
+    /// The server read this many bytes from this client port, to the end.
+    Received(u16, usize),
+    /// A read on one side of the connection from this client port: the
+    /// server's side if true.
+    Read(bool, u16, Result<usize, ConnError>),
+}
+
+/// Logs every packet an endpoint sends.
+struct Tap<I> {
+    inner: I,
+    server: bool,
+    seen: Arc<Mutex<Seen>>,
+}
+
+impl<I: fictionet::Interface> fictionet::Interface for Tap<I> {
+    fn poll_recv(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Packet, fictionet::RecvError>> {
+        self.inner.poll_recv(fcx, cx)
+    }
+
+    fn send(&mut self, packet: Packet) {
+        self.seen
+            .lock()
+            .packets
+            .push((self.server, packet.to_vec()));
+        self.inner.send(packet);
+    }
+}
+
+/// A world that churns connections: waves of connects, most of them
+/// moving data at once and closing while others stay open, so later
+/// waves take the slots earlier ones left out of order; then every
+/// connection still open is aborted. Returns what it saw.
+fn churn(seed: u64) -> Seen {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let log = seen.clone();
+    block_on(lab(Seed::from_u64(seed), move |fcx| async move {
+        let tap = |inner, server| Tap {
+            inner,
+            server,
+            seen: log.clone(),
+        };
+        let (a, b) = pair();
+        let server = endpoint(&fcx, tap(a, true), "10.0.0.1".parse().unwrap());
+        let client = endpoint(&fcx, tap(b, false), "10.0.0.2".parse().unwrap());
+        let mut listener = server.listen(80)?;
+        let mut kept = Vec::new();
+        let mut opened = 0;
+        for wave in 0..4 {
+            let mut tasks = Vec::new();
+            for k in 0..12 {
+                let mut c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+                let mut s = listener.accept(&fcx).await?;
+                let port = s.peer_addr().port();
+                log.lock().events.push(Seeing::Accepted(port));
+                opened += 1;
+                if (wave + k) % 5 == 0 {
+                    kept.push((port, c, s));
+                    continue;
+                }
+                // Sizes from a few segments to more than a window, so the
+                // transfers overlap and the engine rotates among them.
+                let size = 40_000 * (1 + (wave * 12 + k) % 7);
+                tasks.push(fcx.spawn(move |fcx| async move {
+                    c.write_all(&fcx, &pattern(size, k as u8)).await?;
+                    c.shutdown(&fcx).await?;
+                    Ok(())
+                }));
+                let log = log.clone();
+                tasks.push(fcx.spawn(move |fcx| async move {
+                    let mut buf = [0; 4096];
+                    let mut got = 0;
+                    loop {
+                        match s.read(&fcx, &mut buf).await? {
+                            0 => break,
+                            n => got += n,
+                        }
+                    }
+                    log.lock().events.push(Seeing::Received(port, got));
+                    Ok(())
+                }));
+            }
+            for task in tasks {
+                task.join(&fcx).await?;
+            }
+            fcx.sleep(Duration::from_secs(1)).await?;
         }
-        let kept = [ids[3], ids[17], ids[93], ids[201]];
-        for id in ids {
-            if !kept.contains(&id) {
-                st.remove_socket(id);
+        {
+            let st = server.shared.lock();
+            assert!(
+                st.sockets.slots.len() < opened,
+                "{} slots for {opened} connections: later ones reused slots",
+                st.sockets.slots.len()
+            );
+        }
+        // A reader waits on each side of every connection still open, in
+        // the order the connections were made; each says what it got as
+        // it wakes, so the events show the order the aborts reached them.
+        let mut readers = Vec::new();
+        for (port, c, s) in kept {
+            for (server, mut conn) in [(true, s), (false, c)] {
+                let log = log.clone();
+                readers.push(fcx.spawn(move |fcx| async move {
+                    let mut buf = [0; 16];
+                    let read = conn.read(&fcx, &mut buf).await;
+                    log.lock().events.push(Seeing::Read(server, port, read));
+                    Ok(())
+                }));
             }
         }
-        // Reuse a low storage slot with a newer SDK ID.
-        let newest = st.add_socket(&fcx, new_socket(MIN_BUFFER));
-        assert!(st.sockets.ids.len() >= COMPACT_SLOTS);
-        st.compact();
-        assert_eq!(st.sockets.ids.len(), 5);
-        let scan: Vec<_> = st
-            .sockets
-            .set
-            .iter()
-            .map(|(slot, _)| {
-                *st.sockets
-                    .handles
-                    .iter()
-                    .find(|(_, h)| **h == slot)
-                    .unwrap()
-                    .0
-            })
-            .collect();
-        assert_eq!(scan, [kept[0], kept[1], kept[2], kept[3], newest]);
-        assert_eq!(st.sockets.pending(), scan.len());
-        for id in scan {
-            assert_eq!(st.sockets.next(), Some(id));
-            st.sockets.acknowledge(id);
+        fcx.sleep(Duration::from_millis(10)).await?;
+        server.abort_peers(|_| true);
+        for reader in readers {
+            reader.join(&fcx).await?;
         }
-        assert_eq!(st.sockets.pending(), 0);
-        drop(st);
         fcx.cancel();
         Ok(())
     }))
     .unwrap();
+    std::mem::take(&mut *seen.lock())
+}
+
+/// The engine keeps no order of its own beyond its lists and its slots:
+/// the same world run twice, with the slots reused out of order and the
+/// keyed hash maps seeded differently each time, sends the same packets
+/// and shows its applications the same events, in the same order.
+#[test]
+fn the_same_world_twice_sends_the_same_packets_in_the_same_order() {
+    let first = churn(7);
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|e| matches!(e, Seeing::Read(false, _, Err(ConnError::Reset))))
+    );
+    let second = churn(7);
+    assert_eq!(first.events, second.events);
+    assert!(first.packets == second.packets, "the packets differ");
 }
 
 /// Resident pages of every socket's buffers on `e`.
@@ -1656,7 +1848,8 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
             let mut socket = new_socket(MIN_BUFFER);
             socket.0.connect(st.iface.context(), peer, local).unwrap();
             let h = st.add_socket(&fcx, socket);
-            st.conns.insert(h, Conn::new(local, peer, Side::Client));
+            st.sockets
+                .insert_conn(h, Conn::new(local, peer, Side::Client));
             st.by_tuple.insert((local, peer), h);
             st.take_port(local.port());
             let syn = egress(&mut st, now).remove(0);
@@ -1846,7 +2039,8 @@ fn rejected_syn_acks(established: bool) {
             let mut s = new_socket(MIN_BUFFER);
             s.0.connect(st.iface.context(), peer, local).unwrap();
             let h = st.add_socket(&fcx, s);
-            st.conns.insert(h, Conn::new(local, peer, Side::Client));
+            st.sockets
+                .insert_conn(h, Conn::new(local, peer, Side::Client));
             st.by_tuple.insert((local, peer), h);
             let packets = egress(&mut st, now);
             let t = Header::parse_whole(&packets[0])
@@ -1943,7 +2137,8 @@ fn rejected_syn_acks(established: bool) {
                 let mut s = new_socket(MIN_BUFFER);
                 s.0.connect(st.iface.context(), peer, local).unwrap();
                 let h = st.add_socket(&fcx, s);
-                st.conns.insert(h, Conn::new(local, peer, Side::Client));
+                st.sockets
+                    .insert_conn(h, Conn::new(local, peer, Side::Client));
                 st.by_tuple.insert((local, peer), h);
                 let packets = egress(&mut st, now);
                 let t = Header::parse_whole(&packets[0])
@@ -1984,7 +2179,8 @@ fn simultaneous_open_records_the_accepted_syn_origin() {
         let mut s = new_socket(MIN_BUFFER);
         s.0.connect(st.iface.context(), peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
-        st.conns.insert(h, Conn::new(local, peer, Side::Client));
+        st.sockets
+            .insert_conn(h, Conn::new(local, peer, Side::Client));
         st.by_tuple.insert((local, peer), h);
         egress(&mut st, now);
         st.ingress(
@@ -2110,7 +2306,7 @@ fn unread_bytes_outlive_time_wait() {
             let conn = accept_by_hand(&ep, &mut st, h);
             // This side shuts down first; the peer answers with its last
             // bytes, its FIN and the ACK of this side's FIN.
-            st.conns.get_mut(&h).unwrap().shut = true;
+            st.sockets.conn_mut(h).unwrap().shut = true;
             st.close_if_drained(h);
             egress(&mut st, now);
             let mut last = segment(peer, local, 101, ack.wrapping_add(1), 0x19).into_vec();
@@ -2150,7 +2346,8 @@ fn client_advertised_window_uses_negotiated_scale() {
             let mut socket = new_socket(BUFFER);
             socket.0.connect(st.iface.context(), peer, local).unwrap();
             let h = st.add_socket(&fcx, socket);
-            st.conns.insert(h, Conn::new(local, peer, Side::Client));
+            st.sockets
+                .insert_conn(h, Conn::new(local, peer, Side::Client));
             st.by_tuple.insert((local, peer), h);
             let packets = egress(&mut st, now);
             let t = Header::parse_whole(&packets[0])
@@ -2164,7 +2361,7 @@ fn client_advertised_window_uses_negotiated_scale() {
                 Some(3)
             );
             assert_eq!(t[13] & 16, 0, "a SYN has no ACK");
-            let start = st.conns[&h].iss.unwrap().wrapping_add(1);
+            let start = st.conn(h).iss.unwrap().wrapping_add(1);
             let mut p = segment(peer, local, 7, start, 0x12).into_vec();
             if scaled {
                 p[32] = 6 << 4;
@@ -2614,12 +2811,12 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                 assert!(egress(&mut st, now).is_empty());
                 assert_eq!(st.get(h).recv_queue(), 0);
                 assert!(!st.get(h).has_pending_recv());
-                assert!(!st.conns[&h].fin);
+                assert!(!st.conn(h).fin);
                 st.ingress(&fcx, &Budget::unlimited(), now, Chunk::unpaid(p));
                 assert_eq!(st.get(h).recv_queue(), 0);
                 assert_eq!(st.get(h).has_pending_recv(), keep != 0);
                 assert_eq!(st.get(h).state(), TcpState::Established);
-                assert!(!st.conns[&h].fin);
+                assert!(!st.conn(h).fin);
                 let packets = egress(&mut st, now);
                 assert_eq!(packets.len(), 1);
                 let t = Header::parse_whole(&packets[0])
@@ -2643,7 +2840,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                 let mut got = vec![0; MIN_BUFFER];
                 assert_eq!(st.sock(h).recv_slice(&mut got).unwrap(), MIN_BUFFER);
                 assert_eq!(got, expected[19..edge]);
-                assert!(!st.conns[&h].fin);
+                assert!(!st.conn(h).fin);
                 egress(&mut st, now);
                 // The discarded tail and FIN fit after the application reads.
                 st.ingress(
@@ -2672,7 +2869,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                     st.sock(h).recv_slice(&mut tail),
                     Err(stcp::RecvError::Finished)
                 );
-                assert!(st.conns[&h].fin);
+                assert!(st.conn(h).fin);
                 drop(st);
                 fcx.cancel();
                 Ok(())
@@ -3227,13 +3424,13 @@ fn unanswered_syns_from_many_addresses_leave_nothing_behind() {
         let l = &st.listeners[&80];
         assert!(l.embryonic.is_empty() && l.ready.is_empty());
         assert!(l.per_peer.is_empty(), "{} peers kept", l.per_peer.len());
-        assert!(st.conns.is_empty(), "{} connections kept", st.conns.len());
-        assert!(st.by_tuple.is_empty());
         assert!(
-            st.sockets.handles.len() <= 1,
-            "{} sockets kept",
-            st.sockets.handles.len()
+            st.sockets.conns().next().is_none(),
+            "{} connections kept",
+            st.sockets.conns().count()
         );
+        assert!(st.by_tuple.is_empty());
+        assert!(st.sockets.len() <= 1, "{} sockets kept", st.sockets.len());
         drop(st);
         fcx.cancel();
         Ok(())
@@ -3374,11 +3571,12 @@ fn syns_from_no_host_s_address_get_nothing() {
     .unwrap();
 }
 
-/// After many connections come and go, the socket set is rebuilt
-/// without its empty slots, and a connection that stayed open keeps
-/// working.
+/// After many connections come and go, a second crowd as large takes the
+/// slots the first one left: neither endpoint's slab grows past the
+/// first crowd, a connection that stayed open keeps its id throughout,
+/// and it keeps working.
 #[test]
-fn the_socket_set_shrinks_after_a_crowd_leaves() {
+fn a_second_crowd_reuses_the_slots_of_the_first() {
     let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
         let (a, b) = pair();
         // Exercise reclamation with a short configured segment lifetime.
@@ -3395,37 +3593,49 @@ fn the_socket_set_shrinks_after_a_crowd_leaves() {
         let mut listener = server.listen(80)?;
         let mut keep_c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
         let mut keep_s = listener.accept(&fcx).await?;
-        let mut crowd = Vec::new();
-        for _ in 0..400 {
-            let c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
-            let s = listener.accept(&fcx).await?;
-            crowd.push((c, s));
-        }
-        assert!(server.shared.lock().sockets.ids.len() >= 401);
-        drop(crowd);
-        let deadline = fcx.now() + Duration::from_secs(11);
-        while ![&server, &client].iter().all(|e| {
-            let st = e.shared.lock();
-            st.sockets.handles.len() <= 3 && st.sockets.ids.len() < COMPACT_SLOTS
-        }) {
-            assert!(fcx.now() < deadline, "closed connections kept socket slots");
-            fcx.sleep(Duration::from_millis(5)).await?;
-        }
-        for e in [&server, &client] {
-            let st = e.shared.lock();
-            assert!(
-                st.sockets.handles.len() <= 3,
-                "{} sockets left",
-                st.sockets.handles.len()
-            );
-            // Compacted on the way down: fewer than 256 slots remain,
-            // not the 401 it had.
-            assert!(
-                st.sockets.ids.len() < COMPACT_SLOTS,
-                "{} slots left",
-                st.sockets.ids.len()
-            );
-            assert_eq!(st.sockets.set.iter().count(), st.sockets.handles.len());
+        let kept = [
+            (&server, server.shared.lock().socket_of(keep_s.id)),
+            (&client, client.shared.lock().socket_of(keep_c.id)),
+        ];
+        let mut peak = Vec::new();
+        for round in 0..2 {
+            let mut crowd = Vec::new();
+            for _ in 0..400 {
+                let c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+                let s = listener.accept(&fcx).await?;
+                crowd.push((c, s));
+            }
+            for (i, e) in [&server, &client].into_iter().enumerate() {
+                let st = e.shared.lock();
+                assert!(st.sockets.len() >= 401);
+                if round == 0 {
+                    peak.push(st.sockets.slots.len());
+                } else {
+                    assert!(
+                        st.sockets.slots.len() <= peak[i],
+                        "{} slots after the second crowd, {} after the first",
+                        st.sockets.slots.len(),
+                        peak[i]
+                    );
+                }
+            }
+            drop(crowd);
+            let deadline = fcx.now() + Duration::from_secs(11);
+            while ![&server, &client]
+                .iter()
+                .all(|e| e.shared.lock().sockets.len() <= 3)
+            {
+                assert!(
+                    fcx.now() < deadline,
+                    "closed connections kept their sockets"
+                );
+                fcx.sleep(Duration::from_millis(5)).await?;
+            }
+            for (e, id) in kept {
+                let st = e.shared.lock();
+                assert!(st.sockets.contains(id), "the kept connection keeps its id");
+                assert_eq!(st.sockets.set.iter().count(), st.sockets.len());
+            }
         }
         let size = rounds(1 << 20);
         let data = pattern(size, 9);
@@ -3505,7 +3715,7 @@ fn an_orphan_in_fin_wait_2_expires_despite_peer_acks() {
         fcx.sleep(Duration::from_millis(10)).await?;
         let open = |server: &Endpoint| {
             let st = server.shared.lock();
-            st.conns.values().any(|c| c.remote == peer)
+            st.sockets.conns().any(|(_, c)| c.remote == peer)
         };
         assert!(open(&server), "FIN-WAIT-2 for now");
         // A bare ACK every 50 seconds, for two and a half minutes.
@@ -3574,7 +3784,7 @@ fn mapping_ownership_follows_socket_moves() {
     let (socket, pages) = new_socket(MIN_BUFFER);
     let pages = pages.expect("mapping available");
     let alive = Arc::downgrade(&pages);
-    let mut sockets = SocketSet::new(Vec::new());
+    let mut sockets = SocketSet::default();
     let handle = sockets.add(socket);
     drop(pages);
     assert!(alive.upgrade().is_some());
@@ -3741,7 +3951,7 @@ fn retransmitted_syn_reuses_the_existing_socket() {
         raw.send(segment(p2, to, 7, 0, 0x02));
         fcx.sleep(Duration::from_millis(100)).await?;
         let st = server.shared.lock();
-        let for_p2 = st.conns.values().filter(|c| c.remote == p2).count();
+        let for_p2 = st.sockets.conns().filter(|(_, c)| c.remote == p2).count();
         drop(st);
         assert_eq!(for_p2, 1, "one socket per tuple");
         Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
@@ -3799,7 +4009,7 @@ fn rejected_fin_does_not_mark_the_receive_side_closed() {
             let st = server.shared.lock();
             let h = st.socket_of(conn.id);
             let state = st.get(h).state();
-            let c = &st.conns[&h];
+            let c = &st.conn(h);
             (state, c.fin)
         };
         assert_eq!(state, TcpState::Established);
@@ -3860,7 +4070,7 @@ fn a_handshake_reset_in_one_batch_does_not_lend_its_socket_to_another_peer() {
             Chunk::unpaid(segment(second, local, 501, isn.wrapping_add(1), 0x10).into_vec()),
         );
         st.housekeeping();
-        for (&h, c) in &st.conns {
+        for (h, c) in st.sockets.conns() {
             if let Some(remote) = st.get(h).remote_endpoint() {
                 assert_eq!(
                     c.remote,
@@ -3874,7 +4084,7 @@ fn a_handshake_reset_in_one_batch_does_not_lend_its_socket_to_another_peer() {
             .ready
             .front()
             .expect("the second peer's connection is ready");
-        assert_eq!(st.conns[&h].remote, second);
+        assert_eq!(st.conn(h).remote, second);
         assert_eq!(st.by_tuple.get(&(local, second)), Some(&h));
         assert_eq!(l.per_peer.get(&second.ip()), Some(&1));
         assert_eq!(l.per_peer.get(&first.ip()), None);
@@ -4005,10 +4215,11 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
         let mut s = new_socket(MIN_BUFFER);
         s.0.connect(st.iface.context(), peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
-        st.conns.insert(h, Conn::new(local, peer, Side::Client));
+        st.sockets
+            .insert_conn(h, Conn::new(local, peer, Side::Client));
         st.by_tuple.insert((local, peer), h);
         egress(&mut st, now);
-        let iss = st.conns[&h].iss.unwrap();
+        let iss = st.conn(h).iss.unwrap();
         // Simultaneous open: the peer's own SYN crosses ours.
         st.ingress(
             &fcx,
@@ -4692,7 +4903,7 @@ mod layer {
                 .any(|e| matches!(e, MuxEvent::Closed(closed) if *closed == id))
         );
         assert!(
-            client.layer().upper().conns.is_empty(),
+            client.layer().upper().sockets.conns().next().is_none(),
             "the refused attempt leaves nothing behind"
         );
     }

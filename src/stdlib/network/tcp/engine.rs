@@ -297,20 +297,50 @@ impl Device for Dev {
     }
 }
 
-/// A socket's name inside [`TcpLayer`]. smoltcp's handles are slot numbers
-/// that change when the socket set is compacted; these never change.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub(super) struct Id(pub(super) u64);
+/// A socket's name inside [`TcpLayer`]: its slot in the socket set, and
+/// the slot's generation when the socket took it.
+///
+/// A slot is reused once its socket goes, in the next generation, so an
+/// id outlives its socket harmlessly: it no longer finds a socket or a
+/// connection. Ids order by slot, which is the socket set's own scan
+/// order, so every order the engine keeps by id is a function of the
+/// sockets' history alone.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) struct Id {
+    slot: SocketHandle,
+    generation: u64,
+}
 
-/// Owns socket identities and pending observations across removal, reuse and compaction.
-/// Transport changes and application credit share the socket set's retained queue.
+impl std::hash::Hash for Id {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.generation.rotate_left(32) ^ self.slot.index() as u64);
+    }
+}
+
+/// What the engine keeps for one slot of the socket set.
+#[derive(Default)]
+struct Slot {
+    /// The generation of the slot's socket, or of the next one while the
+    /// slot is empty.
+    generation: u64,
+    /// The slot holds a socket.
+    used: bool,
+    /// The connection of the slot's socket. A listening socket has none.
+    conn: Option<Conn>,
+}
+
+/// The sockets and their connections, in one slab indexed by the socket
+/// set's slots. Each slot carries a generation, so a stale [`Id`] finds
+/// nothing. Slots are reused lowest first, as the socket set reuses
+/// them, and are never moved: the slab grows to the most sockets held at
+/// once and keeps its slots. Transport changes and application credit
+/// share the socket set's retained queue.
 pub(super) struct Sockets {
     set: SocketSet<'static>,
-    /// Each socket's slot in `set`, ordered by ID so compaction keeps scan order.
-    handles: BTreeMap<Id, SocketHandle>,
-    /// The ID in each slot of `set`, empty slots included.
-    ids: Vec<Option<Id>>,
-    next_id: u64,
+    /// One per slot of `set`, empty slots included.
+    slots: Vec<Slot>,
+    /// How many slots hold a socket.
+    live: usize,
     /// The socket refreshed last, so the next refresh starts after it.
     after: Option<Id>,
 }
@@ -318,52 +348,134 @@ pub(super) struct Sockets {
 impl Sockets {
     fn new() -> Self {
         Self {
-            set: SocketSet::new(Vec::new()),
-            handles: BTreeMap::new(),
-            ids: Vec::new(),
-            next_id: 0,
+            set: SocketSet::default(),
+            slots: Vec::new(),
+            live: 0,
             after: None,
         }
     }
 
     fn add(&mut self, socket: stcp::Socket<'static>) -> Id {
-        let id = Id(self.next_id);
-        self.next_id += 1;
-        self.insert(id, socket);
-        id
-    }
-
-    fn insert(&mut self, id: Id, socket: stcp::Socket<'static>) {
         let slot = self.set.add(socket);
-        assert!(self.handles.insert(id, slot).is_none());
-        if slot.index() == self.ids.len() {
-            self.ids.push(Some(id));
-        } else {
-            assert!(self.ids[slot.index()].replace(id).is_none());
+        if slot.index() == self.slots.len() {
+            self.slots.push(Slot::default());
+        }
+        let entry = &mut self.slots[slot.index()];
+        assert!(!entry.used && entry.conn.is_none(), "a free slot");
+        entry.used = true;
+        self.live += 1;
+        Id {
+            slot,
+            generation: entry.generation,
         }
     }
 
+    /// The slot of `id`, while its socket is there.
+    fn slot(&self, id: Id) -> Option<&Slot> {
+        self.slots
+            .get(id.slot.index())
+            .filter(|s| s.used && s.generation == id.generation)
+    }
+
+    fn slot_mut(&mut self, id: Id) -> Option<&mut Slot> {
+        self.slots
+            .get_mut(id.slot.index())
+            .filter(|s| s.used && s.generation == id.generation)
+    }
+
+    /// Removes the socket of `id` and its connection, if it still has one.
+    /// The slot's next socket gets the next generation.
     fn remove(&mut self, id: Id) -> stcp::Socket<'static> {
-        let slot = self.handles.remove(&id).expect("a socket has a slot");
-        self.ids[slot.index()] = None;
-        self.set.remove(slot)
+        let entry = self.slot_mut(id).expect("a live socket");
+        entry.used = false;
+        entry.conn = None;
+        entry.generation += 1;
+        self.live -= 1;
+        self.set.remove(id.slot)
+    }
+
+    /// Whether the socket of `id` is still there.
+    fn contains(&self, id: Id) -> bool {
+        self.slot(id).is_some()
+    }
+
+    /// How many sockets there are.
+    fn len(&self) -> usize {
+        self.live
+    }
+
+    /// The socket set's handle on the socket of `id`.
+    fn handle(&self, id: Id) -> SocketHandle {
+        assert!(self.contains(id), "a live socket");
+        id.slot
     }
 
     fn get(&self, id: Id) -> &stcp::Socket<'static> {
-        self.set.get(self.handles[&id])
+        self.set.get(self.handle(id))
     }
 
     fn get_mut(&mut self, id: Id) -> &mut stcp::Socket<'static> {
-        self.set.get_mut(self.handles[&id])
+        assert!(self.contains(id), "a live socket");
+        self.set.get_mut(id.slot)
+    }
+
+    /// The connection of `id`, while its socket has one.
+    fn conn(&self, id: Id) -> Option<&Conn> {
+        self.slot(id)?.conn.as_ref()
+    }
+
+    fn conn_mut(&mut self, id: Id) -> Option<&mut Conn> {
+        self.slot_mut(id)?.conn.as_mut()
+    }
+
+    /// Gives the socket of `id` its connection.
+    fn insert_conn(&mut self, id: Id, conn: Conn) {
+        let entry = self.slot_mut(id).expect("a live socket");
+        assert!(entry.conn.is_none(), "one connection per socket");
+        entry.conn = Some(conn);
+    }
+
+    /// Takes the connection of `id` away, keeping its socket.
+    fn take_conn(&mut self, id: Id) -> Option<Conn> {
+        self.slot_mut(id)?.conn.take()
+    }
+
+    /// The socket of `id` and its connection, together.
+    fn socket_and_conn(&mut self, id: Id) -> (&mut stcp::Socket<'static>, &mut Conn) {
+        assert!(self.contains(id), "a live socket");
+        let conn = self.slots[id.slot.index()]
+            .conn
+            .as_mut()
+            .expect("a connection");
+        (self.set.get_mut(id.slot), conn)
+    }
+
+    /// Every connection, in slot order.
+    fn conns(&self) -> impl Iterator<Item = (Id, &Conn)> {
+        self.set.iter().filter_map(|(slot, _)| {
+            let conn = self.slots[slot.index()].conn.as_ref()?;
+            Some((self.id_of(slot), conn))
+        })
+    }
+
+    /// The id of the socket in `slot`.
+    fn id_of(&self, slot: SocketHandle) -> Id {
+        let s = &self.slots[slot.index()];
+        assert!(s.used, "a live socket");
+        Id {
+            slot,
+            generation: s.generation,
+        }
     }
 
     fn mark(&mut self, id: Id) {
-        self.set.mark_changed(self.handles[&id]);
+        assert!(self.contains(id), "a live socket");
+        self.set.mark_changed(id.slot);
     }
 
     fn acknowledge(&mut self, id: Id) {
-        if let Some(&slot) = self.handles.get(&id) {
-            self.set.acknowledge_changed(slot);
+        if self.contains(id) {
+            self.set.acknowledge_changed(id.slot);
         }
     }
 
@@ -372,35 +484,28 @@ impl Sockets {
     }
 
     fn next(&mut self) -> Option<Id> {
-        let id = self.ids[self.set.changed().next()?.index()].expect("a changed socket has an id");
+        let id = self.id_of(self.set.changed().next()?);
         self.after = Some(id);
         Some(id)
     }
 
+    /// Orders the pending observations by id, starting after the socket
+    /// refreshed last.
     fn prepare_refresh(&mut self) -> usize {
+        let (after, slots) = (self.after, &self.slots);
         self.set.order_changed(|slot| {
-            let id = self.ids[slot.index()].expect("a changed socket has an id");
-            (self.after.is_some_and(|after| id <= after), id)
+            let id = Id {
+                slot,
+                generation: slots[slot.index()].generation,
+            };
+            (after.is_some_and(|after| id <= after), id)
         });
         self.pending()
     }
-
-    fn compact(&mut self) {
-        if self.ids.len() < COMPACT_SLOTS || self.handles.len() * 4 > self.ids.len() {
-            return;
-        }
-        let mut set = SocketSet::new(Vec::with_capacity(self.handles.len()));
-        self.ids.clear();
-        for (&id, slot) in &mut self.handles {
-            *slot = set.add(self.set.remove(*slot));
-            self.ids.push(Some(id));
-        }
-        self.set = set;
-    }
 }
 
-/// Hashes an [`Id`] by one multiplication. The engine hands out the ids
-/// itself, one after another, so a keyed hash defends against nothing
+/// Hashes an [`Id`] by one multiplication. The engine makes the ids
+/// itself from its own slots, so a keyed hash defends against nothing
 /// here; maps keyed by addresses the peer chooses keep the default one.
 #[derive(Default)]
 pub(super) struct IdHasher(u64);
@@ -423,11 +528,6 @@ impl std::hash::Hasher for IdHasher {
         self.0
     }
 }
-
-/// Compact the socket set when at least this many slots exist and at most
-/// a quarter of them hold a socket. smoltcp walks every slot, empty or
-/// not, on every packet, and its slot list never shrinks by itself.
-pub(super) const COMPACT_SLOTS: usize = 256;
 
 /// One machine's TCP as a layer: `Packets<CheckedIpPacket, Chunk>` below, the
 /// [`Tcp`] mux above. See the [module docs](super).
@@ -495,8 +595,6 @@ pub struct TcpLayer {
     pub(super) dev: Dev,
     /// Listener maintenance in ascending port order.
     pub(super) listeners: BTreeMap<u16, Listen>,
-    /// Every socket that is or was a connection, in SDK ID order for aborts.
-    pub(super) conns: BTreeMap<Id, Conn>,
     /// Connections by (local, remote), to note RSTs and FINs.
     pub(super) by_tuple: HashMap<(SocketAddr, SocketAddr), Id>,
     /// Local ports in use by listeners (counted once) and connections.
@@ -571,14 +669,14 @@ pub(super) struct Listen {
 
 impl Listen {
     /// Where handshake `h` is in `embryonic`, if it is there.
-    fn embryo(&self, h: Id, conns: &BTreeMap<Id, Conn>) -> Option<(smoltcp::time::Instant, Id)> {
-        let key = (conns.get(&h)?.gives_up?, h);
+    fn embryo(&self, h: Id, sockets: &Sockets) -> Option<(smoltcp::time::Instant, Id)> {
+        let key = (sockets.conn(h)?.gives_up?, h);
         self.embryonic.contains(&key).then_some(key)
     }
 
     /// Takes handshake `h` out of `embryonic`. Returns whether it was there.
-    fn hatch(&mut self, h: Id, conns: &BTreeMap<Id, Conn>) -> bool {
-        self.embryo(h, conns)
+    fn hatch(&mut self, h: Id, sockets: &Sockets) -> bool {
+        self.embryo(h, sockets)
             .is_some_and(|key| self.embryonic.remove(&key))
     }
 
@@ -591,10 +689,10 @@ impl Listen {
     fn relisten(
         &mut self,
         h: Id,
-        conns: &mut BTreeMap<Id, Conn>,
+        sockets: &mut Sockets,
         by_tuple: &mut HashMap<(SocketAddr, SocketAddr), Id>,
     ) -> bool {
-        if let Some(c) = conns.remove(&h) {
+        if let Some(c) = sockets.take_conn(h) {
             by_tuple.remove(&(c.local, c.remote));
             self.left(c.remote.ip());
         }
@@ -966,7 +1064,6 @@ impl TcpLayer {
             next_release: None,
             dev,
             listeners: BTreeMap::new(),
-            conns: BTreeMap::new(),
             by_tuple: HashMap::new(),
             ports: HashMap::new(),
             next_port: EPHEMERAL + entropy.random_below(65536 - EPHEMERAL as u64) as u16,
@@ -1025,9 +1122,9 @@ impl TcpLayer {
         // Include socket scheduling, child slots, connection and listener indexes,
         // and the terminal events a batch of socket removals can produce.
         // Four times the entries covers geometric vector/hash capacity and tree
-        // nodes, including a replacement socket set during compaction.
+        // nodes.
         let entry = size_of::<Option<stcp::Socket<'static>>>()
-            + size_of::<Conn>()
+            + size_of::<Slot>()
             + size_of::<Listen>()
             + size_of::<Charge>()
             + size_of::<Arc<Pages>>()
@@ -1067,7 +1164,7 @@ impl TcpLayer {
     }
 
     fn make_room(&mut self) -> bool {
-        if self.sockets.handles.len() + self.listeners.len() < self.storage_places {
+        if self.sockets.len() + self.listeners.len() < self.storage_places {
             return true;
         }
         let Some(places) = self.storage_places.checked_mul(2) else {
@@ -1157,11 +1254,9 @@ impl TcpLayer {
         self.sockets.get(h)
     }
 
-    /// Moves every socket into a new set without empty slots, once most
-    /// slots are empty. Sockets keep their [`Id`], their state and their
-    /// buffers. The new set scans sockets in ascending SDK socket ID order.
-    pub(super) fn compact(&mut self) {
-        self.sockets.compact();
+    /// The connection of `h`. Panics if its socket has none.
+    fn conn(&self, h: Id) -> &Conn {
+        self.sockets.conn(h).expect("a connection")
     }
 
     pub(super) fn take_port(&mut self, port: u16) {
@@ -1179,7 +1274,7 @@ impl TcpLayer {
 
     /// Forgets a connection socket entirely.
     pub(super) fn remove_conn(&mut self, h: Id) {
-        if let Some(c) = self.conns.remove(&h) {
+        if let Some(c) = self.sockets.take_conn(h) {
             self.by_tuple.remove(&(c.local, c.remote));
             if c.side == Side::Client {
                 self.free_port(c.local.port());
@@ -1195,7 +1290,7 @@ impl TcpLayer {
     /// Sends the FIN after every queued byte is acknowledged.
     /// This preserves the endpoint's shutdown packet order.
     pub(super) fn close_if_drained(&mut self, h: Id) {
-        if self.conns[&h].shut && self.get(h).send_queue() == 0 {
+        if self.conn(h).shut && self.get(h).send_queue() == 0 {
             self.sock(h).close();
         }
     }
@@ -1203,7 +1298,7 @@ impl TcpLayer {
     /// Resets the connection and says so, keeping the socket until its RST
     /// can be sent. It is gone: what it held is let go.
     fn abort(&mut self, h: Id) {
-        let c = self.conns.get_mut(&h).unwrap();
+        let c = self.sockets.conn_mut(h).unwrap();
         c.rst = true;
         c.reset = true;
         c.held.clear();
@@ -1228,7 +1323,7 @@ impl TcpLayer {
     /// removed once it has closed. Unread data means the application lost
     /// bytes, so the peer gets a RST, as from a kernel.
     pub(super) fn orphan(&mut self, h: Id, abort: bool) {
-        if let Some(c) = self.conns.get_mut(&h) {
+        if let Some(c) = self.sockets.conn_mut(h) {
             c.open = false;
             c.recv_credit = 0;
         }
@@ -1239,7 +1334,7 @@ impl TcpLayer {
         if abort || self.get(h).can_recv() {
             self.abort(h);
         } else {
-            self.conns.get_mut(&h).unwrap().shut = true;
+            self.sockets.conn_mut(h).unwrap().shut = true;
             self.close_if_drained(h);
         }
         // An orphan should not live on keepalives. A peer that never
@@ -1249,14 +1344,14 @@ impl TcpLayer {
         let s = self.sock(h);
         s.set_keep_alive(None);
         s.set_timeout(Some(timeout.into()));
-        self.conns.get_mut(&h).unwrap().orphaned = true;
+        self.sockets.conn_mut(h).unwrap().orphaned = true;
         self.orphans.push(h);
         self.work = true;
     }
 
     /// Why a connection can no longer carry bytes, once its socket closed.
     pub(super) fn closed_reason(&self, h: Id) -> ConnError {
-        let c = &self.conns[&h];
+        let c = self.conn(h);
         if self.stopped {
             ConnError::Closed
         } else if let Some(code) = c.unreachable {
@@ -1300,7 +1395,7 @@ impl TcpLayer {
         let remote = SocketAddr::new(destination, u16::from_be_bytes([t[2], t[3]]));
         let mut refreshed = None;
         if let Some(h) = self.by_tuple.get(&(local, remote)) {
-            let c = self.conns.get_mut(h).unwrap();
+            let c = self.sockets.conn_mut(*h).unwrap();
             let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
             match (c.side, t[13] & 0x12) {
                 (Side::Client, 0x02) => {
@@ -1398,7 +1493,7 @@ impl TcpLayer {
         let Some(&h) = self.by_tuple.get(&(local, remote)) else {
             return;
         };
-        let c = &self.conns[&h];
+        let c = self.conn(h);
         if c.side != Side::Client
             || c.iss != Some(seq)
             || !matches!(
@@ -1408,7 +1503,7 @@ impl TcpLayer {
         {
             return;
         }
-        self.conns.get_mut(&h).unwrap().unreachable = Some(message[1]);
+        self.sockets.conn_mut(h).unwrap().unreachable = Some(message[1]);
         self.abort(h);
     }
 
@@ -1559,7 +1654,7 @@ impl TcpLayer {
             && ack
             && !syn
             && !rst
-            && self.conns[&h].side == Side::Server
+            && self.conn(h).side == Side::Server
             && self
                 .listeners
                 .get(&dst.port())
@@ -1571,12 +1666,9 @@ impl TcpLayer {
         let completing = (before == Some(TcpState::SynReceived)).then(|| segment_options(t));
         self.dev.rx = Some(packet);
         if let Some(h) = handle {
-            self.iface.poll_ingress_targeted(
-                now,
-                &mut self.dev,
-                &mut self.sockets.set,
-                self.sockets.handles[&h],
-            );
+            let target = self.sockets.handle(h);
+            self.iface
+                .poll_ingress_targeted(now, &mut self.dev, &mut self.sockets.set, target);
         } else {
             self.iface
                 .poll_ingress_single(now, &mut self.dev, &mut self.sockets.set);
@@ -1584,7 +1676,7 @@ impl TcpLayer {
         let consumed = self.dev.rx.is_none();
         self.dev.reclaim();
         if let Some(h) = handle {
-            if let Some(c) = self.conns.get_mut(&h)
+            if let Some(c) = self.sockets.conn_mut(h)
                 && c.ecn
             {
                 if flags & 0x80 != 0 {
@@ -1602,7 +1694,7 @@ impl TcpLayer {
             if consumed && data && (s.recv_queue() != 0 || s.has_pending_recv()) {
                 self.soiled(h);
             }
-            let c = self.conns.get_mut(&h).unwrap();
+            let c = self.sockets.conn_mut(h).unwrap();
             if (rst || after == TcpState::Closed)
                 && before != Some(after)
                 && matches!(after, TcpState::Closed | TcpState::Listen)
@@ -1619,7 +1711,7 @@ impl TcpLayer {
                     self.notice(TcpNotice::Gone(id));
                 }
             }
-            let c = self.conns.get_mut(&h).unwrap();
+            let c = self.sockets.conn_mut(h).unwrap();
             if flags & 1 != 0
                 && before != Some(after)
                 && matches!(
@@ -1638,8 +1730,8 @@ impl TcpLayer {
             // and must not find it still named for the old peer.
             if after == TcpState::Listen
                 && let Some(l) = self.listeners.get_mut(&dst.port())
-                && l.hatch(h, &self.conns)
-                && !l.relisten(h, &mut self.conns, &mut self.by_tuple)
+                && l.hatch(h, &self.sockets)
+                && !l.relisten(h, &mut self.sockets, &mut self.by_tuple)
             {
                 self.remove_socket(h);
             }
@@ -1648,7 +1740,7 @@ impl TcpLayer {
                     after,
                     TcpState::SynReceived | TcpState::Listen | TcpState::Closed
                 )
-                && self.conns[&h].side == Side::Server
+                && self.conn(h).side == Side::Server
             {
                 self.completed(h, arrived, ack);
             }
@@ -1694,7 +1786,7 @@ impl TcpLayer {
                 conn.handshake.syn_ack = Some(added.into());
                 conn.handshake.irs = arrived.seq;
                 conn.gives_up = Some(gives_up);
-                self.conns.insert(h, conn);
+                self.sockets.insert_conn(h, conn);
                 self.by_tuple.insert((local, remote), h);
             }
         }
@@ -1927,7 +2019,7 @@ impl TcpLayer {
         conn.ecn = kept.ecn;
         conn.handshake.origin = HandshakeOrigin::Cookie;
         (conn.handshake.irs, conn.handshake.iss) = (irs, iss);
-        self.conns.insert(h, conn);
+        self.sockets.insert_conn(h, conn);
         self.by_tuple.insert((dst, src), h);
         true
     }
@@ -1940,8 +2032,8 @@ impl TcpLayer {
     fn completed(&mut self, h: Id, arrived: Arrived, ack: Arc<[TcpOption]>) {
         let port = arrived.to.port();
         let l = self.listeners.get_mut(&port).expect("a listener");
-        l.hatch(h, &self.conns);
-        let c = self.conns.get_mut(&h).expect("a connection");
+        l.hatch(h, &self.sockets);
+        let c = self.sockets.conn_mut(h).expect("a connection");
         c.gives_up = None;
         c.handshake.ack = ack;
         c.handshake.ack_payload = arrived.payload;
@@ -1957,7 +2049,7 @@ impl TcpLayer {
             c.handshake.syn_ipv4 = kept.syn_ipv4;
             c.handshake.syn_ack_ipv4 = kept.syn_ack_ipv4;
         }
-        let handshake = &self.conns[&h].handshake;
+        let handshake = &self.sockets.conn(h).expect("a connection").handshake;
         let answer = l
             .answer
             .as_ref()
@@ -1972,9 +2064,10 @@ impl TcpLayer {
                         .collect();
                     let options = stcp::encode_options_within(&wire, 40)
                         .expect("received handshake options fit a TCP header");
+                    let irs = handshake.irs;
                     let s = self.sockets.get_mut(h);
                     s.set_segment_options(Box::new(SegmentsOnWire(segments)));
-                    s.process_handshake_data(handshake.irs.wrapping_add(1), &options);
+                    s.process_handshake_data(irs.wrapping_add(1), &options);
                 }
                 if arrived.from.port() == 0
                     && self.settings.source_port_zero == SourcePortZero::CloseAfterHandshake
@@ -1997,7 +2090,7 @@ impl TcpLayer {
             }
             AckAnswer::Drop => {}
         }
-        if let Some(c) = self.conns.remove(&h) {
+        if let Some(c) = self.sockets.take_conn(h) {
             self.by_tuple.remove(&(c.local, c.remote));
             l.left(c.remote.ip());
         }
@@ -2013,13 +2106,14 @@ impl TcpLayer {
             // is housekeeping's.
             let due: Vec<_> = l
                 .embryonic
-                .range(..=(now, Id(u64::MAX)))
+                .iter()
+                .take_while(|&&(at, _)| at <= now)
                 .copied()
                 .filter(|&(_, h)| self.sockets.get(h).state() == TcpState::SynReceived)
                 .collect();
             for key @ (_, h) in due {
                 l.embryonic.remove(&key);
-                if let Some(c) = self.conns.remove(&h) {
+                if let Some(c) = self.sockets.take_conn(h) {
                     self.by_tuple.remove(&(c.local, c.remote));
                     l.left(c.remote.ip());
                 }
@@ -2041,7 +2135,7 @@ impl TcpLayer {
         while i < self.orphans.len() {
             let h = self.orphans[i];
             let fin_wait_2 = self.get(h).state() == TcpState::FinWait2;
-            let Some(c) = self.conns.get_mut(&h) else {
+            let Some(c) = self.sockets.conn_mut(h) else {
                 i += 1;
                 continue;
             };
@@ -2069,7 +2163,7 @@ impl TcpLayer {
         let orphans = self
             .orphans
             .iter()
-            .filter_map(|h| self.conns.get(h)?.gives_up);
+            .filter_map(|h| self.sockets.conn(*h)?.gives_up);
         handshakes.chain(orphans).min()
     }
 
@@ -2081,13 +2175,13 @@ impl TcpLayer {
         // Handshakes still to be looked at next turn.
         let mut later = Vec::new();
         for h in std::mem::take(&mut self.touched) {
-            let Some(c) = self.conns.get(&h) else {
+            let Some(c) = self.sockets.conn(h) else {
                 continue;
             };
             let Some(l) = self.listeners.get_mut(&c.local.port()) else {
                 continue;
             };
-            let Some(key) = l.embryo(h, &self.conns) else {
+            let Some(key) = l.embryo(h, &self.sockets) else {
                 continue;
             };
             let s = self.sockets.get(h);
@@ -2100,13 +2194,13 @@ impl TcpLayer {
                 // `ingress` takes back a socket a RST returns to LISTEN.
                 TcpState::Listen => {
                     l.embryonic.remove(&key);
-                    if !l.relisten(h, &mut self.conns, &mut self.by_tuple) {
+                    if !l.relisten(h, &mut self.sockets, &mut self.by_tuple) {
                         gone.push(h);
                     }
                 }
                 TcpState::Closed | TcpState::TimeWait => {
                     l.embryonic.remove(&key);
-                    if let Some(c) = self.conns.remove(&h) {
+                    if let Some(c) = self.sockets.take_conn(h) {
                         self.by_tuple.remove(&(c.local, c.remote));
                         l.left(c.remote.ip());
                     }
@@ -2115,7 +2209,7 @@ impl TcpLayer {
                 _ => {
                     l.embryonic.remove(&key);
                     l.ready.push_back(h);
-                    ready.insert(self.conns[&h].local.port());
+                    ready.insert(self.conn(h).local.port());
                 }
             }
         }
@@ -2138,9 +2232,9 @@ impl TcpLayer {
                 // it through poll_at. Retransmitted FINs restart its ten-
                 // second timer; egress moves the socket to CLOSED at expiry.
                 // The orphan timeout must not interrupt that with a RST.
-                if state == TcpState::TimeWait && !self.conns[&h].retired {
+                if state == TcpState::TimeWait && !self.conn(h).retired {
                     self.sock(h).set_timeout(None);
-                    let c = self.conns.get_mut(&h).unwrap();
+                    let c = self.sockets.conn_mut(h).unwrap();
                     c.retired = true;
                     c.held.clear();
                     if let Some(id) = c.child.take() {
@@ -2152,15 +2246,14 @@ impl TcpLayer {
                 i += 1;
             }
         }
-        self.time_wait.retain(|h| self.conns.contains_key(h));
+        self.time_wait.retain(|h| self.sockets.conn(*h).is_some());
         if self.time_wait.len() > MAX_TIME_WAIT {
             while self.time_wait.len() > MAX_TIME_WAIT {
                 let h = self.time_wait.pop_front().unwrap();
                 self.remove_conn(h);
             }
-            self.orphans.retain(|h| self.conns.contains_key(h));
+            self.orphans.retain(|h| self.sockets.conn(*h).is_some());
         }
-        self.compact();
         for port in ready {
             self.offer(port);
         }
@@ -2170,10 +2263,10 @@ impl TcpLayer {
     /// forgotten, and every command after this fails as closed.
     pub(super) fn stop(&mut self) {
         self.stopped = true;
-        let handles: Vec<Id> = self.conns.keys().copied().collect();
+        let handles: Vec<Id> = self.sockets.conns().map(|(h, _)| h).collect();
         for h in handles {
             self.sock(h).abort();
-            let c = self.conns.get_mut(&h).unwrap();
+            let c = self.sockets.conn_mut(h).unwrap();
             c.held.clear();
             let child = c.child;
             if let Some(id) = child
@@ -2212,7 +2305,7 @@ impl TcpLayer {
             .children
             .insert(h)
             .unwrap_or_else(|_| unreachable!("children are bounded by sockets"));
-        let c = self.conns.get_mut(&h).unwrap();
+        let c = self.sockets.conn_mut(h).unwrap();
         c.child = Some(child.id());
         c.open = true;
         let opening = TcpOpening {
@@ -2241,11 +2334,11 @@ impl TcpLayer {
                 return;
             };
             l.accept -= 1;
-            let c = &self.conns[&h];
+            let c = self.sockets.conn(h).expect("a connection");
             let (remote, handshake) = (c.remote, c.handshake.clone());
             l.left(remote.ip());
             self.open_child(h, TcpOrigin::Accepted(handshake));
-            let c = self.conns.get_mut(&h).unwrap();
+            let c = self.sockets.conn_mut(h).unwrap();
             c.live = true;
             // The peer may have reset it while it waited: its child opens
             // gone, and is told so now rather than when it is closed.
@@ -2264,7 +2357,7 @@ impl TcpLayer {
         let s = self.sockets.get(h);
         let writable = matches!(s.state(), TcpState::Established | TcpState::CloseWait);
         let free = (s.send_capacity() - s.send_queue()) as u64;
-        let c = self.conns.get_mut(&h).unwrap();
+        let c = self.sockets.conn_mut(h).unwrap();
         let Some(id) = c.child else {
             return;
         };
@@ -2280,7 +2373,7 @@ impl TcpLayer {
     /// Brings the child of `h` up to date: its connect's outcome, its
     /// write credit, the data it may read, and its end or reset.
     fn refresh(&mut self, budget: &Budget, h: Id) {
-        let Some(c) = self.conns.get(&h) else {
+        let Some(c) = self.sockets.conn(h) else {
             return;
         };
         let (Some(id), true) = (c.child, c.open) else {
@@ -2291,10 +2384,10 @@ impl TcpLayer {
             match state {
                 TcpState::SynSent | TcpState::SynReceived | TcpState::Listen => return,
                 TcpState::Closed => return self.connect_failed(h, id),
-                _ => self.conns.get_mut(&h).unwrap().live = true,
+                _ => self.sockets.conn_mut(h).unwrap().live = true,
             }
         }
-        let c = self.conns.get_mut(&h).unwrap();
+        let c = self.sockets.conn_mut(h).unwrap();
         if matches!(state, TcpState::TimeWait | TcpState::Closed) && !c.rst && !c.released {
             // The transport is done with it, whether or not the layer above
             // still holds the child: limits that count it stop counting.
@@ -2302,12 +2395,11 @@ impl TcpLayer {
             c.held.clear();
             self.notice(TcpNotice::Gone(id));
         }
-        if self.conns[&h].reset_sent {
+        if self.conn(h).reset_sent {
             return;
         }
         self.grant(h);
-        let c = self.conns.get_mut(&h).unwrap();
-        let s = self.sockets.get_mut(h);
+        let (s, c) = self.sockets.socket_and_conn(h);
         let mut moved = false;
         while c.recv_credit > 0 && s.can_recv() && self.up.len() < UP_ROOM {
             let n = (c.recv_credit as usize).min(s.recv_queue()).min(DATA_MAX);
@@ -2371,7 +2463,7 @@ impl TcpLayer {
             ConnError::Reset => ConnError::Refused,
             e => e,
         };
-        let c = self.conns.get_mut(&h).unwrap();
+        let c = self.sockets.conn_mut(h).unwrap();
         c.child = None;
         c.held.clear();
         let request = c.request;
@@ -2397,8 +2489,8 @@ impl TcpLayer {
             self.refresh(budget, h);
             self.sockets.acknowledge(h);
             if self
-                .conns
-                .get(&h)
+                .sockets
+                .conn(h)
                 .is_some_and(|c| c.open && c.recv_credit > 0)
                 && self.sockets.get(h).can_recv()
             {
@@ -2447,7 +2539,7 @@ impl TcpLayer {
         self.reserved.insert(h, charge);
         let mut conn = Conn::new(local, remote, Side::Client);
         conn.request = Some(request);
-        self.conns.insert(h, conn);
+        self.sockets.insert_conn(h, conn);
         self.by_tuple.insert((local, remote), h);
         self.take_port(port);
         self.open_child(h, TcpOrigin::Connected(request));
@@ -2496,10 +2588,10 @@ impl TcpLayer {
             TcpControl::Connect { request, remote } => self.connect(env, request, remote),
             TcpControl::AbortPeers(which) => {
                 let hs: Vec<Id> = self
-                    .conns
-                    .iter()
+                    .sockets
+                    .conns()
                     .filter(|(_, c)| which(c.remote.ip()))
-                    .map(|(h, _)| *h)
+                    .map(|(h, _)| h)
                     .collect();
                 for h in hs {
                     self.abort(h);
@@ -2530,7 +2622,7 @@ impl TcpLayer {
             }
             TcpControl::KeepAlive { child, interval } => {
                 if let Some(&h) = self.children.get(child)
-                    && self.conns.get(&h).is_some_and(|c| !c.orphaned)
+                    && self.sockets.conn(h).is_some_and(|c| !c.orphaned)
                 {
                     let socket = self.sock(h);
                     socket.set_keep_alive(interval.map(Into::into));
@@ -2540,7 +2632,7 @@ impl TcpLayer {
             }
             TcpControl::Hold { child, item } => match self.children.get(child).copied() {
                 Some(h) if !self.gone(child) => {
-                    self.conns.get_mut(&h).unwrap().held.push(item);
+                    self.sockets.conn_mut(h).unwrap().held.push(item);
                 }
                 _ => drop(item),
             },
@@ -2560,7 +2652,7 @@ impl TcpLayer {
         let StreamCommand::Write(chunk) = command else {
             return None;
         };
-        let c = &self.conns[&h];
+        let c = self.conn(h);
         let s = self.get(h);
         if c.shut
             || c.reset_sent
@@ -2577,7 +2669,7 @@ impl TcpLayer {
         let Some(h) = self.open_socket(id) else {
             return;
         };
-        let c = self.conns.get_mut(&h).unwrap();
+        let c = self.sockets.conn_mut(h).unwrap();
         c.recv_credit = c.recv_credit.saturating_add(units);
         if window.is_some() {
             c.window = window;
@@ -2588,7 +2680,7 @@ impl TcpLayer {
 
     /// The socket of child `id`, while the layer above holds the child.
     fn open_socket(&self, id: ChildId) -> Option<Id> {
-        self.mapped(id).filter(|h| self.conns[h].open)
+        self.mapped(id).filter(|h| self.conn(*h).open)
     }
 
     /// Prepares for the packets of one step: the interface's clock, and
@@ -2675,7 +2767,7 @@ impl TcpLayer {
         if self.stopped {
             return Verdict::Failed(ConnError::Closed);
         }
-        let c = &self.conns[&h];
+        let c = self.conn(h);
         if c.reset {
             return Verdict::Failed(self.closed_reason(h));
         }
@@ -2697,7 +2789,7 @@ impl TcpLayer {
         let Some(h) = self.mapped(id) else {
             return Verdict::Failed(ConnError::Closed);
         };
-        if self.stopped || self.conns[&h].shut {
+        if self.stopped || self.conn(h).shut {
             return Verdict::Failed(ConnError::Closed);
         }
         match self.get(h).state() {
@@ -2730,7 +2822,7 @@ impl TcpLayer {
     /// before this side ended it.
     pub(super) fn end_verdict(&self, id: ChildId) -> Option<ConnError> {
         let h = self.mapped(id)?;
-        (self.get(h).state() == TcpState::Closed && !self.conns[&h].shut)
+        (self.get(h).state() == TcpState::Closed && !self.conn(h).shut)
             .then(|| self.closed_reason(h))
     }
 
@@ -2742,18 +2834,18 @@ impl TcpLayer {
         self.stopped
             || self
                 .mapped(id)
-                .and_then(|h| self.conns.get(&h))
+                .and_then(|h| self.sockets.conn(h))
                 .is_none_or(|c| c.rst || c.retired || c.released)
     }
 
     /// The peer addresses of every connection.
     pub(super) fn peers(&self) -> BTreeSet<IpAddr> {
-        self.conns.values().map(|c| c.remote.ip()).collect()
+        self.sockets.conns().map(|(_, c)| c.remote.ip()).collect()
     }
 
     /// The mapped children, in socket order.
     pub(super) fn child_ids(&self) -> Vec<ChildId> {
-        self.conns.values().filter_map(|c| c.child).collect()
+        self.sockets.conns().filter_map(|(_, c)| c.child).collect()
     }
 
     /// Whether the last step used up the output allowance, so more may be
@@ -2778,9 +2870,9 @@ impl TcpLayer {
     /// orphaned gets a child the layer above has closed.
     #[cfg(test)]
     pub(super) fn adopt(&mut self, h: Id) -> ChildId {
-        let handshake = self.conns[&h].handshake.clone();
+        let handshake = self.conn(h).handshake.clone();
         self.open_child(h, TcpOrigin::Accepted(handshake));
-        let c = self.conns.get_mut(&h).unwrap();
+        let c = self.sockets.conn_mut(h).unwrap();
         c.live = true;
         c.open = !c.orphaned;
         let id = c.child.unwrap();
@@ -2879,7 +2971,7 @@ impl Layer for TcpLayer {
             MuxOp::Child(id, StreamCommand::Write(chunk)) => {
                 let h = self.open_socket(id).expect("admitted");
                 let n = self.sock(h).send_slice(&chunk).unwrap_or(0);
-                let c = self.conns.get_mut(&h).unwrap();
+                let c = self.sockets.conn_mut(h).unwrap();
                 c.send_granted = c.send_granted.saturating_sub(n as u64);
                 self.urgent
                     .push_back(MuxEvent::Child(id, StreamEvent::Written(n as u64)));
@@ -2888,7 +2980,7 @@ impl Layer for TcpLayer {
             }
             MuxOp::Child(id, StreamCommand::End) => {
                 let h = self.open_socket(id).expect("admitted");
-                let c = self.conns.get_mut(&h).unwrap();
+                let c = self.sockets.conn_mut(h).unwrap();
                 c.shut = true;
                 c.send_granted = 0;
                 self.close_if_drained(h);

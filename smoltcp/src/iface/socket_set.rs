@@ -23,7 +23,7 @@ struct Pending {
 }
 
 /// TCP sockets in slot order. Removed slots are reused before the set grows.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SocketSet<'a> {
     sockets: Vec<Option<Socket<'a>>>,
     dirty: VecDeque<SocketHandle>,
@@ -36,30 +36,6 @@ pub struct SocketSet<'a> {
 }
 
 impl<'a> SocketSet<'a> {
-    pub fn new(sockets: Vec<Option<Socket<'a>>>) -> Self {
-        let dirty: VecDeque<_> = sockets
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|_| SocketHandle(i)))
-            .collect();
-        Self {
-            scheduled: vec![None; sockets.len()],
-            pending: sockets
-                .iter()
-                .map(|s| Pending {
-                    dirty: s.is_some(),
-                    changed: s.is_some(),
-                })
-                .collect(),
-            sockets,
-            changed: dirty.clone(),
-            dirty,
-            deadlines: BTreeSet::new(),
-            ready: BTreeSet::new(),
-            served: None,
-        }
-    }
-
     pub fn add(&mut self, socket: Socket<'a>) -> SocketHandle {
         let handle = if let Some(index) = self.sockets.iter().position(Option::is_none) {
             self.sockets[index] = Some(socket);

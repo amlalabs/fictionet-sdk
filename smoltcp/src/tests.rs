@@ -8,7 +8,7 @@ use crate::wire::*;
 pub(crate) fn setup<'a>() -> (Interface, SocketSet<'a>, TestingDevice) {
     let mut device = TestingDevice::new();
     let iface = setup_with_device(&mut device);
-    (iface, SocketSet::new(vec![]), device)
+    (iface, SocketSet::default(), device)
 }
 
 fn setup_with_device(device: &mut impl Device) -> Interface {
