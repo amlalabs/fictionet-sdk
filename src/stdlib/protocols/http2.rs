@@ -1121,6 +1121,15 @@ pub enum Event {
     },
     /// An extension frame that was ignored by connection state.
     Unknown(Unknown),
+    /// A frame that is a stream error (RFC 9113 section 5.4.2), such as
+    /// WINDOW_UPDATE with no credit on a stream: the receiver resets
+    /// `stream` with `error.code`, and the connection goes on.
+    StreamError {
+        /// The stream the receiver resets.
+        stream: u32,
+        /// Why, with the code its RST_STREAM carries.
+        error: Error,
+    },
 }
 /// What credit from the other direction did to this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1851,6 +1860,19 @@ impl Session {
         let frame = match item {
             Input::Preface => return Ok(Some(Event::Preface)),
             Input::Frame(f) => f,
+            // A stream error ends only its stream (RFC 9113 section 5.4.2),
+            // except as the first frame or inside a header block.
+            Input::Refused {
+                header,
+                error,
+                scope: ErrorScope::Stream,
+                ..
+            } if !self.first && self.blocks.pending.is_none() => {
+                return Ok(Some(Event::StreamError {
+                    stream: header.stream,
+                    error,
+                }));
+            }
             Input::Refused { error, .. } => return Err(error),
         };
         if self.first {
@@ -3671,6 +3693,32 @@ mod tests {
         c.peer_settings(&initial(1)).unwrap();
         let error = c.peer_settings(&initial(2)).unwrap_err();
         assert_eq!(error.code, ErrorCode::FlowControlError);
+    }
+
+    /// WINDOW_UPDATE with no credit on a stream is a stream error
+    /// (RFC 9113 section 6.9): it is reported for that stream, and the
+    /// frames after it are read.
+    #[test]
+    fn a_zero_increment_on_a_stream_is_a_stream_error() {
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        let bytes = [raw(8, 0, 1, &[0; 4]), raw(6, 0, 0, &[0; 8])].concat();
+        let events = accept(&mut c, &bytes);
+        assert!(
+            matches!(&events[..], [
+                Event::StreamError { stream: 1, error },
+                Event::Ping(_),
+            ] if error.code == ErrorCode::ProtocolError),
+            "{events:?}"
+        );
+        assert!(c.failed().is_none());
+        // On the connection it is a connection error.
+        assert_eq!(c.push(&raw(8, 0, 0, &[0; 4])), 13);
+        assert_eq!(
+            c.next().unwrap().unwrap_err().code,
+            ErrorCode::ProtocolError
+        );
     }
 
     #[test]
