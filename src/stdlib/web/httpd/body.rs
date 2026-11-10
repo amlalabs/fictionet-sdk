@@ -91,42 +91,38 @@ impl Body {
         let Self::Stream(stream) = self else {
             return Ok(());
         };
-        let Poll::Ready(first) = stream.as_mut().poll_next(cx) else {
+        let Poll::Ready(mut first) = stream.as_mut().poll_next(cx) else {
             return Ok(());
         };
-        if first.is_none() {
-            let trailers = stream.as_mut().take_trailers();
-            *self = if trailers.is_some() {
-                Self::Stream(Box::pin(Prefixed {
-                    first: None,
-                    rest: Self::empty(),
-                    trailers,
-                }))
-            } else {
-                Self::empty()
-            };
-            return Ok(());
+        if let Some(Ok(data)) = &mut first
+            && !data.repay(budget)
+        {
+            return Err(BodyRefused);
         }
-        if stream.is_end_stream() && matches!(&first, Some(Ok(_))) {
-            let Some(Ok(mut data)) = first else {
-                unreachable!()
-            };
-            if !data.repay(budget) {
+        if first.is_none() || (stream.is_end_stream() && matches!(&first, Some(Ok(_)))) {
+            let mut trailers = stream.as_mut().take_trailers();
+            if trailers
+                .as_mut()
+                .is_some_and(|fields| !fields.admit(budget))
+            {
                 return Err(BodyRefused);
             }
-            let trailers = stream.as_mut().take_trailers();
             *self = if trailers.is_some() {
                 Self::Stream(Box::pin(Prefixed {
-                    first: Some(Ok(data)),
+                    first,
                     rest: Self::empty(),
                     trailers,
                 }))
             } else {
-                Self::Full(data)
+                match first {
+                    Some(Ok(data)) => Self::Full(data),
+                    None => Self::empty(),
+                    Some(Err(_)) => unreachable!(),
+                }
             };
             return Ok(());
         }
-        let rest = std::mem::replace(self, Self::empty());
+        let rest = std::mem::take(self);
         *self = Self::Stream(Box::pin(Prefixed {
             first,
             rest,
@@ -260,6 +256,100 @@ mod tests {
                 drop(held);
             }
             assert!(budget.used() == 0);
+        }
+    }
+
+    #[test]
+    fn settling_a_pending_stream_charges_its_retained_prefix() {
+        struct Prefix(Option<Chunk>);
+        impl BodyStream for Prefix {
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Chunk, Error>>> {
+                match self.get_mut().0.take() {
+                    Some(bytes) => Poll::Ready(Some(Ok(bytes))),
+                    None => Poll::Pending,
+                }
+            }
+        }
+        let bytes = b"a prefix retained while its stream waits";
+        for limit in [bytes.len() - 1, bytes.len()] {
+            let budget = Budget::new(limit);
+            let mut body = Body::Stream(Box::pin(Prefix(Some(Chunk::unpaid(bytes.to_vec())))));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let result = body.settle(&mut cx, &budget);
+            assert_eq!(result.is_ok(), limit >= bytes.len());
+            if result.is_ok() {
+                assert_eq!(budget.used(), bytes.len());
+                let Poll::Ready(Some(Ok(prefix))) = body.poll_next(&mut cx) else {
+                    panic!("retained prefix");
+                };
+                assert_eq!(prefix.as_ref(), bytes);
+                assert!(matches!(body.poll_next(&mut cx), Poll::Pending));
+                drop(body);
+                assert_eq!(budget.used(), prefix.charged());
+                drop(prefix);
+            } else {
+                drop(body);
+            }
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn settling_trailers_reserves_them_with_or_without_data() {
+        struct End {
+            data: Option<Chunk>,
+            trailers: Option<Fields>,
+        }
+        impl BodyStream for End {
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Chunk, Error>>> {
+                Poll::Ready(self.get_mut().data.take().map(Ok))
+            }
+            fn is_end_stream(&self) -> bool {
+                self.data.is_none()
+            }
+            fn take_trailers(self: Pin<&mut Self>) -> Option<Fields> {
+                self.get_mut().trailers.take()
+            }
+        }
+        for with_data in [false, true] {
+            for enough in [false, true] {
+                let fields = Fields::new([("x-end", b"value".as_slice())]);
+                let data = with_data.then(|| Chunk::unpaid(b"data".to_vec()));
+                let need = fields.held() + data.as_ref().map_or(0, Chunk::len);
+                let retained = fields
+                    .iter()
+                    .map(|(name, value)| Fields::record_size(name.len(), value.len()).unwrap())
+                    .sum::<usize>()
+                    + data.as_ref().map_or(0, Chunk::len);
+                let budget = Budget::new(need - usize::from(!enough));
+                let mut body = Body::Stream(Box::pin(End {
+                    data,
+                    trailers: Some(fields),
+                }));
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert_eq!(body.settle(&mut cx, &budget).is_ok(), enough);
+                if enough {
+                    assert_eq!(budget.used(), retained);
+                    if with_data {
+                        assert!(matches!(body.poll_next(&mut cx), Poll::Ready(Some(Ok(_)))));
+                    }
+                    assert!(matches!(body.poll_next(&mut cx), Poll::Ready(None)));
+                    let trailers = body.take_trailers().unwrap();
+                    assert_eq!(trailers.get(b"x-end"), Some(b"value".as_slice()));
+                    drop(body);
+                    assert_eq!(budget.used(), trailers.held());
+                    drop(trailers);
+                } else {
+                    drop(body);
+                }
+                assert_eq!(budget.used(), 0);
+            }
         }
     }
 }
