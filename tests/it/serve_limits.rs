@@ -820,7 +820,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
     fictionet_test_support::world::world(Duration::from_secs(10), move |fcx| async move {
         // Room for the idle connection, which holds the runner's read
         // buffer and job table, and two retained request heads.
-        let budget = Budget::new(128 << 10);
+        let budget = Budget::new(idle + (82 << 10));
         let shared = budget.clone();
         fcx.region(move |fcx| async move {
             let budget = shared;
