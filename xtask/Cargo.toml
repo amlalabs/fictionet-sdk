@@ -16,6 +16,11 @@ host-tools = [
 rawnic = ["host-tools", "fictionet-host/virtio-net", "dep:honeypot-world"]
 
 [[bin]]
+name = "honeypot-vm-guest"
+path = "src/bin/honeypot-vm-guest.rs"
+required-features = ["host-tools"]
+
+[[bin]]
 name = "rawnic-guest"
 path = "src/bin/rawnic-guest.rs"
 required-features = ["rawnic"]

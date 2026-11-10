@@ -1,50 +1,57 @@
 ----------------------------- MODULE UdpSockets -----------------------------
 (* The receive side of the UDP layer, `UdpLayer` in
-   src/stdlib/network/udp/sockets.rs: `bind` (lines 243-277) opens a child
-   on a free port, `take_in` (315-371) queues a datagram for the socket on
-   its port or refuses it, `socket_event` (374-401) hands a socket's next
-   datagram up within the credit granted, or its end once the queue is
-   empty, `on_event` with `PacketEvent::Ended` (430-439) marks every
-   socket ending, and `on_command` closes a socket by its handle
-   (`MuxOp::Close`, 480-482) or by its own end (`DatagramCommand::End`,
-   483-487, with `MuxEvent::Closed` from `take_event`, 520-528). `close`
-   (285-291) removes the socket's slot, with its queue, and frees the port.
+   src/stdlib/network/udp/sockets.rs (lines checked on 2026-11-10 at
+   8c582367b): `bind` (lines 241-268) opens a child on a free port,
+   `take_in` (306-357) queues a datagram for the socket on its port or
+   refuses it, `socket_event` (360-387) hands a socket's next datagram up
+   within the credit granted, or its end once the queue is empty,
+   `on_event` with `PacketEvent::Ended` (416-425) marks every socket
+   ending, and `on_command` closes a socket by its handle (`MuxOp::Close`,
+   466-468) or by its own end (`DatagramCommand::End`, 469-473, with
+   `MuxEvent::Closed` from `take_event`, 506-514). `close` (276-282)
+   removes the socket's slot, with its queue, and frees the port.
 
    Child ids are never reused: `Slots` gives each child a new generation
    (checked in verification/layer). A datagram's size is 0 (empty) or 1;
    it costs its size plus DatagramCost against Queue, as DATAGRAM_COST and
    QUEUE do. A datagram that fits the queue is also charged to the layer's
-   budget (`env.budget().charge(cost)`, 358); when the budget has no room
-   it is dropped and reported like one for a full queue, so Arrive may
-   drop any datagram that fits. Each arriving packet is of some network
-   and is checked or an observed copy. The code's lower port carries only
-   CheckedIpPacket, so CheckChecked is the type, not a branch.
+   budget (`env.budget().charge(DATAGRAM_COST)`, 344); when the budget has
+   no room it is dropped and reported like one for a full queue, so Arrive
+   may drop any datagram that fits.
+
+   The layer's lower port carries only `CheckedIpPacket`, which the IP
+   layer of the endpoint that owns this input made, so every packet here
+   is of the endpoint's network and passed the host's IP checks. The
+   earlier flags for those (CheckScope, CheckChecked) and the properties
+   NoCrossScope and OnlyChecked are retired: the code has no branch for
+   either, the type and the endpoint's input path are the check, and
+   `NetworkInput` parts labelled input ahead of the IP layer
+   (Reassembly.tla). What `take_in` still checks itself is whether the
+   packet is a UDP datagram for this host: the sort and protocol, the
+   destination address or a joined group, the UDP length and checksum
+   (309-325). Each arrival is valid or not on those; an invalid one is
+   refused without a report, as one for a port with no socket is.
 
    The code visits sockets in the order of its `ready` list (`wake`,
-   217-225) and gives a socket's send credit back (`MuxEvent::Credit`,
-   381-384) before its next datagram; the model lets any socket with an
+   215-223) and gives a socket's send credit back (`MuxEvent::Credit`,
+   367-371) before its next datagram; the model lets any socket with an
    event go next, which includes that order. The send side, that credit
    and ICMP answers are left out: none moves a received datagram. *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Ports,            \* the ports sockets bind
-    Nets,             \* the networks packets come from
-    Mine,             \* the endpoint's input network
     MaxChildren,      \* how many sockets are ever bound
     MaxArrivals,      \* how many packets arrive
     MaxGrant,         \* the most credit outstanding per socket
     Queue,            \* QUEUE, in units
     DatagramCost,     \* DATAGRAM_COST, in units
-    CheckScope,       \* NetworkInput passes on one network's packets (the code)
-    CheckChecked,     \* the lower port carries only CheckedIpPacket (the code)
+    CheckValid,       \* take_in refuses what is not a UDP datagram for this host (the code)
     KeepEmpty,        \* take_in queues empty datagrams (the code)
     RemoveOnClose,    \* close removes the slot and its queue (the code)
     QueueInSocket,    \* the queue belongs to the socket, not the port (the code)
     FreePort,         \* close frees the port (the code)
     EndAfterQueue     \* the end goes up only once the queue is empty (the code)
-
-ASSUME Mine \in Nets
 
 Children == 1..MaxChildren
 Arrivals == 1..MaxArrivals
@@ -84,8 +91,7 @@ Init ==
     /\ portOf = [p \in Ports |-> NoChild]
     /\ orphan = [p \in Ports |-> <<>>]
     /\ nextChild = 1
-    /\ dg = [d \in Arrivals |-> [port |-> 0, net |-> Mine, checked |-> TRUE,
-                                  size |-> 0, for |-> NoChild]]
+    /\ dg = [d \in Arrivals |-> [port |-> 0, valid |-> TRUE, size |-> 0, for |-> NoChild]]
     /\ arrived = 0
     /\ delivered = {}
     /\ refused = {}
@@ -101,7 +107,7 @@ Init ==
     /\ boundTo = [c \in Children |-> 0]
 
 Seen == <<closedSeen, endedSeen, afterEnded, afterClose>>
-Gone == [port |-> 0, net |-> Mine, checked |-> TRUE, size |-> 0, for |-> NoChild]
+Gone == [port |-> 0, valid |-> TRUE, size |-> 0, for |-> NoChild]
 Cost(d) == dg[d].size + DatagramCost
 RECURSIVE SumCost(_)
 SumCost(q) == IF q = <<>> THEN 0 ELSE Cost(Head(q)) + SumCost(Tail(q))
@@ -124,14 +130,16 @@ Bind(p) ==
                    inputEnded, byEnd, closedQ>>
     /\ UNCHANGED Seen
 
-\* A packet the IP layer sorted to UDP reaches take_in. `room` is whether
-\* the budget has room for the datagram (`env.budget().charge(cost)`).
-Arrive(p, n, checked, size, room) ==
+\* A packet the IP layer sorted to UDP reaches take_in. `valid` is whether
+\* it is a UDP datagram for this host with a good length and checksum;
+\* `room` is whether the budget has room for it
+\* (`env.budget().charge(DATAGRAM_COST)`).
+Arrive(p, valid, size, room) ==
     /\ ~inputEnded /\ arrived < MaxArrivals
     /\ LET d == arrived + 1
            c == portOf[p]
-           rec == [port |-> p, net |-> n, checked |-> checked, size |-> size, for |-> c]
-           filtered == (CheckScope /\ n # Mine) \/ (CheckChecked /\ ~checked)
+           rec == [port |-> p, valid |-> valid, size |-> size, for |-> c]
+           filtered == CheckValid /\ ~valid
            \* No property reads what a refused or dropped datagram was, so
            \* those are all recorded alike, which keeps the state space small.
            gone == filtered \/ c = NoChild
@@ -228,8 +236,8 @@ TakeClosed ==
 
 Next ==
     \/ \E p \in Ports : Bind(p)
-    \/ \E p \in Ports, n \in Nets, ck \in BOOLEAN, sz \in {0, 1}, room \in BOOLEAN :
-          Arrive(p, n, ck, sz, room)
+    \/ \E p \in Ports, ok \in BOOLEAN, sz \in {0, 1}, room \in BOOLEAN :
+          Arrive(p, ok, sz, room)
     \/ \E c \in Children : Grant(c) \/ Deliver(c) \/ EndEvent(c)
     \/ InputEnd
     \/ \E c \in Children, own \in BOOLEAN : Close(c, own)
@@ -247,11 +255,10 @@ Up == {pair[2] : pair \in delivered}
 NoCrossSocket ==
     \A pair \in delivered : dg[pair[2]].for = pair[1] /\ dg[pair[2]].port = boundTo[pair[1]]
 
-\* Only the layer's own network reaches its sockets.
-NoCrossScope == \A pair \in delivered : dg[pair[2]].net = Mine
-
-\* Only checked packets reach its sockets: an observed copy never does.
-OnlyChecked == \A pair \in delivered : dg[pair[2]].checked
+\* Only a UDP datagram for this host with a good checksum reaches a socket:
+\* RFC 1122 section 4.1.3.4 (a bad checksum is silently discarded) and
+\* section 3.2.1.3 (a datagram for another address is discarded).
+OnlyValid == \A pair \in delivered : dg[pair[2]].valid
 
 \* Every datagram that arrived, empty ones included, is in exactly one
 \* place: refused, dropped with a report (a full queue or no room in the

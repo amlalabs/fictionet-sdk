@@ -803,8 +803,9 @@ function showWorld(next) {
     const availability = world[control.dataset.source];
     control.disabled = starting || availability.kind !== 'available';
     control.setAttribute('aria-pressed', String(control.dataset.source === world.source));
-    control.title = { no_captures: 'No captures', no_search_key: 'No search key', no_model_key: 'No model key' }[availability.reason] || '';
+    control.title = { no_captures: 'No captures', no_search_key: 'No search key', no_model_key: 'No model key', searched_only: 'Not on this host' }[availability.reason] || '';
   }
+  $('reset').disabled = starting;
 }
 $('world-toggle').onclick = () => { $('world-menu').hidden = !$('world-menu').hidden; $('world-toggle').setAttribute('aria-expanded', String(!$('world-menu').hidden)); };
 document.addEventListener('click', (event) => { if (!$('world-menu').contains(event.target) && !$('world-toggle').contains(event.target)) { $('world-menu').hidden = true; $('world-toggle').setAttribute('aria-expanded', 'false'); } });
@@ -840,6 +841,16 @@ async function setScenario(scenario) {
 $('scenario-form').onsubmit = (event) => { event.preventDefault(); setScenario($('scenario').value); };
 $('scenario').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); setScenario($('scenario').value); } });
 $('scenario-clear').onclick = () => { $('scenario').value = ''; setScenario(''); };
+// A new session in the same mode: a fresh workstation and an empty world.
+$('reset').onclick = async () => {
+  $('reset').disabled = true;
+  try {
+    await command({ command: 'reset' });
+    $('world-menu').hidden = true;
+    $('world-toggle').setAttribute('aria-expanded', 'false');
+  } catch (error) { $('world-error').textContent = error.message; }
+  finally { if (world) showWorld(world); }
+};
 const MODES = { copied: 'Copied', live: 'Live', live_depth: 'Live-Depth', edited: 'Edited' };
 // While a session starts, the previous workstation's console is gone: the
 // pane says which session is starting until the new one's terminal opens.

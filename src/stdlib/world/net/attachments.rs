@@ -528,7 +528,10 @@ pub(super) async fn filter(
             },
             ports::Event::Packet(_, packet) => f.ports.send(0, packet),
             ports::Event::Closed(_) => return Ok(()),
-            ports::Event::Timer => f.reassembly.expire(fcx.now()),
+            ports::Event::Timer => {
+                f.reassembly.expire(fcx.now());
+                f.timed_out();
+            }
             ports::Event::Extra => {}
         }
     }
@@ -661,8 +664,28 @@ impl Filter {
         self.forward(fcx, self.route6, packet);
     }
 
+    /// Answers the packets whose reassembly timed out after their first
+    /// fragment came, with ICMP Time Exceeded, code 1 (RFC 1122 section
+    /// 3.3.2, RFC 8200 section 4.5), when they were for a host the world
+    /// plays (the gateway or a machine): those hosts see their packets only
+    /// whole, through this filter, so it answers for them, as it answers a
+    /// refused packet for them. A packet bound anywhere else goes
+    /// silently: no host there saw its fragments, and this filter is not a
+    /// host.
+    fn timed_out(&mut self) {
+        while let Some(first) = self.reassembly.take_expired() {
+            if self.context.hooks.destinations.is_host(&first)
+                && let Some(answer) = ip::reassembly_time_exceeded(&first)
+            {
+                self.ports.send(0, answer);
+            }
+        }
+    }
+
     fn forward(&mut self, fcx: &Cx, route: Option<usize>, packet: Packet) {
-        let packet = match self.reassembly.push(packet.into_chunk(), fcx.now()) {
+        let intake = self.reassembly.push(packet.into_chunk(), fcx.now());
+        self.timed_out();
+        let packet = match intake {
             Intake::Whole(p) => Packet::from_chunk(p),
             Intake::Waiting | Intake::Discarded => return,
             Intake::Refused { packet, answer } => {

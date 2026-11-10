@@ -2459,6 +2459,7 @@ mod tests {
             .charge(sandbox.limit() - sandbox.used() - want + 1)
             .unwrap();
         // Rounds as a runner makes them, until nothing moves.
+        let quiet = driver.refusals();
         for _ in 0..4 {
             let since = driver.refusals();
             driver.run().unwrap();
@@ -2467,6 +2468,13 @@ mod tests {
         }
         let tries = driver.layer().child(id).unwrap().tries;
         assert!(tries > 0 && driver.layer().child(id).unwrap().held.is_none());
+        // The runner's own view saw no refusal; the router tells it that a
+        // child waits, so its idle limit stops all the same.
+        assert!(!driver.budget().refused_since(quiet));
+        assert!(
+            driver.layer().waits_for_memory(),
+            "the child's wait is told"
+        );
         driver.run().unwrap();
         assert_eq!(
             driver.layer().child(id).unwrap().tries,
@@ -2483,6 +2491,7 @@ mod tests {
         let child = driver.layer().child(id).unwrap();
         assert!(child.tries > tries, "the child is visited again");
         assert!(child.held.is_some(), "and gets its memory");
+        assert!(!driver.layer().waits_for_memory(), "and waits no more");
         let first = &child.wakers[0];
         assert!(
             child.wakers.iter().all(|w| w.will_wake(first)),

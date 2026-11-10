@@ -50,7 +50,12 @@ impl<L: Layer> Session<L> {
             memory: false,
         }
     }
+}
 
+impl<L: Layer> Session<L> {
+    /// What is under way. The application waits for memory when a charge
+    /// of its was refused, or when a part of it waits on a budget view of
+    /// its own (a child of [`Children`](fictionet::stdlib::layer::Children)).
     fn outstanding(&self) -> Outstanding {
         Outstanding {
             output: self.pending > 0,

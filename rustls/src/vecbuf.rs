@@ -319,6 +319,18 @@ impl ChunkVecBuffer {
         true
     }
 
+    /// Gives back the payment of a record that is never queued: `paid`
+    /// bytes from [`Self::pay`] as one chunk, or from
+    /// [`Self::pay_final_alert`] for the `final_alert`.
+    pub(crate) fn refund(&mut self, paid: usize, final_alert: bool) {
+        self.promised -= paid;
+        if !final_alert {
+            self.promised_chunks -= 1;
+        }
+        self.paid.shrink_by(paid);
+        self.release_idle_places();
+    }
+
     /// Appends `chunk`, paid for by [`Self::pay`] as one chunk of `paid`
     /// bytes. A chunk whose allocation is smaller gives back the rest; one
     /// whose allocation is larger, which its maker said it would not be, is

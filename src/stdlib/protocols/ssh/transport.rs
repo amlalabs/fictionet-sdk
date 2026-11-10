@@ -1292,6 +1292,9 @@ fn unpad(mut packet: Vec<u8>, at: usize) -> Result<Vec<u8>, TransportError> {
 }
 
 #[cfg(test)]
+mod replay;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

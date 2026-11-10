@@ -403,13 +403,19 @@ impl Pages {
     }
 
     /// Open the corpus chosen by the world's brief, relative to the downloads root.
-    /// Its search index is cached beside the immutable archives.
+    /// Its search index is cached beside the immutable archives. When the
+    /// corpus is not on disk, the world has no copied pages and Copied is
+    /// not offered.
     pub fn from_corpus(seed: Seed, downloads: &Path) -> Result<Self, String> {
         let corpus = seed
             .corpus
             .as_ref()
             .ok_or("the seed has no copied corpus")?;
         let root = downloads.join(&corpus.directory);
+        if !root.exists() {
+            eprintln!("No copied pages at {}", root.display());
+            return Ok(Self::with_source(seed, Source::Copied));
+        }
         let urls = corpus.urls.clone();
         let reference = corpus
             .reference

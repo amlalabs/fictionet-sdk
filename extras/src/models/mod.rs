@@ -178,10 +178,78 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// What every Claude subscription token starts with.
-const CLAUDE_TOKEN_PREFIX: &str = "sk-ant-oat01-";
-/// A Claude subscription token's length, prefix included.
-const CLAUDE_TOKEN_LEN: usize = 108;
+/// How Claude Code signs in to Anthropic. A guest image carries a
+/// placeholder of one kind; the host keeps the real credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeLogin {
+    /// A long-lived Claude subscription token, sent as a bearer token.
+    Subscription,
+    /// An Anthropic API key, sent in `x-api-key`.
+    ApiKey,
+}
+impl ClaudeLogin {
+    /// What every credential of this kind starts with.
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Subscription => "sk-ant-oat01-",
+            Self::ApiKey => "sk-ant-api03-",
+        }
+    }
+    /// The variable Claude Code reads this credential from.
+    pub fn variable(self) -> &'static str {
+        match self {
+            Self::Subscription => "CLAUDE_CODE_OAUTH_TOKEN",
+            Self::ApiKey => "ANTHROPIC_API_KEY",
+        }
+    }
+    /// The kind the host provides: a subscription token in the file
+    /// `CLAUDE_CODE_OAUTH_TOKEN_FILE` names, or else an API key in
+    /// `ANTHROPIC_API_KEY`.
+    pub fn of_host() -> Option<Self> {
+        if std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE").is_some() {
+            Some(Self::Subscription)
+        } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()) {
+            Some(Self::ApiKey)
+        } else {
+            None
+        }
+    }
+    /// The host's credential of this kind.
+    pub fn host_secret(self) -> fictionet::Result<Secret> {
+        match self {
+            Self::Subscription => {
+                let path = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE")
+                    .ok_or_else(|| Error::msg("CLAUDE_CODE_OAUTH_TOKEN_FILE is not set"))?;
+                let value = std::fs::read_to_string(path)
+                    .map_err(|_| Error::msg("Cannot read the host Claude OAuth token file"))?;
+                Secret::new("Claude OAuth token", value.trim().into())
+            }
+            Self::ApiKey => Secret::from_env("ANTHROPIC_API_KEY"),
+        }
+    }
+    /// The kind a placeholder was minted for.
+    pub fn of(placeholder: &str) -> Option<Self> {
+        [Self::Subscription, Self::ApiKey]
+            .into_iter()
+            .find(|login| placeholder.starts_with(login.prefix()))
+    }
+    /// Mints a placeholder of this kind, as long as a real one, from the
+    /// system's randomness, for an image to carry in place of the real one.
+    pub fn placeholder(self) -> std::io::Result<String> {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        // Both kinds are 108 characters long, prefix included.
+        let mut bytes = [0; 108 - 13];
+        fictionet::random_bytes(&mut bytes)?;
+        Ok(format!(
+            "{}{}",
+            self.prefix(),
+            bytes
+                .into_iter()
+                .map(|b| ALPHABET[b as usize % ALPHABET.len()] as char)
+                .collect::<String>()
+        ))
+    }
+}
 
 /// An API key paired with the credential installed in the guest.
 #[derive(Clone)]
@@ -231,42 +299,32 @@ impl Credential {
             bearer: false,
         }
     }
-    /// A long-lived Claude subscription token, kept on the host with no
-    /// refresh, paired with the `placeholder` an image was built with (see
-    /// [`Credential::claude_token_placeholder`]).
-    pub fn claude_token(real: Secret, placeholder: String) -> fictionet::Result<Self> {
-        if !real.value.starts_with(CLAUDE_TOKEN_PREFIX) {
-            return Err(Error::msg("Claude OAuth token has an invalid prefix"));
+    /// Claude Code's credential of kind `login`, kept on the host (a
+    /// subscription token is never refreshed), paired with the
+    /// `placeholder` an image was built with (see [`ClaudeLogin::placeholder`]).
+    pub fn claude(
+        login: ClaudeLogin,
+        real: Secret,
+        placeholder: String,
+    ) -> fictionet::Result<Self> {
+        if !real.value.starts_with(login.prefix()) {
+            return Err(Error::msg(format!("{real} has an invalid prefix")));
         }
-        if !placeholder.starts_with(CLAUDE_TOKEN_PREFIX)
-            || placeholder.len() <= CLAUDE_TOKEN_PREFIX.len()
+        if ClaudeLogin::of(&placeholder) != Some(login)
+            || placeholder.len() <= login.prefix().len()
             || !placeholder
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             || placeholder == real.value
         {
-            return Err(Error::msg("Claude OAuth token placeholder is invalid"));
+            return Err(Error::msg(format!("{real} placeholder is invalid")));
         }
         Ok(Self {
             real,
             placeholder,
             oauth: None,
-            bearer: true,
+            bearer: login == ClaudeLogin::Subscription,
         })
-    }
-    /// Mints a placeholder shaped like a Claude subscription token from the
-    /// system's randomness, for an image to carry in place of the real one.
-    pub fn claude_token_placeholder() -> std::io::Result<String> {
-        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        let mut bytes = [0; CLAUDE_TOKEN_LEN - CLAUDE_TOKEN_PREFIX.len()];
-        fictionet::random_bytes(&mut bytes)?;
-        Ok(format!(
-            "{CLAUDE_TOKEN_PREFIX}{}",
-            bytes
-                .into_iter()
-                .map(|b| ALPHABET[b as usize % ALPHABET.len()] as char)
-                .collect::<String>()
-        ))
     }
     fn header(&self, provider: Provider) -> &'static str {
         if self.bearer {

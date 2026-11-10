@@ -113,6 +113,19 @@ impl RxStore {
         self.unread = 0;
     }
 
+    /// Ends the stream `end` bytes past the first byte not yet ready, at
+    /// the peer's FIN: bytes waiting at or past it are the peer's error,
+    /// and are dropped, never read (RFC 9293 section 3.10.7.4).
+    pub(crate) fn end_at(&mut self, end: usize) {
+        self.waiting.retain(|(at, _)| *at < end);
+        // Waiting chunks are sorted and disjoint: only the last can cross.
+        if let Some((at, chunk)) = self.waiting.back_mut()
+            && *at + chunk.len() > end
+        {
+            *chunk = chunk.slice(0..end - *at);
+        }
+    }
+
     /// Keeps the bytes of `payload` at `offset` from the first byte not
     /// yet ready that it does not hold yet: where a segment overlaps bytes
     /// already held, the first copy stays. `payload` lies within the

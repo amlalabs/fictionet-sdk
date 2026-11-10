@@ -98,6 +98,11 @@ impl Pages {
         self.live.is_some()
     }
 
+    /// Whether the host lets Live-Depth copy what searches allow.
+    pub fn live_depth_available(&self) -> bool {
+        self.depth.is_some()
+    }
+
     /// Whether the host has what Edited needs: Live and a model.
     pub fn edited_available(&self) -> bool {
         self.live.is_some() && self.editor.is_some()
@@ -118,8 +123,11 @@ impl Pages {
     pub fn unavailable(&self, source: Source) -> Option<&'static str> {
         match source {
             Source::Copied if self.copied.is_none() => Some("This world has no copied pages"),
-            Source::Live | Source::LiveDepth | Source::Edited if self.live.is_none() => {
+            Source::Live | Source::LiveDepth | Source::Edited if self.depth.is_none() => {
                 Some("Live pages need EXA_API_KEY on the host")
+            }
+            Source::Live | Source::Edited if self.live.is_none() => {
+                Some("This host offers only Live-Depth")
             }
             Source::Edited if self.editor.is_none() => {
                 Some("Edited pages need a model key on the host")

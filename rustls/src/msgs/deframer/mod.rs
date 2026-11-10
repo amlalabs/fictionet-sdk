@@ -66,20 +66,25 @@ fn read_header(bytes: &[u8]) -> Option<Result<u16, Error>> {
     match read_opaque_message_header(&mut reader) {
         Ok((_, _, len)) => Some(Ok(len)),
         Err(MessageError::TooShortForHeader | MessageError::TooShortForLength) => None,
-        Err(err) => Some(Err(invalid_header(err).into())),
+        Err(err) => Some(Err(invalid_header(err))),
     }
 }
 
-fn invalid_header(err: MessageError) -> InvalidMessage {
-    match err {
+/// The read_opaque_message_header error a record's header gives, as the
+/// connection answers it.
+fn invalid_header(err: MessageError) -> Error {
+    let invalid = match err {
         MessageError::TooShortForHeader | MessageError::TooShortForLength => {
             InvalidMessage::MessageTooShort
         }
         MessageError::InvalidEmptyPayload => InvalidMessage::InvalidEmptyPayload,
-        MessageError::MessageTooLarge => InvalidMessage::MessageTooLarge,
+        // record_overflow (RFC 8446 section 5.2, RFC 5246 section 7.2.2),
+        // not decode_error.
+        MessageError::MessageTooLarge => return Error::PeerSentOversizedRecord,
         MessageError::InvalidContentType => InvalidMessage::InvalidContentType,
         MessageError::UnknownProtocolVersion => InvalidMessage::UnknownProtocolVersion,
-    }
+    };
+    invalid.into()
 }
 
 impl<'a> Iterator for DeframerIter<'a> {
@@ -93,7 +98,7 @@ impl<'a> Iterator for DeframerIter<'a> {
             Err(MessageError::TooShortForHeader | MessageError::TooShortForLength) => {
                 return None;
             }
-            Err(err) => return Some(Err(invalid_header(err).into())),
+            Err(err) => return Some(Err(invalid_header(err))),
         };
 
         let end = HEADER_SIZE + len as usize;
@@ -206,7 +211,7 @@ mod tests {
         let mut iter = DeframerIter::new(&mut buffer);
         assert_eq!(
             iter.next().unwrap().err(),
-            Some(Error::InvalidMessage(InvalidMessage::MessageTooLarge))
+            Some(Error::PeerSentOversizedRecord)
         );
     }
 

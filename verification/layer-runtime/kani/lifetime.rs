@@ -18,12 +18,14 @@ fn any_outstanding() -> Outstanding {
     }
 }
 
-/// Over symbolic `u8` times, limits and flags: the idle deadline is never
-/// earlier than an idle limit after the first settle that found the stream
-/// quiet after its last busy one, where busy is any of output, input, work
-/// or memory; a settle that finds the stream waiting for memory leaves no
-/// idle deadline; and memory never moves the write deadline, which a twin
-/// lifetime that never waits for memory keeps exactly.
+/// Over symbolic `u8` times, limits and flags, with bytes read or written
+/// or not before each settle: the idle deadline is never earlier than an
+/// idle limit after the first settle that found the stream quiet since it
+/// was last busy, where busy is a byte read or written, or output, input,
+/// work or memory outstanding at a settle; a settle that finds the stream
+/// waiting for memory leaves no idle deadline; and memory never moves the
+/// write deadline, which a twin lifetime that never waits for memory
+/// keeps exactly.
 #[kani::proof]
 #[kani::unwind(4)]
 fn the_idle_clock_stops_while_memory_waits() {
@@ -41,6 +43,15 @@ fn the_idle_clock_stops_while_memory_waits() {
     for _ in 0..SETTLES {
         let step: u8 = kani::any();
         now = now + Duration::from_millis(u64::from(step));
+        let (read, wrote): (bool, bool) = (kani::any(), kani::any());
+        if read {
+            lifetime.took_input();
+            twin.took_input();
+        }
+        if wrote {
+            lifetime.wrote();
+            twin.wrote();
+        }
         let outstanding = any_outstanding();
         lifetime.settle(now, outstanding);
         twin.settle(
@@ -50,6 +61,11 @@ fn the_idle_clock_stops_while_memory_waits() {
                 ..outstanding
             },
         );
+        // A byte moved in the round this settle ends: quiet starts again,
+        // at the earliest at this settle.
+        if read || wrote {
+            quiet_from = None;
+        }
         let busy =
             outstanding.output || outstanding.input || outstanding.work || outstanding.memory;
         if busy {

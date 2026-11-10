@@ -1267,6 +1267,24 @@ theorem referral_aa_false (z : Zone) (q : Request) (any : AnyResponse) (hq : z.a
     unfold step; rw [hL]; simp only [hds, ↓reduceIte, hr]
   exact ⟨_, answer_done z q any hq hs, rfl, rfl, rfl, rfl⟩
 
+/-- RFC 9471 §3.1: a referral carries every glue RRset the cut holds for one of its NS targets at or below the
+cut (in-domain glue), first in the additional section, and counts exactly those as required, so `Fit.fit`
+sets TC when they do not all fit (`tc_iff_required_dropped`) and drops the sibling glue after them without TC
+(§3.2, `additional_drop_no_tc`). -/
+theorem referral_glue_first (z : Zone) (q : Request) (any : AnyResponse) (hq : z.apex <:+ q.qname)
+    {m : Name} {ns : RRset} {ds : Option RRset} {g : List RRset} (hb : z.BelowCut q.qname m ns ds g)
+    (hds : ¬ (m = q.qname ∧ q.qtype = 43)) :
+    ∃ r sib, answer z q any = .response r ∧
+      r.additional = g.filter (fun s => isAddr s && (targets ns).contains s.owner && under s.owner m) ++ sib ∧
+      r.required = (g.filter fun s => isAddr s && (targets ns).contains s.owner && under s.owner m).length := by
+  have hL := z.locate_eq hq (L := .cut m ns ds g) hb
+  obtain ⟨sib, hs⟩ := collect_total _ (siblingGlue_total z.look_ne_unknown z.apex m) (targets ns)
+  have hst : step z.look z.apex z.soa any q.qname q.qtype = .ok (.done .noerror false [] [ns]
+      (g.filter (fun s => isAddr s && (targets ns).contains s.owner && under s.owner m) ++ sib)
+      (g.filter fun s => isAddr s && (targets ns).contains s.owner && under s.owner m).length) := by
+    unfold step; rw [hL]; simp only [hds, ↓reduceIte]; unfold referral; rw [hs]
+  exact ⟨_, sib, answer_done z q any hq hst, rfl, rfl⟩
+
 /-- A negative answer (NXDOMAIN, or NODATA: NOERROR with no answer and AA=1) carries the zone's SOA in
 authority (RFC 2308 §3). -/
 theorem negative_has_soa (z : Zone) (q : Request) (any : AnyResponse) {r : Response}
@@ -1657,9 +1675,13 @@ def Spec.R5 (sp : Spec) : Prop :=
     ∀ d' ∈ sp.delegations, d' ≠ d → ¬ d.child <:+ d'.child
 def Spec.R6 (sp : Spec) : Prop :=
   ∀ d ∈ sp.delegations, ∀ t ∈ d.targets, d.child <:+ t → ∃ g ∈ d.glue, g.owner = t ∧ isAddr g = true
+/-- `t` is an alias in the zone: the owner of a CNAME, or a name strictly below a DNAME, which answers with
+the CNAME the DNAME makes (RFC 6672 §2.2). The DNAME's own owner is no alias. -/
+def Spec.Alias (sp : Spec) (t : Name) : Prop :=
+  ∃ s' ∈ sp.sets, (s'.owner = t ∧ s'.rtype = 5) ∨ (s'.rtype = 39 ∧ s'.owner <:+ t ∧ t ≠ s'.owner)
+/-- RFC 2181 §10.3: an NS, MX, or SRV target is no alias. -/
 def Spec.R7 (sp : Spec) : Prop :=
-  (∀ s ∈ sp.sets, ∀ t ∈ targets s, ∀ s' ∈ sp.sets, s'.owner = t → s'.rtype ≠ 5) ∧
-    ∀ d ∈ sp.delegations, ∀ t ∈ d.targets, ∀ s' ∈ sp.sets, s'.owner = t → s'.rtype ≠ 5
+  (∀ s ∈ sp.sets, ∀ t ∈ targets s, ¬ sp.Alias t) ∧ ∀ d ∈ sp.delegations, ∀ t ∈ d.targets, ¬ sp.Alias t
 def Spec.R8 (sp : Spec) : Prop :=
   ∀ s ∈ sp.sets, ∀ s' ∈ sp.sets, s.owner = s'.owner → s.rtype = s'.rtype → s.ttl = s'.ttl
 def Spec.R9 (sp : Spec) : Prop :=
@@ -1693,10 +1715,11 @@ def Spec.ok5 (sp : Spec) : Bool :=
 def Spec.ok6 (sp : Spec) : Bool :=
   sp.delegations.all fun d => d.targets.all fun t =>
     !under t d.child || d.glue.any fun g => g.owner == t && isAddr g
+def Spec.aliasB (sp : Spec) (t : Name) : Bool :=
+  sp.sets.any fun s' => (s'.owner == t && s'.rtype == 5) || (s'.rtype == 39 && strictly t s'.owner)
 def Spec.ok7 (sp : Spec) : Bool :=
-  let alias (t : Name) := sp.sets.any fun s' => s'.owner == t && s'.rtype == 5
-  sp.sets.all (fun s => (targets s).all fun t => !alias t) &&
-    sp.delegations.all fun d => d.targets.all fun t => !alias t
+  sp.sets.all (fun s => (targets s).all fun t => !sp.aliasB t) &&
+    sp.delegations.all fun d => d.targets.all fun t => !sp.aliasB t
 def Spec.ok8 (sp : Spec) : Bool :=
   sp.sets.all fun s => sp.sets.all fun s' => s.owner != s'.owner || s.rtype != s'.rtype || s.ttl == s'.ttl
 def Spec.ok9 (sp : Spec) : Bool :=
@@ -1795,9 +1818,13 @@ theorem Spec.ok6_iff (sp : Spec) : sp.ok6 = true ↔ sp.R6 := by
     | false => exact Or.inl rfl
     | true => exact Or.inr (h d hd t ht ((under_iff _ _).mp hu))
 
+theorem Spec.aliasB_iff (sp : Spec) (t : Name) : sp.aliasB t = true ↔ sp.Alias t := by
+  simp only [Spec.aliasB, Spec.Alias, strictly, List.any_eq_true, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq,
+    under_iff, bne_iff_ne, ne_eq]
+
 theorem Spec.ok7_iff (sp : Spec) : sp.ok7 = true ↔ sp.R7 := by
-  simp only [Spec.ok7, Spec.R7, List.all_eq_true, Bool.and_eq_true, Bool.not_eq_true', List.any_eq_false,
-    beq_iff_eq, not_and]
+  simp only [Spec.ok7, Spec.R7, List.all_eq_true, Bool.and_eq_true, Bool.not_eq_true', ← Spec.aliasB_iff,
+    Bool.not_eq_true]
 
 theorem Spec.ok8_iff (sp : Spec) : sp.ok8 = true ↔ sp.R8 := by
   simp only [Spec.ok8, Spec.R8, List.all_eq_true, Bool.or_eq_true, bne_iff_ne, ne_eq, beq_iff_eq]
@@ -1876,7 +1903,7 @@ def Spec.assemble (sp : Spec) : Zone :=
 
 /-- The first rule broken, as its error, naming what breaks it. -/
 def Spec.firstError (sp : Spec) : ZoneError :=
-  let alias (t : Name) := sp.sets.any fun s' => s'.owner == t && s'.rtype == 5
+  let alias := sp.aliasB
   let dnames := (sp.sets.filter (·.rtype == 39)).map (·.owner)
   let belowDname (o : Name) := dnames.any (strictly o ·)
   if !sp.ok1 then

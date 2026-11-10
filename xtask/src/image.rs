@@ -120,7 +120,12 @@ pub async fn build(downloads: &Path) -> Result {
     // The keys, the trust root and the credential placeholder are made once
     // here, baked into the image, and kept beside it for the host.
     let admin = ssh::Identity::generate()?;
-    let placeholder = fictionet_extras::models::Credential::claude_token_placeholder()?;
+    // The guest's Claude Code signs in the way the host will: with an API
+    // key when the host has only `ANTHROPIC_API_KEY`, else a subscription token.
+    let login = fictionet_extras::models::ClaudeLogin::of_host()
+        .unwrap_or(fictionet_extras::models::ClaudeLogin::Subscription);
+    println!("Claude Code signs in with: {login:?}");
+    let placeholder = login.placeholder()?;
     let (send, receive) = tokio::sync::oneshot::channel();
     fictionet::run(fictionet::Seed::random(), |cx| async move {
         let _ = send.send(Roots::generate(
@@ -134,6 +139,7 @@ pub async fn build(downloads: &Path) -> Result {
     let mut script = image::installation(&workstation::recipe(
         &admin,
         roots.root_pem(),
+        login,
         &placeholder,
     )?);
     script.push_str("systemctl disable image-build.service\nrm -f /root/build.sh /etc/systemd/system/image-build.service\nmkdir -p /mnt/build\nmount /dev/vdb /mnt/build\nprintf installed > /mnt/build/result\nsync\numount /mnt/build\nsystemctl poweroff\n");

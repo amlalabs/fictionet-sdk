@@ -48,6 +48,15 @@ pub enum Source {
     Edited,
 }
 
+/// How much of the real web the host lets the world copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveWeb {
+    /// Any public URL: Live, Live-Depth and Edited.
+    Any,
+    /// Only what searches allow: Live-Depth alone.
+    SearchedOnly,
+}
+
 /// Why Live-Depth's network policy blocks an address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

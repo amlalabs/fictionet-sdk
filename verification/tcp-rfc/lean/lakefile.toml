@@ -1,0 +1,10 @@
+name = "tcp_rfc_verification"
+version = "0.1.0"
+defaultTargets = ["TcpRfc", "gen"]
+
+[[lean_lib]]
+name = "TcpRfc"
+
+[[lean_exe]]
+name = "gen"
+root = "Gen"

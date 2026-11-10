@@ -1,15 +1,21 @@
 #![deny(unsafe_code)]
 
 //! Host tooling for demo images and offline web captures, and the
-//! verification of Fictionet's DNS, MPTCP and layer routing.
+//! verification of Fictionet's DNS, MPTCP, HPACK and layer routing.
 
 #[cfg(feature = "host-tools")]
 mod capture;
 mod dns_verify;
 mod gate;
 #[cfg(feature = "host-tools")]
+mod honeypot_vm;
+mod hpack_verify;
+mod http_verify;
+#[cfg(feature = "host-tools")]
 mod image;
+mod ip_verify;
 mod layer_verify;
+mod lean_vectors;
 mod mptcp_verify;
 #[cfg(feature = "host-tools")]
 mod rawnic;
@@ -17,6 +23,10 @@ mod rawnic;
 // This module owns the host syscall boundary.
 #[allow(unsafe_code)]
 mod ssh_connect;
+mod tcp_rfc_verify;
+mod tls_verify;
+mod tls_verify_handshake;
+mod tls_verify_record;
 #[cfg(feature = "host-tools")]
 mod web;
 #[cfg(feature = "host-tools")]
@@ -29,9 +39,9 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + 
 
 fn main() -> Result {
     let mut args = std::env::args().skip(1);
-    let task = args
-        .next()
-        .ok_or("expected gate, dns-verify, mptcp-verify, layer-verify or a host command")?;
+    let task = args.next().ok_or(
+        "expected gate, dns-verify, http-verify, mptcp-verify, hpack-verify, layer-verify or a host command",
+    )?;
     if task == "kani" {
         return gate::kani(&args.collect::<Vec<_>>());
     }
@@ -41,17 +51,33 @@ fn main() -> Result {
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());
     }
+    if task == "tcp-rfc-verify" {
+        return tcp_rfc_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "hpack-verify" {
+        return hpack_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "http-verify" {
+        return http_verify::run(&args.collect::<Vec<_>>());
+    }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "layer-verify" {
         return layer_verify::run(&args.collect::<Vec<_>>());
     }
+    if task == "tls-verify" {
+        return tls_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "ip-verify" {
+        return ip_verify::run(&args.collect::<Vec<_>>());
+    }
     if !matches!(
         task.as_str(),
         "ssh-connect"
             | "rawnic"
             | "egress"
+            | "honeypot-vm"
             | "search-web"
             | "search-requisites"
             | "search-capture"
@@ -81,6 +107,12 @@ async fn host(task: &str, mut args: impl Iterator<Item = String>) -> Result {
         return ssh_connect::run(&args.collect::<Vec<_>>()).await;
     }
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
+    if task == "honeypot-vm" {
+        if args.next().is_some() {
+            return Err("unexpected argument".into());
+        }
+        return honeypot_vm::run(downloads);
+    }
     if task == "rawnic" || task == "egress" {
         if args.next().is_some() {
             return Err("unexpected argument".into());

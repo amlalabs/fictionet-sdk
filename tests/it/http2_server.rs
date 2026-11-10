@@ -1208,6 +1208,37 @@ fn zero_stream_window_is_a_stream_error_and_large_headers_get_431() {
 }
 
 #[test]
+fn a_431_that_ends_a_request_that_ended_is_the_streams_last_frame() {
+    // The 431 carries END_STREAM. After a request that ended, the stream is
+    // closed, and nothing but PRIORITY may follow on it (RFC 9113 section
+    // 5.1). After a request still open, a reset stops its body.
+    let limits = httpd::Limits {
+        head: fictionet::stdlib::protocols::http1::Limits {
+            head: 256,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let router = fictionet_test_support::handler(|_, _| http::Response::new(Bytes::new()));
+    let mut harness = server(Responder::shared(Arc::new(router)).limits(limits));
+    push(&mut harness, &preface());
+    for (stream, end) in [(1, true), (3, false)] {
+        let Frame::Headers(mut oversized) = Frame::parse(&headers(stream, "/", end)).unwrap()
+        else {
+            unreachable!()
+        };
+        oversized.fragment.extend_from_slice(&[0xaf; 10]);
+        let reply = frames(&push(&mut harness, &oversized.to_bytes().unwrap()));
+        assert_eq!(statuses(&reply), [(stream, b"431".to_vec())]);
+        let reset = reply
+            .iter()
+            .any(|f| matches!(f, Frame::Reset(r) if r.stream == stream));
+        assert_eq!(reset, !end, "{reply:?}");
+    }
+    assert!(!harness.ended());
+}
+
+#[test]
 fn graceful_goaway_drains_streams_after_the_ping_round_trip() {
     let mut service = Responder::new(fictionet_test_support::handler(
         |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, _: http::Request<bytes::Bytes>| {
@@ -1834,11 +1865,8 @@ fn repeated_header_refusals_exhaust_the_local_reset_limit() {
         h.fragment.extend_from_slice(&[0xaf; 10]);
         let output = frames(&push(&mut harness, &h.to_bytes().unwrap()));
         assert_eq!(statuses(&output), [(2 * n + 1, b"431".to_vec())]);
-        assert!(
-            output
-                .iter()
-                .any(|f| matches!(f, Frame::Reset(r) if r.code == 7))
-        );
+        // Each request ended, so the 431 is its stream's last frame.
+        assert!(!output.iter().any(|f| matches!(f, Frame::Reset(_))));
         assert_eq!(harness.ended(), n == 1024);
         if n == 1024 {
             assert!(

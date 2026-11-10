@@ -335,8 +335,9 @@ pub(crate) fn read_opaque_message_header(
         return Err(MessageError::InvalidEmptyPayload);
     }
 
-    // Reject oversize messages
-    if len >= MAX_PAYLOAD {
+    // Reject oversize messages: no record is longer than 2^14 + 2048
+    // (RFC 5246 section 6.2.3), the most a TLS 1.2 record may be.
+    if len > MAX_PAYLOAD {
         return Err(MessageError::MessageTooLarge);
     }
 

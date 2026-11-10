@@ -1,6 +1,6 @@
 //! Kani proofs over IP header arithmetic in `src/stdlib/network/ip.rs`:
-//! the Internet checksum (`sum`, `fold` and `checksum`, lines 1464-1494),
-//! the IPv4 reader (`v4` and `v4_checked`, 1185-1215), and the IPv6 check
+//! the Internet checksum (`sum`, `fold` and `checksum`, lines 1491-1521),
+//! the IPv4 reader (`v4` and `v4_checked`, 1200-1239), and the IPv6 check
 //! and extension-header stripping (`chain6`, `strip_extension_headers`,
 //! 1283-1442) that the IP layer's normalization rests on. Compiled only
 //! under `cargo kani`, as a child module of `ip`, so every harness calls the

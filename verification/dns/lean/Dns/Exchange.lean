@@ -142,6 +142,93 @@ theorem advance_clears (x : Bool) (s : State) (g : Nat) (hg : s.generation < g) 
   show r.token.generation ≠ g
   rw [hr, hgen p hp]; omega
 
+/-! ## Each reply answers one exchange, in any order -/
+
+/-- Whether `onReply` takes the reply: its token is current and outstanding and the reply matches the
+tuple. -/
+def takes (x : Bool) (s : State) (r : Reply) : Bool :=
+  r.token.generation == s.generation && (s.pending.find? (·.token == r.token)).any (tupleMatches x · r)
+
+theorem onReply_eq (x : Bool) (s : State) (r : Reply) :
+    onReply x s r = if takes x s r then
+      ({ s with pending := s.pending.filter (·.token != r.token), cache := ⟨s.generation, r.payload⟩ :: s.cache },
+        .accepted)
+    else (s, .ignored) := by
+  unfold onReply takes
+  by_cases hg : r.token.generation = s.generation
+  · simp only [hg, ↓reduceIte, beq_self_eq_true, Bool.true_and]
+    cases s.pending.find? (·.token == r.token) with
+    | none => simp
+    | some p => by_cases hm : tupleMatches x p r = true <;> simp [hm]
+  · simp [hg]
+
+theorem find_filter_other (l : List Pending) (a b : Token) (hne : b ≠ a) :
+    (l.filter (·.token != a)).find? (·.token == b) = l.find? (·.token == b) := by
+  induction l with
+  | nil => rfl
+  | cons p ps ih =>
+    by_cases ha : p.token = a
+    · have hb : (p.token == b) = false := by
+        simp only [beq_eq_false_iff_ne, ne_eq]; intro h; exact hne (h ▸ ha)
+      rw [List.filter_cons_of_neg (by simp [ha]), List.find?_cons_of_neg (by simp [hb]), ih]
+    · rw [List.filter_cons_of_pos (by simp [ha])]
+      by_cases hb : p.token = b
+      · rw [List.find?_cons_of_pos (by simp [hb]), List.find?_cons_of_pos (by simp [hb])]
+      · rw [List.find?_cons_of_neg (by simp [hb]), List.find?_cons_of_neg (by simp [hb]), ih]
+
+/-- Once a reply is taken, its exchange is no longer outstanding: a second copy of it, or any later reply
+bearing its token, is ignored and changes nothing. Each exchange is answered once (RFC 5452 §9.1). -/
+theorem duplicate_ignored (x : Bool) (s : State) (r r' : Reply) (ht : r'.token = r.token)
+    (h : (onReply x s r).2 = .accepted) :
+    onReply x (onReply x s r).1 r' = ((onReply x s r).1, .ignored) := by
+  have hk : takes x s r = true := by
+    cases hk : takes x s r
+    · rw [onReply_eq, hk] at h; simp at h
+    · rfl
+  have hp : (onReply x s r).1.pending = s.pending.filter (·.token != r.token) := by
+    rw [onReply_eq]; simp [hk]
+  have hn : takes x (onReply x s r).1 r' = false := by
+    unfold takes
+    rw [hp]
+    have hf : (s.pending.filter (·.token != r.token)).find? (·.token == r'.token) = none := by
+      rw [List.find?_eq_none]
+      intro p hm
+      simp only [List.mem_filter, bne_iff_ne, ne_eq] at hm
+      simp [ht, hm.2]
+    simp [hf]
+  rw [onReply_eq x (onReply x s r).1 r', hn]
+  rfl
+
+/-- Replies to two exchanges outstanding at once may arrive in either order (RFC 7766 §6.2.1.1: responses
+may come out of order, and a client matches each by its ID and question): whether each is taken, and what
+stays outstanding after both, is the same either way. -/
+theorem replies_commute (x : Bool) (s : State) (r1 r2 : Reply) (hne : r1.token ≠ r2.token) :
+    (onReply x (onReply x s r1).1 r2).2 = (onReply x s r2).2 ∧
+      (onReply x (onReply x s r2).1 r1).2 = (onReply x s r1).2 ∧
+      (onReply x (onReply x s r1).1 r2).1.pending = (onReply x (onReply x s r2).1 r1).1.pending := by
+  -- taking one reply leaves whether the other is taken unchanged
+  have keep : ∀ (a b : Reply), a.token ≠ b.token →
+      takes x (onReply x s a).1 b = takes x s b := by
+    intro a b hab
+    rw [onReply_eq]
+    by_cases ha : takes x s a = true
+    · simp only [ha, ↓reduceIte]
+      unfold takes
+      simp only
+      rw [find_filter_other _ _ _ (Ne.symm hab)]
+    · simp [ha]
+  have k12 := keep r1 r2 hne
+  have k21 := keep r2 r1 (Ne.symm hne)
+  refine ⟨?_, ?_, ?_⟩
+  · rw [onReply_eq x (onReply x s r1).1 r2, k12, onReply_eq x s r2]
+    split <;> rfl
+  · rw [onReply_eq x (onReply x s r2).1 r1, k21, onReply_eq x s r1]
+    split <;> rfl
+  · rw [onReply_eq x (onReply x s r1).1 r2, k12, onReply_eq x (onReply x s r2).1 r1, k21]
+    rw [onReply_eq x s r1, onReply_eq x s r2]
+    by_cases h1 : takes x s r1 = true <;> by_cases h2 : takes x s r2 = true <;>
+      simp [h1, h2, List.filter_filter, Bool.and_comm]
+
 /-! ## Nothing derived from an old generation survives -/
 
 /-- Every cache entry is of the current generation, and every outstanding token is current and below the

@@ -71,9 +71,10 @@ const FAIR: u32 = 64;
 /// The limits [`stream`] keeps on a connection.
 #[derive(Clone, Copy, Debug)]
 pub struct StreamLimits {
-    /// End the input of a connection that sends nothing for this long
-    /// while the runner waits for it with nothing to write and no work
-    /// running. The stack hears [`StreamEvent::Ended`], as if the peer had
+    /// End the input of a connection on which no byte moves either way
+    /// for this long, with nothing to write, no work running and no wait
+    /// for memory: a byte read or written starts the time again.
+    /// The stack hears [`StreamEvent::Ended`], as if the peer had
     /// ended its direction. Default 10 seconds. `None` waits forever.
     ///
     /// [`StreamEvent::Ended`]: fictionet::stdlib::layer::StreamEvent::Ended

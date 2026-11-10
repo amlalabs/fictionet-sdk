@@ -181,6 +181,28 @@ impl Minimise {
             one_label: 4,
         }
     }
+
+    /// How many labels of a name of `total` labels the next minimised
+    /// query shows, when `known` of them are known (the zone cut asked, or
+    /// a deeper name a minimised query already passed through) and `steps`
+    /// minimised queries went before it; `None` when the whole question
+    /// goes next (RFC 9156 §2.3). The first [`one_label`](Self::one_label)
+    /// queries add one label each, and the rest divide the labels not yet
+    /// shown over the queries left, rounding down, so the remainder goes
+    /// to the later ones.
+    pub fn next_labels(&self, known: usize, total: usize, steps: u8) -> Option<usize> {
+        if known + 1 >= total || steps >= self.max_queries {
+            return None;
+        }
+        let add = if steps < self.one_label {
+            1
+        } else {
+            let left = usize::from(self.max_queries - steps);
+            ((total - known) / left).max(1)
+        };
+        let labels = known + add;
+        (labels < total).then_some(labels)
+    }
 }
 
 /// How a resolver serves expired data (RFC 8767).

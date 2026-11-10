@@ -613,3 +613,313 @@ fn write_wide_length(
 fn websocket_control_without_minimal_length() {
     websocket_writer_uses_minimal_length();
 }
+
+fn writer_follows_frame_rules<const N: usize>(
+    opcode: Opcode,
+    fin: bool,
+    mask: Option<[u8; 4]>,
+    data: [u8; N],
+) {
+    let op = opcode.to_u8();
+    let payload = &data[..];
+    let control = op >= 8;
+    let close_ok = op != 8
+        || match payload {
+            [] => true,
+            [hi, lo, reason @ ..] => {
+                let code = u16::from_be_bytes([*hi, *lo]);
+                ((1000..=1003).contains(&code)
+                    || (1007..=1014).contains(&code)
+                    || (3000..=4999).contains(&code))
+                    && core::str::from_utf8(reason).is_ok()
+            }
+            [_] => false,
+        };
+    let mut out = Vec::new();
+    let result = write_frame(&mut out, fin, opcode, mask, payload);
+    // 5.5: control frames are final; 5.5.1: a Close body is a valid code
+    // and a UTF-8 reason.
+    assert!(result.is_ok() == (!(control && !fin) && close_ok));
+    if result.is_err() {
+        assert!(out.is_empty());
+        return;
+    }
+    // 5.2: reserved bits clear, FIN and opcode as asked, mask bit set
+    // exactly when a key is given.
+    assert!(out[0] & 0x70 == 0);
+    assert!((out[0] & 0x80 != 0) == fin);
+    assert!(out[0] & 0x0f == op);
+    assert!((out[1] & 0x80 != 0) == mask.is_some());
+    let Ok(header) = Header::parse_exact(&out) else {
+        panic!("a written frame reads back");
+    };
+    let Some(frame) = Frame::from_header(&out, header) else {
+        panic!("a written frame reads back");
+    };
+    assert!(frame.fin == fin && frame.opcode == opcode && frame.mask == mask);
+    assert!(frame.payload.as_slice() == payload);
+}
+
+// One harness per opcode and payload length, with any FIN, mask and
+// payload bytes. Every opcode the writer can take (the type has no
+// reserved ones) gets two bytes; Close gets 0 to 3 bytes, since three
+// bytes hold a code and a one-byte reason.
+macro_rules! writer_case {
+    ($name:ident, $opcode:expr, $len:expr) => {
+        #[kani::proof]
+        #[kani::unwind(10)]
+        fn $name() {
+            writer_follows_frame_rules::<$len>($opcode, kani::any(), kani::any(), kani::any());
+        }
+    };
+}
+writer_case!(websocket_writer_rules_continuation, Opcode::Continuation, 2);
+writer_case!(websocket_writer_rules_text, Opcode::Text, 2);
+writer_case!(websocket_writer_rules_binary, Opcode::Binary, 2);
+writer_case!(websocket_writer_rules_ping, Opcode::Ping, 2);
+writer_case!(websocket_writer_rules_pong, Opcode::Pong, 2);
+writer_case!(websocket_writer_rules_close_zero, Opcode::Close, 0);
+writer_case!(websocket_writer_rules_close_one, Opcode::Close, 1);
+writer_case!(websocket_writer_rules_close_two, Opcode::Close, 2);
+writer_case!(websocket_writer_rules_close_three, Opcode::Close, 3);
+
+#[kani::proof]
+#[kani::unwind(10)]
+#[kani::stub(Opcode::is_control, ignore_control_kind)]
+fn websocket_control_without_writer_control_rules() {
+    writer_follows_frame_rules(Opcode::Ping, false, None, [0; 0]);
+}
+
+fn write_reserved_bit(
+    out: &mut Vec<u8>,
+    fin: bool,
+    opcode: Opcode,
+    mask: Option<[u8; 4]>,
+    len: usize,
+) {
+    out.push(if fin { 0x80 } else { 0 } | 0x40 | opcode.to_u8());
+    out.push(if mask.is_some() { 0x80 } else { 0 } | len as u8);
+    if let Some(key) = mask {
+        out.extend_from_slice(&key);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(10)]
+#[kani::stub(write_header, write_reserved_bit)]
+fn websocket_control_without_writer_reserved_bits() {
+    writer_follows_frame_rules(Opcode::Binary, true, None, [0; 0]);
+}
+
+fn writer_bounds_control_payload(opcode: Opcode, fin: bool, len: usize) {
+    let mut payload = vec![b'a'; len];
+    if opcode == Opcode::Close {
+        payload[..2].copy_from_slice(&close_code::NORMAL.to_be_bytes());
+    }
+    let mut out = Vec::new();
+    let result = write_frame(&mut out, fin, opcode, None, &payload);
+    // 5.5: at most 125 bytes, and final.
+    assert!(result.is_ok() == (fin && len <= MAX_CONTROL_PAYLOAD));
+}
+
+// Ping and Pong at 125 and 126 bytes in one harness each, and Close at
+// 126. Any FIN. A 125-byte Close needs its 123-byte reason checked as
+// UTF-8, which runs CBMC out of memory under the 8 GiB cap, so it has no
+// harness.
+macro_rules! control_size_case {
+    ($name:ident, $opcode:expr) => {
+        #[kani::proof]
+        #[kani::unwind(130)]
+        fn $name() {
+            let len: usize = kani::any();
+            kani::assume(len == 125 || len == 126);
+            writer_bounds_control_payload($opcode, kani::any(), len);
+        }
+    };
+}
+control_size_case!(websocket_writer_bounds_control_payload_ping, Opcode::Ping);
+control_size_case!(websocket_writer_bounds_control_payload_pong, Opcode::Pong);
+
+#[kani::proof]
+#[kani::unwind(130)]
+fn websocket_writer_bounds_control_payload_close_126() {
+    writer_bounds_control_payload(Opcode::Close, kani::any(), 126);
+}
+
+#[kani::proof]
+#[kani::unwind(130)]
+#[kani::stub(Opcode::is_control, ignore_control_kind)]
+fn websocket_control_without_writer_control_size() {
+    writer_bounds_control_payload(Opcode::Ping, true, 126);
+}
+
+fn fragments_follow_rfc(message: Message, body: &[u8], max: usize, mask: Option<[u8; 4]>) {
+    let Ok(frames) = message.to_frames(max, mask) else {
+        panic!("small messages fit");
+    };
+    let size = max.clamp(1, MAX_PAYLOAD);
+    if message.opcode().is_control() {
+        // 5.5: a control message is one final frame.
+        assert!(frames.len() == 1);
+    }
+    // 5.4: the first frame carries the opcode, the rest are continuations,
+    // only the last is final, and the payloads in order are the message.
+    // Each frame is one the writer accepts.
+    let mut joined = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let expected = if i == 0 {
+            message.opcode()
+        } else {
+            Opcode::Continuation
+        };
+        assert!(f.opcode == expected);
+        assert!(f.fin == (i + 1 == frames.len()));
+        assert!(f.mask == mask);
+        assert!(f.payload.len() <= size || message.opcode().is_control());
+        assert!(!f.payload.is_empty() || frames.len() == 1);
+        joined.extend_from_slice(&f.payload);
+        assert!(f.to_bytes().is_ok());
+    }
+    assert!(joined.as_slice() == body);
+}
+
+// One harness per message kind. Empty text and binary messages and
+// three-byte control messages take any fragment size up to 4 (0 is
+// clamped to 1). Three-byte binary messages, which split into several
+// frames, take each fragment size from 1 to 3 in a harness of their own.
+// Unmasked: masking is proved by the mask and small-frame harnesses.
+fn any_fragment_size() -> usize {
+    let max: usize = kani::any();
+    kani::assume(max <= 4);
+    max
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_fragments_follow_rfc_text_empty() {
+    fragments_follow_rfc(Message::Text(String::new()), &[], any_fragment_size(), None);
+}
+
+macro_rules! split_case {
+    ($name:ident, $max:expr) => {
+        #[kani::proof]
+        #[kani::unwind(8)]
+        fn $name() {
+            let data: [u8; 3] = kani::any();
+            fragments_follow_rfc(Message::Binary(data.to_vec()), &data, $max, None);
+        }
+    };
+}
+split_case!(websocket_fragments_follow_rfc_binary_three_by_one, 1);
+split_case!(websocket_fragments_follow_rfc_binary_three_by_two, 2);
+split_case!(websocket_fragments_follow_rfc_binary_three_by_three, 3);
+
+// Text splits like binary (to_frames takes the text's bytes). The text
+// case that matters is a split inside a character (5.6): "€" is three
+// bytes, split one byte per frame. Any fragment size here runs CBMC out
+// of memory under the 8 GiB cap.
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_fragments_follow_rfc_text_split_character() {
+    let euro = "€";
+    fragments_follow_rfc(Message::Text(euro.to_string()), euro.as_bytes(), 1, None);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_fragments_follow_rfc_binary_empty() {
+    fragments_follow_rfc(Message::Binary(Vec::new()), &[], any_fragment_size(), None);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_fragments_follow_rfc_ping() {
+    let data: [u8; 3] = kani::any();
+    fragments_follow_rfc(
+        Message::Ping(data.to_vec()),
+        &data,
+        any_fragment_size(),
+        None,
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_fragments_follow_rfc_pong() {
+    let data: [u8; 3] = kani::any();
+    fragments_follow_rfc(
+        Message::Pong(data.to_vec()),
+        &data,
+        any_fragment_size(),
+        None,
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+fn websocket_fragments_follow_rfc_close() {
+    fragments_follow_rfc(Message::Close(None), &[], any_fragment_size(), None);
+}
+
+fn frames_all_final(
+    message: &Message,
+    max_fragment: usize,
+    mask: Option<[u8; 4]>,
+) -> Result<Vec<Frame>, Error> {
+    let frame = message.to_frame(mask)?;
+    let size = max_fragment.clamp(1, MAX_PAYLOAD);
+    if frame.opcode.is_control() || frame.payload.len() <= size {
+        return Ok(vec![frame]);
+    }
+    Ok(frame
+        .payload
+        .chunks(size)
+        .enumerate()
+        .map(|(i, chunk)| Frame {
+            fin: true,
+            opcode: if i == 0 {
+                frame.opcode
+            } else {
+                Opcode::Continuation
+            },
+            mask,
+            payload: chunk.to_vec(),
+        })
+        .collect())
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::stub(Message::to_frames, frames_all_final)]
+fn websocket_control_without_fragment_fin() {
+    fragments_follow_rfc(Message::Binary(vec![1, 2]), &[1, 2], 1, None);
+}
+
+fn frames_split_control(
+    message: &Message,
+    max_fragment: usize,
+    mask: Option<[u8; 4]>,
+) -> Result<Vec<Frame>, Error> {
+    let frame = message.to_frame(mask)?;
+    let size = max_fragment.clamp(1, MAX_PAYLOAD);
+    let count = frame.payload.len().div_ceil(size).max(1);
+    Ok((0..count)
+        .map(|i| Frame {
+            fin: i + 1 == count,
+            opcode: if i == 0 {
+                frame.opcode
+            } else {
+                Opcode::Continuation
+            },
+            mask,
+            payload: frame.payload[i * size..frame.payload.len().min((i + 1) * size)].to_vec(),
+        })
+        .collect())
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::stub(Message::to_frames, frames_split_control)]
+fn websocket_control_without_control_unsplit() {
+    fragments_follow_rfc(Message::Ping(vec![1, 2]), &[1, 2], 1, None);
+}

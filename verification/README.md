@@ -39,21 +39,23 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`runtime`](runtime/README.md) | the runtime's state machines: executor, job context, regions, timers and the lab clock | each locked section of `src/run.rs`, `src/cx/*.rs` and `src/timer.rs` is one step; `JobContext.tla` was brought to the code (the cancellation guards it never had are gone) | TLC per config |
 | [`lifecycle`](lifecycle/README.md) | one TCP connection's life, from handshake to retirement (`Conn.tla`) | model named to `tcp/engine.rs` and the handles in `tcp.rs` | TLC per config |
 | [`tls`](tls/README.md) | the server TLS layer under `Driver` and `Harness` (`Layer.tla`), write cancellation in the live connection (`Write.tla`); the layer's write accounting in Kani; the provider draws entropy only from what it was given | models named to `services/tls/layer.rs` and `stack/open.rs`; Kani on the production layer | TLC per config; `cargo kani` |
+| [`tls-rfc`](tls-rfc/README.md) | the vendored rustls against RFC 8446 and RFC 5246/7627: the server handshake (`Handshake.tla`, refined by `ServerHs.tla`), the record layer with the budget's refusals (`Record.tla`, refined by `RecordCode.tla`): plaintext only after authentication, no nonce used twice, no gap on the wire, key update order, refusals change nothing; Lean: record checks before decryption and nonce use (16 theorems, standard axioms only) | `hs_trace.rs` handshakes and `record_trace.rs` schedules replayed by `HandshakeTrace.tla` and `RecordTrace.tla`; `Gen.lean` vectors replayed by `record_vectors` and `nonce_vectors` in rustls's tests | `cargo xtask tls-verify handshake-trace`, `record-trace`, `lean`, `vectors`; TLC per config |
 | [`tls-contract`](tls-contract/README.md) | what a replacement TLS must keep: ordered owned plaintext, sticky failure, stable negotiated metadata; STARTTLS (`Starttls.tla`); encrypted DNS request order | models follow the named Rust transitions; two `EncryptedDns_*_request_order` configs are documented expected failures | TLC per config |
-| [`ssh-layer`](ssh-layer/README.md) | the transport/authentication boundary, ordered key changes, completion ownership, channel lifecycle and the honeypot policy | models named in their headers to `services/ssh`; Kani on the production arithmetic in `ssh.rs` | TLC per config; `cargo kani` |
-| [`http`](http/README.md) | HTTP/1 pipelining and the switch to a tunnel (`Pipeline.tla`), HTTP/2 flow control and stream states (`Flow.tla`, `Streams.tla`), the tunnel's room and charges (`Tunnel.tla`); framing in Lean; body decoding and request smuggling in Kani | models named to `web/httpd/native.rs`, `http2.rs`, `stack/tunnel.rs`; Kani on the production decoder and `Reader` (memchr stubbed); the Lean `Request.lean` rules have no Rust tie | TLC per config; `cargo kani`; `lake build` in `http/lean` |
-| [`http2-layer`](http2-layer/README.md) | the layer `Http2`: flow control with children (`Flow.tla`), stream and connection lifecycle (`Lifecycle.tla`), SETTINGS (`Settings.tla`), the h2c switch (`H2cSwitch.tla`); window arithmetic and the preface scan in Kani | models named to `http2.rs`, `children.rs`, `switch.rs`, `detect.rs`; Kani on the production helpers | TLC per config; `cargo kani` |
-| [`hpack-grpc`](hpack-grpc/README.md) | encoder and decoder table sizes stay in step through SETTINGS and size updates (`HpackSync.tla`), for the default encoder and the server's `Encoder::new(0)` | model named to `hpack.rs` and `http2.rs` | TLC per config |
+| [`ssh-layer`](ssh-layer/README.md) | the transport/authentication boundary, ordered key changes, completion ownership, channel lifecycle and the honeypot policy; conformance with RFC 4253 (ordering, NEWKEYS per direction, rekeys with data in flight, wrapping sequence numbers, strict KEX), RFC 8308 EXT_INFO, RFC 4252 (pipelined requests, no service before success) and RFC 4254 (open replies and reason codes, EOF and CLOSE, requests, windows), and no stall under the half-window adjustment policy against russh's bounded queues (`Transport.tla`, `Auth.tla`, `Close.tla`, `Window.tla`, `Adjust.tla`); window lemmas in Lean | `Transport.tla` traces replayed on the production transport with real crypto (`protocols/ssh/transport/replay.rs`); `Adjust.tla` searched exhaustively on the production `Channel`; other models named in their headers to `services/ssh`; Kani on the production arithmetic in `ssh.rs` | TLC per config; `cargo kani`; `lean lean/Adjust.lean` |
+| [`http`](http/README.md) | HTTP/1 pipelining and the switch to a tunnel (`Pipeline.tla`), HTTP/2 flow control and stream states (`Flow.tla`, `Streams.tla`), the tunnel's room and charges (`Tunnel.tla`); framing in Lean; no request smuggling between the HTTP/1 decoder and any RFC 9112 recipient (`request_agrees`, Lean); body decoding and request smuggling in Kani | `Gen.lean` vectors replayed by `tests/http1_vectors.rs` against `RequestEvents` and `ResponseEvents`, and `Request.lean` tied by `wire_framing_is_request` and `framing.json`; models named to `web/httpd/native.rs`, `http2.rs`, `stack/tunnel.rs`; Kani on the production decoder and `Reader` (memchr stubbed) | `cargo xtask http-verify lean` and `diff`; TLC per config; `cargo kani` |
+| [`http2-layer`](http2-layer/README.md) | the layer `Http2`: flow control with children (`Flow.tla`), stream and connection lifecycle (`Lifecycle.tla`), SETTINGS (`Settings.tla`), the h2c switch (`H2cSwitch.tla`); RFC 9113 specs written from the text (`StreamRules.tla`, `RfcFlow.tla`, `RfcGoaway.tla`) that `Http2` and `Session` refine (`H2Streams`, `SessionStreams`, `Http2Rfc`, `SessionRfc`, `Http2Refusal`); window arithmetic, `Session`'s windows, frame refusals and the preface scan in Kani | models named to `http2.rs`, `protocols/http2.rs`, `children.rs`, `switch.rs`, `detect.rs`; Kani on the production helpers | TLC per config; `cargo kani` |
+| [`hpack-grpc`](hpack-grpc/README.md) | Lean: RFC 7541 integers, Huffman with its padding and EOS rules, the dynamic table, size updates, and encoder-decoder round trips (34 theorems, standard axioms only); TLA+: encoder and decoder table sizes stay in step through SETTINGS and size updates (`HpackSync.tla`) | `Gen.lean` vectors replayed by `tests/hpack_vectors.rs`; `cargo xtask hpack-verify lean|vectors|diff`; model named to `hpack.rs` and `http2.rs` | `cargo xtask hpack-verify lean` and `diff`; TLC per config |
 | [`websocket`](websocket/README.md) | message assembly, control frames and close (`Messages.tla`, `Echo.tla`); frame parsing and writing in Kani (29 harnesses) | models named to `websocket.rs`; Kani on the production functions with the stubs its README lists | TLC per config; `cargo kani` |
 | [`codec`](codec/README.md) | the stream demultiplexer (`Demux.tla`); the codec stream, buffers and limits in Kani (36 harnesses) | model named to `codec/demux.rs`; Kani through the public API, no stubs | TLC; `cargo kani` |
 | [`dissector`](dissector/README.md) | traffic dissection: stream reassembly with gaps (`Stream.tla`), HTTP/1 pairing (`Pairing.tla`), HPACK and TLS dissection | models named to `dissect/`; Kani on the production code | TLC per config; `cargo kani` |
-| [`dns`](dns/README.md) | Lean: the wire format and the answer algorithm (62 theorems, standard axioms only); TLA+: exchanges, resolution (bailiwick, work bounds, negative caching, spoofing), DNSSEC validation | `Gen.lean` vectors replayed by `tests/dns_vectors.rs`; `cargo xtask dns-verify lean|vectors|diff`; models named to the resolver's functions; one control per property | `cargo xtask dns-verify lean` and `diff`; TLC per config |
+| [`dns`](dns/README.md) | Lean: the wire format, request checks, TCP framing, size limits, the answer algorithm, signature windows in serial arithmetic, key tags, the negative cache with the NXDOMAIN cut, and QNAME minimisation (86 headline theorems, standard axioms only); TLA+: exchanges, resolution (bailiwick, work bounds, negative caching, spoofing), DNSSEC validation | `Gen.lean` vectors replayed by `tests/dns_vectors.rs`; `cargo xtask dns-verify lean|vectors|diff`; models named to the resolver's functions; one control per property | `cargo xtask dns-verify lean` and `diff`; TLC per config |
 | [`mptcp`](mptcp/README.md) | Lean: options, sequence mapping, crypto and IPv4 handling (42 theorems); TLA+: the join handshake, data mapping, the listener's backlog with cookies, the honeypot's observation | `Gen.lean` vectors replayed by `tests/mptcp_vectors.rs`; `cargo xtask mptcp-verify lean|diff`; models named to `extras/src/linux/mptcp.rs`, `tcp/engine.rs`, `demos/honeypot` | `cargo xtask mptcp-verify lean` and `diff`; TLC per config |
 | [`tcp-layer`](tcp-layer/README.md) | the TCP layer's handshakes, accept, close and orphan handling over smoltcp (`Layer.tla`) | model named to `tcp/engine.rs`; SYN cookies are left to `mptcp/tla/Listener.tla` | TLC per config |
+| [`tcp-rfc`](tcp-rfc/README.md) | the smoltcp socket refines RFC 9293 segment arrival with RFC 5961 (`Rfc9293.tla`, `Engine.tla`), with eight named departures; Lean: the arrival rules over the full 32-bit space | `Engine.tla` named to `process`; logs of the real socket replayed against `Rfc9293.tla` (`RfcTrace.tla`, `smoltcp/src/socket/tcp/rfc_trace.rs`); `Gen.lean` vectors replayed through `process` (`rfc_vectors.rs`) | `cargo xtask tcp-rfc-verify trace`, `lean`, `diff`; TLC per config |
 | [`tcp-port-zero`](tcp-port-zero/README.md) | smoltcp's socket with source port zero (`Socket.tla`), port allocation and preparation (`Binding.tla`); the wire and socket in Kani | models named to the vendored smoltcp, `engine.rs`, `hosts.rs`; Kani included in smoltcp's tests | TLC per config; `cargo kani` |
 | [`tcp-store`](tcp-store/README.md) | the TCP socket's receive and send stores of retained chunks: what they hold, the window, acknowledgements, and pieces within one chunk | none; harnesses call the stores in `smoltcp/src/socket/tcp/{rx,tx}.rs` | `cargo kani -p smoltcp` |
 | [`observer`](observer/README.md) | the passive observer delivers each byte once and in order with holes marked (`Observer.tla`); the same for `Flow` in Kani | model named to `observer/flow.rs`, `observer.rs`; Kani on the production `Flow` | TLC per config; `cargo kani` |
-| [`packet-udp`](packet-udp/README.md) | IP reassembly per scope with the overlap kill, expiry and the cap (`Reassembly.tla`), the IP layer's slots (`Dispatch.tla`), UDP sockets and their queues (`UdpSockets.tla`); headers and checksums in Kani | models named to `network/ip.rs`, `packet.rs`, `udp/sockets.rs`; Kani on the production parsers | TLC per config; `cargo kani` |
+| [`packet-udp`](packet-udp/README.md) | TLA+: IP reassembly with the overlap kill, expiry and the cap (`Reassembly.tla`) and the IP layer's slots (`Dispatch.tla`), each checked to refine a spec written from the RFCs (`RfcReassembly.tla`, `RfcIpInput.tla`); UDP sockets and their queues (`UdpSockets.tla`); the trusted-checksum flag, ready for the core `Packet` (`TrustedChecksum.tla`). Lean ([lean/](packet-udp/lean/README.md)): the RFC 1071 checksum and the RFC 1624 hop update, IPv4 header checks, UDP, reassembly (any order and copies give the original; overlaps kill; limits; Time Exceeded on timeout), IPv6 extension headers, and the ICMP and ICMPv6 the engine sends (81 headline theorems, standard axioms only). Headers and checksums in Kani | `Gen.lean` vectors replayed by `tests/ip_vectors.rs`; `cargo xtask ip-verify lean|vectors|diff|all`; models named to `network/ip.rs`, `packet.rs`, `udp/sockets.rs`; Kani on the production parsers | `cargo xtask ip-verify all`; TLC per config; `cargo kani` |
 | [`world-layers`](world-layers/README.md) | per-peer admission with holds and releases (`Admission.tla`), staging a machine's ports (`Staging.tla`); packet dispatch in Kani | models named to `world/net/hosts.rs`, `tcp.rs`, `children.rs` | TLC per config; `cargo kani` |
 | [`world-net`](world-net/README.md) | attachments and routes (`Attachments.tla`), the port table (`Ports.tla`), the routing table (`Table.tla`), cables (`Cable.tla`); prefixes in Kani | models named to `world/net/attachments.rs`, `network/route.rs`, `cable.rs` | TLC per config; `cargo kani` |
 
@@ -74,6 +76,28 @@ them. The audit of 2026-11-09 found and fixed two:
   the handshake sends its SYN-ACK again (`mptcp/tla/Listener.tla`,
   `tcp-layer/README.md`).
 
+The RFC 9293 pass of 2026-11-10 (`tcp-rfc/README.md`) found six bugs in
+the smoltcp socket, each fixed with a test: an ACK half the sequence space
+from SND.UNA was taken as new, which stalled a connection and, on a socket
+closed in SYN-RECEIVED, panicked the stack; a retransmitted bare FIN went
+unanswered behind the challenge-ACK rate limit; SYN-SENT dropped a bad ACK
+with PSH or FIN without a RST; text held past the peer's FIN was read
+before the end of the stream; a second FIN dropped the ACK beside it; and
+TIME-WAIT left a closed window's segment unanswered.
+
+The TLS audit of 2026-11-10 (`tls-rfc`) found and fixed, in the vendored
+rustls, each with a test that fails before: a record lost after
+encryption that left the connection sending after the hole, and a record
+under new keys sent without the KeyUpdate before it (both needing an
+encrypter that over-allocates); record sizes and alerts that departed
+from RFC 8446 §5 and RFC 5246 §6.2 (unprotected records up to 2^14 + 2047,
+oversize TLS 1.3 records decrypted, a legal 2^14 + 2048 TLS 1.2 record
+refused, decode_error where record_overflow or unexpected_message is
+named); and EndOfEarlyData taken without ending its record, so a Finished
+in the same record went under the early keys (RFC 8446 §5.1, upstream
+too). Departures left as they are, and what to re-check after the move to
+rustls's unbuffered API, are in its README.
+
 And two found by reading a model's abstractions or a harness against the
 code: an NXDOMAIN's copy under the type it answered outlived the entry
 under ANY when a later NXDOMAIN of another type replaced that entry with a
@@ -83,6 +107,22 @@ shorter one, so data at the name no longer ended it (fixed in
 limit followed a capacity the decoder had just raised, so such a decoder
 was reported `Stuck` (fixed, with a test in `codec/tests.rs`; the Kani
 harness `an_honest_decoder_is_never_stuck` covers it).
+
+The RFC 9113 models of 2026-11-10 (`http2-layer/README.md`) found and
+fixed eleven departures, each with a test that failed before its fix. In
+`Http2`: the reset list forgot a stream a second after its reset, so late
+trailers ended the connection; a full reset list remembered no new reset;
+a reset of a stream already closed was remembered, so HEADERS on a
+skipped stream was ignored; RST_STREAM followed a 431 on a closed stream;
+a refusal during graceful shutdown queued the shutdown's PING after the
+final GOAWAY; and an ended response still moved with an initial window
+change, so a window at 2^31 - 1 failed the connection. In `Session`: a
+client PUSH_PROMISE was refused only at the end of its block, or not at
+all on a reset stream; a stream window overflow and a zero increment on a
+stream stopped the direction instead of ending the stream; overflow was
+judged against the wrong initial window while a smaller one waited for
+its ACK; and ended streams moved with an initial window change. The HPACK
+Lean model found no departure.
 
 ## Known gaps
 
@@ -94,18 +134,34 @@ harness `an_honest_decoder_is_never_stuck` covers it).
   internet sandbox was attached and detached (`world-net`); a host placed
   at an address an outside peer was using keeps that peer's connections
   through the route alive at detach (`world-net`); HTTP/1 dissection skips every later head after a gap inside a
-  body instead of resyncing at the next request line (`dissector`); HEADERS
-  on a stream the client itself reset is a connection error where RFC 9113
-  asks for a stream error (`http`); `native.rs`'s `after` buffer is dead
-  code.
+  body instead of resyncing at the next request line (`dissector`);
+  application packets from an SSH client past 128 or 256 KiB between the
+  server's rekey KEXINIT and the client's fail the connection, and an
+  unknown SSH channel type is refused with reason 1 rather than 3
+  (`ssh-layer`); `native.rs`'s `after` buffer is dead code. (HEADERS on a
+  stream the client itself reset ends the connection; RFC 9113 allows that,
+  and the stream error once listed here is RFC 7540's rule, `http2-layer`.)
+- **`cargo kani -p fictionet` does not compile** at 3db7a847e:
+  `verification/tls/kani/LayerProof.rs` and `verification/layer/kani/mod.rs`
+  no longer match the code. The HTTP/2 harnesses were run with those two
+  modules switched off locally.
 - **Kani in the audited areas was read, not rerun**, except where an
   area's README gives a date for its last run.
+- **`cargo kani` on the library does not compile at `3db7a847e`.** Two
+  areas' harnesses no longer match their code:
+  `layer/kani/mod.rs` compares `Refusals`, which has no `PartialEq`, and
+  `tls/kani/LayerProof.rs` uses `TlsLayer` fields that are gone. The
+  packet-udp reruns of 2026-11-10 switched those two modules off in a
+  scratch copy; nothing in the tree was changed for it.
 - **The trace check covers data only.** `RouteTrace.tla` replays bytes
   through `Chain`, `Switch` and `Driver`; the urgent path (`Written`,
   `Reset`), ends of input, timers and work are checked by `Route_urgent`
-  and the unit tests, not by replay. No other model has a trace check or
-  reference vectors yet: the Lean vectors tie DNS and MPTCP; the TLA+
-  models elsewhere are hand-written descriptions checked by reading.
+  and the unit tests, not by replay. Besides it, `ssh-layer`'s
+  `Transport.tla` traces are replayed on the production SSH transport and
+  `tls-rfc` has trace checks (handshakes and record-layer schedules of the
+  vendored rustls); Lean vectors tie DNS, MPTCP, HPACK, the HTTP/1
+  decoders, the TLS record checks, and the IP, UDP and ICMP code; the
+  TLA+ models elsewhere are hand-written descriptions checked by reading.
 - **Property-based tests of the tricky parts were not written in this
   pass**: byte-stream splits and coalescing through each layer and
   `Chain`, `Switch` handoff of unread bytes under random chunking,

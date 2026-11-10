@@ -629,9 +629,12 @@ impl Parts {
             }
         }
 
-        // Targets that are aliases (RFC 2181 §10.3).
-        let alias =
-            |target: &LowerName| self.sets.contains_key(&(target.clone(), RecordType::CNAME));
+        // Targets that are aliases (RFC 2181 §10.3): owners of a CNAME, and
+        // names below a DNAME, which answer with a CNAME the DNAME makes
+        // (RFC 6672 §2.2).
+        let alias = |target: &LowerName| {
+            self.sets.contains_key(&(target.clone(), RecordType::CNAME)) || below_dname(target)
+        };
         let named = self
             .sets
             .values()

@@ -1167,7 +1167,7 @@ async fn long_lived_claude_token_stays_on_the_host() {
         axum::serve(listener, router).await.unwrap();
     });
     fictionet::run(fictionet::Seed::from_u64(91), |cx| async move {
-        let credential = Credential::claude_token(Secret::new("Claude OAuth token", "sk-ant-oat01-host-private".into())?, Credential::claude_token_placeholder()?)?;
+        let credential = Credential::claude(ClaudeLogin::Subscription, Secret::new("Claude OAuth token", "sk-ant-oat01-host-private".into())?, ClaudeLogin::Subscription.placeholder()?)?;
         assert!(credential.placeholder().starts_with("sk-ant-oat01-"));
         assert_ne!(credential.placeholder(), "sk-ant-oat01-host-private");
         let bearer = format!("Bearer {}", credential.placeholder());

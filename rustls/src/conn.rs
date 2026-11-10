@@ -15,6 +15,7 @@ use crate::log::trace;
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
 use crate::msgs::deframer::handshake::HandshakeDeframer;
 use crate::msgs::deframer::DeframerIter;
+use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
 use crate::msgs::handshake::Random;
 use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
 use crate::record_layer::Decrypted;
@@ -1198,7 +1199,24 @@ impl<Data> ConnectionCore<Data> {
                 };
 
                 if allowed_plaintext && !self.hs_deframer.is_active() {
+                    // Unprotected, so at most 2^14 bytes (RFC 8446 section
+                    // 5.1), as decrypt_incoming checks for records before
+                    // the keys.
+                    if message.payload.len() > MAX_FRAGMENT_LEN {
+                        return Err(
+                            self.handle_deframe_error(Error::PeerSentOversizedRecord, state)
+                        );
+                    }
                     break (message.into_plain_message(), iter.bytes_consumed());
+                }
+
+                // A protected TLS 1.3 record is at most 2^14 + 256 bytes
+                // (RFC 8446 section 5.2): refused before it is decrypted.
+                if version_is_tls13
+                    && self.common_state.record_layer.is_decrypting()
+                    && message.payload.len() > MAX_TLS13_CIPHERTEXT_LEN
+                {
+                    return Err(self.handle_deframe_error(Error::PeerSentOversizedRecord, state));
                 }
 
                 // Room for a place in the plaintext queue, in case this is
@@ -1301,13 +1319,16 @@ impl<Data> ConnectionCore<Data> {
 
     fn handle_deframe_error(&mut self, error: Error, state: Option<&dyn State<Data>>) -> Error {
         match error {
-            error @ Error::InvalidMessage(_) => {
+            Error::InvalidMessage(invalid) => {
+                let error = Error::InvalidMessage(invalid);
                 if self.common_state.is_quic() {
                     self.common_state.quic.alert = Some(AlertDescription::DecodeError);
                     error
                 } else {
+                    // decode_error, or unexpected_message for a record type
+                    // this does not know.
                     self.common_state
-                        .send_fatal_alert(AlertDescription::DecodeError, error)
+                        .send_fatal_alert(AlertDescription::from(invalid), error)
                 }
             }
             Error::PeerSentOversizedRecord => self
@@ -1506,3 +1527,7 @@ impl InboundUnborrowedMessage {
 /// cf. BoringSSL's `kMaxEmptyRecords`
 /// <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls_record.cc#L124-L128>
 const ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX: u8 = 32;
+
+/// The longest protected TLS 1.3 record: 2^14 + 256 bytes (RFC 8446
+/// section 5.2).
+const MAX_TLS13_CIPHERTEXT_LEN: usize = (1 << 14) + 256;

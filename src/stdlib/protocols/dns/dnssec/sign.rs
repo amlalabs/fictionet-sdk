@@ -69,8 +69,9 @@ pub fn sign(
 /// are lowercased here. hickory would order the records by their TTL and
 /// their RDATA as written, case and all, so each record is written alone
 /// and put in canonical order here: by its canonical RDATA, as a string of
-/// octets (RFC 4034 §6.3). The error is hickory's, for a record whose data
-/// does not encode.
+/// octets (RFC 4034 §6.3), with records whose canonical forms are equal
+/// written once, as §6.3 requires of an RRset that holds such duplicates.
+/// The error is hickory's, for a record whose data does not encode.
 pub fn signed_data(set: &RecordSet, input: &SigInput) -> Result<TBS, ProtoError> {
     let fields = TBS::from_input(set.name(), set.dns_class(), input, std::iter::empty())?;
     let fields = fields.as_ref();
@@ -87,6 +88,9 @@ pub fn signed_data(set: &RecordSet, input: &SigInput) -> Result<TBS, ProtoError>
         })
         .collect::<Result<Vec<Vec<u8>>, ProtoError>>()?;
     records.sort_by(|a, b| rdata(a).cmp(rdata(b)));
+    // Records that differ only in the case of a name are one record in
+    // canonical form, and all but one of them must go (RFC 4034 §6.3).
+    records.dedup();
     Ok(TBS::from(&[fields, &records.concat()].concat()[..]))
 }
 
@@ -243,6 +247,46 @@ mod tests {
             panic!("an RRSIG");
         };
         assert_eq!(fields.input().num_labels, 1);
+    }
+
+    /// An RRset of two RP records (RFC 1183 §2.2), which hickory carries
+    /// as unknown RDATA, whose mailbox names differ only in case.
+    fn rp_set(mailboxes: &[&str]) -> RecordSet {
+        let owner = Name::from_ascii("example.").unwrap();
+        let rtype = RecordType::from(17);
+        let mut set = RecordSet::with_ttl(owner.clone(), rtype, 300);
+        for mailbox in mailboxes {
+            let mut rdata = Vec::new();
+            for label in [*mailbox, "example"] {
+                rdata.push(label.len() as u8);
+                rdata.extend_from_slice(label.as_bytes());
+            }
+            rdata.extend_from_slice(&[0, 0]);
+            let rdata = RData::Unknown {
+                code: rtype,
+                rdata: hickory_proto::rr::rdata::NULL::with(rdata),
+            };
+            set.insert(Record::from_rdata(owner.clone(), 300, rdata), 0);
+        }
+        set
+    }
+
+    #[test]
+    fn records_equal_in_canonical_form_are_signed_once() {
+        let both = rp_set(&["Admin", "admin"]);
+        assert_eq!(both.records_count(), 2);
+        let one = rp_set(&["admin"]);
+        let key = ZoneKey::generate(
+            &SeededEntropy::new(Seed::from_u64(3)),
+            Algorithm::Ed25519,
+            KeyFlags::ZSK,
+        );
+        let signer = Name::from_ascii("example.").unwrap();
+        // RFC 4034 §6.3: the duplicate goes before the canonical form is
+        // taken, so a signer that holds one record and a validator that
+        // was sent both agree on the signed bytes.
+        let rrsig = sign(&key, &one, &signer, window()).unwrap();
+        assert!(verifies(&key, &both, &rrsig));
     }
 
     #[test]

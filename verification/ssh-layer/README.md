@@ -7,6 +7,168 @@ The positive Kani harnesses call production Rust arithmetic in
 These are bounded checks of the specified transitions, not a refinement proof
 of all Rust code or a cryptographic proof of SSH.
 
+## Conformance with the RFCs (2026-11-10)
+
+Four models put the server as written against any client the RFCs allow,
+over FIFO links, and check what the RFCs require of both sides. A fifth
+counts window adjustments at full scale. Each header names the RFC sections
+and the source functions it follows.
+
+| Model | What it checks | Bounds and why |
+| --- | --- | --- |
+| `Transport.tla` | RFC 4253 sections 6.4, 7, 7.1, 7.3; strict KEX; RFC 8308 section 2.4. Version, KEXINIT both ways, ECDH, NEWKEYS per direction, rekeys started by either side or both at once with data in flight, first_kex_packet_follows with a right or wrong guess, IGNORE. `SequenceAgreement` and `KeyAgreement` (every packet opens under the receiver's own number and key, across wraps and NEWKEYS), `NoApplicationInExchange`, `ExchangeOrder`, `ExtInfoPlacement`, `StrictEnforced`, `NoServerFault`; `ExchangeEnds` and `Established` under fairness. | Sequence numbers modulo 4, so every run wraps; one rekey started by each side; two application packets each way; one IGNORE and one guess. |
+| `Auth.tla` | RFC 4252 sections 5, 5.1, 5.3, 7; RFC 4256 section 3. Pipelined requests of every kind, partial success, delayed failure, probes, signatures that do not verify, keyboard-interactive, connection messages before and after success. `AnsweredInOrder`, `NoServiceBeforeSuccess`, `NoSuccessWithoutProof`, `NoServerFault`; `RequestsAnswered`. | Three requests, below `max_attempts`; user and service names fixed (a change is a disconnect the RFC allows). |
+| `Close.tla` | RFC 4254 sections 5.1, 5.3, 5.4, 6.10. One OPEN_CONFIRMATION or OPEN_FAILURE per open with the cause's reason code (limit, declined or refused: 1; failed before confirmation: 2; no memory for the opening or the child: 4); data, requests with and without want_reply, EOF and CLOSE from both sides, including what the client sent before it had the server's CLOSE. `OneOpenReply`, `ReasonCode`, `NothingAfterClose`, `NoDataAfterEof`, `RepliesSolicited`, `NoServerFault`; `CloseAnswered`. | One channel; two data packets and two requests from the client, two data from the server. Windows are `Channel.tla`'s and `Window.tla`'s subject. |
+| `Window.tla` | RFC 4254 section 5.2 on echo channels against russh 0.64: one loop that pushes every channel message into a queue of `channel_buffer_size` places and sends nothing while a push waits. The client of `full_windows_on_open_channels_finish_with_an_adjustment_per_half_window` (all channels open, then each sends a full window and EOF before it reads) and one that reads while it sends. `ReceiveWindow`, `WindowAccounting` (what the peer may send equals what it was told, less data on the way, plus adjustments on the way), `AdvertisedWithinCredit`; `AllClosed` (no stall) under fairness. | Batch: 2 channels, window 4, 4 one-unit packets each, queue 8. Reads: 1 channel, window 2, 4 packets (so adjustments are needed), queue 2; two channels did not finish in 24 minutes. The queue is scaled with the window; see Adjust. |
+| `Adjust.tla` | The adjustments one channel sends while its peer sends one full window, over every order of consuming, the child taking (with any lag) and adjusting. `Few` (at most floor(log2 W) + 1), `NeverDry` (at zero room left, any room owed is due), `WithinCredit`. | Full scale: W = 64 units of 1 KiB, the server's 64 KiB window and the test's packets. |
+
+So the half-window policy (df905b036) sends at most 7 adjustments per 64 KiB
+window whatever the child's timing, and some order reaches 7. With the exec
+reply and 64 echoes that is 72 messages per channel, under russh's 100; the
+per-packet policy it replaced sends 64, which with the echoes is 129. Each
+channel's queue is its own and the batch client reads a channel's queue only
+after it has sent on it, so the bound holds for any number of channels;
+`Window_batch` checks two. `Window_tight` shows the scaled bound is exact
+(queue 7 stalls), and `Window_perpacket` that the old policy stalls with the
+queue the new one needs. A client that sends more than one window before it
+reads gets one echo per packet, so its queue fills whatever the adjustment
+policy; that is outside what any server can promise.
+
+| Baseline | Generated | Distinct |
+| --- | ---: | ---: |
+| `Transport_base` (strict, ext-info-c) | 190,337 | 74,659 |
+| `Transport_loose` (neither) | 126,452 | 45,007 |
+| `Transport_inject` (`StrictEnforced` only) | 178,268 | 71,038 |
+| `Auth_base` | 84,922 | 30,986 |
+| `Auth_badhandler` (a handler that accepts unverified signatures) | 89,313 | 32,274 |
+| `Close_base` | 892,058 | 261,598 |
+| `Window_batch` | 700,230 | 239,048 |
+| `Window_reads` | 46,275 | 16,477 |
+| `Adjust_base` | 106,087 | 51,907 |
+
+Controls. Each must fail the named property and did:
+
+| Configuration | Mutation | Fails |
+| --- | --- | --- |
+| `Transport_reset` | reset sequence numbers at NEWKEYS without strict KEX | `SequenceAgreement` |
+| `Transport_keep` | keep them under strict KEX | `SequenceAgreement` |
+| `Transport_sendinkex` | `write_packet` while the server's KEXINIT is out | `NoApplicationInExchange` |
+| `Transport_strictlax` | no strict checks; the client sends IGNORE during the initial exchange | `StrictEnforced` |
+| `Transport_noguess` | handle a wrongly guessed ECDH_INIT | `NoServerFault` |
+| `Transport_extrekey` | EXT_INFO after every exchange | `ExtInfoPlacement` |
+| `Auth_nowait` | the code before cca5c2ae2: take a request while a failure waits | `NoServerFault` |
+| `Auth_strictsig` | the code before cca5c2ae2: disconnect on a bad signature the handler rejected | `NoServerFault` |
+| `Auth_trustsig` | let a handler's Accept of a bad signature through | `NoSuccessWithoutProof` |
+| `Auth_deliver` | pass a connection message on before success | `NoServiceBeforeSuccess` |
+| `Auth_answerafter` | answer requests after SUCCESS | `AnsweredInOrder` |
+| `Close_latefault` | the code before cca5c2ae2: fail on data or a request after our CLOSE | `NoServerFault` |
+| `Close_allone` | the code before 96688e01c: reason 1 for every refusal | `ReasonCode` |
+| `Close_replyafter` | answer a request after our CLOSE | `NothingAfterClose` |
+| `Close_doubleclose` | answer CLOSE after sending one | `NothingAfterClose` |
+| `Window_perpacket` | the per-packet adjustment policy | `AllClosed` |
+| `Window_tight` | queue 7 | `AllClosed` |
+| `Window_never` | no adjustments | `AllClosed` |
+| `Window_over` | advertise one unit more than owed | `AdvertisedWithinCredit` |
+| `Adjust_perpacket` | the per-packet adjustment policy | `Few` |
+
+Coverage configurations must fail their predicate, which shows the runs the
+baselines rely on exist: `Transport_coverage`, `_coverage_strict` and
+`_coverage_wrong` (a quiet end after a rekey started by each side, all data
+both ways, a right or a wrong guess, an IGNORE), `Auth_coverage` (success
+after three pipelined requests), `Close_coverage` (data and a request with
+want_reply arrive after the server's CLOSE), `Adjust_coverage` (7 is reached).
+All did.
+
+`Transport_pending` is a known departure, not a control: see below.
+
+### Tied to the code
+
+* `src/stdlib/protocols/ssh/transport/replay.rs` replays the coverage traces
+  in `traces/` (TLC's action names, one per line, regenerated with the
+  command below) on the production `Transport`, step for step, against a
+  client written from the RFCs with real X25519, ChaCha20-Poly1305 and Ed25519.
+  Every server packet must open under the client's own sequence number and
+  key, the server must sign the exchange hash the client computed, and the
+  model's order, EXT_INFO and §7.1 checks are made on the bytes. Without
+  strict KEX the sequence numbers start at `u32::MAX - 1` and wrap. The
+  `inject` trace must be refused at the injected IGNORE. With the incoming
+  sequence number reset at every NEWKEYS the replay fails at step 18.
+* `a_full_window_brings_at_most_seven_adjustments_in_any_order`
+  (`src/stdlib/services/ssh/tests.rs`) is `Adjust.tla` on the production
+  `Channel`: an exhaustive search of every order, with `consume_receive`,
+  `adjustment` and the credit `on_command` adds, gives at most 7 and reaches 7,
+  never owes room to a peer with none, and never advertises past the credit.
+* `lean/Adjust.lean` proves, for every u32 and u64 value, the facts the
+  bounded models rely on: consuming and crediting keep advertised within
+  receive, an adjustment tells exactly the credit and never overflows, a peer
+  with no room hears of any room owed, each adjustment at least doubles what
+  the peer may send, and none is due while the peer has more than half the
+  credit. Core Lean 4.35, `omega` only; axioms `propext`, `Classical.choice`
+  and `Quot.sound`.
+* The Auth and Close models are tied by the three tests below, each run
+  against the code before the fix.
+
+### Departures found
+
+Fixed in cca5c2ae2, each with a test that fails on the code before:
+
+* Data, a request or EOF the peer sent before it had our CLOSE failed the
+  connection and every sibling channel (RFC 4254 section 5.3). Now dropped,
+  with no reply on the closed channel.
+  `what_the_peer_sent_before_our_close_arrived_is_dropped`.
+* A USERAUTH_REQUEST that arrived while an earlier failure waited out its
+  delay failed the connection (RFC 4252 section 5 lets a client send
+  requests without waiting). Nothing more is read until the delayed FAILURE
+  is out. `a_request_sent_before_the_last_failure_waits_for_it`.
+* A signature that did not verify ended the connection even when the handler
+  rejected it (RFC 4252 section 7: answer with FAILURE). A handler that
+  accepts an unverified signature still ends it.
+  `a_signature_that_does_not_verify_is_answered_with_failure`.
+
+Reported, not fixed:
+
+* **Packets during a server-initiated rekey.** Between the server's KEXINIT
+  and the client's, the client may go on sending application messages
+  (RFC 4253 section 7.1). `progress` keeps them in `pending_packets` while
+  rekeying and fails the connection past 128 packets or 256 KiB. A client
+  with several channels' windows in flight, or one sending small packets,
+  can pass that. `Transport_pending` shows it with a cap of one. It is reached
+  only after `needs_rekey` (half a GiB or 2^29 packets on one key). Handling
+  them during the exchange would need replies to wait for the new keys.
+* **Unknown channel types are refused with reason 1.** `SessionLayer`
+  answers `Accept(false)` for a type it does not run, which becomes
+  ADMINISTRATIVELY_PROHIBITED; RFC 4254 section 5.1 has
+  UNKNOWN_CHANNEL_TYPE (3) for it. `ChannelCommand::Accept` carries no reason,
+  so this is an API change.
+
+### Not covered
+
+Algorithm negotiation beyond the guess, key derivation inputs other than the
+X25519 path the replay uses, AES-GCM in the replay, DISCONNECT, rekeys driven
+by the real `needs_rekey` limits, user or service name changes, the
+`max_attempts` disconnect, X11 and agent forwarding, global requests,
+`exit-signal`, server send windows smaller than the echo (the output limit
+and the client's window are taken as never binding in `Window.tla`), and two
+channels in the reading-client configuration. The models are hand-written
+from the code; only `Transport.tla` (by replay) and `Adjust.tla` (by the
+exhaustive test) are run against it.
+
+Rerun one configuration as below (from `tla/`), one at a time:
+
+```sh
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=3G \
+  -p MemorySwapMax=0 ~/.cache/adorably-fv/jdk/bin/java -Xmx2g \
+  -cp ~/.cache/adorably-fv/tla2tools.jar tlc2.TLC -workers 2 \
+  -metadir <dir outside the tree> -config Transport_base.cfg Transport.tla
+```
+
+Regenerate a trace by running its coverage configuration and keeping the
+action names: `... -config Transport_coverage.cfg Transport.tla | grep -E
+'^State [0-9]+: <' | grep -v 'Initial predicate' | sed -E 's/^State [0-9]+:
+<([A-Za-z]+).*/\1/' > ../traces/loose.txt` (`_coverage_strict` gives
+`strict.txt`, `_coverage_wrong` `wrong.txt`, `Transport_strictlax`
+`inject.txt`). Check the Lean file with `lean lean/Adjust.lean`.
+
 ## Properties and negative controls
 
 Every row has a passing baseline and a mutation configuration that must fail

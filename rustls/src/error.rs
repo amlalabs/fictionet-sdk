@@ -227,6 +227,10 @@ impl From<InvalidMessage> for AlertDescription {
             InvalidMessage::PreSharedKeyIsNotFinalExtension => Self::IllegalParameter,
             InvalidMessage::DuplicateExtension(_) => Self::IllegalParameter,
             InvalidMessage::UnknownHelloRetryRequestExtension => Self::UnsupportedExtension,
+            // "If a TLS implementation receives an unexpected record type, it
+            // MUST terminate the connection with an "unexpected_message"
+            // alert." (RFC 8446 section 5; RFC 5246 section 6)
+            InvalidMessage::InvalidContentType => Self::UnexpectedMessage,
             _ => Self::DecodeError,
         }
     }

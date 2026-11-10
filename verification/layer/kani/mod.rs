@@ -262,7 +262,7 @@ fn charges_sum_to_the_budget_and_never_pass_its_limit() {
 /// left if that covers its start, else nothing, changing nothing but the
 /// count of refusals. Over every `u8` limit, charge held and range.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(3)]
 fn charge_within_takes_what_fits_or_nothing() {
     let limit: u8 = kani::any();
     let budget = Budget::new(limit as usize);
@@ -282,7 +282,7 @@ fn charge_within_takes_what_fits_or_nothing() {
         None => {
             assert!(start as usize > room);
             assert_eq!(budget.used(), held as usize);
-            assert_ne!(budget.refusals(), mark);
+            assert!(budget.refused_since(mark));
         }
     }
 }

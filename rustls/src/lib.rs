@@ -599,6 +599,8 @@ pub mod server {
     mod common;
     pub(crate) mod handy;
     mod hs;
+    #[cfg(all(test, feature = "std", feature = "tls12"))]
+    mod hs_trace;
     mod server_conn;
     #[cfg(test)]
     mod test;

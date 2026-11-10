@@ -18,7 +18,9 @@
 //! - fragments are put back together ([`Reassembly`]), with its limits on
 //!   overlap, size and waiting time, and the layer's
 //!   [deadline](fictionet::stdlib::layer::Layer::deadline) is when the
-//!   oldest unfinished packet expires;
+//!   oldest unfinished packet expires; one that expires after its first
+//!   fragment came is answered with ICMP Time Exceeded, code 1, sent back
+//!   down (RFC 1122 section 3.3.2, RFC 8200 section 4.5);
 //! - a packet it cannot read, whose IPv4 header checksum is wrong, or whose
 //!   fragments can never make a packet is dropped and reported
 //!   ([`IpReport::Malformed`]), so it never reaches a transport;
@@ -89,7 +91,7 @@ use fictionet::stdlib::layer::{
     PacketEvent, Packets, Whole,
 };
 use fictionet::stdlib::network::Transport;
-use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, protocol};
+use fictionet::stdlib::network::ip::{self, Header, Intake, Reassembly, protocol};
 use fictionet::time::Instant;
 use fictionet::{Checksums, Packet};
 
@@ -666,10 +668,22 @@ impl Layer for IpLayer {
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
-        self.answer
-            .take()
-            .map(|answer| PacketCommand::Send(Packet::from_chunk(answer)))
-            .or_else(|| self.down.take())
+        if let Some(answer) = self.answer.take() {
+            return Some(PacketCommand::Send(Packet::from_chunk(answer)));
+        }
+        // A packet whose reassembly timed out after its first fragment came
+        // is answered with Time Exceeded, code 1 (RFC 1122 section 3.3.2,
+        // RFC 8200 section 4.5), as a refused one is answered: before the
+        // transports' packets, and never after the end.
+        while let Some(first) = self.reassembly.take_expired() {
+            if self.output_closed {
+                continue;
+            }
+            if let Some(answer) = ip::reassembly_time_exceeded(&first) {
+                return Some(PacketCommand::Send(answer));
+            }
+        }
+        self.down.take()
     }
 
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>> {
@@ -902,6 +916,122 @@ mod tests {
             assert!(matches!(d.deliver(raw(p.clone())), Ok(Admit::Taken)));
         }
         assert!(up(&mut d).is_empty());
+    }
+
+    /// `packet`, an IPv6 packet with no extension headers, cut into
+    /// fragments of at most `size` data bytes each, a multiple of eight.
+    fn fragments6(packet: &[u8], size: usize) -> Vec<Vec<u8>> {
+        let data = &packet[40..];
+        let mut out = Vec::new();
+        for (i, piece) in data.chunks(size).enumerate() {
+            let offset = i * size;
+            let more = offset + piece.len() < data.len();
+            let mut f = packet[..40].to_vec();
+            f[6] = protocol::FRAGMENT;
+            f.extend_from_slice(&[packet[6], 0]);
+            f.extend_from_slice(&(offset as u16 | u16::from(more)).to_be_bytes());
+            f.extend_from_slice(&7u32.to_be_bytes());
+            f.extend_from_slice(piece);
+            let len = (f.len() - 40) as u16;
+            f[4..6].copy_from_slice(&len.to_be_bytes());
+            out.push(f);
+        }
+        out
+    }
+
+    /// Delivers `pieces` and lets their packet time out.
+    fn time_out(pieces: &[&Vec<u8>]) -> Driver<IpLayer> {
+        let mut d = driver();
+        for p in pieces {
+            assert!(matches!(d.deliver(raw((*p).clone())), Ok(Admit::Taken)));
+        }
+        assert!(down(&mut d).is_empty());
+        let due = d.deadline().unwrap();
+        d.set_now(due);
+        d.run().unwrap();
+        d
+    }
+
+    /// The one answer below, checked as an ICMP error from `from` to `to`
+    /// of `kind` and `code`: its body after the first 8 bytes.
+    fn icmp_error(answers: &[Vec<u8>], from: IpAddr, to: IpAddr, kind: u8, code: u8) -> Vec<u8> {
+        assert_eq!(answers.len(), 1);
+        let h = Header::parse_whole(&answers[0]).unwrap();
+        assert_eq!((h.src, h.dst), (from, to));
+        let icmp = h.payload(&answers[0]);
+        assert_eq!((icmp[0], icmp[1]), (kind, code));
+        let sum = match (from, to) {
+            (IpAddr::V4(_), _) => {
+                assert_eq!(h.protocol, protocol::ICMP);
+                ip::checksum(icmp)
+            }
+            _ => {
+                assert_eq!(h.protocol, protocol::ICMPV6);
+                ip::transport_checksum(from, to, protocol::ICMPV6, icmp)
+            }
+        };
+        assert_eq!(sum, 0);
+        icmp[8..].to_vec()
+    }
+
+    /// RFC 1122, section 3.3.2: an IPv4 packet whose reassembly times out
+    /// after fragment zero arrived is answered with ICMP Time Exceeded,
+    /// code 1, from its destination, quoting fragment zero. A fragment
+    /// that comes after the deadline, before the timer runs, sends the
+    /// answer too.
+    #[test]
+    fn a_timed_out_ipv4_packet_is_answered_when_fragment_zero_came() {
+        let (a, b) = (addr("10.0.0.2"), addr("10.0.0.1"));
+        let whole = ip::packet(a, b, protocol::UDP, &udp(100)).to_vec();
+        let pieces = fragments(&whole, 32);
+        let mut d = time_out(&[&pieces[0], &pieces[2]]);
+        let quote = icmp_error(&down(&mut d), b, a, 11, 1);
+        assert_eq!(quote, pieces[0]);
+        assert_eq!(d.deadline(), None);
+        let mut d = driver();
+        assert!(matches!(
+            d.deliver(raw(pieces[0].clone())),
+            Ok(Admit::Taken)
+        ));
+        let due = d.deadline().unwrap();
+        d.set_now(due);
+        assert!(matches!(
+            d.deliver(raw(pieces[1].clone())),
+            Ok(Admit::Taken)
+        ));
+        let quote = icmp_error(&down(&mut d), b, a, 11, 1);
+        assert_eq!(quote, pieces[0]);
+    }
+
+    /// RFC 8200, section 4.5 (and RFC 4443, section 3.3): the same for
+    /// IPv6, with ICMPv6 Time Exceeded, code 1.
+    #[test]
+    fn a_timed_out_ipv6_packet_is_answered_when_fragment_zero_came() {
+        let (a, b) = (addr("2001:db8::2"), addr("2001:db8::1"));
+        let whole = ip::packet(a, b, protocol::UDP, &udp(100)).to_vec();
+        let pieces = fragments6(&whole, 32);
+        let mut d = time_out(&[&pieces[0], &pieces[2]]);
+        let quote = icmp_error(&down(&mut d), b, a, 3, 1);
+        assert_eq!(quote, pieces[0]);
+    }
+
+    /// Without fragment zero there is nothing to answer about (RFC 1122,
+    /// section 3.3.2; RFC 8200, section 4.5): the packet goes silently.
+    #[test]
+    fn a_timed_out_packet_without_fragment_zero_is_not_answered() {
+        let v4 = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).to_vec();
+        let v6 = ip::packet(
+            addr("2001:db8::2"),
+            addr("2001:db8::1"),
+            protocol::UDP,
+            &udp(100),
+        )
+        .to_vec();
+        for pieces in [fragments(&v4, 32), fragments6(&v6, 32)] {
+            let mut d = time_out(&[&pieces[1], &pieces[2]]);
+            assert!(down(&mut d).is_empty());
+            assert_eq!(d.deadline(), None);
+        }
     }
 
     #[test]

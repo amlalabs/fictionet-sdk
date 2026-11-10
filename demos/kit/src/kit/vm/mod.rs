@@ -5,6 +5,7 @@
 //! host reaches it over that card, through the world.
 
 pub mod disk;
+pub mod nitro;
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -17,6 +18,27 @@ use tokio::process::{Child, Command};
 // `pub static CH_BIN: Option<&[u8]>`: Cloud Hypervisor's static binary when
 // it is in demos/downloads/cloudimage (see build.rs), else `None`.
 include!(concat!(env!("OUT_DIR"), "/ch_bin.rs"));
+
+/// The virtual machine monitor the host provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vmm {
+    /// Cloud Hypervisor on `/dev/kvm`, with our vhost-user network card.
+    CloudHypervisor,
+    /// A Nitro Sandbox on an EC2 parent, with a TAP network card.
+    Nitro,
+}
+
+impl Vmm {
+    /// A Nitro Sandbox where `/dev/nitro_enclaves` exists, else Cloud
+    /// Hypervisor.
+    pub fn of_host() -> Self {
+        if Path::new("/dev/nitro_enclaves").exists() {
+            Self::Nitro
+        } else {
+            Self::CloudHypervisor
+        }
+    }
+}
 
 /// How to boot one VM.
 pub struct Config<'a> {
@@ -58,6 +80,8 @@ pub struct Vm {
     /// The write-protected memfd the embedded binary runs from, held open for the
     /// child's life so its `/proc/self/fd` entry stays valid.
     _ch_memfd: Option<OwnedFd>,
+    /// A Nitro Sandbox's namespace and jail, removed after Firecracker.
+    sandbox: Option<nitro::Sandbox>,
 }
 
 impl Vm {
@@ -132,6 +156,7 @@ impl Vm {
             console_log,
             stderr_log,
             _ch_memfd: ch_memfd,
+            sandbox: None,
         })
     }
 
@@ -155,6 +180,14 @@ impl Vm {
     /// Waits up to `timeout` for Cloud Hypervisor to exit (as it does when
     /// the guest powers off over ACPI), then kills it as a backup.
     pub async fn stop(mut self, timeout: Duration) -> io::Result<()> {
+        // A Nitro Sandbox does not end when its guest powers off, and its
+        // disk is this run's own, so it is stopped at once.
+        if self.sandbox.is_some() {
+            self.child.kill().await?;
+            self.child.wait().await?;
+            self.sandbox.take();
+            return Ok(());
+        }
         match tokio::time::timeout(timeout, self.child.wait()).await {
             Ok(status) => {
                 let status = status?;
@@ -375,6 +408,7 @@ mod process_tests {
                 stderr_log: dir.path().join("stderr"),
                 _socket_dir: std::fs::File::open(dir.path()).unwrap(),
                 _ch_memfd: None,
+                sandbox: None,
             };
             assert_eq!(vm.stop(Duration::from_secs(5)).await.is_ok(), code == 0);
         }

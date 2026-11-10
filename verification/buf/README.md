@@ -15,6 +15,7 @@ the memory cap there.
 | `a_chunk_cursor_never_passes_the_end` | advancing past the end panics |
 | `split_pieces_see_disjoint_bytes_of_one_backing` | a split at any point gives two pieces of one backing that see the two halves in order; editing either copies it out and leaves the other's bytes as they were |
 | `a_shared_chunk_edit_preserves_ownership_and_budget` | a copied edit is charged before it is made, leaves its sibling unchanged, and both charges go back when the pieces do |
+| `a_repay_pays_before_it_lets_go_and_a_refusal_changes_nothing` | `repay` charges the new budget before the old one lets go, whole or as a shared piece, and a refusal changes nothing |
 | `prepend_needs_room_and_uniqueness` | `prepend` succeeds exactly when the headroom holds the bytes and no other piece shares the backing; the cursor moves back by that much, the old bytes follow unchanged, and nothing is charged |
 | `a_pooled_backing_is_charged_to_one_budget_at_every_instant` | taken by either budget, admitted by either, shared or not, dropped in either order: after every step the budgets hold the pool's charge plus one slot while a piece lives, and a live chunk's charge is its capacity |
 | `recycle_happens_only_for_the_sole_owner` | with up to three pieces, made by cloning or splitting, the free list stays empty until the last piece is dropped |

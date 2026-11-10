@@ -375,6 +375,32 @@ foundation; the second is the branch's run:
 | `credit_written` credits one byte before the fence (`delivered + 1 >= fence`) | `a_write_is_acknowledged_...` | branch: 1 of 16,545 failed: `layer.delivered >= end` |
 | `abort` keeps the credit (`layer.rs:276` deleted) | `a_reset_drops_...` | merged: 1 of 18,545 failed: `(credit, pending_plaintext) == (0, 0)` |
 
+### On main `3db7a847e` (November 10, 2026)
+
+The write accounting was renamed after the runs above, so the proofs no
+longer compiled: `produced` is now `ciphertext_emitted`, `delivered` is
+`ciphertext_completed`, `credit` is `completed_plaintext_bytes`, and the
+pending plaintext and its fence are one `plaintext_completion`
+(`plaintext_bytes`, `ciphertext_end`). The harnesses read the last two
+through helpers, `pending` and `fence`, and keep every assertion.
+
+Each was then run alone, as
+`cargo kani -p fictionet -Z stubbing --exact --harness stdlib::services::tls::layer::proofs::<name>`,
+under an 8 GB memory cap without swap:
+
+| Harness | Result |
+| --- | --- |
+| `a_completion_credits_the_pending_write_once_at_its_fence` | did not finish; stopped after about 13 minutes with the retry loop of `Budget::release` unrolled 1,753 times |
+| `a_write_is_acknowledged_once_after_its_ciphertext_completes` | out of memory, 170 s |
+| `a_reset_drops_what_is_owed_and_sends_only_a_reset` | did not finish; stopped at 15 minutes with the same loop unrolled 1,630 times |
+
+No check failed. The layer charges `Budget::unlimited()`, and every release
+goes through the budget's compare-exchange loop and its wake path. The
+first and third harnesses have no unwind bound, so CBMC unrolls that loop
+without end; the second has a bound of 8 and runs out of memory on the
+wake path instead. The cause is the one recorded in
+`verification/layer/VERIFICATION.md` under "Kani on main `3db7a847e`".
+
 ## Entropy: `entropy.rs`
 
 The provider's randomness reaches rustls in three places: the

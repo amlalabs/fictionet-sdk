@@ -1,25 +1,34 @@
 //! The Search workstation's installed software, settings and fixed package sources.
 
 use fictionet_demo::kit::{Guest, desktop, image, ssh};
+use fictionet_extras::models::ClaudeLogin;
 use std::io;
 
 pub const IMAGE: &str = "search-workstation.qcow2";
 const USER: &str = "analyst";
 
 /// The workstation with the root certificate it trusts and the Claude
-/// credential placeholder it carries.
-fn definition(root_pem: &str, placeholder: &str) -> io::Result<Guest> {
+/// credential placeholder of kind `login` it carries.
+fn definition(root_pem: &str, login: ClaudeLogin, placeholder: &str) -> io::Result<Guest> {
     let mut settings: serde_json::Value =
         serde_json::from_str(desktop::CLAUDE_SETTINGS).expect("managed settings");
-    settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"] = placeholder.into();
+    settings["env"][login.variable()] = placeholder.into();
     settings["env"]["COLORTERM"] = "truecolor".into();
-    let claude_state = serde_json::json!({
+    let mut claude_state = serde_json::json!({
         "hasCompletedOnboarding": true,
         "theme": "dark",
         "projects": {
             format!("/home/{USER}"): {"hasTrustDialogAccepted": true}
         }
     });
+    // Claude Code asks before using an API key from its environment unless
+    // the key's last 20 characters are already approved.
+    if login == ClaudeLogin::ApiKey {
+        claude_state["customApiKeyResponses"] = serde_json::json!({
+            "approved": [&placeholder[placeholder.len() - 20..]],
+            "rejected": []
+        });
+    }
     desktop::claude_code(desktop::browser_image(
         "workstation",
         USER,
@@ -73,9 +82,10 @@ fn definition(root_pem: &str, placeholder: &str) -> io::Result<Guest> {
 pub fn recipe(
     admin: &ssh::Identity,
     root_pem: &str,
+    login: ClaudeLogin,
     placeholder: &str,
 ) -> io::Result<image::Recipe> {
-    definition(root_pem, placeholder)?.into_recipe(admin)?
+    definition(root_pem, login, placeholder)?.into_recipe(admin)?
     .archive("firefox", "https://packages.mozilla.org/apt/pool/mozilla/firefox_158.0.1~build1_amd64_563b50f128d7d58759d99e57779c0cb7.deb",
         "18dbb71cbbd8ecca54b2523ec01104457cd48cf5a0ad30943d2b05da6ec6b6a8")
 }

@@ -966,18 +966,25 @@ impl Pages {
 
     /// Configure host search from environment credentials, for Live,
     /// Live-Depth and Edited, and select Live.
-    pub fn with_live_search(mut self, downloads: &Path) -> Result<Self, String> {
-        self.live = Some(Live::new(
-            downloads,
-            Reach::Asked,
-            self.observation.clone(),
-        )?);
+    /// With [`LiveWeb::SearchedOnly`], only Live-Depth is offered, and it is
+    /// selected.
+    pub fn with_live_search(mut self, downloads: &Path, web: LiveWeb) -> Result<Self, String> {
+        if web == LiveWeb::Any {
+            self.live = Some(Live::new(
+                downloads,
+                Reach::Asked,
+                self.observation.clone(),
+            )?);
+        }
         self.depth = Some(Live::new(
             downloads,
             Reach::Allowlist,
             self.observation.clone(),
         )?);
-        self.settings.get_mut().unwrap().source = Source::Live;
+        self.settings.get_mut().unwrap().source = match web {
+            LiveWeb::Any => Source::Live,
+            LiveWeb::SearchedOnly => Source::LiveDepth,
+        };
         Ok(self)
     }
 
