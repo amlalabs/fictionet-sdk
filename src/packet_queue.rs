@@ -10,8 +10,6 @@ use crate::{Budget, Charge, PACKET_COST, Packet};
 pub struct PacketQueue {
     packets: VecDeque<(Packet, Charge)>,
     budget: Budget,
-    /// What the queued packets are charged, in all.
-    bytes: usize,
 }
 
 /// What a queued packet costs: the memory it keeps alive plus its place in
@@ -41,14 +39,7 @@ impl PacketQueue {
         PacketQueue {
             packets: VecDeque::new(),
             budget: budget.clone(),
-            bytes: 0,
         }
-    }
-
-    /// Whether the budget has room for `packet` now.
-    pub fn fits(&self, packet: &Packet) -> bool {
-        let room = self.budget.limit().saturating_sub(self.budget.used());
-        cost(packet).is_some_and(|cost| cost <= room)
     }
 
     /// Queues `packet`, charging the budget first. Returns the queued
@@ -58,24 +49,27 @@ impl PacketQueue {
         let Some(charge) = cost(&packet).and_then(|cost| self.budget.charge(cost)) else {
             return Err(packet);
         };
-        self.bytes += charge.bytes();
         self.packets.push_back((packet, charge));
         Ok(&self.packets.back().expect("just queued").0)
     }
 
     /// Takes out the oldest packet and gives back its charge.
     pub fn pop(&mut self) -> Option<Packet> {
-        let (packet, charge) = self.packets.pop_front()?;
-        self.bytes -= charge.bytes();
-        Some(packet)
+        self.packets.pop_front().map(|(packet, _)| packet)
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl PacketQueue {
+    /// Whether the budget has room for `packet` now.
+    pub fn fits(&self, packet: &Packet) -> bool {
+        let room = self.budget.limit().saturating_sub(self.budget.used());
+        cost(packet).is_some_and(|cost| cost <= room)
+    }
+
     /// What the queued packets are charged, including [`PACKET_COST`].
     pub fn bytes(&self) -> usize {
-        self.bytes
+        self.packets.iter().map(|(_, charge)| charge.bytes()).sum()
     }
 
     /// Borrows the oldest packet without giving back its charge.
@@ -96,7 +90,6 @@ impl PacketQueue {
     /// Drops every queued packet and gives back their charges.
     pub fn clear(&mut self) {
         self.packets.clear();
-        self.bytes = 0;
     }
 }
 

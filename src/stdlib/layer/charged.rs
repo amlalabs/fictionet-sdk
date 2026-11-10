@@ -154,9 +154,7 @@ impl ChargedBytes {
 
     /// The bytes as a chunk, which carries their charge.
     pub fn into_chunk(self) -> Chunk {
-        Chunk::paid(self.bytes, self.charge)
-            .ok()
-            .expect("charged bytes are charged their capacity")
+        Chunk::paid(self.bytes, self.charge).expect("charged bytes are charged their capacity")
     }
 
     /// The vector and the charge that pays for it, for an owner that keeps

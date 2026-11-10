@@ -307,7 +307,7 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
             Box::new(v6_mine),
             Box::new(other_mine),
         ]);
-        split(fcx, ports, |packet| match version(&packet) {
+        split(fcx, ports, |packet| match version(packet) {
             Some(4) => 1,
             Some(6) => 2,
             _ => 3,

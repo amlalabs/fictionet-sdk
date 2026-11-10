@@ -321,7 +321,7 @@ impl ConnSlot {
     fn flush(&self, out: &mut OutQueue, shared: &ListenShared) {
         let fd = self.fd.as_raw_fd();
         while let Some(packet) = out.queue.front() {
-            match unix::send_parts(fd, &[&[relay::PACKET], &packet], true) {
+            match unix::send_parts(fd, &[&[relay::PACKET], packet], true) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(_) => {
@@ -1019,7 +1019,11 @@ mod tests {
             drop(first);
             let second = agent.recv(&fcx).await?;
             assert_eq!(second, short[..]);
-            assert_eq!(second.as_ptr().addr(), at, "the same block, read into again");
+            assert_eq!(
+                second.as_ptr().addr(),
+                at,
+                "the same block, read into again"
+            );
             assert_eq!(agent.recv(&fcx).await?, long[..]);
             Ok(())
         }))

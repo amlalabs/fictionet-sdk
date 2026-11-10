@@ -137,7 +137,7 @@ impl Shared {
 
 /// Sends one packet without waiting. `Ok(false)`: the socket is full.
 fn send_one(fd: std::os::fd::RawFd, packet: &Packet) -> io::Result<bool> {
-    match unix::send_parts(fd, &[&[relay::PACKET], &packet], true) {
+    match unix::send_parts(fd, &[&[relay::PACKET], packet], true) {
         Ok(()) => Ok(true),
         Err(e)
             if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS) =>
