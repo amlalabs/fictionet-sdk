@@ -464,6 +464,7 @@ name = "fictionet"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fictionet-buf",
  "fictionet-rustls",
  "getrandom 0.4.3",
  "hickory-proto",
@@ -476,6 +477,7 @@ dependencies = [
  "ring",
  "rsa",
  "rustls-pki-types",
+ "slab",
  "smoltcp",
  "tokio",
  "tower-service",
@@ -483,6 +485,10 @@ dependencies = [
  "web-time",
  "x25519-dalek",
 ]
+
+[[package]]
+name = "fictionet-buf"
+version = "0.1.0"
 
 [[package]]
 name = "fictionet-cli"
