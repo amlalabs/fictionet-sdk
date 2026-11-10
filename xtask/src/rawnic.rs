@@ -16,7 +16,7 @@ impl Drop for Guest {
     }
 }
 
-fn output(command: &mut Command) -> Result<Vec<u8>> {
+pub(super) fn output(command: &mut Command) -> Result<Vec<u8>> {
     let result = command.output()?;
     if !result.status.success() {
         return Err(format!(
@@ -28,11 +28,11 @@ fn output(command: &mut Command) -> Result<Vec<u8>> {
     Ok(result.stdout)
 }
 
-fn entry(archive: &mut Vec<u8>, name: &str, mode: u32, bytes: &[u8]) {
+pub(super) fn entry(archive: &mut Vec<u8>, name: &str, mode: u32, bytes: &[u8]) {
     node(archive, name, mode, bytes, (0, 0));
 }
 
-fn node(archive: &mut Vec<u8>, name: &str, mode: u32, bytes: &[u8], device: (u32, u32)) {
+pub(super) fn node(archive: &mut Vec<u8>, name: &str, mode: u32, bytes: &[u8], device: (u32, u32)) {
     let header = format!(
         "070701{:08x}{mode:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
         0,
@@ -60,7 +60,12 @@ fn node(archive: &mut Vec<u8>, name: &str, mode: u32, bytes: &[u8], device: (u32
     }
 }
 
-fn executable(archive: &mut Vec<u8>, source: &Path, destination: &str, directory: &Path) -> Result {
+pub(super) fn executable(
+    archive: &mut Vec<u8>,
+    source: &Path,
+    destination: &str,
+    directory: &Path,
+) -> Result {
     // Debug sections can exhaust guest memory while the initramfs is unpacked.
     // Keep the original binary for debugging and strip only its guest copy.
     let stripped = directory.join("guest-executable");
