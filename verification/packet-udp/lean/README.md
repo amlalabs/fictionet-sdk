@@ -53,17 +53,25 @@ specification; each names the RFC text it states. They rest only on
 | `late_completes_nothing` | A fragment arriving at or after its packet's deadline completes nothing: only a one-fragment packet can come out of that step. | RFC 8200 section 4.5 |
 | `atomic_alone` | A one-fragment packet (offset 0, no more fragments) is handed up alone and changes nothing else. | RFC 6946 section 4 |
 | `bad_discarded`, `arrived_header` | A non-last fragment whose length is not a multiple of 8, and an empty fragment, are discarded and change nothing; only a fragment at offset 0 carries headers. | RFC 8200 section 4.5 |
+| `expire_out`, `reassemble_out` | Expiry keeps, after what it kept before, the first fragment of every packet whose deadline has come, if that fragment arrived; a step keeps nothing else (the fragment it takes and the cap add nothing). | RFC 1122 section 3.3.2, RFC 8200 section 4.5 |
+| `firstPacket_none`, `firstPacket_dead` | A packet whose fragment zero never came, and one already dropped for a bad fragment, keep nothing: no answer. | RFC 1122 section 3.3.2 ("if fragment zero has been received"), RFC 5722 section 4 |
+| `firstPacket_from`, `expire_from` | Every kept first fragment is the rebuild of one fragment taken for the packet's key at offset 0: its headers, its Fragment header (`frag6`) and its data (with `Hist`, which now also tracks `frag6`). | RFC 792, RFC 1122 section 3.3.2, RFC 4443 section 3.3 |
+| `arrived4_rebuild`, `arrived6_rebuild` | That rebuild is the packet as it came, up to its IPv4 total length or IPv6 payload length: for IPv6, the "next header" byte names the Fragment header (44) again and the Fragment header's 8 bytes are back. | RFC 792, RFC 4443 section 3.3 |
 
 The cap itself (4 MiB) is far too large for vectors; it is proved
 (`reassemble_inv`) and not tested.
 
 ### Vectors (`reassembly.json`)
 
-Each case is a run of packets with arrival times, from an empty table;
-each step's expected result is what the model's `push` makes of it: the
-whole packet's bytes, waiting, discarded, or refused.
-`tests/ip_vectors/reassembly.rs` feeds the same packets to
-`Reassembly::push` with the same `Instant`s and compares every step. Twelve
+Each case is a run of steps with times, from an empty table: a packet for
+`push`, or no packet for the timer (`expire`). Each step's expected result
+is what the model makes of it: the whole packet's bytes, waiting,
+discarded, or refused; and then the first fragments kept for Time Exceeded
+answers, which the test takes (`take_expired`) and compares byte for byte.
+It also checks the answer `reassembly_time_exceeded` builds for each: ICMP
+Time Exceeded, code 1, from the fragment's destination, quoting its start.
+`tests/ip_vectors/reassembly.rs` runs the same steps on `Reassembly` with
+the same `Instant`s and compares every one. Thirteen
 scenarios, each for IPv4 and IPv6, 25 rounds, plus four cases at the length
 limit: fragments in any order with exact copies; partial overlaps (with the
 original bytes there or others); the same place with other bytes; a copy
@@ -73,8 +81,10 @@ interleaved (another identification, or the other family); an end past
 65,535; a non-last length not a multiple of 8 and an empty fragment; a
 one-fragment packet next to waiting ones; a copy with its TTL changed (an
 IPv4 header that no longer verifies, so not a fragment) or its hop limit
-changed; and a packet killed by an overlap that the same key makes again
-after its deadline. IPv4 packets carry random options (copied to later
+changed; a packet killed by an overlap that the same key makes again
+after its deadline; and some fragments, then the timer just before, at,
+or past the first deadline, then the rest. A pause may also run the timer.
+IPv4 packets carry random options (copied to later
 fragments or not), "don't fragment" and the reserved bit; IPv6 packets carry
 an optional Hop-by-Hop header in front of the Fragment header and an
 optional Destination Options header behind it, and later fragments may
@@ -92,6 +102,16 @@ length or IPv6 payload length of 65,535 and 65,536.
   on which.
 - A piece carries the "more fragments" flag of its fragment as a ghost
   field that the step never reads, for the soundness theorem.
+- The table also holds `out`, the first fragments kept for answers, as
+  the code's `expired` queue, counted in `size`. A packet keeps
+  `frag6` (where the "next header" byte that named the Fragment header
+  is, and the Fragment header) with its first fragment's headers, as the
+  code does; `rebuild` reads at most 8 bytes of it, as the code keeps a
+  `[u8; 8]`.
+- The model keeps several first fragments expired in one step in its
+  table's order, the code by deadline; the vector test compares them as
+  sets. `complete` takes the IPv6 Fragment header of the first
+  fragment as any `f6`.
 - `arrived6` walks chains the way `chain6` walks the ones it accepts. A
   chain `chain6` refuses never reaches reassembly (`push` refuses it
   first); those checks belong to the extension-header model, and the
@@ -109,13 +129,15 @@ length or IPv6 payload length of 65,535 and 65,536.
   are "should"s; kept. Answering would also change what the world's
   sandbox filter (`world/net/attachments.rs`) does with a refused packet
   bound elsewhere: it forwards it.
-- RFC 1122 section 3.3.2 says a host MUST send ICMP Time Exceeded (code 1)
-  when IPv4 reassembly times out with fragment zero received; RFC 792 and
-  RFC 8200 section 4.5 ask for the same ("should" for IPv6). `expire`
-  drops the packet silently. This is a real gap for IPv4, and a guest can
-  see it, since a Linux host sends the message. It is not fixed here: it
-  needs `expire` to return the answers and the IP layer (`packet.rs`) to
-  send them.
+- Fixed: RFC 1122 section 3.3.2 says a host MUST send ICMP Time Exceeded
+  (code 1) when IPv4 reassembly times out with fragment zero received;
+  RFC 8200 section 4.5 asks the same of IPv6 ("should"). `expire` dropped
+  the packet silently. Now it keeps the packet's first fragment, rebuilt
+  as it came, for `take_expired`; `reassembly_time_exceeded` builds the
+  answer with `icmp::error` (so nothing about an ICMP error or to a
+  source that is not one host); `IpLayer` sends it down like a parameter
+  problem; and the sandbox filter answers for the gateway and the
+  machines, the hosts the world plays, and drops the rest silently.
 - RFC 1122 section 3.3.2 recommends an IPv4 timeout of 60 to 120 seconds;
   the code waits 30, as Linux's `ipfrag_time`. Kept.
 - RFC 791's algorithm accepts overlapping IPv4 fragments; the code applies
@@ -132,17 +154,19 @@ length or IPv6 payload length of 65,535 and 65,536.
 
 ### Results
 
-Lean 4.35.0: `Ip/Reassembly.lean` checks with no `sorry`, 161 theorems,
-of which the 21 in the table above are listed in `Ip/Axioms.lean`; each
+Lean 4.35.0: `Ip/Reassembly.lean` checks with no `sorry`, 187 theorems,
+of which the 29 named in the table above are listed in `Ip/Axioms.lean`; each
 rests on `propext`, `Quot.sound` and `Classical.choice` or fewer.
 `inv_empty` shows the empty table keeps the invariant, and `cut_witness`
 that `Cut` is met by a real cut, so the premises of `complete` are not
-empty. With seed 1, `reassembly.json` holds 604 cases and 11,035 steps
-(632 whole packets, 8,075 waiting, 2,328 discarded, none refused), and
-`Reassembly::push` agrees with the model on every step.
+empty. With seed 1, `reassembly.json` holds 654 cases and 12,407 steps
+(688 whole packets, 9,386 waiting, 2,206 discarded, none refused, 127
+timer steps) with 27 first fragments kept for answers (16 IPv4, 11
+IPv6), and `Reassembly` agrees with the model on every step.
 
-No bug was found in `Reassembly`. The departures above are the findings;
-the one that matters is the missing ICMP Time Exceeded for IPv4.
+The one finding that needed a fix was the missing ICMP Time Exceeded
+(above); `packet::tests::a_timed_out_ipv4_packet_is_answered_when_fragment_zero_came`
+and its IPv6 twin fail without the fix. No other bug was found.
 
 ### Rerunning
 

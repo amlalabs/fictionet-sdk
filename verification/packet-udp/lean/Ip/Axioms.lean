@@ -27,6 +27,14 @@ import Ip
 #print axioms Ip.Reassembly.atomic_alone
 #print axioms Ip.Reassembly.bad_discarded
 #print axioms Ip.Reassembly.arrived_header
+#print axioms Ip.Reassembly.expire_out
+#print axioms Ip.Reassembly.reassemble_out
+#print axioms Ip.Reassembly.firstPacket_none
+#print axioms Ip.Reassembly.firstPacket_dead
+#print axioms Ip.Reassembly.firstPacket_from
+#print axioms Ip.Reassembly.expire_from
+#print axioms Ip.Reassembly.arrived4_rebuild
+#print axioms Ip.Reassembly.arrived6_rebuild
 
 -- IPv6 extension headers and ICMP
 #print axioms Ip.Ext6.chain6_check_eq_rfc
