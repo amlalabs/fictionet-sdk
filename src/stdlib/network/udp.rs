@@ -64,7 +64,7 @@ use fictionet::stdlib::network::icmp;
 
 use fictionet::stdlib::network::packet::CheckedIpPacket;
 use fictionet::stdlib::network::transport::{Request, Udp, UdpControl, UdpNotice};
-use fictionet::{Cx, Interface, RecvError};
+use fictionet::{Cx, Interface, Packet, RecvError};
 
 /// Choices for a machine's UDP that a world passes in with
 /// [`Endpoint::settings`]. The default is what the standards say.
@@ -211,7 +211,7 @@ impl PacketDriver {
     pub(crate) fn poll(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        out: &mut Vec<Chunk>,
+        out: &mut Vec<Packet>,
         limit: usize,
         now: fictionet::time::Instant,
     ) -> fictionet::Result<(bool, Option<fictionet::time::Instant>)> {
@@ -286,7 +286,7 @@ struct Shared {
 
 struct Inner {
     driver: Driver<UdpLayer>,
-    output: Vec<Chunk>,
+    output: Vec<Packet>,
     wake: Option<Waker>,
     /// The sockets by port.
     sockets: BTreeMap<u16, Mailbox>,

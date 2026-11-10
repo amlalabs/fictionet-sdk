@@ -25,8 +25,9 @@
 //! reach this layer.
 //!
 //! smoltcp handles TCP receive windows, acknowledgments, and retransmission.
-//! Empty buffer pages are released only when the socket also holds no
-//! out-of-order data.
+//! A connection keeps the chunks segments arrived in and the chunks its
+//! application wrote, not rings, so one with nothing to read, send or
+//! reassemble holds no buffer.
 //!
 //! This builds a machine at `104.18.32.7` and accepts connections on its
 //! port 443. The other end of the [`pair`](fictionet::pair) goes to a router,
@@ -54,16 +55,15 @@
 
 use fictionet::stdlib::codec::Side;
 use fictionet::sync::Mutex;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use smoltcp::iface::{Config, Interface as Iface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
+use smoltcp::iface::{Config, Context as TcpContext, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self as stcp, State as TcpState};
-use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
+use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr, TcpSum};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::layer::{
@@ -82,7 +82,7 @@ use fictionet::stdlib::network::transport::{
 };
 use fictionet::stdlib::network::{ConnError, Connection, Read};
 use fictionet::time::{Duration, Instant};
-use fictionet::{Cx, Entropy, Error, Interface};
+use fictionet::{Cx, Entropy, Error, Interface, Packet};
 
 mod applications;
 mod engine;
@@ -104,9 +104,6 @@ const BUFFER: usize = 256 * 1024;
 /// The smallest and largest buffers [`Options::buffer`] allows.
 const MIN_BUFFER: usize = 4 * 1024;
 const MAX_BUFFER: usize = 64 * 1024 * 1024;
-/// How often buffers of connections that went quiet are given back to the
-/// system.
-const RELEASE_EVERY: Duration = Duration::from_secs(1);
 /// A connection whose peer sends nothing for this long while it waits for
 /// an answer (a SYN, unacknowledged data, a keepalive) is given up.
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -555,10 +552,14 @@ pub trait Segments: Send {
     /// data can be read, and chooses whether to acknowledge or reset it.
     fn received(&mut self, segment: &Received<'_>) -> SegmentVerdict;
 
-    /// Validates and orders contiguous bytes before the application reads them.
-    fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) -> SegmentVerdict {
-        let _ = seq;
-        out.extend_from_slice(data);
+    /// Validates and orders contiguous bytes, `data` from subflow sequence
+    /// number `seq`, before the application reads them, in place: what is
+    /// left in `data` is what the application reads. Edit them with
+    /// [`Chunk::make_mut`], charged to `budget`, or put other bytes in
+    /// their place, fewer while some wait for a mapping. The default leaves
+    /// them as they are and copies nothing.
+    fn arrived(&mut self, seq: u32, data: &mut Chunk, budget: &Budget) -> SegmentVerdict {
+        let _ = (seq, data, budget);
         SegmentVerdict::Take
     }
 
@@ -634,8 +635,8 @@ impl stcp::SegmentOptions for SegmentsOnWire {
             .on_wire()
     }
 
-    fn arrived(&mut self, seq: u32, data: &[u8], out: &mut Vec<u8>) -> stcp::Verdict {
-        self.0.arrived(seq, data, out).on_wire()
+    fn arrived(&mut self, seq: u32, data: &mut Chunk, budget: &Budget) -> stcp::Verdict {
+        self.0.arrived(seq, data, budget).on_wire()
     }
 
     fn reset(&mut self, out: &mut Vec<u8>) {
@@ -826,10 +827,10 @@ pub use smoltcp::wire::{OptionLayout, OptionOrder};
 /// supplies [`Settings::cookies`]. Incomplete handshakes expire after
 /// [`Settings::handshake_timeout`]. [`endpoint_with`] takes other settings,
 /// buffer sizes and backlogs, subject to the maximum and
-/// per-peer limits described in [`Options::backlog`]. Buffer memory is used only
-/// as data passes through: once a connection's buffers are empty, their
-/// pages go back to the system within about two seconds, though the
-/// connection stays open, and closing frees them. A connection gives up with
+/// per-peer limits described in [`Options::backlog`]. Buffer memory is used
+/// only as data passes through: a connection keeps the chunks its bytes came
+/// in until they are read or acknowledged, and holds none once its peer has
+/// acknowledged what it sent and it read what came. A connection gives up with
 /// [`ConnError::TimedOut`] when the peer has not answered for two minutes:
 /// a SYN, data that is not acknowledged, or a keepalive (sent after 45
 /// seconds of quiet). A connection whose handle was dropped finishes
@@ -849,10 +850,8 @@ pub use smoltcp::wire::{OptionLayout, OptionOrder};
 /// restart that timer. An endpoint retains at most 1,024 such sockets.
 /// Past that cap, housekeeping forgets them in the order it first saw
 /// them as TIME-WAIT orphans, so later packets for those tuples may get
-/// RSTs. Live handles and sockets still closing are not evicted. At the
-/// default buffer size, the cap retains up to 512 MiB of buffer address
-/// space; empty pages can be released on native builds, while browser
-/// buffers use the heap. Larger buffers increase this bound.
+/// RSTs. Live handles and sockets still closing are not evicted. A socket
+/// in TIME-WAIT has nothing to read or send, so it holds no buffer.
 #[track_caller]
 pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
     endpoint_with(fcx, inner, addr, Options::default())
@@ -929,12 +928,11 @@ impl Options {
     /// accept queue is full, [`Settings::reset_full_queue`] selects whether
     /// a new SYN gets a reset; otherwise it is dropped.
     ///
-    /// Each connection in the backlog has its buffers from its first SYN.
-    /// Their pages cost memory only once data arrives, but each connection
-    /// holds one memory mapping, and Linux allows a process 65,530 of them
-    /// by default (`vm.max_map_count`). Spoofed SYNs from many addresses
-    /// fill the backlog of every port they reach, so a world with many
-    /// listening ports may want a smaller one.
+    /// Each connection in the backlog is charged the places for the chunks
+    /// it may retain from its first SYN, and holds bytes only once data
+    /// arrives. Spoofed SYNs from many addresses fill the backlog of every
+    /// port they reach, so a world with many listening ports may want a
+    /// smaller one.
     pub fn backlog(self, connections: usize) -> Options {
         Options {
             backlog: connections.clamp(1, MAX_BACKLOG),
@@ -1061,7 +1059,7 @@ impl PacketDriver {
     pub(crate) fn poll(
         &mut self,
         cx: &mut Context<'_>,
-        out: &mut Vec<Chunk>,
+        out: &mut Vec<Packet>,
         limit: usize,
         now: Instant,
     ) -> fictionet::Result<(bool, Option<Instant>)> {
@@ -1614,7 +1612,7 @@ impl Host {
     }
 
     /// Steps the transport and drains its output before yielding.
-    fn visit(&mut self, out: &mut Vec<Chunk>, limit: usize, now: Instant) -> bool {
+    fn visit(&mut self, out: &mut Vec<Packet>, limit: usize, now: Instant) -> bool {
         self.tcp.set_now(now);
         let mut work_exhausted = false;
         for turn in 0..64 {

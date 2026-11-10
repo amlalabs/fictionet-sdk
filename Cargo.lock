@@ -4815,6 +4815,7 @@ name = "smoltcp"
 version = "0.14.0"
 dependencies = [
  "byteorder",
+ "fictionet-buf",
  "managed",
  "rand 0.8.8",
 ]

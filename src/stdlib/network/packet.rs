@@ -25,7 +25,7 @@
 //! - each packet is sorted by protocol, and an ICMP error goes to the
 //!   transport of the packet it quotes ([`Sort::of`]).
 //!
-//! A transport layer sits above it with `Packets<CheckedIpPacket, Chunk>` as
+//! A transport layer sits above it with `Packets<CheckedIpPacket, Packet>` as
 //! its lower port. It receives the packets whose [`CheckedIpPacket::sort`]
 //! is its [`Transport`], ICMP errors quoting its packets included, and sends
 //! whole IP packets it built down. The IP layer sends them on unchanged.
@@ -91,6 +91,7 @@ use fictionet::stdlib::layer::{
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, protocol};
 use fictionet::time::Instant;
+use fictionet::{Checksums, Packet};
 
 mod factory;
 mod framed;
@@ -259,6 +260,9 @@ pub struct CheckedIpPacket {
     header: Header,
     sort: Sort,
     origin: Origin,
+    /// What a stack in this process verified of the bytes: only of bytes
+    /// that arrived as they are, never of ones put together here.
+    checksums: Checksums,
 }
 
 impl CheckedIpPacket {
@@ -283,7 +287,18 @@ impl CheckedIpPacket {
             header,
             sort,
             origin,
+            checksums: Checksums::default(),
         })
+    }
+
+    /// What a stack in this process verified of the bytes, unchanged since.
+    pub fn checksums(&self) -> Checksums {
+        self.checksums
+    }
+
+    /// The packet as it goes on, with what was verified of it.
+    pub fn into_packet(self) -> Packet {
+        Packet::verified(self.bytes, self.checksums)
     }
 
     /// The packet's bytes, IP header first. For a reassembled or normalized
@@ -424,13 +439,14 @@ impl NetworkInput {
         Self { network }
     }
 
-    /// The raw bytes of `packet` if it is of this network; otherwise
+    /// The raw packet in `packet` if it is of this network, with nothing
+    /// verified of it; otherwise
     /// `packet` back, unchanged, for another network's input.
-    pub fn accept(&self, packet: Datagram<Ingress>) -> Result<Chunk, Datagram<Ingress>> {
+    pub fn accept(&self, packet: Datagram<Ingress>) -> Result<Packet, Datagram<Ingress>> {
         if packet.meta().scope != self.network {
             return Err(packet);
         }
-        Ok(packet.into_parts().0)
+        Ok(Packet::from_chunk(packet.into_parts().0))
     }
 }
 
@@ -510,7 +526,7 @@ pub struct IpLayer {
     reassembly: Reassembly,
     up: Option<PacketEvent<CheckedIpPacket>>,
     answer: Option<Chunk>,
-    down: Option<PacketCommand<Chunk>>,
+    down: Option<PacketCommand<Packet>>,
     input_closed: bool,
     output_closed: bool,
 }
@@ -521,8 +537,12 @@ impl IpLayer {
         IpLayer::default()
     }
 
-    /// Takes in one raw packet the layer has room for.
-    fn take_in(&mut self, env: &mut Env<'_, IpReport>, bytes: Chunk) {
+    /// Takes in one raw packet the layer has room for. What a stack in this
+    /// process verified of it goes up with it if its bytes go up as they
+    /// arrived.
+    fn take_in(&mut self, env: &mut Env<'_, IpReport>, raw: Packet) {
+        let checksums = raw.checksums();
+        let bytes = raw.into_chunk();
         let before = Header::parse(&bytes);
         let fragment = before.as_ref().is_some_and(|h| h.fragment.is_some());
         let extended = before
@@ -534,7 +554,7 @@ impl IpLayer {
         // checked there first.
         if before.as_ref().is_some_and(|h| h.src.is_ipv4()) && !fragment {
             self.reassembly.expire(env.now());
-            self.checked(env, bytes, Origin::Arrived);
+            self.checked(env, bytes, Origin::Arrived, checksums);
             return;
         }
         // The original is another piece of the same bytes, no copy; it is
@@ -550,7 +570,7 @@ impl IpLayer {
                     }
                     _ => Origin::Arrived,
                 };
-                self.checked(env, whole, origin);
+                self.checked(env, whole, origin, checksums);
             }
             Intake::Waiting => {}
             Intake::Discarded => env.report(IpReport::Malformed),
@@ -565,17 +585,30 @@ impl IpLayer {
     }
 
     /// Hands `bytes` up if a host takes them in, and reports them otherwise.
-    fn checked(&mut self, env: &mut Env<'_, IpReport>, bytes: Chunk, origin: Origin) {
+    /// `checksums` stay with bytes that arrived as they are, and no others.
+    fn checked(
+        &mut self,
+        env: &mut Env<'_, IpReport>,
+        bytes: Chunk,
+        origin: Origin,
+        checksums: Checksums,
+    ) {
+        let arrived = matches!(origin, Origin::Arrived);
         match CheckedIpPacket::checked(bytes, origin) {
-            Ok(packet) => self.up = Some(PacketEvent::Packet(packet)),
+            Ok(mut packet) => {
+                if arrived {
+                    packet.checksums = checksums;
+                }
+                self.up = Some(PacketEvent::Packet(packet));
+            }
             Err(_) => env.report(IpReport::Malformed),
         }
     }
 }
 
 impl Layer for IpLayer {
-    type Lower = Packets<Chunk, Chunk>;
-    type Upper = Packets<CheckedIpPacket, Chunk>;
+    type Lower = Packets<Packet, Packet>;
+    type Upper = Packets<CheckedIpPacket, Packet>;
     type Report = IpReport;
     type Timer = ();
     type Work = ();
@@ -635,7 +668,7 @@ impl Layer for IpLayer {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
         self.answer
             .take()
-            .map(PacketCommand::Send)
+            .map(|answer| PacketCommand::Send(Packet::from_chunk(answer)))
             .or_else(|| self.down.take())
     }
 
@@ -675,8 +708,8 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn raw(bytes: Vec<u8>) -> PacketEvent<Chunk> {
-        PacketEvent::Packet(Chunk::unpaid(bytes))
+    fn raw(bytes: Vec<u8>) -> PacketEvent<Packet> {
+        PacketEvent::Packet(Packet::new(bytes))
     }
 
     fn up(d: &mut Driver<IpLayer>) -> Vec<CheckedIpPacket> {
@@ -936,11 +969,11 @@ mod tests {
 
         // The same holds going down.
         assert!(matches!(
-            d.command(PacketCommand::Send(Chunk::unpaid(first.clone()))),
+            d.command(PacketCommand::Send(Packet::new(first.clone()))),
             Ok(Admit::Taken)
         ));
         assert!(matches!(
-            d.command(PacketCommand::Send(Chunk::unpaid(vec![1]))),
+            d.command(PacketCommand::Send(Packet::new(vec![1]))),
             Ok(Admit::Blocked(_))
         ));
         assert_eq!(down(&mut d), [first]);
@@ -959,7 +992,7 @@ mod tests {
         assert!(matches!(d.deliver(raw(vec![0x45])), Ok(Admit::Closed(_))));
         assert!(matches!(d.command(PacketCommand::End), Ok(Admit::Taken)));
         assert!(matches!(
-            d.command(PacketCommand::Send(Chunk::unpaid(vec![1]))),
+            d.command(PacketCommand::Send(Packet::new(vec![1]))),
             Ok(Admit::Closed(_))
         ));
         let mut ends = 0;
@@ -1022,6 +1055,7 @@ mod tests {
             origin: Origin::Normalized {
                 original: Chunk::unpaid(vec![0; 64]),
             },
+            checksums: Checksums::default(),
         };
         let tight = Budget::new(plain.len() + 10);
         assert!(!packet.reserve(&tight));

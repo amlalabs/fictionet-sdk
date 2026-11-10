@@ -6,14 +6,14 @@ use fictionet::stdlib::network::tcp::{Options, TcpLayer};
 use fictionet::stdlib::network::transport::{Request, TcpControl, TcpNotice, TcpOpening};
 use fictionet::stdlib::services::stack::{Boxed, Polling};
 use fictionet::time::Instant;
-use fictionet::{Seed, SeededEntropy};
+use fictionet::{Packet, Seed, SeededEntropy};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-type Raw = Packets<Chunk, Chunk>;
+type Raw = Packets<Packet, Packet>;
 type ControlPort = Messages<TcpNotice, TcpControl>;
 
 struct Control(VecDeque<TcpControl>);
@@ -172,7 +172,7 @@ fn fragments(bytes: &[u8], serial: &mut u16) -> Vec<Vec<u8>> {
 /// Disturbs the inner network before framing puts it on the outer stream.
 struct Fragmented {
     frames: packet::Framed,
-    packets: VecDeque<Chunk>,
+    packets: VecDeque<Packet>,
     serial: u16,
 }
 impl Layer for Fragmented {
@@ -193,8 +193,8 @@ impl Layer for Fragmented {
     fn on_command(
         &mut self,
         env: &mut Env<'_, Infallible>,
-        command: PacketCommand<Chunk>,
-    ) -> Result<Admit<PacketCommand<Chunk>>, Self::Error> {
+        command: PacketCommand<Packet>,
+    ) -> Result<Admit<PacketCommand<Packet>>, Self::Error> {
         if !self.packets.is_empty() {
             return Ok(Admit::Blocked(command));
         }
@@ -202,7 +202,7 @@ impl Layer for Fragmented {
             PacketCommand::Send(bytes) => self.packets.extend(
                 fragments(&bytes, &mut self.serial)
                     .into_iter()
-                    .map(Chunk::unpaid),
+                    .map(Packet::new),
             ),
             PacketCommand::End => return self.frames.on_command(env, PacketCommand::End),
         }
@@ -223,7 +223,7 @@ impl Layer for Fragmented {
     fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.frames.take_command(env)
     }
-    fn take_event(&mut self) -> Option<PacketEvent<Chunk>> {
+    fn take_event(&mut self) -> Option<PacketEvent<Packet>> {
         self.frames.take_event()
     }
 }
@@ -371,7 +371,7 @@ pub(super) fn exchange(
                 Admit::Taken
             });
             for packet in packets {
-                let mut event = PacketEvent::Packet(Chunk::unpaid(packet));
+                let mut event = PacketEvent::Packet(Packet::new(packet));
                 loop {
                     to.run().unwrap();
                     match to.deliver(event).unwrap() {
@@ -601,10 +601,10 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         ready: bool,
         blocked: Arc<AtomicBool>,
         up: Option<PacketEvent<packet::CheckedIpPacket>>,
-        down: Option<PacketCommand<Chunk>>,
+        down: Option<PacketCommand<Packet>>,
     }
     impl Layer for Gate {
-        type Lower = Packets<packet::CheckedIpPacket, Chunk>;
+        type Lower = Packets<packet::CheckedIpPacket, Packet>;
         type Upper = Self::Lower;
         type Report = Infallible;
         type Timer = ();
@@ -625,8 +625,8 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         fn on_command(
             &mut self,
             _: &mut Env<'_, Infallible>,
-            command: PacketCommand<Chunk>,
-        ) -> Result<Admit<PacketCommand<Chunk>>, Infallible> {
+            command: PacketCommand<Packet>,
+        ) -> Result<Admit<PacketCommand<Packet>>, Infallible> {
             if !self.ready {
                 self.blocked.store(true, Ordering::SeqCst);
                 return Ok(Admit::Blocked(command));
@@ -647,7 +647,7 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
         fn take_event(&mut self) -> Option<PacketEvent<packet::CheckedIpPacket>> {
             self.up.take()
         }
-        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Chunk>> {
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<PacketCommand<Packet>> {
             self.down.take()
         }
     }

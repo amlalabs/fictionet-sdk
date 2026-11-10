@@ -2,8 +2,9 @@
 //! public SDK contracts. It owns validation, fragment reassembly, buffering,
 //! deadlines, and the outgoing hop-limit policy. It never constructs `IpLayer`.
 
+use fictionet::Packet;
 use fictionet::stdlib::layer::{
-    Admit, Chunk, CommandOf, Env, EventOf, Layer, PacketCommand, PacketEvent, Packets,
+    Admit, CommandOf, Env, EventOf, Layer, PacketCommand, PacketEvent, Packets,
 };
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, set_header_checksum};
 use fictionet::stdlib::network::packet::{CheckedIpPacket, IpReport, Origin};
@@ -16,8 +17,8 @@ pub struct HopLimit {
     hops: u8,
     reassembly: Reassembly,
     up: Option<PacketEvent<CheckedIpPacket>>,
-    answer: Option<Chunk>,
-    down: Option<PacketCommand<Chunk>>,
+    answer: Option<Packet>,
+    down: Option<PacketCommand<Packet>>,
     input_closed: bool,
     output_closed: bool,
 }
@@ -37,7 +38,8 @@ impl HopLimit {
     }
 
     /// Takes in one raw packet the layer has room for.
-    fn take_in(&mut self, env: &mut Env<'_, IpReport>, bytes: Chunk) {
+    fn take_in(&mut self, env: &mut Env<'_, IpReport>, raw: Packet) {
+        let bytes = raw.into_chunk();
         let before = Header::parse(&bytes);
         let fragment = before.as_ref().is_some_and(|h| h.fragment.is_some());
         let original = (!fragment
@@ -66,15 +68,15 @@ impl HopLimit {
                 env.report(IpReport::Refused {
                     answered: answer.is_some(),
                 });
-                self.answer = answer;
+                self.answer = answer.map(Packet::from_chunk);
             }
         }
     }
 }
 
 impl Layer for HopLimit {
-    type Lower = Packets<Chunk, Chunk>;
-    type Upper = Packets<CheckedIpPacket, Chunk>;
+    type Lower = Packets<Packet, Packet>;
+    type Upper = Packets<CheckedIpPacket, Packet>;
     type Report = IpReport;
     type Timer = ();
     type Work = ();
@@ -132,12 +134,12 @@ impl Layer for HopLimit {
     }
 
     fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
-        let chunk = self.answer.as_mut().or(match &mut self.down {
-            Some(PacketCommand::Send(chunk)) => Some(chunk),
+        let packet = self.answer.as_mut().or(match &mut self.down {
+            Some(PacketCommand::Send(packet)) => Some(packet),
             _ => None,
         });
-        if let Some(chunk) = chunk {
-            let bytes = chunk.make_mut(env.budget())?;
+        if let Some(packet) = packet {
+            let bytes = packet.make_mut(env.budget())?;
             match bytes.first().map(|version| version >> 4) {
                 Some(4) if bytes.len() >= 20 => {
                     let header_len = usize::from(bytes[0] & 15) * 4;
@@ -192,7 +194,7 @@ mod tests {
         );
         for bytes in [vec![0x45], fragment] {
             assert!(matches!(
-                driver.deliver(PacketEvent::Packet(Chunk::unpaid(bytes))),
+                driver.deliver(PacketEvent::Packet(Packet::new(bytes))),
                 Ok(Admit::Taken)
             ));
             driver.send_above(|_| panic!("malformed input reached a transport"));

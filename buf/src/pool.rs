@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::task::Waker;
 
 use crate::budget::{Budget, Charge};
 use crate::chunk::{Backing, Chunk, Reservation};
@@ -53,6 +54,8 @@ struct State {
     floor: usize,
     /// Pays for the free list's places, charged when it first keeps one.
     places: Charge,
+    /// One logical control sender waits for a returned backing here.
+    control_waiter: Option<Waker>,
 }
 
 impl State {
@@ -113,6 +116,7 @@ impl Pool {
                     paid: Charge::nothing(&budget),
                     floor: 0,
                     places: Charge::nothing(&budget),
+                    control_waiter: None,
                 }),
                 budget,
             }),
@@ -191,6 +195,33 @@ impl Pool {
         Some(Self::taken(backing, charge, headroom))
     }
 
+    /// Parks one logical control sender until a returned backing can pay
+    /// for its next control block. Returns `true` instead of parking when
+    /// one is already available; the caller must retry taking it. The
+    /// availability check and registration are atomic with recycling.
+    /// Clones of a pool share this one sender registration.
+    pub fn wait_control(&self, task: &Waker) -> bool {
+        let mut state = self.shared.state.lock();
+        if state.paid.bytes() >= self.shared.slot {
+            let previous = state.control_waiter.take();
+            drop(state);
+            drop(previous);
+            return true;
+        }
+        let previous = if state
+            .control_waiter
+            .as_ref()
+            .is_none_or(|old| !old.will_wake(task))
+        {
+            state.control_waiter.replace(task.clone())
+        } else {
+            None
+        };
+        drop(state);
+        drop(previous);
+        false
+    }
+
     /// Keeps `slots` backings' worth of the pool's budget for
     /// [`take_control`](Self::take_control), charged now through `budget`,
     /// a view of the pool's own budget, so that a refusal is recorded where
@@ -219,8 +250,14 @@ impl Pool {
             return false;
         }
         let surplus = state.surplus(self.shared.slot);
+        let task = (state.paid.bytes() >= self.shared.slot)
+            .then(|| state.control_waiter.take())
+            .flatten();
         drop(state);
         drop(surplus);
+        if let Some(task) = task {
+            task.wake();
+        }
         true
     }
 
@@ -230,7 +267,15 @@ impl Pool {
     #[must_use = "a refused refill leaves the reserve short"]
     pub fn refill(&self, budget: &Budget) -> bool {
         let mut state = self.shared.state.lock();
-        Self::top_up(&mut state, budget, self.shared.slot)
+        let filled = Self::top_up(&mut state, budget, self.shared.slot);
+        let task = (state.paid.bytes() >= self.shared.slot)
+            .then(|| state.control_waiter.take())
+            .flatten();
+        drop(state);
+        if let Some(task) = task {
+            task.wake();
+        }
+        filled
     }
 
     /// Charges what `paid` lacks of what it must hold through `budget`.
@@ -297,8 +342,12 @@ impl PoolShared {
             .expect("both charges are on the pool's budget");
         state.free.push(backing);
         let surplus = state.surplus(self.slot);
+        let task = state.control_waiter.take();
         drop(state);
         drop((stale, surplus));
+        if let Some(task) = task {
+            task.wake();
+        }
     }
 }
 

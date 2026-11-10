@@ -24,8 +24,8 @@ struct Pending {
 
 /// TCP sockets in slot order. Removed slots are reused before the set grows.
 #[derive(Debug, Default)]
-pub struct SocketSet<'a> {
-    sockets: Vec<Option<Socket<'a>>>,
+pub struct SocketSet {
+    sockets: Vec<Option<Socket>>,
     dirty: VecDeque<SocketHandle>,
     changed: VecDeque<SocketHandle>,
     pending: Vec<Pending>,
@@ -35,8 +35,8 @@ pub struct SocketSet<'a> {
     served: Option<SocketHandle>,
 }
 
-impl<'a> SocketSet<'a> {
-    pub fn add(&mut self, socket: Socket<'a>) -> SocketHandle {
+impl SocketSet {
+    pub fn add(&mut self, socket: Socket) -> SocketHandle {
         let handle = if let Some(index) = self.sockets.iter().position(Option::is_none) {
             self.sockets[index] = Some(socket);
             SocketHandle(index)
@@ -52,18 +52,18 @@ impl<'a> SocketSet<'a> {
     }
 
     /// Get a socket. Panics if its handle is invalid.
-    pub fn get(&self, handle: SocketHandle) -> &Socket<'a> {
+    pub fn get(&self, handle: SocketHandle) -> &Socket {
         self.sockets[handle.0]
             .as_ref()
             .expect("invalid socket handle")
     }
 
-    pub(crate) fn try_get(&self, handle: SocketHandle) -> Option<&Socket<'a>> {
+    pub fn try_get(&self, handle: SocketHandle) -> Option<&Socket> {
         self.sockets.get(handle.0)?.as_ref()
     }
 
     /// Get a mutable socket. Panics if its handle is invalid.
-    pub fn get_mut(&mut self, handle: SocketHandle) -> &mut Socket<'a> {
+    pub fn get_mut(&mut self, handle: SocketHandle) -> &mut Socket {
         self.mark(handle);
         self.sockets[handle.0]
             .as_mut()
@@ -71,7 +71,7 @@ impl<'a> SocketSet<'a> {
     }
 
     /// Remove a socket without changing its state. Panics if its handle is invalid.
-    pub fn remove(&mut self, handle: SocketHandle) -> Socket<'a> {
+    pub fn remove(&mut self, handle: SocketHandle) -> Socket {
         if self.pending[handle.0].dirty {
             self.dirty.retain(|&h| h != handle);
         }
@@ -86,7 +86,7 @@ impl<'a> SocketSet<'a> {
             .expect("invalid socket handle")
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (SocketHandle, &Socket<'a>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (SocketHandle, &Socket)> {
         self.sockets
             .iter()
             .enumerate()
@@ -135,10 +135,13 @@ impl<'a> SocketSet<'a> {
         self.mark_changed(handle);
     }
 
-    pub(crate) fn schedule(&mut self, cx: &mut Context) {
+    pub fn schedule(&mut self, cx: &mut Context) {
         while let Some(handle) = self.dirty.pop_front() {
             self.pending[handle.0].dirty = false;
-            let at = match self.get(handle).poll_at(cx) {
+            let at = match self
+                .get(handle)
+                .poll_at(cx, crate::socket::tcp::DispatchMode::All)
+            {
                 PollAt::Ingress => {
                     self.ready.remove(&handle);
                     None
@@ -164,7 +167,7 @@ impl<'a> SocketSet<'a> {
         }
     }
 
-    pub(crate) fn prepare(&mut self, cx: &mut Context, now: Instant) -> usize {
+    pub fn prepare(&mut self, cx: &mut Context, now: Instant) -> usize {
         self.schedule(cx);
         while let Some(&(at, handle)) = self.deadlines.first() {
             if at > now {
@@ -177,24 +180,24 @@ impl<'a> SocketSet<'a> {
         self.ready.len()
     }
 
-    pub(crate) fn next_ready(&self) -> Option<SocketHandle> {
+    pub fn next_ready(&self) -> Option<SocketHandle> {
         self.served
             .and_then(|after| self.ready.range((Excluded(after), Unbounded)).next())
             .or_else(|| self.ready.first())
             .copied()
     }
 
-    pub(crate) fn dispatched(&mut self, handle: SocketHandle, blocked: bool) {
+    pub fn dispatched(&mut self, handle: SocketHandle, blocked: bool) {
         if !blocked {
             self.served = Some(handle);
         }
     }
 
-    pub(crate) fn finish_egress(&mut self) {
+    pub fn finish_egress(&mut self) {
         self.served = None;
     }
 
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    pub fn next_deadline(&self) -> Option<Instant> {
         if self.ready.is_empty() {
             self.deadlines.first().map(|&(at, _)| at)
         } else {
@@ -202,3 +205,7 @@ impl<'a> SocketSet<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "socket_set_tests.rs"]
+mod tests;

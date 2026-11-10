@@ -128,6 +128,23 @@ impl Chunk {
         ))
     }
 
+    /// An empty block of `capacity` bytes, not from a pool, with its cursor
+    /// at `headroom`, charged to `budget` at its full capacity before it is
+    /// made: a place to gather bytes with
+    /// [`extend_within`](Self::extend_within) when no pool slot is large
+    /// enough. `None`, with nothing allocated, if the budget has no room or
+    /// `headroom` is past `capacity`.
+    pub fn block(budget: &Budget, headroom: usize, capacity: usize) -> Option<Chunk> {
+        if headroom > capacity {
+            return None;
+        }
+        let charge = budget.charge(capacity)?;
+        let mut chunk = Self::backed(vec![0; capacity], Some(Reservation::Own(charge)), None);
+        chunk.start = headroom;
+        chunk.end = headroom;
+        Some(chunk)
+    }
+
     /// Bytes for a child, made in the receive window its receiver lent and
     /// still keeps, which paid for them before it granted the credit they
     /// use: nothing is charged, and the receiver takes them in with no

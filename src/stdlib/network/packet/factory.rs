@@ -1,14 +1,15 @@
+use fictionet::Packet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use fictionet::Cx;
-use fictionet::stdlib::layer::{Budget, Chunk, Layer, Packets};
+use fictionet::stdlib::layer::{Budget, Layer, Packets};
 use fictionet::stdlib::services::stack::{BoxError, Boxed, Job};
 
 use super::{CheckedIpPacket, IpLayer};
 
 /// An IP implementation between a machine's interface and its transports.
-pub type Stack = Boxed<Packets<Chunk, Chunk>, Packets<CheckedIpPacket, Chunk>>;
+pub type Stack = Boxed<Packets<Packet, Packet>, Packets<CheckedIpPacket, Packet>>;
 
 /// Construction context for one machine's IP layer, before its route or
 /// services are published. A factory must not start protocol progress.
@@ -33,7 +34,7 @@ impl Factory {
     /// so a replacement can encapsulate both directions.
     pub fn new<L>(make: impl Fn(Opening) -> L + Send + Sync + 'static) -> Self
     where
-        L: Layer<Lower = Packets<Chunk, Chunk>, Upper = Packets<CheckedIpPacket, Chunk>>
+        L: Layer<Lower = Packets<Packet, Packet>, Upper = Packets<CheckedIpPacket, Packet>>
             + Send
             + 'static,
         L::Report: core::fmt::Debug + Send + 'static,

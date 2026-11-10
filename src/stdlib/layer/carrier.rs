@@ -445,6 +445,12 @@ impl<C: Port, K: Port> MuxCommand<C, K> {
     pub fn into_op(self) -> MuxOp<C, K> {
         self.0
     }
+
+    /// The command that asks for `op`, as a mux that took it apart hands
+    /// it back refused.
+    pub(crate) fn from_op(op: MuxOp<C, K>) -> MuxCommand<C, K> {
+        MuxCommand(op)
+    }
 }
 
 impl<C: Port, K: Port> core::fmt::Debug for MuxCommand<C, K> {

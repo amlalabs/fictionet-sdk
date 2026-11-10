@@ -1,7 +1,7 @@
-//! TCP packet dispatch over an in-memory IP device.
+//! Explicit TCP context and deterministic socket scheduling.
 
-mod interface;
+mod context;
 mod socket_set;
 
-pub use self::interface::{Config, InitialSeq, Interface, InterfaceInner as Context, PollResult};
+pub use self::context::{Config, Context, InitialSeq};
 pub use self::socket_set::{SocketHandle, SocketSet};

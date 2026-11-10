@@ -157,7 +157,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub(crate) fn new_checked(buffer: T) -> Result<Packet<T>> {
+    pub fn new_checked(buffer: T) -> Result<Packet<T>> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
@@ -279,7 +279,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 
     /// Return the header length, in octets.
     #[inline]
-    pub(crate) fn header_len(&self) -> u8 {
+    pub fn header_len(&self) -> u8 {
         let data = self.buffer.as_ref();
         let raw = NetworkEndian::read_u16(&data[field::FLAGS]);
         ((raw >> 12) * 4) as u8
@@ -340,7 +340,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
     /// Return a pointer to the options.
     #[inline]
-    pub(crate) fn options(&self) -> &'a [u8] {
+    pub fn options(&self) -> &'a [u8] {
         let header_len = self.header_len();
         let data = self.buffer.as_ref();
         &data[field::OPTIONS(header_len)]
@@ -826,6 +826,16 @@ pub struct OptionLayout {
     pub align: bool,
 }
 
+/// Whether [`Repr::parse_with`] checks a segment's checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sum {
+    /// Check it, as for every segment from outside the process.
+    Check,
+    /// A stack in this process computed or checked it, and nothing has
+    /// changed a byte since: the packet says so, and only the stack can.
+    Verified,
+}
+
 /// A high-level representation of a Transmission Control Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Repr<'a> {
@@ -872,6 +882,27 @@ impl TcpTimestampRepr {
 }
 
 impl<'a> Repr<'a> {
+    /// This segment with `extra` options and `payload` in place of its own,
+    /// borrowing nothing of it.
+    pub(crate) fn with_parts<'b>(&self, extra: &'b [u8], payload: &'b [u8]) -> Repr<'b> {
+        Repr {
+            src_port: self.src_port,
+            dst_port: self.dst_port,
+            control: self.control,
+            seq_number: self.seq_number,
+            ack_number: self.ack_number,
+            window_len: self.window_len,
+            window_scale: self.window_scale,
+            max_seg_size: self.max_seg_size,
+            sack_permitted: self.sack_permitted,
+            sack_ranges: self.sack_ranges,
+            timestamp: self.timestamp,
+            extra,
+            layout: self.layout,
+            payload,
+        }
+    }
+
     /// Parse a Transmission Control Protocol packet and return a high-level representation.
     pub fn parse<T>(
         packet: &Packet<&'a T>,
@@ -881,15 +912,18 @@ impl<'a> Repr<'a> {
     where
         T: AsRef<[u8]> + ?Sized,
     {
-        Self::parse_with(packet, src_addr, dst_addr, false)
+        Self::parse_with(packet, src_addr, dst_addr, false, Sum::Check)
     }
 
-    /// Parses a segment, optionally keeping the valid prefix of a malformed list.
+    /// Parses a segment, optionally keeping the valid prefix of a malformed
+    /// list. Its checksum is checked unless `sum` says a stack in this
+    /// process verified it and nothing changed the bytes since.
     pub fn parse_with<T>(
         packet: &Packet<&'a T>,
         src_addr: &IpAddress,
         dst_addr: &IpAddress,
         ignore_malformed: bool,
+        sum: Sum,
     ) -> Result<Repr<'a>>
     where
         T: AsRef<[u8]> + ?Sized,
@@ -897,7 +931,7 @@ impl<'a> Repr<'a> {
         packet.check_len()?;
 
         // Valid checksum is expected.
-        if !packet.verify_checksum(src_addr, dst_addr) {
+        if sum == Sum::Check && !packet.verify_checksum(src_addr, dst_addr) {
             return Err(Error);
         }
 
@@ -1046,12 +1080,8 @@ impl<'a> Repr<'a> {
     }
 
     /// Emit a high-level representation into a Transmission Control Protocol packet.
-    pub(crate) fn emit<T>(
-        &self,
-        packet: &mut Packet<&mut T>,
-        src_addr: &IpAddress,
-        dst_addr: &IpAddress,
-    ) where
+    pub fn emit<T>(&self, packet: &mut Packet<&mut T>, src_addr: &IpAddress, dst_addr: &IpAddress)
+    where
         T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
     {
         packet.set_src_port(self.src_port);
@@ -1448,7 +1478,14 @@ mod test {
         packet.fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
         let packet = Packet::new_unchecked(&bytes[..]);
         assert!(Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into()).is_err());
-        let repr = Repr::parse_with(&packet, &SRC_ADDR.into(), &DST_ADDR.into(), true).unwrap();
+        let repr = Repr::parse_with(
+            &packet,
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            true,
+            Sum::Check,
+        )
+        .unwrap();
         assert_eq!(repr.control, Control::Syn);
         assert_eq!(repr.max_seg_size, Some(1460));
         assert_eq!(repr.window_scale, None);
@@ -1540,7 +1577,16 @@ mod test {
             let read: Vec<_> = packet.options_iter().unwrap().collect();
             let repr = Repr::parse(&packet, &SRC_ADDR.into(), &DST_ADDR.into());
             assert_eq!(repr.is_ok(), read.iter().all(Result::is_ok), "{options:?}");
-            assert!(Repr::parse_with(&packet, &SRC_ADDR.into(), &DST_ADDR.into(), true).is_ok());
+            assert!(
+                Repr::parse_with(
+                    &packet,
+                    &SRC_ADDR.into(),
+                    &DST_ADDR.into(),
+                    true,
+                    Sum::Check
+                )
+                .is_ok()
+            );
             assert!(read.iter().filter(|o| o.is_err()).count() <= 1);
             let _ = packet.options_summary();
         }

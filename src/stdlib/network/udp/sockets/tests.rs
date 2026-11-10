@@ -51,7 +51,7 @@ fn datagram(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
 
 /// Offers one raw packet and runs the stack.
 fn arrive(d: &mut Driver<Stack>, bytes: Vec<u8>) {
-    let raw = Chunk::unpaid(bytes);
+    let raw = fictionet::Packet::new(bytes);
     assert!(matches!(
         d.deliver(PacketEvent::Packet(raw)),
         Ok(Admit::Taken)
@@ -587,7 +587,7 @@ fn a_full_layer_refuses_a_packet_unchanged() {
     let back = loop {
         assert!(taken <= 2 * HELD, "the layer kept taking packets");
         let packet = datagram(peer, local, &(taken as u32).to_be_bytes());
-        let raw = Chunk::unpaid(packet.clone());
+        let raw = fictionet::Packet::new(packet.clone());
         match d.deliver(PacketEvent::Packet(raw)) {
             Ok(Admit::Taken) => taken += 1,
             Ok(Admit::Blocked(PacketEvent::Packet(back))) => break (back, packet),
@@ -688,7 +688,7 @@ fn an_application_on_each_socket_answers_through_ip_and_udp() {
     let mut expected = Vec::new();
     for (n, payload) in sent.iter().enumerate() {
         let peer = peers[n % peers.len()];
-        let raw = Chunk::unpaid(datagram(peer, echo, payload));
+        let raw = fictionet::Packet::new(datagram(peer, echo, payload));
         assert!(matches!(
             d.deliver(PacketEvent::Packet(raw)),
             Ok(Admit::Taken)

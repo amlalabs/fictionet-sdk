@@ -512,7 +512,7 @@ impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
 
     /// Return a pointer to the payload.
     #[inline]
-    pub(crate) fn payload(&self) -> &'a [u8] {
+    pub fn payload(&self) -> &'a [u8] {
         let range = self.header_len() as usize..self.total_len() as usize;
         let data = self.buffer.as_ref();
         &data[range]
@@ -650,7 +650,7 @@ impl<T: AsRef<[u8]>> AsRef<[u8]> for Packet<T> {
 
 /// A high-level representation of an Internet Protocol version 4 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct Repr {
+pub struct Repr {
     pub(crate) identification: u16,
     pub(crate) src_addr: Address,
     pub(crate) dst_addr: Address,

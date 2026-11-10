@@ -28,6 +28,26 @@ fn bytes_made_from_their_charge_carry_exactly_it() {
 }
 
 #[test]
+fn a_block_is_charged_its_capacity_first_and_gathers_within_it() {
+    let budget = Budget::new(64);
+    assert!(Chunk::block(&budget, 0, 65).is_none());
+    assert!(Chunk::block(&budget, 9, 8).is_none());
+    assert_eq!(budget.used(), 0);
+    let mut block = Chunk::block(&budget, 4, 16).unwrap();
+    assert!(block.is_empty());
+    assert_eq!(block.headroom(), 4);
+    assert_eq!(block.room(), 12);
+    assert!(budget.used() >= block.capacity());
+    block.extend_within(&[1, 2, 3]).unwrap();
+    assert_eq!(block.extend_within(&[0; 10]), Err(1));
+    assert_eq!(&*block, &[1, 2, 3]);
+    let shared = block.clone();
+    assert!(block.extend_within(&[4]).is_err());
+    drop((block, shared));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn a_copy_is_charged_exactly_its_bytes() {
     let budget = Budget::new(64);
     let chunk = paid(&budget, &[1, 2, 3]);
@@ -556,6 +576,46 @@ fn the_control_reserve_pays_for_control_blocks_when_the_budget_is_full() {
     assert!(pool.take_control(0).is_some());
     drop(gone);
     assert_eq!(budget.used(), pool.charged());
+}
+
+#[test]
+fn a_returned_control_block_wakes_its_sender_without_freeing_budget() {
+    use std::task::{Wake, Waker};
+    struct Sender {
+        pool: Pool,
+        wakes: AtomicUsize,
+    }
+    impl Wake for Sender {
+        fn wake(self: Arc<Self>) {
+            assert!(self.pool.free() > 0, "wake runs after the pool is unlocked");
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let budget = Budget::new(256);
+    let pool = Pool::new(&budget, 32, 2);
+    assert!(pool.reserve_control(&budget, 1));
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    let block = pool.take_control(0).unwrap();
+    let sender = Arc::new(Sender {
+        pool: pool.clone(),
+        wakes: AtomicUsize::new(0),
+    });
+    let task = Waker::from(sender.clone());
+    assert!(!pool.wait_control(&task));
+    drop(block);
+    assert_eq!(budget.used(), budget.limit());
+    assert!(sender.wakes.load(Ordering::SeqCst) > 0);
+    assert!(
+        pool.wait_control(&task),
+        "a return before registration is observed"
+    );
+    let block = pool.take_control(0).unwrap();
+    assert!(!pool.wait_control(&task));
+    let before = sender.wakes.load(Ordering::SeqCst);
+    drop(block);
+    assert!(sender.wakes.load(Ordering::SeqCst) > before);
+    drop((task, sender, held, pool));
+    assert_eq!(budget.used(), 0);
 }
 
 #[test]

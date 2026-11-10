@@ -8,8 +8,8 @@
 //!
 //! | Transport | Lower port | Upper port | A child is |
 //! | --- | --- | --- | --- |
-//! | TCP | `Packets<CheckedIpPacket, Chunk>` | [`Tcp`] | one connection, a [`ByteStream`], opened as a [`TcpOpening`] |
-//! | UDP | `Packets<CheckedIpPacket, Chunk>` | [`Udp`] | one bound socket, [`Datagrams`] with the peer's address, opened as a [`UdpBound`] |
+//! | TCP | `Packets<CheckedIpPacket, Packet>` | [`Tcp`] | one connection, a [`ByteStream`], opened as a [`TcpOpening`] |
+//! | UDP | `Packets<CheckedIpPacket, Packet>` | [`Udp`] | one bound socket, [`Datagrams`] with the peer's address, opened as a [`UdpBound`] |
 //! | TCP observer | `Packets<ObservedIpPacket, Infallible>` | [`TcpObserver`] | one observed connection, an [`ObservedStream`], opened as an [`ObservedConnection`] |
 //!
 //! TCP and UDP each take the [checked](super::packet::CheckedIpPacket)

@@ -1,3 +1,4 @@
+use fictionet::Packet;
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -6,8 +7,7 @@ use std::sync::Arc;
 
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ChildId, Chunk, CommandOf, Env, EventOf, Layer, PacketCommand, PacketEvent,
-    Packets,
+    Admit, Budget, ChildId, CommandOf, Env, EventOf, Layer, PacketCommand, PacketEvent, Packets,
 };
 use fictionet::stdlib::network::ConnError;
 use fictionet::stdlib::network::packet::CheckedIpPacket;
@@ -67,7 +67,7 @@ impl Factory {
     where
         L: EndpointState
             + Layer<
-                Lower = Packets<CheckedIpPacket, Chunk>,
+                Lower = Packets<CheckedIpPacket, Packet>,
                 Upper = Tcp,
                 Report = (),
                 Timer = (),
@@ -113,7 +113,7 @@ trait Erased: EndpointState {
     ) -> Result<Admit<CommandOf<Tcp>>, Infallible>;
     fn timer(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible>;
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible>;
-    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>>;
+    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Packet>>;
     fn take_event(&mut self) -> Option<EventOf<Tcp>>;
     fn take_urgent(&mut self) -> Option<EventOf<Tcp>>;
     fn deadline(&self) -> Option<(Instant, ())>;
@@ -127,7 +127,7 @@ impl<L> Erased for L
 where
     L: EndpointState
         + Layer<
-            Lower = Packets<CheckedIpPacket, Chunk>,
+            Lower = Packets<CheckedIpPacket, Packet>,
             Upper = Tcp,
             Report = (),
             Timer = (),
@@ -156,7 +156,7 @@ where
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
         Layer::advance(self, env)
     }
-    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>> {
+    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Packet>> {
         Layer::take_command(self, env)
     }
     fn take_event(&mut self) -> Option<EventOf<Tcp>> {
@@ -204,7 +204,7 @@ impl Stack {
 }
 
 impl Layer for Stack {
-    type Lower = Packets<CheckedIpPacket, Chunk>;
+    type Lower = Packets<CheckedIpPacket, Packet>;
     type Upper = Tcp;
     type Report = ();
     type Timer = ();
@@ -240,7 +240,7 @@ impl Layer for Stack {
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
         env.part(|env| self.0.advance(env))
     }
-    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Chunk>> {
+    fn take_command(&mut self, env: &mut Env<'_, ()>) -> Option<PacketCommand<Packet>> {
         env.part(|env| self.0.take_command(env))
     }
     fn take_event(&mut self) -> Option<EventOf<Tcp>> {
@@ -298,7 +298,7 @@ mod tests {
     use fictionet::stdlib::network::transport::TcpControl;
     use fictionet::{Seed, SeededEntropy};
 
-    type Inner = Probe<Packets<CheckedIpPacket, Chunk>, Tcp>;
+    type Inner = Probe<Packets<CheckedIpPacket, Packet>, Tcp>;
 
     /// The probe holds no connections; the facade's queries never reach it
     /// here.
