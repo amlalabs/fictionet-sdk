@@ -19,6 +19,8 @@ const SENSOR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 const ATTACKER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 // Linux's MPTCP socket option level is distinct from its IP protocol number.
 const SOL_MPTCP: libc::c_int = 284;
+/// The first SSH command; the honeypot must log it and hang up without running it.
+const SSH_COMMAND: &[u8] = b"whoami\n";
 
 fn mount(source: &str, target: &str, kind: &str, options: &str) -> Result {
     let source = CString::new(source)?;
@@ -447,7 +449,7 @@ fn ssh() -> Result {
         .stdin
         .take()
         .ok_or("missing SSH stdin")?
-        .write_all(b"whoami\n")?;
+        .write_all(SSH_COMMAND)?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -484,7 +486,7 @@ fn attacker() -> Result {
     }
     let report = json!({"mptcp": mptcp, "port_zero": {"destination": "192.0.2.2:0",
         "protocol": libc::IPPROTO_TCP, "errno": libc::ECONNREFUSED},
-        "ssh": {"exit_code": 255, "sent_input_bytes": 7}});
+        "ssh": {"exit_code": 255, "sent_input_bytes": SSH_COMMAND.len()}});
     fs::write("/share/probes.json", serde_json::to_vec_pretty(&report)?)?;
     isolation(true)?;
     Ok(())

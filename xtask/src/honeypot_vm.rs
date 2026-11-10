@@ -552,7 +552,7 @@ fn verify(directory: &Path) -> Result {
         .filter(|e| e["connection"] == *connection && e["event"] == "input")
         .filter_map(|e| e["data_bytes"].as_u64())
         .sum();
-    if input_bytes != 7
+    if input_bytes == 0
         || probes["ssh"]["sent_input_bytes"] != input_bytes
         || probes["ssh"]["exit_code"] != 255
     {
