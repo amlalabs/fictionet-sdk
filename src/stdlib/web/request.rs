@@ -1,3 +1,4 @@
+use super::fields::{Records, length_size, write_length};
 use std::ops::Range;
 
 use fictionet::Chunk;
@@ -271,32 +272,6 @@ impl Head {
     }
 }
 
-#[derive(Clone)]
-struct Records<'a> {
-    bytes: &'a [u8],
-    left: usize,
-}
-
-impl<'a> Iterator for Records<'a> {
-    type Item = (&'a [u8], &'a [u8]);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.left == 0 {
-            return None;
-        }
-        let name = read_length(&mut self.bytes);
-        let value = read_length(&mut self.bytes);
-        let bytes = self.bytes;
-        let result = (&bytes[..name], &bytes[name..name + value]);
-        self.bytes = &bytes[name + value..];
-        self.left -= 1;
-        Some(result)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.left, Some(self.left))
-    }
-}
-impl ExactSizeIterator for Records<'_> {}
-
 impl PartialEq for Head {
     fn eq(&self, other: &Self) -> bool {
         self.method() == other.method()
@@ -314,30 +289,6 @@ impl std::fmt::Debug for Head {
             .field("version", &self.version)
             .field("fields", &self.headers().collect::<Vec<_>>())
             .finish()
-    }
-}
-
-fn length_size(n: usize) -> usize {
-    ((usize::BITS - n.leading_zeros()).max(1) as usize).div_ceil(7)
-}
-fn write_length(mut n: usize, mut write: impl FnMut(&[u8])) {
-    while n >= 128 {
-        write(&[(n as u8 & 127) | 128]);
-        n >>= 7;
-    }
-    write(&[n as u8]);
-}
-fn read_length(bytes: &mut &[u8]) -> usize {
-    let mut n = 0;
-    let mut shift = 0;
-    loop {
-        let b = bytes[0];
-        *bytes = &bytes[1..];
-        n |= usize::from(b & 127) << shift;
-        if b < 128 {
-            return n;
-        }
-        shift += 7;
     }
 }
 
