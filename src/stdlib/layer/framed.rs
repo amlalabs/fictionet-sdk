@@ -592,14 +592,16 @@ pub(crate) mod tests {
         };
         let reply = Owned::new(late.clone(), budget.charge(late.pdu.capacity()).unwrap());
         let held = budget.charge(budget.limit() - budget.used()).unwrap();
-        let mark = budget.refusals();
+        // The stack charges through its driver's view of the budget.
+        let mark = h.driver().refusals();
         h.driver().layer_mut().upper_mut().reply = Some(reply);
         for _ in 0..3 {
             h.settle().unwrap();
             assert_eq!(read(h.output()), before, "nothing is written without room");
         }
-        assert!(budget.refused_since(mark), "the runner is told to wait");
-        assert_eq!(budget.starved_since(mark), None, "the reply fits the limit");
+        let view = h.driver().budget();
+        assert!(view.refused_since(mark), "the runner is told to wait");
+        assert_eq!(view.starved_since(mark), None, "the reply fits the limit");
         drop(held);
         h.settle().unwrap();
         h.settle().unwrap();
@@ -645,7 +647,8 @@ pub(crate) mod tests {
             fictionet::time::Instant::ZERO,
         );
         let value = Owned::new(Large, budget.charge(0).unwrap());
-        let mark = budget.refusals();
+        // The stack charges through its driver's view of the budget.
+        let mark = d.refusals();
         assert!(matches!(
             d.command(MessageCommand::Send(value)),
             Ok(Admit::Blocked(MessageCommand::Send(_)))
@@ -654,7 +657,10 @@ pub(crate) mod tests {
         assert_eq!(budget.used(), 0);
         // No release can make room for more than the limit: the runner
         // reads that as starved and ends the connection instead of waiting.
-        let starved = budget.starved_since(mark).expect("a need over the limit");
+        let starved = d
+            .budget()
+            .starved_since(mark)
+            .expect("a need over the limit");
         assert!(starved.need > starved.limit);
     }
 
