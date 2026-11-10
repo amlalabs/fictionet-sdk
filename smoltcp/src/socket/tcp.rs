@@ -5523,6 +5523,67 @@ pub(crate) mod test {
     }
 
     #[test]
+    fn receive_window_holds_small_segments_until_the_application_reads() {
+        for capacity in [256 * 1024, 2 * 1024 * 1024] {
+            let mut s = socket_established_with_buffer_sizes(64, capacity);
+            let stream: Vec<u8> = (0..capacity)
+                .map(|offset| (offset ^ (offset >> 8)) as u8)
+                .collect();
+            let mut accepted = 0;
+            for payload in stream.chunks(usize::from(BASE_MSS)) {
+                send(
+                    &mut s,
+                    Instant::ZERO,
+                    &TcpRepr {
+                        seq_number: REMOTE_SEQ + 1 + accepted,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        payload,
+                        ..SEND_TEMPL
+                    },
+                );
+                accepted += payload.len();
+                assert_eq!(s.recv_queue(), accepted);
+                assert_eq!(s.rx_buffer.window(), capacity - accepted);
+                assert!(s.assembler.is_empty());
+            }
+            let mut delivered = Vec::new();
+            while s.can_recv() {
+                s.recv(|bytes| {
+                    delivered.extend_from_slice(bytes);
+                    (bytes.len(), ())
+                })
+                .unwrap();
+                assert_eq!(s.rx_buffer.window(), delivered.len());
+            }
+            assert_eq!(delivered, stream);
+        }
+    }
+
+    #[test]
+    fn send_window_admits_small_writes_until_its_byte_capacity() {
+        for capacity in [256 * 1024, 2 * 1024 * 1024] {
+            let mut s = socket_established_with_buffer_sizes(capacity, 64);
+            let stream: Vec<u8> = (0..capacity)
+                .map(|offset| (offset ^ (offset >> 8)) as u8)
+                .collect();
+            let mut queued = 0;
+            for bytes in stream.chunks(usize::from(BASE_MSS)) {
+                assert_eq!(s.send_slice(bytes), Ok(bytes.len()));
+                queued += bytes.len();
+                assert_eq!(s.send_queue(), queued);
+                assert_eq!(s.tx_buffer.window(), capacity - queued);
+            }
+            let mut offset = 0;
+            while offset < stream.len() {
+                let bytes = s.tx_buffer.get_allocated(offset, stream.len() - offset);
+                assert!(!bytes.is_empty());
+                assert_eq!(bytes, &stream[offset..offset + bytes.len()]);
+                offset += bytes.len();
+            }
+        }
+    }
+
+    #[test]
     fn test_recv_slice_partial_buffer() {
         const BUF_SIZE: usize = 10;
 
