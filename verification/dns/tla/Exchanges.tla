@@ -21,7 +21,10 @@
 (* Ablation flags: IdOnly matches a reply on the 16-bit ID alone;          *)
 (* FlushOnly clears the cache on a new session but keeps no generations,   *)
 (* so outstanding exchanges survive it; CancelShared tears down the shared *)
-(* work when any one client goes.                                         *)
+(* work when any one client goes; NoToken matches a reply on its source,   *)
+(* ID, and question without its token, as a resolver that sends every     *)
+(* query from one port and keeps no generations would (RFC 5452 section   *)
+(* 9.1 asks for the destination port too).                                *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -38,6 +41,7 @@ CONSTANTS
     IdOnly,        \* ablation: match on the 16-bit ID alone
     FlushOnly,     \* ablation: a new session only clears the cache
     CancelShared,  \* ablation: Gone tears down shared work
+    NoToken,       \* ablation: match without the token
     None
 
 Q == "q"          \* the question the shared work asks
@@ -79,8 +83,10 @@ Strip(m) == [m EXCEPT !.copy = 1]
 
 \* Rule 4 of the step contract: the token is outstanding, and the source,
 \* the ID, and the question equal the transmit's (RFC 5452 section 9.1).
+\* The token stands for the port the query went out from and the
+\* generation it was sent in.
 Matches(x, m) ==
-    /\ m.token = x.token
+    /\ ~NoToken => m.token = x.token
     /\ m.txid = x.txid
     /\ ~IdOnly => m.from = x.to /\ m.qn = x.qn
 

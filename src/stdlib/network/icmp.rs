@@ -63,8 +63,9 @@ impl Options {
 /// the request's identifier, sequence number and data, with a TTL or hop
 /// limit of 64 and correct checksums. A request with a wrong ICMP checksum
 /// gets no reply, as from a kernel, and so does one from a source that is
-/// not one host: the unspecified address, loopback, a multicast address or
-/// the IPv4 broadcast address. So does a fragment: put fragments back
+/// not one host: the unspecified address, loopback, a multicast address,
+/// or over IPv4 network 0, class E (240/4) or the broadcast address. So
+/// does a fragment: put fragments back
 /// together first, as [`split_protocols`](fictionet::stdlib::network::ip::split_protocols)
 /// does. IPv4 options and IPv6 extension headers of the request are not
 /// copied into the reply. A request with IPv6 extension headers that a host
@@ -181,8 +182,8 @@ pub fn address_unreachable(packet: &[u8], from: Ipv6Addr) -> Option<Packet> {
 /// section 2.4):
 ///
 /// - for a packet from an address that is not one host (unspecified,
-///   loopback, multicast, or the IPv4 broadcast address) or to a multicast
-///   or broadcast address;
+///   loopback, multicast, or over IPv4 network 0, class E or the broadcast
+///   address) or to a multicast or broadcast address;
 /// - for an ICMP error: over IPv4 only queries (echo, timestamp,
 ///   information, mask) are answered; over IPv6, errors (types below 128)
 ///   and redirects (137) are not, nor the other neighbor discovery
@@ -249,13 +250,15 @@ impl Options {
 }
 
 /// Whether `src` can be the source of one host: not the unspecified
-/// address, a multicast address, loopback (which never comes from the
-/// network) or the IPv4 broadcast address (RFC 1122, section 3.2.1.3; RFC
-/// 4291, section 2.5.2).
+/// address, a multicast address or loopback (which never comes from the
+/// network); over IPv4 also not an address in network 0, a class E
+/// address (240/4) or the broadcast address (RFC 1122, sections 3.2.1.3
+/// and 3.2.2; RFC 1812, section 4.3.2.7; RFC 4291, section 2.5.2).
 fn is_one_host(src: IpAddr) -> bool {
     match src {
         IpAddr::V4(a) => {
-            !(a.is_unspecified() || a.is_broadcast() || a.is_multicast() || a.is_loopback())
+            let [first, ..] = a.octets();
+            !(first == 0 || first >= 240 || a.is_multicast() || a.is_loopback())
         }
         IpAddr::V6(a) => !(a.is_unspecified() || a.is_multicast() || a.is_loopback()),
     }
@@ -343,7 +346,9 @@ mod tests {
         assert!(error(&to("10.0.0.2", "10.0.0.9"), from, 3, 3, 0).is_some());
         for (src, dst) in [
             ("0.0.0.0", "10.0.0.9"),
+            ("0.1.2.3", "10.0.0.9"),
             ("127.0.0.1", "10.0.0.9"),
+            ("240.0.0.1", "10.0.0.9"),
             ("224.0.0.1", "10.0.0.9"),
             ("10.0.0.2", "255.255.255.255"),
         ] {
@@ -400,14 +405,21 @@ mod tests {
     }
 
     /// A ping from an address that is not one host gets no reply, as an
-    /// ICMP error gets none ([`error`]): the unspecified address, a
-    /// broadcast or multicast address, or loopback from the network
-    /// (RFC 1122, section 3.2.1.3).
+    /// ICMP error gets none ([`error`]): the unspecified address, an
+    /// address in network 0, a broadcast, multicast or class E address, or
+    /// loopback from the network (RFC 1122, sections 3.2.1.3 and 3.2.2).
     #[test]
     fn pings_from_an_address_that_is_not_one_host_get_no_reply() {
         let v4: IpAddr = "10.0.0.1".parse().unwrap();
         assert!(echo_reply(&ping("10.0.0.2", "10.0.0.1"), v4).is_some());
-        for src in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "127.0.0.1"] {
+        for src in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "224.0.0.1",
+            "127.0.0.1",
+            "240.0.0.1",
+        ] {
             assert!(
                 echo_reply(&ping(src, "10.0.0.1"), v4).is_none(),
                 "a ping from {src}"

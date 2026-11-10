@@ -79,7 +79,7 @@
 //! assert!(ip::udp_checksum_ok(src, dst, header.payload(&packet.0)));
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
@@ -565,6 +565,11 @@ struct Partial {
     /// For IPv6, the "next header" byte that named the fragment header
     /// already names what the fragment header named.
     header: Option<Vec<u8>>,
+    /// From an IPv6 first fragment, with `header`: where the "next header"
+    /// byte that named the fragment header is, and the fragment header, so
+    /// that the first fragment can be quoted as it came
+    /// ([`Reassembly::take_expired`]).
+    frag6: Option<(usize, [u8; 8])>,
     /// Data by offset. Never overlapping.
     pieces: BTreeMap<usize, Vec<u8>>,
     /// The length of the data, once the last fragment has arrived.
@@ -585,11 +590,20 @@ struct Partial {
 /// packets, since the agent decides how many there are. At most 4 MiB of
 /// fragments wait at once; past that, the packets that expire soonest are
 /// dropped. IPv4 packets wait at most 30 seconds, IPv6 packets 60.
+///
+/// A packet whose time runs out after its first fragment came is answered
+/// with ICMP Time Exceeded, code 1 (RFC 1122 section 3.3.2; RFC 8200
+/// section 4.5 for IPv6): its first fragment, as it came, waits in
+/// [`take_expired`](Reassembly::take_expired) for the caller to answer
+/// ([`reassembly_time_exceeded`]). It counts against the 4 MiB until
+/// taken; it is never bigger than what its packet counted.
 #[derive(Default)]
 pub struct Reassembly {
     partial: HashMap<Key, Partial>,
     /// Every unfinished packet by when it expires, soonest first.
     by_expiry: BTreeSet<(Instant, Key)>,
+    /// The first fragments of the packets that timed out, oldest first.
+    expired: VecDeque<Packet>,
     size: usize,
 }
 
@@ -623,6 +637,8 @@ struct Arrived<'a> {
     /// The headers in front of the data, ready to use, if this is the first
     /// fragment.
     header: Option<Vec<u8>>,
+    /// See [`Partial::frag6`].
+    frag6: Option<(usize, [u8; 8])>,
     timeout: Duration,
 }
 
@@ -715,6 +731,7 @@ impl Reassembly {
             Partial {
                 dead: false,
                 header: None,
+                frag6: None,
                 pieces: BTreeMap::new(),
                 total: None,
                 have: 0,
@@ -783,6 +800,7 @@ impl Reassembly {
         {
             added += h.len();
             partial.header = Some(h);
+            partial.frag6 = frag.frag6;
         }
         partial.pieces.insert(frag.offset, frag.data.to_vec());
         partial.have += frag.data.len();
@@ -857,18 +875,66 @@ impl Reassembly {
             assert!(p.total.is_none_or(|t| end <= t));
             size += p.size;
         }
+        size += self.expired.iter().map(|p| p.0.len()).sum::<usize>();
         assert_eq!(size, self.size);
     }
 
-    /// Drops every unfinished packet whose time is up.
+    /// Drops every unfinished packet whose time is up. Each one whose first
+    /// fragment came keeps that fragment for
+    /// [`take_expired`](Reassembly::take_expired) (RFC 1122 section 3.3.2,
+    /// RFC 8200 section 4.5). This also runs before every packet
+    /// [`push`](Reassembly::push) takes.
     pub fn expire(&mut self, now: Instant) {
         while let Some(&(t, k)) = self.by_expiry.first() {
             if t > now {
                 break;
             }
-            self.remove(&k);
+            let Some(p) = self.take(&k) else { break };
+            if let Some(first) = first_fragment(&p) {
+                // Never more than the packet counted: the fragment's
+                // headers and data, and 8 bytes of fragment header.
+                self.size += first.len();
+                self.expired.push_back(Packet(first));
+            }
         }
     }
+
+    /// The first fragment, as it came, of a packet whose reassembly timed
+    /// out, oldest first. Answer it with [`reassembly_time_exceeded`].
+    pub fn take_expired(&mut self) -> Option<Packet> {
+        let first = self.expired.pop_front()?;
+        self.size -= first.0.len();
+        Some(first)
+    }
+}
+
+/// The first fragment of a packet, as it came, if it arrived: its headers
+/// and the data at offset 0. For IPv6, the "next header" byte that named the
+/// fragment header names it again, and the fragment header goes back in
+/// front of the data.
+fn first_fragment(p: &Partial) -> Option<Vec<u8>> {
+    let header = p.header.as_ref()?;
+    let data = p.pieces.get(&0)?;
+    let mut first = header.clone();
+    if let Some((next_at, frag)) = p.frag6 {
+        first[next_at] = protocol::FRAGMENT;
+        first.extend_from_slice(&frag);
+    }
+    first.extend_from_slice(data);
+    Some(first)
+}
+
+/// The ICMP or ICMPv6 Time Exceeded answer, code 1 ("fragment reassembly
+/// time exceeded"), to `first`, the first fragment of a packet whose
+/// reassembly timed out ([`Reassembly::take_expired`]). It comes from the
+/// packet's destination and goes to its source (RFC 792; RFC 1122 section
+/// 3.3.2; RFC 4443 section 3.3 and RFC 8200 section 4.5 for IPv6), quoting
+/// the fragment as [`icmp::error`] quotes. `None` where `icmp::error` sends
+/// no answer: about an ICMP error, or from a source that is not one host.
+pub fn reassembly_time_exceeded(first: &Packet) -> Option<Packet> {
+    let from = destination(&first.0)?;
+    let kind = if from.is_ipv4() { 11 } else { 3 };
+    icmp::error(&first.0, from, kind, 1, 0)
 }
 
 /// Reads a fragment. `None` if the packet is not a fragment, or cannot be
@@ -892,6 +958,7 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
                 more: f.more,
                 data: h.payload(packet),
                 header: (f.offset == 0).then(|| packet[..h.payload.start].to_vec()),
+                frag6: None,
                 timeout: V4_TIMEOUT,
             })
         }
@@ -916,6 +983,10 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
                 more: f.more,
                 data: &packet[at + 8..chain.end],
                 header,
+                frag6: (f.offset == 0).then(|| {
+                    let frag: [u8; 8] = packet[at..at + 8].try_into().expect("8 bytes");
+                    (next_at, frag)
+                }),
                 timeout: V6_TIMEOUT,
             })
         }
@@ -1117,7 +1188,9 @@ impl Header {
 
     /// Reads the header of a whole packet as a host that is its
     /// destination takes it in, fragment or not. An IPv4 header with a
-    /// wrong checksum discards the packet (RFC 1122, section 3.2.1.2).
+    /// wrong checksum discards the packet (RFC 1122, section 3.2.1.2), and
+    /// so does an IPv4 source that is the limited broadcast address or a
+    /// multicast address (section 3.2.1.3).
     /// IPv6 extension headers are checked as RFC 8200 asks (sections 4.1
     /// to 4.6):
     ///
@@ -1221,11 +1294,19 @@ fn v4(bytes: &[u8], truncated: bool) -> Option<Header> {
 }
 
 /// Reads the IPv4 header of a whole packet as a host takes it in: one
-/// with a wrong header checksum is discarded (RFC 1122, section 3.2.1.2).
+/// with a wrong header checksum is discarded (RFC 1122, section 3.2.1.2),
+/// and so is one from the limited broadcast address or a multicast
+/// address, which no datagram may come from (section 3.2.1.3). A
+/// directed broadcast source is not caught here: the reader does not know
+/// the subnet.
 #[inline]
 fn v4_checked(bytes: &[u8]) -> Option<Header> {
     let h = v4(bytes, false)?;
-    (checksum(&bytes[..h.payload.start]) == 0).then_some(h)
+    let IpAddr::V4(src) = h.src else {
+        return None;
+    };
+    (checksum(&bytes[..h.payload.start]) == 0 && !src.is_broadcast() && !src.is_multicast())
+        .then_some(h)
 }
 
 /// The header of an IPv6 packet whose chain [`chain6`] walked.
@@ -1618,10 +1699,11 @@ pub fn transport_checksum(src: IpAddr, dst: IpAddr, protocol: u8, data: &[u8]) -
 /// Whether a UDP datagram from `src` to `dst` has a good checksum. A zero
 /// checksum field means "no checksum" over IPv4. Over IPv6 it is never
 /// valid (RFC 8200, section 8.1): a sender whose sum comes out as zero
-/// sends `0xffff` instead.
+/// sends `0xffff` instead. Addresses of two families have no pseudo-header,
+/// and never have a good checksum.
 #[inline]
 pub fn udp_checksum_ok(src: IpAddr, dst: IpAddr, udp: &[u8]) -> bool {
-    if udp.len() < 8 {
+    if udp.len() < 8 || src.is_ipv4() != dst.is_ipv4() {
         return false;
     }
     if udp[6..8] == [0, 0] {
@@ -1944,16 +2026,17 @@ mod tests {
     #[test]
     fn unfinished_packets_time_out() {
         let mut r = Reassembly::default();
-        assert!(
-            r.reassemble(frag4(1, 0, 16, true), at(0))
-                .unwrap()
-                .is_none()
-        );
+        let first = frag4(1, 0, 16, true);
+        assert!(r.reassemble(first.clone(), at(0)).unwrap().is_none());
         assert_eq!(r.next_expiry(), Some(at(30)));
         r.expire(at(29));
         assert_eq!(r.partial.len(), 1);
         r.expire(at(30));
         assert!(r.partial.is_empty());
+        // What is left counted is the first fragment, kept for the Time
+        // Exceeded answer until taken.
+        assert_eq!(r.size, first.0.len());
+        assert_eq!(r.take_expired(), Some(first));
         assert_eq!(r.size, 0);
         // The rest alone does not make a packet: the first fragment is gone.
         assert!(
@@ -1996,6 +2079,55 @@ mod tests {
         assert_eq!(r.next_expiry(), Some(at(60)));
     }
 
+    /// A packet that times out keeps its first fragment, as it came, for
+    /// the Time Exceeded answer (RFC 1122 section 3.3.2), counted until
+    /// taken. One without its first fragment, and one dropped for an
+    /// overlap, keep nothing.
+    #[test]
+    fn a_timed_out_packet_keeps_its_first_fragment_until_taken() {
+        let mut r = Reassembly::default();
+        let first = frag4(1, 0, 16, true);
+        assert!(r.reassemble(first.clone(), at(0)).unwrap().is_none());
+        assert!(
+            r.reassemble(frag4(1, 24, 8, false), at(1))
+                .unwrap()
+                .is_none()
+        );
+        // No first fragment.
+        assert!(
+            r.reassemble(frag4(2, 16, 8, false), at(2))
+                .unwrap()
+                .is_none()
+        );
+        // Dropped for an overlap.
+        assert!(
+            r.reassemble(frag4(3, 0, 16, true), at(3))
+                .unwrap()
+                .is_none()
+        );
+        assert!(r.reassemble(frag4(3, 8, 16, true), at(3)).is_err());
+        let before = r.size;
+        r.expire(at(40));
+        r.check();
+        assert!(r.partial.is_empty());
+        assert!(r.size <= before);
+        let taken = r.take_expired().expect("the first fragment");
+        assert_eq!(taken, first);
+        assert!(r.take_expired().is_none());
+        assert_eq!(r.size, 0);
+        r.check();
+        // The answer to it comes from the destination, quoting it.
+        let answer = reassembly_time_exceeded(&taken).expect("an answer").0;
+        let h = Header::parse_whole(&answer).unwrap();
+        assert_eq!(
+            (h.src, h.dst),
+            (destination(&first.0).unwrap(), source(&first.0).unwrap())
+        );
+        let icmp = h.payload(&answer);
+        assert_eq!((icmp[0], icmp[1]), (11, 1));
+        assert_eq!(&icmp[8..], &first.0[..]);
+    }
+
     #[test]
     fn waiting_fragments_are_capped() {
         let mut r = Reassembly::default();
@@ -2031,11 +2163,24 @@ mod tests {
         assert!(r.partial.len() < MAX_WAITING / PARTIAL_COST);
         assert_eq!(r.partial.len(), r.by_expiry.len());
         // The ones left are the newest, and they expire in order.
+        let left = r.partial.len();
         let first = r.next_expiry().unwrap();
         r.expire(first);
         assert_eq!(r.partial.len(), r.by_expiry.len());
         r.expire(at(1_000));
         assert!(r.partial.is_empty() && r.by_expiry.is_empty());
+        r.check();
+        // Each was a first fragment, kept for its Time Exceeded answer and
+        // counted until taken; taking them all leaves nothing counted.
+        let kept: usize = r.expired.iter().map(|p| p.0.len()).sum();
+        assert_eq!(r.size, kept);
+        let mut taken = 0;
+        while let Some(p) = r.take_expired() {
+            let f = Header::parse(&p.0).unwrap().fragment.unwrap();
+            assert!(f.offset == 0 && f.more);
+            taken += 1;
+        }
+        assert_eq!(taken, left);
         assert_eq!(r.size, 0);
     }
 
@@ -2899,5 +3044,36 @@ mod tests {
         u[6..8].copy_from_slice(&[0x12, 0x34]);
         assert!(!udp_checksum_ok(v6a, v6b, &u));
         assert!(!udp_checksum_ok(v4a, v4b, &u));
+    }
+
+    #[test]
+    fn addresses_of_two_families_have_no_good_udp_checksum() {
+        let v4: IpAddr = "10.0.0.2".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        // A zero field means "no checksum" only over IPv4, and two families
+        // have no pseudo-header at all, so no field is right for them.
+        let u = [0, 1, 0, 2, 0, 8, 0, 0];
+        assert!(udp_checksum_ok(v4, v4, &u));
+        assert!(!udp_checksum_ok(v4, v6, &u));
+        assert!(!udp_checksum_ok(v6, v4, &u));
+    }
+
+    #[test]
+    fn a_host_takes_nothing_from_a_broadcast_or_multicast_source() {
+        let dst: IpAddr = "10.0.0.1".parse().unwrap();
+        let from = |src: &str| packet(src.parse().unwrap(), dst, protocol::UDP, &[0; 8]).0;
+        // RFC 1122 section 3.2.1.3: a host silently discards a datagram from
+        // the limited broadcast address or a class D (multicast) address.
+        for src in ["255.255.255.255", "224.0.0.1", "239.255.255.250"] {
+            let p = from(src);
+            assert!(Header::parse(&p).is_some(), "{src} is read");
+            assert_eq!(Header::check(&p), Err(Reject::Discard), "{src}");
+            assert_eq!(Header::parse_whole(&p), None, "{src}");
+        }
+        // The unspecified address is a host that does not know its address
+        // yet, as a DHCP client, and is taken; so are other addresses.
+        for src in ["0.0.0.0", "10.0.0.2", "223.255.255.255", "240.0.0.1"] {
+            assert!(Header::check(&from(src)).is_ok(), "{src}");
+        }
     }
 }

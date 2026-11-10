@@ -1679,24 +1679,10 @@ impl<V: Verify> Resolver<V> {
             known = known.max(label_count(through));
         }
         let total = label_count(&qname);
-        let steps = lookup.minimise.steps;
-        if known + 1 >= total || steps >= bounds.max_queries {
-            return Some(whole);
+        match bounds.next_labels(known, total, lookup.minimise.steps) {
+            Some(labels) => Some((qname.trim_to(labels), RecordType::A, true)),
+            None => Some(whole),
         }
-        // The labels not yet shown are divided over the queries left, and
-        // the remainder goes to the last ones (RFC 9156 §2.3): rounding
-        // down here leaves it for the queries after this one.
-        let add = if steps < bounds.one_label {
-            1
-        } else {
-            let left = usize::from(bounds.max_queries - steps);
-            ((total - known) / left).max(1)
-        };
-        let labels = known + add;
-        if labels >= total {
-            return Some(whole);
-        }
-        Some((qname.trim_to(labels), RecordType::A, true))
     }
 
     /// Sends one query for lookup `id` and waits for it.

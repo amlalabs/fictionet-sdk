@@ -1,0 +1,10 @@
+name = "ip_verification"
+version = "0.1.0"
+defaultTargets = ["Ip", "gen"]
+
+[[lean_lib]]
+name = "Ip"
+
+[[lean_exe]]
+name = "gen"
+root = "Gen"

@@ -37,7 +37,7 @@ proof of the rule and the counterexample that shows why it is there.
 | | `OneAnswerPerQuery` | invariant | each client query gets at most one answer |
 | | `EveryAcceptedAnswered` | liveness | every accepted query is answered unless its client goes |
 | Validation | `SecureImpliesChain` | invariant | Secure only with a valid chain from a configured anchor to the answer |
-| | `InsecureNeedsProof` | invariant | Insecure only with no covering anchor, or below a validated chain a signed no-DS proof, an opt-out cover, or a DS whose algorithm the policy does not admit, each from a DS set that was fetched |
+| | `InsecureNeedsProof` | invariant | Insecure only with no covering anchor, or below a validated chain a signed no-DS proof, an opt-out cover, or a DS whose algorithm the policy does not admit, each from a DS set that was fetched; a matching NSEC without the NS bit is no such proof (RFC 6840 section 4.4) |
 | | `UnreachableLinkIndeterminate` | invariant | a zone below a validated chain whose DS set cannot be fetched is Indeterminate, whatever that set would have said, as `Check::delegation` reads the DS fetch before `Check::dnskeys` reads the keys |
 | | `NoDowngrade` | invariant | a valid chain is always Secure |
 | | `IndeterminateOnlyUnreachable` | invariant | Indeterminate only when a zone could not be fetched |
@@ -77,13 +77,18 @@ Configs:
   `_cachebounded`, `_nocountdown`, `_noid`, `_noport`, `_notype`,
   `_cachebyname`, `_sharedbound`.
 * **Exchanges:** `_base`, `_advance`, `_cancel`. Ablations: `_idonly`,
-  `_flushonly`, `_cancelshared`.
+  `_flushonly`, `_cancelshared`, `_notoken` (a reply matched on its
+  source, ID, and question without its token: a late reply to an
+  exchange of the old generation completes the new generation's exchange
+  to the same server, so the token, the query's port and generation, is
+  what `ObsoleteNeverPopulates` rests on; RFC 5452 section 9.1 asks for
+  the destination port as well as the ID and question).
 * **Validation:** `_paths`, `_skew`, `_unreachable`, `_policy`,
   `_signers`, the six `_witness_*` (one reachability witness each, every
   one expected to fail), and
   `_edits` (the witness that an edited zone of the world's own can be
   Secure). Ablations: `_trustupstreamad`, `_nopolicy`,
-  `_missingasinsecure`, `_signerpeek`.
+  `_missingasinsecure`, `_signerpeek`, `_nonsbit`.
 
 Bounds. Every counter is bounded in the enabling conditions of its
 actions, never by a `CONSTRAINT`, so the liveness checks are sound:
@@ -102,15 +107,20 @@ actions, never by a `CONSTRAINT`, so the liveness checks are sound:
   property, so TLC's first error is the one expected.
 * **Exchanges:** the clock by `MaxTime` 3, exchange identities by
   `MaxExchanges` 4, generations by `MaxGeneration` 2 in `_advance` and
-  `_flushonly` and 1 in the other four configs; one duplicate, one spoofed
-  reply, one `Gone`.
+  `_flushonly` and `_notoken` and 1 in the other four configs; one
+  duplicate, one spoofed reply, one `Gone`.
 * **Validation:** no counters; the data dimensions are finite sets.
 
 ## Results
 
-TLC 2.19, JDK 21, `-Xmx6g`, one TLC run per property: `-workers 8` for
+TLC 2.19, JDK 21, one TLC run per property: `-workers 8` for
 the configs that must pass, `-workers 1` for ablations and witnesses so each
-counterexample is a shortest one. "pass" means TLC found no error;
+counterexample is a shortest one. The audit of 2026-11-10 reran every
+config with `-Xmx2g` under a 3 GB memory cap, `-workers 2` for the configs
+that must pass, and a metadir off `/tmp`; every distinct-state count and
+depth below came out the same, except where the row says otherwise. Under
+that cap the liveness runs of `_base`, `_edit`, and `_types` were run
+apart from their safety properties. "pass" means TLC found no error;
 "violated" means it found the counterexample shown, as a sequence of
 actions after the initial state. Every invariant of a config explores the
 same state space, so a row covers all the invariants it names; times are
@@ -122,7 +132,7 @@ in `_concurrent` explores the same states as the invariants there.
 | Resolution_base | the 11 invariants, `ReferralsDescend` | pass | 2749819 | 66 | 11-16 s | |
 | Resolution_base | `EveryQueryAnswered` | pass | 2749819 | 66 | 142 s | |
 | Resolution_concurrent | the 11 invariants, `ReferralsDescend` (symmetry) | pass | 4359020 | 59 | 19-20 s | |
-| Resolution_concurrent_live | `EveryQueryAnswered` | not finished | the rerun after the restart fix was stopped at 5669737 distinct states with no error found so far (log /home/souvik/Projects/amlalabs/.fictionet-comp-work/fvdeep-logs/dns-tla-Resolution_concurrent_live.log); 9038685 before the fix | 59 before the fix | 519 s | |
+| Resolution_concurrent_live | `EveryQueryAnswered` | not finished | the rerun after the restart fix was stopped at 5669737 distinct states with no error found so far; the 2026-11-10 rerun (`-Xmx2g`, two workers) was stopped at its ten-minute limit at 2979418 distinct states, 518797 on the queue, with no error found; 9038685 before the fix | 59 before the fix | 519 s, 600 s | |
 | Resolution_loop | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 12560 | 30 | 0-1 s | |
 | Resolution_rogue | the 11 invariants, `ReferralsDescend`, `EveryQueryAnswered` | pass | 36437 | 33 | 0-2 s | |
 | Resolution_edit | the 11 invariants, `ReferralsDescend` | pass | 468532 | 45 | 2 s | |
@@ -151,9 +161,21 @@ in `_concurrent` explores the same states as the invariants there.
 | Exchanges_idonly | `MatchRequiresTuple` | violated | 64 | 5 | 1 s | Query, Send, Spoof, Deliver |
 | Exchanges_flushonly | `ObsoleteNeverPopulates` | violated | 282 | 6 | 0 s | Query, Send, Serve, Advance, Deliver |
 | Exchanges_cancelshared | `CancelPreservesWaiters` | violated | 13 | 4 | 1 s | Query, Query, Gone |
-| Validation_paths | the 11 invariants | pass | 124416 | 1 | 1-2 s | |
+| Exchanges_notoken | `ObsoleteNeverPopulates` | violated | 1109 | 7 | 0 s | Query, Send (to s1), Serve, Advance, Send (to s1 again, in generation 2), Deliver: the generation-1 reply matches the new exchange on source, ID, and question, and its data is cached |
+
+Rerun on 2026-11-10 after `NoToken` was added (TLC 2.19, `-Xmx2g`, `-workers 2` for the passing configs and
+`-workers 1` for the controls): `_base` (every property together) 66914 distinct states, depth 19, 4 s;
+`_cancel` (every property together) 853762, depth 23, 65 s; `_advance` with its three invariants,
+`MatchRequiresTuple`, and `DuplicateHarmless` 4564834, depth 28, 40 s; the four controls fail on their
+property with the counts above. With `NoToken` false the specs' state spaces are the ones before, as the
+counts show. `_advance`'s `EveryAcceptedAnswered` was not rerun: under the 3 GB cap TLC's liveness check of
+its 4.5 million states was stopped, and the row above is from the earlier run with `-Xmx6g`.
+
+| Config | Properties | Result | Distinct states | Depth | Time | Counterexample |
+|---|---|---|---|---|---|---|
+| Validation_paths | the 11 invariants | pass | 169344 (124416 before `NsecNoNs`) | 1 | 1-4 s | |
 | Validation_skew | the 11 invariants | pass | 10368 | 1 | 0-1 s | |
-| Validation_unreachable | the 11 invariants | pass | 147456 | 1 | 0-1 s | |
+| Validation_unreachable | the 11 invariants | pass | 262144 (147456 before `NsecNoNs`) | 1 | 0-3 s | |
 | Validation_policy | the 11 invariants | pass | 3456 | 1 | 0-1 s | |
 | Validation_signers | the 11 invariants | pass | 65536 | 1 | 0-1 s | |
 | Validation_witness_edited, _optout, _tld, _root, _unsigned, _noanchors | one `Never...` form each | violated (reachable) | 1 | 1 | 0-1 s | an initial state of each scenario |
@@ -162,6 +184,7 @@ in `_concurrent` explores the same states as the invariants there.
 | Validation_nopolicy | `Sha1Insecure` | violated | 1 | 1 | 1 s | a chain of key A where sld's DS names algorithm 5: Secure |
 | Validation_missingasinsecure | `InsecureNeedsProof` | violated | 1 | 1 | 1 s | the root cannot be fetched: Insecure with no proof |
 | Validation_signerpeek | `RecordsOnly` | violated | 1 | 1 | 0 s | sld's RRset changed after signing: Bogus for signer B, Secure for signer A |
+| Validation_nonsbit | `InsecureNeedsProof` | violated | 1 | 1 | 0 s | root signed with key A under anchor A, the root's proof for tld an NSEC at tld without the NS bit, taken as a no-DS proof: Insecure with no proof (RFC 6840 section 4.4) |
 
 ## Modelling choices
 
@@ -356,6 +379,15 @@ Validation:
 * The world signs its zones over their edits, so an edit (`edited`) is
   never a change after signing; `_edits` shows an edited zone of the
   world's own validating Secure under the world's anchor.
+* A parent's proof may be an NSEC that matches the child's name but
+  lacks the NS bit (`NsecNoNs`): a signed record an attacker replays
+  from a name that is no delegation. RFC 6840 section 4.4 has the
+  validator check the NS bit, so such a proof proves nothing and the
+  answer is Bogus (`Nsecs::no_ds`, `Nsec3s::no_ds`). `CheckNsBit` FALSE
+  takes it as proof of an unsigned delegation, and `InsecureNeedsProof`
+  fails in `_nonsbit`. The bitmaps themselves, and the other denial
+  rules of RFC 6840 section 4 and RFC 5155 section 8, are Lean's
+  (`Dns/Dnssec.lean`) and the unit tests' in `dnssec/proof.rs`.
 * `check_chain` reports five problems: `DsMismatch`, `NoDsProofMissing`,
   `WindowClosed`, `UnsupportedAlgorithm`, and `SignatureInvalid`. A zone
   whose RRset changed after signing (a `Zone::with` after `Zone::signed`)

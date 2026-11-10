@@ -80,8 +80,10 @@ impl Request {
     ///    of a type whose RDATA hickory reads by stricter rules, or with
     ///    empty RDATA, is carried as octets (RFC 3597 §4), so only a
     ///    message whose records do not read even as octets fails here, and
-    ///    so does a TSIG record that is not the last record of the message,
-    ///    or is one of several (RFC 8945 §5.2).
+    ///    so does a TSIG record that is not the last record of the
+    ///    additional section, or is one of several (RFC 8945 §5.1), or does
+    ///    not read; that FORMERR carries an OPT record when the query has
+    ///    one (RFC 6891 §7).
     /// 3. More than one OPT record: FORMERR with an OPT (RFC 6891 §6.1.1).
     /// 4. An EDNS version above 0: BADVERS with an OPT of version 0
     ///    (RFC 6891 §6.1.3).
@@ -106,7 +108,10 @@ impl Request {
         if bytes.len() < HEADER || bytes[2] & 0x80 != 0 {
             return Parsed::Silent;
         }
-        let message = match Message::from_vec(bytes).map_err(|_| opaque(bytes)) {
+        let read = Message::from_vec(bytes)
+            .ok()
+            .filter(|_| layouts_hold(bytes));
+        let message = match read.ok_or_else(|| opaque(bytes)) {
             Ok(message) | Err(Ok(message)) => message,
             Err(Err(Fault { in_opt })) => return Parsed::Reject(unparsed(bytes, in_opt)),
         };
@@ -331,9 +336,10 @@ fn question_bytes(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
 
 /// Why a query does not read even with its RDATA as octets.
 struct Fault {
-    /// Whether the fault is in an OPT record: one that does not read, one
-    /// outside the additional section, one whose options do not decode,
-    /// or one of several. The FORMERR then carries an OPT (RFC 6891 §7).
+    /// Whether the FORMERR carries an OPT record (RFC 6891 §7): the fault
+    /// is in an OPT record (one that does not read, one outside the
+    /// additional section, one whose options do not decode, or one of
+    /// several), or in a TSIG record of a query that has an OPT record.
     in_opt: bool,
 }
 
@@ -343,7 +349,8 @@ struct Fault {
 /// message has the query's header, its questions, the OPT record of its
 /// additional section, and its TSIG record, and none of its other records,
 /// which a server does not use. A TSIG record that is not the last record
-/// of the message, or does not read, is a fault (RFC 8945 §5.2).
+/// of the message, or does not read, is a fault (RFC 8945 §5.2), whose
+/// FORMERR carries an OPT record when the query has one (RFC 6891 §7).
 fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
     let mut decoder = BinDecoder::new(bytes);
     let header = Header::read(&mut decoder).map_err(|_| Fault { in_opt: false })?;
@@ -354,6 +361,7 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
     let outside = u32::from(header.counts.answers) + u32::from(header.counts.authorities);
     let records = outside + u32::from(header.counts.additionals);
     let (mut at, mut opts, mut tsig) = (questions, Vec::new(), None);
+    let mut misplaced_tsig = false;
     for index in 0..records {
         let (rtype, end) = record(bytes, at).map_err(|rtype| Fault {
             in_opt: rtype == Some(OPT),
@@ -365,17 +373,23 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
             opts.push(at..end);
         }
         if rtype == u16::from(RecordType::TSIG) {
-            if index + 1 != records {
-                return Err(Fault { in_opt: false });
-            }
+            // The last record of the additional section (RFC 8945 §5.1).
+            // Read on, to learn whether the query has an OPT record.
+            misplaced_tsig |= index < outside || index + 1 != records;
             tsig = Some(at);
         }
         at = end;
+    }
+    if misplaced_tsig {
+        return Err(Fault {
+            in_opt: !opts.is_empty(),
+        });
     }
     let mut reduced = bytes[..questions].to_vec();
     reduced[6..10].fill(0);
     let count = u16::try_from(opts.len()).map_err(|_| Fault { in_opt: true })?;
     reduced[10..12].copy_from_slice(&count.to_be_bytes());
+    let with_opt = !opts.is_empty();
     for opt in opts {
         reduced.extend_from_slice(&bytes[opt]);
     }
@@ -383,7 +397,7 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
     if let Some(start) = tsig {
         // Read where it lies, so a name compressed against an earlier
         // record still reads.
-        let fault = |_| Fault { in_opt: false };
+        let fault = |_| Fault { in_opt: with_opt };
         let mut decoder = BinDecoder::new(bytes);
         decoder.read_slice(start).map_err(fault)?;
         let signature = Record::read(&mut decoder)
@@ -392,10 +406,39 @@ fn opaque(bytes: &[u8]) -> Result<Message, Fault> {
                 RData::TSIG(tsig) => Some(tsig),
                 _ => None,
             })
-            .ok_or(Fault { in_opt: false })?;
+            .ok_or(Fault { in_opt: with_opt })?;
         message.signature = Some(Box::new(signature));
     }
     Ok(message)
+}
+
+/// Whether every record of the message has the RDATA layout its type
+/// asks for, read as [`record`] reads it. hickory reads the RDATA of the
+/// RFC 1035 name types it has no type for (MD, MF, MB, MG, MR, MINFO) as
+/// octets, so it takes such a record whose RDATA holds no name; RFC 3597
+/// §4 has the names of these types read inside their RDATA, as of every
+/// type that may hold compressed names.
+fn layouts_hold(bytes: &[u8]) -> bool {
+    let mut decoder = BinDecoder::new(bytes);
+    let Ok(header) = Header::read(&mut decoder) else {
+        return false;
+    };
+    for _ in 0..header.counts.queries {
+        if Query::read(&mut decoder).is_err() {
+            return false;
+        }
+    }
+    let counts = header.counts;
+    let records =
+        u32::from(counts.answers) + u32::from(counts.authorities) + u32::from(counts.additionals);
+    let mut at = decoder.index();
+    (0..records).all(|_| match record(bytes, at) {
+        Ok((_, end)) => {
+            at = end;
+            true
+        }
+        Err(_) => false,
+    })
 }
 
 /// The NOTAUTH reply to a query signed with `tsig`, from a server that
@@ -469,13 +512,16 @@ fn compressible(rtype: u16) -> Option<(usize, usize, usize)> {
     }
 }
 
-/// Where the name at `start` ends, reading no octet at or past `limit`.
-/// Each compression pointer must point before itself, and the name it
-/// points to is read with the pointer's position as the new limit
-/// (RFC 1035 §4.1.4). `None` for a name that does not read, or one longer
-/// than 255 octets (RFC 1035 §2.3.4).
+/// Where the name at `start` ends, reading no label octet at or past
+/// `limit`. A compression pointer names a prior occurrence of the rest of
+/// the name (RFC 1035 §4.1.4), so it must point before the part of the
+/// name that holds it: the name's first octet, or the target of the last
+/// pointer followed. The name it points to is read with that part's start
+/// as the new limit. This is how hickory's name reader judges pointers, so
+/// both refuse the same names. `None` for a name that does not read, or
+/// one longer than 255 octets (RFC 1035 §2.3.4).
 fn name_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
-    let (mut at, mut limit) = (start, limit);
+    let (mut at, mut limit, mut part) = (start, limit, start);
     let mut end = None;
     let mut length = 1;
     loop {
@@ -494,15 +540,14 @@ fn name_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
                 at += 1 + label;
             }
             0xc0..=0xff => {
-                if at + 1 >= limit {
-                    return None;
-                }
-                let target = usize::from(octet & 0x3f) << 8 | usize::from(bytes[at + 1]);
-                if target >= at {
+                let low = *bytes.get(at + 1)?;
+                let target = usize::from(octet & 0x3f) << 8 | usize::from(low);
+                if target >= part {
                     return None;
                 }
                 end.get_or_insert(at + 2);
-                limit = at;
+                limit = part;
+                part = target;
                 at = target;
             }
             _ => return None,
@@ -641,6 +686,99 @@ mod tests {
         let reply = rejected(&bytes, Transport::Udp);
         assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
         assert!(reply.edns.is_some());
+    }
+
+    /// A TSIG record signed with HMAC-SHA256, with no MAC.
+    fn tsig() -> Record {
+        use super::super::rr::rdata::tsig::TsigAlgorithm;
+        let data = TSIG::new(
+            TsigAlgorithm::HmacSha256,
+            1_700_000_000,
+            300,
+            Vec::new(),
+            77,
+            None,
+            Vec::new(),
+        );
+        let mut record = Record::from_rdata(name("key."), 0, RData::TSIG(data));
+        record.dns_class = DNSClass::ANY;
+        record
+    }
+
+    #[test]
+    fn a_pointer_into_its_own_name_gets_formerr() {
+        // One answer record, NS, whose target is a label holding a zero
+        // octet and then a pointer to that octet: an octet of the same
+        // name, not a prior occurrence of one (RFC 1035 §4.1.4).
+        let mut bytes = query(|_| {});
+        bytes[7] = 1;
+        let rdata = bytes.len() + 12;
+        let target = u8::try_from(rdata + 1).unwrap();
+        bytes.extend_from_slice(&[0xc0, 12, 0, 2, 0, 1, 0, 0, 1, 44, 0, 5]);
+        bytes.extend_from_slice(&[2, 0, 0, 0xc0, target]);
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+
+        // The same record with its target pointing back at the question's
+        // name is a prior occurrence, and the query is answered.
+        let mut good = query(|_| {});
+        good[7] = 1;
+        good.extend_from_slice(&[0xc0, 12, 0, 2, 0, 1, 0, 0, 1, 44, 0, 2, 0xc0, 12]);
+        accepted(&good, Transport::Udp);
+    }
+
+    #[test]
+    fn a_name_type_record_that_holds_no_name_gets_formerr() {
+        // One answer record of type MF (RFC 1035 §3.3.5), whose RDATA must
+        // be a name, holding a label that runs past the RDATA's end.
+        let mut bytes = query(|m| {
+            m.set_edns(edns(0, false));
+        });
+        let opt = bytes.split_off(bytes.len() - 11);
+        bytes[7] = 1;
+        bytes.extend_from_slice(&[0xc0, 12, 0, 4, 0, 1, 0, 0, 1, 44, 0, 3, 1, 2, 3]);
+        bytes.extend_from_slice(&opt);
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        // The fault is not in the OPT record, and the message does not read.
+        assert!(reply.edns.is_none());
+    }
+
+    #[test]
+    fn a_misplaced_tsig_gets_formerr_with_the_querys_opt() {
+        // A TSIG record before the OPT record: not the last record.
+        let bytes = query(|m| {
+            m.add_additional(tsig());
+            m.set_edns(edns(0, false));
+        });
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.edns.is_some());
+
+        // Without an OPT record in the query, the FORMERR has none.
+        let bytes = query(|m| {
+            m.add_additional(tsig());
+            m.add_additional(Record::from_rdata(
+                name("x.test."),
+                0,
+                RData::A(super::super::rr::rdata::A::new(192, 0, 2, 1)),
+            ));
+        });
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.edns.is_none());
+    }
+
+    #[test]
+    fn a_tsig_outside_the_additional_section_gets_formerr() {
+        // The only record, and so the last, but in the answer section
+        // (RFC 8945 §5.1): no signature to check, a fault in the message.
+        let bytes = query(|m| {
+            m.add_answer(tsig());
+        });
+        let reply = rejected(&bytes, Transport::Udp);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.signature().is_none());
     }
 
     #[test]
