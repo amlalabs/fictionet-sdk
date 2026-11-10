@@ -99,6 +99,8 @@ pub struct UdpLayer {
     /// Packets for the layer below, with the socket each one's credit goes
     /// back to.
     down: VecDeque<Pending>,
+    /// Avoid scanning receive-ready sockets when no tracked send retired.
+    has_completions: bool,
     input_ended: bool,
 }
 
@@ -197,6 +199,7 @@ impl UdpLayer {
             up: VecDeque::new(),
             closed: VecDeque::new(),
             down: VecDeque::new(),
+            has_completions: false,
             input_ended: false,
         }
     }
@@ -528,6 +531,7 @@ impl Layer for UdpLayer {
             {
                 socket.owed += 1;
                 socket.completed += u64::from(completion);
+                self.has_completions |= completion;
                 self.wake(id);
             }
             if let Some(packet) = packet {
@@ -548,6 +552,9 @@ impl Layer for UdpLayer {
     }
 
     fn take_urgent(&mut self) -> Option<EventOf<Self::Upper>> {
+        if !self.has_completions {
+            return None;
+        }
         for _ in 0..self.ready.len() {
             let id = self.ready.pop_front()?;
             let Some(socket) = self.sockets.get_mut(id) else {
@@ -561,6 +568,7 @@ impl Layer for UdpLayer {
                 ));
             }
         }
+        self.has_completions = false;
         None
     }
 }
