@@ -52,6 +52,11 @@ impl MessageFragmenter {
         })
     }
 
+    /// The most payload one fragment carries.
+    pub(crate) fn max_fragment_len(&self) -> usize {
+        self.max_frag
+    }
+
     /// Set the maximum fragment size that will be produced.
     ///
     /// This includes overhead. A `max_fragment_size` of 10 will produce TLS fragments

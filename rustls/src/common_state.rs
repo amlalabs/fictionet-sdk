@@ -870,6 +870,26 @@ impl CommonState {
         self.send_msg(m, self.record_layer.is_encrypting());
     }
 
+    /// What [`Self::write_plaintext`] writes for `len` bytes: the records
+    /// queued before them, a key update waiting to go, and the records the
+    /// bytes make.
+    pub(crate) fn encrypted_len(&self, len: usize) -> usize {
+        let queued = self.sendable_tls.len()
+            + self
+                .queued_key_update_message
+                .as_ref()
+                .map_or(0, |(message, _)| message.len());
+        let max = self.message_fragmenter.max_fragment_len();
+        let records = (len + max - 1) / max;
+        let last = len - records.saturating_sub(1) * max;
+        let full = records.saturating_sub(1) * (HEADER_SIZE + self.record_layer.encrypted_len(max));
+        let tail = match records {
+            0 => 0,
+            _ => HEADER_SIZE + self.record_layer.encrypted_len(last),
+        };
+        queued + full + tail
+    }
+
     fn check_required_size<'a>(
         &self,
         outgoing_tls: &mut [u8],
@@ -905,11 +925,11 @@ impl CommonState {
             written += len;
         }
 
+        // Each record is sealed where it is written: nothing is allocated.
         for m in fragments {
-            let em = self.record_layer.encrypt_outgoing(m).encode();
-
-            let len = em.len();
-            outgoing_tls[written..written + len].copy_from_slice(&em);
+            let len = m.encoded_len(&self.record_layer);
+            self.record_layer
+                .encrypt_outgoing_into(m, &mut outgoing_tls[written..written + len]);
             written += len;
         }
 

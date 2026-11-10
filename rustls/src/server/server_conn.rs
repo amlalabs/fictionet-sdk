@@ -19,8 +19,9 @@ use crate::conn::{ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon};
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::CryptoProvider;
+use crate::enums::AlertDescription;
 use crate::enums::{CertificateType, CipherSuite, ProtocolVersion, SignatureScheme};
-use crate::error::Error;
+use crate::error::{Error, PeerMisbehaved};
 use crate::kernel::KernelConnection;
 use crate::log::trace;
 use crate::msgs::base::Payload;
@@ -1095,9 +1096,49 @@ impl Accepted {
     /// once the budget has room.
     #[cfg(feature = "std")]
     pub fn into_connection(
-        mut self,
+        self,
         config: Arc<ServerConfig>,
     ) -> Result<ServerConnection, IntoConnectionError> {
+        Ok(ServerConnection {
+            inner: self.answer(config)?,
+        })
+    }
+
+    /// Convert the [`Accepted`] into an [`UnbufferedServerConnection`], as
+    /// [`Self::into_connection`] does into a [`ServerConnection`]: the
+    /// connection goes on through the unbuffered API, whose caller holds
+    /// the bytes it receives. The server's flight is queued for
+    /// [`EncodeTlsData`](crate::unbuffered::EncodeTlsData).
+    ///
+    /// Fails if the client sent bytes after its hello that the [`Acceptor`]
+    /// already read: nothing may follow the hello before the server answers.
+    #[cfg(feature = "std")]
+    pub fn into_unbuffered(
+        mut self,
+        config: Arc<ServerConfig>,
+    ) -> Result<UnbufferedServerConnection, IntoConnectionError> {
+        if self.connection.holds_input() {
+            let err = self.connection.send_fatal_alert(
+                AlertDescription::UnexpectedMessage,
+                PeerMisbehaved::DataAfterClientHello,
+            );
+            return Err(IntoConnectionError::Failed(
+                err,
+                AcceptedAlert::from(self.connection),
+            ));
+        }
+        Ok(UnbufferedServerConnection {
+            inner: self.answer(config)?.into_unbuffered(),
+        })
+    }
+
+    /// Answers the hello with `config`: the connection, with the server's
+    /// flight queued.
+    #[cfg(feature = "std")]
+    fn answer(
+        mut self,
+        config: Arc<ServerConfig>,
+    ) -> Result<ConnectionCommon<ServerConnectionData>, IntoConnectionError> {
         if let Err(err) = self
             .connection
             .set_max_fragment_size(config.max_fragment_size)
@@ -1136,9 +1177,7 @@ impl Accepted {
         };
 
         self.connection.replace_state(new);
-        Ok(ServerConnection {
-            inner: self.connection,
-        })
+        Ok(self.connection)
     }
 
     fn client_hello_payload<'a>(message: &'a Message<'_>) -> &'a ClientHelloPayload {

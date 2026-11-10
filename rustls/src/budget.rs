@@ -288,7 +288,7 @@ pub(crate) const CONTROL_RECORDS: usize = 3;
 pub(crate) const CONTROL_PAYLOAD: usize = 5;
 
 #[cfg(all(test, feature = "std"))]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) mod testing {

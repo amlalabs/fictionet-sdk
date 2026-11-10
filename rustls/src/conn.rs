@@ -900,6 +900,24 @@ impl<Data> ConnectionCommon<Data> {
             + common.sendable_tls.held()
     }
 
+    /// Whether bytes it read are still buffered, unprocessed or in use.
+    #[cfg(feature = "std")]
+    pub(crate) fn holds_input(&self) -> bool {
+        !self.deframer_buffer.filled().is_empty() || self.core.hs_deframer.is_active()
+    }
+
+    /// The connection without its buffers, to go on through the unbuffered
+    /// API, whose caller holds the bytes it receives. Holds no input
+    /// ([`Self::holds_input`]): its buffers are dropped, giving back their
+    /// charge. Plaintext written before is dropped too; a connection made
+    /// from an `Accepted` has none.
+    #[cfg(feature = "std")]
+    pub(crate) fn into_unbuffered(self) -> UnbufferedConnectionCommon<Data> {
+        debug_assert!(self.deframer_buffer.filled().is_empty());
+        debug_assert!(self.sendable_plaintext.is_empty());
+        UnbufferedConnectionCommon::from(self.core)
+    }
+
     /// Pays for every buffer of this connection from `budget`. The buffers
     /// are still empty: this is part of making the connection.
     pub(crate) fn pay_from(mut self, budget: Arc<dyn BufferBudget>) -> Self {

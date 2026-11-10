@@ -23,7 +23,7 @@ use crate::{
     SupportedProtocolVersion,
 };
 
-fn server_config() -> Arc<ServerConfig> {
+pub(crate) fn server_config() -> Arc<ServerConfig> {
     let chain = vec![
         CertificateDer::from(&include_bytes!("../../test-ca/rsa-2048/end.der")[..]),
         CertificateDer::from(&include_bytes!("../../test-ca/rsa-2048/inter.der")[..]),
@@ -44,7 +44,7 @@ fn server_config() -> Arc<ServerConfig> {
 /// The client trusts any server: these tests are about the server's
 /// buffers, not its certificate.
 #[derive(Debug)]
-struct TrustAnything;
+pub(crate) struct TrustAnything;
 
 impl ServerCertVerifier for TrustAnything {
     fn verify_server_cert(
@@ -83,7 +83,7 @@ impl ServerCertVerifier for TrustAnything {
     }
 }
 
-fn client(version: &'static SupportedProtocolVersion) -> ClientConnection {
+pub(crate) fn client(version: &'static SupportedProtocolVersion) -> ClientConnection {
     let config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[version])
         .unwrap()
@@ -98,7 +98,7 @@ fn client(version: &'static SupportedProtocolVersion) -> ClientConnection {
 }
 
 /// What `client` has to send.
-fn from_client(client: &mut ClientConnection) -> Vec<u8> {
+pub(crate) fn from_client(client: &mut ClientConnection) -> Vec<u8> {
     let mut wire = Vec::new();
     while client.wants_write() {
         client.write_tls(&mut wire).unwrap();

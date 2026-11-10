@@ -112,6 +112,22 @@ impl RecordLayer {
         self.message_encrypter.encrypt(plain, seq).unwrap()
     }
 
+    /// Encrypts `plain` as [`Self::encrypt_outgoing`] does, into `record`,
+    /// which is exactly the encoded length of the record it makes.
+    pub(crate) fn encrypt_outgoing_into(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+        record: &mut [u8],
+    ) {
+        debug_assert!(self.encrypt_state == DirectionState::Active);
+        assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
+        let seq = self.write_seq;
+        self.write_seq += 1;
+        self.message_encrypter
+            .encrypt_into(plain, seq, record)
+            .unwrap()
+    }
+
     /// Prepare to use the given `MessageEncrypter` for future message encryption.
     /// It is not used until you call `start_encrypting`.
     pub(crate) fn prepare_message_encrypter(
