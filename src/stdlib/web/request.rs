@@ -161,17 +161,16 @@ impl Head {
     }
 
     /// The host bytes, without a port or trailing dot. No case folding or
-    /// allocation occurs. A Host field takes precedence over an absolute target.
+    /// allocation occurs. An absolute target's authority takes precedence over Host.
     pub fn host(&self) -> Option<&[u8]> {
-        let authority = match self.field(b"host") {
-            Some(host) => host,
-            None => {
-                let (scheme, rest) = self.target().split_once("://")?;
+        let authority = match self.target().split_once("://") {
+            Some((scheme, rest)) => {
                 if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
                     return None;
                 }
                 rest.split(['/', '?', '#']).next()?.as_bytes()
             }
+            None => self.field(b"host")?,
         };
         if !super::super::protocols::http1::valid_authority(authority, false) {
             return None;
@@ -373,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn host_fields_take_precedence_and_absolute_queries_keep_their_path() {
+    fn absolute_authority_takes_precedence_and_queries_keep_their_path() {
         for (target, path, query) in [
             ("http://elsewhere.test", "/", None),
             ("http://elsewhere.test?q=yes", "/", Some("q=yes")),
@@ -386,7 +385,12 @@ mod tests {
                 Version::Http11,
                 [("Host", "Chosen.TEST.:80")],
             );
-            assert_eq!(head.host(), Some(b"Chosen.TEST".as_slice()));
+            let expected = if target.starts_with('/') {
+                b"Chosen.TEST".as_slice()
+            } else {
+                b"elsewhere.test".as_slice()
+            };
+            assert_eq!(head.host(), Some(expected));
             assert_eq!(head.path(), path);
             assert_eq!(head.query(), query);
         }
