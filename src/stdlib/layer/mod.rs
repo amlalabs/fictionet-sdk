@@ -153,7 +153,9 @@
 //!    Fixed engine state has explicit count limits; reports have their own
 //!    byte budget. Each adapter documents external configuration and callback
 //!    allocations it cannot measure.
-//! 5. **Limits apply before growth.** Charge first, then allocate.
+//! 5. **Limits apply before growth.** Charge first, then allocate. The
+//!    charged containers ([`ChargedBytes`], [`ChargedDeque`],
+//!    [`ChargedVec`], [`BoundedMap`]) grow no other way.
 //! 6. **Progress is bounded and fair.** [`Layer::advance`] moves a bounded
 //!    amount of work per call, and children are visited in a stable,
 //!    rotating order. A stalled child holds only its own credit. A
@@ -164,6 +166,9 @@
 //!    by its [`ChildId`], generation included.
 //! 8. **Closed input is explicit.** A layer whose input has ended says
 //!    [`Admit::Closed`] instead of taking and dropping.
+//! 9. **A refused charge waits for memory.** It leaves the layer ready to
+//!    try again on its next [`advance`](Layer::advance), and the runner
+//!    wakes the stack when memory frees ([`Budget::wake_when_freed`]).
 //!
 //! Every entry point is synchronous: it never awaits, reads a socket, reads
 //! a clock, or starts a task. The time, the entropy and the budget come in
