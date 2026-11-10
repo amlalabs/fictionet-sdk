@@ -363,8 +363,8 @@ allows. `H2Streams.tla` follows the server layer `Http2`;
 `SessionStreams.tla` follows the sans-I/O `Session` in
 `src/stdlib/protocols/http2.rs`, which reads one direction for the
 dissector's style of use and for clients. The model headers name the
-source lines, at the commit that adds these models on
-`comp/fv-h2-streams`.
+source lines in the tree after `comp/fv-h2` merged into
+`comp/fv-h2-streams` (ff641d38a).
 
 `StreamRules.tla` keeps each stream's state (idle, open, half closed
 local or remote, closed) and how a closed stream closed: the server
@@ -492,15 +492,20 @@ IDs"), so `IdleFrames`, `EvenHeaders`, `LowerIdHeaders`, `Concurrency`
 GOAWAY rules are not checked here, nor `Refines` as a whole. `ClosedData`
 and `NoRstForRst_` are not listed: every DATA refusal of `Session` is a
 connection error, which `ClosedData` always allows, and `Session` sends
-nothing. Every error of `Session` stops the direction, a connection
-error in the RFC's terms. The caller's steps are the server's reset
-(`peer_reset`), the server's END_STREAM, which only the other direction
-reads, and `retire`. One stream state and one peer-reset id are kept, so
-both watermarks (`retired_before`, `reset_before`) move.
+nothing. An error of `Session` stops the direction, a connection error
+in the RFC's terms, except a stream-scope refusal outside a header block
+(a malformed PRIORITY here), which comes out as `Event::StreamError`
+since comp/fv-h2 merged. The model has the caller act on it as
+`Http2::on_input` does: a reset on an open or closed stream, nothing on a
+stream it reset, a connection error on an idle one. The caller's steps
+are the server's reset (`peer_reset`), the server's END_STREAM, which only
+the other direction reads, and `retire`. One stream state and one
+peer-reset id are kept, so both watermarks (`retired_before`,
+`reset_before`) move.
 
 | Config | Result |
 | --- | --- |
-| `SessionStreams_base` (streams 1 and 3, PRIORITY also on 2, four client frames) | passes: 97,391 states generated, 44,484 distinct, depth 9, 1 s |
+| `SessionStreams_base` (streams 1 and 3, PRIORITY also on 2, four client frames) | passes: 130,423 states generated, 57,214 distinct, depth 9, 1 s |
 | `SessionStreams_without_pushfirst` (the code before this model) | violates `PushRefused_` (2 states): a PUSH_PROMISE without END_HEADERS draws no error |
 | `SessionStreams_without_resetdrops` | violates `ServerResetDiscarded` (4 states): DATA after `peer_reset` stops the direction |
 | `SessionStreams_without_closedcheck` | violates `HalfClosedRemote` (3 states) |
@@ -513,17 +518,27 @@ both watermarks (`retired_before`, `reset_before`) move.
 | `SessionStreams_without_priorityscope` | violates `PriorityMalformed` (2 states) |
 | `SessionStreams_without_priorityidleok` | violates `PriorityAnyState` (2 states) |
 
-### Frame rules in Kani
+### Frame rules in Kani and a test
 
-The models take each frame as its decoded type. The rules that live in
-the frame decoder and the header-block reader are proved in Kani on the
-production code both `Http2` and `Session` read with
-(`kani/frames.rs`, compiled into `protocols/http2.rs`):
+The models take each frame as its decoded type. The refusals that live
+in the frame decoder are proved in Kani on the production code both
+`Http2` and `Session` read with (`kani/frames.rs`, compiled into
+`protocols/http2.rs`):
 
 | Harness | Proves | Time |
 | --- | --- | --- |
-| `frame_refusals_have_the_rfcs_code_and_scope` | for every frame type with a stream rule, any flags, any 31-bit stream (reserved bit set or not) and payloads of up to eight bytes: DATA, HEADERS, PRIORITY, RST_STREAM, PUSH_PROMISE and CONTINUATION on stream 0, and SETTINGS, PING and GOAWAY off it, are connection errors PROTOCOL_ERROR; RST_STREAM of the wrong length a connection error FRAME_SIZE_ERROR; PRIORITY of the wrong length a FRAME_SIZE_ERROR with stream scope, PRIORITY on its own stream a PROTOCOL_ERROR with stream scope, any other PRIORITY a frame; only PRIORITY and a zero WINDOW_UPDATE increment ever have stream scope | XX s |
-| `header_blocks_take_only_their_own_continuation` | after a HEADERS or PUSH_PROMISE without END_HEADERS on any stream, a frame of any other type, or CONTINUATION on any other stream, with END_STREAM on or off, is refused with PROTOCOL_ERROR; CONTINUATION with no block waiting is refused with PROTOCOL_ERROR, and leaves none waiting | XX s |
+| `frame_refusals_have_the_rfcs_code_and_scope` | for every frame type with a stream rule, any flags, any 31-bit stream (reserved bit set or not) and payloads of up to eight bytes: DATA, HEADERS, PRIORITY, RST_STREAM, PUSH_PROMISE and CONTINUATION on stream 0, and SETTINGS, PING and GOAWAY off it, are connection errors PROTOCOL_ERROR; RST_STREAM of the wrong length a connection error FRAME_SIZE_ERROR; PRIORITY of the wrong length a FRAME_SIZE_ERROR with stream scope, PRIORITY on its own stream a PROTOCOL_ERROR with stream scope, any other PRIORITY a frame; only PRIORITY and a zero WINDOW_UPDATE increment ever have stream scope | 191 s |
+
+The header-block sequencing is a plain Rust test,
+`header_blocks_take_only_their_own_continuation` in
+`protocols/http2.rs`: after a HEADERS or PUSH_PROMISE without
+END_HEADERS, each of the 256 frame types, on streams 0, 1, 2, 3 and
+2^31 - 1, with END_STREAM and END_HEADERS on or off, is refused with
+PROTOCOL_ERROR unless it is CONTINUATION on the block's stream; a
+CONTINUATION with no block waiting is refused, and leaves none waiting.
+A Kani harness of the same claim, with the type and stream symbolic, ran
+15 minutes in CBMC without an answer (the HPACK table it builds is on
+every path), so the test enumerates instead.
 
 Which scope reaches the wire is the caller's: `Http2::on_input` turns a
 stream-scope refusal into a reset on an open stream, a reset without
@@ -533,8 +548,18 @@ which `H2Streams.tla` checks.
 
 ```sh
 cargo kani -p fictionet --harness frame_refusals_have_the_rfcs_code_and_scope
-cargo kani -p fictionet --harness header_blocks_take_only_their_own_continuation
+cargo test -p fictionet --lib -- header_blocks_take_only_their_own_continuation
 ```
+
+`cargo kani -p fictionet` does not compile at 3db7a847e or after this
+work: `verification/tls/kani/LayerProof.rs` and
+`verification/layer/kani/mod.rs` no longer match the code. The run above
+switched those two modules off locally (their `cfg(kani)`), without
+committing that change.
+
+The harness was also run once with `Inputs::decode` giving a PRIORITY of
+the wrong length connection scope; it failed at
+`refused(ErrorCode::FrameSizeError, ErrorScope::Stream)`.
 
 ### Stream rules: bugs fixed
 
@@ -622,9 +647,10 @@ Each has a test that failed before its fix and passes after.
   Section 8.1 suggests NO_ERROR after a complete response; REFUSED_STREAM
   is a stream error the RFC allows, and the 431 came from the HTTP/2
   layer, not the application.
-- **`Session` stops the direction for every error**, stream errors
-  included (section 5.4.1 allows it), and leaves idle-stream checks,
-  stream identifiers, the stream limit and GOAWAY to its caller, as its
+- **`Session` stops the direction for every connection-scope error**, and
+  for a stream error that is the first frame or inside a header block
+  (section 5.4.1 allows it); it leaves idle-stream checks, stream
+  identifiers, the stream limit and GOAWAY to its caller, as its
   documentation says. It has no caller in the tree but its tests and the
   fuzz target.
 
@@ -672,9 +698,9 @@ model headers:
   `write_rst`, `reset_closed`, `ignored`.
 - `SessionStreams.Step`: `Session::step` and `Inputs::decode`'s scope;
   `PeerReset`, `Retire`: `Session::peer_reset`, `retire`.
-- The Kani harnesses call `Inputs::decode` and `HeaderBlocks::read`; if
-  either is renamed or split, point the harnesses at the new functions
-  and rerun both.
+- The Kani harness calls `Inputs::decode`, and the sequencing test
+  `HeaderBlocks::read`; if either is renamed or split, point them at the
+  new functions and rerun both.
 
 ## RFC 9113: flow control, SETTINGS and the end of a connection
 

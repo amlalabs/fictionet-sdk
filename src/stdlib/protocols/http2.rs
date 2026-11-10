@@ -3171,6 +3171,62 @@ mod tests {
     }
 
     #[test]
+    fn header_blocks_take_only_their_own_continuation() {
+        // RFC 9113 sections 4.3 and 6.10, for every frame type: while a
+        // block waits for CONTINUATION, a frame of another type, or a
+        // CONTINUATION on another stream, is a connection error
+        // PROTOCOL_ERROR; so is a CONTINUATION with no block waiting. The
+        // payload's own fields parse (four bytes, PADDED and PRIORITY off),
+        // so only the sequencing can refuse it.
+        let payload = [0, 0, 0, 2];
+        for opener in [1, 5] {
+            for kind in 0..=u8::MAX {
+                for stream in [0, 1, 2, 3, MAX_WINDOW] {
+                    for flags in [0, 1, 4, 5] {
+                        if kind == 9 && stream == 1 {
+                            continue;
+                        }
+                        let mut blocks = HeaderBlocks::with_limits(Limits::default());
+                        let open = FrameHeader {
+                            length: if opener == 5 { 4 } else { 0 },
+                            kind: opener,
+                            flags: 0,
+                            stream: 1,
+                        };
+                        let fields: &[u8] = if opener == 5 { &payload } else { &[] };
+                        assert!(blocks.read(open, fields).unwrap().block.is_none());
+                        let next = FrameHeader {
+                            length: 4,
+                            kind,
+                            flags,
+                            stream,
+                        };
+                        let refused = blocks.read(next, &payload);
+                        assert!(
+                            matches!(refused, Err(e) if e.code == ErrorCode::ProtocolError),
+                            "{opener} {kind} {stream} {flags}: {refused:?}"
+                        );
+                    }
+                }
+            }
+        }
+        for stream in [0, 1, 2, MAX_WINDOW] {
+            for flags in [0, 1, 4, 5] {
+                let mut blocks = HeaderBlocks::with_limits(Limits::default());
+                let lone = FrameHeader {
+                    length: 0,
+                    kind: 9,
+                    flags,
+                    stream,
+                };
+                let refused = blocks.read(lone, &[]);
+                assert!(matches!(refused, Err(e) if e.code == ErrorCode::ProtocolError));
+                assert!(!blocks.pending());
+            }
+        }
+    }
+
+    #[test]
     fn a_client_push_promise_fails_on_its_own_frame() {
         // A client cannot push (RFC 9113 section 8.4): the server treats its
         // PUSH_PROMISE as a connection error on receipt, on a stream the

@@ -11,9 +11,11 @@
 (* idle stream come out as events), `EvenHeaders`, `LowerIdHeaders`,      *)
 (* `Concurrency` (its stream limit is a memory bound), `GoawayRefuses`,   *)
 (* `GoawayNeverGrows` and `GoawayCovers` (it sends nothing), and          *)
-(* `Refines` as a whole. Every error of `Session` stops the direction, a  *)
+(* `Refines` as a whole. An error of `Session` stops the direction, a     *)
 (* connection error in the RFC's terms (section 5.4.1 allows it for a     *)
-(* stream error).                                                         *)
+(* stream error), except a stream-scope refusal outside a header block,   *)
+(* which comes out as `Event::StreamError`: the caller resets the stream, *)
+(* or ends the connection when the stream is idle (`Step` says how).      *)
 (*                                                                        *)
 (* The caller's steps: the server resets a stream (`peer_reset`), the     *)
 (* server's END_STREAM (which only the other direction sees), and         *)
@@ -24,12 +26,12 @@
 (*                                                                        *)
 (* Source lines, at the commit in README.md:                              *)
 (*   Inputs::decode (refusals)              protocols/http2.rs 884-965    *)
-(*   HeaderBlocks::read_parsed, read_fragment  protocols/http2.rs 1299-1388 *)
-(*   Session::retire                        protocols/http2.rs 1562-1571  *)
-(*   Session::open_stream, retired          protocols/http2.rs 1590-1601  *)
-(*   Session::peer_reset, reset_by_peer     protocols/http2.rs 1611-1638  *)
-(*   Session::stream_state                  protocols/http2.rs 1786-1799  *)
-(*   Session::step                          protocols/http2.rs 1834-1973  *)
+(*   HeaderBlocks::read_parsed, read_fragment  protocols/http2.rs 1320-1409 *)
+(*   Session::retire                        protocols/http2.rs 1583-1592  *)
+(*   Session::open_stream, retired          protocols/http2.rs 1611-1622  *)
+(*   Session::peer_reset, reset_by_peer     protocols/http2.rs 1632-1659  *)
+(*   Session::stream_state                  protocols/http2.rs 1811-1824  *)
+(*   Session::step                          protocols/http2.rs 1859-2011  *)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS Odd, Even, Top,
@@ -88,6 +90,18 @@ ResetByPeer(o, i) ==
   ELSE i \in o.presets \/ i <= o.resetB[Parity(i)]
 Retired(o, i) == ~o.tracked[i] /\ i <= o.retiredB[Parity(i)]
 
+\* `peer_reset`: the caller tells this direction the server reset stream i.
+Reset(o, i) ==
+  LET p0 == IF i > o.resetB[Parity(i)] THEN o.presets \cup {i} ELSE o.presets
+      oldest == CHOOSE j \in p0 : \A k \in p0 : j <= k
+      p1 == IF Cardinality(p0) > SMax THEN p0 \ {oldest} ELSE p0
+      b1 == IF Cardinality(p0) > SMax
+            THEN [o.resetB EXCEPT ![Parity(oldest)] = Max(@, oldest)]
+            ELSE o.resetB
+  IN [o EXCEPT !.cl = IF o.tracked[i] THEN [@ EXCEPT ![i] = TRUE] ELSE @,
+               !.rbp = IF o.tracked[i] THEN [@ EXCEPT ![i] = TRUE] ELSE @,
+               !.presets = p1, !.resetB = b1]
+
 \* `stream_state` then the checks of `step` for a block that ended.
 Headed(o, i, es, dec) ==
   CASE Retired(o, i) -> Fail(o, "STREAM_CLOSED")
@@ -116,8 +130,16 @@ Event(o, f) ==
 
 Step(o, f) ==
   IF f.t = "PRIORITY" /\ f.v \in {"len", "self"}
-  THEN IF PriorityScope THEN Fail(o, IF f.v = "len" THEN "FRAME_SIZE_ERROR" ELSE "PROTOCOL_ERROR")
-       ELSE Out(o, G!Drop, FALSE)
+  THEN LET c == IF f.v = "len" THEN "FRAME_SIZE_ERROR" ELSE "PROTOCOL_ERROR"
+       IN CASE o.hb.s # 0 -> Fail(o, c)
+            [] ~PriorityScope -> Out(o, G!Drop, FALSE)
+            \* `Event::StreamError`; the caller resets an open or closed
+            \* stream, and routes the reset through `peer_reset`; it ends
+            \* the connection for an idle stream (idle checks are its), and
+            \* does nothing for a stream it reset.
+            [] gst[f.s] = "idle" -> Fail(o, c)
+            [] G!MustDiscard(f.s) -> Out(o, G!Drop, FALSE)
+            [] OTHER -> Out(Reset(o, f.s), G!Rst(c), FALSE)
   ELSE IF f.t = "PRIORITY" /\ ~PriorityIdleOk /\ gst[f.s] = "idle" THEN Fail(o, "PROTOCOL_ERROR")
   ELSE IF f.t = "PUSH" /\ PushFirst THEN Fail(o, "PROTOCOL_ERROR")
   ELSE IF o.hb.s # 0 /\ (f.t # "CONT" \/ f.s # o.hb.s) /\ InterleaveCheck
@@ -175,15 +197,8 @@ Recv(f) ==
 PeerReset(i) ==
   /\ ~stopped /\ gst[i] \in {"open", "hcl", "hcr"}
   /\ G!Reset(i)
-  /\ IF tracked[i]
-     THEN cl' = [cl EXCEPT ![i] = TRUE] /\ rbp' = [rbp EXCEPT ![i] = TRUE]
-     ELSE UNCHANGED <<cl, rbp>>
-  /\ LET p0 == IF i > resetB[Parity(i)] THEN presets \cup {i} ELSE presets
-         oldest == CHOOSE j \in p0 : \A k \in p0 : j <= k
-     IN IF Cardinality(p0) > SMax
-        THEN /\ presets' = p0 \ {oldest}
-             /\ resetB' = [resetB EXCEPT ![Parity(oldest)] = Max(@, oldest)]
-        ELSE presets' = p0 /\ UNCHANGED resetB
+  /\ LET o == Reset(State, i)
+     IN cl' = o.cl /\ rbp' = o.rbp /\ presets' = o.presets /\ resetB' = o.resetB
   /\ UNCHANGED <<tracked, hdr, retiredB, hb, stopped>>
 
 \* The server's END_STREAM, which only the other direction reads.
