@@ -408,6 +408,21 @@ It moved here from the serving engine with its proof:
 | --- | --- | ---: | ---: | --- |
 | `connections_are_counted_up_to_the_maximum` | `Counted::enter` never counts past the maximum, and a dropped count makes room for one more, for maxima up to three | 5 | 451 | all pass, 2.1 s |
 
+## Kani over the idle clock: `kani/lifetime.rs`
+
+`Lifetime` keeps the idle and write limits for the stream runner and
+`Session`. A stream that waits for memory is not waiting for its peer, so
+`Outstanding::memory` stops the idle clock as work does, and leaves the
+write clock alone:
+
+| Harness | Proves | Unwind | Checks | Result |
+| --- | --- | ---: | ---: | --- |
+| `the_idle_clock_stops_while_memory_waits` | over three settles at symbolic `u8` times, with symbolic `u8` limits and flags: the idle deadline is never earlier than an idle limit after the first settle that found the stream quiet since its last busy one (busy: output, input, work or memory); a settle that finds the stream waiting for memory leaves no idle deadline; a twin that never waits for memory keeps the same write clock | 4 | not run yet | not run yet |
+
+The random model test `the_idle_deadline_never_falls_inside_a_wait_for_memory`
+(`lifetime.rs`) checks the same over 256 seeds of 64 steps, with the
+clock resets (`took_input`, `wrote`, `interrupt`) mixed in.
+
 ## Kani over `Framed`
 
 [`kani/framed.rs`](kani/framed.rs), included from `framed.rs` under

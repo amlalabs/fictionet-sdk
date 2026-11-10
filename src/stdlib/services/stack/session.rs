@@ -26,6 +26,9 @@ pub struct Session<L> {
     event: Option<StreamEvent>,
     command: Option<StreamCommand>,
     jobs: Arc<AtomicUsize>,
+    /// The budget refused a charge the application made, and it has not
+    /// moved since: it waits for memory, which is not waiting for the peer.
+    memory: bool,
 }
 
 impl<L> Session<L> {
@@ -44,6 +47,7 @@ impl<L> Session<L> {
             event: None,
             command: None,
             jobs: Arc::new(AtomicUsize::new(0)),
+            memory: false,
         }
     }
 
@@ -52,7 +56,30 @@ impl<L> Session<L> {
             output: self.pending > 0,
             input: self.refused || self.event.is_some(),
             work: self.jobs.load(Ordering::Relaxed) > 0,
+            memory: self.memory,
         }
+    }
+
+    /// Calls the application, as a part of the session, and notes whether
+    /// the budget refused a charge it made in the call. A refusal has the
+    /// session wait for memory; a call that `moved` without one ends the
+    /// wait. So does an [`advance`](Layer::advance) without one, since a
+    /// layer tries a refused charge again there.
+    fn part<R, T, E>(
+        &mut self,
+        env: &mut Env<'_, R>,
+        call: impl FnOnce(&mut L, &mut Env<'_, R>) -> Result<T, E>,
+        moved: impl FnOnce(&T) -> bool,
+    ) -> Result<T, E> {
+        let since = env.budget().refusals();
+        let layer = &mut self.layer;
+        let result = env.part(|env| call(layer, env))?;
+        if env.budget().refused_since(since) {
+            self.memory = true;
+        } else if moved(&result) {
+            self.memory = false;
+        }
+        Ok(result)
     }
 
     fn settle(&mut self) {
@@ -145,7 +172,11 @@ where
             StreamEvent::Written(n) => (false, false, *n, false),
             StreamEvent::Data(_) => (false, false, 0, true),
         };
-        let admitted = env.part(|env| self.layer.on_event(env, event))?;
+        let admitted = self.part(
+            env,
+            |layer, env| layer.on_event(env, event),
+            |admitted| admitted.moved() || matches!(admitted, Admit::Closed(_)),
+        )?;
         self.now = env.now();
         let closed = matches!(&admitted, Admit::Closed(_));
         if input {
@@ -183,7 +214,12 @@ where
         timer: Self::Timer,
     ) -> Result<bool, L::Error> {
         match timer {
-            SessionTimer::Application(timer) => env.part(|env| self.layer.on_timer(env, timer)),
+            SessionTimer::Application(timer) => {
+                let worked = self.part(env, |layer, env| layer.on_timer(env, timer), |w| *w)?;
+                self.now = env.now();
+                self.settle();
+                Ok(worked)
+            }
             SessionTimer::Idle => {
                 self.lifetime.expire(Expiry::Idle);
                 self.event = Some(StreamEvent::Ended);
@@ -194,19 +230,31 @@ where
                 self.lifetime.expire(Expiry::Stalled);
                 self.reset = true;
                 self.command = Some(StreamCommand::Reset);
-                let _ = env.part(|env| self.layer.on_event(env, StreamEvent::Reset))?;
+                let _ = self.part(
+                    env,
+                    |layer, env| layer.on_event(env, StreamEvent::Reset),
+                    |_| true,
+                )?;
                 Ok(true)
             }
         }
     }
     fn on_done(&mut self, env: &mut Env<'_, L::Report>, done: L::Done) -> Result<(), L::Error> {
-        env.part(|env| self.layer.on_done(env, done))
+        // The application heard its work finish: that moved it.
+        self.part(env, |layer, env| layer.on_done(env, done), |_| true)?;
+        self.now = env.now();
+        self.settle();
+        Ok(())
     }
     fn advance(&mut self, env: &mut Env<'_, L::Report>) -> Result<bool, L::Error> {
         self.now = env.now();
         let mut moved = false;
         if let Some(event) = self.event.take() {
-            match env.part(|env| self.layer.on_event(env, event))? {
+            match self.part(
+                env,
+                |layer, env| layer.on_event(env, event),
+                |admitted| !matches!(admitted, Admit::Blocked(_)),
+            )? {
                 Admit::Blocked(event) | Admit::Partial(event) => self.event = Some(event),
                 _ => {
                     // The idle EOF is in: the input is over.
@@ -215,15 +263,29 @@ where
                 }
             }
         }
-        moved |= env.part(|env| self.layer.advance(env))?;
+        // The layer tries a refused charge again here (rule 9): an advance
+        // without a refusal ends the wait for memory.
+        moved |= self.part(env, |layer, env| layer.advance(env), |_| true)?;
         self.settle();
         Ok(moved)
     }
     fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
-        let command = self
-            .command
-            .take()
-            .or_else(|| env.part(|env| self.layer.take_command(env)))?;
+        let taken = match self.command.take() {
+            Some(command) => Some(command),
+            None => self
+                .part(
+                    env,
+                    |layer, env| Ok::<_, Infallible>(layer.take_command(env)),
+                    Option::is_some,
+                )
+                .unwrap_or_else(|never| match never {}),
+        };
+        let Some(command) = taken else {
+            // A command the application could not pay for waits for memory.
+            self.now = env.now();
+            self.settle();
+            return None;
+        };
         match &command {
             StreamCommand::Write(bytes) => {
                 self.now = env.now();
@@ -270,7 +332,7 @@ where
 pub(super) mod tests {
     use super::*;
     use fictionet::Seed;
-    use fictionet::stdlib::layer::{Chunk, Harness};
+    use fictionet::stdlib::layer::{Budget, Charge, Chunk, Harness};
     use std::time::Duration;
 
     #[derive(Default)]
@@ -439,6 +501,103 @@ pub(super) mod tests {
         assert!(
             ended.since_start() >= pause + idle,
             "input ended at {:?}, within the idle limit of the application taking input again",
+            ended.since_start()
+        );
+    }
+
+    /// Asks the budget for `want` bytes on each advance until it gets them
+    /// (rule 9). Notes when its input ended.
+    struct Hungry {
+        want: usize,
+        held: Option<Charge>,
+        input_ended: Option<Instant>,
+    }
+    impl Layer for Hungry {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            env: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            if matches!(event, StreamEvent::Ended) {
+                self.input_ended.get_or_insert(env.now());
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+            if self.held.is_some() {
+                return Ok(false);
+            }
+            self.held = env.budget().charge(self.want);
+            Ok(self.held.is_some())
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// An application waiting for memory is not waiting for its peer: the
+    /// idle limit does not count while it waits, however long, and counts
+    /// from when it got its memory.
+    #[test]
+    fn the_idle_clock_waits_while_the_application_waits_for_memory() {
+        let idle = Duration::from_millis(300);
+        let budget = Budget::new(1024);
+        let hog = budget.charge(budget.limit() - 100).unwrap();
+        let mut session = Harness::with_budget(
+            Seed::from_u64(1),
+            Session::new(
+                Hungry {
+                    want: 512,
+                    held: None,
+                    input_ended: None,
+                },
+                StreamLimits {
+                    idle: Some(idle),
+                    write_timeout: None,
+                },
+                Instant::ZERO,
+            ),
+            budget.clone(),
+        );
+        session.settle().unwrap();
+        session.advance(idle * 10).unwrap();
+        assert!(session.layer().layer.held.is_none(), "no room yet");
+        assert_eq!(
+            session.layer().layer.input_ended,
+            None,
+            "the idle limit ran while the application waited for memory"
+        );
+
+        let freed = idle * 10;
+        drop(hog);
+        session.settle().unwrap();
+        assert!(session.layer().layer.held.is_some(), "the retry fits");
+        session.advance(idle * 10).unwrap();
+        let ended = session
+            .layer()
+            .layer
+            .input_ended
+            .expect("the idle limit runs once the application has its memory");
+        assert!(
+            ended.since_start() >= freed + idle,
+            "input ended at {:?}, within the idle limit of the memory coming",
             ended.since_start()
         );
     }

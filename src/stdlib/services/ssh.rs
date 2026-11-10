@@ -576,8 +576,9 @@ pub enum Ended {
     Failed,
     /// The idle deadline expired.
     Idle,
-    /// The connection held more than its [`Budget`] allows.
-    Budget,
+    /// The connection needed more than its [`Budget`]'s whole limit. A
+    /// charge that only finds no room now waits for memory instead.
+    Budget(crate::stdlib::layer::Starved),
     /// Reading or writing failed: the client reset the connection, or TLS
     /// broke ([`crate::stdlib::network::ConnError::Broken`]).
     Conn(crate::stdlib::network::ConnError),
@@ -594,7 +595,7 @@ impl Ended {
             Ended::Closed => "closed",
             Ended::Failed => "failed",
             Ended::Idle => "idle",
-            Ended::Budget => "budget",
+            Ended::Budget(_) => "budget",
             Ended::Conn(crate::stdlib::network::ConnError::Reset) => "reset",
             Ended::Conn(crate::stdlib::network::ConnError::Broken) => "broken",
             Ended::Conn(crate::stdlib::network::ConnError::TimedOut) => "timed_out",
@@ -675,7 +676,7 @@ impl<H: Handler> Server<H> {
             let end = match result {
                 Ok(stack::StreamEnd::Finished) => protocol_end,
                 Ok(stack::StreamEnd::Idle) => Ended::Idle,
-                Ok(stack::StreamEnd::Budget) | Err(stack::StackError::Budget) => Ended::Budget,
+                Ok(stack::StreamEnd::Budget(starved)) => Ended::Budget(starved),
                 Ok(stack::StreamEnd::Conn(error)) => Ended::Conn(error),
                 Ok(stack::StreamEnd::Reset) => {
                     Ended::Conn(crate::stdlib::network::ConnError::Reset)

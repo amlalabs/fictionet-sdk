@@ -146,7 +146,9 @@ impl Wake for StackWake {
 
 impl<L: Layer> Driver<L> {
     /// Drives `layer` at time `now`, drawing from `entropy` and charging
-    /// `budget`.
+    /// `budget` through a [view](Budget::view) of its own: the stack's
+    /// refusals are its own record, which its runner reads, and another
+    /// stack's refusals on the same count never show in it.
     ///
     /// The composition's depth is checked here and wherever it grows: when
     /// a stack is boxed, and, against the depth left where the new part
@@ -161,7 +163,7 @@ impl<L: Layer> Driver<L> {
         Driver {
             layer,
             entropy,
-            budget,
+            budget: budget.view(),
             now,
             observed: Observations {
                 heap_bytes: L::report_bytes,
@@ -650,6 +652,46 @@ mod tests {
         assert!(driver.layer().tries > tries);
         assert!(driver.layer().held.is_some());
         assert!(!driver.woken(), "the run served the wake");
+    }
+
+    /// Two stacks on one budget, as two connections of one sandbox: a
+    /// refusal of one shows in its own record only, and a need past the
+    /// limit starves only the stack that asked, so a runner never acts on
+    /// another stack's refusal. Given the same handle, each still charges
+    /// the shared count.
+    #[test]
+    fn each_stack_reads_only_its_own_refusals() {
+        let budget = Budget::new(64);
+        let stack = |want| {
+            Driver::new(
+                Hungry {
+                    want,
+                    held: None,
+                    tries: 0,
+                },
+                Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+                budget.clone(),
+                Instant::ZERO,
+            )
+        };
+        let (mut fits, mut waits, mut starves) = (stack(48), stack(32), stack(budget.limit() + 1));
+        let marks = [fits.refusals(), waits.refusals(), starves.refusals()];
+        assert!(fits.run().unwrap());
+        assert_eq!(budget.used(), 48, "a stack charges the shared count");
+        assert!(!waits.run().unwrap(), "no room is left for the second");
+        assert!(
+            !starves.run().unwrap(),
+            "nothing is ever room for the third"
+        );
+
+        assert!(!fits.budget().refused_since(marks[0]));
+        assert_eq!(fits.budget().starved_since(marks[0]), None);
+        assert!(waits.budget().refused_since(marks[1]));
+        assert_eq!(waits.budget().starved_since(marks[1]), None);
+        assert!(starves.budget().refused_since(marks[2]));
+        let starved = starves.budget().starved_since(marks[2]).expect("starved");
+        assert!(starved.need > starved.limit);
+        assert_eq!(starved.limit, budget.limit());
     }
 
     /// Gives back a small charge and takes it again on each advance, as
