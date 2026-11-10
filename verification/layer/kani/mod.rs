@@ -282,7 +282,7 @@ fn charge_within_takes_what_fits_or_nothing() {
         None => {
             assert!(start as usize > room);
             assert_eq!(budget.used(), held as usize);
-            assert_ne!(budget.refusals(), mark);
+            assert!(budget.refused_since(mark));
         }
     }
 }
