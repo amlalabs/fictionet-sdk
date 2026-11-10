@@ -12,6 +12,27 @@ use super::*;
 /// The longest chunk the harnesses build, and the size of a pool's slot.
 const CHUNK: usize = 4;
 
+#[kani::proof]
+#[kani::unwind(3)]
+fn empty_views_do_not_need_a_backing_or_a_charge() {
+    let budget = Budget::new(0);
+    let mut chunk = Chunk::default();
+    if kani::any() {
+        chunk = chunk.clone();
+    }
+    if kani::any() {
+        chunk = chunk.split_to(0);
+    }
+    assert!(chunk.repay(&budget));
+    assert!(chunk.make_mut(&budget).unwrap().is_empty());
+    assert!(chunk.prepend(0).unwrap().is_empty());
+    assert!(chunk.extend_within(&[]).is_ok());
+    assert_eq!(chunk.capacity(), 0);
+    assert_eq!(chunk.charged(), 0);
+    assert_eq!(budget.used(), 0);
+    assert!(chunk.into_vec().is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // The cursor and pieces
 
