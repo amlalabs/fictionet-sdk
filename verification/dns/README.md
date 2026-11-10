@@ -66,15 +66,18 @@ not compare whole, with why.
 |---|---|---|
 | `names` | `LowerName`, `Name` | canonical order (RFC 4034 §6.1), equality ignoring case, folding, wire length |
 | `wire` | `read_message`, the decoder the engines read replies with, and hickory's encoder | whether the message decodes; header, questions, and every record; the uncompressed encoding |
-| `respond` | `Request::parse` and the server front (`ServerConfig::front`) | silence, the rejection's RCODE, header bits, and OPT version, or the request's flags, question, and EDNS, and the header and OPT of an authoritative answer to it |
+| `respond` | `Request::parse` and the server front (`ServerConfig::front`) | silence, the rejection's RCODE, ID, header bits, and OPT version, or the request's flags, question, and EDNS, and the header and OPT of an authoritative answer to it |
 | `fit` | `protocols::dns::fit` | the size, TC, and the RRsets kept in each section |
+| `framing` | `Queries` under `Framing::Stream`, `stream_framed`, `StreamMessage::parse` | the messages read from a stream that arrives in chunks, and the octets left; each message framed again reads back |
 | `zone` | `zone::answer` over `Zone::from_master` | RCODE, AA, every section, and the required additional RRsets |
 | `partial` | `zone::answer` over a view with unknown facts | the unknown name, or the response |
 | `signed` | `Zone::signed`, `answer` with DO=1, `validate_rrset`, `validate_denial` | the answer's records and RRSIGs (for ANY, the NSEC and DNSKEY RRsets at the name too), its denial records, the DNSKEY RRset, and the validation of each answer RRset, paired by owner and type, and of the denial, its SOA RRset included, under the zone's own anchor or, for a zone below a signed parent, along the chain from the parent's anchor across the delegation, with the parent's DNSKEY RRset and its denial of the DS RRset compared too; NSEC3 zones hold their NSEC3PARAM RRset on both sides |
 | `policy` | `AlgorithmPolicy::treat`, under `AlgorithmPolicy::iana` where the vector names `iana` | the treatment of a DS record's algorithm and digest type, so the policy Rust ships is held to the one the Lean theorems are about |
 | `chain` | `check_chain` | the problems reported, as a set |
-| `cache` | `resolver::Cache` | what each lookup serves, with TTLs counted down |
+| `cache` | `resolver::Cache` | what each lookup serves, with TTLs counted down, looking first for an NXDOMAIN at the name or a Secure one above it, as `Resolver::cached` does (RFC 2308 §5, RFC 8020 §2) |
 | `resolver` | `Resolver` driven by `memory::drive` over `AuthorityEngine`s of the zones | each answer, the answers under the work bound with nothing lost, the final cache, and the answers with some servers dead |
+| `keytag` | `dnssec::key_tag` | the key tag of a DNSKEY's flags, algorithm, and public key (RFC 4034 Appendix B, RFC 6840 §5.5) |
+| `minimise` | `resolver::Minimise::next_labels`, which `Resolver::next_question` calls | how many labels the next minimised query shows, or the whole question (RFC 9156 §2.3) |
 
 Signatures in `signed.json` and `chain.json` are symbolic (Lean's
 `Dnssec.Symbolic.scheme`): a key is a number, and a signature is the private
@@ -130,14 +133,16 @@ standards and Rust do, or where a standard lets both answers stand.
 |---|---|---|
 | `wire` | `read_message` refuses messages holding a record hickory cannot read by its type's rules, such as an SRV without a target; the Lean codec carries such RDATA as octets (RFC 3597). A record the RFCs have ignored while the rest of the message stands (an NSEC3 or NSEC3PARAM of another hash algorithm or with unknown flags, RFC 5155 §8.1, §8.2, §4.1.2; a DNSKEY whose Protocol is not 3, RFC 4034 §2.1.2) is kept as octets by both, and compared | hickory's reading of typed RDATA |
 | `fit` | `Gen.lean` sometimes splits one RRset (same owner and type) into two in a section, and the Lean `fit` keeps the two apart | RFC 2181 §5 makes them one RRset, which `fit` writes together |
-| `zone`, `partial` | for QTYPE ANY answered with one RRset, Lean takes the first RRset in the zone's listed order and Rust the RRset of the lowest type; the test then checks that Rust answers Lean's RRset when asked for its type | RFC 8482 §4.1 lets a server pick any one RRset; a master file's order does not survive into a zone |
+| `zone`, `partial` | for QTYPE ANY answered with one RRset, Lean takes the first RRset in the zone's listed order and Rust the RRset of the lowest type; the test then checks that Rust answers Lean's RRset when asked for its type, after the same CNAME and DNAME chain when one leads to the name | RFC 8482 §4.1 lets a server pick any one RRset; a master file's order does not survive into a zone |
 | `chain` | in a tree with a corrupted key, Rust also reports the breaks the bad signatures make, `SignatureInvalid` among them | the Lean check reads no signature and assumes honest signers (`check_sound`) |
 
-Two differences the test found were faults in Rust and are fixed there:
+Three differences the test found were faults in Rust and are fixed there:
 `fit` now ends the additional section at the first optional RRset that does
 not fit, as the Lean model proves (`fit_whole_rrsets`: each section is
 written up to some RRset), instead of skipping it and writing later ones;
-and
 `check_chain` no longer asks a parent whose keys all use algorithms the
 policy does not validate to prove that its unsigned delegations have no DS,
-since a validator already finds that parent Insecure.
+since a validator already finds that parent Insecure; and `Request::parse`
+took a query whose MD, MF, MB, MG, MR, or MINFO record held RDATA that is no
+name, which hickory reads as octets for these types; it now checks every
+record's layout as RFC 3597 §4 asks (`respond.json`, seed 2).

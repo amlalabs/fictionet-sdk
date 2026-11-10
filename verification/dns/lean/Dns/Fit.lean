@@ -34,9 +34,11 @@ inductive Limit where
   | stream
 deriving DecidableEq, Repr
 
+/-- The limit in octets. A UDP payload size below 512 counts as 512 (RFC 6891 §6.2.5), as Rust's
+`Limit::octets` reads it. -/
 def Limit.size : Limit → Nat
   | .udp512 => 512
-  | .udpEdns n => n
+  | .udpEdns n => max 512 n
   | .stream => 65535
 
 /-- The limit for a request: streams take a whole message; a UDP query without EDNS takes 512 octets; one
@@ -46,6 +48,19 @@ def Limit.forRequest (stream : Bool) (payload : Option Nat) (server : Nat) : Lim
   match payload with
   | none => .udp512
   | some p => .udpEdns (min (max 512 p) server)
+
+/-- The size a reply may take: a stream carries 65535 octets, the most its two-octet length says (RFC 1035
+§4.2.2, RFC 7766 §8); a UDP reply to a query without EDNS takes at most 512 octets (RFC 1035 §2.3.4, §4.2.1);
+with EDNS, at least 512 (RFC 6891 §6.2.5) and never more than the requestor's payload size, or 512 when that
+is smaller (§6.2.3), nor than the server's own. -/
+theorem forRequest_size (stream : Bool) (payload : Option Nat) (server : Nat) :
+    (stream = true → (Limit.forRequest stream payload server).size = 65535) ∧
+      (stream = false → payload = none → (Limit.forRequest stream payload server).size = 512) ∧
+      512 ≤ (Limit.forRequest stream payload server).size ∧
+      (stream = false → ∀ p, payload = some p →
+        (Limit.forRequest stream payload server).size ≤ max 512 p ∧
+        (Limit.forRequest stream payload server).size ≤ max 512 server) := by
+  cases stream <;> cases payload <;> simp [Limit.forRequest, Limit.size] <;> omega
 
 /-- The flags word with TC set to `tc`. -/
 def setTc (flags : Nat) (tc : Bool) : Nat := flags - flags / 512 % 2 * 512 + b2n tc * 512
@@ -150,6 +165,24 @@ theorem fit_size_le (r : Resp) (lim : Limit) (hbase : fits r lim [] [] [] = true
   split
   · exact fD
   · exact fO
+
+/-- A reply fitted to the limit of the request it answers takes no more than the request can receive:
+512 octets over UDP without EDNS (RFC 1035 §4.2.1), the requestor's payload size or 512 with EDNS
+(RFC 6891 §6.2.3, §6.2.5), and 65535 over a stream (RFC 1035 §4.2.2), when the header, question, and OPT fit
+at all. -/
+theorem fit_within_request (r : Resp) (stream : Bool) (payload : Option Nat) (server : Nat)
+    (hbase : fits r (Limit.forRequest stream payload server) [] [] [] = true) :
+    (fit r (Limit.forRequest stream payload server)).1.length ≤
+      (if stream then 65535 else max 512 (payload.getD 512)) := by
+  have h := fit_size_le r _ hbase
+  obtain ⟨hs, hn, _, hp⟩ := forRequest_size stream payload server
+  cases stream with
+  | true => simp only [↓reduceIte]; rw [← hs rfl]; exact h
+  | false =>
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    cases payload with
+    | none => rw [← hn rfl rfl]; simpa using h
+    | some p => exact Nat.le_trans h (by simpa using (hp rfl p rfl).1)
 
 /-- The output is the encoding of whole RRsets: a prefix of each section, never part of an RRset. -/
 theorem fit_whole_rrsets (r : Resp) (lim : Limit) :

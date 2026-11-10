@@ -171,7 +171,7 @@ impl Mirror {
                 }
                 Step::Redirect { from, to } => {
                     nl.call(netlink::redirect_ingress(from, to)).map_err(|e| {
-                        context(e, "adding the redirect (are the kernel modules cls_matchall and act_mirred there?)")
+                        context(e, "adding the redirect (are the kernel modules cls_basic and act_mirred there?)")
                     })?;
                 }
                 Step::VmUp => {

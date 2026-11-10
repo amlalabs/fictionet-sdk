@@ -38,7 +38,7 @@ const TCA_KIND: u16 = 1;
 const TCA_OPTIONS: u16 = 2;
 const TC_H_INGRESS: u32 = 0xffff_fff1;
 const INGRESS_HANDLE: u32 = 0xffff_0000;
-const TCA_MATCHALL_ACT: u16 = 2;
+const TCA_BASIC_ACT: u16 = 3;
 const TCA_ACT_KIND: u16 = 1;
 const TCA_ACT_OPTIONS: u16 = 2;
 const TCA_MIRRED_PARMS: u16 = 2;
@@ -220,7 +220,10 @@ pub(crate) fn del_ingress(index: u32) -> Request {
 
 /// `RTM_NEWTFILTER`: on the device's ingress, a filter that takes every
 /// frame and sends it out of device `to` instead (`tc filter add dev X
-/// ingress matchall action mirred egress redirect dev Y`).
+/// ingress basic action mirred egress redirect dev Y`). A `basic` filter
+/// with no match matches every frame. It is used rather than `matchall`
+/// because some distribution kernels leave `matchall` out, among them
+/// Amazon Linux 2023's, which Nitro Sandbox parents run.
 pub(crate) fn redirect_ingress(index: u32, to: u32) -> Request {
     // Priority 1, every protocol (in network byte order).
     let info = (1u32 << 16) | ETH_P_ALL.to_be() as u32;
@@ -229,7 +232,7 @@ pub(crate) fn redirect_ingress(index: u32, to: u32) -> Request {
         NLM_F_CREATE | NLM_F_EXCL,
         &tcmsg(index, 0, INGRESS_HANDLE, info),
     );
-    req.attr(TCA_KIND, b"matchall\0");
+    req.attr(TCA_KIND, b"basic\0");
     // struct tc_mirred: index, capab, action, refcnt, bindcnt, eaction,
     // ifindex.
     let mut parms = Vec::with_capacity(28);
@@ -243,7 +246,7 @@ pub(crate) fn redirect_ingress(index: u32, to: u32) -> Request {
     ]);
     // Actions are a list, numbered from 1.
     let actions = nested(&[(1 | NLA_F_NESTED, &action)]);
-    let options = nested(&[(TCA_MATCHALL_ACT | NLA_F_NESTED, &actions)]);
+    let options = nested(&[(TCA_BASIC_ACT | NLA_F_NESTED, &actions)]);
     req.attr(TCA_OPTIONS | NLA_F_NESTED, &options);
     req
 }

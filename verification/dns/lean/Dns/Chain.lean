@@ -66,7 +66,7 @@ def dsProblems (P : AlgorithmPolicy) : Name × Node → List Problem
 when each key's algorithm is reported (RFC 6840 §5.11); and the DS sets at its cuts whose algorithms the policy
 does not validate. An unsigned zone has no window and no key to report. -/
 def zoneProblems (P : AlgorithmPolicy) (t : Nat) (z : SignedZone S) : List Problem :=
-  (if z.signers ≠ [] ∧ ¬ (z.window.inception ≤ t ∧ t ≤ z.window.expiration) then [.windowClosed z.apex t] else []) ++
+  (if z.signers ≠ [] ∧ z.window.holds t = false then [.windowClosed z.apex t] else []) ++
     (if anyValidated P z.keys then [] else z.signers.map fun s => .unsupportedAlgorithm z.apex s.dnskey.alg) ++
     z.zone.nodes.flatMap (dsProblems P)
 
@@ -104,7 +104,7 @@ def check (tr : Tree S) (P : AlgorithmPolicy) (t : Nat) : List Problem :=
 /-- What each problem says about the tree. -/
 def Holds (tr : Tree S) (P : AlgorithmPolicy) (t : Nat) : Problem → Prop
   | .windowClosed a time =>
-    ∃ z ∈ tr, z.apex = a ∧ time = t ∧ z.signers ≠ [] ∧ ¬ (z.window.inception ≤ t ∧ t ≤ z.window.expiration)
+    ∃ z ∈ tr, z.apex = a ∧ time = t ∧ z.signers ≠ [] ∧ z.window.holds t = false
   | .unsupportedAlgorithm a alg =>
     (∃ z ∈ tr, z.apex = a ∧ (∃ s ∈ z.signers, s.dnskey.alg = alg) ∧ ∀ s ∈ z.signers, s.dnskey.alg ∉ P.validate) ∨
       ∃ z ∈ tr, ∃ ns set g, (a, Node.cut ns (some set) g) ∈ z.zone.nodes ∧ (∃ d ∈ dsOf set, d.keyAlg = alg) ∧
@@ -155,7 +155,7 @@ theorem mem_dsProblems {P : AlgorithmPolicy} {n : Name} {nd : Node} {prob : Prob
 
 theorem zoneProblems_iff {P : AlgorithmPolicy} {t : Nat} {z : SignedZone S} {prob : Problem} :
     prob ∈ zoneProblems P t z ↔
-      (prob = .windowClosed z.apex t ∧ z.signers ≠ [] ∧ ¬ (z.window.inception ≤ t ∧ t ≤ z.window.expiration)) ∨
+      (prob = .windowClosed z.apex t ∧ z.signers ≠ [] ∧ z.window.holds t = false) ∨
         (∃ s ∈ z.signers, prob = .unsupportedAlgorithm z.apex s.dnskey.alg ∧
           ∀ s' ∈ z.signers, s'.dnskey.alg ∉ P.validate) ∨
         ∃ n ns set g, (n, Node.cut ns (some set) g) ∈ z.zone.nodes ∧
@@ -424,7 +424,7 @@ theorem zone_signsWell {tr : Tree S} {P : AlgorithmPolicy} {t : Nat} (hc : check
   · apply Classical.byContradiction
     intro hw
     have : Problem.windowClosed z.apex t ∈ check tr P t :=
-      mem_check.mpr (Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inl ⟨rfl, hne, hw⟩)⟩)
+      mem_check.mpr (Or.inl ⟨z, hz, zoneProblems_iff.mpr (Or.inl ⟨rfl, hne, Bool.eq_false_iff.mpr hw⟩)⟩)
     rw [hc] at this; cases this
 
 theorem sigsBy_verifies {sz : SignedZone S} {P : AlgorithmPolicy} {t : Nat} (hw : SignsWell sz P t)

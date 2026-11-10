@@ -188,5 +188,10 @@ test = false
 name = "http1_vectors"
 test = false
 
+# Lean emits these vectors through cargo xtask ip-verify.
+[[test]]
+name = "ip_vectors"
+test = false
+
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

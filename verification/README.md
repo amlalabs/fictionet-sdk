@@ -47,13 +47,13 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`websocket`](websocket/README.md) | message assembly, control frames and close (`Messages.tla`, `Echo.tla`); frame parsing and writing in Kani (29 harnesses) | models named to `websocket.rs`; Kani on the production functions with the stubs its README lists | TLC per config; `cargo kani` |
 | [`codec`](codec/README.md) | the stream demultiplexer (`Demux.tla`); the codec stream, buffers and limits in Kani (36 harnesses) | model named to `codec/demux.rs`; Kani through the public API, no stubs | TLC; `cargo kani` |
 | [`dissector`](dissector/README.md) | traffic dissection: stream reassembly with gaps (`Stream.tla`), HTTP/1 pairing (`Pairing.tla`), HPACK and TLS dissection | models named to `dissect/`; Kani on the production code | TLC per config; `cargo kani` |
-| [`dns`](dns/README.md) | Lean: the wire format and the answer algorithm (62 theorems, standard axioms only); TLA+: exchanges, resolution (bailiwick, work bounds, negative caching, spoofing), DNSSEC validation | `Gen.lean` vectors replayed by `tests/dns_vectors.rs`; `cargo xtask dns-verify lean|vectors|diff`; models named to the resolver's functions; one control per property | `cargo xtask dns-verify lean` and `diff`; TLC per config |
+| [`dns`](dns/README.md) | Lean: the wire format, request checks, TCP framing, size limits, the answer algorithm, signature windows in serial arithmetic, key tags, the negative cache with the NXDOMAIN cut, and QNAME minimisation (86 headline theorems, standard axioms only); TLA+: exchanges, resolution (bailiwick, work bounds, negative caching, spoofing), DNSSEC validation | `Gen.lean` vectors replayed by `tests/dns_vectors.rs`; `cargo xtask dns-verify lean|vectors|diff`; models named to the resolver's functions; one control per property | `cargo xtask dns-verify lean` and `diff`; TLC per config |
 | [`mptcp`](mptcp/README.md) | Lean: options, sequence mapping, crypto and IPv4 handling (42 theorems); TLA+: the join handshake, data mapping, the listener's backlog with cookies, the honeypot's observation | `Gen.lean` vectors replayed by `tests/mptcp_vectors.rs`; `cargo xtask mptcp-verify lean|diff`; models named to `extras/src/linux/mptcp.rs`, `tcp/engine.rs`, `demos/honeypot` | `cargo xtask mptcp-verify lean` and `diff`; TLC per config |
 | [`tcp-layer`](tcp-layer/README.md) | the TCP layer's handshakes, accept, close and orphan handling over smoltcp (`Layer.tla`) | model named to `tcp/engine.rs`; SYN cookies are left to `mptcp/tla/Listener.tla` | TLC per config |
 | [`tcp-rfc`](tcp-rfc/README.md) | the smoltcp socket refines RFC 9293 segment arrival with RFC 5961 (`Rfc9293.tla`, `Engine.tla`), with eight named departures; Lean: the arrival rules over the full 32-bit space | `Engine.tla` named to `process`; logs of the real socket replayed against `Rfc9293.tla` (`RfcTrace.tla`, `smoltcp/src/socket/tcp/rfc_trace.rs`); `Gen.lean` vectors replayed through `process` (`rfc_vectors.rs`) | `cargo xtask tcp-rfc-verify trace`, `lean`, `diff`; TLC per config |
 | [`tcp-port-zero`](tcp-port-zero/README.md) | smoltcp's socket with source port zero (`Socket.tla`), port allocation and preparation (`Binding.tla`); the wire and socket in Kani | models named to the vendored smoltcp, `engine.rs`, `hosts.rs`; Kani included in smoltcp's tests | TLC per config; `cargo kani` |
 | [`observer`](observer/README.md) | the passive observer delivers each byte once and in order with holes marked (`Observer.tla`); the same for `Flow` in Kani | model named to `observer/flow.rs`, `observer.rs`; Kani on the production `Flow` | TLC per config; `cargo kani` |
-| [`packet-udp`](packet-udp/README.md) | IP reassembly per scope with the overlap kill, expiry and the cap (`Reassembly.tla`), the IP layer's slots (`Dispatch.tla`), UDP sockets and their queues (`UdpSockets.tla`); headers and checksums in Kani | models named to `network/ip.rs`, `packet.rs`, `udp/sockets.rs`; Kani on the production parsers | TLC per config; `cargo kani` |
+| [`packet-udp`](packet-udp/README.md) | TLA+: IP reassembly with the overlap kill, expiry and the cap (`Reassembly.tla`) and the IP layer's slots (`Dispatch.tla`), each checked to refine a spec written from the RFCs (`RfcReassembly.tla`, `RfcIpInput.tla`); UDP sockets and their queues (`UdpSockets.tla`); the trusted-checksum flag, ready for the core `Packet` (`TrustedChecksum.tla`). Lean ([lean/](packet-udp/lean/README.md)): the RFC 1071 checksum and the RFC 1624 hop update, IPv4 header checks, UDP, reassembly (any order and copies give the original; overlaps kill; limits; Time Exceeded on timeout), IPv6 extension headers, and the ICMP and ICMPv6 the engine sends (81 headline theorems, standard axioms only). Headers and checksums in Kani | `Gen.lean` vectors replayed by `tests/ip_vectors.rs`; `cargo xtask ip-verify lean|vectors|diff|all`; models named to `network/ip.rs`, `packet.rs`, `udp/sockets.rs`; Kani on the production parsers | `cargo xtask ip-verify all`; TLC per config; `cargo kani` |
 | [`world-layers`](world-layers/README.md) | per-peer admission with holds and releases (`Admission.tla`), staging a machine's ports (`Staging.tla`); packet dispatch in Kani | models named to `world/net/hosts.rs`, `tcp.rs`, `children.rs` | TLC per config; `cargo kani` |
 | [`world-net`](world-net/README.md) | attachments and routes (`Attachments.tla`), the port table (`Ports.tla`), the routing table (`Table.tla`), cables (`Cable.tla`); prefixes in Kani | models named to `world/net/attachments.rs`, `network/route.rs`, `cable.rs` | TLC per config; `cargo kani` |
 
@@ -145,6 +145,12 @@ Lean model found no departure.
   modules switched off locally.
 - **Kani in the audited areas was read, not rerun**, except where an
   area's README gives a date for its last run.
+- **`cargo kani` on the library does not compile at `3db7a847e`.** Two
+  areas' harnesses no longer match their code:
+  `layer/kani/mod.rs` compares `Refusals`, which has no `PartialEq`, and
+  `tls/kani/LayerProof.rs` uses `TlsLayer` fields that are gone. The
+  packet-udp reruns of 2026-11-10 switched those two modules off in a
+  scratch copy; nothing in the tree was changed for it.
 - **The trace check covers data only.** `RouteTrace.tla` replays bytes
   through `Chain`, `Switch` and `Driver`; the urgent path (`Written`,
   `Reset`), ends of input, timers and work are checked by `Route_urgent`
@@ -152,8 +158,8 @@ Lean model found no departure.
   `Transport.tla` traces are replayed on the production SSH transport and
   `tls-rfc` has trace checks (handshakes and record-layer schedules of the
   vendored rustls); Lean vectors tie DNS, MPTCP, HPACK, the HTTP/1
-  decoders and the TLS record checks; the TLA+ models elsewhere are
-  hand-written descriptions checked by reading.
+  decoders, the TLS record checks, and the IP, UDP and ICMP code; the
+  TLA+ models elsewhere are hand-written descriptions checked by reading.
 - **Property-based tests of the tricky parts were not written in this
   pass**: byte-stream splits and coalescing through each layer and
   `Chain`, `Switch` handoff of unread bytes under random chunking,

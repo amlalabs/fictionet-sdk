@@ -375,6 +375,28 @@ fn every_zone_rule_is_checked() {
             target: lower("alias.example.")
         }
     );
+    // A name below a DNAME is an alias too: it answers with the CNAME the
+    // DNAME makes (RFC 6672 §2.2), so an MX may not name it (RFC 2181
+    // §10.3). The DNAME's own owner is no alias.
+    let mx = RData::MX(MX::new(10, name("mail.old.example.")));
+    assert_eq!(
+        fail(
+            builder("example.")
+                .rrset(rrset("example.", 60, vec![mx]))
+                .rrset(rrset("old.example.", 60, vec![dname(&name("new.test."))]))
+        ),
+        ZoneError::TargetIsAlias {
+            owner: lower("example."),
+            target: lower("mail.old.example.")
+        }
+    );
+    let mx = RData::MX(MX::new(10, name("old.example.")));
+    builder("example.")
+        .rrset(rrset("example.", 60, vec![mx]))
+        .rrset(rrset("old.example.", 60, vec![dname(&name("new.test."))]))
+        .rrset(rrset("old.example.", 60, vec![a("192.0.2.9")]))
+        .build()
+        .unwrap();
 
     let mut mixed = rrset("www.example.", 60, vec![a("192.0.2.1"), a("192.0.2.2")]);
     let mut records: Vec<Record> = mixed.records_without_rrsigs().cloned().collect();

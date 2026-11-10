@@ -13,6 +13,7 @@ mod http_verify;
 mod honeypot_vm;
 #[cfg(feature = "host-tools")]
 mod image;
+mod ip_verify;
 mod layer_verify;
 mod lean_vectors;
 mod mptcp_verify;
@@ -67,6 +68,9 @@ fn main() -> Result {
     }
     if task == "tls-verify" {
         return tls_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "ip-verify" {
+        return ip_verify::run(&args.collect::<Vec<_>>());
     }
     if !matches!(
         task.as_str(),

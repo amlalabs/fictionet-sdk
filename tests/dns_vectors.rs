@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG};
@@ -53,7 +53,10 @@ use fictionet::stdlib::protocols::dns::rr::{
 use fictionet::stdlib::protocols::dns::serialize::binary::{
     BinDecodable, BinDecoder, BinEncodable, BinEncoder, NameEncoding,
 };
-use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit, read_message};
+use fictionet::stdlib::protocols::dns::{
+    Framing, Limit, Parsed, Queries, Request, Response, StreamMessage, fit, read_message,
+    stream_framed,
+};
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::services::dns::authority::{
     AuthorityEngine, ServerConfig, Zones, bare_reply,
@@ -1198,6 +1201,7 @@ fn respond() {
                 same("rcode", number(expected, "rcode") as u16, rcode)?;
                 let flags = field(expected, "flags");
                 let m = &reply.metadata;
+                same("id", number(flags, "id") as u16, m.id)?;
                 let rust = [
                     ("qr", m.message_type == MessageType::Response),
                     ("aa", m.authoritative),
@@ -1276,7 +1280,7 @@ fn respond() {
                     number(flags, "rcode") as u16,
                     u16::from(m.response_code.low()),
                 )?;
-                same("answer id", request.message.metadata.id, m.id)?;
+                same("answer id", number(flags, "id") as u16, m.id)?;
                 let opt = field(expected, "answer_opt");
                 let lean =
                     (!opt.is_null()).then(|| (number(opt, "version") as u8, flag(opt, "do")));
@@ -1395,6 +1399,57 @@ fn split_rrset(response: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------
+// framing.json: Queries over a stream, and StreamMessage
+// ---------------------------------------------------------------------
+
+/// The stream arrives in chunks split at `cuts`. After each chunk the
+/// decoder is asked for messages until it needs more, as the codec runner
+/// asks it, and each message taken is drained from the buffer. The
+/// messages and the octets left must be Lean's `unframeAll`.
+#[test]
+fn framing() {
+    each_case("framing", |case, _| {
+        let input = field(case, "input");
+        let expected = field(case, "expected");
+        let bytes = unhex(text(input, "bytes"));
+        let mut cuts: Vec<usize> = list(input, "cuts")
+            .iter()
+            .map(|cut| cut.as_u64().expect("a cut is a number") as usize)
+            .collect();
+        cuts.push(bytes.len());
+        let mut queries = Queries::new(Framing::Stream);
+        let (mut buffer, mut messages, mut from) = (Vec::new(), Vec::new(), 0);
+        for cut in cuts {
+            let cut = cut.max(from);
+            buffer.extend_from_slice(&bytes[from..cut]);
+            from = cut;
+            while let Step::Item(message, used) = queries
+                .decode(&buffer, false)
+                .map_err(|e| format!("{e:?}"))?
+            {
+                messages.push(hex(&message));
+                buffer.drain(..used);
+            }
+        }
+        let lean = texts(expected, "messages");
+        same("messages", &lean, &messages)?;
+        same(
+            "octets left",
+            number(expected, "rest") as usize,
+            buffer.len(),
+        )?;
+        // Each message, framed again, reads back as one stream message.
+        for message in lean {
+            let message = unhex(&message);
+            let framed = stream_framed(&message).ok_or("a message too long to frame")?;
+            let back = StreamMessage::parse(&framed).map_err(|e| e.to_string())?;
+            same("stream message", message, back.0)?;
+        }
+        Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------
 // zone.json and partial.json: zone::answer over Zone and over views
 // ---------------------------------------------------------------------
 
@@ -1438,7 +1493,9 @@ fn zone_answers() {
 /// RRset of the type it prefers, or else the RRset of the lowest type. When the two pick different RRsets, Rust's
 /// answer is still one RRset with the additional data Lean's has (none,
 /// for an answer to ANY), and asked for the type of Lean's RRset, Rust must
-/// answer with Lean's RCODE, AA, answer, and authority.
+/// answer with Lean's RCODE, AA, answer, and authority. When a CNAME or
+/// DNAME chain leads to the name, the picked RRset is the last of the
+/// answer, and the chain before it must be the same.
 fn compare_answer(
     view: &dyn View,
     req: &Request,
@@ -1452,13 +1509,18 @@ fn compare_answer(
     let lean_sets = rrsets_of(&lean_answer);
     let one_rrset =
         matches!(any, AnyResponse::OneRrset(_)) && req.question.query_type() == RecordType::ANY;
-    if exact.is_ok() || !one_rrset || lean_sets.len() != 1 {
+    // The RRset picked is the last of the answer, after the CNAME and
+    // DNAME RRsets of any chain that led to its name.
+    let Some(picked) = lean_sets.last() else {
+        return exact;
+    };
+    if exact.is_ok() || !one_rrset {
         return exact;
     }
     let rust_lines: Vec<String> = response.message.answers.iter().map(zone_line).collect();
     same(
         "RRsets in an answer to ANY",
-        1,
+        lean_sets.len(),
         rrsets_of(&rust_lines).len(),
     )?;
     let additional_lines: Vec<String> =
@@ -1468,7 +1530,7 @@ fn compare_answer(
         section(&texts(expected, "additional")),
         section(&additional_lines),
     )?;
-    let lean_type = RecordType::from(type_code(&lean_sets[0].0.1));
+    let lean_type = RecordType::from(type_code(&picked.0.1));
     let typed = request(req.question.name(), lean_type, false);
     let mut typed = match answer(view, &typed, any) {
         Answered::Response(typed) => typed,
@@ -2547,8 +2609,9 @@ fn served_lines(set: &RecordSet, ttl: u64) -> Vec<String> {
 }
 
 /// What the cache serves for `key` at `now`, as `cache.json` writes it:
-/// an NXDOMAIN at the name first, as the resolver looks (RFC 8020), then
-/// the entry under the key itself.
+/// an NXDOMAIN at the name, or a Secure one above it, first, as
+/// `Resolver::cached` looks (RFC 2308 §5, RFC 8020 §2), then the entry
+/// under the key itself.
 fn served(cache: &Cache, key: &Key, now: Instant) -> String {
     let left = |expires: Instant| {
         expires
@@ -2558,7 +2621,6 @@ fn served(cache: &Cache, key: &Key, now: Instant) -> String {
     };
     let entry = cache
         .nxdomain_above(&key.name, key.class, now)
-        .filter(|(at, _)| **at == key.name)
         .map(|(_, entry)| entry)
         .or_else(|| cache.get(key, now));
     match entry {
@@ -3267,5 +3329,58 @@ fn resolver() {
             )?;
         }
         Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------
+// keytag.json: dnssec::key_tag
+// ---------------------------------------------------------------------
+
+/// The key tag of each vector's DNSKEY RDATA, by RFC 4034 Appendix B with
+/// the correction of RFC 6840 §5.5 for algorithm 1.
+#[test]
+fn keytag() {
+    each_case("keytag", |case, _| {
+        let input = field(case, "input");
+        let algorithm = hickory_proto::dnssec::Algorithm::from_u8(number(input, "algorithm") as u8);
+        let key = DNSKEY::with_flags(
+            number(input, "flags") as u16,
+            PublicKeyBuf::new(unhex(text(input, "public_key")), algorithm),
+        );
+        same(
+            "key tag",
+            number(field(case, "expected"), "tag"),
+            u64::from(key_tag(&key)),
+        )
+    });
+}
+
+// ---------------------------------------------------------------------
+// minimise.json: resolver::Minimise
+// ---------------------------------------------------------------------
+
+/// How many labels the next minimised query shows (RFC 9156 §2.3), or the
+/// whole question.
+#[test]
+fn minimise() {
+    use fictionet::stdlib::services::dns::resolver::Minimise;
+    each_case("minimise", |case, _| {
+        let input = field(case, "input");
+        let bounds = Minimise {
+            max_queries: number(input, "max_queries") as u8,
+            one_label: number(input, "one_label") as u8,
+        };
+        let rust = bounds.next_labels(
+            number(input, "known") as usize,
+            number(input, "total") as usize,
+            number(input, "steps") as u8,
+        );
+        same(
+            "labels",
+            field(case, "expected")
+                .get("labels")
+                .and_then(Value::as_u64),
+            rust.map(|labels| labels as u64),
+        )
     });
 }
