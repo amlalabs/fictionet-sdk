@@ -836,18 +836,28 @@ impl Table {
                                     Text::Raw(self.table.get(index)?.ok_or(Error::Index)?.name)
                                 }
                             };
+                            let size = text.decoded_len(MAX_STRING)?
+                                + value.decoded_len(MAX_STRING)?
+                                + ENTRY_OVERHEAD;
                             keep(out, budget, limit, text, value, never)?;
-                            if indexing == Indexing::Incremental {
-                                // The name is read before the insertion may
-                                // evict the entry it names.
+                            if indexing == Indexing::Incremental && size > self.max {
+                                // An entry larger than the table empties it
+                                // and is not added (RFC 7541 section 4.4):
+                                // nothing is copied for it.
+                                self.table.evict(0);
+                            } else if indexing == Indexing::Incremental {
+                                // The name is read before the eviction that
+                                // makes room may remove the entry it names;
+                                // then the entry goes in, so the table never
+                                // holds more than its size.
                                 let name = match name {
                                     Name::Literal(text) => shared(text)?,
                                     Name::Index(index) => {
                                         self.table.name(index)?.ok_or(Error::Index)?
                                     }
                                 };
+                                self.table.evict(self.max - size);
                                 self.table.insert(name, value.to_vec(MAX_STRING)?);
-                                self.table.evict(self.max);
                             }
                         }
                         Representation::SizeUpdate(_) => unreachable!(),

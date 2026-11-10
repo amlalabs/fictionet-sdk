@@ -10,7 +10,9 @@ use fictionet::stdlib::{
     },
     test_support,
 };
-use fictionet::{Budget, stdlib::protocols::fields::Fields};
+use fictionet::{Budget, Chunk, stdlib::protocols::fields::Fields};
+
+use crate::common::alloc::measuring;
 
 #[test]
 fn wire_contracts_and_collection_at_eof() {
@@ -129,5 +131,46 @@ fn fields_huffman_strings_and_prefix_integers_keep_the_public_contracts() {
     assert_eq!(
         huffman::decode(&huffman::HuffmanString(vec![0, 255]).to_bytes().unwrap()).unwrap(),
         [0, 255]
+    );
+}
+
+/// A field with incremental indexing larger than the whole table empties
+/// the table and is not added (RFC 7541 section 4.4), and no copy of it is
+/// made for the table: decoding it allocates nothing as large as its value.
+#[test]
+fn an_entry_larger_than_the_table_is_not_copied_for_it() {
+    let incremental = |name: &[u8], value: &[u8]| {
+        let mut bytes = vec![0x40];
+        bytes.extend(StringLiteral(name.to_vec()).to_bytes().unwrap());
+        bytes.extend(StringLiteral(value.to_vec()).to_bytes().unwrap());
+        bytes
+    };
+    let mut decoder = Table::new(4096);
+    let mut fields = Fields::new();
+    let small = incremental(b"x-small", b"kept");
+    decoder
+        .decode_block(
+            &small,
+            &mut fields,
+            &Budget::unlimited(),
+            hpack::MAX_DECODED,
+        )
+        .unwrap();
+    assert_eq!(decoder.table_len(), 1);
+    let value = vec![b'v'; 60_000];
+    let big = incremental(b"x-big", &value);
+    let block = Chunk::block(&Budget::unlimited(), 0, 2 * value.len()).unwrap();
+    let mut fields = Fields::in_block(block);
+    let (decoded, stats) = measuring(|| {
+        decoder.decode_block(&big, &mut fields, &Budget::unlimited(), hpack::MAX_DECODED)
+    });
+    decoded.unwrap();
+    assert_eq!(fields.iter().next().unwrap().1, &value[..]);
+    assert_eq!(decoder.table_len(), 0, "the table is emptied");
+    assert!(
+        stats.largest_request < value.len(),
+        "{} bytes allocated at once for a {}-byte entry the table cannot hold",
+        stats.largest_request,
+        value.len()
     );
 }
