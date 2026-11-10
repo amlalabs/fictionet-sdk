@@ -1215,6 +1215,9 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 ..
             }
         );
+        // RFC 4252 section 7: a signature that is not correct fails the
+        // request, answered with the handler's FAILURE. A handler that
+        // accepts it anyway is never obeyed: the connection ends.
         if matches!(
             &request.method,
             auth::Method::PublicKey {
@@ -1222,6 +1225,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 ..
             }
         ) && !verified
+            && matches!(decision, AuthDecision::Accept)
         {
             return Err(TransportError::Crypto.into());
         }
@@ -1423,8 +1427,10 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 request,
             } => {
                 let id = self.id(recipient)?;
+                // RFC 4254 section 5.3: sent before the peer had our
+                // CLOSE. Nothing more goes on the channel, a reply included.
                 if self.channels.get(id).unwrap().closed {
-                    return Err(TransportError::State.into());
+                    return Ok(Handled::Done);
                 }
                 // All the message holds is the request's.
                 self.raise(MuxEvent::Child(
@@ -1449,6 +1455,9 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     return Err(TransportError::State.into());
                 }
                 channel.eof = true;
+                if channel.closed {
+                    return Ok(Handled::Done);
+                }
                 self.raise(MuxEvent::Child(
                     id,
                     ChannelEvent::Stream(StreamEvent::Ended),
@@ -1500,6 +1509,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
     ) -> Result<(), Error> {
         let id = self.id(recipient)?;
         let channel = self.channels.get_mut(id).unwrap();
+        // RFC 4254 section 5.3: data the peer sent before it had our
+        // CLOSE is dropped; the child is already retired.
+        if channel.closed {
+            return Ok(());
+        }
         channel.consume_receive(data.len())?;
         if kind.is_none() {
             self.handler.observe(
@@ -1622,6 +1636,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 }
                 self.failure_ready = false;
                 return Ok(true);
+            }
+            // RFC 4252 section 5: requests sent without waiting are
+            // answered in turn, so nothing more is read until the delayed
+            // FAILURE has gone out.
+            if self.failure.is_some() {
+                return Ok(false);
             }
             if self.user.is_none()
                 && self.failure.is_none()

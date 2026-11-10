@@ -39,7 +39,7 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`lifecycle`](lifecycle/README.md) | one TCP connection's life, from handshake to retirement (`Conn.tla`) | model named to `tcp/engine.rs` and the handles in `tcp.rs` | TLC per config |
 | [`tls`](tls/README.md) | the server TLS layer under `Driver` and `Harness` (`Layer.tla`), write cancellation in the live connection (`Write.tla`); the layer's write accounting in Kani; the provider draws entropy only from what it was given | models named to `services/tls/layer.rs` and `stack/open.rs`; Kani on the production layer | TLC per config; `cargo kani` |
 | [`tls-contract`](tls-contract/README.md) | what a replacement TLS must keep: ordered owned plaintext, sticky failure, stable negotiated metadata; STARTTLS (`Starttls.tla`); encrypted DNS request order | models follow the named Rust transitions; two `EncryptedDns_*_request_order` configs are documented expected failures | TLC per config |
-| [`ssh-layer`](ssh-layer/README.md) | the transport/authentication boundary, ordered key changes, completion ownership, channel lifecycle and the honeypot policy | models named in their headers to `services/ssh`; Kani on the production arithmetic in `ssh.rs` | TLC per config; `cargo kani` |
+| [`ssh-layer`](ssh-layer/README.md) | the transport/authentication boundary, ordered key changes, completion ownership, channel lifecycle and the honeypot policy; conformance with RFC 4253 (ordering, NEWKEYS per direction, rekeys with data in flight, wrapping sequence numbers, strict KEX), RFC 8308 EXT_INFO, RFC 4252 (pipelined requests, no service before success) and RFC 4254 (open replies and reason codes, EOF and CLOSE, requests, windows), and no stall under the half-window adjustment policy against russh's bounded queues (`Transport.tla`, `Auth.tla`, `Close.tla`, `Window.tla`, `Adjust.tla`); window lemmas in Lean | `Transport.tla` traces replayed on the production transport with real crypto (`protocols/ssh/transport/replay.rs`); `Adjust.tla` searched exhaustively on the production `Channel`; other models named in their headers to `services/ssh`; Kani on the production arithmetic in `ssh.rs` | TLC per config; `cargo kani`; `lean lean/Adjust.lean` |
 | [`http`](http/README.md) | HTTP/1 pipelining and the switch to a tunnel (`Pipeline.tla`), HTTP/2 flow control and stream states (`Flow.tla`, `Streams.tla`), the tunnel's room and charges (`Tunnel.tla`); framing in Lean; body decoding and request smuggling in Kani | models named to `web/httpd/native.rs`, `http2.rs`, `stack/tunnel.rs`; Kani on the production decoder and `Reader` (memchr stubbed); the Lean `Request.lean` rules have no Rust tie | TLC per config; `cargo kani`; `lake build` in `http/lean` |
 | [`http2-layer`](http2-layer/README.md) | the layer `Http2`: flow control with children (`Flow.tla`), stream and connection lifecycle (`Lifecycle.tla`), SETTINGS (`Settings.tla`), the h2c switch (`H2cSwitch.tla`); window arithmetic and the preface scan in Kani | models named to `http2.rs`, `children.rs`, `switch.rs`, `detect.rs`; Kani on the production helpers | TLC per config; `cargo kani` |
 | [`hpack-grpc`](hpack-grpc/README.md) | encoder and decoder table sizes stay in step through SETTINGS and size updates (`HpackSync.tla`), for the default encoder and the server's `Encoder::new(0)` | model named to `hpack.rs` and `http2.rs` | TLC per config |
@@ -104,14 +104,18 @@ harness `an_honest_decoder_is_never_stuck` covers it).
   through the route alive at detach (`world-net`); HTTP/1 dissection skips every later head after a gap inside a
   body instead of resyncing at the next request line (`dissector`); HEADERS
   on a stream the client itself reset is a connection error where RFC 9113
-  asks for a stream error (`http`); `native.rs`'s `after` buffer is dead
+  asks for a stream error (`http`); application packets from an SSH client
+  past 128 or 256 KiB between the server's rekey KEXINIT and the client's
+  fail the connection, and an unknown SSH channel type is refused with
+  reason 1 rather than 3 (`ssh-layer`); `native.rs`'s `after` buffer is dead
   code.
 - **Kani in the audited areas was read, not rerun**, except where an
   area's README gives a date for its last run.
 - **The trace check covers data only.** `RouteTrace.tla` replays bytes
   through `Chain`, `Switch` and `Driver`; the urgent path (`Written`,
   `Reset`), ends of input, timers and work are checked by `Route_urgent`
-  and the unit tests, not by replay. No other model has a trace check or
+  and the unit tests, not by replay. `ssh-layer`'s `Transport.tla` traces
+  are replayed on the production SSH transport. No other model has a trace check or
   reference vectors yet: the Lean vectors tie DNS and MPTCP; the TLA+
   models elsewhere are hand-written descriptions checked by reading.
 - **Property-based tests of the tricky parts were not written in this
