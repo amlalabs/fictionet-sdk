@@ -783,10 +783,13 @@ model does not see:
   at any time (`:960-961`); a child with `urgent` set and `waiting`
   false is unreachable in the model and ordinary in the code. Its visit
   offers the completion first either way.
-- Refusals the model does not have: an atomic command past `max_command`
-  (`:789-792`), a command whose payload the budget refuses (`:793-796`),
-  and `Overrun::Budget` when receive backing cannot be reserved
-  (`:974-976`), which ends the connection like a credit overrun.
+- Refusals the model does not have: an atomic command past `max_command`,
+  which closes the child as failed. Memory the model does not have
+  either: a command whose payload the child's budget refuses waits in the
+  outbox, and an event whose inbox place or payload it refuses goes back
+  to the mux, each until the budget frees; routing storage the stack's
+  budget refuses hands the event or command back. None closes a child or
+  ends the connection.
 - The release handshake. `ChildWake::release` adds to a counter and wakes
   the child only outside a call (`:285-290`); `take_released` collects it
   at the end of a visit (`:813`). The model's `Release` moves the credit

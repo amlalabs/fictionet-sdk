@@ -14,8 +14,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 
 use fictionet::stdlib::codec::{self, Fail, Wire};
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedDeque, ChargedVec, ChildId, Chunk, Env,
-    Layer, Mux, MuxCommand, MuxEvent, MuxOp, Slots, StreamCommand, StreamEvent, Top,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedDeque, ChargedVec, ChildId, Chunk,
+    Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Slots, StreamCommand, StreamEvent, Top,
 };
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
@@ -1964,16 +1964,24 @@ impl Layer for Http2 {
                 }
                 Ok(Admit::Taken)
             }
-            MuxOp::Close(child, _) => {
-                // The children refused or dropped this exchange: its stream
-                // is refused, or reset if its response had begun.
+            MuxOp::Close(child, why) => {
+                // The children closed this exchange for the cause `why`.
+                // One they never took, past their limit, refused by the
+                // application or for want of memory, was not processed,
+                // so the client may send it again: REFUSED_STREAM. One
+                // that failed after it was taken is INTERNAL_ERROR. One
+                // they are done with is refused if its response never
+                // began, and reset if it had.
                 if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child))
                     && let Some(stream) = self.streams.get(&id)
                 {
-                    let code = if matches!(stream.response.reply, Reply::Waiting) {
-                        ErrorCode::RefusedStream
-                    } else {
-                        ErrorCode::InternalError
+                    let code = match why {
+                        Closing::Prohibited | Closing::ResourceShortage => ErrorCode::RefusedStream,
+                        Closing::Failed => ErrorCode::InternalError,
+                        Closing::Done if matches!(stream.response.reply, Reply::Waiting) => {
+                            ErrorCode::RefusedStream
+                        }
+                        Closing::Done => ErrorCode::InternalError,
                     };
                     self.write_reset(env, id, code);
                 }
@@ -3052,6 +3060,91 @@ mod tests {
             "{output:?}"
         );
         assert!(!harness.ended());
+    }
+
+    /// A child that fails on its first visit.
+    struct Fails;
+
+    impl Layer for Fails {
+        type Lower = HttpExchange;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = ();
+
+        fn advance(&mut self, _: &mut Env<'_, Infallible>) -> Result<bool, ()> {
+            Err(())
+        }
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: ExchangeEvent,
+        ) -> Result<Admit<ExchangeEvent>, ()> {
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, ()> {
+            match command {}
+        }
+
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
+            None
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// The code of the RST_STREAM that a request on stream 1 gets from
+    /// `server`.
+    fn reset_code<L: Layer<Lower = ByteStream, Error: std::fmt::Debug>>(server: L) -> u32 {
+        let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        harness.push(&post(1, false)).unwrap();
+        let output = frames(&harness.take_output());
+        assert!(!harness.ended(), "the connection goes on");
+        let codes: Vec<u32> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Reset(r) if r.stream == 1 => Some(r.code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(codes.len(), 1, "one reset for the stream: {output:?}");
+        codes[0]
+    }
+
+    /// A stream closed by the children above is reset with their cause: one
+    /// they never took, past their limit, is refused, so the client may
+    /// send it again; one taken that failed before its response began is
+    /// an internal error, not a refusal.
+    #[test]
+    fn a_closed_stream_is_reset_with_the_childrens_cause() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let refused = ErrorCode::RefusedStream as u32;
+        let limit = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(0, Http2::WINDOW, |_, _, _| Some(Sink::reading(true))),
+        );
+        assert_eq!(reset_code(limit), refused, "past the limit");
+        let failed = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(8, Http2::WINDOW, |_, _, _| Some(Fails)),
+        );
+        assert_eq!(
+            reset_code(failed),
+            ErrorCode::InternalError as u32,
+            "failed after it was taken"
+        );
     }
 
     #[test]
