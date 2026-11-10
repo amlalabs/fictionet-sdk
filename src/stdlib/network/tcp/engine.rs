@@ -2188,7 +2188,7 @@ impl TcpLayer {
         let mut moved = false;
         while c.recv_credit > 0 && s.can_recv() && self.up.len() < UP_ROOM {
             let n = (c.recv_credit as usize).min(s.recv_queue()).min(DATA_MAX);
-            let Some(mut bytes) = ChargedBytes::with_capacity(budget, n) else {
+            let Some(mut bytes) = ChargedBytes::with_capacity_within(budget, 1..=n) else {
                 break;
             };
             // Copied straight out of the socket's ring, which may hand the
@@ -2490,14 +2490,18 @@ impl TcpLayer {
             }
         }
         self.refresh_all(env.budget());
+        self.schedule(now);
+        self.primed = false;
+        self.stepped = Some(env.now());
+    }
+
+    fn schedule(&mut self, now: smoltcp::time::Instant) {
         let at = self.iface.poll_at(now, &mut self.sockets.set);
         self.next = [at, self.next_release, self.next_expiry()]
             .into_iter()
             .flatten()
             .min()
             .map(unsmol);
-        self.primed = false;
-        self.stepped = Some(env.now());
     }
 
     fn flush_transmit(&mut self) {
@@ -2753,12 +2757,15 @@ impl Layer for TcpLayer {
             self.work = true;
             return Ok(true);
         }
+        self.schedule(smol(env.now()));
         Ok(false)
     }
 
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
         if !self.work {
-            return Ok(false);
+            let before = (self.up.len(), self.urgent.len());
+            self.refresh_all(env.budget());
+            return Ok(before != (self.up.len(), self.urgent.len()));
         }
         self.step(env);
         Ok(true)

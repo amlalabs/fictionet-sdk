@@ -314,6 +314,193 @@ fn receive_credit_survives_a_full_event_queue() {
 }
 
 #[test]
+fn a_declined_timer_recomputes_the_remaining_deadline() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let (h, _) = established(&mut st, smol_now(&fcx), local, peer);
+        st.sock(h)
+            .set_keep_alive(Some(smoltcp::time::Duration::from_secs(1)));
+        let budget = Budget::unlimited();
+        let mut observations = fictionet::stdlib::layer::Observations::new(0);
+        let mut env = Env::new(fcx.now(), &fcx, &budget, &mut observations);
+        st.step(&env);
+        assert!(st.deadline().is_some());
+        st.remove_conn(h);
+        assert!(!st.on_timer(&mut env, ()).unwrap());
+        assert!(st.sockets.handles.is_empty());
+        assert!(st.next_expiry().is_none());
+        assert!(st.deadline().is_none());
+        drop(st);
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+fn budget_read(release_after_poll: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Wake, Waker};
+    struct Ready(AtomicBool);
+    impl Wake for Ready {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let now = smol_now(&fcx);
+        let (h, ack) = established(&mut st, now, local, peer);
+        let child = st.adopt(h);
+        let payload = vec![7; MTU / 2];
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            now,
+            data_segment(peer, local, 101, ack, 16, &payload).0,
+        );
+        st.refresh_all(&Budget::unlimited());
+        let child_handle = st
+            .up
+            .drain(..)
+            .find_map(|event| match event {
+                MuxEvent::Opened(handle, _, _) if handle.id() == child => Some(handle),
+                _ => None,
+            })
+            .unwrap();
+        st.up.clear();
+        let budget = Budget::new(payload.len());
+        let mut elsewhere = budget.charge(budget.limit()).unwrap();
+        let room = payload.len() / 3;
+        if !release_after_poll {
+            elsewhere.shrink_to(budget.limit() - room);
+        }
+        let mut observations = fictionet::stdlib::layer::Observations::new(0);
+        let mut env = Env::new(fcx.now(), &fcx, &budget, &mut observations);
+        let ready = Arc::new(Ready(AtomicBool::new(false)));
+        let waker = Waker::from(ready.clone());
+        let before = budget.refusals();
+        assert!(matches!(
+            st.on_command(&mut env, child_handle.grant(payload.len() as u64)),
+            Ok(Admit::Taken)
+        ));
+        st.step(&env);
+        if release_after_poll {
+            assert!(
+                st.up
+                    .iter()
+                    .all(|event| !matches!(event, MuxEvent::Child(_, StreamEvent::Data(_))))
+            );
+            assert!(!st.work);
+            budget.wake_when_freed(&waker, before);
+            assert!(!ready.0.load(Ordering::SeqCst));
+            elsewhere.shrink_to(budget.limit() - room);
+            assert!(ready.0.swap(false, Ordering::SeqCst));
+            // The runner's next poll advances at the same time with no input.
+            st.advance(&mut env).unwrap();
+        }
+        let received: Vec<_> = st
+            .up
+            .iter()
+            .filter_map(|event| match event {
+                MuxEvent::Child(id, StreamEvent::Data(bytes)) if *id == child => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        let count: usize = received.iter().map(|bytes| bytes.len()).sum();
+        assert!(count > 0 && count <= room);
+        assert_eq!(st.get(h).recv_queue() + count, payload.len());
+        assert_eq!(st.conns[&h].recv_credit as usize + count, payload.len());
+        assert_eq!(budget.used(), elsewhere.bytes() + count);
+        assert!(
+            received
+                .iter()
+                .flat_map(|bytes| bytes.iter())
+                .eq(payload[..count].iter())
+        );
+        drop(st);
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn a_tcp_read_takes_the_room_left_in_its_budget() {
+    budget_read(false);
+}
+
+#[test]
+fn a_tcp_read_resumes_on_the_budget_wake_without_input_or_time() {
+    budget_read(true);
+}
+
+#[test]
+fn the_native_tcp_runner_wakes_and_reads_after_another_owner_releases_memory() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Wake;
+    struct Ready(AtomicBool);
+    impl Wake for Ready {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let (ep, mut driver) =
+            prepare_transport(&fcx, local.ip(), Options::default(), &Factory::default());
+        let _listener = ep.listen(local.port())?;
+        let payload = vec![9; MTU / 2];
+        let (child, budget) = {
+            let mut host = ep.shared.lock();
+            let (h, ack) = established(&mut host, smol_now(&fcx), local, peer);
+            let child = host.adopt(h);
+            host.pump();
+            host.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                smol_now(&fcx),
+                data_segment(peer, local, 101, ack, 16, &payload).0,
+            );
+            host.conns.get_mut(&h).unwrap().recv_credit = payload.len() as u64;
+            (child, host.tcp.budget().clone())
+        };
+        let mut elsewhere = budget.charge(budget.limit() - budget.used()).unwrap();
+        let ready = Arc::new(Ready(AtomicBool::new(false)));
+        let waker = Waker::from(ready.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut out = Vec::new();
+        driver.poll(&mut cx, &mut out, EGRESS_PACKETS, fcx.now())?;
+        assert!(ep.shared.lock().routes.links[&child].inbox.is_empty());
+        ready.0.store(false, Ordering::SeqCst);
+        elsewhere.shrink_to(elsewhere.bytes() - payload.len());
+        assert!(ready.0.swap(false, Ordering::SeqCst));
+        driver.poll(&mut cx, &mut out, EGRESS_PACKETS, fcx.now())?;
+        let host = ep.shared.lock();
+        let received: Vec<_> = host.routes.links[&child]
+            .inbox
+            .iter()
+            .flat_map(|bytes| bytes.iter().copied())
+            .collect();
+        assert_eq!(received, payload);
+        drop(host);
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn receive_refresh_rotates_after_the_event_queue_fills() {
     block_on(run(Seed::from_u64(1), |fcx| async move {
         let (_raw, side) = pair();
