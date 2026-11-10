@@ -1,5 +1,7 @@
 //! Public HPACK and shared Huffman values through the codec tools.
 use fictionet::stdlib::codec::Stream;
+use fictionet::stdlib::dissect::http2::PartialBlocks;
+use fictionet::stdlib::protocols::http2::FrameHeader;
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
 use fictionet::stdlib::{
     codec::{Collect, Lcg, Wire},
@@ -265,4 +267,36 @@ fn an_encoder_table_lowered_stays_within_most_held() {
         encoder
     });
     within_its_bounds("encoder", live, encoder.held(), encoder.most_held());
+}
+
+/// The capture dissector's header assembly reports in `held()` what it
+/// keeps allocated, counted: its HPACK table's slots, names and values,
+/// and a block that waits for its CONTINUATION.
+#[test]
+fn a_captured_table_and_open_block_are_within_held() {
+    let mut encoder = Encoder::new(4096);
+    let mut block = Vec::new();
+    encoder.encode_block(&forty_fields(), &mut block).unwrap();
+    let headers = |stream, flags| FrameHeader {
+        length: block.len(),
+        kind: 1,
+        flags,
+        stream,
+    };
+    let (blocks, live) = left_allocated(|| {
+        let mut blocks = PartialBlocks::default();
+        // END_HEADERS: the block is decoded and its forty entries kept.
+        let read = blocks.read(headers(1, 0x4), Some(&block)).unwrap();
+        assert!(read.block.is_some(), "the first block is decoded");
+        drop(read);
+        // No END_HEADERS: the second block waits for its CONTINUATION.
+        drop(blocks.read(headers(3, 0), Some(&block)).unwrap());
+        blocks
+    });
+    assert!(blocks.pending(), "the second block waits");
+    assert!(
+        live <= blocks.held() as i128,
+        "{live} bytes allocated, past held() of {}",
+        blocks.held()
+    );
 }

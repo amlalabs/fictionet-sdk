@@ -355,13 +355,14 @@ impl PartialBlocks {
         self.pending = None;
         self.table.forget();
     }
-    /// Bytes held: the HPACK table and a block in progress.
+    /// Bytes allocated: the HPACK table's storage, slots included, and a
+    /// block in progress.
     pub fn held(&self) -> usize {
-        self.table.table_size().saturating_add(
+        self.table.held().saturating_add(
             self.pending
                 .as_ref()
                 .and_then(|p| p.bytes.as_ref())
-                .map_or(0, Vec::len),
+                .map_or(0, Vec::capacity),
         )
     }
     /// Whether a header block waits for its CONTINUATION.
