@@ -46,7 +46,9 @@ where
                         .unwrap(),
                 );
             };
-            Reply::Now((self.0)(ex, Request::from_parts(parts, body)).map(Body::from))
+            Reply::Now(
+                (self.0)(ex, Request::from_parts(parts, Bytes::from_owner(body))).map(Body::from),
+            )
         }
     }
     std::sync::Arc::new(BytesHandler(f))
@@ -77,7 +79,7 @@ where
             let f = self.0.clone();
             Reply::Later(Box::new(move |cx| {
                 Box::pin(async move {
-                    Ok(f(cx, Request::from_parts(parts, body))
+                    Ok(f(cx, Request::from_parts(parts, Bytes::from_owner(body)))
                         .await
                         .map(Body::from))
                 })

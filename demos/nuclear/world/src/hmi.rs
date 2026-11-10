@@ -1809,7 +1809,7 @@ async fn control(
     tcp: tcp::Endpoint,
     controllers: Controllers,
     held: Arc<Mutex<Held>>,
-    request: Request<Bytes>,
+    request: Request<fictionet::Chunk>,
 ) -> Response<Bytes> {
     let kind = request
         .uri()

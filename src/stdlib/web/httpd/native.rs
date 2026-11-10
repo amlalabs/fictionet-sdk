@@ -25,7 +25,6 @@ use fictionet::stdlib::services::stack::{Job, Tunnel};
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
-use super::body::Inner;
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
 use super::response::{Asked, Dates, ResponsePolicy, head_held, request_held, response_held};
@@ -136,8 +135,9 @@ enum Phase {
 /// so delivery is counted in written pieces.
 ///
 /// Input storage, decoded heads, owned bodies and wire output are reserved
-/// before allocation. Application-provided body bytes are copied into
-/// reserved storage so an opaque slice cannot retain a larger allocation.
+/// before allocation. Full bodies carry their backing's reservation;
+/// admission transfers it, copying only when shared storage needs a new
+/// payer. Opaque HTTP body frames are copied into reserved storage.
 /// Handler and body-stream internals, opaque HTTP metadata allocations and
 /// extension values remain outside this byte accounting. Past the budget
 /// the connection closes with nothing more written.
@@ -429,9 +429,13 @@ impl Http1 {
 
     /// Move the body's reservation into its shared backing storage. Handler
     /// clones and streams may outlive both this layer and its current job.
-    fn take_body(&mut self, budget: &Budget) -> Bytes {
+    fn take_body(&mut self, budget: &Budget) -> Chunk {
         let bytes = std::mem::replace(&mut self.body, ChargedBytes::new(budget));
-        Bytes::from(bytes)
+        if bytes.is_empty() {
+            Chunk::default()
+        } else {
+            Chunk::from(bytes)
+        }
     }
 
     /// Answers the request whose head is pending, with `body`. `close`
@@ -485,7 +489,7 @@ impl Http1 {
         } else if lacks_host {
             Reply::Now(no_host())
         } else if request.headers().contains_key(http::header::UPGRADE)
-            && matches!(&request.body().0, Inner::Stream(_))
+            && matches!(request.body(), Body::Stream(_))
         {
             Reply::Now(status_only(StatusCode::BAD_REQUEST))
         } else if let Some(settings) = h2c {
@@ -504,10 +508,10 @@ impl Http1 {
         };
         let (stage, body_charge) = match reply {
             Reply::Now(mut response) => {
-                let Some(charge) = normalize_body(response.body_mut(), env.budget()) else {
+                if !response.body_mut().admit(env.budget()) {
                     return self.over_budget(env);
-                };
-                (Stage::Made(response), charge)
+                }
+                (Stage::Made(response), None)
             }
             Reply::Later(later) => {
                 let Some(charge) = env.budget().charge(held) else {
@@ -537,7 +541,7 @@ impl Http1 {
             chunked: false,
             body_charge,
             stage,
-            rest: Bytes::new(),
+            rest: Chunk::default(),
             base: self.queued,
         });
         self.phase = Phase::Answering;
@@ -561,7 +565,7 @@ impl Http1 {
                 .extend_within(&self.stream.unread()[..added])
                 .expect("body growth reserved room");
             let bytes = self.take_body(env.budget());
-            let body = partial(bytes, "the request body was cut off");
+            let body = partial(Bytes::from_owner(bytes), "the request body was cut off");
             self.dispatch(env, body, true, Closing::Failed);
             env.report(Report::Failed(fail));
             return;
@@ -727,11 +731,11 @@ impl Http1 {
             return self.piece(env, r, head, 0);
         }
         // A body held in full goes out with the head, a piece at a time.
-        match body.0 {
-            Inner::Full(bytes) => {
-                r.rest = bytes.unwrap_or_default();
+        match body {
+            Body::Full(bytes) => {
+                r.rest = bytes;
             }
-            stream => r.stage = Stage::Body(Some(Body(stream))),
+            stream => r.stage = Stage::Body(Some(stream)),
         }
         // A streamed body has nothing held yet, and an empty chunk would
         // end it before it starts.
@@ -830,8 +834,9 @@ struct Responding {
     then: Closing,
     chunked: bool,
     stage: Stage,
-    /// Body bytes not yet written, covered by `body_charge` until the last piece.
-    rest: Bytes,
+    /// Body bytes not yet written. Full bodies carry their own reservation;
+    /// streamed frames are covered by `body_charge` until the last piece.
+    rest: Chunk,
     /// Where the response starts among the bytes queued.
     base: u64,
     body_charge: Option<Charge>,
@@ -849,10 +854,10 @@ enum Stage {
 }
 
 impl Responding {
-    fn take_piece(&mut self) -> Bytes {
+    fn take_piece(&mut self) -> Chunk {
         let piece = self.rest.split_to(self.rest.len().min(PIECE));
         if self.rest.is_empty() {
-            self.rest = Bytes::new();
+            self.rest = Chunk::default();
         }
         piece
     }
@@ -1143,7 +1148,7 @@ pub struct Done {
 enum Answer {
     Made(Result<Response<Body>, Error>),
     /// The body back, with its next frame or its end.
-    Frame(Body, Option<Result<Frame<Bytes>, Error>>),
+    Frame(Body, Option<Result<Frame<Chunk>, Error>>),
 }
 
 impl Job for Work {
@@ -1173,12 +1178,13 @@ impl Job for Work {
                 let made = made.and_then(|mut response| {
                     // A body all there now goes out with the head, without
                     // work of its own.
-                    response.body_mut().settle(cx);
-                    let charge =
-                        normalize_body(response.body_mut(), &self.budget).ok_or_else(|| {
-                            Error::msg("the response body exceeds the connection budget")
-                        })?;
-                    self.charge = charge;
+                    response.body_mut().settle(cx, &self.budget)?;
+                    if !response.body_mut().admit(&self.budget) {
+                        return Err(Error::msg(
+                            "the response body exceeds the connection budget",
+                        ));
+                    }
+                    self.charge = None;
                     Ok(response)
                 });
                 Answer::Made(made)
@@ -1192,7 +1198,7 @@ impl Job for Work {
                     frame.and_then(|frame| {
                         let data = match frame.into_data() {
                             Ok(data) => data,
-                            Err(_) => return Ok(Frame::data(Bytes::new())),
+                            Err(_) => return Ok(Frame::data(Chunk::default())),
                         };
                         let want = PIECE.max(data.len());
                         let fits = self.charge.as_mut().is_some_and(|charge| {
@@ -1206,7 +1212,7 @@ impl Job for Work {
                         if !fits {
                             return Err(Error::msg("the body frame exceeds the connection budget"));
                         }
-                        Ok(Frame::data(Bytes::copy_from_slice(&data)))
+                        Ok(Frame::data(Chunk::unpaid(data.to_vec())))
                     })
                 });
                 Answer::Frame(body.take().unwrap_or_default(), frame)
@@ -1235,7 +1241,7 @@ fn h2c_settings(request: &Request<Body>) -> Option<Vec<Setting>> {
             .map(<[u8]>::trim_ascii)
     }
     if request.version() != Version::HTTP_11
-        || !matches!(&request.body().0, Inner::Full(_))
+        || !matches!(request.body(), Body::Full(_))
         || !tokens(request, "upgrade").any(|t| t.eq_ignore_ascii_case(b"h2c"))
         || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"upgrade"))
         || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"http2-settings"))
@@ -1350,20 +1356,6 @@ fn error_output(error: &Error, budget: &Budget) -> Option<(Response<Body>, Charg
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     Some((response, charge))
-}
-
-/// Application bodies may share an opaque backing allocation. Copy at the
-/// admission boundary so the connection retains only the bytes it reserved.
-/// Application handler and stream internals remain owned by the application.
-fn normalize_body(body: &mut Body, budget: &Budget) -> Option<Option<Charge>> {
-    match &mut body.0 {
-        Inner::Full(Some(bytes)) => {
-            let charge = budget.charge(bytes.len())?;
-            *bytes = Bytes::copy_from_slice(bytes);
-            Some(Some(charge))
-        }
-        _ => Some(None),
-    }
 }
 
 /// Bounds headers plus every generated field. Suppressed application fields
@@ -1527,7 +1519,7 @@ mod router_tests {
 
     #[test]
     fn a_handler_retaining_request_bytes_retains_the_backing_reservation() {
-        struct Keep(Arc<Mutex<Option<Bytes>>>);
+        struct Keep(Arc<Mutex<Option<Chunk>>>);
         impl Handler for Keep {
             fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
                 *self.0.lock() = request.body().bytes();
@@ -2099,5 +2091,32 @@ mod tests {
             assert_eq!(h.output(), whole, "{step}");
             assert!(!h.ended());
         }
+    }
+}
+
+#[cfg(test)]
+mod body_admission_tests {
+    use super::*;
+    use fictionet::Pool;
+
+    #[test]
+    fn full_body_admission_moves_storage_and_refuses_without_changes() {
+        let owner = Budget::new(4096);
+        let pool = Pool::new(&owner, 512, 2);
+        let mut block = pool.take(&owner, 64).unwrap();
+        block.extend_within(b"response").unwrap();
+        let address = block.as_ptr();
+        let mut body = Body::Full(block);
+        let short = Budget::new(pool.slot() - 1);
+        assert!(!body.admit(&short));
+        assert!(short.used() == 0);
+        assert_eq!(body.bytes().unwrap().as_ptr(), address);
+        let destination = Budget::new(pool.slot());
+        assert!(body.admit(&destination));
+        assert_eq!(body.bytes().unwrap().as_ptr(), address);
+        assert!(destination.used() >= pool.slot());
+        drop(body);
+        assert!(destination.used() == 0);
+        assert!(pool.free() > 0);
     }
 }

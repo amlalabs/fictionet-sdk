@@ -884,7 +884,7 @@ fictionet_test_support::reply_handler(move |ex, request| {
 use fictionet::stdlib::web::httpd::{Body, Reply};
 let (parts, body) = request.into_parts();
 let Some(body) = body.bytes() else { return Reply::Now(http::Response::builder().status(400).body(Body::empty()).unwrap()); };
-let request = http::Request::from_parts(parts, body);
+let request = http::Request::from_parts(parts, Bytes::from_owner(body));
 if request.uri().path() == "/" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(route_0(ex, request).map(Body::from)); }
 if request.uri().path() == "/large/curl" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(route_1(ex, request).map(Body::from)); }
 if (request.uri().path() == "/large" || request.uri().path().starts_with("/large/")) && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return { let route = route_2.clone(); Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(route(cx, request).await.map(Body::from)) }))) }; }
@@ -1290,6 +1290,38 @@ fn statuses(output: &[Frame]) -> Vec<(u32, Vec<u8>)> {
             })
         })
         .collect()
+}
+
+#[test]
+fn retained_request_chunks_keep_their_charge_after_the_connection() {
+    struct Keep(Arc<Mutex<Option<fictionet::Chunk>>>);
+    impl httpd::Handler for Keep {
+        fn call(
+            &self,
+            request: http::Request<httpd::Body>,
+            _: &mut httpd::Exchange<'_>,
+        ) -> httpd::Reply {
+            *self.0.lock().unwrap() = request.body().bytes();
+            httpd::Reply::Now(http::Response::new(httpd::Body::empty()))
+        }
+    }
+    let held = Arc::new(Mutex::new(None));
+    let budget = Budget::new(1 << 20);
+    let mut harness = budgeted(Responder::new(Keep(held.clone())), budget.clone());
+    let mut input = preface();
+    input.extend(headers(1, "/", false));
+    input.extend(data(1, 4, true));
+    push(&mut harness, &input);
+    drop(harness);
+    let bytes = held
+        .lock()
+        .unwrap()
+        .take()
+        .expect("handler retained the body");
+    assert!(!bytes.is_empty());
+    assert!(budget.used() >= bytes.len());
+    drop(bytes);
+    assert!(budget.used() == 0);
 }
 
 #[test]
@@ -2021,7 +2053,7 @@ fn deferred_response_budget_refusal_preserves_other_streams() {
                             .unwrap(),
                     );
                 };
-                let request = http::Request::from_parts(parts, body);
+                let request = http::Request::from_parts(parts, Bytes::from_owner(body));
                 if request.uri().path() == "/small" && (request.method() == http::Method::POST) {
                     return Reply::Now(route_0(ex, request).map(Body::from));
                 }

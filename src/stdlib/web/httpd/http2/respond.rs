@@ -157,13 +157,10 @@ struct State {
     responder: Arc<Responder>,
     head: Option<Request<()>>,
     /// What this exchange holds besides the request's body: the request's
-    /// head, then the response's head and the body bytes not yet sent.
+    /// head, then the response's head. Response chunks carry their own charge.
     charge: Option<Charge>,
     /// The request's body as it is collected, which carries its charge.
     body: Option<ChargedBytes>,
-    /// The charge of the request's body once it is handed to the handler,
-    /// held until the response replaces it.
-    handed: Option<Charge>,
     deadline: Option<Instant>,
     /// The request ended before it was answered.
     ended: bool,
@@ -173,7 +170,7 @@ struct State {
     /// The next command, for the connection to take.
     next: Option<ExchangeCommand>,
     /// Body bytes held in full, not yet sent.
-    rest: Bytes,
+    rest: Chunk,
     generation: u64,
     work: Option<Work>,
 }
@@ -204,14 +201,13 @@ impl Respond {
                 head: Some(*opening.request),
                 charge: opening.charge,
                 body: None,
-                handed: None,
                 deadline,
                 ended: opening.ended,
                 stage: Stage::Collecting,
                 wants: Asked::Body,
                 delivery: None,
                 next: None,
-                rest: Bytes::new(),
+                rest: Chunk::default(),
                 generation: 0,
                 work: None,
             }),
@@ -234,10 +230,6 @@ impl State {
                 self.charge.is_some()
             }
         }
-    }
-
-    fn held(&self) -> usize {
-        self.charge.as_ref().map_or(0, Charge::bytes)
     }
 
     /// The bytes of the request's body collected so far.
@@ -279,13 +271,7 @@ impl State {
         self.deadline = None;
         let responder = self.responder.clone();
         let (parts, ()) = head.into_parts();
-        let body = match self.body.take().map(ChargedBytes::into_parts) {
-            Some((body, charge)) => {
-                self.handed = Some(charge);
-                body
-            }
-            None => Vec::new(),
-        };
+        let body = self.body.take().map(Chunk::from).unwrap_or_default();
         let mut request = Request::from_parts(parts, Body::from(body));
         request.extensions_mut().insert(responder.conn.clone());
         self.wants = Asked::of(request.method());
@@ -333,16 +319,36 @@ impl State {
     /// The response replaces the request in the budget. One the budget
     /// cannot hold gets `503` instead, so it does not end the connection's
     /// other streams.
-    fn made(&mut self, env: &Env<'_, Infallible>, response: Response<Body>) {
-        // The handler is done with the request's body.
-        self.handed = None;
+    fn made(&mut self, env: &Env<'_, Infallible>, mut response: Response<Body>) {
         let delivery = self.delivery.as_ref().map_or(0, |d| d.held);
-        let response = if self.hold(env, response_held(&response) + delivery) {
+        let fits = self.hold(env, response_held(&response) + delivery);
+        // Response admission uses the head's account: this owner handles
+        // its refusal with a service-unavailable response. A body poll's
+        // refusal instead belongs to the child runner and resets the stream.
+        let budget = self
+            .charge
+            .as_ref()
+            .map_or_else(|| env.budget().clone(), |charge| charge.budget().clone());
+        let settled = if fits && matches!(response.body(), Body::Stream(_)) {
+            let waker = env.waker();
+            response
+                .body_mut()
+                .settle(&mut Context::from_waker(&waker), &budget)
+                .is_ok()
+        } else {
+            fits
+        };
+        let response = if settled && response.body_mut().admit(&budget) {
             response
         } else {
-            let response = over_budget();
-            // Less than the request held, so it fits.
-            self.hold(env, response_held(&response) + delivery);
+            drop(response);
+            let mut response = over_budget();
+            if !self.hold(env, response_held(&response) + delivery)
+                || !response.body_mut().admit(&budget)
+            {
+                self.reset();
+                return;
+            }
             response
         };
         self.stage = Stage::Made(response);
@@ -396,40 +402,33 @@ impl State {
             self.stage = Stage::Done;
             return;
         }
-        self.stage = match body.0 {
-            super::super::body::Inner::Full(bytes) => {
-                self.rest = bytes.unwrap_or_default();
+        self.stage = match body {
+            Body::Full(bytes) => {
+                self.rest = bytes;
                 Stage::Body(None)
             }
-            stream => Stage::Body(Some(Body(stream))),
+            stream => Stage::Body(Some(stream)),
         };
     }
 
-    /// The next piece of the body held in full, carrying its share of the
-    /// charge.
-    fn piece(&mut self, env: &Env<'_, Infallible>) -> Option<Chunk> {
+    /// Splits a body without copying; its backing retains the reservation.
+    fn piece(&mut self) -> Chunk {
         let piece = self.rest.split_to(self.rest.len().min(PIECE));
         if self.rest.is_empty() {
-            self.rest = Bytes::new();
+            self.rest = Chunk::default();
         }
-        let charge = match self.charge.as_mut().and_then(|c| c.split(piece.len())) {
-            Some(charge) => charge,
-            None => env.budget().charge(piece.len())?,
-        };
-        let mut bytes = ChargedBytes::from_charge(charge);
-        bytes.extend_within(&piece).ok()?;
-        Some(Chunk::from(bytes))
+        piece
     }
 
     fn reset(&mut self) {
         self.stage = Stage::Done;
-        self.rest = Bytes::new();
+        self.rest = Chunk::default();
         self.work = None;
         self.next = Some(ExchangeCommand::Reset(ErrorCode::InternalError));
     }
 
     /// Moves the response on by one command, once the last was taken.
-    fn respond(&mut self, env: &mut Env<'_, Infallible>) -> bool {
+    fn respond(&mut self) -> bool {
         if self.next.is_some() {
             return false;
         }
@@ -440,10 +439,7 @@ impl State {
             }
             Stage::Body(body) if !self.rest.is_empty() => {
                 self.stage = Stage::Body(body);
-                match self.piece(env) {
-                    Some(chunk) => self.next = Some(ExchangeCommand::Data(chunk)),
-                    None => self.reset(),
-                }
+                self.next = Some(ExchangeCommand::Data(self.piece()));
                 true
             }
             Stage::Body(Some(body)) => {
@@ -564,12 +560,12 @@ impl Layer for Respond {
                 Ok(data) => {
                     // The head is out, so a chunk the budget cannot hold
                     // resets this stream alone.
-                    let held = state.held();
-                    if !data.is_empty() && !state.hold(env, held + data.len()) {
-                        state.reset();
-                    } else {
-                        state.rest = data;
-                        state.stage = Stage::Body(Some(body));
+                    match Chunk::copy_of(env.budget(), &data) {
+                        Some(chunk) => {
+                            state.rest = chunk;
+                            state.stage = Stage::Body(Some(body));
+                        }
+                        None => state.reset(),
                     }
                 }
                 Err(frame) => match frame.into_trailers() {
@@ -589,7 +585,7 @@ impl Layer for Respond {
             state.dispatch(env, Received::Complete);
             return Ok(true);
         }
-        Ok(state.respond(env))
+        Ok(state.respond())
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
@@ -659,12 +655,7 @@ impl Job for Work {
                     None => Err(Error::msg("this answer was already made")),
                 };
                 *making = None;
-                // A body all there now goes out with the head, without
-                // work of its own.
-                Answer::Made(made.map(|mut response| {
-                    response.body_mut().settle(cx);
-                    response
-                }))
+                Answer::Made(made)
             }
             Op::Frame(body) => {
                 let frame = match body {
@@ -681,8 +672,7 @@ impl Job for Work {
 pub(super) fn response_held(response: &Response<Body>) -> usize {
     let headers = response.headers();
     let slots = headers.capacity() + headers.len() - headers.keys_len();
-    response.body().full_len()
-        + slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
+    slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
         + headers
             .iter()
             .map(|(n, v)| n.as_str().len() + v.as_bytes().len())
