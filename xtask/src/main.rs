@@ -13,6 +13,7 @@ mod layer_verify;
 mod mptcp_verify;
 #[cfg(feature = "host-tools")]
 mod rawnic;
+mod tls_verify;
 #[cfg(feature = "host-tools")]
 // This module owns the host syscall boundary.
 #[allow(unsafe_code)]
@@ -46,6 +47,9 @@ fn main() -> Result {
     }
     if task == "layer-verify" {
         return layer_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "tls-verify" {
+        return tls_verify::run(&args.collect::<Vec<_>>());
     }
     if !matches!(
         task.as_str(),

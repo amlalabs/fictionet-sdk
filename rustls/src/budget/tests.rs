@@ -1,6 +1,8 @@
 //! A server connection paid from a budget: every buffer charged what it
 //! holds, and each refusal changing nothing until the budget has room.
 
+mod record_vectors;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use std::io::{self, Read, Write};

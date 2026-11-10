@@ -1342,6 +1342,9 @@ const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
 pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
 
 #[cfg(all(test, feature = "std"))]
+mod nonce_vectors;
+
+#[cfg(all(test, feature = "std"))]
 mod ciphertext_ownership_tests {
     use super::*;
     use crate::crypto::cipher::MessageEncrypter;
@@ -1426,14 +1429,12 @@ mod ciphertext_ownership_tests {
         let limit = crate::budget::testing::Limit::new(1 << 20);
         let mut state = CommonState::new(Side::Server);
         state.pay_from(Some(limit.clone()));
-        state
-            .record_layer
-            .set_message_encrypter(
-                Box::new(Overallocating {
-                    typ: ContentType::ApplicationData,
-                }),
-                u64::MAX,
-            );
+        state.record_layer.set_message_encrypter(
+            Box::new(Overallocating {
+                typ: ContentType::ApplicationData,
+            }),
+            u64::MAX,
+        );
         state.may_send_application_data = true;
 
         let data = [7; 10];
@@ -1457,14 +1458,12 @@ mod ciphertext_ownership_tests {
         let limit = crate::budget::testing::Limit::new(1 << 20);
         let mut state = CommonState::new(Side::Server);
         state.pay_from(Some(limit.clone()));
-        state
-            .record_layer
-            .set_message_encrypter(
-                Box::new(Overallocating {
-                    typ: ContentType::Handshake,
-                }),
-                u64::MAX,
-            );
+        state.record_layer.set_message_encrypter(
+            Box::new(Overallocating {
+                typ: ContentType::Handshake,
+            }),
+            u64::MAX,
+        );
         state.may_send_application_data = true;
 
         state.enqueue_key_update_notification();
