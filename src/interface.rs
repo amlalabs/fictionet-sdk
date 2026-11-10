@@ -76,8 +76,9 @@ pub trait Interface: Send + 'static {
     /// process. When the connection to `fictionet attach` is full, the packet
     /// waits in a queue inside the world, and the queue is written out in
     /// order as attach makes room. The queue has a budget of 32 MiB. Each
-    /// waiting packet counts its own length plus 64 bytes. A packet that
-    /// would take the queue past that budget is dropped. See [`listen`](crate::listen).
+    /// waiting packet counts the memory its bytes keep alive plus 64 bytes.
+    /// A packet that would take the queue past that budget is dropped. See
+    /// [`listen`](crate::listen).
     fn send(&mut self, packet: Packet);
 }
 
