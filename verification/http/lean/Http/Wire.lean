@@ -623,7 +623,7 @@ inductive Stop
   | ended (consumed : Nat)
   | truncated
   | failed (e : Error)
-  deriving Repr
+  deriving Repr, DecidableEq
 
 /-- One step of `Reader::body` from state `s`, on the unread `input`. -/
 inductive BodyStep
@@ -707,7 +707,7 @@ on to read the next message there, or the stream stops. -/
 inductive MsgEnd
   | next (used : Nat)
   | stop (s : Stop)
-  deriving Repr
+  deriving Repr, DecidableEq
 
 /-- `Reader::body` until the body is done: from state `s` at offset `pos`,
 the events and how the message ends. `close` is whether the connection ends

@@ -6,3 +6,6 @@ import Http.Lines
 import Http.Fields
 import Http.Smuggling
 import Http.Body
+import Http.RequestTie
+import Http.Responses
+import Http.Controls

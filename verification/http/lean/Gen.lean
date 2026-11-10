@@ -14,6 +14,7 @@
   then sometimes cut short or given one wrong byte. The bytes are a JSON array.
 -/
 import Http.Wire
+import Http.Request
 import Lean
 
 open Http Http.Wire Lean
@@ -376,6 +377,78 @@ def responseVectors (seed : Nat) (emit : Json → IO Unit) : IO Unit := do
     rng := r
     emit (caseJson l ms input eof (responses l ms input eof))
 
+/-! ## `framing.json`: the rules of `Request.lean` -/
+
+def rejectName : Http.Reject → String
+  | .transferEncodingAndContentLength => "TransferEncodingAndContentLength"
+  | .contentLength => "ContentLength"
+  | .conflictingContentLength => "ConflictingContentLength"
+  | .http10TransferEncoding => "Http10TransferEncoding"
+  | .chunkedNotLast => "ChunkedNotLast"
+  | .transferEncoding => "TransferEncoding"
+  | .requestTransferEncoding => "RequestTransferEncoding"
+  | .unsupportedTransferCoding => "UnsupportedTransferCoding"
+
+/-- List elements written into one or two field lines named `name`, with
+empty elements here and there. -/
+def listFields (name : String) (elems : List String) : G (List Bytes) := do
+  let mut parts : List String := []
+  for e in elems do
+    if ← chance 5 then parts := parts ++ [""]
+    parts := parts ++ [e]
+  if parts.isEmpty then parts := [← pick #["", ",", " "]]
+  let cut ← rNat (parts.length + 1)
+  let one := ", ".intercalate (parts.take cut)
+  let two := ", ".intercalate (parts.drop cut)
+  let lines := (if cut == 0 then [] else [one]) ++ (if cut == parts.length then [] else [two])
+  let lines := if lines.isEmpty then [""] else lines
+  return lines.map fun l => str (name ++ ": " ++ l)
+
+/-- A request head written from the abstract framing fields of
+`Request.lean`, and what `Http.requestFraming` says of them: the body the
+decoder must then read, or the refusal. -/
+def framingCase : G Json := do
+  let v : Version := if ← chance 3 then .h10 else .h11
+  let te ← if ← chance 2 then pure none else do
+    let k ← rNat 4
+    let mut cs : List Bool := []
+    for _ in [0:k] do cs := cs ++ [← chance 2]
+    pure (some cs)
+  let cl ← if ← chance 2 then pure none else do
+    let k ← pick #[1, 1, 2, 3]
+    let n ← pick #[0, 3, 5]
+    let mut ls : List (Option Nat) := []
+    for _ in [0:k] do
+      let bad ← chance 6
+      let other ← chance 6
+      ls := ls ++ [if bad then none else if other then some (n + 1) else some n]
+    pure (some ls)
+  let mut fields : List Bytes := [str "Host: a.test"]
+  if let some cs := te then
+    let names ← cs.mapM fun c => if c then pure "chunked" else pick #["gzip", "deflate", "x-custom"]
+    fields := fields ++ (← listFields "Transfer-Encoding" names)
+  if let some ls := cl then
+    let names := ls.map fun l => match l with | some n => toString n | none => "x1"
+    let cls ← listFields "Content-Length" names
+    fields := if ← chance 2 then fields ++ cls else cls ++ fields
+  let start := str ("POST / " ++ (if v == .h10 then "HTTP/1.0" else "HTTP/1.1"))
+  let head := line start ++ fields.flatMap line ++ crlf
+  let expected := Http.requestFraming v te cl
+  let (body, expect) : Bytes × Json := match expected with
+    | .error rej => ([], Json.mkObj [("error", toJson (rejectName rej))])
+    | .ok .empty => ([], Json.mkObj [("body", nums [])])
+    | .ok (.length n) => (List.replicate n 97, Json.mkObj [("body", nums (List.replicate n 97))])
+    | .ok .chunked => (str "3\r\nabc\r\n0\r\n\r\n", Json.mkObj [("body", nums (str "abc"))])
+    | .ok .close => ([], Json.mkObj [("body", nums [])])
+  return Json.mkObj [("input", nums (head ++ body)), ("expect", expect)]
+
+def framingVectors (seed : Nat) (emit : Json → IO Unit) : IO Unit := do
+  let mut rng : Rng := ⟨(seed + 0x2545F491).toUInt64⟩
+  for _ in [0:4000] do
+    let (j, r) := framingCase.run rng
+    rng := r
+    emit j
+
 def write (dir : System.FilePath) (name : String)
     (generate : (Json → IO Unit) → IO Unit) : IO Unit := do
   IO.FS.withFile (dir / (name ++ ".json")) .write fun handle => do
@@ -395,3 +468,4 @@ def main (args : List String) : IO Unit := do
   IO.FS.createDirAll dir
   write dir "requests" (requestVectors seed)
   write dir "responses" (responseVectors seed)
+  write dir "framing" (framingVectors seed)
