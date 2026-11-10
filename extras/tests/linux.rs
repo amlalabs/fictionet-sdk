@@ -509,8 +509,12 @@ fn time_wait_expires_after_sixty_seconds() {
         cx.sleep(Duration::from_secs(59)).await?;
         raw.send(fin.clone());
         assert_eq!(receive(&mut raw, &cx).await[13], 16);
-        // Retransmitting the FIN restarts the TIME-WAIT timer.
-        cx.sleep(Duration::from_secs(60)).await?;
+        // Retransmitting the FIN restarts the TIME-WAIT timer. The probe goes
+        // a moment past the sixty seconds: a timer moved later is ordered
+        // among timers due at the same instant from when it moved, after
+        // this sleep.
+        cx.sleep(Duration::from_secs(60) + Duration::from_millis(1))
+            .await?;
         raw.send(fin);
         assert_eq!(receive(&mut raw, &cx).await[13], 4);
         cx.cancel();

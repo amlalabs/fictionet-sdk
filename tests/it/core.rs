@@ -576,11 +576,13 @@ fn cancellation_registration_moves_between_regions() {
         let wake = Arc::new(CancellationWake::default());
         let waker = std::task::Waker::from(wake.clone());
         let mut wait = fictionet::CancelWait::default();
+        // A registration holds two clones of the waker: the region's, and
+        // the wait's own, which it compares the next waker with.
         fcx.region(|child| {
             assert!(!child.register_cancel(&waker, &mut wait));
-            assert_eq!(Arc::strong_count(&wake), 3);
+            assert_eq!(Arc::strong_count(&wake), 4);
             assert!(!fcx.register_cancel(&waker, &mut wait));
-            assert_eq!(Arc::strong_count(&wake), 3);
+            assert_eq!(Arc::strong_count(&wake), 4);
             child.cancel();
             assert_eq!(wake.0.load(Ordering::SeqCst), 0);
             async { Ok(()) }
@@ -601,12 +603,14 @@ fn cancellation_registration_replaces_wakers_and_unregisters_on_drop() {
         let old = Arc::new(CancellationWake::default());
         let new = Arc::new(CancellationWake::default());
         let mut wait = fictionet::CancelWait::default();
+        // A registration holds two clones of the waker: the region's, and
+        // the wait's own.
         assert!(!fcx.register_cancel(&old.clone().into(), &mut wait));
         assert!(!fcx.register_cancel(&old.clone().into(), &mut wait));
-        assert_eq!(Arc::strong_count(&old), 2);
+        assert_eq!(Arc::strong_count(&old), 3);
         assert!(!fcx.register_cancel(&new.clone().into(), &mut wait));
         assert_eq!(Arc::strong_count(&old), 1);
-        assert_eq!(Arc::strong_count(&new), 2);
+        assert_eq!(Arc::strong_count(&new), 3);
         drop(wait);
         assert_eq!(Arc::strong_count(&new), 1);
         fcx.cancel();
@@ -627,7 +631,9 @@ fn cancellation_registration_is_released_when_an_end_moves_into_the_run() {
             end.poll_recv(&fcx, &mut std::task::Context::from_waker(&waker))
                 .is_pending()
         );
-        assert_eq!(Arc::strong_count(&wake), 4);
+        // Besides the test's two: the end's parked waker, and the region's
+        // and the wait's clones for the cancellation registration.
+        assert_eq!(Arc::strong_count(&wake), 5);
         std::future::poll_fn(|cx| {
             assert!(end.poll_recv(&fcx, cx).is_pending());
             std::task::Poll::Ready(())
