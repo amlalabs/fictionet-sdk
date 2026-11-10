@@ -67,12 +67,14 @@ fn renaming_ports_preserves_packet_validation() {
         &source_address,
         &destination_address,
         ignore_malformed,
+        Sum::Check,
     );
     let renamed = Repr::parse_with(
         &Packet::new_unchecked(&renamed[..]),
         &source_address,
         &destination_address,
         ignore_malformed,
+        Sum::Check,
     );
     assert_eq!(original.is_ok(), renamed.is_ok());
     if let (Ok(mut original), Ok(renamed)) = (original, renamed) {
@@ -135,12 +137,14 @@ fn renaming_ports_without_the_checksum_refilled() {
         &source_address,
         &destination_address,
         ignore_malformed,
+        Sum::Check,
     );
     let renamed = Repr::parse_with(
         &Packet::new_unchecked(&renamed[..]),
         &source_address,
         &destination_address,
         ignore_malformed,
+        Sum::Check,
     );
     assert!(
         original.is_ok() == renamed.is_ok(),
