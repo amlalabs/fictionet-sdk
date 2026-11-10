@@ -17,6 +17,7 @@ members = [
     "buf",
     "smoltcp",
     "rustls",
+    "quinn-proto",
     "xtask",
 ]
 default-members = [".", "buf", "cli", "codegen", "codegen/tests/golden", "codegen/tests/layouts", "xtask"]
