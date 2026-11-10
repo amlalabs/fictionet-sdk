@@ -263,7 +263,7 @@ pub use fictionet::{generated_runtime, layout};
 mod stream;
 
 pub use bounded::{ReserveError, RewriteError, append_bounded, reserve_bytes, write_bounded};
-pub use buffer::Buffer;
+pub use buffer::{Buffer, Storage};
 pub use checked::write_checked;
 pub use combinators::{
     Assemble, AssembleError, Assembled, Collect, CollectError, Ending, Fragment, LineError, Lines,

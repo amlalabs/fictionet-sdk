@@ -181,6 +181,61 @@ impl ChargedBytes {
     pub fn into_parts(self) -> (Vec<u8>, Charge) {
         (self.bytes, self.charge)
     }
+
+    /// Moves the charge to `to`, as when what holds the bytes changes
+    /// owner ([`Charge::transfer`]). Refuses, changing nothing, if `to`
+    /// has no room for it.
+    #[must_use = "a refused transfer leaves the bytes charged where they were"]
+    pub fn transfer(&mut self, to: &Budget) -> bool {
+        self.charge.transfer(to)
+    }
+}
+
+/// The bytes of a [`Buffer`](fictionet::stdlib::codec::Buffer), such as a
+/// decoder's input: the buffer grows only as far as the budget pays for,
+/// charging each growth before it allocates.
+impl fictionet::stdlib::codec::Storage for ChargedBytes {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    fn grow_within(&mut self, capacity: RangeInclusive<usize>) -> bool {
+        let (least, most) = (*capacity.start(), *capacity.end());
+        if least <= self.bytes.capacity() {
+            return true;
+        }
+        // The capacity is at least what is paid for, so `least` is more.
+        let paid = self.charge.bytes();
+        let Some(more) = self
+            .charge
+            .grow_by_units(least - paid..=most.max(least) - paid, 1)
+        else {
+            return false;
+        };
+        self.bytes.reserve_exact(paid + more - self.bytes.len());
+        true
+    }
+
+    fn resize_within(&mut self, len: usize) -> bool {
+        if len > self.bytes.capacity() {
+            return false;
+        }
+        self.bytes.resize(len, 0);
+        true
+    }
+
+    fn shrink_to(&mut self, len: usize) {
+        self.bytes.truncate(len);
+        self.trim();
+    }
 }
 
 impl Deref for ChargedBytes {
@@ -1778,6 +1833,39 @@ mod tests {
         }
         assert_eq!(budget.used(), charged);
         drop(map);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// A codec buffer kept in charged bytes grows only as its budget pays,
+    /// charging before it allocates; a push the budget cannot pay for
+    /// takes nothing and changes nothing, and is taken once memory frees.
+    #[test]
+    fn a_buffer_in_charged_bytes_is_paid_before_it_grows() {
+        use fictionet::stdlib::codec::Buffer;
+        let budget = Budget::new(64);
+        let mut buffer = Buffer::in_storage(32, ChargedBytes::new(&budget));
+        let covered = |buffer: &Buffer<ChargedBytes>, elsewhere: usize| {
+            assert!(buffer.storage().charged() >= buffer.allocated());
+            assert_eq!(budget.used(), buffer.storage().charged() + elsewhere);
+            assert!(budget.used() <= budget.limit());
+        };
+        assert_eq!(buffer.push(&[1; 4]), 4);
+        covered(&buffer, 0);
+        let other = budget.charge(budget.limit() - budget.used()).unwrap();
+        let (allocated, unread) = (buffer.allocated(), buffer.unread().to_vec());
+        assert_eq!(buffer.push(&[2; 20]), 0, "no room to grow");
+        assert_eq!(buffer.allocated(), allocated);
+        assert_eq!(buffer.unread(), unread);
+        covered(&buffer, other.bytes());
+        drop(other);
+        assert_eq!(buffer.push(&[2; 20]), 20);
+        assert_eq!(buffer.unread().len(), 24);
+        covered(&buffer, 0);
+        assert!(buffer.allocated() <= buffer.most_allocated());
+        buffer.consume(24);
+        buffer.shrink();
+        covered(&buffer, 0);
+        drop(buffer);
         assert_eq!(budget.used(), 0);
     }
 }
