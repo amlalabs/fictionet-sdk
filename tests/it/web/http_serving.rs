@@ -355,7 +355,7 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
         let request = web::Request {
             head: web::Head::new(
                 "POST",
-                "https://different.test:443/path?q=1",
+                "https://127.0.0.1:443/path?q=1",
                 fictionet::stdlib::protocols::http1::Version::Http2,
                 [
                     ("host", "127.0.0.1"),
