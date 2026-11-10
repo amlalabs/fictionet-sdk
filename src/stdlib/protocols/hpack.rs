@@ -623,17 +623,29 @@ impl DynamicTable {
                 .map(|(name, value)| name.len() + value.len())
                 .sum::<usize>()
     }
-    /// The most [`held`](Self::held) reaches while each insert is followed
-    /// by an [`evict`](Self::evict) to at most `capacity`. What stays fits
-    /// `capacity`: at most `capacity / ENTRY_OVERHEAD` entries, whose
-    /// octets come to at most `capacity`. The slots grow only when an
-    /// insert finds them all full, so they double from at most that many
-    /// entries, or start at four.
+    /// The most the table allocates at any moment while each insert comes
+    /// after an [`evict`](Self::evict) that made room for its entry within
+    /// `capacity`, as [`Table`] and [`Encoder`] do. The entries fit
+    /// `capacity`: at most `capacity / ENTRY_OVERHEAD` of them, whose
+    /// octets come to at most `capacity`. The slots start at four and
+    /// double only when an insert finds them all full, so they reach at
+    /// most twice the entries. While they double, the old slots and the new
+    /// are both allocated. Room was made first, so the old ones were fewer
+    /// than the entries that fit: the most such count of four doubled,
+    /// three times over, for that moment.
     pub fn most_held(capacity: usize) -> usize {
         let entries = capacity / ENTRY_OVERHEAD;
+        let mut old: usize = 0;
+        if entries > 4 {
+            old = 4;
+            while old.saturating_mul(2) < entries {
+                old *= 2;
+            }
+        }
         entries
             .saturating_mul(2)
             .max(4)
+            .max(old.saturating_mul(3))
             .saturating_mul(size_of::<Slot>())
             .saturating_add(capacity)
     }
@@ -840,24 +852,8 @@ impl Table {
                                 + value.decoded_len(MAX_STRING)?
                                 + ENTRY_OVERHEAD;
                             keep(out, budget, limit, text, value, never)?;
-                            if indexing == Indexing::Incremental && size > self.max {
-                                // An entry larger than the table empties it
-                                // and is not added (RFC 7541 section 4.4):
-                                // nothing is copied for it.
-                                self.table.evict(0);
-                            } else if indexing == Indexing::Incremental {
-                                // The name is read before the eviction that
-                                // makes room may remove the entry it names;
-                                // then the entry goes in, so the table never
-                                // holds more than its size.
-                                let name = match name {
-                                    Name::Literal(text) => shared(text)?,
-                                    Name::Index(index) => {
-                                        self.table.name(index)?.ok_or(Error::Index)?
-                                    }
-                                };
-                                self.table.evict(self.max - size);
-                                self.table.insert(name, value.to_vec(MAX_STRING)?);
+                            if indexing == Indexing::Incremental {
+                                self.index(name, value, size)?;
                             }
                         }
                         Representation::SizeUpdate(_) => unreachable!(),
@@ -868,6 +864,36 @@ impl Table {
         if self.required_min.is_some() {
             return Err(Error::MissingSizeUpdate);
         }
+        Ok(())
+    }
+
+    /// Adds a field with incremental indexing whose entry takes `size`
+    /// (its name and value octets and [`ENTRY_OVERHEAD`]) to the table.
+    fn index(&mut self, name: Name<'_>, value: Text<'_>, size: usize) -> Result<(), Error> {
+        if size > self.max {
+            // An entry larger than the table empties it and is not added
+            // (RFC 7541 section 4.4): nothing is copied for it.
+            self.table.evict(0);
+            return Ok(());
+        }
+        // A name the dynamic table holds is shared before the eviction that
+        // makes room may remove its entry, which allocates nothing. Any
+        // other name is copied after the eviction, so no copy sits beside
+        // the entries about to leave, and the table never holds more than
+        // its size.
+        let held = match name {
+            Name::Index(index) if index > STATIC_TABLE.len() as u64 => {
+                Some(self.table.name(index)?.ok_or(Error::Index)?)
+            }
+            _ => None,
+        };
+        self.table.evict(self.max - size);
+        let name = match (held, name) {
+            (Some(name), _) => name,
+            (None, Name::Literal(text)) => shared(text)?,
+            (None, Name::Index(index)) => self.table.name(index)?.ok_or(Error::Index)?,
+        };
+        self.table.insert(name, value.to_vec(MAX_STRING)?);
         Ok(())
     }
 }
@@ -1196,6 +1222,12 @@ fictionet::codec_from!(Error, Trailing, |_| Error::Trailing);
 #[cfg(kani)]
 #[path = "../../../verification/hpack-grpc/kani/hpack.rs"]
 mod proofs;
+
+/// Bounded proofs that the tables hold no more than is charged for them,
+/// with every allocation counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../verification/hpack-grpc/kani/resources.rs"]
+mod resource_proofs;
 
 #[cfg(test)]
 mod tests {
