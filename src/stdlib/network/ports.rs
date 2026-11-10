@@ -123,14 +123,22 @@ impl Ready {
     }
 
     /// Clears slot `i`'s bit, and its word's summary bit if the word is
-    /// left empty. A waker that sets a bit in that word meanwhile sets the
-    /// summary bit after, or this sees its bit and sets the summary again.
+    /// left empty.
     fn clear(&self, i: usize) {
         let w = i / 64;
         let bit = 1 << (i % 64);
         if self.words[w].fetch_and(!bit, Ordering::AcqRel) & !bit != 0 {
             return;
         }
+        self.clear_summary(w);
+    }
+
+    /// Clears word `w`'s summary bit, found with the word empty. A waker
+    /// that sets a bit in that word meanwhile sets the summary bit after,
+    /// or this sees its bit and sets the summary again. A waker's summary
+    /// bit that lands after this looked again is left for an empty word,
+    /// and the next search that finds it so clears it here.
+    fn clear_summary(&self, w: usize) {
         let summary = &self.summary[w / 64];
         let summary_bit = 1 << (w % 64);
         summary.fetch_and(!summary_bit, Ordering::AcqRel);
@@ -168,6 +176,9 @@ impl Ready {
                 return None;
             }
             let mut bits = self.words[w].load(Ordering::Acquire);
+            if bits == 0 {
+                self.clear_summary(w);
+            }
             if w == lo / 64 {
                 bits &= u64::MAX << (lo % 64);
             }
@@ -385,6 +396,33 @@ impl<I: Interface> Ports<I> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// A waker's summary bit that lands after a clear found its word
+    /// empty is left set for a word with no bits; the next search that
+    /// finds it so clears it, and a slot set after is still found.
+    #[test]
+    fn a_search_clears_a_summary_bit_left_for_an_empty_word() {
+        let mut ready = Ready::default();
+        for i in 0..64 * 3 {
+            ready.grow(i);
+        }
+        let mark = ready.mark(70);
+        // The waker sets its bit; the task clears it and finds the word
+        // empty; then the waker's summary bit lands.
+        mark.word.fetch_or(mark.bit, Ordering::Release);
+        ready.clear(70);
+        mark.summary.fetch_or(mark.summary_bit, Ordering::Release);
+        assert_eq!(ready.find(0), None);
+        assert_eq!(
+            ready.summary[0].load(Ordering::Acquire) & mark.summary_bit,
+            0,
+            "the search left the summary bit of an empty word"
+        );
+        ready.set(130);
+        assert_eq!(ready.find(0), Some(130));
+        mark.set();
+        assert_eq!(ready.find(0), Some(70));
+    }
 
     #[test]
     fn replacing_the_task_releases_its_waker_outside_the_lock() {
