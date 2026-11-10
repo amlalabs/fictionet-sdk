@@ -3027,6 +3027,7 @@ fn vector_resolver(input: &Value, zones: &[Zone], queries: u16) -> Resolver {
             start: time(1_750_000_000),
         },
     )
+    .unwrap()
 }
 
 #[test]

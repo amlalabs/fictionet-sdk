@@ -135,7 +135,7 @@ impl<A: Authority> Program for Authoritative<A> {
         let make = move |session: Session| {
             let mut engine = AuthorityEngine::new(authority.clone(), server.clone(), local);
             engine.advance(session);
-            engine
+            Ok(engine)
         };
         let driver = Arc::new(Driver {
             fcx: fcx.clone(),
@@ -181,9 +181,13 @@ impl<A: Authority> Program for Authoritative<A> {
 /// [`partition`](Self::partition) gives each machine one engine per key
 /// instead. Each engine's cache is charged to a budget of its own, of
 /// [`max_cache_bytes`](Config::max_cache_bytes), which the world's
-/// resolver owns: no sandbox pays for what the cache holds. TCP
-/// connections are kept open and pipelined as [`Authoritative`] keeps
-/// them.
+/// resolver owns: no sandbox pays for what the cache holds. A budget with
+/// no room for the cache's index ([`CacheTooSmall`]) fails the program
+/// when its first engine is made, with that error, which ends the world's
+/// run. TCP connections are kept open and pipelined as [`Authoritative`]
+/// keeps them.
+///
+/// [`CacheTooSmall`]: fictionet::stdlib::services::dns::resolver::CacheTooSmall
 pub struct Recursive {
     config: Config,
     clock: WallClock,
@@ -275,9 +279,9 @@ impl Program for Recursive {
     ) -> Pin<Box<dyn Future<Output = fictionet::Result> + Send>> {
         let config = self.config.clone();
         let make = move |session: Session| {
-            let mut engine = Resolver::new(config.clone(), Ring, session.clock);
+            let mut engine = Resolver::new(config.clone(), Ring, session.clock)?;
             engine.advance(session);
-            engine
+            Ok(engine)
         };
         let driver = Arc::new(Driver {
             fcx: fcx.clone(),
@@ -589,18 +593,28 @@ impl Carrier for ToUpstream {
 struct Driver<E: Engine + Send + 'static> {
     fcx: Cx,
     machine: Endpoints,
-    /// Makes an engine in a session.
-    make: Box<dyn Fn(Session) -> E + Send + Sync>,
+    /// Makes an engine in a session, or says why it cannot.
+    make: Box<dyn Fn(Session) -> fictionet::Result<E> + Send + Sync>,
     /// The session without a namespace.
     first: Session,
     namespace: Option<Namespace>,
     on_event: Option<OnEvent>,
     carrier: Arc<dyn Carrier>,
     state: Mutex<State<E>>,
-    /// Wakes the timer when the next deadline moves.
-    kick: Mailbox<()>,
+    /// Wakes the timer when the next deadline moves, or with why the
+    /// driver stops.
+    kick: Mailbox<Kick>,
     /// Answers for UDP clients, which the task on port 53 sends.
     datagrams: Mailbox<(Vec<u8>, SocketAddr)>,
+}
+
+/// What the driver's timer task hears.
+enum Kick {
+    /// The engines' next deadline moved.
+    Deadline,
+    /// No engine could be made for a client: the program fails with this
+    /// error, which ends the world's run.
+    Fail(fictionet::Error),
 }
 
 /// What the driver's mutex guards.
@@ -687,13 +701,18 @@ impl<E: Engine + Send + 'static> Driver<E> {
         (id, answers)
     }
 
-    /// Hands `bytes` from `client` to its engine.
+    /// Hands `bytes` from `client` to its engine. When the client needs a
+    /// new engine and none can be made, the query is dropped and the
+    /// program fails.
     fn query(self: &Arc<Self>, client: Client, bytes: Vec<u8>) {
         let mut state = self.state.lock();
         let engines = state.engines.len();
         let index = state.partition.engine(&client, engines);
         if index == engines {
-            state.engines.push((self.make)(self.session()));
+            match (self.make)(self.session()) {
+                Ok(engine) => state.engines.push(engine),
+                Err(error) => return self.kick.push(Kick::Fail(error)),
+            }
         }
         let query = fictionet::stdlib::services::dns::ClientQuery { client, bytes };
         self.handle(&mut state, index, Input::Query(query));
@@ -820,16 +839,23 @@ impl<E: Engine + Send + 'static> Driver<E> {
         let deadline = state.engines.iter().filter_map(Engine::next_deadline).min();
         if deadline != state.deadline {
             state.deadline = deadline;
-            self.kick.push(());
+            self.kick.push(Kick::Deadline);
         }
     }
 
-    /// Ticks the engines at each deadline they ask for.
+    /// Ticks the engines at each deadline they ask for, until the driver
+    /// fails: then it ends with the error, which fails the program.
     async fn wake_at_deadlines(self: Arc<Self>, fcx: Cx) -> fictionet::Result {
         loop {
             let deadline = self.state.lock().deadline;
             match fcx.race(deadline, self.kick.take()).await {
-                Ok(_) => {}
+                Ok(kicks) => {
+                    for kick in kicks.into_iter().flatten() {
+                        if let Kick::Fail(error) = kick {
+                            return Err(error);
+                        }
+                    }
+                }
                 Err(RaceError::Deadline) => self.tick(),
                 Err(RaceError::Cancelled) => return Ok(()),
             }

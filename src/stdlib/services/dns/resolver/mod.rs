@@ -119,6 +119,40 @@ pub struct Resolver<V: Verify = Ring> {
     now: Instant,
 }
 
+/// Why [`Resolver::new`] made no resolver: its
+/// [`max_cache_bytes`](Config::max_cache_bytes) has no room for the index
+/// of a cache of [`max_cache_entries`](Config::max_cache_entries) things,
+/// which the cache charges when it is made ([`Cache::storage`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheTooSmall {
+    /// The cache's budget.
+    pub max_cache_bytes: usize,
+    /// The most things the cache holds.
+    pub max_cache_entries: usize,
+}
+
+impl std::fmt::Display for CacheTooSmall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            max_cache_bytes,
+            max_cache_entries,
+        } = self;
+        match Cache::storage(*max_cache_entries) {
+            Some(needs) => write!(
+                f,
+                "max_cache_bytes of {max_cache_bytes} has no room for the index of \
+                 {max_cache_entries} cache entries, which needs {needs} bytes"
+            ),
+            None => write!(
+                f,
+                "the index of {max_cache_entries} cache entries is larger than memory"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CacheTooSmall {}
+
 /// One client query being answered.
 struct Asker {
     client: Client,
@@ -261,11 +295,9 @@ impl<V: Verify> Resolver<V> {
     /// as it owns the cache, and not the sandbox of a client whose
     /// question brought the data in.
     ///
-    /// # Panics
-    ///
-    /// If `max_cache_bytes` has no room for the cache's index of
+    /// Fails if `max_cache_bytes` has no room for the cache's index of
     /// `max_cache_entries` things ([`Cache::storage`]).
-    pub fn new(config: Config, verify: V, clock: WallClock) -> Resolver<V> {
+    pub fn new(config: Config, verify: V, clock: WallClock) -> Result<Resolver<V>, CacheTooSmall> {
         let server = ServerConfig {
             identity: config.identity.clone(),
             payload: config.payload,
@@ -284,8 +316,11 @@ impl<V: Verify> Resolver<V> {
                 .map_or(std::time::Duration::ZERO, |stale| stale.max_stale),
             max_entries: config.max_cache_entries,
         };
-        let cache = Cache::new(limits, &Budget::new(config.max_cache_bytes))
-            .expect("max_cache_bytes holds the cache's index of max_cache_entries things");
+        let cache =
+            Cache::new(limits, &Budget::new(config.max_cache_bytes)).ok_or(CacheTooSmall {
+                max_cache_bytes: config.max_cache_bytes,
+                max_cache_entries: config.max_cache_entries,
+            })?;
         let mut local_order: Vec<usize> = (0..config.local.len()).collect();
         local_order.sort_by_key(|&index| {
             std::cmp::Reverse((label_count(config.local[index].data.apex()), index))
@@ -295,7 +330,7 @@ impl<V: Verify> Resolver<V> {
             .iter()
             .map(|zone| zone.data.apex().clone())
             .collect();
-        Resolver {
+        Ok(Resolver {
             config,
             local_order,
             hosted,
@@ -310,7 +345,7 @@ impl<V: Verify> Resolver<V> {
             restart: Vec::new(),
             queue: VecDeque::new(),
             now: Instant::ZERO,
-        }
+        })
     }
 
     /// The cache, to look at what the resolver has learned.

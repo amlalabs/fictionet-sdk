@@ -27,7 +27,7 @@ use fictionet::stdlib::services::dns::authority::{
 };
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{
-    Cache, Config, Entry, FailureKind, Key, LocalZone, Resolver, Work,
+    Cache, CacheTooSmall, Config, Entry, FailureKind, Key, LocalZone, Resolver, Work,
 };
 use fictionet::stdlib::services::dns::zone::{
     Denial, Fact, Lazy, Transparent, Zone, ZoneBuilder, ZoneData, dname,
@@ -435,7 +435,7 @@ pub(super) fn clock() -> WallClock {
 }
 
 pub(super) fn resolver(config: Config) -> Resolver {
-    Resolver::new(config, Ring, clock())
+    Resolver::new(config, Ring, clock()).unwrap()
 }
 
 pub(super) fn client(port: u16) -> Client {
@@ -658,13 +658,26 @@ fn the_resolver_charges_its_cache_to_a_budget_of_its_own() {
 }
 
 #[test]
-#[should_panic(expected = "max_cache_bytes")]
 fn a_resolver_needs_room_for_the_index_of_its_cache() {
     let config = config(None);
-    resolver(Config {
-        max_cache_bytes: Cache::storage(config.max_cache_entries).unwrap() - 1,
+    let index = Cache::storage(config.max_cache_entries).unwrap();
+    let short = Config {
+        max_cache_bytes: index - 1,
+        ..config.clone()
+    };
+    let refused = Resolver::new(short, Ring, clock()).err();
+    assert_eq!(
+        refused,
+        Some(CacheTooSmall {
+            max_cache_bytes: index - 1,
+            max_cache_entries: config.max_cache_entries,
+        })
+    );
+    let exact = Config {
+        max_cache_bytes: index,
         ..config
-    });
+    };
+    assert!(Resolver::new(exact, Ring, clock()).is_ok());
 }
 
 #[test]
@@ -1502,7 +1515,8 @@ fn a_new_session_keeps_old_completions_out_and_checks_signatures_against_its_clo
         WallClock {
             start: date(1_900_000_000),
         },
-    );
+    )
+    .unwrap();
     let mut watched = Watched {
         engine: resolver,
         events: Vec::new(),
@@ -1581,7 +1595,8 @@ fn the_old_clock_finds_expired_signatures() {
         WallClock {
             start: date(1_900_000_000),
         },
-    );
+    )
+    .unwrap();
     let reply = ask(
         &mut resolver,
         &mut net,
@@ -4815,7 +4830,8 @@ fn a_fresh_secure_answer_lives_no_longer_than_its_signatures() {
         WallClock {
             start: date(1_800_000_000 - 60),
         },
-    );
+    )
+    .unwrap();
     for (seconds, port) in [(0, 1), (1, 2)] {
         let reply = ask(
             &mut resolver,
@@ -4856,7 +4872,8 @@ fn a_fresh_secure_alias_from_a_dname_lives_no_longer_than_its_signatures() {
             WallClock {
                 start: date(1_800_000_000 - 60),
             },
-        );
+        )
+        .unwrap();
         let reply = ask(
             &mut resolver,
             &mut net,
@@ -4984,7 +5001,8 @@ fn priming_offers_room_for_the_roots_ns_rrset_and_glue() {
         },
         Ring,
         clock(),
-    );
+    )
+    .unwrap();
     let www = query(client(1), "www.example.com.", RecordType::A, |_| {});
     google.handle(Input::Query(www), at(0), &entropy());
     let sent = std::iter::from_fn(|| google.poll())
@@ -5517,7 +5535,8 @@ fn a_secure_negative_lives_no_longer_than_its_signatures() {
         WallClock {
             start: date(1_800_000_000 - 60),
         },
-    );
+    )
+    .unwrap();
     let reply = ask(
         &mut resolver,
         &mut net,
