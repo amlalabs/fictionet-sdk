@@ -879,3 +879,48 @@ redesign, and HTTP/1 the same number. Instructions are within 0.1 percent
 for both benches, and TCP's allocations and packets are unchanged. The
 ten-connection TCP time is the noisiest case: in a later check of both
 builds back to back, each ran it between 52 and 60 ms.
+
+## The budget leftovers merge of November 10, 2026 (`comp/lo-integ`)
+
+The foundation `comp/lo-found` (553f72347: budget views, close causes,
+heap bounds) and the five stage branches built on it, `comp/lo-runners`,
+`comp/lo-children`, `comp/lo-ssh`, `comp/lo-http2` and `comp/lo-framed`,
+were merged into `main` at 2dc95d6a8. `main` had moved since 705ac6aa8: `comp/bfix-tls2`
+(rustls keeps one buffer per record) was merged at 1be1d97ef, and `main`
+stood at 334e2fc79 before this merge. The table gives all three, so the
+TLS branch's share and this merge's share can be read apart.
+
+The method is the one above: the bench profile with frame pointers and
+line tables, each build in a target directory of its own, each bench
+process (`runtime::http` and `network::tcp`, with the benches' own three
+samples per case) under `perf stat -e instructions:u`. Each build ran
+three times, interleaved, with the order rotated each round, and the
+table gives the median. Instruction counts repeated to within 0.1
+percent.
+
+| Workload | 705ac6aa8 | Before (334e2fc79) | After (2dc95d6a8) |
+| --- | ---: | ---: | ---: |
+| HTTP bench process, instructions | 122.39 G | 124.26 G | 125.75 G |
+| HTTP/1, 101,010 requests | 1.108 s | 1.111 s | 1.143 s |
+| HTTP/2, 101,010 requests | 1.727 s | 1.737 s | 1.784 s |
+| HTTP/1 allocations | 5,654,751 | 5,654,757 | 5,654,744 |
+| HTTP/2 allocations | 8,697,051 | 8,797,053 | 8,897,099 |
+| TCP bulk process, instructions | 14.29 G | 14.29 G | 14.29 G |
+| TCP, one connection, 32 MiB | 31.48 ms | 31.65 ms | 31.57 ms |
+| TCP, ten connections, 4 MiB each | 46.67 ms | 46.70 ms | 48.54 ms |
+| TCP, one hundred connections, 1 MiB each | 203.7 ms | 204.0 ms | 205.6 ms |
+| TCP allocations, one connection | 88,856 | 88,856 | 88,856 |
+| TCP allocations, ten connections | 128,728 | 128,728 | 128,728 |
+| TCP allocations, one hundred connections | 479,872 | 479,872 | 479,872 |
+| Packets sent, one hundred connections | 109,400 | 109,400 | 109,400 |
+
+This merge adds 1.2 percent to the HTTP bench's instructions, and the TLS
+branch before it 1.5 percent. Each adds about one allocation per HTTP/2
+request. This merge's one is the budget view each child of `Children`
+now asks through: a view is a shared record of its own, so each HTTP/2
+stream makes one. The HTTP bench ran once on each stage branch built
+alone: `comp/lo-children` made 100,055 more HTTP/2 allocations than its
+base, 553f72347, and `comp/lo-runners` and `comp/lo-http2` none. Those
+single runs did not separate the instructions: each branch alone was
+within 1.1 percent of its base. HTTP/1 and TCP are unchanged in
+allocations, and TCP in instructions and packets.
