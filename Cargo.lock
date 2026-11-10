@@ -1396,6 +1396,7 @@ dependencies = [
  "bytes",
  "divan",
  "etherparse",
+ "fictionet-buf",
  "fictionet-codegen",
  "fictionet-codegen-golden",
  "fictionet-extras",
@@ -1430,6 +1431,10 @@ dependencies = [
  "web-time",
  "x25519-dalek",
 ]
+
+[[package]]
+name = "fictionet-buf"
+version = "0.1.0"
 
 [[package]]
 name = "fictionet-cli"

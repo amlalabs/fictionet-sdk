@@ -77,6 +77,7 @@ mod contract_buffers;
 
 pub use provider::{client_config_builder, config_builder, crypto_provider};
 
+pub use budget::TlsBudget;
 pub use factory::{
     CertifiedKey, Factory, Handshake, Negotiation, Opening, Selected, Selecting, Selection,
 };

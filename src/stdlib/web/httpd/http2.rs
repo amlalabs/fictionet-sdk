@@ -666,7 +666,7 @@ impl Http2 {
             return false;
         }
         debug_assert_eq!(bytes.len(), len);
-        self.queue(env, Chunk::from_bytes(bytes), stream, 0, end)
+        self.queue(env, Chunk::from(bytes), stream, 0, end)
     }
 
     /// A connection frame.
@@ -757,11 +757,11 @@ impl Http2 {
                 code: code as u32,
                 debug: Vec::new(),
             };
-            let mut bytes = charge.into_bytes();
+            let mut bytes = ChargedBytes::from_charge(charge);
             if bytes.fill(|bytes| goaway.write(bytes)).is_ok() {
                 // The place every other piece left free takes it.
                 let len = bytes.len();
-                let goaway = piece(Chunk::from_bytes(bytes), 0, 0, false, false);
+                let goaway = piece(Chunk::from(bytes), 0, 0, false, false);
                 if self.sent.push_back(goaway).is_ok() {
                     self.unwritten_bytes += len;
                 }
@@ -1725,7 +1725,7 @@ impl Http2 {
             self.write_reset(env, id, ErrorCode::InternalError);
             return false;
         }
-        self.queue(env, Chunk::from_bytes(out), id, 0, end)
+        self.queue(env, Chunk::from(out), id, 0, end)
     }
 
     /// Frames response bodies within both windows, a frame per stream in
@@ -1813,9 +1813,9 @@ impl Http2 {
                 return Sent::Frame;
             };
             let queued = if whole {
-                self.queue(env, Chunk::from_bytes(bytes), id, n as u64, false)
+                self.queue(env, Chunk::from(bytes), id, n as u64, false)
             } else {
-                self.queue(env, Chunk::from_bytes(bytes), id, 0, false)
+                self.queue(env, Chunk::from(bytes), id, 0, false)
                     && self.queue_continuation(env, payload, id, n as u64)
             };
             if queued {

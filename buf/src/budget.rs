@@ -3,22 +3,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::Waker;
 
-use fictionet::sync::Mutex;
+use crate::sync::Mutex;
 
 /// Bytes that connections may hold, shared by everything charged to it:
-/// one sandbox's connections in [`Net`](fictionet::stdlib::world::net::Net).
+/// one sandbox's connections in a world, or one stack's.
 /// Cheap to clone; clones share the count.
 ///
 /// A [`Charge`] holds part of it and gives it back when dropped. Charge
 /// before growing: [`Budget::charge`] and [`Charge::grow_to`] refuse,
 /// changing nothing, when the total would pass the limit, so the limit
-/// holds at every moment and not only when someone checks. The charged
-/// containers ([`ChargedBytes`](super::ChargedBytes),
-/// [`ChargedDeque`](super::ChargedDeque) and the rest) hold their charge
-/// inside, so they cannot grow without it. A layer reaches its
-/// connection's budget through [`Env::budget`](super::Env::budget); a
-/// [`Chunk`](super::Chunk) carries its charge with it, so the charge moves
-/// with the bytes.
+/// holds at every moment and not only when someone checks. Containers
+/// that hold their charge inside cannot grow without it. A
+/// [`Chunk`](crate::Chunk) carries its charge with it, so the charge moves
+/// with the bytes, and a [`Pool`](crate::Pool) charges what it keeps.
 ///
 /// A refusal is not a dead end. The runner that drove the refused layer
 /// asks to be woken when memory frees ([`Budget::wake_when_freed`]), and
@@ -34,11 +31,6 @@ use fictionet::sync::Mutex;
 /// than the whole limit, which no release can ever meet
 /// ([`starved_since`](Budget::starved_since)). A refusal through one view
 /// is invisible to another.
-///
-/// The [stack runners](fictionet::stdlib::services::stack) charge each
-/// connection its read buffer, the bytes read but not yet taken, and the
-/// table of the stack's work; each layer charges what it holds, such as a
-/// framer's buffer and the replies not yet written.
 #[derive(Clone)]
 pub struct Budget {
     inner: Arc<BudgetInner>,
@@ -81,8 +73,7 @@ struct View {
 }
 
 /// What a budget wakes when memory frees after a refusal: a stack, or one
-/// child of a stack ([`Children`](super::Children)), with the waker that
-/// gets it run again.
+/// child of a stack, with the waker that gets it run again.
 ///
 /// Its owner makes it once and keeps it, so asking again while it waits
 /// adds nothing to the budget's list. Dropping it takes it off: it is
@@ -152,8 +143,8 @@ impl Waiter {
 
     /// A waiter that calls `wake` when woken, and whose
     /// [`waker`](Self::waker) calls it too: one allocation for both, for an
-    /// owner that makes the waker only to wait with it, as a child of
-    /// [`Children`](super::Children) does.
+    /// owner that makes the waker only to wait with it, as a child of a
+    /// multiplexing layer does.
     pub fn from_fn(wake: impl Fn() + Send + Sync + 'static) -> Waiter {
         let node = Arc::new(Node {
             wake,
@@ -303,8 +294,8 @@ impl Budget {
     /// refused since `since`: once a release leaves room for the least
     /// that a charge refused since the last wake needed. A runner calls
     /// this after each round, with what [`refusals`](Self::refusals) said
-    /// before it; a layer never does, though a layer that runs others, as
-    /// [`Children`](super::Children) does, calls it for each of them.
+    /// before it; a layer never does, though a layer that runs others
+    /// calls it for each of them.
     /// When nothing was refused through this view since, it does nothing,
     /// whatever other views were refused. When a release woke the runners
     /// since `since`, or there is room now, it wakes `waiter` at once.
@@ -333,11 +324,12 @@ impl Budget {
         self.inner.limit.saturating_sub(self.used())
     }
 
-    /// Takes as much of `want` as fits, or nothing. Outside this module
-    /// only a holder that keeps its own count calls it, as rustls's charges
-    /// do ([`services::tls`](fictionet::stdlib::services::tls)), and gives
-    /// the bytes back with [`release`](Self::release).
-    pub(crate) fn take(&self, want: RangeInclusive<usize>) -> Option<usize> {
+    /// Takes as much of `want` as fits, or nothing, with no [`Charge`] to
+    /// hold it. Only a holder that keeps its own count calls this, such as
+    /// a library's buffers paid from a budget, and it gives the bytes back
+    /// with [`release`](Self::release), or hands them to a charge with
+    /// [`Charge::adopt`]. A refusal is recorded as any other is.
+    pub fn take(&self, want: RangeInclusive<usize>) -> Option<usize> {
         if *want.end() == 0 {
             return (*want.start() == 0).then_some(0);
         }
@@ -402,9 +394,11 @@ impl Budget {
         fits(room(before))
     }
 
-    /// Gives back `bytes`, waking the runners if that leaves room for the
-    /// least that a charge refused since they were last woken needed.
-    pub(crate) fn release(&self, bytes: usize) {
+    /// Gives back `bytes` taken with [`take`](Self::take), waking the
+    /// runners if that leaves room for the least that a charge refused
+    /// since they were last woken needed. Only the holder that took them
+    /// calls this.
+    pub fn release(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
@@ -445,7 +439,7 @@ impl std::fmt::Debug for Charge {
 
 impl Charge {
     /// A charge of nothing, which always fits.
-    pub(crate) fn nothing(budget: &Budget) -> Charge {
+    pub fn nothing(budget: &Budget) -> Charge {
         Charge {
             budget: budget.clone(),
             now: 0,
@@ -453,10 +447,10 @@ impl Charge {
     }
 
     /// A charge of `bytes` that `budget` already counts, taken over from
-    /// a holder that ended its own charge without giving them back, as
-    /// rustls's charges do when bytes leave a connection. The budget's
-    /// total does not change.
-    pub(crate) fn adopt(budget: &Budget, bytes: usize) -> Charge {
+    /// a holder that took them with [`Budget::take`] and ended its own
+    /// count without giving them back, as a library's buffers do when
+    /// bytes leave a connection. The budget's total does not change.
+    pub fn adopt(budget: &Budget, bytes: usize) -> Charge {
         Charge {
             budget: budget.clone(),
             now: bytes,
@@ -558,60 +552,6 @@ impl Drop for Charge {
         self.budget.release(self.now);
     }
 }
-
-/// The lifetime of work issued by a layer. Dropping or cancelling it makes
-/// every outstanding lease invalid; the runner drops the work before polling.
-pub struct WorkOwner {
-    live: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl WorkOwner {
-    /// A new live owner.
-    pub fn new() -> Self {
-        Self {
-            live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        }
-    }
-
-    /// Associate work with this lifetime.
-    pub fn own<W>(&self, work: W) -> OwnedWork<W> {
-        OwnedWork {
-            work,
-            live: self.live.clone(),
-        }
-    }
-
-    /// Invalidate all outstanding work, without waiting for its tasks.
-    pub fn cancel(&self) {
-        self.live.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for WorkOwner {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-/// Work carrying the lifetime of the layer that issued it.
-pub struct OwnedWork<W> {
-    pub(crate) work: W,
-    live: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl<W> OwnedWork<W> {
-    /// Whether the issuing lifetime has ended.
-    pub fn cancelled(&self) -> bool {
-        !self.live.load(Ordering::Acquire)
-    }
-}
-
-impl Default for WorkOwner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,7 +839,7 @@ mod tests {
         );
         assert_eq!(refusals(marks), [false, false, true]);
         let marks = [&budget, &a, &b].map(Budget::refusals);
-        assert!(super::super::ChargedBytes::with_capacity(&a, 4).is_none());
+        assert!(crate::Chunk::copy_of(&a, &[0; 4]).is_none());
         assert_eq!(refusals(marks), [false, true, false]);
 
         let (count_a, count_b) = (Arc::new(Count::default()), Arc::new(Count::default()));

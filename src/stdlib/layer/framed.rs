@@ -290,7 +290,7 @@ where
                         return Err(FramedError::Write(WriteFailure::Bound));
                     }
                 }
-                self.out = Some(Chunk::from_bytes(bytes));
+                self.out = Some(Chunk::from(bytes));
                 Ok(Admit::Taken)
             }
             MessageCommand::End => {

@@ -318,7 +318,7 @@ impl Layer for Echo {
             let Some(room) = reserve.split(self.room) else {
                 return Ok(false);
             };
-            self.out = Some(room.into_bytes());
+            self.out = Some(ChargedBytes::from_charge(room));
         }
         let Some(out) = self.out.as_mut() else {
             return Ok(false);
@@ -348,7 +348,7 @@ impl Layer for Echo {
         if self.ready.is_none()
             && let Some(out) = self.out.take_if(|out| !out.is_empty())
         {
-            self.ready = Some(Chunk::from_bytes(out));
+            self.ready = Some(Chunk::from(out));
             moved = true;
         }
         Ok(moved)

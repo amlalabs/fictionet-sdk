@@ -199,7 +199,7 @@ impl Grpc {
             self.finish(Status::new(Code::ResourceExhausted, "message too large"));
             return;
         }
-        self.next = Some(ExchangeCommand::Data(Chunk::from_bytes(bytes)));
+        self.next = Some(ExchangeCommand::Data(Chunk::from(bytes)));
     }
 
     /// Reads the whole messages at the start of the partial bytes, while

@@ -2388,7 +2388,7 @@ impl Connection for TcpConnection {
         cx: &mut Context<'_>,
         data: &Chunk,
     ) -> Poll<Result<usize, ConnError>> {
-        self.poll_send(fcx, cx, data.len(), |n| data.prefix(n))
+        self.poll_send(fcx, cx, data.len(), |n| data.slice(0..n))
     }
 
     /// Sends a FIN once the peer has acknowledged every byte already written.

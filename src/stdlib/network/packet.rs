@@ -463,10 +463,10 @@ impl Whole for CheckedIpPacket {
             None
         };
         if let (Some(copy), Origin::Normalized { original }) = (original, &mut self.origin) {
-            *original = Chunk::from_bytes(copy);
+            *original = Chunk::from(copy);
         }
         if let Some(copy) = packet {
-            self.bytes = Chunk::from_bytes(copy);
+            self.bytes = Chunk::from(copy);
         }
         true
     }

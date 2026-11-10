@@ -211,7 +211,7 @@ where
         let n = data.len().min(WRITE);
         let bytes = ChargedBytes::copy_of(self.live.driver().budget(), &data[..n])
             .ok_or(ConnError::Broken)?;
-        let command = StreamCommand::Write(Chunk::from_bytes(bytes));
+        let command = StreamCommand::Write(Chunk::from(bytes));
         let taken = match self.live.driver().command(command).map_err(Into::into)? {
             Admit::Taken => n,
             Admit::Partial(StreamCommand::Write(rest)) => n - rest.len(),

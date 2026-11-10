@@ -366,6 +366,7 @@ pub use cable::{End, PACKET_COST, pair, pair_with_limit};
 pub use clock::RunMode;
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
+pub use fictionet_buf::{Budget, Charge, Chunk, Pool};
 pub use interface::{Interface, InterfaceExt, Packet, Recv, RecvError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};

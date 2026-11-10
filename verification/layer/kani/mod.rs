@@ -1,6 +1,6 @@
 //! Kani proofs over the parts of the layer foundation that hold state of
 //! their own: the child slots of a mux, the budget, its charges and the
-//! containers they pay for, a layer's timers, and the cursor of a chunk.
+//! containers they pay for, a layer's timers, and stream credit over chunks.
 //! Compiled only under `cargo kani`, as a child module of
 //! `src/stdlib/layer/mod.rs`, so every harness calls the production code
 //! through its public API.
@@ -724,68 +724,11 @@ fn timers_cancel_fire_and_retain_touch_one_name() {
 }
 
 // ---------------------------------------------------------------------------
-// Chunk (src/stdlib/layer/carrier.rs, `Chunk`)
+// Stream credit over chunks (src/stdlib/layer/carrier.rs; the chunk itself is
+// proved in verification/buf/kani/mod.rs)
 
 /// The longest chunk the harness builds.
 const CHUNK: usize = 4;
-
-/// For any four bytes, paid for by a charge or not, two advances of any
-/// lengths that fit (zero and up to the end included) leave exactly the
-/// suffix after both: `len`, `is_empty` and the bytes agree with the
-/// original from the cursor on. The charge does not move with the cursor
-/// (it pays for the whole allocation) and is given back when the chunk is
-/// dropped. The length is fixed: a symbolic allocation size took the
-/// solver past the memory cap.
-#[kani::proof]
-#[kani::unwind(6)]
-#[kani::solver(minisat)]
-fn a_chunk_cursor_keeps_the_rest_in_place() {
-    let bytes: [u8; CHUNK] = kani::any();
-    let length = CHUNK;
-    let budget = Budget::new(CHUNK);
-    let charged: bool = kani::any();
-    let mut chunk = if charged {
-        ChargedBytes::copy_of(&budget, &bytes).unwrap().into_chunk()
-    } else {
-        Chunk::unpaid(bytes.to_vec())
-    };
-    let cost = if charged { length } else { 0 };
-    assert_eq!(chunk.len(), length);
-    assert_eq!(chunk.charged(), cost);
-
-    let mut cursor = 0usize;
-    for _ in 0..2 {
-        let n: usize = kani::any();
-        kani::assume(n <= length - cursor);
-        chunk.advance(n);
-        cursor += n;
-        assert_eq!(chunk.len(), length - cursor);
-        assert_eq!(chunk.is_empty(), cursor == length);
-        for i in 0..CHUNK {
-            if i < chunk.len() {
-                assert_eq!(chunk[i], bytes[cursor + i]);
-            }
-        }
-        assert_eq!(chunk.charged(), cost);
-        assert_eq!(budget.used(), cost);
-    }
-    drop(chunk);
-    assert_eq!(budget.used(), 0);
-}
-
-/// Advancing past the end panics instead of moving the cursor anywhere.
-#[kani::proof]
-#[kani::should_panic]
-#[kani::unwind(6)]
-#[kani::solver(minisat)]
-fn a_chunk_cursor_never_passes_the_end() {
-    let length: usize = kani::any();
-    kani::assume(length <= CHUNK);
-    let mut chunk = Chunk::unpaid(vec![0u8; length]);
-    let n: usize = kani::any();
-    kani::assume(n > length && n <= CHUNK + 1);
-    chunk.advance(n);
-}
 
 /// Splitting for a peer window preserves both byte order and the backing
 /// reservation, whichever half is released first.
@@ -849,30 +792,4 @@ fn work_cancellation_stays_with_its_owner() {
     assert!(first.cancelled());
     assert!(second.cancelled());
     assert!(!next.cancelled());
-}
-
-/// A copied edit preserves its sibling, is reserved before allocation, and
-/// returns both reservations when the owners leave.
-#[kani::proof]
-#[kani::unwind(6)]
-fn a_shared_chunk_edit_preserves_ownership_and_budget() {
-    let bytes: [u8; 4] = kani::any();
-    let value: u8 = kani::any();
-    let room: bool = kani::any();
-    let budget = Budget::new(if room { 6 } else { 5 });
-    let mut suffix = ChargedBytes::copy_of(&budget, &bytes).unwrap().into_chunk();
-    let mut prefix = suffix.split_to(2);
-    let edited = prefix.make_mut(&budget);
-    assert_eq!(edited.is_some(), room);
-    if let Some(edited) = edited {
-        edited[0] = value;
-    }
-    assert_eq!(&*suffix, &bytes[2..]);
-    assert_eq!(prefix[0], if room { value } else { bytes[0] });
-    assert_eq!(prefix[1], bytes[1]);
-    assert_eq!(budget.used(), if room { 6 } else { 4 });
-    drop(suffix);
-    assert_eq!(budget.used(), if room { 2 } else { 4 });
-    drop(prefix);
-    assert_eq!(budget.used(), 0);
 }

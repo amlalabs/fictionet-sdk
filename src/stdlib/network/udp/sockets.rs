@@ -347,7 +347,7 @@ impl UdpLayer {
             socket.bytes += cost;
             socket
                 .queue
-                .push_back((Datagram::new(Chunk::from_bytes(bytes), peer), place));
+                .push_back((Datagram::new(Chunk::from(bytes), peer), place));
             self.wake(id);
             return;
         } else {

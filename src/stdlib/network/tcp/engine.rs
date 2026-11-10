@@ -1050,7 +1050,7 @@ impl TcpLayer {
         if !charge.grow_to(Self::storage_bytes(places).unwrap() + spare_bytes) {
             return false;
         }
-        let spare = charge.split(spare_bytes).unwrap().into_vec();
+        let spare = ChargedVec::from_charge(charge.split(spare_bytes).unwrap());
         self.dev.spare = Spare(Some(spare));
         self.up.reserve_exact(UP_ROOM);
         self.urgent.reserve_exact(UP_ROOM);
@@ -2313,7 +2313,7 @@ impl TcpLayer {
                             Ok::<_, Infallible>(())
                         })
                         .expect("a receive stops at the capacity");
-                    Chunk::from_bytes(bytes)
+                    Chunk::from(bytes)
                 }
             };
             let got = chunk.len();

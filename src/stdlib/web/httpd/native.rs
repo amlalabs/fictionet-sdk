@@ -322,8 +322,7 @@ impl Http1 {
     /// Queues bytes whose allocation was reserved before encoding.
     fn push_out(&mut self, bytes: ChargedBytes) {
         self.queued += bytes.len() as u64;
-        self.out
-            .push_back(StreamCommand::Write(Chunk::from_bytes(bytes)));
+        self.out.push_back(StreamCommand::Write(Chunk::from(bytes)));
     }
 
     /// Whether everything queued has been handed below and written.
@@ -805,14 +804,12 @@ impl Http1 {
             let Some(bytes) = ChargedBytes::copy_of(env.budget(), unread) else {
                 return self.over_budget(env);
             };
-            self.leftover
-                .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
+            self.leftover.push(StreamEvent::Data(Chunk::from(bytes)));
         }
         if !self.after.is_empty() {
             let mut bytes = std::mem::replace(&mut self.after, ChargedBytes::new(env.budget()));
             bytes.trim();
-            self.leftover
-                .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
+            self.leftover.push(StreamEvent::Data(Chunk::from(bytes)));
         }
         if self.peer_ended {
             self.leftover.push(StreamEvent::Ended);

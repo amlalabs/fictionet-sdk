@@ -350,7 +350,7 @@ impl Connection for TunnelConn {
         let n = room.min(data.len());
         let chunk = match &shared.budget {
             Some(budget) => match ChargedBytes::copy_of(budget, &data[..n]) {
-                Some(bytes) => Chunk::from_bytes(bytes),
+                Some(bytes) => Chunk::from(bytes),
                 None => return Poll::Ready(Err(ConnError::Closed)),
             },
             None => Chunk::unpaid(&data[..n]),

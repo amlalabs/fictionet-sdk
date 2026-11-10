@@ -376,8 +376,8 @@ impl Output {
             let mut data = if self.chunks.places() == 0 {
                 let places = 1025 * size_of::<Chunk>();
                 let mut charge = self.budget.charge(places + bytes.len()).ok_or(OutputFull)?;
-                self.chunks = charge.split(places).unwrap().into_deque();
-                charge.into_bytes()
+                self.chunks = ChargedDeque::from_charge(charge.split(places).unwrap());
+                ChargedBytes::from_charge(charge)
             } else {
                 ChargedBytes::with_capacity(&self.budget, bytes.len()).ok_or(OutputFull)?
             };
@@ -388,7 +388,7 @@ impl Output {
                 self.chunks
                     .push_back(Chunk::Data {
                         stderr,
-                        data: Bytes::from_bytes(data),
+                        data: Bytes::from(data),
                     })
                     .is_ok()
             );
@@ -1510,13 +1510,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 },
             );
         }
-        let mut kept = paid
-            .split(data.len())
-            .ok_or(TransportError::State)?
-            .into_bytes();
+        let mut kept =
+            ChargedBytes::from_charge(paid.split(data.len()).ok_or(TransportError::State)?);
         kept.extend_within(&data)
             .map_err(|_| TransportError::State)?;
-        let data = Bytes::from_bytes(kept);
+        let data = Bytes::from(kept);
         self.raise(MuxEvent::Child(
             id,
             match kind {
@@ -2013,7 +2011,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                     })
                     .is_ok()
             );
-            return Some(StreamCommand::Write(Bytes::from_bytes(bytes)));
+            return Some(StreamCommand::Write(Bytes::from(bytes)));
         }
         if self.ended && !self.end_sent {
             self.end_sent = true;

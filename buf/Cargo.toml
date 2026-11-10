@@ -1,0 +1,16 @@
+# Fictionet's bytes and budgets: Chunk, Budget, Charge, Waiter and Pool.
+# Standard library only, so the vendored smoltcp can hold chunks.
+[package]
+name = "fictionet-buf"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Bytes on their way through a Fictionet world, and what pays for them."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[dependencies]

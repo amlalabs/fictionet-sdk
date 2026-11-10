@@ -47,7 +47,7 @@ impl<T: Clone + Eq, W, N> Out<'_, T, W, N> {
     /// has no room for ends the connection.
     pub(crate) fn write(&mut self, bytes: &[u8]) {
         match ChargedBytes::copy_of(self.budget, bytes) {
-            Some(bytes) => self.writes.push_back(Chunk::from_bytes(bytes)),
+            Some(bytes) => self.writes.push_back(Chunk::from(bytes)),
             None => *self.over_budget = true,
         }
     }

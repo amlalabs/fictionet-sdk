@@ -133,7 +133,7 @@ impl Layer for Framed {
         if body.room() == 0
             && let Some(body) = self.body.take()
         {
-            self.packet = Some(PacketEvent::Packet(Chunk::from_bytes(body)));
+            self.packet = Some(PacketEvent::Packet(Chunk::from(body)));
             self.prefix_len = 0;
         }
         Ok(if bytes.is_empty() {
@@ -167,7 +167,7 @@ impl Layer for Framed {
                     .extend_within(&(packet.len() as u32).to_be_bytes())
                     .and_then(|()| frame.extend_within(&packet))
                     .expect("the prefix and packet fit in the reserved frame");
-                StreamCommand::Write(Chunk::from_bytes(frame))
+                StreamCommand::Write(Chunk::from(frame))
             }
             PacketCommand::End => {
                 self.output_end = true;
@@ -196,7 +196,7 @@ mod tests {
             let expected: Vec<_> = (0..len).collect();
             let budget = Budget::new(4096);
             let mut stack = Harness::with_budget(Seed::from_u64(1), Framed::new(), budget.clone());
-            let packet = Chunk::from_bytes(ChargedBytes::copy_of(&budget, &expected).unwrap());
+            let packet = Chunk::from(ChargedBytes::copy_of(&budget, &expected).unwrap());
             let pointer = packet.as_ptr();
             let paid = budget.used();
             let held = budget.charge(budget.limit() - paid).unwrap();

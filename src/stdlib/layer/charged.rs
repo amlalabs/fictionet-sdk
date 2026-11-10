@@ -23,53 +23,34 @@ pub struct ChargedBytes {
     charge: Charge,
 }
 
-impl Charge {
-    /// The bytes this charge pays for: an empty allocation of exactly
-    /// [`bytes`](Self::bytes).
-    pub fn into_bytes(self) -> ChargedBytes {
-        ChargedBytes {
-            bytes: Vec::with_capacity(self.bytes()),
-            charge: self,
-        }
-    }
-
-    /// The places of a queue this charge pays for: as many as it holds in
-    /// whole items, and no more, since the queue holds what it was paid
-    /// for. What the charge holds past the last whole place goes back.
-    pub fn into_deque<T>(mut self) -> ChargedDeque<T> {
-        let places = self.bytes().checked_div(size_of::<T>()).unwrap_or(0);
-        self.shrink_to(places * size_of::<T>());
-        ChargedDeque {
-            items: VecDeque::with_capacity(places),
-            charge: self,
-            most: places,
-        }
-    }
-
-    /// The whole vector places this charge pays for. Partial places are
-    /// released and the vector cannot grow beyond the reserved places.
-    pub fn into_vec<T>(mut self) -> ChargedVec<T> {
-        let places = self.bytes().checked_div(size_of::<T>()).unwrap_or(0);
-        self.shrink_to(places * size_of::<T>());
-        ChargedVec {
-            items: Vec::with_capacity(places),
-            charge: self,
-            most: places,
-        }
-    }
+/// The whole places of `T` that `charge` pays for, giving back what it
+/// holds past the last one.
+fn places_of<T>(charge: &mut Charge) -> usize {
+    let places = charge.bytes().checked_div(size_of::<T>()).unwrap_or(0);
+    charge.shrink_to(places * size_of::<T>());
+    places
 }
 
 impl ChargedBytes {
+    /// The bytes `charge` pays for: an empty allocation of exactly
+    /// [`Charge::bytes`].
+    pub fn from_charge(charge: Charge) -> ChargedBytes {
+        ChargedBytes {
+            bytes: Vec::with_capacity(charge.bytes()),
+            charge,
+        }
+    }
+
     /// No bytes and no room yet, which costs nothing, counted against
     /// `budget` as it grows.
     pub fn new(budget: &Budget) -> ChargedBytes {
-        Charge::nothing(budget).into_bytes()
+        Self::from_charge(Charge::nothing(budget))
     }
 
     /// Room for `capacity` bytes, charged before it is allocated. `None`,
     /// with nothing allocated, if the budget has no room.
     pub fn with_capacity(budget: &Budget, capacity: usize) -> Option<ChargedBytes> {
-        Some(budget.charge(capacity)?.into_bytes())
+        Some(Self::from_charge(budget.charge(capacity)?))
     }
 
     /// Room for as much of `want` as the budget has, charged before it is
@@ -78,7 +59,7 @@ impl ChargedBytes {
         budget: &Budget,
         want: RangeInclusive<usize>,
     ) -> Option<ChargedBytes> {
-        Some(budget.charge_within(want)?.into_bytes())
+        Some(Self::from_charge(budget.charge_within(want)?))
     }
 
     /// A copy of `bytes` in an allocation of exactly their size, charged
@@ -173,7 +154,9 @@ impl ChargedBytes {
 
     /// The bytes as a chunk, which carries their charge.
     pub fn into_chunk(self) -> Chunk {
-        Chunk::from_bytes(self)
+        Chunk::paid(self.bytes, self.charge)
+            .ok()
+            .expect("charged bytes are charged their capacity")
     }
 
     /// The vector and the charge that pays for it, for an owner that keeps
@@ -250,6 +233,12 @@ impl Deref for ChargedBytes {
 impl DerefMut for ChargedBytes {
     fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
+    }
+}
+
+impl From<ChargedBytes> for Chunk {
+    fn from(bytes: ChargedBytes) -> Chunk {
+        bytes.into_chunk()
     }
 }
 
@@ -357,6 +346,18 @@ impl<T> Place<'_, T> {
 }
 
 impl<T> ChargedDeque<T> {
+    /// The places of a queue `charge` pays for: as many as it holds in
+    /// whole items, and no more, since the queue holds what it was paid
+    /// for. What the charge holds past the last whole place goes back.
+    pub fn from_charge(mut charge: Charge) -> ChargedDeque<T> {
+        let places = places_of::<T>(&mut charge);
+        ChargedDeque {
+            items: VecDeque::with_capacity(places),
+            charge,
+            most: places,
+        }
+    }
+
     /// An empty queue with no places yet, which costs nothing, for at most
     /// `most` items.
     pub fn new(budget: &Budget, most: usize) -> ChargedDeque<T> {
@@ -557,6 +558,18 @@ pub struct ChargedVec<T> {
 }
 
 impl<T> ChargedVec<T> {
+    /// The whole places `charge` pays for, and no more: what it holds past
+    /// the last whole place goes back, and the vector cannot grow beyond
+    /// the places it was paid for.
+    pub fn from_charge(mut charge: Charge) -> ChargedVec<T> {
+        let places = places_of::<T>(&mut charge);
+        ChargedVec {
+            items: Vec::with_capacity(places),
+            charge,
+            most: places,
+        }
+    }
+
     /// An empty vector with no places yet, which costs nothing, for at
     /// most `most` items.
     pub fn new(budget: &Budget, most: usize) -> ChargedVec<T> {
@@ -986,7 +999,7 @@ mod tests {
                 Item::List(list) => list.places() * size_of::<u32>(),
                 Item::Map(map) => BoundedMap::<u16, u64>::storage(map.limit()).unwrap(),
                 Item::Charge(charge) => charge.bytes(),
-                Item::Chunk(chunk, _) => chunk.backing_capacity(),
+                Item::Chunk(chunk, _) => chunk.capacity(),
             }
         }
 
@@ -998,12 +1011,7 @@ mod tests {
                 Item::List(l) => (l.charged(), l.places(), l.len(), l.as_ptr() as usize),
                 Item::Map(m) => (m.charged(), m.limit(), m.len(), 0),
                 Item::Charge(c) => (c.bytes(), 0, 0, 0),
-                Item::Chunk(c, _) => (
-                    c.charged(),
-                    c.backing_capacity(),
-                    c.len(),
-                    c.as_ptr() as usize,
-                ),
+                Item::Chunk(c, _) => (c.charged(), c.capacity(), c.len(), c.as_ptr() as usize),
             }
         }
     }
@@ -1122,8 +1130,7 @@ mod tests {
                 return false;
             };
             self.held.iter().enumerate().any(|(i, held)| {
-                i != at
-                    && matches!(&held.item, Item::Chunk(other, _) if other.shares_backing(chunk))
+                i != at && matches!(&held.item, Item::Chunk(other, _) if other.shares(chunk))
             })
         }
 
@@ -1555,7 +1562,7 @@ mod tests {
                     let Item::Chunk(chunk, whole) = &mut self.held[at].item else {
                         unreachable!()
                     };
-                    let (bytes, capacity) = (chunk.to_vec(), chunk.backing_capacity());
+                    let (bytes, capacity) = (chunk.to_vec(), chunk.capacity());
                     let in_place = *whole && !shared;
                     let fits = payer == to
                         || if in_place {
@@ -1769,7 +1776,7 @@ mod tests {
                     // Pieces of one chunk name one charge: count it once.
                     let counted = matches!(&held.item, Item::Chunk(chunk, _)
                         if self.held[..i].iter().any(|earlier| matches!(&earlier.item,
-                            Item::Chunk(other, _) if other.shares_backing(chunk))));
+                            Item::Chunk(other, _) if other.shares(chunk))));
                     if !counted {
                         paid += held.item.charged();
                     }
@@ -1878,7 +1885,7 @@ mod tests {
     fn a_charge_becomes_the_places_it_pays_for() {
         let budget = Budget::new(64);
         let charge = budget.charge(3 * size_of::<u64>() + 5).unwrap();
-        let mut deque = charge.into_deque::<u64>();
+        let mut deque = ChargedDeque::<u64>::from_charge(charge);
         assert_eq!(deque.places() * size_of::<u64>(), deque.charged());
         assert_eq!(
             budget.used(),
@@ -1902,7 +1909,7 @@ mod tests {
             3 * size_of::<u64>() + 1,
             budget.limit(),
         ] {
-            let mut vector = budget.charge(paid).unwrap().into_vec::<u64>();
+            let mut vector = ChargedVec::<u64>::from_charge(budget.charge(paid).unwrap());
             assert_eq!(vector.places(), paid / size_of::<u64>());
             assert_eq!(vector.charged(), vector.places() * size_of::<u64>());
             for value in 0..vector.places() {

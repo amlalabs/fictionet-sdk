@@ -711,12 +711,11 @@ fn engine_storage_belongs_to_the_first_environment_until_drop() {
 #[test]
 fn spare_packet_buffers_never_retain_more_than_the_mtu() {
     let budget = Budget::unlimited();
-    let mut spare = Spare(Some(
+    let mut spare = Spare(Some(ChargedVec::from_charge(
         budget
             .charge(Spare::PACKETS * size_of::<Vec<u8>>())
-            .unwrap()
-            .into_vec(),
-    ));
+            .unwrap(),
+    )));
     spare.keep(Vec::with_capacity(MTU + 1));
     assert!(spare.take(MTU).capacity() <= MTU);
     spare.keep(Vec::with_capacity(3 * MTU / 4));

@@ -289,7 +289,7 @@ impl<S: MakeVersion> Handoff for Detect<S> {
         let servers = self.servers.take()?;
         let mut below = Vec::new();
         if let Some(first) = self.first.take_if(|first| !first.is_empty()) {
-            below.push(StreamEvent::Data(Chunk::from_bytes(first)));
+            below.push(StreamEvent::Data(Chunk::from(first)));
         }
         if self.peer_ended {
             below.push(StreamEvent::Ended);

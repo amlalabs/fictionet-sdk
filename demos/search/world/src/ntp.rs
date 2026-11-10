@@ -8,7 +8,8 @@ use std::time::SystemTime;
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::layer::{
-    Admit, Budget, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Env, Layer, Top,
+    Admit, Budget, ChargedBytes, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Env,
+    Layer, Top,
 };
 use fictionet::stdlib::protocols::ntp::{self, Leap, Packet, ServerInfo, Timestamp};
 use fictionet::stdlib::world::net::Host;
@@ -107,9 +108,9 @@ impl<C: Fn() -> SystemTime> Layer for TimeServer<C> {
             && let Some(answer) = self.answer(datagram.payload())
             && let Some(room) = charge.split(answer.len())
         {
-            let mut bytes = room.into_bytes();
+            let mut bytes = ChargedBytes::from_charge(room);
             if bytes.extend_within(&answer).is_ok() {
-                self.reply = Some(Datagram::new(Chunk::from_bytes(bytes), client));
+                self.reply = Some(Datagram::new(Chunk::from(bytes), client));
             }
         }
         Ok(Admit::Taken)

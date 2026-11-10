@@ -197,7 +197,6 @@
 //! async code written against a connection, such as what runs after a
 //! CONNECT.
 
-mod budget;
 mod carrier;
 mod chain;
 mod charged;
@@ -211,6 +210,7 @@ mod observed;
 mod packet;
 mod switch;
 mod timers;
+mod work;
 
 #[cfg(test)]
 mod tests;
@@ -232,13 +232,14 @@ pub(crate) mod probe;
 #[path = "../../../verification/layer/kani/mod.rs"]
 mod proofs;
 
-pub use budget::{Budget, Charge, OwnedWork, Refusals, Starved, Waiter, WorkOwner};
 pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, FIRST_PLACES, Owned, Place};
+pub use fictionet_buf::{Budget, Charge, Chunk, Held, Pool, Refusals, Starved, Waiter};
+pub use work::{OwnedWork, WorkOwner};
 
 /// Maximum supported composition depth, including erased layers.
 pub const MAX_DEPTH: usize = 32;
 pub use carrier::{
-    ByteStream, Child, ChildId, Chunk, Closing, CreditLease, Credited, Datagram, DatagramCommand,
+    ByteStream, Child, ChildId, Closing, CreditLease, Credited, Datagram, DatagramCommand,
     DatagramEvent, Datagrams, MessageCommand, MessageEvent, Messages, Mux, MuxCommand, MuxEvent,
     MuxOp, Slots, StreamCommand, StreamEvent,
 };

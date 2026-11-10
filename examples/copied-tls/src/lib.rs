@@ -15,7 +15,7 @@ use fictionet::stdlib::layer::{
     Admit, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
 };
 use fictionet::stdlib::services::stack::Job;
-use fictionet::stdlib::services::tls::{Handshake, HandshakeError, Negotiation};
+use fictionet::stdlib::services::tls::{Handshake, HandshakeError, Negotiation, TlsBudget};
 use fictionet::time::Instant;
 
 const CHUNK: usize = 16 * 1024;
@@ -419,7 +419,7 @@ impl Layer for TlsLayer {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                 }
                 if !self.initialized {
-                    self.acceptor = Some(Acceptor::with_budget(Arc::new(env.budget().clone())));
+                    self.acceptor = Some(Acceptor::with_budget(TlsBudget::of(env.budget())));
                     self.initialized = true;
                 }
                 let limit = chunk.len().min(CHUNK);
@@ -623,7 +623,7 @@ impl Layer for TlsLayer {
                 self.alert = None;
             } else {
                 self.produced += bytes.len() as u64;
-                self.below = Some(StreamCommand::Write(Chunk::from_bytes(bytes)));
+                self.below = Some(StreamCommand::Write(Chunk::from(bytes)));
             }
             if self.pending_plaintext != 0
                 && self.fence.is_none()
@@ -652,7 +652,7 @@ impl Layer for TlsLayer {
                         return Ok(false);
                     };
                     tls.reader().consume(n);
-                    self.above = Some(StreamEvent::Data(Chunk::from_bytes(bytes)));
+                    self.above = Some(StreamEvent::Data(Chunk::from(bytes)));
                     return Ok(true);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}

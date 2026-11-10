@@ -416,9 +416,9 @@ impl State {
             Some(charge) => charge,
             None => env.budget().charge(piece.len())?,
         };
-        let mut bytes = charge.into_bytes();
+        let mut bytes = ChargedBytes::from_charge(charge);
         bytes.extend_within(&piece).ok()?;
-        Some(Chunk::from_bytes(bytes))
+        Some(Chunk::from(bytes))
     }
 
     fn reset(&mut self) {

@@ -10,7 +10,7 @@ use rustls::ServerConfig;
 use rustls::server::{Accepted, AcceptedAlert, Acceptor, IntoConnectionError, ServerConnection};
 
 use super::HandshakeError;
-use super::budget::charge_of;
+use super::budget::{TlsBudget, charge_of};
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
     Admit, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
@@ -354,7 +354,7 @@ impl TlsLayer {
             let charge = charge.and_then(charge_of).ok_or_else(|| {
                 HandshakeError::Failed("ciphertext left rustls without its charge".to_owned())
             })?;
-            return Chunk::adopt(bytes, charge)
+            return Chunk::paid(bytes, charge)
                 .map(Some)
                 .map_err(|_| HandshakeError::Failed("ciphertext outgrew its charge".to_owned()));
         }
@@ -462,7 +462,7 @@ impl Layer for TlsLayer {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                 }
                 if !self.initialized {
-                    self.acceptor = Some(Acceptor::with_budget(Arc::new(env.budget().clone())));
+                    self.acceptor = Some(Acceptor::with_budget(TlsBudget::of(env.budget())));
                     self.initialized = true;
                 }
                 let limit = chunk.len().min(CHUNK);
@@ -708,7 +708,7 @@ impl Layer for TlsLayer {
                             "plaintext left rustls without its charge".to_owned(),
                         )
                     })?;
-                    let chunk = Chunk::adopt(bytes, charge).map_err(|_| {
+                    let chunk = Chunk::paid(bytes, charge).map_err(|_| {
                         HandshakeError::Failed("plaintext outgrew its charge".to_owned())
                     })?;
                     self.above = Some(StreamEvent::Data(chunk));
@@ -833,7 +833,7 @@ mod ciphertext_transfer_tests {
         );
         let budget = Budget::new(1 << 20);
         let mut tls =
-            ServerConnection::with_budget(config.clone(), Arc::new(budget.clone())).unwrap();
+            ServerConnection::with_budget(config.clone(), TlsBudget::of(&budget)).unwrap();
         assert!(tls.send_close_notify());
         let mut inspect = Inspect(std::ptr::null());
         assert_eq!(tls.write_tls(&mut inspect).unwrap(), 0);
@@ -925,7 +925,7 @@ mod ciphertext_transfer_tests {
                 )?;
                 let budget = Budget::new(1 << 20);
                 let mut tls =
-                    ServerConnection::with_budget(config.clone(), Arc::new(budget.clone()))?;
+                    ServerConnection::with_budget(config.clone(), TlsBudget::of(&budget))?;
                 while client.is_handshaking() || tls.is_handshaking() || tls.wants_write() {
                     deliver(&mut *client, &mut *tls);
                     deliver(&mut *tls, &mut *client);
