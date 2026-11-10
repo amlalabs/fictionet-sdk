@@ -1601,6 +1601,162 @@ fn the_socket_slab_reuses_slots_and_forgets_stale_ids() {
     }
 }
 
+/// What one world saw, in order: every packet each endpoint sent, and
+/// what its applications saw.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Seen {
+    /// Whether the server sent it, and its bytes.
+    packets: Vec<(bool, Vec<u8>)>,
+    events: Vec<Seeing>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Seeing {
+    /// The server accepted a connection from this client port.
+    Accepted(u16),
+    /// The server read this many bytes from this client port, to the end.
+    Received(u16, usize),
+    /// A read on one side of the connection from this client port: the
+    /// server's side if true.
+    Read(bool, u16, Result<usize, ConnError>),
+}
+
+/// Logs every packet an endpoint sends.
+struct Tap<I> {
+    inner: I,
+    server: bool,
+    seen: Arc<Mutex<Seen>>,
+}
+
+impl<I: fictionet::Interface> fictionet::Interface for Tap<I> {
+    fn poll_recv(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Packet, fictionet::RecvError>> {
+        self.inner.poll_recv(fcx, cx)
+    }
+
+    fn send(&mut self, packet: Packet) {
+        self.seen
+            .lock()
+            .packets
+            .push((self.server, packet.0.clone()));
+        self.inner.send(packet);
+    }
+}
+
+/// A world that churns connections: waves of connects, most of them
+/// moving data at once and closing while others stay open, so later
+/// waves take the slots earlier ones left out of order; then every
+/// connection still open is aborted. Returns what it saw.
+fn churn(seed: u64) -> Seen {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let log = seen.clone();
+    block_on(lab(Seed::from_u64(seed), move |fcx| async move {
+        let tap = |inner, server| Tap {
+            inner,
+            server,
+            seen: log.clone(),
+        };
+        let (a, b) = pair();
+        let server = endpoint(&fcx, tap(a, true), "10.0.0.1".parse().unwrap());
+        let client = endpoint(&fcx, tap(b, false), "10.0.0.2".parse().unwrap());
+        let mut listener = server.listen(80)?;
+        let mut kept = Vec::new();
+        let mut opened = 0;
+        for wave in 0..4 {
+            let mut tasks = Vec::new();
+            for k in 0..12 {
+                let mut c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
+                let mut s = listener.accept(&fcx).await?;
+                let port = s.peer_addr().port();
+                log.lock().events.push(Seeing::Accepted(port));
+                opened += 1;
+                if (wave + k) % 5 == 0 {
+                    kept.push((port, c, s));
+                    continue;
+                }
+                // Sizes from a few segments to more than a window, so the
+                // transfers overlap and the engine rotates among them.
+                let size = 40_000 * (1 + (wave * 12 + k) % 7);
+                tasks.push(fcx.spawn(move |fcx| async move {
+                    c.write_all(&fcx, &pattern(size, k as u8)).await?;
+                    c.shutdown(&fcx).await?;
+                    Ok(())
+                }));
+                let log = log.clone();
+                tasks.push(fcx.spawn(move |fcx| async move {
+                    let mut buf = [0; 4096];
+                    let mut got = 0;
+                    loop {
+                        match s.read(&fcx, &mut buf).await? {
+                            0 => break,
+                            n => got += n,
+                        }
+                    }
+                    log.lock().events.push(Seeing::Received(port, got));
+                    Ok(())
+                }));
+            }
+            for task in tasks {
+                task.join(&fcx).await?;
+            }
+            fcx.sleep(Duration::from_secs(1)).await?;
+        }
+        {
+            let st = server.shared.lock();
+            assert!(
+                st.sockets.slots.len() < opened,
+                "{} slots for {opened} connections: later ones reused slots",
+                st.sockets.slots.len()
+            );
+        }
+        // A reader waits on each side of every connection still open, in
+        // the order the connections were made; each says what it got as
+        // it wakes, so the events show the order the aborts reached them.
+        let mut readers = Vec::new();
+        for (port, c, s) in kept {
+            for (server, mut conn) in [(true, s), (false, c)] {
+                let log = log.clone();
+                readers.push(fcx.spawn(move |fcx| async move {
+                    let mut buf = [0; 16];
+                    let read = conn.read(&fcx, &mut buf).await;
+                    log.lock().events.push(Seeing::Read(server, port, read));
+                    Ok(())
+                }));
+            }
+        }
+        fcx.sleep(Duration::from_millis(10)).await?;
+        server.abort_peers(|_| true);
+        for reader in readers {
+            reader.join(&fcx).await?;
+        }
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+    std::mem::take(&mut *seen.lock())
+}
+
+/// The engine keeps no order of its own beyond its lists and its slots:
+/// the same world run twice, with the slots reused out of order and the
+/// keyed hash maps seeded differently each time, sends the same packets
+/// and shows its applications the same events, in the same order.
+#[test]
+fn the_same_world_twice_sends_the_same_packets_in_the_same_order() {
+    let first = churn(7);
+    assert!(
+        first
+            .events
+            .iter()
+            .any(|e| matches!(e, Seeing::Read(false, _, Err(ConnError::Reset))))
+    );
+    let second = churn(7);
+    assert_eq!(first.events, second.events);
+    assert!(first.packets == second.packets, "the packets differ");
+}
+
 /// Resident pages of every socket's buffers on `e`.
 fn resident(e: &Endpoint) -> usize {
     let st = e.shared.lock();
