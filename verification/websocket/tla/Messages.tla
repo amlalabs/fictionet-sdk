@@ -21,9 +21,16 @@ EXTENDS Naturals
    appends it to the partial message (1027), so a message briefly costs
    its held bytes plus twice the frame.
    Line numbers checked against e2858ccc4 on 2026-11-09: all hold.
+   Frames::decode, line 881, refuses a Close whose payload parse_close
+   refuses; the model keeps only the length rule, a 1-byte body
+   (CheckCloseBody). Codes and UTF-8 reasons are left to Kani. Control
+   frames are never charged against the limit: Frames::header line 854
+   and check_header line 972 both skip them (ChargeControl = FALSE).
+   last.stopped marks a frame refused only because a Close came first;
+   the decoder returns End there, not an error.
 *)
 CONSTANTS Limit, Steps, CheckOrder, CheckControl, CheckBeforeGrowth,
-          StopAfterClose, PreservePartial
+          StopAfterClose, PreservePartial, CheckCloseBody, ChargeControl
 VARIABLES partial, held, closed, failed, count, closes, charged, last
 vars == <<partial, held, closed, failed, count, closes, charged, last>>
 Ops == {"data", "continuation", "ping", "pong", "close"}
@@ -34,17 +41,20 @@ Init == /\ partial = FALSE /\ held = 0 /\ closed = FALSE
         /\ failed = FALSE /\ count = 0 /\ closes = 0 /\ charged = 0
         /\ last = [accepted |-> FALSE, op |-> "data", fin |-> TRUE,
                     len |-> 0, before |-> FALSE, bytes |-> 0,
-                    wasClosed |-> FALSE]
+                    wasClosed |-> FALSE, stopped |-> FALSE]
 Receive(op, fin, len) ==
-    LET accept == ~(StopAfterClose /\ closed)
+    LET stopped == StopAfterClose /\ closed
+        accept == ~stopped
                   /\ (~CheckOrder \/ Order(op, partial))
                   /\ (~CheckControl \/ ~Control(op) \/ (fin /\ len <= 125))
-                  /\ (~CheckBeforeGrowth \/ Control(op) \/ held + len <= Limit)
+                  /\ (~CheckCloseBody \/ op # "close" \/ len # 1)
+                  /\ (~CheckBeforeGrowth \/ (Control(op) /\ ~ChargeControl)
+                      \/ held + len <= Limit)
     IN /\ ~failed /\ count < Steps
        /\ count' = count + 1
        /\ last' = [accepted |-> accept, op |-> op, fin |-> fin,
                     len |-> len, before |-> partial, bytes |-> held,
-                    wasClosed |-> closed]
+                    wasClosed |-> closed, stopped |-> stopped]
        /\ failed' = ~accept /\ closed' = (closed \/ (accept /\ op = "close"))
        /\ closes' = closes + (IF accept /\ op = "close" THEN 1 ELSE 0)
        /\ charged' = IF accept /\ ~Control(op) THEN held + len ELSE 0

@@ -2487,6 +2487,161 @@ mod tests {
         );
     }
 
+    /// How a stream of frames ends, as RFC 6455 has it.
+    #[derive(Debug, PartialEq)]
+    enum Ending {
+        /// A Close was delivered; nothing after it is read.
+        Closed,
+        /// The receiver must fail the connection.
+        Failed,
+        /// The bytes ended inside a fragmented message.
+        Incomplete,
+        /// The bytes ended between messages.
+        Clean,
+    }
+
+    /// What a receiver makes of unmasked frames (opcode, FIN, payload),
+    /// written from RFC 6455 rather than from this module: 5.2 (reserved
+    /// opcodes), 5.4 (fragment order, control frames between fragments,
+    /// the message is its fragments joined in order), 5.5 (control frames
+    /// are final), 5.5.1 and 7.4 (a Close body is empty or a sendable code
+    /// and a UTF-8 reason), 5.6 and 8.1 (text is UTF-8, and a prefix that
+    /// no later bytes can make valid fails at once). Rust's validator
+    /// defines UTF-8, as in the Kani text harness.
+    fn rfc_receive(frames: &[(u8, bool, &[u8])]) -> (Vec<Message>, Ending) {
+        let mut out = Vec::new();
+        let mut message: Option<(bool, Vec<u8>)> = None;
+        for &(op, fin, payload) in frames {
+            if !matches!(op, 0 | 1 | 2 | 8 | 9 | 10) || op >= 8 && !fin {
+                return (out, Ending::Failed);
+            }
+            match op {
+                0 => match message.as_mut() {
+                    Some((_, data)) => data.extend_from_slice(payload),
+                    None => return (out, Ending::Failed),
+                },
+                1 | 2 if message.is_some() => return (out, Ending::Failed),
+                1 | 2 => message = Some((op == 1, payload.to_vec())),
+                8 => {
+                    let close = match payload {
+                        [] => None,
+                        [hi, lo, reason @ ..] => {
+                            let code = u16::from_be_bytes([*hi, *lo]);
+                            let sendable = (1000..=1003).contains(&code)
+                                || (1007..=1014).contains(&code)
+                                || (3000..=4999).contains(&code);
+                            match core::str::from_utf8(reason) {
+                                Ok(reason) if sendable => Some(Close {
+                                    code,
+                                    reason: reason.to_string(),
+                                }),
+                                _ => return (out, Ending::Failed),
+                            }
+                        }
+                        [_] => return (out, Ending::Failed),
+                    };
+                    out.push(Message::Close(close));
+                    return (out, Ending::Closed);
+                }
+                9 => out.push(Message::Ping(payload.to_vec())),
+                _ => out.push(Message::Pong(payload.to_vec())),
+            }
+            if op > 2 {
+                continue;
+            }
+            let Some((text, data)) = message.take() else {
+                unreachable!("a data frame leaves a message in progress");
+            };
+            if text {
+                match core::str::from_utf8(&data) {
+                    Ok(_) => {}
+                    Err(e) if e.error_len().is_none() && !fin => {}
+                    Err(_) => return (out, Ending::Failed),
+                }
+            }
+            if !fin {
+                message = Some((text, data));
+            } else if text {
+                out.push(Message::Text(String::from_utf8(data).unwrap()));
+            } else {
+                out.push(Message::Binary(data));
+            }
+        }
+        let ending = if message.is_some() {
+            Ending::Incomplete
+        } else {
+            Ending::Clean
+        };
+        (out, ending)
+    }
+
+    fn check_against_rfc(frames: &[(u8, bool, &[u8])]) {
+        let mut wire = Vec::new();
+        for &(op, fin, payload) in frames {
+            wire.push(if fin { 0x80 } else { 0 } | op);
+            wire.push(payload.len() as u8);
+            wire.extend_from_slice(payload);
+        }
+        let (got, failure) = decode(Side::Client, &wire);
+        let ending = match failure {
+            None if matches!(got.last(), Some(Message::Close(_))) => Ending::Closed,
+            None => Ending::Clean,
+            Some(Fail::Protocol(AssembleError::Incomplete { .. })) => Ending::Incomplete,
+            Some(Fail::Protocol(AssembleError::Inner(_))) => Ending::Failed,
+            Some(other) => panic!("{frames:?}: unexpected failure {other:?}"),
+        };
+        assert_eq!((got, ending), rfc_receive(frames), "{frames:?}");
+    }
+
+    /// Every frame over all 16 opcodes, both FIN values and these payloads.
+    fn every_frame<'a>(payloads: &[&'a [u8]]) -> Vec<(u8, bool, &'a [u8])> {
+        let mut frames = Vec::new();
+        for op in 0..16 {
+            for fin in [false, true] {
+                for &payload in payloads {
+                    frames.push((op, fin, payload));
+                }
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn decoder_follows_rfc_on_every_short_stream() {
+        // Every stream of up to three frames, with payloads that are empty,
+        // ASCII, the two halves of "é" (so text can split inside a
+        // character) and a byte that is never UTF-8. Streams of up to two
+        // frames also take close bodies: a sendable code, a code that may
+        // not be sent, and a sendable code with a reason that is not UTF-8.
+        let short: [&[u8]; 5] = [b"", b"a", &[0xc3], &[0xa9], &[0xff]];
+        let with_close: [&[u8]; 8] = [
+            b"",
+            b"a",
+            &[0xc3],
+            &[0xa9],
+            &[0xff],
+            &[0x03, 0xe8],
+            &[0x03, 0xed],
+            &[0x03, 0xe8, 0xff],
+        ];
+        let short = every_frame(&short);
+        let with_close = every_frame(&with_close);
+        check_against_rfc(&[]);
+        for &a in &with_close {
+            check_against_rfc(&[a]);
+            for &b in &with_close {
+                check_against_rfc(&[a, b]);
+            }
+        }
+        for &a in &short {
+            for &b in &short {
+                for &c in &short {
+                    check_against_rfc(&[a, b, c]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn close_payloads() {
         let p = [0x03, 0xe8, b'b', b'y', b'e'];
