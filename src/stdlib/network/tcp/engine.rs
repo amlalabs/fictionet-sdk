@@ -2798,11 +2798,17 @@ impl Layer for TcpLayer {
             Some(false) => return Ok(Admit::Blocked(command)),
             None => {}
         }
-        // Credit must still reach a socket while output is full. Other commands
-        // wait for their notices to drain, bounding repeated control requests.
-        if (self.up.len() >= UP_ROOM || self.urgent.len() >= UP_ROOM)
-            && !matches!(command.op(), MuxOp::Credit(..))
-        {
+        // The commands that can repeat without end each add an event: a
+        // control its answer to `up`, a write its completion to `urgent`.
+        // Each waits for room in that queue alone, so a write never waits
+        // behind events the layer above refused. The rest add a bounded
+        // number per child.
+        let full = match command.op() {
+            MuxOp::Control(MessageCommand::Send(_)) => self.up.len() >= UP_ROOM,
+            MuxOp::Child(_, StreamCommand::Write(_)) => self.urgent.len() >= UP_ROOM,
+            _ => false,
+        };
+        if full {
             return Ok(Admit::Blocked(command));
         }
         match command.into_op() {

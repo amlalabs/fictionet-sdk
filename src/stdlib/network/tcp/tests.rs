@@ -426,6 +426,63 @@ fn a_declined_timer_recomputes_the_remaining_deadline() {
     .unwrap();
 }
 
+/// Events the layer above has not taken never hold up a write: its
+/// completion goes ahead of them (layer rule 6). Only the urgent queue
+/// that carries completions bounds writes.
+#[test]
+fn a_write_is_taken_while_the_event_queue_is_full() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let (h, _) = established(&mut st, smol_now(&fcx), local, peer);
+        let child = st.adopt(h);
+        st.refresh_all(&Budget::unlimited());
+        let handle = st
+            .up
+            .drain(..)
+            .find_map(|event| match event {
+                MuxEvent::Opened(handle, _, _) if handle.id() == child => Some(handle),
+                _ => None,
+            })
+            .unwrap();
+        st.up.clear();
+        st.urgent.clear();
+        while st.up.len() < UP_ROOM {
+            st.up.push_back(MuxEvent::Control(MessageEvent::Message(
+                TcpNotice::ListenFailed { port: 1 },
+            )));
+        }
+        let budget = Budget::unlimited();
+        let mut observations = fictionet::stdlib::layer::Observations::new(0);
+        let mut env = Env::new(fcx.now(), &fcx, &budget, &mut observations);
+        let write = |n: usize| handle.send(StreamCommand::Write(Chunk::unpaid(vec![5; n])));
+        assert!(matches!(
+            st.on_command(&mut env, write(8)),
+            Ok(Admit::Taken)
+        ));
+        assert!(st.urgent.iter().any(
+            |event| matches!(event, MuxEvent::Child(id, StreamEvent::Written(8)) if *id == child)
+        ));
+        // Completions the layer above has not taken do bound writes.
+        while st.urgent.len() < UP_ROOM {
+            st.urgent
+                .push_back(MuxEvent::Child(child, StreamEvent::Written(0)));
+        }
+        assert!(matches!(
+            st.on_command(&mut env, write(8)),
+            Ok(Admit::Blocked(_))
+        ));
+        drop(st);
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
 fn budget_read(release_after_poll: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Wake, Waker};
