@@ -1901,8 +1901,12 @@ impl<'a> Socket<'a> {
             // This is required by RFC 9293, which states "A TCP implementation MUST support
             // simultaneous open attempts (MUST-10)."
             (State::SynSent, TcpControl::Syn, None) => (),
-            // ACKs in the SYN-SENT state are invalid.
-            (State::SynSent, TcpControl::None, Some(ack_number)) => {
+            // ACKs in the SYN-SENT state are invalid, with or without PSH or FIN.
+            (
+                State::SynSent,
+                TcpControl::None | TcpControl::Psh | TcpControl::Fin,
+                Some(ack_number),
+            ) => {
                 // Ignore an ACK of our SYN without the peer's SYN.
                 if self.acknowledges_syn(ack_number) {
                     return None;
@@ -12512,6 +12516,45 @@ pub(crate) mod test {
         assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
         assert_eq!(s.send_queue(), 6);
         recv_nothing!(s);
+    }
+
+    /// In SYN-SENT an ACK that does not acknowledge the SYN is answered with
+    /// a RST whatever else the segment carries but a SYN or a RST (RFC 9293
+    /// section 3.10.7.3): PSH and FIN change nothing.
+    #[test]
+    fn test_syn_sent_bad_ack_with_psh_or_fin_is_reset() {
+        for control in [TcpControl::Psh, TcpControl::Fin] {
+            let mut s = socket_syn_sent();
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: None,
+                    max_seg_size: Some(BASE_MSS),
+                    window_scale: Some(0),
+                    sack_permitted: true,
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(
+                s,
+                TcpRepr {
+                    control,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: Some(LOCAL_SEQ + 5),
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: LOCAL_SEQ + 5,
+                    ack_number: None,
+                    window_len: 0,
+                    ..RECV_TEMPL
+                })
+            );
+            assert_eq!(s.state, State::SynSent);
+        }
     }
 
     /// The peer's FIN retransmitted in TIME-WAIT is acknowledged every time
