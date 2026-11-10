@@ -1135,15 +1135,15 @@ impl<Data> ConnectionCore<Data> {
             let mut iter = DeframerIter::new(&mut buffer[buffer_progress.processed()..]);
 
             let (message, processed) = loop {
+                // The records before this one in `iter` failed trial
+                // decryption: they are done with.
+                let skipped = iter.bytes_consumed();
                 let message = match iter.next().transpose() {
                     Ok(Some(message)) => message,
                     Ok(None) => {
-                        // Records that failed trial decryption are done
-                        // with: the record after them is read only once
-                        // they leave the buffer.
-                        let skipped = iter.bytes_consumed();
-                        buffer_progress.add_processed(skipped);
-                        buffer_progress.add_discard(skipped);
+                        // The record after them is read only once they
+                        // leave the buffer.
+                        buffer_progress.skip(skipped);
                         return Ok(None);
                     }
                     Err(err) => return Err(self.handle_deframe_error(err, state)),
@@ -1177,10 +1177,13 @@ impl<Data> ConnectionCore<Data> {
                 // application data that is kept, before the record is
                 // decrypted, which cannot be undone. The plaintext itself
                 // stays in the buffer the record arrived in, already paid
-                // for. The record stays where it is if there is no room.
+                // for. The record stays where it is if there is no room;
+                // those skipped before it go, so that they are not tried,
+                // and counted against the early data allowance, again.
                 if self.common_state.record_layer.is_decrypting()
                     && !self.common_state.reserve_plaintext()
                 {
+                    buffer_progress.skip(skipped);
                     return Ok(None);
                 }
 

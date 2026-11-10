@@ -560,13 +560,22 @@ impl CommonState {
     }
 
     /// Pays for the record `m` makes, from the room reserved for output
-    /// first, then encrypts and queues it. `false`, encrypting nothing, if
-    /// the budget has no room for it.
+    /// first, then encrypts and queues it. `false` if it was not sent:
+    /// encrypting nothing if the budget has no room for it.
+    ///
+    /// A record whose allocation comes out larger than paid for, and whose
+    /// extra the budget refuses, is dropped after it was encrypted. It has
+    /// taken its sequence number, and any record after it would leave a gap
+    /// the peer refuses: so the connection fails ([`Self::output_paid`]),
+    /// and nothing more is encrypted.
     #[must_use = "an unpaid record was not sent"]
     fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
         // Alerts are always sendable -- never quashed by a PreEncryptAction.
         if m.typ != ContentType::Alert && !self.check_pre_encrypt_action(0) {
             return true;
+        }
+        if self.output_unpaid {
+            return false;
         }
 
         let len = m.encoded_len(&self.record_layer);
@@ -574,7 +583,11 @@ impl CommonState {
             return false;
         }
         let em = self.record_layer.encrypt_outgoing(m).encode();
-        self.queue_paid(em, len)
+        if !self.queue_paid(em, len) {
+            self.output_unpaid = true;
+            return false;
+        }
+        true
     }
 
     /// Take the remedial action needed before encrypting the record `add` records after the next.
@@ -1373,5 +1386,63 @@ mod ciphertext_ownership_tests {
         assert!(state.take_sendable_tls_chunk(64).is_none());
         assert_eq!(state.sendable_tls_len(), 65);
         assert_eq!(state.sendable_tls.write_to(&mut Vec::new()).unwrap(), 65);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod dropped_record_tests {
+    use super::*;
+    use crate::budget::testing::Limit as Budget;
+    use crate::crypto::cipher::MessageEncrypter;
+    use crate::msgs::message::{OutboundOpaqueMessage, PrefixedPayload};
+
+    /// Encrypts nothing, into an allocation larger than the record it
+    /// makes, as an encrypter other than ring's may.
+    struct Roomy;
+
+    impl MessageEncrypter for Roomy {
+        fn encrypt(
+            &mut self,
+            msg: OutboundPlainMessage<'_>,
+            _: u64,
+        ) -> Result<OutboundOpaqueMessage, Error> {
+            let mut payload = PrefixedPayload::with_capacity(msg.payload.len() + 4096);
+            payload.extend_from_chunks(&msg.payload);
+            Ok(OutboundOpaqueMessage::new(msg.typ, msg.version, payload))
+        }
+
+        fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+            payload_len
+        }
+    }
+
+    /// A record the budget pays for, in an allocation it does not, is
+    /// dropped after it took its sequence number: the connection fails, and
+    /// nothing is encrypted after the gap, even once there is room.
+    #[test]
+    fn a_record_dropped_after_encryption_fails_the_connection() {
+        let budget = Budget::new(1 << 20);
+        let mut common = CommonState::new(Side::Server);
+        common.pay_from(Some(budget.clone()));
+        common
+            .record_layer
+            .set_message_encrypter(Box::new(Roomy), u64::MAX);
+        common.may_send_application_data = true;
+        budget.set_limit(budget.used() + 1000);
+
+        let sent = common.send_plain_non_buffering(b"first"[..].into(), Limit::No, false);
+        assert_eq!(sent, 0);
+        assert_eq!(common.output_paid(), Err(Error::BudgetExhausted));
+        let seq = common.record_layer.write_seq();
+
+        budget.set_limit(1 << 20);
+        let sent = common.send_plain_non_buffering(b"second"[..].into(), Limit::No, false);
+        assert_eq!(sent, 0);
+        assert_eq!(
+            common.record_layer.write_seq(),
+            seq,
+            "a record was encrypted after the gap"
+        );
+        assert!(!common.wants_write());
     }
 }

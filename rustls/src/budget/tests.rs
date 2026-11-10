@@ -379,6 +379,50 @@ fn a_full_record_takes_one_buffer_of_its_size() {
     }
 }
 
+/// A header no record may have (an unknown content type, a version that is
+/// not 3.x, a length past the most a record carries) grows the buffer no
+/// further than the header itself, however long it says the record is, and
+/// the connection fails on it.
+#[test]
+fn a_junk_header_grows_no_buffer_past_itself() {
+    use crate::msgs::message::HEADER_SIZE;
+    let junk: [[u8; HEADER_SIZE]; 4] = [
+        [0x99, 0x03, 0x03, 0x00, 0xff],
+        [0x16, 0x7f, 0x00, 0x00, 0xff],
+        [0x17, 0x03, 0x03, 0xff, 0xff],
+        [0x16, 0x03, 0x03, 0x00, 0x00],
+    ];
+    for header in junk {
+        let limit = Limit::new(1 << 20);
+        let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
+        let wire = [&header[..], &[0x42; 300]].concat();
+        let mut rest = &wire[..];
+        let mut failed = false;
+        let mut buffered = 0;
+        for _ in 0..4 {
+            // What reading takes: the record buffer and nothing else.
+            let before = limit.used();
+            limit.reset_most();
+            match server.read_tls(&mut rest) {
+                Ok(n) => buffered += n,
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{header:?}");
+                    failed = true;
+                }
+            }
+            assert!(
+                limit.most() - before <= HEADER_SIZE,
+                "{header:?}: the buffer grew by {} bytes",
+                limit.most() - before
+            );
+            assert!(buffered <= HEADER_SIZE, "{header:?}: read {buffered} bytes");
+            failed |= server.process_new_packets().is_err();
+            assert!(server.buffers_accounted());
+        }
+        assert!(failed, "{header:?}: the connection went on");
+    }
+}
+
 /// A read takes no more than the record arriving: once a whole record is
 /// buffered, the next read takes nothing until it has been processed.
 #[test]
