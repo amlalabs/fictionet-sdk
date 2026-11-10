@@ -1281,7 +1281,14 @@ impl Http2 {
             1 => self.encoder.set_settings_limit(setting.value as usize),
             4 => {
                 let initial = setting.value as i32;
-                for (&id, stream) in self.streams.iter_mut() {
+                // The change moves the windows of streams that may still
+                // send (RFC 9113 section 6.9.2). One whose END_STREAM is
+                // framed sends no more DATA, and its window is left alone.
+                let sending = self
+                    .streams
+                    .iter_mut()
+                    .filter(|(_, stream)| !matches!(stream.response.reply, Reply::Ended));
+                for (&id, stream) in sending {
                     stream.response.window = shifted(stream.response.window, self.initial, initial)
                         .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "initial window overflow")
@@ -3285,6 +3292,64 @@ mod tests {
                 .any(|f| matches!(f, Frame::Settings(s) if s.flags & 1 != 0)),
             "{output:?}"
         );
+    }
+
+    /// A stream whose response has ended has no active send window: a
+    /// change of initial window that would take that window past 2^31 - 1
+    /// leaves it alone, and is no error (RFC 9113 section 6.9.2 applies the
+    /// change to streams open or half closed (remote) only).
+    #[test]
+    fn an_initial_window_change_leaves_ended_responses_alone() {
+        let mut harness = answering(BODY.to_vec(), BODY.len(), Budget::new(1 << 24));
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        // The response to stream 1 is framed to its END_STREAM, but the
+        // transport has not taken it yet: the stream is still known.
+        harness.withhold();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        // Its send window, raised to exactly 2^31 - 1.
+        let mut input = Vec::new();
+        write(
+            &wire::WindowUpdate {
+                stream: 1,
+                flags: 0,
+                increment: wire::MAX_WINDOW - (WINDOW as u32 - BODY.len() as u32),
+            },
+            &mut input,
+        );
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting {
+                    id: 4,
+                    value: WINDOW as u32 + 1,
+                }],
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        harness.allow_all().unwrap();
+        let output = frames(harness.output());
+        assert!(
+            !output.iter().any(|f| matches!(f, Frame::GoAway(_))),
+            "{output:?}"
+        );
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Settings(s) if s.flags & 1 != 0)),
+            "{output:?}"
+        );
+        let body: Vec<u8> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 1 => Some(d.data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(body, BODY);
     }
 
     const BODY: &[u8] = b"hello";
