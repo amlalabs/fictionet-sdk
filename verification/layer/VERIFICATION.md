@@ -891,7 +891,7 @@ sequences over symbolic `u8` sizes, and have not been run:
 | --- | --- |
 | `charge_within_takes_what_fits_or_nothing` | a charge within a range takes its end if it fits, else all the room left if that covers its start, else nothing, changing nothing but the count of refusals |
 | `transfer_within_one_budget_never_raises_used` | moving a charge within one budget changes nothing even when the budget is full; across budgets the target is charged first, a refusal changes neither count, and a move takes exactly the charge from one count to the other |
-| `a_release_after_a_refusal_wakes_once` | a runner that asks after a refusal is woken once by the next release, asking again adds nothing, and asking when nothing was refused wakes nothing |
+| `a_release_after_a_refusal_wakes_once` | a runner that asks after a refusal is woken once by the first release that leaves room for the refused charge, a release that leaves less wakes nothing, a charge past the limit is never woken for, asking again adds nothing, and asking when nothing was refused wakes nothing |
 | `charged_bytes_capacity_is_its_charge` | for three fixed sizes, bytes are charged their capacity after being made, grown, overrun by a writer that is undone, written and trimmed; a growth without room is refused and everything comes back on drop |
 | `a_refused_growth_changes_nothing` | a refused growth leaves a charge, bytes (their allocation included) and a queue as they were, with the count unchanged |
 

@@ -528,7 +528,7 @@ fn budget_read(release_after_poll: bool) {
         let mut observations = fictionet::stdlib::layer::Observations::new(0);
         let mut env = Env::new(fcx.now(), &fcx, &budget, &mut observations);
         let ready = Arc::new(Ready(AtomicBool::new(false)));
-        let waker = Waker::from(ready.clone());
+        let waker = fictionet::stdlib::layer::Waiter::new(Waker::from(ready.clone()));
         let before = budget.refusals();
         assert!(matches!(
             st.on_command(&mut env, child_handle.grant(payload.len() as u64)),

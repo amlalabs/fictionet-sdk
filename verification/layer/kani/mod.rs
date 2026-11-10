@@ -321,10 +321,12 @@ fn transfer_within_one_budget_never_raises_used() {
     assert_eq!((one.used(), other.used()), (0, 0));
 }
 
-/// A runner that asks to be woken after a refusal is woken by the next
-/// release, once: a second release wakes it no more, and asking again
-/// before memory frees adds no second wake. Asking when nothing was
-/// refused wakes nothing. Over every `u8` limit, request and release.
+/// A runner that asks to be woken after a refusal is woken by the first
+/// release that leaves room for the refused charge, once: a release that
+/// leaves less wakes nothing, a later one wakes it no more, and asking
+/// again before memory frees adds no second wake. A charge past the limit
+/// is never woken for. Asking when nothing was refused wakes nothing. Over
+/// every `u8` limit, request and release.
 #[kani::proof]
 #[kani::unwind(4)]
 fn a_release_after_a_refusal_wakes_once() {
@@ -343,21 +345,25 @@ fn a_release_after_a_refusal_wakes_once() {
     let budget = Budget::new(limit as usize);
     let mut held = budget.charge(limit as usize).unwrap();
     let count = Arc::new(Count(AtomicUsize::new(0)));
-    let waker = Waker::from(count.clone());
+    let waiter = Waiter::new(Waker::from(count.clone()));
     let mark = budget.refusals();
-    budget.wake_when_freed(&waker, mark);
+    budget.wake_when_freed(&waiter, mark);
     let more: u8 = kani::any();
     kani::assume(more > 0);
     assert!(budget.charge(more as usize).is_none());
-    budget.wake_when_freed(&waker, mark);
-    budget.wake_when_freed(&waker, mark);
+    budget.wake_when_freed(&waiter, mark);
+    budget.wake_when_freed(&waiter, mark);
     assert_eq!(count.0.load(Ordering::Relaxed), 0);
     let keep: u8 = kani::any();
     kani::assume(keep < limit);
     held.shrink_to(keep as usize);
-    assert_eq!(count.0.load(Ordering::Relaxed), 1);
+    let room = usize::from(limit - keep);
+    assert_eq!(
+        count.0.load(Ordering::Relaxed),
+        usize::from(room >= more as usize)
+    );
     drop(held);
-    assert_eq!(count.0.load(Ordering::Relaxed), 1);
+    assert_eq!(count.0.load(Ordering::Relaxed), usize::from(more <= limit));
 }
 
 // ---------------------------------------------------------------------------

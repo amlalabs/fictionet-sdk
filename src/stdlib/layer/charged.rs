@@ -784,16 +784,18 @@ mod tests {
     //! - Return: a drop or a shrink gives back what Cover says was held.
     //! - Move: moving within one budget never raises its count; across
     //!   budgets the target is charged at most what moved.
-    //! - Wake: a release after a refusal wakes each runner that asked in
-    //!   between, once, and a runner that asks after memory was freed is
-    //!   woken at once.
+    //! - Wake: the first release after a refusal that leaves room for the
+    //!   least refused charge wakes each runner that asked in between,
+    //!   once; a release that leaves less wakes none; and a runner that
+    //!   asks after memory was freed, or while there is room, is woken at
+    //!   once.
 
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Wake, Waker};
 
-    use fictionet::stdlib::layer::Refusals;
+    use fictionet::stdlib::layer::{Refusals, Waiter};
     use fictionet::{Entropy, Seed, SeededEntropy};
 
     /// A runner's waker that counts its wakes.
@@ -811,7 +813,7 @@ mod tests {
 
     struct Runner {
         count: Arc<Count>,
-        waker: Waker,
+        waiter: Waiter,
         /// The wakes the model says it has had.
         woken: usize,
     }
@@ -820,7 +822,9 @@ mod tests {
     #[derive(Default)]
     struct Waits {
         refusals: u64,
-        starved: bool,
+        /// The least a charge refused since the last wake needed; 0 if
+        /// none was refused.
+        wanted: usize,
         woken_at: u64,
         waiting: Vec<usize>,
     }
@@ -888,6 +892,8 @@ mod tests {
     struct Acted {
         /// The call refused, or found nothing to act on.
         refused: bool,
+        /// The budget a refused charge was on, and the bytes it needed.
+        need: Option<(usize, usize)>,
         /// The budget a charge was given back to although the call charged
         /// more on it overall: a chunk paid for whole, then trimmed.
         trimmed: Option<usize>,
@@ -898,6 +904,8 @@ mod tests {
     #[derive(Default)]
     struct Reached {
         refusals: usize,
+        /// Releases after a refusal that left too little room for it.
+        released_too_little: usize,
         woken_after_waiting: usize,
         woken_at_once: usize,
         moved_in_place: usize,
@@ -925,7 +933,7 @@ mod tests {
                 .map(|_| {
                     let count = Arc::new(Count::default());
                     Runner {
-                        waker: Waker::from(count.clone()),
+                        waiter: Waiter::new(Waker::from(count.clone())),
                         count,
                         woken: 0,
                     }
@@ -983,7 +991,13 @@ mod tests {
             let budget = self.below(2);
             let refused = |done: bool| Acted {
                 refused: !done,
-                trimmed: None,
+                ..Acted::default()
+            };
+            // A call on budget `payer` that needed `need` bytes of it.
+            let charging = |done: bool, payer: usize, need: usize| Acted {
+                refused: !done,
+                need: (!done).then_some((payer, need)),
+                ..Acted::default()
             };
             match self.below(23) {
                 0 | 1 => {
@@ -996,7 +1010,7 @@ mod tests {
                         assert_eq!(bytes.capacity(), n);
                         self.add(Item::Bytes(bytes), budget);
                     }
-                    refused(done)
+                    charging(done, budget, n)
                 }
                 2 => {
                     let start = self.below(64);
@@ -1010,7 +1024,7 @@ mod tests {
                         assert_eq!(bytes.capacity(), end.min(room));
                         self.add(Item::Bytes(bytes), budget);
                     }
-                    refused(done)
+                    charging(done, budget, start)
                 }
                 3 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
@@ -1022,13 +1036,14 @@ mod tests {
                     let Item::Bytes(bytes) = &mut self.held[at].item else {
                         unreachable!()
                     };
-                    let fits = to <= bytes.capacity() || to - bytes.capacity() <= room;
+                    let more = to.saturating_sub(bytes.capacity());
+                    let fits = more <= room;
                     let grew = bytes.grow_to(to);
                     assert_eq!(grew, fits);
                     if grew {
                         assert!(bytes.capacity() >= to);
                     }
-                    refused(grew)
+                    charging(grew, payer, more)
                 }
                 4 | 5 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
@@ -1102,7 +1117,7 @@ mod tests {
                         if let Some(deque) = made {
                             self.add(Item::Deque(deque), budget);
                         }
-                        return refused(done);
+                        return charging(done, budget, places.min(most) * size_of::<u64>());
                     };
                     let payer = self.held[at].payer;
                     let room = self.room(payer);
@@ -1137,7 +1152,7 @@ mod tests {
                         }
                         Err(back) => assert_eq!(back, item),
                     }
-                    refused(pushed.is_ok())
+                    charging(pushed.is_ok(), payer, size_of::<u64>())
                 }
                 10 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Deque(_))) else {
@@ -1209,7 +1224,7 @@ mod tests {
                         assert_eq!(list.places(), if full { grown } else { places });
                         assert_eq!(list.last(), Some(&item));
                     }
-                    refused(pushed.is_ok())
+                    charging(pushed.is_ok(), payer, size_of::<u32>())
                 }
                 12 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Map(_))) else {
@@ -1222,7 +1237,11 @@ mod tests {
                         if let Some(map) = made {
                             self.add(Item::Map(map), budget);
                         }
-                        return refused(done);
+                        return charging(
+                            done,
+                            budget,
+                            BoundedMap::<u16, u64>::storage(limit).unwrap(),
+                        );
                     };
                     let key = self.below(8) as u16;
                     let value = self.rng.random_u64();
@@ -1247,7 +1266,7 @@ mod tests {
                     if let Some(charge) = made {
                         self.add(Item::Charge(charge), budget);
                     }
-                    refused(done)
+                    charging(done, budget, n)
                 }
                 14 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Charge(_))) else {
@@ -1268,7 +1287,7 @@ mod tests {
                     let grew = charge.grow_to(to);
                     assert_eq!(grew, to <= was || to - was <= room);
                     assert_eq!(charge.bytes(), if grew { was.max(to) } else { was });
-                    refused(grew)
+                    charging(grew, payer, to.saturating_sub(was))
                 }
                 15 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Charge(_))) else {
@@ -1311,13 +1330,14 @@ mod tests {
                         assert_eq!(after[to], before[to] + bytes);
                         self.held[at].payer = to;
                     }
-                    refused(moved)
+                    charging(moved, to, bytes)
                 }
                 21 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Deque(_))) else {
                         return refused(false);
                     };
-                    let room = self.room(self.held[at].payer);
+                    let payer = self.held[at].payer;
+                    let room = self.room(payer);
                     let additional = self.below(24);
                     let Item::Deque(deque) = &mut self.held[at].item else {
                         unreachable!()
@@ -1344,7 +1364,11 @@ mod tests {
                         }
                         assert_eq!(deque.len(), wanted);
                     }
-                    refused(reserved)
+                    charging(
+                        reserved,
+                        payer,
+                        wanted.saturating_sub(places) * size_of::<u64>(),
+                    )
                 }
                 17 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
@@ -1410,7 +1434,7 @@ mod tests {
                         return refused(repaid);
                     }
                     if !repaid {
-                        return refused(false);
+                        return charging(false, to, if in_place { capacity } else { bytes.len() });
                     }
                     assert!(
                         after[to] - before[to] <= capacity,
@@ -1426,6 +1450,7 @@ mod tests {
                     Acted {
                         refused: false,
                         trimmed: (in_place && bytes.len() < capacity).then_some(to),
+                        need: None,
                     }
                 }
                 _ => {
@@ -1449,30 +1474,36 @@ mod tests {
         /// Asks runner `runner` to be woken when memory frees on `budget`,
         /// with a mark it took before a round.
         fn ask(&mut self, budget: usize, runner: usize, (mark, counted): (Refusals, u64)) {
+            let room = self.room(budget);
             let waits = &mut self.waits[budget];
             if waits.refusals != counted {
-                if waits.woken_at > counted || !waits.starved {
+                if waits.woken_at > counted || waits.wanted == 0 || room >= waits.wanted {
                     self.runners[runner].woken += 1;
                     self.reached.woken_at_once += 1;
                 } else if !waits.waiting.contains(&runner) {
                     waits.waiting.push(runner);
                 }
             }
-            self.budgets[budget].wake_when_freed(&self.runners[runner].waker, mark);
+            self.budgets[budget].wake_when_freed(&self.runners[runner].waiter, mark);
         }
 
-        /// Memory came back to `budget`: after a refusal, the runners that
-        /// asked are woken.
+        /// Memory came back to `budget`: once there is room for the least
+        /// refused charge, the runners that asked are woken.
         fn released(&mut self, budget: usize) {
+            let room = self.room(budget);
             let waits = &mut self.waits[budget];
-            if !waits.starved {
+            if waits.wanted == 0 {
+                return;
+            }
+            if room < waits.wanted {
+                self.reached.released_too_little += 1;
                 return;
             }
             for runner in waits.waiting.drain(..) {
                 self.runners[runner].woken += 1;
                 self.reached.woken_after_waiting += 1;
             }
-            waits.starved = false;
+            waits.wanted = 0;
             waits.woken_at = waits.refusals;
         }
 
@@ -1491,8 +1522,15 @@ mod tests {
                 let released = self.budgets[b].used() < used[b] || acted.trimmed == Some(b);
                 assert!(!(refused && released), "one call refused and released");
                 if refused {
-                    self.waits[b].refusals += 1;
-                    self.waits[b].starved = true;
+                    let Some((on, need)) = acted.need else {
+                        panic!("a call the model thought fit was refused");
+                    };
+                    assert_eq!(on, b, "refused on the budget it charged");
+                    let waits = &mut self.waits[b];
+                    waits.refusals += 1;
+                    if waits.wanted == 0 || need < waits.wanted {
+                        waits.wanted = need;
+                    }
                     self.reached.refusals += 1;
                 }
                 if released {
@@ -1575,6 +1613,7 @@ mod tests {
             }
             let r = &model.reached;
             reached.refusals += r.refusals;
+            reached.released_too_little += r.released_too_little;
             reached.woken_after_waiting += r.woken_after_waiting;
             reached.woken_at_once += r.woken_at_once;
             reached.moved_in_place += r.moved_in_place;
@@ -1582,6 +1621,7 @@ mod tests {
             reached.overruns += r.overruns;
         }
         assert!(reached.refusals > 0);
+        assert!(reached.released_too_little > 0);
         assert!(reached.woken_after_waiting > 0);
         assert!(reached.woken_at_once > 0);
         assert!(reached.moved_in_place > 0);

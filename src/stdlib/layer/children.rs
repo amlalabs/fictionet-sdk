@@ -8,7 +8,7 @@ use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
     Admit, Budget, Charge, ChargedDeque, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer,
-    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
+    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Top, Waiter, WorkOwner,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -230,6 +230,9 @@ struct Kid<B: Layer> {
     /// Events the mux sent within credit that the layer has not taken.
     inbox: ChargedDeque<(EventOf<B::Lower>, bool)>,
     wake: Arc<ChildWake>,
+    /// Its [`Within`]: the waker its calls get, and what waits on its
+    /// budget after a charge of its was refused.
+    waiter: Waiter,
     /// Its places in the ready and work lists.
     links: [Link; 2],
     /// Its deadline after its last call, the arming number that orders it
@@ -389,19 +392,12 @@ impl Wake for ChildWake {
     }
 }
 
-impl ChildWake {
-    /// The child's [`Env::waker`]: it queues the child, then wakes
-    /// `around`, what the child runs in. It changes nothing in the child's
-    /// wake, so it stays good while the child is open.
-    pub(crate) fn waker_in(self: &Arc<Self>, around: Waker) -> Waker {
-        Waker::from(Arc::new(Within {
-            child: self.clone(),
-            around,
-        }))
-    }
-}
-
-/// A child's [`Env::waker`] ([`ChildWake::waker_in`]).
+/// A child's [`Env::waker`], and what its budget wakes when memory frees
+/// after a charge of the child's was refused: it queues the child, then
+/// wakes `around`, what the child runs in. Made once when the child opens,
+/// so every call gets the same one and the budget sees a child that waits
+/// again as the same waiter. It changes nothing in the child's wake, so it
+/// stays good while the child is open.
 struct Within {
     child: Arc<ChildWake>,
     around: Waker,
@@ -834,16 +830,17 @@ where
         let report = move |e| ChildReport::Event(id, e);
         // Until `take_released` below. A closed child takes nothing more.
         kid.wake.enter();
-        let mut moved =
-            match env.scoped_child(&kid.budget, &kid.wake, report, |env| kid.layer.advance(env)) {
-                Ok(moved) => moved,
-                Err(e) => {
-                    self.fail(env, id, e);
-                    return None;
-                }
-            };
+        let mut moved = match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
+            kid.layer.advance(env)
+        }) {
+            Ok(moved) => moved,
+            Err(e) => {
+                self.fail(env, id, e);
+                return None;
+            }
+        };
         if let Some(event) = kid.urgent.take() {
-            match env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+            match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
                 kid.layer.on_event(env, event)
             }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => moved = true,
@@ -856,7 +853,7 @@ where
         }
         if let Some((event, retained)) = kid.inbox.pop_front() {
             let cost = event.credit();
-            match env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+            match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
                 kid.layer.on_event(env, event)
             }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => {
@@ -882,7 +879,7 @@ where
             }
         }
         if kid.outbox.is_none() {
-            kid.outbox = env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+            kid.outbox = env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
                 kid.layer.take_command(env)
             });
             moved |= kid.outbox.is_some();
@@ -996,6 +993,11 @@ where
                 assert!(env.fits_below(&layer), "composition is too deep");
                 let place = self.kids.vacant_entry();
                 let key = place.key();
+                let wake = Arc::new(ChildWake::new(key, self.woken.clone()));
+                let waiter = Waiter::new(Waker::from(Arc::new(Within {
+                    child: wake.clone(),
+                    around: env.waker(),
+                })));
                 place.insert(Kid {
                     id,
                     handle: child,
@@ -1008,7 +1010,8 @@ where
                     budget,
                     owner: WorkOwner::new(),
                     urgent: None,
-                    wake: Arc::new(ChildWake::new(key, self.woken.clone())),
+                    wake,
+                    waiter,
                     window,
                     max_command,
                     granted: 0,
@@ -1033,7 +1036,7 @@ where
                         kid.owner.cancel();
                         if let Err(error) = env.scoped_child(
                             &kid.budget,
-                            &kid.wake,
+                            kid.waiter.waker(),
                             |event| ChildReport::Event(id, event),
                             |env| kid.layer.on_event(env, event),
                         ) {
@@ -1135,7 +1138,7 @@ where
         let result = kid.wake.call(|| {
             env.scoped_child(
                 &kid.budget,
-                &kid.wake,
+                kid.waiter.waker(),
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_timer(env, timer),
             )
@@ -1167,7 +1170,7 @@ where
         let result = kid.wake.call(|| {
             env.scoped_child(
                 &kid.budget,
-                &kid.wake,
+                kid.waiter.waker(),
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_done(env, done),
             )
