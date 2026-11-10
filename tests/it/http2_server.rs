@@ -2000,8 +2000,11 @@ fn connection_budget_exhaustion_sends_goaway() {
     assert!(harness.ended());
 }
 
+/// A stream refused because the budget has no room is not the client's
+/// error: past the local error reset limit, each is still refused alone
+/// and the connection stays open.
 #[test]
-fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
+fn repeated_budget_refusals_leave_the_connection_open() {
     let budget = fictionet::stdlib::layer::Budget::new(h2_input() + 1024);
     let mut harness = budgeted(
         Responder::new(fictionet_test_support::handler(|_, _| {
@@ -2027,14 +2030,11 @@ fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
                 .any(|f| matches!(f, Frame::Reset(r) if r.code == 7)),
             "reset attempt {n}: {output:?}"
         );
-        assert_eq!(harness.ended(), n == 1024);
-        if n == 1024 {
-            assert!(
-                output
-                    .iter()
-                    .any(|f| matches!(f, Frame::GoAway(g) if g.code == 11))
-            );
-        }
+        assert!(
+            !output.iter().any(|f| matches!(f, Frame::GoAway(_))),
+            "reset attempt {n}: {output:?}"
+        );
+        assert!(!harness.ended(), "reset attempt {n}");
     }
 }
 
