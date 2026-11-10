@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
 
 use crate::{PACKET_COST, Packet};
@@ -5,6 +6,7 @@ use crate::{PACKET_COST, Packet};
 /// A packet FIFO that charges each packet's retained allocation (its
 /// vector's capacity) plus [`PACKET_COST`]. Capacity limits and the policy
 /// for rejected packets belong to the caller.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct PacketQueue {
     packets: VecDeque<Packet>,
@@ -17,6 +19,7 @@ pub(crate) fn charge(packet: &Packet) -> Option<usize> {
     packet.0.capacity().checked_add(PACKET_COST)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PacketQueue {
     /// Whether `packet` fits beside the queued packets within `limit`. Every
     /// packet fits when `limit` is `None`, unless the total charge would

@@ -533,6 +533,15 @@ impl RunState {
             drop(q);
             // Give the executor its turn too, then come back.
             cx.waker().wake_by_ref();
+        } else {
+            drop(q);
+            // In a browser, `block_on` holds the thread and polls the run over
+            // and over, so no `setTimeout` fires: the run fires its own
+            // timers as they come due.
+            #[cfg(target_arch = "wasm32")]
+            if self.shared.environment.clock.fire_due() {
+                cx.waker().wake_by_ref();
+            }
         }
         Poll::Pending
     }

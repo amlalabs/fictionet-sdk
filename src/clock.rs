@@ -28,7 +28,8 @@ pub(crate) struct Clock {
     /// lock of `state`; [`now`](Clock::now) reads it without that lock.
     lab_now: LabNow,
     state: Mutex<State>,
-    wake: Option<Waker>,
+    /// A real clock's host wake driver, which this clock owns.
+    driver: Option<crate::timer::Driver>,
 }
 
 /// A lab's time, readable without a lock. One writer at a time (the
@@ -76,20 +77,14 @@ struct State {
     next_id: u64,
     entries: BTreeMap<(Instant, u64), Waker>,
     deadlines: BTreeMap<u64, Instant>,
-    host: Option<Host>,
-}
-
-/// The run's registration in the host wake driver.
-struct Host {
-    id: u64,
-    /// The deadline the driver holds for `id`. `None` once the driver may
-    /// have consumed the entry, so the next arm sets it again.
+    /// The deadline the host driver holds. `None` once the driver may have
+    /// forgotten it, so the next arm sets it again.
     armed: Option<crate::sys::Instant>,
 }
 
 impl Clock {
     pub(crate) fn new(mode: RunMode) -> Arc<Self> {
-        Arc::new_cyclic(|wake| Self {
+        Arc::new_cyclic(|clock| Self {
             #[cfg(test)]
             reads: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -97,7 +92,8 @@ impl Clock {
             origin: (mode == RunMode::Real).then(crate::sys::Instant::now),
             lab_now: LabNow::default(),
             state: Mutex::new(State::default()),
-            wake: (mode == RunMode::Real).then(|| Waker::from(Arc::new(HostWake(wake.clone())))),
+            driver: (mode == RunMode::Real)
+                .then(|| crate::timer::Driver::new(Waker::from(Arc::new(HostWake(clock.clone()))))),
         })
     }
 
@@ -192,31 +188,35 @@ impl Clock {
     // Only the earliest logical deadline is represented in the host driver,
     // and the driver is called only when that deadline changes.
     fn arm(&self, s: &mut State) {
-        let Some(origin) = self.origin else { return };
-        let next = s.entries.first_key_value().map(|((at, _), _)| *at);
-        if let Some(at) = next {
-            let deadline = origin.checked_add(at.since_start()).expect("finite timer");
-            let waker = self.wake.as_ref().expect("real clock waker");
-            match &mut s.host {
-                Some(host) if host.armed == Some(deadline) => {}
-                Some(host) => {
-                    self.note_host_call();
-                    crate::timer::timers().reset(host.id, deadline, waker);
-                    host.armed = Some(deadline);
-                }
-                None => {
-                    self.note_host_call();
-                    let id = crate::timer::timers().add(deadline, waker.clone());
-                    s.host = Some(Host {
-                        id,
-                        armed: Some(deadline),
-                    });
-                }
-            }
-        } else if let Some(host) = s.host.take() {
+        let (Some(origin), Some(driver)) = (self.origin, &self.driver) else {
+            return;
+        };
+        let next = s
+            .entries
+            .first_key_value()
+            .map(|((at, _), _)| origin.checked_add(at.since_start()).expect("finite timer"));
+        if next != s.armed {
             self.note_host_call();
-            crate::timer::timers().remove(host.id);
+            driver.set(next);
+            s.armed = next;
         }
+    }
+
+    /// Wakes the timers due now, for a browser's [`block_on`](crate::block_on),
+    /// which holds the thread so that no `setTimeout` can fire. Returns
+    /// whether any was due.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn fire_due(&self) -> bool {
+        let now = self.now();
+        let mut s = self.state.lock();
+        let due = Self::take_due(&mut s, now);
+        self.arm(&mut s);
+        drop(s);
+        let fired = !due.is_empty();
+        for waker in due {
+            waker.wake();
+        }
+        fired
     }
 
     fn note_host_call(&self) {
@@ -271,25 +271,15 @@ impl Wake for HostWake {
         };
         let now = clock.now();
         let mut s = clock.state.lock();
-        // The driver removed the host entry before waking this waker, and
-        // an arm since then may have skipped the driver for an unchanged
-        // deadline. Set the entry again.
-        if let Some(host) = &mut s.host {
-            host.armed = None;
-        }
+        // The driver forgot its deadline before waking this waker, and an
+        // arm since then may have skipped the driver for an unchanged
+        // deadline. Set it again.
+        s.armed = None;
         let due = Clock::take_due(&mut s, now);
         clock.arm(&mut s);
         drop(s);
         for waker in due {
             waker.wake();
-        }
-    }
-}
-
-impl Drop for Clock {
-    fn drop(&mut self) {
-        if let Some(host) = &self.state.get_mut().host {
-            crate::timer::timers().remove(host.id);
         }
     }
 }
@@ -343,8 +333,7 @@ mod tests {
 
     /// The deadline the host driver holds for `clock`, if any.
     fn driver_deadline(clock: &Clock) -> Option<crate::sys::Instant> {
-        let id = clock.state.lock().host.as_ref()?.id;
-        crate::timer::timers().deadline(id)
+        clock.driver.as_ref().unwrap().deadline()
     }
 
     /// The host instant of logical instant `at` on `clock`.
@@ -369,19 +358,18 @@ mod tests {
         assert_eq!(driver_deadline(&clock), Some(host_instant(&clock, first)));
     }
 
-    /// The driver removes a due entry before it wakes the clock, so an arm
+    /// The driver forgets a deadline before it wakes the clock, so an arm
     /// in between sees an unchanged deadline although the driver no longer
-    /// holds it. The wake must set the entry again.
+    /// holds it. The wake must set the deadline again.
     #[test]
-    fn a_host_wake_sets_the_driver_entry_again() {
+    fn a_host_wake_sets_the_driver_deadline_again() {
         let clock = Clock::new(RunMode::Real);
         let waker = Waker::noop();
         let first = clock.now() + HOUR;
         clock.add(first, waker.clone());
-        let id = clock.state.lock().host.as_ref().unwrap().id;
-        crate::timer::timers().remove(id);
+        clock.driver.as_ref().unwrap().forget();
         clock.add(first + SECOND, waker.clone());
-        clock.wake.as_ref().unwrap().wake_by_ref();
+        Waker::from(Arc::new(HostWake(Arc::downgrade(&clock)))).wake();
         assert_eq!(driver_deadline(&clock), Some(host_instant(&clock, first)));
     }
 
@@ -392,15 +380,50 @@ mod tests {
         let first = clock.now() + HOUR;
         let a = clock.add(first, waker.clone());
         let b = clock.add(first + SECOND, waker.clone());
-        let id = clock.state.lock().host.as_ref().unwrap().id;
         clock.remove(a);
         assert_eq!(
             driver_deadline(&clock),
             Some(host_instant(&clock, first + SECOND))
         );
         clock.remove(b);
-        assert_eq!(crate::timer::timers().deadline(id), None);
+        assert_eq!(driver_deadline(&clock), None);
         clock.add(first, waker.clone());
         assert_eq!(driver_deadline(&clock), Some(host_instant(&clock, first)));
+    }
+
+    /// Each real clock has a driver of its own: a deadline on one clock
+    /// leaves another's driver alone, and dropping a clock ends its
+    /// driver's thread. A lab clock has no driver.
+    #[test]
+    fn each_real_clock_owns_its_driver() {
+        let a = Clock::new(RunMode::Real);
+        let b = Clock::new(RunMode::Real);
+        assert!(Clock::new(RunMode::Lab).driver.is_none());
+        a.add(a.now() + HOUR, Waker::noop().clone());
+        assert!(driver_deadline(&a).is_some());
+        assert_eq!(driver_deadline(&b), None);
+        let thread = a.driver.as_ref().unwrap().thread();
+        drop(a);
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while thread.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the driver outlived its clock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A real run's sleep wakes through its own clock's driver.
+    #[test]
+    fn a_real_sleep_wakes_through_the_runs_driver() {
+        let slept = crate::block_on(crate::run(crate::Seed::from_u64(0), |fcx| async move {
+            let start = fcx.now();
+            fcx.sleep(Duration::from_millis(20)).await?;
+            assert!(fcx.now() >= start + Duration::from_millis(20));
+            assert!(fcx.run.environment.clock.driver.is_some());
+            Ok(())
+        }));
+        assert!(slept.is_ok(), "{slept:?}");
     }
 }

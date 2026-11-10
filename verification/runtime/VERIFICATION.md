@@ -82,7 +82,7 @@ passing runs:
 | `Executor_base` | `RunState::poll`, `TaskWaker`, `RunShared::spawn` and `wake_all`, `Queue::outer` (`src/run.rs`) | 6,415 | 1,369 | 16 | `OuterIsWoken`, `QueuedMeansQueued`, `WakesArePolled`, `CancelsAreSeen` |
 | `Region_base` | `Cx::region` and `Cx::spawn` (`src/cx.rs`), `Region` (`src/cx/region.rs`), `Task::join` (`src/cx/task.rs`), the end-of-task steps and `Drop for RunState` (`src/run.rs`) | 124,050 | 30,395 | 17 | `LiveCounts`, `NoTaskOutlives`, `AdmissionClosed`, `ErrorIsAFailure`, `JoinerSeesFailure`, `DroppedRunIsCancelled`, `ReturnMatches`, `OwnerReturns` |
 | `LabClock_base` | `Clock` in lab mode (`src/clock.rs`), `Timer` (`src/cx/timer.rs`), `Cx::idle`, `RunShared::idle` and the end of a turn (`src/run.rs`) | 1,322,969 | 526,048 | 39 | `Monotonic`, `WakesInOrderAndInTime`, `EntriesOwned`, `SleepersHaveEntries`, `SleepersWake` |
-| `Timers_base` | `Timers::add`, `reset`, `remove`, `State::take_due`, `Timers::thread` (`src/timer.rs`) | 131,483 | 21,878 | 19 | `NoEarlyFire`, `SleepIsSafe`, `DueTimersFire` |
+| `Timers_base` | `Driver::set`, `native::Shared::run`, `Drop for Driver` (`src/timer.rs`) | not run | | | `SleepIsSafe`, `DueFires`, `ThreadEnds` |
 
 On branch `comp/buf-locks` a `Timer` polled for a later deadline keeps its
 entry at the earlier instant while that instant has yet to come: it wakes
@@ -90,6 +90,12 @@ there once, and the next poll moves the entry. `LabClock.tla` was changed to
 match (`Register` takes the poller's clock reading, `Keep`, and each timer's
 `wanted` deadline) and has not been run since; the `LabClock_base` counts
 above are from before the change.
+
+On the same branch the process-wide host timer thread (`Timers`, with a heap
+of every run's deadline) is gone: each real `Clock` owns a `Driver` with one
+deadline and its own thread. `Timers.tla` was rewritten for it, with the
+ablations `Timers_without_notify` and `Timers_without_closenotify`, and has
+not been run.
 
 The properties say, in the runtime's terms: a task that is woken is polled
 again, even when the wake lands during its own poll; queued work between polls
@@ -115,8 +121,8 @@ Ablations, each run alone and each violating the property it names:
 | `LabClock_without_idlewoken` | `Queue::idle_woken` | `SleepersWake` | 9,806 |
 | `LabClock_without_freshid` | the new id `Clock::reset` takes | `WakesInOrderAndInTime` | 2,175 |
 | `LabClock_without_max` | `advance` keeping `max(now, deadline)` | `Monotonic` | 4,026 |
-| `Timers_without_stalecheck` | `take_due` skipping stale heap pairs | `NoEarlyFire` | 637 |
-| `Timers_without_notify` | the `Condvar` notify for an earlier deadline | `SleepIsSafe` | 4 |
+| `Timers_without_closenotify` | the `Condvar` notify when the driver is dropped | `ThreadEnds` | not run |
+| `Timers_without_notify` | the `Condvar` notify in `Driver::set` | `SleepIsSafe` | not run |
 
 Three of the ablations are the bugs earlier rounds fixed in `16abcc1bb` and
 `6a0cc67c3` (the idle point, the moved timer's id, the clock moving back); the
@@ -181,7 +187,7 @@ The real clock with an origin (its registrations are the lab's code; the host
 driver it arms is the `Timers` spec); `Cx::race` and `Cx::yield_now`; the
 foreign cancel wakers of `RegionState::foreign` and `Cx::register_cancel`
 (their release order has unit tests in `src/cx/region.rs`); `Region::child`'s
-list of children; the heap rebuild in `Timers`; `block_on`; the run's note
+list of children; `block_on`; the run's note
 of the task it polls, which `RunShared::is_polling` reads; panics; memory; the `Waker`
 contract. The bounds are two tasks per spec, deadlines 1 and 2 in the lab, one
 stale wake per task, two harness deadlines, and instants 0 to 3 for the host

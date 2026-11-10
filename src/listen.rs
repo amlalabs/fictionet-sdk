@@ -138,9 +138,9 @@ impl std::error::Error for ParseWorldSocketError {}
 #[doc = include_str!("../docs/diagrams/listen.svg")]
 ///
 /// The wall-clock timers behind [`Cx::sleep`](crate::Cx::sleep) work the
-/// same way: one helper thread waits for the earliest deadline and wakes
-/// the world. Fictionet has no reactor of its own, and needs none from the
-/// executor.
+/// same way: each run has one helper thread, which waits for the run's
+/// earliest deadline and wakes the world. Fictionet has no reactor of its
+/// own, and needs none from the executor.
 ///
 /// ```no_run
 /// # use fictionet::{Attachments, Cx, Result};
