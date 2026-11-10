@@ -4,6 +4,7 @@ use core::cmp::min;
 use crate::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
 use crate::error::Error;
 use crate::log::trace;
+use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
 use crate::msgs::message::{InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage};
 
 #[derive(PartialEq)]
@@ -61,6 +62,11 @@ impl RecordLayer {
         encr: InboundOpaqueMessage<'a>,
     ) -> Result<Option<Decrypted<'a>>, Error> {
         if self.decrypt_state != DirectionState::Active {
+            // An unprotected record carries at most 2^14 bytes (RFC 8446
+            // section 5.1, RFC 5246 section 6.2.1).
+            if encr.payload.len() > MAX_FRAGMENT_LEN {
+                return Err(Error::PeerSentOversizedRecord);
+            }
             return Ok(Some(Decrypted {
                 want_close_before_decrypt: false,
                 plaintext: encr.into_plain_message(),

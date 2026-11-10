@@ -1173,6 +1173,15 @@ impl<Data> ConnectionCore<Data> {
                     break (message.into_plain_message(), iter.bytes_consumed());
                 }
 
+                // A protected TLS 1.3 record is at most 2^14 + 256 bytes
+                // (RFC 8446 section 5.2): refused before it is decrypted.
+                if version_is_tls13
+                    && self.common_state.record_layer.is_decrypting()
+                    && message.payload.len() > MAX_TLS13_CIPHERTEXT_LEN
+                {
+                    return Err(self.handle_deframe_error(Error::PeerSentOversizedRecord, state));
+                }
+
                 // Room for a place in the plaintext queue, in case this is
                 // application data that is kept, before the record is
                 // decrypted, which cannot be undone. The plaintext itself
@@ -1475,3 +1484,7 @@ impl InboundUnborrowedMessage {
 /// cf. BoringSSL's `kMaxEmptyRecords`
 /// <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls_record.cc#L124-L128>
 const ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX: u8 = 32;
+
+/// The longest protected TLS 1.3 record: 2^14 + 256 bytes (RFC 8446
+/// section 5.2).
+const MAX_TLS13_CIPHERTEXT_LEN: usize = (1 << 14) + 256;
