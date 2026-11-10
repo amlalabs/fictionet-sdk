@@ -1,10 +1,11 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Wake, Waker};
 
 use fictionet::Entropy;
-use fictionet::stdlib::layer::{Admit, Budget, Charge, CommandOf, Env, EventOf, Layer, Observe};
+use fictionet::stdlib::layer::{
+    Admit, Budget, Charge, ChargedDeque, CommandOf, Env, EventOf, Layer, Observe, Refusals,
+};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 
@@ -15,13 +16,14 @@ const KEPT: usize = 1024;
 
 /// A layer's reports, as many as there is room for, and a count of the
 /// ones there was no room for. Reports never hold up the protocol.
+///
+/// The store has a byte budget of its own, apart from the connection's:
+/// each report kept is charged what it holds, and the queue its places.
 #[derive(Debug)]
 pub struct Observations<E> {
-    kept: VecDeque<(E, Charge)>,
+    kept: ChargedDeque<(E, Charge)>,
     budget: Budget,
-    storage: Option<Charge>,
     heap_bytes: fn(&E) -> Option<usize>,
-    limit: usize,
     omitted: u64,
 }
 
@@ -29,23 +31,18 @@ impl<E> Observations<E> {
     /// An empty store with an item limit. Unmeasured reports are omitted;
     /// use [`bounded`](Self::bounded) to supply their allocation bound.
     pub fn new(limit: usize) -> Observations<E> {
-        Observations {
-            kept: VecDeque::new(),
-            budget: Budget::new(256 * 1024),
-            storage: None,
-            heap_bytes: |_| None,
-            limit,
-            omitted: 0,
-        }
+        Observations::bounded(limit, 256 * 1024, |_| None)
     }
 
     /// Bound report retention with a separate byte budget and an allocation
     /// size function. The function must include all retained backing storage.
     pub fn bounded(limit: usize, bytes: usize, heap_bytes: fn(&E) -> Option<usize>) -> Self {
+        let budget = Budget::new(bytes);
         Self {
-            budget: Budget::new(bytes),
+            kept: ChargedDeque::new(&budget, limit),
+            budget,
             heap_bytes,
-            ..Self::new(limit)
+            omitted: 0,
         }
     }
 
@@ -70,46 +67,16 @@ impl<E> Observations<E> {
     }
 }
 
-impl<E> Observations<E> {
-    /// Makes room for one more kept report: doubles the slots up to the
-    /// limit, or adds one when the budget has no room to double. Whatever
-    /// the event itself retains is already charged, so growth never takes
-    /// the room it needs. Nothing changes when no slot fits.
-    fn grow(&mut self) -> bool {
-        let len = self.kept.len();
-        if len < self.kept.capacity() {
-            return true;
-        }
-        let slot = std::mem::size_of::<(E, Charge)>();
-        let doubled = len.saturating_mul(2).max(1).min(self.limit);
-        let reserved = [doubled, len + 1].into_iter().find(|&slots| {
-            let Some(wanted) = slots.checked_mul(slot) else {
-                return false;
-            };
-            match &mut self.storage {
-                Some(charge) => charge.grow_to(wanted),
-                None => {
-                    self.storage = self.budget.charge(wanted);
-                    self.storage.is_some()
-                }
-            }
-        });
-        let Some(slots) = reserved else {
-            return false;
-        };
-        self.kept.reserve_exact(slots - len);
-        true
-    }
-}
-
 impl<E> Observe<E> for Observations<E> {
+    /// Charges what the report holds first, then its place, so the
+    /// queue's growth never takes the room the report needs.
     fn observe(&mut self, event: E) {
-        if self.kept.len() < self.limit
+        if self.kept.len() < self.kept.most()
             && let Some(bytes) = (self.heap_bytes)(&event)
             && let Some(charge) = self.budget.charge(bytes)
-            && self.grow()
+            && let Some(place) = self.kept.place()
         {
-            self.kept.push_back((event, charge));
+            place.push_back((event, charge));
             return;
         }
         self.omitted = self.omitted.saturating_add(1);
@@ -118,7 +85,7 @@ impl<E> Observe<E> for Observations<E> {
     /// A store that keeps no reports wants none made, so none is counted
     /// in [`omitted`](Self::omitted) either.
     fn interested(&self) -> bool {
-        self.limit > 0
+        self.kept.most() > 0
     }
 }
 
@@ -146,9 +113,14 @@ pub struct Driver<L: Layer> {
     steps: usize,
     exhausted: bool,
     wake: Arc<StackWake>,
+    /// `wake` as a waker, for the budget to wake when memory frees.
+    stack: Waker,
+    /// The task `wake` wakes, as last set: the same as `wake.task`.
+    task: Option<Waker>,
 }
 
-/// What a layer's [`Env::waker`] wakes in the end: it notes that the stack
+/// What a layer's [`Env::waker`] wakes in the end, and what the budget
+/// wakes when memory frees after a refused charge: it notes that the stack
 /// should run, and wakes the task that runs it.
 pub(crate) struct StackWake {
     /// Woken since the last [`Driver::run`] began.
@@ -181,6 +153,10 @@ impl<L: Layer> Driver<L> {
     /// hands over and when a child is made. No call walks the stack for it.
     pub fn new(layer: L, entropy: Arc<dyn Entropy>, budget: Budget, now: Instant) -> Driver<L> {
         assert!(layer.depth() <= super::MAX_DEPTH, "composition is too deep");
+        let wake = Arc::new(StackWake {
+            woken: AtomicBool::new(false),
+            task: Mutex::new(None),
+        });
         Driver {
             layer,
             entropy,
@@ -195,11 +171,30 @@ impl<L: Layer> Driver<L> {
             urgent: None,
             steps: STEPS,
             exhausted: false,
-            wake: Arc::new(StackWake {
-                woken: AtomicBool::new(false),
-                task: Mutex::new(None),
-            }),
+            stack: Waker::from(wake.clone()),
+            wake,
+            task: None,
         }
+    }
+
+    /// Where the count of charges the stack's budget refused stands. A
+    /// runner takes this at the start of each round, to hand to
+    /// [`wake_when_freed`](Self::wake_when_freed) after it.
+    pub fn refusals(&self) -> Refusals {
+        self.budget.refusals()
+    }
+
+    /// Gets the stack run again once memory frees, if its budget refused a
+    /// charge since `since`: the runner's last round, which ended with
+    /// nothing moving. A layer whose charge was refused tries again when it
+    /// is next advanced (rule 9), so the runner calls this before it waits,
+    /// and the release that frees memory marks the stack
+    /// [`woken`](Self::woken) and wakes the task
+    /// ([`set_waker`](Self::set_waker)). When nothing was refused it does
+    /// nothing; when memory was freed after the refusal already, the stack
+    /// is woken at once.
+    pub fn wake_when_freed(&self, since: Refusals) {
+        self.budget.wake_when_freed(&self.stack, since);
     }
 
     /// `task` runs the stack from now on: a layer that wakes its
@@ -207,10 +202,13 @@ impl<L: Layer> Driver<L> {
     /// is polled. Until a runner says, a wake is only noted
     /// ([`woken`](Self::woken)).
     pub fn set_waker(&mut self, task: &Waker) {
-        let mut current = self.wake.task.lock();
-        if !current.as_ref().is_some_and(|w| w.will_wake(task)) {
-            *current = Some(task.clone());
+        // Runners say so on every poll, nearly always with the same task:
+        // compare with the driver's own copy, and lock only to change it.
+        if self.task.as_ref().is_some_and(|w| w.will_wake(task)) {
+            return;
         }
+        self.task = Some(task.clone());
+        *self.wake.task.lock() = Some(task.clone());
     }
 
     /// Whether a layer woke its [`Env::waker`] since the last
@@ -230,7 +228,7 @@ impl<L: Layer> Driver<L> {
     /// Keeps at most `limit` reports from now on. With none kept, the stack
     /// makes none ([`Env::observing`]).
     pub fn keep_observations(&mut self, limit: usize) {
-        self.observed.limit = limit;
+        self.observed.kept.set_most(limit);
     }
 
     /// The stack.
@@ -268,8 +266,13 @@ impl<L: Layer> Driver<L> {
         &mut self,
         event: EventOf<L::Lower>,
     ) -> Result<Admit<EventOf<L::Lower>>, L::Error> {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         self.layer.on_event(&mut env, event)
     }
 
@@ -278,15 +281,25 @@ impl<L: Layer> Driver<L> {
         &mut self,
         command: CommandOf<L::Upper>,
     ) -> Result<Admit<CommandOf<L::Upper>>, L::Error> {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         self.layer.on_command(&mut env, command)
     }
 
     /// Gives the stack the result of work it asked for.
     pub fn complete(&mut self, done: L::Done) -> Result<(), L::Error> {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         self.layer.on_done(&mut env, done)
     }
 
@@ -295,13 +308,23 @@ impl<L: Layer> Driver<L> {
     /// after input or output has moved, or whenever [`exhausted`](Self::exhausted) is true.
     pub fn run(&mut self) -> Result<bool, L::Error> {
         // This run serves every wake before it, and sees what each woke
-        // for; one during it is noted again.
-        self.wake.woken.swap(false, Ordering::AcqRel);
+        // for; one during it is noted again. Most runs follow no wake, and
+        // reading the flag is cheaper than clearing it; a wake that the
+        // read misses leaves the flag set, and the runner runs again.
+        if self.wake.woken.load(Ordering::Relaxed) {
+            self.wake.woken.swap(false, Ordering::AcqRel);
+        }
         self.exhausted = true;
         let mut moved = false;
+        // One environment for every step: the time stands still in a run.
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         for _ in 0..self.steps {
-            let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-                .in_stack(&self.wake);
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
             let mut step = false;
             if let Some((_, timer)) = due {
@@ -328,8 +351,13 @@ impl<L: Layer> Driver<L> {
         &mut self,
         sink: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
     ) -> bool {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         send(&mut self.below, || self.layer.take_command(&mut env), sink)
     }
 
@@ -337,8 +365,13 @@ impl<L: Layer> Driver<L> {
     /// the caller. A previously refused command is returned first.
     pub fn take_command(&mut self) -> Option<CommandOf<L::Lower>> {
         self.below.take().or_else(|| {
-            let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-                .in_stack(&self.wake);
+            let mut env = Env::in_stack(
+                self.now,
+                &*self.entropy,
+                &self.budget,
+                &mut self.observed,
+                &self.wake,
+            );
             self.layer.take_command(&mut env)
         })
     }
@@ -525,6 +558,96 @@ mod tests {
         fn deadline(&self) -> Option<(Instant, ())> {
             Some((Instant::ZERO, ()))
         }
+    }
+
+    /// Asks its budget for `want` bytes on each advance until it gets
+    /// them, as a layer does whose charge was refused (rule 9).
+    struct Hungry {
+        want: usize,
+        held: Option<Charge>,
+        tries: usize,
+    }
+    impl Layer for Hungry {
+        type Lower = Units;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<Admit<()>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
+            if self.held.is_some() {
+                return Ok(false);
+            }
+            self.tries += 1;
+            self.held = env.budget().charge(self.want);
+            Ok(self.held.is_some())
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<()> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// The task that runs a stack, counting its wakes.
+    #[derive(Default)]
+    struct Task(std::sync::atomic::AtomicUsize);
+    impl Wake for Task {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_round_that_was_refused_wakes_the_stack_when_memory_frees() {
+        let budget = Budget::new(64);
+        let hog = budget.charge(48).unwrap();
+        let mut driver = Driver::new(
+            Hungry {
+                want: budget.limit() - hog.bytes() + 1,
+                held: None,
+                tries: 0,
+            },
+            Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+            budget.clone(),
+            Instant::ZERO,
+        );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
+        let woken = || task.0.load(Ordering::Relaxed);
+
+        // A round with no refusal waits for nothing.
+        let quiet = driver.refusals();
+        driver.wake_when_freed(quiet);
+        let mark = driver.refusals();
+        assert!(!driver.run().unwrap(), "the charge is refused");
+        driver.wake_when_freed(mark);
+        assert!(!driver.woken());
+        assert_eq!(woken(), 0, "no memory freed yet");
+        let tries = driver.layer().tries;
+
+        drop(hog);
+        assert!(driver.woken(), "the release marks the stack");
+        assert_eq!(woken(), 1, "and wakes its task once");
+        assert!(driver.run().unwrap(), "the layer tries again and fits");
+        assert!(driver.layer().tries > tries);
+        assert!(driver.layer().held.is_some());
+        assert!(!driver.woken(), "the run served the wake");
     }
 
     #[test]

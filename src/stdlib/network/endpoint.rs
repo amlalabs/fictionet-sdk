@@ -57,7 +57,7 @@ pub(crate) async fn drive(
     let mut raw = None;
     let mut output = Vec::new();
     let mut outgoing = std::collections::VecDeque::new();
-    let mut jobs = Jobs::new();
+    let mut jobs = Jobs::new(ip.budget());
     let mut closed = false;
     poll_fn(|cx| {
         if fcx.is_cancelled() {

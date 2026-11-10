@@ -168,7 +168,7 @@
 //!    [`Admit::Closed`] instead of taking and dropping.
 //! 9. **A refused charge waits for memory.** It leaves the layer ready to
 //!    try again on its next [`advance`](Layer::advance), and the runner
-//!    wakes the stack when memory frees ([`Budget::wake_when_freed`]).
+//!    wakes the stack when memory frees ([`Driver::wake_when_freed`]).
 //!
 //! Every entry point is synchronous: it never awaits, reads a socket, reads
 //! a clock, or starts a task. The time, the entropy and the budget come in
@@ -226,7 +226,7 @@ pub(crate) use framed::tests as framed_echo;
 mod proofs;
 
 pub use budget::{Budget, Charge, OwnedWork, Refusals, WorkOwner};
-pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, Owned};
+pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, Owned, Place};
 
 /// Maximum supported composition depth, including erased layers.
 pub const MAX_DEPTH: usize = 32;

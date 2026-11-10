@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use fictionet::stdlib::layer::{
-    Charge, ChildId, ChildWork, Driver, Layer, OwnedWork, Side, Worker,
+    Budget, ChargedDeque, ChildId, ChildWork, Driver, Layer, OwnedWork, Side, Worker,
 };
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy};
@@ -148,10 +148,10 @@ impl Job for Infallible {
 }
 
 /// The work a stack handed over that has not finished, in the order it
-/// was handed over.
+/// was handed over. Its places are charged to the stack's budget, each
+/// before the work that goes in it is taken from the stack.
 pub(crate) struct Jobs<W> {
-    running: Vec<Running<W>>,
-    storage: Option<Charge>,
+    running: ChargedDeque<Running<W>>,
     budget_failed: bool,
 }
 
@@ -174,10 +174,11 @@ impl<W> Drop for Running<W> {
 }
 
 impl<W: Job> Jobs<W> {
-    pub(crate) fn new() -> Jobs<W> {
+    /// No work yet, its places to be charged to `budget`: the budget of
+    /// the stack whose work it runs.
+    pub(crate) fn new(budget: &Budget) -> Jobs<W> {
         Jobs {
-            running: Vec::new(),
-            storage: None,
+            running: ChargedDeque::new(budget, JOBS),
             budget_failed: false,
         }
     }
@@ -199,40 +200,22 @@ impl<W: Job> Jobs<W> {
     pub(crate) fn take<L: Layer<Work = W>>(&mut self, driver: &mut Driver<L>) -> bool {
         let mut took = false;
         for _ in 0..INTAKE {
-            if self.running.len() == JOBS || self.budget_failed {
+            if self.budget_failed {
                 break;
             }
-            if self.running.len() == self.running.capacity() {
-                let capacity = self.running.len() + 1;
-                let bytes = capacity * std::mem::size_of::<Running<W>>();
-                let reserved = match &mut self.storage {
-                    Some(charge) => charge.grow_to(bytes),
-                    None => {
-                        self.storage = driver.budget().charge(bytes);
-                        self.storage.is_some()
-                    }
-                };
-                if !reserved {
-                    // Existing jobs can release storage or budget when polled.
-                    self.budget_failed = self.running.is_empty();
-                    break;
-                }
-                if self.running.capacity() == 0 {
-                    // Keep one reserved slot while idle so work can be checked
-                    // even when the layer retains the rest of its budget.
-                    self.running.reserve_exact(1);
-                }
-            }
-            let Some(work) = driver.take_work() else {
-                if let Some(charge) = &mut self.storage {
-                    charge.shrink_to(self.running.capacity() * std::mem::size_of::<Running<W>>());
-                }
+            // The place first: work taken from the stack cannot go back.
+            // The place made while idle stays, so work can be checked even
+            // when the layer holds the rest of its budget.
+            let Some(place) = self.running.place() else {
+                // Full, or no room for a place. Existing jobs can release
+                // storage or budget when polled.
+                self.budget_failed = self.running.is_empty();
                 break;
             };
-            if self.running.len() == self.running.capacity() {
-                self.running.reserve_exact(1);
-            }
-            self.running.push(Running {
+            let Some(work) = driver.take_work() else {
+                break;
+            };
+            place.push_back(Running {
                 work: Some(work),
                 completed: false,
                 region: None,
@@ -245,7 +228,7 @@ impl<W: Job> Jobs<W> {
     /// End the tasks behind completed work once the whole stack is terminal.
     /// Half-closing one direction does not end their owner.
     pub(crate) fn close_completed(&mut self) {
-        for running in &mut self.running {
+        for running in self.running.iter_mut() {
             if running.completed {
                 running.work = None;
                 if let Some(region) = &running.region {
@@ -266,8 +249,7 @@ impl<W: Job> Jobs<W> {
         let mut finished = false;
         let before = self.running.len();
         let mut i = 0;
-        while i < self.running.len() {
-            let running = &mut self.running[i];
+        while let Some(running) = self.running.get_mut(i) {
             if running.work.is_some() && running.region.is_none() {
                 running.region = fcx.map(Cx::job_context);
             }
@@ -313,11 +295,8 @@ impl<W: Job> Jobs<W> {
             }
         }
         if self.running.len() < before {
-            // Release the allocation before returning its reservation.
+            // Keep one place for the next check of the stack's work.
             self.running.shrink_to(1);
-            if let Some(charge) = &mut self.storage {
-                charge.shrink_to(self.running.capacity() * std::mem::size_of::<Running<W>>());
-            }
         }
         Ok(finished)
     }
@@ -328,7 +307,8 @@ impl<W: Job> Jobs<W> {
 /// is not ready waits for the next call; work that wakes itself while it
 /// is polled is polled again at once.
 pub struct Polling<W> {
-    jobs: Jobs<W>,
+    /// Made at the first visit, charged to the stack's budget.
+    jobs: Option<Jobs<W>>,
     fcx: Option<Cx>,
     woken: Arc<Flag>,
 }
@@ -351,7 +331,7 @@ impl<W: Job> Polling<W> {
     /// error.
     pub fn new() -> Polling<W> {
         Polling {
-            jobs: Jobs::new(),
+            jobs: None,
             fcx: None,
             woken: Arc::new(Flag(AtomicBool::new(false))),
         }
@@ -382,26 +362,25 @@ where
     L::Work: Job<Done = L::Done>,
 {
     fn work(&mut self, driver: &mut Driver<L>) -> Result<bool, L::Error> {
+        let jobs = self.jobs.get_or_insert_with(|| Jobs::new(driver.budget()));
         if driver.layer().is_terminal() {
-            self.jobs.close_completed();
+            jobs.close_completed();
         }
-        let mut moved = self.jobs.take(driver);
+        let mut moved = jobs.take(driver);
         self.woken.0.store(false, Ordering::Relaxed);
         let waker = Waker::from(self.woken.clone());
         let mut cx = Context::from_waker(&waker);
-        moved |= self
-            .jobs
-            .poll(self.fcx.as_ref(), &mut cx, |done| driver.complete(done))?;
+        moved |= jobs.poll(self.fcx.as_ref(), &mut cx, |done| driver.complete(done))?;
         // Work that woke itself while it was polled has more to do.
         Ok(moved || self.woken.0.load(Ordering::Relaxed))
     }
 
     fn budget_exhausted(&self) -> bool {
-        self.jobs.budget_exhausted()
+        self.jobs.as_ref().is_some_and(Jobs::budget_exhausted)
     }
 
     fn running(&self) -> usize {
-        self.jobs.len()
+        self.jobs.as_ref().map_or(0, Jobs::len)
     }
 
     fn entropy(&self) -> Option<Arc<dyn Entropy>> {
@@ -562,7 +541,7 @@ mod tests {
     fn productive_work_source_has_bounded_intake_and_storage() {
         let budget = Budget::unlimited();
         let mut driver = driver(budget.clone());
-        let mut jobs = Jobs::new();
+        let mut jobs = Jobs::new(&budget);
         assert!(jobs.take(&mut driver));
         assert_eq!(jobs.len(), INTAKE);
         for _ in 0..JOBS {
@@ -572,7 +551,7 @@ mod tests {
         assert_eq!(driver.layer().extracted, JOBS);
         assert!(
             budget.used()
-                >= jobs.running.capacity() * std::mem::size_of::<Running<OwnedWork<PendingJob>>>()
+                >= jobs.running.places() * std::mem::size_of::<Running<OwnedWork<PendingJob>>>()
         );
         drop(jobs);
         assert_eq!(budget.used(), 0);
@@ -581,7 +560,7 @@ mod tests {
     #[test]
     fn cancelled_work_drops_before_another_poll() {
         let mut driver = driver(Budget::unlimited());
-        let mut jobs = Jobs::new();
+        let mut jobs = Jobs::new(driver.budget());
         jobs.take(&mut driver);
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
@@ -609,7 +588,7 @@ mod tests {
             budget.clone(),
             Instant::ZERO,
         );
-        let mut jobs = Jobs::new();
+        let mut jobs = Jobs::new(&budget);
         assert!(!jobs.take(&mut driver));
         assert!(!jobs.budget_exhausted());
         assert!(jobs.is_empty());
@@ -624,7 +603,7 @@ mod tests {
         let budget = Budget::new(std::mem::size_of::<Running<OwnedWork<PendingJob>>>());
         let mut driver = driver(budget.clone());
         driver.layer_mut().remaining = Some(1);
-        let mut jobs = Jobs::new();
+        let mut jobs = Jobs::new(&budget);
         assert!(jobs.take(&mut driver));
         assert_eq!(jobs.len(), 1);
         assert!(!jobs.budget_exhausted());
@@ -648,7 +627,7 @@ mod tests {
     #[test]
     fn exhausted_job_storage_never_launches_work() {
         let mut driver = driver(Budget::new(0));
-        let mut jobs = Jobs::new();
+        let mut jobs = Jobs::new(driver.budget());
         assert!(!jobs.take(&mut driver));
         assert!(jobs.budget_exhausted());
         assert!(jobs.is_empty());
@@ -667,7 +646,7 @@ mod tests {
             let (sibling_start, sibling_started) = tokio::sync::oneshot::channel();
             *closing.layer().start.lock() = Some(closing_start);
             *sibling.layer().start.lock() = Some(sibling_start);
-            let mut jobs = Jobs::new();
+            let mut jobs = Jobs::new(closing.budget());
             jobs.take(&mut closing);
             jobs.take(&mut sibling);
             std::future::poll_fn(|cx| {
@@ -727,7 +706,7 @@ mod tests {
             let (start, started) = tokio::sync::oneshot::channel();
             *source.layer().start.lock() = Some(start);
             let returned = source.layer().returned.clone();
-            let mut jobs = Jobs::new();
+            let mut jobs = Jobs::new(source.budget());
             jobs.take(&mut source);
             std::future::poll_fn(|cx| {
                 Poll::Ready(jobs.poll(Some(&fcx), cx, |_| {

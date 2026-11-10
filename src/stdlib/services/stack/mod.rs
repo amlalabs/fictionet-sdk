@@ -244,7 +244,8 @@ impl Drop for Counted {
 /// with the world's context in a [region](fictionet::Cx#regions) of its
 /// own: what it spawns is cancelled when the run ends. A task of the work
 /// that fails ends that work and cancels the run, never the caller's
-/// region.
+/// region. When `budget` refuses the stack a charge, the stack tries again
+/// once memory frees: the release wakes the run.
 ///
 /// It returns once the stack has ended its direction with every byte
 /// written and no work left, and input has ended or the stack declares
@@ -330,8 +331,9 @@ pub enum DatagramReport<R> {
 /// one the stack sends goes to the address it names, at once. A datagram
 /// the stack has not taken holds up the next receive, so the socket queues
 /// them. When the socket closes the stack hears [`DatagramEvent::Ended`]
-/// and sends what it still has. The stack's work runs as [`stream`]'s
-/// does. A panic in the stack names it and the socket on standard error as
+/// and sends what it still has. The stack's work runs, and a refused
+/// charge is tried again, as in [`stream`]. A panic in the stack names it
+/// and the socket on standard error as
 /// it unwinds ([`PanicNote`]).
 pub async fn datagrams<L, D>(
     fcx: &Cx,
@@ -371,7 +373,7 @@ where
     D: DatagramSocket,
 {
     let mut driver = Driver::new(stack, std::sync::Arc::new(fcx.clone()), budget, fcx.now());
-    let mut jobs = Jobs::new();
+    let mut jobs = Jobs::new(driver.budget());
     let mut input: Option<DatagramEvent<SocketAddr>> = None;
     let mut socket_closed = false;
     let mut rounds = 0u32;
@@ -389,7 +391,11 @@ where
         .await?;
         let mut ended = false;
         let mut settled = false;
+        let mut refusals = driver.refusals();
         for _ in 0..FAIR {
+            // As in the stream runner: a charge refused in the round that
+            // settles is tried again when memory frees.
+            refusals = driver.refusals();
             let mut moved = false;
             moved |= jobs.take(&mut driver);
             if jobs.budget_exhausted() {
@@ -439,6 +445,9 @@ where
             fcx.yield_now().await?;
             continue;
         }
+        // Memory freed after a refusal marks the stack woken, which ends
+        // the wait below.
+        driver.wake_when_freed(refusals);
 
         let deadline = driver.deadline();
         let got = {

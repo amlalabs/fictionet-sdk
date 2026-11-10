@@ -101,11 +101,23 @@ impl<'a, E> Env<'a, E> {
         part.depth() < self.room
     }
 
-    /// The same environment, in a driver whose stack `stack` wakes.
-    pub(super) fn in_stack(self, stack: &'a Arc<StackWake>) -> Env<'a, E> {
+    /// An environment for one call to the top of a stack that a driver
+    /// runs, whose [`waker`](Self::waker) wakes `stack`.
+    pub(super) fn in_stack(
+        now: Instant,
+        entropy: &'a dyn Entropy,
+        budget: &'a Budget,
+        observer: &'a mut dyn Observe<E>,
+        stack: &'a Arc<StackWake>,
+    ) -> Env<'a, E> {
         Env {
+            now,
+            entropy,
+            budget,
+            observing: observer.interested(),
+            observer,
+            room: MAX_DEPTH,
             wakes: Wakes::Stack(stack),
-            ..self
         }
     }
 
@@ -154,16 +166,13 @@ impl<'a, E> Env<'a, E> {
     /// itself in its [`depth`](Layer::depth) calls its parts through this
     /// or [`scoped`](Self::scoped).
     pub fn part<R>(&mut self, body: impl FnOnce(&mut Env<'_, E>) -> R) -> R {
-        let mut env = Env {
-            now: self.now,
-            entropy: self.entropy,
-            budget: self.budget,
-            observer: &mut *self.observer,
-            observing: self.observing,
-            room: self.room.saturating_sub(1),
-            wakes: self.wakes,
-        };
-        body(&mut env)
+        // The part shares everything with this layer but the depth left,
+        // so it borrows this environment rather than a copy of it.
+        let room = self.room;
+        self.room = room.saturating_sub(1);
+        let result = body(self);
+        self.room = room;
+        result
     }
 
     /// Runs `body` with an environment for a part of this layer, one level
