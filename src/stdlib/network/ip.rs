@@ -2026,16 +2026,17 @@ mod tests {
     #[test]
     fn unfinished_packets_time_out() {
         let mut r = Reassembly::default();
-        assert!(
-            r.reassemble(frag4(1, 0, 16, true), at(0))
-                .unwrap()
-                .is_none()
-        );
+        let first = frag4(1, 0, 16, true);
+        assert!(r.reassemble(first.clone(), at(0)).unwrap().is_none());
         assert_eq!(r.next_expiry(), Some(at(30)));
         r.expire(at(29));
         assert_eq!(r.partial.len(), 1);
         r.expire(at(30));
         assert!(r.partial.is_empty());
+        // What is left counted is the first fragment, kept for the Time
+        // Exceeded answer until taken.
+        assert_eq!(r.size, first.0.len());
+        assert_eq!(r.take_expired(), Some(first));
         assert_eq!(r.size, 0);
         // The rest alone does not make a packet: the first fragment is gone.
         assert!(
@@ -2162,11 +2163,24 @@ mod tests {
         assert!(r.partial.len() < MAX_WAITING / PARTIAL_COST);
         assert_eq!(r.partial.len(), r.by_expiry.len());
         // The ones left are the newest, and they expire in order.
+        let left = r.partial.len();
         let first = r.next_expiry().unwrap();
         r.expire(first);
         assert_eq!(r.partial.len(), r.by_expiry.len());
         r.expire(at(1_000));
         assert!(r.partial.is_empty() && r.by_expiry.is_empty());
+        r.check();
+        // Each was a first fragment, kept for its Time Exceeded answer and
+        // counted until taken; taking them all leaves nothing counted.
+        let kept: usize = r.expired.iter().map(|p| p.0.len()).sum();
+        assert_eq!(r.size, kept);
+        let mut taken = 0;
+        while let Some(p) = r.take_expired() {
+            let f = Header::parse(&p.0).unwrap().fragment.unwrap();
+            assert!(f.offset == 0 && f.more);
+            taken += 1;
+        }
+        assert_eq!(taken, left);
         assert_eq!(r.size, 0);
     }
 
