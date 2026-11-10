@@ -367,11 +367,11 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
         let admit = match ports.next(&fcx, ip.deadline(), |_| Poll::Pending).await? {
             Event::Packet(0, Packet(bytes)) => {
                 ip.set_now(fcx.now());
-                let raw = Chunk::new(bytes);
+                let raw = Chunk::unpaid(bytes);
                 ip.deliver(PacketEvent::Packet(raw))?.map(drop)
             }
             Event::Packet(_, Packet(bytes)) => ip
-                .command(PacketCommand::Send(Chunk::new(bytes)))?
+                .command(PacketCommand::Send(Chunk::unpaid(bytes)))?
                 .map(drop),
             Event::Timer => {
                 ip.set_now(fcx.now());

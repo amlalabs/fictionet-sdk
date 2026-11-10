@@ -183,7 +183,7 @@ fuzz_target!(|input: Input| {
             }),
             ..Ingress::default()
         };
-        let packet = ObservedIpPacket::observed(Chunk::new(packet), ingress);
+        let packet = ObservedIpPacket::observed(Chunk::unpaid(packet), ingress);
         assert!(matches!(
             tcp.deliver(PacketEvent::Packet(packet)),
             Ok(Admit::Taken)

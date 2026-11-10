@@ -55,9 +55,10 @@ impl Reservation {
 }
 
 impl Chunk {
-    /// Bytes nothing has been charged for, such as input whose owner
-    /// accounts for it.
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Chunk {
+    /// Bytes nothing pays for yet: input from the wire, data from the
+    /// world. Whoever takes them in pays at admission
+    /// ([`Credited::reserve`]).
+    pub fn unpaid(bytes: impl Into<Vec<u8>>) -> Chunk {
         Self::backed(bytes.into(), None, None)
     }
 
@@ -1053,7 +1054,7 @@ mod slot_tests {
 
     #[test]
     fn repaying_unique_whole_backing_reuses_its_allocation() {
-        let mut chunk = Chunk::new(vec![1, 2, 3, 4]);
+        let mut chunk = Chunk::unpaid(vec![1, 2, 3, 4]);
         let allocation = chunk.as_ptr();
         assert!(!chunk.repay(&Budget::new(3)));
         assert_eq!(chunk.charged(), 0);
@@ -1070,7 +1071,7 @@ mod slot_tests {
     fn repaying_spare_capacity_pays_for_it_first_then_keeps_only_the_bytes() {
         let mut bytes = Vec::with_capacity(64);
         bytes.extend_from_slice(&[1, 2]);
-        let mut chunk = Chunk::new(bytes);
+        let mut chunk = Chunk::unpaid(bytes);
         let (allocation, room) = (chunk.as_ptr(), capacity(&chunk));
         // The allocation is paid for whole before it shrinks: room for
         // less is refused, and nothing moves.
@@ -1089,7 +1090,7 @@ mod slot_tests {
 
     #[test]
     fn repaying_shared_backing_copies_and_leaves_siblings_alone() {
-        let mut tail = Chunk::new(vec![1, 2, 3, 4]);
+        let mut tail = Chunk::unpaid(vec![1, 2, 3, 4]);
         let mut head = tail.split_to(2);
         let budget = Budget::new(2);
         assert!(head.repay(&budget));
@@ -1167,7 +1168,7 @@ mod slot_tests {
     fn editing_unreserved_bytes_accounts_for_the_backing_capacity() {
         let mut bytes = Vec::with_capacity(32);
         bytes.extend_from_slice(&[1, 2]);
-        let mut chunk = Chunk::new(bytes);
+        let mut chunk = Chunk::unpaid(bytes);
         assert!(chunk.make_mut(&Budget::new(2)).is_none());
         assert_eq!(&*chunk, &[1, 2]);
         let budget = Budget::new(32);

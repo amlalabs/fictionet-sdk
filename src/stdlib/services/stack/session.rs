@@ -296,7 +296,7 @@ pub(super) mod tests {
             match event {
                 StreamEvent::Ended if !self.written => {
                     if !self.started {
-                        self.write = Some(StreamCommand::Write(Chunk::new(b"last".to_vec())));
+                        self.write = Some(StreamCommand::Write(Chunk::unpaid(b"last".to_vec())));
                         self.started = true;
                     }
                     return Ok(Admit::Blocked(StreamEvent::Ended));
@@ -515,7 +515,7 @@ pub(super) mod tests {
             Seed::from_u64(1),
             Session::new(
                 Says {
-                    write: Some(StreamCommand::Write(Chunk::new(b"four".to_vec()))),
+                    write: Some(StreamCommand::Write(Chunk::unpaid(b"four".to_vec()))),
                     reset_at: None,
                 },
                 StreamLimits {
@@ -556,7 +556,7 @@ pub(super) mod tests {
             Seed::from_u64(1),
             Session::new(
                 Says {
-                    write: Some(StreamCommand::Write(Chunk::new(b"four".to_vec()))),
+                    write: Some(StreamCommand::Write(Chunk::unpaid(b"four".to_vec()))),
                     reset_at: None,
                 },
                 StreamLimits {

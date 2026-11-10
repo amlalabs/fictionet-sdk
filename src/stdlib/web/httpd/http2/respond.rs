@@ -111,7 +111,7 @@ impl Responder {
         let body = body
             .bytes()
             .filter(|bytes| !bytes.is_empty())
-            .map(|bytes| Chunk::new(bytes.to_vec()));
+            .map(|bytes| Chunk::unpaid(bytes.to_vec()));
         let opening = Opening {
             request: Box::new(head),
             ended: body.is_none(),

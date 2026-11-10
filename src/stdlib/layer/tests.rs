@@ -122,7 +122,7 @@ impl Layer for Mask {
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if !self.down.is_empty() {
-            return Some(StreamCommand::Write(Chunk::new(std::mem::take(
+            return Some(StreamCommand::Write(Chunk::unpaid(std::mem::take(
                 &mut self.down,
             ))));
         }
@@ -138,7 +138,9 @@ impl Layer for Mask {
             return Some(StreamEvent::Written(std::mem::take(&mut self.written)));
         }
         if !self.up.is_empty() {
-            return Some(StreamEvent::Data(Chunk::new(std::mem::take(&mut self.up))));
+            return Some(StreamEvent::Data(Chunk::unpaid(std::mem::take(
+                &mut self.up,
+            ))));
         }
         if self.peer_ended && !self.ended_up {
             self.ended_up = true;
@@ -379,7 +381,9 @@ impl Handoff for Echo {
         self.handed = true;
         let mut below = Vec::new();
         if !self.lines.unread().is_empty() {
-            below.push(StreamEvent::Data(Chunk::new(self.lines.unread().to_vec())));
+            below.push(StreamEvent::Data(Chunk::unpaid(
+                self.lines.unread().to_vec(),
+            )));
         }
         if self.peer_ended {
             below.push(StreamEvent::Ended);
@@ -460,7 +464,7 @@ impl Layer for Tunnel {
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if !self.out.is_empty() {
-            return Some(StreamCommand::Write(Chunk::new(std::mem::take(
+            return Some(StreamCommand::Write(Chunk::unpaid(std::mem::take(
                 &mut self.out,
             ))));
         }
@@ -532,7 +536,7 @@ impl Layer for Beat {
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         (!self.out.is_empty())
-            .then(|| StreamCommand::Write(Chunk::new(std::mem::take(&mut self.out))))
+            .then(|| StreamCommand::Write(Chunk::unpaid(std::mem::take(&mut self.out))))
     }
 
     fn take_event(&mut self) -> Option<Infallible> {
@@ -851,7 +855,7 @@ impl Layer for Toy {
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         (!self.out.is_empty())
-            .then(|| StreamCommand::Write(Chunk::new(std::mem::take(&mut self.out))))
+            .then(|| StreamCommand::Write(Chunk::unpaid(std::mem::take(&mut self.out))))
     }
 
     fn take_event(&mut self) -> Option<MuxEvent<Exchange, Ctl>> {
@@ -1467,14 +1471,16 @@ fn a_mux_refuses_commands_for_a_child_that_is_gone() {
         Instant::ZERO,
     );
     let open = frame(OPEN, 5, b"head");
-    let _ = driver.deliver(StreamEvent::Data(Chunk::new(open))).unwrap();
+    let _ = driver
+        .deliver(StreamEvent::Data(Chunk::unpaid(open)))
+        .unwrap();
     driver.run().unwrap();
     let Some(MuxEvent::Opened(child, (), u64::MAX)) = driver.layer_mut().take_event() else {
         panic!("the child opened");
     };
     let close = frame(CLOSE, 5, &[]);
     let _ = driver
-        .deliver(StreamEvent::Data(Chunk::new(close)))
+        .deliver(StreamEvent::Data(Chunk::unpaid(close)))
         .unwrap();
     driver.run().unwrap();
     // The peer closed it; the handle is still here, and goes nowhere.

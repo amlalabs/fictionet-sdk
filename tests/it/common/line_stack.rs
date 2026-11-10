@@ -420,7 +420,9 @@ impl<A: LineApp> Handoff for Lined<A> {
         let next = self.next.take()?;
         let mut below = Vec::new();
         if !self.stream.unread().is_empty() {
-            below.push(StreamEvent::Data(Chunk::new(self.stream.unread().to_vec())));
+            below.push(StreamEvent::Data(Chunk::unpaid(
+                self.stream.unread().to_vec(),
+            )));
         }
         if self.peer_ended {
             below.push(StreamEvent::Ended);
@@ -616,7 +618,10 @@ impl<A: DatagramApp> Layer for Datagrammed<A> {
         _: &mut Env<'_, Self::Report>,
     ) -> Option<DatagramCommand<SocketAddr>> {
         let (bytes, to) = self.sends.pop_front()?;
-        Some(DatagramCommand::Send(Datagram::new(Chunk::new(bytes), to)))
+        Some(DatagramCommand::Send(Datagram::new(
+            Chunk::unpaid(bytes),
+            to,
+        )))
     }
 
     fn take_event(&mut self) -> Option<Infallible> {

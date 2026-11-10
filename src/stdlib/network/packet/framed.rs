@@ -197,7 +197,7 @@ mod tests {
             stack.settle().unwrap();
             let Admit::Closed(PacketCommand::Send(packet)) = stack
                 .driver()
-                .command(PacketCommand::Send(Chunk::new(b"late".to_vec())))
+                .command(PacketCommand::Send(Chunk::unpaid(b"late".to_vec())))
                 .unwrap()
             else {
                 panic!("output has ended");
@@ -230,7 +230,7 @@ mod tests {
         assert!(
             stack
                 .driver()
-                .command(PacketCommand::Send(Chunk::new(b"first".to_vec())))
+                .command(PacketCommand::Send(Chunk::unpaid(b"first".to_vec())))
                 .unwrap()
                 .moved()
         );
@@ -238,11 +238,11 @@ mod tests {
         assert!(
             stack
                 .driver()
-                .command(PacketCommand::Send(Chunk::new(b"second".to_vec())))
+                .command(PacketCommand::Send(Chunk::unpaid(b"second".to_vec())))
                 .unwrap()
                 .moved()
         );
-        let third = PacketCommand::Send(Chunk::new(b"third".to_vec()));
+        let third = PacketCommand::Send(Chunk::unpaid(b"third".to_vec()));
         let Admit::Blocked(third) = stack.driver().command(third).unwrap() else {
             panic!("both output places are occupied");
         };

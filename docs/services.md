@@ -187,7 +187,7 @@ impl Layer for Prompt {
     fn advance(&mut self, _: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
         if !self.asked {
             self.asked = true;
-            self.out.push_back(StreamCommand::Write(Chunk::new(b"password: ".to_vec())));
+            self.out.push_back(StreamCommand::Write(Chunk::unpaid(b"password: ".to_vec())));
             return Ok(true);
         }
         if self.done {
@@ -198,7 +198,7 @@ impl Layer for Prompt {
         };
         let right = line.unwrap_or_default() == self.password.as_bytes();
         let answer: &[u8] = if right { b"welcome\n" } else { b"no\n" };
-        self.out.push_back(StreamCommand::Write(Chunk::new(answer.to_vec())));
+        self.out.push_back(StreamCommand::Write(Chunk::unpaid(answer.to_vec())));
         self.out.push_back(StreamCommand::End);
         self.done = true;
         Ok(true)
@@ -929,7 +929,7 @@ impl Mailbox {
                 smtp::Input::Command(_) => b"250 OK\r\n",
                 smtp::Input::Line(_) => b"503 Unexpected response\r\n",
             };
-            self.out.push_back(StreamCommand::Write(Chunk::new(reply.to_vec())));
+            self.out.push_back(StreamCommand::Write(Chunk::unpaid(reply.to_vec())));
         }
         Ok(())
     }

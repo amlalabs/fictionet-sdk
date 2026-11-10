@@ -595,7 +595,7 @@ fn ip_tcp_tls_and_http_run_in_the_pure_packet_harness() {
         }
         fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             let bytes = ciphertext(&mut self.tls);
-            (!bytes.is_empty()).then(|| StreamCommand::Write(Chunk::new(bytes)))
+            (!bytes.is_empty()).then(|| StreamCommand::Write(Chunk::unpaid(bytes)))
         }
         fn take_event(&mut self) -> Option<Infallible> {
             None

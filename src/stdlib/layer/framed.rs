@@ -603,7 +603,7 @@ pub(crate) mod tests {
             fictionet::time::Instant::ZERO,
         );
         assert!(matches!(
-            d.deliver(StreamEvent::Data(Chunk::new(wire(&frames(1)))))
+            d.deliver(StreamEvent::Data(Chunk::unpaid(wire(&frames(1)))))
                 .unwrap(),
             Admit::Taken
         ));
@@ -767,7 +767,7 @@ pub(crate) mod tests {
         let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
         let mut d = Driver::new(framed, entropy, budget.clone(), Instant::ZERO);
         assert!(matches!(
-            d.deliver(StreamEvent::Data(Chunk::new(vec![1]))),
+            d.deliver(StreamEvent::Data(Chunk::unpaid(vec![1]))),
             Ok(Admit::Taken)
         ));
         assert!(matches!(
@@ -775,7 +775,7 @@ pub(crate) mod tests {
             Some(MessageEvent::Message(Ok(value))) if *value == 1
         ));
         let _ = d
-            .deliver(StreamEvent::Data(Chunk::new(vec![2; 16])))
+            .deliver(StreamEvent::Data(Chunk::unpaid(vec![2; 16])))
             .unwrap();
         let holds = d.layer().stream.allocated() + d.layer().stream.held();
         assert!(

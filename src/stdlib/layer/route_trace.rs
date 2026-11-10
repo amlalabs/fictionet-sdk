@@ -336,13 +336,13 @@ impl Layer for Abstract {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         self.down_out
             .pop_front()
-            .map(|bytes| StreamCommand::Write(Chunk::new(bytes)))
+            .map(|bytes| StreamCommand::Write(Chunk::unpaid(bytes)))
     }
 
     fn take_event(&mut self) -> Option<StreamEvent> {
         self.up_out
             .pop_front()
-            .map(|bytes| StreamEvent::Data(Chunk::new(bytes)))
+            .map(|bytes| StreamEvent::Data(Chunk::unpaid(bytes)))
     }
 }
 
@@ -373,11 +373,11 @@ impl Handoff for Abstract {
             },
             below: below
                 .into_iter()
-                .map(|bytes| StreamEvent::Data(Chunk::new(bytes)))
+                .map(|bytes| StreamEvent::Data(Chunk::unpaid(bytes)))
                 .collect(),
             above: above
                 .into_iter()
-                .map(|bytes| StreamCommand::Write(Chunk::new(bytes)))
+                .map(|bytes| StreamCommand::Write(Chunk::unpaid(bytes)))
                 .collect(),
         })
     }
@@ -487,7 +487,7 @@ impl Owner {
         let chunk = self.in_q.front().expect("input waits").clone();
         let admit = self
             .driver
-            .deliver(StreamEvent::Data(Chunk::new(chunk.clone())))
+            .deliver(StreamEvent::Data(Chunk::unpaid(chunk.clone())))
             .unwrap_or_else(|e| match e {});
         let k = answer_of(&admit, chunk.len(), |event| match event {
             StreamEvent::Data(rest) => rest.len(),
@@ -507,7 +507,7 @@ impl Owner {
         let chunk = self.cmd_q.front().expect("a command waits").clone();
         let admit = self
             .driver
-            .command(StreamCommand::Write(Chunk::new(chunk.clone())))
+            .command(StreamCommand::Write(Chunk::unpaid(chunk.clone())))
             .unwrap_or_else(|e| match e {});
         let k = answer_of(&admit, chunk.len(), |command| match command {
             StreamCommand::Write(rest) => rest.len(),

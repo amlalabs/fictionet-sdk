@@ -38,7 +38,7 @@ fn taken_in(bytes: [u8; 28]) -> Option<CheckedIpPacket> {
     let mut quiet = Quiet;
     let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut quiet);
     let mut layer = IpLayer::host();
-    let _ = layer.on_event(&mut env, PacketEvent::Packet(Chunk::new(bytes.to_vec())));
+    let _ = layer.on_event(&mut env, PacketEvent::Packet(Chunk::unpaid(bytes.to_vec())));
     match layer.take_event() {
         Some(PacketEvent::Packet(packet)) => Some(packet),
         _ => None,

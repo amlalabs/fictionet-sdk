@@ -1345,7 +1345,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             );
         }
         // The decoded payload is paid for as the connection takes it in.
-        let mut data = Bytes::new(data);
+        let mut data = Bytes::unpaid(data);
         if !data.repay(env.budget()) {
             return Err(Error::Budget);
         }
@@ -2415,7 +2415,7 @@ mod tests {
             assert_eq!(control.requested(), Requested::Open);
             assert!(
                 driver
-                    .deliver(ChannelEvent::Stream(StreamEvent::Data(Bytes::new(
+                    .deliver(ChannelEvent::Stream(StreamEvent::Data(Bytes::unpaid(
                         b"trigger".to_vec()
                     ))))
                     .unwrap()

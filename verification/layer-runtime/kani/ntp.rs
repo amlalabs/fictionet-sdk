@@ -41,7 +41,7 @@ fn server() -> Driver<Server> {
 }
 
 fn datagram(bytes: &'static [u8], from: SocketAddr) -> DatagramEvent<SocketAddr> {
-    DatagramEvent::Datagram(Datagram::new(Chunk::new(bytes), from))
+    DatagramEvent::Datagram(Datagram::new(Chunk::unpaid(bytes), from))
 }
 
 /// The first datagram the server sends now, with where to, and how many it

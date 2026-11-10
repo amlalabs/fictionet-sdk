@@ -767,7 +767,7 @@ impl Socket {
                 return;
             };
             mailbox.credit = credit;
-            let datagram = layer::Datagram::new(Chunk::new(data.to_vec()), to);
+            let datagram = layer::Datagram::new(Chunk::unpaid(data.to_vec()), to);
             let send = mailbox.child.send(DatagramCommand::Send(datagram));
             inner.command(send);
         });

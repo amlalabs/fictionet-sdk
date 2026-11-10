@@ -1106,7 +1106,7 @@ impl Http2 {
         receive.closed = end;
         if !data.data.is_empty() && matches!(stream.delivery.overflow, Overflow::None) {
             // The decoded body is paid for as the connection takes it in.
-            let mut chunk = Chunk::new(data.data);
+            let mut chunk = Chunk::unpaid(data.data);
             if chunk.repay(env.budget()) {
                 self.deliver_body(id, chunk, true);
             } else {
@@ -2596,7 +2596,7 @@ mod tests {
             at: Instant::ZERO,
             charge: None,
         };
-        let body = Chunk::new(vec![b'x'; 200_000]);
+        let body = Chunk::unpaid(vec![b'x'; 200_000]);
         let server = Chain::new(
             Http2::upgraded(Limits::default(), &[], opening, Some(body)),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
@@ -2885,7 +2885,7 @@ mod tests {
                 })));
             for piece in self.body.chunks(self.piece) {
                 self.out
-                    .push_back(ExchangeCommand::Data(Chunk::new(piece.to_vec())));
+                    .push_back(ExchangeCommand::Data(Chunk::unpaid(piece.to_vec())));
             }
             self.out.push_back(ExchangeCommand::End);
         }
@@ -3503,8 +3503,8 @@ mod tests {
         let mut harness = sending(Http2::new(Limits::default()), || {
             vec![
                 head(false),
-                ExchangeCommand::Data(Chunk::new(Vec::new())),
-                ExchangeCommand::Data(Chunk::new(BODY.to_vec())),
+                ExchangeCommand::Data(Chunk::unpaid(Vec::new())),
+                ExchangeCommand::Data(Chunk::unpaid(BODY.to_vec())),
                 ExchangeCommand::End,
             ]
         });

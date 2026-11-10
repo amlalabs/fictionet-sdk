@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn a_packet_is_never_split_by_credit() {
-        let packet = PacketEvent::Packet(Chunk::new(vec![7; 1500]));
+        let packet = PacketEvent::Packet(Chunk::unpaid(vec![7; 1500]));
         assert_eq!(packet.credit(), 1);
         assert!(!packet.splittable());
         let Err(packet) = packet.admit_credit(0) else {
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn an_empty_packet_is_a_packet() {
-        let empty = PacketCommand::Send(Datagram::new(Chunk::new(Vec::new()), ()));
+        let empty = PacketCommand::Send(Datagram::new(Chunk::unpaid(Vec::new()), ()));
         assert_eq!(empty.credit(), 1);
         assert_eq!(PacketCommand::<Chunk>::End.credit(), 0);
         assert_eq!(PacketEvent::<Chunk>::Ended.credit(), 0);
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn reserving_charges_the_payload_once_or_refuses_unchanged() {
         let tight = Budget::new(10);
-        let mut big = PacketEvent::Packet(Datagram::new(Chunk::new(vec![1; 11]), 5u8));
+        let mut big = PacketEvent::Packet(Datagram::new(Chunk::unpaid(vec![1; 11]), 5u8));
         assert!(!big.reserve(&tight));
         assert_eq!(tight.used(), 0);
         let PacketEvent::Packet(datagram) = &big else {

@@ -86,7 +86,7 @@ pub enum ChannelCommand {
 }
 
 fn with_stream<R>(data: &mut Chunk, f: impl FnOnce(&mut StreamEvent) -> R) -> R {
-    let mut event = StreamEvent::Data(std::mem::replace(data, Chunk::new(Vec::new())));
+    let mut event = StreamEvent::Data(std::mem::replace(data, Chunk::unpaid(Vec::new())));
     let result = f(&mut event);
     let StreamEvent::Data(bytes) = event else {
         unreachable!()
@@ -331,7 +331,7 @@ mod tests {
         ));
         assert!(
             driver
-                .deliver(ChannelEvent::Stream(StreamEvent::Data(Chunk::new(
+                .deliver(ChannelEvent::Stream(StreamEvent::Data(Chunk::unpaid(
                     b"payload".to_vec()
                 ))))
                 .unwrap()
@@ -364,7 +364,7 @@ mod tests {
             driver
                 .deliver(ChannelEvent::Extended {
                     kind: 7,
-                    data: Chunk::new(b"side".to_vec())
+                    data: Chunk::unpaid(b"side".to_vec())
                 })
                 .unwrap()
                 .moved()

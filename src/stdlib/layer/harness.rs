@@ -127,7 +127,7 @@ impl<L: Layer<Lower = ByteStream>> Harness<L> {
     /// The peer sends `bytes`.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), L::Error> {
         if !bytes.is_empty() {
-            let chunk = Chunk::new(bytes.to_vec());
+            let chunk = Chunk::unpaid(bytes.to_vec());
             self.input.push_back(StreamEvent::Data(chunk));
         }
         self.settle()

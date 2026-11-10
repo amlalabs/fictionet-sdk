@@ -185,7 +185,7 @@ mod tests {
     fn data(direction: Direction, bytes: &[u8]) -> ObservedEvent {
         ObservedEvent::Data {
             direction,
-            bytes: Chunk::new(bytes.to_vec()),
+            bytes: Chunk::unpaid(bytes.to_vec()),
             sequence: 1,
             source: None,
         }

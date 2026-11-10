@@ -202,7 +202,7 @@ impl Layer for Fragmented {
             PacketCommand::Send(bytes) => self.packets.extend(
                 fragments(&bytes, &mut self.serial)
                     .into_iter()
-                    .map(Chunk::new),
+                    .map(Chunk::unpaid),
             ),
             PacketCommand::End => return self.frames.on_command(env, PacketCommand::End),
         }
@@ -240,7 +240,7 @@ fn unchanged_application_runs_directly_and_in_a_packet_stream_with_overlapping_f
         let client_output = output.clone();
         let client = move || {
             Boxed::new(Client {
-                request: Some(Chunk::new(b"one\n".repeat(1000))),
+                request: Some(Chunk::unpaid(b"one\n".repeat(1000))),
                 output: client_output.clone(),
             })
         };
@@ -320,7 +320,7 @@ fn nested_packet_tunnels_own_independent_input_paths() {
                     packet::Framed::new(),
                     endpoint("10.0.0.2".parse().unwrap(), false, move || {
                         Boxed::new(Client {
-                            request: Some(Chunk::new(b"nested\n".repeat(100))),
+                            request: Some(Chunk::unpaid(b"nested\n".repeat(100))),
                             output: client_output.clone(),
                         })
                     }),
@@ -371,7 +371,7 @@ pub(super) fn exchange(
                 Admit::Taken
             });
             for packet in packets {
-                let mut event = PacketEvent::Packet(Chunk::new(packet));
+                let mut event = PacketEvent::Packet(Chunk::unpaid(packet));
                 loop {
                     to.run().unwrap();
                     match to.deliver(event).unwrap() {

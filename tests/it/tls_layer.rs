@@ -127,7 +127,7 @@ fn ciphertext_completion_is_not_admission_and_close_follows_data() {
         assert!(matches!(
             server
                 .driver()
-                .command(StreamCommand::Write(Chunk::new(b"payload".to_vec())))?,
+                .command(StreamCommand::Write(Chunk::unpaid(b"payload".to_vec())))?,
             Admit::Taken
         ));
         server.push(&[])?;
@@ -185,7 +185,7 @@ fn no_budget_refuses_input_without_consuming_it() {
     let bytes = vec![22, 3, 3, 0, 4, 1, 0, 0, 0];
     let result = server
         .driver()
-        .deliver(StreamEvent::Data(Chunk::new(bytes.clone())))
+        .deliver(StreamEvent::Data(Chunk::unpaid(bytes.clone())))
         .unwrap();
     match result {
         Admit::Blocked(StreamEvent::Data(chunk)) => assert_eq!(&*chunk, bytes),
@@ -218,7 +218,7 @@ fn ciphertext_batches_and_completions_survive_key_updates_and_record_splits() {
             assert!(matches!(
                 server
                     .driver()
-                    .command(StreamCommand::Write(Chunk::new(payload.clone())))?,
+                    .command(StreamCommand::Write(Chunk::unpaid(payload.clone())))?,
                 Admit::Taken
             ));
             let mut chunks = Vec::new();
@@ -280,7 +280,7 @@ fn transport_eof_waits_for_buffered_plaintext() {
         let (mut server, mut client) = handshake(config, client_config, 0);
         let message = vec![42; 16 * 1024 + 32];
         client.writer().write_all(&message)?;
-        let mut event = StreamEvent::Data(Chunk::new(client_output(&mut client)));
+        let mut event = StreamEvent::Data(Chunk::unpaid(client_output(&mut client)));
         loop {
             match server.driver().deliver(event)? {
                 Admit::Taken => break,
@@ -318,7 +318,7 @@ fn transport_eof_waits_for_buffered_plaintext() {
         assert!(matches!(
             server
                 .driver()
-                .deliver(StreamEvent::Data(Chunk::new(vec![1])))?,
+                .deliver(StreamEvent::Data(Chunk::unpaid(vec![1])))?,
             Admit::Closed(_)
         ));
         Ok(())
@@ -372,9 +372,9 @@ fn ciphertext_keeps_its_charge_after_leaving_the_layer() {
         let (mut server, mut client) = handshake(config, client_config, 0);
         let budget = server.driver().budget().clone();
         assert!(matches!(
-            server
-                .driver()
-                .command(StreamCommand::Write(Chunk::new(b"owned output".to_vec())))?,
+            server.driver().command(StreamCommand::Write(Chunk::unpaid(
+                b"owned output".to_vec()
+            )))?,
             Admit::Taken
         ));
         server.driver().run()?;
@@ -459,13 +459,13 @@ fn a_bad_record_after_close_notify_writes_nothing_after_the_end() {
         let mut record = client_output(&mut client);
         let last = record.len() - 1;
         record[last] ^= 1;
-        let mut event = StreamEvent::Data(Chunk::new(record));
+        let mut event = StreamEvent::Data(Chunk::unpaid(record));
         let mut after_end = Vec::new();
         for _ in 0..8 {
             if let Admit::Partial(rest) | Admit::Blocked(rest) = server.driver().deliver(event)? {
                 event = rest;
             } else {
-                event = StreamEvent::Data(Chunk::new(Vec::new()));
+                event = StreamEvent::Data(Chunk::unpaid(Vec::new()));
             }
             let _ = server.driver().run();
             server.driver().send_below(|command| {

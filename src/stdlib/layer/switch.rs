@@ -463,8 +463,8 @@ mod tests {
     fn a_write_completion_passes_the_leftovers_the_successor_waits_to_read() {
         let first = Finished {
             leftovers: Some(vec![
-                StreamEvent::Data(Chunk::new(b"first".to_vec())),
-                StreamEvent::Data(Chunk::new(b"second".to_vec())),
+                StreamEvent::Data(Chunk::unpaid(b"first".to_vec())),
+                StreamEvent::Data(Chunk::unpaid(b"second".to_vec())),
             ]),
         };
         let mut driver: Driver<Switch<Finished, Waiting>> = Driver::new(

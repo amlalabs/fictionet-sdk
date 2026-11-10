@@ -286,7 +286,7 @@ fn control_disconnects_while_channel_commands_wait() {
     layer.channels.get_mut(child.id()).unwrap().confirmed = true;
     // Output not yet handed to the byte stream holds back channel commands.
     layer.write(&env, b"pending").unwrap();
-    let write = child.send(ChannelCommand::Stream(StreamCommand::Write(Bytes::new(
+    let write = child.send(ChannelCommand::Stream(StreamCommand::Write(Bytes::unpaid(
         b"data".to_vec(),
     ))));
     assert!(!layer.on_command(&mut env, write).unwrap().moved());

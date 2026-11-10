@@ -2785,7 +2785,7 @@ impl Layer for TcpLayer {
             Some(packet) => {
                 // Room again: smoltcp may have more to send.
                 self.work |= full;
-                Some(PacketCommand::Send(Chunk::new(packet)))
+                Some(PacketCommand::Send(Chunk::unpaid(packet)))
             }
             None if self.stopped && self.dev.tx.is_empty() && !self.ended => {
                 self.ended = true;

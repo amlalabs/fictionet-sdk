@@ -49,7 +49,7 @@ fn datagram(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
 
 /// Offers one raw packet and runs the stack.
 fn arrive(d: &mut Driver<Stack>, bytes: Vec<u8>) {
-    let raw = Chunk::new(bytes);
+    let raw = Chunk::unpaid(bytes);
     assert!(matches!(
         d.deliver(PacketEvent::Packet(raw)),
         Ok(Admit::Taken)
@@ -185,7 +185,7 @@ fn malformed_and_foreign_host_packets_reach_no_socket() {
     let tunnel = Scopes::default().tunnel();
     for (scope, payload) in [(tunnel, &b"tunnel"[..]), (Scope::ROOT, b"mine")] {
         let labelled = Datagram::new(
-            Chunk::new(datagram(peer, bound.local, payload)),
+            Chunk::unpaid(datagram(peer, bound.local, payload)),
             Ingress {
                 scope,
                 ..Ingress::default()
@@ -479,7 +479,7 @@ fn a_socket_sends_each_datagram_whole_in_one_packet_from_its_port() {
     let peer = addr("10.0.0.2:40000");
     let sent: [&[u8]; 2] = [b"", b"answer"];
     for payload in sent {
-        let datagram = Datagram::new(Chunk::new(payload.to_vec()), peer);
+        let datagram = Datagram::new(Chunk::unpaid(payload.to_vec()), peer);
         command(&mut d, child.send(DatagramCommand::Send(datagram)));
     }
     let packets = down(&mut d);
@@ -506,7 +506,7 @@ fn a_socket_sends_each_datagram_whole_in_one_packet_from_its_port() {
         (vec![0; 70_000], peer),
         (b"v6".to_vec(), addr("[fd00::2]:40000")),
     ] {
-        let datagram = Datagram::new(Chunk::new(payload), to);
+        let datagram = Datagram::new(Chunk::unpaid(payload), to);
         command(&mut d, child.send(DatagramCommand::Send(datagram)));
     }
     assert_eq!(down(&mut d), Vec::<Vec<u8>>::new());
@@ -526,13 +526,13 @@ fn a_command_beyond_the_credit_granted_is_an_overrun() {
     let (child, _, credit) = bind(&mut d, 0, 5353);
     let peer = addr("10.0.0.2:40000");
     for _ in 0..credit {
-        let datagram = Datagram::new(Chunk::new(b"x".to_vec()), peer);
+        let datagram = Datagram::new(Chunk::unpaid(b"x".to_vec()), peer);
         assert!(matches!(
             d.command(child.send(DatagramCommand::Send(datagram))),
             Ok(Admit::Taken)
         ));
     }
-    let datagram = Datagram::new(Chunk::new(b"x".to_vec()), peer);
+    let datagram = Datagram::new(Chunk::unpaid(b"x".to_vec()), peer);
     assert!(matches!(
         d.command(child.send(DatagramCommand::Send(datagram))),
         Err(Side::Upper(Overrun(id))) if id == child.id()
@@ -585,7 +585,7 @@ fn a_full_layer_refuses_a_packet_unchanged() {
     let back = loop {
         assert!(taken <= 2 * HELD, "the layer kept taking packets");
         let packet = datagram(peer, local, &(taken as u32).to_be_bytes());
-        let raw = Chunk::new(packet.clone());
+        let raw = Chunk::unpaid(packet.clone());
         match d.deliver(PacketEvent::Packet(raw)) {
             Ok(Admit::Taken) => taken += 1,
             Ok(Admit::Blocked(PacketEvent::Packet(back))) => break (back, packet),
@@ -686,7 +686,7 @@ fn an_application_on_each_socket_answers_through_ip_and_udp() {
     let mut expected = Vec::new();
     for (n, payload) in sent.iter().enumerate() {
         let peer = peers[n % peers.len()];
-        let raw = Chunk::new(datagram(peer, echo, payload));
+        let raw = Chunk::unpaid(datagram(peer, echo, payload));
         assert!(matches!(
             d.deliver(PacketEvent::Packet(raw)),
             Ok(Admit::Taken)

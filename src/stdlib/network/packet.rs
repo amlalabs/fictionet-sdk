@@ -51,7 +51,7 @@
 //! use fictionet::stdlib::network::packet::{CheckedIpPacket, Ingress, ObservedIpPacket};
 //!
 //! fn transport_input(_: CheckedIpPacket) {}
-//! let captured = ObservedIpPacket::observed(Chunk::new(vec![]), Ingress::default());
+//! let captured = ObservedIpPacket::observed(Chunk::unpaid(vec![]), Ingress::default());
 //! transport_input(captured);
 //! ```
 //!
@@ -70,7 +70,7 @@
 //! let mut ip = Driver::new(IpLayer::host(), entropy, Budget::unlimited(), Instant::ZERO);
 //! let udp = [0, 1, 0, 53, 0, 8, 0, 0];
 //! let packet = ip::packet("10.0.0.2".parse()?, "10.0.0.1".parse()?, protocol::UDP, &udp);
-//! assert!(matches!(ip.deliver(PacketEvent::Packet(Chunk::new(packet.0))), Ok(Admit::Taken)));
+//! assert!(matches!(ip.deliver(PacketEvent::Packet(Chunk::unpaid(packet.0))), Ok(Admit::Taken)));
 //! ip.send_above(|event| {
 //!     let PacketEvent::Packet(packet) = event else { unreachable!() };
 //!     assert_eq!(packet.sort(), Sort::Transport(Transport::Udp));
@@ -539,7 +539,7 @@ impl IpLayer {
             return;
         }
         let bytes = bytes.into_vec();
-        let original = (!fragment && extended).then(|| Chunk::new(bytes.clone()));
+        let original = (!fragment && extended).then(|| Chunk::unpaid(bytes.clone()));
         match self.reassembly.push(Packet(bytes), env.now()) {
             Intake::Whole(Packet(whole)) => {
                 let origin = match original {
@@ -549,7 +549,7 @@ impl IpLayer {
                     }
                     _ => Origin::Arrived,
                 };
-                self.checked(env, Chunk::new(whole), origin);
+                self.checked(env, Chunk::unpaid(whole), origin);
             }
             Intake::Waiting => {}
             Intake::Discarded => env.report(IpReport::Malformed),
@@ -558,7 +558,7 @@ impl IpLayer {
                 env.report(IpReport::Refused {
                     answered: answer.is_some(),
                 });
-                self.answer = answer.map(|Packet(bytes)| Chunk::new(bytes));
+                self.answer = answer.map(|Packet(bytes)| Chunk::unpaid(bytes));
             }
         }
     }
@@ -675,7 +675,7 @@ mod tests {
     }
 
     fn raw(bytes: Vec<u8>) -> PacketEvent<Chunk> {
-        PacketEvent::Packet(Chunk::new(bytes))
+        PacketEvent::Packet(Chunk::unpaid(bytes))
     }
 
     fn up(d: &mut Driver<IpLayer>) -> Vec<CheckedIpPacket> {
@@ -930,11 +930,11 @@ mod tests {
 
         // The same holds going down.
         assert!(matches!(
-            d.command(PacketCommand::Send(Chunk::new(first.clone()))),
+            d.command(PacketCommand::Send(Chunk::unpaid(first.clone()))),
             Ok(Admit::Taken)
         ));
         assert!(matches!(
-            d.command(PacketCommand::Send(Chunk::new(vec![1]))),
+            d.command(PacketCommand::Send(Chunk::unpaid(vec![1]))),
             Ok(Admit::Blocked(_))
         ));
         assert_eq!(down(&mut d), [first]);
@@ -953,7 +953,7 @@ mod tests {
         assert!(matches!(d.deliver(raw(vec![0x45])), Ok(Admit::Closed(_))));
         assert!(matches!(d.command(PacketCommand::End), Ok(Admit::Taken)));
         assert!(matches!(
-            d.command(PacketCommand::Send(Chunk::new(vec![1]))),
+            d.command(PacketCommand::Send(Chunk::unpaid(vec![1]))),
             Ok(Admit::Closed(_))
         ));
         let mut ends = 0;
@@ -977,16 +977,16 @@ mod tests {
             }),
             ..Ingress::default()
         };
-        let full = ObservedIpPacket::observed(Chunk::new(whole.clone()), capture(whole.len()));
+        let full = ObservedIpPacket::observed(Chunk::unpaid(whole.clone()), capture(whole.len()));
         assert!(full.is_complete());
         assert_eq!(full.sort(), Sort::Transport(Transport::Tcp));
         let cut =
-            ObservedIpPacket::observed(Chunk::new(whole[..30].to_vec()), capture(whole.len()));
+            ObservedIpPacket::observed(Chunk::unpaid(whole[..30].to_vec()), capture(whole.len()));
         assert!(!cut.is_complete());
         assert_eq!(cut.sort(), Sort::Transport(Transport::Tcp));
         assert_eq!(cut.payload(), &whole[20..30]);
         assert_eq!(cut.ingress().capture.unwrap().number, 7);
-        let garbage = ObservedIpPacket::observed(Chunk::new(vec![0x60, 1]), Ingress::default());
+        let garbage = ObservedIpPacket::observed(Chunk::unpaid(vec![0x60, 1]), Ingress::default());
         assert_eq!(garbage.sort(), Sort::Other(protocol::NONE));
         assert!(garbage.header().is_none());
         assert!(!garbage.is_complete());
@@ -996,8 +996,10 @@ mod tests {
     fn a_later_fragment_is_not_a_transport_packet_to_an_observer() {
         let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
         let pieces = fragments(&whole, 32);
-        let first = ObservedIpPacket::observed(Chunk::new(pieces[0].clone()), Ingress::default());
-        let later = ObservedIpPacket::observed(Chunk::new(pieces[1].clone()), Ingress::default());
+        let first =
+            ObservedIpPacket::observed(Chunk::unpaid(pieces[0].clone()), Ingress::default());
+        let later =
+            ObservedIpPacket::observed(Chunk::unpaid(pieces[1].clone()), Ingress::default());
         assert_eq!(first.sort(), Sort::Transport(Transport::Udp));
         assert_eq!(later.sort(), Sort::Other(protocol::UDP));
     }
@@ -1007,11 +1009,11 @@ mod tests {
         let (a, b) = (addr("2001:db8::2"), addr("2001:db8::1"));
         let plain = ip::packet(a, b, protocol::UDP, &udp(3)).0;
         let mut packet = CheckedIpPacket {
-            bytes: Chunk::new(plain.clone()),
+            bytes: Chunk::unpaid(plain.clone()),
             header: Header::parse_whole(&plain).unwrap(),
             sort: Sort::Transport(Transport::Udp),
             origin: Origin::Normalized {
-                original: Chunk::new(vec![0; 64]),
+                original: Chunk::unpaid(vec![0; 64]),
             },
         };
         let tight = Budget::new(plain.len() + 10);
@@ -1066,7 +1068,7 @@ mod tests {
                     scope: *from,
                     ..Ingress::default()
                 };
-                let packet = Datagram::new(Chunk::new(bytes.clone()), ingress);
+                let packet = Datagram::new(Chunk::unpaid(bytes.clone()), ingress);
                 match input.accept(packet) {
                     Ok(bytes) => {
                         assert!(d.deliver(PacketEvent::Packet(bytes)).unwrap().moved());
@@ -1093,11 +1095,12 @@ mod tests {
         let mut d = driver();
         assert!(matches!(d.deliver(raw(good.clone())), Ok(Admit::Taken)));
         let layer = up(&mut d).pop().unwrap();
-        let checked = CheckedIpPacket::checked(Chunk::new(good.clone()), Origin::Arrived).unwrap();
+        let checked =
+            CheckedIpPacket::checked(Chunk::unpaid(good.clone()), Origin::Arrived).unwrap();
         assert_eq!(checked.header(), layer.header());
         assert_eq!(checked.sort(), layer.sort());
         // The same bytes observed are read, but not checked.
-        let observed = ObservedIpPacket::observed(Chunk::new(good.clone()), Ingress::default());
+        let observed = ObservedIpPacket::observed(Chunk::unpaid(good.clone()), Ingress::default());
         assert_eq!(observed.sort(), Sort::Transport(Transport::Udp));
         // What a host would not take in is handed back unchanged.
         let mut bad_sum = good.clone();
@@ -1112,11 +1115,11 @@ mod tests {
         let len = (options6.len() - 40) as u16;
         options6[4..6].copy_from_slice(&len.to_be_bytes());
         for refused in [bad_sum, fragment, options6, vec![0x45]] {
-            let back =
-                CheckedIpPacket::checked(Chunk::new(refused.clone()), Origin::Arrived).unwrap_err();
+            let back = CheckedIpPacket::checked(Chunk::unpaid(refused.clone()), Origin::Arrived)
+                .unwrap_err();
             assert_eq!(&back[..], &refused[..]);
         }
-        assert!(CheckedIpPacket::checked(Chunk::new(plain6), Origin::Arrived).is_ok());
+        assert!(CheckedIpPacket::checked(Chunk::unpaid(plain6), Origin::Arrived).is_ok());
     }
 
     /// A world's tunnels never share a scope, whichever clone of its

@@ -2372,7 +2372,7 @@ impl Connection for TcpConnection {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
-        self.poll_send(fcx, cx, data.len(), |n| Chunk::new(data[..n].to_vec()))
+        self.poll_send(fcx, cx, data.len(), |n| Chunk::unpaid(data[..n].to_vec()))
     }
 
     /// Sends a piece of `data` that shares its bytes, without copying them.

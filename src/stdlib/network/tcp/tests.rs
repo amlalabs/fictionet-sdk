@@ -3433,7 +3433,7 @@ mod layer {
     /// Hands `packets` to `stack`, a packet at a time.
     fn receive(stack: &mut Stack, packets: Vec<Vec<u8>>) {
         for packet in packets {
-            let mut raw = PacketEvent::Packet(Chunk::new(packet));
+            let mut raw = PacketEvent::Packet(Chunk::unpaid(packet));
             loop {
                 match stack.deliver(raw) {
                     Ok(Admit::Blocked(back)) => raw = back,
@@ -3568,7 +3568,7 @@ mod layer {
         assert!(matches!(&accepted.origin, TcpOrigin::Accepted(h) if h.syn.is_some()));
 
         let request = pattern(3000, 1);
-        let write: Command = c.send(StreamCommand::Write(Chunk::new(request.clone())));
+        let write: Command = c.send(StreamCommand::Write(Chunk::unpaid(request.clone())));
         assert!(matches!(client.command(write), Ok(Admit::Taken)));
         let written = events(&mut client);
         assert!(written.iter().any(|e| matches!(
@@ -3595,7 +3595,7 @@ mod layer {
         assert!(last_data < ended, "the end comes after the bytes");
 
         let reply = pattern(500, 2);
-        let write: Command = s.send(StreamCommand::Write(Chunk::new(reply.clone())));
+        let write: Command = s.send(StreamCommand::Write(Chunk::unpaid(reply.clone())));
         assert!(matches!(server.command(write), Ok(Admit::Taken)));
         let grant: Command = c.grant(10_000);
         assert!(matches!(client.command(grant), Ok(Admit::Taken)));
@@ -3628,7 +3628,7 @@ mod layer {
         let tcp = TcpLayer::new(SERVER.parse().unwrap(), options, &*entropy, Instant::ZERO);
         let mut alone = Driver::new(tcp, entropy, Budget::unlimited(), Instant::ZERO);
         assert!(matches!(alone.command(listen()), Ok(Admit::Taken)));
-        let packet = CheckedIpPacket::checked(Chunk::new(syn.clone()), Origin::Arrived).unwrap();
+        let packet = CheckedIpPacket::checked(Chunk::unpaid(syn.clone()), Origin::Arrived).unwrap();
         assert!(matches!(
             alone.deliver(PacketEvent::Packet(packet)),
             Ok(Admit::Taken)
@@ -3655,7 +3655,7 @@ mod layer {
         let mut malformed = syn.clone();
         malformed[10] ^= 1;
         assert!(matches!(
-            stack.deliver(PacketEvent::Packet(Chunk::new(malformed))),
+            stack.deliver(PacketEvent::Packet(Chunk::unpaid(malformed))),
             Ok(Admit::Taken)
         ));
         assert_eq!(syn_acks(&sent(&mut stack)), 0);
@@ -3669,7 +3669,7 @@ mod layer {
                 ..Ingress::default()
             },
         ] {
-            match input.accept(Datagram::new(Chunk::new(syn.clone()), ingress)) {
+            match input.accept(Datagram::new(Chunk::unpaid(syn.clone()), ingress)) {
                 Ok(raw) => assert!(matches!(
                     stack.deliver(PacketEvent::Packet(raw)),
                     Ok(Admit::Taken)
@@ -3686,7 +3686,7 @@ mod layer {
     fn a_lost_segment_is_sent_again_when_its_deadline_comes() {
         let (mut server, mut client, (s, _), (c, _)) = connected();
         let bytes = pattern(1000, 3);
-        let write: Command = c.send(StreamCommand::Write(Chunk::new(bytes.clone())));
+        let write: Command = c.send(StreamCommand::Write(Chunk::unpaid(bytes.clone())));
         assert!(matches!(client.command(write), Ok(Admit::Taken)));
         let grant: Command = s.grant(10_000);
         assert!(matches!(server.command(grant), Ok(Admit::Taken)));
@@ -3879,7 +3879,7 @@ mod layer {
     #[test]
     fn a_write_past_the_credit_is_handed_back() {
         let (_server, mut client, _, (c, _)) = connected();
-        let write: Command = c.send(StreamCommand::Write(Chunk::new(vec![0; MIN_BUFFER + 1])));
+        let write: Command = c.send(StreamCommand::Write(Chunk::unpaid(vec![0; MIN_BUFFER + 1])));
         let back = client.command(write);
         assert!(
             matches!(&back, Ok(Admit::Blocked(command)) if matches!(command.op(), MuxOp::Child(id, StreamCommand::Write(bytes)) if *id == c.id() && bytes.len() == MIN_BUFFER + 1)),
@@ -3892,7 +3892,7 @@ mod layer {
     #[test]
     fn a_step_keeps_the_vector_it_sent_into() {
         let (mut server, _client, (s, _), _) = connected();
-        let write: Command = s.send(StreamCommand::Write(Chunk::new(pattern(3000, 1))));
+        let write: Command = s.send(StreamCommand::Write(Chunk::unpaid(pattern(3000, 1))));
         assert!(matches!(server.command(write), Ok(Admit::Taken)));
         assert!(!sent(&mut server).is_empty());
         let tx = &server.layer().upper().dev.tx;
@@ -3945,7 +3945,7 @@ mod layer {
     fn a_connection_that_times_out_is_gone_with_its_child_open() {
         let (mut server, _client, (s, _), _) = connected();
         let token = hold(&mut server, s.id());
-        let write: Command = s.send(StreamCommand::Write(Chunk::new(pattern(100, 4))));
+        let write: Command = s.send(StreamCommand::Write(Chunk::unpaid(pattern(100, 4))));
         assert!(matches!(server.command(write), Ok(Admit::Taken)));
         let until = server.now() + TIMEOUT + Duration::from_secs(120);
         let seen = alone_until(&mut server, until);

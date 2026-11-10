@@ -38,7 +38,7 @@ fn checked_is_a_host_packet(bytes: &[u8]) {
     kani::assume(at < bytes.len());
     let same = |got: &[u8]| got.len() == bytes.len() && got[at] == bytes[at];
     let whole = Header::parse_whole(bytes);
-    match CheckedIpPacket::checked(Chunk::new(bytes.to_vec()), origin(kani::any())) {
+    match CheckedIpPacket::checked(Chunk::unpaid(bytes.to_vec()), origin(kani::any())) {
         Ok(p) => {
             let h = whole.expect("a checked packet is whole");
             assert!(h.src.is_ipv4() || h.payload.start == 40);
@@ -98,7 +98,7 @@ fn checked_ipv6_packets_are_host_packets() {
 fn checked_ipv4_packets_without_the_header_checksum() {
     let mut bytes: [u8; 48] = kani::any();
     bytes[0] = 0x45;
-    if CheckedIpPacket::checked(Chunk::new(bytes.to_vec()), Origin::Arrived).is_err() {
+    if CheckedIpPacket::checked(Chunk::unpaid(bytes.to_vec()), Origin::Arrived).is_err() {
         assert!(
             Header::parse(&bytes).is_none(),
             "only unreadable IPv4 bytes are handed back"
@@ -114,7 +114,7 @@ fn checked_ipv4_packets_without_the_header_checksum() {
 fn checked_ipv6_packets_with_extension_headers_left() {
     let mut bytes: [u8; 48] = kani::any();
     bytes[0] = 0x60;
-    if CheckedIpPacket::checked(Chunk::new(bytes.to_vec()), Origin::Arrived).is_err() {
+    if CheckedIpPacket::checked(Chunk::unpaid(bytes.to_vec()), Origin::Arrived).is_err() {
         assert!(
             Header::parse_whole(&bytes).is_none(),
             "every whole IPv6 packet is checked"

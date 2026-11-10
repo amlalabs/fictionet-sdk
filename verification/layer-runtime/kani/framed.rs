@@ -168,7 +168,7 @@ fn seen<T, E>(event: &MessageEvent<Result<T, E>>) -> Seen {
 /// A chunk of exactly `N` symbolic bytes. Separate fixed lengths keep
 /// allocation sizes concrete while covering every byte value.
 fn fixed<const N: usize>() -> Chunk {
-    Chunk::new(kani::any::<[u8; N]>().to_vec())
+    Chunk::unpaid(kani::any::<[u8; N]>().to_vec())
 }
 
 /// What a push of `offered` hands back is exactly the bytes it did not take.
@@ -201,7 +201,7 @@ fn charged_across<const A: usize, const B: usize>() {
     let first = kani::any::<[u8; A]>();
     suffix_kept(
         &first,
-        d.deliver(StreamEvent::Data(Chunk::new(first.to_vec())))
+        d.deliver(StreamEvent::Data(Chunk::unpaid(first.to_vec())))
             .unwrap(),
     );
     check(&d);
@@ -213,7 +213,7 @@ fn charged_across<const A: usize, const B: usize>() {
     let second = kani::any::<[u8; B]>();
     suffix_kept(
         &second,
-        d.deliver(StreamEvent::Data(Chunk::new(second.to_vec())))
+        d.deliver(StreamEvent::Data(Chunk::unpaid(second.to_vec())))
             .unwrap(),
     );
     check(&d);
@@ -376,7 +376,7 @@ fn in_order<const ODD_FIRST: bool, const CUT: usize>() {
         }
     };
     for (from, to) in [(0, CUT), (CUT, wire.len())] {
-        let mut offer = Some(Chunk::new(&wire[from..to]));
+        let mut offer = Some(Chunk::unpaid(&wire[from..to]));
         for _ in 0..3 {
             let Some(chunk) = offer.take() else {
                 break;
@@ -389,7 +389,7 @@ fn in_order<const ODD_FIRST: bool, const CUT: usize>() {
                     assert!(rest[..] == wire[to - rest.len()..to]);
                     // Offered again as the same bytes, fresh, so the solver need not
                     // carry the returned chunk across rounds.
-                    offer = Some(Chunk::new(&wire[to - rest.len()..to]));
+                    offer = Some(Chunk::unpaid(&wire[to - rest.len()..to]));
                 }
                 _ => panic!("open input is never closed"),
             }

@@ -498,7 +498,7 @@ mod tests {
         let _ = d
             .deliver(MuxEvent::Child(
                 id,
-                StreamEvent::Data(Chunk::new(b"hi".to_vec())),
+                StreamEvent::Data(Chunk::unpaid(b"hi".to_vec())),
             ))
             .unwrap();
         d.run().unwrap();
@@ -529,7 +529,7 @@ mod tests {
         d.run().unwrap();
         let peer = addr("10.0.0.2:1234");
         for payload in [&b""[..], b"query"] {
-            let datagram = Datagram::new(Chunk::new(payload.to_vec()), peer);
+            let datagram = Datagram::new(Chunk::unpaid(payload.to_vec()), peer);
             let event = MuxEvent::Child(id, DatagramEvent::Datagram(datagram));
             assert!(matches!(d.deliver(event), Ok(Admit::Taken)));
             d.run().unwrap();
@@ -570,7 +570,7 @@ mod tests {
         d.run().unwrap();
         let data = |direction, bytes: &[u8], sequence| ObservedEvent::Data {
             direction,
-            bytes: Chunk::new(bytes.to_vec()),
+            bytes: Chunk::unpaid(bytes.to_vec()),
             sequence,
             source: None,
         };

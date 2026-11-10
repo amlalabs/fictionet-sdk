@@ -327,7 +327,7 @@ impl Connection for TunnelConn {
                 Some(bytes) => Chunk::from_bytes(bytes),
                 None => return Poll::Ready(Err(ConnError::Closed)),
             },
-            None => Chunk::new(&data[..n]),
+            None => Chunk::unpaid(&data[..n]),
         };
         shared.outbound_len += n;
         shared.unwritten += n as u64;

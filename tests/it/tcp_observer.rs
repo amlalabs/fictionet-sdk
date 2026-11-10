@@ -83,7 +83,7 @@ impl Capture {
             }),
             ..Ingress::default()
         };
-        ObservedIpPacket::observed(Chunk::new(packet), ingress)
+        ObservedIpPacket::observed(Chunk::unpaid(packet), ingress)
     }
 
     /// What the connections got since the last segment, in order, with

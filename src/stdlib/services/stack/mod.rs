@@ -476,7 +476,7 @@ where
         match got {
             Some(Ok((bytes, from))) => {
                 // What the socket received is paid for as it is taken in.
-                let mut bytes = Chunk::new(bytes);
+                let mut bytes = Chunk::unpaid(bytes);
                 if bytes.repay(driver.budget()) {
                     input = Some(DatagramEvent::Datagram(Datagram::new(bytes, from)));
                 } else {

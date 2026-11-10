@@ -46,7 +46,7 @@ impl HopLimit {
             && before
                 .as_ref()
                 .is_some_and(|h| h.src.is_ipv6() && h.payload.start != 40))
-        .then(|| Chunk::new(bytes.clone()));
+        .then(|| Chunk::unpaid(bytes.clone()));
         match self.reassembly.push(Packet(bytes), env.now()) {
             Intake::Whole(Packet(whole)) => {
                 let origin = match original {
@@ -56,7 +56,7 @@ impl HopLimit {
                     }
                     _ => Origin::Arrived,
                 };
-                match CheckedIpPacket::checked(Chunk::new(whole), origin) {
+                match CheckedIpPacket::checked(Chunk::unpaid(whole), origin) {
                     Ok(packet) => self.up = Some(PacketEvent::Packet(packet)),
                     Err(_) => env.report(IpReport::Malformed),
                 }
@@ -68,7 +68,7 @@ impl HopLimit {
                 env.report(IpReport::Refused {
                     answered: answer.is_some(),
                 });
-                self.answer = answer.map(|Packet(bytes)| Chunk::new(bytes));
+                self.answer = answer.map(|Packet(bytes)| Chunk::unpaid(bytes));
             }
         }
     }
@@ -194,7 +194,7 @@ mod tests {
         );
         for bytes in [vec![0x45], fragment] {
             assert!(matches!(
-                driver.deliver(PacketEvent::Packet(Chunk::new(bytes))),
+                driver.deliver(PacketEvent::Packet(Chunk::unpaid(bytes))),
                 Ok(Admit::Taken)
             ));
             driver.send_above(|_| panic!("malformed input reached a transport"));

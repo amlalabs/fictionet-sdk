@@ -810,7 +810,7 @@ impl Dissector {
             &p[..payload.start]
         };
         let packet = ObservedIpPacket::observed(
-            Chunk::new(held.to_vec()),
+            Chunk::unpaid(held.to_vec()),
             Ingress {
                 capture: Some(Capture {
                     number: self.packets,

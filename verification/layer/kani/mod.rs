@@ -432,7 +432,7 @@ fn a_chunk_cursor_keeps_the_rest_in_place() {
     let mut chunk = if charged {
         ChargedBytes::copy_of(&budget, &bytes).unwrap().into_chunk()
     } else {
-        Chunk::new(bytes.to_vec())
+        Chunk::unpaid(bytes.to_vec())
     };
     let cost = if charged { length } else { 0 };
     assert_eq!(chunk.len(), length);
@@ -466,7 +466,7 @@ fn a_chunk_cursor_keeps_the_rest_in_place() {
 fn a_chunk_cursor_never_passes_the_end() {
     let length: usize = kani::any();
     kani::assume(length <= CHUNK);
-    let mut chunk = Chunk::new(vec![0u8; length]);
+    let mut chunk = Chunk::unpaid(vec![0u8; length]);
     let n: usize = kani::any();
     kani::assume(n > length && n <= CHUNK + 1);
     chunk.advance(n);

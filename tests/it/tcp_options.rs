@@ -59,7 +59,7 @@ fn acknowledging_idle_connections_reuses_refresh_storage() {
     let packet = |port, seq, ack, flags| {
         PacketEvent::Packet(
             CheckedIpPacket::checked(
-                Chunk::new(segment(port, seq, ack, flags, &[]).0),
+                Chunk::unpaid(segment(port, seq, ack, flags, &[]).0),
                 Origin::Arrived,
             )
             .unwrap(),

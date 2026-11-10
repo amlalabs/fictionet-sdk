@@ -354,7 +354,7 @@ impl Layer for Mail {
                     match self.careless {
                         None => {}
                         Some(Careless::HandsOver) => {
-                            self.below.push(StreamEvent::Data(Chunk::new(rest)))
+                            self.below.push(StreamEvent::Data(Chunk::unpaid(rest)))
                         }
                         Some(Careless::Refuses) if !rest.is_empty() => {
                             chunk.advance(chunk.len() - rest.len());
@@ -385,7 +385,7 @@ impl Layer for Mail {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if let Some(bytes) = self.out.pop_front() {
             self.produced += bytes.len() as u64;
-            return Some(StreamCommand::Write(Chunk::new(bytes)));
+            return Some(StreamCommand::Write(Chunk::unpaid(bytes)));
         }
         if self.input_over && self.next.is_none() && !self.end_sent {
             self.end_sent = true;

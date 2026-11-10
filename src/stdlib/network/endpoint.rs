@@ -147,7 +147,7 @@ pub(crate) async fn drive(
                             && let Some(reply) =
                                 options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
                         {
-                            outgoing.push_back(PacketCommand::Send(Chunk::new(reply.0)));
+                            outgoing.push_back(PacketCommand::Send(Chunk::unpaid(reply.0)));
                         }
                     }
                 }
@@ -162,7 +162,7 @@ pub(crate) async fn drive(
                 match interface.poll_recv(&fcx, cx) {
                     Poll::Ready(Ok(packet)) => {
                         moved = true;
-                        raw = Some(PacketEvent::Packet(Chunk::new(packet.0)));
+                        raw = Some(PacketEvent::Packet(Chunk::unpaid(packet.0)));
                     }
                     Poll::Ready(Err(_)) => {
                         moved = true;

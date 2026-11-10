@@ -179,7 +179,7 @@ mod tests {
         from: SocketAddr,
         bytes: &[u8],
     ) -> Vec<(Vec<u8>, SocketAddr)> {
-        let datagram = Datagram::new(Chunk::new(bytes.to_vec()), from);
+        let datagram = Datagram::new(Chunk::unpaid(bytes.to_vec()), from);
         let admit = server
             .deliver(DatagramEvent::Datagram(datagram))
             .expect("the server never fails");
@@ -219,7 +219,7 @@ mod tests {
                 Instant::ZERO,
             );
             let event =
-                DatagramEvent::Datagram(Datagram::new(Chunk::new(bytes.clone()), client(1)));
+                DatagramEvent::Datagram(Datagram::new(Chunk::unpaid(bytes.clone()), client(1)));
             assert!(matches!(driver.deliver(event).unwrap(), Admit::Taken));
             let command = driver.take_command();
             assert_eq!(

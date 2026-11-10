@@ -12,7 +12,7 @@ use fictionet::stdlib::layer::Chunk;
 
 fn partial_admissions() {
     let bytes: [u8; 4] = kani::any();
-    let mut chunk = Chunk::new(bytes.to_vec());
+    let mut chunk = Chunk::unpaid(bytes.to_vec());
     let mut consumed = 0;
     for _ in 0..2 {
         let accepted: usize = kani::any();
@@ -32,7 +32,7 @@ fn switch_suffix() {
     let bytes: [u8; 4] = kani::any();
     let boundary: usize = kani::any();
     kani::assume(boundary <= 4);
-    let mut secure = Chunk::new(bytes.to_vec());
+    let mut secure = Chunk::unpaid(bytes.to_vec());
     let plain = secure.split_to(boundary);
     assert_eq!(plain.len(), boundary, "plaintext ends at the switch");
     assert_eq!(
@@ -64,7 +64,7 @@ fn starttls_split_excludes_the_plaintext_prefix() {
 fn keep_cursor(_: &mut Chunk, _: usize) {}
 
 fn replay_prefix(chunk: &mut Chunk, n: usize) -> Chunk {
-    Chunk::new(chunk[..n].to_vec())
+    Chunk::unpaid(chunk[..n].to_vec())
 }
 
 #[kani::proof]

@@ -143,7 +143,7 @@ fn tcp_hands_received_chunks_over_and_sends_pieces_of_chunks() {
         }
         assert_eq!(got, request);
         assert_eq!(budget.used(), 0, "every handed chunk was released");
-        let mut reply = Chunk::new(reply);
+        let mut reply = Chunk::unpaid(reply);
         while !reply.is_empty() {
             let n = poll_fn(|cx| conn.poll_write_chunk(&fcx, cx, &reply)).await?;
             reply.advance(n);
@@ -207,7 +207,7 @@ impl Layer for Loud {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let n = self.left.min(64 * 1024);
         self.left -= n;
-        (n > 0).then(|| StreamCommand::Write(Chunk::new(vec![b'x'; n])))
+        (n > 0).then(|| StreamCommand::Write(Chunk::unpaid(vec![b'x'; n])))
     }
 
     fn take_event(&mut self) -> Option<Infallible> {
@@ -415,7 +415,7 @@ impl Layer for Floods {
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
-        Some(StreamCommand::Write(Chunk::new(vec![b'x'; 64 * 1024])))
+        Some(StreamCommand::Write(Chunk::unpaid(vec![b'x'; 64 * 1024])))
     }
 
     fn take_event(&mut self) -> Option<Infallible> {
@@ -527,7 +527,7 @@ impl Layer for Counter {
                 let from = *d.meta();
                 let count = self.seen.entry(from).or_default();
                 *count += 1;
-                let payload = Chunk::new(count.to_be_bytes().to_vec());
+                let payload = Chunk::unpaid(count.to_be_bytes().to_vec());
                 self.reply = Some(Datagram::new(payload, from));
                 Ok(Admit::Taken)
             }
@@ -660,7 +660,7 @@ impl Layer for Goodbyes {
             return Ok(false);
         }
         self.left -= 1;
-        self.slot = Some(Datagram::new(Chunk::new(b"bye".to_vec()), server_addr()));
+        self.slot = Some(Datagram::new(Chunk::unpaid(b"bye".to_vec()), server_addr()));
         Ok(true)
     }
 
@@ -952,7 +952,7 @@ impl Layer for BusyDatagram {
             self.end_sent = true;
             DatagramCommand::End
         } else {
-            DatagramCommand::Send(Datagram::new(Chunk::new(Vec::new()), server_addr()))
+            DatagramCommand::Send(Datagram::new(Chunk::unpaid(Vec::new()), server_addr()))
         })
     }
 
@@ -1409,7 +1409,7 @@ fn stream_extraction_reports_before_reset() {
 
 #[test]
 fn stream_extraction_reports_before_write_failure() {
-    check_stream_extraction(Some(StreamCommand::Write(Chunk::new(vec![1]))), true);
+    check_stream_extraction(Some(StreamCommand::Write(Chunk::unpaid(vec![1]))), true);
 }
 
 #[test]
@@ -1803,7 +1803,7 @@ mod flush {
 
         fn take_command(&mut self, _: &mut Env<'_, Infallible>) -> Option<StreamCommand> {
             (!std::mem::replace(&mut self.sent, true))
-                .then(|| StreamCommand::Write(Chunk::new(b"hello".to_vec())))
+                .then(|| StreamCommand::Write(Chunk::unpaid(b"hello".to_vec())))
         }
 
         fn take_event(&mut self) -> Option<Infallible> {

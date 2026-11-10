@@ -1332,7 +1332,7 @@ mod tests {
         fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
             self.writes.pop_front().or_else(|| {
                 self.productive
-                    .then(|| StreamCommand::Write(Chunk::new(vec![1])))
+                    .then(|| StreamCommand::Write(Chunk::unpaid(vec![1])))
             })
         }
         fn take_event(&mut self) -> Option<Infallible> {
@@ -1403,7 +1403,7 @@ mod tests {
     fn observed_byte() -> ObservedEvent {
         ObservedEvent::Data {
             direction: Direction::Forward,
-            bytes: Chunk::new(vec![1]),
+            bytes: Chunk::unpaid(vec![1]),
             sequence: 0,
             source: None,
         }
@@ -1479,8 +1479,8 @@ mod tests {
         let mut driver = driver(|_, _, _| Reader {
             terminal: true,
             writes: [
-                StreamCommand::Write(Chunk::new(b"first".to_vec())),
-                StreamCommand::Write(Chunk::new(b"last".to_vec())),
+                StreamCommand::Write(Chunk::unpaid(b"first".to_vec())),
+                StreamCommand::Write(Chunk::unpaid(b"last".to_vec())),
                 StreamCommand::End,
             ]
             .into(),
@@ -1584,7 +1584,7 @@ mod tests {
         let mut driver = driver(|_, name, _| {
             assert_eq!(name, "stream");
             Reader {
-                writes: VecDeque::from([StreamCommand::Write(Chunk::new(Bytes::from_static(
+                writes: VecDeque::from([StreamCommand::Write(Chunk::unpaid(Bytes::from_static(
                     b"abcdefgh",
                 )))]),
                 ..Reader::default()
@@ -1632,7 +1632,7 @@ mod tests {
         let _ = driver
             .deliver(MuxEvent::Child(
                 id,
-                StreamEvent::Data(Chunk::new(Bytes::from_static(b"abc"))),
+                StreamEvent::Data(Chunk::unpaid(Bytes::from_static(b"abc"))),
             ))
             .unwrap();
         let _ = driver
@@ -1664,7 +1664,7 @@ mod tests {
         let _ = driver
             .deliver(MuxEvent::Child(
                 id,
-                StreamEvent::Data(Chunk::new(Bytes::from_static(b"abc"))),
+                StreamEvent::Data(Chunk::unpaid(Bytes::from_static(b"abc"))),
             ))
             .unwrap();
         driver.run().unwrap();
@@ -1695,7 +1695,7 @@ mod tests {
             let _ = driver
                 .deliver(MuxEvent::Child(
                     id,
-                    StreamEvent::Data(Chunk::new(vec![1, 2, 3])),
+                    StreamEvent::Data(Chunk::unpaid(vec![1, 2, 3])),
                 ))
                 .unwrap();
             driver.run().unwrap();
@@ -1737,7 +1737,10 @@ mod tests {
         driver.run().unwrap();
         while driver.take_command().is_some() {}
         let _ = driver
-            .deliver(MuxEvent::Child(id, StreamEvent::Data(Chunk::new(vec![1]))))
+            .deliver(MuxEvent::Child(
+                id,
+                StreamEvent::Data(Chunk::unpaid(vec![1])),
+            ))
             .unwrap();
         driver.run().unwrap();
         assert!(driver.take_command().is_none());
@@ -1783,7 +1786,7 @@ mod tests {
         fn take_command(&mut self, _: &mut Env<'_, ()>) -> Option<StreamCommand> {
             (self.go.load(Ordering::Acquire) && !self.wrote).then(|| {
                 self.wrote = true;
-                StreamCommand::Write(Chunk::new(vec![1]))
+                StreamCommand::Write(Chunk::unpaid(vec![1]))
             })
         }
         fn take_event(&mut self) -> Option<Infallible> {
@@ -1936,7 +1939,7 @@ mod tests {
                 driver
                     .deliver(MuxEvent::Child(
                         a,
-                        StreamEvent::Data(Chunk::new(Bytes::new()))
+                        StreamEvent::Data(Chunk::unpaid(Bytes::new()))
                     ))
                     .unwrap()
                     .moved()
@@ -1988,7 +1991,7 @@ mod tests {
                 driver
                     .deliver(MuxEvent::Child(
                         a,
-                        StreamEvent::Data(Chunk::new(Vec::new()))
+                        StreamEvent::Data(Chunk::unpaid(Vec::new()))
                     ))
                     .unwrap()
                     .moved()
@@ -2078,9 +2081,9 @@ mod tests {
         let rounds = 4 * QUEUE;
         for round in 0..rounds {
             for event in [
-                MuxEvent::Child(stuck, StreamEvent::Data(Chunk::new(Bytes::new()))),
+                MuxEvent::Child(stuck, StreamEvent::Data(Chunk::unpaid(Bytes::new()))),
                 MuxEvent::Child(stuck_urgent, StreamEvent::Written(1)),
-                MuxEvent::Child(ready, StreamEvent::Data(Chunk::new(Bytes::new()))),
+                MuxEvent::Child(ready, StreamEvent::Data(Chunk::unpaid(Bytes::new()))),
                 MuxEvent::Child(ready, StreamEvent::Written(1)),
                 MuxEvent::Control(MessageEvent::Message(round as u8)),
             ] {
@@ -2329,7 +2332,7 @@ mod tests {
         let _ = driver
             .deliver(MuxEvent::Child(
                 a,
-                StreamEvent::Data(Chunk::new(Bytes::from_static(b"ab"))),
+                StreamEvent::Data(Chunk::unpaid(Bytes::from_static(b"ab"))),
             ))
             .unwrap();
         driver.run().unwrap();
@@ -2494,7 +2497,7 @@ mod http_children {
                 let _ = driver
                     .deliver(MuxEvent::Child(
                         *id,
-                        StreamEvent::Data(Chunk::new(
+                        StreamEvent::Data(Chunk::unpaid(
                             b"GET / HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n".to_vec(),
                         )),
                     ))
