@@ -3,7 +3,7 @@
 The TLA+ models of how `Chain`, `Switch` and the `Driver` route items
 between layers (`tla/Route.tla`) and of `Children` over a multiplexed
 connection whose children live in `Slots` (`tla/Children.tla`), and the Kani
-proofs over `Slots`, `Budget` and `Charge`, `Timers`, `Chunk` and `WorkOwner`
+proofs over `Slots`, `Budget` and `Charge`, `Timers` and `WorkOwner`
 (`kani/mod.rs`). The code is in `src/stdlib/layer/`. What each model covers,
 what it leaves out, and what it found is in [VERIFICATION.md](VERIFICATION.md).
 
@@ -103,15 +103,14 @@ cargo kani -p fictionet --harness timers_in_order_second_armed_again
 cargo kani -p fictionet --harness timers_in_order_first_armed_twice
 cargo kani -p fictionet --harness timers_in_order_one_name_three_times
 cargo kani -p fictionet --harness timers_cancel_fire_and_retain_touch_one_name
-cargo kani -p fictionet --harness a_chunk_cursor_keeps_the_rest_in_place
-cargo kani -p fictionet --harness a_chunk_cursor_never_passes_the_end
 cargo kani -p fictionet --harness stream_credit_splits_keep_the_allocation_owned
 cargo kani -p fictionet --harness charges_sum_to_the_budget_and_never_pass_its_limit
 cargo kani -p fictionet --harness work_cancellation_stays_with_its_owner
 ```
 
-Sixteen harnesses in all. None stubs anything: every call reaches the
-production code.
+None stubs anything: every call reaches the
+production code. The proofs of `Chunk` itself moved with it to
+[`verification/buf`](../buf/README.md).
 
 Run Cargo under `systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0`
 with `CARGO_BUILD_JOBS=4` and the worktree's `CARGO_TARGET_DIR`. Measured results
@@ -126,8 +125,9 @@ TCP socket retired.
 
 `Chunk::make_mut` reuses unique charged backing and reserves before copying a
 shared view. Its receive-credit token is shared by all edited and original
-pieces, so copying cannot release receive credit early. The Kani harness
-`a_shared_chunk_edit_preserves_ownership_and_budget` checks a symbolic four-byte
+pieces, so copying cannot release receive credit early. The Kani harness (now
+in `verification/buf`) `a_shared_chunk_edit_preserves_ownership_and_budget`
+checks a symbolic four-byte
 payload, both sufficient and insufficient budgets, sibling immutability and
 final charge release. Child routing tests also check credit return exactly once
 after every edited piece is released. `Layer::take_command` now receives the
