@@ -14,10 +14,13 @@ mod tcp;
 
 use core::fmt;
 
+pub(crate) use self::ip::Protocol as IpProtocol;
+pub use self::ip::Repr as IpRepr;
+#[cfg(test)]
+pub(crate) use self::ip::Version as IpVersion;
 pub use self::ip::{
     Address as IpAddress, Endpoint as IpEndpoint, ListenEndpoint as IpListenEndpoint,
 };
-pub(crate) use self::ip::{Protocol as IpProtocol, Repr as IpRepr, Version as IpVersion};
 pub(crate) use self::ipv4::AddressExt as Ipv4AddressExt;
 pub(crate) use self::ipv4::OptionBytes as Ipv4OptionBytes;
 pub(crate) use self::ipv4::{

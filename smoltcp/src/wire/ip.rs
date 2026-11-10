@@ -207,7 +207,7 @@ impl<T: Into<Address>> From<(T, u16)> for ListenEndpoint {
 /// This enum abstracts the various versions of IP packets. It either contains an IPv4
 /// or IPv6 concrete high-level representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Repr {
+pub enum Repr {
     Ipv4(Ipv4Repr),
 
     Ipv6(Ipv6Repr),
@@ -226,6 +226,14 @@ impl From<Ipv6Repr> for Repr {
 }
 
 impl Repr {
+    /// Validate a whole IP header before passing its TCP segment to a socket.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        match Version::of_packet(bytes)? {
+            Version::Ipv4 => Ok(Ipv4Repr::parse(&Ipv4Packet::new_checked(bytes)?)?.into()),
+            Version::Ipv6 => Ok(Ipv6Repr::parse(&Ipv6Packet::new_checked(bytes)?)?.into()),
+        }
+    }
+
     /// Create a new IpRepr, choosing the right IP version for the src/dst addrs.
     ///
     /// # Panics
@@ -262,7 +270,7 @@ impl Repr {
     }
 
     /// Return the source address.
-    pub(crate) const fn src_addr(&self) -> Address {
+    pub const fn src_addr(&self) -> Address {
         match *self {
             Repr::Ipv4(repr) => Address::Ipv4(repr.src_addr),
             Repr::Ipv6(repr) => Address::Ipv6(repr.src_addr),
@@ -270,7 +278,7 @@ impl Repr {
     }
 
     /// Return the destination address.
-    pub(crate) const fn dst_addr(&self) -> Address {
+    pub const fn dst_addr(&self) -> Address {
         match *self {
             Repr::Ipv4(repr) => Address::Ipv4(repr.dst_addr),
             Repr::Ipv6(repr) => Address::Ipv6(repr.dst_addr),
@@ -294,7 +302,7 @@ impl Repr {
     }
 
     /// Return the length of a header that will be emitted from this high-level representation.
-    pub(crate) const fn header_len(&self) -> usize {
+    pub const fn header_len(&self) -> usize {
         match *self {
             Repr::Ipv4(repr) => repr.buffer_len(),
             Repr::Ipv6(repr) => repr.buffer_len(),
@@ -302,7 +310,7 @@ impl Repr {
     }
 
     /// Emit this high-level representation into a buffer.
-    pub(crate) fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, buffer: T) {
+    pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(&self, buffer: T) {
         match *self {
             Repr::Ipv4(repr) => repr.emit(&mut Ipv4Packet::new_unchecked(buffer)),
             Repr::Ipv6(repr) => repr.emit(&mut Ipv6Packet::new_unchecked(buffer)),
@@ -313,7 +321,7 @@ impl Repr {
     /// high-level representation.
     ///
     /// This is the same as `repr.buffer_len() + repr.payload_len()`.
-    pub(crate) const fn buffer_len(&self) -> usize {
+    pub const fn buffer_len(&self) -> usize {
         self.header_len() + self.payload_len()
     }
 }

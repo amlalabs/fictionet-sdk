@@ -2,7 +2,7 @@
 //! packets below, one byte-stream child per connection above.
 //!
 //! [`TcpLayer`] owns everything one machine's TCP keeps: the smoltcp
-//! interface and socket set, the listeners with their backlogs and SYN
+//! context and socket set, the listeners with their backlogs and SYN
 //! cookies, the handshake answers and segment options a listener supplies,
 //! the buffers and their pages, keepalive, retransmission and TIME-WAIT,
 //! the orphans of closed connections, and what a closed port or a SYN from
@@ -187,8 +187,7 @@ impl Sequences {
 /// allowance lets it hold; one leaving the engine keeps its payment, and
 /// the reserve is charged back up before the layer below takes it.
 #[derive(Default)]
-pub(super) struct Dev {
-    pub(super) rx: Option<Chunk>,
+pub(super) struct Output {
     /// What smoltcp sent since the endpoint last looked at its packets.
     pub(super) tx: Vec<Chunk>,
     /// Packets the endpoint has looked at, for the layer below to take.
@@ -196,8 +195,6 @@ pub(super) struct Dev {
     /// Where smoltcp's packets are written, once the engine's storage is
     /// reserved.
     pool: Option<Pool>,
-    /// The packet smoltcp is reading, until it is done.
-    read: Option<Chunk>,
     /// Packets went out since the reserve was last charged back up.
     short: bool,
 }
@@ -206,94 +203,47 @@ pub(super) struct Dev {
 /// front of an MTU of packet, and slack.
 const PACKET_SLOT: usize = 2048;
 
-impl Dev {
+impl Output {
     /// Whether the output allowance is used up: smoltcp may not send
     /// until the layer below takes some packets.
     fn full(&self) -> bool {
         self.tx.len() + self.out.len() >= EGRESS_PACKETS
     }
 
-    /// Lets go of the packet smoltcp read, or did not read: its block goes
-    /// back to the pool it came from, if it came from one.
-    fn reclaim(&mut self) {
-        self.read = None;
-        self.rx = None;
-    }
-}
-
-pub(super) struct Rx<'a> {
-    bytes: Chunk,
-    read: &'a mut Option<Chunk>,
-}
-
-pub(super) struct Tx<'a> {
-    tx: &'a mut Vec<Chunk>,
-    pool: Option<&'a Pool>,
-}
-
-impl RxToken for Rx<'_> {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        let r = f(&self.bytes);
-        *self.read = Some(self.bytes);
-        r
-    }
-}
-
-impl TxToken for Tx<'_> {
-    /// smoltcp writes every byte of the `len` it asks for (the IP and TCP
-    /// headers, the options in full and the payload), so a block's old
-    /// bytes are never sent.
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let r;
-        let packet = match self.pool.and_then(|pool| pool.take_control(0)) {
+    /// Write the IP and TCP headers and payload into a charged packet block.
+    fn emit(&mut self, ip: smoltcp::wire::IpRepr, tcp: TcpRepr<'_>) -> Result<(), ()> {
+        if self.full() {
+            return Err(());
+        }
+        assert!(!IpAddr::from(ip.dst_addr()).is_unspecified());
+        if ip.buffer_len() > MTU {
+            return Ok(());
+        }
+        let len = ip.buffer_len();
+        let fill = |bytes: &mut [u8]| {
+            ip.emit(&mut *bytes);
+            tcp.emit(
+                &mut TcpPacket::new_unchecked(&mut bytes[ip.header_len()..]),
+                &ip.src_addr(),
+                &ip.dst_addr(),
+            );
+        };
+        let packet = match self.pool.as_ref().and_then(|pool| pool.take_control(0)) {
             Some(mut block) if block.room() >= len => {
-                let mut wrote = None;
                 block.fill(|room| {
-                    wrote = Some(f(&mut room[..len]));
+                    fill(&mut room[..len]);
                     len
                 });
-                r = wrote.expect("the engine alone holds a block it just took");
                 block
             }
-            // Before the engine reserved its storage, as when a test feeds
-            // it directly, there is no pool: the packet is a vector of its
-            // own, paid for by the layer below when it takes it.
             _ => {
                 let mut bytes = vec![0; len];
-                r = f(&mut bytes);
+                fill(&mut bytes);
                 Chunk::unpaid(bytes)
             }
         };
         self.tx.push(packet);
-        r
-    }
-}
-
-impl Device for Dev {
-    type RxToken<'a> = Rx<'a>;
-    type TxToken<'a> = Tx<'a>;
-
-    fn receive(&mut self, _: smoltcp::time::Instant) -> Option<(Rx<'_>, Tx<'_>)> {
-        if self.full() {
-            return None;
-        }
-        let bytes = self.rx.take()?;
-        let Dev { tx, pool, read, .. } = self;
-        let pool = pool.as_ref();
-        Some((Rx { bytes, read }, Tx { tx, pool }))
-    }
-
-    fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
-        (!self.full()).then_some(Tx {
-            tx: &mut self.tx,
-            pool: self.pool.as_ref(),
-        })
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        DeviceCapabilities {
-            max_transmission_unit: MTU,
-        }
+        Ok(())
     }
 }
 
@@ -581,7 +531,7 @@ impl std::hash::Hasher for IdHasher {
 /// and their allocations are not measured.
 pub struct TcpLayer {
     pub(super) addr: IpAddr,
-    pub(super) iface: Iface,
+    pub(super) context: TcpContext,
     pub(super) sockets: Sockets,
     /// Reclamation handles. Each socket also owns its mapping.
     pub(super) pages: HashMap<Id, Arc<Pages>, ById>,
@@ -592,7 +542,7 @@ pub struct TcpLayer {
     pub(super) dirty: HashSet<Id, ById>,
     /// When `dirty` is next looked at.
     next_release: Option<smoltcp::time::Instant>,
-    pub(super) dev: Dev,
+    pub(super) output: Output,
     /// Listener maintenance in ascending port order.
     pub(super) listeners: BTreeMap<u16, Listen>,
     /// Connections by (local, remote), to note RSTs and FINs.
@@ -1039,7 +989,7 @@ impl TcpLayer {
     /// TCP for a machine with address `addr` and `options`, made at `now`.
     /// Draws its keys and first ephemeral port from `entropy`.
     pub fn new(addr: IpAddr, options: Options, entropy: &dyn Entropy, now: Instant) -> TcpLayer {
-        let mut dev = Dev::default();
+        let output = Output::default();
         let mut cookie_key = [0; 32];
         entropy.fill_random(&mut cookie_key);
         let sequences = Sequences(secret(entropy));
@@ -1049,20 +999,18 @@ impl TcpLayer {
             }),
             ip_addr: addr.into(),
         };
-        let mut iface = Iface::new(config, &mut dev, smol(now));
-        iface.set_ignore_malformed_options(options.settings.ignore_malformed_options);
-        iface.set_reset_closed_ports(options.settings.closed_port == ClosedPort::Reset);
+        let context = TcpContext::new(config, MTU, smol(now));
         TcpLayer {
             storage: None,
             storage_places: 0,
             addr,
-            iface,
+            context,
             sockets: Sockets::new(),
             pages: HashMap::default(),
             reserved: HashMap::default(),
             dirty: HashSet::default(),
             next_release: None,
-            dev,
+            output,
             listeners: BTreeMap::new(),
             by_tuple: HashMap::new(),
             ports: HashMap::new(),
@@ -1147,7 +1095,7 @@ impl TcpLayer {
             return false;
         }
         let pool = self
-            .dev
+            .output
             .pool
             .get_or_insert_with(|| Pool::new(charge.budget(), PACKET_SLOT, EGRESS_PACKETS));
         if !pool.reserve_control(charge.budget(), EGRESS_PACKETS) {
@@ -1157,8 +1105,8 @@ impl TcpLayer {
         }
         self.up.reserve_exact(UP_ROOM);
         self.urgent.reserve_exact(UP_ROOM);
-        self.dev.tx.reserve_exact(EGRESS_PACKETS);
-        self.dev.out.reserve_exact(EGRESS_PACKETS);
+        self.output.tx.reserve_exact(EGRESS_PACKETS);
+        self.output.out.reserve_exact(EGRESS_PACKETS);
         self.storage_places = places;
         true
     }
@@ -1527,7 +1475,7 @@ impl TcpLayer {
         let Some(ip) = Header::parse_whole(&packet) else {
             return false;
         };
-        if ip.dst != addr {
+        if !self.context.has_ip_addr(ip.dst) {
             return false;
         }
         if ip.protocol == ICMP && addr.is_ipv4() {
@@ -1545,9 +1493,9 @@ impl TcpLayer {
             return false;
         }
         // Validate before a rejected packet can change connection bookkeeping.
-        if ip.src.is_ipv4() && !Ipv4Packet::new_unchecked(&packet).verify_checksum() {
+        let Ok(ip_repr) = smoltcp::wire::IpRepr::parse(&packet) else {
             return false;
-        }
+        };
         let t = &packet[ip.payload.clone()];
         let Ok(repr) = TcpRepr::parse_with(
             &TcpPacket::new_unchecked(t),
@@ -1570,7 +1518,7 @@ impl TcpLayer {
             {
                 let src = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
                 let dst = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
-                self.dev.tx.push(Chunk::unpaid(
+                self.output.tx.push(Chunk::unpaid(
                     Arrived::of(src, dst, t, repr.payload.len()).reset(&[]),
                 ));
             }
@@ -1580,7 +1528,7 @@ impl TcpLayer {
         // host's (RFC 1122 section 3.2.1.3), as smoltcp does on its own
         // path. The SYN cookies and refusals here answer before smoltcp
         // sees the segment, so the check comes first.
-        if !unicast(ip.src) {
+        if !unicast(ip.src) || ip.dst.is_unspecified() {
             return false;
         }
         let data = !repr.payload.is_empty();
@@ -1664,17 +1612,45 @@ impl TcpLayer {
         }
         // The options of an ACK that may complete a handshake.
         let completing = (before == Some(TcpState::SynReceived)).then(|| segment_options(t));
-        self.dev.rx = Some(packet);
-        if let Some(h) = handle {
-            let target = self.sockets.handle(h);
-            self.iface
-                .poll_ingress_targeted(now, &mut self.dev, &mut self.sockets.set, target);
-        } else {
-            self.iface
-                .poll_ingress_single(now, &mut self.dev, &mut self.sockets.set);
+        self.context.set_now(now);
+        let consumed = !self.output.full();
+        if consumed {
+            let cx = &mut self.context;
+            // An established tuple belongs to its socket even after reset.
+            // Only a listening owner allows the general listener lookup.
+            let owner = handle
+                .map(|h| self.sockets.handle(h))
+                .filter(|&h| self.sockets.set.get(h).state() != TcpState::Listen);
+            let accepted = match owner {
+                Some(h) => self
+                    .sockets
+                    .set
+                    .get(h)
+                    .accepts(cx, &ip_repr, &repr)
+                    .then_some(h),
+                None => self
+                    .sockets
+                    .set
+                    .iter()
+                    .find(|(_, socket)| socket.accepts(cx, &ip_repr, &repr))
+                    .map(|(h, _)| h),
+            };
+            let reply = match accepted {
+                Some(h) => self.sockets.set.get_mut(h).process(
+                    cx,
+                    &ip_repr,
+                    &repr,
+                    TcpPacket::new_unchecked(t).options(),
+                ),
+                None if self.settings.closed_port == ClosedPort::Reset && !rst => {
+                    Some(stcp::Socket::rst_reply(&ip_repr, &repr))
+                }
+                None => None,
+            };
+            if let Some((ip, tcp)) = reply {
+                self.output.emit(ip, tcp).expect("output room was checked");
+            }
         }
-        let consumed = self.dev.rx.is_none();
-        self.dev.reclaim();
         if let Some(h) = handle {
             if let Some(c) = self.sockets.conn_mut(h)
                 && c.ecn
@@ -1816,7 +1792,7 @@ impl TcpLayer {
             .backlog_per_peer
             .is_some_and(|limit| l.per_peer.get(&src.ip()).is_some_and(|&n| n >= limit));
         if l.ready.len() >= l.backlog && self.settings.reset_full_queue {
-            self.dev.tx.push(Chunk::unpaid(arrived.reset(&[])));
+            self.output.tx.push(Chunk::unpaid(arrived.reset(&[])));
             return None;
         }
         if l.ready.len() >= l.backlog
@@ -1844,12 +1820,12 @@ impl TcpLayer {
             Some(SynAnswer::Refuse(refusal)) => {
                 // Options that cannot be sent leave a plain RST.
                 let options = encode(&refusal).unwrap_or_default();
-                self.dev.tx.push(Chunk::unpaid(arrived.reset(&options)));
+                self.output.tx.push(Chunk::unpaid(arrived.reset(&options)));
                 return None;
             }
         };
         let Some(encoded) = encode(&added) else {
-            self.dev.tx.push(Chunk::unpaid(arrived.reset(&[])));
+            self.output.tx.push(Chunk::unpaid(arrived.reset(&[])));
             return None;
         };
         let ipv4_reply = if dst.is_ipv4() {
@@ -1861,7 +1837,7 @@ impl TcpLayer {
             Ipv4Reply::default()
         };
         if encode_ipv4_options(&ipv4_reply.options).is_err() {
-            self.dev.tx.push(Chunk::unpaid(arrived.reset(&[])));
+            self.output.tx.push(Chunk::unpaid(arrived.reset(&[])));
             return None;
         }
         if cookie {
@@ -1924,7 +1900,7 @@ impl TcpLayer {
             } else {
                 reply
             };
-            self.dev.tx.push(Chunk::unpaid(reply));
+            self.output.tx.push(Chunk::unpaid(reply));
             return None;
         }
         if l.idle.is_empty() {
@@ -2086,7 +2062,7 @@ impl TcpLayer {
             AckAnswer::Refuse(refusal) => {
                 // Options that cannot be sent leave a plain RST.
                 let options = encode(&refusal).unwrap_or_default();
-                self.dev.tx.push(Chunk::unpaid(arrived.reset(&options)));
+                self.output.tx.push(Chunk::unpaid(arrived.reset(&options)));
             }
             AckAnswer::Drop => {}
         }
@@ -2532,7 +2508,7 @@ impl TcpLayer {
         };
         let local = SocketAddr::new(addr, port);
         let mut s = new_socket(self.buffer);
-        if s.0.connect(self.iface.context(), remote, local).is_err() {
+        if s.0.connect(&mut self.context, remote, local).is_err() {
             return failed(self, ConnError::Refused);
         }
         let h = self.add_socket(env.entropy(), s);
@@ -2683,11 +2659,11 @@ impl TcpLayer {
         self.mapped(id).filter(|h| self.conn(*h).open)
     }
 
-    /// Prepares for the packets of one step: the interface's clock, and
+    /// Prepares for the packets of one step: the context's clock, and
     /// the handshakes given up, before anything more is sent for them.
     fn prime(&mut self, now: smoltcp::time::Instant) {
         if !self.primed {
-            self.iface.poll_maintenance(now);
+            self.context.set_now(now);
             self.expire_handshakes(now);
             self.primed = true;
         }
@@ -2701,14 +2677,10 @@ impl TcpLayer {
         // another.
         self.work = false;
         self.prime(now);
-        while self
-            .iface
-            .poll_egress(now, &mut self.dev, &mut self.sockets.set)
-            != smoltcp::iface::PollResult::None
-        {}
+        while self.egress(now) {}
         self.expire_orphans(now);
         self.housekeeping();
-        self.saturated = self.dev.full();
+        self.saturated = self.output.full();
         self.flush_transmit();
         if self.dirty.is_empty() {
             self.next_release = None;
@@ -2729,11 +2701,40 @@ impl TcpLayer {
         self.stepped = Some(env.now());
     }
 
+    /// Send one segment per ready socket, preserving rotation when output fills.
+    fn egress(&mut self, now: smoltcp::time::Instant) -> bool {
+        self.context.set_now(now);
+        let count = self.sockets.set.prepare(&mut self.context, now);
+        let mut emitted = false;
+        for _ in 0..count {
+            let Some(handle) = self.sockets.set.next_ready() else {
+                break;
+            };
+            let sent =
+                self.sockets
+                    .set
+                    .get_mut(handle)
+                    .dispatch(&mut self.context, |_, (ip, tcp)| {
+                        self.output.emit(ip, tcp)?;
+                        emitted = true;
+                        Ok::<_, ()>(())
+                    });
+            self.sockets.set.dispatched(handle, sent.is_err());
+            if sent.is_err() {
+                return emitted;
+            }
+        }
+        self.sockets.set.finish_egress();
+        emitted
+    }
+
     fn schedule(&mut self, now: smoltcp::time::Instant) {
         if self.dirty.is_empty() {
             self.next_release = None;
         }
-        let at = self.iface.poll_at(now, &mut self.sockets.set);
+        self.context.set_now(now);
+        self.sockets.set.schedule(&mut self.context);
+        let at = self.sockets.set.next_deadline();
         self.next = [at, self.next_release, self.next_expiry()]
             .into_iter()
             .flatten()
@@ -2742,13 +2743,13 @@ impl TcpLayer {
     }
 
     fn flush_transmit(&mut self) {
-        let mut sent = std::mem::take(&mut self.dev.tx);
+        let mut sent = std::mem::take(&mut self.output.tx);
         for p in &mut sent {
             self.sent(p);
         }
-        self.dev.short |= !sent.is_empty();
-        self.dev.out.extend(sent.drain(..));
-        self.dev.tx = sent;
+        self.output.short |= !sent.is_empty();
+        self.output.out.extend(sent.drain(..));
+        self.output.tx = sent;
     }
 
     // -----------------------------------------------------------------------
@@ -2856,7 +2857,7 @@ impl TcpLayer {
 
     /// Whether a step has something to do or packets wait to go.
     pub(super) fn busy(&self) -> bool {
-        self.work || !self.dev.tx.is_empty() || !self.dev.out.is_empty()
+        self.work || !self.output.tx.is_empty() || !self.output.out.is_empty()
     }
 
     /// The socket of child `id`.
@@ -2895,7 +2896,7 @@ impl Layer for TcpLayer {
     }
 
     fn is_terminal(&self) -> bool {
-        self.stopped && self.dev.out.is_empty()
+        self.stopped && self.output.out.is_empty()
     }
 
     fn on_event(
@@ -2918,7 +2919,7 @@ impl Layer for TcpLayer {
         if !self.reserve_storage(env.budget()) {
             return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
         }
-        if self.dev.full() || self.up.len() >= UP_ROOM || self.urgent.len() >= UP_ROOM {
+        if self.output.full() || self.up.len() >= UP_ROOM || self.urgent.len() >= UP_ROOM {
             return Ok(Admit::Blocked(PacketEvent::Packet(packet)));
         }
         if packet.sort() != Sort::Transport(Transport::Tcp) {
@@ -2933,8 +2934,7 @@ impl Layer for TcpLayer {
         // per round trip. Pure ACKs are still handled as a batch.
         let bytes = packet.into_bytes();
         if self.ingress(env.entropy(), env.budget(), now, bytes) {
-            self.iface
-                .poll_egress(now, &mut self.dev, &mut self.sockets.set);
+            self.egress(now);
         }
         Ok(Admit::Taken)
     }
@@ -3037,27 +3037,27 @@ impl Layer for TcpLayer {
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
-        let full = self.dev.full();
+        let full = self.output.full();
         // A block leaves with its payment, so the reserve that paid for it
         // is charged back up first, to the budget that pays for the storage;
         // without room the packet waits here and the runner waits for memory.
         // One top-up covers every block the engine holds then, so it is
         // done once for each batch smoltcp wrote.
-        if self.dev.short && !self.dev.out.is_empty() {
-            if let (Some(pool), Some(storage)) = (&self.dev.pool, &self.storage)
+        if self.output.short && !self.output.out.is_empty() {
+            if let (Some(pool), Some(storage)) = (&self.output.pool, &self.storage)
                 && !pool.refill(storage.budget())
             {
                 return None;
             }
-            self.dev.short = false;
+            self.output.short = false;
         }
-        match self.dev.out.pop_front() {
+        match self.output.out.pop_front() {
             Some(packet) => {
                 // Room again: smoltcp may have more to send.
                 self.work |= full;
                 Some(PacketCommand::Send(packet))
             }
-            None if self.stopped && self.dev.tx.is_empty() && !self.ended => {
+            None if self.stopped && self.output.tx.is_empty() && !self.ended => {
                 self.ended = true;
                 Some(PacketCommand::End)
             }
@@ -3077,7 +3077,7 @@ impl Layer for TcpLayer {
     }
 
     fn deadline(&self) -> Option<(Instant, ())> {
-        if self.dev.full() {
+        if self.output.full() {
             return None;
         }
         self.next.map(|at| (at, ()))

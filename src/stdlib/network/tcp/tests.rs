@@ -699,7 +699,7 @@ fn engine_storage_belongs_to_the_first_environment_until_drop() {
     assert_eq!(second.used(), 0);
     // The reserve pays for as many blocks as the engine may hold, and they
     // come back to its pool paid as before, round after round.
-    let pool = tcp.dev.pool.clone().expect("reserved with the storage");
+    let pool = tcp.output.pool.clone().expect("reserved with the storage");
     for _ in 0..3 {
         let blocks: Vec<Chunk> = (0..EGRESS_PACKETS)
             .map(|_| {
@@ -796,7 +796,10 @@ fn refused_engine_storage_keeps_the_first_budget_and_allocates_nothing() {
     };
     assert_eq!(first.used(), held.bytes());
     assert_eq!(
-        tcp.up.capacity() + tcp.urgent.capacity() + tcp.dev.tx.capacity() + tcp.dev.out.capacity(),
+        tcp.up.capacity()
+            + tcp.urgent.capacity()
+            + tcp.output.tx.capacity()
+            + tcp.output.out.capacity(),
         0
     );
     assert!(tcp.listeners.is_empty());
@@ -1015,16 +1018,16 @@ fn transmit_batches_retain_descriptor_capacity() {
         let peer = "10.0.0.2:1234".parse()?;
         let local = "10.0.0.1:80".parse()?;
         for n in 0..8 {
-            host.dev
+            host.output
                 .tx
                 .push(Chunk::unpaid(segment(local, peer, n, 0, 4).into_vec()));
         }
-        let capacity = host.dev.tx.capacity();
+        let capacity = host.output.tx.capacity();
         host.flush_transmit();
-        assert!(host.dev.tx.is_empty());
-        assert!(host.dev.tx.capacity() >= capacity);
-        assert_eq!(host.dev.out.len(), 8);
-        for (n, packet) in host.dev.out.iter().enumerate() {
+        assert!(host.output.tx.is_empty());
+        assert!(host.output.tx.capacity() >= capacity);
+        assert_eq!(host.output.out.len(), 8);
+        for (n, packet) in host.output.out.iter().enumerate() {
             let tcp = Header::parse_whole(packet).unwrap().payload(packet);
             assert_eq!(u32::from_be_bytes(tcp[4..8].try_into().unwrap()), n as u32);
         }
@@ -1034,21 +1037,31 @@ fn transmit_batches_retain_descriptor_capacity() {
 }
 
 #[test]
-fn device_output_yields_and_preserves_waiting_input() {
-    let mut dev = Dev::default();
-    let now = smoltcp::time::Instant::from_micros(0);
+fn output_yields_until_queued_packets_are_drained() {
+    let mut output = Output::default();
+    let local = "10.0.0.1:80".parse().unwrap();
+    let peer = "10.0.0.2:1234".parse().unwrap();
+    let packet = segment(local, peer, 13, 29, 0x10);
+    let ip = smoltcp::wire::IpRepr::parse(&packet).unwrap();
+    let wire = TcpPacket::new_unchecked(&packet[ip.header_len()..]);
+    let tcp = TcpRepr::parse(&wire, &ip.src_addr(), &ip.dst_addr()).unwrap();
     for _ in 0..EGRESS_PACKETS {
-        dev.transmit(now).unwrap().consume(MTU, |_| {});
+        output.emit(ip.clone(), tcp).unwrap();
     }
-    assert!(dev.transmit(now).is_none());
-    dev.rx = Some(Chunk::unpaid(vec![1, 2, 3]));
-    assert!(dev.receive(now).is_none());
-    assert_eq!(dev.rx.as_deref(), Some([1, 2, 3].as_slice()));
-    dev.tx.clear();
-    let (rx, tx) = dev.receive(now).unwrap();
-    rx.consume(|p| assert_eq!(p, [1, 2, 3]));
-    tx.consume(40, |_| {});
-    assert_eq!(dev.tx.len(), 1);
+    let queued = output.tx.len();
+    assert!(output.emit(ip.clone(), tcp).is_err());
+    assert_eq!(output.tx.len(), queued);
+    for packet in &output.tx {
+        let sent = smoltcp::wire::IpRepr::parse(packet).unwrap();
+        let wire = TcpPacket::new_unchecked(&packet[sent.header_len()..]);
+        assert_eq!(
+            TcpRepr::parse(&wire, &sent.src_addr(), &sent.dst_addr()).unwrap(),
+            tcp
+        );
+    }
+    output.tx.clear();
+    assert!(output.emit(ip.clone(), tcp).is_ok());
+    assert!(!output.full());
 }
 
 #[test]
@@ -1088,16 +1101,16 @@ fn orphan_waits_for_reset_when_output_is_full() {
             .unwrap();
         st.orphan(h, true);
         for _ in 0..EGRESS_PACKETS {
-            st.dev.transmit(now).unwrap().consume(40, |_| {});
+            st.output.tx.push(Chunk::unpaid(vec![0; 40]));
         }
         let st: &mut TcpLayer = &mut st;
-        st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set);
+        st.egress(now);
         st.housekeeping();
         assert!(
             st.sockets.conn(h).is_some(),
             "unsent reset must keep its socket"
         );
-        st.dev.tx.clear();
+        st.output.tx.clear();
         let packets = egress(st, now);
         assert_eq!(packets.len(), 1);
         let t = Header::parse_whole(&packets[0])
@@ -1208,14 +1221,13 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
                 .is_pending()
         );
         let mut st = ep.shared.lock();
-        while st.dev.tx.len() < EGRESS_PACKETS {
-            st.dev.transmit(now).unwrap().consume(40, |_| {});
+        while st.output.tx.len() < EGRESS_PACKETS {
+            st.output.tx.push(Chunk::unpaid(vec![0; 40]));
         }
         let later = now + smoltcp::time::Duration::from_millis(20);
         {
             let st: &mut TcpLayer = &mut st;
-            st.iface
-                .poll_egress(later, &mut st.dev, &mut st.sockets.set);
+            st.egress(later);
         }
         st.housekeeping();
         st.pump();
@@ -1234,7 +1246,7 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         let mut st = ep.shared.lock();
         let st: &mut TcpLayer = &mut st;
         assert_eq!(st.get(h).state(), TcpState::TimeWait);
-        st.dev.tx.clear();
+        st.output.tx.clear();
         let packets = egress(st, later);
         assert_eq!(packets.len(), 1);
         let t = Header::parse_whole(&packets[0])
@@ -1400,19 +1412,19 @@ fn local_reset_wakes_watches_before_rst_egress() {
             let now = smol_now(&fcx);
             {
                 let mut st = server.shared.lock();
-                st.dev.tx.clear();
+                st.output.tx.clear();
                 for _ in 0..EGRESS_PACKETS {
-                    st.dev.transmit(now).unwrap().consume(40, |_| {});
+                    st.output.tx.push(Chunk::unpaid(vec![0; 40]));
                 }
                 let st: &mut TcpLayer = &mut st;
-                st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set);
+                st.egress(now);
                 st.housekeeping();
                 assert!(
                     st.sockets.conn(h).is_some(),
                     "unsent reset must keep its socket"
                 );
                 assert!(st.get(h).remote_endpoint().is_some());
-                st.dev.tx.clear();
+                st.output.tx.clear();
                 let packets = egress(st, now);
                 assert_eq!(packets.len(), 1);
                 let t = Header::parse_whole(&packets[0])
@@ -1817,10 +1829,8 @@ fn data_segment(
 
 /// Drives the stack at one fixed time, without running its background task.
 fn egress(st: &mut TcpLayer, now: smoltcp::time::Instant) -> Vec<Vec<u8>> {
-    while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets.set)
-        != smoltcp::iface::PollResult::None
-    {}
-    let mut packets = std::mem::take(&mut st.dev.tx);
+    while st.egress(now) {}
+    let mut packets = std::mem::take(&mut st.output.tx);
     for p in &mut packets {
         st.sent(p);
     }
@@ -1844,9 +1854,9 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
             // the same endpoints at the same instant it would not
             // (RFC 6528).
             let now = smol_now(&fcx) + smoltcp::time::Duration::from_millis(attempt as u64);
-            st.iface.poll_maintenance(now);
+            st.context.set_now(now);
             let mut socket = new_socket(MIN_BUFFER);
-            socket.0.connect(st.iface.context(), peer, local).unwrap();
+            socket.0.connect(&mut st.context, peer, local).unwrap();
             let h = st.add_socket(&fcx, socket);
             st.sockets
                 .insert_conn(h, Conn::new(local, peer, Side::Client));
@@ -2037,7 +2047,7 @@ fn rejected_syn_acks(established: bool) {
             let now = smol_now(&fcx);
             let mut st = ep.shared.lock();
             let mut s = new_socket(MIN_BUFFER);
-            s.0.connect(st.iface.context(), peer, local).unwrap();
+            s.0.connect(&mut st.context, peer, local).unwrap();
             let h = st.add_socket(&fcx, s);
             st.sockets
                 .insert_conn(h, Conn::new(local, peer, Side::Client));
@@ -2135,7 +2145,7 @@ fn rejected_syn_acks(established: bool) {
             if !established {
                 let local = SocketAddr::new(local.ip(), local.port() + 1);
                 let mut s = new_socket(MIN_BUFFER);
-                s.0.connect(st.iface.context(), peer, local).unwrap();
+                s.0.connect(&mut st.context, peer, local).unwrap();
                 let h = st.add_socket(&fcx, s);
                 st.sockets
                     .insert_conn(h, Conn::new(local, peer, Side::Client));
@@ -2177,7 +2187,7 @@ fn simultaneous_open_records_the_accepted_syn_origin() {
         let now = smol_now(&fcx);
         let mut st = ep.shared.lock();
         let mut s = new_socket(MIN_BUFFER);
-        s.0.connect(st.iface.context(), peer, local).unwrap();
+        s.0.connect(&mut st.context, peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
         st.sockets
             .insert_conn(h, Conn::new(local, peer, Side::Client));
@@ -2344,7 +2354,7 @@ fn client_advertised_window_uses_negotiated_scale() {
             let now = smol_now(&fcx);
             let mut st = ep.shared.lock();
             let mut socket = new_socket(BUFFER);
-            socket.0.connect(st.iface.context(), peer, local).unwrap();
+            socket.0.connect(&mut st.context, peer, local).unwrap();
             let h = st.add_socket(&fcx, socket);
             st.sockets
                 .insert_conn(h, Conn::new(local, peer, Side::Client));
@@ -4213,7 +4223,7 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
         let now = smol_now(&fcx);
         let mut st = ep.shared.lock();
         let mut s = new_socket(MIN_BUFFER);
-        s.0.connect(st.iface.context(), peer, local).unwrap();
+        s.0.connect(&mut st.context, peer, local).unwrap();
         let h = st.add_socket(&fcx, s);
         st.sockets
             .insert_conn(h, Conn::new(local, peer, Side::Client));
@@ -4927,7 +4937,7 @@ mod layer {
         let write: Command = s.send(StreamCommand::Write(Chunk::unpaid(pattern(3000, 1))));
         assert!(matches!(server.command(write), Ok(Admit::Taken)));
         assert!(!sent(&mut server).is_empty());
-        let tx = &server.layer().upper().dev.tx;
+        let tx = &server.layer().upper().output.tx;
         assert!(tx.is_empty());
         assert!(tx.capacity() > 0, "the vector went with the packets");
     }

@@ -157,7 +157,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub(crate) fn new_checked(buffer: T) -> Result<Packet<T>> {
+    pub fn new_checked(buffer: T) -> Result<Packet<T>> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
@@ -340,7 +340,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
     /// Return a pointer to the options.
     #[inline]
-    pub(crate) fn options(&self) -> &'a [u8] {
+    pub fn options(&self) -> &'a [u8] {
         let header_len = self.header_len();
         let data = self.buffer.as_ref();
         &data[field::OPTIONS(header_len)]
@@ -1046,12 +1046,8 @@ impl<'a> Repr<'a> {
     }
 
     /// Emit a high-level representation into a Transmission Control Protocol packet.
-    pub(crate) fn emit<T>(
-        &self,
-        packet: &mut Packet<&mut T>,
-        src_addr: &IpAddress,
-        dst_addr: &IpAddress,
-    ) where
+    pub fn emit<T>(&self, packet: &mut Packet<&mut T>, src_addr: &IpAddress, dst_addr: &IpAddress)
+    where
         T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
     {
         packet.set_src_port(self.src_port);

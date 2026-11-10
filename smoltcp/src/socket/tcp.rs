@@ -1339,7 +1339,7 @@ impl<'a> Socket<'a> {
     ///
     /// ```no_run
     /// # use smoltcp::socket::tcp::{Socket, SocketBuffer};
-    /// # use smoltcp::iface::Interface;
+    /// # use smoltcp::iface::Context;
     /// #
     /// # fn get_ephemeral_port() -> u16 {
     /// #     49152
@@ -1350,10 +1350,10 @@ impl<'a> Socket<'a> {
     /// #     SocketBuffer::new(vec![0; 1200])
     /// # );
     /// #
-    /// # let mut iface: Interface = todo!();
+    /// # let mut context: Context = todo!();
     /// #
     /// socket.connect(
-    ///     iface.context(),
+    ///     &mut context,
     ///     ("10.0.0.1".parse::<core::net::IpAddr>().unwrap(), 80),
     ///     ("10.0.0.2".parse::<core::net::IpAddr>().unwrap(), get_ephemeral_port())
     /// ).unwrap();
@@ -1664,7 +1664,7 @@ impl<'a> Socket<'a> {
         (ip_reply_repr, reply_repr)
     }
 
-    pub(crate) fn rst_reply(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
+    pub fn rst_reply(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         debug_assert!(repr.control != TcpControl::Rst);
 
         let (ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
@@ -1777,7 +1777,7 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(cx, ip_repr, repr))
     }
 
-    pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+    pub fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
         }
@@ -1840,7 +1840,7 @@ impl<'a> Socket<'a> {
 
     /// Takes a segment: `repr`, whose options are `options` as they
     /// are on the wire.
-    pub(crate) fn process(
+    pub fn process(
         &mut self,
         cx: &mut Context,
         ip_repr: &IpRepr,
@@ -2605,7 +2605,7 @@ impl<'a> Socket<'a> {
         }
     }
 
-    pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
+    pub fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
         F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
@@ -2855,7 +2855,7 @@ impl<'a> Socket<'a> {
             repr.extra = &self.segment_extra;
         }
 
-        // Advance send state only after the device accepts the packet.
+        // Advance send state only after the emitter accepts the packet.
         ip_repr.set_payload_len(repr.buffer_len());
         self.identify_ipv4(&mut ip_repr);
         let increment_id = !matches!(

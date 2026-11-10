@@ -11,7 +11,7 @@ impl Device for LimitedDevice {
     type RxToken<'a> = crate::tests::RxToken;
     type TxToken<'a> = crate::tests::TxToken<'a>;
 
-    fn capabilities(&self) -> crate::phy::DeviceCapabilities {
+    fn capabilities(&self) -> crate::tests::phy::DeviceCapabilities {
         self.inner.capabilities()
     }
 

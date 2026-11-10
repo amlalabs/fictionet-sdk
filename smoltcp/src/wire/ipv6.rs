@@ -131,6 +131,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
     }
 }
 
+#[cfg(test)]
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
     /// Return a pointer to the payload.
     #[inline]
@@ -203,7 +204,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
 /// A high-level representation of an Internet Protocol version 6 packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct Repr {
+pub struct Repr {
     /// IPv6 address of the source node.
     pub(crate) src_addr: Address,
     /// IPv6 address of the destination node.

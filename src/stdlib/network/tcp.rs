@@ -60,8 +60,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use smoltcp::iface::{Config, Interface as Iface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
+use smoltcp::iface::{Config, Context as TcpContext, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self as stcp, State as TcpState};
 use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
 

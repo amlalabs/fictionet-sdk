@@ -4,8 +4,8 @@ mod tcp;
 #[cfg(test)]
 mod tests;
 
-use super::socket_set::{SocketHandle, SocketSet};
-use crate::phy::{Device, RxToken, TxToken};
+use crate::iface::{SocketHandle, SocketSet};
+use crate::tests::phy::{Device, RxToken, TxToken};
 use crate::time::Instant;
 use crate::wire::*;
 use core::result::Result;
@@ -22,31 +22,7 @@ pub struct Interface {
     pub(crate) inner: InterfaceInner,
 }
 
-/// Clock, addresses, MTU, and initial sequence numbers shared by TCP
-/// sockets.
-pub struct InterfaceInner {
-    mtu: usize,
-    now: Instant,
-    initial_seq: InitialSeq,
-    ip_addr: IpAddress,
-    ignore_malformed_options: bool,
-    reset_closed_ports: bool,
-    ingress_target: Option<SocketHandle>,
-}
-
-/// Picks the initial sequence number of a connection from its local and
-/// remote endpoints and the time, as RFC 6528 has it: a keyed hash of the
-/// endpoints plus a clock, so that what one connection shows of its
-/// number tells nothing of another's.
-pub type InitialSeq = Box<dyn Fn(IpEndpoint, IpEndpoint, Instant) -> u32 + Send + Sync>;
-
-/// Configuration for a simulated host's TCP interface.
-pub struct Config {
-    /// The host address.
-    pub ip_addr: IpAddress,
-    /// Each new connection's initial sequence number.
-    pub initial_seq: InitialSeq,
-}
+use crate::iface::{Config, Context as InterfaceInner};
 
 impl Interface {
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
@@ -62,18 +38,6 @@ impl Interface {
                 ingress_target: None,
             },
         }
-    }
-
-    /// Selects whether a malformed option list retains its valid prefix.
-    pub fn set_ignore_malformed_options(&mut self, ignore: bool) {
-        self.inner.ignore_malformed_options = ignore;
-    }
-
-    /// Selects whether a segment that no socket accepts gets a RST, as
-    /// RFC 9293 section 3.10.7.1 says of the CLOSED state, or nothing.
-    /// The default is a RST.
-    pub fn set_reset_closed_ports(&mut self, reset: bool) {
-        self.inner.reset_closed_ports = reset;
     }
 
     /// Context for connecting a TCP socket.
@@ -160,33 +124,6 @@ impl Interface {
 }
 
 impl InterfaceInner {
-    pub(crate) fn now(&self) -> Instant {
-        self.now
-    }
-    pub(crate) fn ip_mtu(&self) -> usize {
-        self.mtu
-    }
-    /// The initial sequence number of a connection from `local` to
-    /// `remote` that starts now.
-    pub(crate) fn initial_seq(&self, local: IpEndpoint, remote: IpEndpoint) -> TcpSeqNumber {
-        TcpSeqNumber((self.initial_seq)(local, remote, self.now) as i32)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_now(&mut self, now: Instant) {
-        self.now = now;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_ip_addr(&mut self, addr: IpAddress) {
-        self.ip_addr = addr;
-    }
-
-    pub(crate) fn has_ip_addr(&self, addr: impl Into<IpAddress>) -> bool {
-        let addr = addr.into();
-        self.ip_addr == addr
-    }
-
     fn process_ip<'a>(
         &mut self,
         sockets: &mut SocketSet,
