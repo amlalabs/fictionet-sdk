@@ -2096,8 +2096,15 @@ impl Socket {
             control = TcpControl::None;
         }
 
-        // Validate and update the state.
-        match (self.state, control) {
+        // Apply the acknowledgement now, but accept a FIN only after its
+        // payload has been retained. A refused allocation must leave the
+        // receive side open for a retransmission.
+        let state_control = if control == TcpControl::Fin {
+            TcpControl::None
+        } else {
+            control
+        };
+        match (self.state, state_control) {
             // RSTs are not accepted in the LISTEN state.
             (State::Listen, TcpControl::Rst) => return None,
 
@@ -2141,15 +2148,6 @@ impl Socket {
                 self.set_state(State::Established);
             }
 
-            // FIN packets in the SYN-RECEIVED state change it to CLOSE-WAIT.
-            // It's not obvious from RFC 793 that this is permitted, but
-            // 7th and 8th steps in the "SEGMENT ARRIVES" event describe this behavior.
-            (State::SynReceived, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
-                self.rx_fin_received = true;
-                self.set_state(State::CloseWait);
-            }
-
             // SYN|ACK packets in the SYN-SENT state change it to ESTABLISHED.
             // SYN packets in the SYN-SENT state change it to SYN-RECEIVED.
             (State::SynSent, TcpControl::Syn) => {
@@ -2174,13 +2172,6 @@ impl Socket {
 
             (State::Established, TcpControl::None) => {}
 
-            // FIN packets in ESTABLISHED state indicate the remote side has closed.
-            (State::Established, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
-                self.rx_fin_received = true;
-                self.set_state(State::CloseWait);
-            }
-
             // ACK packets in FIN-WAIT-1 state change it to FIN-WAIT-2, if we've already
             // sent everything in the transmit buffer. If not, they reset the retransmit timer.
             (State::FinWait1, TcpControl::None) => {
@@ -2189,28 +2180,7 @@ impl Socket {
                 }
             }
 
-            // FIN packets in FIN-WAIT-1 state change it to CLOSING, or to TIME-WAIT
-            // if they also acknowledge our FIN.
-            (State::FinWait1, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
-                self.rx_fin_received = true;
-                if ack_of_fin {
-                    self.set_state(State::TimeWait);
-                    self.timer.set_for_close(cx.now(), self.settings.time_wait);
-                } else {
-                    self.set_state(State::Closing);
-                }
-            }
-
             (State::FinWait2, TcpControl::None) => {}
-
-            // FIN packets in FIN-WAIT-2 state change it to TIME-WAIT.
-            (State::FinWait2, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
-                self.rx_fin_received = true;
-                self.set_state(State::TimeWait);
-                self.timer.set_for_close(cx.now(), self.settings.time_wait);
-            }
 
             // ACK packets in CLOSING state change it to TIME-WAIT.
             (State::Closing, TcpControl::None) => {
@@ -2321,6 +2291,9 @@ impl Socket {
 
         let payload_len = payload.len();
         if payload_len == 0 {
+            if control == TcpControl::Fin {
+                self.receive_fin(cx.now());
+            }
             return dropped_probe.then(|| self.ack_reply(cx, ip_repr, repr));
         }
 
@@ -2346,6 +2319,9 @@ impl Socket {
             return Some(self.ack_reply(cx, ip_repr, repr));
         }
 
+        if control == TcpControl::Fin {
+            self.receive_fin(cx.now());
+        }
         if contig_len != 0 {
             // Enqueue the contiguous data octets in front of the buffer, those
             // the segment options keep.
@@ -2388,6 +2364,24 @@ impl Socket {
         } else {
             None
         }
+    }
+
+    /// Consumes the FIN's sequence number once all preceding text has
+    /// been retained. Acknowledgement processing may already have moved
+    /// FIN-WAIT-1 to FIN-WAIT-2 or SYN-RECEIVED to ESTABLISHED.
+    fn receive_fin(&mut self, now: Instant) {
+        let state = match self.state {
+            State::Established => State::CloseWait,
+            State::FinWait1 => State::Closing,
+            State::FinWait2 => {
+                self.timer.set_for_close(now, self.settings.time_wait);
+                State::TimeWait
+            }
+            _ => return,
+        };
+        self.remote_seq_no += 1;
+        self.rx_fin_received = true;
+        self.set_state(state);
     }
 
     fn negotiate_options(&mut self, repr: &TcpRepr) {
@@ -11034,6 +11028,44 @@ pub(crate) mod test {
     // =========================================================================================//
     // Tests for graceful vs ungraceful rx close
     // =========================================================================================//
+
+    #[test]
+    fn a_refused_payload_does_not_accept_its_fin() {
+        for state in [State::Established, State::FinWait1, State::FinWait2] {
+            let mut s = match state {
+                State::Established => socket_established(),
+                State::FinWait1 => socket_fin_wait_1(),
+                State::FinWait2 => socket_fin_wait_2(),
+                _ => unreachable!(),
+            };
+            let budget = Budget::new(4096);
+            s.rx = RxStore::new(64, budget.clone());
+            let held = budget.charge(budget.limit()).unwrap();
+            let before = s.remote_seq_no;
+            let bytes: Vec<u8> = (0..32).collect();
+            let segment = TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: before,
+                ack_number: Some(s.local_seq_no),
+                payload: &bytes,
+                ..SEND_TEMPL
+            };
+            let reply = send(&mut s, Instant::from_millis(0), &segment).unwrap();
+            assert_eq!(reply.ack_number, Some(before));
+            assert_eq!(s.state, state);
+            assert!(!s.rx_fin_received);
+            assert!(s.pop(64).unwrap().is_none());
+            drop(held);
+            send(&mut s, Instant::from_millis(1), &segment);
+            let mut read = Vec::new();
+            while let Ok(Some(chunk)) = s.pop(64) {
+                read.extend_from_slice(&chunk);
+            }
+            assert_eq!(read, bytes);
+            assert_eq!(s.pop(64), Err(RecvError::Finished));
+            assert_eq!(s.remote_seq_no, before + bytes.len() + 1);
+        }
+    }
 
     #[test]
     fn test_rx_close_fin() {
