@@ -776,9 +776,12 @@ The counting allocator found the two HTTP/1 allocations:
   empty `ChargedBytes` now becomes empty `Bytes`, giving its charge back;
   a nonempty one keeps its charge until the last clone is dropped.
 - TLS allocated a buffer of the largest record for each write, and threw
-  it away when rustls handed over its own ciphertext. TLS now reserves
-  the record as a charge and makes a buffer from it only for output it
-  copies.
+  it away when rustls handed over its own ciphertext. On this branch TLS
+  reserved the record as a charge and made a buffer from it only for
+  output it copied. In the merge below, `comp/bfix-tls` replaced that
+  code: TLS keeps no reservation, a whole record goes down in the buffer
+  rustls encrypted it into, and copied output gets a buffer of its own
+  size.
 
 HTTP/2 no longer charges input and header assembly at their bounds when
 the connection opens:
@@ -818,3 +821,61 @@ HTTP/1 is back to the 5.65 M of 47a901718. HTTP/2 makes about four fewer
 allocations per request: the TLS record buffers, the copy of each header block,
 and the input buffer that is no longer freed and made again between
 requests. Instructions are unchanged.
+
+## The budget fixes merge of November 9, 2026 (`comp/bfix-integ`)
+
+Five fix branches from b1d241d87 were merged into `main`:
+`comp/bfix-wake` (wakes that need enough room, `Children` waiting on
+each child's budget, one charged structure for the router's tables, the
+stream runner waiting for memory, TCP bytes made in the child's window),
+`comp/bfix-misc` (the resolver's cache error, the lending tests, Framed's
+charged buffer), `comp/bfix-http`, `comp/bfix-ssh` (the window
+adjustment, the transport paying for its own buffers) and `comp/bfix-tls`
+(rustls's buffers charged to the connection's budget). The allocation
+oracle passes for every stack with no allowance for rustls's buffers, and
+for SSH with four channels each sending a full window.
+
+Two costs appeared only once the branches were together, and two commits
+after the merge remove them:
+
+- Each record that left rustls with its charge, read or written, boxed a
+  new charge for it: two more allocations per HTTP/1 request than
+  `comp/bfix-http` alone, and four more per HTTP/2 request. A rustls
+  charge is now one concrete type, the budget and a count, so it leaves
+  without a box.
+- Each child of `Children` got a waker and a waiter when it opened: two
+  allocations per HTTP/2 stream. They are now one, made the first time
+  the child asks for its waker or waits for memory, which most children
+  never do.
+
+This compares `main` before the redesign (47a901718) with `main` after
+these fixes (2dfb5f019). The method is the one of the performance pass:
+the bench profile with frame pointers and line tables, each build in a
+target directory of its own, each bench process (`runtime::http` and
+`network::tcp`, with the benches' own three samples per case) under
+`perf stat -e instructions:u`. Each build ran three times, interleaved,
+and the table gives the median. These runs count about three times the
+instructions of the tables above for the same bench, so compare only
+within this table. Instruction counts repeated to within 0.1 percent.
+
+| Workload | Before (47a901718) | After (2dfb5f019) |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 122.28 G | 122.37 G |
+| HTTP/1, 101,010 requests | 1.140 s | 1.111 s |
+| HTTP/2, 101,010 requests | 1.731 s | 1.733 s |
+| HTTP/1 allocations | 5,654,697 | 5,654,756 |
+| HTTP/2 allocations | 9,997,051 | 8,696,975 |
+| TCP bulk process, instructions | 14.28 G | 14.29 G |
+| TCP, one connection, 32 MiB | 33.29 ms | 32.47 ms |
+| TCP, ten connections, 4 MiB each | 46.98 ms | 53.46 ms |
+| TCP, one hundred connections, 1 MiB each | 201.9 ms | 210.4 ms |
+| TCP allocations, one connection | 88,857 | 88,855 |
+| TCP allocations, ten connections | 128,730 | 128,726 |
+| TCP allocations, one hundred connections | 479,874 | 479,872 |
+| Packets sent, one hundred connections | 109,400 | 109,400 |
+
+HTTP/2 makes about 13 fewer allocations per request than before the
+redesign, and HTTP/1 the same number. Instructions are within 0.1 percent
+for both benches, and TCP's allocations and packets are unchanged. The
+ten-connection TCP time is the noisiest case: in a later check of both
+builds back to back, each ran it between 52 and 60 ms.
