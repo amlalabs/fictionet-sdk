@@ -82,15 +82,18 @@ fn connected(
         .unwrap()
         .server_config(cx, start, &Budget::unlimited())
         .unwrap();
-    let client_config = Arc::new(
-        super::super::client_config_builder(cx, start)
-            .with_protocol_versions(&[version])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
-    let mut client =
-        rustls::ClientConnection::new(client_config, "layer.example".try_into().unwrap()).unwrap();
+    let mut client_config = super::super::client_config_builder(cx, start)
+        .with_protocol_versions(&[version])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // Tests seal records rustls itself would not send with its keys.
+    client_config.enable_secret_extraction = true;
+    let mut client = rustls::ClientConnection::new(
+        Arc::new(client_config),
+        "layer.example".try_into().unwrap(),
+    )
+    .unwrap();
     let mut h = Harness::with_budget(
         Seed::from_u64(7),
         TlsLayer::new(config.clone()),
@@ -119,6 +122,44 @@ fn connected(
         }
     }
     panic!("the handshake did not finish");
+}
+
+/// A TLS 1.3 record of `kind` carrying `plaintext`, sealed under the
+/// client's traffic secrets at sequence number `seq`: what a client may
+/// send that rustls's own writer never does.
+fn sealed(
+    secrets: &rustls::ConnectionTrafficSecrets,
+    seq: u64,
+    kind: u8,
+    plaintext: &[u8],
+) -> Vec<u8> {
+    use ring::aead;
+    use rustls::ConnectionTrafficSecrets::{Aes128Gcm, Aes256Gcm, Chacha20Poly1305};
+    let (algorithm, key, iv) = match secrets {
+        Aes128Gcm { key, iv } => (&aead::AES_128_GCM, key, iv),
+        Aes256Gcm { key, iv } => (&aead::AES_256_GCM, key, iv),
+        Chacha20Poly1305 { key, iv } => (&aead::CHACHA20_POLY1305, key, iv),
+        _ => panic!("an unknown cipher"),
+    };
+    let mut nonce = [0u8; aead::NONCE_LEN];
+    nonce.copy_from_slice(iv.as_ref());
+    for (byte, seq) in nonce[4..].iter_mut().zip(seq.to_be_bytes()) {
+        *byte ^= seq;
+    }
+    // TLSInnerPlaintext: the content, then its real type.
+    let mut body = [plaintext, &[kind]].concat();
+    let len = u16::try_from(body.len() + algorithm.tag_len()).unwrap();
+    let mut record = vec![23, 3, 3];
+    record.extend_from_slice(&len.to_be_bytes());
+    let key = aead::LessSafeKey::new(aead::UnboundKey::new(algorithm, key.as_ref()).unwrap());
+    key.seal_in_place_append_tag(
+        aead::Nonce::assume_unique_for_key(nonce),
+        aead::Aad::from(&record[..]),
+        &mut body,
+    )
+    .unwrap();
+    record.extend_from_slice(&body);
+    record
 }
 
 fn lab_test(seed: u64, test: impl FnOnce(Cx) + Send + 'static) {
@@ -344,5 +385,34 @@ fn a_refusal_goes_out_with_the_budget_full() {
             client.process_new_packets().unwrap_err(),
             rustls::Error::AlertReceived(rustls::AlertDescription::UnrecognisedName)
         );
+    });
+}
+
+/// An application data record with no plaintext hands nothing up, so it
+/// cannot read as the end of the stream above; the records after it go
+/// up as before.
+#[test]
+fn an_empty_record_hands_nothing_up() {
+    lab_test(6, |cx| {
+        let budget = Budget::new(1 << 20);
+        let (client, mut h) = connected(&cx, &rustls::version::TLS13, &budget);
+        let (seq, secrets) = client.dangerous_extract_secrets().unwrap().tx;
+        h.push(&sealed(&secrets, seq, 23, b"")).unwrap();
+        let up = taken_up(&mut h);
+        assert!(
+            up.iter().all(|chunk| !chunk.is_empty()),
+            "an empty chunk went up for an empty record"
+        );
+        let wire = [
+            sealed(&secrets, seq + 1, 23, b"before"),
+            sealed(&secrets, seq + 2, 23, b""),
+            sealed(&secrets, seq + 3, 23, b"after"),
+        ]
+        .concat();
+        h.push(&wire).unwrap();
+        let mut got = Vec::new();
+        drain(&mut h, &mut got);
+        assert_eq!(got, b"beforeafter");
+        assert!(h.layer().failure().is_none());
     });
 }

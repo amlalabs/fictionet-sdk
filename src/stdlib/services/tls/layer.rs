@@ -594,7 +594,9 @@ impl TlsLayer {
             self.pending = matches!(stopped, Step::Wait) && error.is_none();
         }
         if let Some(input) = self.input.take_if(|_| read) {
-            if let Some(plain) = plain {
+            // Records with no plaintext hand nothing up: an empty chunk
+            // above reads as the end of the stream.
+            if let Some(plain) = plain.filter(|plain| !plain.is_empty()) {
                 self.above = Some(StreamEvent::Data(input.slice(plain)));
             }
             if done < input.len() {
