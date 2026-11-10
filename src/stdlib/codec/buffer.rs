@@ -27,6 +27,9 @@ pub trait Storage {
     /// Keeps the first `len` initialized bytes and gives back the capacity
     /// past them.
     fn shrink_to(&mut self, len: usize);
+    /// Forgets every byte and gives back the capacity past `keep`, keeping
+    /// as much of it as the storage holds up to `keep` for the next bytes.
+    fn clear_to(&mut self, keep: usize);
 }
 
 /// Storage that asks only the allocator.
@@ -58,6 +61,10 @@ impl Storage for Vec<u8> {
     fn shrink_to(&mut self, len: usize) {
         self.truncate(len);
         self.shrink_to_fit();
+    }
+    fn clear_to(&mut self, keep: usize) {
+        self.clear();
+        Vec::shrink_to(self, keep);
     }
 }
 

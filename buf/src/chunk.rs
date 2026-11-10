@@ -128,6 +128,19 @@ impl Chunk {
         ))
     }
 
+    /// No bytes yet, with `room` bytes after them to write in place
+    /// ([`extend_within`](Self::extend_within), [`fill`](Self::fill)), in
+    /// an allocation charged to `budget` before it is made. `None`, with
+    /// nothing allocated, if the budget has no room. For a block larger
+    /// than a [`Pool`](crate::Pool)'s slots: a pool's blocks are not
+    /// zeroed, these are.
+    pub fn with_room(budget: &Budget, room: usize) -> Option<Chunk> {
+        let charge = budget.charge(room)?;
+        let mut chunk = Self::backed(vec![0; room], Some(Reservation::Own(charge)), None);
+        chunk.end = 0;
+        Some(chunk)
+    }
+
     /// Bytes for a child, made in the receive window its receiver lent and
     /// still keeps, which paid for them before it granted the credit they
     /// use: nothing is charged, and the receiver takes them in with no

@@ -533,7 +533,16 @@ pub struct Slots<T> {
     free: Vec<u32>,
     live: usize,
     limit: usize,
-    _storage: Option<Charge>,
+    /// What pays for the slots, when a budget does: all of them at once
+    /// ([`Slots::with_budget`]), or those made so far
+    /// ([`Slots::with_places`]), which grow charged first.
+    storage: Option<Charge>,
+    /// The slots grow only as their charge does.
+    charged_growth: bool,
+    /// The generation a new slot starts at: past every generation a slot
+    /// given back by [`shrink_to`](Slots::shrink_to) had, so no id of one
+    /// finds its successor.
+    fresh: u64,
 }
 
 impl<T> Slots<T> {
@@ -548,24 +557,88 @@ impl<T> Slots<T> {
             free: Vec::new(),
             live: 0,
             limit: limit.min(u32::MAX as usize),
-            _storage: None,
+            storage: None,
+            charged_growth: false,
+            fresh: 0,
         }
     }
+
+    /// The bytes one slot takes: its entry and its place in the free list.
+    const PLACE: usize = size_of::<(u64, Option<T>)>() + size_of::<u32>();
 
     /// Reserves all slot and free-list storage against a connection budget
     /// before allocating. Values stored in a slot own their payload charges.
     pub fn with_budget(limit: usize, budget: &Budget) -> Option<Slots<T>> {
         let limit = limit.min(u32::MAX as usize);
-        let bytes = limit.checked_mul(size_of::<(u64, Option<T>)>() + size_of::<u32>())?;
+        let bytes = limit.checked_mul(Self::PLACE)?;
         let charge = budget.charge(bytes)?;
         let mut slots = Slots::new(limit);
         slots.entries = Vec::with_capacity(limit);
         slots.free = Vec::with_capacity(limit);
-        slots._storage = Some(charge);
+        slots.storage = Some(charge);
         Some(slots)
     }
 
-    /// Adds a child, or hands `value` back when the limit is reached.
+    /// Room for at most `limit` children, `keep` slots of it charged to
+    /// `budget` and made now. More slots are made as children need them,
+    /// doubling, each growth charged before it is made; a growth the
+    /// budget refuses refuses the child. Slots stay made for the next
+    /// children, and those past `keep` go back once every child has gone
+    /// ([`shrink_to`](Self::shrink_to)), so a connection that serves one
+    /// child at a time allocates nothing for them.
+    pub fn with_places(budget: &Budget, keep: usize, limit: usize) -> Option<Slots<T>> {
+        let limit = limit.min(u32::MAX as usize);
+        let keep = keep.min(limit);
+        let charge = budget.charge(keep.checked_mul(Self::PLACE)?)?;
+        let mut slots = Slots::new(limit);
+        slots.entries = Vec::with_capacity(keep);
+        slots.free = Vec::with_capacity(keep);
+        slots.storage = Some(charge);
+        slots.charged_growth = true;
+        Some(slots)
+    }
+
+    /// Makes room for one more slot: by one place without a budget, or,
+    /// with one, by doubling within the limit, charged first. `false`,
+    /// changing nothing, when the budget refuses.
+    fn grow(&mut self) -> bool {
+        let made = self.entries.capacity();
+        let Some(storage) = self.storage.as_mut().filter(|_| self.charged_growth) else {
+            self.entries.reserve_exact(1);
+            return true;
+        };
+        let more = made.max(1).min(self.limit - made);
+        let Some(bytes) = (made + more).checked_mul(Self::PLACE) else {
+            return false;
+        };
+        if !storage.grow_to(bytes) {
+            return false;
+        }
+        self.entries.reserve_exact(made + more - self.entries.len());
+        self.free.reserve_exact(made + more - self.free.len());
+        true
+    }
+
+    /// Gives back the slots past `keep` and their charge, once no child is
+    /// live. A slot made afterwards starts at a generation past every one
+    /// given back, so their ids never find it.
+    pub fn shrink_to(&mut self, keep: usize) {
+        if self.live > 0 || self.entries.capacity() <= keep {
+            return;
+        }
+        let past = self.entries.iter().map(|(generation, _)| *generation).max();
+        self.fresh = self.fresh.max(past.unwrap_or(0));
+        self.entries.clear();
+        self.free.clear();
+        self.entries.shrink_to(keep);
+        self.free.shrink_to(keep);
+        if let Some(storage) = &mut self.storage {
+            storage.shrink_to(self.entries.capacity() * Self::PLACE);
+        }
+    }
+
+    /// Adds a child, or hands `value` back when the limit is reached, or
+    /// when a slot must be made and the budget refuses it.
     pub fn insert(&mut self, value: T) -> Result<Child, T> {
         if self.live >= self.limit {
             return Err(value);
@@ -576,10 +649,10 @@ impl<T> Slots<T> {
                 if self.entries.len() >= self.limit {
                     return Err(value);
                 }
-                if self.entries.len() == self.entries.capacity() {
-                    self.entries.reserve_exact(1);
+                if self.entries.len() == self.entries.capacity() && !self.grow() {
+                    return Err(value);
                 }
-                self.entries.push((0, None));
+                self.entries.push((self.fresh, None));
                 (self.entries.len() - 1) as u32
             }
         };
@@ -711,6 +784,38 @@ mod slot_tests {
         assert_eq!(slots.remove(last), Some(()));
         assert!(!slots.contains(last));
         assert!(slots.insert(()).is_err());
+    }
+
+    /// Slots made with places grow as children need them, each growth
+    /// charged first and refused, changing nothing, when the budget has no
+    /// room; once every child has gone, what they grew goes back. An id of
+    /// a child whose slot went back never finds a later child.
+    #[test]
+    fn slots_with_places_grow_charged_and_shrink_without_reviving_ids() {
+        let budget = Budget::new(1 << 16);
+        let mut slots = Slots::with_places(&budget, 2, 64).unwrap();
+        let kept = budget.used();
+        let first: Vec<ChildId> = (0..10).map(|i| slots.insert(i).unwrap().id()).collect();
+        assert!(budget.used() > kept, "growth past the places is charged");
+        for id in &first {
+            assert!(slots.remove(*id).is_some());
+        }
+        slots.shrink_to(2);
+        assert_eq!(budget.used(), kept, "the growth went back");
+        let again: Vec<ChildId> = (0..10).map(|i| slots.insert(i).unwrap().id()).collect();
+        for old in &first {
+            assert!(!slots.contains(*old), "an old id found a new child");
+        }
+        assert!(again.iter().all(|id| slots.contains(*id)));
+
+        // A budget with room for the kept places only refuses the third
+        // child, and the slots stay as they were.
+        let tight = Budget::new(Slots::<u8>::PLACE * 2);
+        let mut slots = Slots::with_places(&tight, 2, 64).unwrap();
+        let _a = slots.insert(1u8).unwrap();
+        let _b = slots.insert(2).unwrap();
+        assert_eq!(slots.insert(3).map(|child| child.id()), Err(3));
+        assert_eq!((slots.len(), tight.used()), (2, tight.limit()));
     }
 
     #[test]

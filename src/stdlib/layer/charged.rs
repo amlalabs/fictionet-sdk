@@ -217,6 +217,14 @@ impl fictionet::stdlib::codec::Storage for ChargedBytes {
         self.bytes.truncate(len);
         self.trim();
     }
+
+    fn clear_to(&mut self, keep: usize) {
+        self.bytes.clear();
+        if self.bytes.capacity() > keep {
+            self.bytes.shrink_to(keep);
+            self.charge.shrink_to(self.bytes.capacity());
+        }
+    }
 }
 
 impl Deref for ChargedBytes {
@@ -624,6 +632,12 @@ impl<T> ChargedVec<T> {
     /// Takes the last item. Its place stays paid for.
     pub fn pop(&mut self) -> Option<T> {
         self.items.pop()
+    }
+
+    /// Takes the item at `index`, moving those after it down one. Its
+    /// place stays paid for. `None` past the end.
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        (index < self.items.len()).then(|| self.items.remove(index))
     }
 
     /// Keeps the items `keep` accepts, in order. Their places stay paid
