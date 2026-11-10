@@ -99,9 +99,10 @@ const KEEP: usize = 8;
 /// that makes the server reset more than 1024 streams for its errors, or
 /// resets more than 20 streams the server has not taken in yet, loses the
 /// connection with `ENHANCE_YOUR_CALM`. Everything the connection holds is
-/// charged to its budget before it is allocated: input and header assembly
-/// share a frame-sized allowance and pay for growth beyond it; stream
-/// lists when streams are admitted; stream state, request
+/// charged to its budget before it is allocated: the list of recent resets
+/// at its bound when the connection opens; input and header assembly from
+/// a shared frame-sized allowance, paying for growth beyond it; places in
+/// the lists of streams when streams are admitted; stream state, request
 /// heads and bodies, events for the children and output frames as they
 /// come. Past the budget, the connection sends GOAWAY with
 /// `ENHANCE_YOUR_CALM` and ends.
@@ -241,9 +242,14 @@ impl InputState {
         Some(result)
     }
 
+    /// Gives back input storage past the frame-sized allowance. Storage
+    /// within the allowance stays: it is paid for either way, and keeping
+    /// it saves reallocating it for the next request.
     fn trim(&mut self) {
-        self.frames.shrink();
-        self.release();
+        if self.frames.allocated() > self.frames.limit() {
+            self.frames.shrink();
+            self.release();
+        }
     }
 
     fn release(&mut self) {
@@ -251,10 +257,9 @@ impl InputState {
             .frames
             .allocated()
             .saturating_add(self.headers.allocated());
-        self.storage
-            .as_mut()
-            .unwrap()
-            .shrink_to(held.max(self.frames.limit()));
+        if let Some(storage) = self.storage.as_mut() {
+            storage.shrink_to(held.max(self.frames.limit()));
+        }
     }
 }
 
@@ -506,7 +511,9 @@ impl Http2 {
         // table stays empty.
         self.codec.open(budget)?;
         self.dates_storage = Some(budget.charge(self.dates.held())?);
-        self.resets = ChargedDeque::with_places(budget, KEEP, RESET_MAX)?;
+        // The list of recent resets is small and bounded, so it is paid
+        // for at its bound: recording a reset never needs memory.
+        self.resets = ChargedDeque::with_places(budget, RESET_MAX, RESET_MAX)?;
         // Each open stream is in each list of streams at most once.
         let streams = self.limits.streams as usize;
         self.credit_due = ChargedVec::with_places(budget, KEEP, streams)?;
@@ -750,17 +757,11 @@ impl Http2 {
             id,
             false,
         );
-        // A closed connection reads no more frames to ignore. Once the
-        // bounded list is full, it remembers no more.
-        if self.phase == Phase::Open
-            && !self.ignored(id)
-            && self.resets.len() < RESET_MAX
-            && self
-                .resets
-                .push_back((id, env.now() + RESET_LIFETIME))
-                .is_err()
-        {
-            self.over_budget(env);
+        // A closed connection reads no more frames to ignore. The list has
+        // places for its most, paid for at the start: once full, it
+        // remembers no more.
+        if self.phase == Phase::Open && !self.ignored(id) {
+            let _ = self.resets.push_back((id, env.now() + RESET_LIFETIME));
         }
     }
 
@@ -2003,7 +2004,6 @@ impl Layer for Http2 {
             self.resets.pop_front();
             forgot = true;
         }
-        self.resets.shrink_to(KEEP.max(self.resets.len()));
         Ok(forgot)
     }
 
@@ -3887,6 +3887,11 @@ mod tests {
         harness.push(&client_preface()).unwrap();
         harness.take_output();
         let http = harness.layer();
+        // What an idle connection was charged before every queue was
+        // charged at its bound (47a901718): one frame of input, the
+        // places each queue keeps, the list of recent resets at its
+        // bound, the child slots, the dates and the final GOAWAY.
+        let resets = RESET_MAX * size_of::<(u32, Instant)>();
         let queues = KEEP
             * (size_of::<MuxEvent<HttpExchange, Top, Opening>>()
                 + size_of::<StreamCommand>()
@@ -3896,19 +3901,39 @@ mod tests {
         let _slots =
             Slots::<u32>::with_budget(http.limits.streams as usize, &slots_budget).unwrap();
         let model = http.codec.frames.limit()
+            + resets
             + queues
             + slots_budget.used()
             + http.dates.held()
             + LAST_WORDS;
-        eprintln!(
-            "idle HTTP/2 charge: {}; previous-layout model: {model}",
-            budget.used()
-        );
         assert!(
             budget.used() <= model,
             "idle charge {} exceeds {model}",
             budget.used()
         );
+    }
+
+    /// Input storage within the frame-sized allowance is paid for whether
+    /// it is allocated or not, so a finished request leaves it allocated
+    /// and the next request reads into it without allocating again.
+    #[test]
+    fn input_storage_within_the_allowance_stays_between_requests() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(8, 1, |_, _, _| Some(Sink::reading(false))),
+        );
+        let mut harness = Harness::new(fictionet::Seed::from_u64(6), server);
+        harness.push(&client_preface()).unwrap();
+        harness.push(&post(1, false)).unwrap();
+        harness.take_output();
+        let http = harness.layer().lower();
+        let kept = http.codec.frames.allocated();
+        assert!(kept > 0, "the input storage was given back");
+        assert!(kept <= http.codec.frames.limit());
+        harness.push(&post(3, false)).unwrap();
+        harness.take_output();
+        assert_eq!(harness.layer().lower().codec.frames.allocated(), kept);
     }
 
     /// Input and assembly grow during a request and give their storage

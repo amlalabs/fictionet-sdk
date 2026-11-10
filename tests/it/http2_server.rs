@@ -1933,6 +1933,38 @@ fn repeated_budget_refusals_exhaust_the_local_reset_limit() {
     }
 }
 
+/// Refusing streams for want of memory records each reset in the list of
+/// recent resets, which was paid for when the connection opened: filling
+/// that list needs no memory, so the connection keeps refusing streams
+/// one by one instead of ending.
+#[test]
+fn refusals_at_a_full_budget_fill_the_reset_list_without_ending() {
+    let budget = fictionet::stdlib::layer::Budget::new(h2_input() + 64);
+    let mut harness = budgeted(
+        Responder::new(fictionet_test_support::handler(|_, _| {
+            http::Response::new(Bytes::new())
+        })),
+        budget,
+    );
+    push(&mut harness, &preface());
+    for n in 0..2 * 50 {
+        let Frame::Headers(mut h) = Frame::parse(&headers(2 * n + 1, "/", true)).unwrap() else {
+            unreachable!()
+        };
+        hpack::Field::new("x-large", "x".repeat(1024))
+            .write(&mut h.fragment)
+            .unwrap();
+        let output = frames(&push(&mut harness, &h.to_bytes().unwrap()));
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 2 * n + 1 && r.code == 7)),
+            "refusal {n}: {output:?}"
+        );
+        assert!(!harness.ended(), "refusal {n} ended the connection");
+    }
+}
+
 #[test]
 fn protocol_errors_use_reserved_output_when_the_budget_is_full() {
     let budget = fictionet::stdlib::layer::Budget::new(h2_input() + 1024);
