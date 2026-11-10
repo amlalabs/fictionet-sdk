@@ -431,7 +431,7 @@ impl OAuth {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))?;
         let exchange = async {
-            let response = self.forward.clone().call(request).await?;
+            let response = self.forward.send(request).await?;
             let status = response.status();
             let bytes = response
                 .into_body()
@@ -634,8 +634,12 @@ impl Service<Request<Body>> for OAuth {
     }
 }
 impl httpd::Handler for OAuth {
-    fn call(&self, request: Request<Body>, exchange: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        httpd::tower(self.clone()).call(request, exchange)
+    fn call(
+        &self,
+        request: fictionet::stdlib::web::Request,
+        exchange: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        crate::httpd::tower(self.clone()).call(request, exchange)
     }
 }
 fn oauth_error(status: u16, error: &str) -> Response<Body> {

@@ -36,7 +36,17 @@ where
     where
         F: Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync + 'static,
     {
-        fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+            let Ok(mut parts) = request.head.to_http() else {
+                return Reply::Now(
+                    http::Response::builder()
+                        .status(400)
+                        .body(Body::empty())
+                        .unwrap(),
+                );
+            };
+            parts.extensions.insert(request.site);
+            let request = http::Request::from_parts(parts, request.body);
             let (parts, body) = request.into_parts();
             let Some(body) = body.bytes() else {
                 return Reply::Now(
@@ -66,7 +76,17 @@ where
         F: Fn(fictionet::Cx, Request<Bytes>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Response<Bytes>> + Send + 'static,
     {
-        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let Ok(mut parts) = request.head.to_http() else {
+                return Reply::Now(
+                    http::Response::builder()
+                        .status(400)
+                        .body(Body::empty())
+                        .unwrap(),
+                );
+            };
+            parts.extensions.insert(request.site);
+            let request = http::Request::from_parts(parts, request.body);
             let (parts, body) = request.into_parts();
             let Some(body) = body.bytes() else {
                 return Reply::Now(
@@ -99,7 +119,17 @@ where
     where
         F: Fn(&mut Exchange<'_>, Request<Body>) -> Reply + Send + Sync + 'static,
     {
-        fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+            let Ok(mut parts) = request.head.to_http() else {
+                return Reply::Now(
+                    http::Response::builder()
+                        .status(400)
+                        .body(Body::empty())
+                        .unwrap(),
+                );
+            };
+            parts.extensions.insert(request.site);
+            let request = http::Request::from_parts(parts, request.body);
             (self.0)(ex, request)
         }
     }
@@ -110,7 +140,17 @@ where
 pub struct EchoSocket;
 
 impl Handler for EchoSocket {
-    fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+        let Ok(mut parts) = request.head.to_http() else {
+            return Reply::Now(
+                http::Response::builder()
+                    .status(400)
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+        };
+        parts.extensions.insert(request.site);
+        let request = http::Request::from_parts(parts, request.body);
         use fictionet::stdlib::protocols::websocket as ws;
         let fields: Vec<_> = request
             .headers()

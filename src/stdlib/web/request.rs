@@ -3,6 +3,49 @@ use std::ops::Range;
 use fictionet::Chunk;
 use fictionet::stdlib::protocols::http1::{Error, FieldRef, Version};
 
+/// A handler's request, retaining its head and body storage.
+pub struct Request {
+    /// The request's method, target and fields.
+    pub head: Head,
+    /// The received body.
+    pub body: super::Body,
+    /// The selected site and trusted connection metadata.
+    pub site: Site,
+}
+
+/// Routing and connection metadata, independent of client headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Site {
+    /// The registered site name, or requested host for a fallback; empty before routing.
+    pub name: std::sync::Arc<str>,
+    /// The name received in the TLS hello.
+    pub sni: Option<std::sync::Arc<str>>,
+    /// The connection's scheme.
+    pub scheme: http::uri::Scheme,
+    /// The local connection port.
+    pub port: u16,
+    /// How routing selected the handler.
+    pub routing: super::Routing,
+}
+
+impl Site {
+    /// Metadata for a connection before a virtual host has been selected.
+    /// Construct once per connection and clone for each request.
+    pub fn connection(conn: &fictionet::stdlib::network::ConnInfo) -> Self {
+        Self {
+            name: std::sync::Arc::from(""),
+            sni: conn.sni.clone(),
+            scheme: if conn.tls {
+                http::uri::Scheme::HTTPS
+            } else {
+                http::uri::Scheme::HTTP
+            },
+            port: conn.local.map_or(0, |a| a.port()),
+            routing: super::Routing::Fallback,
+        }
+    }
+}
+
 /// A request head in one backing. Field records preserve order, duplicates,
 /// and spelling. Cloning shares that backing without allocating.
 #[derive(Clone)]
@@ -220,6 +263,7 @@ impl Head {
             .version(match self.version {
                 Version::Http10 => http::Version::HTTP_10,
                 Version::Http11 => http::Version::HTTP_11,
+                Version::Http2 => http::Version::HTTP_2,
             });
         for (name, value) in self.fields() {
             request = request.header(name, value);
@@ -346,6 +390,20 @@ mod tests {
             assert_eq!(head.path(), path);
             assert_eq!(head.query(), query);
         }
+    }
+
+    #[test]
+    fn http_two_heads_convert_explicitly_but_cannot_be_written_as_http_one() {
+        let head = Head::new(
+            "GET",
+            "https://example.test/",
+            Version::Http2,
+            [("x-field", "value")],
+        );
+        let converted = head.to_http().unwrap();
+        assert_eq!(converted.version, http::Version::HTTP_2);
+        assert_eq!(head.host(), Some(b"example.test".as_slice()));
+        assert!(head.to_bytes().is_err());
     }
 
     #[test]

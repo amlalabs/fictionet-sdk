@@ -86,10 +86,10 @@ pub fn app() -> axum::Router {
         .route(
             "/",
             get(
-                |Extension(t): Extension<web::Target>, version: Version| async move {
+                |Extension(t): Extension<web::Site>, version: Version| async move {
                     format!(
                         "hello from {} {} {} over {:?}\n",
-                        t.scheme, t.host, t.port, version
+                        t.scheme, t.name, t.port, version
                     )
                 },
             ),
@@ -105,8 +105,8 @@ pub fn app() -> axum::Router {
 
 /// The plain HTTP app, shared by both HTTP names.
 pub fn plain() -> axum::Router {
-    axum::Router::new().fallback(|Extension(t): Extension<web::Target>| async move {
-        format!("plain site {} {} {}\n", t.scheme, t.host, t.port)
+    axum::Router::new().fallback(|Extension(t): Extension<web::Site>| async move {
+        format!("plain site {} {} {}\n", t.scheme, t.name, t.port)
     })
 }
 
@@ -116,21 +116,33 @@ pub fn sites(
     key: PrivateKeyDer<'static>,
     app: axum::Router,
     plain: axum::Router,
-) -> impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static {
+) -> impl Fn(&str) -> Option<web::SiteConfig> + Send + Sync + 'static {
     let config = Arc::new(tls::CertifiedKey { chain, key });
     move |host: &str| {
         println!("lookup {host}");
         match host {
             "example.test" | "www.example.test" => Some(
-                web::Site::new(app.clone())
+                web::SiteConfig::handler(crate::httpd::tower(app.clone()))
                     .at(SHARED)
                     .at(SHARED6)
                     .tls(config.clone()),
             ),
-            "v4only.test" => Some(web::Site::new(app.clone()).ipv4_only().tls(config.clone())),
-            "v6only.test" => Some(web::Site::new(app.clone()).ipv6_only().tls(config.clone())),
-            "shared.test" => Some(web::Site::new(plain.clone()).at(SHARED).at(SHARED6)),
-            "plain.test" => Some(web::Site::new(plain.clone())),
+            "v4only.test" => Some(
+                web::SiteConfig::handler(crate::httpd::tower(app.clone()))
+                    .ipv4_only()
+                    .tls(config.clone()),
+            ),
+            "v6only.test" => Some(
+                web::SiteConfig::handler(crate::httpd::tower(app.clone()))
+                    .ipv6_only()
+                    .tls(config.clone()),
+            ),
+            "shared.test" => Some(
+                web::SiteConfig::handler(crate::httpd::tower(plain.clone()))
+                    .at(SHARED)
+                    .at(SHARED6),
+            ),
+            "plain.test" => Some(web::SiteConfig::handler(crate::httpd::tower(plain.clone()))),
             _ => None,
         }
     }

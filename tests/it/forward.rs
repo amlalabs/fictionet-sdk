@@ -1,7 +1,6 @@
 use fictionet::stdlib::web::{self, Body};
 use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tower_service::Service;
 
 #[tokio::test]
 async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
@@ -20,13 +19,13 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
         String::from_utf8(received).unwrap()
     });
     fictionet::run(fictionet::Seed::from_u64(1), move |fcx| async move {
-        let mut forward = web::forward(
+        let forward = web::forward(
             &fcx,
             format!("http://{address}/ignored").parse()?,
             std::sync::Arc::new(fictionet_host::Client::new()),
         )?;
         let response = forward
-            .call(
+            .send(
                 http::Request::builder()
                     .method("POST")
                     .uri("http://different.test/path?q=1")
@@ -141,7 +140,7 @@ async fn a_chunked_upstream_answer_reaches_the_agent_chunked() {
             std::sync::Arc::new(fictionet_host::Client::new()),
         )?;
         web::Sites::new(fictionet_extras::network::cdn_pools(), move |name: &str| {
-            (name == "clone.test").then(|| web::Site::new(forward.clone()))
+            (name == "clone.test").then(|| web::SiteConfig::handler(forward.clone()))
         })
         .start(&fcx, attachments)?;
         let machine = sandbox::machine(&fcx, attacher.attach("agent")?, Ipv4Addr::new(10, 0, 0, 2));

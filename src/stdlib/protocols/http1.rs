@@ -224,6 +224,8 @@ pub enum Version {
     Http10,
     /// HTTP/1.1, with persistent connections by default.
     Http11,
+    /// HTTP/2 request metadata; not a valid HTTP/1 wire version.
+    Http2,
 }
 
 impl Version {
@@ -232,6 +234,7 @@ impl Version {
         match self {
             Self::Http10 => "HTTP/1.0",
             Self::Http11 => "HTTP/1.1",
+            Self::Http2 => "HTTP/2.0",
         }
     }
 }
@@ -1716,6 +1719,9 @@ fn fields<'a>(
     headers: impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
     version: Version,
 ) -> Result<Fields, Error> {
+    if version == Version::Http2 {
+        return Err(Error::StartLine);
+    }
     let mut result = Fields {
         length: None,
         transfer: false,

@@ -1204,10 +1204,12 @@ impl Layer for StreamChild {
 #[test]
 fn an_async_http_child_runs_over_the_live_stream_with_a_small_window() {
     use fictionet::stdlib::layer::{Chain, Children};
-    use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Http1, Reply};
+    use fictionet::stdlib::web::httpd::{self, Exchange, Handler, Http1, Reply};
     struct Deferred;
     impl Handler for Deferred {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             let path = request.uri().path().to_owned();
             Reply::Later(Box::new(move |fcx| {
                 Box::pin(async move {
@@ -1292,7 +1294,7 @@ fn serve_lazy_frames(frames: usize) {
     use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
     struct Lazy(usize);
     impl Handler for Lazy {
-        fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             let left = self.0;
             Reply::Later(Box::new(move |context| {
                 Box::pin(async move {

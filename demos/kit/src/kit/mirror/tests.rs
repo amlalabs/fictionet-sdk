@@ -1,4 +1,6 @@
 use super::*;
+use fictionet::stdlib::web::Site;
+use http::Request;
 use std::sync::{Mutex, atomic::AtomicUsize};
 
 const PACKAGE: &str = "/ubuntu/pool/main/p/package/package_1_amd64.deb";
@@ -16,21 +18,16 @@ impl Upstream {
         }
     }
 }
-impl Service<Request<Body>> for Upstream {
-    type Response = Response<Body>;
-    type Error = Error;
-    type Future = std::future::Ready<Answer>;
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Poll::Ready(Ok(()))
-    }
-    fn call(&mut self, _: Request<Body>) -> Self::Future {
+impl Handler for Upstream {
+    fn call(&self, _: web::Request, _: &mut Exchange<'_>) -> Reply {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        std::future::ready(Ok(self
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| Response::new(Body::from("package")))))
+        Reply::Now(
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Response::new(Body::from("package"))),
+        )
     }
 }
 fn request(path: &str) -> Request<Body> {
@@ -39,10 +36,7 @@ fn request(path: &str) -> Request<Body> {
 async fn send(mirror: &Mirror<Upstream>, request: Request<Body>) -> Answer {
     use fictionet::stdlib::web::httpd::{self, Handler};
     let hosts = httpd::VirtualHosts::new();
-    hosts.insert(
-        "mirror.test",
-        httpd::VHost::new(httpd::tower(mirror.clone())),
-    );
+    hosts.insert("mirror.test", httpd::VHost::new(mirror.clone()));
     let output = Arc::new(Mutex::new(None));
     let result = output.clone();
     fictionet::run(fictionet::Seed::from_u64(1), |cx| async move {
@@ -50,8 +44,22 @@ async fn send(mirror: &Mirror<Upstream>, request: Request<Body>) -> Answer {
         request
             .headers_mut()
             .insert(header::HOST, http::HeaderValue::from_static("mirror.test"));
+        let (parts, body) = request.into_parts();
+        let head = web::Head::new(
+            parts.method.as_str(),
+            &parts.uri.to_string(),
+            fictionet::stdlib::protocols::http1::Version::Http11,
+            parts
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_bytes())),
+        );
         let reply = hosts.call(
-            request,
+            web::Request {
+                head,
+                body,
+                site: Site::connection(&Default::default()),
+            },
             &mut httpd::Exchange::new(cx.now(), &cx, &Default::default()),
         );
         let response = match reply {

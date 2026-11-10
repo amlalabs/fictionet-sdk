@@ -5,7 +5,6 @@
 //! handler calls do not depend on chunk boundaries.
 #![no_main]
 
-use bytes::Bytes;
 use fictionet::stdlib::layer::Harness;
 use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
@@ -13,10 +12,9 @@ use libfuzzer_sys::fuzz_target;
 
 struct Pages(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl Handler for Pages {
-    fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (parts, body) = request.into_parts();
-        let Some(body) = body.bytes() else {
+        let Some(body) = request.body.bytes() else {
             return Reply::Now(
                 http::Response::builder()
                     .status(400)
@@ -24,23 +22,22 @@ impl Handler for Pages {
                     .unwrap(),
             );
         };
-        let request = http::Request::from_parts(parts, body);
-        let response = match (request.method().as_str(), request.uri().path()) {
-            ("GET" | "HEAD", "/") => http::Response::new(Bytes::from("home\n")),
-            ("POST", "/echo") => http::Response::new(request.into_body()),
+        let response = match (request.head.method(), request.head.path()) {
+            ("GET" | "HEAD", "/") => http::Response::new(Body::from("home\n")),
+            ("POST", "/echo") => http::Response::new(Body::from(body)),
             ("GET" | "HEAD", path) if path == "/files" || path.starts_with("/files/") => {
-                http::Response::new(Bytes::from(path.to_owned()))
+                http::Response::new(Body::from(path.to_owned()))
             }
             (_, "/" | "/echo") => http::Response::builder()
                 .status(405)
-                .body(Bytes::new())
+                .body(Body::empty())
                 .unwrap(),
             _ => http::Response::builder()
                 .status(404)
-                .body(Bytes::new())
+                .body(Body::empty())
                 .unwrap(),
         };
-        Reply::Now(response.map(Body::from))
+        Reply::Now(response)
     }
 }
 

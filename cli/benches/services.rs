@@ -281,8 +281,12 @@ impl Proxy {
                                 v6: Some("2606:4700:100::/48".parse().unwrap()),
                             },
                             move |host: &str| {
-                                (host == "plain.test")
-                                    .then(|| web::Site::new(page.clone()).plain_http())
+                                (host == "plain.test").then(|| {
+                                    web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                                        page.clone(),
+                                    ))
+                                    .plain_http()
+                                })
                             },
                         )
                         .start(&fcx, attachments)?;

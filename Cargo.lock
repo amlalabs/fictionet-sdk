@@ -1446,6 +1446,7 @@ dependencies = [
  "divan",
  "etherparse",
  "fictionet",
+ "fictionet-extras",
  "fictionet-host",
  "fictionet-test-support",
  "http",

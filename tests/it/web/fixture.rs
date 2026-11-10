@@ -88,7 +88,7 @@ fn events_site(waiting: Arc<AtomicUsize>) -> axum::Router {
     axum::Router::new()
         .route(
             "/page",
-            axum::routing::get(|Extension(t): Extension<web::Target>| async move {
+            axum::routing::get(|Extension(t): Extension<web::Site>| async move {
                 format!("page sni={:?}", t.sni)
             }),
         )
@@ -162,12 +162,12 @@ pub(super) fn sites(fcx: &Cx) -> TestSites {
     };
 
     let secure = axum::Router::new().fallback(
-        move |Extension(t): Extension<web::Target>, version: Version| {
+        move |Extension(t): Extension<web::Site>, version: Version| {
             let n = served.fetch_add(1, Ordering::SeqCst) + 1;
             async move {
                 format!(
                     "secure {} {} {} {:?} #{n}",
-                    t.scheme, t.host, t.port, version
+                    t.scheme, t.name, t.port, version
                 )
             }
         },
@@ -176,55 +176,75 @@ pub(super) fn sites(fcx: &Cx) -> TestSites {
         calls.fetch_add(1, Ordering::SeqCst);
         match host {
             "secure.test" => Some(
-                web::Site::new(secure.clone())
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(secure.clone()))
                     .at(SECURE_ADDR)
                     .tls(config.clone()),
             ),
-            "shared.test" => Some(web::Site::new(Plain("shared")).at(SECURE_ADDR)),
-            "plain.test" => Some(web::Site::new(Plain("plain"))),
-            "inside.test" => Some(web::Site::new(Plain("inside")).at(Ipv4Addr::new(10, 0, 0, 50))),
+            "shared.test" => Some(
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("shared")))
+                    .at(SECURE_ADDR),
+            ),
+            "plain.test" => Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                Plain("plain"),
+            ))),
+            "inside.test" => Some(
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("inside")))
+                    .at(Ipv4Addr::new(10, 0, 0, 50)),
+            ),
             "inside6.test" => Some(
-                web::Site::new(Plain("inside")).at("2001:db8::50".parse::<Ipv6Addr>().unwrap()),
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("inside")))
+                    .at("2001:db8::50".parse::<Ipv6Addr>().unwrap()),
             ),
             "dual.test" => Some(
-                web::Site::new(secure.clone())
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(secure.clone()))
                     .at(DUAL_ADDR)
                     .at(DUAL_ADDR6)
                     .tls(config.clone()),
             ),
             "v4only.test" => Some(
-                web::Site::new(secure.clone())
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(secure.clone()))
                     .ipv4_only()
                     .tls(config.clone()),
             ),
             "v6only.test" => Some(
-                web::Site::new(secure.clone())
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(secure.clone()))
                     .ipv6_only()
                     .at(V6ONLY_ADDR6)
                     .tls(config.clone()),
             ),
-            "broken.test" => Some(web::Site::new(Broken)),
-            h if h.ends_with(".wild.test") => Some(web::Site::new(Plain("wild"))),
-            "slow.test" => Some(web::Site::new(events_site(handler_waiting.clone()))),
+            "broken.test" => Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                Broken,
+            ))),
+            h if h.ends_with(".wild.test") => Some(web::SiteConfig::handler(
+                fictionet_extras::httpd::tower(Plain("wild")),
+            )),
+            "slow.test" => Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                events_site(handler_waiting.clone()),
+            ))),
             "events.test" => Some(
-                web::Site::new(events_site(handler_waiting.clone()))
-                    .at(EVENTS_ADDR)
-                    .tls(config.clone()),
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(events_site(
+                    handler_waiting.clone(),
+                )))
+                .at(EVENTS_ADDR)
+                .tls(config.clone()),
             ),
             "both.test" => Some(
-                web::Site::new(secure.clone())
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(secure.clone()))
                     .at(BOTH_ADDR)
                     .tls(config.clone())
                     .plain_http(),
             ),
             "default.test" => Some(
-                web::Site::new(Plain("default"))
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("default")))
                     .at(DEFAULT_ADDR)
                     .default_host(),
             ),
-            "other.test" => Some(web::Site::new(Plain("other")).at(DEFAULT_ADDR)),
+            "other.test" => Some(
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("other")))
+                    .at(DEFAULT_ADDR),
+            ),
             "tls-default.test" => Some(
-                web::Site::new(secure.clone())
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(secure.clone()))
                     .at(TLS_DEFAULT_ADDR)
                     .tls(config.clone())
                     .default_host(),
@@ -252,13 +272,13 @@ impl tower_service::Service<Request<web::Body>> for Plain {
     fn call(&mut self, request: Request<web::Body>) -> Self::Future {
         let t = request
             .extensions()
-            .get::<web::Target>()
+            .get::<web::Site>()
             .expect("serve sets a Target");
         let body = format!(
             "{} {} {} {} {:?} {}",
             self.0,
             t.scheme,
-            t.host,
+            t.name,
             t.port,
             request.version(),
             request.uri().path()

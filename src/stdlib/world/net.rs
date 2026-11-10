@@ -33,7 +33,7 @@
 //! # } } }
 //! # stack!(Ldap); stack!(Plc);
 //! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let intranet = httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "intranet\n" })));
+//! let intranet = fictionet_extras::httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "intranet\n" })));
 //! Net::new(fictionet_extras::network::cdn_pools())
 //!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp_stack(389, |_| Ldap))
 //!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))

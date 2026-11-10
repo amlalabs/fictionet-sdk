@@ -68,7 +68,7 @@ use std::task::{Context, Poll, ready};
 use std::time::{Duration, SystemTime};
 
 use http::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE};
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Response, StatusCode};
 
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
@@ -87,7 +87,7 @@ use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::stack::{self, Boxed, Job, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::{self, CertifiedKey};
-use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
+use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
 use fictionet::time::Instant;
 
 use super::super::{Arrival, Host, Limits, Opening, PortServer, PortStack, Sni};
@@ -721,7 +721,7 @@ struct Doh {
 }
 
 impl Handler for Doh {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
         let conn = ex.conn();
         let client = self
             .front
@@ -797,16 +797,20 @@ impl Doh {
     /// Whether this resolver answers `request` over `conn`: a name the
     /// client sent with SNI must be one of its names, and the request's
     /// host must be one of them or the address it arrived at.
-    fn serves(&self, conn: &ConnInfo, request: &Request<Body>) -> bool {
+    fn serves(&self, conn: &ConnInfo, request: &fictionet::stdlib::web::Request) -> bool {
         let named = |host: &str| fqdn(host).is_some_and(|name| self.names.contains(&name));
         let sni = conn.sni.as_deref().is_none_or(named);
-        let host = request_host(request).is_some_and(|host| {
-            let literal = host.trim_start_matches('[').trim_end_matches(']');
-            match IpAddr::from_str(literal) {
-                Ok(addr) => conn.local.is_some_and(|local| local.ip() == addr),
-                Err(_) => named(&host),
-            }
-        });
+        let host = request
+            .head
+            .host()
+            .and_then(|host| std::str::from_utf8(host).ok())
+            .is_some_and(|host| {
+                let literal = host.trim_start_matches('[').trim_end_matches(']');
+                match IpAddr::from_str(literal) {
+                    Ok(addr) => conn.local.is_some_and(|local| local.ip() == addr),
+                    Err(_) => named(host),
+                }
+            });
         sni && host
     }
 }
@@ -821,18 +825,18 @@ fn fqdn(host: &str) -> Option<LowerName> {
 
 /// The query `request` asks of `/dns-query` (RFC 8484 §4.1), or why it
 /// asks none.
-fn ask(request: &Request<Body>) -> Asked {
-    if request.uri().path() != DNS_QUERY {
+fn ask(request: &fictionet::stdlib::web::Request) -> Asked {
+    if request.head.path() != DNS_QUERY {
         return Asked::Elsewhere(Refusal::Text(StatusCode::NOT_FOUND, "Not found.\n"));
     }
-    let method = request.method();
-    if *method == Method::POST {
+    let method = request.head.method();
+    if method == "POST" {
         return posted(request);
     }
-    if *method != Method::GET {
+    if method != "GET" {
         return Asked::Refused(Refusal::Method("GET, POST"));
     }
-    let query = request.uri().query().unwrap_or("");
+    let query = request.head.query().unwrap_or("");
     let Ok(form) = Form::parse(query.as_bytes()) else {
         return Asked::Refused(Refusal::Text(
             StatusCode::BAD_REQUEST,
@@ -855,11 +859,11 @@ fn ask(request: &Request<Body>) -> Asked {
 }
 
 /// The DNS message a POST carries as its body (RFC 8484 §4.1).
-fn posted(request: &Request<Body>) -> Asked {
+fn posted(request: &fictionet::stdlib::web::Request) -> Asked {
     let media = request
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
+        .head
+        .field(b"content-type")
+        .and_then(|value| std::str::from_utf8(value).ok())
         .and_then(|value| value.split(';').next())
         .map(|value| value.trim().to_ascii_lowercase());
     if media.as_deref() != Some(DNS_MESSAGE) {
@@ -868,7 +872,7 @@ fn posted(request: &Request<Body>) -> Asked {
             "Unsupported media type.\n",
         ));
     }
-    let Some(body) = request.body().bytes() else {
+    let Some(body) = request.body.bytes() else {
         return Asked::Refused(Refusal::Text(
             StatusCode::BAD_REQUEST,
             "The body did not arrive whole.\n",

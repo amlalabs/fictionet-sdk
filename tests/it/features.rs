@@ -164,7 +164,7 @@ mod http {
         impl<H: httpd::Handler> httpd::Handler for Wrapped<H> {
             fn call(
                 &self,
-                request: http::Request<httpd::Body>,
+                request: fictionet::stdlib::web::Request,
                 ex: &mut httpd::Exchange<'_>,
             ) -> httpd::Reply {
                 self.0.call(request, ex)
@@ -185,7 +185,7 @@ mod http {
         ] {
             fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
                 let app = axum::Router::new().route("/", axum::routing::post(echo));
-                let mut conn = client(&fcx, Wrapped(httpd::tower(app))).await;
+                let mut conn = client(&fcx, Wrapped(fictionet_extras::httpd::tower(app))).await;
                 let mut input = b"POST / HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n".to_vec();
                 input.extend_from_slice(body);
                 conn.write_all(&fcx, &input).await?;
@@ -209,7 +209,7 @@ mod http {
     fn tower_upgrade_with_a_cut_off_body_is_answered() {
         fictionet::block_on(fictionet::lab(Seed::from_u64(1), |fcx| async move {
             let app = axum::Router::new().route("/", axum::routing::post(|| async { "reached" }));
-            let mut conn = client(&fcx, httpd::tower(app)).await;
+            let mut conn = client(&fcx, fictionet_extras::httpd::tower(app)).await;
             conn.write_all(&fcx, b"POST / HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 10\r\n\r\nbody").await?;
             conn.shutdown(&fcx).await?;
             assert!(head(&fcx, &mut conn).await.starts_with("http/1.1 400"));
@@ -274,10 +274,10 @@ mod http {
             }
         }
         fictionet::block_on(fictionet::lab(Seed::from_u64(3), |fcx| async move {
-            let router = fictionet_test_support::handler(|_: &mut fictionet::stdlib::web::httpd::Exchange<'_>, request: http::Request<bytes::Bytes>| {
+            let router = fictionet_test_support::handler(|ex: &mut fictionet::stdlib::web::httpd::Exchange<'_>, request: http::Request<bytes::Bytes>| {
                 let headers: Vec<_> = request.headers().iter().map(|(n, v)| (n.as_str(), v.to_str().unwrap())).collect();
                 let upgrade = websocket::check_request(&headers).unwrap();
-                assert!(request.extensions().get::<fictionet::stdlib::network::ConnInfo>().is_some());
+                assert!(ex.conn().local.is_some());
                 let mut response = ::http::Response::builder().status(101);
                 for (name, value) in upgrade.response_headers(None).unwrap() { response = response.header(name, value); }
                 let mut response = response.body(bytes::Bytes::new()).unwrap();

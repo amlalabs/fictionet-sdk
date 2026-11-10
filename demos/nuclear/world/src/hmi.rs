@@ -1570,7 +1570,18 @@ fn server_header<T>(mut response: Response<T>) -> Response<T> {
 }
 
 impl Handler for WebServer {
-    fn call(&self, request: Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(
+        &self,
+        request: fictionet::stdlib::web::Request,
+        _: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         let Some(body) = request.body().bytes() else {
             return httpd::Reply::Now(
                 server_header(refusal(StatusCode::BAD_REQUEST, "incomplete body", None))

@@ -1,6 +1,6 @@
 //! Model API sites with host-held credentials, streaming usage and run budgets.
 //!
-//! Mount [`Provider::host`] with `web::Site::handler` and a [`Model`] built by
+//! Mount [`Provider::host`] with `web::SiteConfig::handler` and a [`Model`] built by
 //! [`anthropic`], [`openai`], [`openrouter`] or [`gemini`]. Host sockets stay
 //! in [`web::forward`]. The OpenAI sites also serve the Responses WebSocket
 //! that Codex opens first, with HTTP streaming to the upstream.
@@ -950,7 +950,18 @@ impl Model {
 /// The site's requests: a Responses WebSocket handshake gets its `101`
 /// here, and every other request runs as deferred work.
 impl httpd::Handler for Model {
-    fn call(&self, request: Request<Body>, exchange: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(
+        &self,
+        request: fictionet::stdlib::web::Request,
+        exchange: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         let mut model = self.clone();
         model.connection = exchange.conn().clone();
         if self.catalog.is_none() && websocket::wanted(self.provider, &request) {

@@ -6,9 +6,10 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use http::header::{HOST, LOCATION};
-use http::uri::{Authority, Scheme};
-use http::{Request, StatusCode};
+use http::header::LOCATION;
+
+use crate::stdlib::web::Request;
+use http::StatusCode;
 
 use fictionet::Cx;
 use fictionet::stdlib::network::ConnInfo;
@@ -22,32 +23,6 @@ use fictionet::stdlib::world::net::{
 use super::{
     Body, Exchange, Handler, HttpOptions, Limits, Reply, http_for, serve_connection, text,
 };
-
-pub use fictionet::stdlib::world::net::normalize;
-
-/// Where a request arrived: the scheme and port from the connection, the
-/// host from the request. [`VirtualHosts`] puts one in the extensions of
-/// every request it hands on; handlers read it with
-/// `request.extensions().get::<Target>()`, or axum's `Extension`.
-///
-/// The scheme, port and SNI come from the connection, not from headers the
-/// client wrote. The host is the one the request named, even when routing
-/// used the default site. [`routing`](Self::routing) says how it matched.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Target {
-    /// `http` or `https`.
-    pub scheme: Scheme,
-    /// The host the request was routed by, in lowercase, without a port or
-    /// a trailing dot.
-    pub host: String,
-    /// The port the connection arrived on.
-    pub port: u16,
-    /// The name the client sent in its TLS hello. `None` without TLS.
-    pub sni: Option<String>,
-    /// Whether the requested host matched a registered site or used the default.
-    pub routing: Routing,
-}
 
 /// How [`VirtualHosts`] selected a request's handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,8 +80,8 @@ impl VHost {
 ///   Request`. So does a site without `https`, asked for over TLS.
 /// - A site with `https` asked for over plain HTTP gets a `301` to the same
 ///   path at `https://host`, unless it has `plain_http`.
-/// - Every other request goes to the site's handler, with a [`Target`] in
-///   its extensions. Its [`Target::routing`] distinguishes a registered
+/// - Every other request goes to the site's handler, with a typed [`Site`](crate::stdlib::web::Site).
+///   Its [`routing`](crate::stdlib::web::Site::routing) distinguishes a registered
 ///   host from a default-site fallback.
 ///
 /// Its own answers carry an [`Answer`] in their response extensions.
@@ -117,7 +92,7 @@ pub struct VirtualHosts {
 
 #[derive(Default)]
 struct VInner {
-    hosts: RwLock<HashMap<String, VHost>>,
+    hosts: RwLock<Vec<(Arc<str>, VHost)>>,
     default: RwLock<Option<VHost>>,
 }
 
@@ -127,20 +102,22 @@ impl VirtualHosts {
         VirtualHosts::default()
     }
 
-    /// Adds `site` under `name` (lowercase, without a trailing dot),
+    /// Adds `site` under `name`, ignoring ASCII case and trailing dots,
     /// replacing one there.
     pub fn insert(&self, name: &str, site: VHost) {
-        self.inner
-            .hosts
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(normalize(name), site);
+        let mut hosts = self.inner.hosts.write().unwrap_or_else(|e| e.into_inner());
+        let name = name.trim_end_matches('.');
+        if let Some((_, old)) = hosts.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            *old = site;
+        } else {
+            hosts.push((Arc::from(name), site));
+        }
     }
 
     /// Makes `site` the default, for hosts no site has. The first default
     /// set keeps the role.
     /// Requests routed this way keep their requested host and carry
-    /// [`Routing::Fallback`] in their [`Target`].
+    /// [`Routing::Fallback`] in their [`Site`](crate::stdlib::web::Site).
     pub fn set_default(&self, site: VHost) {
         self.inner
             .default
@@ -150,37 +127,43 @@ impl VirtualHosts {
     }
 
     /// The site named `name`.
-    pub fn get(&self, name: &str) -> Option<VHost> {
+    pub fn get(&self, name: &[u8]) -> Option<VHost> {
         self.inner
             .hosts
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .cloned()
+            .iter()
+            .find(|(n, _)| n.as_bytes().eq_ignore_ascii_case(name))
+            .map(|(_, site)| site.clone())
     }
 
     /// Whether a site named `name` is served over HTTPS here.
     pub fn has_https(&self, name: &str) -> bool {
-        self.get(name).is_some_and(|s| s.https)
+        self.get(name.as_bytes()).is_some_and(|s| s.https)
     }
 
-    fn site_or_default(&self, host: &str) -> Option<(VHost, Routing)> {
-        self.get(host)
-            .map(|site| (site, Routing::Exact))
+    fn site_or_default(&self, host: &[u8]) -> Option<(Option<Arc<str>>, VHost, Routing)> {
+        self.inner
+            .hosts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(name, _)| name.as_bytes().eq_ignore_ascii_case(host))
+            .map(|(name, site)| (Some(name.clone()), site.clone(), Routing::Exact))
             .or_else(|| {
                 self.inner
                     .default
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
-                    .map(|site| (site, Routing::Fallback))
+                    .map(|site| (None, site, Routing::Fallback))
             })
     }
 }
 
 impl Handler for VirtualHosts {
-    fn call(&self, mut request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
-        let Some(host) = request_host(&request) else {
+    fn call(&self, mut request: Request, ex: &mut Exchange<'_>) -> Reply {
+        let Some(host) = request.head.host() else {
             return Reply::Now(no_host());
         };
         let misdirected = || {
@@ -191,7 +174,7 @@ impl Handler for VirtualHosts {
             response.extensions_mut().insert(Answer::Misdirected);
             Reply::Now(response)
         };
-        let Some((site, routing)) = self.site_or_default(&host) else {
+        let Some((name, site, routing)) = self.site_or_default(host) else {
             return misdirected();
         };
 
@@ -199,12 +182,10 @@ impl Handler for VirtualHosts {
         match (tls, site.https) {
             (true, false) => misdirected(),
             (false, true) if !site.plain_http => {
-                let path = request
-                    .uri()
-                    .path_and_query()
-                    .map(|p| p.as_str())
-                    .unwrap_or("/");
-                let location = format!("https://{host}{path}");
+                let path = request.head.path_and_query();
+                let host = std::str::from_utf8(host).expect("validated host");
+                let slash = if path.starts_with('?') { "/" } else { "" };
+                let location = format!("https://{host}{slash}{path}");
                 let mut response = text(
                     StatusCode::MOVED_PERMANENTLY,
                     &format!("Moved to {location}\n"),
@@ -216,15 +197,10 @@ impl Handler for VirtualHosts {
                 Reply::Now(response)
             }
             _ => {
-                let conn = ex.conn();
-                let target = Target {
-                    scheme: if tls { Scheme::HTTPS } else { Scheme::HTTP },
-                    host,
-                    port: conn.local.map_or(0, |a| a.port()),
-                    sni: conn.sni.as_deref().map(str::to_owned),
-                    routing,
-                };
-                request.extensions_mut().insert(target);
+                request.site.name = name.unwrap_or_else(|| {
+                    Arc::from(std::str::from_utf8(host).expect("validated host"))
+                });
+                request.site.routing = routing;
                 site.handler.call(request, ex)
             }
         }
@@ -238,21 +214,6 @@ pub(super) fn no_host() -> http::Response<Body> {
     let mut response = text(StatusCode::BAD_REQUEST, "The request names no host.\n");
     response.extensions_mut().insert(Answer::NoHost);
     response
-}
-
-/// The host a request is for: the authority of its URI (HTTP/2's
-/// `:authority`, or an absolute URI in HTTP/1.1), else its `Host` header.
-/// Lowercase, without the port or a trailing dot.
-pub fn request_host<B>(request: &Request<B>) -> Option<String> {
-    let host = match request.uri().authority() {
-        Some(a) => a.host().to_owned(),
-        None => {
-            let value = request.headers().get(HOST)?.to_str().ok()?;
-            value.parse::<Authority>().ok()?.host().to_owned()
-        }
-    };
-    let host = normalize(&host);
-    (!host.is_empty()).then_some(host)
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +236,7 @@ pub fn request_host<B>(request: &Request<B>) -> Option<String> {
 ///
 /// ```
 /// # use fictionet::stdlib::{web::httpd, world::net::Host};
-/// let page = httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "hello\n" })));
+/// let page = fictionet_extras::httpd::tower(axum::Router::new().route("/", axum::routing::get(|| async { "hello\n" })));
 /// let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
 /// # drop(host);
 /// ```
@@ -344,9 +305,9 @@ impl Server {
 
     /// Answers requests at its address whose host names no site there.
     /// The first default site at each local address and port keeps the role.
-    /// These requests keep their requested host in [`Target`] and carry
+    /// These requests keep their requested host in [`Site`](crate::stdlib::web::Site) and carry
     /// [`Routing::Fallback`]. Handlers that forward dynamically should
-    /// check [`Target::routing`].
+    /// check [`Site::routing`](crate::stdlib::web::Site::routing).
     pub fn default_host(mut self) -> Server {
         self.default_host = true;
         self

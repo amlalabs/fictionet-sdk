@@ -39,7 +39,7 @@ use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::zone::dname_target;
-use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
+use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
 use fictionet::stdlib::world::net::dns::encrypted::{Fronts, freshness, message_response};
 
 /// The path of RFC 8484, where Cloudflare also serves its JSON.
@@ -555,7 +555,14 @@ impl Google {
 const GOOGLE_ERROR_STYLE: &str = "*{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}";
 
 impl Handler for Google {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if request.uri().path() == RESOLVE {
             return resolve(&self.fronts, &request, ex);
         }
@@ -599,17 +606,24 @@ struct Cloudflare {
 }
 
 impl Handler for Cloudflare {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let redirects = request
+            .head
+            .host()
+            .is_some_and(|host| host.eq_ignore_ascii_case(b"cloudflare-dns.com"));
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if no_query(&request) {
             if asks_dns_json(&request) {
                 return dns_json(&self.fronts, &request, ex);
             }
             return Reply::Now(http_reply(StatusCode::BAD_REQUEST, None, String::new()));
         }
-        let redirects = request_host(&request).is_some_and(|host| {
-            host.trim_end_matches('.')
-                .eq_ignore_ascii_case("cloudflare-dns.com")
-        });
         if !redirects {
             return Reply::Now(http_reply(
                 StatusCode::NOT_FOUND,
@@ -645,7 +659,14 @@ pub fn quad9(_fronts: Fronts) -> Arc<dyn Handler> {
 struct Quad9;
 
 impl Handler for Quad9 {
-    fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, _ex: &mut Exchange<'_>) -> Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if !no_query(&request) {
             return Reply::Now(httpd::text(
                 StatusCode::NOT_FOUND,
@@ -682,7 +703,14 @@ impl OpenDns {
 }
 
 impl Handler for OpenDns {
-    fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, _ex: &mut Exchange<'_>) -> Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if no_query(&request) {
             return Reply::Now(OpenDns::error(
                 StatusCode::BAD_REQUEST,

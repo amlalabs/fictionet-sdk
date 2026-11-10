@@ -37,6 +37,7 @@ pub struct Responder {
     observe: Option<Observe>,
     date: Option<SystemTime>,
     conn: ConnInfo,
+    site: crate::stdlib::web::Site,
 }
 
 impl Responder {
@@ -53,6 +54,7 @@ impl Responder {
             observe: None,
             date: None,
             conn: ConnInfo::default(),
+            site: crate::stdlib::web::Site::connection(&ConnInfo::default()),
         }
     }
 
@@ -86,9 +88,9 @@ impl Responder {
         self
     }
 
-    /// Says which connection this is: handlers find it in each request's
-    /// extensions and in their [`Exchange`].
+    /// Sets the trusted connection metadata, borrowed through [`Exchange`].
     pub fn conn(mut self, conn: ConnInfo) -> Self {
+        self.site = crate::stdlib::web::Site::connection(&conn);
         self.conn = conn;
         self
     }
@@ -103,9 +105,10 @@ impl Responder {
     pub(in super::super) fn upgraded(
         &self,
         settings: &[Setting],
-        request: Request<Body>,
-    ) -> Http2Server {
-        let (parts, body) = request.into_parts();
+        request: crate::stdlib::web::Request,
+    ) -> Option<Http2Server> {
+        let parts = request.head.to_http().ok()?;
+        let body = request.body;
         let mut head = Request::from_parts(parts, ());
         *head.version_mut() = http::Version::HTTP_2;
         let body = body
@@ -118,7 +121,7 @@ impl Responder {
             at: Instant::ZERO,
             charge: None,
         };
-        self.server(Http2::upgraded(self.limits, settings, opening, body))
+        Some(self.server(Http2::upgraded(self.limits, settings, opening, body)))
     }
 
     fn server(&self, mut connection: Http2) -> Http2Server {
@@ -272,9 +275,43 @@ impl State {
         let responder = self.responder.clone();
         let (parts, ()) = head.into_parts();
         let body = self.body.take().map(Chunk::from).unwrap_or_default();
-        let mut request = Request::from_parts(parts, Body::from(body));
-        request.extensions_mut().insert(responder.conn.clone());
-        self.wants = Asked::of(request.method());
+        let target = parts.uri.to_string();
+        let size = parts.headers.iter().fold(
+            parts.method.as_str().len().checked_add(target.len()),
+            |size, (name, value)| {
+                size?.checked_add(crate::stdlib::web::Head::record_size(
+                    name.as_str().len(),
+                    value.as_bytes().len(),
+                )?)
+            },
+        );
+        let Some(block) =
+            size.and_then(|size| fictionet::Pool::new(env.budget(), size, 0).take(env.budget(), 0))
+        else {
+            self.reset();
+            return;
+        };
+        let mut head = crate::stdlib::web::Head::in_block(
+            block,
+            parts.method.as_str(),
+            &target,
+            crate::stdlib::protocols::http1::Version::Http2,
+        )
+        .expect("reserved request head");
+        for (name, value) in &parts.headers {
+            head.push(name.as_str(), value.as_bytes())
+                .expect("reserved field records");
+        }
+        drop(parts);
+        if responder.observe.is_none() {
+            self.charge = None;
+        }
+        let request = crate::stdlib::web::Request {
+            head,
+            body: Body::from(body),
+            site: responder.site.clone(),
+        };
+        self.wants = Asked::of(request.head.method());
         let now = env.now();
         self.delivery = Delivery::new(&responder.observe, &request, &responder.conn, now, received);
         let reply = match received {

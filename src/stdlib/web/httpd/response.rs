@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use bytes::BytesMut;
 use http::header::{CONTENT_LENGTH, DATE};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 
 use fictionet::Error;
 use fictionet::time::Instant;
@@ -66,10 +66,10 @@ pub(super) enum Asked {
 
 impl Asked {
     /// What a request with `method` asks.
-    pub(super) fn of(method: &Method) -> Asked {
-        if method == Method::HEAD {
+    pub(super) fn of(method: &str) -> Asked {
+        if method == "HEAD" {
             Asked::Head
-        } else if method == Method::CONNECT {
+        } else if method == "CONNECT" {
             Asked::Tunnel
         } else {
             Asked::Body

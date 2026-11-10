@@ -57,7 +57,7 @@ fn website_observers(secure: bool, h2: bool) {
             if name == "override.test" || name == "shared.test" {
                 server = server.observe(own.clone());
             }
-            let site = web::Site::from_server(server);
+            let site = web::SiteConfig::from_server(server);
             Some(if name == "first.test" || name == "shared.test" {
                 site.at(Ipv4Addr::new(203, 0, 113, 8))
             } else {
@@ -355,7 +355,9 @@ fn the_sites_keep_running_after_the_world_returns() {
     std::thread::spawn(move || {
         let r = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             web::Sites::new(fictionet_extras::network::cdn_pools(), |h| {
-                (h == "plain.test").then(|| web::Site::new(Plain("plain")))
+                (h == "plain.test").then(|| {
+                    web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("plain")))
+                })
             })
             .start(&fcx, attachments)?;
             let _ = tx.send(fcx.clone());
@@ -417,7 +419,7 @@ where
         let (attacher, attachments) = fictionet::attachments();
         web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
             host.ends_with(".test")
-                .then(|| web::Site::new(Plain("auto")))
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("auto"))))
         })
         .subnet(subnet)
         .start(&fcx, attachments)?;

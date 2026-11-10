@@ -1,8 +1,8 @@
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use http::{HeaderValue, Request, Response, StatusCode};
+use http::{HeaderValue, Response, StatusCode};
 
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::Connection;
@@ -11,6 +11,7 @@ use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
 use super::Body;
+use crate::stdlib::web::Request;
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -67,13 +68,12 @@ pub enum Reply {
 
 /// Answers HTTP requests. See the [module docs](super).
 pub trait Handler: Send + Sync + 'static {
-    /// Answers `request`. The request's extensions hold its connection's
-    /// [`ConnInfo`].
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply;
+    /// Answers `request`; the exchange borrows its connection.
+    fn call(&self, request: Request, ex: &mut Exchange<'_>) -> Reply;
 }
 
 impl<H: Handler + ?Sized> Handler for Arc<H> {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: Request, ex: &mut Exchange<'_>) -> Reply {
         (**self).call(request, ex)
     }
 }
@@ -121,52 +121,6 @@ pub fn text(status: StatusCode, body: &str) -> Response<Body> {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
-}
-
-/// Runs a tower service as a [`Handler`]: see [`tower`].
-pub struct Tower<S> {
-    service: Mutex<S>,
-}
-
-/// Runs any tower service, such as an `axum::Router`, as a [`Handler`].
-/// Each request gets its own clone of the service, as tower expects, and
-/// runs as work of its connection. The response's body streams
-/// to the client as it comes.
-pub fn tower<S, B>(service: S) -> Tower<S>
-where
-    S: tower_service::Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    S::Error: Into<Error>,
-    B: http_body::Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Error>,
-{
-    Tower {
-        service: Mutex::new(service),
-    }
-}
-
-impl<S, B> Handler for Tower<S>
-where
-    S: tower_service::Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    S::Error: Into<Error>,
-    B: http_body::Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Error>,
-{
-    fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
-        let mut service = self.service.lock().clone();
-        Reply::Later(Box::new(move |_fcx| {
-            Box::pin(async move {
-                poll_fn(|cx| service.poll_ready(cx))
-                    .await
-                    .map_err(Into::into)?;
-                let response = service.call(request).await.map_err(Into::into)?;
-                Ok(response.map(Body::new))
-            })
-        }))
-    }
 }
 
 /// Runs a protocol after an HTTP/1 response that hands the connection on is

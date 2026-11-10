@@ -38,9 +38,9 @@ impl Handler {
         let started = std::time::Instant::now();
         let target = request
             .extensions()
-            .get::<web::Target>()
+            .get::<web::Site>()
             .cloned()
-            .ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
+            .ok_or_else(|| fictionet::Error::msg("request without a web::Site"))?;
         let (parts, body) = request.into_parts();
         let body = body
             .collect()
@@ -49,7 +49,7 @@ impl Handler {
             .to_bytes();
         let asked = Asked {
             scheme: &target.scheme,
-            host: &target.host,
+            host: &target.name,
             parts: &parts,
             body: &body,
         };
@@ -60,7 +60,7 @@ impl Handler {
             started,
             fact: Some(crate::observation::SearchObs::Abandoned {
                 scheme: target.scheme.clone(),
-                host: target.host.parse()?,
+                host: target.name.parse()?,
                 method: parts.method.clone(),
                 path: parts
                     .uri

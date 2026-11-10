@@ -95,7 +95,13 @@ fn upgrade(_: Request<httpd::Body>) -> httpd::Reply {
 
 struct Http;
 impl httpd::Handler for Http {
-    fn call(&self, request: Request<httpd::Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(
+        &self,
+        request: fictionet::stdlib::web::Request,
+        ex: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        let parts = request.head.to_http().expect("valid request head");
+        let request = http::Request::from_parts(parts, request.body);
         if request.uri().path() == "/upgrade" {
             return upgrade(request);
         }
@@ -351,7 +357,10 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
             });
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
-                (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
+                (name == "site.test").then(|| {
+                    web::SiteConfig::handler(fictionet_extras::httpd::tower(app.clone()))
+                        .tls(config.clone())
+                })
             })
             .date(date)
             .start(&cx, attachments)?;

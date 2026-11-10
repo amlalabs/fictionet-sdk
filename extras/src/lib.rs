@@ -81,3 +81,5 @@ pub mod web_world;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod zscaler;
+
+pub mod httpd;

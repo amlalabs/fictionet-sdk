@@ -1,16 +1,12 @@
 //! A `web::Sites` world for the web fuzz targets, and a client side to
 //! reach it with.
 
-use std::convert::Infallible;
-use std::future::Future;
 use std::net::Ipv4Addr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http::{Request, Response};
-use http_body_util::{BodyExt, Full, Limited};
+use http::Response;
+use http_body_util::{BodyExt, Limited};
 use rustls::pki_types::CertificateDer;
 
 use fictionet::stdlib::{services::tls, web};
@@ -36,31 +32,26 @@ pub const NAMES: [&str; 8] = [
 #[derive(Clone)]
 struct Echo;
 
-impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Echo {
-    type Response = Response<Full<Bytes>>;
-    type Error = Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<fictionet::stdlib::web::Body>) -> Self::Future {
-        Box::pin(async move {
-            let (parts, body) = request.into_parts();
-            let n = match Limited::new(body, 1 << 20).collect().await {
-                Ok(b) => b.to_bytes().len() as i64,
-                Err(_) => -1,
-            };
-            let text = format!("{} {} {:?} {n}\n", parts.method, parts.uri, parts.version);
-            let big = parts.uri.path() == "/big";
-            let body = if big {
-                Bytes::from(vec![b'x'; 256 * 1024])
-            } else {
-                Bytes::from(text)
-            };
-            Ok(Response::new(Full::new(body)))
-        })
+impl web::httpd::Handler for Echo {
+    fn call(&self, request: web::Request, _: &mut web::httpd::Exchange<'_>) -> web::httpd::Reply {
+        web::httpd::Reply::Later(Box::new(move |_| {
+            Box::pin(async move {
+                let parts = request.head.to_http()?;
+                let body = request.body;
+                let n = match Limited::new(body, 1 << 20).collect().await {
+                    Ok(b) => b.to_bytes().len() as i64,
+                    Err(_) => -1,
+                };
+                let text = format!("{} {} {:?} {n}\n", parts.method, parts.uri, parts.version);
+                let big = parts.uri.path() == "/big";
+                let body = if big {
+                    Bytes::from(vec![b'x'; 256 * 1024])
+                } else {
+                    Bytes::from(text)
+                };
+                Ok(Response::new(web::Body::from(body)))
+            })
+        }))
     }
 }
 
@@ -68,23 +59,20 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Echo {
 #[derive(Clone)]
 struct Broken;
 
-impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
-    type Response = Response<Full<Bytes>>;
-    type Error = std::io::Error;
-    type Future = std::future::Ready<Result<Self::Response, std::io::Error>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: Request<fictionet::stdlib::web::Body>) -> Self::Future {
-        std::future::ready(Err(std::io::Error::other("broken on purpose")))
+impl web::httpd::Handler for Broken {
+    fn call(&self, _: web::Request, _: &mut web::httpd::Exchange<'_>) -> web::httpd::Reply {
+        web::httpd::Reply::Later(Box::new(|_| {
+            Box::pin(async { Err(std::io::Error::other("broken on purpose").into()) })
+        }))
     }
 }
 
 /// Starts the sites, with events on, and returns the attacher.
 pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::services::ca::Leaf) -> Attacher {
-    let config = Arc::new(tls::CertifiedKey { chain: cert.chain.clone(), key: cert.key.clone_key() });
+    let config = Arc::new(tls::CertifiedKey {
+        chain: cert.chain.clone(),
+        key: cert.key.clone_key(),
+    });
     let sites = web::Sites::new(
         fictionet::stdlib::world::net::Pools {
             v4: Some("104.18.0.0/15".parse().unwrap()),
@@ -93,13 +81,22 @@ pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::services::ca::Leaf) -> Attacher
         move |host| {
             let c = config.clone();
             match host {
-                "plain.test" => Some(web::Site::new(Echo)),
-                "tls.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c)),
-                "both.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c).plain_http()),
-                "broken.test" => Some(web::Site::new(Broken).at(SITE_ADDR)),
-                "default.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR).default_host()),
-                "other.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR)),
-                h if h.ends_with(".wild.test") => Some(web::Site::new(Echo)),
+                "plain.test" => Some(web::SiteConfig::handler(Echo)),
+                "tls.test" => Some(web::SiteConfig::handler(Echo).at(SITE_ADDR).tls(c)),
+                "both.test" => Some(
+                    web::SiteConfig::handler(Echo)
+                        .at(SITE_ADDR)
+                        .tls(c)
+                        .plain_http(),
+                ),
+                "broken.test" => Some(web::SiteConfig::handler(Broken).at(SITE_ADDR)),
+                "default.test" => Some(
+                    web::SiteConfig::handler(Echo)
+                        .at(DEFAULT_ADDR)
+                        .default_host(),
+                ),
+                "other.test" => Some(web::SiteConfig::handler(Echo).at(DEFAULT_ADDR)),
+                h if h.ends_with(".wild.test") => Some(web::SiteConfig::handler(Echo)),
                 _ => None,
             }
         },

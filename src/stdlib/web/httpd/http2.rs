@@ -2629,7 +2629,11 @@ mod tests {
                 };
                 struct Reject;
                 impl Handler for Reject {
-                    fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+                    fn call(
+                        &self,
+                        _: fictionet::stdlib::web::Request,
+                        _: &mut Exchange<'_>,
+                    ) -> Reply {
                         panic!("a stalled body cannot reach the handler")
                     }
                 }
@@ -2705,7 +2709,7 @@ mod tests {
 
     struct NotFound;
     impl Handler for NotFound {
-        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             Reply::Now(text(StatusCode::NOT_FOUND, "Not found.\n"))
         }
     }
@@ -4148,7 +4152,13 @@ mod tests {
         use std::time::SystemTime;
         struct Answers;
         impl Handler for Answers {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                let parts = request.head.to_http().expect("valid request head");
+                let request = http::Request::from_parts(parts, request.body);
                 if request.uri().path() == "/big" {
                     return Reply::Now(http::Response::new(Body::from(vec![b'b'; 100_000])));
                 }

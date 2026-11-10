@@ -123,7 +123,7 @@ pub(super) async fn forward(
             event,
         }
     });
-    let result = forward.clone().call(request).await;
+    let result = forward.send(request).await;
     if let Some(attempt) = &mut attempt {
         match &result {
             Ok(response) => attempt.finish(UpstreamPhase::Response, Some(response.status())),

@@ -772,19 +772,20 @@ mod clients {
     impl httpd::Handler for Site {
         fn call(
             &self,
-            request: http::Request<httpd::Body>,
+            request: fictionet::stdlib::web::Request,
             ex: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
+            let parts = request.head.to_http().unwrap();
             let fact = RequestFact {
-                path: request.uri().path_and_query().cloned().unwrap(),
-                version: request.version(),
+                path: parts.uri.path_and_query().cloned().unwrap(),
+                version: parts.version,
                 connection: ex.conn().id,
                 started: ex.now(),
                 ended: ex.now(),
                 sent: 0,
                 complete: false,
             };
-            let reply = if request.uri().path() == "/cancel" {
+            let reply = if request.head.path() == "/cancel" {
                 httpd::Reply::Now(
                     http::Response::builder()
                         .header("content-type", "application/octet-stream")
@@ -1294,14 +1295,14 @@ fn statuses(output: &[Frame]) -> Vec<(u32, Vec<u8>)> {
 
 #[test]
 fn retained_request_chunks_keep_their_charge_after_the_connection() {
-    struct Keep(Arc<Mutex<Option<fictionet::Chunk>>>);
+    struct Keep(Arc<Mutex<Option<fictionet::stdlib::web::Request>>>);
     impl httpd::Handler for Keep {
         fn call(
             &self,
-            request: http::Request<httpd::Body>,
+            request: fictionet::stdlib::web::Request,
             _: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
-            *self.0.lock().unwrap() = request.body().bytes();
+            *self.0.lock().unwrap() = Some(request);
             httpd::Reply::Now(http::Response::new(httpd::Body::empty()))
         }
     }
@@ -1313,13 +1314,21 @@ fn retained_request_chunks_keep_their_charge_after_the_connection() {
     input.extend(data(1, 4, true));
     push(&mut harness, &input);
     drop(harness);
-    let bytes = held
+    let request = held
         .lock()
         .unwrap()
         .take()
-        .expect("handler retained the body");
+        .expect("handler retained the request");
+    let bytes = request.body.bytes().unwrap();
+    assert_eq!(
+        request.head.version(),
+        fictionet::stdlib::protocols::http1::Version::Http2
+    );
+    assert_eq!(request.head.host(), Some(b"localhost".as_slice()));
     assert!(!bytes.is_empty());
-    assert!(budget.used() >= bytes.len());
+    assert_eq!(budget.used(), request.head.held() + bytes.charged());
+    drop(request);
+    assert_eq!(budget.used(), bytes.charged());
     drop(bytes);
     assert!(budget.used() == 0);
 }
@@ -1760,7 +1769,11 @@ fn failing_response_body_is_an_internal_stream_error() {
     }
     struct Handler;
     impl httpd::Handler for Handler {
-        fn call(&self, _: http::Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        fn call(
+            &self,
+            _: fictionet::stdlib::web::Request,
+            _: &mut httpd::Exchange<'_>,
+        ) -> httpd::Reply {
             httpd::Reply::Now(http::Response::new(httpd::Body::new(Broken)))
         }
     }
@@ -1856,9 +1869,11 @@ fn streamed_chunk_over_budget_resets_only_its_stream() {
     impl httpd::Handler for Streamed {
         fn call(
             &self,
-            request: http::Request<httpd::Body>,
+            request: fictionet::stdlib::web::Request,
             _: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             let body = if request.uri().path() == "/large" {
                 httpd::Body::new(http_body_util::Full::new(Bytes::from(vec![b'x'; 200_000])))
             } else {

@@ -3184,7 +3184,7 @@ mod http_children {
     use crate::stdlib::services::stack::Polling;
     use crate::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
     use crate::{Seed, block_on, lab};
-    use http::{Request, Response};
+    use http::Response;
     use std::sync::atomic::AtomicBool;
 
     struct Dropped(Arc<AtomicBool>);
@@ -3198,7 +3198,7 @@ mod http_children {
         dropped: Arc<AtomicBool>,
     }
     impl Handler for Answer {
-        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             let name = self.name;
             let dropped = self.dropped.clone();
             Reply::Later(Box::new(move |_| {

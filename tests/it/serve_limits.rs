@@ -254,7 +254,7 @@ impl http_body::Body for Unsized {
 struct Streams;
 
 impl Handler for Streams {
-    fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         Reply::Now(http::Response::new(Body::new(Unsized(Some(
             Bytes::from_static(b"streamed\n"),
         )))))
@@ -266,7 +266,9 @@ fn response_policy_agrees_across_http_versions() {
     struct Responses;
 
     impl Handler for Responses {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             let status: u16 = request.uri().path()[1..].parse().unwrap();
             let bytes = Bytes::from_static(b"body");
             let body = if request.headers().contains_key("x-unknown") {
@@ -666,7 +668,9 @@ fn pending_http1_requests_keep_their_body_charge() {
 fn truncated_http1_requests_keep_their_body_charge() {
     struct Partial;
     impl Handler for Partial {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             Reply::Later(Box::new(move |fcx| {
                 Box::pin(async move {
                     fcx.sleep(Duration::from_secs(1)).await?;
@@ -758,7 +762,9 @@ fn metadata_request() -> http::Request<Full<Bytes>> {
 struct WaitingMetadata(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Handler for WaitingMetadata {
-    fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+        let parts = request.head.to_http().expect("valid request head");
+        let request = http::Request::from_parts(parts, request.body);
         let waiting = self.0.clone();
         Reply::Later(Box::new(move |_| {
             Box::pin(async move {
@@ -943,7 +949,7 @@ impl http_body::Body for WaitingBody {
 struct StreamingMetadata;
 
 impl Handler for StreamingMetadata {
-    fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         Reply::Now(http::Response::new(Body::new(WaitingBody)))
     }
 }

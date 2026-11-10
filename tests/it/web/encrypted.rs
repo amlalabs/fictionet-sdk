@@ -28,7 +28,7 @@ use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
 use fictionet::stdlib::services::dns::resolver::Config;
 use fictionet::stdlib::services::dns::zone::{Denial, Node, Zone, ZoneData};
 use fictionet::stdlib::services::dns::{Event, WallClock};
-use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
+use fictionet::stdlib::web::httpd::{self, Exchange, Handler, Reply};
 use fictionet::stdlib::world::net::dns::encrypted::Fronts;
 use fictionet::stdlib::world::net::dns::{Authoritative, Recursive};
 use fictionet::stdlib::world::net::{Host, Net};
@@ -244,7 +244,9 @@ fn recursive(anchors: Anchors, sent: &Arc<Mutex<Vec<Sent>>>) -> Recursive {
 struct BothJson(Fronts);
 
 impl Handler for BothJson {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let parts = request.head.to_http().expect("valid request head");
+        let request = http::Request::from_parts(parts, request.body);
         match request.uri().path() {
             "/resolve" => doh::resolve(&self.0, &request, ex),
             "/dns-query" if doh::asks_dns_json(&request) => doh::dns_json(&self.0, &request, ex),
@@ -1001,10 +1003,12 @@ fn a_site_cannot_take_a_fronts_name_at_its_address() {
         let handle = net.handle();
         net.start(&fcx, attachments)?;
         let doh = "cloudflare-dns.com";
-        let site = fictionet::stdlib::web::Site::new(super::Plain("site"))
-            .tls(site_config)
-            .into_host(doh)
-            .at(elsewhere);
+        let site = fictionet::stdlib::web::SiteConfig::handler(fictionet_extras::httpd::tower(
+            super::Plain("site"),
+        ))
+        .tls(site_config)
+        .into_host(doh)
+        .at(elsewhere);
         assert!(handle.add_host(site).is_err());
 
         let m = machine(&fcx, attacher.attach("agent")?, ME);
@@ -1202,9 +1206,11 @@ fn corporate_egress_keeps_gateway_recursion_and_drops_direct_dns() {
             .egress(fictionet_extras::network::corporate_egress)
             .hosts(hosts)
             .add_host(
-                fictionet::stdlib::web::Site::new(super::Plain("page"))
-                    .into_host("www.example")
-                    .at(WWW),
+                fictionet::stdlib::web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                    super::Plain("page"),
+                ))
+                .into_host("www.example")
+                .at(WWW),
             )
             .add_host(
                 fronts.doh(fronts.dot(Host::new("public-dns").at(resolver_ip).program(external))),

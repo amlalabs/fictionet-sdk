@@ -49,7 +49,7 @@ fn copied() -> tls::Factory {
 
 struct Page;
 impl Handler for Page {
-    fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         Reply::Now(Response::new(Body::from(vec![b'x'; 16_000])))
     }
 }
@@ -240,7 +240,7 @@ fn owned_tls_serves_both_http_versions_and_encrypted_dns() {
         roots.add(ca.cert_der())?;
         let roots = Arc::new(roots);
         let site_config = config.clone();
-        let site = fictionet::stdlib::web::Site::from_server(
+        let site = fictionet::stdlib::web::SiteConfig::from_server(
             httpd::Server::new(Page)
                 .tls_with(move |_| site_config.clone())
                 .tls_layer(copied()),

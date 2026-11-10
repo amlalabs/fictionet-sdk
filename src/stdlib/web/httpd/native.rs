@@ -8,8 +8,7 @@ use std::task::{Context, Poll, ready};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use http::header::HOST;
-use http::{HeaderValue, Request, Response, StatusCode, Version};
+use http::{HeaderValue, Response, StatusCode, Version};
 use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::codec::{Fail, Stream, base64};
@@ -27,11 +26,12 @@ use fictionet::{Cx, Error};
 
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
-use super::response::{Asked, Dates, ResponsePolicy, request_held, response_held};
+use super::response::{Asked, Dates, ResponsePolicy, response_held};
 use super::sites::no_host;
 use super::{
     Body, Delivery, Exchange, Handler, Later, Limits, PIECE, Received, Reply, Reset, UpgradeHandler,
 };
+use crate::stdlib::web::{Request, Site};
 
 // ---------------------------------------------------------------------------
 // HTTP/1 as a layer
@@ -153,6 +153,7 @@ pub struct Http1 {
     /// `Date` headers, from the world's date at the start of the run.
     pub(super) dates: Dates,
     conn: ConnInfo,
+    site: Site,
     /// Whether `Upgrade: h2c` hands the connection to HTTP/2.
     h2c: bool,
     pub(super) first_head_deadline: Option<Instant>,
@@ -198,6 +199,7 @@ impl Http1 {
             opts,
             dates: Dates::new(None),
             conn: ConnInfo::default(),
+            site: Site::connection(&ConnInfo::default()),
             h2c: false,
             first_head_deadline: None,
             stream: Stream::new(http1::RequestEvents::with_limits(opts.head)),
@@ -237,9 +239,9 @@ impl Http1 {
         self
     }
 
-    /// Says which connection this is: handlers find it in each request's
-    /// extensions and in their [`Exchange`].
+    /// Sets the trusted connection metadata, borrowed through [`Exchange`].
     pub fn conn(mut self, conn: ConnInfo) -> Self {
+        self.site = Site::connection(&conn);
         self.conn = conn;
         self
     }
@@ -262,7 +264,7 @@ impl Http1 {
     }
 
     /// HTTP/2 for this connection after `Upgrade: h2c`.
-    fn http2(&self, settings: &[Setting], request: Request<Body>) -> Http2Server {
+    fn http2(&self, settings: &[Setting], request: Request) -> Option<Http2Server> {
         Responder::shared(self.handler.clone())
             .limits(self.opts)
             .maybe_observe(self.observe.clone())
@@ -434,24 +436,18 @@ impl Http1 {
         };
         let version = version_of(&head);
         let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method() != "CONNECT";
-        let Ok(parts) = head.to_http() else {
-            let date = self.dates.at(env.now());
-            let Some(out) = simple_output(env, version, StatusCode::BAD_REQUEST, date) else {
-                return self.over_budget(env);
-            };
-            self.push_out(out);
-            return self.close(env, Closing::Failed);
+        let request = Request {
+            head,
+            body,
+            site: self.site.clone(),
         };
-        let mut request = Request::from_parts(parts, body);
-        request.extensions_mut().insert(self.conn.clone());
-
-        let wants = Asked::of(request.method());
-        let held = request_held(&request);
+        let wants = Asked::of(request.head.method());
+        let held = request.head.held();
         let now = env.now();
         // RFC 9112 section 3.2: an HTTP/1.1 request without Host gets 400
         // from the service, unless its body is too large. The decoder
         // refuses such a head, so only a failure brings one here.
-        let lacks_host = version == Version::HTTP_11 && !request.headers().contains_key(HOST);
+        let lacks_host = version == Version::HTTP_11 && request.head.field(b"host").is_none();
         let received = if self.too_big {
             Received::TooLarge
         } else if close {
@@ -477,20 +473,24 @@ impl Http1 {
             Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
         } else if lacks_host {
             Reply::Now(no_host())
-        } else if request.headers().contains_key(http::header::UPGRADE)
-            && matches!(request.body(), Body::Stream(_))
+        } else if request.head.field(b"upgrade").is_some()
+            && matches!(&request.body, Body::Stream(_))
         {
             Reply::Now(status_only(StatusCode::BAD_REQUEST))
         } else if let Some(settings) = h2c {
             // The request is HTTP/2's stream 1, observed there: the 101
             // is not its answer.
-            delivery = None;
-            self.next = Some(Next::H2c(Box::new(self.http2(&settings, request))));
-            let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
-            switching
-                .headers_mut()
-                .insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
-            Reply::Now(switching)
+            if let Some(server) = self.http2(&settings, request) {
+                delivery = None;
+                self.next = Some(Next::H2c(Box::new(server)));
+                let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
+                switching
+                    .headers_mut()
+                    .insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
+                Reply::Now(switching)
+            } else {
+                Reply::Now(status_only(StatusCode::BAD_REQUEST))
+            }
         } else {
             self.handler
                 .call(request, &mut Exchange::new(now, env.entropy(), &self.conn))
@@ -503,14 +503,11 @@ impl Http1 {
                 (Stage::Made(response), None)
             }
             Reply::Later(later) => {
-                let Some(charge) = env.budget().charge(held) else {
-                    return self.over_budget(env);
-                };
                 self.generation += 1;
                 self.work = Some(Work {
                     generation: self.generation,
                     lease: self.work_owner.own(()),
-                    charge: Some(charge),
+                    charge: None,
                     budget: env.budget().clone(),
                     op: Op::Make {
                         later: Some(later),
@@ -1221,30 +1218,33 @@ impl Job for Work {
 /// `Connection` naming `Upgrade` and `HTTP2-Settings`, and one
 /// `HTTP2-Settings` whose base64url holds valid SETTINGS. `None` keeps the
 /// request on HTTP/1.
-fn h2c_settings(request: &Request<Body>) -> Option<Vec<Setting>> {
-    fn tokens<'a>(request: &'a Request<Body>, name: &str) -> impl Iterator<Item = &'a [u8]> {
+fn h2c_settings(request: &Request) -> Option<Vec<Setting>> {
+    fn tokens<'a>(request: &'a Request, name: &'a str) -> impl Iterator<Item = &'a [u8]> {
         request
-            .headers()
-            .get_all(name)
-            .iter()
-            .flat_map(|value| value.as_bytes().split(|b| *b == b','))
+            .head
+            .fields()
+            .filter(move |(key, _)| key.eq_ignore_ascii_case(name.as_bytes()))
+            .flat_map(|(_, value)| value.split(|b| *b == b','))
             .map(<[u8]>::trim_ascii)
     }
-    if request.version() != Version::HTTP_11
-        || !matches!(request.body(), Body::Full(_))
+    if request.head.version() != http1::Version::Http11
+        || !matches!(&request.body, Body::Full(_))
         || !tokens(request, "upgrade").any(|t| t.eq_ignore_ascii_case(b"h2c"))
         || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"upgrade"))
         || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"http2-settings"))
     {
         return None;
     }
-    let mut values = request.headers().get_all("http2-settings").iter();
+    let mut values = request
+        .head
+        .fields()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(b"http2-settings"))
+        .map(|(_, value)| value);
     let (Some(value), None) = (values.next(), values.next()) else {
         return None;
     };
     // base64url (RFC 4648 section 5), its padding left off.
     let standard: Vec<u8> = value
-        .as_bytes()
         .iter()
         .map(|b| match b {
             b'-' => b'+',
@@ -1297,6 +1297,7 @@ fn version_of(head: &Head) -> Version {
     match head.version() {
         http1::Version::Http10 => Version::HTTP_10,
         http1::Version::Http11 => Version::HTTP_11,
+        http1::Version::Http2 => Version::HTTP_2,
     }
 }
 
@@ -1461,7 +1462,7 @@ mod router_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Count(Arc<AtomicUsize>);
         impl Handler for Count {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 Reply::Now(Response::new(Body::empty()))
             }
@@ -1497,8 +1498,12 @@ mod router_tests {
     fn a_handler_retaining_request_bytes_retains_the_backing_reservation() {
         struct Keep(Arc<Mutex<Option<Chunk>>>);
         impl Handler for Keep {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-                *self.0.lock() = request.body().bytes();
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                *self.0.lock() = request.body.bytes();
                 Reply::Now(Response::new(Body::empty()))
             }
         }
@@ -1519,9 +1524,16 @@ mod router_tests {
 
     #[test]
     fn pending_request_work_keeps_its_memory_after_the_layer_is_dropped() {
-        struct Wait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Wait(Arc<AtomicUsize>);
         impl Handler for Wait {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                let bytes = request.head.held() + request.body.bytes().unwrap().charged();
+                self.0.store(bytes, Ordering::Relaxed);
                 Reply::Later(Box::new(move |_| {
                     Box::pin(async move {
                         let _request = request;
@@ -1531,19 +1543,24 @@ mod router_tests {
             }
         }
         let budget = Budget::new(1 << 20);
+        let retained = Arc::new(AtomicUsize::new(0));
         let mut h = Harness::with_budget(
             fictionet::Seed::from_u64(12),
-            Http1::new(Wait),
+            Http1::new(Wait(retained.clone())),
             budget.clone(),
         );
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\n\r\nbody")
             .unwrap();
         let work = h.work().expect("handler work");
-        let reserved = work.charge.as_ref().unwrap().bytes();
-        assert!(reserved >= 4);
+        assert!(
+            work.charge.is_none(),
+            "request storage carries its own charge"
+        );
+        let reserved = retained.load(Ordering::Relaxed);
+        assert!(reserved > 0);
         drop(h);
         assert!(work.cancelled());
-        assert_eq!(budget.used(), reserved + 4);
+        assert_eq!(budget.used(), reserved);
         drop(work);
         assert_eq!(budget.used(), 0);
     }
@@ -1592,7 +1609,7 @@ mod router_tests {
         }
         struct Answer(Mutex<Option<Bytes>>);
         impl Handler for Answer {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 Reply::Now(Response::new(Body::from(self.0.lock().take().unwrap())))
             }
         }
@@ -1626,7 +1643,7 @@ mod router_tests {
     fn blocked_response_input_capacity_stays_reserved() {
         struct Answer;
         impl Handler for Answer {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 Reply::Now(Response::new(Body::from("body")))
             }
         }
@@ -1656,8 +1673,12 @@ mod router_tests {
         struct Length(usize);
         struct Echo;
         impl Handler for Echo {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-                let bytes = request.body().bytes().unwrap();
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                let bytes = request.body.bytes().unwrap();
                 let mut response = Response::new(Body::from(bytes.clone()));
                 response.extensions_mut().insert(Length(bytes.len()));
                 Reply::Now(response)
@@ -1718,7 +1739,7 @@ mod router_tests {
         }
         struct Wait;
         impl Handler for Wait {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 Reply::Now(Response::new(Body::new(Waiting)))
             }
         }
@@ -1748,7 +1769,7 @@ mod router_tests {
     fn response_suffix_keeps_the_original_charge() {
         struct Big;
         impl Handler for Big {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 Reply::Now(Response::new(Body::from(vec![b'x'; 3 * PIECE])))
             }
         }
@@ -1794,8 +1815,8 @@ mod tests {
     struct Frames(Arc<Mutex<Vec<u8>>>);
 
     impl Handler for Frames {
-        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-            let mut body = request.into_body();
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let mut body = request.body;
             let mut cx = Context::from_waker(std::task::Waker::noop());
             while let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) {
                 if let Ok(data) = frame.into_data() {
@@ -1840,8 +1861,12 @@ mod tests {
     fn ambiguous_framing_never_dispatches_a_pipelined_request() {
         struct Paths(Arc<Mutex<Vec<String>>>);
         impl Handler for Paths {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-                self.0.lock().push(request.uri().path().to_owned());
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                self.0.lock().push(request.head.path().to_owned());
                 Reply::Now(Response::new(Body::empty()))
             }
         }
@@ -1935,8 +1960,8 @@ mod tests {
     struct Slow(Arc<AtomicBool>);
 
     impl Handler for Slow {
-        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-            let body = if request.uri().path() == "/slow" {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let body = if request.head.path() == "/slow" {
                 Body::new(Gate(self.0.clone(), false))
             } else {
                 Body::from("next")
@@ -1965,8 +1990,26 @@ mod tests {
 
     struct Hello;
 
+    #[test]
+    fn http_two_upgrade_refuses_unrepresentable_request_heads() {
+        let server = Http1::new(Hello);
+        for (target, representable) in [("/kept", true), ("http://[", false)] {
+            let request = Request {
+                head: Head::new(
+                    "GET",
+                    target,
+                    http1::Version::Http11,
+                    [("host", "example.test")],
+                ),
+                body: Body::empty(),
+                site: Site::connection(&ConnInfo::default()),
+            };
+            assert_eq!(server.http2(&[], request).is_some(), representable);
+        }
+    }
+
     impl Handler for Hello {
-        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             Reply::Now(Response::new(Body::from("hello")))
         }
     }
@@ -1992,7 +2035,7 @@ mod tests {
     struct Bare101;
 
     impl Handler for Bare101 {
-        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
             Reply::Now(response)
@@ -2022,9 +2065,9 @@ mod tests {
     struct Count(Arc<AtomicUsize>);
 
     impl Handler for Count {
-        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             self.0.fetch_add(1, Ordering::Relaxed);
-            let path = request.uri().path().to_owned();
+            let path = request.head.path().to_owned();
             Reply::Now(Response::new(Body::from(path.repeat(4096))))
         }
     }

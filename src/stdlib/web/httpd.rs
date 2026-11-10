@@ -1,4 +1,4 @@
-//! HTTP as a service: plain handlers, an adapter for tower services (axum
+//! HTTP as a service: plain handlers, with tower adapters in fictionet-extras (axum
 //! included), and name-based virtual hosting.
 //!
 //! [`Http1`] is a [`Layer`](fictionet::stdlib::layer::Layer) over an
@@ -12,7 +12,7 @@
 //!
 //! A [`Handler`] answers one request. Adapters and virtual hosting:
 //!
-//! - [`tower`]: any `tower_service::Service<http::Request<Body>>`, such as an
+//! - `fictionet_extras::httpd::tower`: an allocating adapter for tower services, such as an
 //!   `axum::Router`, run as the connection's work.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
 //!   with several sites at one address does, with the redirect to https and
@@ -95,10 +95,10 @@
 //!
 //! struct Pages;
 //! impl Handler for Pages {
-//!     fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
-//!         let body = match request.uri().path() {
+//!     fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+//!         let body = match request.head.path() {
 //!             "/hello" => Body::from("hi\n"),
-//!             _ => request.into_body(),
+//!             _ => request.body,
 //!         };
 //!         Reply::Now(http::Response::new(body))
 //!     }
@@ -146,9 +146,7 @@ mod sites;
 
 pub use body::Body;
 pub use detect::{Detect, Http, MakeVersion, Versions};
-pub use handlers::{
-    BadGateway, Exchange, Handler, Later, Reply, Reset, Tower, UpgradeHandler, text, tower,
-};
+pub use handlers::{BadGateway, Exchange, Handler, Later, Reply, Reset, UpgradeHandler, text};
 
 pub use http2::{
     Ending, ExchangeCommand, ExchangeEvent, Grpc, GrpcCommand, GrpcEvent, Http2, Http2Server,
@@ -161,7 +159,7 @@ pub use native::{
 };
 use response::Dates;
 pub use response::{date_header, http_date};
-pub use sites::{Answer, Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
+pub use sites::{Answer, Routing, Server, VHost, VirtualHosts};
 
 /// How receipt of a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +178,7 @@ pub enum Received {
 
 /// A finished or interrupted response to a dispatched HTTP request.
 /// Rejections before dispatch (including malformed heads and HTTP/1 body timeouts)
-/// are outside this callback. Request and response extensions belong to the
+/// are outside this callback. Response extensions belong to the
 /// world; the server does not interpret them.
 pub struct Observation {
     /// When the request was dispatched.
@@ -215,18 +213,13 @@ struct Delivery {
 impl Delivery {
     fn new(
         observe: &Option<Observe>,
-        request: &http::Request<Body>,
+        request: &super::Request,
         conn: &ConnInfo,
         at: fictionet::time::Instant,
         received: Received,
     ) -> Option<Self> {
         let observe = observe.as_ref()?.clone();
-        let mut head = http::Request::new(());
-        *head.method_mut() = request.method().clone();
-        *head.uri_mut() = request.uri().clone();
-        *head.version_mut() = request.version();
-        *head.headers_mut() = request.headers().clone();
-        *head.extensions_mut() = request.extensions().clone();
+        let head = http::Request::from_parts(request.head.to_http().ok()?, ());
         let held = response::request_held(&head);
         Some(Self {
             held,

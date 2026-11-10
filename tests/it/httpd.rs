@@ -135,9 +135,11 @@ struct StreamHandler;
 impl httpd::Handler for StreamHandler {
     fn call(
         &self,
-        request: http::Request<httpd::Body>,
+        request: fictionet::stdlib::web::Request,
         _ex: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
+        let parts = request.head.to_http().expect("valid request head");
+        let request = http::Request::from_parts(parts, request.body);
         let pieces: Vec<&'static [u8]> = match request.uri().path() {
             "/empty" => vec![],
             "/empty-frame" => vec![b"hello", b"", b" world"],
@@ -468,7 +470,9 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
     struct Paced;
 
     impl Handler for Paced {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             let body = if request.uri().path() == "/next" {
                 Body::from(Bytes::from_static(b"next\n"))
             } else {
@@ -873,9 +877,11 @@ fn http1_custom_handler_receives_partial_body_then_error() {
     impl httpd::Handler for Partial {
         fn call(
             &self,
-            request: http::Request<httpd::Body>,
+            request: fictionet::stdlib::web::Request,
             _: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             self.0.fetch_add(1, Ordering::Relaxed);
             let mut body = request.into_body();
             assert!(body.bytes().is_none());
@@ -934,7 +940,7 @@ fn world_host_names_match_http_sites_and_tls_names() {
         (" A.TEST ", " a.test "),
         ("É.TEST.", "É.test"),
     ] {
-        assert_eq!(httpd::normalize(name), expected);
+        assert_eq!(fictionet::stdlib::world::net::normalize(name), expected);
         assert_eq!(Sni::from(name), Sni::Name(expected.to_owned()));
         let vhosts = httpd::VirtualHosts::new();
         vhosts.insert(
@@ -946,21 +952,24 @@ fn world_host_names_match_http_sites_and_tls_names() {
                     .unwrap()
             })),
         );
-        assert!(vhosts.get(expected).is_some(), "{name:?}");
+        assert!(vhosts.get(expected.as_bytes()).is_some(), "{name:?}");
     }
 
     for authority in ["A.TeSt", "A.TEST.:80", "A.Test...:443"] {
-        let request = http::Request::builder()
-            .header("host", authority)
-            .body(())
-            .unwrap();
-        assert_eq!(httpd::request_host(&request).as_deref(), Some("a.test"));
-        let request = http::Request::builder()
-            .uri(format!("https://{authority}/"))
-            .header("host", "other.test")
-            .body(())
-            .unwrap();
-        assert_eq!(httpd::request_host(&request).as_deref(), Some("a.test"));
+        let head = fictionet::stdlib::web::Head::new(
+            "GET",
+            "/",
+            fictionet::stdlib::protocols::http1::Version::Http11,
+            [("host", authority)],
+        );
+        assert!(head.host().unwrap().eq_ignore_ascii_case(b"a.test"));
+        let head = fictionet::stdlib::web::Head::new(
+            "GET",
+            &format!("https://{authority}/"),
+            fictionet::stdlib::protocols::http1::Version::Http11,
+            [] as [(&str, &str); 0],
+        );
+        assert!(head.host().unwrap().eq_ignore_ascii_case(b"a.test"));
     }
 }
 
@@ -972,8 +981,12 @@ fn virtual_hosts_pick_a_site_by_host() {
         httpd::VHost::new(fictionet_test_support::handler(
             |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
              r: http::Request<bytes::Bytes>| {
-                let t = r.extensions().get::<httpd::Target>().cloned().unwrap();
-                http::Response::new(Bytes::from(format!("a {} {}", t.host, t.port)))
+                let t = r
+                    .extensions()
+                    .get::<fictionet::stdlib::web::Site>()
+                    .cloned()
+                    .unwrap();
+                http::Response::new(Bytes::from(format!("a {} {}", t.name, t.port)))
             },
         )),
     );

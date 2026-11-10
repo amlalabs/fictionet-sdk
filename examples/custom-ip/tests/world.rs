@@ -13,7 +13,7 @@ use http_body_util::{BodyExt, Full};
 
 struct Page;
 impl Handler for Page {
-    fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         Reply::Now(Response::new(Body::from("unchanged application")))
     }
 }
