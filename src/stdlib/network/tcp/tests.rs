@@ -249,11 +249,18 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
             smol_now(&fcx),
             segment(peer, local, 100, 0, 2).0,
         );
-        assert!(st.sockets.set.changed().all(|slot| {
-            st.sockets.ids[slot.index()] == Some(accepted)
-        }));
+        assert!(
+            st.sockets
+                .set
+                .changed()
+                .all(|slot| { st.sockets.ids[slot.index()] == Some(accepted) })
+        );
         assert_eq!(st.by_tuple[&(local, peer)], accepted);
-        assert!(idle[1..].iter().all(|&h| st.get(h).state() == TcpState::Listen));
+        assert!(
+            idle[1..]
+                .iter()
+                .all(|&h| st.get(h).state() == TcpState::Listen)
+        );
         Ok(())
     }))
     .unwrap();
@@ -322,9 +329,15 @@ fn a_declined_timer_recomputes_the_remaining_deadline() {
         let ep = endpoint(&fcx, side, local.ip());
         let _listener = ep.listen(local.port())?;
         let mut st = ep.shared.lock();
-        let (h, _) = established(&mut st, smol_now(&fcx), local, peer);
+        let (h, ack) = established(&mut st, smol_now(&fcx), local, peer);
         st.sock(h)
             .set_keep_alive(Some(smoltcp::time::Duration::from_secs(1)));
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            smol_now(&fcx),
+            data_segment(peer, local, 101, ack, 16, &[7]).0,
+        );
         let budget = Budget::unlimited();
         let mut observations = fictionet::stdlib::layer::Observations::new(0);
         let mut env = Env::new(fcx.now(), &fcx, &budget, &mut observations);
@@ -442,6 +455,242 @@ fn a_tcp_read_takes_the_room_left_in_its_budget() {
 #[test]
 fn a_tcp_read_resumes_on_the_budget_wake_without_input_or_time() {
     budget_read(true);
+}
+
+#[test]
+fn engine_storage_belongs_to_the_first_environment_until_drop() {
+    use fictionet::{SeededEntropy, stdlib::layer::Observations};
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let first = Budget::unlimited();
+    let second = Budget::unlimited();
+    let mut observed = Observations::new(0);
+    let mut tcp = TcpLayer::new(
+        "10.0.0.1".parse().unwrap(),
+        Options::default(),
+        &entropy,
+        Instant::ZERO,
+    );
+    assert_eq!(first.used(), 0);
+    tcp.advance(&mut Env::new(
+        Instant::ZERO,
+        &entropy,
+        &first,
+        &mut observed,
+    ))
+    .unwrap();
+    let paid = first.used();
+    assert!(paid >= 2 * UP_ROOM * size_of::<Up>() + Spare::PACKETS * MTU);
+    tcp.advance(&mut Env::new(
+        Instant::ZERO,
+        &entropy,
+        &second,
+        &mut observed,
+    ))
+    .unwrap();
+    assert_eq!(first.used(), paid);
+    assert_eq!(second.used(), 0);
+    for size in [2 * MTU, MTU + 1, MTU / 2, MTU] {
+        for _ in 0..2 * Spare::PACKETS {
+            tcp.dev.spare.keep(Vec::with_capacity(size));
+            let buffers = tcp.dev.spare.0.as_ref().unwrap();
+            assert!(buffers.len() <= Spare::PACKETS);
+            assert!(buffers.iter().all(|buffer| buffer.capacity() <= MTU));
+            let held: usize = buffers.iter().map(Vec::capacity).sum();
+            assert!(held <= Spare::PACKETS * MTU);
+            assert!(held + buffers.charged() <= first.used());
+        }
+    }
+    assert_eq!(first.used(), paid);
+    drop(tcp);
+    assert_eq!(first.used(), 0);
+}
+
+#[test]
+fn spare_packet_buffers_never_retain_more_than_the_mtu() {
+    let budget = Budget::unlimited();
+    let mut spare = Spare(Some(
+        budget
+            .charge(Spare::PACKETS * size_of::<Vec<u8>>())
+            .unwrap()
+            .into_vec(),
+    ));
+    spare.keep(Vec::with_capacity(MTU + 1));
+    assert!(spare.take(MTU).capacity() <= MTU);
+    spare.keep(Vec::with_capacity(3 * MTU / 4));
+    let packet = spare.take(MTU);
+    assert!(packet.capacity() <= MTU);
+    assert_eq!(packet.len(), MTU);
+}
+
+#[test]
+fn control_notices_stop_admission_until_the_event_queue_drains() {
+    use fictionet::{SeededEntropy, stdlib::layer::Observations};
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let budget = Budget::unlimited();
+    let mut observed = Observations::new(0);
+    let mut tcp = TcpLayer::new(
+        "10.0.0.1".parse().unwrap(),
+        Options::default(),
+        &entropy,
+        Instant::ZERO,
+    );
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observed);
+    let listen = || {
+        MuxCommand::control(MessageCommand::Send(TcpControl::Listen {
+            port: 80,
+            backlog: None,
+            answer: None,
+        }))
+    };
+    for _ in 0..UP_ROOM {
+        assert!(matches!(
+            tcp.on_command(&mut env, listen()),
+            Ok(Admit::Taken)
+        ));
+    }
+    let used = budget.used();
+    let command = match tcp.on_command(&mut env, listen()).unwrap() {
+        Admit::Blocked(command) => command,
+        _ => panic!("control notices must stop at the queue allowance"),
+    };
+    assert_eq!(budget.used(), used);
+    assert!(tcp.take_event().is_some());
+    assert!(matches!(
+        tcp.on_command(&mut env, command),
+        Ok(Admit::Taken)
+    ));
+}
+
+#[test]
+fn refused_engine_storage_keeps_the_first_budget_and_allocates_nothing() {
+    use fictionet::{SeededEntropy, stdlib::layer::Observations};
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let fixed =
+        TcpLayer::storage_bytes(STORAGE_FLOOR).unwrap() + Spare::PACKETS * size_of::<Vec<u8>>();
+    let first = Budget::new(fixed);
+    let second = Budget::unlimited();
+    let held = first.charge(1).unwrap();
+    let mut observed = Observations::new(0);
+    let mut tcp = TcpLayer::new(
+        "10.0.0.1".parse().unwrap(),
+        Options::default(),
+        &entropy,
+        Instant::ZERO,
+    );
+    let command = MuxCommand::control(MessageCommand::Send(TcpControl::Listen {
+        port: 80,
+        backlog: None,
+        answer: None,
+    }));
+    let command = match tcp
+        .on_command(
+            &mut Env::new(Instant::ZERO, &entropy, &first, &mut observed),
+            command,
+        )
+        .unwrap()
+    {
+        Admit::Blocked(command) => command,
+        _ => panic!("the entire initial reservation must fit"),
+    };
+    assert_eq!(first.used(), held.bytes());
+    assert_eq!(
+        tcp.up.capacity() + tcp.urgent.capacity() + tcp.dev.tx.capacity() + tcp.dev.out.capacity(),
+        0
+    );
+    assert!(tcp.listeners.is_empty());
+    tcp.advance(&mut Env::new(
+        Instant::ZERO,
+        &entropy,
+        &second,
+        &mut observed,
+    ))
+    .unwrap();
+    assert_eq!(second.used(), 0);
+    assert_eq!(first.used(), held.bytes());
+    drop(held);
+    assert!(matches!(
+        tcp.on_command(
+            &mut Env::new(Instant::ZERO, &entropy, &second, &mut observed),
+            command
+        ),
+        Ok(Admit::Taken)
+    ));
+    assert_eq!(first.used(), fixed);
+    assert_eq!(second.used(), 0);
+    drop(tcp);
+    assert_eq!(first.used(), 0);
+}
+
+#[test]
+fn routing_capacity_grows_on_its_original_budget_and_survives_removal() {
+    use fictionet::{SeededEntropy, stdlib::layer::Observations};
+    let entropy = SeededEntropy::new(Seed::from_u64(1));
+    let first = Budget::unlimited();
+    let second = Budget::unlimited();
+    let mut observed = Observations::new(0);
+    let mut tcp = TcpLayer::new(
+        "10.0.0.1".parse().unwrap(),
+        Options::default(),
+        &entropy,
+        Instant::ZERO,
+    );
+    tcp.advance(&mut Env::new(
+        Instant::ZERO,
+        &entropy,
+        &first,
+        &mut observed,
+    ))
+    .unwrap();
+    let places = tcp.storage_places;
+    assert!(places > 0);
+    let initial = first.used();
+    let mut env = Env::new(Instant::ZERO, &entropy, &second, &mut observed);
+    for port in 1..=places as u16 {
+        tcp.control(
+            &env,
+            TcpControl::Listen {
+                port,
+                backlog: None,
+                answer: None,
+            },
+        );
+    }
+    assert_eq!(tcp.listeners.len(), places);
+    assert_eq!(first.used(), initial);
+    let elsewhere = first.charge(first.limit() - first.used()).unwrap();
+    let next_port = places as u16 + 1;
+    tcp.control(
+        &env,
+        TcpControl::Listen {
+            port: next_port,
+            backlog: None,
+            answer: None,
+        },
+    );
+    assert_eq!(tcp.listeners.len(), places);
+    assert_eq!(first.used() - elsewhere.bytes(), initial);
+    drop(elsewhere);
+    tcp.control(
+        &env,
+        TcpControl::Listen {
+            port: next_port,
+            backlog: None,
+            answer: None,
+        },
+    );
+    assert_eq!(tcp.listeners.len(), places + 1);
+    assert!(first.used() > initial);
+    assert!(tcp.storage_places >= tcp.listeners.len());
+    let retained = first.used();
+    for port in 1..=next_port {
+        tcp.control(&env, TcpControl::Unlisten { port });
+    }
+    tcp.advance(&mut env).unwrap();
+    assert!(tcp.listeners.is_empty());
+    assert_eq!(first.used(), retained);
+    assert_eq!(second.used(), 0);
+    drop(tcp);
+    assert_eq!(first.used(), 0);
 }
 
 #[test]
@@ -3990,8 +4239,10 @@ mod layer {
     #[test]
     fn buffers_that_do_not_fit_the_budget_are_refused_before_a_socket() {
         let remote: SocketAddr = format!("{SERVER}:80").parse().unwrap();
-        // Two buffers of MIN_BUFFER do not fit.
-        let mut client = stack(CLIENT, 2, Budget::new(MIN_BUFFER));
+        let fixed =
+            TcpLayer::storage_bytes(STORAGE_FLOOR).unwrap() + Spare::PACKETS * size_of::<Vec<u8>>();
+        // Engine storage fits, but two socket buffers do not.
+        let mut client = stack(CLIENT, 2, Budget::new(fixed + MIN_BUFFER));
         control(
             &mut client,
             TcpControl::Connect {
@@ -4008,9 +4259,9 @@ mod layer {
             }))
         )));
         assert!(sent(&mut client).is_empty(), "no SYN goes out");
-        assert_eq!(client.budget().used(), 0);
+        assert_eq!(client.budget().used(), fixed);
 
-        let mut server = stack(SERVER, 1, Budget::new(MIN_BUFFER));
+        let mut server = stack(SERVER, 1, Budget::new(fixed + MIN_BUFFER));
         let mut client = stack(CLIENT, 2, Budget::unlimited());
         control(
             &mut server,
@@ -4034,7 +4285,7 @@ mod layer {
             true
         });
         assert_eq!(answered, 0, "a SYN whose buffers do not fit gets nothing");
-        assert_eq!(server.budget().used(), 0);
+        assert_eq!(server.budget().used(), fixed);
     }
 
     #[test]

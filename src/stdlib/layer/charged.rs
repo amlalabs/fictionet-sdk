@@ -45,6 +45,18 @@ impl Charge {
             most: places,
         }
     }
+
+    /// The whole vector places this charge pays for. Partial places are
+    /// released and the vector cannot grow beyond the reserved places.
+    pub fn into_vec<T>(mut self) -> ChargedVec<T> {
+        let places = self.bytes().checked_div(size_of::<T>()).unwrap_or(0);
+        self.shrink_to(places * size_of::<T>());
+        ChargedVec {
+            items: Vec::with_capacity(places),
+            charge: self,
+            most: places,
+        }
+    }
 }
 
 impl ChargedBytes {
@@ -1431,6 +1443,23 @@ mod tests {
         assert_eq!(budget.used(), deque.charged());
         drop(deque);
         assert_eq!(budget.used(), 0);
+        for paid in [
+            0,
+            size_of::<u64>() - 1,
+            3 * size_of::<u64>() + 1,
+            budget.limit(),
+        ] {
+            let mut vector = budget.charge(paid).unwrap().into_vec::<u64>();
+            assert_eq!(vector.places(), paid / size_of::<u64>());
+            assert_eq!(vector.charged(), vector.places() * size_of::<u64>());
+            for value in 0..vector.places() {
+                assert!(vector.push(value as u64).is_ok());
+            }
+            assert!(vector.push(0).is_err());
+            assert_eq!(budget.used(), vector.charged());
+            drop(vector);
+            assert_eq!(budget.used(), 0);
+        }
     }
 
     #[test]
