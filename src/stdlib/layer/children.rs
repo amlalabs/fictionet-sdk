@@ -11,7 +11,8 @@ use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
     Admit, Budget, Charge, ChargedDeque, Child, ChildId, Closing, CommandOf, Credited, Env,
-    EventOf, Layer, Mux, MuxCommand, MuxEvent, OwnedWork, Port, Refusals, Top, Waiter, WorkOwner,
+    EventOf, Layer, Mux, MuxCommand, MuxEvent, OwnedWork, Port, Refusals, Starved, Top, Waiter,
+    WorkOwner,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -112,7 +113,10 @@ type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 /// (rule 9): each child asks through a [view](Budget::view) of its budget,
 /// and when that refuses, a command waits in the child's outbox, and an
 /// event goes back to the mux, until the budget frees and the child is
-/// visited again.
+/// visited again. The one exception is a charge larger than the child's
+/// whole limit, which no release can meet: that child alone is closed and
+/// reported as failed ([`Closing::Failed`]), as the runner ends a stack
+/// that needs more than its limit.
 ///
 /// The mux never waits for a child's reading. Credit bounds a child's
 /// bytes, but not how many events it holds: many small pieces, completions
@@ -403,12 +407,18 @@ impl<B: Layer> Kid<B> {
     /// again once its budget has room for it (rule 9). The child asks
     /// through a view of its own, which the runner above does not read,
     /// so the router waits on it for the child, with the waiter made from
-    /// `around`, what the child runs in.
-    fn wait_for_memory(&self, since: Refusals, around: Wakes<'_>) {
-        if self.budget.refused_since(since) {
+    /// `around`, what the child runs in. A charge that needed more than the
+    /// whole limit is met by no release: the child is starved, nothing
+    /// waits, and the caller closes it as failed, as the runner ends a
+    /// stack that needs more than its limit.
+    #[must_use]
+    fn wait_for_memory(&self, since: Refusals, around: Wakes<'_>) -> Option<Starved> {
+        let starved = self.budget.starved_since(since);
+        if starved.is_none() && self.budget.refused_since(since) {
             let waiter = self.waiter.waiter(|| around.waker());
             self.budget.wake_when_freed(waiter, since);
         }
+        starved
     }
 }
 
@@ -894,7 +904,12 @@ where
         let Some((moved, waiting)) = self.visit_kid(env, key) else {
             return true;
         };
-        self.places.kids[key].wait_for_memory(since, env.wakes());
+        let kid = &self.places.kids[key];
+        let id = kid.id;
+        if kid.wait_for_memory(since, env.wakes()).is_some() {
+            self.refuse(env, id, Closing::Failed);
+            return true;
+        }
         self.called(key, moved || waiting, false);
         moved
     }
@@ -1175,11 +1190,16 @@ where
                         // inbox has room for it, so only memory refuses:
                         // the event goes back to the mux and waits, the
                         // child with it, until its budget frees (rule 9).
+                        // An event the child could never pay for closes
+                        // the child, and goes with it.
                         let since = kid.budget.refusals();
                         if !kid.inbox.reserve(1) || !event.reserve_receive(&kid.budget, &kid.window)
                         {
-                            kid.wait_for_memory(since, env.wakes());
-                            return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
+                            if kid.wait_for_memory(since, env.wakes()).is_none() {
+                                return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
+                            }
+                            self.refuse(env, id, Closing::Failed);
+                            return Ok(Admit::Taken);
                         }
                         kid.granted -= cost;
                         // Credit the payload does not hold goes back when
@@ -1255,8 +1275,14 @@ where
         // due at the same time, so theirs fire first.
         match result {
             Ok(fired) => {
-                self.places.kids[key].wait_for_memory(since, env.wakes());
-                self.called(key, true, true);
+                if self.places.kids[key]
+                    .wait_for_memory(since, env.wakes())
+                    .is_some()
+                {
+                    self.refuse(env, id, Closing::Failed);
+                } else {
+                    self.called(key, true, true);
+                }
                 Ok(fired)
             }
             Err(e) => {
@@ -1287,8 +1313,14 @@ where
         });
         match result {
             Ok(()) => {
-                self.places.kids[key].wait_for_memory(since, env.wakes());
-                self.called(key, true, false);
+                if self.places.kids[key]
+                    .wait_for_memory(since, env.wakes())
+                    .is_some()
+                {
+                    self.refuse(env, id, Closing::Failed);
+                } else {
+                    self.called(key, true, false);
+                }
             }
             Err(e) => self.fail(env, id, e),
         }
@@ -1617,6 +1649,156 @@ mod tests {
         let _ = driver.deliver(MuxEvent::Child(ids[1], payload())).unwrap();
         driver.run().unwrap();
         assert_eq!(driver.layer().child(ids[1]).unwrap().0, 2);
+    }
+
+    /// Children closed or refused, each with its cause.
+    type Causes = Vec<(ChildId, Closing)>;
+
+    /// The closes a stack of children sent down, and the refusals it
+    /// reported.
+    fn closes_and_refusals(driver: &mut Driver<Children<Observe, Top, ()>>) -> (Causes, Causes) {
+        let closed = std::iter::from_fn(|| driver.take_command())
+            .filter_map(|command| match command.into_op() {
+                super::super::MuxOp::Close(id, why) => Some((id, why)),
+                _ => None,
+            })
+            .collect();
+        let refused = driver
+            .observations()
+            .drain()
+            .filter_map(|report| match report {
+                ChildReport::Refused(id, why) => Some((id, why)),
+                _ => None,
+            })
+            .collect();
+        (closed, refused)
+    }
+
+    /// An event larger than its child's whole limit can never be paid for:
+    /// no release meets it, so waiting would hold up the mux for good. That
+    /// child alone is closed as failed and the event goes with it; its
+    /// sibling and the connection go on.
+    #[test]
+    fn an_event_past_its_childs_limit_closes_that_child_alone() {
+        let budget = Budget::new(4096);
+        let child_budget = budget.clone();
+        // Credit for the event, so only memory stands in its way.
+        let window = 4 * budget.limit() as u64;
+        let children =
+            Children::<Observe, Top, ()>::new(2, window, |_, (), _| Some(Observe::default()))
+                .budgets(move |_, _, _| child_budget.clone());
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(94))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(2);
+        let ids: Vec<_> = (0..2)
+            .map(|_| {
+                let child = slots.insert(()).unwrap();
+                let id = child.id();
+                let _ = driver.deliver(MuxEvent::Opened(child, (), 0)).unwrap();
+                id
+            })
+            .collect();
+        driver.run().unwrap();
+        let _ = closes_and_refusals(&mut driver);
+        let mark = driver.refusals();
+        let past = ObservedEvent::Data {
+            direction: Direction::Forward,
+            bytes: Chunk::unpaid(vec![1; 2 * budget.limit()]),
+            sequence: 0,
+            source: None,
+        };
+        assert!(
+            matches!(
+                driver.deliver(MuxEvent::Child(ids[0], past)),
+                Ok(Admit::Taken)
+            ),
+            "the mux is not held up"
+        );
+        driver.run().unwrap();
+        assert!(
+            driver.layer().child(ids[0]).is_none(),
+            "the child is closed"
+        );
+        let (closed, refused) = closes_and_refusals(&mut driver);
+        assert_eq!(closed, [(ids[0], Closing::Failed)]);
+        assert_eq!(refused, [(ids[0], Closing::Failed)]);
+        assert_eq!(
+            driver.budget().starved_since(mark),
+            None,
+            "the connection is not starved"
+        );
+        let _ = driver
+            .deliver(MuxEvent::Child(ids[1], observed_byte()))
+            .unwrap();
+        driver.run().unwrap();
+        assert_eq!(driver.layer().child(ids[1]).unwrap().0, 1);
+    }
+
+    /// A command larger than its child's whole limit can never be paid for,
+    /// so it does not wait in the outbox for good: that child alone is
+    /// closed as failed, nothing of the command goes down, and its sibling
+    /// and the connection go on.
+    #[test]
+    fn a_command_past_its_childs_limit_closes_that_child_alone() {
+        let budget = Budget::new(4096);
+        let child_budget = budget.clone();
+        let limit = budget.limit();
+        let mut driver = Driver::new(
+            Children::<Reader, Top, ()>::new(2, 8, move |_, (), _| {
+                Some(Reader {
+                    writes: [StreamCommand::Write(Chunk::unpaid(vec![7; 2 * limit]))].into(),
+                    ..Reader::default()
+                })
+            })
+            .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(95))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mark = driver.refusals();
+        let mut slots = Slots::new(2);
+        let first = slots.insert(()).unwrap();
+        let id = first.id();
+        let _ = driver.deliver(MuxEvent::Opened(first, (), 64)).unwrap();
+        let _ = driver.deliver(MuxEvent::Credit(id, 64)).unwrap();
+        driver.run().unwrap();
+        assert!(driver.layer().child(id).is_none(), "the child is closed");
+        let mut closed = Vec::new();
+        while let Some(command) = driver.take_command() {
+            match command.into_op() {
+                super::super::MuxOp::Child(_, StreamCommand::Write(_)) => {
+                    panic!("nothing unpaid goes down")
+                }
+                super::super::MuxOp::Close(gone, why) => closed.push((gone, why)),
+                _ => {}
+            }
+        }
+        assert_eq!(closed, [(id, Closing::Failed)]);
+        let refused: Vec<_> = driver
+            .observations()
+            .drain()
+            .filter_map(|report| match report {
+                ChildReport::Refused(id, why) => Some((id, why)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, [(id, Closing::Failed)]);
+        assert_eq!(
+            driver.budget().starved_since(mark),
+            None,
+            "the connection is not starved"
+        );
+        let second = slots.insert(()).unwrap();
+        let sibling = second.id();
+        assert!(matches!(
+            driver.deliver(MuxEvent::Opened(second, (), 64)),
+            Ok(Admit::Taken)
+        ));
+        assert!(driver.layer().child(sibling).is_some(), "a sibling opens");
     }
 
     #[test]

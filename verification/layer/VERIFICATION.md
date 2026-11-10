@@ -789,7 +789,10 @@ model does not see:
   outbox, and an event whose inbox place or payload it refuses goes back
   to the mux, each until the budget frees; routing storage the stack's
   budget refuses hands the event or command back. None closes a child or
-  ends the connection.
+  ends the connection. The exception is a charge larger than the child's
+  whole limit, which no release meets: that child alone is closed as
+  failed (`a_command_past_its_childs_limit_closes_that_child_alone`,
+  `an_event_past_its_childs_limit_closes_that_child_alone`).
 - The release handshake. `ChildWake::release` adds to a counter and wakes
   the child only outside a call (`:285-290`); `take_released` collects it
   at the end of a visit (`:813`). The model's `Release` moves the credit
