@@ -3,6 +3,7 @@
 
 mod common;
 
+mod allocations;
 mod asn1_codec;
 mod bodies_codec;
 mod budget_oracle;
