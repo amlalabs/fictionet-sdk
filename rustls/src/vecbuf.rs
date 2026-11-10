@@ -11,10 +11,10 @@ use crate::budget::{Paid, PaidBytes};
 use crate::msgs::message::OutboundChunks;
 
 /// What one place in the queue of chunks takes.
-const PLACE: usize = size_of::<Vec<u8>>();
+pub(crate) const PLACE: usize = size_of::<Vec<u8>>();
 
 /// The places a queue takes when it first needs any.
-const FIRST_PLACES: usize = 4;
+pub(crate) const FIRST_PLACES: usize = 4;
 
 /// This is a byte buffer that is built from a deque of byte vectors.
 ///
@@ -164,12 +164,36 @@ impl ChunkVecBuffer {
         }
         if chunk.is_empty() {
             self.paid.shrink_by(capacity);
+            self.release_idle_places();
             return true;
         }
         if self.chunks.is_empty() {
             debug_assert_eq!(self.prefix_used, 0);
         }
         self.chunks.push_back(chunk);
+        true
+    }
+
+    /// Appends `chunk`, which comes with the charge that pays for its
+    /// allocation, without copying it: a record decrypted where it was
+    /// read. Its place is paid for first, from the reserve if there is one.
+    /// `false`, with the chunk dropped and its charge given back, if the
+    /// place does not fit or the charge is not on this queue's budget.
+    #[must_use = "a refused chunk was never queued"]
+    pub(crate) fn push_charged(&mut self, chunk: PaidBytes) -> bool {
+        let (bytes, charge) = chunk.into_parts();
+        if bytes.is_empty() {
+            return true;
+        }
+        if !self.pay(0, 1) {
+            return false;
+        }
+        self.promised_chunks -= 1;
+        if !self.paid.absorb(charge) {
+            self.release_idle_places();
+            return false;
+        }
+        self.chunks.push_back(bytes);
         true
     }
 
@@ -200,6 +224,21 @@ impl ChunkVecBuffer {
     /// Gives back the room reserved and not used.
     pub(crate) fn release_reserve(&mut self) {
         self.paid.shrink_by(mem::take(&mut self.reserve));
+        self.release_idle_places();
+    }
+
+    /// Gives the places back once nothing is queued, promised or reserved,
+    /// so that an idle queue holds no allocation at all.
+    fn release_idle_places(&mut self) {
+        if self.chunks.is_empty()
+            && self.promised_chunks == 0
+            && self.reserve == 0
+            && self.chunks.capacity() != 0
+        {
+            let places = self.chunks.capacity();
+            self.chunks = VecDeque::new();
+            self.paid.shrink_by(places * PLACE);
+        }
     }
 
     /// Take one of the chunks from this object. Its bytes are given back.
@@ -214,6 +253,7 @@ impl ChunkVecBuffer {
             first.drain(0..prefix);
             self.paid.shrink_by(first.capacity());
         }
+        self.release_idle_places();
 
         first
     }
@@ -225,6 +265,7 @@ impl ChunkVecBuffer {
         let prefix = mem::take(&mut self.prefix_used);
         first.drain(0..prefix);
         let charge = self.paid.split(first.capacity());
+        self.release_idle_places();
         Some(PaidBytes::new(first, charge))
     }
 
@@ -292,6 +333,7 @@ impl ChunkVecBuffer {
                 self.paid.shrink_by(capacity);
             }
         }
+        self.release_idle_places();
 
         debug_assert_eq!(
             self.prefix_used, 0,
@@ -394,9 +436,9 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::ChunkVecBuffer;
+    use super::{ChunkVecBuffer, PLACE};
     use crate::budget::testing::Limit;
-    use crate::budget::{Account, Paid};
+    use crate::budget::{Account, BufferBudget, Paid, PaidBytes};
 
     #[test]
     fn short_append_copy_with_limit() {
@@ -506,7 +548,7 @@ mod tests {
         for step in 0..4000usize {
             let used = limit.used();
             let len = cvb.len();
-            match next(5) {
+            match next(6) {
                 0 | 1 => {
                     let n = 1 + next(120);
                     let byte = step as u8;
@@ -536,13 +578,34 @@ mod tests {
                     model.drain(..n);
                     assert!(limit.used() <= used);
                 }
+                4 => {
+                    // A chunk made elsewhere, paid for by a charge of its
+                    // own on the same budget, joins without a copy.
+                    let n = 1 + next(120);
+                    let byte = step as u8;
+                    let mut charge = limit.open();
+                    let place = cvb.room_for(0, 1).saturating_sub(cvb.reserve);
+                    if !charge.grow_to(n) {
+                        assert!(used + n > 600);
+                    } else if cvb.push_charged(PaidBytes::new(vec![byte; n], Some(charge))) {
+                        model.extend(core::iter::repeat(byte).take(n));
+                        assert_eq!(limit.used(), used + n + place);
+                    } else {
+                        assert_eq!((limit.used(), cvb.len()), (used, len));
+                        assert!(used + n + place > 600);
+                    }
+                }
                 _ => {
+                    let places = cvb.chunks.capacity() * PLACE;
                     if let Some(paid) = cvb.pop_paid() {
                         let (bytes, charge) = paid.into_parts();
                         assert_eq!(&bytes[..], &model[..bytes.len()]);
                         model.drain(..bytes.len());
                         assert_eq!(charge.as_ref().unwrap().bytes(), bytes.capacity());
-                        assert_eq!(limit.used(), used);
+                        // The chunk's charge leaves with it; only places the
+                        // queue gave back leave the budget.
+                        let freed = places - cvb.chunks.capacity() * PLACE;
+                        assert_eq!(limit.used(), used - freed);
                         taken.push((bytes, charge));
                         if taken.len() > 3 {
                             taken.remove(0);
@@ -552,6 +615,9 @@ mod tests {
                 }
             }
             assert!(cvb.accounted(), "step {step}");
+            if cvb.is_empty() && cvb.reserve == 0 {
+                assert_eq!(cvb.held(), 0, "step {step}: an idle queue holds nothing");
+            }
             assert_eq!(cvb.len(), model.len());
             assert!(limit.used() <= 600);
         }
@@ -583,7 +649,7 @@ mod tests {
 mod benchmarks {
     use alloc::vec;
 
-    use super::ChunkVecBuffer;
+    use super::{ChunkVecBuffer, PLACE};
 
     #[bench]
     fn read_one_byte_from_large_message(b: &mut test::Bencher) {
