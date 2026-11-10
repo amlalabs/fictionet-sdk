@@ -924,3 +924,61 @@ base, 553f72347, and `comp/lo-runners` and `comp/lo-http2` none. Those
 single runs did not separate the instructions: each branch alone was
 within 1.1 percent of its base. HTTP/1 and TCP are unchanged in
 allocations, and TCP in instructions and packets.
+
+## Separate HTTP server and client measurements, November 10, 2026
+
+The baseline is the budget leftovers merge at `3db7a847e`. No SDK code
+changes in this measurement pass. The HTTP fixture now builds the client
+machines, TCP endpoints, TLS clients and Hyper clients inside a separate
+`run` on a separate thread. The server world stays on the calling thread.
+The two runs communicate through the existing attachment cables.
+
+Both sides finish DNS lookup, connection setup and 200 warmup requests
+per connection before measurement starts. Checkpoints hold the client
+until the server measurement begins, and keep both sides alive until
+measurement ends. Cleanup and thread joining happen afterward. Every
+measured response checks its status, HTTP version and body length. Fixed
+seeds reproduce the generated traffic; host scheduling still varies.
+
+`tests/it/allocations.rs` measures both threads separately with the test
+allocator: one kept TLS connection, one site, a 1024-byte response, and
+2000 measured sequential requests. Counts include allocation and
+reallocation requests. Run only these tests with
+`cargo test -p fictionet --test it allocations:: -- --nocapture`.
+Across three runs in the test profile:
+
+| Protocol | Server allocations | Client allocations | Server per request | Client per request | Server ceiling |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HTTP/1 | 76,002–76,003 | 41,418–41,423 | 38.001–38.002 | 20.709–20.712 | 39 |
+| HTTP/2 | 126,007–126,010 | 59,456–59,462 | 63.004–63.005 | 29.728–29.731 | 64 |
+
+The tests assert `allocations <= requests * ceiling`. The ceilings round
+today's complete measured totals upward to whole allocations per request;
+there is no additional fixed allowance. This includes checkpoint overhead
+and still rejects one new allocation on every request. Later buffer stages
+can lower these ceilings. The current cable uses a retained queue, not the
+proposed channel with list-block allocations; its future list-block
+allowance must be measured when that implementation lands.
+
+As a negative check, restoring the original same-thread fixture, with the
+same 200-request warmup and the interface needed to invoke it, failed both
+unchanged ceiling assertions: 117,421 allocations for HTTP/1 and 185,492
+for HTTP/2. Restoring the separate client thread passed both tests. The
+client callback also asserts that it executes on a different thread from
+the server test.
+
+The existing HTTP Divan cases still use ten connections and 100,000
+measured requests. Divan profiles the calling thread only, so its numbers
+now describe the server; the integration test supplies the client split.
+`cargo bench --profile test -p fictionet --bench runtime -- http` ran three
+samples per protocol. The median-time samples reported:
+
+| Protocol | Server alloc | Server grow | Server shrink | Sum per request | Time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HTTP/1 | 3,700,114 | 110,028 | 9,986 | 38.201 | 2.430 s |
+| HTTP/2 | 6,200,337 | 110,186 | 10,073 | 63.206 | 3.839 s |
+
+Sum `alloc`, `grow` and `shrink` to compare with the test allocator, which
+counts every reallocation. These are test-profile measurements with real
+cross-thread wakeups, not the earlier single-thread release-profile
+timings or instruction counts. Setup, warmup and teardown are excluded.
