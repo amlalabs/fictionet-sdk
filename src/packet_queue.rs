@@ -2,14 +2,17 @@ use std::collections::VecDeque;
 
 use crate::{Budget, Charge, PACKET_COST, Packet};
 
-/// A packet FIFO whose packets are charged to a [`Budget`]: each one the
-/// memory it keeps alive (its backing's capacity) plus [`PACKET_COST`] for
-/// its place, held from when it is queued until it is taken out. A packet
-/// the budget has no room for is refused whole; what to do with it is the
-/// caller's.
+/// A packet FIFO. Each packet costs the memory it keeps alive (its
+/// backing's capacity) plus [`PACKET_COST`] for its place. A queue with a
+/// limit charges that cost to a [`Budget`] from when the packet is queued
+/// until it is taken out, and refuses whole a packet the budget has no room
+/// for; what to do with it is the caller's. A queue with no limit charges
+/// nothing.
+#[derive(Default)]
 pub struct PacketQueue {
-    packets: VecDeque<(Packet, Charge)>,
-    budget: Budget,
+    /// Each packet, with its charge when the queue has a budget.
+    packets: VecDeque<(Packet, Option<Charge>)>,
+    budget: Option<Budget>,
 }
 
 /// What a queued packet costs: the memory it keeps alive plus its place in
@@ -19,18 +22,14 @@ fn cost(packet: &Packet) -> Option<usize> {
     packet.chunk().capacity().checked_add(PACKET_COST)
 }
 
-impl Default for PacketQueue {
-    /// A queue with no limit.
-    fn default() -> Self {
-        PacketQueue::new(None)
-    }
-}
-
 impl PacketQueue {
     /// A queue whose packets hold at most `limit` bytes, counted as above,
     /// or with no limit.
     pub fn new(limit: Option<usize>) -> Self {
-        PacketQueue::on(&Budget::new(limit.unwrap_or(usize::MAX)))
+        PacketQueue {
+            packets: VecDeque::new(),
+            budget: limit.map(Budget::new),
+        }
     }
 
     /// A queue whose packets count against `budget`, beside whatever else
@@ -38,16 +37,23 @@ impl PacketQueue {
     pub fn on(budget: &Budget) -> Self {
         PacketQueue {
             packets: VecDeque::new(),
-            budget: budget.clone(),
+            budget: Some(budget.clone()),
         }
     }
 
-    /// Queues `packet`, charging the budget first. Returns the queued
-    /// packet, or the packet itself, with nothing charged, if the budget
-    /// has no room.
+    /// Queues `packet`, charging the budget first if there is one. Returns
+    /// the queued packet, or the packet itself, with nothing charged, if
+    /// the budget has no room.
     pub fn try_push(&mut self, packet: Packet) -> Result<&Packet, Packet> {
-        let Some(charge) = cost(&packet).and_then(|cost| self.budget.charge(cost)) else {
+        let Some(cost) = cost(&packet) else {
             return Err(packet);
+        };
+        let charge = match &self.budget {
+            Some(budget) => match budget.charge(cost) {
+                Some(charge) => Some(charge),
+                None => return Err(packet),
+            },
+            None => None,
         };
         self.packets.push_back((packet, charge));
         Ok(&self.packets.back().expect("just queued").0)
@@ -61,15 +67,21 @@ impl PacketQueue {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl PacketQueue {
-    /// Whether the budget has room for `packet` now.
+    /// Whether the queue has room for `packet` now.
     pub fn fits(&self, packet: &Packet) -> bool {
-        let room = self.budget.limit().saturating_sub(self.budget.used());
+        let room = self.budget.as_ref().map_or(usize::MAX, |budget| {
+            budget.limit().saturating_sub(budget.used())
+        });
         cost(packet).is_some_and(|cost| cost <= room)
     }
 
-    /// What the queued packets are charged, including [`PACKET_COST`].
+    /// What the queued packets cost, including [`PACKET_COST`], whether or
+    /// not the queue charges it.
     pub fn bytes(&self) -> usize {
-        self.packets.iter().map(|(_, charge)| charge.bytes()).sum()
+        self.packets
+            .iter()
+            .map(|(packet, _)| cost(packet).expect("a queued packet has a cost"))
+            .sum()
     }
 
     /// Borrows the oldest packet without giving back its charge.

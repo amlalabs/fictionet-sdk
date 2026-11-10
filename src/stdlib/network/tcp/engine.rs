@@ -198,6 +198,8 @@ pub(super) struct Dev {
     pool: Option<Pool>,
     /// The packet smoltcp is reading, until it is done.
     read: Option<Chunk>,
+    /// Packets went out since the reserve was last charged back up.
+    short: bool,
 }
 
 /// The bytes of one of the engine's packet blocks: room for a header in
@@ -2652,6 +2654,7 @@ impl TcpLayer {
         for p in &mut sent {
             self.sent(p);
         }
+        self.dev.short |= !sent.is_empty();
         self.dev.out.extend(sent.drain(..));
         self.dev.tx = sent;
     }
@@ -2946,11 +2949,15 @@ impl Layer for TcpLayer {
         // A block leaves with its payment, so the reserve that paid for it
         // is charged back up first, to the budget that pays for the storage;
         // without room the packet waits here and the runner waits for memory.
-        if !self.dev.out.is_empty()
-            && let (Some(pool), Some(storage)) = (&self.dev.pool, &self.storage)
-            && !pool.refill(storage.budget())
-        {
-            return None;
+        // One top-up covers every block the engine holds then, so it is
+        // done once for each batch smoltcp wrote.
+        if self.dev.short && !self.dev.out.is_empty() {
+            if let (Some(pool), Some(storage)) = (&self.dev.pool, &self.storage)
+                && !pool.refill(storage.budget())
+            {
+                return None;
+            }
+            self.dev.short = false;
         }
         match self.dev.out.pop_front() {
             Some(packet) => {
