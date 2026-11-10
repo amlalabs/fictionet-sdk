@@ -1212,6 +1212,9 @@ impl State<ServerConnectionData> for ExpectEarlyData {
                 parsed: HandshakeMessagePayload(HandshakePayload::EndOfEarlyData),
                 ..
             } => {
+                // The read key changes after it: it must end its record
+                // (RFC 8446 section 5.1).
+                cx.common.check_aligned_handshake()?;
                 self.key_schedule.update_decrypter(cx.common);
                 self.transcript.add_message(&m);
                 Ok(Box::new(ExpectFinished {

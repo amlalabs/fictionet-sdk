@@ -5,6 +5,7 @@
 //! | --- | --- |
 //! | `tls-verify lean` | builds the Lean proofs in `verification/tls-rfc/lean` (record checks before decryption, nonce uniqueness and the order of records on the wire), fails on a proof left as `sorry`, and checks that each headline theorem rests only on Lean's standard axioms |
 //! | `tls-verify vectors [seed]` | writes the Lean model's vectors (`lake exe gen`) and replays them against the real rustls: `record_vectors` (`rustls/src/budget/tests/record_vectors.rs`) and `nonce_vectors` (`rustls/src/common_state/nonce_vectors.rs`); the seed defaults to 1 |
+//! | `tls-verify handshake-trace` | logs real handshakes of the vendored server (`rustls/src/server/hs_trace.rs`) and checks each log against `verification/tls-rfc/tla/Handshake.tla` with `HandshakeTrace.tla` (`tls_verify_handshake.rs`) |
 //!
 //! Everything is written under a fresh run directory in `tls-verify/` in
 //! Cargo's target directory (`CARGO_TARGET_DIR`, or `target/`). `LAKE`
@@ -22,7 +23,8 @@ pub fn run(args: &[String]) -> Result {
         ["lean"] => lean(&Paths::new()?),
         ["vectors"] => vectors(&Paths::new()?, 1),
         ["vectors", seed] => vectors(&Paths::new()?, seed.parse()?),
-        _ => Err("expected tls-verify lean or tls-verify vectors [seed]".into()),
+        ["handshake-trace"] => crate::tls_verify_handshake::trace(),
+        _ => Err("expected tls-verify lean, vectors [seed] or handshake-trace".into()),
     }
 }
 
