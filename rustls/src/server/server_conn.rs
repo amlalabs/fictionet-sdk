@@ -25,6 +25,7 @@ use crate::error::{Error, PeerMisbehaved};
 use crate::kernel::KernelConnection;
 use crate::log::trace;
 use crate::msgs::base::Payload;
+use crate::msgs::fragmenter::{MAX_FRAGMENT_LEN, PACKET_OVERHEAD};
 use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtensionsInput};
 use crate::msgs::message::Message;
 use crate::suites::ExtractedSecrets;
@@ -112,6 +113,12 @@ pub trait ProducesTickets: Debug + Send + Sync {
     /// panic-proof, and otherwise bullet-proof.  If the decryption
     /// fails, return None.
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>>;
+
+    /// The most bytes a ticket [`Self::encrypt`] returns takes, or `None`
+    /// if there is no such bound (see [`ServerConfig::most_connection`]).
+    fn most_ticket(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// How to choose a certificate chain and signing key for use
@@ -129,6 +136,16 @@ pub trait ResolvesServerCert: Debug + Send + Sync {
     ///
     /// Return `None` to abort the handshake.
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>>;
+
+    /// The most bytes any chain [`Self::resolve`] returns takes in the
+    /// server's flight, with its OCSP response, as
+    /// [`sign::CertifiedKey::flight_bytes`] counts them; `None` if there
+    /// is no such bound. With a bound, a connection charges room for its
+    /// whole flight before it answers any hello, and output never outgrows
+    /// it ([`ServerConfig::most_connection`]).
+    fn most_chain(&self) -> Option<usize> {
+        None
+    }
 
     /// Return true when the server only supports raw public keys.
     fn only_raw_public_keys(&self) -> bool {
@@ -591,6 +608,65 @@ impl ServerConfig {
         self.time_provider
             .current_time()
             .ok_or(Error::FailedToGetCurrentTime)
+    }
+
+    /// The most bytes of output one handshake message a connection with
+    /// this config receives can make: its share of the server's flight with
+    /// the largest chain [`ResolvesServerCert::most_chain`] allows, the CA
+    /// names of a certificate request, and its tickets, cut into records.
+    /// A connection charges this room to its budget before each handshake
+    /// message it processes, waiting until the budget has it, so its
+    /// handshake output never needs more and never fails for memory.
+    ///
+    /// `None` if the certificate resolver, or an enabled ticketer
+    /// ([`ProducesTickets::most_ticket`]), does not bound what it returns.
+    /// A connection then charges room for the chain it is given once it is
+    /// chosen, and fails with [`Error::BudgetExhausted`] if its output
+    /// outgrows that room and the budget refuses the rest.
+    pub fn most_connection(&self) -> Option<usize> {
+        self.handshake_room().map(|(bytes, _)| bytes)
+    }
+
+    /// [`Self::most_connection`], with the records it is cut into.
+    pub(crate) fn handshake_room(&self) -> Option<(usize, usize)> {
+        /// A TLS 1.3 NewSessionTicket around its ticket: the message header,
+        /// lifetime, age_add, a 32-byte nonce and its length, the ticket's
+        /// length, and the extensions with early_data. TLS 1.2's is smaller.
+        const NEW_SESSION_TICKET: usize = 4 + 4 + 4 + 1 + 32 + 2 + 2 + 8;
+        /// A ticket that names a session in `session_storage`.
+        const SESSION_ID: usize = 32;
+        /// The certificate_authorities extension's header and its list's
+        /// length; TLS 1.2's list has only the length.
+        const CA_LIST: usize = 4 + 2;
+
+        let chain = self.cert_resolver.most_chain()?;
+        let names = match self.verifier.offer_client_auth() {
+            true => {
+                CA_LIST
+                    + self
+                        .verifier
+                        .root_hint_subjects()
+                        .iter()
+                        .map(|name| 2 + name.as_ref().len())
+                        .sum::<usize>()
+            }
+            false => 0,
+        };
+        let ticket = match self.ticketer.enabled() {
+            true => self.ticketer.most_ticket()?,
+            false => SESSION_ID,
+        };
+        // TLS 1.2 sends one ticket; TLS 1.3 as many as the config or the
+        // client asks for, up to the config's most.
+        let tickets = self.send_tls13_tickets.max(self.max_tls13_tickets).max(1)
+            * (NEW_SESSION_TICKET + ticket);
+        let fragment = self.max_fragment_size.map_or(MAX_FRAGMENT_LEN, |size| {
+            size.saturating_sub(PACKET_OVERHEAD).max(1)
+        });
+        Some(crate::budget::handshake_room(
+            chain + names + tickets,
+            fragment,
+        ))
     }
 }
 
@@ -1149,6 +1225,7 @@ impl Accepted {
         }
 
         self.connection.enable_secret_extraction = config.enable_secret_extraction;
+        self.connection.bound_handshake(config.handshake_room());
 
         let state = hs::ExpectClientHello::new(config, ServerExtensionsInput::default());
         let mut cx = hs::ServerContext::from(&mut self.connection);
@@ -1341,6 +1418,7 @@ impl ConnectionCore<ServerConnectionData> {
         common.set_max_fragment_size(config.max_fragment_size)?;
         common.enable_secret_extraction = config.enable_secret_extraction;
         common.fips = config.fips();
+        common.bound_handshake(config.handshake_room());
         Ok(Self::new(
             Box::new(hs::ExpectClientHello::new(config, extra_exts)),
             ServerConnectionData::default(),

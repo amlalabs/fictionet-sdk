@@ -33,9 +33,12 @@
 //! key update, an alert) cannot be refused halfway through, since the
 //! handshake state has moved on by then. So before each message the
 //! connection charges room for the most that message can make, and the output
-//! is paid from that room. Output that outgrows its room is charged directly;
-//! if that is refused too, the output is dropped and the connection fails
-//! with [`Error::BudgetExhausted`] rather than hold bytes nothing pays for.
+//! is paid from that room. A server whose config bounds what its flight,
+//! CA names and tickets take ([`ServerConfig::most_connection`]) charges
+//! room for all of it, so its output never outgrows the room. Without that
+//! bound, output that outgrows its room is charged directly; if that is
+//! refused too, the output is dropped and the connection fails with
+//! [`Error::BudgetExhausted`] rather than hold bytes nothing pays for.
 //!
 //! [`ConnectionCommon::read_tls`]: crate::ConnectionCommon::read_tls
 //! [`ConnectionCommon::process_new_packets`]: crate::ConnectionCommon::process_new_packets
@@ -46,6 +49,7 @@
 //! [`Accepted::into_unbuffered`]: crate::server::Accepted::into_unbuffered
 //! [`Accepted`]: crate::server::Accepted
 //! [`Error::BudgetExhausted`]: crate::Error::BudgetExhausted
+//! [`ServerConfig::most_connection`]: crate::ServerConfig::most_connection
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -250,18 +254,47 @@ impl fmt::Debug for Paid {
 }
 
 /// The room charged before a handshake message is processed, for the output
-/// it makes: one full record, enough for every handshake flight except a
-/// certificate chain larger than that, whose own size is added once it is
-/// known.
+/// it makes: one full record, enough for every handshake message whose size
+/// the config does not set. What the config sets (a certificate chain, the
+/// CA names of a certificate request, tickets) is added by
+/// [`handshake_room`].
 pub(crate) const HANDSHAKE_ROOM: usize = crate::msgs::message::MAX_WIRE_SIZE;
 
-/// How many records a handshake message's output is counted as, for the
-/// places of the queue they wait in. A server's largest flight in TLS 1.3 is
-/// ServerHello, ChangeCipherSpec, EncryptedExtensions, CertificateRequest,
-/// Certificate, CertificateVerify and Finished; tickets follow the client's
-/// Finished. Records a long certificate chain takes beyond one are added once
-/// its size is known.
+/// How many messages one received handshake message's output is made of,
+/// each of which may end in a record of its own. A server's largest flight
+/// in TLS 1.3 is ServerHello, ChangeCipherSpec, EncryptedExtensions,
+/// CertificateRequest, Certificate, CertificateVerify and Finished; tickets
+/// follow the client's Finished, in one flight.
 pub(crate) const HANDSHAKE_RECORDS: usize = 8;
+
+/// The most a record adds to its payload: the 5-byte header and the most a
+/// cipher adds (TLS 1.2 GCM's 8-byte explicit nonce and 16-byte tag; TLS
+/// 1.3 adds a type byte and a tag, 17 bytes).
+pub(crate) const RECORD_OVERHEAD: usize = 5 + 8 + 16;
+
+/// The room, in bytes and records, for the output of one received handshake
+/// message: [`HANDSHAKE_ROOM`] for the messages whose size the config does
+/// not set, and `more` bytes of the messages whose size it does, all cut
+/// into records of at most `fragment` bytes of payload.
+pub(crate) fn handshake_room(more: usize, fragment: usize) -> (usize, usize) {
+    let payload = HANDSHAKE_ROOM + more;
+    let records = HANDSHAKE_RECORDS + payload.div_ceil(fragment);
+    (payload + records * RECORD_OVERHEAD, records)
+}
+
+/// The bytes a certificate chain and its OCSP response take in the
+/// server's Certificate (and, in TLS 1.2, CertificateStatus) message.
+pub(crate) fn chain_bytes(chain: &[pki_types::CertificateDer<'_>], ocsp: Option<&[u8]>) -> usize {
+    /// A certificate entry's 24-bit length and 16-bit extensions length.
+    const ENTRY: usize = 3 + 2;
+    /// The status_request extension around an OCSP response.
+    const STATUS: usize = 4 + 1 + 3;
+    chain
+        .iter()
+        .map(|cert| cert.as_ref().len() + ENTRY)
+        .sum::<usize>()
+        + ocsp.map_or(0, |ocsp| ocsp.len() + STATUS)
+}
 
 /// The most records one message received after the handshake makes: a
 /// close_notify when the peer's records use up the read keys, a key update,

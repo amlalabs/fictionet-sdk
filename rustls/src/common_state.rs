@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 use pki_types::CertificateDer;
 
 use crate::budget::{
-    Account, Paid, CONTROL_PAYLOAD, CONTROL_RECORDS, HANDSHAKE_RECORDS, HANDSHAKE_ROOM,
+    chain_bytes, handshake_room, Account, Paid, CONTROL_PAYLOAD, CONTROL_RECORDS,
+    HANDSHAKE_RECORDS, HANDSHAKE_ROOM,
 };
 use crate::conn::kernel::KernelState;
 use crate::crypto::SupportedKxGroup;
@@ -197,8 +198,19 @@ impl CommonState {
         reserved
     }
 
+    /// Sets the room charged before each handshake message to the most a
+    /// server's config says one message's output takes
+    /// ([`ServerConfig::most_connection`](crate::ServerConfig::most_connection)).
+    pub(crate) fn bound_handshake(&mut self, room: Option<(usize, usize)>) {
+        if let Some(room) = room {
+            self.handshake_room = room;
+        }
+    }
+
     /// Charges room for a server's handshake flight once its certificate
-    /// chain is known: a record for everything else, and the chain and its
+    /// chain is known: the room set by [`Self::bound_handshake`], which
+    /// covers every chain the config's resolver returns, or, for a config
+    /// that does not bound it, room for the rest and for this chain and its
     /// OCSP response. Later handshake messages are given the same room. The
     /// room is kept charged until the end of the step. `false`, charging
     /// nothing, if the budget has no room.
@@ -207,19 +219,13 @@ impl CommonState {
         chain: &[CertificateDer<'_>],
         ocsp: Option<&[u8]>,
     ) -> bool {
-        /// A certificate entry's 24-bit length and 16-bit extensions length.
-        const ENTRY: usize = 3 + 2;
-        /// The status_request extension around an OCSP response.
-        const STATUS: usize = 4 + 1 + 3;
-        let chain = chain
-            .iter()
-            .map(|cert| cert.as_ref().len() + ENTRY)
-            .sum::<usize>()
-            + ocsp.map_or(0, |ocsp| ocsp.len() + STATUS);
-        // Each record holds at most 2^14 bytes of the chain.
+        let (bytes, records) = handshake_room(
+            chain_bytes(chain, ocsp),
+            self.message_fragmenter.max_fragment_len(),
+        );
         let room = (
-            HANDSHAKE_ROOM + chain,
-            HANDSHAKE_RECORDS + chain / (1 << 14),
+            bytes.max(self.handshake_room.0),
+            records.max(self.handshake_room.1),
         );
         self.handshake_room = room;
         self.sendable_tls.reserve(room.0, room.1)

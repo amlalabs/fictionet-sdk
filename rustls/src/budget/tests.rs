@@ -1,6 +1,7 @@
 //! A server connection paid from a budget: every buffer charged what it
 //! holds, and each refusal changing nothing until the budget has room.
 
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use std::io::{self, Read, Write};
@@ -15,16 +16,19 @@ use crate::crypto::ring::default_provider;
 use crate::enums::{AlertDescription, ContentType, SignatureScheme};
 use crate::msgs::enums::AlertLevel;
 use crate::msgs::message::{HEADER_SIZE, MAX_WIRE_SIZE};
+use crate::server::danger::{ClientCertVerified, ClientCertVerifier};
 use crate::server::{Acceptor, IntoConnectionError, ServerConnection};
 use crate::sync::Arc;
 use crate::vecbuf::{ALERT_ROOM, FIRST_PLACES, PLACE};
 use crate::version::{TLS12, TLS13};
+use crate::DistinguishedName;
 use crate::{
     ClientConfig, CommonState, DigitallySignedStruct, Error, ServerConfig, Side,
     SupportedProtocolVersion,
 };
 
-pub(crate) fn server_config() -> Arc<ServerConfig> {
+/// The test CA's RSA server chain and its key.
+fn chain_and_key() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     let chain = vec![
         CertificateDer::from(&include_bytes!("../../test-ca/rsa-2048/end.der")[..]),
         CertificateDer::from(&include_bytes!("../../test-ca/rsa-2048/inter.der")[..]),
@@ -32,6 +36,11 @@ pub(crate) fn server_config() -> Arc<ServerConfig> {
     let key =
         PrivateKeyDer::from_pem_reader(&mut &include_bytes!("../../test-ca/rsa-2048/end.key")[..])
             .unwrap();
+    (chain, key)
+}
+
+pub(crate) fn server_config() -> Arc<ServerConfig> {
+    let (chain, key) = chain_and_key();
     Arc::new(
         ServerConfig::builder_with_provider(Arc::new(default_provider()))
             .with_safe_default_protocol_versions()
@@ -560,6 +569,158 @@ fn a_fatal_alert_goes_out_with_the_budget_full() {
         AlertDescription::from(payload[1]),
         AlertDescription::DecodeError
     );
+}
+
+/// Offers client authentication without requiring it, naming many CAs, so
+/// its certificate request is larger than a record. The client in these
+/// tests sends no certificate, so nothing is verified.
+#[derive(Debug)]
+struct ManyAuthorities(Vec<DistinguishedName>);
+
+impl ClientCertVerifier for ManyAuthorities {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.0
+    }
+
+    fn verify_client_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        Err(Error::General("the client sends no certificate".into()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::General("the client sends no certificate".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::General("the client sends no certificate".into()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Runs a handshake with `config` on a budget of `start` bytes that grows
+/// by a little each time the server can neither read nor write, as memory
+/// another connection frees would. The server may wait for room, but never
+/// fails: returns the error if it does.
+fn handshake_on_a_growing_budget(
+    config: &Arc<ServerConfig>,
+    version: &'static SupportedProtocolVersion,
+    start: usize,
+) -> Result<(), Error> {
+    const STEP: usize = 512;
+    let limit = Limit::new(start);
+    let mut room = start;
+    let mut server = ServerConnection::with_budget(config.clone(), limit.clone())?;
+    let mut client = client(version);
+    let mut wire = Vec::new();
+    for _ in 0..10_000 {
+        wire.extend(from_client(&mut client));
+        if wire.is_empty()
+            && !client.is_handshaking()
+            && !server.is_handshaking()
+            && !server.wants_write()
+        {
+            return Ok(());
+        }
+        let mut moved = false;
+        if !wire.is_empty() {
+            let mut rest = &wire[..];
+            match server.read_tls(&mut rest) {
+                Ok(read) => {
+                    moved |= read > 0;
+                    wire.drain(..read);
+                }
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::OutOfMemory),
+            }
+        }
+        server.process_new_packets()?;
+        assert!(server.buffers_accounted());
+        if server.wants_write() {
+            to_client(&mut server, &mut client);
+            moved = true;
+        }
+        if !moved {
+            room += STEP;
+            limit.set_limit(room);
+        }
+    }
+    panic!("{version:?}: the handshake from {start} bytes never finished");
+}
+
+/// A server whose config bounds its handshake output (here: a chain, many
+/// CA names, many tickets, small records) waits for room for all of it
+/// before each handshake message, so however little its budget has when
+/// the handshake starts, it never fails for memory: the output a message
+/// makes never needs more than was charged for it.
+#[test]
+fn a_bounded_config_never_fails_its_handshake_for_memory() {
+    let plain = server_config();
+    let names = (0..200u8)
+        .map(|n| DistinguishedName::from(vec![n; 150]))
+        .collect();
+    let authorities = {
+        let (chain, key) = chain_and_key();
+        Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(Arc::new(ManyAuthorities(names)))
+                .with_single_cert(chain, key)
+                .unwrap(),
+        )
+    };
+    let tickets = {
+        let mut config = (*plain).clone();
+        config.send_tls13_tickets = 400;
+        Arc::new(config)
+    };
+    let small_records = {
+        let mut config = (*plain).clone();
+        config.max_fragment_size = Some(512);
+        Arc::new(config)
+    };
+    let mut failures = Vec::new();
+    for (what, config) in [
+        ("a chain", &plain),
+        ("many CA names", &authorities),
+        ("many tickets", &tickets),
+        ("small records", &small_records),
+    ] {
+        let most = config.most_connection().expect("the config is bounded");
+        for version in [&TLS12, &TLS13] {
+            let failed = (0..2 * most).step_by(most / 16).find_map(|start| {
+                handshake_on_a_growing_budget(config, version, start)
+                    .err()
+                    .map(|error| (start, error))
+            });
+            if let Some((start, error)) = failed {
+                failures.push(format!("{what}, {version:?}, from {start} bytes: {error}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]

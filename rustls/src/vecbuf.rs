@@ -149,11 +149,9 @@ enum AlertRoom {
     Spent,
 }
 
-/// The most one alert record takes: a 5-byte header, the 2-byte alert,
-/// and the most a cipher adds (TLS 1.2 GCM's 8-byte explicit nonce and
-/// 16-byte tag; TLS 1.3 adds a type byte and a tag, 17 bytes). The final
-/// alert takes no place in the queue.
-pub(crate) const ALERT_ROOM: usize = 5 + 2 + 8 + 16;
+/// The most one alert record takes: the 2-byte alert and the most a record
+/// adds to it. The final alert takes no place in the queue.
+pub(crate) const ALERT_ROOM: usize = 2 + crate::budget::RECORD_OVERHEAD;
 
 impl ChunkVecBuffer {
     pub(crate) fn new(limit: Option<usize>) -> Self {

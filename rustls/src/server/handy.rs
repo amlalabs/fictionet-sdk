@@ -372,6 +372,10 @@ impl server::ResolvesServerCert for AlwaysResolvesServerRawPublicKeys {
         Some(self.0.clone())
     }
 
+    fn most_chain(&self) -> Option<usize> {
+        Some(self.0.flight_bytes())
+    }
+
     fn only_raw_public_keys(&self) -> bool {
         true
     }
@@ -396,6 +400,8 @@ mod sni_resolver {
     #[derive(Debug)]
     pub struct ResolvesServerCertUsingSni {
         by_name: HashMap<String, Arc<sign::CertifiedKey>>,
+        /// The most [`sign::CertifiedKey::flight_bytes`] of any chain added.
+        most_chain: usize,
     }
 
     impl ResolvesServerCertUsingSni {
@@ -403,6 +409,7 @@ mod sni_resolver {
         pub fn new() -> Self {
             Self {
                 by_name: HashMap::new(),
+                most_chain: 0,
             }
         }
 
@@ -433,6 +440,7 @@ mod sni_resolver {
                 .and_then(|cert| verify_server_name(&cert, &server_name))?;
 
             if let ServerName::DnsName(name) = server_name {
+                self.most_chain = self.most_chain.max(ck.flight_bytes());
                 self.by_name.insert(name.as_ref().to_string(), Arc::new(ck));
             }
             Ok(())
@@ -447,6 +455,10 @@ mod sni_resolver {
                 // This kind of resolver requires SNI
                 None
             }
+        }
+
+        fn most_chain(&self) -> Option<usize> {
+            Some(self.most_chain)
         }
     }
 
