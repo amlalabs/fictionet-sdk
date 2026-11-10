@@ -794,7 +794,10 @@ impl Layer for Toy {
             return Ok(Admit::Blocked(command));
         }
         let child = match command.op() {
-            MuxOp::Child(id, _) | MuxOp::Credit(id, _) | MuxOp::Close(id) => Some(*id),
+            MuxOp::Child(id, _)
+            | MuxOp::Credit(id, _)
+            | MuxOp::Window(id, ..)
+            | MuxOp::Close(id) => Some(*id),
             MuxOp::Control(_) => None,
         };
         // A child that is gone takes nothing, and never will.
@@ -818,7 +821,7 @@ impl Layer for Toy {
                 self.out.extend(frame(END, lane.peer, &[]));
                 self.finish(id);
             }
-            MuxOp::Credit(id, units) => {
+            MuxOp::Credit(id, units) | MuxOp::Window(id, units, _) => {
                 let lane = self.lanes.get_mut(id).expect("checked above");
                 lane.up_credit += units;
                 lane.window += units;

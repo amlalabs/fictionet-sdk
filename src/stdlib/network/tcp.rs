@@ -1066,12 +1066,15 @@ impl PacketDriver {
     ) -> fictionet::Result<(bool, Option<Instant>)> {
         // This task's own commands below need no wake: what they leave for
         // the engine makes the walk busy instead.
-        let (busy, deadline, refusals, parked, budget, since) = {
+        let (busy, deadline, refusals, parked) = {
             let mut host = self.shared.lock();
             let parked = host.routes.driver.take();
-            let budget = host.tcp.budget().clone();
-            let since = budget.refusals();
+            // A charge the engine's budget refused is tried again once
+            // memory frees, which wakes this task.
+            host.tcp.set_waker(cx.waker());
+            let since = host.tcp.refusals();
             let busy = host.visit(out, limit, now);
+            host.tcp.wake_when_freed(since);
             let refusals = (!host.routes.refusals.is_empty())
                 .then(|| {
                     let refused = host.routes.refused.clone()?;
@@ -1086,9 +1089,8 @@ impl PacketDriver {
             } else {
                 Some(parked)
             };
-            (busy, host.tcp.deadline(), refusals, parked, budget, since)
+            (busy, host.tcp.deadline(), refusals, parked)
         };
-        budget.wake_when_freed(cx.waker(), since);
         if let Some((refused, refusals)) = refusals {
             for (peer, local) in refusals {
                 refused(peer, local);

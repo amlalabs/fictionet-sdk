@@ -528,7 +528,7 @@ fn budget_read(release_after_poll: bool) {
         let mut observations = fictionet::stdlib::layer::Observations::new(0);
         let mut env = Env::new(fcx.now(), &fcx, &budget, &mut observations);
         let ready = Arc::new(Ready(AtomicBool::new(false)));
-        let waker = Waker::from(ready.clone());
+        let waker = fictionet::stdlib::layer::Waiter::new(Waker::from(ready.clone()));
         let before = budget.refusals();
         assert!(matches!(
             st.on_command(&mut env, child_handle.grant(payload.len() as u64)),
@@ -569,6 +569,80 @@ fn budget_read(release_after_poll: bool) {
                 .eq(payload[..count].iter())
         );
         drop(st);
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
+/// A child whose receiver lent its window gets its bytes made in that
+/// window: the endpoint pays nothing for them, the child's budget pays
+/// nothing more, and nothing moves when the receiver takes them. The window
+/// is lent, not given: once the receiver lets it go, its budget gets it
+/// back at once, and later bytes are the endpoint's to pay for again.
+#[test]
+fn bytes_come_up_in_the_window_their_receiver_lent() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let now = smol_now(&fcx);
+        let (h, ack) = established(&mut st, now, local, peer);
+        let child = st.adopt(h);
+        let payload = vec![7; MTU / 2];
+        let segment = |seq| data_segment(peer, local, seq, ack, 16, &payload).0;
+        let engine = Budget::unlimited();
+        st.ingress(&fcx, &engine, now, segment(101));
+        st.refresh_all(&engine);
+        let handle = st
+            .up
+            .drain(..)
+            .find_map(|event| match event {
+                MuxEvent::Opened(handle, _, _) if handle.id() == child => Some(handle),
+                _ => None,
+            })
+            .unwrap();
+        st.up.clear();
+        let data = |st: &mut TcpLayer| {
+            st.up
+                .drain(..)
+                .find_map(|event| match event {
+                    MuxEvent::Child(id, StreamEvent::Data(chunk)) if id == child => Some(chunk),
+                    _ => None,
+                })
+                .expect("the bytes came up")
+        };
+
+        let sandbox = Budget::new(1 << 16);
+        let window = Arc::new(sandbox.charge(payload.len()).unwrap());
+        let (engine_before, sandbox_before) = (engine.used(), sandbox.used());
+        let mut observations = fictionet::stdlib::layer::Observations::new(0);
+        let mut env = Env::new(fcx.now(), &fcx, &engine, &mut observations);
+        let lend = handle.lend_window(payload.len() as u64, &window);
+        assert!(matches!(st.on_command(&mut env, lend), Ok(Admit::Taken)));
+        let chunk = data(&mut st);
+        assert_eq!(&chunk[..], &payload[..]);
+        assert_eq!(engine.used(), engine_before, "the endpoint pays nothing");
+        assert_eq!(sandbox.used(), sandbox_before, "the window paid already");
+        assert_eq!(Arc::strong_count(&window), 2, "the bytes are in the window");
+        drop(chunk);
+        assert_eq!(Arc::strong_count(&window), 1);
+
+        // The receiver lets go of the window: its budget gets it back,
+        // although the endpoint still has the connection.
+        drop(window);
+        assert_eq!(sandbox.used(), 0);
+        st.ingress(&fcx, &engine, now, segment(101 + payload.len() as u32));
+        let grant = handle.grant(payload.len() as u64);
+        assert!(matches!(st.on_command(&mut env, grant), Ok(Admit::Taken)));
+        let chunk = data(&mut st);
+        assert_eq!(&chunk[..], &payload[..]);
+        assert_eq!(engine.used(), engine_before + chunk.charged());
+        assert!(chunk.charged() >= chunk.len(), "the endpoint pays for them");
+        drop((chunk, st));
         fcx.cancel();
         Ok(())
     }))

@@ -1,8 +1,8 @@
 //! The four carrier contracts and the handles of multiplexed children.
 
 use core::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use super::children::ChildWake;
 use fictionet::stdlib::layer::{Budget, Charge, ChargedBytes, CommandOf, EventOf, Port};
@@ -66,6 +66,16 @@ impl Chunk {
     pub fn from_bytes(bytes: ChargedBytes) -> Chunk {
         let (bytes, charge) = bytes.into_parts();
         Self::backed(bytes, Some(Reservation::Own(charge)), None)
+    }
+
+    /// Bytes for a child, made in the receive window its receiver lent
+    /// ([`MuxOp::Window`]) and still keeps, which paid for them before it
+    /// granted the credit they use: nothing is charged, and the receiver
+    /// takes them in with no charge moving. Their capacity is their
+    /// length, as the window pays for bytes, not spare room.
+    pub fn in_window(mut bytes: Vec<u8>, window: Arc<Charge>) -> Chunk {
+        bytes.shrink_to_fit();
+        Self::backed(bytes, Some(Reservation::Shared(window)), None)
     }
 
     /// Bytes a library allocated in a buffer of its own, such as a record
@@ -698,6 +708,17 @@ pub enum MuxOp<C: Port, K: Port> {
     Child(ChildId, CommandOf<C>),
     /// The child's events may use this many more credit units.
     Credit(ChildId, u64),
+    /// The child's first credit, as [`Credit`](Self::Credit) gives it,
+    /// with the receive window its events go in: memory the receiver paid
+    /// for on the child's budget, as large as all the credit it grants, so
+    /// it holds every byte the mux may send the child at once. The window
+    /// is lent, not given: while the receiver keeps it, a mux may make the
+    /// child's bytes in it ([`Chunk::in_window`]) instead of paying for
+    /// them itself, and the receiver takes them in with no charge moving.
+    /// It goes back to the child's budget when the receiver lets go of the
+    /// child and its bytes, whatever the mux holds. A mux with no use for
+    /// it takes the credit alone.
+    Window(ChildId, u64, Weak<Charge>),
     /// Close the child at once, as a reset does.
     Close(ChildId),
     /// A connection control command.
@@ -726,6 +747,7 @@ impl<C: Port, K: Port> core::fmt::Debug for MuxCommand<C, K> {
         f.write_str(match &self.0 {
             MuxOp::Child(..) => "Child",
             MuxOp::Credit(..) => "Credit",
+            MuxOp::Window(..) => "Window",
             MuxOp::Close(_) => "Close",
             MuxOp::Control(_) => "Control",
         })
@@ -766,6 +788,17 @@ impl Child {
     /// Lets the mux send this child's events using `units` more credit.
     pub fn grant<C: Port, K: Port>(&self, units: u64) -> MuxCommand<C, K> {
         MuxCommand(MuxOp::Credit(self.id, units))
+    }
+
+    /// Lets the mux send this child's events using its first `units` of
+    /// credit, and lends it `window`, the receive window they go in
+    /// ([`MuxOp::Window`]).
+    pub fn lend_window<C: Port, K: Port>(
+        &self,
+        units: u64,
+        window: &Arc<Charge>,
+    ) -> MuxCommand<C, K> {
+        MuxCommand(MuxOp::Window(self.id, units, Arc::downgrade(window)))
     }
 
     /// Closes the child at once, giving up the handle.

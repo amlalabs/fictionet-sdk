@@ -1852,7 +1852,7 @@ impl Layer for Http2 {
                 self.on_child(env, child, command);
                 Ok(Admit::Taken)
             }
-            MuxOp::Credit(child, units) => {
+            MuxOp::Credit(child, units) | MuxOp::Window(child, units, _) => {
                 if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child)) {
                     if let Some(stream) = self.streams.get_mut(&id) {
                         let delivery = &mut stream.delivery;

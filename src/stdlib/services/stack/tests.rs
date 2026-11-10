@@ -497,6 +497,42 @@ fn a_budget_without_room_for_the_read_buffer_never_runs_the_stack() {
     assert_eq!(ended, Ok(StreamEnd::Budget));
 }
 
+/// Bytes read that the budget has no room to pay a copy of go to the stack
+/// in the read buffer that paid for them, and the next read waits for
+/// memory instead of ending the run: once memory frees, every frame is
+/// answered and the run finishes.
+#[test]
+fn bytes_read_without_room_wait_for_memory() {
+    let budget = Budget::new(1 << 20);
+    let hogged = budget.clone();
+    let client = move |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        // One frame answered: the server runs, with its read buffer.
+        let first = frames(1);
+        conn.write_all(&fcx, &wire(&first)).await?;
+        let mut got = vec![0u8; wire(&first).len()];
+        let mut filled = 0;
+        while filled < got.len() {
+            let n = conn.read(&fcx, &mut got[filled..]).await?;
+            assert!(n > 0, "the server answers before it ends");
+            filled += n;
+        }
+        assert_eq!(read(&got), first);
+        // Nothing is left for the bytes the server reads next.
+        let hog = hogged.charge(hogged.limit() - hogged.used()).unwrap();
+        let rest = frames(40);
+        conn.write_all(&fcx, &wire(&rest)).await?;
+        conn.shutdown(&fcx).await?;
+        fcx.sleep(Duration::from_millis(50)).await?;
+        drop(hog);
+        let got = read_to_end(&fcx, &mut conn).await?;
+        assert_eq!(read(&got), rest, "every frame comes back once memory frees");
+        Ok(())
+    };
+    let ended = serve_one(StreamLimits::default(), budget, stack, client);
+    assert_eq!(ended, Ok(StreamEnd::Finished));
+}
+
 /// Counts each sender's datagrams and answers each with the count so far:
 /// what it keeps between datagrams is the conversation.
 #[derive(Default)]
@@ -1067,7 +1103,7 @@ impl Layer for StreamChild {
                 assert!(self.slots.contains(child));
                 self.outgoing = Some(command);
             }
-            MuxOp::Credit(child, n) => {
+            MuxOp::Credit(child, n) | MuxOp::Window(child, n, _) => {
                 assert_eq!(child, self.child);
                 self.receive_credit += n;
             }

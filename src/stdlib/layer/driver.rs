@@ -4,7 +4,7 @@ use std::task::{Wake, Waker};
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, Budget, Charge, ChargedDeque, CommandOf, Env, EventOf, Layer, Observe, Refusals,
+    Admit, Budget, Charge, ChargedDeque, CommandOf, Env, EventOf, Layer, Observe, Refusals, Waiter,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -113,8 +113,9 @@ pub struct Driver<L: Layer> {
     steps: usize,
     exhausted: bool,
     wake: Arc<StackWake>,
-    /// `wake` as a waker, for the budget to wake when memory frees.
-    stack: Waker,
+    /// `wake` as a waker: what the stack's layers get as their
+    /// [`Env::waker`], and what the budget wakes when memory frees.
+    waiter: Waiter,
     /// The task `wake` wakes, as last set: the same as `wake.task`.
     task: Option<Waker>,
 }
@@ -122,7 +123,7 @@ pub struct Driver<L: Layer> {
 /// What a layer's [`Env::waker`] wakes in the end, and what the budget
 /// wakes when memory frees after a refused charge: it notes that the stack
 /// should run, and wakes the task that runs it.
-pub(crate) struct StackWake {
+struct StackWake {
     /// Woken since the last [`Driver::run`] began.
     woken: AtomicBool,
     /// The task that runs the stack, as its runner last said.
@@ -171,7 +172,7 @@ impl<L: Layer> Driver<L> {
             urgent: None,
             steps: STEPS,
             exhausted: false,
-            stack: Waker::from(wake.clone()),
+            waiter: Waiter::new(Waker::from(wake.clone())),
             wake,
             task: None,
         }
@@ -188,13 +189,14 @@ impl<L: Layer> Driver<L> {
     /// charge since `since`: the runner's last round, which ended with
     /// nothing moving. A layer whose charge was refused tries again when it
     /// is next advanced (rule 9), so the runner calls this before it waits,
-    /// and the release that frees memory marks the stack
-    /// [`woken`](Self::woken) and wakes the task
+    /// and the release that leaves room for the refused charge marks the
+    /// stack [`woken`](Self::woken) and wakes the task
     /// ([`set_waker`](Self::set_waker)). When nothing was refused it does
     /// nothing; when memory was freed after the refusal already, the stack
-    /// is woken at once.
+    /// is woken at once. Children of [`Children`](super::Children) with
+    /// budgets of their own wait on those themselves.
     pub fn wake_when_freed(&self, since: Refusals) {
-        self.budget.wake_when_freed(&self.stack, since);
+        self.budget.wake_when_freed(&self.waiter, since);
     }
 
     /// `task` runs the stack from now on: a layer that wakes its
@@ -271,7 +273,7 @@ impl<L: Layer> Driver<L> {
             &*self.entropy,
             &self.budget,
             &mut self.observed,
-            &self.wake,
+            self.waiter.waker(),
         );
         self.layer.on_event(&mut env, event)
     }
@@ -286,7 +288,7 @@ impl<L: Layer> Driver<L> {
             &*self.entropy,
             &self.budget,
             &mut self.observed,
-            &self.wake,
+            self.waiter.waker(),
         );
         self.layer.on_command(&mut env, command)
     }
@@ -298,7 +300,7 @@ impl<L: Layer> Driver<L> {
             &*self.entropy,
             &self.budget,
             &mut self.observed,
-            &self.wake,
+            self.waiter.waker(),
         );
         self.layer.on_done(&mut env, done)
     }
@@ -322,7 +324,7 @@ impl<L: Layer> Driver<L> {
             &*self.entropy,
             &self.budget,
             &mut self.observed,
-            &self.wake,
+            self.waiter.waker(),
         );
         for _ in 0..self.steps {
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
@@ -356,7 +358,7 @@ impl<L: Layer> Driver<L> {
             &*self.entropy,
             &self.budget,
             &mut self.observed,
-            &self.wake,
+            self.waiter.waker(),
         );
         send(&mut self.below, || self.layer.take_command(&mut env), sink)
     }
@@ -370,7 +372,7 @@ impl<L: Layer> Driver<L> {
                 &*self.entropy,
                 &self.budget,
                 &mut self.observed,
-                &self.wake,
+                self.waiter.waker(),
             );
             self.layer.take_command(&mut env)
         })
@@ -648,6 +650,86 @@ mod tests {
         assert!(driver.layer().tries > tries);
         assert!(driver.layer().held.is_some());
         assert!(!driver.woken(), "the run served the wake");
+    }
+
+    /// Gives back a small charge and takes it again on each advance, as
+    /// memory that comes and goes, then asks for `want` bytes until it
+    /// gets them.
+    struct Churns {
+        small: Option<Charge>,
+        size: usize,
+        want: usize,
+        held: Option<Charge>,
+    }
+    impl Layer for Churns {
+        type Lower = Units;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(&mut self, _: &mut Env<'_, ()>, _: ()) -> Result<Admit<()>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
+            self.small = None;
+            self.small = env.budget().charge(self.size);
+            if self.held.is_some() {
+                return Ok(false);
+            }
+            self.held = env.budget().charge(self.want);
+            Ok(self.held.is_some())
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<()> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// A stack whose charge was refused, and which frees and takes back a
+    /// little memory in every round, is not woken by that memory: it is
+    /// too little for the refused charge, so the runner waits instead of
+    /// running round after round. Room for the charge wakes it once.
+    #[test]
+    fn memory_that_churns_below_the_refused_charge_wakes_nothing() {
+        let budget = Budget::new(64);
+        let hog = budget.charge(40).unwrap();
+        let mut driver = Driver::new(
+            Churns {
+                small: None,
+                size: 8,
+                want: 32,
+                held: None,
+            },
+            Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+            budget.clone(),
+            Instant::ZERO,
+        );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
+        let woken = || task.0.load(Ordering::Relaxed);
+        for _ in 0..16 {
+            let since = driver.refusals();
+            assert!(!driver.run().unwrap(), "the charge is refused");
+            driver.wake_when_freed(since);
+        }
+        assert!(driver.layer().held.is_none());
+        assert_eq!(woken(), 0, "the memory that came and went was too little");
+
+        drop(hog);
+        assert_eq!(woken(), 1);
+        assert!(driver.run().unwrap(), "the layer tries again and fits");
+        assert!(driver.layer().held.is_some());
     }
 
     #[test]

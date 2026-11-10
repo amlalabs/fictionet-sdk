@@ -457,7 +457,7 @@ impl Layer for UdpLayer {
                 UdpControl::Leave(group) => self.groups.retain(|g| *g != group),
             },
             MuxOp::Control(MessageCommand::End) => {}
-            MuxOp::Credit(id, units) => {
+            MuxOp::Credit(id, units) | MuxOp::Window(id, units, _) => {
                 if let Some(socket) = self.sockets.get_mut(id) {
                     socket.granted = socket.granted.saturating_add(units);
                     self.wake(id);

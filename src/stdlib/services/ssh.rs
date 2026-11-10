@@ -1685,7 +1685,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         }
         match command.into_op() {
             MuxOp::Control(never) => match never {},
-            MuxOp::Credit(id, units) => {
+            MuxOp::Credit(id, units) | MuxOp::Window(id, units, _) => {
                 if let Some(channel) = self.channels.get_mut(id) {
                     channel.receive = channel
                         .receive

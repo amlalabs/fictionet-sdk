@@ -791,7 +791,7 @@ impl Layer for Observer {
         match command.into_op() {
             MuxOp::Child(_, command) => match command {},
             MuxOp::Control(command) => match command {},
-            MuxOp::Credit(child, units) => {
+            MuxOp::Credit(child, units) | MuxOp::Window(child, units, _) => {
                 if let Some(output) = self.outputs.children.get_mut(child) {
                     output.credit = output.credit.saturating_add(units);
                     if !output.queued && (!output.pending.is_empty() || output.closing) {

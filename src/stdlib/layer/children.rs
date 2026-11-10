@@ -1,4 +1,5 @@
 use super::carrier::CreditLease;
+use super::charged::charge_places;
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -8,7 +9,7 @@ use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
     Admit, Budget, Charge, ChargedDeque, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer,
-    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
+    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Refusals, Top, Waiter, WorkOwner,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -124,27 +125,156 @@ where
     make: Box<ChildFactory<B, O>>,
     budget_for: Option<Box<ChildBudget<O>>>,
     close_finished: bool,
-    /// The open children, each at a key that stays its own while it is open.
-    kids: Slab<Kid<B>>,
-    /// Their ids and keys, in id order.
-    order: Vec<(ChildId, usize)>,
     /// Children to visit, linked through their own `links`.
     ready: List,
     /// Children whose layers may have work to hand over.
     work: List,
+    /// How many deadlines have been armed, to order those due together.
+    armed: u64,
+    limit: usize,
+    window: u64,
+    /// The children and the router's queues, with what pays for them.
+    places: Places<B, K>,
+}
+
+/// The router's storage, paid for as one: its two queues, and for each
+/// child place a place in every table, which are the children, their ids
+/// in order, the deadline heap, the wake queue and a closing place in the
+/// command queue. The places grow only here, every table together or none:
+/// the growth is charged first, as a charged queue grows, by doubling when
+/// the budget has room and by as many places as it has room for when not.
+/// They go back together too.
+struct Places<B: Layer, K: Port> {
+    /// The open children, each at a key that stays its own while it is open.
+    kids: Slab<Kid<B>>,
+    /// Their ids and keys, in id order.
+    order: Vec<(ChildId, usize)>,
     /// The keys of children with a deadline, a binary heap with the first
     /// due at the top. Each child knows where it is.
     timers: Vec<usize>,
-    /// How many deadlines have been armed, to order those due together.
-    armed: u64,
     /// The children something outside a call reached ([`ChildWake`]).
     woken: Arc<Woken>,
-    limit: usize,
-    window: u64,
+    /// Commands for the mux: [`QUEUE`] places, and one more for each child
+    /// place, for the child's closing.
     down: VecDeque<MuxCommand<B::Lower, K>>,
+    /// Control events for above.
     up: VecDeque<EventOf<K>>,
-    // Reservations outlive every allocation they cover during destruction.
-    storage: Option<Charge>,
+    /// The child places paid for, which every table holds.
+    count: usize,
+    /// What pays for the queues and the places: `None` until the first
+    /// step paid for the queues and the first [`FLOOR`] places. Last, so
+    /// it outlives everything it pays for.
+    charge: Option<Charge>,
+}
+
+impl<B: Layer, K: Port> Places<B, K> {
+    /// Nothing paid for and nothing allocated.
+    fn new() -> Self {
+        Places {
+            kids: Slab::new(),
+            order: Vec::new(),
+            timers: Vec::new(),
+            woken: Arc::new(Woken {
+                any: AtomicBool::new(false),
+                keys: Mutex::new(Vec::new()),
+            }),
+            down: VecDeque::new(),
+            up: VecDeque::new(),
+            count: 0,
+            charge: None,
+        }
+    }
+
+    /// The two queues' [`QUEUE`] places.
+    fn queue_bytes() -> usize {
+        QUEUE * (size_of::<MuxCommand<B::Lower, K>>() + size_of::<EventOf<K>>())
+    }
+
+    /// One child place: the child itself, a vacant place's next key
+    /// included, its wake state with its two counts, its place in the wake
+    /// queue, its id in order, its place in the deadline heap, and its
+    /// closing place in the command queue.
+    fn place_bytes() -> usize {
+        size_of::<Kid<B>>()
+            + size_of::<usize>()
+            + size_of::<ChildWake>()
+            + 2 * size_of::<usize>()
+            + size_of::<usize>()
+            + size_of::<(ChildId, usize)>()
+            + size_of::<usize>()
+            + size_of::<MuxCommand<B::Lower, K>>()
+    }
+
+    /// Pays for the queues and the first [`FLOOR`] places the first time
+    /// anything arrives, then allocates them.
+    fn reserve(&mut self, budget: &Budget) -> Result<(), Overrun> {
+        if self.charge.is_some() {
+            return Ok(());
+        }
+        let bytes = Self::place_bytes()
+            .checked_mul(FLOOR)
+            .and_then(|places| places.checked_add(Self::queue_bytes()))
+            .ok_or(Overrun::Budget)?;
+        self.charge = Some(budget.charge(bytes).ok_or(Overrun::Budget)?);
+        self.up = VecDeque::with_capacity(QUEUE);
+        self.grow_to(FLOOR);
+        Ok(())
+    }
+
+    /// Makes a place for one more child, at most `limit`. Returns whether
+    /// there is one.
+    fn make_room(&mut self, limit: usize) -> bool {
+        if self.kids.len() < self.count {
+            return true;
+        }
+        let Some(charge) = &mut self.charge else {
+            return false;
+        };
+        let wanted = self.kids.len() + 1;
+        let Some(more) = charge_places(charge, self.count, wanted, limit, Self::place_bytes())
+        else {
+            return false;
+        };
+        self.grow_to(self.count + more);
+        true
+    }
+
+    /// Every table holds `count` places, which are paid for.
+    fn grow_to(&mut self, count: usize) {
+        self.kids.reserve_exact(count - self.kids.len());
+        self.order.reserve_exact(count - self.order.len());
+        self.timers.reserve_exact(count - self.timers.len());
+        // Only open children wait in the wake queue, fewer than `count`.
+        let mut keys = self.woken.keys.lock();
+        let queued = keys.len();
+        keys.reserve_exact(count - queued);
+        drop(keys);
+        self.down.reserve_exact(QUEUE + count - self.down.len());
+        self.count = count;
+    }
+
+    /// With no children, the places past the first [`FLOOR`] go, so an
+    /// idle connection holds the same whatever it held before: its queues
+    /// and those places, so one with a few children at a time never gives
+    /// places back to take them again. Closing commands still queued keep
+    /// their places until the mux takes them.
+    fn release(&mut self) {
+        let count = FLOOR.max(self.down.len().saturating_sub(QUEUE));
+        if !self.kids.is_empty() || count >= self.count {
+            return;
+        }
+        let Some(charge) = &mut self.charge else {
+            return;
+        };
+        self.kids = Slab::with_capacity(count);
+        self.order = Vec::with_capacity(count);
+        self.timers = Vec::with_capacity(count);
+        // Closed children left the wake queue, so it is empty.
+        *self.woken.keys.lock() = Vec::with_capacity(count);
+        self.down.shrink_to(QUEUE + count);
+        self.count = count;
+        charge.shrink_to(Self::queue_bytes() + count * Self::place_bytes());
+    }
 }
 
 /// A child's place in one of the router's lists.
@@ -230,6 +360,9 @@ struct Kid<B: Layer> {
     /// Events the mux sent within credit that the layer has not taken.
     inbox: ChargedDeque<(EventOf<B::Lower>, bool)>,
     wake: Arc<ChildWake>,
+    /// Its [`Within`]: the waker its calls get, and what waits on its
+    /// budget after a charge of its was refused.
+    waiter: Waiter,
     /// Its places in the ready and work lists.
     links: [Link; 2],
     /// Its deadline after its last call, the arming number that orders it
@@ -240,6 +373,8 @@ struct Kid<B: Layer> {
     /// What pays for the memory of the bytes in its receive window, shared
     /// by every chunk that waits in it.
     window: Arc<Charge>,
+    /// The window went to the mux with the first credit.
+    lent: bool,
     max_command: u64,
     /// Credit the mux may still use for this child's events.
     granted: u64,
@@ -249,6 +384,17 @@ struct Kid<B: Layer> {
     credit: u64,
     /// A command of the layer's that waits for credit.
     outbox: Option<CommandOf<B::Lower>>,
+}
+
+impl<B: Layer> Kid<B> {
+    /// After calls into the child that began with its budget's refusals at
+    /// `since`: if a charge was refused meanwhile, the child is visited
+    /// again once its budget has room for it (rule 9). Its budget may not
+    /// be the stack's, which the runner above waits on, so the router
+    /// waits on it for the child.
+    fn wait_for_memory(&self, since: Refusals) {
+        self.budget.wake_when_freed(&self.waiter, since);
+    }
 }
 
 /// What reaches a child from outside `Children`'s calls into it: receive
@@ -389,19 +535,12 @@ impl Wake for ChildWake {
     }
 }
 
-impl ChildWake {
-    /// The child's [`Env::waker`]: it queues the child, then wakes
-    /// `around`, what the child runs in. It changes nothing in the child's
-    /// wake, so it stays good while the child is open.
-    pub(crate) fn waker_in(self: &Arc<Self>, around: Waker) -> Waker {
-        Waker::from(Arc::new(Within {
-            child: self.clone(),
-            around,
-        }))
-    }
-}
-
-/// A child's [`Env::waker`] ([`ChildWake::waker_in`]).
+/// A child's [`Env::waker`], and what its budget wakes when memory frees
+/// after a charge of the child's was refused: it queues the child, then
+/// wakes `around`, what the child runs in. Made once when the child opens,
+/// so every call gets the same one and the budget sees a child that waits
+/// again as the same waiter. It changes nothing in the child's wake, so it
+/// stays good while the child is open.
 struct Within {
     child: Arc<ChildWake>,
     around: Waker,
@@ -502,21 +641,12 @@ where
             make: Box::new(make),
             budget_for: None,
             close_finished: false,
-            kids: Slab::new(),
-            order: Vec::new(),
             ready: List::new(List::READY),
             work: List::new(List::WORK),
-            timers: Vec::new(),
             armed: 0,
-            woken: Arc::new(Woken {
-                any: AtomicBool::new(false),
-                keys: Mutex::new(Vec::new()),
-            }),
-            storage: None,
             limit,
             window,
-            down: VecDeque::new(),
-            up: VecDeque::new(),
+            places: Places::new(),
         }
     }
 
@@ -540,95 +670,29 @@ where
         self
     }
 
-    /// The routing storage for `kids` child places: the places themselves,
-    /// a vacant place's next key included, with their wake state, their
-    /// places in the wake queue, their ids in order and their places in the
-    /// deadline heap, the command queue with one closing place per child,
-    /// and the control queue.
-    fn routing_bytes(kids: usize) -> Option<usize> {
-        let place = size_of::<Kid<B>>()
-            + size_of::<usize>()
-            // The wake state's shared allocation, with its two counts.
-            + size_of::<ChildWake>()
-            + 2 * size_of::<usize>()
-            + size_of::<usize>()
-            + size_of::<(ChildId, usize)>()
-            + size_of::<usize>();
-        kids.checked_mul(place)?.checked_add(
-            (QUEUE.checked_add(kids)?)
-                .checked_mul(size_of::<MuxCommand<B::Lower, K>>())?
-                .checked_add(QUEUE.checked_mul(size_of::<EventOf<K>>())?)?,
-        )
-    }
-
-    /// Reserves the queues and the first [`FLOOR`] child places the first
-    /// time anything arrives. Further places are reserved as children open
-    /// ([`Self::make_room`]).
-    fn reserve(&mut self, budget: &Budget) -> Result<(), Overrun> {
-        if self.storage.is_some() {
-            return Ok(());
-        }
-        let bytes = Self::routing_bytes(FLOOR).ok_or(Overrun::Budget)?;
-        let charge = budget.charge(bytes).ok_or(Overrun::Budget)?;
-        self.kids = Slab::with_capacity(FLOOR);
-        self.order = Vec::with_capacity(FLOOR);
-        self.timers = Vec::with_capacity(FLOOR);
-        self.woken.keys.lock().reserve_exact(FLOOR);
-        self.down = VecDeque::with_capacity(QUEUE + FLOOR);
-        self.up = VecDeque::with_capacity(QUEUE);
-        self.storage = Some(charge);
-        Ok(())
-    }
-
-    /// Makes a place for one more child, charging its routing storage
-    /// before growing. Places grow geometrically up to the limit and are
-    /// kept while children are open. Returns whether there is room.
-    fn make_room(&mut self) -> bool {
-        if self.kids.len() < self.kids.capacity() {
-            return true;
-        }
-        let places = self
-            .kids
-            .capacity()
-            .saturating_mul(2)
-            .max(FLOOR)
-            .min(self.limit.max(1));
-        let Some(bytes) = Self::routing_bytes(places) else {
-            return false;
-        };
-        let Some(storage) = &mut self.storage else {
-            return false;
-        };
-        if !storage.grow_to(bytes) {
-            return false;
-        }
-        self.kids.reserve_exact(places - self.kids.len());
-        self.order.reserve_exact(places - self.order.len());
-        self.timers.reserve_exact(places - self.timers.len());
-        // Only open children wait in the wake queue, fewer than `places`.
-        let mut keys = self.woken.keys.lock();
-        let queued = keys.len();
-        keys.reserve_exact(places - queued);
-        drop(keys);
-        self.down.reserve_exact(QUEUE + places - self.down.len());
-        true
-    }
-
     /// The key of child `id`, while it is open.
     fn key(&self, id: ChildId) -> Option<usize> {
-        let at = self.order.binary_search_by_key(&id, |(key, _)| *key).ok()?;
-        Some(self.order[at].1)
+        let at = self
+            .places
+            .order
+            .binary_search_by_key(&id, |(key, _)| *key)
+            .ok()?;
+        Some(self.places.order[at].1)
     }
 
     fn remove(&mut self, id: ChildId) -> Option<Kid<B>> {
-        let at = self.order.binary_search_by_key(&id, |(key, _)| *key).ok()?;
-        let key = self.order.remove(at).1;
-        self.ready.unlink(&mut self.kids, key);
-        self.work.unlink(&mut self.kids, key);
-        if let Some(place) = self.kids[key].heap {
+        let at = self
+            .places
+            .order
+            .binary_search_by_key(&id, |(key, _)| *key)
+            .ok()?;
+        let key = self.places.order.remove(at).1;
+        self.ready.unlink(&mut self.places.kids, key);
+        self.work.unlink(&mut self.places.kids, key);
+        if let Some(place) = self.places.kids[key].heap {
             self.unschedule(place);
         }
-        let kid = self.kids.remove(key);
+        let kid = self.places.kids.remove(key);
         kid.wake.close();
         Some(kid)
     }
@@ -638,16 +702,16 @@ where
     /// is armed again even at the same moment, behind the others.
     fn called(&mut self, key: usize, ready: bool, fired: bool) {
         if ready {
-            self.ready.push(&mut self.kids, key);
+            self.ready.push(&mut self.places.kids, key);
         }
-        self.work.push(&mut self.kids, key);
-        let due = self.kids[key].layer.deadline();
+        self.work.push(&mut self.places.kids, key);
+        let due = self.places.kids[key].layer.deadline();
         self.schedule(key, due, fired);
     }
 
     /// Sets child `key`'s deadline in the heap.
     fn schedule(&mut self, key: usize, due: Option<(Instant, B::Timer)>, fired: bool) {
-        let kid = &mut self.kids[key];
+        let kid = &mut self.places.kids[key];
         if !fired && kid.due == due {
             return;
         }
@@ -662,8 +726,8 @@ where
         self.armed += 1;
         kid.armed = self.armed;
         let place = place.unwrap_or_else(|| {
-            self.timers.push(key);
-            self.timers.len() - 1
+            self.places.timers.push(key);
+            self.places.timers.len() - 1
         });
         let place = self.sift_up(place);
         self.sift_down(place);
@@ -671,9 +735,9 @@ where
 
     /// Takes the deadline at `place` out of the heap.
     fn unschedule(&mut self, place: usize) {
-        let key = self.timers.swap_remove(place);
-        self.kids[key].heap = None;
-        if place < self.timers.len() {
+        let key = self.places.timers.swap_remove(place);
+        self.places.kids[key].heap = None;
+        if place < self.places.timers.len() {
             let place = self.sift_up(place);
             self.sift_down(place);
         }
@@ -681,7 +745,7 @@ where
 
     /// When the child at heap `place` is due, and its arming number.
     fn due_at(&self, place: usize) -> (Instant, u64) {
-        let kid = &self.kids[self.timers[place]];
+        let kid = &self.places.kids[self.places.timers[place]];
         let (at, _) = kid.due.as_ref().expect("a scheduled child has a deadline");
         (*at, kid.armed)
     }
@@ -692,11 +756,11 @@ where
             if self.due_at(parent) <= self.due_at(place) {
                 break;
             }
-            self.timers.swap(parent, place);
-            self.kids[self.timers[place]].heap = Some(place);
+            self.places.timers.swap(parent, place);
+            self.places.kids[self.places.timers[place]].heap = Some(place);
             place = parent;
         }
-        self.kids[self.timers[place]].heap = Some(place);
+        self.places.kids[self.places.timers[place]].heap = Some(place);
         place
     }
 
@@ -704,29 +768,29 @@ where
         loop {
             let mut first = place;
             for child in [2 * place + 1, 2 * place + 2] {
-                if child < self.timers.len() && self.due_at(child) < self.due_at(first) {
+                if child < self.places.timers.len() && self.due_at(child) < self.due_at(first) {
                     first = child;
                 }
             }
             if first == place {
                 break;
             }
-            self.timers.swap(first, place);
-            self.kids[self.timers[place]].heap = Some(place);
+            self.places.timers.swap(first, place);
+            self.places.kids[self.places.timers[place]].heap = Some(place);
             place = first;
         }
-        self.kids[self.timers[place]].heap = Some(place);
+        self.places.kids[self.places.timers[place]].heap = Some(place);
     }
 
     /// Readies the children something reached from outside a call, in id
     /// order, whatever order their wakes came in.
     fn collect_wakes(&mut self) {
-        let any = &self.woken.any;
+        let any = &self.places.woken.any;
         if !any.load(Ordering::Relaxed) || !any.swap(false, Ordering::Acquire) {
             return;
         }
-        let mut keys = self.woken.keys.lock();
-        let kids = &mut self.kids;
+        let mut keys = self.places.woken.keys.lock();
+        let kids = &mut self.places.kids;
         keys.sort_unstable_by_key(|&key| kids[key].id);
         for key in keys.drain(..) {
             // Reads the wake that queued it, and whatever came before it.
@@ -736,41 +800,20 @@ where
         }
     }
 
-    /// With no children, the places past the first [`FLOOR`] go, so an idle
-    /// connection holds the same whatever it held before: its queues and
-    /// those places, so one with a few children at a time never gives
-    /// places back to take them again. Closing commands still queued keep
-    /// their places until the mux takes them.
-    fn release_places(&mut self) {
-        if !self.kids.is_empty() || self.storage.is_none() || self.kids.capacity() <= FLOOR {
-            return;
-        }
-        self.kids = Slab::with_capacity(FLOOR);
-        self.order = Vec::with_capacity(FLOOR);
-        self.timers = Vec::with_capacity(FLOOR);
-        // Closed children left the wake queue, so it is empty.
-        *self.woken.keys.lock() = Vec::with_capacity(FLOOR);
-        self.down.shrink_to((QUEUE + FLOOR).max(self.down.len()));
-        let places = self.down.capacity().saturating_sub(QUEUE);
-        if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
-            storage.shrink_to(bytes);
-        }
-    }
-
     /// The layer of child `id`, while it is open.
     pub fn child(&self, id: ChildId) -> Option<&B> {
-        self.key(id).map(|key| &self.kids[key].layer)
+        self.key(id).map(|key| &self.places.kids[key].layer)
     }
 
     /// The open children, in order.
     pub fn ids(&self) -> impl Iterator<Item = ChildId> + '_ {
-        self.order.iter().map(|(id, _)| *id)
+        self.places.order.iter().map(|(id, _)| *id)
     }
 
     /// Whether nothing is open or queued either way: until an event comes,
     /// no step can move anything, and there is no timer or work.
     pub(crate) fn is_idle(&self) -> bool {
-        self.kids.is_empty() && self.down.is_empty() && self.up.is_empty()
+        self.places.kids.is_empty() && self.places.down.is_empty() && self.places.up.is_empty()
     }
 
     /// Closes a failed child and reports it.
@@ -783,7 +826,7 @@ where
         if let Some(kid) = self.remove(id) {
             // Closing is bounded by the mux's own limit on children: the
             // mux keeps the slot until it takes this command.
-            self.down.push_back(kid.handle.close());
+            self.places.down.push_back(kid.handle.close());
             env.report(ChildReport::Failed(id, error));
         }
     }
@@ -792,7 +835,7 @@ where
     /// cancels its work.
     fn refuse(&mut self, env: &mut Env<'_, ChildReport<B::Report, B::Error>>, id: ChildId) {
         if let Some(kid) = self.remove(id) {
-            self.down.push_back(kid.handle.close());
+            self.places.down.push_back(kid.handle.close());
             env.report(ChildReport::Refused(id));
         }
     }
@@ -800,7 +843,7 @@ where
     /// Whether child `id`'s place is full: its urgent place, or its inbox.
     fn full(&self, id: ChildId, urgent: bool) -> bool {
         self.key(id).is_some_and(|key| {
-            let kid = &self.kids[key];
+            let kid = &self.places.kids[key];
             if urgent {
                 kid.urgent.is_some()
             } else {
@@ -814,10 +857,12 @@ where
     /// moved. The child stays ready if something moved or if the mux's
     /// queue had no room for what it has to send.
     fn visit(&mut self, env: &mut Env<'_, ChildReport<B::Report, B::Error>>, key: usize) -> bool {
-        self.ready.unlink(&mut self.kids, key);
+        self.ready.unlink(&mut self.places.kids, key);
+        let since = self.places.kids[key].budget.refusals();
         let Some((moved, waiting)) = self.visit_kid(env, key) else {
             return true;
         };
+        self.places.kids[key].wait_for_memory(since);
         self.called(key, moved || waiting, false);
         moved
     }
@@ -829,21 +874,22 @@ where
         env: &mut Env<'_, ChildReport<B::Report, B::Error>>,
         key: usize,
     ) -> Option<(bool, bool)> {
-        let kid = &mut self.kids[key];
+        let kid = &mut self.places.kids[key];
         let id = kid.id;
         let report = move |e| ChildReport::Event(id, e);
         // Until `take_released` below. A closed child takes nothing more.
         kid.wake.enter();
-        let mut moved =
-            match env.scoped_child(&kid.budget, &kid.wake, report, |env| kid.layer.advance(env)) {
-                Ok(moved) => moved,
-                Err(e) => {
-                    self.fail(env, id, e);
-                    return None;
-                }
-            };
+        let mut moved = match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
+            kid.layer.advance(env)
+        }) {
+            Ok(moved) => moved,
+            Err(e) => {
+                self.fail(env, id, e);
+                return None;
+            }
+        };
         if let Some(event) = kid.urgent.take() {
-            match env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+            match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
                 kid.layer.on_event(env, event)
             }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => moved = true,
@@ -856,7 +902,7 @@ where
         }
         if let Some((event, retained)) = kid.inbox.pop_front() {
             let cost = event.credit();
-            match env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+            match env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
                 kid.layer.on_event(env, event)
             }) {
                 Ok(Admit::Taken | Admit::Closed(_)) => {
@@ -882,7 +928,7 @@ where
             }
         }
         if kid.outbox.is_none() {
-            kid.outbox = env.scoped_child(&kid.budget, &kid.wake, report, |env| {
+            kid.outbox = env.scoped_child(&kid.budget, kid.waiter.waker(), report, |env| {
                 kid.layer.take_command(env)
             });
             moved |= kid.outbox.is_some();
@@ -898,11 +944,11 @@ where
                 self.refuse(env, id);
                 return None;
             }
-            if self.down.len() < QUEUE - RESERVE {
+            if self.places.down.len() < QUEUE - RESERVE {
                 match command.admit_credit(kid.credit) {
                     Ok((prefix, rest)) => {
                         kid.credit -= prefix.credit();
-                        self.down.push_back(kid.handle.send(prefix));
+                        self.places.down.push_back(kid.handle.send(prefix));
                         kid.outbox = rest;
                         moved = true;
                     }
@@ -916,8 +962,17 @@ where
         }
         kid.owed += kid.wake.take_released();
         if kid.owed > 0 {
-            if self.down.len() < QUEUE {
-                self.down.push_back(kid.handle.grant(kid.owed));
+            if self.places.down.len() < QUEUE {
+                // The first credit lends the mux the window that pays for
+                // every byte it lets come up, so the mux can make them in
+                // it.
+                let grant = if kid.lent {
+                    kid.handle.grant(kid.owed)
+                } else {
+                    kid.lent = true;
+                    kid.handle.lend_window(kid.owed, &kid.window)
+                };
+                self.places.down.push_back(grant);
                 kid.granted += kid.owed;
                 kid.owed = 0;
                 moved = true;
@@ -926,9 +981,9 @@ where
             }
         }
         if self.close_finished && output_idle && kid.layer.is_terminal() {
-            if self.down.len() < QUEUE {
+            if self.places.down.len() < QUEUE {
                 let kid = self.remove(id).expect("visited child");
-                self.down.push_back(kid.handle.close());
+                self.places.down.push_back(kid.handle.close());
                 return None;
             }
             waiting = true;
@@ -957,11 +1012,11 @@ where
         env: &mut Env<'_, Self::Report>,
         event: MuxEvent<B::Lower, K, O>,
     ) -> Result<Admit<MuxEvent<B::Lower, K, O>>, Overrun> {
-        self.reserve(env.budget())?;
+        self.places.reserve(env.budget())?;
         match event {
             MuxEvent::Opened(child, opening, max_command) => {
                 let id = child.id();
-                if self.down.len() >= QUEUE {
+                if self.places.down.len() >= QUEUE {
                     return Ok(Admit::Blocked(MuxEvent::Opened(
                         child,
                         opening,
@@ -975,27 +1030,32 @@ where
                     || env.budget().clone(),
                     |select| select(id, &opening, env.budget()),
                 );
-                let reserved = (self.kids.len() < self.limit && self.make_room())
-                    .then(|| {
-                        let window =
-                            budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
-                        Some(Arc::new(window))
-                    })
-                    .flatten();
+                let reserved = (self.places.kids.len() < self.limit
+                    && self.places.make_room(self.limit))
+                .then(|| {
+                    let window = budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
+                    Some(Arc::new(window))
+                })
+                .flatten();
                 let Some(window) = reserved else {
-                    self.down.push_back(child.close());
+                    self.places.down.push_back(child.close());
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
                 };
                 let Some(layer) = (self.make)(id, opening, &budget) else {
-                    self.down.push_back(child.close());
+                    self.places.down.push_back(child.close());
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
                 };
                 let due = layer.deadline();
                 assert!(env.fits_below(&layer), "composition is too deep");
-                let place = self.kids.vacant_entry();
+                let place = self.places.kids.vacant_entry();
                 let key = place.key();
+                let wake = Arc::new(ChildWake::new(key, self.places.woken.clone()));
+                let waiter = Waiter::new(Waker::from(Arc::new(Within {
+                    child: wake.clone(),
+                    around: env.waker(),
+                })));
                 place.insert(Kid {
                     id,
                     handle: child,
@@ -1008,21 +1068,24 @@ where
                     budget,
                     owner: WorkOwner::new(),
                     urgent: None,
-                    wake: Arc::new(ChildWake::new(key, self.woken.clone())),
+                    wake,
+                    waiter,
                     window,
                     max_command,
+                    lent: false,
                     granted: 0,
                     owed: self.window,
                     credit: 0,
                     outbox: None,
                 });
                 let at = self
+                    .places
                     .order
                     .binary_search_by_key(&id, |(key, _)| *key)
                     .unwrap_err();
-                self.order.insert(at, (id, key));
-                self.ready.push(&mut self.kids, key);
-                self.work.push(&mut self.kids, key);
+                self.places.order.insert(at, (id, key));
+                self.ready.push(&mut self.places.kids, key);
+                self.work.push(&mut self.places.kids, key);
                 self.schedule(key, due, false);
             }
             MuxEvent::Child(id, mut event) => {
@@ -1033,13 +1096,13 @@ where
                         kid.owner.cancel();
                         if let Err(error) = env.scoped_child(
                             &kid.budget,
-                            &kid.wake,
+                            kid.waiter.waker(),
                             |event| ChildReport::Event(id, event),
                             |env| kid.layer.on_event(env, event),
                         ) {
                             env.report(ChildReport::Failed(id, error));
                         }
-                        self.down.push_back(kid.handle.close());
+                        self.places.down.push_back(kid.handle.close());
                     }
                     return Ok(Admit::Taken);
                 }
@@ -1048,7 +1111,7 @@ where
                     return Ok(Admit::Taken);
                 };
                 let cost = event.credit();
-                if cost > self.kids[key].granted {
+                if cost > self.places.kids[key].granted {
                     return Err(Overrun::Credit(id));
                 }
                 // A full place gets the child one visit to make room. A
@@ -1062,7 +1125,7 @@ where
                     }
                 }
                 if let Some(key) = self.key(id) {
-                    let kid = &mut self.kids[key];
+                    let kid = &mut self.places.kids[key];
                     if urgent {
                         kid.urgent = Some(event);
                     } else {
@@ -1086,24 +1149,24 @@ where
                             return Ok(Admit::Taken);
                         }
                     }
-                    self.ready.push(&mut self.kids, key);
+                    self.ready.push(&mut self.places.kids, key);
                 }
             }
             MuxEvent::Credit(id, units) => {
                 if let Some(key) = self.key(id) {
-                    let kid = &mut self.kids[key];
+                    let kid = &mut self.places.kids[key];
                     kid.credit = kid.credit.saturating_add(units);
-                    self.ready.push(&mut self.kids, key);
+                    self.ready.push(&mut self.places.kids, key);
                 }
             }
             MuxEvent::Closed(id) => {
                 self.remove(id);
             }
             MuxEvent::Control(event) => {
-                if self.up.len() >= QUEUE {
+                if self.places.up.len() >= QUEUE {
                     return Ok(Admit::Blocked(MuxEvent::Control(event)));
                 }
-                self.up.push_back(event);
+                self.places.up.push_back(event);
             }
         }
         Ok(Admit::Taken)
@@ -1114,11 +1177,11 @@ where
         env: &mut Env<'_, Self::Report>,
         command: CommandOf<K>,
     ) -> Result<Admit<CommandOf<K>>, Overrun> {
-        self.reserve(env.budget())?;
-        if self.down.len() >= QUEUE {
+        self.places.reserve(env.budget())?;
+        if self.places.down.len() >= QUEUE {
             return Ok(Admit::Blocked(command));
         }
-        self.down.push_back(MuxCommand::control(command));
+        self.places.down.push_back(MuxCommand::control(command));
         Ok(Admit::Taken)
     }
 
@@ -1130,12 +1193,13 @@ where
         let Some(key) = self.key(id) else {
             return Ok(false);
         };
-        let kid = &mut self.kids[key];
+        let kid = &mut self.places.kids[key];
+        let since = kid.budget.refusals();
         let layer = &mut kid.layer;
         let result = kid.wake.call(|| {
             env.scoped_child(
                 &kid.budget,
-                &kid.wake,
+                kid.waiter.waker(),
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_timer(env, timer),
             )
@@ -1144,6 +1208,7 @@ where
         // due at the same time, so theirs fire first.
         match result {
             Ok(fired) => {
+                self.places.kids[key].wait_for_memory(since);
                 self.called(key, true, true);
                 Ok(fired)
             }
@@ -1162,18 +1227,22 @@ where
         let Some(key) = self.key(id) else {
             return Ok(());
         };
-        let kid = &mut self.kids[key];
+        let kid = &mut self.places.kids[key];
+        let since = kid.budget.refusals();
         let layer = &mut kid.layer;
         let result = kid.wake.call(|| {
             env.scoped_child(
                 &kid.budget,
-                &kid.wake,
+                kid.waiter.waker(),
                 move |e| ChildReport::Event(id, e),
                 |env| layer.on_done(env, done),
             )
         });
         match result {
-            Ok(()) => self.called(key, true, false),
+            Ok(()) => {
+                self.places.kids[key].wait_for_memory(since);
+                self.called(key, true, false);
+            }
             Err(e) => self.fail(env, id, e),
         }
         Ok(())
@@ -1182,14 +1251,14 @@ where
     fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Overrun> {
         // The queues are the router's fixed state: an idle connection holds
         // them from its first step.
-        self.reserve(env.budget())?;
+        self.places.reserve(env.budget())?;
         self.collect_wakes();
         // The children ready now, in list order, at most QUEUE of them. One
         // that stays ready goes to the end and waits for the next advance.
         let mut moved = false;
         for visits in 0..self.ready.len {
             if visits == QUEUE {
-                self.release_places();
+                self.places.release();
                 return Ok(true);
             }
             let Some(key) = self.ready.head else {
@@ -1197,21 +1266,21 @@ where
             };
             moved |= self.visit(env, key);
         }
-        self.release_places();
+        self.places.release();
         Ok(moved)
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<MuxCommand<B::Lower, K>> {
-        self.down.pop_front()
+        self.places.down.pop_front()
     }
 
     fn take_event(&mut self) -> Option<EventOf<K>> {
-        self.up.pop_front()
+        self.places.up.pop_front()
     }
 
     fn take_work(&mut self) -> Option<Self::Work> {
-        while let Some(key) = self.work.pop(&mut self.kids) {
-            let kid = &mut self.kids[key];
+        while let Some(key) = self.work.pop(&mut self.places.kids) {
+            let kid = &mut self.places.kids[key];
             let layer = &mut kid.layer;
             let Some(work) = kid.wake.call(|| layer.take_work()) else {
                 continue;
@@ -1241,6 +1310,7 @@ where
 
     fn depth(&self) -> usize {
         1 + self
+            .places
             .kids
             .iter()
             .map(|(_, kid)| kid.layer.depth())
@@ -1249,7 +1319,7 @@ where
     }
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
-        let kid = &self.kids[*self.timers.first()?];
+        let kid = &self.places.kids[*self.places.timers.first()?];
         let (at, timer) = kid.due.clone()?;
         Some((at, (kid.id, timer)))
     }
@@ -1416,8 +1486,8 @@ mod tests {
         let _ = driver
             .deliver(MuxEvent::Child(id, observed_byte()))
             .unwrap();
-        assert!(!driver.layer().woken.any.load(Ordering::Acquire));
-        assert!(driver.layer().woken.keys.lock().is_empty());
+        assert!(!driver.layer().places.woken.any.load(Ordering::Acquire));
+        assert!(driver.layer().places.woken.keys.lock().is_empty());
         driver.run().unwrap();
         assert_eq!(driver.layer().child(id).unwrap().0, 1);
         assert!(matches!(
@@ -1658,7 +1728,7 @@ mod tests {
             .unwrap();
         driver.run().unwrap();
         assert!(driver.take_command().is_none());
-        let chunk = driver.layer_mut().kids[0].layer.held.take().unwrap();
+        let chunk = driver.layer_mut().places.kids[0].layer.held.take().unwrap();
         driver.run().unwrap();
         assert!(driver.take_command().is_none());
         drop(chunk);
@@ -1688,7 +1758,7 @@ mod tests {
                 ))
                 .unwrap();
             driver.run().unwrap();
-            let chunk = driver.layer_mut().kids[0].layer.held.take().unwrap();
+            let chunk = driver.layer_mut().places.kids[0].layer.held.take().unwrap();
             let mut original = Some(chunk);
             let mut edit = if shared {
                 original.as_mut().unwrap().split_to(1)
@@ -1735,7 +1805,7 @@ mod tests {
         assert!(driver.take_command().is_none());
         let layer = driver.layer_mut();
         let key = layer.key(id).unwrap();
-        (id, layer.kids[key].layer.held.take().unwrap())
+        (id, layer.places.kids[key].layer.held.take().unwrap())
     }
 
     /// A child whose state changes outside its calls: it keeps the waker
@@ -1835,6 +1905,120 @@ mod tests {
         ));
     }
 
+    /// A child that asks its budget for `want` bytes on each advance until
+    /// it gets them (rule 9), and keeps the waker of each call.
+    struct Hungry {
+        want: usize,
+        held: Option<Charge>,
+        tries: usize,
+        wakers: Vec<Waker>,
+    }
+
+    impl Layer for Hungry {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
+            self.wakers.push(env.waker());
+            if self.held.is_some() {
+                return Ok(false);
+            }
+            self.tries += 1;
+            self.held = env.budget().charge(self.want);
+            Ok(self.held.is_some())
+        }
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            _: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, ()>) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// A child charges a budget of its own, not the stack's, which the
+    /// runner above waits on. When that budget refuses it, the router waits
+    /// on it for the child, with the one waker the child has: the release
+    /// that leaves room wakes the runner and gets the child visited, with
+    /// no other event.
+    #[test]
+    fn a_child_refused_by_its_own_budget_is_visited_when_that_budget_frees() {
+        let sandbox = Budget::new(4096);
+        let child_budget = sandbox.clone();
+        let want = 1024;
+        let mut driver = Driver::new(
+            Children::<Hungry, Top, ()>::new(1, 8, move |_, (), _| {
+                Some(Hungry {
+                    want,
+                    held: None,
+                    tries: 0,
+                    wakers: Vec::new(),
+                })
+            })
+            .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
+        let woken = || task.0.load(Ordering::Acquire);
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+        // The sandbox has less room than the child wants.
+        let hog = sandbox
+            .charge(sandbox.limit() - sandbox.used() - want + 1)
+            .unwrap();
+        // Rounds as a runner makes them, until nothing moves.
+        for _ in 0..4 {
+            let since = driver.refusals();
+            driver.run().unwrap();
+            while driver.take_command().is_some() {}
+            driver.wake_when_freed(since);
+        }
+        let tries = driver.layer().child(id).unwrap().tries;
+        assert!(tries > 0 && driver.layer().child(id).unwrap().held.is_none());
+        driver.run().unwrap();
+        assert_eq!(
+            driver.layer().child(id).unwrap().tries,
+            tries,
+            "a refused child waits"
+        );
+        assert_eq!(woken(), 0, "no memory freed yet");
+
+        // Memory frees on the child's budget, not the stack's.
+        drop(hog);
+        assert_eq!(woken(), 1, "the release wakes the runner once");
+        assert!(driver.woken());
+        driver.run().unwrap();
+        let child = driver.layer().child(id).unwrap();
+        assert!(child.tries > tries, "the child is visited again");
+        assert!(child.held.is_some(), "and gets its memory");
+        let first = &child.wakers[0];
+        assert!(
+            child.wakers.iter().all(|w| w.will_wake(first)),
+            "every call gets the child's one waker"
+        );
+    }
+
     #[test]
     fn children_woken_together_are_visited_in_id_order() {
         let mut driver = driver(|_, _, _| Reader::default());
@@ -1862,9 +2046,9 @@ mod tests {
         // Woken, then closed before it was collected.
         let (queued, chunk) = holding(&mut driver, &mut slots);
         drop(chunk);
-        assert!(!driver.layer().woken.keys.lock().is_empty());
+        assert!(!driver.layer().places.woken.keys.lock().is_empty());
         let _ = driver.deliver(MuxEvent::Closed(queued)).unwrap();
-        assert!(driver.layer().woken.keys.lock().is_empty());
+        assert!(driver.layer().places.woken.keys.lock().is_empty());
         // Closed, then woken: a later child has its place by then.
         let (closed, chunk) = holding(&mut driver, &mut slots);
         let place = driver.layer().key(closed);
@@ -1872,7 +2056,7 @@ mod tests {
         let (later, later_chunk) = holding(&mut driver, &mut slots);
         assert_eq!(driver.layer().key(later), place);
         drop(chunk);
-        assert!(driver.layer().woken.keys.lock().is_empty());
+        assert!(driver.layer().places.woken.keys.lock().is_empty());
         driver.run().unwrap();
         assert!(driver.take_command().is_none());
         // The later child's own wake still reaches it.
@@ -1935,7 +2119,7 @@ mod tests {
             );
         }
         // Empty data costs no credit, but holds one of the bounded places.
-        assert_eq!(driver.layer().kids[0].inbox.len(), QUEUE);
+        assert_eq!(driver.layer().places.kids[0].inbox.len(), QUEUE);
         let work = driver.layer_mut().take_work().unwrap();
         let first = work.id();
         let second = driver.layer_mut().take_work().unwrap().id();
@@ -1987,7 +2171,7 @@ mod tests {
             );
         }
         assert!(work.cancelled());
-        assert_eq!(driver.layer_mut().kids.len(), 1);
+        assert_eq!(driver.layer_mut().places.kids.len(), 1);
         assert_eq!(driver.layer_mut().take_work().unwrap().id(), b);
         assert!(
             driver
@@ -2334,6 +2518,136 @@ mod tests {
         driver.run().unwrap();
         while driver.take_command().is_some() {}
         assert_eq!(budget.used(), idle);
+    }
+
+    /// Full places grow every table together, and when the budget has no
+    /// room to double them, by the places it has room for: a child that
+    /// fits is not refused for places it does not need. What the places
+    /// are charged is what every table holds, and with no children left
+    /// they shrink back together.
+    #[test]
+    fn full_places_grow_every_table_by_the_places_that_fit() {
+        let children: Children<Reader, Top, ()> =
+            Children::new(8, 8, |_, (), _| Some(Reader::default()));
+        let budget = Budget::new(100_000);
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(96))),
+            budget.clone(),
+            Instant::ZERO,
+        );
+        driver.run().unwrap();
+        let idle = budget.used();
+        let place = Places::<Reader, Top>::place_bytes();
+        let held = |driver: &Driver<Children<Reader, Top, ()>>| {
+            let places = &driver.layer().places;
+            let count = places.count;
+            assert!(places.kids.capacity() >= count);
+            assert!(places.order.capacity() >= count);
+            assert!(places.timers.capacity() >= count);
+            assert!(places.woken.keys.lock().capacity() >= count);
+            assert!(places.down.capacity() >= QUEUE + count);
+            assert_eq!(
+                places.charge.as_ref().unwrap().bytes(),
+                Places::<Reader, Top>::queue_bytes() + count * place,
+                "charged what the tables hold"
+            );
+            count
+        };
+        let mut slots = Slots::new(8);
+        let mut open = Vec::new();
+        for _ in 0..FLOOR {
+            let child = slots.insert(()).unwrap();
+            open.push(child.id());
+            let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+        }
+        assert_eq!(held(&driver), FLOOR);
+        // Room for one more place and the child's window, not for twice
+        // the places.
+        let window = <StreamEvent as Credited>::receive_bytes(8).unwrap();
+        let other = budget
+            .charge(budget.limit() - budget.used() - place - window)
+            .unwrap();
+        let child = slots.insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+        assert!(
+            driver.layer().child(id).is_some(),
+            "the child that fits opens"
+        );
+        assert_eq!(held(&driver), FLOOR + 1);
+        drop(other);
+        open.push(id);
+        for id in open {
+            let _ = driver.deliver(MuxEvent::Closed(id)).unwrap();
+        }
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        driver.run().unwrap();
+        assert_eq!(held(&driver), FLOOR);
+        assert_eq!(budget.used(), idle);
+    }
+
+    /// The first credit lends the mux the child's receive window, and
+    /// bytes the mux makes in it are taken in with nothing charged or
+    /// given back. The window stays the router's: once the child closes,
+    /// what the mux kept of it no longer reaches it.
+    #[test]
+    fn the_first_credit_lends_the_window_and_bytes_made_in_it_move_no_charge() {
+        let budget = Budget::new(100_000);
+        let child_budget = budget.clone();
+        let mut driver = Driver::new(
+            Children::<Reader, Top, ()>::new(1, 8, |_, (), _| Some(Reader::default()))
+                .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(96))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+        driver.run().unwrap();
+        let mut lent = None;
+        while let Some(command) = driver.take_command() {
+            match command.into_op() {
+                super::super::MuxOp::Window(found, units, window) if found == id => {
+                    lent = Some((units, window));
+                }
+                super::super::MuxOp::Credit(found, _) if found == id => {
+                    panic!("the first credit lends the window");
+                }
+                _ => {}
+            }
+        }
+        let (units, kept) = lent.expect("the first credit went to the mux");
+        assert_eq!(units, 8);
+        let window = kept.upgrade().expect("the child keeps its window");
+        assert_eq!(
+            window.bytes(),
+            <StreamEvent as Credited>::receive_bytes(8).unwrap()
+        );
+
+        let used = budget.used();
+        let bytes = Chunk::in_window(vec![1; 8], window.clone());
+        drop(window);
+        let _ = driver
+            .deliver(MuxEvent::Child(id, StreamEvent::Data(bytes)))
+            .unwrap();
+        driver.run().unwrap();
+        let layer = driver.layer();
+        let inbox = layer.places.kids[layer.key(id).unwrap()].inbox.charged();
+        assert_eq!(
+            budget.used(),
+            used + inbox,
+            "the bytes charged or gave back nothing; the inbox paid for its places"
+        );
+        assert_eq!(layer.child(id).unwrap().held.as_deref(), Some(&[1; 8][..]));
+
+        let _ = driver.deliver(MuxEvent::Closed(id)).unwrap();
+        assert!(
+            kept.upgrade().is_none(),
+            "the window went back with the child"
+        );
     }
 
     #[test]
