@@ -1120,6 +1120,27 @@ mod slot_tests {
     }
 
     #[test]
+    fn admitting_bytes_paid_elsewhere_moves_their_charge_to_the_receiver() {
+        let sender = Budget::new(4);
+        let receiver = Budget::new(4);
+        let mut event = StreamEvent::Data(paid(&sender, &[1, 2, 3, 4]));
+        assert!(!event.reserve(&Budget::new(3)));
+        assert_eq!(
+            sender.used(),
+            4,
+            "a refused admission leaves the old charge"
+        );
+        assert!(event.reserve(&receiver));
+        assert_eq!((sender.used(), receiver.used()), (0, 4));
+        let StreamEvent::Data(chunk) = event else {
+            unreachable!()
+        };
+        assert_eq!(&*chunk, &[1, 2, 3, 4]);
+        drop(chunk);
+        assert_eq!(receiver.used(), 0);
+    }
+
+    #[test]
     fn repaying_spare_capacity_elsewhere_keeps_only_the_bytes_charged() {
         let from = Budget::new(64);
         let mut chunk = paid_with_room(&from, &[1, 2], 64);
