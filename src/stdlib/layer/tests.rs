@@ -1684,3 +1684,50 @@ fn a_later_layer_must_fit_where_its_later_sits() {
     }));
     assert!(set.is_err(), "a layer one level too deep was set");
 }
+
+#[test]
+fn a_later_layer_is_lent_one_level_less_and_the_stacks_waker() {
+    use super::probe::{Call, Probe, Task};
+    let (probe, notes) = Probe::<ByteStream, ByteStream>::new();
+    let mut later = Later::new();
+    {
+        let entropy = SeededEntropy::new(Seed::from_u64(0));
+        let budget = Budget::unlimited();
+        let mut reports = Observations::new(0);
+        later.set(
+            &Env::new(Instant::ZERO, &entropy, &budget, &mut reports),
+            probe,
+        );
+    }
+    let mut driver = Driver::new(
+        later,
+        std::sync::Arc::new(SeededEntropy::new(Seed::from_u64(1))),
+        Budget::unlimited(),
+        Instant::ZERO,
+    );
+    let (task, waker) = Task::new();
+    driver.set_waker(&waker);
+    let _ = driver
+        .deliver(StreamEvent::Data(Chunk::unpaid(b"in".to_vec())))
+        .unwrap();
+    let _ = driver
+        .command(StreamCommand::Write(Chunk::unpaid(b"out".to_vec())))
+        .unwrap();
+    driver.run().unwrap();
+    assert!(driver.take_command().is_none());
+    driver.complete(()).unwrap();
+    // The part sits one level below the `Later`, at the top of the stack.
+    let room = MAX_DEPTH - (driver.layer().depth() - 1);
+    notes.assert_lent(
+        &[
+            Call::Event,
+            Call::Command,
+            Call::Timer,
+            Call::Advance,
+            Call::TakeCommand,
+            Call::Done,
+        ],
+        room,
+        &task,
+    );
+}

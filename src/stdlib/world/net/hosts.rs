@@ -2126,6 +2126,68 @@ mod tests {
     use super::super::{Net, TEST_POOLS};
     use super::*;
 
+    /// The TLS stack inside the observer runs one level below it, with the
+    /// stack's own waker, in every call that reaches it.
+    #[test]
+    fn the_observed_tls_stack_is_lent_one_level_less_and_the_stacks_waker() {
+        use fictionet::stdlib::layer::probe::{Call, Probe, Task};
+        use fictionet::stdlib::layer::{Chunk, Driver, MAX_DEPTH, StreamEvent};
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let (probe, notes) = Probe::<ByteStream, Top>::new();
+                let local: SocketAddr = "10.0.0.1:443".parse()?;
+                let peer: SocketAddr = "10.0.0.2:5000".parse()?;
+                let observed = ObservedTls {
+                    stack: Boxed::new(probe),
+                    factory: tls::Factory::default(),
+                    fcx: fcx.clone(),
+                    info: ConnInfo::new(1, local, peer),
+                    requested: Arc::default(),
+                    handshook: Arc::default(),
+                    observe: None,
+                    reported: false,
+                };
+                let mut driver = Driver::new(
+                    observed,
+                    Arc::new(fictionet::SeededEntropy::new(fictionet::Seed::from_u64(2))),
+                    Budget::unlimited(),
+                    fcx.now(),
+                );
+                let (task, waker) = Task::new();
+                driver.set_waker(&waker);
+                let _ = driver
+                    .deliver(StreamEvent::Data(Chunk::unpaid(b"hello".to_vec())))
+                    .map_err(fictionet::Error::boxed)?;
+                driver.run().map_err(fictionet::Error::boxed)?;
+                assert!(driver.take_command().is_none());
+                let mut work = driver.take_work().expect("the probe's work");
+                let std::task::Poll::Ready(done) = work.poll(
+                    Some(&fcx),
+                    &mut std::task::Context::from_waker(std::task::Waker::noop()),
+                ) else {
+                    panic!("the probe's work is done at once");
+                };
+                driver.complete(done).map_err(fictionet::Error::boxed)?;
+                // The probe sits below the observer and the box it is in.
+                let room = MAX_DEPTH - (driver.layer().depth() - 1);
+                notes.assert_lent(
+                    &[
+                        Call::Event,
+                        Call::Timer,
+                        Call::Advance,
+                        Call::TakeCommand,
+                        Call::Done,
+                    ],
+                    room,
+                    &task,
+                );
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+
     /// A peer refused under a limit of zero is not left in the count, so a
     /// limit that refuses everyone keeps nothing for each address it meets.
     #[test]

@@ -1,17 +1,77 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::ops::RangeInclusive;
 
-/// A bounded unread suffix and its stream offset.
+/// Where a [`Buffer`] keeps its bytes: a plain vector, or a container whose
+/// growth is paid for before it allocates, such as a layer's
+/// [`ChargedBytes`](fictionet::stdlib::layer::ChargedBytes).
+///
+/// The buffer keeps its own read and write positions inside
+/// [`bytes`](Self::bytes); the storage only holds them.
+pub trait Storage {
+    /// The bytes that are initialized, written or not.
+    fn bytes(&self) -> &[u8];
+    /// The same bytes, to write.
+    fn bytes_mut(&mut self) -> &mut [u8];
+    /// How many bytes the allocation holds, initialized or not.
+    fn capacity(&self) -> usize;
+    /// Grows the allocation to hold as much of `capacity` as it may: at
+    /// least its start, at most its end. Returns `false`, changing
+    /// nothing, if not even the start can be had.
+    fn grow_within(&mut self, capacity: RangeInclusive<usize>) -> bool;
+    /// Initializes up to `len` bytes, zeroing the new ones, if `len` fits
+    /// in the capacity. Returns `false`, changing nothing, if it does not.
+    /// Never reallocates.
+    fn resize_within(&mut self, len: usize) -> bool;
+    /// Keeps the first `len` initialized bytes and gives back the capacity
+    /// past them.
+    fn shrink_to(&mut self, len: usize);
+}
+
+/// Storage that asks only the allocator.
+impl Storage for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self
+    }
+    fn capacity(&self) -> usize {
+        Vec::capacity(self)
+    }
+    fn grow_within(&mut self, capacity: RangeInclusive<usize>) -> bool {
+        let (least, most) = (*capacity.start(), *capacity.end());
+        least <= Vec::capacity(self)
+            || self
+                .try_reserve_exact(most.saturating_sub(self.len()))
+                .is_ok()
+            || self.try_reserve_exact(least - self.len()).is_ok()
+    }
+    fn resize_within(&mut self, len: usize) -> bool {
+        if len > Vec::capacity(self) {
+            return false;
+        }
+        self.resize(len, 0);
+        true
+    }
+    fn shrink_to(&mut self, len: usize) {
+        self.truncate(len);
+        self.shrink_to_fit();
+    }
+}
+
+/// A bounded unread suffix and its stream offset, kept in storage `S`.
 ///
 /// New input is bounded by `limit`. A handoff can retain a larger suffix.
 /// Storage is at most twice the largest limit used:
 /// a consumed prefix is kept until it is at least as large as the suffix.
 /// This makes compaction amortized linear even when a full buffer is
-/// consumed and refilled one byte at a time. Allocation grows on demand.
+/// consumed and refilled one byte at a time. Allocation grows on demand,
+/// and only as far as the storage allows.
 #[derive(Clone, Debug)]
-pub struct Buffer {
-    buf: Vec<u8>,
+pub struct Buffer<S = Vec<u8>> {
+    buf: S,
     start: usize,
     end: usize,
     offered: usize,
@@ -24,20 +84,30 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    const MAX_SPARE: usize = 64 * 1024;
-
     /// Largest supported unread limit. Twice this fits in a vector.
     pub const MAX_LIMIT: usize = (isize::MAX as usize) / 2;
 
-    /// Creates an empty buffer. Limits above [`MAX_LIMIT`](Self::MAX_LIMIT)
-    /// are clamped. A zero limit accepts no bytes.
+    /// Creates an empty buffer in a vector. Limits above
+    /// [`MAX_LIMIT`](Self::MAX_LIMIT) are clamped. A zero limit accepts no
+    /// bytes.
     pub fn new(limit: usize) -> Self {
+        Self::in_storage(limit, Vec::new())
+    }
+}
+
+impl<S: Storage> Buffer<S> {
+    const MAX_SPARE: usize = 64 * 1024;
+
+    /// Creates an empty buffer in `storage`, whose initialized bytes it
+    /// reuses as room. Limits above [`MAX_LIMIT`](Buffer::MAX_LIMIT) are
+    /// clamped. A zero limit accepts no bytes.
+    pub fn in_storage(limit: usize, storage: S) -> Self {
         Self {
-            buf: Vec::new(),
+            buf: storage,
             start: 0,
             end: 0,
             offered: 0,
-            limit: limit.min(Self::MAX_LIMIT),
+            limit: limit.min(Buffer::MAX_LIMIT),
             offset: 0,
             #[cfg(test)]
             moved: 0,
@@ -45,13 +115,25 @@ impl Buffer {
             initialized: 0,
         }
     }
+    /// The storage, to see what pays for it.
+    pub fn storage(&self) -> &S {
+        &self.buf
+    }
+    /// The storage, to move what pays for it. Its bytes are the buffer's:
+    /// changing them changes what the buffer holds.
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.buf
+    }
     /// The unread limit for new input. A handoff may retain a larger suffix.
     pub fn limit(&self) -> usize {
         self.limit
     }
     /// All committed, unread bytes.
     pub fn unread(&self) -> &[u8] {
-        self.buf.get(self.start..self.end).unwrap_or_default()
+        self.buf
+            .bytes()
+            .get(self.start..self.end)
+            .unwrap_or_default()
     }
     /// The unread length.
     pub fn len(&self) -> usize {
@@ -69,7 +151,7 @@ impl Buffer {
     pub fn offset(&self) -> u64 {
         self.offset
     }
-    /// The allocated vector capacity, including any consumed prefix.
+    /// The allocated capacity, including any consumed prefix.
     pub fn allocated(&self) -> usize {
         self.buf.capacity()
     }
@@ -84,9 +166,8 @@ impl Buffer {
     /// Preserves the offset and invalidates any outstanding spare offer.
     pub fn shrink(&mut self) {
         let n = self.len();
-        self.buf.copy_within(self.start..self.end, 0);
-        self.buf.truncate(n);
-        self.buf.shrink_to_fit();
+        self.buf.bytes_mut().copy_within(self.start..self.end, 0);
+        self.buf.shrink_to(n);
         self.start = 0;
         self.end = n;
         self.offered = 0;
@@ -100,8 +181,8 @@ impl Buffer {
         self.offered = 0;
         if self.start >= self.len() && self.start != 0 {
             let n = self.len();
-            // Both ends are maintained within buf.len().
-            self.buf.copy_within(self.start..self.end, 0);
+            // Both ends are maintained within the initialized bytes.
+            self.buf.bytes_mut().copy_within(self.start..self.end, 0);
             self.start = 0;
             self.end = n;
             #[cfg(test)]
@@ -117,32 +198,27 @@ impl Buffer {
                 .max(self.buf.capacity().saturating_mul(2))
                 .min(self.limit.saturating_mul(2))
                 .min(capacity);
-            if target < size {
-                return false;
-            }
-            if self
-                .buf
-                .try_reserve_exact(target.saturating_sub(self.buf.len()))
-                .is_err()
-            {
+            if target < size || !self.buf.grow_within(size..=target) {
                 return false;
             }
         }
-        if size > self.buf.len() {
+        let initialized = self.buf.bytes().len();
+        if size > initialized {
+            if !self.buf.resize_within(size) {
+                return false;
+            }
             #[cfg(test)]
             {
-                self.initialized = self
-                    .initialized
-                    .saturating_add(size.saturating_sub(self.buf.len()));
+                self.initialized = self.initialized.saturating_add(size - initialized);
             }
-            self.buf.resize(size, 0);
         }
         true
     }
 
     /// Appends what fits and returns the accepted count. Compacts only
     /// when the consumed prefix is at least half of committed storage.
-    /// Returns zero if allocation fails. Invalidates any prior spare offer.
+    /// Returns zero if the storage cannot grow. Invalidates any prior
+    /// spare offer.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
         self.push_with_budget(bytes, usize::MAX)
@@ -162,7 +238,9 @@ impl Buffer {
         if !self.size(end, capacity) {
             return 0;
         }
-        if let (Some(dst), Some(src)) = (self.buf.get_mut(self.end..end), bytes.get(..n)) {
+        if let (Some(dst), Some(src)) =
+            (self.buf.bytes_mut().get_mut(self.end..end), bytes.get(..n))
+        {
             dst.copy_from_slice(src);
             self.end = end;
             n
@@ -172,10 +250,10 @@ impl Buffer {
     }
 
     /// Offers initialized space for direct reads. Call [`commit`](Self::commit)
-    /// afterward. Uncommitted bytes are never unread input. An allocation
-    /// failure gives an empty slice. Space can contain bytes from earlier
-    /// offers. Initialized storage is reused across short reads. Each offer
-    /// is at most 64 KiB.
+    /// afterward. Uncommitted bytes are never unread input. A storage that
+    /// cannot grow gives an empty slice. Space can contain bytes from
+    /// earlier offers. Initialized storage is reused across short reads.
+    /// Each offer is at most 64 KiB.
     pub fn spare(&mut self) -> &mut [u8] {
         self.compact();
         let offered = self.room().min(Self::MAX_SPARE);
@@ -184,14 +262,17 @@ impl Buffer {
             return &mut [];
         }
         self.offered = offered;
-        self.buf.get_mut(self.end..end).unwrap_or_default()
+        self.buf
+            .bytes_mut()
+            .get_mut(self.end..end)
+            .unwrap_or_default()
     }
     /// Commits at most the last offered spare length. Without a spare
     /// offer this does nothing. Discards the rest of that offer.
     pub fn commit(&mut self, n: usize) {
         let n = n
             .min(self.offered)
-            .min(self.buf.len().saturating_sub(self.end))
+            .min(self.buf.bytes().len().saturating_sub(self.end))
             .min(self.room());
         self.end = self.end.saturating_add(n);
         self.offered = 0;
@@ -210,11 +291,11 @@ impl Buffer {
             self.end = 0;
         }
     }
-    /// Sets the limit for new input, clamped to [`MAX_LIMIT`](Self::MAX_LIMIT).
+    /// Sets the limit for new input, clamped to [`MAX_LIMIT`](Buffer::MAX_LIMIT).
     /// Keeps unread bytes and invalidates any spare offer.
     #[inline]
     pub fn set_limit(&mut self, limit: usize) {
-        self.limit = limit.min(Self::MAX_LIMIT);
+        self.limit = limit.min(Buffer::MAX_LIMIT);
         self.offered = 0;
     }
 }

@@ -144,9 +144,10 @@ where
     )
 }
 
-/// What `Framed` holds as charged for its buffer, by its own fields.
+/// What `Framed` holds as charged for its buffer and the decoder's state,
+/// by the charges themselves.
 fn buffer_charge<D: Decode>(f: &Framed<D, Blob>) -> usize {
-    f.charge.as_ref().map_or(0, |c| c.bytes())
+    f.state.as_ref().map_or(0, |c| c.bytes()) + f.stream.storage().charged()
 }
 
 /// What one event says, without its payload.
@@ -264,8 +265,11 @@ fn charges_come_back<const LIMIT: usize, const S1: u8, const S2: u8>() {
     let mut d = driver(Units, &budget);
     // Output the transport has not taken yet.
     let mut flying: Option<Chunk> = None;
-    if d.deliver(StreamEvent::Data(fixed::<2>())).is_err() {
-        // A budget refusal takes no byte.
+    if matches!(
+        d.deliver(StreamEvent::Data(fixed::<2>())).unwrap(),
+        Admit::Blocked(_)
+    ) {
+        // A budget refusal takes no byte, and waits for memory.
         assert_eq!(d.layer().stream.allocated(), 0);
         assert_eq!(d.layer().stream.buffered(), 0);
     }

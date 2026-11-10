@@ -5,7 +5,7 @@ use fictionet::stdlib::protocols::dns::rr::rdata::{NS, SOA};
 use fictionet::stdlib::protocols::dns::rr::{LowerName, Record, RecordSet};
 use fictionet::stdlib::protocols::dns::{Ede, EdeCode};
 use fictionet::stdlib::services::dns::authority::{ServerConfig, Zones};
-use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
+use fictionet::stdlib::services::dns::resolver::{Cache, CacheTooSmall, Config, LocalZone};
 use fictionet::stdlib::services::dns::zone::Zone;
 use fictionet::stdlib::services::dns::{Client, Event, Looked, Lookup, WallClock};
 use fictionet::stdlib::world::net::dns::{
@@ -1652,6 +1652,49 @@ fn transparent_declared_names_leave_the_names_above_them_to_iteration() {
         assert_eq!(soa.mname, Name::from_ascii("ns.").unwrap());
         Ok(())
     });
+}
+
+/// A resolver whose cache budget has no room for the cache's index fails
+/// its program with that error when a client first asks it, and the
+/// world's run ends with the error instead of a panic.
+#[test]
+fn a_resolver_without_room_for_its_cache_fails_the_world() {
+    let resolver = Ipv4Addr::new(203, 0, 113, 53);
+    let config = Config::new();
+    let too_small = Cache::storage(config.max_cache_entries).unwrap() - 1;
+    let config = Config {
+        max_cache_bytes: too_small,
+        ..config
+    };
+    let clock = WallClock {
+        start: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let result = fictionet_test_support::within(Duration::from_secs(60), move || {
+        block_on(lab(fictionet::Seed::from_u64(1), move |fcx| async move {
+            let (attacher, attachments) = fictionet::attachments();
+            Net::new(fictionet_extras::network::cdn_pools())
+                .ipv4_only()
+                .host("resolver", |h| {
+                    h.at(resolver).program(Recursive::new(config, clock))
+                })
+                .start(&fcx, attachments)?;
+            let m = machine(&fcx, attacher.attach("client")?, ME);
+            let query = dns_query(1, "example.", RecordType::A, false);
+            let answer = ask(&fcx, &m, SocketAddr::new(resolver.into(), 53), &query).await;
+            Err(fictionet::Error::msg(format!(
+                "the world ran on after the query, answered with {answer:?}"
+            )))
+        }))
+    });
+    let error = result.expect_err("the world fails");
+    assert_eq!(
+        error.downcast_ref::<CacheTooSmall>(),
+        Some(&CacheTooSmall {
+            max_cache_bytes: too_small,
+            max_cache_entries: Config::new().max_cache_entries,
+        }),
+        "{error}"
+    );
 }
 
 /// Advancing a namespace reaches a running resolver: it empties its cache

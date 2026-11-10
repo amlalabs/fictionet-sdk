@@ -258,7 +258,7 @@ fn in_memory(
 ) -> Vec<(Vec<u8>, Outcome)> {
     let entropy = SeededEntropy::new(Seed::from_u64(SEED));
     let mut engine = Watched {
-        resolver: Resolver::new(config.clone(), Ring, TestInternet::clock()),
+        resolver: Resolver::new(config.clone(), Ring, TestInternet::clock()).unwrap(),
         replies: Vec::new(),
         now: Instant::ZERO,
     };
@@ -976,7 +976,7 @@ fn a_validation_that_failed_is_tried_again_after_the_failure_ttl() {
     let mut net = internet.memory();
     let entropy = SeededEntropy::new(Seed::from_u64(SEED));
     let mut engine = Watched {
-        resolver: Resolver::new(config.clone(), Ring, TestInternet::clock()),
+        resolver: Resolver::new(config.clone(), Ring, TestInternet::clock()).unwrap(),
         replies: Vec::new(),
         now: Instant::ZERO,
     };

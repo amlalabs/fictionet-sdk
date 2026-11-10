@@ -1227,7 +1227,14 @@ mod tests {
     fn a_query_stays_charged_while_the_resolver_has_it() {
         let budget = Budget::unlimited();
         let mut h = harness(budget.clone());
-        h.settle().unwrap();
+        // A first query of the same size grows the decoder's buffer to hold
+        // one, which the connection keeps paying for while it lasts.
+        h.push(&framed(&[message(3, 300)])).unwrap();
+        let mut first = asks(&mut h);
+        let done = poll_answering(&mut first[0], Some(message(4, 900)));
+        drop(first);
+        h.complete(Side::Upper(done)).unwrap();
+        let _ = h.take_output();
         let before = budget.used();
         let query = message(1, 300);
         h.push(&framed(std::slice::from_ref(&query))).unwrap();

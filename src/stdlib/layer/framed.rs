@@ -127,13 +127,18 @@ pub type Framing<D, O> = Messages<Decoded<D>, Owned<O>>;
 /// Going down, each value is written whole, after the ones before.
 /// [`MessageCommand::End`] ends the direction after them.
 ///
-/// The decoder's buffer and state are charged to the connection's
-/// [`Budget`](super::Budget) before bytes are buffered, and each written
-/// value carries its own charge until the transport takes it.
+/// The decoder's buffer is a [`ChargedBytes`]: it grows only as the
+/// connection's [`Budget`](super::Budget) pays for it, charged before it
+/// allocates. Bytes the budget has no room to buffer are refused, and taken
+/// once memory frees. The decoder's state is charged when the first call
+/// names the budget, and each written value carries its own charge until
+/// the transport takes it.
 pub struct Framed<D: Decode, O> {
-    stream: Stream<D>,
-    charge: Option<Charge>,
-    budget: Option<Budget>,
+    stream: Stream<D, ChargedBytes>,
+    /// What the decoder holds besides its input, charged to the
+    /// connection's budget, whose charge also says which budget that is.
+    /// `None` until a call names it.
+    state: Option<Charge>,
     out: Option<Chunk>,
     /// The upper side asked to end the direction.
     end: bool,
@@ -149,10 +154,12 @@ pub struct Framed<D: Decode, O> {
 impl<D: Decode, O> Framed<D, O> {
     /// Frames with `decoder`, buffering at most its capacity.
     pub fn new(decoder: D) -> Framed<D, O> {
+        // Until a call names the connection's budget, the buffer is charged
+        // to one with no room: it holds nothing and cannot grow.
+        let unbound = ChargedBytes::new(&Budget::new(0));
         Framed {
-            stream: Stream::new(decoder),
-            charge: None,
-            budget: None,
+            stream: Stream::in_storage(decoder, 0, unbound),
+            state: None,
             out: None,
             end: false,
             end_sent: false,
@@ -169,37 +176,22 @@ impl<D: Decode, O> Framed<D, O> {
         self.stream.unread()
     }
 
-    /// Charges the buffer as it may grow and the decoder's state. The
-    /// buffer's limit follows the decoder's capacity on the next push, and
-    /// the buffer keeps a consumed prefix until it is as long as what is
-    /// left, so it grows to at most twice that limit: charging that is
-    /// enough before taking bytes.
-    fn charge(&mut self, env: &Env<'_, Infallible>) -> Result<(), FramedError<O>>
-    where
-        O: Wire,
-    {
-        self.budget = Some(env.budget().clone());
-        let limit = self.stream.limit().max(self.stream.decoder().capacity());
-        let need = limit
-            .saturating_mul(2)
-            .max(self.stream.allocated())
-            .saturating_add(self.stream.held());
-        let fits = match &mut self.charge {
-            Some(charge) if need < charge.bytes() => {
-                charge.shrink_to(need);
-                true
-            }
-            Some(charge) => charge.grow_to(need),
-            None => {
-                self.charge = env.budget().charge(need);
-                self.charge.is_some()
-            }
-        };
-        if fits {
-            Ok(())
-        } else {
-            Err(FramedError::Budget)
+    /// Takes the connection's budget from the first call that names it:
+    /// the decoder's state is charged to it, and the buffer, empty until
+    /// now, moves to it. Returns whether the budget is known; `false`,
+    /// changing nothing, while it has no room for the state.
+    fn bind(&mut self, env: &Env<'_, Infallible>) -> bool {
+        if self.state.is_some() {
+            return true;
         }
+        let Some(state) = env.budget().charge(self.stream.held()) else {
+            return false;
+        };
+        if !self.stream.storage_mut().transfer(env.budget()) {
+            return false;
+        }
+        self.state = Some(state);
+        true
     }
 }
 
@@ -230,7 +222,11 @@ where
                 if chunk.is_empty() {
                     return Ok(Admit::Taken);
                 }
-                self.charge(env)?;
+                if !self.bind(env) {
+                    return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
+                }
+                // A full buffer, or one the budget has no room to grow,
+                // takes nothing.
                 let n = self.stream.push(&chunk);
                 if n == 0 {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
@@ -302,9 +298,7 @@ where
     }
 
     fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Self::Error> {
-        if self.budget.is_none() {
-            self.charge(env)?;
-        }
+        self.bind(env);
         Ok(false)
     }
 
@@ -327,15 +321,11 @@ where
             return None;
         }
         if !self.input_over {
-            let budget = self.budget.as_ref()?;
+            // What decoding the next item may allocate is paid first. When
+            // the budget has no room, the item waits for memory, as a
+            // buffer that cannot grow does.
             let bound = self.stream.decoder().allocation_bound();
-            let Some(charge) = budget.charge(bound) else {
-                self.input_over = true;
-                return Some(MessageEvent::Message(Err(Fail::Refused {
-                    unread: self.stream.buffered(),
-                    limit: budget.limit(),
-                })));
-            };
+            let charge = self.state.as_ref()?.budget().charge(bound)?;
             match self.stream.next() {
                 Some(Ok(item)) => return Some(MessageEvent::Message(Ok(Owned::new(item, charge)))),
                 Some(Err(fail)) => {
@@ -353,8 +343,7 @@ where
 
 /// Why [`Framed`] gave up on its connection.
 pub enum FramedError<O: Wire> {
-    /// The connection's budget had no room for the decoder's buffer or a
-    /// written value.
+    /// The connection's budget had no room for a written value.
     Budget,
     /// The protocol above sent a value its wire format cannot hold.
     Write(WriteFailure<O::WriteError>),
@@ -399,7 +388,7 @@ pub(crate) mod tests {
     use super::*;
     use fictionet::Seed;
     use fictionet::stdlib::codec::Frames;
-    use fictionet::stdlib::layer::{Budget, Chain, Harness, Side, Top};
+    use fictionet::stdlib::layer::{Budget, Chain, Harness, Top};
     use fictionet::stdlib::protocols::modbus::{self, Frame};
 
     pub(crate) type Port = Framing<Frames<Frame>, Frame>;
@@ -785,20 +774,62 @@ pub(crate) mod tests {
         );
     }
 
+    /// The buffer pays for what it holds as it grows, not for the most it
+    /// may grow to.
     #[test]
-    fn a_budget_without_room_for_the_buffer_gives_up_before_taking_bytes() {
-        let small = Budget::new(modbus::MAX_FRAME - 1);
-        let mut h = Harness::with_budget(Seed::from_u64(5), stack(), small.clone());
-        assert!(matches!(
-            h.push(&wire(&frames(1))),
-            Err(Side::Lower(FramedError::Budget))
-        ));
-        assert_eq!(small.used(), 0, "nothing stays charged");
+    fn the_buffer_is_charged_what_it_holds_not_its_bound() {
+        let budget = Budget::new(1 << 16);
+        let mut h = Harness::with_budget(Seed::from_u64(5), stack(), budget.clone());
+        let input = wire(&frames(1));
+        // Part of a frame: nothing is decoded, so only the buffer and the
+        // decoder's state are charged.
+        h.push(&input[..3]).unwrap();
+        let framed = h.layer().lower();
+        let holds = framed.stream.allocated() + framed.stream.held();
+        assert!(holds > 0, "the buffer holds the bytes");
+        assert!(
+            budget.used() >= holds,
+            "the budget is charged {} for a buffer of {holds}",
+            budget.used()
+        );
+        assert!(
+            budget.used() < framed.stream.most_allocated(),
+            "the budget is charged {} before the buffer needs {}",
+            budget.used(),
+            framed.stream.most_allocated()
+        );
+    }
 
+    /// Bytes the budget has no room to buffer wait with the peer, and are
+    /// taken and answered once memory frees.
+    #[test]
+    fn a_budget_without_room_for_the_buffer_waits_for_memory() {
+        let budget = Budget::new(1 << 16);
+        let held = budget.charge(budget.limit() - 2).unwrap();
+        let mut h = Harness::with_budget(Seed::from_u64(5), stack(), budget.clone());
+        let sent = frames(1);
+        let input = wire(&sent);
+        // The chain above the peer holds the refused bytes; the decoder's
+        // buffer takes none and nothing more is charged.
+        h.push(&input).unwrap();
+        assert_eq!(h.layer().lower().stream.buffered(), 0, "no byte is taken");
+        assert_eq!(h.layer().lower().stream.allocated(), 0);
+        assert_eq!(budget.used(), held.bytes());
+        assert!(h.output().is_empty());
+        drop(held);
+        h.settle().unwrap();
+        assert_eq!(read(h.output()), sent);
+    }
+
+    #[test]
+    fn every_charge_comes_back() {
         let roomy = Budget::new(1 << 16);
         let mut h = Harness::with_budget(Seed::from_u64(5), stack(), roomy.clone());
         h.push(&wire(&frames(4))).unwrap();
-        assert!(roomy.used() >= modbus::MAX_FRAME, "the buffer is charged");
+        let framed = h.layer().lower();
+        let holds = framed.stream.allocated() + framed.stream.held();
+        assert!(holds > 0, "the buffer grew");
+        assert!(roomy.used() >= holds, "the buffer is charged");
         drop(h);
         assert_eq!(roomy.used(), 0, "every charge comes back");
     }

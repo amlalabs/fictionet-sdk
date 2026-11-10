@@ -1,5 +1,8 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::{error::Error, fmt, ops::Range};
-use fictionet::stdlib::codec::{Buffer, Decode, Step};
+use fictionet::stdlib::codec::{Buffer, Decode, Step, Storage};
 
 /// Why a stream stopped.
 ///
@@ -59,13 +62,14 @@ impl<E: Error + 'static> Error for Fail<E> {
     }
 }
 
-/// One decoder and its bounded input buffer.
+/// One decoder and its bounded input buffer, kept in storage `S`: a
+/// vector, or a container whose growth is paid for first ([`Storage`]).
 ///
 /// A terminal error is returned once. Later calls return no items and
 /// [`failed`](Self::failed) retains the error. Driving methods require
 /// `D::Error: Clone` to keep an owned copy without changing [`Fail`].
-pub struct Stream<D: Decode> {
-    buf: Buffer,
+pub struct Stream<D: Decode, S = Vec<u8>> {
+    buf: Buffer<S>,
     dec: D,
     eof: bool,
     done: bool,
@@ -80,13 +84,30 @@ impl<D: Decode> Stream<D> {
     /// [`Buffer::MAX_LIMIT`]. Extra room allows read-ahead for this decoder.
     /// [`swap`](Self::swap) resets the limit to the next decoder's capacity.
     pub fn with_buffer(dec: D, limit: usize) -> Self {
+        Self::in_storage(dec, limit, Vec::new())
+    }
+}
+impl<D: Decode, S: Storage> Stream<D, S> {
+    /// As [`with_buffer`](Stream::with_buffer), with the buffer in
+    /// `storage`: it grows only as far as the storage allows, and a push
+    /// the storage cannot make room for takes nothing.
+    pub fn in_storage(dec: D, limit: usize, storage: S) -> Self {
         Self {
-            buf: Buffer::new(limit.max(dec.capacity())),
+            buf: Buffer::in_storage(limit.max(dec.capacity()), storage),
             dec,
             eof: false,
             done: false,
             failed: None,
         }
+    }
+    /// The buffer's storage, to see what pays for it.
+    pub fn storage(&self) -> &S {
+        self.buf.storage()
+    }
+    /// The buffer's storage, to move what pays for it. Its bytes are the
+    /// buffer's: changing them changes the unread input.
+    pub fn storage_mut(&mut self) -> &mut S {
+        self.buf.storage_mut()
     }
     /// Adds what fits. After EOF or completion, takes and drops new bytes.
     /// Already buffered bytes remain available for handoff.
@@ -199,7 +220,7 @@ impl<D: Decode> Stream<D> {
     /// Hands the same unread bytes and offset to a new decoder. Preserves
     /// EOF and clears terminal status. The new capacity becomes the buffer
     /// limit. A larger unread suffix is kept and drains before more input fits.
-    pub fn swap<E: Decode>(mut self, next: E) -> Stream<E> {
+    pub fn swap<E: Decode>(mut self, next: E) -> Stream<E, S> {
         self.buf.set_limit(next.capacity());
         Stream {
             buf: self.buf,
@@ -210,7 +231,7 @@ impl<D: Decode> Stream<D> {
         }
     }
     /// Returns the buffer and decoder for transfer outside the codec layer.
-    pub fn into_parts(self) -> (Buffer, D) {
+    pub fn into_parts(self) -> (Buffer<S>, D) {
         (self.buf, self.dec)
     }
     fn stuck(&self) -> Fail<D::Error> {
@@ -226,7 +247,7 @@ impl<D: Decode> Stream<D> {
         }
     }
 }
-impl<D: Decode> Stream<D>
+impl<D: Decode, S: Storage> Stream<D, S>
 where
     D::Error: Clone,
 {
