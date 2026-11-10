@@ -32,12 +32,26 @@ fn handshake(
     client_config: Arc<ClientConfig>,
     split: usize,
 ) -> (Server, rustls::ClientConnection) {
+    handshake_charging(config, client_config, split, Budget::unlimited())
+}
+
+/// A handshake whose server charges `budget`.
+fn handshake_charging(
+    config: Arc<ServerConfig>,
+    client_config: Arc<ClientConfig>,
+    split: usize,
+    budget: Budget,
+) -> (Server, rustls::ClientConnection) {
     let mut client = rustls::ClientConnection::new(
         client_config,
         rustls::pki_types::ServerName::try_from("example.test").unwrap(),
     )
     .unwrap();
-    let mut server = Harness::new(Seed::from_u64(12), tls::TlsLayer::new(config.clone()));
+    let mut server = Harness::with_budget(
+        Seed::from_u64(12),
+        tls::TlsLayer::new(config.clone()),
+        budget,
+    );
     let hello = client_output(&mut client);
     let split = split.min(hello.len());
     server.push(&hello[..split]).unwrap();
@@ -166,7 +180,7 @@ fn ciphertext_completion_is_not_admission_and_close_follows_data() {
                 .iter()
                 .all(|e| !matches!(e, StreamEvent::Written(_)))
         );
-        client.send_close_notify();
+        assert!(client.send_close_notify());
         server.push(&client_output(&mut client))?;
         assert!(
             events(&mut server)
@@ -193,6 +207,137 @@ fn no_budget_refuses_input_without_consuming_it() {
     }
     assert_eq!(budget.used(), 0);
     assert!(server.layer().hello().is_none());
+}
+
+/// Takes all the room `budget` has left, as other connections on it would.
+fn fill(budget: &Budget) -> fictionet::stdlib::layer::Charge {
+    budget.charge(budget.limit() - budget.used()).unwrap()
+}
+
+#[test]
+fn a_flight_without_room_waits_for_memory_and_then_goes() {
+    block_on(lab(Seed::from_u64(21), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let mut client = rustls::ClientConnection::new(
+            client_config,
+            rustls::pki_types::ServerName::try_from("example.test").unwrap(),
+        )?;
+        let budget = Budget::new(256 << 10);
+        let mut server = Harness::with_budget(
+            Seed::from_u64(21),
+            tls::TlsLayer::new(config.clone()),
+            budget.clone(),
+        );
+        server.push(&client_output(&mut client))?;
+        assert!(server.work().is_some());
+
+        let others = fill(&budget);
+        let refusals = budget.refusals();
+        let (completed, held) =
+            crate::common::alloc::left_allocated(|| server.complete(Some(config)));
+        completed?;
+        // Nothing of the connection or its flight is kept unpaid: what the
+        // step leaves allocated is only the config it keeps to try again.
+        assert!(
+            held <= 0,
+            "the step kept {held} bytes the budget had no room for"
+        );
+        assert!(server.take_output().is_empty(), "a flight went out unpaid");
+        assert!(server.layer().is_handshaking());
+        assert!(server.layer().failure().is_none());
+        // The refusal is counted, so the runner asks to be woken when
+        // memory frees.
+        assert_ne!(budget.refusals(), refusals);
+
+        drop(others);
+        server.settle()?;
+        for _ in 0..32 {
+            receive(&mut client, &server.take_output());
+            server.push(&client_output(&mut client))?;
+            if !client.is_handshaking() && !server.layer().is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.layer().is_handshaking());
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn a_record_without_room_waits_and_its_plaintext_comes_when_memory_frees() {
+    block_on(lab(Seed::from_u64(22), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let budget = Budget::new(256 << 10);
+        let (mut server, mut client) = handshake_charging(config, client_config, 0, budget.clone());
+        let message = vec![b'r'; 10 << 10];
+        client.writer().write_all(&message)?;
+        let wire = client_output(&mut client);
+
+        let others = fill(&budget);
+        server.push(&wire)?;
+        assert!(events(&mut server).is_empty(), "plaintext came unpaid");
+        assert!(
+            server.unread() > 0,
+            "the record was read without room for it"
+        );
+        assert!(server.layer().failure().is_none());
+
+        drop(others);
+        server.settle()?;
+        let mut plaintext = Vec::new();
+        for _ in 0..8 {
+            for event in events(&mut server) {
+                if let StreamEvent::Data(chunk) = event {
+                    plaintext.extend_from_slice(&chunk);
+                }
+            }
+            server.settle()?;
+        }
+        assert_eq!(server.unread(), 0);
+        assert!(plaintext == message, "the record waited intact");
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn a_write_and_an_end_without_room_wait_for_memory() {
+    block_on(lab(Seed::from_u64(23), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let budget = Budget::new(256 << 10);
+        let (mut server, mut client) = handshake_charging(config, client_config, 0, budget.clone());
+
+        let others = fill(&budget);
+        let write = StreamCommand::Write(Chunk::unpaid(b"reply".to_vec()));
+        let Admit::Blocked(write) = server.driver().command(write)? else {
+            panic!("a write was taken without room for its record");
+        };
+        let Admit::Blocked(end) = server.driver().command(StreamCommand::End)? else {
+            panic!("an end was taken without room for its close_notify");
+        };
+        server.settle()?;
+        assert!(server.take_output().is_empty());
+
+        drop(others);
+        assert!(matches!(server.driver().command(write)?, Admit::Taken));
+        server.settle()?;
+        receive(&mut client, &server.take_output());
+        assert!(matches!(server.driver().command(end)?, Admit::Taken));
+        server.settle()?;
+        receive(&mut client, &server.take_output());
+        let mut reply = Vec::new();
+        assert_eq!(client.reader().read_to_end(&mut reply)?, 5);
+        assert_eq!(reply, b"reply");
+        Ok(())
+    }))
+    .unwrap();
 }
 
 #[test]

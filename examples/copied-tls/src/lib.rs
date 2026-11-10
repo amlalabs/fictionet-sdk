@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustls::ServerConfig;
-use rustls::server::{Accepted, AcceptedAlert, Acceptor, ServerConnection};
+use rustls::server::{Accepted, AcceptedAlert, Acceptor, IntoConnectionError, ServerConnection};
 
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
@@ -106,20 +106,22 @@ impl Job for Pick {
 /// A failure remains available while its alert drains, allowing the carrier to
 /// report the original TLS failure even if sending the alert also fails.
 ///
-/// The budget covers this adapter's hello snapshot and transferred byte
-/// buffers. Rustls owns its protocol and cryptographic allocations separately;
-/// its buffer limits and read readiness bound streaming input and output, but
-/// are not a byte-exact heap limit for handshake state or user configurations.
+/// The connection's budget pays for every buffer it holds: rustls's own,
+/// charged by the vendored rustls before they grow (`rustls::budget`), the
+/// hello snapshot, and the byte buffers it hands on, which are copies. A
+/// buffer the budget has no room for waits until memory frees.
 pub struct TlsLayer {
     acceptor: Option<Acceptor>,
     accepted: Option<Accepted>,
+    /// The config picked for `accepted`, kept while the budget has no room
+    /// for the server's flight.
+    unpaid_config: Option<Arc<ServerConfig>>,
     tls: Option<ServerConnection>,
     hello: Option<Arc<Hello>>,
     select: Select,
     work: bool,
     deadline: Timers<()>,
     initialized: bool,
-    output_reserve: Option<Charge>,
     alert: Option<AcceptedAlert>,
     reject: bool,
     first_byte: Option<u8>,
@@ -170,13 +172,13 @@ impl TlsLayer {
         Self {
             acceptor: None,
             accepted: None,
+            unpaid_config: None,
             tls: None,
             hello: None,
             select,
             work: false,
             deadline: Timers::new(),
             initialized: false,
-            output_reserve: None,
             alert: None,
             reject: false,
             first_byte: None,
@@ -265,23 +267,65 @@ impl TlsLayer {
         self.below = None;
         self.acceptor = None;
         self.accepted = None;
+        self.unpaid_config = None;
         self.tls = None;
         self.hello = None;
         self.alert = None;
         self.reject = false;
         self.failure = None;
-        self.output_reserve = None;
         self.delivered = self.produced;
         self.pending_plaintext = 0;
         self.fence = None;
         self.credit = 0;
     }
 
-    fn reserve_output(&mut self, env: &Env<'_, ()>) -> bool {
-        if self.output_reserve.is_none() {
-            self.output_reserve = env.budget().charge(CHUNK);
+    /// Answers the client's hello with `config`. `false` if the budget had
+    /// no room for the server's flight: the hello and the config are kept
+    /// to try again when memory frees.
+    fn connect(&mut self, config: Arc<ServerConfig>) -> bool {
+        let Some(accepted) = self.accepted.take() else {
+            return true;
+        };
+        match accepted.into_connection(config.clone()) {
+            Ok(mut tls) => {
+                tls.set_buffer_limit(Some(CHUNK * 2));
+                self.tls = Some(tls);
+            }
+            Err(IntoConnectionError::Unpaid(accepted)) => {
+                self.accepted = Some(*accepted);
+                self.unpaid_config = Some(config);
+                return false;
+            }
+            Err(IntoConnectionError::Failed(error, alert)) => {
+                self.alert = Some(alert);
+                self.fail(Self::protocol_error(error));
+            }
         }
-        self.output_reserve.is_some()
+        true
+    }
+
+    /// Ciphertext for the carrier below, copied into an allocation of its
+    /// size paid for first. `None` if the budget has no room for it yet.
+    fn output(&mut self, env: &Env<'_, ()>) -> Result<Option<ChargedBytes>, HandshakeError> {
+        let len = if self.reject {
+            UNRECOGNIZED_NAME.len()
+        } else if let Some(alert) = self.alert.as_ref() {
+            alert.len()
+        } else {
+            self.tls.as_ref().unwrap().sendable_tls_len().min(CHUNK)
+        };
+        let Some(mut bytes) = ChargedBytes::with_capacity(env.budget(), len) else {
+            return Ok(None);
+        };
+        let result = if self.reject {
+            bytes.write(UNRECOGNIZED_NAME.as_slice())
+        } else if let Some(alert) = self.alert.as_mut() {
+            alert.write(&mut bytes)
+        } else {
+            self.tls.as_mut().unwrap().write_tls(&mut bytes)
+        };
+        result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
+        Ok(Some(bytes))
     }
 
     fn credit_written(&mut self) {
@@ -327,22 +371,37 @@ impl Layer for TlsLayer {
             }
             event if self.input_ended || self.failed || self.reset => Ok(Admit::Closed(event)),
             StreamEvent::Ended => {
+                // The end comes after every record already read: after the
+                // plaintext waiting above, and after a record waiting for
+                // room.
                 if let Some(tls) = self.tls.as_mut()
-                    && tls
-                        .reader()
-                        .into_first_chunk()
-                        .is_ok_and(|bytes| !bytes.is_empty())
+                    && (tls.wants_budget()
+                        || tls
+                            .reader()
+                            .into_first_chunk()
+                            .is_ok_and(|bytes| !bytes.is_empty()))
                 {
                     return Ok(Admit::Blocked(StreamEvent::Ended));
                 }
-                self.input_ended = true;
                 if self.is_handshaking() {
+                    self.input_ended = true;
                     self.fail(HandshakeError::Closed);
                 } else if let Some(tls) = self.tls.as_mut() {
                     match tls.read_tls(&mut &[][..]) {
-                        Ok(_) => self.process(),
-                        Err(error) => self.fail(HandshakeError::Failed(error.to_string())),
+                        Ok(_) => {
+                            self.input_ended = true;
+                            self.process();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                            return Ok(Admit::Blocked(StreamEvent::Ended));
+                        }
+                        Err(error) => {
+                            self.input_ended = true;
+                            self.fail(HandshakeError::Failed(error.to_string()));
+                        }
                     }
+                } else {
+                    self.input_ended = true;
                 }
                 Ok(Admit::Taken)
             }
@@ -353,20 +412,14 @@ impl Layer for TlsLayer {
                 if self.accepted.is_some()
                     || self.above.is_some()
                     || self.below.is_some()
-                    || self
-                        .tls
-                        .as_ref()
-                        .is_some_and(|tls| tls.wants_write() || !tls.wants_read())
+                    || self.tls.as_ref().is_some_and(|tls| {
+                        tls.wants_write() || !tls.wants_read() || tls.wants_budget()
+                    })
                 {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                 }
-                // Reserve the next output allocation before processing bytes
-                // that can produce a handshake response or a fatal alert.
-                if !self.reserve_output(env) {
-                    return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
-                }
                 if !self.initialized {
-                    self.acceptor = Some(Acceptor::default());
+                    self.acceptor = Some(Acceptor::with_budget(Arc::new(env.budget().clone())));
                     self.initialized = true;
                 }
                 let limit = chunk.len().min(CHUNK);
@@ -384,6 +437,11 @@ impl Layer for TlsLayer {
                         return Ok(Admit::Closed(StreamEvent::Data(chunk)));
                     }
                     Ok(n) => n,
+                    // No room to read into: the bytes wait, and the runner
+                    // comes back when memory frees.
+                    Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                        return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
+                    }
                     Err(error) => {
                         self.fail(HandshakeError::Failed(error.to_string()));
                         return Ok(Admit::Closed(StreamEvent::Data(chunk)));
@@ -419,7 +477,7 @@ impl Layer for TlsLayer {
 
     fn on_command(
         &mut self,
-        env: &mut Env<'_, ()>,
+        _env: &mut Env<'_, ()>,
         command: StreamCommand,
     ) -> Result<Admit<StreamCommand>, HandshakeError> {
         if matches!(command, StreamCommand::Reset) && !self.reset {
@@ -432,11 +490,10 @@ impl Layer for TlsLayer {
         match command {
             StreamCommand::Reset => Ok(Admit::Closed(StreamCommand::Reset)),
             StreamCommand::End => {
-                if self.is_handshaking() || !self.reserve_output(env) {
+                if self.is_handshaking() || !self.tls.as_mut().unwrap().send_close_notify() {
                     return Ok(Admit::Blocked(StreamCommand::End));
                 }
                 self.closing = true;
-                self.tls.as_mut().unwrap().send_close_notify();
                 Ok(Admit::Taken)
             }
             StreamCommand::Write(mut chunk) => {
@@ -446,9 +503,7 @@ impl Layer for TlsLayer {
                 if chunk.is_empty() {
                     return Ok(Admit::Taken);
                 }
-                if !self.reserve_output(env) {
-                    return Ok(Admit::Blocked(StreamCommand::Write(chunk)));
-                }
+                // Takes none if the budget has no room for its records.
                 let n = self
                     .tls
                     .as_mut()
@@ -479,11 +534,14 @@ impl Layer for TlsLayer {
             // A pick that finished after the handshake gave up.
             return Ok(());
         }
-        let accepted = self.accepted.take().ok_or_else(|| {
-            HandshakeError::Failed("TLS configuration without a client hello".into())
-        })?;
+        if self.accepted.is_none() {
+            return Err(HandshakeError::Failed(
+                "TLS configuration without a client hello".into(),
+            ));
+        }
         self.work = false;
         let Some(config) = config else {
+            self.accepted = None;
             self.reject = true;
             self.fail(HandshakeError::Rejected);
             return Ok(());
@@ -492,16 +550,9 @@ impl Layer for TlsLayer {
         // Its caller still supplies certificates, protocol choices and entropy.
         let mut config = (*config).clone();
         config.max_fragment_size = Some(512);
-        match accepted.into_connection(Arc::new(config)) {
-            Ok(mut tls) => {
-                tls.set_buffer_limit(Some(CHUNK * 2));
-                self.tls = Some(tls);
-            }
-            Err((error, alert)) => {
-                self.alert = Some(alert);
-                self.fail(Self::protocol_error(error));
-            }
-        }
+        // Without room for the flight, `advance` tries again when memory
+        // frees.
+        self.connect(Arc::new(config));
         Ok(())
     }
 
@@ -543,29 +594,35 @@ impl Layer for TlsLayer {
             self.work = true;
             return Ok(true);
         }
+        // Memory freed since the budget had no room for the server's
+        // flight, or for a record waiting in rustls.
+        let mut moved = false;
+        if let Some(config) = self.unpaid_config.take() {
+            if !self.connect(config) {
+                return Ok(false);
+            }
+            moved = true;
+        }
+        if let Some(tls) = self.tls.as_mut()
+            && tls.wants_budget()
+        {
+            self.process();
+            moved |= !self.tls.as_ref().is_some_and(|tls| tls.wants_budget());
+        }
         // At most one charged chunk each way is retained by this layer.
         if self.below.is_none()
             && (self.reject
                 || self.alert.is_some()
                 || self.tls.as_ref().is_some_and(|tls| tls.wants_write()))
         {
-            if !self.reserve_output(env) {
-                return Ok(false);
-            }
-            let mut bytes = self.output_reserve.take().unwrap().into_bytes();
-            let result = if self.reject {
-                bytes.write(UNRECOGNIZED_NAME.as_slice())
-            } else if let Some(alert) = self.alert.as_mut() {
-                alert.write(&mut bytes)
-            } else {
-                self.tls.as_mut().unwrap().write_tls(&mut bytes)
+            let Some(bytes) = self.output(env)? else {
+                return Ok(moved);
             };
-            let n = result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
             self.reject = false;
-            if n == 0 {
+            if bytes.is_empty() {
                 self.alert = None;
             } else {
-                self.produced += n as u64;
+                self.produced += bytes.len() as u64;
                 self.below = Some(StreamCommand::Write(Chunk::from_bytes(bytes)));
             }
             if self.pending_plaintext != 0
@@ -618,7 +675,7 @@ impl Layer for TlsLayer {
         {
             return Err(error);
         }
-        Ok(false)
+        Ok(moved)
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {

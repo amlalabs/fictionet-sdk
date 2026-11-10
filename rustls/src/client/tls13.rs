@@ -1547,7 +1547,9 @@ impl State<ClientConnectionData> for ExpectTraffic {
         Self: 'm,
     {
         match m.payload {
-            MessagePayload::ApplicationData(payload) => cx.common.take_received_plaintext(payload),
+            MessagePayload::ApplicationData(payload) => {
+                cx.common.take_received_plaintext(payload)?
+            }
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(new_ticket)),
                 ..

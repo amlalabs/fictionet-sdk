@@ -6,13 +6,27 @@ use std::io;
 #[cfg(feature = "std")]
 use std::io::Read;
 
+use crate::budget::{Paid, PaidBytes};
 #[cfg(feature = "std")]
 use crate::msgs::message::OutboundChunks;
+
+/// What one place in the queue of chunks takes.
+const PLACE: usize = size_of::<Vec<u8>>();
+
+/// The places a queue takes when it first needs any.
+const FIRST_PLACES: usize = 4;
 
 /// This is a byte buffer that is built from a deque of byte vectors.
 ///
 /// This avoids extra copies when appending a new byte vector,
 /// at the expense of more complexity when reading out.
+///
+/// With a budget, it pays for its allocations before it makes them: each
+/// chunk is paid for before it exists ([`Self::pay`]) and appended against
+/// that payment ([`Self::push_paid`]); the places of the queue are paid for
+/// as they grow; and room may be paid ahead for output a caller is about to
+/// make ([`Self::reserve`]). Chunks leaving give their bytes back, or take
+/// their charge with them ([`Self::pop_paid`]).
 pub(crate) struct ChunkVecBuffer {
     /// How many bytes have been consumed in the first chunk.
     ///
@@ -24,6 +38,17 @@ pub(crate) struct ChunkVecBuffer {
 
     /// The total upper limit (in bytes) of this object.
     limit: Option<usize>,
+
+    /// Invariant, with a budget: the chunks' capacities, the places, the
+    /// promised chunks and the reserve, in bytes.
+    paid: Paid,
+
+    /// Bytes paid for chunks not yet appended, and how many chunks.
+    promised: usize,
+    promised_chunks: usize,
+
+    /// Room paid ahead, which the next payments take first.
+    reserve: usize,
 }
 
 impl ChunkVecBuffer {
@@ -32,6 +57,18 @@ impl ChunkVecBuffer {
             prefix_used: 0,
             chunks: VecDeque::new(),
             limit,
+            paid: Paid::default(),
+            promised: 0,
+            promised_chunks: 0,
+            reserve: 0,
+        }
+    }
+
+    /// An empty buffer that pays for itself with `paid`.
+    pub(crate) fn paid_with(limit: Option<usize>, paid: Paid) -> Self {
+        Self {
+            paid,
+            ..Self::new(limit)
         }
     }
 
@@ -71,22 +108,101 @@ impl ChunkVecBuffer {
         }
     }
 
-    /// Take and append the given `bytes`.
-    pub(crate) fn append(&mut self, bytes: Vec<u8>) -> usize {
-        let len = bytes.len();
-
-        if !bytes.is_empty() {
-            if self.chunks.is_empty() {
-                debug_assert_eq!(self.prefix_used, 0);
-            }
-
-            self.chunks.push_back(bytes);
-        }
-
-        len
+    /// The places the queue grows to so that `chunks` more fit with those
+    /// already promised, or `None` if they fit already.
+    fn places_for(&self, chunks: usize) -> Option<usize> {
+        let wanted = self.chunks.len() + self.promised_chunks + chunks;
+        let now = self.chunks.capacity();
+        (wanted > now).then(|| wanted.max(now * 2).max(FIRST_PLACES))
     }
 
-    /// Take one of the chunks from this object.
+    /// The bytes `chunks` more chunks of `bytes` in all would take, places
+    /// included.
+    fn room_for(&self, bytes: usize, chunks: usize) -> usize {
+        let places = self
+            .places_for(chunks)
+            .map_or(0, |places| (places - self.chunks.capacity()) * PLACE);
+        bytes + places
+    }
+
+    /// Pays for `chunks` more chunks holding `bytes` in all, from the reserve
+    /// first, before any of them exists, and makes their places. Refuses,
+    /// changing nothing, if they do not fit.
+    #[must_use = "a refused payment must not be followed by the chunk"]
+    pub(crate) fn pay(&mut self, bytes: usize, chunks: usize) -> bool {
+        let places = self.places_for(chunks);
+        let total = self.room_for(bytes, chunks);
+        let from_reserve = cmp::min(self.reserve, total);
+        if !self.paid.grow_by(total - from_reserve) {
+            return false;
+        }
+        self.reserve -= from_reserve;
+        if let Some(places) = places {
+            self.chunks.reserve_exact(places - self.chunks.len());
+        }
+        self.promised += bytes;
+        self.promised_chunks += chunks;
+        true
+    }
+
+    /// Appends `chunk`, paid for by [`Self::pay`] as one chunk of `paid`
+    /// bytes. A chunk whose allocation is smaller gives back the rest; one
+    /// whose allocation is larger, which its maker said it would not be, is
+    /// charged the difference, or dropped, returning `false`, if that does
+    /// not fit.
+    #[must_use = "a dropped chunk was never queued"]
+    pub(crate) fn push_paid(&mut self, chunk: Vec<u8>, paid: usize) -> bool {
+        debug_assert_eq!(chunk.capacity(), paid);
+        self.promised -= paid;
+        self.promised_chunks -= 1;
+        let capacity = chunk.capacity();
+        if capacity < paid {
+            self.paid.shrink_by(paid - capacity);
+        } else if capacity > paid && !self.paid.grow_by(capacity - paid) {
+            self.paid.shrink_by(paid);
+            return false;
+        }
+        if chunk.is_empty() {
+            self.paid.shrink_by(capacity);
+            return true;
+        }
+        if self.chunks.is_empty() {
+            debug_assert_eq!(self.prefix_used, 0);
+        }
+        self.chunks.push_back(chunk);
+        true
+    }
+
+    /// Pays for a chunk of `len` bytes and appends it, made by `make` once
+    /// paid for. `false`, with nothing made, if it does not fit.
+    #[must_use = "a refused chunk was never queued"]
+    pub(crate) fn append_with(&mut self, len: usize, make: impl FnOnce() -> Vec<u8>) -> bool {
+        self.pay(len, 1) && self.push_paid(make(), len)
+    }
+
+    /// Pays ahead for room for `chunks` more chunks of `bytes` in all, so
+    /// that paying for them later takes nothing more from the budget. Room
+    /// already reserved counts. Refuses, changing nothing, if it does not
+    /// fit.
+    #[must_use = "a refused reservation leaves no room"]
+    pub(crate) fn reserve(&mut self, bytes: usize, chunks: usize) -> bool {
+        let wanted = self.room_for(bytes, chunks);
+        if wanted <= self.reserve {
+            return true;
+        }
+        if !self.paid.grow_by(wanted - self.reserve) {
+            return false;
+        }
+        self.reserve = wanted;
+        true
+    }
+
+    /// Gives back the room reserved and not used.
+    pub(crate) fn release_reserve(&mut self) {
+        self.paid.shrink_by(mem::take(&mut self.reserve));
+    }
+
+    /// Take one of the chunks from this object. Its bytes are given back.
     ///
     /// This function returns `None` if the object `is_empty`.
     pub(crate) fn pop(&mut self) -> Option<Vec<u8>> {
@@ -96,19 +212,30 @@ impl ChunkVecBuffer {
             // slice off `prefix_used` if needed (uncommon)
             let prefix = mem::take(&mut self.prefix_used);
             first.drain(0..prefix);
+            self.paid.shrink_by(first.capacity());
         }
 
         first
     }
 
-    pub(crate) fn take_sole_whole_chunk(&mut self, max_capacity: usize) -> Option<Vec<u8>> {
+    /// Take one of the chunks from this object, with the charge that pays
+    /// for it.
+    pub(crate) fn pop_paid(&mut self) -> Option<PaidBytes> {
+        let mut first = self.chunks.pop_front()?;
+        let prefix = mem::take(&mut self.prefix_used);
+        first.drain(0..prefix);
+        let charge = self.paid.split(first.capacity());
+        Some(PaidBytes::new(first, charge))
+    }
+
+    pub(crate) fn take_sole_whole_chunk(&mut self, max_capacity: usize) -> Option<PaidBytes> {
         if self.prefix_used != 0
             || self.chunks.len() != 1
             || self.chunks.front()?.capacity() > max_capacity
         {
             return None;
         }
-        self.chunks.pop_front()
+        self.pop_paid()
     }
 
     #[cfg(read_buf)]
@@ -131,6 +258,61 @@ impl ChunkVecBuffer {
     pub(crate) fn peek(&self) -> Option<&[u8]> {
         self.chunks.front().map(|ch| ch.as_slice())
     }
+
+    /// Returns the first contiguous chunk of data, or None if empty.
+    pub(crate) fn chunk(&self) -> Option<&[u8]> {
+        self.chunks.front().map(|chunk| &chunk[self.prefix_used..])
+    }
+
+    pub(crate) fn consume_first_chunk(&mut self, used: usize) {
+        // this backs (infallible) `BufRead::consume`, where `used` is
+        // user-supplied.
+        assert!(
+            used <= self.chunk().map(|ch| ch.len()).unwrap_or_default(),
+            "illegal `BufRead::consume` usage",
+        );
+        self.consume(used);
+    }
+
+    /// Drops the first `used` bytes, giving back each chunk they cover
+    /// wholly.
+    fn consume(&mut self, used: usize) {
+        // first, mark the rightmost extent of the used buffer
+        self.prefix_used += used;
+
+        // then reduce `prefix_used` by discarding wholly-covered
+        // buffers
+        while let Some(buf) = self.chunks.front() {
+            if self.prefix_used < buf.len() {
+                return;
+            } else {
+                self.prefix_used -= buf.len();
+                let capacity = buf.capacity();
+                self.chunks.pop_front();
+                self.paid.shrink_by(capacity);
+            }
+        }
+
+        debug_assert_eq!(
+            self.prefix_used, 0,
+            "attempted to `ChunkVecBuffer::consume` more than available"
+        );
+    }
+
+    /// What the queue's allocations take, with what it has paid ahead.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.chunks.iter().map(Vec::capacity).sum::<usize>()
+            + self.chunks.capacity() * PLACE
+            + self.promised
+            + self.reserve
+    }
+
+    /// Whether what is paid for is what is held, as the invariant says.
+    #[cfg(test)]
+    pub(crate) fn accounted(&self) -> bool {
+        !self.paid.is_budgeted() || self.paid.bytes() == self.held()
+    }
 }
 
 #[cfg(feature = "std")]
@@ -142,10 +324,12 @@ impl ChunkVecBuffer {
     }
 
     /// Append a copy of `bytes`, perhaps a prefix if
-    /// we're near the limit.
+    /// we're near the limit, and none if the budget has no room.
     pub(crate) fn append_limited_copy(&mut self, payload: OutboundChunks<'_>) -> usize {
         let take = self.apply_limit(payload.len());
-        self.append(payload.split_at(take).0.to_vec());
+        if take == 0 || !self.append_with(take, || payload.split_at(take).0.to_vec()) {
+            return 0;
+        }
         take
     }
 
@@ -162,37 +346,6 @@ impl ChunkVecBuffer {
         }
 
         Ok(offs)
-    }
-
-    pub(crate) fn consume_first_chunk(&mut self, used: usize) {
-        // this backs (infallible) `BufRead::consume`, where `used` is
-        // user-supplied.
-        assert!(
-            used <= self.chunk().map(|ch| ch.len()).unwrap_or_default(),
-            "illegal `BufRead::consume` usage",
-        );
-        self.consume(used);
-    }
-
-    fn consume(&mut self, used: usize) {
-        // first, mark the rightmost extent of the used buffer
-        self.prefix_used += used;
-
-        // then reduce `prefix_used` by discarding wholly-covered
-        // buffers
-        while let Some(buf) = self.chunks.front() {
-            if self.prefix_used < buf.len() {
-                return;
-            } else {
-                self.prefix_used -= buf.len();
-                self.chunks.pop_front();
-            }
-        }
-
-        debug_assert_eq!(
-            self.prefix_used, 0,
-            "attempted to `ChunkVecBuffer::consume` more than available"
-        );
     }
 
     /// Read data out of this object, passing it `wr`
@@ -226,10 +379,13 @@ impl ChunkVecBuffer {
         self.consume(used);
         Ok(used)
     }
+}
 
-    /// Returns the first contiguous chunk of data, or None if empty.
-    pub(crate) fn chunk(&self) -> Option<&[u8]> {
-        self.chunks.front().map(|chunk| &chunk[self.prefix_used..])
+#[cfg(test)]
+impl ChunkVecBuffer {
+    /// Pays for a copy of `bytes` and appends it, for tests.
+    pub(crate) fn append_copy(&mut self, bytes: &[u8]) -> bool {
+        self.append_with(bytes.len(), || bytes.to_vec())
     }
 }
 
@@ -239,6 +395,8 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::ChunkVecBuffer;
+    use crate::budget::testing::Limit;
+    use crate::budget::{Account, Paid};
 
     #[test]
     fn short_append_copy_with_limit() {
@@ -256,7 +414,7 @@ mod tests {
     #[test]
     fn read_byte_by_byte() {
         let mut cvb = ChunkVecBuffer::new(None);
-        cvb.append(b"test fixture data".to_vec());
+        assert!(cvb.append_copy(b"test fixture data"));
         assert!(!cvb.is_empty());
         for expect in b"test fixture data" {
             let mut byte = [0];
@@ -276,7 +434,7 @@ mod tests {
                 std::println!("check input={input_chunk_len} output={output_chunk_len}");
                 let mut cvb = ChunkVecBuffer::new(None);
                 for chunk in input.chunks(input_chunk_len) {
-                    cvb.append(chunk.to_vec());
+                    assert!(cvb.append_copy(chunk));
                 }
 
                 assert_eq!(cvb.len(), input.len());
@@ -300,9 +458,9 @@ mod tests {
 
         {
             let mut cvb = ChunkVecBuffer::new(None);
-            cvb.append(b"test ".to_vec());
-            cvb.append(b"fixture ".to_vec());
-            cvb.append(b"data".to_vec());
+            assert!(cvb.append_copy(b"test "));
+            assert!(cvb.append_copy(b"fixture "));
+            assert!(cvb.append_copy(b"data"));
 
             let mut buf = [MaybeUninit::<u8>::uninit(); 8];
             let mut buf: BorrowedBuf<'_, u8> = buf.as_mut_slice().into();
@@ -318,13 +476,106 @@ mod tests {
 
         {
             let mut cvb = ChunkVecBuffer::new(None);
-            cvb.append(b"short message".to_vec());
+            assert!(cvb.append_copy(b"short message"));
 
             let mut buf = [MaybeUninit::<u8>::uninit(); 1024];
             let mut buf: BorrowedBuf<'_, u8> = buf.as_mut_slice().into();
             cvb.read_buf(buf.unfilled()).unwrap();
             assert_eq!(buf.filled(), b"short message");
         }
+    }
+
+    /// A small model of the queue: random payments, appends, reservations,
+    /// reads and takes against a budget, checking after each that the
+    /// charge is what the queue holds, that a refusal changes nothing, and
+    /// that everything comes back at the end.
+    #[test]
+    fn a_paid_queue_holds_exactly_what_it_is_charged() {
+        let limit = Limit::new(600);
+        let account: Account = Some(limit.clone());
+        let mut cvb = ChunkVecBuffer::paid_with(None, Paid::open(&account));
+        let mut model = Vec::new();
+        let mut taken = Vec::new();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        for step in 0..4000usize {
+            let used = limit.used();
+            let len = cvb.len();
+            match next(5) {
+                0 | 1 => {
+                    let n = 1 + next(120);
+                    let byte = step as u8;
+                    let need = cvb.room_for(n, 1).saturating_sub(cvb.reserve);
+                    if cvb.append_with(n, || vec![byte; n]) {
+                        model.extend(core::iter::repeat(byte).take(n));
+                        assert_eq!(limit.used(), used + need);
+                    } else {
+                        assert_eq!((limit.used(), cvb.len()), (used, len));
+                        assert!(used + need > 600);
+                    }
+                }
+                2 => {
+                    let n = next(200);
+                    let need = cvb.room_for(n, 1).saturating_sub(cvb.reserve);
+                    if cvb.reserve(n, 1) {
+                        assert_eq!(limit.used(), used + need);
+                    } else {
+                        assert_eq!((limit.used(), cvb.len()), (used, len));
+                        assert!(used + need > 600);
+                    }
+                }
+                3 => {
+                    let mut buf = vec![0; next(90)];
+                    let n = cvb.read(&mut buf).unwrap();
+                    assert_eq!(&buf[..n], &model[..n]);
+                    model.drain(..n);
+                    assert!(limit.used() <= used);
+                }
+                _ => {
+                    if let Some(paid) = cvb.pop_paid() {
+                        let (bytes, charge) = paid.into_parts();
+                        assert_eq!(&bytes[..], &model[..bytes.len()]);
+                        model.drain(..bytes.len());
+                        assert_eq!(charge.as_ref().unwrap().bytes(), bytes.capacity());
+                        assert_eq!(limit.used(), used);
+                        taken.push((bytes, charge));
+                        if taken.len() > 3 {
+                            taken.remove(0);
+                        }
+                    }
+                    cvb.release_reserve();
+                }
+            }
+            assert!(cvb.accounted(), "step {step}");
+            assert_eq!(cvb.len(), model.len());
+            assert!(limit.used() <= 600);
+        }
+        drop(taken);
+        drop(cvb);
+        assert_eq!(limit.used(), 0);
+    }
+
+    #[test]
+    fn a_reservation_pays_for_what_follows_without_the_budget() {
+        let limit = Limit::new(1000);
+        let account: Account = Some(limit.clone());
+        let mut cvb = ChunkVecBuffer::paid_with(None, Paid::open(&account));
+        assert!(cvb.reserve(100, 2));
+        let reserved = limit.used();
+        assert!(reserved >= 100);
+        limit.set_limit(reserved);
+        assert!(cvb.append_with(60, || vec![1; 60]));
+        assert!(cvb.append_with(40, || vec![2; 40]));
+        assert_eq!(limit.used(), reserved);
+        assert!(!cvb.append_with(1, || vec![3; 1]));
+        assert!(cvb.accounted());
+        cvb.release_reserve();
+        assert!(cvb.accounted());
     }
 }
 
@@ -338,7 +589,7 @@ mod benchmarks {
     fn read_one_byte_from_large_message(b: &mut test::Bencher) {
         b.iter(|| {
             let mut cvb = ChunkVecBuffer::new(None);
-            cvb.append(vec![0u8; 16_384]);
+            assert!(cvb.append_copy(&vec![0u8; 16_384]));
             assert_eq!(1, cvb.read(&mut [0u8]).unwrap());
         });
     }
@@ -347,7 +598,7 @@ mod benchmarks {
     fn read_all_individual_from_large_message(b: &mut test::Bencher) {
         b.iter(|| {
             let mut cvb = ChunkVecBuffer::new(None);
-            cvb.append(vec![0u8; 16_384]);
+            assert!(cvb.append_copy(&vec![0u8; 16_384]));
             loop {
                 if let Ok(0) = cvb.read(&mut [0u8]) {
                     break;
@@ -360,7 +611,7 @@ mod benchmarks {
     fn read_half_bytes_from_large_message(b: &mut test::Bencher) {
         b.iter(|| {
             let mut cvb = ChunkVecBuffer::new(None);
-            cvb.append(vec![0u8; 16_384]);
+            assert!(cvb.append_copy(&vec![0u8; 16_384]));
             assert_eq!(8192, cvb.read(&mut [0u8; 8192]).unwrap());
             assert_eq!(8192, cvb.read(&mut [0u8; 8192]).unwrap());
         });
@@ -370,7 +621,7 @@ mod benchmarks {
     fn read_entire_large_message(b: &mut test::Bencher) {
         b.iter(|| {
             let mut cvb = ChunkVecBuffer::new(None);
-            cvb.append(vec![0u8; 16_384]);
+            assert!(cvb.append_copy(&vec![0u8; 16_384]));
             assert_eq!(16_384, cvb.read(&mut [0u8; 16_384]).unwrap());
         });
     }

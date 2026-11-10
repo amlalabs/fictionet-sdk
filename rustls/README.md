@@ -52,9 +52,30 @@ The divergences from upstream are:
   `Reader::take_first_chunk` hands over the decrypted plaintext in the
   buffer that holds it instead of copying it out.
   `CommonState::take_sendable_tls_chunk` transfers the sole whole queued
-  ciphertext buffer when its capacity fits a caller's reservation. Multiple
+  ciphertext buffer when its capacity fits a caller's limit. Multiple
   chunks, partially consumed chunks and oversized allocations stay queued
-  for the existing bounded, coalescing `write_tls` path.
+  for the existing bounded, coalescing `write_tls` path. Both hand over the
+  bytes with the charge that pays for them (`budget::PaidBytes`).
+- A connection's buffers can be paid from a budget the caller passes in
+  (`budget::BufferBudget`, through `Acceptor::with_budget` or
+  `ServerConnection::with_budget`); there is no global or thread-local
+  state. The records read and not yet processed, the plaintext decrypted
+  and not yet taken, the plaintext written during the handshake, and the
+  records queued to send are each charged before they grow, and their
+  capacities are exact, so what is charged is what they hold. A growth the
+  budget refuses changes nothing: `read_tls` fails with `OutOfMemory`
+  having read nothing; `process_new_packets` stops before the record or
+  message it cannot pay for and `CommonState::wants_budget` says so;
+  writes take fewer bytes; `Accepted::into_connection` gives the
+  `Accepted` back (`IntoConnectionError::Unpaid`); `send_close_notify`
+  returns `false` and `refresh_traffic_keys` fails with
+  `Error::BudgetExhausted`. Output rustls makes for a received message is
+  paid from room charged before the message is taken: a record for a
+  handshake message, plus the certificate chain once it is chosen, and
+  three small records after the handshake. Output that outgrows its room
+  and is refused by the budget is dropped and fails the connection with
+  `Error::BudgetExhausted`. Without a budget nothing is charged and every
+  growth fits, as upstream.
 
 The fork retains upstream `no_std` support and builds for
 `wasm32-unknown-unknown`. Fictionet configures ring's browser randomness

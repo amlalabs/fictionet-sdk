@@ -203,6 +203,10 @@ impl RecordLayer {
         self.encrypt_state == DirectionState::Active
     }
 
+    pub(crate) fn is_decrypting(&self) -> bool {
+        self.decrypt_state == DirectionState::Active
+    }
+
     /// Return true if we have ever decrypted a message. This is used in place
     /// of checking the read_seq since that will be reset on key updates.
     pub(crate) fn has_decrypted(&self) -> bool {

@@ -397,6 +397,7 @@ mod sync {
 
 #[macro_use]
 mod msgs;
+pub mod budget;
 mod common_state;
 pub mod compress;
 mod conn;
@@ -616,7 +617,9 @@ pub mod server {
         ServerConnectionData, StoresServerSessions, UnbufferedServerConnection,
     };
     #[cfg(feature = "std")]
-    pub use server_conn::{AcceptedAlert, Acceptor, ReadEarlyData, ServerConnection};
+    pub use server_conn::{
+        AcceptedAlert, Acceptor, IntoConnectionError, ReadEarlyData, ServerConnection,
+    };
 
     pub use crate::enums::CertificateType;
     pub use crate::verify::NoClientAuth;

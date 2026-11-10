@@ -196,7 +196,7 @@ fuzz_target!(|data: &[u8]| {
             settle(&fcx, 2).await;
         }
         if input.half_close {
-            tls.tls.send_close_notify();
+            assert!(tls.tls.send_close_notify());
             let _ = tls.flush(&fcx).await;
         }
         let mut buf = vec![0u8; 64 * 1024];

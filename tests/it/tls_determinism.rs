@@ -177,8 +177,8 @@ fn exchange(
         server.reader().read_exact(&mut updated).unwrap();
         assert_eq!(&updated, b"updated");
     }
-    client.send_close_notify();
-    server.send_close_notify();
+    assert!(client.send_close_notify());
+    assert!(server.send_close_notify());
     pump(&mut client, &mut server, &mut records);
     assert_eq!(client.reader().read(&mut received).unwrap(), 0);
     assert_eq!(server.reader().read(&mut received).unwrap(), 0);

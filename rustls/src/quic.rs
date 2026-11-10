@@ -392,7 +392,10 @@ mod connection {
         ///
         /// Handshake data obtained from separate encryption levels should be supplied in separate calls.
         pub fn read_hs(&mut self, plaintext: &[u8]) -> Result<(), Error> {
-            let range = self.deframer_buffer.extend(plaintext);
+            let range = self
+                .deframer_buffer
+                .extend(plaintext)
+                .ok_or(Error::BudgetExhausted)?;
 
             self.core.hs_deframer.input_message(
                 InboundPlainMessage {

@@ -65,6 +65,7 @@
 //! can run rustls, OpenSSL, or anything else over a connection itself,
 //! since [`Connection`] is an open trait.
 
+mod budget;
 mod factory;
 mod layer;
 mod provider;

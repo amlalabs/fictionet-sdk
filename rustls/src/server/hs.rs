@@ -34,6 +34,11 @@ use crate::{suites, SupportedCipherSuite};
 
 pub(super) type NextState<'a> = Box<dyn State<ServerConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
+
+/// The connection's budget had no room for the server's flight in answer to
+/// a `ClientHello`. Nothing was sent, and handling the same `ClientHello`
+/// again once the budget has room does what this call would have done.
+pub(super) struct FlightUnpaid;
 pub(super) type ServerContext<'a> = crate::common_state::Context<'a, ServerConnectionData>;
 
 pub(super) fn can_resume(
@@ -330,13 +335,19 @@ impl ExpectClientHello {
     }
 
     /// Continues handling of a `ClientHello` message once config and certificate are available.
+    ///
+    /// Once the certificate is chosen, and before anything that cannot be
+    /// repeated, room for the server's flight is charged to the
+    /// connection's budget. Without room this returns [`FlightUnpaid`],
+    /// having sent and changed nothing a second call would not do again.
     pub(super) fn with_certified_key(
         self,
-        mut sig_schemes: Vec<SignatureScheme>,
+        sig_schemes: &[SignatureScheme],
         client_hello: &ClientHelloPayload,
         m: &Message<'_>,
         cx: &mut ServerContext<'_>,
-    ) -> NextStateOrError<'static> {
+    ) -> Result<NextStateOrError<'static>, FlightUnpaid> {
+        let mut sig_schemes = sig_schemes.to_vec();
         let tls13_enabled = self
             .config
             .supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol);
@@ -350,33 +361,33 @@ impl ExpectClientHello {
             if versions.tls13 && tls13_enabled {
                 ProtocolVersion::TLSv1_3
             } else if !versions.tls12 || !tls12_enabled {
-                return Err(cx.common.send_fatal_alert(
+                return Ok(Err(cx.common.send_fatal_alert(
                     AlertDescription::ProtocolVersion,
                     PeerIncompatible::Tls12NotOfferedOrEnabled,
-                ));
+                )));
             } else if cx.common.is_quic() {
-                return Err(cx.common.send_fatal_alert(
+                return Ok(Err(cx.common.send_fatal_alert(
                     AlertDescription::ProtocolVersion,
                     PeerIncompatible::Tls13RequiredForQuic,
-                ));
+                )));
             } else {
                 ProtocolVersion::TLSv1_2
             }
         } else if u16::from(client_hello.client_version) < u16::from(ProtocolVersion::TLSv1_2) {
-            return Err(cx.common.send_fatal_alert(
+            return Ok(Err(cx.common.send_fatal_alert(
                 AlertDescription::ProtocolVersion,
                 PeerIncompatible::Tls12NotOffered,
-            ));
+            )));
         } else if cx.common.is_quic() {
-            return Err(cx.common.send_fatal_alert(
+            return Ok(Err(cx.common.send_fatal_alert(
                 AlertDescription::ProtocolVersion,
                 PeerIncompatible::Tls13RequiredForQuic,
-            ));
+            )));
         } else if !tls12_enabled && tls13_enabled {
-            return Err(cx.common.send_fatal_alert(
+            return Ok(Err(cx.common.send_fatal_alert(
                 AlertDescription::ProtocolVersion,
                 PeerIncompatible::SupportedVersionsExtensionRequired,
-            ));
+            )));
         } else {
             ProtocolVersion::TLSv1_2
         };
@@ -419,17 +430,50 @@ impl ExpectClientHello {
             };
             trace!("Resolving server certificate: {client_hello:#?}");
 
-            let certkey = self.config.cert_resolver.resolve(client_hello);
-
-            certkey.ok_or_else(|| {
-                cx.common.send_fatal_alert(
-                    AlertDescription::AccessDenied,
-                    Error::General("no server certificate chain resolved".to_owned()),
-                )
-            })?
+            match self.config.cert_resolver.resolve(client_hello) {
+                Some(certkey) => certkey,
+                None => {
+                    return Ok(Err(cx.common.send_fatal_alert(
+                        AlertDescription::AccessDenied,
+                        Error::General("no server certificate chain resolved".to_owned()),
+                    )));
+                }
+            }
         };
         let certkey = ActiveCertifiedKey::from_certified_key(&certkey);
 
+        // Nothing so far is undone by giving up here: the version is set
+        // again on the next try. From here the handshake moves on.
+        if !cx
+            .common
+            .reserve_flight(certkey.get_cert(), certkey.get_ocsp())
+        {
+            return Err(FlightUnpaid);
+        }
+        Ok(self.with_paid_flight(
+            version,
+            tls13_enabled,
+            sig_schemes,
+            certkey,
+            client_hello,
+            m,
+            cx,
+        ))
+    }
+
+    /// Completes a `ClientHello` once room for the server's flight is paid.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "tls12"), allow(unused_variables))]
+    fn with_paid_flight(
+        self,
+        version: ProtocolVersion,
+        tls13_enabled: bool,
+        sig_schemes: Vec<SignatureScheme>,
+        certkey: ActiveCertifiedKey<'_>,
+        client_hello: &ClientHelloPayload,
+        m: &Message<'_>,
+        cx: &mut ServerContext<'_>,
+    ) -> NextStateOrError<'static> {
         let (suite, skxg) = self
             .choose_suite_and_kx_group(
                 version,
@@ -650,7 +694,10 @@ impl State<ServerConnectionData> for ExpectClientHello {
     {
         let (client_hello, sig_schemes) =
             process_client_hello(&m, self.previous_hello.is_some(), cx)?;
-        self.with_certified_key(sig_schemes, client_hello, &m, cx)
+        // The message is taken already, so a flight the budget has no room
+        // for fails the connection here.
+        self.with_certified_key(&sig_schemes, client_hello, &m, cx)
+            .unwrap_or(Err(Error::BudgetExhausted))
     }
 
     fn into_owned(self: Box<Self>) -> NextState<'static> {

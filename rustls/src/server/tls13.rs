@@ -441,7 +441,7 @@ mod client_hello {
                 EarlyDataDecision::Accepted => {
                     cx.data
                         .early_data
-                        .accept(self.config.max_early_data_size as usize);
+                        .accept(self.config.max_early_data_size as usize, &cx.common.account);
                 }
             }
 
@@ -1200,7 +1200,7 @@ impl State<ServerConnectionData> for ExpectEarlyData {
     {
         match m.payload {
             MessagePayload::ApplicationData(payload) => {
-                match cx.data.early_data.take_received_plaintext(payload) {
+                match cx.data.early_data.take_received_plaintext(payload)? {
                     true => Ok(self),
                     false => Err(cx.common.send_fatal_alert(
                         AlertDescription::UnexpectedMessage,
@@ -1426,7 +1426,9 @@ impl State<ServerConnectionData> for ExpectTraffic {
         Self: 'm,
     {
         match m.payload {
-            MessagePayload::ApplicationData(payload) => cx.common.take_received_plaintext(payload),
+            MessagePayload::ApplicationData(payload) => {
+                cx.common.take_received_plaintext(payload)?
+            }
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::KeyUpdate(key_update)),
                 ..

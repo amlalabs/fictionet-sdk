@@ -177,8 +177,8 @@ impl Pair {
                 self.server.writer().write_all(b"reply").unwrap();
             }
             1 => {
-                self.client.send_close_notify();
-                self.server.send_close_notify();
+                assert!(self.client.send_close_notify());
+                assert!(self.server.send_close_notify());
             }
             _ => return up.is_empty() && down.is_empty(),
         }

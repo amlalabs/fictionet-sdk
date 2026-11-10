@@ -7,6 +7,7 @@ use std::io;
 
 use kernel::KernelConnection;
 
+use crate::budget::{Account, BufferBudget, Paid};
 use crate::common_state::{CommonState, Context, IoState, State, DEFAULT_BUFFER_LIMIT};
 use crate::enums::{AlertDescription, ContentType, ProtocolVersion};
 use crate::error::{Error, PeerMisbehaved};
@@ -18,6 +19,7 @@ use crate::msgs::handshake::Random;
 use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
 use crate::record_layer::Decrypted;
 use crate::suites::ExtractedSecrets;
+use crate::sync::Arc;
 use crate::vecbuf::ChunkVecBuffer;
 
 // pub so that it can be re-exported from the crate root
@@ -31,6 +33,7 @@ mod connection {
     use core::ops::{Deref, DerefMut};
     use std::io::{self, BufRead, Read};
 
+    use crate::budget::PaidBytes;
     use crate::common_state::{CommonState, IoState};
     use crate::error::Error;
     use crate::msgs::message::OutboundChunks;
@@ -209,16 +212,16 @@ mod connection {
         }
 
         /// Take the first chunk of plaintext data received from the peer, in the buffer
-        /// that holds it, so it is not copied out.
+        /// that holds it, so it is not copied out, with the charge that pays for it.
         ///
-        /// Returns what [`Self::into_first_chunk`] would return, owned: an empty vector
-        /// means the peer closed the session cleanly.
-        pub fn take_first_chunk(self) -> io::Result<Vec<u8>> {
-            match self.received_plaintext.pop() {
+        /// Returns what [`Self::into_first_chunk`] would return, owned: empty bytes
+        /// mean the peer closed the session cleanly.
+        pub fn take_first_chunk(self) -> io::Result<PaidBytes> {
+            match self.received_plaintext.pop_paid() {
                 Some(chunk) => Ok(chunk),
                 None => {
                     self.check_no_bytes_state()?;
-                    Ok(Vec::new())
+                    Ok(PaidBytes::new(Vec::new(), None))
                 }
             }
         }
@@ -372,17 +375,30 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
 
     impl<T> ConnectionCommon<T> {
         /// Return the fatal error this connection previously encountered, if any.
+        ///
+        /// Output that went unpaid fails the connection too.
         fn check_error(&self) -> io::Result<()> {
-            match &self.core.state {
-                Ok(_) => Ok(()),
-                Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err.clone())),
-            }
+            let failed = match &self.core.state {
+                Ok(_) => self.core.common_state.output_paid(),
+                Err(err) => Err(err.clone()),
+            };
+            failed.map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
         }
 
         /// Send or buffer as much of `payload` as possible.
         ///
         /// This updates the TLS 1.3 traffic keys as needed between records.
+        /// Plaintext written during the handshake and not yet sent for want
+        /// of budget goes first; none of `payload` is taken while it waits.
         fn send_plaintext(&mut self, payload: OutboundChunks<'_>) -> usize {
+            if !self
+                .core
+                .common_state
+                .flush_plaintext(&mut self.sendable_plaintext)
+                && self.core.common_state.may_send_application_data
+            {
+                return 0;
+            }
             let mut len = 0;
             loop {
                 len += self
@@ -856,6 +872,40 @@ impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
     }
 }
 
+impl<Data> ConnectionCommon<Data> {
+    /// Whether every buffer is charged exactly what it holds, as their
+    /// invariants say.
+    #[cfg(test)]
+    pub(crate) fn buffers_accounted(&self) -> bool {
+        let common = &self.core.common_state;
+        self.deframer_buffer.accounted()
+            && self.sendable_plaintext.accounted()
+            && common.received_plaintext.accounted()
+            && common.sendable_tls.accounted()
+    }
+
+    /// What every buffer's allocations take, with what they have paid ahead.
+    #[cfg(test)]
+    pub(crate) fn buffers_held(&self) -> usize {
+        let common = &self.core.common_state;
+        self.deframer_buffer.held()
+            + self.sendable_plaintext.held()
+            + common.received_plaintext.held()
+            + common.sendable_tls.held()
+    }
+
+    /// Pays for every buffer of this connection from `budget`. The buffers
+    /// are still empty: this is part of making the connection.
+    pub(crate) fn pay_from(mut self, budget: Arc<dyn BufferBudget>) -> Self {
+        let account: Account = Some(budget);
+        self.deframer_buffer = DeframerVecBuffer::paid_with(Paid::open(&account));
+        self.sendable_plaintext =
+            ChunkVecBuffer::paid_with(Some(DEFAULT_BUFFER_LIMIT), Paid::open(&account));
+        self.core.common_state.pay_from(account);
+        self
+    }
+}
+
 /// Interface shared by unbuffered client and server connections.
 pub struct UnbufferedConnectionCommon<Data> {
     pub(crate) core: ConnectionCore<Data>,
@@ -916,7 +966,11 @@ impl<Data> ConnectionCore<Data> {
         deframer_buffer: &mut DeframerVecBuffer,
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> Result<IoState, Error> {
-        let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
+        // Output that went unpaid outside this call, as a write's, fails the
+        // connection here too.
+        let state = mem::replace(&mut self.state, Err(Error::HandshakeNotComplete))
+            .and_then(|state| self.common_state.output_paid().map(|()| state));
+        let mut state = match state {
             Ok(state) => state,
             Err(e) => {
                 self.state = Err(e.clone());
@@ -924,9 +978,23 @@ impl<Data> ConnectionCore<Data> {
             }
         };
 
+        self.common_state.start_step();
+        // Plaintext written during the handshake that the budget had no room
+        // to send yet.
+        self.common_state.flush_plaintext(sendable_plaintext);
+
         let mut buffer_progress = self.hs_deframer.progress();
 
         loop {
+            // Room for the most output the next message can make, charged
+            // before any of it is taken, so that its processing, which cannot
+            // be undone, never waits for the budget halfway.
+            let unprocessed = self.hs_deframer.has_message_ready()
+                || deframer_buffer.filled().len() > buffer_progress.processed();
+            if unprocessed && !self.common_state.reserve_step() {
+                break;
+            }
+
             let res = self.deframe(
                 Some(&*state),
                 deframer_buffer.filled_mut(),
@@ -938,6 +1006,7 @@ impl<Data> ConnectionCore<Data> {
                 Err(e) => {
                     self.state = Err(e.clone());
                     deframer_buffer.discard(buffer_progress.take_discard());
+                    self.common_state.release_step();
                     return Err(e);
                 }
             };
@@ -946,11 +1015,15 @@ impl<Data> ConnectionCore<Data> {
                 break;
             };
 
-            match self.process_msg(msg, state, Some(sendable_plaintext)) {
+            let processed = self
+                .process_msg(msg, state, Some(sendable_plaintext))
+                .and_then(|new| self.common_state.output_paid().map(|()| new));
+            match processed {
                 Ok(new) => state = new,
                 Err(e) => {
                     self.state = Err(e.clone());
                     deframer_buffer.discard(buffer_progress.take_discard());
+                    self.common_state.release_step();
                     return Err(e);
                 }
             }
@@ -967,6 +1040,7 @@ impl<Data> ConnectionCore<Data> {
         }
 
         deframer_buffer.discard(buffer_progress.take_discard());
+        self.common_state.release_step();
         self.state = Ok(state);
         Ok(self.common_state.current_io_state())
     }
@@ -1050,6 +1124,15 @@ impl<Data> ConnectionCore<Data> {
                     break (message.into_plain_message(), iter.bytes_consumed());
                 }
 
+                // Room for its plaintext, which may be application data that
+                // is kept, before the record is decrypted, which cannot be
+                // undone. The record stays where it is if there is none.
+                if self.common_state.record_layer.is_decrypting()
+                    && !self.common_state.reserve_plaintext(message.payload.len())
+                {
+                    return Ok(None);
+                }
+
                 let message = match self.common_state.record_layer.decrypt_incoming(message) {
                     // failed decryption during trial decryption is not allowed to be
                     // interleaved with partial handshake data.
@@ -1073,7 +1156,7 @@ impl<Data> ConnectionCore<Data> {
                 } = message;
 
                 if want_close_before_decrypt {
-                    self.common_state.send_close_notify();
+                    self.common_state.queue_close_notify();
                 }
 
                 break (plaintext, iter.bytes_consumed());
@@ -1269,16 +1352,43 @@ impl<Data> ConnectionCore<Data> {
     /// Trigger a `refresh_traffic_keys` if required by `CommonState`.
     ///
     /// Returns whether the traffic keys were updated.
+    /// A refresh the budget has no room for stays pending.
     fn maybe_refresh_traffic_keys(&mut self) -> bool {
-        mem::take(&mut self.common_state.refresh_traffic_keys_pending)
-            && self.refresh_traffic_keys().is_ok()
+        if !mem::take(&mut self.common_state.refresh_traffic_keys_pending) {
+            return false;
+        }
+        match self.refresh_traffic_keys() {
+            Ok(()) => true,
+            Err(Error::BudgetExhausted) if self.state.is_ok() => {
+                self.common_state.refresh_traffic_keys_pending = true;
+                false
+            }
+            Err(_) => false,
+        }
     }
 
+    /// Sends a key update request, with room for it charged first: without
+    /// room, nothing is sent and the call fails with
+    /// [`Error::BudgetExhausted`], leaving the connection as it was. Output
+    /// that went unpaid all the same fails the connection.
     fn refresh_traffic_keys(&mut self) -> Result<(), Error> {
-        match &mut self.state {
-            Ok(st) => st.send_key_update_request(&mut self.common_state),
-            Err(e) => Err(e.clone()),
+        let st = match &mut self.state {
+            Ok(st) => st,
+            Err(e) => return Err(e.clone()),
+        };
+        let mut sent = Ok(());
+        if !self
+            .common_state
+            .with_control_room(1, |common| sent = st.send_key_update_request(common))
+        {
+            return Err(Error::BudgetExhausted);
         }
+        sent?;
+        if let Err(e) = self.common_state.output_paid() {
+            self.state = Err(e.clone());
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
