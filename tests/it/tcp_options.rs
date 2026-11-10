@@ -59,7 +59,7 @@ fn acknowledging_idle_connections_reuses_refresh_storage() {
     let packet = |port, seq, ack, flags| {
         PacketEvent::Packet(
             CheckedIpPacket::checked(
-                Chunk::unpaid(segment(port, seq, ack, flags, &[]).0),
+                Chunk::unpaid(segment(port, seq, ack, flags, &[]).into_vec()),
                 Origin::Arrived,
             )
             .unwrap(),
@@ -92,7 +92,7 @@ fn acknowledging_idle_connections_reuses_refresh_storage() {
         let mut ack = None;
         stack.send_below(|command| {
             if let PacketCommand::Send(bytes) = command {
-                ack = Some(seq_of(tcp_of(&Packet(bytes.to_vec()))).wrapping_add(1));
+                ack = Some(seq_of(tcp_of(&Packet::new(bytes.to_vec()))).wrapping_add(1));
             }
             Admit::Taken
         });
@@ -164,8 +164,8 @@ fn segment_with(
 
 /// The TCP header and payload of a packet from the server.
 fn tcp_of(p: &Packet) -> &[u8] {
-    let ihl = (p.0[0] & 15) as usize * 4;
-    &p.0[ihl..]
+    let ihl = (p[0] & 15) as usize * 4;
+    &p[ihl..]
 }
 
 fn seq_of(t: &[u8]) -> u32 {
@@ -1324,18 +1324,18 @@ fn ipv4_syn_options_and_source_route_reply_survive_retransmission_and_cookies() 
                         tcp_of(&syn),
                     )
                     .unwrap();
-                    let received = ip::ipv4_options(&syn.0).unwrap();
+                    let received = ip::ipv4_options(&syn[..]).unwrap();
                     raw.send(syn);
                     let reply = next(&fcx, &mut raw).await.expect("optioned SYN-ACK");
                     let check = |packet: &Packet| {
-                        let header = ip::Header::parse(&packet.0).unwrap();
+                        let header = ip::Header::parse(&packet[..]).unwrap();
                         assert_eq!(header.dst, ip(if consumed { PEER } else { "10.0.0.3" }));
                         assert_eq!(header.payload.start, 28);
                         assert_eq!(
-                            u16::from_be_bytes(packet.0[2..4].try_into().unwrap()) as usize,
-                            packet.0.len()
+                            u16::from_be_bytes(packet[2..4].try_into().unwrap()) as usize,
+                            packet.len()
                         );
-                        assert_eq!(ip::checksum(&packet.0[..28]), 0);
+                        assert_eq!(ip::checksum(&packet[..28]), 0);
                         assert_eq!(
                             tcp_of(packet)[13],
                             SYN | ACK | if cookie { 0 } else { 0x40 }
@@ -1345,7 +1345,7 @@ fn ipv4_syn_options_and_source_route_reply_survive_retransmission_and_cookies() 
                             0
                         );
                         assert_eq!(
-                            ip::ipv4_options(&packet.0).unwrap(),
+                            ip::ipv4_options(&packet[..]).unwrap(),
                             vec![route(strict, consumed), Ipv4Option::EndOfList,]
                         );
                     };

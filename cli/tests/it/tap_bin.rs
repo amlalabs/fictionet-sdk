@@ -196,11 +196,11 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
             let mut vm1 = attachments.get(&fcx, "vm1").await?;
             loop {
                 match vm1.recv(&fcx).await {
-                    Ok(Packet(p)) => {
+                    Ok(p) => {
                         let from_vm = p[12..16] == [10, 0, 0, 2];
-                        out.lock().unwrap().push(p);
+                        out.lock().unwrap().push(p.into_vec());
                         if from_vm {
-                            vm1.send(Packet(from_world()));
+                            vm1.send(Packet::new(from_world()));
                         }
                     }
                     // QEMU closed its socket: attach detached.

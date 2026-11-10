@@ -222,11 +222,11 @@ impl World {
                             let answer = answer.clone();
                             fcx.spawn(move |fcx| async move {
                                 while let Ok(p) = sandbox.recv(&fcx).await {
-                                    if let Some(addrs) = p.0.get(12..20) {
+                                    if let Some(addrs) = p.get(12..20) {
                                         seen.0.lock().unwrap().insert(addrs.try_into().unwrap());
                                         seen.1.notify_all();
                                     }
-                                    for reply in answer(&p.0) {
+                                    for reply in answer(&p[..]) {
                                         sandbox.send(reply);
                                     }
                                 }

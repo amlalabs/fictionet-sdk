@@ -315,7 +315,7 @@ fn a_busy_task_cannot_starve_another() {
             fcx.spawn(move |fcx| async move {
                 // A cable that loops back into itself: recv is always ready.
                 let (mut a, mut b) = pair();
-                b.send(Packet(vec![0]));
+                b.send(Packet::new(vec![0]));
                 let mut n = 0u32;
                 while !st.load(Ordering::SeqCst) {
                     let p = a.recv(&fcx).await?;
@@ -349,17 +349,17 @@ fn cable_delivers_in_order_then_closed() {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (mut a, mut b) = pair();
             for i in 0..3u8 {
-                a.send(Packet(vec![i]));
+                a.send(Packet::new(vec![i]));
             }
-            b.send(Packet(vec![9]));
+            b.send(Packet::new(vec![9]));
             drop(a);
             for i in 0..3u8 {
-                assert_eq!(b.recv(&fcx).await, Ok(Packet(vec![i])));
+                assert_eq!(b.recv(&fcx).await, Ok(Packet::new(vec![i])));
             }
             assert_eq!(b.recv(&fcx).await, Err(RecvError::Closed));
             assert_eq!(b.recv(&fcx).await, Err(RecvError::Closed));
             // Sending into a closed cable loses the packet quietly.
-            b.send(Packet(vec![1]));
+            b.send(Packet::new(vec![1]));
             Ok(())
         }))
     })
@@ -374,13 +374,13 @@ fn cable_wakes_across_threads() {
         let sender = std::thread::spawn(move || {
             let mut b = b;
             for i in 0..100u8 {
-                b.send(Packet(vec![i]));
+                b.send(Packet::new(vec![i]));
                 acknowledged.recv_timeout(Duration::from_secs(5)).unwrap();
             }
         });
         block_on(run(Seed::random(), move |fcx| async move {
             for i in 0..100u8 {
-                assert_eq!(a.recv(&fcx).await?, Packet(vec![i]));
+                assert_eq!(a.recv(&fcx).await?, Packet::new(vec![i]));
                 ack.send(()).unwrap();
             }
             assert_eq!(a.recv(&fcx).await, Err(RecvError::Closed));
@@ -397,10 +397,10 @@ fn boxed_interfaces_work() {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (a, mut b) = pair();
             let mut list: Vec<Box<dyn Interface>> = vec![Box::new(a)];
-            list[0].send(Packet(vec![7]));
-            assert_eq!(b.recv(&fcx).await?, Packet(vec![7]));
-            b.send(Packet(vec![8]));
-            assert_eq!(list[0].recv(&fcx).await?, Packet(vec![8]));
+            list[0].send(Packet::new(vec![7]));
+            assert_eq!(b.recv(&fcx).await?, Packet::new(vec![7]));
+            b.send(Packet::new(vec![8]));
+            assert_eq!(list[0].recv(&fcx).await?, Packet::new(vec![8]));
             Ok(())
         }))
     })
@@ -436,10 +436,10 @@ fn attacher_name_rules() {
             assert_eq!(first.name(), "kept");
             drop((first, kept));
 
-            abc.send(Packet(vec![1]));
-            assert_eq!(second.recv(&fcx).await?, Packet(vec![1]));
-            second.send(Packet(vec![2]));
-            assert_eq!(abc.recv(&fcx).await?, Packet(vec![2]));
+            abc.send(Packet::new(vec![1]));
+            assert_eq!(second.recv(&fcx).await?, Packet::new(vec![1]));
+            second.send(Packet::new(vec![2]));
+            assert_eq!(abc.recv(&fcx).await?, Packet::new(vec![2]));
 
             // Freed when the world's end closes, too.
             assert_eq!(attacher.attach("abc").unwrap_err(), AttachError::Taken);
@@ -541,7 +541,7 @@ fn cancellation_reaches_waits_outside_the_run() {
                     let slept = std::future::poll_fn(|cx| {
                         let result = sleep.as_mut().poll(cx);
                         if result.is_pending() && !notified {
-                            ready.send(Packet(Vec::new()));
+                            ready.send(Packet::new(Vec::new()));
                             notified = true;
                         }
                         result
@@ -664,8 +664,8 @@ fn runs_on_tokio() {
         }));
         let client = tokio::spawn(run(Seed::random(), move |fcx| async move {
             for i in 0..100u8 {
-                outside.send(Packet(vec![i]));
-                assert_eq!(outside.recv(&fcx).await?, Packet(vec![i]));
+                outside.send(Packet::new(vec![i]));
+                assert_eq!(outside.recv(&fcx).await?, Packet::new(vec![i]));
                 if i % 25 == 0 {
                     fcx.sleep(ms(1)).await?;
                 }
@@ -807,8 +807,8 @@ fn cancel_stops_the_world_cleanly() {
                 r?;
                 Ok(())
             });
-            agent.send(Packet(vec![0x45, 0, 0, 20]));
-            assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
+            agent.send(Packet::new(vec![0x45, 0, 0, 20]));
+            assert_eq!(agent.recv(&fcx).await?, Packet::new(vec![0x45, 0, 0, 20]));
             fcx.cancel();
             assert!(fcx.is_cancelled());
             Ok(())

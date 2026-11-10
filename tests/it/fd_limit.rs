@@ -191,7 +191,7 @@ fn reconnects_reclaim_pending_sockets_without_world_polling() {
                 other => panic!("pending socket was not reclaimed: {other:?}"),
             }
             drop(agent);
-            go.send(Packet(vec![]));
+            go.send(Packet::new(vec![]));
         }
         world.join().unwrap().unwrap();
     }

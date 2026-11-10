@@ -269,8 +269,8 @@
 //!
 //! let test = fictionet::lab(fictionet::Seed::from_u64(1), move |fcx| async move {
 //!     fcx.spawn(move |fcx| world(fcx, attachments));
-//!     agent.send(Packet(vec![0x45, 0, 0, 20]));
-//!     assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
+//!     agent.send(Packet::new(vec![0x45, 0, 0, 20]));
+//!     assert_eq!(agent.recv(&fcx).await?, Packet::new(vec![0x45, 0, 0, 20]));
 //!     // The checks passed. Stop the world, and every task in it.
 //!     fcx.cancel();
 //!     Ok(())

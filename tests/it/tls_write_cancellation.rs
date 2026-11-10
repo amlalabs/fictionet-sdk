@@ -123,7 +123,7 @@ fn scenario_mode(mode: u8) {
                 let mut d2 = drain;
                 fcx.spawn(move |fcx| async move {
                     fcx.sleep(ms(200)).await?;
-                    d2.send(fictionet::Packet(Vec::new()));
+                    d2.send(fictionet::Packet::new(Vec::new()));
                     Ok(())
                 });
                 w.await?;
@@ -149,7 +149,7 @@ fn scenario_mode(mode: u8) {
                 "wrote {total} bytes, then dropped a pending write of {}",
                 chunk.len()
             );
-            drain.send(fictionet::Packet(Vec::new()));
+            drain.send(fictionet::Packet::new(Vec::new()));
             if mode == 1 {
                 conn.write_all(&fcx, b"hi").await?;
                 eprintln!("write_all of 2 bytes returned");

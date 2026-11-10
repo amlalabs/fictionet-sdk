@@ -46,7 +46,7 @@ fn datagram(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
     .concat();
     let sum = ip::transport_checksum(from.ip(), to.ip(), protocol::UDP, &udp);
     udp[6..8].copy_from_slice(&sum.to_be_bytes());
-    ip::packet(from.ip(), to.ip(), protocol::UDP, &udp).0
+    ip::packet(from.ip(), to.ip(), protocol::UDP, &udp).into_vec()
 }
 
 /// Offers one raw packet and runs the stack.

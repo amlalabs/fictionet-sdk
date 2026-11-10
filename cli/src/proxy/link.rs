@@ -137,7 +137,7 @@ impl Shared {
 
 /// Sends one packet without waiting. `Ok(false)`: the socket is full.
 fn send_one(fd: std::os::fd::RawFd, packet: &Packet) -> io::Result<bool> {
-    match unix::send_parts(fd, &[&[relay::PACKET], &packet.0], true) {
+    match unix::send_parts(fd, &[&[relay::PACKET], &packet], true) {
         Ok(()) => Ok(true),
         Err(e)
             if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS) =>
@@ -215,7 +215,7 @@ impl Interface for Link {
                     return Poll::Ready(Err(RecvError::Closed));
                 }
                 Ok(n) => match world::world_packet(&self.buf[..n]) {
-                    Ok(p) => return Poll::Ready(Ok(Packet(p.to_vec()))),
+                    Ok(p) => return Poll::Ready(Ok(Packet::new(p.to_vec()))),
                     Err(why) => {
                         shared.close(Some(why));
                         return Poll::Ready(Err(RecvError::Closed));
@@ -265,7 +265,7 @@ mod tests {
         unix::set_nonblocking(socket.as_raw_fd(), true).unwrap();
         let link = Link::new(socket).unwrap();
         drop(peer);
-        link.shared.send(Packet(vec![1]));
+        link.shared.send(Packet::new(vec![1]));
         assert!(link.shared.closed.load(Ordering::SeqCst));
         assert_eq!(link.shared.error(), None);
     }
@@ -344,7 +344,7 @@ mod tests {
                 let mut link = Link::new(sock).unwrap();
                 let result = std::future::poll_fn(|cx| link.poll_recv(&fcx, cx)).await;
                 match result {
-                    Ok(packet) => assert_eq!(Some(packet.0), received),
+                    Ok(packet) => assert_eq!(Some(packet.to_vec()), received),
                     Err(e) => {
                         assert_eq!(e, RecvError::Closed);
                         assert!(expected_error.is_some());

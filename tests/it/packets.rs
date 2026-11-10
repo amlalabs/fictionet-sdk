@@ -92,7 +92,7 @@ fn removed(end: End) -> (Removed, Arc<AtomicBool>) {
 fn tagged(tag: u8, len: usize) -> Packet {
     let mut v = vec![0xee; len];
     v[0] = tag;
-    Packet(v)
+    Packet::new(v)
 }
 
 // ---------------------------------------------------------------- delay
@@ -110,7 +110,7 @@ fn delay_holds_every_packet_both_ways_and_keeps_order() {
         }
         for i in 0..10 {
             let p = recv_soon(&fcx, &mut link).await;
-            assert_eq!(p.0[0], i, "order kept");
+            assert_eq!(p[0], i, "order kept");
             let waited = fcx.now().since_start() - sent.since_start();
             assert!(waited >= ms(50), "packet {i} came after {waited:?}");
             assert!(waited < ms(5000), "packet {i} came after {waited:?}");
@@ -123,7 +123,7 @@ fn delay_holds_every_packet_both_ways_and_keeps_order() {
         }
         for i in 0..10 {
             let p = recv_soon(&fcx, &mut sandbox).await;
-            assert_eq!(p.0[0], 100 + i);
+            assert_eq!(p[0], 100 + i);
             let waited = fcx.now().since_start() - sent.since_start();
             assert!(waited >= ms(50) && waited < ms(5000), "{waited:?}");
         }
@@ -175,7 +175,7 @@ fn bottleneck_sends_at_the_rate() {
         let mut times = Vec::new();
         for i in 0..20 {
             let p = recv_soon(&fcx, &mut link).await;
-            assert_eq!(p.0[0], i);
+            assert_eq!(p[0], i);
             times.push(fcx.now().since_start() - t0.since_start());
         }
         assert!(times[0] >= ms(10), "first after {:?}", times[0]);
@@ -195,7 +195,7 @@ fn bottleneck_sends_at_the_rate() {
             link.send(tagged(i, 1250));
         }
         for i in 0..5 {
-            assert_eq!(recv_soon(&fcx, &mut sandbox).await.0[0], i);
+            assert_eq!(recv_soon(&fcx, &mut sandbox).await[0], i);
         }
         let took = fcx.now().since_start() - t0.since_start();
         assert!(took >= ms(50) && took < ms(5000), "{took:?}");
@@ -218,7 +218,7 @@ fn bottleneck_queue_of_ten_drops_the_eleventh_of_a_burst() {
                 from.send(tagged(i, 1250));
             }
             for i in 0..10 {
-                assert_eq!(recv_soon(&fcx, to).await.0[0], i);
+                assert_eq!(recv_soon(&fcx, to).await[0], i);
             }
             assert!(
                 recv_within(&fcx, to, ms(100)).await.is_none(),
@@ -227,7 +227,7 @@ fn bottleneck_queue_of_ten_drops_the_eleventh_of_a_burst() {
 
             // Once the queue has drained, packets pass again.
             from.send(tagged(42, 1250));
-            assert_eq!(recv_soon(&fcx, to).await.0[0], 42);
+            assert_eq!(recv_soon(&fcx, to).await[0], 42);
         }
         Ok(())
     });
@@ -413,22 +413,22 @@ fn split_versions_sorts_by_version_and_merges_back() {
         let (mut v4, mut v6, mut other) = ip::split_versions(&fcx, world_side);
         let p4 = v4_udp(A4, B4, b"four");
         let p6 = v6_udp(A6, B6, b"six");
-        sandbox.send(Packet(p4.clone()));
-        sandbox.send(Packet(p6.clone()));
-        sandbox.send(Packet(vec![]));
-        sandbox.send(Packet(vec![0x50, 1, 2]));
-        assert_eq!(recv_soon(&fcx, &mut v4).await.0, p4);
-        assert_eq!(recv_soon(&fcx, &mut v6).await.0, p6);
-        assert_eq!(recv_soon(&fcx, &mut other).await.0, Vec::<u8>::new());
-        assert_eq!(recv_soon(&fcx, &mut other).await.0, vec![0x50, 1, 2]);
+        sandbox.send(Packet::new(p4.clone()));
+        sandbox.send(Packet::new(p6.clone()));
+        sandbox.send(Packet::new(vec![]));
+        sandbox.send(Packet::new(vec![0x50, 1, 2]));
+        assert_eq!(recv_soon(&fcx, &mut v4).await.to_vec(), p4);
+        assert_eq!(recv_soon(&fcx, &mut v6).await.to_vec(), p6);
+        assert_eq!(recv_soon(&fcx, &mut other).await.to_vec(), Vec::<u8>::new());
+        assert_eq!(recv_soon(&fcx, &mut other).await.to_vec(), vec![0x50, 1, 2]);
 
         // Packets sent into any end go out on the cable being split.
-        v6.send(Packet(p6.clone()));
-        other.send(Packet(vec![9]));
-        v4.send(Packet(p4.clone()));
+        v6.send(Packet::new(p6.clone()));
+        other.send(Packet::new(vec![9]));
+        v4.send(Packet::new(p4.clone()));
         let mut got = Vec::new();
         for _ in 0..3 {
-            got.push(recv_soon(&fcx, &mut sandbox).await.0);
+            got.push(recv_soon(&fcx, &mut sandbox).await.to_vec());
         }
         got.sort();
         let mut want = vec![p6, vec![9], p4];
@@ -514,22 +514,22 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
             &unreachable6,
             &about_ping,
         ] {
-            sandbox.send(Packet(p.clone()));
+            sandbox.send(Packet::new(p.clone()));
         }
-        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, tcp4);
-        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, tcp6);
-        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, frag_needed);
-        assert_eq!(recv_soon(&fcx, &mut tcp).await.0, too_big);
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, udp4);
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, udp6);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.to_vec(), tcp4);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.to_vec(), tcp6);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.to_vec(), frag_needed);
+        assert_eq!(recv_soon(&fcx, &mut tcp).await.to_vec(), too_big);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), udp4);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), udp6);
         // The hop-by-hop header asks nothing of the host, and is taken out.
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, udp6);
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, port_unreachable);
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, unreachable6);
-        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.0, ping4);
-        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.0, ping6);
-        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.0, about_ping);
-        assert_eq!(recv_soon(&fcx, &mut other).await.0, gre);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), udp6);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), port_unreachable);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), unreachable6);
+        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.to_vec(), ping4);
+        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.to_vec(), ping6);
+        assert_eq!(recv_soon(&fcx, &mut icmp_end).await.to_vec(), about_ping);
+        assert_eq!(recv_soon(&fcx, &mut other).await.to_vec(), gre);
         for end in [&mut tcp, &mut udp, &mut icmp_end, &mut other] {
             assert!(
                 recv_within(&fcx, end, ms(30)).await.is_none(),
@@ -538,10 +538,10 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
         }
 
         // Everything sent into the ends goes out on the split cable.
-        tcp.send(Packet(tcp4.clone()));
-        udp.send(Packet(udp4.clone()));
-        icmp_end.send(Packet(ping4.clone()));
-        other.send(Packet(gre.clone()));
+        tcp.send(Packet::new(tcp4.clone()));
+        udp.send(Packet::new(udp4.clone()));
+        icmp_end.send(Packet::new(ping4.clone()));
+        other.send(Packet::new(gre.clone()));
         for _ in 0..4 {
             recv_soon(&fcx, &mut sandbox).await;
         }
@@ -638,9 +638,9 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         assert_eq!(frags.len(), 3);
         // Last, first, middle. Only the first names UDP's port numbers.
         for i in [2, 0, 1] {
-            sandbox.send(Packet(frags[i].clone()));
+            sandbox.send(Packet::new(frags[i].clone()));
         }
-        let got = recv_soon(&fcx, &mut udp).await.0;
+        let got = recv_soon(&fcx, &mut udp).await.to_vec();
         assert_eq!(got, whole);
         assert_eq!(internet_checksum(&[], &got[..20]), 0, "header checksum");
 
@@ -648,9 +648,9 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         let whole6 = v6_udp(A6, B6, &payload);
         let frags6 = fragment_v6(&whole6, &[1232, 1232], 77);
         for i in [1, 2, 0] {
-            sandbox.send(Packet(frags6[i].clone()));
+            sandbox.send(Packet::new(frags6[i].clone()));
         }
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole6);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), whole6);
 
         // Two packets whose fragments arrive interleaved.
         let (whole_a, frags_a) = fragment_v4(&v4_udp(A4, B4, &payload[..1000]), &[504]);
@@ -664,19 +664,19 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
             &frags_a[0],
             &frags_b[1],
         ] {
-            sandbox.send(Packet(f.clone()));
+            sandbox.send(Packet::new(f.clone()));
         }
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole_a);
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole_b);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), whole_a);
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), whole_b);
 
         // Overlapping fragments drop the whole packet.
         let mut bad_id = v4_udp(A4, B4, &payload[..1600]);
         bad_id[5] ^= 0x33;
         let (_, frags_c) = fragment_v4(&bad_id, &[800]);
         let (_, overlap) = fragment_v4(&bad_id, &[400, 800]);
-        sandbox.send(Packet(frags_c[0].clone()));
-        sandbox.send(Packet(overlap[1].clone())); // bytes 400..1200 overlap 0..800
-        sandbox.send(Packet(frags_c[1].clone()));
+        sandbox.send(Packet::new(frags_c[0].clone()));
+        sandbox.send(Packet::new(overlap[1].clone())); // bytes 400..1200 overlap 0..800
+        sandbox.send(Packet::new(frags_c[1].clone()));
         assert!(
             recv_within(&fcx, &mut udp, ms(50)).await.is_none(),
             "overlapping fragments were joined"
@@ -686,8 +686,8 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         // A packet in one fragment (an atomic fragment) passes at once.
         let atomic = fragment_v6(&whole6, &[], 5);
         assert_eq!(atomic.len(), 1);
-        sandbox.send(Packet(atomic[0].clone()));
-        assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole6);
+        sandbox.send(Packet::new(atomic[0].clone()));
+        assert_eq!(recv_soon(&fcx, &mut udp).await.to_vec(), whole6);
         Ok(())
     });
 }
@@ -695,7 +695,7 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
 // --------------------------------------------------------------- router
 
 fn to4(dst: [u8; 4], tag: u8) -> Packet {
-    Packet(v4_udp(A4, dst, &[tag]))
+    Packet::new(v4_udp(A4, dst, &[tag]))
 }
 
 #[test]
@@ -901,48 +901,48 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
         };
         c.send(to4([10, 1, 2, 3], 1));
         assert_eq!(
-            recv_soon(&fcx, &mut b).await.0,
+            recv_soon(&fcx, &mut b).await.to_vec(),
             hop(A4, [10, 1, 2, 3], &[1])
         );
         c.send(to4([10, 2, 0, 1], 2));
         assert_eq!(
-            recv_soon(&fcx, &mut a).await.0,
+            recv_soon(&fcx, &mut a).await.to_vec(),
             hop(A4, [10, 2, 0, 1], &[2])
         );
         a.send(to4([8, 8, 8, 8], 3));
-        assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 3);
+        assert_eq!(recv_soon(&fcx, &mut c).await[28], 3);
         // Back out the cable it came in on, when that is the best route.
         c.send(to4([9, 9, 9, 9], 4));
-        assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 4);
+        assert_eq!(recv_soon(&fcx, &mut c).await[28], 4);
         // IPv6 matches IPv6 prefixes only.
-        a.send(Packet(v6_udp(A6, B6, &[5])));
-        assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 5);
+        a.send(Packet::new(v6_udp(A6, B6, &[5])));
+        assert_eq!(recv_soon(&fcx, &mut d).await[48], 5);
         // Junk is dropped.
-        a.send(Packet(vec![0x45, 0]));
-        a.send(Packet(vec![]));
+        a.send(Packet::new(vec![0x45, 0]));
+        a.send(Packet::new(vec![]));
 
         // Add a longer prefix.
         let (e_router, mut e) = pair();
         let (e_router, e_removed) = removed(e_router);
         r.add("10.1.2.0/24".parse()?, Box::new(e_router));
         c.send(to4([10, 1, 2, 3], 6));
-        assert_eq!(recv_soon(&fcx, &mut e).await.0[28], 6);
+        assert_eq!(recv_soon(&fcx, &mut e).await[28], 6);
         c.send(to4([10, 1, 3, 3], 7));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 7);
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 7);
 
         // Replace 10.1.0.0/16: the old cable is dropped.
         let (f_router, mut f) = pair();
         r.add("10.1.0.0/16".parse()?, Box::new(f_router));
         assert_eq!(b.recv(&fcx).await, Err(RecvError::Closed));
         c.send(to4([10, 1, 3, 3], 8));
-        assert_eq!(recv_soon(&fcx, &mut f).await.0[28], 8);
+        assert_eq!(recv_soon(&fcx, &mut f).await[28], 8);
 
         // A closed cable loses its route: the next best one takes over.
         drop(e);
         fcx.idle().await?;
         assert!(e_removed.load(Ordering::SeqCst));
         c.send(to4([10, 1, 2, 3], 9));
-        assert_eq!(recv_soon(&fcx, &mut f).await.0[28], 9);
+        assert_eq!(recv_soon(&fcx, &mut f).await[28], 9);
         // And with no route left for an address, packets are dropped.
         drop(c);
         fcx.idle().await?;
@@ -981,7 +981,7 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
         r.add("10.0.0.0/8".parse()?, Box::new(b_router));
         r.add("0.0.0.0/0".parse()?, Box::new(c_router));
         c.send(to4([10, 0, 0, 1], 1));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 1);
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 1);
         drop(r);
         drop((b, c));
         Ok(())
@@ -1001,8 +1001,12 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
         lan.add("192.168.56.22".parse()?, Box::new(c_lan))?;
 
         // Unicast goes only to the member that owns the destination.
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 1);
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 11],
+            &[1],
+        )));
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 1);
         assert!(recv_within(&fcx, &mut c, ms(20)).await.is_none());
 
         // The subnet broadcast, limited broadcast and multicast are copied
@@ -1012,9 +1016,9 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
             ([255, 255, 255, 255], 3),
             ([224, 0, 0, 252], 4),
         ] {
-            a.send(Packet(v4_udp([192, 168, 56, 10], dst, &[tag])));
-            assert_eq!(recv_soon(&fcx, &mut b).await.0[28], tag);
-            assert_eq!(recv_soon(&fcx, &mut c).await.0[28], tag);
+            a.send(Packet::new(v4_udp([192, 168, 56, 10], dst, &[tag])));
+            assert_eq!(recv_soon(&fcx, &mut b).await[28], tag);
+            assert_eq!(recv_soon(&fcx, &mut c).await[28], tag);
             assert!(recv_within(&fcx, &mut a, ms(20)).await.is_none());
         }
 
@@ -1022,8 +1026,12 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
         let (new_b_lan, mut new_b) = pair();
         lan.add("192.168.56.11".parse()?, Box::new(new_b_lan))?;
         assert_eq!(b.recv(&fcx).await, Err(RecvError::Closed));
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[5])));
-        assert_eq!(recv_soon(&fcx, &mut new_b).await.0[28], 5);
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 11],
+            &[5],
+        )));
+        assert_eq!(recv_soon(&fcx, &mut new_b).await[28], 5);
 
         let (outside_lan, _outside) = pair();
         assert!(
@@ -1048,38 +1056,50 @@ fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
 
         // With no gateway, a packet for another subnet goes nowhere, and
         // the LAN carries on.
-        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[1])));
+        a.send(Packet::new(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[1])));
         assert!(recv_within(&fcx, &mut b, ms(20)).await.is_none());
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[2])));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 2);
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 11],
+            &[2],
+        )));
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 2);
 
         // With one, it goes there. The gateway's packets come in like a
         // member's: unicast to the owner, broadcast to everyone.
         let (gw_lan, mut gw) = pair();
         lan.gateway(Box::new(gw_lan))?;
-        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[3])));
-        assert_eq!(recv_soon(&fcx, &mut gw).await.0[28], 3);
-        gw.send(Packet(v4_udp([10, 0, 0, 1], [192, 168, 56, 11], &[4])));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 4);
+        a.send(Packet::new(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[3])));
+        assert_eq!(recv_soon(&fcx, &mut gw).await[28], 3);
+        gw.send(Packet::new(v4_udp([10, 0, 0, 1], [192, 168, 56, 11], &[4])));
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 4);
         assert!(recv_within(&fcx, &mut a, ms(20)).await.is_none());
-        gw.send(Packet(v4_udp([10, 0, 0, 1], [192, 168, 56, 255], &[5])));
-        assert_eq!(recv_soon(&fcx, &mut a).await.0[28], 5);
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 5);
+        gw.send(Packet::new(v4_udp(
+            [10, 0, 0, 1],
+            [192, 168, 56, 255],
+            &[5],
+        )));
+        assert_eq!(recv_soon(&fcx, &mut a).await[28], 5);
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 5);
 
         // Members' broadcasts and multicasts stay among the members.
-        a.send(Packet(v4_udp(
+        a.send(Packet::new(v4_udp(
             [192, 168, 56, 10],
             [192, 168, 56, 255],
             &[6],
         )));
-        a.send(Packet(v4_udp([192, 168, 56, 10], [224, 0, 0, 252], &[7])));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 6);
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 7);
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [224, 0, 0, 252],
+            &[7],
+        )));
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 6);
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 7);
         assert!(recv_within(&fcx, &mut gw, ms(20)).await.is_none());
 
         // A packet from the gateway for another subnet is dropped, not
         // sent back.
-        gw.send(Packet(v4_udp([10, 0, 0, 1], [10, 0, 0, 2], &[8])));
+        gw.send(Packet::new(v4_udp([10, 0, 0, 1], [10, 0, 0, 2], &[8])));
         assert!(recv_within(&fcx, &mut gw, ms(20)).await.is_none());
 
         // A new gateway replaces the old one, which is closed.
@@ -1087,14 +1107,18 @@ fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
         let (gw2_lan, gw2_removed) = removed(gw2_lan);
         lan.gateway(Box::new(gw2_lan))?;
         assert_eq!(gw.recv(&fcx).await, Err(RecvError::Closed));
-        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[9])));
-        assert_eq!(recv_soon(&fcx, &mut gw2).await.0[28], 9);
+        a.send(Packet::new(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[9])));
+        assert_eq!(recv_soon(&fcx, &mut gw2).await[28], 9);
 
         // When the gateway closes, the LAN has no route to the internet again.
         drop(gw2);
         fcx.idle().await?;
         assert!(gw2_removed.load(Ordering::SeqCst));
-        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[10])));
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [10, 0, 0, 1],
+            &[10],
+        )));
         for end in [&mut a, &mut b] {
             assert!(recv_within(&fcx, end, ms(20)).await.is_none());
         }
@@ -1120,12 +1144,20 @@ fn lan_carries_one_address_family() {
         lan4.add("192.168.56.10".parse()?, Box::new(a_lan))?;
         lan4.add("192.168.56.11".parse()?, Box::new(b_lan))?;
         lan4.gateway(Box::new(gw_lan))?;
-        a.send(Packet(v6_udp(LL_A, LLMNR6, &[1])));
-        a.send(Packet(v6_udp(LL_A, B6, &[2])));
+        a.send(Packet::new(v6_udp(LL_A, LLMNR6, &[1])));
+        a.send(Packet::new(v6_udp(LL_A, B6, &[2])));
         // IPv4 link-local stays on the LAN too: no member, so dropped.
-        a.send(Packet(v4_udp([192, 168, 56, 10], [169, 254, 1, 1], &[3])));
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[4])));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 4);
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [169, 254, 1, 1],
+            &[3],
+        )));
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 11],
+            &[4],
+        )));
+        assert_eq!(recv_soon(&fcx, &mut b).await[28], 4);
         for end in [&mut a, &mut b, &mut gw] {
             assert!(recv_within(&fcx, end, ms(20)).await.is_none());
         }
@@ -1145,20 +1177,20 @@ fn lan_carries_one_address_family() {
         lan6.gateway(Box::new(gw6_lan))?;
         let (x_lan, _x) = pair();
         assert!(lan6.add("192.168.56.10".parse()?, Box::new(x_lan)).is_err());
-        c.send(Packet(v6_udp(fd(0x10), fd(0x11), &[5])));
-        assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 5);
+        c.send(Packet::new(v6_udp(fd(0x10), fd(0x11), &[5])));
+        assert_eq!(recv_soon(&fcx, &mut d).await[48], 5);
         assert!(recv_within(&fcx, &mut e, ms(20)).await.is_none());
-        c.send(Packet(v6_udp(fd(0x10), LLMNR6, &[6])));
-        assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 6);
-        assert_eq!(recv_soon(&fcx, &mut e).await.0[48], 6);
-        c.send(Packet(v6_udp(fd(0x10), B6, &[7])));
-        assert_eq!(recv_soon(&fcx, &mut gw6).await.0[48], 7);
-        c.send(Packet(v6_udp(
+        c.send(Packet::new(v6_udp(fd(0x10), LLMNR6, &[6])));
+        assert_eq!(recv_soon(&fcx, &mut d).await[48], 6);
+        assert_eq!(recv_soon(&fcx, &mut e).await[48], 6);
+        c.send(Packet::new(v6_udp(fd(0x10), B6, &[7])));
+        assert_eq!(recv_soon(&fcx, &mut gw6).await[48], 7);
+        c.send(Packet::new(v6_udp(
             LL_A,
             [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11],
             &[8],
         )));
-        c.send(Packet(v4_udp(A4, B4, &[9])));
+        c.send(Packet::new(v4_udp(A4, B4, &[9])));
         for end in [&mut c, &mut d, &mut e, &mut gw6] {
             assert!(recv_within(&fcx, end, ms(20)).await.is_none());
         }
@@ -1185,20 +1217,28 @@ fn lan_forgets_a_member_whose_interface_closed() {
         assert!(b_removed.load(Ordering::SeqCst));
 
         // Unicast for it goes nowhere. Broadcast still reaches the rest.
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 11],
+            &[1],
+        )));
         assert!(recv_within(&fcx, &mut c, ms(20)).await.is_none());
-        a.send(Packet(v4_udp(
+        a.send(Packet::new(v4_udp(
             [192, 168, 56, 10],
             [192, 168, 56, 255],
             &[2],
         )));
-        assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 2);
+        assert_eq!(recv_soon(&fcx, &mut c).await[28], 2);
 
         // The address is free for a new member.
         let (b2_lan, mut b2) = pair();
         lan.add("192.168.56.11".parse()?, Box::new(b2_lan))?;
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[3])));
-        assert_eq!(recv_soon(&fcx, &mut b2).await.0[28], 3);
+        a.send(Packet::new(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 11],
+            &[3],
+        )));
+        assert_eq!(recv_soon(&fcx, &mut b2).await[28], 3);
 
         // The LAN ends once every member has closed and the handle is
         // gone. The run then ends, which `world` checks.
@@ -1253,7 +1293,7 @@ fn lan_fan_out_counts_toward_the_budget() {
             members.push(far);
         }
         for i in 0..200u32 {
-            sender.send(Packet(v4_udp(
+            sender.send(Packet::new(v4_udp(
                 [10, 0, 0, 1],
                 [10, 0, 0, 255],
                 &i.to_be_bytes(),
@@ -1343,7 +1383,7 @@ fn each_task_yields_after_64_packets_in_a_row() {
             let done = Arc::new(AtomicBool::new(false));
             let (mut sandbox, world_side) = pair();
             for i in 0..1000u32 {
-                sandbox.send(Packet(v4_udp(A4, B4, &i.to_be_bytes())));
+                sandbox.send(Packet::new(v4_udp(A4, B4, &i.to_be_bytes())));
             }
             ticker(&fcx, l.clone(), done.clone());
             let inner = Logged {
@@ -1397,9 +1437,9 @@ fn echo_reply_v4_has_correct_checksums() {
         .icmpv4_echo_request(0x1234, 7)
         .write(&mut req, b"abcdefghij")
         .unwrap();
-    let reply = icmp::echo_reply(&Packet(req.clone()), IpAddr::V4(addr))
+    let reply = icmp::echo_reply(&Packet::new(req.clone()), IpAddr::V4(addr))
         .expect("a reply")
-        .0;
+        .to_vec();
 
     // IPv4 header: from the address, to the sender, checksum good.
     assert_eq!(reply[0], 0x45);
@@ -1437,15 +1477,27 @@ fn echo_reply_v4_has_correct_checksums() {
 
     // No reply to another address, to a reply, or to a bad checksum.
     assert!(
-        icmp::echo_reply(&Packet(req.clone()), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2))).is_none()
+        icmp::echo_reply(
+            &Packet::new(req.clone()),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2))
+        )
+        .is_none()
     );
-    assert!(icmp::echo_reply(&Packet(req.clone()), IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none());
-    assert!(icmp::echo_reply(&Packet(reply.clone()), IpAddr::V4(Ipv4Addr::from(A4))).is_none());
+    assert!(icmp::echo_reply(&Packet::new(req.clone()), IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none());
+    assert!(
+        icmp::echo_reply(&Packet::new(reply.clone()), IpAddr::V4(Ipv4Addr::from(A4))).is_none()
+    );
     let mut bad = req.clone();
     bad[30] ^= 1;
-    assert!(icmp::echo_reply(&Packet(bad), IpAddr::V4(addr)).is_none());
-    assert!(icmp::echo_reply(&Packet(vec![0x45; 10]), IpAddr::V4(addr)).is_none());
-    assert!(icmp::echo_reply(&Packet(v4_udp(A4, addr.octets(), b"x")), IpAddr::V4(addr)).is_none());
+    assert!(icmp::echo_reply(&Packet::new(bad), IpAddr::V4(addr)).is_none());
+    assert!(icmp::echo_reply(&Packet::new(vec![0x45; 10]), IpAddr::V4(addr)).is_none());
+    assert!(
+        icmp::echo_reply(
+            &Packet::new(v4_udp(A4, addr.octets(), b"x")),
+            IpAddr::V4(addr)
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -1456,9 +1508,9 @@ fn echo_reply_v6_has_correct_checksums() {
         .icmpv6_echo_request(0x4321, 9)
         .write(&mut req, b"0123456789abc")
         .unwrap();
-    let reply = icmp::echo_reply(&Packet(req.clone()), IpAddr::V6(addr))
+    let reply = icmp::echo_reply(&Packet::new(req.clone()), IpAddr::V6(addr))
         .expect("a reply")
-        .0;
+        .to_vec();
 
     assert_eq!(reply[0] >> 4, 6);
     assert_eq!(
@@ -1497,9 +1549,11 @@ fn echo_reply_v6_has_correct_checksums() {
 
     let mut bad = req.clone();
     bad[50] ^= 1;
-    assert!(icmp::echo_reply(&Packet(bad), IpAddr::V6(addr)).is_none());
-    assert!(icmp::echo_reply(&Packet(req.clone()), IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none());
-    assert!(icmp::echo_reply(&Packet(reply.clone()), IpAddr::V6(Ipv6Addr::from(A6))).is_none());
+    assert!(icmp::echo_reply(&Packet::new(bad), IpAddr::V6(addr)).is_none());
+    assert!(icmp::echo_reply(&Packet::new(req.clone()), IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none());
+    assert!(
+        icmp::echo_reply(&Packet::new(reply.clone()), IpAddr::V6(Ipv6Addr::from(A6))).is_none()
+    );
 }
 
 #[test]
@@ -1525,9 +1579,9 @@ fn a_ping_loop_answers_through_split_protocols() {
         // whole.
         let (whole, frags) = fragment_v4(&req, &[1480, 1480]);
         for f in frags.iter().rev() {
-            sandbox.send(Packet(f.clone()));
+            sandbox.send(Packet::new(f.clone()));
         }
-        let reply = recv_soon(&fcx, &mut sandbox).await.0;
+        let reply = recv_soon(&fcx, &mut sandbox).await.to_vec();
         assert_eq!(reply.len(), whole.len());
         assert_eq!(reply[20], 0);
         assert_eq!(internet_checksum(&[], &reply[20..]), 0);

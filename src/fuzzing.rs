@@ -2,10 +2,10 @@
 //! public. Built only under `cfg(fuzzing)`, which `cargo fuzz` sets. Not
 //! part of the API.
 
-use crate::Packet;
 use crate::stdlib::network::ip::{Intake, Reassembly};
 use crate::stdlib::network::packet::Sort;
 use crate::time::{Duration, Instant};
+use crate::{Chunk, Packet};
 
 /// Feeds packets to fragment reassembly, as `split_protocols` takes them in
 /// (with IPv6 extension headers checked and taken out), each at its time in
@@ -23,12 +23,12 @@ pub fn reassemble(packets: impl IntoIterator<Item = (u64, Vec<u8>)>) -> Vec<Pack
             r.expire(now);
             r.check();
         }
-        match r.push(Packet(bytes.clone()), now) {
-            Intake::Whole(p) if p.0 != bytes => out.push(p),
+        match r.push(Chunk::unpaid(bytes.clone()), now) {
+            Intake::Whole(p) if *p != *bytes => out.push(Packet::from_chunk(p)),
             Intake::Refused {
                 answer: Some(answer),
                 ..
-            } => out.push(answer),
+            } => out.push(Packet::from_chunk(answer)),
             _ => {}
         }
         r.check();

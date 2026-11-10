@@ -321,7 +321,7 @@ impl ConnSlot {
     fn flush(&self, out: &mut OutQueue, shared: &ListenShared) {
         let fd = self.fd.as_raw_fd();
         while let Some(packet) = out.queue.front() {
-            match unix::send_parts(fd, &[&[relay::PACKET], &packet.0], true) {
+            match unix::send_parts(fd, &[&[relay::PACKET], &packet], true) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(_) => {
@@ -686,7 +686,7 @@ impl SocketLink {
             match unix::recv(fd, &mut self.buf, true) {
                 Ok(n) if (1..=relay::MAX_MESSAGE).contains(&n) && self.buf[0] == relay::PACKET => {
                     self.budget -= 1;
-                    return Poll::Ready(Ok(Packet(self.buf[1..n].to_vec())));
+                    return Poll::Ready(Ok(Packet::new(self.buf[1..n].to_vec())));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if registered {
@@ -725,11 +725,7 @@ impl SocketLink {
             self.slot.flush(&mut out, &self.listen);
         }
         if out.queue.is_empty() {
-            match unix::send_parts(
-                self.slot.fd.as_raw_fd(),
-                &[&[relay::PACKET], &packet.0],
-                true,
-            ) {
+            match unix::send_parts(self.slot.fd.as_raw_fd(), &[&[relay::PACKET], &packet], true) {
                 Ok(()) => {
                     drop(out);
                     return;
@@ -929,7 +925,7 @@ mod tests {
                 // The client does not drain the burst, so it exceeds even
                 // the raised socket buffer and needs EPOLLOUT.
                 for _ in 0..10_000 {
-                    agent.send(Packet(vec![0; 1400]));
+                    agent.send(Packet::new(vec![0; 1400]));
                 }
                 assert_eq!(agent.recv(&fcx).await, Err(RecvError::Closed));
                 let out = slot.out.lock();

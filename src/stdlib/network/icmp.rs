@@ -71,14 +71,13 @@ impl Options {
 /// must not accept, such as an unknown option whose type says to discard
 /// the packet, gets no reply; `split_protocols` drops those before they get
 /// here, and answers the ones RFC 8200 asks it to.
-pub fn echo_reply(packet: &Packet, addr: IpAddr) -> Option<Packet> {
+pub fn echo_reply(packet: &[u8], addr: IpAddr) -> Option<Packet> {
     Options::default().echo_reply(packet, addr)
 }
 
 impl Options {
     /// Builds an echo reply using this host's receive and header choices.
-    pub fn echo_reply(&self, packet: &Packet, addr: IpAddr) -> Option<Packet> {
-        let bytes = &packet.0;
+    pub fn echo_reply(&self, bytes: &[u8], addr: IpAddr) -> Option<Packet> {
         let ip = Header::parse_whole(bytes)?;
         if ip.dst != addr || !is_one_host(ip.src) {
             return None;
@@ -119,11 +118,11 @@ impl Options {
                 ..Fields::default()
             },
         );
-        let mut out = ip::packet_with(addr, ip.src, proto, fields, &message);
+        let mut out = ip::packet_with(addr, ip.src, proto, fields, &message).into_vec();
         if addr.is_ipv6() {
-            out.0[..4].copy_from_slice(&bytes[..4]);
+            out[..4].copy_from_slice(&bytes[..4]);
         }
-        Some(out)
+        Some(Packet::new(out))
     }
 }
 
@@ -298,7 +297,7 @@ mod tests {
             fields,
             &[&frag[..], &body].concat(),
         )
-        .0
+        .to_vec()
     }
 
     /// Time exceeded and address unreachable now come from the one ICMP
@@ -308,7 +307,9 @@ mod tests {
     #[test]
     fn a_later_ipv6_fragment_is_answered() {
         let later = fragment6(8, 1);
-        let answer = time_exceeded(&later, ROUTER.into()).expect("an answer").0;
+        let answer = time_exceeded(&later, ROUTER.into())
+            .expect("an answer")
+            .into_vec();
         let h = Header::parse(&answer).unwrap();
         assert_eq!(
             (h.src, h.dst, h.protocol),
@@ -337,7 +338,7 @@ mod tests {
                 protocol::UDP,
                 &[0; 8],
             )
-            .0
+            .to_vec()
         };
         let from = "10.0.0.1".parse().unwrap();
         assert!(error(&to("10.0.0.2", "10.0.0.9"), from, 3, 3, 0).is_some());
@@ -362,7 +363,7 @@ mod tests {
                 protocol::ICMP,
                 &[kind, 0, 0, 0, 0, 0, 0, 0],
             )
-            .0
+            .to_vec()
         };
         assert!(host_unreachable(&icmp(3), "10.0.0.1".parse().unwrap()).is_none());
         assert!(host_unreachable(&icmp(8), "10.0.0.1".parse().unwrap()).is_some());
@@ -390,12 +391,8 @@ mod tests {
         let good = ping("10.0.0.2", "10.0.0.1");
         assert!(echo_reply(&good, me).is_some());
         let mut bad = good.clone();
-        bad.0[11] ^= 0x01;
-        assert_ne!(
-            ip::checksum(&bad.0[..20]),
-            0,
-            "the header checksum is wrong"
-        );
+        bad.make_mut(&fictionet::Budget::unlimited()).unwrap()[11] ^= 0x01;
+        assert_ne!(ip::checksum(&bad[..20]), 0, "the header checksum is wrong");
         assert!(echo_reply(&bad, me).is_none());
     }
 

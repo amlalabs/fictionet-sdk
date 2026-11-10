@@ -14,14 +14,14 @@ fn fragment(
     more: bool,
     data: &[u8],
 ) -> Packet {
-    let mut p = ipv4(src, dst, proto, data);
-    p.0[4..6].copy_from_slice(&id.to_be_bytes());
+    let mut p = ipv4(src, dst, proto, data).into_vec();
+    p[4..6].copy_from_slice(&id.to_be_bytes());
     let flags = ((offset / 8) as u16) | if more { 0x2000 } else { 0 };
-    p.0[6..8].copy_from_slice(&flags.to_be_bytes());
-    p.0[10..12].copy_from_slice(&[0, 0]);
-    let c = ip::checksum(&p.0[..20]);
-    p.0[10..12].copy_from_slice(&c.to_be_bytes());
-    p
+    p[6..8].copy_from_slice(&flags.to_be_bytes());
+    p[10..12].copy_from_slice(&[0, 0]);
+    let c = ip::checksum(&p[..20]);
+    p[10..12].copy_from_slice(&c.to_be_bytes());
+    Packet::new(p)
 }
 
 /// Tens of thousands of first fragments that never complete, each a
@@ -635,7 +635,7 @@ fn malformed_dns_does_not_break_the_server() {
         big.extend_from_slice(&29_000u16.to_be_bytes());
         big.extend(std::iter::repeat_n(b'x', 29_000));
         let whole = udp(me, 5354, GATEWAY, 53, &big);
-        let payload = &whole.0[20..];
+        let payload = &whole[20..];
         let mut at = 0;
         while at < payload.len() {
             let n = 1480.min(payload.len() - at);

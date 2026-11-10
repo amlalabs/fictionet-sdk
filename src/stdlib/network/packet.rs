@@ -70,7 +70,7 @@
 //! let mut ip = Driver::new(IpLayer::host(), entropy, Budget::unlimited(), Instant::ZERO);
 //! let udp = [0, 1, 0, 53, 0, 8, 0, 0];
 //! let packet = ip::packet("10.0.0.2".parse()?, "10.0.0.1".parse()?, protocol::UDP, &udp);
-//! assert!(matches!(ip.deliver(PacketEvent::Packet(Chunk::unpaid(packet.0))), Ok(Admit::Taken)));
+//! assert!(matches!(ip.deliver(PacketEvent::Packet(packet.into_chunk())), Ok(Admit::Taken)));
 //! ip.send_above(|event| {
 //!     let PacketEvent::Packet(packet) = event else { unreachable!() };
 //!     assert_eq!(packet.sort(), Sort::Transport(Transport::Udp));
@@ -84,7 +84,6 @@ use core::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fictionet::Packet;
 use fictionet::stdlib::layer::{
     Admit, Budget, ChargedBytes, Chunk, CommandOf, Datagram, Env, EventOf, Layer, PacketCommand,
     PacketEvent, Packets, Whole,
@@ -538,18 +537,20 @@ impl IpLayer {
             self.checked(env, bytes, Origin::Arrived);
             return;
         }
-        let bytes = bytes.into_vec();
-        let original = (!fragment && extended).then(|| Chunk::unpaid(bytes.clone()));
-        match self.reassembly.push(Packet(bytes), env.now()) {
-            Intake::Whole(Packet(whole)) => {
-                let origin = match original {
-                    _ if fragment => Origin::Reassembled,
-                    Some(original) if original.len() != whole.len() => {
+        // The original is another piece of the same bytes, no copy; it is
+        // let go before the whole packet goes up unless headers were taken
+        // out, which made the whole packet bytes of its own.
+        let original = (!fragment && extended).then(|| bytes.clone());
+        match self.reassembly.push(bytes, env.now()) {
+            Intake::Whole(whole) => {
+                let origin = match (fragment, original) {
+                    (true, _) => Origin::Reassembled,
+                    (false, Some(original)) if original.len() != whole.len() => {
                         Origin::Normalized { original }
                     }
                     _ => Origin::Arrived,
                 };
-                self.checked(env, Chunk::unpaid(whole), origin);
+                self.checked(env, whole, origin);
             }
             Intake::Waiting => {}
             Intake::Discarded => env.report(IpReport::Malformed),
@@ -558,7 +559,7 @@ impl IpLayer {
                 env.report(IpReport::Refused {
                     answered: answer.is_some(),
                 });
-                self.answer = answer.map(|Packet(bytes)| Chunk::unpaid(bytes));
+                self.answer = answer;
             }
         }
     }
@@ -734,7 +735,8 @@ mod tests {
     #[test]
     fn malformed_host_input_is_reported_without_reaching_transports() {
         let mut d = driver();
-        let mut checksum = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(4)).0;
+        let mut checksum =
+            ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(4)).into_vec();
         checksum[10] ^= 1;
         for bytes in [vec![0x45], checksum] {
             assert!(d.deliver(raw(bytes)).unwrap().moved());
@@ -750,13 +752,13 @@ mod tests {
     #[test]
     fn transports_get_their_packets_and_the_errors_about_them() {
         let (a, b) = (addr("10.0.0.2"), addr("10.0.0.1"));
-        let tcp = ip::packet(a, b, protocol::TCP, &[0; 20]).0;
-        let datagram = ip::packet(a, b, protocol::UDP, &udp(4)).0;
+        let tcp = ip::packet(a, b, protocol::TCP, &[0; 20]).into_vec();
+        let datagram = ip::packet(a, b, protocol::UDP, &udp(4)).into_vec();
         let mut unreachable = vec![3, 3, 0, 0, 0, 0, 0, 0];
         unreachable.extend_from_slice(&tcp);
-        let error = ip::packet(b, a, protocol::ICMP, &unreachable).0;
-        let ping = ip::packet(a, b, protocol::ICMP, &[8, 0, 0, 0, 0, 1, 0, 1]).0;
-        let gre = ip::packet(a, b, 47, &[0; 4]).0;
+        let error = ip::packet(b, a, protocol::ICMP, &unreachable).into_vec();
+        let ping = ip::packet(a, b, protocol::ICMP, &[8, 0, 0, 0, 0, 1, 0, 1]).into_vec();
+        let gre = ip::packet(a, b, 47, &[0; 4]).into_vec();
         let mut d = driver();
         let mut seen = Vec::new();
         for p in [tcp, datagram, error, ping, gre] {
@@ -780,7 +782,8 @@ mod tests {
 
     #[test]
     fn malformed_fragments_are_reported_without_reaching_transports() {
-        let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
+        let whole =
+            ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).into_vec();
         let pieces = fragments(&whole, 32);
         for payload_len in [0, 9] {
             let mut malformed = pieces[0][..20 + payload_len].to_vec();
@@ -804,7 +807,8 @@ mod tests {
 
     #[test]
     fn fragments_in_any_order_come_up_as_one_packet() {
-        let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
+        let whole =
+            ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).into_vec();
         let mut pieces = fragments(&whole, 32);
         assert!(pieces.len() > 2);
         pieces.reverse();
@@ -826,7 +830,8 @@ mod tests {
 
     #[test]
     fn unfinished_packets_expire_at_the_deadline() {
-        let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
+        let whole =
+            ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).into_vec();
         let pieces = fragments(&whole, 32);
         let mut d = driver();
         assert!(matches!(
@@ -850,7 +855,8 @@ mod tests {
     /// runs. They still do not complete it.
     #[test]
     fn fragments_after_the_deadline_complete_nothing_before_the_timer_runs() {
-        let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
+        let whole =
+            ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).into_vec();
         let pieces = fragments(&whole, 32);
         let mut d = driver();
         assert!(matches!(
@@ -868,7 +874,7 @@ mod tests {
     #[test]
     fn extension_headers_are_taken_out_and_the_original_kept() {
         let (a, b) = (addr("2001:db8::2"), addr("2001:db8::1"));
-        let plain = ip::packet(a, b, protocol::UDP, &udp(3)).0;
+        let plain = ip::packet(a, b, protocol::UDP, &udp(3)).into_vec();
         // Destination options with one PadN option, in front of UDP.
         let mut with = plain[..40].to_vec();
         with[6] = protocol::DEST_OPTIONS;
@@ -890,7 +896,7 @@ mod tests {
     #[test]
     fn a_refused_packet_is_answered_below_and_never_handed_up() {
         let (a, b) = (addr("2001:db8::2"), addr("2001:db8::1"));
-        let plain = ip::packet(a, b, protocol::UDP, &udp(3)).0;
+        let plain = ip::packet(a, b, protocol::UDP, &udp(3)).into_vec();
         // A Routing header with segments left: a host here forwards none.
         let mut routed = plain[..40].to_vec();
         routed[6] = protocol::ROUTING;
@@ -915,8 +921,8 @@ mod tests {
     #[test]
     fn a_full_layer_refuses_without_changing_anything() {
         let (a, b) = (addr("10.0.0.2"), addr("10.0.0.1"));
-        let first = ip::packet(a, b, protocol::UDP, &udp(1)).0;
-        let second = ip::packet(a, b, protocol::UDP, &udp(2)).0;
+        let first = ip::packet(a, b, protocol::UDP, &udp(1)).into_vec();
+        let second = ip::packet(a, b, protocol::UDP, &udp(2)).into_vec();
         let mut d = driver();
         assert!(matches!(d.deliver(raw(first.clone())), Ok(Admit::Taken)));
         let Ok(Admit::Blocked(PacketEvent::Packet(back))) = d.deliver(raw(second.clone())) else {
@@ -968,7 +974,7 @@ mod tests {
     #[test]
     fn an_observed_copy_cut_short_is_read_but_not_complete() {
         let (a, b) = (addr("10.0.0.2"), addr("10.0.0.1"));
-        let whole = ip::packet(a, b, protocol::TCP, &[0; 40]).0;
+        let whole = ip::packet(a, b, protocol::TCP, &[0; 40]).into_vec();
         let capture = |original_len| Ingress {
             capture: Some(Capture {
                 number: 7,
@@ -994,7 +1000,8 @@ mod tests {
 
     #[test]
     fn a_later_fragment_is_not_a_transport_packet_to_an_observer() {
-        let whole = ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).0;
+        let whole =
+            ip::packet(addr("10.0.0.2"), addr("10.0.0.1"), protocol::UDP, &udp(100)).into_vec();
         let pieces = fragments(&whole, 32);
         let first =
             ObservedIpPacket::observed(Chunk::unpaid(pieces[0].clone()), Ingress::default());
@@ -1007,7 +1014,7 @@ mod tests {
     #[test]
     fn a_packet_and_its_original_are_charged_together() {
         let (a, b) = (addr("2001:db8::2"), addr("2001:db8::1"));
-        let plain = ip::packet(a, b, protocol::UDP, &udp(3)).0;
+        let plain = ip::packet(a, b, protocol::UDP, &udp(3)).into_vec();
         let mut packet = CheckedIpPacket {
             bytes: Chunk::unpaid(plain.clone()),
             header: Header::parse_whole(&plain).unwrap(),
@@ -1038,10 +1045,10 @@ mod tests {
             dont_fragment: false,
             ..ip::Fields::default()
         };
-        let outer = ip::packet_with(a, b, protocol::UDP, fields, &udp(100)).0;
+        let outer = ip::packet_with(a, b, protocol::UDP, fields, &udp(100)).into_vec();
         let mut inner_udp = udp(100);
         inner_udp[8..].reverse();
-        let inner = ip::packet_with(a, b, protocol::UDP, fields, &inner_udp).0;
+        let inner = ip::packet_with(a, b, protocol::UDP, fields, &inner_udp).into_vec();
         let tunnel = Scopes::default().tunnel();
         let (outer_pieces, inner_pieces) = (fragments(&outer, 32), fragments(&inner, 32));
         assert_eq!(outer_pieces.len(), 4);
@@ -1091,7 +1098,7 @@ mod tests {
     #[test]
     fn a_checked_packet_is_what_the_ip_layer_hands_up() {
         let (a, b) = (addr("10.0.0.2"), addr("10.0.0.1"));
-        let good = ip::packet(a, b, protocol::UDP, &udp(4)).0;
+        let good = ip::packet(a, b, protocol::UDP, &udp(4)).into_vec();
         let mut d = driver();
         assert!(matches!(d.deliver(raw(good.clone())), Ok(Admit::Taken)));
         let layer = up(&mut d).pop().unwrap();
@@ -1105,9 +1112,10 @@ mod tests {
         // What a host would not take in is handed back unchanged.
         let mut bad_sum = good.clone();
         bad_sum[10] ^= 1;
-        let fragment = fragments(&ip::packet(a, b, protocol::UDP, &udp(100)).0, 32).remove(0);
+        let fragment =
+            fragments(&ip::packet(a, b, protocol::UDP, &udp(100)).into_vec(), 32).remove(0);
         let (a6, b6) = (addr("2001:db8::2"), addr("2001:db8::1"));
-        let plain6 = ip::packet(a6, b6, protocol::UDP, &udp(3)).0;
+        let plain6 = ip::packet(a6, b6, protocol::UDP, &udp(3)).into_vec();
         let mut options6 = plain6[..40].to_vec();
         options6[6] = protocol::DEST_OPTIONS;
         options6.extend_from_slice(&[protocol::UDP, 0, 1, 4, 0, 0, 0, 0]);

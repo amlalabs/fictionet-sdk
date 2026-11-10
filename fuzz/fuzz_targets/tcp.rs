@@ -97,7 +97,7 @@ fn drain(
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     while let std::task::Poll::Ready(Ok(p)) = raw.poll_recv(fcx, &mut cx) {
-        let p = p.0;
+        let p = p.into_vec();
         let (at, end) = if me.is_ipv4() {
             assert_eq!(p[0] >> 4, 4);
             assert_eq!(
@@ -221,7 +221,7 @@ fuzz_target!(|input: Input| {
                         data: &payload,
                         bad_checksum,
                     };
-                    raw.send(Packet(tcp_packet(me, world_addr, &seg)));
+                    raw.send(Packet::new(tcp_packet(me, world_addr, &seg)));
                 }
                 Op::Pump(n) => {
                     settle(&fcx, 1 + n as usize % 8).await;

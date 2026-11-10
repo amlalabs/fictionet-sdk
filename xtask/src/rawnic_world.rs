@@ -464,7 +464,7 @@ pub fn tun() -> fictionet::Result {
                         fictionet::stdlib::dissect::hex(&incoming.0)
                     )));
                 }
-                peer.send(Packet(expected.clone()));
+                peer.send(Packet::new(expected.clone()));
                 let received = fcx
                     .race(None, async {
                         loop {

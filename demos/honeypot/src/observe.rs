@@ -1782,7 +1782,7 @@ mod tests {
         };
         let sum = ip::transport_checksum(from, to, protocol, &transport);
         transport[checksum..checksum + 2].copy_from_slice(&sum.to_be_bytes());
-        ip::packet(from, to, protocol, &transport).0
+        ip::packet(from, to, protocol, &transport).into_vec()
     }
 
     #[test]
@@ -1838,7 +1838,7 @@ mod tests {
             protocol::ICMP,
             &packet,
         );
-        assert!(port_zero(&attachment, &quote.0, 0, 0, true).is_none());
+        assert!(port_zero(&attachment, &quote[..], 0, 0, true).is_none());
     }
 
     #[test]

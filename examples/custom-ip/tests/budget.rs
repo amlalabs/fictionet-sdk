@@ -15,7 +15,7 @@ fn rewriting_a_packet_keeps_its_reservation_until_delivery() {
             ip::protocol::UDP,
             &[0; 8],
         )
-        .0;
+        .to_vec();
         let capacity = packet.len();
         let budget = Budget::new(capacity);
         let chunk = ChargedBytes::copy_of(&budget, &packet)
@@ -56,7 +56,7 @@ fn a_shared_packet_waits_for_copy_budget_without_losing_ownership() {
         ip::protocol::UDP,
         &[0; 8],
     )
-    .0;
+    .to_vec();
     let capacity = packet.len();
     let budget = Budget::new(capacity);
     let mut retained = ChargedBytes::copy_of(&budget, &packet)

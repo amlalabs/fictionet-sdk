@@ -1434,11 +1434,11 @@ mod tests {
     }
 
     fn packet4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
-        ip::packet(src.into(), dst.into(), 17, &[0; 8]).0
+        ip::packet(src.into(), dst.into(), 17, &[0; 8]).into_vec()
     }
 
     fn packet6(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
-        ip::packet(src.into(), dst.into(), 17, &[0; 8]).0
+        ip::packet(src.into(), dst.into(), 17, &[0; 8]).into_vec()
     }
 
     fn sn_mac(addr: Ipv6Addr) -> Mac {
@@ -2356,9 +2356,9 @@ mod tests {
             Err(Unsent::Source)
         );
         assert_eq!(h.send(at(1000), &[0x45, 0, 0]), Err(Unsent::Malformed));
-        let full = ip::packet(ADDR4.into(), REMOTE4.into(), 17, &[0; 1480]).0;
+        let full = ip::packet(ADDR4.into(), REMOTE4.into(), 17, &[0; 1480]).into_vec();
         assert!(h.send(at(1000), &full).is_ok());
-        let over = ip::packet(ADDR4.into(), REMOTE4.into(), 17, &[0; 1481]).0;
+        let over = ip::packet(ADDR4.into(), REMOTE4.into(), 17, &[0; 1481]).into_vec();
         assert_eq!(h.send(at(1000), &over), Err(Unsent::TooBig));
         // Multicast and broadcast go to the group's MAC.
         let f = h.send(at(1000), &packet6(ADDR6, ndp::ALL_NODES)).unwrap();
@@ -2578,7 +2578,7 @@ mod tests {
             },
             &body,
         )
-        .0;
+        .to_vec();
         assert_eq!(
             h.receive(at(1000), &eth(GW_MAC, all_nodes, frame::IPV6, &fragment)),
             Received::Drop(Dropped::Malformed)

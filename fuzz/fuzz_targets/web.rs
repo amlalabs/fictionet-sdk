@@ -164,7 +164,7 @@ fuzz_target!(|steps: Vec<Step>| {
                     continue;
                 }
             };
-            end.send(Packet(packet));
+            end.send(Packet::new(packet));
         }
         settle(&fcx, 16).await;
         drop(end);

@@ -135,7 +135,7 @@ fn segment(
     t[20..20 + options.len()].copy_from_slice(options);
     let sum = transport_checksum(from.ip(), to.ip(), TCP, &t);
     t[16..18].copy_from_slice(&sum.to_be_bytes());
-    fictionet::stdlib::network::ip::packet(from.ip(), to.ip(), TCP, &t).0
+    fictionet::stdlib::network::ip::packet(from.ip(), to.ip(), TCP, &t).into_vec()
 }
 
 /// An HMAC-SHA256 key of 32 bytes from the run's random stream.
@@ -1811,7 +1811,7 @@ impl TcpLayer {
                     &reply[20..],
                 )
                 .expect("checked IPv4 reply")
-                .0
+                .into_vec()
             } else {
                 reply
             };

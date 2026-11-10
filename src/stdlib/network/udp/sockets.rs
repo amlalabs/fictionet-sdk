@@ -299,7 +299,7 @@ impl UdpLayer {
             },
             &udp,
         );
-        Some(Chunk::unpaid(packet.0))
+        Some(packet.into_chunk())
     }
 
     /// Takes in one packet the IP layer sorted to UDP.
@@ -331,7 +331,7 @@ impl UdpLayer {
             }
             let silent = local.port() == 0 && self.settings.port_zero == PortZero::Silent;
             if !silent && let Some(answer) = port_unreachable(packet.bytes(), dst, &self.icmp) {
-                self.down.push_back((Chunk::unpaid(answer.0), None));
+                self.down.push_back((answer.into_chunk(), None));
             }
             self.notice(UdpNotice::Refused { peer, local });
             return;

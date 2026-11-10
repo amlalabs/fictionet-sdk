@@ -25,7 +25,7 @@ pub async fn run(
             frame = to_world.recv() => {
                 let Some(frame) = frame else { break };
                 match link.frame_from_vm(&frame) {
-                    FromVm::World(packet) => sandbox.send(Packet(packet.to_vec())),
+                    FromVm::World(packet) => sandbox.send(Packet::new(packet.to_vec())),
                     FromVm::Answer(reply) => rx.push(reply),
                     FromVm::Drop(_) => {}
                 }
@@ -33,10 +33,10 @@ pub async fn run(
             packet = sandbox.recv(&fcx) => {
                 match packet {
                     Ok(packet) => {
-                        if let Some(addr) = lease_address(&packet.0) { address.send_replace(Some(addr)); }
-                        if let Some(header) = link.to_vm(&packet.0) {
+                        if let Some(addr) = lease_address(&packet) { address.send_replace(Some(addr)); }
+                        if let Some(header) = link.to_vm(&packet) {
                             let mut frame = header.to_vec();
-                            frame.extend_from_slice(&packet.0);
+                            frame.extend_from_slice(&packet);
                             rx.push(frame);
                         }
                     }

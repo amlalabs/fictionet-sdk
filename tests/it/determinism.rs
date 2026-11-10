@@ -176,7 +176,7 @@ async fn episode(
     let agent = filter(&cx, agent, move |_, direction, p| {
         packets.lock().unwrap().packets.push((
             direction == fictionet::stdlib::network::Direction::FromInner,
-            p.0.clone(),
+            p.to_vec(),
         ));
         true
     });

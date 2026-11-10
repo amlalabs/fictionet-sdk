@@ -266,9 +266,9 @@ where
             match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
                 ports::Event::Packet(i, packet) => {
                     let now = fcx.now();
-                    let cost = packet.0.len() + PACKET_COST;
+                    let cost = packet.len() + PACKET_COST;
                     let fits = queues[i].bytes + cost <= LINK_STORE;
-                    if let Some(leaves) = admit(&queues[i], now, packet.0.len()).filter(|_| fits) {
+                    if let Some(leaves) = admit(&queues[i], now, packet.len()).filter(|_| fits) {
                         queues[i].bytes += cost;
                         queues[i].packets.push_back((leaves, packet));
                     }
@@ -283,7 +283,7 @@ where
                                 _ => break,
                             }
                             let (_, packet) = queue.packets.pop_front().unwrap();
-                            queue.bytes -= packet.0.len() + PACKET_COST;
+                            queue.bytes -= packet.len() + PACKET_COST;
                             ports.send(1 - i, packet);
                             sent += 1;
                         }
@@ -310,7 +310,7 @@ mod tests {
     /// link's task turns as it goes.
     async fn flood(fcx: &Cx, into: &mut End, n: usize) -> fictionet::Result {
         for i in 0..n {
-            into.send(Packet(vec![0x45; 1500]));
+            into.send(Packet::new(vec![0x45; 1500]));
             if i % 32 == 31 {
                 fcx.yield_now().await?;
             }
@@ -344,7 +344,7 @@ mod tests {
                     "nothing leaves before the delay"
                 );
                 for _ in 0..FIT {
-                    assert_eq!(far.recv(&fcx).await?, Packet(vec![0x45; 1500]));
+                    assert_eq!(far.recv(&fcx).await?, Packet::new(vec![0x45; 1500]));
                 }
                 assert_eq!(fcx.now().since_start(), Duration::from_secs(1));
                 assert_eq!(
@@ -353,8 +353,8 @@ mod tests {
                     "the delay kept exactly 32 MiB and dropped the rest"
                 );
                 // Room again, once the queue has emptied.
-                sandbox.send(Packet(vec![1; 100]));
-                assert_eq!(far.recv(&fcx).await?, Packet(vec![1; 100]));
+                sandbox.send(Packet::new(vec![1; 100]));
+                assert_eq!(far.recv(&fcx).await?, Packet::new(vec![1; 100]));
                 assert_eq!(fcx.now().since_start(), Duration::from_secs(2));
                 Ok(())
             },
@@ -370,10 +370,10 @@ mod tests {
                 let (mut sandbox, inner) = pair();
                 let mut far = bottleneck(&fcx, 1_000_000, 10, inner);
                 for byte in 0..11 {
-                    sandbox.send(Packet(vec![byte; 1250]));
+                    sandbox.send(Packet::new(vec![byte; 1250]));
                 }
                 for byte in 0..10 {
-                    assert_eq!(far.recv(&fcx).await?, Packet(vec![byte; 1250]));
+                    assert_eq!(far.recv(&fcx).await?, Packet::new(vec![byte; 1250]));
                     assert_eq!(
                         fcx.now().since_start(),
                         Duration::from_millis(10 * (u64::from(byte) + 1))
@@ -451,10 +451,10 @@ mod tap_tests {
                 let (inner, mut peer) = fictionet::pair();
                 let (send, receive) = std::sync::mpsc::sync_channel(1);
                 let mut tapped = tap(inner, send);
-                let outbound = Packet(vec![1, 2, 3]);
+                let outbound = Packet::new(vec![1, 2, 3]);
                 peer.send(outbound.clone());
                 assert_eq!(tapped.recv(&cx).await?, outbound);
-                let inbound = Packet(vec![4, 5, 6]);
+                let inbound = Packet::new(vec![4, 5, 6]);
                 tapped.send(inbound.clone());
                 assert_eq!(peer.recv(&cx).await?, inbound);
                 assert_eq!(
@@ -468,8 +468,8 @@ mod tap_tests {
                 );
                 assert_eq!(peer.recv(&cx).await?, inbound);
                 drop(receive);
-                tapped.send(Packet(vec![7]));
-                assert_eq!(peer.recv(&cx).await?, Packet(vec![7]));
+                tapped.send(Packet::new(vec![7]));
+                assert_eq!(peer.recv(&cx).await?, Packet::new(vec![7]));
                 Ok(())
             },
         ))

@@ -71,7 +71,7 @@ fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, id: u16, frag: u16, payload: &[
     p.extend_from_slice(&dst.octets());
     ip::set_header_checksum(&mut p);
     p.extend_from_slice(payload);
-    Packet(p)
+    Packet::new(p)
 }
 
 fn udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Packet {
@@ -127,8 +127,8 @@ async fn drain(fcx: &Cx, raw: &mut End, quiet: Duration) -> Vec<Packet> {
 
 /// The TCP header of a packet from the world, if it carries TCP.
 fn tcp_of(p: &Packet) -> Option<&[u8]> {
-    let ihl = (p.0[0] & 15) as usize * 4;
-    (p.0[9] == 6).then(|| &p.0[ihl..])
+    let ihl = (p[0] & 15) as usize * 4;
+    (p[9] == 6).then(|| &p[ihl..])
 }
 
 async fn lookup(machine: &Machine, fcx: &Cx, name: &str) -> Ipv4Addr {
@@ -247,7 +247,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             let mut count = |got: Vec<Packet>| {
                 for p in got {
                     if let Some(t) = tcp_of(&p)
-                        && p.0[12..16] == wild.octets()
+                        && p[12..16] == wild.octets()
                         && t[13] & (SYN | ACK) == SYN | ACK
                     {
                         synacks.insert(u16::from_be_bytes([t[2], t[3]]));
@@ -296,7 +296,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
                         // flood's machine may still come.
                         let Some(t) = tcp_of(&p) else { continue };
                         let port = u16::from_be_bytes([t[2], t[3]]);
-                        if p.0[12..16] != plain.octets() || !(50_000..51_000).contains(&port) {
+                        if p[12..16] != plain.octets() || !(50_000..51_000).contains(&port) {
                             continue;
                         }
                         let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
@@ -428,7 +428,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
                         let p = udp(Ipv4Addr::new(10, 0, 0, 2 + i), 5000, GATEWAY, 9, &[0; 100]);
                         while !stop.load(Ordering::Relaxed) {
                             if let Err(e) =
-                                unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &p.0], false)
+                                unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &p[..]], false)
                             {
                                 return if stop.load(Ordering::Relaxed) {
                                     Ok(())

@@ -72,17 +72,14 @@ fn an_external_ip_policy_carries_the_same_http_application() {
         let custom_packets: Vec<_> = packets
             .iter()
             .filter(|packet| {
-                ip::Header::parse(&packet.0).is_some_and(|header| header.src == custom)
+                ip::Header::parse(&packet[..]).is_some_and(|header| header.src == custom)
             })
             .collect();
         assert!(!custom_packets.is_empty());
         for packet in custom_packets {
             // World routes preserve the host's configured TTL.
-            assert_eq!(packet.0[8], hops.get());
-            assert_eq!(
-                ip::checksum(&packet.0[..usize::from(packet.0[0] & 15) * 4]),
-                0
-            );
+            assert_eq!(packet[8], hops.get());
+            assert_eq!(ip::checksum(&packet[..usize::from(packet[0] & 15) * 4]), 0);
         }
         Ok(())
     });

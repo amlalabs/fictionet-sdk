@@ -223,7 +223,10 @@ async fn receive(raw: &mut End, cx: &Cx) -> Vec<u8> {
         .await
         .unwrap()
         .unwrap();
-    Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec()
+    Header::parse_whole(&p[..])
+        .unwrap()
+        .payload(&p[..])
+        .to_vec()
 }
 
 fn sequence(t: &[u8]) -> u32 {
@@ -294,9 +297,9 @@ fn syn_ack_bytes_offsets_and_repeated_syn() {
         raw.send(packet(peer, local, 101, next, 16, &echo));
         let _connection = listener.accept(&cx).await?;
         let out_of_order = packet(peer, local, 102, next, 16, &echo);
-        let mut tcp = Header::parse_whole(&out_of_order.0)
+        let mut tcp = Header::parse_whole(&out_of_order[..])
             .unwrap()
-            .payload(&out_of_order.0)
+            .payload(&out_of_order[..])
             .to_vec();
         tcp.extend_from_slice(b"hello");
         tcp[16..18].fill(0);
@@ -498,8 +501,11 @@ fn time_wait_expires_after_sixty_seconds() {
         let fin = packet(peer, local, 101, next.wrapping_add(1), 17, &[]);
         raw.send(fin.clone());
         let ack = raw.recv(&cx).await?;
-        assert_eq!(Header::parse_whole(&ack.0).unwrap().payload(&ack.0)[13], 16);
-        assert_eq!(&ack.0[4..6], &[0, 0]);
+        assert_eq!(
+            Header::parse_whole(&ack[..]).unwrap().payload(&ack[..])[13],
+            16
+        );
+        assert_eq!(&ack[4..6], &[0, 0]);
         cx.sleep(Duration::from_secs(59)).await?;
         raw.send(fin.clone());
         assert_eq!(receive(&mut raw, &cx).await[13], 16);
@@ -587,9 +593,9 @@ fn a_linux_host_treats_port_zero_as_measured() {
             .race(Some(cx.now() + Duration::from_secs(1)), raw.recv(&cx))
             .await
             .unwrap()?;
-        assert_eq!(reply.0[9], 1, "ICMP");
-        assert_eq!((reply.0[20], reply.0[21]), (3, 3), "port unreachable");
-        assert_eq!(&reply.0[28..], &datagram.0[..]);
+        assert_eq!(reply[9], 1, "ICMP");
+        assert_eq!((reply[20], reply[21]), (3, 3), "port unreachable");
+        assert_eq!(&reply[28..], &datagram[..]);
         // From an ordinary port the service is served, and closes.
         let from = SocketAddr::new(me.into(), 45000);
         raw.send(packet(from, ssh, 700, 0, 2, &[]));

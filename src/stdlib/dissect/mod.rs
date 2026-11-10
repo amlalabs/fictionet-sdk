@@ -1360,15 +1360,15 @@ mod tests {
             51,
             &payload,
         );
-        let header = Header::parse(&packet.0).unwrap();
-        let decoded = Dissector::default().decode(&packet.0);
+        let header = Header::parse(&packet[..]).unwrap();
+        let decoded = Dissector::default().decode(&packet[..]);
         assert_eq!(decoded.proto, "ICMPv6");
         assert_eq!(decoded.src, header.src.to_string());
         assert_eq!(decoded.dst, header.dst.to_string());
         assert_eq!(decoded.layers[0].range, (0, header.payload.start));
         assert_eq!(
             decoded.layers[1].range,
-            (header.payload.start, packet.0.len())
+            (header.payload.start, packet.len())
         );
         assert!(decoded.info.contains("Echo (ping) request"));
     }
@@ -1416,7 +1416,7 @@ mod tests {
             proto,
             body,
         )
-        .0
+        .to_vec()
     }
 
     /// The first `cut` bytes of an IPv4 packet's payload as its first

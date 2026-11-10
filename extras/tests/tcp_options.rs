@@ -74,8 +74,8 @@ fn segment_with(
 
 /// The TCP header and payload of a packet from the server.
 fn tcp_of(p: &Packet) -> &[u8] {
-    let ihl = (p.0[0] & 15) as usize * 4;
-    &p.0[ihl..]
+    let ihl = (p[0] & 15) as usize * 4;
+    &p[ihl..]
 }
 
 fn seq_of(t: &[u8]) -> u32 {

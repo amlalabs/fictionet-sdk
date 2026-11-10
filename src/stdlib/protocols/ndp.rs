@@ -649,7 +649,7 @@ impl Message {
             },
             &msg,
         )
-        .0)
+        .into_vec())
     }
 }
 

@@ -2,14 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::{Cancelled, Cx};
-
-/// One IPv4 or IPv6 packet, exactly the bytes on the wire.
-///
-/// The core never parses a packet, so a program can send a broken one on
-/// purpose. Parsing lives in [`stdlib`](crate::stdlib).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Packet(pub Vec<u8>);
+use crate::{Cancelled, Cx, Packet};
 
 /// Why [`recv`](InterfaceExt::recv) returned no packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

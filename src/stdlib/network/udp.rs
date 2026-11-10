@@ -938,7 +938,11 @@ mod tests {
                 }));
                 let valid = datagram(b"query");
                 let mut invalid = valid.clone();
-                *invalid.0.last_mut().unwrap() ^= 1;
+                *invalid
+                    .make_mut(&fictionet::Budget::unlimited())
+                    .unwrap()
+                    .last_mut()
+                    .unwrap() ^= 1;
                 raw.send(invalid);
                 raw.send(valid);
                 raw.recv(&fcx).await?;

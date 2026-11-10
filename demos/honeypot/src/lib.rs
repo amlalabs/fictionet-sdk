@@ -370,9 +370,9 @@ async fn relay(
         match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
             Event::Packet(SANDBOX, packet) => {
                 let mut observer = observer.lock();
-                observer.crossed(&name, Direction::In, &packet.0, fcx.now());
-                let goes_on = route.goes_on(&packet.0);
-                let fragment = ip::Header::parse_truncated(&packet.0)
+                observer.crossed(&name, Direction::In, &packet, fcx.now());
+                let goes_on = route.goes_on(&packet);
+                let fragment = ip::Header::parse_truncated(&packet)
                     .is_some_and(|h| h.fragment.is_some_and(|f| !f.is_atomic()));
                 if fragment && !goes_on {
                     continue;
@@ -380,17 +380,19 @@ async fn relay(
                 // A packet refused for its IPv6 extension headers goes on
                 // as it is, so the world refuses it and answers as a host
                 // does.
-                let packet = match reassembly.push(packet, fcx.now()) {
-                    Intake::Whole(packet) | Intake::Refused { packet, .. } => packet,
+                let packet = match reassembly.push(packet.into_chunk(), fcx.now()) {
+                    Intake::Whole(packet) | Intake::Refused { packet, .. } => {
+                        fictionet::Packet::from_chunk(packet)
+                    }
                     Intake::Waiting | Intake::Discarded => continue,
                 };
                 let reassembled = fragment
-                    && ip::Header::parse_truncated(&packet.0)
+                    && ip::Header::parse_truncated(&packet)
                         .is_some_and(|header| header.fragment.is_none());
                 if reassembled {
-                    observer.reassembled(&name, Direction::In, &packet.0, fcx.now());
+                    observer.reassembled(&name, Direction::In, &packet, fcx.now());
                 } else {
-                    observer.whole(&name, Direction::In, &packet.0, fcx.now());
+                    observer.whole(&name, Direction::In, &packet, fcx.now());
                 }
                 if goes_on {
                     ports.send(NETWORK, packet);
@@ -398,8 +400,8 @@ async fn relay(
             }
             Event::Packet(_, packet) => {
                 let mut observer = observer.lock();
-                observer.crossed(&name, Direction::Out, &packet.0, fcx.now());
-                observer.whole(&name, Direction::Out, &packet.0, fcx.now());
+                observer.crossed(&name, Direction::Out, &packet, fcx.now());
+                observer.whole(&name, Direction::Out, &packet, fcx.now());
                 ports.send(SANDBOX, packet);
             }
             Event::Timer => reassembly.expire(fcx.now()),

@@ -64,7 +64,7 @@
 //!
 //! let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(1)));
 //! let mut tcp = Driver::new(Observer::default(), entropy, Budget::unlimited(), Instant::ZERO);
-//! let packet = ObservedIpPacket::observed(Chunk::unpaid(packet.0), Ingress::default());
+//! let packet = ObservedIpPacket::observed(packet.into_chunk(), Ingress::default());
 //! assert!(matches!(tcp.deliver(PacketEvent::Packet(packet)), Ok(Admit::Taken)));
 //! let mut child = None;
 //! tcp.send_above(|event| {

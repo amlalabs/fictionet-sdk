@@ -132,21 +132,21 @@ impl Tun {
                     let write = async {
                         loop {
                             let mut ready = self.0.writable().await?;
-                            match ready.try_io(|fd| fd.get_ref().write(&packet.0)) {
+                            match ready.try_io(|fd| fd.get_ref().write(&packet)) {
                                 Ok(result) => return result,
                                 Err(_) => continue,
                             }
                         }
                     };
                     let count = fcx.race(None, write).await??;
-                    if count != packet.0.len() {
+                    if count != packet.len() {
                         return Err(io::Error::new(io::ErrorKind::WriteZero, "partial TUN packet write").into());
                     }
                 }
                 result = incoming => {
                     let count = result?;
                     if count == 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed").into()); }
-                    end.send(Packet(buffer[..count].to_vec()));
+                    end.send(Packet::new(buffer[..count].to_vec()));
                 }
             }
             fcx.yield_now().await?;

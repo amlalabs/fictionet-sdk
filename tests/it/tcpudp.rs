@@ -216,7 +216,7 @@ fn a_closed_port_refuses_at_once() {
             raw.send(tcp_syn(ip(A), 40000 + port, ip(B), port));
             let p = raw.recv(&fcx).await?;
             times.push(fcx.now().since_start() - started.since_start());
-            assert_eq!(p.0[20 + 13] & 0x04, 0x04, "a RST for port {port}");
+            assert_eq!(p[20 + 13] & 0x04, 0x04, "a RST for port {port}");
         }
         times.sort();
         let (median, max) = (times[times.len() / 2], times[times.len() - 1]);
@@ -437,21 +437,23 @@ fn icmp_fails_only_the_quoted_connect() {
             Ok(())
         });
         let syn2 = raw.recv(&fcx).await?;
-        assert_ne!(&syn1.0[20..22], &syn2.0[20..22]);
-        let mut unreachable = icmp::host_unreachable(&syn1.0, B.parse().unwrap()).unwrap();
+        assert_ne!(&syn1[20..22], &syn2[20..22]);
+        let mut unreachable = icmp::host_unreachable(&syn1[..], B.parse().unwrap())
+            .unwrap()
+            .into_vec();
         // RFC minimum: the quoted TCP header ends after the sequence number.
-        unreachable.0.truncate(56);
-        unreachable.0[2..4].copy_from_slice(&56u16.to_be_bytes());
-        ip::set_header_checksum(&mut unreachable.0[..20]);
-        unreachable.0[22..24].fill(0);
-        let sum = checksum(&unreachable.0[20..]);
-        unreachable.0[22..24].copy_from_slice(&sum.to_be_bytes());
-        raw.send(unreachable);
+        unreachable.truncate(56);
+        unreachable[2..4].copy_from_slice(&56u16.to_be_bytes());
+        ip::set_header_checksum(&mut unreachable[..20]);
+        unreachable[22..24].fill(0);
+        let sum = checksum(&unreachable[20..]);
+        unreachable[22..24].copy_from_slice(&sum.to_be_bytes());
+        raw.send(Packet::new(unreachable));
         first.join(&fcx).await?;
-        let mut reply = syn2.0[20..40].to_vec();
+        let mut reply = syn2[20..40].to_vec();
         reply[..2].copy_from_slice(&80u16.to_be_bytes());
-        reply[2..4].copy_from_slice(&syn2.0[20..22]);
-        let seq = u32::from_be_bytes(syn2.0[24..28].try_into().unwrap());
+        reply[2..4].copy_from_slice(&syn2[20..22]);
+        let seq = u32::from_be_bytes(syn2[24..28].try_into().unwrap());
         reply[4..8].copy_from_slice(&1000u32.to_be_bytes());
         reply[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());
         reply[12] = 0x50;
@@ -460,11 +462,11 @@ fn icmp_fails_only_the_quoted_connect() {
         raw.send(ip_packet(ip(B), ip(A), 6, reply.clone(), 16));
         loop {
             let p = raw.recv(&fcx).await?;
-            if p.0[20..22] == syn2.0[20..22] && p.0[33] == 0x10 {
+            if p[20..22] == syn2[20..22] && p[33] == 0x10 {
                 break;
             }
         }
-        raw.send(icmp::host_unreachable(&syn2.0, B.parse().unwrap()).unwrap());
+        raw.send(icmp::host_unreachable(&syn2[..], B.parse().unwrap()).unwrap());
         reply[4..8].copy_from_slice(&1001u32.to_be_bytes());
         reply[13] = 0x18;
         reply.push(b'x');
@@ -847,9 +849,9 @@ fn packets_for_other_addresses_are_dropped() {
         // A SYN to B on a closed port: a RST.
         raw.send(tcp_syn(ip(A), 4001, ip(B), 81));
         let p = raw.recv(&fcx).await?;
-        let flags = p.0[20 + 13];
+        let flags = p[20 + 13];
         assert_eq!(flags & 0x04, 0x04, "a RST");
-        assert_eq!(u16::from_be_bytes([p.0[22], p.0[23]]), 4001);
+        assert_eq!(u16::from_be_bytes([p[22], p[23]]), 4001);
         let next = poll_fn(|cx| Poll::Ready(raw.poll_recv(&fcx, cx))).await;
         assert!(next.is_pending(), "only one answer");
         Ok(())
@@ -909,22 +911,18 @@ fn udp_the_largest_datagrams_that_fit_are_sent() {
             s.send_to(&pattern(max, 5), to);
             let p = raw.recv(&fcx).await?;
             let header = if ip(a).is_ipv4() { 20 } else { 40 };
-            assert_eq!(p.0.len(), header + 8 + max);
-            assert_eq!(&p.0[header + 8..], &pattern(max, 5)[..]);
+            assert_eq!(p.len(), header + 8 + max);
+            assert_eq!(&p[header + 8..], &pattern(max, 5)[..]);
             if ip(a).is_ipv4() {
-                assert_eq!(u16::from_be_bytes([p.0[2], p.0[3]]), 65_535, "total length");
-                assert_eq!(checksum(&p.0[..20]), 0);
+                assert_eq!(u16::from_be_bytes([p[2], p[3]]), 65_535, "total length");
+                assert_eq!(checksum(&p[..20]), 0);
             } else {
-                assert_eq!(
-                    u16::from_be_bytes([p.0[4], p.0[5]]),
-                    65_535,
-                    "payload length"
-                );
+                assert_eq!(u16::from_be_bytes([p[4], p[5]]), 65_535, "payload length");
             }
             s.send_to(&pattern(max + 1, 5), to);
             s.send_to(b"after", to);
             let p = raw.recv(&fcx).await?;
-            assert_eq!(&p.0[header + 8..], b"after", "one byte more is dropped");
+            assert_eq!(&p[header + 8..], b"after", "one byte more is dropped");
             Ok(())
         });
     }
@@ -940,7 +938,7 @@ fn udp_closed_port_gets_port_unreachable() {
             let sent = udp_packet(ip(a), 4000, ip(b), 99, b"anyone?");
             raw.send(sent.clone());
             let reply = raw.recv(&fcx).await?;
-            let r = &reply.0;
+            let r = &reply[..];
             if ip(a).is_ipv4() {
                 assert_eq!(r[9], 1, "ICMP");
                 assert_eq!(
@@ -952,13 +950,13 @@ fn udp_closed_port_gets_port_unreachable() {
                         .octets()
                 );
                 assert_eq!((r[20], r[21]), (3, 3), "port unreachable");
-                assert_eq!(&r[28..], &sent.0[..], "quotes the datagram");
+                assert_eq!(&r[28..], &sent[..], "quotes the datagram");
                 assert_eq!(checksum(&r[..20]), 0);
                 assert_eq!(checksum(&r[20..]), 0);
             } else {
                 assert_eq!(r[6], 58, "ICMPv6");
                 assert_eq!((r[40], r[41]), (1, 4), "port unreachable");
-                assert_eq!(&r[48..], &sent.0[..], "quotes the datagram");
+                assert_eq!(&r[48..], &sent[..], "quotes the datagram");
                 assert_eq!(
                     transport_checksum(source(r).unwrap(), destination(r).unwrap(), 58, &r[40..]),
                     0
@@ -1028,27 +1026,27 @@ fn udp_packets_have_good_checksums_and_bad_ones_are_dropped() {
         let (mut raw, cb) = pair();
         let ub = udp::endpoint(&fcx, cb, ip(B));
         let mut sock = ub.bind(53)?;
-        let mut bad = udp_packet(ip(A), 4000, ip(B), 53, b"bad");
-        let n = bad.0.len();
-        bad.0[n - 1] ^= 0xff;
-        raw.send(bad);
+        let mut bad = udp_packet(ip(A), 4000, ip(B), 53, b"bad").into_vec();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        raw.send(Packet::new(bad));
         raw.send(udp_packet(ip(A), 4000, ip(B), 53, b"good"));
         let (data, from) = sock.recv(&fcx).await?;
         assert_eq!(data, b"good");
         assert_eq!(from, SocketAddr::new(ip(A), 4000));
         sock.send_to(b"answer", from);
         let p = raw.recv(&fcx).await?;
-        assert_eq!(checksum(&p.0[..20]), 0);
+        assert_eq!(checksum(&p[..20]), 0);
         assert_eq!(
             transport_checksum(
-                source(&p.0).unwrap(),
-                destination(&p.0).unwrap(),
+                source(&p[..]).unwrap(),
+                destination(&p[..]).unwrap(),
                 17,
-                &p.0[20..]
+                &p[20..]
             ),
             0
         );
-        assert_eq!(&p.0[28..], b"answer");
+        assert_eq!(&p[28..], b"answer");
         Ok(())
     });
 }
@@ -1140,8 +1138,8 @@ fn tcp_segment(
 /// options or extension headers.
 async fn next_tcp(fcx: &Cx, raw: &mut fictionet::End) -> Result<Vec<u8>, RecvError> {
     let p = raw.recv(fcx).await?;
-    let header = if p.0[0] >> 4 == 4 { 20 } else { 40 };
-    Ok(p.0[header..].to_vec())
+    let header = if p[0] >> 4 == 4 { 20 } else { 40 };
+    Ok(p[header..].to_vec())
 }
 
 /// Reads segments until one ends the connection, with FIN or RST.
@@ -1170,11 +1168,11 @@ async fn quiet(fcx: &Cx, raw: &mut fictionet::End) -> bool {
 
 /// Whether `reply` is an ICMP port unreachable that quotes `sent`.
 fn is_port_unreachable(reply: &Packet, sent: &Packet) -> bool {
-    let r = &reply.0;
+    let r = &reply[..];
     if r[0] >> 4 == 4 {
-        r[9] == 1 && (r[20], r[21]) == (3, 3) && r[28..] == sent.0[..]
+        r[9] == 1 && (r[20], r[21]) == (3, 3) && r[28..] == sent[..]
     } else {
-        r[6] == 58 && (r[40], r[41]) == (1, 4) && r[48..] == sent.0[..]
+        r[6] == 58 && (r[40], r[41]) == (1, 4) && r[48..] == sent[..]
     }
 }
 
@@ -1272,7 +1270,7 @@ fn fin_then_drop(gap: Duration) {
         let (a, b) = pair();
         let (c, d) = pair();
         lossy_relay(&fcx, b, c, move |p| {
-            let v = &p.0;
+            let v = &p[..];
             if v.len() >= 40 && v[9] == 6 {
                 log.lock()
                     .unwrap()
@@ -1331,8 +1329,8 @@ fn lost_final_ack(simultaneous: bool) {
         let (c, d) = pair();
         let mut fin_end = None;
         lossy_relay(&fcx, b, c, move |p| {
-            let header = fictionet::stdlib::network::ip::Header::parse_whole(&p.0).unwrap();
-            let t = header.payload(&p.0);
+            let header = fictionet::stdlib::network::ip::Header::parse_whole(&p[..]).unwrap();
+            let t = header.payload(&p[..]);
             let flags = t[13];
             let mut seen = log.lock().unwrap();
             if flags & 4 != 0 {
@@ -1462,8 +1460,8 @@ fn every_closed_port_is_refused() {
             }
             for _ in chunk {
                 let p = raw.recv(&fcx).await?;
-                let flags = p.0[20 + 13];
-                let port = u16::from_be_bytes([p.0[20], p.0[21]]);
+                let flags = p[20 + 13];
+                let port = u16::from_be_bytes([p[20], p[21]]);
                 if port == 443 {
                     assert_eq!(flags & 0x12, 0x12, "a SYN-ACK from the open port");
                     open_seen = true;

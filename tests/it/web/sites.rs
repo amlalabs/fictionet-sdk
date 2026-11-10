@@ -123,7 +123,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         assert_eq!((src, dst, proto), (GATEWAY, me, 1));
         assert_eq!((icmp[0], icmp[1]), (3, 1));
         assert_eq!(ip::checksum(&icmp), 0, "ICMP checksum");
-        assert_eq!(&icmp[8..], &sent.0[..]);
+        assert_eq!(&icmp[8..], &sent[..]);
 
         // A site's address before its name was looked up: unreachable too.
         raw.send(ping(me, Ipv4Addr::new(104, 18, 0, 1), 2));
@@ -184,13 +184,13 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         // An ICMP error gets no ICMP error back. IPv6 to the unspecified
         // address is dropped.
         let mut err = vec![3, 1, 0, 0, 0, 0, 0, 0];
-        err.extend_from_slice(&sent.0[..28]);
+        err.extend_from_slice(&sent[..28]);
         let c = ip::checksum(&err);
         err[2..4].copy_from_slice(&c.to_be_bytes());
         raw.send(ipv4(me, Ipv4Addr::new(192, 0, 2, 1), 1, &err));
         let mut v6 = vec![0x60, 0, 0, 0, 0, 0, 59, 64];
         v6.extend_from_slice(&[0; 32]);
-        raw.send(Packet(v6));
+        raw.send(Packet::new(v6));
         assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none());
         Ok(())
     });

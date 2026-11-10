@@ -321,7 +321,7 @@ fn ping_pong(n: usize) -> World {
             }
             Ok(())
         });
-        let mut p = Packet(vec![0x45; 1500]);
+        let mut p = Packet::new(vec![0x45; 1500]);
         checkpoint.wait().await;
         for _ in 0..n {
             a.send(p);
@@ -374,7 +374,7 @@ fn unread(delayed: bool, n: usize, result: Arc<Mutex<Option<u64>>>) -> World {
         };
         checkpoint.wait().await;
         for i in 0..n {
-            a.send(Packet(vec![0x45; 1500]));
+            a.send(Packet::new(vec![0x45; 1500]));
             if i % 32 == 31 {
                 fcx.yield_now().await?;
             }

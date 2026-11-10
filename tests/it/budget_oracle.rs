@@ -533,7 +533,9 @@ fn tcp_segment(
     let sum = transport_checksum(src, dst, 6, &t);
     t[16..18].copy_from_slice(&sum.to_be_bytes());
     let packet = packet_with(src, dst, 6, Fields::default(), &t);
-    PacketEvent::Packet(CheckedIpPacket::checked(Chunk::unpaid(packet.0), Origin::Arrived).unwrap())
+    PacketEvent::Packet(
+        CheckedIpPacket::checked(Chunk::unpaid(packet.to_vec()), Origin::Arrived).unwrap(),
+    )
 }
 
 #[test]

@@ -418,7 +418,7 @@ async fn ethernet(fcx: Cx, mut raw: RawAttachment, mut end: End) -> fictionet::R
             }
             frame = raw.recv(&fcx) => {
                 if let Received::World(packet) = host.receive(fcx.now(), &frame?.0) {
-                    end.send(Packet(packet.to_vec()));
+                    end.send(Packet::new(packet.to_vec()));
                 }
             }
         }

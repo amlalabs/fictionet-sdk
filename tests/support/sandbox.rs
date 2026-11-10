@@ -422,9 +422,9 @@ pub fn watch_dns(
                         break;
                     };
                     if from_sandbox {
-                        if let Some(header) = ip::Header::parse(&packet.0)
+                        if let Some(header) = ip::Header::parse(&packet)
                             && header.protocol == ip::protocol::UDP
-                            && let Some(datagram) = udp::Datagram::parse(header.payload(&packet.0))
+                            && let Some(datagram) = udp::Datagram::parse(header.payload(&packet))
                             && datagram.destination_port() == 53
                             && let Ok(message) = Message::from_vec(datagram.payload())
                         {

@@ -422,10 +422,10 @@ fn live_echo(tunnel: bool, inner_server: IpAddr) {
     }
     impl Link {
         fn packets(&mut self, packet: Packet) -> Vec<Packet> {
-            if packet.0.len() >= 40 && packet.0[0] >> 4 == 4 && packet.0[9] == 6 {
-                fragments(&packet.0, &mut self.serial)
+            if packet.len() >= 40 && packet[0] >> 4 == 4 && packet[9] == 6 {
+                fragments(&packet[..], &mut self.serial)
                     .into_iter()
-                    .map(Packet)
+                    .map(Packet::new)
                     .collect()
             } else {
                 vec![packet]
@@ -695,7 +695,7 @@ fn a_custom_ip_stack_can_wait_for_a_timer_with_output_backpressured() {
             etherparse::PacketBuilder::ipv4([10, 0, 0, 2], address.octets(), 64)
                 .icmpv4_echo_request(1, sequence)
                 .write(&mut request, b"timer")?;
-            wire.send(fictionet::Packet(request));
+            wire.send(fictionet::Packet::new(request));
         }
         let client =
             fictionet_test_support::sandbox::machine(&cx, wire, Ipv4Addr::new(10, 0, 0, 2));

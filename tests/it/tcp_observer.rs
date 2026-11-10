@@ -73,7 +73,7 @@ impl Capture {
         segment[12] = 0x50;
         segment[13] = flags;
         segment.extend_from_slice(payload);
-        let packet = ip::packet(from.ip(), to.ip(), protocol::TCP, &segment).0;
+        let packet = ip::packet(from.ip(), to.ip(), protocol::TCP, &segment).into_vec();
         self.number += 1;
         let ingress = Ingress {
             capture: Some(Captured {

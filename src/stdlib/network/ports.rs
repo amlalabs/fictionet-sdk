@@ -352,11 +352,11 @@ mod tests {
             let (b, _peer_b) = fictionet::pair();
             let (c, _peer_c) = fictionet::pair();
             let mut ports = Ports::new(vec![a, b, c]);
-            peer.send(Packet(vec![1]));
+            peer.send(Packet::new(vec![1]));
             let now = fcx.now();
             assert!(matches!(ports.next(&fcx, Some(now), |_| Poll::Ready(())).await?, Event::Timer));
             assert!(matches!(ports.next(&fcx, None, |_| Poll::Ready(())).await?, Event::Extra));
-            assert!(matches!(ports.next(&fcx, None, |_| Poll::Pending).await?, Event::Packet(0, Packet(p)) if p == [1]));
+            assert!(matches!(ports.next(&fcx, None, |_| Poll::Pending).await?, Event::Packet(0, p) if p == [1]));
             ports.close(2);
             ports.close(0);
             let (a, _peer_a) = fictionet::pair();

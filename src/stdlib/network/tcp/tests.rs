@@ -126,7 +126,7 @@ fn closed_port_observations_follow_validation_and_release_the_lock() {
         }));
         let valid = segment(peer, local, 7, 0, 2);
         let mut invalid = valid.clone();
-        invalid.0[36] ^= 1;
+        invalid.make_mut(&fictionet::Budget::unlimited()).unwrap()[36] ^= 1;
         raw.send(invalid);
         raw.send(valid);
         raw.recv(&fcx).await?;
@@ -223,7 +223,7 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
             &fcx,
             &Budget::unlimited(),
             smol_now(&fcx),
-            segment(peer, local, 100, 0, 2).0,
+            segment(peer, local, 100, 0, 2).into_vec(),
         );
         let accepted = st.by_tuple[&(local, peer)];
         assert_eq!(OFFSETS.load(Ordering::Relaxed), 1);
@@ -248,7 +248,7 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
             &fcx,
             &Budget::unlimited(),
             smol_now(&fcx),
-            segment(peer, local, 100, 0, 2).0,
+            segment(peer, local, 100, 0, 2).into_vec(),
         );
         assert!(
             st.sockets
@@ -286,7 +286,7 @@ fn a_syn_for_a_reset_connection_still_held_is_not_taken_by_a_listener() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, 0, 4).0,
+            segment(peer, local, 101, 0, 4).into_vec(),
         );
         assert_eq!(st.get(h).state(), TcpState::Closed);
         assert_eq!(st.by_tuple[&(local, peer)], h);
@@ -309,7 +309,7 @@ fn a_syn_for_a_reset_connection_still_held_is_not_taken_by_a_listener() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 9000, 0, 2).0,
+            segment(peer, local, 9000, 0, 2).into_vec(),
         );
         assert!(
             idle.iter().all(|&i| st.get(i).state() == TcpState::Listen),
@@ -354,7 +354,7 @@ fn receive_credit_survives_a_full_event_queue() {
             &fcx,
             &Budget::unlimited(),
             now,
-            data_segment(peer, local, 101, ack, 16, &[1; 100]).0,
+            data_segment(peer, local, 101, ack, 16, &[1; 100]).into_vec(),
         );
         st.refresh_all(&Budget::unlimited());
         let child_handle = st
@@ -408,7 +408,7 @@ fn a_declined_timer_recomputes_the_remaining_deadline() {
             &fcx,
             &Budget::unlimited(),
             smol_now(&fcx),
-            data_segment(peer, local, 101, ack, 16, &[7]).0,
+            data_segment(peer, local, 101, ack, 16, &[7]).into_vec(),
         );
         let budget = Budget::unlimited();
         let mut observations = fictionet::stdlib::layer::Observations::new(0);
@@ -508,7 +508,7 @@ fn budget_read(release_after_poll: bool) {
             &fcx,
             &Budget::unlimited(),
             now,
-            data_segment(peer, local, 101, ack, 16, &payload).0,
+            data_segment(peer, local, 101, ack, 16, &payload).into_vec(),
         );
         st.refresh_all(&Budget::unlimited());
         let child_handle = st
@@ -594,7 +594,7 @@ fn bytes_come_up_in_the_window_their_receiver_lent() {
         let (h, ack) = established(&mut st, now, local, peer);
         let child = st.adopt(h);
         let payload = vec![7; MTU / 2];
-        let segment = |seq| data_segment(peer, local, seq, ack, 16, &payload).0;
+        let segment = |seq| data_segment(peer, local, seq, ack, 16, &payload).into_vec();
         let engine = Budget::unlimited();
         st.ingress(&fcx, &engine, now, segment(101));
         st.refresh_all(&engine);
@@ -921,7 +921,7 @@ fn the_native_tcp_runner_wakes_and_reads_after_another_owner_releases_memory() {
                 &fcx,
                 &Budget::unlimited(),
                 smol_now(&fcx),
-                data_segment(peer, local, 101, ack, 16, &payload).0,
+                data_segment(peer, local, 101, ack, 16, &payload).into_vec(),
             );
             host.conns.get_mut(&h).unwrap().recv_credit = payload.len() as u64;
             (child, host.tcp.budget().clone())
@@ -970,7 +970,7 @@ fn receive_refresh_rotates_after_the_event_queue_fills() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                data_segment(peer, local, 101, ack, 16, &[1; 100]).0,
+                data_segment(peer, local, 101, ack, 16, &[1; 100]).into_vec(),
             );
             connections.push((h, child, ack));
         }
@@ -994,7 +994,7 @@ fn receive_refresh_rotates_after_the_event_queue_fills() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    data_segment(peers[0], local, 201, connections[0].2, 16, &[2; 100]).0,
+                    data_segment(peers[0], local, 201, connections[0].2, 16, &[2; 100]).into_vec(),
                 );
             }
         }
@@ -1012,7 +1012,7 @@ fn transmit_batches_retain_descriptor_capacity() {
         let peer = "10.0.0.2:1234".parse()?;
         let local = "10.0.0.1:80".parse()?;
         for n in 0..8 {
-            host.dev.tx.push(segment(local, peer, n, 0, 4).0);
+            host.dev.tx.push(segment(local, peer, n, 0, 4).into_vec());
         }
         let capacity = host.dev.tx.capacity();
         host.flush_transmit();
@@ -1060,7 +1060,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 100, 0, 2).0,
+            segment(peer, local, 100, 0, 2).into_vec(),
         );
         let syn_ack = egress(&mut st, now);
         let t = Header::parse_whole(&syn_ack[0])
@@ -1071,7 +1071,7 @@ fn orphan_waits_for_reset_when_output_is_full() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, ack, 16).0,
+            segment(peer, local, 101, ack, 16).into_vec(),
         );
         st.housekeeping();
         let h = st
@@ -1129,7 +1129,7 @@ fn established(
         &NO_DRAWS,
         &Budget::unlimited(),
         now,
-        segment(peer, local, 100, 0, 2).0,
+        segment(peer, local, 100, 0, 2).into_vec(),
     );
     let syn_ack = egress(st, now);
     let t = Header::parse_whole(&syn_ack[0])
@@ -1140,7 +1140,7 @@ fn established(
         &NO_DRAWS,
         &Budget::unlimited(),
         now,
-        segment(peer, local, 101, ack, 16).0,
+        segment(peer, local, 101, ack, 16).into_vec(),
     );
     st.housekeeping();
     let l = st.listeners.get_mut(&local.port()).unwrap();
@@ -1165,7 +1165,7 @@ fn time_wait(
         0x11
     );
     let peer_fin = segment(peer, local, 101, ack.wrapping_add(1), 0x11);
-    st.ingress(&NO_DRAWS, &Budget::unlimited(), now, peer_fin.0.clone());
+    st.ingress(&NO_DRAWS, &Budget::unlimited(), now, peer_fin.to_vec());
     assert_eq!(st.get(h).state(), TcpState::TimeWait);
     st.orphan(h, false);
     (h, peer_fin)
@@ -1236,7 +1236,7 @@ fn time_wait_survives_full_output_and_expires_after_retransmission() {
         // orphan timeout for sockets that have not reached TIME-WAIT.
         for seconds in [239, 478, 717, 956, 1195, 1434, 1673] {
             let retry = now + smoltcp::time::Duration::from_secs(seconds);
-            st.ingress(&fcx, &Budget::unlimited(), retry, fin.0.clone());
+            st.ingress(&fcx, &Budget::unlimited(), retry, fin.to_vec());
             let packets = egress(st, retry);
             assert_eq!(packets.len(), 1);
             let t = Header::parse_whole(&packets[0])
@@ -1298,7 +1298,7 @@ fn time_wait_overflow_evicts_the_oldest_dropped_connections() {
         st.sock(recent).close();
         assert_eq!(egress(&mut st, later).len(), 1);
         let fin = segment(recent_peer, local, 101, ack.wrapping_add(1), 0x11);
-        st.ingress(&fcx, &Budget::unlimited(), later, fin.0);
+        st.ingress(&fcx, &Budget::unlimited(), later, fin.to_vec());
         assert_eq!(st.get(recent).state(), TcpState::TimeWait);
         st.orphan(recent, false);
         egress(&mut st, later);
@@ -1647,11 +1647,16 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
             }
             let fragmentation_needed =
                 icmp::error(&syn, "10.0.0.254".parse().unwrap(), 3, 4, 1400).unwrap();
-            st.ingress(&fcx, &Budget::unlimited(), now, fragmentation_needed.0);
+            st.ingress(
+                &fcx,
+                &Budget::unlimited(),
+                now,
+                fragmentation_needed.to_vec(),
+            );
             assert_eq!(st.get(h).state(), TcpState::SynSent, "fragmentation needed");
             let error = icmp::host_unreachable(&syn, "10.0.0.254".parse().unwrap())
                 .unwrap()
-                .0;
+                .to_vec();
             for fault in [
                 "outer_ip",
                 "icmp_checksum",
@@ -1723,7 +1728,7 @@ fn icmp_requires_the_current_syn_and_a_valid_quote() {
                 let sum = checksum(&message);
                 message[2..4].copy_from_slice(&sum.to_be_bytes());
                 let p = ip::packet(peer.ip(), local.ip(), ICMP, &message);
-                st.ingress(&fcx, &Budget::unlimited(), now, p.0);
+                st.ingress(&fcx, &Budget::unlimited(), now, p.to_vec());
                 assert_eq!(st.get(h).state(), TcpState::SynSent, "quote length {len}");
             }
             // Also accept the minimum quote with IPv4 options.
@@ -1768,7 +1773,7 @@ fn syn_rst_does_not_prepare_a_listening_socket() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 7, 0, 0x02).0,
+            segment(peer, local, 7, 0, 0x02).into_vec(),
         );
         egress(&mut st, now);
         assert!(st.listeners[&80].idle.is_empty());
@@ -1778,7 +1783,7 @@ fn syn_rst_does_not_prepare_a_listening_socket() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(other, local, 7, 0, 0x06).0,
+            segment(other, local, 7, 0, 0x06).into_vec(),
         );
         assert_eq!(st.sockets.set.iter().count(), count);
         assert!(st.listeners[&80].idle.is_empty());
@@ -1834,7 +1839,7 @@ fn rejected_syn_acks(established: bool) {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs, ack, 0x12).0,
+                    segment(peer, local, irs, ack, 0x12).into_vec(),
                 );
                 egress(&mut st, now);
                 assert_eq!(st.get(h).state(), TcpState::Established);
@@ -1858,7 +1863,7 @@ fn rejected_syn_acks(established: bool) {
                 }
                 // This origin would put the receive edge at the first real byte.
                 let seq = irs.wrapping_sub(MIN_BUFFER as u32);
-                let mut p = segment(peer, local, seq, ack, 0x12).0;
+                let mut p = segment(peer, local, seq, ack, 0x12).into_vec();
                 let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
                 if !matches!(fault, "empty_checksum" | "none") {
                     p.extend_from_slice(b"ignored");
@@ -1892,7 +1897,7 @@ fn rejected_syn_acks(established: bool) {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs, ack, 0x12).0,
+                    segment(peer, local, irs, ack, 0x12).into_vec(),
                 );
                 egress(&mut st, now);
             }
@@ -1902,7 +1907,7 @@ fn rejected_syn_acks(established: bool) {
             let expected = b"abcdefgh";
             for begin in [4usize, 0] {
                 let seq = irs.wrapping_add(1).wrapping_add(begin as u32);
-                let mut p = segment(peer, local, seq, ack, 0x10).0;
+                let mut p = segment(peer, local, seq, ack, 0x10).into_vec();
                 let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
                 p.extend_from_slice(&expected[begin..begin + 4]);
                 fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
@@ -1926,7 +1931,7 @@ fn rejected_syn_acks(established: bool) {
                     .payload(&packets[0]);
                 let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
                 let seq = irs.wrapping_sub(MIN_BUFFER as u32);
-                let mut p = segment(peer, local, seq, ack, 0x16).0;
+                let mut p = segment(peer, local, seq, ack, 0x16).into_vec();
                 let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
                 p.extend_from_slice(b"ignored");
                 fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
@@ -1966,7 +1971,7 @@ fn simultaneous_open_records_the_accepted_syn_origin() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, u32::MAX, 0, 0x02).0,
+            segment(peer, local, u32::MAX, 0, 0x02).into_vec(),
         );
         assert_eq!(st.get(h).state(), TcpState::SynReceived);
         let packets = egress(&mut st, now);
@@ -2019,7 +2024,7 @@ fn a_rejected_ack_does_not_free_send_buffer() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 102, 100, 0x10).0,
+            segment(peer, local, 102, 100, 0x10).into_vec(),
         );
         let packets = egress(&mut st, now);
         assert_eq!(packets.len(), 1);
@@ -2034,7 +2039,7 @@ fn a_rejected_ack_does_not_free_send_buffer() {
         assert_eq!(st.sock(h).send_slice(b"abcdefgh").unwrap(), 8);
         egress(&mut st, now);
         for (seq, corrupt) in [(102, true), (100, false)] {
-            let mut p = segment(peer, local, seq, start.wrapping_add(4), 0x10).0;
+            let mut p = segment(peer, local, seq, start.wrapping_add(4), 0x10).into_vec();
             if corrupt {
                 p[36] ^= 1;
             }
@@ -2056,7 +2061,7 @@ fn a_rejected_ack_does_not_free_send_buffer() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, start.wrapping_add(4), 0x10).0,
+            segment(peer, local, 101, start.wrapping_add(4), 0x10).into_vec(),
         );
         assert_eq!(st.get(h).send_queue(), 4);
         drop(st);
@@ -2088,7 +2093,7 @@ fn unread_bytes_outlive_time_wait() {
             st.conns.get_mut(&h).unwrap().shut = true;
             st.close_if_drained(h);
             egress(&mut st, now);
-            let mut last = segment(peer, local, 101, ack.wrapping_add(1), 0x19).0;
+            let mut last = segment(peer, local, 101, ack.wrapping_add(1), 0x19).into_vec();
             last.extend_from_slice(b"last words");
             fix_lengths(&mut last, 20, peer.ip(), local.ip());
             st.ingress(&fcx, &Budget::unlimited(), now, last);
@@ -2140,7 +2145,7 @@ fn client_advertised_window_uses_negotiated_scale() {
             );
             assert_eq!(t[13] & 16, 0, "a SYN has no ACK");
             let start = st.conns[&h].iss.unwrap().wrapping_add(1);
-            let mut p = segment(peer, local, 7, start, 0x12).0;
+            let mut p = segment(peer, local, 7, start, 0x12).into_vec();
             if scaled {
                 p[32] = 6 << 4;
                 p.extend_from_slice(&[1, 3, 3, 7]);
@@ -2178,7 +2183,7 @@ fn legitimate_rounded_window_recovery() {
             let _listener = ep.listen(local.port())?;
             let now = smol_now(&fcx);
             let mut st = ep.shared.lock();
-            let mut syn = segment(peer, local, irs, 0, 0x02).0;
+            let mut syn = segment(peer, local, irs, 0, 0x02).into_vec();
             syn[32] = 6 << 4;
             syn.extend_from_slice(&[1, 3, 3, 7]);
             fix_lengths(&mut syn, 20, peer.ip(), local.ip());
@@ -2204,7 +2209,7 @@ fn legitimate_rounded_window_recovery() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, origin, start, 0x10).0,
+                segment(peer, local, origin, start, 0x10).into_vec(),
             );
             st.sock(h).set_ack_delay(None);
             assert_eq!(st.sock(h).send_slice(b"abcdefgh").unwrap(), 8);
@@ -2222,7 +2227,8 @@ fn legitimate_rounded_window_recovery() {
             );
             let expected = pattern(BUFFER, 7);
             let incoming = |begin: usize, end: usize, ack: u32| {
-                let mut p = segment(peer, local, origin.wrapping_add(begin as u32), ack, 0x10).0;
+                let mut p =
+                    segment(peer, local, origin.wrapping_add(begin as u32), ack, 0x10).into_vec();
                 p.extend_from_slice(&expected[begin..end]);
                 fix_lengths(&mut p, 20, peer.ip(), local.ip());
                 p
@@ -2255,14 +2261,14 @@ fn legitimate_rounded_window_recovery() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, edge, start.wrapping_add(9), 0x10).0,
+                segment(peer, local, edge, start.wrapping_add(9), 0x10).into_vec(),
             );
             assert_eq!(st.get(h).send_queue(), 8);
             st.ingress(
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, edge, start.wrapping_add(4), 0x10).0,
+                segment(peer, local, edge, start.wrapping_add(4), 0x10).into_vec(),
             );
             assert_eq!(
                 st.get(h).send_queue(),
@@ -2319,7 +2325,7 @@ fn ack_window_boundary(irs: u32) {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, irs, 0, 0x02).0,
+                segment(peer, local, irs, 0, 0x02).into_vec(),
             );
             let syn_ack = egress(&mut st, now).remove(0);
             let t = Header::parse_whole(&syn_ack).unwrap().payload(&syn_ack);
@@ -2331,7 +2337,7 @@ fn ack_window_boundary(irs: u32) {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, rcv_nxt, start, 0x10).0,
+                segment(peer, local, rcv_nxt, start, 0x10).into_vec(),
             );
             let h = st.by_tuple[&(local, peer)];
             assert_eq!(st.get(h).state(), TcpState::Established);
@@ -2345,14 +2351,14 @@ fn ack_window_boundary(irs: u32) {
                 t.len() - ((t[12] >> 4) as usize) * 4 >= 4
             }));
             if reopened {
-                let mut p = segment(peer, local, rcv_nxt, start, 0x10).0;
+                let mut p = segment(peer, local, rcv_nxt, start, 0x10).into_vec();
                 p[34..36].copy_from_slice(&0u16.to_be_bytes());
                 fix_lengths(&mut p, 20, peer.ip(), local.ip());
                 st.ingress(&fcx, &Budget::unlimited(), now, p);
                 egress(&mut st, now);
             }
             for seq in [rcv_nxt.wrapping_add(10_000_000), edge.wrapping_add(1), edge] {
-                let p = segment(peer, local, seq, start.wrapping_add(4), 0x10).0;
+                let p = segment(peer, local, seq, start.wrapping_add(4), 0x10).into_vec();
                 st.ingress(&fcx, &Budget::unlimited(), now, p);
                 let accepted = seq == edge;
                 assert_eq!(
@@ -2388,7 +2394,7 @@ fn sack_ack_ahead_without_advertised_window_is_unchanged() {
         let _listener = ep.listen(local.port())?;
         let now = smol_now(&fcx);
         let mut st = ep.shared.lock();
-        let mut p = segment(peer, local, 9, 100, 0x10).0;
+        let mut p = segment(peer, local, 9, 100, 0x10).into_vec();
         p[32] = 8 << 4;
         p[34..36].copy_from_slice(&456u16.to_be_bytes());
         p.extend_from_slice(&[5, 10, 0, 0, 0, 104, 0, 0, 0, 105, 0, 0]);
@@ -2421,7 +2427,7 @@ fn sack_acks_preserve_zero_window_changes() {
             let _listener = ep.listen(local.port())?;
             let now = smol_now(&fcx);
             let mut st = ep.shared.lock();
-            let mut syn = segment(peer, local, 7, 0, 2).0;
+            let mut syn = segment(peer, local, 7, 0, 2).into_vec();
             syn[32] = 6 << 4;
             syn.extend_from_slice(&[4, 2, 0, 0]);
             fix_lengths(&mut syn, 20, peer.ip(), local.ip());
@@ -2441,11 +2447,11 @@ fn sack_acks_preserve_zero_window_changes() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer, local, 8, start, 16).0,
+                segment(peer, local, 8, start, 16).into_vec(),
             );
             let h = st.by_tuple[&(local, peer)];
             let ack = |window: u16, sack: bool| {
-                let mut p = segment(peer, local, 8, start, 16).0;
+                let mut p = segment(peer, local, 8, start, 16).into_vec();
                 p[34..36].copy_from_slice(&window.to_be_bytes());
                 if sack {
                     p[32] = 8 << 4;
@@ -2520,7 +2526,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs, 0, 2).0,
+                    segment(peer, local, irs, 0, 2).into_vec(),
                 );
                 let packets = egress(&mut st, now);
                 let t = Header::parse_whole(&packets[0])
@@ -2531,7 +2537,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, origin, start, 16).0,
+                    segment(peer, local, origin, start, 16).into_vec(),
                 );
                 let h = st.by_tuple[&(local, peer)];
                 st.sock(h).set_ack_delay(None);
@@ -2544,7 +2550,7 @@ fn payload_at_buffer_end_preserves_data_and_defers_fin() {
                         start,
                         16 | u8::from(fin),
                     )
-                    .0;
+                    .to_vec();
                     let tcp_at = Header::parse_whole(&p).unwrap().payload.start;
                     p.extend_from_slice(&expected[begin..end]);
                     fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
@@ -2662,7 +2668,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
             // Cross sequence number zero while filling the buffer.
             let irs = u32::MAX - 131072;
             let start = {
-                let mut syn = segment(peer, local, irs, 0, 0x02).0;
+                let mut syn = segment(peer, local, irs, 0, 0x02).into_vec();
                 syn[tcp_at + 12] = 6 << 4;
                 syn.extend_from_slice(&[1, 3, 3, 7]);
                 fix_lengths(&mut syn, tcp_at, peer.ip(), local.ip());
@@ -2678,7 +2684,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer, local, irs.wrapping_add(1), start, 0x10).0,
+                    segment(peer, local, irs.wrapping_add(1), start, 0x10).into_vec(),
                 );
                 st.housekeeping();
                 egress(&mut st, now);
@@ -2696,7 +2702,7 @@ fn scaled_syn_ack_buffer_end(read_as_received: bool) {
                 .collect();
             let incoming = |begin: usize, end: usize| {
                 let seq = irs.wrapping_add(1).wrapping_add(begin as u32);
-                let mut p = segment(peer, local, seq, start, 0x10).0;
+                let mut p = segment(peer, local, seq, start, 0x10).into_vec();
                 p.extend_from_slice(&expected[begin..end]);
                 fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
                 let mut st = server.shared.lock();
@@ -2764,7 +2770,7 @@ fn window_reopens(drop_handle: bool, data: &'static [u8]) {
         let mut listener = server.listen(local.port())?;
         let now = smoltcp::time::Instant::from_millis(100);
         let incoming = |seq, ack, flags, win: u16| {
-            let mut p = segment(peer, local, seq, ack, flags).0;
+            let mut p = segment(peer, local, seq, ack, flags).into_vec();
             p[34..36].copy_from_slice(&win.to_be_bytes());
             fix_lengths(&mut p, 20, peer.ip(), local.ip());
             p
@@ -2890,7 +2896,10 @@ fn syns_past_the_backlog_get_cookies_until_accept_falls_behind() {
         let mut iss = BTreeMap::new();
         while iss.len() < 10 {
             let p = raw.recv(&fcx).await?;
-            let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+            let t = Header::parse_whole(&p[..])
+                .unwrap()
+                .payload(&p[..])
+                .to_vec();
             assert_eq!(t[13], 0x12, "a SYN-ACK");
             let port = u16::from_be_bytes([t[2], t[3]]);
             iss.insert(port, u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
@@ -2944,7 +2953,7 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer(port), local, 7, 0, 0x02).0,
+                    segment(peer(port), local, 7, 0, 0x02).into_vec(),
                 );
                 egress(&mut st, now);
             }
@@ -2952,7 +2961,7 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer(9000), local, 0, 0, 0x02).0,
+                segment(peer(9000), local, 0, 0, 0x02).into_vec(),
             );
             let packets = egress(&mut st, now);
             assert_eq!(packets.len(), 1);
@@ -2966,7 +2975,7 @@ fn spoofed_syns_cannot_block_a_real_peer_cookie_handshake() {
                 &fcx,
                 &Budget::unlimited(),
                 now,
-                segment(peer(9000), local, 1, iss.wrapping_add(1), 0x10).0,
+                segment(peer(9000), local, 1, iss.wrapping_add(1), 0x10).into_vec(),
             );
             assert_eq!(st.listeners[&80].ready.len(), 1);
         }
@@ -3003,7 +3012,8 @@ fn kept_handshakes_complete_only_while_the_backlog_has_room() {
             assert_eq!(t[13], 0x12, "a SYN-ACK");
             u32::from_be_bytes(t[4..8].try_into().unwrap())
         };
-        let ack = |port, iss: u32| segment(peer(port), local, 1, iss.wrapping_add(1), 0x10).0;
+        let ack =
+            |port, iss: u32| segment(peer(port), local, 1, iss.wrapping_add(1), 0x10).into_vec();
         let mut iss = BTreeMap::new();
         {
             let mut st = server.shared.lock();
@@ -3012,7 +3022,7 @@ fn kept_handshakes_complete_only_while_the_backlog_has_room() {
                     &fcx,
                     &Budget::unlimited(),
                     now,
-                    segment(peer(port), local, 0, 0, 0x02).0,
+                    segment(peer(port), local, 0, 0, 0x02).into_vec(),
                 );
                 iss.insert(port, syn_ack_iss(egress(&mut st, now)));
             }
@@ -3079,8 +3089,8 @@ fn a_burst_of_reset_handshakes_leaves_no_pool_of_sockets() {
         let mut acks = 0;
         while acks < 250 {
             let p = raw.recv(&fcx).await?;
-            let ip = Header::parse_whole(&p.0).unwrap();
-            let t = ip.payload(&p.0);
+            let ip = Header::parse_whole(&p[..]).unwrap();
+            let t = ip.payload(&p[..]);
             assert_eq!(t[13], 0x12, "a SYN-ACK");
             let port = u16::from_be_bytes([t[2], t[3]]);
             let isn = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
@@ -3122,7 +3132,10 @@ fn unanswered_syns_from_many_addresses_leave_nothing_behind() {
         let mut syn_acks = 0;
         while syn_acks < sources {
             let p = raw.recv(&fcx).await?;
-            let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+            let t = Header::parse_whole(&p[..])
+                .unwrap()
+                .payload(&p[..])
+                .to_vec();
             assert_eq!(t[13], 0x12, "a SYN-ACK");
             syn_acks += 1;
         }
@@ -3178,8 +3191,8 @@ fn handshakes_wait_and_expire_in_the_order_they_came() {
             }
             while isn.len() < (batch as usize + 1) * 100 {
                 let p = raw.recv(&fcx).await?;
-                let ip = Header::parse_whole(&p.0).unwrap();
-                let t = ip.payload(&p.0);
+                let ip = Header::parse_whole(&p[..]).unwrap();
+                let t = ip.payload(&p[..]);
                 if t[13] == 0x12 {
                     isn.insert(ip.dst, u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
                 }
@@ -3259,7 +3272,10 @@ fn syns_from_no_host_s_address_get_nothing() {
             0x02,
         ));
         let p = raw.recv(&fcx).await?;
-        assert_eq!(Header::parse_whole(&p.0).unwrap().payload(&p.0)[13], 0x12);
+        assert_eq!(
+            Header::parse_whole(&p[..]).unwrap().payload(&p[..])[13],
+            0x12
+        );
         for port in [80, 81] {
             let to = SocketAddr::new("10.0.0.1".parse().unwrap(), port);
             for (n, src) in martians.iter().enumerate() {
@@ -3277,7 +3293,7 @@ fn syns_from_no_host_s_address_get_nothing() {
             let to = SocketAddr::new("10.0.0.1".parse().unwrap(), port);
             raw.send(segment("10.0.0.8:4000".parse().unwrap(), to, 7, 0, 0x02));
             let p = raw.recv(&fcx).await?;
-            let flags = Header::parse_whole(&p.0).unwrap().payload(&p.0)[13];
+            let flags = Header::parse_whole(&p[..]).unwrap().payload(&p[..])[13];
             assert_eq!(flags, if port == 80 { 0x14 } else { 0x12 });
         }
         fcx.cancel();
@@ -3404,7 +3420,10 @@ fn an_orphan_in_fin_wait_2_expires_despite_peer_acks() {
         drop(conn);
         loop {
             let p = raw.recv(&fcx).await?;
-            let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+            let t = Header::parse_whole(&p[..])
+                .unwrap()
+                .payload(&p[..])
+                .to_vec();
             if t[13] & 0x01 != 0 {
                 break;
             }
@@ -3427,7 +3446,10 @@ fn an_orphan_in_fin_wait_2_expires_despite_peer_acks() {
         // Data now gets a RST: there is no connection.
         raw.send(data_segment(peer, to, 8, acked, 0x18, b"x"));
         let p = raw.recv(&fcx).await?;
-        let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+        let t = Header::parse_whole(&p[..])
+            .unwrap()
+            .payload(&p[..])
+            .to_vec();
         assert_eq!(t[13] & 0x04, 0x04, "a RST");
         Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
     }));
@@ -3616,7 +3638,10 @@ fn quiet_connections_give_their_buffer_pages_back() {
 async fn syn_ack_isn(raw: &mut fictionet::End, fcx: &Cx, port: u16) -> u32 {
     loop {
         let p = raw.recv(fcx).await.unwrap();
-        let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+        let t = Header::parse_whole(&p[..])
+            .unwrap()
+            .payload(&p[..])
+            .to_vec();
         if t[13] == 0x12 && u16::from_be_bytes([t[2], t[3]]) == port {
             return u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
         }
@@ -3741,26 +3766,26 @@ fn a_handshake_reset_in_one_batch_does_not_lend_its_socket_to_another_peer() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(first, local, 100, 0, 0x02).0,
+            segment(first, local, 100, 0, 0x02).into_vec(),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(first, local, 101, 0, 0x04).0,
+            segment(first, local, 101, 0, 0x04).into_vec(),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 500, 0, 0x02).0,
+            segment(second, local, 500, 0, 0x02).into_vec(),
         );
         let isn = syn_ack_to(&egress(&mut st, now), second);
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 501, isn.wrapping_add(1), 0x10).0,
+            segment(second, local, 501, isn.wrapping_add(1), 0x10).into_vec(),
         );
         st.housekeeping();
         for (&h, c) in &st.conns {
@@ -3803,26 +3828,26 @@ fn a_handshake_restarted_in_one_batch_is_not_reported_reset() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 100, 0, 0x02).0,
+            segment(peer, local, 100, 0, 0x02).into_vec(),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, 0, 0x04).0,
+            segment(peer, local, 101, 0, 0x04).into_vec(),
         );
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 300, 0, 0x02).0,
+            segment(peer, local, 300, 0, 0x02).into_vec(),
         );
         let isn = syn_ack_to(&egress(&mut st, now), peer);
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 301, isn.wrapping_add(1), 0x10).0,
+            segment(peer, local, 301, isn.wrapping_add(1), 0x10).into_vec(),
         );
         st.housekeeping();
         let h = *st.listeners[&80]
@@ -3866,7 +3891,7 @@ fn bytes_after_the_peers_fin_are_not_read() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 101, ack, 0x11).0,
+            segment(peer, local, 101, ack, 0x11).into_vec(),
         );
         assert_eq!(st.get(h).state(), TcpState::CloseWait);
         egress(&mut st, now);
@@ -3876,7 +3901,7 @@ fn bytes_after_the_peers_fin_are_not_read() {
             Err(stcp::RecvError::Finished)
         );
         // The peer sends more after its FIN, next in sequence.
-        let mut late = segment(peer, local, 102, ack, 0x18).0;
+        let mut late = segment(peer, local, 102, ack, 0x18).into_vec();
         late.extend_from_slice(b"late");
         fix_lengths(&mut late, 20, peer.ip(), local.ip());
         st.ingress(&fcx, &Budget::unlimited(), now, late);
@@ -3917,7 +3942,7 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 7, 0, 0x02).0,
+            segment(peer, local, 7, 0, 0x02).into_vec(),
         );
         assert_eq!(st.get(h).state(), TcpState::SynReceived);
         egress(&mut st, now);
@@ -3934,7 +3959,7 @@ fn closing_in_syn_received_waits_for_the_fin_to_be_acknowledged() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(peer, local, 8, iss.wrapping_add(1), 0x10).0,
+            segment(peer, local, 8, iss.wrapping_add(1), 0x10).into_vec(),
         );
         assert_eq!(
             st.get(h).state(),
@@ -3969,7 +3994,7 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
         let now = smol_now(&fcx);
         let mut st = ep.shared.lock();
         // The first peer offers a 1460-byte MSS, then resets its handshake.
-        let mut syn = segment(first, local, 100, 0, 0x02).0;
+        let mut syn = segment(first, local, 100, 0, 0x02).into_vec();
         syn[32] = 6 << 4;
         syn.extend_from_slice(&[2, 4, 0x05, 0xb4]);
         fix_lengths(&mut syn, 20, first.ip(), local.ip());
@@ -3979,7 +4004,7 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(first, local, 101, 0, 0x04).0,
+            segment(first, local, 101, 0, 0x04).into_vec(),
         );
         st.housekeeping();
         let spare = st.listeners[&80].idle.clone();
@@ -3989,14 +4014,14 @@ fn a_reused_listening_socket_forgets_the_previous_peers_mss() {
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 500, 0, 0x02).0,
+            segment(second, local, 500, 0, 0x02).into_vec(),
         );
         let isn = syn_ack_to(&egress(&mut st, now), second);
         st.ingress(
             &fcx,
             &Budget::unlimited(),
             now,
-            segment(second, local, 501, isn.wrapping_add(1), 0x10).0,
+            segment(second, local, 501, isn.wrapping_add(1), 0x10).into_vec(),
         );
         st.housekeeping();
         let h = *st.listeners[&80]
@@ -4260,7 +4285,7 @@ mod layer {
         let tunnel = Scopes::default().tunnel();
         let client: SocketAddr = format!("{CLIENT}:40000").parse().unwrap();
         let server: SocketAddr = format!("{SERVER}:80").parse().unwrap();
-        let syn = segment(client, server, 1000, 0, 0x02).0;
+        let syn = segment(client, server, 1000, 0, 0x02).into_vec();
         let listen = || {
             MuxCommand::control(MessageCommand::Send(TcpControl::Listen {
                 port: 80,

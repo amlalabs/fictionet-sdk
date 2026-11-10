@@ -74,9 +74,9 @@
 //! udp[6..8].copy_from_slice(&sum.to_be_bytes());
 //! let packet = ip::packet(src, dst, protocol::UDP, &udp);
 //!
-//! let header = Header::parse(&packet.0).unwrap();
+//! let header = Header::parse(&packet).unwrap();
 //! assert_eq!((header.src, header.protocol), (src, protocol::UDP));
-//! assert!(ip::udp_checksum_ok(src, dst, header.payload(&packet.0)));
+//! assert!(ip::udp_checksum_ok(src, dst, header.payload(&packet)));
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -307,7 +307,7 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
             Box::new(v6_mine),
             Box::new(other_mine),
         ]);
-        split(fcx, ports, |packet| match version(&packet.0) {
+        split(fcx, ports, |packet| match version(&packet) {
             Some(4) => 1,
             Some(6) => 2,
             _ => 3,
@@ -365,13 +365,13 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
     ip.keep_observations(0);
     loop {
         let admit = match ports.next(&fcx, ip.deadline(), |_| Poll::Pending).await? {
-            Event::Packet(0, Packet(bytes)) => {
+            Event::Packet(0, packet) => {
                 ip.set_now(fcx.now());
-                let raw = Chunk::unpaid(bytes);
+                let raw = packet.into_chunk();
                 ip.deliver(PacketEvent::Packet(raw))?.map(drop)
             }
-            Event::Packet(_, Packet(bytes)) => ip
-                .command(PacketCommand::Send(Chunk::unpaid(bytes)))?
+            Event::Packet(_, packet) => ip
+                .command(PacketCommand::Send(packet.into_chunk()))?
                 .map(drop),
             Event::Timer => {
                 ip.set_now(fcx.now());
@@ -389,7 +389,7 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
         ip.run()?;
         ip.send_below(|command| {
             if let PacketCommand::Send(bytes) = command {
-                ports.send(0, Packet(bytes.into_vec()));
+                ports.send(0, Packet::from_chunk(bytes));
             }
             Admit::Taken
         });
@@ -401,7 +401,7 @@ async fn split_transports(fcx: Cx, mut ports: Ports<Box<dyn Interface>>) -> fict
                     Sort::Icmp => 3,
                     Sort::Other(_) => 4,
                 };
-                ports.send(to, Packet(packet.into_bytes().into_vec()));
+                ports.send(to, Packet::from_chunk(packet.into_bytes()));
             }
             Admit::Taken
         });
@@ -598,7 +598,7 @@ pub struct Reassembly {
 pub enum Intake {
     /// A whole packet. An IPv6 packet's extension headers are checked and
     /// taken out.
-    Whole(Packet),
+    Whole(Chunk),
     /// A fragment, waiting for the rest of its packet.
     Waiting,
     /// A fragment discarded because it cannot form a valid packet.
@@ -608,9 +608,9 @@ pub enum Intake {
     /// if RFC 8200 asks for one.
     Refused {
         /// The packet that was refused.
-        packet: Packet,
+        packet: Chunk,
         /// The ICMPv6 "parameter problem" to send back, if any.
-        answer: Option<Packet>,
+        answer: Option<Chunk>,
     },
 }
 
@@ -637,13 +637,13 @@ impl Reassembly {
     /// A whole IPv6 packet is checked again and its extension headers taken out
     /// ([`strip_extension_headers`]); that also drops a packet whose
     /// fragments held another fragment.
-    pub fn push(&mut self, packet: Packet, now: Instant) -> Intake {
-        let refused = |packet: Packet, reject| {
-            let answer = parameter_problem(&packet.0, reject);
+    pub fn push(&mut self, packet: Chunk, now: Instant) -> Intake {
+        let refused = |packet: Chunk, reject| {
+            let answer = parameter_problem(&packet, reject).map(Packet::into_chunk);
             Intake::Refused { packet, answer }
         };
-        if version(&packet.0) == Some(6)
-            && let Err(reject) = chain6(&packet.0, Walk::Check)
+        if version(&packet) == Some(6)
+            && let Err(reject) = chain6(&packet, Walk::Check)
         {
             return refused(packet, reject);
         }
@@ -652,12 +652,12 @@ impl Reassembly {
             Ok(None) => return Intake::Waiting,
             Err(()) => return Intake::Discarded,
         };
-        if version(&whole.0) != Some(6) {
+        if version(&whole) != Some(6) {
             return Intake::Whole(whole);
         }
-        match strip_extension_headers(&whole.0) {
+        match strip_extension_headers(&whole) {
             Ok(None) => Intake::Whole(whole),
-            Ok(Some(stripped)) => Intake::Whole(Packet(stripped)),
+            Ok(Some(stripped)) => Intake::Whole(Chunk::unpaid(stripped)),
             Err(reject) => refused(whole, reject),
         }
     }
@@ -669,7 +669,7 @@ impl Reassembly {
     /// Packets whose time is up are dropped first, so a fragment that comes
     /// after its packet expired never completes it, even when the caller
     /// has not called [`expire`](Reassembly::expire) yet.
-    fn reassemble(&mut self, packet: Packet, now: Instant) -> Result<Option<Packet>, ()> {
+    fn reassemble(&mut self, packet: Chunk, now: Instant) -> Result<Option<Chunk>, ()> {
         self.expire(now);
         let whole = self.push_fragment(packet, now);
         // Every path that may have added bookkeeping ends here, so the cap
@@ -684,15 +684,15 @@ impl Reassembly {
     }
 
     /// [`reassemble`](Reassembly::reassemble), without the cap.
-    fn push_fragment(&mut self, packet: Packet, now: Instant) -> Result<Option<Packet>, ()> {
-        let Some(frag) = arrived(&packet.0) else {
+    fn push_fragment(&mut self, packet: Chunk, now: Instant) -> Result<Option<Chunk>, ()> {
+        let Some(frag) = arrived(&packet) else {
             return Ok(Some(packet));
         };
         // A packet in one fragment needs no waiting (RFC 6946).
         if frag.offset == 0 && !frag.more {
             let header = frag.header.ok_or(())?;
             return finish(header, &[(0, frag.data)], frag.data.len())
-                .map(|bytes| Some(Packet(bytes)))
+                .map(|bytes| Some(Chunk::unpaid(bytes)))
                 .ok_or(());
         }
         // Every fragment but the last carries a multiple of 8 bytes, and
@@ -798,7 +798,7 @@ impl Reassembly {
                 .map(|(o, d)| (*o, d.as_slice()))
                 .collect();
             return finish(partial.header.unwrap(), &pieces, partial.have)
-                .map(|bytes| Some(Packet(bytes)))
+                .map(|bytes| Some(Chunk::unpaid(bytes)))
                 .ok_or(());
         }
         Ok(None)
@@ -1728,7 +1728,7 @@ pub fn packet_with(
         _ => panic!("an IP packet from {src} to {dst}: the addresses are of two families"),
     }
     p.extend_from_slice(payload);
-    Packet(p)
+    Packet::new(p)
 }
 
 /// Build an IPv4 packet carrying typed options. `dst` is the wire destination;
@@ -1758,7 +1758,7 @@ pub fn packet_with_ipv4_options(
     p[20..20 + options.len()].copy_from_slice(&options);
     set_header_checksum(&mut p);
     p.extend_from_slice(payload);
-    Ok(Packet(p))
+    Ok(Packet::new(p))
 }
 
 /// What a router hop did to a packet's TTL or hop limit, from [`hop`].
@@ -1828,7 +1828,7 @@ mod tests {
             dont_fragment: false,
             ..Fields::default()
         };
-        let mut h = packet_with(src.into(), dst.into(), proto, fields, &[]).0;
+        let mut h = packet_with(src.into(), dst.into(), proto, fields, &[]).into_vec();
         h.extend_from_slice(options);
         h[0] = 0x40 | (h.len() / 4) as u8;
         let total = (h.len() + payload_len) as u16;
@@ -1839,12 +1839,12 @@ mod tests {
 
     /// IPv4 fragment of a packet with identification `id`: `len` data bytes
     /// at `offset`.
-    fn frag4(id: u16, offset: usize, len: usize, more: bool) -> Packet {
+    fn frag4(id: u16, offset: usize, len: usize, more: bool) -> Chunk {
         frag4_of(id, offset, &vec![0xab; len], more)
     }
 
     /// The same, with `data` as the data.
-    fn frag4_of(id: u16, offset: usize, data: &[u8], more: bool) -> Packet {
+    fn frag4_of(id: u16, offset: usize, data: &[u8], more: bool) -> Chunk {
         let mut h = v4_header(
             protocol::UDP,
             Ipv4Addr::new(10, 0, 0, 2),
@@ -1857,7 +1857,7 @@ mod tests {
         h[6..8].copy_from_slice(&((offset / 8) as u16 | flags).to_be_bytes());
         set_header_checksum(&mut h[..20]);
         h.extend_from_slice(data);
-        Packet(h)
+        Chunk::unpaid(h)
     }
 
     /// How many packets are being put back together, not counting the
@@ -1971,8 +1971,8 @@ mod tests {
             .reassemble(frag4(2, 16, 8, false), at(69))
             .unwrap()
             .expect("a whole packet");
-        assert_eq!(whole.0.len(), 20 + 24);
-        assert_eq!(checksum(&whole.0[..20]), 0);
+        assert_eq!(whole.len(), 20 + 24);
+        assert_eq!(checksum(&whole[..20]), 0);
     }
 
     /// A fragment that comes once its packet's time is up does not complete
@@ -2023,8 +2023,9 @@ mod tests {
         for i in 0..rounds(200_000) {
             let t = Instant::from_since_start(Duration::from_micros(i as u64));
             let mut f = frag4((i % 65_536) as u16, 0, 8, true);
-            f.0[15] = (i / 65_536) as u8; // another source for each round of ids
-            set_header_checksum(&mut f.0[..20]);
+            let bytes = f.get_mut().expect("a new fragment is unique");
+            bytes[15] = (i / 65_536) as u8; // another source for each round of ids
+            set_header_checksum(&mut bytes[..20]);
             assert!(r.reassemble(f, t).unwrap().is_none());
             assert!(r.size <= MAX_WAITING);
         }
@@ -2060,7 +2061,7 @@ mod tests {
             .reassemble(frag4(9, 0, 8, true), at(0))
             .unwrap()
             .expect("a whole packet");
-        assert_eq!(whole.0.len(), 20 + 69);
+        assert_eq!(whole.len(), 20 + 69);
         assert!(r.partial.is_empty() && r.by_expiry.is_empty());
         assert_eq!(r.size, 0);
     }
@@ -2092,7 +2093,7 @@ mod tests {
             set_header_checksum(&mut h[..ihl]);
             h.extend(std::iter::repeat_n(0xab, len));
             assert_eq!(
-                r.reassemble(Packet(h), at(0)),
+                r.reassemble(Chunk::unpaid(h), at(0)),
                 if more { Ok(None) } else { Err(()) },
                 "a packet of {} bytes came out",
                 40 + 20 + offset + len
@@ -2143,7 +2144,7 @@ mod tests {
             p.extend_from_slice(&9u32.to_be_bytes());
             p.extend(std::iter::repeat_n(0xab, len));
             assert_eq!(
-                r.reassemble(Packet(p), at(0)),
+                r.reassemble(Chunk::unpaid(p), at(0)),
                 if more { Ok(None) } else { Err(()) },
                 "a packet came out at offset {offset}"
             );
@@ -2174,7 +2175,7 @@ mod tests {
                     );
                     let mut p = h;
                     p.extend_from_slice(&[0; 1000]);
-                    raw.send(Packet(p));
+                    raw.send(Packet::new(p));
                     fcx.yield_now().await?;
                 }
                 assert!(other.queued() <= QUEUE, "{} bytes wait", other.queued());
@@ -2209,8 +2210,7 @@ mod tests {
         assert!(r.partial.is_empty() && r.by_expiry.is_empty());
         assert_eq!(r.size, 0);
         // Truncated packets are not fragments and pass through as they are.
-        let mut cut = frag4(6, 0, 16, true);
-        cut.0.truncate(30);
+        let cut = frag4(6, 0, 16, true).slice(0..30);
         assert_eq!(r.reassemble(cut.clone(), at(0)), Ok(Some(cut)));
     }
 
@@ -2244,7 +2244,7 @@ mod tests {
             .reassemble(frag4(1, 16, 8, false), at(31))
             .unwrap()
             .expect("a whole packet");
-        assert_eq!(&whole.0[20..36], &first);
+        assert_eq!(&whole[20..36], &first);
         // An exact copy is ignored.
         assert!(
             r.reassemble(frag4_of(2, 0, &first, true), at(40))
@@ -2279,10 +2279,11 @@ mod tests {
         // Dead entries count against the cap like any other.
         for id in 0..rounds(40_000) {
             let mut first = frag4_of((id % 65_536) as u16, 0, &[1; 16], true);
-            first.0[15] = (id / 65_536) as u8 + 1;
-            set_header_checksum(&mut first.0[..20]);
+            let bytes = first.get_mut().expect("a new fragment is unique");
+            bytes[15] = (id / 65_536) as u8 + 1;
+            set_header_checksum(&mut bytes[..20]);
             let mut other = first.clone();
-            other.0[28] ^= 1;
+            other.make_mut(&Budget::unlimited()).unwrap()[28] ^= 1;
             assert!(r.reassemble(first, at(0)).unwrap().is_none());
             assert!(r.reassemble(other, at(0)).is_err());
             if id % 4_000 == 0 {
@@ -2589,7 +2590,7 @@ mod tests {
                     protocol::UDP,
                     &[7; 30],
                 )
-                .0,
+                .to_vec(),
                 20,
             ),
             (
@@ -2617,7 +2618,9 @@ mod tests {
     fn parameter_problems_follow_rfc_4443() {
         let bad = chained(43, &[&[17, 0, 250, 1, 0, 0, 0, 0]]);
         let reject = checked(&bad).unwrap_err();
-        let answer = parameter_problem(&bad, reject).expect("an answer").0;
+        let answer = parameter_problem(&bad, reject)
+            .expect("an answer")
+            .into_vec();
         let ip = Header::parse(&answer).unwrap();
         assert_eq!(
             (ip.src, ip.dst, ip.protocol),
@@ -2691,7 +2694,7 @@ mod tests {
         big.resize(4000, 0);
         let len = (big.len() - 40) as u16;
         big[4..6].copy_from_slice(&len.to_be_bytes());
-        assert_eq!(parameter_problem(&big, reject).unwrap().0.len(), 1280);
+        assert_eq!(parameter_problem(&big, reject).unwrap().len(), 1280);
     }
 
     // Checksums and building
@@ -2830,7 +2833,7 @@ mod tests {
             },
             &[1; 8],
         )
-        .0;
+        .to_vec();
         assert_eq!(
             &p[..12],
             &[0x45, 0x10, 0, 28, 0, 7, 0, 0, 9, 17, p[10], p[11]]
@@ -2857,14 +2860,14 @@ mod tests {
             },
             &[1; 8],
         )
-        .0;
+        .to_vec();
         assert_eq!(&p[..8], &[0x6a, 0xb0, 0, 0, 0, 8, 17, 64]);
         assert_eq!(
             (source(&p), destination(&p)),
             (Some(SRC.into()), Some(DST.into()))
         );
         // A router hop lowers the TTL and keeps the header checksum right.
-        let mut p = packet(s, d, protocol::UDP, &[]).0;
+        let mut p = packet(s, d, protocol::UDP, &[]).into_vec();
         assert_eq!(hop(&mut p), Hop::Forward);
         assert_eq!((p[8], checksum(&p)), (63, 0));
         p[8] = 1;

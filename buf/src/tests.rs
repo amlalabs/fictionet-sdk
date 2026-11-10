@@ -782,7 +782,9 @@ fn backings_dropped_on_many_threads_come_back_consistent() {
             });
         }
         for i in 0..20_000usize {
-            let mut chunk = pool.take(&budget, 0).expect("an unlimited budget never refuses");
+            let mut chunk = pool
+                .take(&budget, 0)
+                .expect("an unlimited budget never refuses");
             chunk.extend_within(&i.to_le_bytes()).unwrap();
             assert_eq!(&*chunk, &i.to_le_bytes());
             senders[i % 4].send(chunk).unwrap();

@@ -15,15 +15,15 @@ fn filter_sees_both_directions_and_drops_what_it_rejects() {
             let log = Arc::new(std::sync::Mutex::new(Vec::new()));
             let l = log.clone();
             let mut outer = stdlib::network::filter(&fcx, b, move |_, direction, packet| {
-                l.lock().unwrap().push((direction, packet.0.clone()));
-                packet.0 != [9]
+                l.lock().unwrap().push((direction, packet.to_vec()));
+                packet.to_vec() != [9]
             });
-            a.send(Packet(vec![9]));
-            a.send(Packet(vec![1]));
-            assert_eq!(outer.recv(&fcx).await?, Packet(vec![1]));
-            outer.send(Packet(vec![9]));
-            outer.send(Packet(vec![2]));
-            assert_eq!(a.recv(&fcx).await?, Packet(vec![2]));
+            a.send(Packet::new(vec![9]));
+            a.send(Packet::new(vec![1]));
+            assert_eq!(outer.recv(&fcx).await?, Packet::new(vec![1]));
+            outer.send(Packet::new(vec![9]));
+            outer.send(Packet::new(vec![2]));
+            assert_eq!(a.recv(&fcx).await?, Packet::new(vec![2]));
             assert_eq!(
                 *log.lock().unwrap(),
                 [

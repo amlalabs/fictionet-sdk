@@ -332,6 +332,7 @@ mod interface;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(unsafe_code, reason = "Linux listener and readiness system calls")]
 mod listen;
+mod packet;
 mod packet_queue;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
@@ -367,9 +368,10 @@ pub use clock::RunMode;
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
 pub use fictionet_buf::{Budget, Charge, Chunk, Pool};
-pub use interface::{Interface, InterfaceExt, Packet, Recv, RecvError};
+pub use interface::{Interface, InterfaceExt, Recv, RecvError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
+pub use packet::{Checksums, Packet};
 pub use run::lab;
 pub use run::run;
 mod clock;

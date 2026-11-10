@@ -459,7 +459,7 @@ pub(super) fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> P
     let c = ip::checksum(&p);
     p[10..12].copy_from_slice(&c.to_be_bytes());
     p.extend_from_slice(payload);
-    Packet(p)
+    Packet::new(p)
 }
 
 pub(super) fn ping(src: Ipv4Addr, dst: Ipv4Addr, seq: u16) -> Packet {
@@ -485,7 +485,7 @@ pub(super) fn udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[
 
 /// (src, dst, protocol, payload) of an IPv4 packet.
 pub(super) fn parse(p: &Packet) -> (Ipv4Addr, Ipv4Addr, u8, Vec<u8>) {
-    let b = &p.0;
+    let b = &p[..];
     assert_eq!(b[0] >> 4, 4);
     assert_eq!(ip::checksum(&b[..20]), 0, "IPv4 header checksum");
     let src = Ipv4Addr::new(b[12], b[13], b[14], b[15]);
@@ -513,7 +513,7 @@ pub(super) async fn bind_by_ping(
             _ => panic!("the sandbox and gateway must use the same address family"),
         });
         if let Some(p) = recv_within(fcx, end, Duration::from_millis(20)).await {
-            let (src, dst, proto, icmp) = match p.0[0] >> 4 {
+            let (src, dst, proto, icmp) = match p[0] >> 4 {
                 4 => {
                     let (src, dst, proto, body) = parse(&p);
                     (IpAddr::V4(src), IpAddr::V4(dst), proto, body)

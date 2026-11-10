@@ -1099,9 +1099,9 @@ async fn unreachable(
 ) -> fictionet::Result {
     let mut run = 0;
     while let Ok(packet) = end.recv(&fcx).await {
-        hooks.refused(&fcx, &packet.0, Refusal::NoRoute);
+        hooks.refused(&fcx, &packet, Refusal::NoRoute);
         if let Some(report) = &report
-            && let Some(header) = crate::stdlib::network::ip::Header::parse(&packet.0)
+            && let Some(header) = crate::stdlib::network::ip::Header::parse(&packet)
         {
             report(Unreachable {
                 from: header.src,
@@ -1110,8 +1110,8 @@ async fn unreachable(
         }
         if !drop_unrouted {
             let reply = match gateway {
-                IpAddr::V4(g) => icmp::host_unreachable(&packet.0, g),
-                IpAddr::V6(g) => icmp::address_unreachable(&packet.0, g),
+                IpAddr::V4(g) => icmp::host_unreachable(&packet, g),
+                IpAddr::V6(g) => icmp::address_unreachable(&packet, g),
             };
             if let Some(reply) = reply {
                 end.send(reply);
@@ -1523,7 +1523,7 @@ mod tests {
                     t[16..18].copy_from_slice(&sum.to_be_bytes());
                     ip::packet(client.into(), server.into(), PROTO_TCP, &t)
                 };
-                let tcp_of = |p: &fictionet::Packet| p.0[20..].to_vec();
+                let tcp_of = |p: &fictionet::Packet| p[20..].to_vec();
 
                 internet.send(syn(4000, 100, 0, 0x02, &[253, 3, 2, 0]));
                 let syn_ack = tcp_of(&internet.recv(&fcx).await?);
@@ -1627,19 +1627,19 @@ mod tests {
                 let agent_addr = Ipv4Addr::new(10, 0, 0, 2);
                 agent.send(syn(agent_addr, 45000));
                 let syn_ack = fcx.race(within(&fcx), agent.recv(&fcx)).await??;
-                assert_eq!(syn_ack.0[20 + 13], 0x12, "the agent's own SYN is answered");
+                assert_eq!(syn_ack[20 + 13], 0x12, "the agent's own SYN is answered");
 
                 internet.send(syn(agent_addr, 45001));
                 internet.send(syn(server, 45002));
                 internet.send(syn(Ipv4Addr::new(10, 0, 0, 1), 45003));
                 internet.send(syn(Ipv4Addr::new(198, 51, 100, 7), 45004));
                 let syn_ack = fcx.race(within(&fcx), internet.recv(&fcx)).await??;
-                assert_eq!(&syn_ack.0[16..20], &[198, 51, 100, 7]);
+                assert_eq!(&syn_ack[16..20], &[198, 51, 100, 7]);
                 assert!(fcx.race(within(&fcx), internet.recv(&fcx)).await.is_err());
                 // The agent's own SYN-ACK may come again, and nothing else.
                 while let Ok(p) = fcx.race(within(&fcx), agent.recv(&fcx)).await {
                     let p = p?;
-                    assert_eq!(u16::from_be_bytes([p.0[22], p.0[23]]), 45000);
+                    assert_eq!(u16::from_be_bytes([p[22], p[23]]), 45000);
                 }
                 drop((internet, agent));
                 fcx.cancel();
@@ -1695,8 +1695,8 @@ mod tests {
                 ] {
                     internet.send(syn(client, server));
                     let syn_ack = fcx.race(within(&fcx), internet.recv(&fcx)).await??;
-                    assert_eq!(ip::source(&syn_ack.0), Some(server));
-                    assert_eq!(ip::destination(&syn_ack.0), Some(client));
+                    assert_eq!(ip::source(&syn_ack[..]), Some(server));
+                    assert_eq!(ip::destination(&syn_ack[..]), Some(client));
                 }
                 drop(internet);
                 fcx.cancel();
@@ -1775,10 +1775,10 @@ mod unreachable_tests {
                     let to: IpAddr = to.parse()?;
                     guest.send(ip::packet(from, to, 253, &[1, 2, 3]));
                     let reply = guest.recv(&cx).await?;
-                    let header = ip::Header::parse(&reply.0).unwrap();
+                    let header = ip::Header::parse(&reply[..]).unwrap();
                     assert_eq!(header.src, gateway.parse::<IpAddr>()?);
                     assert_eq!(header.dst, from);
-                    let payload = header.payload(&reply.0);
+                    let payload = header.payload(&reply[..]);
                     assert_eq!(
                         &payload[..2],
                         if from.is_ipv4() { &[3, 1] } else { &[1, 3] }

@@ -307,7 +307,7 @@ impl Interface for Routed {
         loop {
             let packet = std::task::ready!(self.sandbox.poll_recv(fcx, cx))?;
             let destinations = &self.context.hooks.destinations;
-            if ip::source(&packet.0).is_some_and(|src| {
+            if ip::source(&packet).is_some_and(|src| {
                 self.prefixes
                     .iter()
                     .any(|p| destinations.routes_to(*p, src))
@@ -522,7 +522,7 @@ pub(super) async fn filter(
     loop {
         let deadline = f.reassembly.next_expiry();
         match f.ports.next(&fcx, deadline, |_| Poll::Pending).await? {
-            ports::Event::Packet(0, packet) => match ip::version(&packet.0) {
+            ports::Event::Packet(0, packet) => match ip::version(&packet) {
                 Some(6) => f.sent_v6(&fcx, packet),
                 _ => f.sent_v4(&fcx, packet),
             },
@@ -585,13 +585,13 @@ impl Filter {
     fn sent_v4(&mut self, fcx: &Cx, packet: Packet) {
         let context = self.context.clone();
         let gateway = context.bindings.subnet.gateway;
-        let Some(h) = Header::parse(&packet.0).filter(|h| h.src.is_ipv4()) else {
+        let Some(h) = Header::parse(&packet).filter(|h| h.src.is_ipv4()) else {
             return;
         };
         let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else {
             return;
         };
-        if let Some(message) = to_dhcp_server(&packet.0, &h, gateway) {
+        if let Some(message) = to_dhcp_server(&packet, &h, gateway) {
             let Some(message) = message else { return };
             let inform_first = self.bound.is_none()
                 && message.message_type() == Some(dhcp::INFORM)
@@ -634,7 +634,7 @@ impl Filter {
         let Some(subnet) = context.bindings.subnet6 else {
             return;
         };
-        let Some(h) = Header::parse(&packet.0).filter(|h| h.src.is_ipv6()) else {
+        let Some(h) = Header::parse(&packet).filter(|h| h.src.is_ipv6()) else {
             return;
         };
         let (IpAddr::V6(src), IpAddr::V6(dst)) = (h.src, h.dst) else {
@@ -662,22 +662,22 @@ impl Filter {
     }
 
     fn forward(&mut self, fcx: &Cx, route: Option<usize>, packet: Packet) {
-        let packet = match self.reassembly.push(packet, fcx.now()) {
-            Intake::Whole(p) => p,
+        let packet = match self.reassembly.push(packet.into_chunk(), fcx.now()) {
+            Intake::Whole(p) => Packet::from_chunk(p),
             Intake::Waiting | Intake::Discarded => return,
             Intake::Refused { packet, answer } => {
-                if !self.context.hooks.destinations.is_host(&packet.0) {
-                    packet
+                if !self.context.hooks.destinations.is_host(&packet) {
+                    Packet::from_chunk(packet)
                 } else {
                     if let Some(answer) = answer {
-                        self.ports.send(0, answer);
+                        self.ports.send(0, Packet::from_chunk(answer));
                     }
                     return;
                 }
             }
         };
         if let Some(allow) = &self.context.egress {
-            let Some(header) = Header::parse_whole(&packet.0) else {
+            let Some(header) = Header::parse_whole(&packet) else {
                 return;
             };
             let gateway = header.dst == IpAddr::V4(self.context.bindings.subnet.gateway)
@@ -687,12 +687,12 @@ impl Filter {
                     .subnet6
                     .is_some_and(|subnet| header.dst == IpAddr::V6(subnet.gateway));
             if !gateway
-                && let Some(port) = header.dst_port(&packet.0)
+                && let Some(port) = header.dst_port(&packet)
                 && !allow(SocketAddr::new(header.dst, port))
             {
                 self.context
                     .hooks
-                    .refused(fcx, &packet.0, super::Refusal::Policy);
+                    .refused(fcx, &packet, super::Refusal::Policy);
                 return;
             }
         }

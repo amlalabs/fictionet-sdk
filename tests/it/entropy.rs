@@ -59,7 +59,7 @@ fn connection_trace(seed: Seed) -> Trace {
         let (left, right) = pair();
         let seen = output.clone();
         let right = filter(&fcx, right, move |fcx, _, packet| {
-            let bytes = &packet.0;
+            let bytes = &packet[..];
             let header = usize::from(bytes[0] & 15) * 4;
             if bytes[header + 13] & 2 != 0 {
                 let keep = fcx.random_f64() >= 0.3;

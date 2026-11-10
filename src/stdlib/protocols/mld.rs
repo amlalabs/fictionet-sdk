@@ -373,7 +373,7 @@ impl Report {
             },
             &payload,
         )
-        .0)
+        .into_vec())
     }
 }
 
@@ -545,7 +545,7 @@ mod tests {
             },
             &good[48..],
         )
-        .0;
+        .to_vec();
         assert_eq!(Report::from_packet(&bare), Err(Error::NoRouterAlert));
         let global = addr("2001:db8::2");
         assert_eq!(sample().packet(global), Err(Error::Source(global)));

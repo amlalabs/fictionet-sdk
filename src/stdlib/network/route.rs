@@ -26,7 +26,7 @@ use fictionet::stdlib::network::{
     ip,
     ports::{self, Ports},
 };
-use fictionet::{Cx, Error, Interface, Packet};
+use fictionet::{Budget, Cx, Error, Interface, Packet};
 
 /// An address prefix, such as `104.18.32.7/32` or `::/0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -265,6 +265,10 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
         let mut handles_gone = false;
         let mut addrs = (None, None);
         let mut keep_ttl = false;
+        // What a forwarded packet is charged to when its TTL changes and
+        // another holder shares its bytes: the router keeps nothing, so
+        // nothing limits it.
+        let budget = Budget::unlimited();
         loop {
             let (edits, gone) = changes.drain();
             handles_gone = handles_gone || gone;
@@ -310,13 +314,13 @@ pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
                 .await?;
             match event {
                 ports::Event::Packet(_, mut packet) => {
-                    let Some(dst) = ip::destination(&packet.0) else {
+                    let Some(dst) = ip::destination(&packet) else {
                         continue;
                     };
                     if !keep_ttl
                         && !is_own(addrs, dst)
-                        && !ip::source(&packet.0).is_some_and(|src| is_own(addrs, src))
-                        && ip::hop(&mut packet.0) == ip::Hop::Expired
+                        && !ip::source(&packet).is_some_and(|src| is_own(addrs, src))
+                        && packet.header_mut(&budget).map(ip::hop) == Some(ip::Hop::Expired)
                     {
                         expired(&fcx, addrs, &table, &mut ports, packet);
                         continue;
@@ -343,7 +347,7 @@ fn expired<I: Interface>(
     ports: &mut Ports<I>,
     packet: Packet,
 ) {
-    let v4 = ip::version(&packet.0) == Some(4);
+    let v4 = ip::version(&packet) == Some(4);
 
     let (a4, a6) = addrs;
     let from = if v4 {
@@ -352,9 +356,9 @@ fn expired<I: Interface>(
         a6.map(IpAddr::V6)
     };
     let answer =
-        from.and_then(|from| fictionet::stdlib::network::icmp::time_exceeded(&packet.0, from));
+        from.and_then(|from| fictionet::stdlib::network::icmp::time_exceeded(&packet, from));
     if let Some(answer) = answer
-        && let Some(src) = ip::source(&packet.0)
+        && let Some(src) = ip::source(&packet)
         && let Some(i) = table.best(src)
     {
         ports.send(i, answer);
@@ -778,7 +782,7 @@ impl Members {
         from: usize,
         packet: Packet,
     ) {
-        let Some(dst) = ip::destination(&packet.0) else {
+        let Some(dst) = ip::destination(&packet) else {
             return;
         };
         if dst.is_ipv4() != subnet.addr.is_ipv4() {
@@ -920,7 +924,7 @@ mod tests {
         let mut p = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 253, 0, 0];
         p.extend_from_slice(&src);
         p.extend_from_slice(&dst);
-        Packet(p)
+        Packet::new(p)
     }
 
     /// The packet waiting on `iface`, if any, without waiting.
@@ -938,14 +942,15 @@ mod tests {
             dst.parse().unwrap(),
             17,
             &[0; 8],
-        );
-        if p.0[0] >> 4 == 4 {
-            p.0[8] = ttl;
-            ip::set_header_checksum(&mut p.0[..20]);
+        )
+        .into_vec();
+        if p[0] >> 4 == 4 {
+            p[8] = ttl;
+            ip::set_header_checksum(&mut p[..20]);
         } else {
-            p.0[7] = ttl;
+            p[7] = ttl;
         }
-        p
+        Packet::new(p)
     }
 
     /// Two routers whose default routes point at each other: the packet
@@ -990,20 +995,20 @@ mod tests {
                 fcx.sleep(Duration::from_millis(100)).await?;
 
                 let answer = ready(&fcx, &mut s4).expect("a time exceeded answer");
-                assert_eq!(ip::source(&answer.0), Some("10.0.0.1".parse()?));
+                assert_eq!(ip::source(&answer[..]), Some("10.0.0.1".parse()?));
                 assert_eq!(
-                    (answer.0[9], answer.0[20], answer.0[21]),
+                    (answer[9], answer[20], answer[21]),
                     (ip::protocol::ICMP, 11, 0)
                 );
                 assert!(ready(&fcx, &mut s4).is_none());
                 let answer = ready(&fcx, &mut s6).expect("a time exceeded answer");
-                assert_eq!(ip::source(&answer.0), Some("fd00:1::1".parse()?));
+                assert_eq!(ip::source(&answer[..]), Some("fd00:1::1".parse()?));
                 assert_eq!(
-                    (answer.0[6], answer.0[40], answer.0[41]),
+                    (answer[6], answer[40], answer[41]),
                     (ip::protocol::ICMPV6, 3, 0)
                 );
                 // r1 forwarded r2's answer: one hop.
-                assert_eq!(answer.0[7], 63);
+                assert_eq!(answer[7], 63);
                 fcx.cancel();
                 Ok(())
             },
@@ -1032,18 +1037,18 @@ mod tests {
                 r.address("10.0.0.1".parse()?);
                 a.send(ip("10.0.0.2", "10.0.0.3", 64));
                 let p = b.recv(&fcx).await?;
-                assert_eq!(p.0[8], 63);
-                assert_eq!(ip::checksum(&p.0[..20]), 0, "the header checksum holds");
+                assert_eq!(p[8], 63);
+                assert_eq!(ip::checksum(&p[..20]), 0, "the header checksum holds");
                 // An expired packet for the router itself is still delivered.
                 a.send(ip("10.0.0.2", "10.0.0.1", 1));
-                assert_eq!(g.recv(&fcx).await?.0[8], 1);
+                assert_eq!(g.recv(&fcx).await?[8], 1);
                 g.send(ip("10.0.0.1", "10.0.0.2", 64));
-                assert_eq!(a.recv(&fcx).await?.0[8], 64);
+                assert_eq!(a.recv(&fcx).await?[8], 64);
                 // A private router changes nothing, and forwards even TTL 1.
                 r.keep_ttl();
                 fcx.sleep(Duration::from_millis(1)).await?;
                 a.send(ip("10.0.0.2", "10.0.0.3", 1));
-                assert_eq!(b.recv(&fcx).await?.0[8], 1);
+                assert_eq!(b.recv(&fcx).await?[8], 1);
                 fcx.cancel();
                 Ok(())
             },

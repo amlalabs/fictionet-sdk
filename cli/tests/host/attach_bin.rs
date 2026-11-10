@@ -134,11 +134,11 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
                 })??;
             let mtu = abc.mtu();
             // Attach configures the device before its world handshake.
-            abc.send(Packet(echo_request(0)));
+            abc.send(Packet::new(echo_request(0)));
             let reply = fcx
                 .race(Some(fcx.now() + Duration::from_secs(5)), async {
                     loop {
-                        let Packet(p) = abc.recv(&fcx).await?;
+                        let Packet::new(p) = abc.recv(&fcx).await?;
                         if p.len() >= 28 && p[9] == 1 && p[20] == 0 {
                             break Ok::<_, fictionet::RecvError>(p);
                         }

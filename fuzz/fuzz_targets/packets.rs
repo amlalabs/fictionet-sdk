@@ -17,7 +17,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     let proto = fictionet::fuzzing::sort(data);
     let _ = proto;
-    let packet = Packet(data.to_vec());
+    let packet = Packet::new(data.to_vec());
     // The address the packet is for, so the reply path runs too.
     let to: Option<IpAddr> = match data.first().map(|b| b >> 4) {
         Some(4) if data.len() >= 20 => {
@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
         if let Some(reply) = icmp::echo_reply(&packet, addr) {
             // A reply is the same size as the request's ICMP message plus a
             // fresh header, and is never itself a request.
-            assert!(reply.0.len() <= data.len() + 40);
+            assert!(reply.len() <= data.len() + 40);
             assert!(icmp::echo_reply(&reply, addr).is_none());
         }
     }

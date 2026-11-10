@@ -627,7 +627,7 @@ fn replay() -> Trace {
         let (attach, arrivals) = fictionet::attachments();
         net::Net::new(fictionet_extras::network::cdn_pools()).ipv4_only().host("site", |host| host.at(SITE).dns_name("localhost").tls_accept(443, "localhost", move |_| config.clone(), httpd::Server::new(router).https())).start(&cx, arrivals)?;
         let cable = filter(&cx, attach.attach("client")?, move |_, direction, packet| {
-            packets.lock().unwrap().packets.push((direction == fictionet::stdlib::network::Direction::FromInner, packet.0.clone()));
+            packets.lock().unwrap().packets.push((direction == fictionet::stdlib::network::Direction::FromInner, packet.to_vec()));
             true
         });
         let machine = sandbox::machine(&cx, cable, Ipv4Addr::new(10, 0, 0, 2));

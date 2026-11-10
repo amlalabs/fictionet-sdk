@@ -162,7 +162,7 @@ pub(super) fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> V
         },
         payload,
     )
-    .0
+    .into_vec()
 }
 
 /// A UDP datagram in an IPv4 packet, with a correct checksum.
@@ -207,7 +207,7 @@ pub(super) fn ipv6(
         },
         payload,
     )
-    .0
+    .into_vec()
 }
 
 /// A UDP datagram in an IPv6 packet, with a correct checksum.
@@ -690,12 +690,12 @@ pub(super) mod tests {
                 payload: datagram.payload(),
             });
             let packet = ip::packet(h.src, h.dst, UDP, &bytes);
-            assert_eq!(upper(&packet.0), expected);
+            assert_eq!(upper(&packet[..]), expected);
             for len in [0u16, 7, 100] {
                 bytes[4..6].copy_from_slice(&len.to_be_bytes());
                 assert!(udp::Datagram::parse(&bytes).is_none());
                 assert_eq!(
-                    upper(&ip::packet(h.src, h.dst, UDP, &bytes).0),
+                    upper(&ip::packet(h.src, h.dst, UDP, &bytes).into_vec()),
                     Err(Unreadable)
                 );
             }

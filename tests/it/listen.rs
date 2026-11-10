@@ -99,9 +99,10 @@ fn attach_echo_and_detach() {
             // Echo every packet back with its bytes reversed, until detach.
             loop {
                 match abc.recv(&fcx).await {
-                    Ok(Packet(mut bytes)) => {
+                    Ok(packet) => {
+                        let mut bytes = packet.into_vec();
                         bytes.reverse();
-                        abc.send(Packet(bytes));
+                        abc.send(Packet::new(bytes));
                         count += 1;
                         if count == 20_501 || count == 21_501 {
                             echoed_tx.send(count).unwrap();
@@ -295,7 +296,7 @@ fn the_world_closing_detaches_attach() {
 
     let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let mut abc = attachments.get(&fcx, "abc").await?;
-        abc.send(Packet(vec![42]));
+        abc.send(Packet::new(vec![42]));
         drop(abc);
         Ok(())
     }));
@@ -316,7 +317,7 @@ fn an_unknown_kind_closes_the_connection() {
     unix::send(client.fd.as_raw_fd(), &[9, 9], false).unwrap();
     let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let mut abc = attachments.get(&fcx, "abc").await?;
-        assert_eq!(abc.recv(&fcx).await, Ok(Packet(vec![1])));
+        assert_eq!(abc.recv(&fcx).await, Ok(Packet::new(vec![1])));
         assert_eq!(abc.recv(&fcx).await, Err(RecvError::Closed));
         Ok(())
     }));
@@ -446,10 +447,10 @@ fn the_largest_packet_crosses_both_ways() {
             let mut a = attachments.get(&fcx, "big").await?;
             assert_eq!(a.mtu(), 65_535);
             let p = a.recv(&fcx).await?;
-            assert_eq!(p.0.len(), 65_535);
+            assert_eq!(p.len(), 65_535);
             a.send(p);
             // And one the world makes itself.
-            a.send(Packet(vec![7u8; 65_535]));
+            a.send(Packet::new(vec![7u8; 65_535]));
             Ok(())
         }))
     });
@@ -478,12 +479,12 @@ fn an_oversized_message_closes_the_connection() {
         block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let mut a = attachments.get(&fcx, "o").await?;
             let first = a.recv(&fcx).await?;
-            assert_eq!(first, Packet(vec![1]));
+            assert_eq!(first, Packet::new(vec![1]));
             match a.recv(&fcx).await {
                 Err(RecvError::Closed) => Ok(()),
                 Ok(p) => Err(fictionet::Error::msg(format!(
                     "got a packet of {} bytes",
-                    p.0.len()
+                    p.len()
                 ))),
                 Err(e) => Err(e.into()),
             }
@@ -525,7 +526,7 @@ fn reattaching_before_the_world_asks_gives_the_new_connection() {
     client.send(&Message::Packet(&[5]));
     let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let mut a = attachments.get(&fcx, "abc").await?;
-        assert_eq!(a.recv(&fcx).await?, Packet(vec![5]));
+        assert_eq!(a.recv(&fcx).await?, Packet::new(vec![5]));
         Ok(())
     }));
     out.unwrap();
@@ -544,12 +545,12 @@ fn a_taken_attachment_drains_packets_after_detach_and_reconnect() {
             ready_tx.send(()).unwrap();
             assert_eq!(wait.recv(&fcx).await, Err(RecvError::Closed));
             for i in 0..100u8 {
-                assert_eq!(first.recv(&fcx).await?, Packet(vec![i]));
+                assert_eq!(first.recv(&fcx).await?, Packet::new(vec![i]));
             }
             assert_eq!(first.recv(&fcx).await, Err(RecvError::Closed));
             drop(first);
             let mut next = attachments.get(&fcx, "agent").await?;
-            assert_eq!(next.recv(&fcx).await?, Packet(vec![255]));
+            assert_eq!(next.recv(&fcx).await?, Packet::new(vec![255]));
             Ok(())
         }))
     });
@@ -595,7 +596,7 @@ fn a_world_that_only_sends_gets_its_queue_written_out() {
             for i in 0..10_000u32 {
                 let mut p = vec![0u8; 1400];
                 p[..4].copy_from_slice(&i.to_be_bytes());
-                abc.send(Packet(p));
+                abc.send(Packet::new(p));
             }
             assert_eq!(stopped.recv(&fcx).await, Err(RecvError::Closed));
             drop(abc);
@@ -631,14 +632,14 @@ fn real_listeners_can_feed_a_lab() {
     let path = socket_path("lab");
     let (attacher, mut attachments) = attachments();
     let mut sandbox = attacher.attach("agent").unwrap();
-    sandbox.send(Packet(vec![7]));
+    sandbox.send(Packet::new(vec![7]));
     let listening = listen(WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     block_on(fictionet::lab(
         fictionet::Seed::from_u64(0),
         move |fcx| async move {
             let mut agent = attachments.next(&fcx).await?;
             assert_eq!(agent.name(), "agent");
-            assert_eq!(agent.recv(&fcx).await?, Packet(vec![7]));
+            assert_eq!(agent.recv(&fcx).await?, Packet::new(vec![7]));
             Ok(())
         },
     ))

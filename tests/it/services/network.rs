@@ -474,7 +474,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             &fcx,
             attacher.attach("operator")?,
             move |_, _, p| {
-                captured.lock().unwrap().push(p.0.clone());
+                captured.lock().unwrap().push(p.to_vec());
                 true
             },
         );

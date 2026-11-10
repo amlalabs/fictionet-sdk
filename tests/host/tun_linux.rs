@@ -74,7 +74,7 @@ fn open_tun(name: &str) -> Tun {
             if n <= 0 {
                 return;
             }
-            feed.send(Packet(buf[..n as usize].to_vec()));
+            feed.send(Packet::new(buf[..n as usize].to_vec()));
         }
     });
     Tun { fd, rx }

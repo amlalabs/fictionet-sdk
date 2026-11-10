@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::task::Poll;
 
-use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, PacketCommand, PacketEvent};
+use fictionet::stdlib::layer::{Admit, Budget, Driver, PacketCommand, PacketEvent};
 use fictionet::{Cx, Interface, Packet};
 
 use super::Transport;
@@ -139,10 +139,9 @@ pub(crate) async fn drive(
                     }
                     Destination::Icmp => {
                         if let Some((addr, options)) = &ping
-                            && let Some(reply) =
-                                options.echo_reply(&Packet(packet.bytes().to_vec()), *addr)
+                            && let Some(reply) = options.echo_reply(packet.bytes(), *addr)
                         {
-                            outgoing.push_back(PacketCommand::Send(Chunk::unpaid(reply.0)));
+                            outgoing.push_back(PacketCommand::Send(reply.into_chunk()));
                         }
                     }
                 }
@@ -157,7 +156,7 @@ pub(crate) async fn drive(
                 match interface.poll_recv(&fcx, cx) {
                     Poll::Ready(Ok(packet)) => {
                         moved = true;
-                        raw = Some(PacketEvent::Packet(Chunk::unpaid(packet.0)));
+                        raw = Some(PacketEvent::Packet(packet.into_chunk()));
                     }
                     Poll::Ready(Err(_)) => {
                         moved = true;
@@ -233,7 +232,7 @@ pub(crate) async fn drive(
 fn send_below(ip: &mut Driver<Stack>, interface: &mut impl Interface) -> bool {
     ip.send_below(|command| {
         if let PacketCommand::Send(bytes) = command {
-            interface.send(Packet(bytes.into_vec()));
+            interface.send(Packet::from_chunk(bytes));
         }
         Admit::Taken
     })

@@ -72,7 +72,7 @@ fuzz_target!(|steps: Vec<Step>| {
                         fix_checksums(&mut bytes);
                     }
                     let which = (bytes.first().is_some_and(|b| b >> 4 == 6)) as usize;
-                    raws[which].send(Packet(bytes));
+                    raws[which].send(Packet::new(bytes));
                 }
                 Step::Pump(n) => settle(&fcx, n as usize % 8).await,
             }

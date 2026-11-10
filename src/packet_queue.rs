@@ -14,7 +14,7 @@ pub struct PacketQueue {
 /// What a queued packet costs: the memory it retains plus its place in the
 /// queue. Admission and release both use this.
 fn charge(packet: &Packet) -> Option<usize> {
-    packet.0.capacity().checked_add(PACKET_COST)
+    packet.chunk().capacity().checked_add(PACKET_COST)
 }
 
 impl PacketQueue {
@@ -90,21 +90,21 @@ mod tests {
         bytes.push(1);
         let capacity = bytes.capacity();
         let packet = queue
-            .try_push(Packet(bytes), Some(PACKET_COST + 1))
+            .try_push(Packet::new(bytes), Some(PACKET_COST + 1))
             .unwrap_err();
         assert!(queue.is_empty());
         assert!(queue.try_push(packet, Some(PACKET_COST + capacity)).is_ok());
         assert_eq!(queue.bytes(), PACKET_COST + capacity);
-        assert_eq!(queue.pop().unwrap().0.capacity(), capacity);
+        assert_eq!(queue.pop().unwrap().chunk().capacity(), capacity);
         assert_eq!(queue.bytes(), 0);
     }
 
     #[test]
     fn unrepresentable_charges_never_fit() {
         let mut queue = PacketQueue::default();
-        assert!(queue.try_push(Packet(vec![1]), None).is_ok());
+        assert!(queue.try_push(Packet::new(vec![1]), None).is_ok());
         queue.bytes = usize::MAX - PACKET_COST;
-        let packet = Packet(vec![2]);
+        let packet = Packet::new(vec![2]);
         assert!(!queue.fits(&packet, Some(usize::MAX)));
         assert!(!queue.fits(&packet, None));
         assert_eq!(queue.try_push(packet.clone(), None), Err(packet));
@@ -115,26 +115,26 @@ mod tests {
     fn exact_capacity_rejection_and_drain_preserve_order_and_charges() {
         let mut queue = PacketQueue::default();
         let limit = 2 * PACKET_COST + 3;
-        assert!(queue.try_push(Packet(vec![1]), Some(limit)).is_ok());
-        assert!(queue.try_push(Packet(vec![2, 3]), Some(limit)).is_ok());
+        assert!(queue.try_push(Packet::new(vec![1]), Some(limit)).is_ok());
+        assert!(queue.try_push(Packet::new(vec![2, 3]), Some(limit)).is_ok());
         assert_eq!(queue.bytes(), limit);
         assert_eq!(queue.len(), 2);
         assert!(!queue.is_empty());
-        assert_eq!(queue.front(), Some(&Packet(vec![1])));
+        assert_eq!(queue.front(), Some(&Packet::new(vec![1])));
 
-        let rejected = Packet(vec![4]);
+        let rejected = Packet::new(vec![4]);
         assert_eq!(queue.try_push(rejected.clone(), Some(limit)), Err(rejected));
         assert_eq!(queue.bytes(), limit);
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.pop(), Some(Packet(vec![1])));
+        assert_eq!(queue.pop(), Some(Packet::new(vec![1])));
         assert_eq!(queue.bytes(), PACKET_COST + 2);
-        assert!(queue.fits(&Packet(vec![5]), Some(limit)));
-        assert!(!queue.fits(&Packet(vec![5, 6]), Some(limit)));
-        assert!(queue.fits(&Packet(vec![5, 6]), None));
-        assert!(queue.try_push(Packet(vec![5]), Some(limit)).is_ok());
-        assert_eq!(queue.pop(), Some(Packet(vec![2, 3])));
+        assert!(queue.fits(&Packet::new(vec![5]), Some(limit)));
+        assert!(!queue.fits(&Packet::new(vec![5, 6]), Some(limit)));
+        assert!(queue.fits(&Packet::new(vec![5, 6]), None));
+        assert!(queue.try_push(Packet::new(vec![5]), Some(limit)).is_ok());
+        assert_eq!(queue.pop(), Some(Packet::new(vec![2, 3])));
         assert_eq!(queue.bytes(), PACKET_COST + 1);
-        assert_eq!(queue.pop(), Some(Packet(vec![5])));
+        assert_eq!(queue.pop(), Some(Packet::new(vec![5])));
         assert_eq!(queue.bytes(), 0);
         assert!(queue.is_empty());
         assert_eq!(queue.front(), None);
@@ -145,20 +145,27 @@ mod tests {
     #[test]
     fn empty_packets_are_charged_and_oversized_packets_leave_room() {
         let mut queue = PacketQueue::default();
-        assert_eq!(queue.try_push(Packet(vec![]), Some(0)), Err(Packet(vec![])));
         assert_eq!(
-            queue.try_push(Packet(vec![1]), Some(PACKET_COST)),
-            Err(Packet(vec![1]))
+            queue.try_push(Packet::new(vec![]), Some(0)),
+            Err(Packet::new(vec![]))
+        );
+        assert_eq!(
+            queue.try_push(Packet::new(vec![1]), Some(PACKET_COST)),
+            Err(Packet::new(vec![1]))
         );
         assert_eq!(queue.bytes(), 0);
         assert!(queue.is_empty());
-        assert!(queue.try_push(Packet(vec![]), Some(PACKET_COST)).is_ok());
+        assert!(
+            queue
+                .try_push(Packet::new(vec![]), Some(PACKET_COST))
+                .is_ok()
+        );
         assert_eq!(queue.bytes(), PACKET_COST);
         assert_eq!(
-            queue.try_push(Packet(vec![]), Some(PACKET_COST)),
-            Err(Packet(vec![]))
+            queue.try_push(Packet::new(vec![]), Some(PACKET_COST)),
+            Err(Packet::new(vec![]))
         );
-        assert_eq!(queue.pop(), Some(Packet(vec![])));
+        assert_eq!(queue.pop(), Some(Packet::new(vec![])));
         assert_eq!(queue.bytes(), 0);
     }
 
@@ -166,8 +173,8 @@ mod tests {
     fn clearing_and_taking_release_all_charges() {
         let mut queue = PacketQueue::default();
         for _ in 0..2 {
-            assert!(queue.try_push(Packet(vec![1, 2]), None).is_ok());
-            assert!(queue.try_push(Packet(vec![]), None).is_ok());
+            assert!(queue.try_push(Packet::new(vec![1, 2]), None).is_ok());
+            assert!(queue.try_push(Packet::new(vec![]), None).is_ok());
             assert_eq!(queue.bytes(), 2 * PACKET_COST + 2);
             queue.clear();
             assert_eq!(queue.bytes(), 0);
@@ -175,12 +182,12 @@ mod tests {
             assert!(queue.is_empty());
         }
         let limit = Some(PACKET_COST + 1);
-        assert!(queue.try_push(Packet(vec![3]), limit).is_ok());
+        assert!(queue.try_push(Packet::new(vec![3]), limit).is_ok());
         let mut taken = std::mem::take(&mut queue);
         assert_eq!(queue.bytes(), 0);
         assert!(queue.is_empty());
         assert_eq!(taken.bytes(), PACKET_COST + 1);
-        assert_eq!(taken.pop(), Some(Packet(vec![3])));
-        assert!(queue.try_push(Packet(vec![4]), limit).is_ok());
+        assert_eq!(taken.pop(), Some(Packet::new(vec![3])));
+        assert!(queue.try_push(Packet::new(vec![4]), limit).is_ok());
     }
 }

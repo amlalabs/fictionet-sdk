@@ -220,7 +220,7 @@ pub fn start_raw(
             fcx.yield_now().await?;
             let mut link = incoming.lock();
             if let Received::World(packet) = link.host.receive(fcx.now(), &bytes) {
-                incoming_end.lock().send(Packet(packet.to_vec()));
+                incoming_end.lock().send(Packet::new(packet.to_vec()));
             }
             link.transmit(&fcx)?;
         }
@@ -246,7 +246,7 @@ pub fn start_raw(
         loop {
             let packet = std::future::poll_fn(|cx| end.lock().poll_recv(&fcx, cx)).await?;
             let mut link = link.lock();
-            if let Ok(frame) = link.host.send(fcx.now(), &packet.0) {
+            if let Ok(frame) = link.host.send(fcx.now(), &packet) {
                 link.put(&fcx, frame)?;
             }
             link.wake_timer();

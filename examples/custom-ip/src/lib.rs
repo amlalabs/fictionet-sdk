@@ -2,7 +2,6 @@
 //! public SDK contracts. It owns validation, fragment reassembly, buffering,
 //! deadlines, and the outgoing hop-limit policy. It never constructs `IpLayer`.
 
-use fictionet::Packet;
 use fictionet::stdlib::layer::{
     Admit, Chunk, CommandOf, Env, EventOf, Layer, PacketCommand, PacketEvent, Packets,
 };
@@ -39,24 +38,23 @@ impl HopLimit {
 
     /// Takes in one raw packet the layer has room for.
     fn take_in(&mut self, env: &mut Env<'_, IpReport>, bytes: Chunk) {
-        let bytes = bytes.into_vec();
         let before = Header::parse(&bytes);
         let fragment = before.as_ref().is_some_and(|h| h.fragment.is_some());
         let original = (!fragment
             && before
                 .as_ref()
                 .is_some_and(|h| h.src.is_ipv6() && h.payload.start != 40))
-        .then(|| Chunk::unpaid(bytes.clone()));
-        match self.reassembly.push(Packet(bytes), env.now()) {
-            Intake::Whole(Packet(whole)) => {
-                let origin = match original {
-                    _ if fragment => Origin::Reassembled,
-                    Some(original) if original.len() != whole.len() => {
+        .then(|| bytes.clone());
+        match self.reassembly.push(bytes, env.now()) {
+            Intake::Whole(whole) => {
+                let origin = match (fragment, original) {
+                    (true, _) => Origin::Reassembled,
+                    (false, Some(original)) if original.len() != whole.len() => {
                         Origin::Normalized { original }
                     }
                     _ => Origin::Arrived,
                 };
-                match CheckedIpPacket::checked(Chunk::unpaid(whole), origin) {
+                match CheckedIpPacket::checked(whole, origin) {
                     Ok(packet) => self.up = Some(PacketEvent::Packet(packet)),
                     Err(_) => env.report(IpReport::Malformed),
                 }
@@ -68,7 +66,7 @@ impl HopLimit {
                 env.report(IpReport::Refused {
                     answered: answer.is_some(),
                 });
-                self.answer = answer.map(|Packet(bytes)| Chunk::unpaid(bytes));
+                self.answer = answer;
             }
         }
     }
@@ -183,7 +181,7 @@ mod tests {
             ip::protocol::UDP,
             &[0; 9],
         )
-        .0;
+        .to_vec();
         fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
         ip::set_header_checksum(&mut fragment[..20]);
         let mut driver = Driver::new(

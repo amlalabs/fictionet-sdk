@@ -17,7 +17,7 @@ fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, payload: &[u8]) -> Packet {
     p.extend_from_slice(&src.octets());
     p.extend_from_slice(&dst.octets());
     p.extend_from_slice(payload);
-    Packet(p)
+    Packet::new(p)
 }
 
 /// An IPv6 packet carrying `data`, with its checksum at `at` filled in.
@@ -57,7 +57,7 @@ fn syn6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16) -> Packet {
 /// (src, dst, next header, payload) of an IPv6 packet with no extension
 /// headers, checking the upper layer's checksum.
 pub(super) fn parse6(p: &Packet) -> (Ipv6Addr, Ipv6Addr, u8, Vec<u8>) {
-    let b = &p.0;
+    let b = &p[..];
     assert_eq!(b[0] >> 4, 6);
     let len = u16::from_be_bytes([b[4], b[5]]) as usize;
     assert_eq!(b.len(), 40 + len, "the payload length");
@@ -615,7 +615,7 @@ fn ipv6_pings_closed_ports_and_unknown_addresses() {
         );
         assert_eq!((src, dst, next), (GATEWAY6, ME6, 58));
         assert_eq!((icmp[0], icmp[1]), (1, 3));
-        assert_eq!(&icmp[8..], &sent.0[..]);
+        assert_eq!(&icmp[8..], &sent[..]);
 
         // Once its name is looked up, a site's IPv6 address answers pings.
         let (code, addrs) = raw_dns6(
@@ -667,7 +667,7 @@ fn ipv6_pings_closed_ports_and_unknown_addresses() {
         // No error for an ICMPv6 error, or for a router solicitation from a
         // link-local address to all routers.
         let mut err = vec![1, 3, 0, 0, 0, 0, 0, 0];
-        err.extend_from_slice(&sent.0[..48]);
+        err.extend_from_slice(&sent[..48]);
         raw.send(checksummed6(ME6, NOWHERE6, 58, err, 2));
         let rs = checksummed6(
             "fe80::1".parse().unwrap(),
@@ -903,7 +903,7 @@ fn echo6_with(data: &[u8; 16]) -> Packet {
 /// payload. `header[0]` must name the payload's protocol.
 fn with_header(packet: &Packet, next: u8, header: &[u8]) -> Packet {
     let mut body = header.to_vec();
-    body.extend_from_slice(&packet.0[40..]);
+    body.extend_from_slice(&packet[40..]);
     ipv6(ME6, GATEWAY6, next, &body)
 }
 
@@ -915,15 +915,7 @@ fn fragments_do_not_outlive_their_sandbox() {
     world(|fcx, attacher, _| async move {
         let mut a = attacher.attach("a").unwrap();
         let whole = echo6_with(b"SECRET-Atailtail");
-        a.send(fragment6(
-            ME6,
-            GATEWAY6,
-            12345,
-            0,
-            true,
-            58,
-            &whole.0[40..56],
-        ));
+        a.send(fragment6(ME6, GATEWAY6, 12345, 0, true, 58, &whole[40..56]));
         assert!(
             recv_within(&fcx, &mut a, Duration::from_millis(20))
                 .await
@@ -934,23 +926,15 @@ fn fragments_do_not_outlive_their_sandbox() {
         let mut b = attacher.attach("b").unwrap();
         let other = bind_by_ping(&fcx, &mut b, ME6.into(), GATEWAY6.into()).await;
         assert!(other.is_empty(), "packets arrived while b bound: {other:?}");
-        b.send(fragment6(
-            ME6,
-            GATEWAY6,
-            12345,
-            16,
-            false,
-            58,
-            &whole.0[56..],
-        ));
+        b.send(fragment6(ME6, GATEWAY6, 12345, 16, false, 58, &whole[56..]));
         assert!(
             recv_within(&fcx, &mut b, SHORT).await.is_none(),
             "a's fragment completed b's packet"
         );
         // b's own fragments still make a packet.
         let mine = echo6_with(b"b's own packet!!");
-        b.send(fragment6(ME6, GATEWAY6, 777, 0, true, 58, &mine.0[40..56]));
-        b.send(fragment6(ME6, GATEWAY6, 777, 16, false, 58, &mine.0[56..]));
+        b.send(fragment6(ME6, GATEWAY6, 777, 0, true, 58, &mine[40..56]));
+        b.send(fragment6(ME6, GATEWAY6, 777, 16, false, 58, &mine[56..]));
         let reply = recv_within(&fcx, &mut b, SHORT)
             .await
             .expect("an echo reply");
@@ -969,35 +953,19 @@ fn conflicting_fragments_drop_the_packet() {
     world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
         let whole = echo6_with(b"abcdefghABCDEFGH");
-        let first = &whole.0[40..56];
+        let first = &whole[40..56];
         let mut conflicting = first.to_vec();
         conflicting[8] ^= 0xff;
         raw.send(fragment6(ME6, GATEWAY6, 9876, 0, true, 58, first));
         raw.send(fragment6(ME6, GATEWAY6, 9876, 0, true, 58, &conflicting));
-        raw.send(fragment6(
-            ME6,
-            GATEWAY6,
-            9876,
-            16,
-            false,
-            58,
-            &whole.0[56..],
-        ));
+        raw.send(fragment6(ME6, GATEWAY6, 9876, 16, false, 58, &whole[56..]));
         assert!(
             recv_within(&fcx, &mut raw, SHORT).await.is_none(),
             "a packet with conflicting fragments was delivered"
         );
         // The same fragments again, without the conflict: still dropped.
         raw.send(fragment6(ME6, GATEWAY6, 9876, 0, true, 58, first));
-        raw.send(fragment6(
-            ME6,
-            GATEWAY6,
-            9876,
-            16,
-            false,
-            58,
-            &whole.0[56..],
-        ));
+        raw.send(fragment6(ME6, GATEWAY6, 9876, 16, false, 58, &whole[56..]));
         assert!(
             recv_within(&fcx, &mut raw, SHORT).await.is_none(),
             "a dropped packet was started again"
@@ -1005,15 +973,7 @@ fn conflicting_fragments_drop_the_packet() {
         // An exact copy of a fragment is not a conflict.
         raw.send(fragment6(ME6, GATEWAY6, 9877, 0, true, 58, first));
         raw.send(fragment6(ME6, GATEWAY6, 9877, 0, true, 58, first));
-        raw.send(fragment6(
-            ME6,
-            GATEWAY6,
-            9877,
-            16,
-            false,
-            58,
-            &whole.0[56..],
-        ));
+        raw.send(fragment6(ME6, GATEWAY6, 9877, 16, false, 58, &whole[56..]));
         let reply = recv_within(&fcx, &mut raw, SHORT)
             .await
             .expect("an echo reply");
@@ -1061,7 +1021,7 @@ fn tcp_behind_extension_headers_is_accepted() {
         };
         let syn = syn6(ME6, 41000, site, 80);
         let mut body = vec![6, 0, 0, 0, 0, 0, 0, 0];
-        body.extend_from_slice(&syn.0[40..]);
+        body.extend_from_slice(&syn[40..]);
         raw.send(ipv6(ME6, site, 60, &body));
         let reply = recv_within(&fcx, &mut raw, SHORT)
             .await
@@ -1116,7 +1076,7 @@ fn extension_headers_a_host_must_refuse_are_refused() {
                 pointer,
                 "{header:?}"
             );
-            assert_eq!(&body[8..], &sent.0[..], "the packet is quoted");
+            assert_eq!(&body[8..], &sent[..], "the packet is quoted");
             assert!(
                 recv_within(&fcx, &mut raw, Duration::from_millis(50))
                     .await
@@ -1239,7 +1199,7 @@ fn dns_makes_no_more_sites_than_the_limit() {
 fn nested6(outer_id: u32, inner: &Packet) -> Packet {
     let mut body = vec![44, 0, 0, 0];
     body.extend_from_slice(&outer_id.to_be_bytes());
-    body.extend_from_slice(&inner.0[40..]);
+    body.extend_from_slice(&inner[40..]);
     ipv6(ME6, GATEWAY6, 44, &body)
 }
 
@@ -1252,7 +1212,7 @@ fn a_fragment_inside_a_fragment_is_dropped() {
         let whole = echo6_with(b"SECRET-Atailtail");
         a.send(nested6(
             1,
-            &fragment6(ME6, GATEWAY6, 4242, 0, true, 58, &whole.0[40..56]),
+            &fragment6(ME6, GATEWAY6, 4242, 0, true, 58, &whole[40..56]),
         ));
         assert!(
             recv_within(&fcx, &mut a, Duration::from_millis(20))
@@ -1265,7 +1225,7 @@ fn a_fragment_inside_a_fragment_is_dropped() {
         assert!(other.is_empty(), "packets arrived while b bound: {other:?}");
         b.send(nested6(
             2,
-            &fragment6(ME6, GATEWAY6, 4242, 16, false, 58, &whole.0[56..]),
+            &fragment6(ME6, GATEWAY6, 4242, 16, false, 58, &whole[56..]),
         ));
         assert!(
             recv_within(&fcx, &mut b, SHORT).await.is_none(),
@@ -1284,10 +1244,10 @@ fn every_fragments_headers_are_checked() {
         // The last fragment behind Hop-by-Hop with an option that says to
         // discard: the packet is never delivered.
         let whole = echo6_with(b"0123456789abcdef");
-        raw.send(fragment6(ME6, GATEWAY6, 31, 0, true, 58, &whole.0[40..56]));
-        let last = fragment6(ME6, GATEWAY6, 31, 16, false, 58, &whole.0[56..]);
+        raw.send(fragment6(ME6, GATEWAY6, 31, 0, true, 58, &whole[40..56]));
+        let last = fragment6(ME6, GATEWAY6, 31, 16, false, 58, &whole[56..]);
         let mut body = vec![44, 0, 0x40, 0, 0, 0, 0, 0];
-        body.extend_from_slice(&last.0[40..]);
+        body.extend_from_slice(&last[40..]);
         raw.send(ipv6(ME6, GATEWAY6, 0, &body));
         assert!(
             recv_within(&fcx, &mut raw, SHORT).await.is_none(),
@@ -1296,7 +1256,7 @@ fn every_fragments_headers_are_checked() {
         // A Destination Options header cut in two by the fragments: the
         // first fragment gets "parameter problem" code 3, pointer 0.
         let mut dest = vec![58, 1, 1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        dest.extend_from_slice(&whole.0[40..]);
+        dest.extend_from_slice(&whole[40..]);
         let first = fragment6(ME6, GATEWAY6, 32, 0, true, 60, &dest[..8]);
         raw.send(first.clone());
         let reply = recv_within(&fcx, &mut raw, SHORT)
@@ -1349,7 +1309,7 @@ fn refused_headers_to_nowhere_get_address_unreachable() {
         assert!(recv_within(&fcx, &mut raw, SHORT).await.is_some());
         let ping = ping6(ME6, NOWHERE6, 2);
         let mut body = vec![58, 0, 250, 1, 0, 0, 0, 0];
-        body.extend_from_slice(&ping.0[40..]);
+        body.extend_from_slice(&ping[40..]);
         raw.send(ipv6(ME6, NOWHERE6, 43, &body));
         let reply = recv_within(&fcx, &mut raw, SHORT).await.expect("an answer");
         let (src, _, proto, body) = parse6(&reply);
@@ -1379,30 +1339,14 @@ fn egress_filters_ipv6_after_fragment_reassembly() {
         let mut raw = attacher.attach("agent")?;
         let destination: Ipv6Addr = "2001:503:ba3e::2:30".parse()?;
         let packet = udp6(ME6, 4000, destination, 53, b"a fragmented DNS question");
-        raw.send(fragment6(
-            ME6,
-            destination,
-            7,
-            0,
-            true,
-            17,
-            &packet.0[40..56],
-        ));
+        raw.send(fragment6(ME6, destination, 7, 0, true, 17, &packet[40..56]));
         assert!(
             bind_by_ping(&fcx, &mut raw, ME6.into(), GATEWAY6.into())
                 .await
                 .is_empty()
         );
         assert!(seen.lock().unwrap().is_empty());
-        raw.send(fragment6(
-            ME6,
-            destination,
-            7,
-            16,
-            false,
-            17,
-            &packet.0[56..],
-        ));
+        raw.send(fragment6(ME6, destination, 7, 16, false, 17, &packet[56..]));
         assert!(
             bind_by_ping(&fcx, &mut raw, ME6.into(), GATEWAY6.into())
                 .await

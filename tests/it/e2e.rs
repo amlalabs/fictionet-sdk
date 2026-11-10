@@ -173,13 +173,13 @@ impl<I: Interface> Interface for Count<I> {
     fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
         let r = self.inner.poll_recv(fcx, cx);
         if let Poll::Ready(Ok(p)) = &r {
-            self.counts.lock().unwrap()[carries_data(&p.0) as usize] += 1;
+            self.counts.lock().unwrap()[carries_data(&p[..]) as usize] += 1;
         }
         r
     }
 
     fn send(&mut self, p: Packet) {
-        self.counts.lock().unwrap()[2 + carries_data(&p.0) as usize] += 1;
+        self.counts.lock().unwrap()[2 + carries_data(&p[..]) as usize] += 1;
         self.inner.send(p)
     }
 }
