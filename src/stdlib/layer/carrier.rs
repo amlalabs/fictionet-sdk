@@ -111,21 +111,31 @@ pub trait Credited {
 /// ([`Admit::Partial`](super::Admit::Partial)). Writing is three steps: the
 /// layer below takes the bytes, hands them on, and later says the transport
 /// took them ([`StreamEvent::Written`]).
+///
+/// The default error type makes directional cancellation uninhabited.
+/// Transports such as QUIC use `ByteStream<Code>` with a copyable
+/// application error code: a reset of the receive direction and a peer
+/// request to stop the send direction remain distinct. Such a port cannot
+/// be connected to an ordinary byte-stream layer without an adapter that
+/// explicitly handles those errors.
 #[derive(Clone, Copy, Debug)]
-pub struct ByteStream;
+pub struct ByteStream<E = core::convert::Infallible>(PhantomData<fn() -> E>);
 
-impl Port for ByteStream {
-    type Event = StreamEvent;
-    type Command = StreamCommand;
+impl<E: Copy> Port for ByteStream<E> {
+    type Event = StreamEvent<E>;
+    type Command = StreamCommand<E>;
 
-    fn urgent(event: &StreamEvent) -> bool {
-        matches!(event, StreamEvent::Written(_) | StreamEvent::Reset)
+    fn urgent(event: &StreamEvent<E>) -> bool {
+        matches!(
+            event,
+            StreamEvent::Written(_) | StreamEvent::Reset | StreamEvent::SendStopped(_)
+        )
     }
 }
 
 /// What comes up a byte stream.
 #[derive(Debug)]
-pub enum StreamEvent {
+pub enum StreamEvent<E = core::convert::Infallible> {
     /// The next bytes from the peer.
     Data(Chunk),
     /// The transport took this many more of the bytes written to it. This
@@ -135,20 +145,33 @@ pub enum StreamEvent {
     Ended,
     /// The connection was reset: both directions are gone.
     Reset,
+    /// The peer reset its send direction with this application error.
+    /// Earlier admitted data precedes this event. The local send direction
+    /// stays open, and the child retains its identity and work.
+    ReceiveReset(E),
+    /// The peer requested cancellation of the local send direction. The
+    /// receive direction stays open. This passes blocked receive data.
+    SendStopped(E),
 }
 
 /// What goes down a byte stream.
 #[derive(Debug)]
-pub enum StreamCommand {
+pub enum StreamCommand<E = core::convert::Infallible> {
     /// Bytes to send, after the ones before.
     Write(Chunk),
     /// Nothing more will be sent. The other direction stays open.
     End,
     /// Reset the connection.
     Reset,
+    /// Abandon the send direction with this application error. The receive
+    /// direction remains open.
+    ResetSend(E),
+    /// Ask the peer to stop its send direction. The local send direction
+    /// remains open.
+    StopReceive(E),
 }
 
-impl Credited for StreamEvent {
+impl<E: Copy> Credited for StreamEvent<E> {
     fn terminal_reset(&self) -> bool {
         matches!(self, Self::Reset)
     }
@@ -185,7 +208,7 @@ impl Credited for StreamEvent {
     }
 }
 
-impl Credited for StreamCommand {
+impl<E: Copy> Credited for StreamCommand<E> {
     fn splittable(&self) -> bool {
         matches!(self, Self::Write(_))
     }
@@ -811,7 +834,7 @@ mod slot_tests {
     fn admitting_bytes_paid_elsewhere_moves_their_charge_to_the_receiver() {
         let sender = Budget::new(4);
         let receiver = Budget::new(4);
-        let mut event = StreamEvent::Data(paid(&sender, &[1, 2, 3, 4]));
+        let mut event: StreamEvent = StreamEvent::Data(paid(&sender, &[1, 2, 3, 4]));
         assert!(!event.reserve(&Budget::new(3)));
         assert_eq!(
             sender.used(),

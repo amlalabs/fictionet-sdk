@@ -175,6 +175,7 @@ where
             return Ok(Admit::Blocked(event));
         }
         let (ended, reset, written, input) = match &event {
+            StreamEvent::ReceiveReset(error) | StreamEvent::SendStopped(error) => match *error {},
             StreamEvent::Ended => (true, false, 0, true),
             StreamEvent::Reset => (true, true, 0, false),
             StreamEvent::Written(n) => (false, false, *n, false),
@@ -295,6 +296,7 @@ where
             return None;
         };
         match &command {
+            StreamCommand::ResetSend(error) | StreamCommand::StopReceive(error) => match *error {},
             StreamCommand::Write(bytes) => {
                 self.now = env.now();
                 self.pending = self.pending.saturating_add(bytes.len() as u64);

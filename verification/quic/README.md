@@ -105,3 +105,48 @@ payload ownership after budget refusal. All 4,329 SDK library tests passed
 on 2026-11-10. The model does not yet replay production traces or prove
 allocation costs; the existing UDP queue storage still has its documented
 count limits rather than a heap reservation.
+
+## Directional stream cancellation
+
+`ByteStream<Code>` uses the existing byte, credit, lease and completion
+contract, with copyable application errors for `ReceiveReset` and
+`SendStopped`, and `ResetSend` and `StopReceive` commands. The default
+`ByteStream` has the uninhabited error type, so existing TCP and TLS layers
+cannot construct these events. A QUIC application can use the typed
+carrier directly; adapting it to the default carrier requires an explicit
+policy for directional errors.
+
+`ReceiveReset` follows previously admitted receive bytes. `SendStopped`
+passes blocked receive input, without discarding it. Neither is a terminal
+child reset. The production `Children` test checks that both retain the
+child and that the existing full `Reset` still retires it. A second test
+checks error codes, zero-credit cancellation, and shared backing after
+splitting a write on the typed carrier.
+
+The Kani harness
+`stdlib::layer::proofs::directional_stream_cancellation_keeps_its_code_and_other_direction`
+passed over every 64-bit error code, calling the production carrier methods
+without stubs. It checks terminal status, urgent routing, credit and code
+preservation. It proves the carrier decisions, not a QUIC stream state
+machine. It adds no allocation or resource bound.
+
+Compiling this harness required updating stale calls in four existing
+verification areas: `ChargedVec::from_charge`, the `Packet` wrapper at
+packet-layer entry points, and the HTTP body reader's explicit partial
+input flag. No harness was disabled and no assertion was weakened.
+
+The four HTTP pipeline-boundary harnesses passed after that update. The
+existing packet-refusal and charged-vector harnesses both exhausted their
+14 GiB scopes before returning a verdict; they are not reported as proved.
+The host-dispatch harness was compiled but not rerun. These limits do not
+affect the separate successful directional-cancellation proof.
+
+The SDK's 4,331 library tests and 1,413 integration tests passed with the
+typed carrier. All 302 doctests passed after updating four stale examples
+to the merged APIs, including checking the closed-child example for the
+intended use-after-move error. The 19 UDP tests passed again after avoiding a scan of
+receive-ready sockets when no completion is pending. Clippy with warnings
+denied passed; rustdoc completed with its existing redundant-link warning
+in `network/udp.rs`. The existing `quic_sparse_reassembly` benchmark ran
+at 16 KiB and 64 KiB. This is a baseline for the old codec's reassembler,
+not a benchmark of the vendored transport or an interoperability result.

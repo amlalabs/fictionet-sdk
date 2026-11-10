@@ -1034,6 +1034,7 @@ impl Layer for Http1 {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let command = self.out.pop_front()?;
         match &command {
+            StreamCommand::ResetSend(error) | StreamCommand::StopReceive(error) => match *error {},
             StreamCommand::Write(chunk) => self.handed += chunk.len() as u64,
             StreamCommand::End | StreamCommand::Reset => self.phase = Phase::Closed,
         }
