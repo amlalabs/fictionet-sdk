@@ -67,9 +67,12 @@ use crate::{
 // ---------------------------------------------------------------------------
 // Configs
 
+/// A logged secret: its label, the client random it belongs to, the secret.
+type Secret = (String, Vec<u8>, Vec<u8>);
+
 /// Every secret either side logs, with the client random it belongs to.
 #[derive(Debug, Default)]
-struct Keys(Mutex<Vec<(String, Vec<u8>, Vec<u8>)>>);
+struct Keys(Mutex<Vec<Secret>>);
 
 impl KeyLog for Keys {
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
@@ -434,7 +437,7 @@ impl Run {
         }
     }
 
-    fn to_server(
+    fn send_to_server(
         &mut self,
         client: &mut ClientConnection,
         server: &mut ServerConnection,
@@ -444,7 +447,7 @@ impl Run {
         feed_server(server, &bytes)
     }
 
-    fn to_client(
+    fn send_to_client(
         &mut self,
         server: &mut ServerConnection,
         client: &mut ClientConnection,
@@ -462,8 +465,8 @@ impl Run {
 
     fn handshake(&mut self, client: &mut ClientConnection, server: &mut ServerConnection) {
         loop {
-            self.to_server(client, server).unwrap();
-            self.to_client(server, client).unwrap();
+            self.send_to_server(client, server).unwrap();
+            self.send_to_client(server, client).unwrap();
             if !client.is_handshaking()
                 && !server.is_handshaking()
                 && !client.wants_write()
@@ -477,7 +480,7 @@ impl Run {
     /// The client sends `data`, the server reads it and sends it back.
     fn echo(&mut self, client: &mut ClientConnection, server: &mut ServerConnection, data: &[u8]) {
         client.writer().write_all(data).unwrap();
-        self.to_server(client, server).unwrap();
+        self.send_to_server(client, server).unwrap();
         let mut got = Vec::new();
         let _ = server.reader().read_to_end(&mut got);
         assert!(
@@ -486,7 +489,7 @@ impl Run {
             self.name
         );
         server.writer().write_all(&got).unwrap();
-        self.to_client(server, client).unwrap();
+        self.send_to_client(server, client).unwrap();
         let mut back = Vec::new();
         let _ = client.reader().read_to_end(&mut back);
         assert!(back == data, "{}: the client read the echo", self.name);
@@ -918,10 +921,10 @@ impl Run {
                 em: false,
                 ss: "none",
             });
-            write!(
+            writeln!(
                 tla,
                 "  [d |-> \"{}\", m |-> \"{}\", e |-> \"{}\", x |-> \"{}\", co |-> {}, \
-                 ch |-> [v |-> \"{}\", sh |-> {}, ed |-> {}, pk |-> {}, em |-> {}, ss |-> \"{}\"]]{}\n",
+                 ch |-> [v |-> \"{}\", sh |-> {}, ed |-> {}, pk |-> {}, em |-> {}, ss |-> \"{}\"]]{}",
                 e.d,
                 e.m,
                 e.e,
@@ -1073,7 +1076,7 @@ fn tls13_client_auth_and_half_rtt() {
         &Resumption::in_memory_sessions(8),
         &keys,
     ));
-    run.to_server(&mut c, &mut s).unwrap();
+    run.send_to_server(&mut c, &mut s).unwrap();
     assert!(s.is_handshaking());
     assert_eq!(s.writer().write(b"early answer").unwrap(), 12);
     run.handshake(&mut c, &mut s);
@@ -1100,7 +1103,7 @@ fn tls13_key_updates_both_ways() {
     run.echo(&mut c, &mut s, b"after the client's update");
     // The server asks; the client answers before its data.
     s.refresh_traffic_keys().unwrap();
-    run.to_client(&mut s, &mut c).unwrap();
+    run.send_to_client(&mut s, &mut c).unwrap();
     run.echo(&mut c, &mut s, b"after the server's update");
     let entries = run.write(false);
     assert_eq!(entries.iter().filter(|e| e.m == "KU").count(), 4);
@@ -1152,8 +1155,8 @@ fn early_run(
         .write(b"early")
         .unwrap();
     assert_eq!(written, 5);
-    run.to_server(&mut c, &mut s).unwrap();
-    run.to_client(&mut s, &mut c).unwrap();
+    run.send_to_server(&mut c, &mut s).unwrap();
+    run.send_to_client(&mut s, &mut c).unwrap();
     if coalesce {
         let bytes = drain_client(&mut c);
         let bytes = coalesce_eoed(&keys, &run, &bytes);
@@ -1162,7 +1165,7 @@ fn early_run(
             run.server_output(&mut s);
             return (run, false);
         }
-        run.to_client(&mut s, &mut c).unwrap();
+        run.send_to_client(&mut s, &mut c).unwrap();
     }
     run.handshake(&mut c, &mut s);
     run.echo(&mut c, &mut s, b"after");
@@ -1431,7 +1434,7 @@ fn tls12_extended_master_secret_mismatch() {
     let bytes = without_ems(&drain_client(&mut c));
     run.note(Dir::In, &bytes);
     feed_server(&mut s, &bytes).unwrap();
-    run.to_client(&mut s, &mut c).unwrap();
+    run.send_to_client(&mut s, &mut c).unwrap();
     let bytes = drain_client(&mut c);
     run.note(Dir::In, &bytes);
     assert!(
