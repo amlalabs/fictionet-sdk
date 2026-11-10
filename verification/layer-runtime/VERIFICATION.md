@@ -744,9 +744,19 @@ TLC 2.19, two workers, a 2 GiB heap under a 3 GiB scope, November 10,
 | `StreamRunner_without_wakeonrelease.cfg` | 1,165,027 | 13,866 | | `Terminates` violated: the runner waits for memory with no deadline, memory frees, and nothing wakes it |
 | `StreamRunner_without_starvedends.cfg` | 689,976 | 8,806 | | `Terminates` violated: a starved stack is refused in every round and the runner sleeps with no deadline and no wake |
 
-The other configurations (`StreamRunner_base.cfg`, `_halfclose` and the
-eleven older controls) were queued behind other work on the shared
-machine; their results are added below as they finish.
+The nine older controls that stop at a violation were rerun on the
+rewritten model (with memory never short), each violating the property
+it names: `_without_finishinput` (`FinishNeedsInput`, 977 distinct),
+`_idleresetonread` (`IdleNeedsQuiet`, 18,728), `_keeppartialrest`
+(`InputKept`, 146), `_readonlywhentaken` (`ReadOnlyWhenTaken`, 746),
+`_reportonce` (`WrittenOnce`, 346), `_resetonbreak`
+(`ResetHeardOnBreak`, 20), `_restartidleonwait` (`IdleNeedsQuiet`,
+13,302), `_stallresetonprogress` (`StallNeedsNoProgress`, 24,850) and
+`_writebeforeend` (`EndAfterWrites`, 76). `StreamRunner_base.cfg`,
+`_halfclose` and `_without_writetimeout`, which explore the whole state
+space, were not finished on the shared machine in this pass: the base
+had reached 30,702 distinct states when it was stopped. They are the
+first to run next.
 
 The model as it stood before this pass was also rerun unchanged:
 `StreamRunner_base.cfg` passed with 27,865,057 generated and 185,569

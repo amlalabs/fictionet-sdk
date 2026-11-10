@@ -1078,8 +1078,10 @@ no wire reason and ignore it.
 `MuxSend`. After the leftovers that is the behavior for a place or window
 refused at `Opened` (`ResourceShortage`) and for a charge past the child's
 whole limit (`Failed`); a refusal within the limit now waits, which
-`ChildMemory.tla` covers. The `Children` configurations were rerun
-unchanged (below).
+`ChildMemory.tla` covers. The `Children` and `Route` configurations
+were not rerun in this pass: the shared machine's queue was given to
+the new models. The trace check, `cargo xtask layer-verify trace`, ran
+on the fixed code: 32 logs replayed, all passed.
 
 ### Kani
 
