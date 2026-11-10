@@ -35,8 +35,10 @@ fn sandbox_looks_up_connects_and_requests_with_optional_roots() {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
                 (name == "site.test").then(|| {
-                    web::Site::new(axum::Router::new().fallback(|| async { "hello" }))
-                        .tls(config.clone())
+                    web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                        axum::Router::new().fallback(|| async { "hello" }),
+                    ))
+                    .tls(config.clone())
                 })
             })
             .start(&fcx, attachments)?;

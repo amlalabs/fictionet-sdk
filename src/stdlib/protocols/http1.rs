@@ -22,6 +22,7 @@ use fictionet::stdlib::codec::{
     Buffer, Decode, Ending, Fail, LineError, Lines, PumpError, Step, Stream, Wire, finish, try_pump,
 };
 use fictionet::stdlib::protocols::json;
+use fictionet::stdlib::web::Head;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -101,6 +102,8 @@ impl Limits {
 /// A framing, syntax, limit, or writer error. Each decode error is terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The owner refused storage for a decoded head.
+    Budget,
     /// The start line exceeds `Limits::start_line`.
     StartLineTooLong,
     /// A header line exceeds `Limits::header_line`.
@@ -173,6 +176,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Budget => "HTTP head storage refused",
             Self::StartLineTooLong => "HTTP start line exceeds limit",
             Self::HeaderLineTooLong => "HTTP header line exceeds limit",
             Self::TooManyHeaders => "HTTP header count exceeds limit",
@@ -220,6 +224,8 @@ pub enum Version {
     Http10,
     /// HTTP/1.1, with persistent connections by default.
     Http11,
+    /// HTTP/2 request metadata; not a valid HTTP/1 wire version.
+    Http2,
 }
 
 impl Version {
@@ -228,6 +234,7 @@ impl Version {
         match self {
             Self::Http10 => "HTTP/1.0",
             Self::Http11 => "HTTP/1.1",
+            Self::Http2 => "HTTP/2.0",
         }
     }
 }
@@ -244,7 +251,7 @@ pub struct Header {
     pub value: Vec<u8>,
 }
 
-/// A header field borrowed from a [`RequestHead`], or from a [`Header`].
+/// A header field borrowed from a [`Head`], or from a [`Header`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldRef<'a> {
     /// The field name, with its casing as written.
@@ -284,138 +291,7 @@ impl Span {
     }
 }
 
-/// An HTTP request head. The body follows separately.
-///
-/// The head keeps its bytes in one buffer and reads the method, target and
-/// fields out of it, so a parsed head costs two allocations whatever its
-/// size. Build one with [`RequestHead::new`].
-///
-/// `Wire` reads and writes exactly a head, using default limits. No body is
-/// required to write a head; [`Request`] validates the complete body length.
-/// HTTP/1.1 requires one Host field, which may be empty. Obsolete folding
-/// is refused. Upgrade offers are accepted without switching protocols.
-///
-/// ```
-/// use fictionet::stdlib::{codec::Wire, protocols::http1::RequestHead};
-/// let head = RequestHead::parse(b"POST /tools HTTP/1.1\r\nHost: example.test\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n")?;
-/// assert!(head.expects_continue());
-/// assert!(head.keep_alive()?);
-/// assert_eq!(head.method(), "POST");
-/// assert_eq!(head.header("host"), Some(b"example.test".as_slice()));
-/// # Ok::<(), fictionet::stdlib::protocols::http1::Error>(())
-/// ```
-#[derive(Clone)]
-pub struct RequestHead {
-    // The head's lines. The method, target and field names in it are UTF-8.
-    bytes: Vec<u8>,
-    method: Span,
-    target: Span,
-    version: Version,
-    // Each field's name and value, the value without outer whitespace.
-    fields: Vec<(Span, Span)>,
-}
-
-impl PartialEq for RequestHead {
-    /// Heads are equal when their method, target, version and fields are,
-    /// however their lines were spaced.
-    fn eq(&self, other: &Self) -> bool {
-        self.method() == other.method()
-            && self.target() == other.target()
-            && self.version == other.version
-            && self.headers().eq(other.headers())
-    }
-}
-impl Eq for RequestHead {}
-
-impl fmt::Debug for RequestHead {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RequestHead")
-            .field("method", &self.method())
-            .field("target", &self.target())
-            .field("version", &self.version)
-            .field("headers", &self.headers().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-impl RequestHead {
-    /// Builds a head from its parts. Nothing is checked here: writing the
-    /// head validates the method, target and fields.
-    pub fn new<N: AsRef<str>, V: AsRef<[u8]>>(
-        method: &str,
-        target: &str,
-        version: Version,
-        headers: impl IntoIterator<Item = (N, V)>,
-    ) -> Self {
-        let mut bytes = Vec::new();
-        let method_span = Span::at(0, method.len());
-        bytes.extend_from_slice(method.as_bytes());
-        bytes.push(b' ');
-        let target_span = Span::at(bytes.len(), target.len());
-        bytes.extend_from_slice(target.as_bytes());
-        bytes.push(b' ');
-        bytes.extend_from_slice(version.as_str().as_bytes());
-        bytes.extend_from_slice(b"\r\n");
-        let fields = headers
-            .into_iter()
-            .map(|(name, value)| {
-                let (name, value) = (name.as_ref().as_bytes(), value.as_ref());
-                let name_span = Span::at(bytes.len(), name.len());
-                bytes.extend_from_slice(name);
-                bytes.push(b':');
-                let value_span = Span::at(bytes.len(), value.len());
-                bytes.extend_from_slice(value);
-                bytes.extend_from_slice(b"\r\n");
-                (name_span, value_span)
-            })
-            .collect();
-        bytes.extend_from_slice(b"\r\n");
-        Self {
-            bytes,
-            method: method_span,
-            target: target_span,
-            version,
-            fields,
-        }
-    }
-    /// The case-sensitive method token.
-    pub fn method(&self) -> &str {
-        self.text(self.method)
-    }
-    /// The request target, as written.
-    pub fn target(&self) -> &str {
-        self.text(self.target)
-    }
-    /// The start line's protocol version.
-    pub fn version(&self) -> Version {
-        self.version
-    }
-    /// The header fields in order, duplicates and name casing kept.
-    pub fn headers(&self) -> impl ExactSizeIterator<Item = FieldRef<'_>> + Clone {
-        self.fields.iter().map(|&(name, value)| FieldRef {
-            name: self.text(name),
-            value: value.of(&self.bytes),
-        })
-    }
-    /// The value of the first field named `name`, ignoring ASCII case.
-    pub fn header(&self, name: &str) -> Option<&[u8]> {
-        named(self.pairs(), name).next()
-    }
-    /// The bytes this head holds: its buffer and its field list.
-    pub fn held(&self) -> usize {
-        self.bytes.capacity() + self.fields.capacity() * std::mem::size_of::<(Span, Span)>()
-    }
-    // Each field's name and value as bytes.
-    fn pairs(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + Clone {
-        self.fields
-            .iter()
-            .map(|&(name, value)| (name.of(&self.bytes), value.of(&self.bytes)))
-    }
-    // The method, target and names were checked as UTF-8 when the head was
-    // made, so this never falls back to the empty string.
-    fn text(&self, span: Span) -> &str {
-        core::str::from_utf8(span.of(&self.bytes)).unwrap_or_default()
-    }
+impl Head {
     /// Reads the head at the start of `bytes` by its syntax alone: the
     /// request line and the fields, without the framing, `Host` and target
     /// rules that [`RequestEvents`] and `Wire` apply. For a passive observer or a
@@ -481,7 +357,7 @@ impl ResponseHead {
         }
     }
     /// Reads the head at the start of `bytes` by its syntax alone, as
-    /// [`RequestHead::parse_lenient`] does: the status line and the fields,
+    /// [`Head::parse_lenient`] does: the status line and the fields,
     /// without the framing rules. Returns the head and its length, or
     /// `None` until a whole head is there.
     pub fn parse_lenient(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
@@ -512,11 +388,11 @@ impl ResponseHead {
 /// Collect per body when the inner value needs EOF. `Assemble` can join Body
 /// events with an empty final fragment at Done while passing heads through.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event<H> {
+pub enum Event<H, B = Vec<u8>> {
     /// A complete head, before any body bytes are consumed.
     Head(H),
     /// A non-empty block of body bytes.
-    Body(Vec<u8>),
+    Body(B),
     /// The current message is complete.
     Done,
 }
@@ -538,7 +414,7 @@ pub struct RejectedRequest {
     /// The validation failure.
     pub error: Error,
     /// The original parsed head, without repaired or invented fields.
-    pub head: RequestHead,
+    pub head: Head,
     /// Bytes occupied by this head in the decoder's current input.
     pub head_bytes: usize,
     /// Body framing, or the reason its boundary cannot be trusted.
@@ -609,6 +485,7 @@ impl From<RequestError> for Error {
 pub struct RequestEvents {
     core: Reader,
     empty_lines: usize,
+    storage: Option<(fictionet::Budget, fictionet::Pool, fictionet::Pool)>,
 }
 
 impl RequestEvents {
@@ -637,6 +514,154 @@ impl RequestEvents {
         Self {
             core: Reader::new(limits),
             empty_lines: 0,
+            storage: None,
+        }
+    }
+
+    /// Uses the owner's pools for request heads. Oversized heads use a
+    /// separately charged block; no storage is allocated after refusal.
+    pub fn storage(
+        &mut self,
+        budget: fictionet::Budget,
+        small: fictionet::Pool,
+        large: fictionet::Pool,
+    ) {
+        self.storage = Some((budget, small, large));
+    }
+}
+
+/// HTTP request input retained as contiguous chunks. Only an incomplete
+/// protocol unit crossing deliveries is copied into charged storage.
+pub(crate) struct RequestStream {
+    dec: RequestEvents,
+    input: fictionet::Chunk,
+    eof: bool,
+    done: bool,
+}
+
+impl RequestStream {
+    pub(crate) fn new(dec: RequestEvents) -> Self {
+        Self {
+            dec,
+            input: fictionet::Chunk::default(),
+            eof: false,
+            done: false,
+        }
+    }
+    pub(crate) fn decoder(&mut self) -> &mut RequestEvents {
+        &mut self.dec
+    }
+    pub(crate) fn limit(&self) -> usize {
+        self.dec.capacity()
+    }
+    pub(crate) fn unread(&self) -> &[u8] {
+        &self.input
+    }
+    pub(crate) fn pending(&self, n: usize) -> fictionet::Chunk {
+        self.input.slice(0..n)
+    }
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
+    pub(crate) fn end(&mut self) {
+        self.eof = true;
+    }
+    pub(crate) fn push(&mut self, chunk: &mut fictionet::Chunk) -> usize {
+        let n = chunk
+            .len()
+            .min(self.limit().saturating_sub(self.input.len()));
+        if n == 0 {
+            return 0;
+        }
+        let (budget, small, large) = self.dec.storage.as_ref().expect("connection storage");
+        if self.input.is_empty() {
+            if !chunk.repay(budget) {
+                return 0;
+            }
+            self.input = chunk.split_to(n);
+        } else {
+            let need = self.input.len() + n;
+            let Some(mut joined) = (if need <= small.slot() {
+                small.take(budget, 0)
+            } else if need <= large.slot() {
+                large.take(budget, 0)
+            } else {
+                budget.charge(need).map(|charge| {
+                    fictionet::Chunk::paid(vec![0; need], charge)
+                        .expect("reserved input")
+                        .slice(0..0)
+                })
+            }) else {
+                return 0;
+            };
+            joined.extend_within(&self.input).expect("reserved input");
+            joined.extend_within(&chunk[..n]).expect("reserved input");
+            self.input = joined;
+            chunk.advance(n);
+        }
+        n
+    }
+    pub(crate) fn next(
+        &mut self,
+    ) -> Option<Result<Event<Head, fictionet::Chunk>, crate::stdlib::codec::Fail<RequestError>>>
+    {
+        use crate::stdlib::codec::Fail;
+        if self.done {
+            return None;
+        }
+        loop {
+            // Body pieces follow delivery boundaries rather than waiting for
+            // a whole configured block. Head and framing limits stay fixed.
+            let step = self
+                .dec
+                .scan_request(&self.input, self.eof, true)
+                .map(|step| {
+                    step.map(|event| match event {
+                        BorrowedEvent::Head(head) => Event::Head(head),
+                        BorrowedEvent::Body(bytes) => {
+                            let start = bytes.as_ptr() as usize - self.input.as_ptr() as usize;
+                            Event::Body(self.input.slice(start..start + bytes.len()))
+                        }
+                        BorrowedEvent::Done => Event::Done,
+                    })
+                });
+            match step {
+                Ok(Step::Item(event, n)) => {
+                    self.input.advance(n);
+                    if self.input.is_empty() {
+                        self.input = fictionet::Chunk::default();
+                    }
+                    return Some(Ok(event));
+                }
+                Ok(Step::Skip(n)) => {
+                    self.input.advance(n);
+                    if self.input.is_empty() {
+                        self.input = fictionet::Chunk::default();
+                    }
+                }
+                Ok(Step::End) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(Step::Need) if !self.eof && self.input.len() < self.limit() => return None,
+                Ok(Step::Need) if self.eof && self.input.is_empty() => {
+                    self.done = true;
+                    return None;
+                }
+                other => {
+                    self.done = true;
+                    return Some(Err(match other {
+                        Err(error) => Fail::Protocol(error),
+                        _ if self.eof => Fail::Truncated {
+                            unread: self.input.len(),
+                        },
+                        _ => Fail::Stuck {
+                            unread: self.input.len(),
+                            capacity: self.limit(),
+                        },
+                    }));
+                }
+            }
         }
     }
 }
@@ -647,8 +672,86 @@ impl Default for RequestEvents {
     }
 }
 
+#[cfg(test)]
+mod retained_input_tests {
+    use super::*;
+    use fictionet::{Budget, Chunk, Pool};
+
+    #[test]
+    fn consumed_input_releases_its_backing_including_empty_lines() {
+        let budget = Budget::new(1 << 20);
+        let small = Pool::new(&budget, 2048, 4);
+        let large = Pool::new(&budget, 16384 + 64, 2);
+        let mut decoder = RequestEvents::new();
+        decoder.storage(budget.clone(), small.clone(), large.clone());
+        let mut stream = RequestStream::new(decoder);
+        for wire in [b"\r\n".as_slice(), b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"] {
+            let mut input = Chunk::unpaid(wire.to_vec());
+            assert_eq!(stream.push(&mut input), wire.len());
+            drop(input);
+            while let Some(event) = stream.next() {
+                drop(event.unwrap());
+            }
+            assert!(stream.unread().is_empty());
+            assert_eq!(budget.used(), small.charged() + large.charged());
+        }
+        drop(stream);
+        drop(small);
+        drop(large);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn heads_larger_than_the_pool_class_survive_fragmentation() {
+        let value = "x".repeat(6000);
+        let wire = format!(
+            "GET / HTTP/1.1\r\nHost: a\r\n{}\r\n",
+            format!("X-Field: {value}\r\n").repeat(4)
+        );
+        for piece in [4096, 10000, wire.len()] {
+            let budget = Budget::new(1 << 20);
+            let small = Pool::new(&budget, 2048, 4);
+            let large = Pool::new(&budget, 16384 + 64, 2);
+            let mut decoder = RequestEvents::new();
+            decoder.storage(budget.clone(), small, large);
+            let mut stream = RequestStream::new(decoder);
+            let mut head = None;
+            let mut complete = false;
+            for part in wire.as_bytes().chunks(piece) {
+                let mut input = Chunk::unpaid(part.to_vec());
+                assert_eq!(stream.push(&mut input), part.len());
+                drop(input);
+                while let Some(event) = stream.next() {
+                    match event.unwrap() {
+                        Event::Head(value) => {
+                            assert!(head.replace(value).is_none());
+                        }
+                        Event::Done => {
+                            assert!(!complete);
+                            complete = true;
+                        }
+                        Event::Body(_) => panic!("bodyless request"),
+                    }
+                }
+            }
+            assert!(complete);
+            let head = head.unwrap();
+            assert!(
+                head.fields()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(b"x-field"))
+                    .map(|(_, bytes)| bytes)
+                    .eq(std::iter::repeat_n(value.as_bytes(), 4))
+            );
+            drop(stream);
+            assert_eq!(budget.used(), head.held());
+            drop(head);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+}
+
 impl Decode for RequestEvents {
-    type Item = Event<RequestHead>;
+    type Item = Event<Head>;
     type Error = RequestError;
     const NAME: &'static str = "HTTP/1 requests";
     fn capacity(&self) -> usize {
@@ -656,7 +759,7 @@ impl Decode for RequestEvents {
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, RequestError> {
         Ok(self
-            .scan_request(input, eof)?
+            .scan_request(input, eof, false)?
             .map(BorrowedEvent::into_owned))
     }
 }
@@ -809,7 +912,7 @@ impl Decode for BodyEvents {
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
         Ok(self
             .core
-            .body(input, eof)?
+            .body(input, eof, false)?
             .map_or(Step::End, |step| step.map(BorrowedEvent::into_owned)))
     }
 }
@@ -1003,8 +1106,9 @@ impl RequestEvents {
         &mut self,
         input: &'a [u8],
         eof: bool,
-    ) -> Result<Step<BorrowedEvent<'a, RequestHead>>, RequestError> {
-        if let Some(step) = self.core.body(input, eof)? {
+        partial: bool,
+    ) -> Result<Step<BorrowedEvent<'a, Head>>, RequestError> {
+        if let Some(step) = self.core.body(input, eof, partial)? {
             return Ok(step);
         }
         if self.core.scanned == 0 {
@@ -1023,7 +1127,21 @@ impl RequestEvents {
         let Some(n) = self.core.head(input)? else {
             return Ok(Step::Need);
         };
-        let head = request_syntax(&input[..n], false)?;
+        let head = match &self.storage {
+            None => request_syntax(&input[..n], false)?,
+            Some((budget, small, large)) => request_syntax_in(&input[..n], false, |size| {
+                if size <= small.slot() {
+                    small.take(budget, 0).ok_or(Error::Budget)
+                } else if size <= large.slot() {
+                    large.take(budget, 0).ok_or(Error::Budget)
+                } else {
+                    let charge = budget.charge(size).ok_or(Error::Budget)?;
+                    Ok(fictionet::Chunk::paid(vec![0; size], charge)
+                        .expect("head storage was charged")
+                        .slice(0..0))
+                }
+            })?,
+        };
         let (info, framing) = match request_info(&head) {
             Ok(info) => info,
             Err(error) => {
@@ -1033,7 +1151,7 @@ impl RequestEvents {
                     self.core.begin(framing, true);
                     let mut rest = &input[n..];
                     loop {
-                        match self.core.body::<RequestHead>(rest, eof) {
+                        match self.core.body::<Head>(rest, eof, false) {
                             Ok(Some(Step::Item(BorrowedEvent::Body(bytes), used))) => {
                                 received_body_bytes += bytes.len();
                                 rest = &rest[used..];
@@ -1062,19 +1180,19 @@ impl RequestEvents {
     }
 }
 
-impl Framed<RequestHead> for RequestEvents {
+impl Framed<Head> for RequestEvents {
     fn scan<'a>(
         &mut self,
         input: &'a [u8],
         eof: bool,
-    ) -> Result<Step<BorrowedEvent<'a, RequestHead>>, Error> {
-        self.scan_request(input, eof)
+    ) -> Result<Step<BorrowedEvent<'a, Head>>, Error> {
+        self.scan_request(input, eof, false)
             .map_err(|error| error.reason())
     }
     fn reader(&self) -> &Reader {
         &self.core
     }
-    fn parse_head(bytes: &[u8]) -> Result<RequestHead, Error> {
+    fn parse_head(bytes: &[u8]) -> Result<Head, Error> {
         Ok(request_head(bytes)?.0)
     }
 }
@@ -1085,7 +1203,7 @@ impl Framed<ResponseHead> for ResponseEvents {
         input: &'a [u8],
         eof: bool,
     ) -> Result<Step<BorrowedEvent<'a, ResponseHead>>, Error> {
-        if let Some(step) = self.core.body(input, eof)? {
+        if let Some(step) = self.core.body(input, eof, false)? {
             return Ok(step);
         }
         let Some(n) = self.core.head(input)? else {
@@ -1231,7 +1349,7 @@ fn collect_body(
     let mut at = 0;
     loop {
         let rest = bytes.get(at..).ok_or(Error::State)?;
-        let n = match reader.body::<()>(rest, true)? {
+        let n = match reader.body::<()>(rest, true, false)? {
             Some(Step::Item(BorrowedEvent::Body(data), n)) => {
                 body.extend_from_slice(data);
                 n
@@ -1271,7 +1389,7 @@ fn collect_body(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     /// Request metadata, available for header rewriting.
-    pub head: RequestHead,
+    pub head: Head,
     /// Body bytes, with chunked framing removed.
     pub body: Vec<u8>,
 }
@@ -1538,10 +1656,7 @@ impl Reader {
             let rest = input.get(self.scanned..).ok_or(Error::State)?;
             let room = self.limits.head.saturating_sub(self.scanned);
             let window = &rest[..rest.len().min(room)];
-            let step = match self.lines.decode(window, false) {
-                Ok(s) => s,
-                Err(e) => match e {},
-            };
+            let step = self.lines.scan(window, false);
             match step {
                 Step::Item(line, n) => {
                     let line = line.map_err(|e| match e {
@@ -1591,6 +1706,7 @@ impl Reader {
         &mut self,
         input: &'a [u8],
         eof: bool,
+        partial: bool,
     ) -> Result<Option<Step<BorrowedEvent<'a, H>>>, Error> {
         let step = match self.state {
             State::Head => return Ok(None),
@@ -1614,7 +1730,8 @@ impl Reader {
                 let n = usize::try_from(left)
                     .unwrap_or(usize::MAX)
                     .min(self.limits.body_chunk);
-                if input.len() < n {
+                let n = if partial { n.min(input.len()) } else { n };
+                if input.len() < n || n == 0 {
                     Step::Need
                 } else {
                     let remaining = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
@@ -1657,10 +1774,7 @@ impl Reader {
         if !self.chunk_extras || matches!(self.state, State::DataEnd) {
             return chunk_framing(&mut self.lines, self.state, input);
         }
-        let step = match self.lines.decode(input, false) {
-            Ok(s) => s,
-            Err(e) => match e {},
-        };
+        let step = self.lines.scan(input, false);
         let Step::Item(line, n) = step else {
             return Ok(None);
         };
@@ -1672,7 +1786,7 @@ impl Reader {
         })?;
         if !trailer {
             return Ok(Some((
-                match chunk_size_skipping_extensions(&line)? {
+                match chunk_size_skipping_extensions(line)? {
                     0 => {
                         self.scanned = 0;
                         self.count = 0;
@@ -1690,7 +1804,7 @@ impl Reader {
         if line.is_empty() {
             return Ok(Some((State::Done, n)));
         }
-        if !header_line_ok(&line) {
+        if !header_line_ok(line) {
             return Err(Error::Trailers);
         }
         self.count = self.count.saturating_add(1);
@@ -1707,10 +1821,7 @@ fn chunk_framing(
     input: &[u8],
 ) -> Result<Option<(State, usize)>, Error> {
     if matches!(state, State::Size) {
-        let step = match lines.decode(input, false) {
-            Ok(s) => s,
-            Err(e) => match e {},
-        };
+        let step = lines.scan(input, false);
         let Step::Item(line, n) = step else {
             return Ok(None);
         };
@@ -1718,7 +1829,7 @@ fn chunk_framing(
             LineError::TooLong { .. } => Error::ChunkLineTooLong,
             _ => Error::LineEnding,
         })?;
-        let size = chunk_size(&line)?;
+        let size = chunk_size(line)?;
         return Ok(Some((
             if size == 0 {
                 State::Trailers
@@ -1825,6 +1936,9 @@ fn fields<'a>(
     headers: impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
     version: Version,
 ) -> Result<Fields, Error> {
+    if version == Version::Http2 {
+        return Err(Error::StartLine);
+    }
     let mut result = Fields {
         length: None,
         transfer: false,
@@ -2025,7 +2139,7 @@ fn split_head(
     }
     Err(Error::Incomplete)
 }
-/// Reads a head with [`RequestHead::parse_lenient`] or
+/// Reads a head with [`Head::parse_lenient`] or
 /// [`ResponseHead::parse_lenient`]: where it starts, after any empty
 /// lines, and where it ends, after its own empty line. Lines may end in a
 /// bare LF. Before the head is whole, the lines that are there are checked,
@@ -2071,7 +2185,7 @@ fn lenient_bounds(b: &[u8], request: bool) -> Result<Option<(usize, usize)>, Err
     }
     Ok(None)
 }
-fn valid_authority(value: &[u8], require_port: bool) -> bool {
+pub(crate) fn valid_authority(value: &[u8], require_port: bool) -> bool {
     if value.is_empty()
         || !value.iter().all(|b| b.is_ascii_graphic())
         || value.iter().any(|b| b"/@?#,".contains(b))
@@ -2131,7 +2245,7 @@ fn validate_target(method: &str, target: &str) -> Result<(), Error> {
     };
     if valid { Ok(()) } else { Err(Error::StartLine) }
 }
-fn validate_host(head: &RequestHead) -> Result<(), Error> {
+fn validate_host(head: &Head) -> Result<(), Error> {
     let mut hosts = named(head.pairs(), "host");
     match hosts.next() {
         None if head.version == Version::Http10 => Ok(()),
@@ -2166,25 +2280,43 @@ fn request_line(line: &[u8], lenient: bool) -> Result<(Span, Span, Version), Err
         version,
     ))
 }
-// Copies the head's bytes once and reads its parts as spans of the copy.
-fn request_syntax(b: &[u8], lenient: bool) -> Result<RequestHead, Error> {
-    // One line per field, besides the request line and the empty line.
-    let lines = b.iter().filter(|b| **b == b'\n').count();
-    let mut fields = Vec::with_capacity(lines.saturating_sub(2));
+// The first pass validates and measures; the second writes field records.
+fn request_syntax(b: &[u8], lenient: bool) -> Result<Head, Error> {
+    request_syntax_in(b, lenient, |size| {
+        Ok(fictionet::Chunk::unpaid(vec![0; size]).slice(0..0))
+    })
+}
+fn request_syntax_in(
+    b: &[u8],
+    lenient: bool,
+    block: impl FnOnce(usize) -> Result<fictionet::Chunk, Error>,
+) -> Result<Head, Error> {
+    let mut size = 0usize;
     let line = split_head(b, lenient, |name, value| {
-        fields.push((name, value));
+        size = size
+            .checked_add(
+                Head::record_size(name.of(b).len(), value.of(b).len()).ok_or(Error::HeadTooLong)?,
+            )
+            .ok_or(Error::HeadTooLong)?;
         Ok(())
     })?;
     let (method, target, version) = request_line(line, lenient)?;
-    Ok(RequestHead {
-        bytes: b.to_vec(),
-        method,
-        target,
-        version,
-        fields,
-    })
+    let method = std::str::from_utf8(method.of(line)).map_err(|_| Error::StartLine)?;
+    let target = std::str::from_utf8(target.of(line)).map_err(|_| Error::StartLine)?;
+    size = size
+        .checked_add(method.len())
+        .and_then(|n| n.checked_add(target.len()))
+        .ok_or(Error::HeadTooLong)?;
+    let mut head = Head::in_block(block(size)?, method, &[target], version)?;
+    split_head(b, lenient, |name, value| {
+        head.push(
+            std::str::from_utf8(name.of(b)).map_err(|_| Error::Header)?,
+            value.of(b),
+        )
+    })?;
+    Ok(head)
 }
-fn request_head(b: &[u8]) -> Result<(RequestHead, Fields, Framing), Error> {
+fn request_head(b: &[u8]) -> Result<(Head, Fields, Framing), Error> {
     let head = request_syntax(b, false)?;
     let (info, framing) = request_info(&head)?;
     Ok((head, info, framing))
@@ -2260,13 +2392,13 @@ fn head_size<'a>(
     }
     Ok(())
 }
-fn request_info(head: &RequestHead) -> Result<(Fields, Framing), Error> {
+fn request_info(head: &Head) -> Result<(Fields, Framing), Error> {
     validate_target(head.method(), head.target())?;
     validate_host(head)?;
     let info = fields(head.pairs(), head.version)?;
     Ok((info, request_framing(info)?))
 }
-fn validate_request(head: &RequestHead) -> Result<Framing, Error> {
+fn validate_request(head: &Head) -> Result<Framing, Error> {
     let (_, framing) = request_info(head)?;
     let start = head
         .method()
@@ -2317,7 +2449,7 @@ fn emit_headers<'a>(headers: impl Iterator<Item = (&'a [u8], &'a [u8])>, out: &m
     }
     out.extend_from_slice(b"\r\n");
 }
-fn emit_request(head: &RequestHead, out: &mut Vec<u8>) {
+fn emit_request(head: &Head, out: &mut Vec<u8>) {
     out.extend_from_slice(head.method().as_bytes());
     out.push(b' ');
     out.extend_from_slice(head.target().as_bytes());
@@ -2378,7 +2510,7 @@ where
     let mut done = false;
     // A handler refusal stops at the first Done. None marks completion;
     // Some(error) marks a refused value or an oversized owned body.
-    let mut collect = |event| -> Result<(), Option<Error>> {
+    let mut collect = |event: Event<_>| -> Result<(), Option<Error>> {
         match event {
             Event::Head(h) => head = Some(h),
             Event::Body(data) => {
@@ -2432,7 +2564,7 @@ fn wire_failure<E: Into<Error>>(failure: Fail<E>) -> Error {
     }
 }
 
-impl Wire for RequestHead {
+impl Wire for Head {
     type ParseError = Error;
     type WriteError = Error;
     /// Parses exactly one request head under default limits. Ignores up to
@@ -2575,9 +2707,9 @@ mod tests {
 
     // The head with its parts changed by `edit`, built again.
     fn edited(
-        head: &RequestHead,
+        head: &Head,
         edit: impl FnOnce(&mut String, &mut String, &mut Version, &mut Vec<Header>),
-    ) -> RequestHead {
+    ) -> Head {
         let (mut method, mut target) = (head.method().to_owned(), head.target().to_owned());
         let mut version = head.version();
         let mut headers: Vec<Header> = head
@@ -2588,7 +2720,7 @@ mod tests {
             })
             .collect();
         edit(&mut method, &mut target, &mut version, &mut headers);
-        RequestHead::new(
+        Head::new(
             &method,
             &target,
             version,
@@ -2607,14 +2739,14 @@ mod tests {
         // No Host, two lengths that disagree, and chunked with a length:
         // Wire refuses each, the lenient reader takes them as written.
         let bytes = b"\r\nPOST http://u@a/x#f HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\nTransfer-Encoding: chunked\r\n\r\nbody";
-        assert!(RequestHead::parse(&bytes[2..bytes.len() - 4]).is_err());
-        let (head, n) = RequestHead::parse_lenient(bytes).unwrap().unwrap();
+        assert!(Head::parse(&bytes[2..bytes.len() - 4]).is_err());
+        let (head, n) = Head::parse_lenient(bytes).unwrap().unwrap();
         assert_eq!(n, bytes.len() - 4);
         assert_eq!((head.method(), head.target()), ("POST", "http://u@a/x#f"));
         assert_eq!(head.headers().len(), 3);
         assert_eq!(head.headers().nth(2).unwrap().value, b"chunked");
         assert_eq!(
-            RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap(),
+            Head::parse_lenient(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap(),
             None
         );
         let (head, n) =
@@ -2635,7 +2767,7 @@ mod tests {
             b"GET / HTTP/1.1\r\nX: a\x01b\r\n\r\n",
         ] {
             assert!(
-                RequestHead::parse_lenient(bad).is_err(),
+                Head::parse_lenient(bad).is_err(),
                 "{:?}",
                 String::from_utf8_lossy(bad)
             );
@@ -2652,8 +2784,8 @@ mod tests {
             );
         }
         // Bytes that are not HTTP fail before the head would end.
-        assert!(RequestHead::parse_lenient(b"\x05\x01\x00").is_err());
-        assert!(RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nno colon\r\n").is_err());
+        assert!(Head::parse_lenient(b"\x05\x01\x00").is_err());
+        assert!(Head::parse_lenient(b"GET / HTTP/1.1\r\nno colon\r\n").is_err());
         assert!(ResponseHead::parse_lenient(b"SSH-2.0-OpenSSH\r\n").is_err());
         assert!(ResponseHead::parse_lenient(b"SSH").is_err());
     }
@@ -2672,7 +2804,7 @@ mod tests {
     #[test]
     fn valid_request_prefix_is_not_error() {
         for partial in [&b""[..], b"\r", b"\r\n", b"HTT", b"GET / HT"] {
-            assert_eq!(RequestHead::parse_lenient(partial), Ok(None), "{partial:?}");
+            assert_eq!(Head::parse_lenient(partial), Ok(None), "{partial:?}");
         }
     }
 
@@ -2683,7 +2815,7 @@ mod tests {
             Err(Error::StartLine)
         );
         assert_eq!(
-            RequestHead::parse_lenient(b"HTTP/1.1 200 OK\r\nX: y"),
+            Head::parse_lenient(b"HTTP/1.1 200 OK\r\nX: y"),
             Err(Error::Version)
         );
     }
@@ -3305,18 +3437,14 @@ mod tests {
             "[::1]",
         ] {
             let bytes = format!("GET /%zz+ HTTP/1.1\r\nHost:{host}\r\n\r\n");
-            let head = RequestHead::parse(bytes.as_bytes()).unwrap();
+            let head = Head::parse(bytes.as_bytes()).unwrap();
             assert_eq!(head.target(), "/%zz+");
             assert_eq!(head.header("host"), Some(host.as_bytes()));
             assert_eq!(head.to_bytes().unwrap(), bytes.as_bytes());
         }
         for host in ["a,b", "a:65536", "a:18446744073709551616", "[v1.a]", "a@b"] {
             let bytes = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
-            assert_eq!(
-                RequestHead::parse(bytes.as_bytes()),
-                Err(Error::Host),
-                "{host}"
-            );
+            assert_eq!(Head::parse(bytes.as_bytes()), Err(Error::Host), "{host}");
         }
     }
 
@@ -3324,9 +3452,9 @@ mod tests {
     fn empty_host_and_port_are_valid_but_connect_requires_a_port() {
         for host in ["", "a:", "[::1]:"] {
             let bytes = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
-            let head = RequestHead::parse(bytes.as_bytes()).unwrap();
+            let head = Head::parse(bytes.as_bytes()).unwrap();
             assert_eq!(head.header("host"), Some(host.as_bytes()));
-            if let Ok(value) = RequestHead::parse(bytes.as_bytes()) {
+            if let Ok(value) = Head::parse(bytes.as_bytes()) {
                 assert_write(&value).unwrap();
             }
             assert_eq!(
@@ -3475,7 +3603,7 @@ mod tests {
         }
         let bytes = request_with(&format!("X:{}\r\n", "a".repeat(8191)), b"");
         request_error(&bytes, Error::HeaderLineTooLong);
-        assert_eq!(RequestHead::parse(&bytes), Err(Error::HeaderLineTooLong));
+        assert_eq!(Head::parse(&bytes), Err(Error::HeaderLineTooLong));
     }
 
     #[test]
@@ -4031,14 +4159,11 @@ mod tests {
     fn leading_empty_lines_agree_between_request_wire_types() {
         for n in 0..=MAX_EMPTY_LINES + 1 {
             let bytes = [b"\r\n".repeat(n), GET.to_vec()].concat();
-            assert_eq!(
-                Request::parse(&bytes).map(|r| r.head),
-                RequestHead::parse(&bytes)
-            );
+            assert_eq!(Request::parse(&bytes).map(|r| r.head), Head::parse(&bytes));
             if let Ok(value) = Request::parse(&bytes) {
                 assert_write(&value).unwrap();
             }
-            if let Ok(value) = RequestHead::parse(&bytes) {
+            if let Ok(value) = Head::parse(&bytes) {
                 assert_write(&value).unwrap();
             }
         }
@@ -4697,7 +4822,7 @@ mod tests {
             Request::parse(&[GET, b"tail"].concat()),
             Err(Error::Trailing)
         );
-        assert_eq!(RequestHead::parse(POST), Err(Error::Trailing));
+        assert_eq!(Head::parse(POST), Err(Error::Trailing));
         assert_eq!(
             Response::parse(&[OK, b"tail"].concat()),
             Err(Error::Trailing)
@@ -4858,7 +4983,7 @@ mod tests {
                 ),
                 decode_all(ResponseEvents::default, &bytes)
             );
-            if let Ok(value) = RequestHead::parse(&bytes) {
+            if let Ok(value) = Head::parse(&bytes) {
                 assert_write(&value).unwrap();
             }
             if let Ok(value) = ResponseHead::parse(&bytes) {

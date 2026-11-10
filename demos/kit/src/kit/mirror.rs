@@ -1,18 +1,16 @@
 //! Immutable package files stored under their upstream host and path.
 
-use bytes::Bytes;
+use fictionet::stdlib::web::httpd::{Exchange, Handler, Reply};
+use fictionet::stdlib::web::{Fields, Response};
 use fictionet::{
     Cx, Error,
     stdlib::web::{
         self,
-        httpd::{Body, Routing, Target},
+        httpd::{Body, Routing},
     },
 };
-use http::{Method, Request, Response, StatusCode, header};
-use http_body::{Body as HttpBody, Frame};
-use http_body_util::BodyExt;
+use http::StatusCode;
 use std::{
-    future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -22,9 +20,8 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWriteExt};
-use tower_service::Service;
 
-type Answer = Result<Response<Body>, Error>;
+type Answer = Result<Response, Error>;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Opens the package mirror used while guests install their software.
@@ -95,38 +92,39 @@ fn immutable(path: &str) -> bool {
     parts.contains(&"pool") && !parts.contains(&"dists") && path.ends_with(".deb")
 }
 
-fn key(request: &Request<Body>) -> Option<PathBuf> {
-    let target = request.extensions().get::<Target>()?;
+fn key(request: &web::Request) -> Option<PathBuf> {
+    let target = &request.site;
     if target.routing != Routing::Exact
-        || target.host.is_empty()
-        || !target.host.split('.').all(|part| {
+        || target.name.is_empty()
+        || !target.name.split('.').all(|part| {
             !part.is_empty()
                 && part.len() <= 63
                 && part
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
-        || request.method() != Method::GET
-        || request.uri().query().is_some()
-        || request.body().bytes().is_none_or(|body| !body.is_empty())
-        || request.headers().keys().any(|name| {
-            matches!(
-                name.as_str(),
-                "authorization"
-                    | "cookie"
-                    | "range"
-                    | "if-range"
-                    | "if-match"
-                    | "if-none-match"
-                    | "if-modified-since"
-                    | "if-unmodified-since"
-            )
+        || request.head.method() != "GET"
+        || request.head.query().is_some()
+        || request.body.bytes().is_none_or(|body| !body.is_empty())
+        || request.head.fields().any(|(name, _)| {
+            [
+                "authorization",
+                "cookie",
+                "range",
+                "if-range",
+                "if-match",
+                "if-none-match",
+                "if-modified-since",
+                "if-unmodified-since",
+            ]
+            .iter()
+            .any(|field| name.eq_ignore_ascii_case(field.as_bytes()))
         })
-        || !immutable(request.uri().path())
+        || !immutable(request.head.path())
     {
         return None;
     }
-    Some(Path::new(&target.host).join(request.uri().path().strip_prefix('/')?))
+    Some(Path::new(&*target.name).join(request.head.path().strip_prefix('/')?))
 }
 
 struct Temporary(PathBuf);
@@ -136,115 +134,133 @@ impl Drop for Temporary {
     }
 }
 
-impl<S> Service<Request<Body>> for Mirror<S>
-where
-    S: Service<Request<Body>, Response = Response<Body>, Error = Error>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    S::Future: Send,
-{
-    type Response = Response<Body>;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Answer> + Send>>;
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Poll::Ready(Ok(()))
-    }
-    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
-        let mut mirror = self.clone();
-        Box::pin(async move {
-            if mirror.closed.load(Ordering::Acquire) {
-                return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
-            }
-            let path = key(&request).map(|key| mirror.root.join(key));
-            let _download = mirror.download.lock().await;
-            if mirror.closed.load(Ordering::Acquire) {
-                return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
-            }
-            if let Some(path) = &path {
-                match tokio::fs::File::open(path).await {
-                    Ok(file) => return file_response(file).await,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+impl<S: Handler + Clone> Handler for Mirror<S> {
+    fn call(&self, request: web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let mirror = self.clone();
+        let conn = ex.conn().clone();
+        let responses = ex.responses().clone();
+        Reply::Later(Box::new(move |cx| {
+            Box::pin(async move {
+                let mut request = request;
+                if mirror.closed.load(Ordering::Acquire) {
+                    return Ok(web::httpd::text(
+                        &responses,
+                        StatusCode::FORBIDDEN,
+                        "Forbidden\n",
+                    ));
                 }
-                request.headers_mut().insert(
-                    header::ACCEPT_ENCODING,
-                    http::HeaderValue::from_static("identity"),
-                );
-            }
-            std::future::poll_fn(|cx| mirror.upstream.poll_ready(cx)).await?;
-            if mirror.closed.load(Ordering::Acquire) {
-                return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
-            }
-            let response = mirror.upstream.call(request).await?;
-            let Some(path) = path.filter(|_| {
-                response.status() == StatusCode::OK
-                    && !response.headers().contains_key(header::CONTENT_ENCODING)
-            }) else {
-                return Ok(response);
-            };
-            let expected = response
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .map(|length| length.to_str()?.parse::<u64>().map_err(Error::from))
-                .transpose()?;
-            tokio::fs::create_dir_all(path.parent().expect("file parent")).await?;
-            let temporary = Temporary(path.with_extension(format!(
-                "part-{}-{}",
-                std::process::id(),
-                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-            )));
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary.0)
-                .await?;
-            let mut body = response.into_body();
-            let mut length = 0u64;
-            while let Some(frame) = body.frame().await {
-                if let Ok(bytes) = frame?.into_data() {
+                let path = key(&request).map(|key| mirror.root.join(key));
+                let _download = mirror.download.lock().await;
+                if mirror.closed.load(Ordering::Acquire) {
+                    return Ok(web::httpd::text(
+                        &responses,
+                        StatusCode::FORBIDDEN,
+                        "Forbidden\n",
+                    ));
+                }
+                if let Some(path) = &path {
+                    match tokio::fs::File::open(path).await {
+                        Ok(file) => return file_response(file).await,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    request.head = web::Head::new(
+                        request.head.method(),
+                        request.head.target(),
+                        request.head.version(),
+                        request
+                            .head
+                            .headers()
+                            .filter(|field| !field.name.eq_ignore_ascii_case("accept-encoding"))
+                            .map(|field| (field.name, field.value))
+                            .chain([("accept-encoding", b"identity".as_slice())]),
+                    );
+                }
+                if mirror.closed.load(Ordering::Acquire) {
+                    return Ok(web::httpd::text(
+                        &responses,
+                        StatusCode::FORBIDDEN,
+                        "Forbidden\n",
+                    ));
+                }
+                let reply = mirror
+                    .upstream
+                    .call(request, &mut Exchange::new(cx.now(), &cx, &conn, responses));
+                let response = match reply {
+                    Reply::Now(response) => response,
+                    Reply::Later(work) => work(cx).await?,
+                };
+                let Some(path) = path.filter(|_| {
+                    response.status == StatusCode::OK
+                        && response.fields.get(b"content-encoding").is_none()
+                }) else {
+                    return Ok(response);
+                };
+                let expected = response
+                    .fields
+                    .get(b"content-length")
+                    .map(|length| {
+                        std::str::from_utf8(length)?
+                            .parse::<u64>()
+                            .map_err(Error::from)
+                    })
+                    .transpose()?;
+                tokio::fs::create_dir_all(path.parent().expect("file parent")).await?;
+                let temporary = Temporary(path.with_extension(format!(
+                    "part-{}-{}",
+                    std::process::id(),
+                    NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+                )));
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary.0)
+                    .await?;
+                let mut body = response.body;
+                let mut length = 0u64;
+                while let Some(frame) = std::future::poll_fn(|cx| body.poll_next(cx)).await {
+                    let bytes = frame?;
                     file.write_all(&bytes).await?;
                     length += bytes.len() as u64;
                 }
-            }
-            if expected.is_some_and(|expected| expected != length) {
-                return Err(Error::msg("incomplete package download"));
-            }
-            file.flush().await?;
-            drop(file);
-            tokio::fs::rename(&temporary.0, &path).await?;
-            file_response(tokio::fs::File::open(path).await?).await
-        })
+                if expected.is_some_and(|expected| expected != length) {
+                    return Err(Error::msg("incomplete package download"));
+                }
+                file.flush().await?;
+                drop(file);
+                tokio::fs::rename(&temporary.0, &path).await?;
+                file_response(tokio::fs::File::open(path).await?).await
+            })
+        }))
     }
 }
 
 async fn file_response(file: tokio::fs::File) -> Answer {
     let length = file.metadata().await?.len();
-    Ok(Response::builder()
-        .header(header::CONTENT_LENGTH, length)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::new(FileBody { file }))?)
+    let mut response = Response::new(Body::Stream(Box::pin(FileBody { file })));
+    response.fields = Fields::new([
+        ("content-length", length.to_string().as_str()),
+        ("content-type", "application/octet-stream"),
+    ]);
+    Ok(response)
 }
 struct FileBody {
     file: tokio::fs::File,
 }
-impl HttpBody for FileBody {
-    type Data = Bytes;
-    type Error = Error;
-    fn poll_frame(
+impl web::httpd::BodyStream for FileBody {
+    fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    ) -> Poll<Option<Result<fictionet::Chunk, Error>>> {
         let mut bytes = [0; 64 << 10];
         let mut buffer = tokio::io::ReadBuf::new(&mut bytes);
         match Pin::new(&mut self.file).poll_read(cx, &mut buffer) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(Ok(())) if buffer.filled().is_empty() => Poll::Ready(None),
-            Poll::Ready(Ok(())) => Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
-                buffer.filled(),
-            ))))),
+            Poll::Ready(Ok(())) => {
+                Poll::Ready(Some(Ok(fictionet::Chunk::unpaid(buffer.filled().to_vec()))))
+            }
         }
     }
 }

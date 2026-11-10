@@ -252,9 +252,15 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
                 let site = match name {
-                    "a.test" => web::Site::new(Plain("a")).at(shared).at(other),
+                    "a.test" => {
+                        web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("a")))
+                            .at(shared)
+                            .at(other)
+                    }
                     "b.test" => {
-                        let site = web::Site::new(Plain("b")).at(shared);
+                        let site =
+                            web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("b")))
+                                .at(shared);
                         let site = if distinct {
                             site.at(separate)
                         } else if shared_v6 {
@@ -265,7 +271,10 @@ fn endpoint_scoped_sites(shared_v6: bool, defaults: bool) {
                         if defaults { site.default_host() } else { site }
                     }
                     "c.test" if defaults => {
-                        let site = web::Site::new(Plain("c")).at(other).default_host();
+                        let site =
+                            web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("c")))
+                                .at(other)
+                                .default_host();
                         if shared_v6 {
                             site.ipv4_only()
                         } else {
@@ -766,10 +775,13 @@ where
 fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
     let make = || {
         web::Sites::new(fictionet_extras::network::cdn_pools(), |host| match host {
-            "six.test" => Some(web::Site::new(Plain("six")).ipv6_only()),
-            h => h
-                .ends_with(".test")
-                .then(|| web::Site::new(Plain("auto")).at(DUAL_ADDR6)),
+            "six.test" => Some(
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("six"))).ipv6_only(),
+            ),
+            h => h.ends_with(".test").then(|| {
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("auto")))
+                    .at(DUAL_ADDR6)
+            }),
         })
         .ipv4_only()
     };
@@ -807,7 +819,7 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
     let make = || {
         web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
             host.ends_with(".test")
-                .then(|| web::Site::new(Plain("auto")))
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("auto"))))
         })
         .subnet("2606:4700:100::/64".parse().unwrap())
     };
@@ -849,7 +861,7 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
     let make = || {
         web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
             host.ends_with(".test")
-                .then(|| web::Site::new(Plain("auto")))
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("auto"))))
         })
         .subnet("2606::/16".parse().unwrap())
     };
@@ -1146,7 +1158,10 @@ fn dns_drops_a_zero_udp_checksum_over_ipv6() {
 fn dns_makes_no_more_sites_than_the_limit() {
     let make = || {
         web::Sites::new(fictionet_extras::network::cdn_pools(), |_| {
-            Some(web::Site::new(Plain("wildcard")).ipv6_only())
+            Some(
+                web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("wildcard")))
+                    .ipv6_only(),
+            )
         })
         .max_sites(8)
     };

@@ -91,7 +91,7 @@ too. TLS 1.3 records are opened with the key schedule and record protection
 of rustls, which the world's TLS endpoints use. Past missing bytes, TLS stops
 reading that direction, since where its next record starts and which
 sequence number it has are unknown. HTTP/1 capture reads each head with `stdlib::protocols::http1`'s lenient reader
-(`RequestHead::parse_lenient`), which checks syntax but not the framing
+(`web::Head::parse_lenient`), which checks syntax but not the framing
 rules an endpoint applies, and frames bodies itself. Chunked bodies end after
 the empty line that terminates all trailers. Trailer bytes do not enter the
 body preview, and the next message starts after that empty line. Incomplete

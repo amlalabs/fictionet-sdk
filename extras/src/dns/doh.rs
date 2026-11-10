@@ -19,11 +19,12 @@
 //! question reaches the resolver as the fronts' own queries do, from the
 //! same cache.
 
+use fictionet::stdlib::web::{Fields, Response};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use http::header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, LOCATION};
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::header::ACCEPT;
+use http::{HeaderValue, Method, Request, StatusCode};
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64;
@@ -39,7 +40,7 @@ use fictionet::stdlib::protocols::dns::serialize::binary::BinEncodable;
 use fictionet::stdlib::protocols::json::Value;
 use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::zone::dname_target;
-use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
+use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
 use fictionet::stdlib::world::net::dns::encrypted::{Fronts, freshness, message_response};
 
 /// The path of RFC 8484, where Cloudflare also serves its JSON.
@@ -71,14 +72,19 @@ enum Answer {
 /// `ct=application/dns-message` asks for the message itself.
 pub fn resolve(fronts: &Fronts, request: &Request<Body>, ex: &mut Exchange<'_>) -> Reply {
     if *request.method() != Method::GET {
-        let mut response = httpd::text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n");
-        response
-            .headers_mut()
-            .insert(ALLOW, HeaderValue::from_static("GET"));
+        let mut response = httpd::text(
+            ex.responses(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Method not allowed.\n",
+        );
+        response.fields = Fields::new([
+            ("content-type", "text/plain; charset=utf-8"),
+            ("allow", "GET"),
+        ]);
         return Reply::Now(response);
     }
     let Some(form) = form(request) else {
-        return Reply::Now(bad_query_string());
+        return Reply::Now(bad_query_string(ex));
     };
     let answer = match urlencoded_form::first(&form.pairs, "ct") {
         Some(DNS_MESSAGE) => Answer::Message,
@@ -105,7 +111,7 @@ pub fn asks_dns_json(request: &Request<Body>) -> bool {
 /// parameters, answered as `application/dns-json`.
 pub fn dns_json(fronts: &Fronts, request: &Request<Body>, ex: &mut Exchange<'_>) -> Reply {
     let Some(form) = form(request) else {
-        return Reply::Now(bad_query_string());
+        return Reply::Now(bad_query_string(ex));
     };
     json_reply(fronts, &form.pairs, Answer::Json(DNS_JSON), ex)
 }
@@ -115,8 +121,12 @@ fn form(request: &Request<Body>) -> Option<Form> {
     Form::parse(request.uri().query().unwrap_or("").as_bytes()).ok()
 }
 
-fn bad_query_string() -> Response<Body> {
-    httpd::text(StatusCode::BAD_REQUEST, "Bad query string.\n")
+fn bad_query_string(ex: &Exchange<'_>) -> Response {
+    httpd::text(
+        ex.responses(),
+        StatusCode::BAD_REQUEST,
+        "Bad query string.\n",
+    )
 }
 
 /// The reply to the JSON API question in `pairs`, put to the resolver
@@ -131,6 +141,7 @@ fn json_reply(
 ) -> Reply {
     let Some(client) = fronts.client(ex.conn()) else {
         return Reply::Now(httpd::text(
+            ex.responses(),
             StatusCode::MISDIRECTED_REQUEST,
             "This server does not serve that host.\n",
         ));
@@ -140,10 +151,12 @@ fn json_reply(
         Err(error) => return Reply::Now(json_error(error)),
     };
     let resolver = fronts.resolver().clone();
+    let responses = ex.responses().clone();
     Reply::Later(Box::new(move |fcx| {
         Box::pin(async move {
             let Some(reply) = resolver.query(&fcx, client, query).await else {
                 return Ok(httpd::text(
+                    &responses,
                     StatusCode::BAD_REQUEST,
                     "The query is not a DNS query.\n",
                 ));
@@ -154,31 +167,27 @@ fn json_reply(
 }
 
 /// `400 Bad Request` with `error` in JSON.
-fn json_error(error: String) -> Response<Body> {
+fn json_error(error: String) -> Response {
     let body = Value::Object(vec![("error".to_owned(), Value::from(error))]);
     let mut response = Response::new(Body::from(body.to_bytes().unwrap_or_default()));
-    *response.status_mut() = StatusCode::BAD_REQUEST;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(JSON));
+    response.status = StatusCode::BAD_REQUEST;
+    response.fields = Fields::new([("content-type", JSON)]);
     response
 }
 
 /// The response carrying the resolver's `reply` as `answer` says. A reply
 /// that does not parse goes back as the message itself. Every DNS answer,
 /// SERVFAIL and NXDOMAIN included, is `200 OK`.
-fn answered(reply: Vec<u8>, answer: Answer) -> Response<Body> {
+fn answered(reply: Vec<u8>, answer: Answer) -> Response {
     let (Answer::Json(media), Ok(message)) = (answer, read_message(&reply)) else {
         return message_response(reply);
     };
     let mut response = Response::new(Body::from(to_json(&message)));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(media));
-    if let Some(seconds) = freshness(&message)
-        && let Ok(value) = HeaderValue::from_str(&format!("max-age={seconds}"))
-    {
-        headers.insert(CACHE_CONTROL, value);
-    }
+    let cache = freshness(&message).map(|seconds| format!("max-age={seconds}"));
+    response.fields = Fields::new(
+        std::iter::once(("content-type", media))
+            .chain(cache.as_deref().map(|value| ("cache-control", value))),
+    );
     response
 }
 
@@ -513,13 +522,11 @@ fn no_query(request: &Request<Body>) -> bool {
 }
 
 /// A response with `status`, `body`, and its media type when it has one.
-fn http_reply(status: StatusCode, media: Option<&'static str>, body: String) -> Response<Body> {
+fn http_reply(status: StatusCode, media: Option<&'static str>, body: String) -> Response {
     let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
+    response.status = status;
     if let Some(media) = media {
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static(media));
+        response.fields = Fields::new([("content-type", media)]);
     }
     response
 }
@@ -536,7 +543,7 @@ struct Google {
 
 impl Google {
     /// Google's error page for `status`, saying `message`.
-    fn error(status: StatusCode, message: &str) -> Response<Body> {
+    fn error(status: StatusCode, message: &str) -> Response {
         let code = status.as_u16();
         let reason = status.canonical_reason().unwrap_or_default();
         let body = format!(
@@ -555,7 +562,15 @@ impl Google {
 const GOOGLE_ERROR_STYLE: &str = "*{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}";
 
 impl Handler for Google {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                ex.responses(),
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if request.uri().path() == RESOLVE {
             return resolve(&self.fronts, &request, ex);
         }
@@ -599,17 +614,25 @@ struct Cloudflare {
 }
 
 impl Handler for Cloudflare {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let redirects = request
+            .head
+            .host()
+            .is_some_and(|host| host.eq_ignore_ascii_case(b"cloudflare-dns.com"));
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                ex.responses(),
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if no_query(&request) {
             if asks_dns_json(&request) {
                 return dns_json(&self.fronts, &request, ex);
             }
             return Reply::Now(http_reply(StatusCode::BAD_REQUEST, None, String::new()));
         }
-        let redirects = request_host(&request).is_some_and(|host| {
-            host.trim_end_matches('.')
-                .eq_ignore_ascii_case("cloudflare-dns.com")
-        });
         if !redirects {
             return Reply::Now(http_reply(
                 StatusCode::NOT_FOUND,
@@ -630,7 +653,12 @@ impl Handler for Cloudflare {
             body.to_owned(),
         );
         if let Ok(location) = HeaderValue::from_str(&format!("https://one.one.one.one{target}")) {
-            response.headers_mut().insert(LOCATION, location);
+            response.fields = Fields::new(
+                response
+                    .fields
+                    .iter()
+                    .chain([(b"location".as_slice(), location.as_bytes())]),
+            );
         }
         Reply::Now(response)
     }
@@ -645,9 +673,18 @@ pub fn quad9(_fronts: Fronts) -> Arc<dyn Handler> {
 struct Quad9;
 
 impl Handler for Quad9 {
-    fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                ex.responses(),
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if !no_query(&request) {
             return Reply::Now(httpd::text(
+                ex.responses(),
                 StatusCode::NOT_FOUND,
                 "there is no endpoint configured for this path",
             ));
@@ -656,7 +693,7 @@ impl Handler for Quad9 {
             None | Some("") => "DoH non-compliant query",
             Some(_) => "DoH unable to decode BASE64-URL",
         };
-        Reply::Now(httpd::text(StatusCode::BAD_REQUEST, text))
+        Reply::Now(httpd::text(ex.responses(), StatusCode::BAD_REQUEST, text))
     }
 }
 
@@ -670,7 +707,7 @@ struct OpenDns;
 
 impl OpenDns {
     /// OpenDNS's error page for `status`, saying `message`.
-    fn error(status: StatusCode, message: &str) -> Response<Body> {
+    fn error(status: StatusCode, message: &str) -> Response {
         let code = status.as_u16();
         let reason = status.canonical_reason().unwrap_or_default();
         let body = format!(
@@ -682,7 +719,15 @@ impl OpenDns {
 }
 
 impl Handler for OpenDns {
-    fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                ex.responses(),
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         if no_query(&request) {
             return Reply::Now(OpenDns::error(
                 StatusCode::BAD_REQUEST,

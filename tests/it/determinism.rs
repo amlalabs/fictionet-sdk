@@ -90,20 +90,28 @@ fn upgrade(_: Request<httpd::Body>) -> httpd::Reply {
         .insert(httpd::UpgradeHandler::new(|cx, mut conn| async move {
             let _ = conn.write_all(&cx, b"upgraded\n").await;
         }));
-    httpd::Reply::Now(response)
+    httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(response))
 }
 
 struct Http;
 impl httpd::Handler for Http {
-    fn call(&self, request: Request<httpd::Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(
+        &self,
+        request: fictionet::stdlib::web::Request,
+        ex: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        let parts = request.head.to_http().expect("valid request head");
+        let request = http::Request::from_parts(parts, request.body);
         if request.uri().path() == "/upgrade" {
             return upgrade(request);
         }
         if request.uri().path() == "/reset" {
-            return httpd::Reply::Now(Response::new(httpd::Body::new(BrokenBody)));
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::new(
+                fictionet_extras::httpd::from_http(BrokenBody),
+            ));
         }
         let draw = ex.random_u64();
-        httpd::Reply::Now(Response::new(
+        httpd::Reply::Now(fictionet::stdlib::web::Response::new(
             format!("{} {draw}\n", request.uri().path()).into(),
         ))
     }
@@ -351,7 +359,10 @@ fn https_sites_with_lab_ca_and_axum_repeat() {
             });
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |name| {
-                (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
+                (name == "site.test").then(|| {
+                    web::SiteConfig::handler(fictionet_extras::httpd::tower(app.clone()))
+                        .tls(config.clone())
+                })
             })
             .date(date)
             .start(&cx, attachments)?;

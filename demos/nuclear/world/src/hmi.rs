@@ -1570,22 +1570,34 @@ fn server_header<T>(mut response: Response<T>) -> Response<T> {
 }
 
 impl Handler for WebServer {
-    fn call(&self, request: Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(
+        &self,
+        request: fictionet::stdlib::web::Request,
+        ex: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        let Ok(parts) = request.head.to_http() else {
+            return httpd::Reply::Now(httpd::text(
+                ex.responses(),
+                http::StatusCode::BAD_REQUEST,
+                "Invalid HTTP request.\n",
+            ));
+        };
+        let request = http::Request::from_parts(parts, request.body);
         let Some(body) = request.body().bytes() else {
-            return httpd::Reply::Now(
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
                 server_header(refusal(StatusCode::BAD_REQUEST, "incomplete body", None))
                     .map(httpd::Body::from),
-            );
+            ));
         };
         let request = request.map(|_| body);
         if request.method() == Method::POST && request.uri().path().starts_with(CONTROL_PREFIX) {
             let (tcp, held, controllers) = (self.tcp.clone(), self.held.clone(), self.controllers);
             return httpd::Reply::Later(Box::new(move |fcx| {
                 Box::pin(async move {
-                    Ok(
+                    Ok(fictionet::stdlib::web::Response::from_http(
                         server_header(control(fcx, tcp, controllers, held, request).await)
                             .map(httpd::Body::from),
-                    )
+                    ))
                 })
             }));
         }
@@ -1634,7 +1646,9 @@ impl Handler for WebServer {
                 _ => refusal(StatusCode::NOT_FOUND, "not found", None),
             }
         };
-        httpd::Reply::Now(server_header(response).map(httpd::Body::from))
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+            server_header(response).map(httpd::Body::from),
+        ))
     }
 }
 
@@ -1809,7 +1823,7 @@ async fn control(
     tcp: tcp::Endpoint,
     controllers: Controllers,
     held: Arc<Mutex<Held>>,
-    request: Request<Bytes>,
+    request: Request<fictionet::Chunk>,
 ) -> Response<Bytes> {
     let kind = request
         .uri()

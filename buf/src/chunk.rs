@@ -35,9 +35,10 @@ use crate::pool::PoolShared;
 /// [`fill`](Self::fill)), which is how a header goes in front of bytes
 /// already written. A shared backing is never written: the writers refuse
 /// and [`make_mut`](Self::make_mut) copies.
+#[derive(Default)]
 pub struct Chunk {
-    /// Always present while the chunk lives; taken out only as it drops,
-    /// so the backing can go back to its pool whole.
+    /// Absent for an empty chunk without storage; taken out on drop so a
+    /// pooled backing can go back whole.
     backing: Option<Arc<Backing>>,
     start: usize,
     end: usize,
@@ -196,13 +197,18 @@ impl Chunk {
 
     /// Whether the backing goes back to a pool.
     fn pooled_backing(&self) -> bool {
-        self.backing().pool.is_some()
+        self.backing.as_ref().is_some_and(|b| b.pool.is_some())
     }
 
     /// Whether the bytes not yet taken are all of an unpooled backing's
     /// bytes, so its spare capacity is all that lies outside them.
     fn whole(&self) -> bool {
-        !self.pooled_backing() && self.start == 0 && self.end == self.backing().bytes.len()
+        !self.pooled_backing()
+            && self.start == 0
+            && self
+                .backing
+                .as_ref()
+                .is_some_and(|b| self.end == b.bytes.len())
     }
 
     /// The backing, when this chunk alone holds it and the bytes are all
@@ -215,7 +221,7 @@ impl Chunk {
     /// holding `bytes`, a copy of them. The other pieces keep the old
     /// backing, with what pays for it. What the bytes held stays held.
     fn rebacked(&mut self, bytes: Vec<u8>, reservation: Reservation) {
-        let held = self.backing().held.clone();
+        let held = self.backing.as_ref().and_then(|b| b.held.clone());
         *self = Self::backed(bytes, Some(reservation), held);
     }
 
@@ -227,6 +233,9 @@ impl Chunk {
     /// the shared charge covers no more than the bytes, and a pooled
     /// backing goes back to its pool.
     pub fn move_into_window(&mut self, window: Arc<Charge>) {
+        if self.backing.is_none() {
+            return;
+        }
         if let Some(backing) = self.sole_whole() {
             backing.bytes.shrink_to_fit();
             backing.reservation = Some(Reservation::Shared(window));
@@ -269,6 +278,9 @@ impl Chunk {
     /// A refusal changes nothing: no copy, no reallocation, no release.
     #[must_use = "bytes a budget refused to pay for are not admitted"]
     pub fn repay(&mut self, budget: &Budget) -> bool {
+        if self.backing.is_none() {
+            return true;
+        }
         let paid_here = self
             .backing()
             .reservation
@@ -315,6 +327,9 @@ impl Chunk {
     /// an allocation of exactly these bytes, charged before it is made; the
     /// other pieces keep the original. A refusal changes nothing.
     pub fn make_mut(&mut self, budget: &Budget) -> Option<&mut [u8]> {
+        if self.backing.is_none() {
+            return Some(&mut []);
+        }
         if self.unique().is_none() {
             let charge = budget.charge(self.len())?;
             self.rebacked(exact(self), Reservation::Own(charge));
@@ -332,6 +347,9 @@ impl Chunk {
     /// its backing. Charges nothing: what pays for the backing, or nothing,
     /// stays as it is. `None` when another piece shares it.
     pub fn get_mut(&mut self) -> Option<&mut [u8]> {
+        if self.backing.is_none() {
+            return Some(&mut []);
+        }
         let range = self.start..self.end;
         Some(&mut self.unique()?.bytes[range])
     }
@@ -351,6 +369,9 @@ impl Chunk {
         if n > self.start {
             return None;
         }
+        if self.backing.is_none() {
+            return Some(&mut []);
+        }
         self.unique()?;
         self.start -= n;
         let start = self.start;
@@ -361,7 +382,9 @@ impl Chunk {
     /// [`extend_within`](Self::extend_within) and [`fill`](Self::fill) can
     /// write while this chunk alone holds its backing.
     pub fn room(&self) -> usize {
-        self.backing().bytes.len() - self.end
+        self.backing
+            .as_ref()
+            .map_or(0, |b| b.bytes.len() - self.end)
     }
 
     /// Appends `bytes` within the room, when this chunk alone holds its
@@ -369,6 +392,9 @@ impl Chunk {
     /// not fit: all of them when the backing is shared. Never reallocates
     /// and charges nothing.
     pub fn extend_within(&mut self, bytes: &[u8]) -> Result<(), usize> {
+        if self.backing.is_none() && bytes.is_empty() {
+            return Ok(());
+        }
         let end = self.end;
         let Some(backing) = self.unique() else {
             return Err(bytes.len());
@@ -388,6 +414,11 @@ impl Chunk {
     /// piece shares the backing. The room may hold old bytes: `fill` must
     /// write every byte it counts. Panics if it counts more than the room.
     pub fn fill(&mut self, fill: impl FnOnce(&mut [u8]) -> usize) -> Option<usize> {
+        if self.backing.is_none() {
+            let wrote = fill(&mut []);
+            assert!(wrote == 0, "a fill counted more than its room");
+            return Some(0);
+        }
         let end = self.end;
         let backing = self.unique()?;
         let room = &mut backing.bytes[end..];
@@ -444,6 +475,9 @@ impl Chunk {
     /// goes back when the chunk's backing is dropped, and a pooled backing
     /// goes back to its pool: the vector carries neither.
     pub fn into_vec(mut self) -> Vec<u8> {
+        if self.backing.is_none() {
+            return Vec::new();
+        }
         let free = self.backing().reservation.is_none() && self.backing().held.is_none();
         if self.whole() && free {
             let backing = self.backing.take().expect("a chunk holds its backing");
@@ -458,16 +492,16 @@ impl Chunk {
     /// The charge that pays for the backing. Pieces of one backing name
     /// the same charge; their charged values must not be added together.
     pub fn charged(&self) -> usize {
-        self.backing()
-            .reservation
+        self.backing
             .as_ref()
+            .and_then(|b| b.reservation.as_ref())
             .map_or(0, |reservation| reservation.charge().bytes())
     }
 
     /// What the backing's allocation holds, written or not: the memory the
     /// chunk keeps alive, whoever pays for it.
     pub fn capacity(&self) -> usize {
-        self.backing().bytes.capacity()
+        self.backing.as_ref().map_or(0, |b| b.bytes.capacity())
     }
 
     /// Whether the two are pieces of one backing.
@@ -488,7 +522,7 @@ impl Chunk {
 
     /// The budget that pays for the backing, if one does.
     pub(crate) fn payer(&self) -> Option<Budget> {
-        let reservation = self.backing().reservation.as_ref()?;
+        let reservation = self.backing.as_ref()?.reservation.as_ref()?;
         Some(reservation.charge().budget().clone())
     }
 
@@ -530,7 +564,9 @@ impl Drop for Chunk {
 impl Deref for Chunk {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.backing().bytes[self.start..self.end]
+        self.backing
+            .as_ref()
+            .map_or(&[], |b| &b.bytes[self.start..self.end])
     }
 }
 
@@ -555,5 +591,40 @@ impl std::fmt::Debug for Chunk {
             .field("len", &self.len())
             .field("charged", &self.charged())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod empty_tests {
+    use super::*;
+
+    #[test]
+    fn empty_views_need_neither_storage_nor_budget() {
+        let budget = Budget::new(0);
+        let mut chunk = Chunk::default();
+        let copy = chunk.clone();
+        assert!(chunk.repay(&budget));
+        assert!(chunk.make_mut(&budget).unwrap().is_empty());
+        assert!(chunk.get_mut().unwrap().is_empty());
+        assert!(chunk.prepend(0).unwrap().is_empty());
+        assert!(chunk.prepend(1).is_none());
+        assert!(chunk.extend_within(&[]).is_ok());
+        assert!(chunk.extend_within(b"x").is_err());
+        assert!(
+            chunk
+                .fill(|room| {
+                    assert!(room.is_empty());
+                    0
+                })
+                .is_some()
+        );
+        for view in [chunk.slice(0..0), chunk.split_to(0), copy, chunk] {
+            assert!(view.is_empty());
+            assert!(view.capacity() == 0);
+            assert!(view.room() == 0);
+            assert!(view.charged() == 0);
+            assert!(view.into_vec().is_empty());
+        }
+        assert!(budget.used() == 0);
     }
 }

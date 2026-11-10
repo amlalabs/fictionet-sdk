@@ -192,7 +192,7 @@ pub(super) async fn serve(
         });
         Ok(Response::builder()
             .header("content-type", "text/event-stream")
-            .body(Body::new(splice::Channel(rx)))?)
+            .body(crate::httpd::from_http(splice::Channel(rx)))?)
     } else {
         if let Some(refused) =
             run(model, engine, parts, body, settings, response, &mut output).await?
@@ -208,8 +208,7 @@ pub(super) async fn serve(
 /// Ends a stream whose continuation was refused, such as by a budget stop,
 /// with the provider's `response.failed` carrying the refusal's error.
 async fn failed(refused: Response<Body>, output: &mut Output) -> fictionet::Result<()> {
-    let bytes = refused
-        .into_body()
+    let bytes = crate::httpd::HttpBody(refused.into_body())
         .collect()
         .await
         .map(|body| body.to_bytes())
@@ -248,7 +247,10 @@ async fn read(
     let first = output.response.is_null();
     let mut calls = HashMap::new();
     if !stream {
-        let bytes = response.into_body().collect().await?.to_bytes();
+        let bytes = crate::httpd::HttpBody(response.into_body())
+            .collect()
+            .await?
+            .to_bytes();
         let response: Value = serde_json::from_slice(&bytes)?;
         if first {
             output.response = output.shown(response.clone());
@@ -266,7 +268,7 @@ async fn read(
         }
         return Ok(Turn { response, calls });
     }
-    let mut body = response.into_body();
+    let mut body = crate::httpd::HttpBody(response.into_body());
     let mut decoder = transport::events();
     while let Some(frame) = body.frame().await {
         let frame = frame?;

@@ -1204,15 +1204,18 @@ impl Layer for StreamChild {
 #[test]
 fn an_async_http_child_runs_over_the_live_stream_with_a_small_window() {
     use fictionet::stdlib::layer::{Chain, Children};
-    use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Http1, Reply};
+    use fictionet::stdlib::web::httpd::{self, Exchange, Handler, Http1, Reply};
     struct Deferred;
     impl Handler for Deferred {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             let path = request.uri().path().to_owned();
+            let responses = ex.responses().clone();
             Reply::Later(Box::new(move |fcx| {
                 Box::pin(async move {
                     fcx.yield_now().await?;
-                    Ok(httpd::text(http::StatusCode::OK, &path))
+                    Ok(httpd::text(&responses, http::StatusCode::OK, &path))
                 })
             }))
         }
@@ -1258,14 +1261,11 @@ struct LazyFrames {
     waiting: Option<FrameWait>,
 }
 
-impl http_body::Body for LazyFrames {
-    type Data = bytes::Bytes;
-    type Error = Cancelled;
-
-    fn poll_frame(
+impl fictionet::stdlib::web::httpd::BodyStream for LazyFrames {
+    fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<bytes::Bytes>, Cancelled>>> {
+    ) -> Poll<Option<Result<fictionet::Chunk, fictionet::Error>>> {
         if self.left == 0 {
             return Poll::Ready(None);
         }
@@ -1281,7 +1281,9 @@ impl http_body::Body for LazyFrames {
                 self.waiting = None;
                 self.left -= 1;
                 Poll::Ready(Some(
-                    result.map(|()| http_body::Frame::data(bytes::Bytes::from_static(b"x"))),
+                    result
+                        .map(|()| fictionet::Chunk::unpaid(b"x".to_vec()))
+                        .map_err(Into::into),
                 ))
             }
         }
@@ -1292,15 +1294,17 @@ fn serve_lazy_frames(frames: usize) {
     use fictionet::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
     struct Lazy(usize);
     impl Handler for Lazy {
-        fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             let left = self.0;
             Reply::Later(Box::new(move |context| {
                 Box::pin(async move {
-                    Ok(http::Response::new(Body::new(LazyFrames {
-                        context,
-                        left,
-                        waiting: None,
-                    })))
+                    Ok(fictionet::stdlib::web::Response::new(Body::Stream(
+                        Box::pin(LazyFrames {
+                            context,
+                            left,
+                            waiting: None,
+                        }),
+                    )))
                 })
             }))
         }

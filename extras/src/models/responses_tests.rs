@@ -76,7 +76,11 @@ fn reply(
 }
 async fn collect(response: Response<Body>, stream: bool) -> Value {
     assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let bytes = crate::httpd::HttpBody(response.into_body())
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     if !stream {
         return serde_json::from_slice(&bytes).unwrap();
     }
@@ -214,7 +218,9 @@ fn zstd_requests_are_decoded_and_metered() {
                 .body(Body::from(bytes))?;
             let response = model.clone().send(request).await?;
             assert_eq!(response.status(), 200);
-            response.into_body().collect().await?;
+            crate::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?;
             assert_eq!(model.ledger.lock().unwrap().calls, 1);
             assert_eq!(model.ledger.lock().unwrap().output, 2);
             Ok(())
@@ -226,7 +232,11 @@ fn zstd_requests_are_decoded_and_metered() {
 /// Every SSE event of a streamed response, in order.
 async fn events(response: Response<Body>) -> Vec<Value> {
     assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let bytes = crate::httpd::HttpBody(response.into_body())
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let mut decoder =
         fictionet::stdlib::codec::Stream::new(fictionet::stdlib::protocols::sse::Events::new());
     let mut events = Vec::new();
@@ -402,7 +412,7 @@ fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
             let response = model.clone().send(request(false)).await?;
             assert_eq!(response.status(), 429);
             let body: Value =
-                serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                serde_json::from_slice(&crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes())?;
             assert_eq!(body["error"]["type"], "insufficient_quota");
             assert!(
                 body["error"]["message"]
@@ -420,7 +430,11 @@ fn a_budget_stop_during_a_search_fails_the_response_like_openai() {
 /// or not.
 async fn completed_id(response: Response<Body>) -> String {
     assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let bytes = crate::httpd::HttpBody(response.into_body())
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
         return body["id"].as_str().unwrap().to_owned();
     }

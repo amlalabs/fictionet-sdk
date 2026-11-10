@@ -67,8 +67,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, SystemTime};
 
-use http::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE};
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use fictionet::stdlib::web::{Fields, Response};
+use http::StatusCode;
 
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
@@ -87,7 +87,7 @@ use fictionet::stdlib::protocols::urlencoded_form::{self, Form};
 use fictionet::stdlib::services::dns::Client;
 use fictionet::stdlib::services::stack::{self, Boxed, Job, StreamEnd, StreamLimits};
 use fictionet::stdlib::services::tls::{self, CertifiedKey};
-use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply, request_host};
+use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
 use fictionet::time::Instant;
 
 use super::super::{Arrival, Host, Limits, Opening, PortServer, PortStack, Sni};
@@ -721,7 +721,7 @@ struct Doh {
 }
 
 impl Handler for Doh {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
         let conn = ex.conn();
         let client = self
             .front
@@ -732,25 +732,26 @@ impl Handler for Doh {
                 StatusCode::MISDIRECTED_REQUEST,
                 "This server does not serve that host.\n",
             );
-            return Reply::Now(refusal.response());
+            return Reply::Now(refusal.response(ex.responses()));
         };
         let query = match ask(&request) {
             Asked::Query(query) => query,
-            Asked::Refused(refusal) => return Reply::Now(refusal.response()),
+            Asked::Refused(refusal) => return Reply::Now(refusal.response(ex.responses())),
             Asked::Elsewhere(refusal) => {
                 return match &self.fallback {
                     Some(fallback) => fallback.call(request, ex),
-                    None => Reply::Now(refusal.response()),
+                    None => Reply::Now(refusal.response(ex.responses())),
                 };
             }
         };
+        let responses = ex.responses().clone();
         let resolver = self.front.resolver.clone();
         Reply::Later(Box::new(move |fcx| {
             Box::pin(async move {
                 let Some(answer) = resolver.query(fcx, client, query).await else {
                     let refusal =
                         Refusal::Text(StatusCode::BAD_REQUEST, "The query is not a DNS query.\n");
-                    return Ok(refusal.response());
+                    return Ok(refusal.response(&responses));
                 };
                 Ok(message_response(answer))
             })
@@ -778,15 +779,19 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn response(self) -> Response<Body> {
+    fn response(self, storage: &httpd::Responses) -> fictionet::stdlib::web::Response {
         match self {
-            Refusal::Text(status, text) => httpd::text(status, text),
+            Refusal::Text(status, text) => httpd::text(storage, status, text),
             Refusal::Method(allowed) => {
-                let mut response =
-                    httpd::text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n");
-                response
-                    .headers_mut()
-                    .insert(ALLOW, HeaderValue::from_static(allowed));
+                let mut response = httpd::text(
+                    storage,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Method not allowed.\n",
+                );
+                response.fields = fictionet::stdlib::web::Fields::new([
+                    ("content-type", "text/plain; charset=utf-8"),
+                    ("allow", allowed),
+                ]);
                 response
             }
         }
@@ -797,16 +802,20 @@ impl Doh {
     /// Whether this resolver answers `request` over `conn`: a name the
     /// client sent with SNI must be one of its names, and the request's
     /// host must be one of them or the address it arrived at.
-    fn serves(&self, conn: &ConnInfo, request: &Request<Body>) -> bool {
+    fn serves(&self, conn: &ConnInfo, request: &fictionet::stdlib::web::Request) -> bool {
         let named = |host: &str| fqdn(host).is_some_and(|name| self.names.contains(&name));
         let sni = conn.sni.as_deref().is_none_or(named);
-        let host = request_host(request).is_some_and(|host| {
-            let literal = host.trim_start_matches('[').trim_end_matches(']');
-            match IpAddr::from_str(literal) {
-                Ok(addr) => conn.local.is_some_and(|local| local.ip() == addr),
-                Err(_) => named(&host),
-            }
-        });
+        let host = request
+            .head
+            .host()
+            .and_then(|host| std::str::from_utf8(host).ok())
+            .is_some_and(|host| {
+                let literal = host.trim_start_matches('[').trim_end_matches(']');
+                match IpAddr::from_str(literal) {
+                    Ok(addr) => conn.local.is_some_and(|local| local.ip() == addr),
+                    Err(_) => named(host),
+                }
+            });
         sni && host
     }
 }
@@ -821,18 +830,18 @@ fn fqdn(host: &str) -> Option<LowerName> {
 
 /// The query `request` asks of `/dns-query` (RFC 8484 §4.1), or why it
 /// asks none.
-fn ask(request: &Request<Body>) -> Asked {
-    if request.uri().path() != DNS_QUERY {
+fn ask(request: &fictionet::stdlib::web::Request) -> Asked {
+    if request.head.path() != DNS_QUERY {
         return Asked::Elsewhere(Refusal::Text(StatusCode::NOT_FOUND, "Not found.\n"));
     }
-    let method = request.method();
-    if *method == Method::POST {
+    let method = request.head.method();
+    if method == "POST" {
         return posted(request);
     }
-    if *method != Method::GET {
+    if method != "GET" {
         return Asked::Refused(Refusal::Method("GET, POST"));
     }
-    let query = request.uri().query().unwrap_or("");
+    let query = request.head.query().unwrap_or("");
     let Ok(form) = Form::parse(query.as_bytes()) else {
         return Asked::Refused(Refusal::Text(
             StatusCode::BAD_REQUEST,
@@ -855,11 +864,11 @@ fn ask(request: &Request<Body>) -> Asked {
 }
 
 /// The DNS message a POST carries as its body (RFC 8484 §4.1).
-fn posted(request: &Request<Body>) -> Asked {
+fn posted(request: &fictionet::stdlib::web::Request) -> Asked {
     let media = request
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
+        .head
+        .field(b"content-type")
+        .and_then(|value| std::str::from_utf8(value).ok())
         .and_then(|value| value.split(';').next())
         .map(|value| value.trim().to_ascii_lowercase());
     if media.as_deref() != Some(DNS_MESSAGE) {
@@ -868,7 +877,7 @@ fn posted(request: &Request<Body>) -> Asked {
             "Unsupported media type.\n",
         ));
     }
-    let Some(body) = request.body().bytes() else {
+    let Some(body) = request.body.bytes() else {
         return Asked::Refused(Refusal::Text(
             StatusCode::BAD_REQUEST,
             "The body did not arrive whole.\n",
@@ -903,16 +912,14 @@ fn base64url(text: &str) -> Option<Vec<u8>> {
 /// `application/dns-message`, with a `Cache-Control` freshness from
 /// [`freshness`] when the answer parses. Every DNS answer, SERVFAIL and
 /// NXDOMAIN included, is `200 OK` (RFC 8484 §4.2.1).
-pub fn message_response(answer: Vec<u8>) -> Response<Body> {
+pub fn message_response(answer: Vec<u8>) -> Response {
     let freshness = read_message(&answer).ok().as_ref().and_then(freshness);
     let mut response = Response::new(Body::from(answer));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(DNS_MESSAGE));
-    if let Some(seconds) = freshness
-        && let Ok(value) = HeaderValue::from_str(&format!("max-age={seconds}"))
-    {
-        headers.insert(CACHE_CONTROL, value);
-    }
+    let cache = freshness.map(|seconds| format!("max-age={seconds}"));
+    response.fields = Fields::new(
+        std::iter::once(("content-type", DNS_MESSAGE))
+            .chain(cache.as_deref().map(|value| ("cache-control", value))),
+    );
     response
 }
 

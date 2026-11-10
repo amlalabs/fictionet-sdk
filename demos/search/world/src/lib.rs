@@ -204,7 +204,7 @@ impl Sites {
         );
         let config: Arc<OnceLock<Arc<CertifiedKey>>> = Arc::new(OnceLock::new());
         let refused: Arc<OnceLock<Arc<CertifiedKey>>> = Arc::new(OnceLock::new());
-        web::Site::new(self.handler.clone())
+        web::SiteConfig::handler(fictionet_extras::httpd::tower(self.handler.clone()))
             .date(self.start)
             .tls_when(move |fcx| {
                 let (fcx, ca, name, pages, upstream) = (

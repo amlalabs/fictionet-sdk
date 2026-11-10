@@ -30,7 +30,7 @@ use fictionet::stdlib::web::httpd::Body;
 /// An HTTP/1.1 client using host DNS, pooled sockets and verified TLS.
 /// It works with any executor; its runtime only drives host I/O.
 pub struct Client {
-    http: HttpClient<Connector, Body>,
+    http: HttpClient<Connector, http_body_util::combinators::BoxBody<Bytes, Error>>,
     slots: Arc<Semaphore>,
     runtime: Option<Runtime>,
 }
@@ -97,7 +97,7 @@ impl Client {
 
     async fn send(self: Arc<Self>, request: Request<Body>) -> Result<Response<Body>, Error> {
         let (mut parts, body) = request.into_parts();
-        let length = body.size_hint().exact();
+        let length = body.remaining();
         if !parts.headers.contains_key(http::header::CONTENT_LENGTH)
             && let Some(length) = length
             && (length > 0
@@ -121,7 +121,14 @@ impl Client {
         } else {
             None
         };
-        let replay = replay.map(|bytes| Request::from_parts(parts.clone(), Body::from(bytes)));
+        let replay = replay.map(|bytes| {
+            Request::from_parts(
+                parts.clone(),
+                http_body_util::Full::new(Bytes::from_owner(bytes))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+        });
         let (sender, receiver) = mpsc::channel(1);
         let mut upload = Upload {
             body: Some(body),
@@ -131,11 +138,12 @@ impl Client {
         };
         let outgoing = Request::from_parts(
             parts,
-            Body::new(UploadBody {
+            UploadBody {
                 receiver,
                 remaining: length,
                 yielded: false,
-            }),
+            }
+            .boxed(),
         );
         let permit = self.slots.clone().acquire_owned().await?;
         let (head, response) = tokio::sync::oneshot::channel();
@@ -156,10 +164,16 @@ impl Client {
                     return;
                 }
             };
-            if response.headers().contains_key(http::header::TRANSFER_ENCODING)
-                && response.headers().contains_key(http::header::CONTENT_LENGTH)
+            if response
+                .headers()
+                .contains_key(http::header::TRANSFER_ENCODING)
+                && response
+                    .headers()
+                    .contains_key(http::header::CONTENT_LENGTH)
             {
-                let _ = head.send(Err(Error::msg("the upstream response has both transfer encoding and content length")));
+                let _ = head.send(Err(Error::msg(
+                    "the upstream response has both transfer encoding and content length",
+                )));
                 return;
             }
             if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
@@ -221,14 +235,14 @@ impl Client {
         }
         Ok(Response::from_parts(
             head.0,
-            Body::new(Incoming {
+            Body::Stream(Box::pin(Incoming {
                 receiver,
                 upload,
                 _abort: abort,
                 _client: self,
                 remaining: head.1,
                 done: false,
-            }),
+            })),
         ))
     }
 }
@@ -469,11 +483,9 @@ impl Upload {
                 self.sender = None;
                 return Ok(());
             };
-            match Pin::new(body).poll_frame(cx) {
+            match body.poll_next(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
-                    if let Ok(bytes) = frame.into_data() {
-                        self.data = bytes;
-                    }
+                    self.data = Bytes::from_owner(frame);
                 }
                 Poll::Ready(Some(Err(error))) => return Err(error),
                 Poll::Ready(None) => self.body = None,
@@ -492,14 +504,11 @@ struct Incoming {
     done: bool,
 }
 
-impl http_body::Body for Incoming {
-    type Data = Bytes;
-    type Error = Error;
-
-    fn poll_frame(
+impl fictionet::stdlib::web::httpd::BodyStream for Incoming {
+    fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    ) -> Poll<Option<Result<fictionet::Chunk, Error>>> {
         let this = self.get_mut();
         if this.done || this.remaining == Some(0) {
             this.done = true;
@@ -514,11 +523,11 @@ impl http_body::Body for Incoming {
                 if let Some(remaining) = &mut this.remaining {
                     *remaining = remaining.saturating_sub(bytes.len() as u64);
                 }
-                Poll::Ready(Some(Ok(Frame::data(bytes))))
+                Poll::Ready(Some(Ok(fictionet::Chunk::unpaid(bytes.to_vec()))))
             }
             result => {
                 this.done = true;
-                Poll::Ready(result.map(|r| r.map(Frame::data)))
+                Poll::Ready(result.map(|r| r.map(|bytes| fictionet::Chunk::unpaid(bytes.to_vec()))))
             }
         }
     }
@@ -527,9 +536,8 @@ impl http_body::Body for Incoming {
         self.done
     }
 
-    fn size_hint(&self) -> SizeHint {
+    fn remaining(&self) -> Option<u64> {
         self.remaining
-            .map_or_else(SizeHint::default, SizeHint::with_exact)
     }
 }
 

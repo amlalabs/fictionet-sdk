@@ -498,7 +498,9 @@ fn read_head(
         };
         Some((line, "response", body, unpaired))
     } else {
-        let (r, _) = http1::RequestHead::parse_lenient(head).ok().flatten()?;
+        let (r, _) = fictionet::stdlib::web::Head::parse_lenient(head)
+            .ok()
+            .flatten()?;
         let line = format!("{} {} {}", r.method(), r.target(), r.version().as_str());
         methods.request(r.method());
         Some((line, "request", body_kind(r.headers(), false, false), false))

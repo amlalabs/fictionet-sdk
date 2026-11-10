@@ -13,6 +13,8 @@ fictionet = { path = "..", default-features = false }
 hyper = "1"
 bytes = "1"
 http = "1"
+http-body = "1"
+tower-service = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
@@ -30,7 +32,6 @@ fictionet-host = { path = "../host" }
 flate2 = "1"
 httparse = "1"
 html5ever = "0.40"
-http-body = "1"
 http-body-util = "0.1"
 include_dir = "0.7"
 kuchiki = "0.8"
@@ -41,7 +42,6 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "io-util"] }
 time = { version = "0.3", features = ["parsing"] }
-tower-service = "0.3"
 url = "2"
 zstd = "0.14"
 tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "zstd-compression", "stemmer"] }

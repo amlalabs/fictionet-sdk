@@ -10,7 +10,7 @@ pub fn build(
     cx: &Cx,
     claude_token: Option<fictionet_extras::models::Credential>,
 ) -> fictionet::Result<fictionet::stdlib::world::net::Net> {
-    use fictionet::stdlib::web::Site;
+    use fictionet::stdlib::web::SiteConfig;
     use fictionet_extras::models::{Model, Provider};
     report_run(&world.pages, cx)?;
     let models = [Provider::Anthropic]
@@ -45,14 +45,14 @@ pub fn build(
         .map(|(host, (model, tls))| {
             Ok((
                 Name::from_ascii(host)?,
-                Site::handler(model).tls(tls).into_host(host),
+                SiteConfig::handler(model).tls(tls).into_host(host),
             ))
         })
         .collect::<fictionet::Result<Vec<_>>>()?;
     let startup = "platform.claude.com";
     forwarded.push((
         Name::from_ascii(startup)?,
-        Site::handler(Startup)
+        SiteConfig::handler(Startup)
             .tls(world.ca.config(cx, startup)?.0)
             .into_host(startup),
     ));
@@ -86,16 +86,16 @@ struct Gateway {
 impl httpd::Handler for Gateway {
     fn call(
         &self,
-        request: http::Request<Body>,
+        request: fictionet::stdlib::web::Request,
         exchange: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
-        if request.uri().path() == "/api/oauth/cli/create_api_key" {
-            return httpd::Reply::Now(
+        if request.head.path() == "/api/oauth/cli/create_api_key" {
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
                 http::Response::builder()
                     .status(403)
                     .body(Body::empty())
                     .expect("static response"),
-            );
+            ));
         }
         let pages = self.pages.clone();
         let host = self.host.clone();
@@ -167,21 +167,25 @@ impl httpd::Handler for Gateway {
 #[derive(Clone)]
 struct Startup;
 impl httpd::Handler for Startup {
-    fn call(&self, request: http::Request<Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        let status = if matches!(*request.method(), http::Method::GET | http::Method::HEAD)
-            && request.uri().path() == "/v1/oauth/hello"
-            && request.uri().query().is_none()
+    fn call(
+        &self,
+        request: fictionet::stdlib::web::Request,
+        _: &mut httpd::Exchange<'_>,
+    ) -> httpd::Reply {
+        let status = if matches!(request.head.method(), "GET" | "HEAD")
+            && request.head.path() == "/v1/oauth/hello"
+            && request.head.query().is_none()
         {
             200
         } else {
             403
         };
-        httpd::Reply::Now(
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
             http::Response::builder()
                 .status(status)
                 .body(Body::empty())
                 .expect("static response"),
-        )
+        ))
     }
 }
 

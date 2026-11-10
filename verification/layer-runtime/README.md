@@ -982,3 +982,67 @@ Sum `alloc`, `grow` and `shrink` to compare with the test allocator, which
 counts every reallocation. These are test-profile measurements with real
 cross-thread wakeups, not the earlier single-thread release-profile
 timings or instruction counts. Setup, warmup and teardown are excluded.
+
+## Native HTTP request storage, November 10, 2026
+
+The native HTTP/1 path now retains a request head in one charged pool
+block with length-prefixed field records. Body pieces slice incoming
+chunks; noncontiguous body pieces are joined. A complete body
+is an unboxed chunk. Native streams yield chunks with their reservations,
+including prefixes retained while a stream waits and trailing fields kept
+after data ends. Consumed input releases its backing, including skipped
+leading empty lines.
+
+Handlers receive an explicit exchange with connection metadata and pooled
+response storage. Immediate replies use no job. Host lookup borrows bytes
+and gives an absolute target's authority precedence. Dispatch uses typed
+site and response records; allocating HTTP request and body conversions
+are explicit, and the tower adapter lives in extras.
+
+The native allocation test warms one connection for 200 requests, then
+measures 2000 requests with a complete request body and response below one
+segment. Each response has ten fields. Input pool acquisition, delivery,
+parsing, handler dispatch, encoding, output consumption and written
+feedback are all inside the measured region. It asserts
+`allocations <= requests * CEILING + FIXED`, with both constants zero.
+The direct layer driver has no cable or checkpoint allocation to cover
+with a fixed allowance. The separate job test checks that taking work
+never adds a job at any phase of an immediate exchange.
+
+The merged split-thread fixture still includes TCP, TLS and the allocating
+tower adapter, so its totals measure a different boundary. Both use the
+test allocator and test profile described above:
+
+| Boundary | Requests | Allocations | Per request ceiling |
+| --- | ---: | ---: | ---: |
+| Complete native HTTP/1 exchange | 2000 | 0 | 0 |
+| Pooled head decoding | 2000 | 0 | 0 |
+| Borrowed host routing | 2000 | 0 | 0 |
+| Head cloning | 2000 | 0 | 0 |
+| Pooled full bodies | 2000 | 0 | 0 |
+| HTTP/1 server with TCP, TLS and tower | 2000 | 54,003 | 28 |
+| HTTP/2 server with TCP, TLS and tower | 2000 | 124,008 | 63 |
+
+The full-stack ceilings round the measured totals upward, including their
+checkpoint overhead, with no separate fixed allowance. HTTP/2 still builds
+an HTTP head before converting it to native records; direct HPACK decoding
+and stream storage changes remain separate work. The conversion writes URI
+parts directly into the record block and does not construct a temporary
+string or a throwaway pool. Empty field collections have no backing.
+
+Small and large HTTP/1 pools retain at most four 2048-byte blocks and two
+16448-byte blocks, respectively, plus their charged free-list places. Large
+head metadata tests account for that cache and its places, check exact
+reservation ownership while a handler waits, compare the streaming path
+after warming its head class, and require zero usage after closing. Heads
+larger than the pool classes use separately charged blocks. Fragmentation
+tests cover every split of a small body and heads beyond the large class.
+
+The consumed-empty-line test failed before the release fix; the pending
+stream-prefix test failed before prefix admission. Their unchanged
+assertions pass after the fixes. Other focused checks cover body ownership,
+request and field models, protocol behavior, adapter trailers, host clients,
+models, and demo callers. No full suite or Search demo tests were run.
+Kani, TLA+ and Lean were not run. The buffer design names no HTTP-specific
+Kani harness for this stage; its named buffer and TCP harnesses belong to
+their respective stages. The security review remains after integration.

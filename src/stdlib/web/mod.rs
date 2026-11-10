@@ -40,20 +40,20 @@
 //!     let upstream = web::proxy(&fcx, client)?;
 //!     web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| match host {
 //!         "en.wikipedia.org" | "www.wikipedia.org" => Some(
-//!             web::Site::new(wiki.clone())
+//!             web::SiteConfig::handler(fictionet_extras::httpd::tower(wiki.clone()))
 //!                 .at(Ipv4Addr::new(185, 15, 59, 224))
 //!                 .at("2a02:ec80:300:ed1a::1".parse::<Ipv6Addr>().unwrap())
 //!                 .tls(certs.wikipedia.clone()),
 //!         ),
 //!         "api.stripe.com" => Some(
-//!             web::Site::new(fake_stripe.clone()) // an axum::Router
+//!             web::SiteConfig::handler(fictionet_extras::httpd::tower(fake_stripe.clone())) // an axum::Router
 //!                 .tls_with({
 //!                     let (real, fake) = (certs.stripe.clone(), certs.bad.clone());
 //!                     move |fcx| if fcx.random_f64() < 0.1 { fake.clone() } else { real.clone() }
 //!                 }),
 //!         ),
 //!         h if h == "github.com" || h.ends_with(".github.com") => Some(
-//!             web::Site::new(upstream.clone()) // the real site, over the world's own network
+//!             web::SiteConfig::handler(upstream.clone()) // the real site, over the world's own network
 //!                 .tls(certs.github.clone()), // github.com and *.github.com
 //!         ),
 //!         _ => None, // NXDOMAIN: the world stays closed
@@ -65,7 +65,7 @@
 //! ```
 //!
 //! For HTTPS to work, the sandbox must trust the world's CA, and each site
-//! must have a certificate for its names. [`Site::tls`] gives a site its
+//! must have a certificate for its names. [`SiteConfig::tls`] gives a site its
 //! certificate. A site without `tls` serves plain HTTP only. Port 443 is
 //! closed at its address, unless another site there has `tls`: then a TLS
 //! handshake for its name is rejected.
@@ -97,7 +97,7 @@
 //! reply. On a machine that exists, a TLS handshake or request for a name
 //! that has no site at that address is rejected with `unrecognized_name`
 //! or answered with `421 Misdirected Request` (unless a site there is the
-//! [`default_host`](Site::default_host), which answers such requests). The
+//! [`default_host`](SiteConfig::default_host), which answers such requests). The
 //! callback is not run for names seen there.
 //!
 //! A site is kept for the whole run: the callback runs once for a name it
@@ -117,13 +117,12 @@
 //!
 //! # Handlers
 //!
-//! [`Site::new`] takes any [`tower_service::Service`] that takes an
-//! `http::Request<web::Body>` and returns an `http::Response`. An
-//! `axum::Router` is one. So is a plain async function wrapped in
-//! `tower::service_fn`. So is `web::proxy(&fcx, client)?` (feature `web-proxy`, off by
-//! default), which forwards to the real site. [`Site::handler`] takes an
-//! [`httpd::Handler`] instead. A request's body is read whole before the
-//! handler is called, up to 64 MiB; past that the answer is `413`.
+//! [`SiteConfig::handler`] takes an [`httpd::Handler`], which receives a
+//! [`Request`] with a pooled head, its body and typed [`Site`] metadata.
+//! The connection, clock and randomness are borrowed through [`httpd::Exchange`].
+//! Tower services such as axum routers use the explicit allocating
+//! `fictionet_extras::httpd::tower` adapter. A request's body is read whole
+//! before the handler is called, up to 64 MiB; past that the answer is `413`.
 //!
 //! # Passing a site through to the real one
 //!
@@ -133,7 +132,7 @@
 //!
 //! 1. **From the sandbox to the world.** The agent's TLS connection ends at
 //!    the world. The world finishes the handshake with the certificate from
-//!    the site's [`tls`](Site::tls) config: one for `github.com`, issued by
+//!    the site's [`tls`](SiteConfig::tls) config: one for `github.com`, issued by
 //!    the world's CA. The sandbox must trust that CA, as it must for any
 //!    site in the world. The agent sees the world's certificate, never
 //!    GitHub's.
@@ -143,14 +142,14 @@
 //!    the host's DNS, sends the name as its TLS SNI, and checks the real
 //!    certificate against the Mozilla root store (`webpki-roots`). It
 //!    offers HTTP/2 and HTTP/1.1, and uses whichever the real site picks.
-//!    The scheme, host and port come from the [`Target`] of the agent's
+//!    The scheme, host and port come from the [`Site`] of the agent's
 //!    request, and the path and query from its URI. The `Host` header is
 //!    set to that host. Hop-by-hop headers (`Connection`, `Keep-Alive`,
 //!    `Transfer-Encoding` and the like) are dropped both ways. Every other
 //!    header, and the body, passes through unchanged.
 //!
 //! Only an exact match to a registered host can be proxied. A request
-//! routed through [`default_host`](Site::default_host) gets `421 Misdirected
+//! routed through [`default_host`](SiteConfig::default_host) gets `421 Misdirected
 //! Request` before any upstream I/O. Use `web::forward(&fcx, upstream, client)?` for a
 //! catch-all that forwards to one fixed origin.
 //!
@@ -180,7 +179,7 @@
 //!
 //! `web::proxy(&fcx, client)?` goes to the real site for the name; `web::forward`
 //! goes to the one origin you give it, whatever the name.
-//! Return one [`Site`] per name the clone answers, such as `slack.com` and
+//! Return one [`SiteConfig`] per name the clone answers, such as `slack.com` and
 //! `api.slack.com`, each with a certificate from the world's CA that lists
 //! that name. The sandbox must trust that CA.
 //!
@@ -230,7 +229,7 @@
 //!     let gmail = web::forward(&fcx, upstream, client)?;
 //!     web::Sites::new(fictionet_extras::network::cdn_pools(), move |name: &str| match name {
 //!         "gmail.googleapis.com" => Some(
-//!             web::Site::new(gmail.clone()).tls(config.clone()),
+//!             web::SiteConfig::handler(gmail.clone()).tls(config.clone()),
 //!         ),
 //!         _ => None,
 //!     })
@@ -331,8 +330,8 @@
 //!   and NXDOMAIN for names the callback turned down, with an SOA for the
 //!   sandbox's resolver to cache. Answers set RA, as a resolver's do.
 //! - **Addresses.** Every site has an IPv4 and an IPv6 address, unless it
-//!   is made [`ipv4_only`](Site::ipv4_only) or
-//!   [`ipv6_only`](Site::ipv6_only). A site with [`at`](Site::at) uses the
+//!   is made [`ipv4_only`](SiteConfig::ipv4_only) or
+//!   [`ipv6_only`](SiteConfig::ipv6_only). A site with [`at`](SiteConfig::at) uses the
 //!   addresses given there. For a family without one, it gets a free
 //!   address from the world's [`Pools`],
 //!   given to [`Sites::new`]. Sites with the same address share one
@@ -344,11 +343,11 @@
 //! - **Ports 80 and 443.** Ports belong to an address, not a site, because
 //!   a TCP connection names only an address and port until the client sends
 //!   a hostname. Port 80 is open on every machine. Port 443 is open on a
-//!   machine if any site at its address has [`tls`](Site::tls), and refuses
+//!   machine if any site at its address has [`tls`](SiteConfig::tls), and refuses
 //!   connections otherwise. Once the client names a host:
 //!   - a site with `tls`: served over HTTPS on 443. On port 80 it answers
 //!     with a 301 redirect to https, unless it also has
-//!     [`plain_http`](Site::plain_http): then its handler answers on port
+//!     [`plain_http`](SiteConfig::plain_http): then its handler answers on port
 //!     80 too.
 //!   - a site without `tls`: served over plain HTTP on 80. A TLS handshake
 //!     for its name on 443 is rejected with `unrecognized_name`.
@@ -361,21 +360,14 @@
 //!   Each HTTP/2 stream is a child of the connection's layer, and its
 //!   handler's async work runs in the connection's
 //!   [region](fictionet::Cx#regions).
-//! - **Routing by host.** Each request goes to the site for its host: the
-//!   authority of its URI if it has one (the `:authority` in HTTP/2, or an
-//!   absolute URI in HTTP/1.1), else its `Host` header. A host with no site
-//!   at the address gets `421 Misdirected Request`, unless a site there is
-//!   the [`default_host`](Site::default_host).
-//! - **A [`Target`] on every request.** Before calling a handler, `start`
-//!   puts a `Target` in the request's extensions. Its scheme and port come
-//!   from the connection, not from headers: TLS or not, and the port the
-//!   connection arrived on. Its host comes from the request, the same
-//!   authority or `Host` header that chose the site. Its SNI comes from the
-//!   TLS client hello. Its [`routing`](Target::routing) is [`Routing::Exact`]
-//!   for a registered host or [`Routing::Fallback`] for the default site.
-//!   Handlers read it with
-//!   `request.extensions().get::<web::Target>()`, or with axum's
-//!   `Extension` extractor.
+//! - **Routing by host.** A Host field selects the site, or the authority
+//!   of an absolute target when no Host field is present. Matching ignores
+//!   ASCII case, ports and trailing dots. Unknown hosts get `421` unless
+//!   the listener has a [`default_host`](SiteConfig::default_host).
+//! - **Typed site metadata.** Handlers read `request.site`. Its scheme,
+//!   port and SNI come from the connection; its name and [`Routing`] say
+//!   how the host matched. The extras tower adapter explicitly allocates
+//!   an HTTP request and inserts this [`Site`] for axum's `Extension` extractor.
 //!
 //! How one sandbox's IPv4 address is bound, as its filter sees it:
 //!
@@ -426,9 +418,9 @@
 //!   (see [`lowering`](fictionet::guide::lowering#tap-ethernet-frames-with-the-ethernet-taken-off)).
 //!   `Sites` sends no router advertisements, so such a VM gets its IPv6
 //!   address from attach's `--ip-addr-v6`, or sets one itself.
-//! - **Fallback is quick.** A site made [`ipv4_only`](Site::ipv4_only) gets
+//! - **Fallback is quick.** A site made [`ipv4_only`](SiteConfig::ipv4_only) gets
 //!   NODATA for AAAA, so clients go straight to IPv4. One made
-//!   [`ipv6_only`](Site::ipv6_only) gets NODATA for A. An address with no
+//!   [`ipv6_only`](SiteConfig::ipv6_only) gets NODATA for A. An address with no
 //!   site gets "address unreachable" immediately. A sandbox attached without
 //!   IPv6 has no IPv6 route, so its connections to an IPv6 address fail
 //!   immediately and the client moves on to IPv4.
@@ -472,7 +464,7 @@
 //!   second address. Addresses inside the sandboxes' subnets are skipped, so a
 //!   subnet inside a pool works too. A family with no pool, or whose pool a
 //!   subnet covers, has no automatic addresses: sites without
-//!   [`at`](Site::at) then have only the other family, and a site with
+//!   [`at`](SiteConfig::at) then have only the other family, and a site with
 //!   neither gets NXDOMAIN.
 //! - **Machines** answer pings, refuse TCP on ports other than 80 and 443
 //!   with a RST, and answer UDP with ICMP "port unreachable", over both
@@ -536,17 +528,21 @@
 //!
 //! [`Sites::into_net`] gives the [`fictionet::stdlib::world::net::Net`] before
 //! it starts, to add hosts with other services next to the websites.
-//! [`Site::into_host`] turns a site into a host;
+//! [`SiteConfig::into_host`] turns a site into a host;
 //! [`net`](fictionet::stdlib::world::net) binds addresses and answers DNS. To
 //! change those parts, see [Changing a protocol by copying
 //! it](fictionet::stdlib#changing-a-protocol-by-copying-it).
 
 pub mod httpd;
+mod response;
+pub use response::{Facts, ObservedResponse, Response};
+mod fields;
+pub use fields::Fields;
+mod request;
+pub use request::{Head, Request, Site};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-
-use http::{Request, Response};
 
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::services::dns::resolver::{Config, LocalZone};
@@ -556,7 +552,7 @@ use fictionet::stdlib::services::tls::CertifiedKey;
 use fictionet::stdlib::world::net::dns::{self, Recursive};
 use fictionet::stdlib::world::net::{Host, Net, Pools};
 use fictionet::{Attachments, Cx, Error};
-pub use httpd::{Body, Routing, Target};
+pub use httpd::{Body, Routing};
 use httpd::{Handler, Server};
 
 /// Websites by hostname, and the network around them. See the
@@ -571,7 +567,7 @@ pub struct Sites {
 }
 
 /// The callback given to [`Sites::new`].
-type SiteFor = dyn Fn(&str) -> Option<Site> + Send + Sync;
+type SiteFor = dyn Fn(&str) -> Option<SiteConfig> + Send + Sync;
 
 /// The callback given to [`Sites::on_dns_event`].
 type OnDnsEvent = dyn Fn(&Event) + Send + Sync;
@@ -590,7 +586,7 @@ impl Sites {
     /// handler.
     pub fn new<F>(pools: Pools, site_for: F) -> Sites
     where
-        F: Fn(&str) -> Option<Site> + Send + Sync + 'static,
+        F: Fn(&str) -> Option<SiteConfig> + Send + Sync + 'static,
     {
         Sites {
             observe: None,
@@ -613,7 +609,7 @@ impl Sites {
     /// let delivered = Arc::new(AtomicUsize::new(0));
     /// let count = delivered.clone();
     /// let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), |_| {
-    ///     Some(web::Site::new(axum::Router::new()))
+    ///     Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(axum::Router::new())))
     /// }).observe_http(Arc::new(move |exchange| {
     ///     if exchange.complete {
     ///         count.fetch_add(1, Ordering::Relaxed);
@@ -734,7 +730,7 @@ impl Sites {
 }
 
 /// One website: a handler, and optionally an address and TLS.
-pub struct Site {
+pub struct SiteConfig {
     server: Server,
     at: Option<Ipv4Addr>,
     at_v6: Option<Ipv6Addr>,
@@ -748,31 +744,17 @@ enum Family {
     V6,
 }
 
-impl Site {
-    /// A site served by `service`, a tower service such as an
-    /// `axum::Router`. See [Handlers](fictionet::stdlib::web#handlers).
-    pub fn new<S, B>(service: S) -> Site
-    where
-        S: tower_service::Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
-        S::Future: Send + 'static,
-        S::Error: Into<Error>,
-        B: http_body::Body + Send + 'static,
-        B::Data: Send,
-        B::Error: Into<Error>,
-    {
-        Site::handler(httpd::tower(service))
-    }
-
+impl SiteConfig {
     /// A site served by a custom [`httpd::Handler`].
-    pub fn handler(handler: impl Handler) -> Site {
+    pub fn handler(handler: impl Handler) -> SiteConfig {
         Self::from_server(Server::new(handler))
     }
 
     /// A site using an explicitly configured HTTP server. Use this to supply
     /// a replacement TLS factory or negotiated application through
     /// [`Server::tls_layer`] and [`Server::applications`].
-    pub fn from_server(server: Server) -> Site {
-        Site {
+    pub fn from_server(server: Server) -> SiteConfig {
+        SiteConfig {
             server,
             at: None,
             at_v6: None,
@@ -782,8 +764,8 @@ impl Site {
 
     /// Sets the site's date at the start of the run. Responses send this
     /// date plus elapsed run time in their `Date` header.
-    pub fn date(self, start: std::time::SystemTime) -> Site {
-        Site {
+    pub fn date(self, start: std::time::SystemTime) -> SiteConfig {
+        SiteConfig {
             server: self.server.date(start),
             ..self
         }
@@ -799,7 +781,7 @@ impl Site {
     /// # use std::net::{Ipv4Addr, Ipv6Addr};
     /// # use fictionet::stdlib::web;
     /// # let wiki: axum::Router = axum::Router::new();
-    /// let site = web::Site::new(wiki)
+    /// let site = web::SiteConfig::handler(fictionet_extras::httpd::tower(wiki))
     ///     .at(Ipv4Addr::new(185, 15, 59, 224))
     ///     .at("2a02:ec80:300:ed1a::1".parse::<Ipv6Addr>().unwrap());
     /// # drop(site);
@@ -808,7 +790,7 @@ impl Site {
     /// A family without `at` gets a free address from that family's pool
     /// ([`Sites::new`]). An address given
     /// for a family the site does not have (see
-    /// [`ipv4_only`](Site::ipv4_only)) is not used.
+    /// [`ipv4_only`](SiteConfig::ipv4_only)) is not used.
     ///
     /// The address must not be inside the sandboxes' subnet, and must be
     /// one a host can have: not unspecified, broadcast, multicast or
@@ -816,13 +798,13 @@ impl Site {
     /// or IPv4-mapped. If it is not, the site is not served and the name
     /// gets NXDOMAIN. IPv4 link-local addresses are allowed, so a world can
     /// serve a site at `169.254.169.254`.
-    pub fn at(self, addr: impl Into<IpAddr>) -> Site {
+    pub fn at(self, addr: impl Into<IpAddr>) -> SiteConfig {
         match addr.into() {
-            IpAddr::V4(a) => Site {
+            IpAddr::V4(a) => SiteConfig {
                 at: Some(a),
                 ..self
             },
-            IpAddr::V6(a) => Site {
+            IpAddr::V6(a) => SiteConfig {
                 at_v6: Some(a),
                 ..self
             },
@@ -831,8 +813,8 @@ impl Site {
 
     /// Gives the site only an IPv4 address. DNS answers AAAA queries for
     /// its name with NODATA, so clients connect over IPv4.
-    pub fn ipv4_only(self) -> Site {
-        Site {
+    pub fn ipv4_only(self) -> SiteConfig {
+        SiteConfig {
             family: Family::V4,
             ..self
         }
@@ -842,15 +824,15 @@ impl Site {
     /// name with NODATA, so a sandbox without IPv6 cannot reach it. On a
     /// network with IPv6 turned off ([`Sites::ipv4_only`]) the site has
     /// no address at all, and its name gets NXDOMAIN.
-    pub fn ipv6_only(self) -> Site {
-        Site {
+    pub fn ipv6_only(self) -> SiteConfig {
+        SiteConfig {
             family: Family::V6,
             ..self
         }
     }
 
     /// Serves HTTPS with the same certificate on every handshake.
-    pub fn tls(self, config: Arc<CertifiedKey>) -> Site {
+    pub fn tls(self, config: Arc<CertifiedKey>) -> SiteConfig {
         self.tls_with(move |_| config.clone())
     }
 
@@ -860,11 +842,11 @@ impl Site {
     ///
     /// The server offers `h2` and `http/1.1` by default. Its TLS factory
     /// receives the certificate and the application's ALPN list separately.
-    pub fn tls_with<F>(self, certificate_for: F) -> Site
+    pub fn tls_with<F>(self, certificate_for: F) -> SiteConfig
     where
         F: Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync + 'static,
     {
-        Site {
+        SiteConfig {
             server: self.server.tls_with(certificate_for),
             ..self
         }
@@ -873,27 +855,27 @@ impl Site {
     /// [`tls_with`](Self::tls_with) with a certificate that may take time to
     /// choose (a check of the real host, say): each handshake waits for its
     /// own, up to its deadline, while the world goes on.
-    pub fn tls_when<F, R>(self, certificate_for: F) -> Site
+    pub fn tls_when<F, R>(self, certificate_for: F) -> SiteConfig
     where
         F: Fn(&Cx) -> R + Send + Sync + 'static,
         R: std::future::Future<Output = Arc<CertifiedKey>> + Send + 'static,
     {
-        Site {
+        SiteConfig {
             server: self.server.tls_when(certificate_for),
             ..self
         }
     }
 
-    /// Serves a site with [`tls`](Site::tls) over plain HTTP on port 80
+    /// Serves a site with [`tls`](SiteConfig::tls) over plain HTTP on port 80
     /// as well. Its handler answers those requests, instead of the 301
     /// redirect to https that a TLS site gets by default.
     ///
     /// This is a site that never moved to HTTPS, or a machine that answers
     /// in plain text where the real site would redirect, as an attacker
     /// that strips TLS does. The handler tells the two kinds of request
-    /// apart by [`Target::scheme`].
-    pub fn plain_http(self) -> Site {
-        Site {
+    /// apart by [`Site::scheme`].
+    pub fn plain_http(self) -> SiteConfig {
+        SiteConfig {
             server: self.server.plain_http(),
             ..self
         }
@@ -905,19 +887,19 @@ impl Site {
     /// (`http://203.0.113.10/`) reaches it, and so does any `Host` header.
     /// Without this, such requests get `421 Misdirected Request`.
     ///
-    /// The request's [`Target`] keeps the host the client named and marks
-    /// [`routing`](Target::routing) as [`Routing::Fallback`]. `web::Proxy`
+    /// The request's [`Site`] keeps the host the client named and marks
+    /// [`routing`](Site::routing) as [`Routing::Fallback`]. `web::Proxy`
     /// rejects these requests with `421 Misdirected Request` before any
     /// upstream I/O. Use `web::Forward` for a fixed-origin catch-all.
     /// Requests for this site's registered name still use [`Routing::Exact`].
     /// The rest is as for any request to the site: over plain HTTP, a site with
-    /// [`tls`](Site::tls) redirects to https (to the host the client
-    /// named) unless it has [`plain_http`](Site::plain_http). A TLS
+    /// [`tls`](SiteConfig::tls) redirects to https (to the host the client
+    /// named) unless it has [`plain_http`](SiteConfig::plain_http). A TLS
     /// handshake still needs an SNI that names a site at the address.
     ///
     /// The first default site that appears at an address keeps the role.
-    pub fn default_host(self) -> Site {
-        Site {
+    pub fn default_host(self) -> SiteConfig {
+        SiteConfig {
             server: self.server.default_host(),
             ..self
         }

@@ -20,12 +20,13 @@
 //!
 //! The door relays: the world's site is the client's server, and the
 //! client is the site's. So it reads heads both ways by their syntax
-//! alone, with [`RequestHead::parse_lenient`] and
+//! alone, with [`Head::parse_lenient`] and
 //! [`ResponseHead::parse_lenient`], and leaves the framing rules to the
 //! two ends. A request the site would take is not refused here, nor an
 //! answer the client would take turned into a `502`.
 
-use fictionet::stdlib::protocols::http1::{FieldRef, RequestHead, ResponseHead};
+use fictionet::stdlib::protocols::http1::{FieldRef, ResponseHead};
+use fictionet::stdlib::web::Head;
 
 use super::Host;
 
@@ -52,7 +53,7 @@ pub enum Target {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     /// The head as the client sent it.
-    pub head: RequestHead,
+    pub head: Head,
     /// Where it goes.
     pub target: Target,
 }
@@ -94,7 +95,7 @@ fn reason(status: u16) -> &'static str {
 
 /// Reads a request head. `Ok(None)`: not all of it yet.
 pub fn parse_request(bytes: &[u8]) -> Result<Option<(Request, usize)>, Reject> {
-    let (head, len) = match RequestHead::parse_lenient(bytes) {
+    let (head, len) = match Head::parse_lenient(bytes) {
         Ok(Some(found)) => found,
         Ok(None) => return Ok(None),
         Err(e) => return Err(reject(400, format!("cannot read the request: {e}"))),
@@ -533,7 +534,7 @@ mod tests {
                 let request =
                     parse(&format!("GET http://{authority}/ HTTP/1.1\r\n{fields}\r\n")).unwrap();
                 let bytes = forward_head(&request);
-                let (forwarded, _) = RequestHead::parse_lenient(&bytes).unwrap().unwrap();
+                let (forwarded, _) = Head::parse_lenient(&bytes).unwrap().unwrap();
                 let hosts: Vec<_> = forwarded
                     .headers()
                     .filter(|header| header.name.eq_ignore_ascii_case("host"))

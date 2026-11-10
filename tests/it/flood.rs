@@ -35,7 +35,7 @@ const ACK: u8 = 0x10;
 #[derive(Clone)]
 struct Hello;
 
-impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Hello {
+impl tower_service::Service<Request<fictionet_extras::httpd::HttpBody>> for Hello {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<Result<Self::Response, Infallible>>;
@@ -44,7 +44,7 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Hello {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: Request<fictionet::stdlib::web::Body>) -> Self::Future {
+    fn call(&mut self, _: Request<fictionet_extras::httpd::HttpBody>) -> Self::Future {
         std::future::ready(Ok(Response::new(Full::new(Bytes::from_static(b"hello\n")))))
     }
 }
@@ -193,8 +193,12 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
         let result = block_on(lab(fictionet::Seed::from_u64(1), |fcx| async move {
             let sites =
                 web::Sites::new(fictionet_extras::network::cdn_pools(), |host| match host {
-                    "plain.test" => Some(web::Site::new(Hello)),
-                    h if h.ends_with(".wild.test") => Some(web::Site::new(Hello)),
+                    "plain.test" => Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                        Hello,
+                    ))),
+                    h if h.ends_with(".wild.test") => Some(web::SiteConfig::handler(
+                        fictionet_extras::httpd::tower(Hello),
+                    )),
                     _ => None,
                 })
                 .max_sites(1_000);
@@ -391,7 +395,8 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     std::thread::spawn(move || {
         let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
-                (host == "plain.test").then(|| web::Site::new(Hello))
+                (host == "plain.test")
+                    .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Hello)))
             });
             sites.start(&fcx, attachments)?;
             let other = machine(

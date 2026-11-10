@@ -135,17 +135,21 @@ struct StreamHandler;
 impl httpd::Handler for StreamHandler {
     fn call(
         &self,
-        request: http::Request<httpd::Body>,
+        request: fictionet::stdlib::web::Request,
         _ex: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
+        let parts = request.head.to_http().expect("valid request head");
+        let request = http::Request::from_parts(parts, request.body);
         let pieces: Vec<&'static [u8]> = match request.uri().path() {
             "/empty" => vec![],
             "/empty-frame" => vec![b"hello", b"", b" world"],
             _ => vec![b"hello", b" world"],
         };
-        httpd::Reply::Now(http::Response::new(httpd::Body::new(StreamPieces(
-            pieces.into_iter(),
-        ))))
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+            http::Response::new(fictionet_extras::httpd::from_http(StreamPieces(
+                pieces.into_iter(),
+            ))),
+        ))
     }
 }
 
@@ -311,7 +315,7 @@ pub(crate) fn streamed(pieces: &'static [&'static [u8]]) -> httpd::Body {
         }
     }
 
-    httpd::Body::new(Pieces(pieces.iter()))
+    fictionet_extras::httpd::from_http(Pieces(pieces.iter()))
 }
 
 /// Answers every request with `status`, `supplied` as its `Content-Length`
@@ -332,7 +336,9 @@ pub(crate) fn framing_case(
         } else {
             streamed(&[b"bo", b"dy"])
         };
-        httpd::Reply::Now(response.body(body).unwrap())
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+            response.body(body).unwrap(),
+        ))
     })
 }
 
@@ -468,11 +474,13 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
     struct Paced;
 
     impl Handler for Paced {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             let body = if request.uri().path() == "/next" {
                 Body::from(Bytes::from_static(b"next\n"))
             } else {
-                Body::new(Frames(
+                fictionet_extras::httpd::from_http(Frames(
                     vec![
                         None,
                         Some(b"".as_slice()),
@@ -486,7 +494,9 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
                     .into_iter(),
                 ))
             };
-            Reply::Now(http::Response::new(body))
+            Reply::Now(fictionet::stdlib::web::Response::from_http(
+                http::Response::new(body),
+            ))
         }
     }
 
@@ -867,32 +877,31 @@ fn http1_router_accepts_valid_empty_post_bodies() {
 
 #[test]
 fn http1_custom_handler_receives_partial_body_then_error() {
-    use http_body::Body as _;
-
     struct Partial(Arc<AtomicUsize>);
     impl httpd::Handler for Partial {
         fn call(
             &self,
-            request: http::Request<httpd::Body>,
+            request: fictionet::stdlib::web::Request,
             _: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             self.0.fetch_add(1, Ordering::Relaxed);
             let mut body = request.into_body();
             assert!(body.bytes().is_none());
             let mut cx = Context::from_waker(std::task::Waker::noop());
-            let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            let Poll::Ready(Some(Ok(frame))) = body.poll_next(&mut cx) else {
                 panic!("missing partial body");
             };
-            assert_eq!(frame.into_data().unwrap(), b"abc"[..]);
-            let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            assert_eq!(frame.as_ref(), b"abc");
+            let Poll::Ready(Some(Err(error))) = body.poll_next(&mut cx) else {
                 panic!("missing body error");
             };
             assert_eq!(error.to_string(), "the request body was cut off");
-            assert!(matches!(
-                Pin::new(&mut body).poll_frame(&mut cx),
-                Poll::Ready(None)
-            ));
-            httpd::Reply::Now(http::Response::new(httpd::Body::empty()))
+            assert!(matches!(body.poll_next(&mut cx), Poll::Ready(None)));
+            httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+                http::Response::new(httpd::Body::empty()),
+            ))
         }
     }
     let seen = Arc::new(AtomicUsize::new(0));
@@ -934,7 +943,7 @@ fn world_host_names_match_http_sites_and_tls_names() {
         (" A.TEST ", " a.test "),
         ("É.TEST.", "É.test"),
     ] {
-        assert_eq!(httpd::normalize(name), expected);
+        assert_eq!(fictionet::stdlib::world::net::normalize(name), expected);
         assert_eq!(Sni::from(name), Sni::Name(expected.to_owned()));
         let vhosts = httpd::VirtualHosts::new();
         vhosts.insert(
@@ -946,21 +955,24 @@ fn world_host_names_match_http_sites_and_tls_names() {
                     .unwrap()
             })),
         );
-        assert!(vhosts.get(expected).is_some(), "{name:?}");
+        assert!(vhosts.get(expected.as_bytes()).is_some(), "{name:?}");
     }
 
     for authority in ["A.TeSt", "A.TEST.:80", "A.Test...:443"] {
-        let request = http::Request::builder()
-            .header("host", authority)
-            .body(())
-            .unwrap();
-        assert_eq!(httpd::request_host(&request).as_deref(), Some("a.test"));
-        let request = http::Request::builder()
-            .uri(format!("https://{authority}/"))
-            .header("host", "other.test")
-            .body(())
-            .unwrap();
-        assert_eq!(httpd::request_host(&request).as_deref(), Some("a.test"));
+        let head = fictionet::stdlib::web::Head::new(
+            "GET",
+            "/",
+            fictionet::stdlib::protocols::http1::Version::Http11,
+            [("host", authority)],
+        );
+        assert!(head.host().unwrap().eq_ignore_ascii_case(b"a.test"));
+        let head = fictionet::stdlib::web::Head::new(
+            "GET",
+            &format!("https://{authority}/"),
+            fictionet::stdlib::protocols::http1::Version::Http11,
+            [] as [(&str, &str); 0],
+        );
+        assert!(head.host().unwrap().eq_ignore_ascii_case(b"a.test"));
     }
 }
 
@@ -972,8 +984,12 @@ fn virtual_hosts_pick_a_site_by_host() {
         httpd::VHost::new(fictionet_test_support::handler(
             |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
              r: http::Request<bytes::Bytes>| {
-                let t = r.extensions().get::<httpd::Target>().cloned().unwrap();
-                http::Response::new(Bytes::from(format!("a {} {}", t.host, t.port)))
+                let t = r
+                    .extensions()
+                    .get::<fictionet::stdlib::web::Site>()
+                    .cloned()
+                    .unwrap();
+                http::Response::new(Bytes::from(format!("a {} {}", t.name, t.port)))
             },
         )),
     );
@@ -1240,12 +1256,12 @@ mod live {
     fn tunnels() -> impl httpd::Handler {
         fictionet_test_support::reply_handler(|_, request| {
             if request.method() != http::Method::CONNECT {
-                return httpd::Reply::Now(
+                return httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(404)
                         .body(httpd::Body::empty())
                         .unwrap(),
-                );
+                ));
             }
             let mut response = http::Response::new(httpd::Body::empty());
             response.extensions_mut().insert(httpd::UpgradeHandler::new(
@@ -1258,7 +1274,7 @@ mod live {
                     }
                 },
             ));
-            httpd::Reply::Now(response)
+            httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(response))
         })
     }
 

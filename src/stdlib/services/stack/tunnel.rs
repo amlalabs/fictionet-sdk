@@ -633,7 +633,7 @@ mod tests {
 
         struct Connects(Outcome);
         impl Handler for Connects {
-            fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 let outcome = self.0.clone();
                 let mut response = http::Response::new(Body::empty());
                 response.extensions_mut().insert(UpgradeHandler::new(
@@ -642,7 +642,7 @@ mod tests {
                         *outcome.lock() = Some(flushed);
                     },
                 ));
-                Reply::Now(response)
+                Reply::Now(fictionet::stdlib::web::Response::from_http(response))
             }
         }
 

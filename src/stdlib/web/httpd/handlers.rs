@@ -1,8 +1,9 @@
-use std::future::{Future, poll_fn};
+use crate::stdlib::web::Response;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use http::{HeaderValue, Request, Response, StatusCode};
+use http::StatusCode;
 
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::Connection;
@@ -11,6 +12,7 @@ use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
 use super::Body;
+use crate::stdlib::web::Request;
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -21,6 +23,7 @@ pub struct Exchange<'a> {
     now: Instant,
     entropy: &'a dyn fictionet::Entropy,
     conn: &'a ConnInfo,
+    responses: Responses,
 }
 
 impl<'a> Exchange<'a> {
@@ -30,8 +33,19 @@ impl<'a> Exchange<'a> {
         now: Instant,
         entropy: &'a dyn fictionet::Entropy,
         conn: &'a ConnInfo,
+        responses: Responses,
     ) -> Exchange<'a> {
-        Exchange { now, entropy, conn }
+        Exchange {
+            now,
+            entropy,
+            conn,
+            responses,
+        }
+    }
+
+    /// Charged response storage shared with this connection.
+    pub fn responses(&self) -> &Responses {
+        &self.responses
     }
 
     /// The run's clock when the request was read.
@@ -53,27 +67,25 @@ impl<'a> Exchange<'a> {
 /// An answer that needs async work: given the connection's [`Cx`], a future
 /// of the response. An error answers `500`, or `502` for [`BadGateway`];
 /// [`Reset`] answers nothing.
-pub type Later = Box<
-    dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>> + Send,
->;
+pub type Later =
+    Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>> + Send>;
 
 /// What a handler gives back for a request.
 pub enum Reply {
     /// The response, now.
-    Now(Response<Body>),
+    Now(Response),
     /// Work that makes the response.
     Later(Later),
 }
 
 /// Answers HTTP requests. See the [module docs](super).
 pub trait Handler: Send + Sync + 'static {
-    /// Answers `request`. The request's extensions hold its connection's
-    /// [`ConnInfo`].
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply;
+    /// Answers `request`; the exchange borrows its connection.
+    fn call(&self, request: Request, ex: &mut Exchange<'_>) -> Reply;
 }
 
 impl<H: Handler + ?Sized> Handler for Arc<H> {
-    fn call(&self, request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: Request, ex: &mut Exchange<'_>) -> Reply {
         (**self).call(request, ex)
     }
 }
@@ -106,73 +118,128 @@ impl std::fmt::Display for Reset {
 
 impl std::error::Error for Reset {}
 
-pub(super) fn status_only(status: StatusCode) -> Response<Body> {
+pub(super) fn status_only(status: StatusCode) -> Response {
     let mut r = Response::new(Body::empty());
-    *r.status_mut() = status;
+    r.status = status;
     r
 }
 
-/// A short plain-text response.
-pub fn text(status: StatusCode, body: &str) -> Response<Body> {
-    let mut response = Response::new(Body::from(body.to_owned()));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
+/// Response storage that can also be retained by asynchronous handlers.
+#[derive(Clone)]
+pub struct Responses {
+    budget: fictionet::Budget,
+    pool: Option<fictionet::Pool>,
 }
 
-/// Runs a tower service as a [`Handler`]: see [`tower`].
-pub struct Tower<S> {
-    service: Mutex<S>,
-}
-
-/// Runs any tower service, such as an `axum::Router`, as a [`Handler`].
-/// Each request gets its own clone of the service, as tower expects, and
-/// runs as work of its connection. The response's body streams
-/// to the client as it comes.
-pub fn tower<S, B>(service: S) -> Tower<S>
-where
-    S: tower_service::Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    S::Error: Into<Error>,
-    B: http_body::Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Error>,
-{
-    Tower {
-        service: Mutex::new(service),
+impl Responses {
+    /// A reusable cache charged to its owner.
+    pub fn new(budget: &fictionet::Budget) -> Self {
+        Self::pooled(budget, fictionet::Pool::new(budget, 2048, 4))
+    }
+    pub(crate) fn pooled(budget: &fictionet::Budget, pool: fictionet::Pool) -> Self {
+        Self {
+            budget: budget.clone(),
+            pool: Some(pool),
+        }
+    }
+    pub(crate) fn unpooled(budget: &fictionet::Budget) -> Self {
+        Self {
+            budget: budget.clone(),
+            pool: None,
+        }
+    }
+    /// An empty field block. Refusal leaves the budget unchanged.
+    pub fn fields(&self) -> Option<crate::stdlib::web::Fields> {
+        let block = match &self.pool {
+            Some(pool) => pool.take(&self.budget, 0)?,
+            None => {
+                let charge = self.budget.charge(2048)?;
+                fictionet::Chunk::paid(vec![0; 2048], charge)
+                    .expect("reserved fields")
+                    .slice(0..0)
+            }
+        };
+        crate::stdlib::web::Fields::in_block(block).ok()
+    }
+    /// Copies bytes into a charged block, reusing small backings.
+    pub fn body(&self, bytes: &[u8]) -> Option<Body> {
+        if bytes.is_empty() {
+            return Some(Body::empty());
+        }
+        let mut block = if let Some(pool) = &self.pool
+            && bytes.len() <= pool.slot()
+        {
+            pool.take(&self.budget, 0)?
+        } else {
+            return Some(Body::Full(fictionet::Chunk::copy_of(&self.budget, bytes)?));
+        };
+        block.extend_within(bytes).ok()?;
+        Some(Body::Full(block))
     }
 }
 
-impl<S, B> Handler for Tower<S>
-where
-    S: tower_service::Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    S::Error: Into<Error>,
-    B: http_body::Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Error>,
-{
-    fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
-        let mut service = self.service.lock().clone();
-        Reply::Later(Box::new(move |_fcx| {
-            Box::pin(async move {
-                poll_fn(|cx| service.poll_ready(cx))
-                    .await
-                    .map_err(Into::into)?;
-                let response = service.call(request).await.map_err(Into::into)?;
-                Ok(response.map(Body::new))
-            })
-        }))
+/// A short plain-text response, or an empty unavailable response if storage is refused.
+pub fn text(storage: &Responses, status: StatusCode, body: &str) -> Response {
+    let Some(body) = storage.body(body.as_bytes()) else {
+        return status_only(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let Some(mut fields) = storage.fields() else {
+        return status_only(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    fields
+        .push("content-type", b"text/plain; charset=utf-8")
+        .expect("small field fits");
+    let mut response = Response::new(body);
+    response.status = status;
+    response.fields = fields;
+    response
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn response_storage_preserves_bodies_across_pool_sizes_and_refuses_without_room() {
+        for pooled in [false, true] {
+            let budget = fictionet::Budget::new(1 << 20);
+            let storage = if pooled {
+                Responses::new(&budget)
+            } else {
+                Responses::unpooled(&budget)
+            };
+            for length in [0, 1, 2048, 2049, 8192] {
+                let bytes = "x".repeat(length);
+                let response = text(&storage, StatusCode::OK, &bytes);
+                assert_eq!(response.status, StatusCode::OK);
+                assert_eq!(response.body.bytes().unwrap().as_ref(), bytes.as_bytes());
+                assert_eq!(response.fields.iter().count(), 1);
+                drop(response);
+                assert_eq!(
+                    budget.used(),
+                    storage.pool.as_ref().map_or(0, |p| p.charged())
+                );
+            }
+            drop(storage);
+            assert_eq!(budget.used(), 0);
+            let budget = fictionet::Budget::new(0);
+            let storage = if pooled {
+                Responses::new(&budget)
+            } else {
+                Responses::unpooled(&budget)
+            };
+            let response = text(&storage, StatusCode::OK, "unavailable");
+            assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response.body.bytes().unwrap().is_empty());
+            assert_eq!(budget.used(), 0);
+        }
     }
 }
 
 /// Runs a protocol after an HTTP/1 response that hands the connection on is
 /// written.
 ///
-/// Insert this in the extensions of a `101 Switching Protocols` response,
+/// Set this in the `upgrade` field of a `101 Switching Protocols` response,
 /// or of a 2xx response to CONNECT. Once the response is written,
 /// [`Http1::upgradable`](super::Http1::upgradable) calls it with the rest of
 /// the stream as a connection, whose first bytes are those the client sent

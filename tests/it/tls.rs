@@ -1031,7 +1031,7 @@ fn observed_world_handshake_failure(rejected_name: bool) {
                 443,
                 "accepted.test",
                 move |_| config.clone(),
-                httpd::Server::new(httpd::tower(axum::Router::new())),
+                httpd::Server::new(fictionet_extras::httpd::tower(axum::Router::new())),
             );
         Net::new(fictionet_extras::network::cdn_pools())
             .ipv4_only()

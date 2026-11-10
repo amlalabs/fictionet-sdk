@@ -24,7 +24,7 @@ pub fn world(
     web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| {
         if host == "upstream" {
             println!("lookup {host}");
-            Some(web::Site::new(upstream.clone()))
+            Some(web::SiteConfig::handler(upstream.clone()))
         } else {
             sites(host)
         }

@@ -88,8 +88,8 @@ where
 ///
 /// struct Hello;
 /// impl Handler for Hello {
-///     fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
-///         Reply::Now(http::Response::new(Body::from("hello\n")))
+///     fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+///         Reply::Now(fictionet::stdlib::web::Response::new(Body::from("hello\n")))
 ///     }
 /// }
 /// let detect = Detect::new(

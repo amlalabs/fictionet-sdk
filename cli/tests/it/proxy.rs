@@ -142,14 +142,18 @@ impl World {
                             v6: Some("2606:4700:100::/48".parse().unwrap()),
                         },
                         move |host: &str| match host {
-                            "plain.test" => Some(web::Site::new(app.clone())),
+                            "plain.test" => Some(web::SiteConfig::handler(
+                                fictionet_extras::httpd::tower(app.clone()),
+                            )),
                             "ws.test" => {
-                                Some(web::Site::handler(fictionet_test_support::EchoSocket))
+                                Some(web::SiteConfig::handler(fictionet_test_support::EchoSocket))
                             }
                             "secure.test" => Some(
-                                web::Site::new(secure.clone())
-                                    .at(SECURE)
-                                    .tls(config.clone()),
+                                web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                                    secure.clone(),
+                                ))
+                                .at(SECURE)
+                                .tls(config.clone()),
                             ),
                             _ => None,
                         },
@@ -1435,9 +1439,8 @@ fn lookups_of_one_name_are_shared_and_misses_remembered() {
 }
 
 mod routing {
-    use fictionet::stdlib::web::httpd::{
-        self, Body, Handler, Routing, Target, VHost, VirtualHosts,
-    };
+    use fictionet::stdlib::web::httpd::{self, Body, Handler, Routing, VHost, VirtualHosts};
+    use fictionet::stdlib::web::{Head, Site};
     use http::{Request, Response};
     use std::net::SocketAddr;
 
@@ -1456,8 +1459,30 @@ mod routing {
             "10.0.0.2:5000".parse().unwrap(),
         );
         let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
-        let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
-        vhosts.call(request, &mut ex)
+        let mut ex = httpd::Exchange::new(
+            fictionet::time::Instant::ZERO,
+            &entropy,
+            &conn,
+            fictionet::stdlib::web::httpd::Responses::new(&fictionet::Budget::unlimited()),
+        );
+        let (parts, body) = request.into_parts();
+        let head = Head::new(
+            parts.method.as_str(),
+            &parts.uri.to_string(),
+            fictionet::stdlib::protocols::http1::Version::Http11,
+            parts
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_bytes())),
+        );
+        vhosts.call(
+            fictionet::stdlib::web::Request {
+                head,
+                body,
+                site: Site::connection(&conn),
+            },
+            &mut ex,
+        )
     }
 
     #[test]
@@ -1465,9 +1490,11 @@ mod routing {
         let site = VHost::new(fictionet_test_support::handler(
             |_: &mut fictionet::stdlib::web::httpd::Exchange<'_>,
              request: http::Request<bytes::Bytes>| {
-                let target = request.extensions().get::<Target>().unwrap().clone();
+                let target = request.extensions().get::<Site>().unwrap().clone();
                 let mut response = Response::new(bytes::Bytes::new());
-                response.extensions_mut().insert(target);
+                response
+                    .extensions_mut()
+                    .insert(fictionet::stdlib::web::Facts::new(target));
                 response
             },
         ));
@@ -1494,8 +1521,8 @@ mod routing {
             let httpd::Reply::Now(response) = route(&vhosts, request(uri, host), 80) else {
                 panic!("the router answers immediately");
             };
-            let target = response.extensions().get::<Target>().unwrap();
-            assert_eq!(target.host, name);
+            let target = response.facts.as_ref().unwrap().get::<Site>().unwrap();
+            assert_eq!(&*target.name, name);
             assert_eq!(target.routing, routing);
             assert_eq!(target.scheme, http::uri::Scheme::HTTP);
             assert_eq!(target.port, 80);
@@ -1546,10 +1573,10 @@ mod upstream {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         fictionet::run(Seed::from_u64(0), |fcx| async move {
-            let site = VHost::new(httpd::tower(web::proxy(
+            let site = VHost::new(web::proxy(
                 &fcx,
                 std::sync::Arc::new(fictionet_host::Client::new()),
-            )?));
+            )?);
             let vhosts = VirtualHosts::new();
             vhosts.insert("allowed.test", site.clone());
             vhosts.set_default(site);
@@ -1582,10 +1609,10 @@ mod upstream {
     async fn proxy_forwards_exact_hosts_even_when_the_site_is_default() {
         let (address, server) = origin().await;
         fictionet::run(Seed::from_u64(0), |fcx| async move {
-            let site = VHost::new(httpd::tower(web::proxy(
+            let site = VHost::new(web::proxy(
                 &fcx,
                 std::sync::Arc::new(fictionet_host::Client::new()),
-            )?));
+            )?);
             let vhosts = VirtualHosts::new();
             vhosts.insert("127.0.0.1", site.clone());
             vhosts.set_default(site);

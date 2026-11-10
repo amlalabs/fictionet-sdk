@@ -144,7 +144,7 @@ pub fn tcp_packet(src: IpAddr, dst: IpAddr, s: &Segment<'_>) -> Vec<u8> {
         sum ^= 0x5a5a;
     }
     t[16..18].copy_from_slice(&sum.to_be_bytes());
-    ip::packet(src, dst, 6, &t).0
+    ip::packet(src, dst, 6, &t).into_vec()
 }
 
 /// A UDP datagram in an IP packet.
@@ -160,7 +160,7 @@ pub fn udp_packet(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8])
         sum = 0xffff;
     }
     u[6..8].copy_from_slice(&sum.to_be_bytes());
-    ip::packet(src, dst, 17, &u).0
+    ip::packet(src, dst, 17, &u).into_vec()
 }
 
 /// A [`Connection`] that reads `input` in pieces of the given sizes, then

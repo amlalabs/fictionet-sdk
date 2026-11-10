@@ -164,7 +164,7 @@ impl Drop for Call {
 }
 
 pub(super) struct Metered {
-    body: Body,
+    body: crate::httpd::HttpBody,
     call: Option<Call>,
     sse: Option<Stream<sse::Events>>,
     json: Vec<u8>,
@@ -174,7 +174,7 @@ pub(super) struct Metered {
 impl Metered {
     pub fn new(body: Body, call: Call, sse: bool) -> Self {
         Self {
-            body,
+            body: crate::httpd::HttpBody(body),
             call: Some(call),
             sse: sse.then(transport::events),
             json: Vec::new(),

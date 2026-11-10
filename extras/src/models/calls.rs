@@ -47,7 +47,7 @@ impl Model {
             .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
         let call = observer(&self.cx, request.method(), &path);
         let mut body = CallBody {
-            inner: Body::empty(),
+            inner: crate::httpd::HttpBody(Body::empty()),
             call,
             status: None,
             done: false,
@@ -68,8 +68,8 @@ impl Model {
                 };
                 (body.call.observe)(phase, body.status);
                 Ok(response.map(|inner| {
-                    body.inner = inner;
-                    Body::new(body)
+                    body.inner = crate::httpd::HttpBody(inner);
+                    crate::httpd::from_http(body)
                 }))
             }
             Err(error) => {
@@ -81,7 +81,7 @@ impl Model {
 }
 
 struct CallBody {
-    inner: Body,
+    inner: crate::httpd::HttpBody,
     call: Call,
     status: Option<http::StatusCode>,
     done: bool,
@@ -135,7 +135,7 @@ mod tests {
         let phases = Arc::new(Mutex::new(Vec::new()));
         let observed = phases.clone();
         drop(CallBody {
-            inner: Body::from("unread"),
+            inner: crate::httpd::HttpBody(Body::from("unread")),
             call: Call {
                 engine: Arc::new(super::super::tests::ValidationPages),
                 observe: Arc::new(move |phase, _| observed.lock().unwrap().push(phase)),

@@ -1,11 +1,11 @@
 use crate::common::alloc::allocations;
 use fictionet::stdlib::codec::{Decode, Step, Stream, Wire};
 use fictionet::stdlib::protocols::http1::{
-    Event, Header, Limits, Request, RequestEvents, RequestHead, Requests, Response, ResponseEvents,
-    Responses,
+    Event, Header, Limits, Request, RequestEvents, Requests, Response, ResponseEvents, Responses,
 };
 use fictionet::stdlib::test_support;
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
+use fictionet::stdlib::web::Head;
 
 const FIRST: &[u8] = b"POST /tools HTTP/1.1\r\nHost: api.test\r\nTransfer-Encoding: chunked\r\nX-Raw:\t keep \t\r\n\r\n01\r\n{\r\n1\r\n}\r\n000\r\n\r\n";
 const SECOND: &[u8] = b"GET /next HTTP/1.1\r\nHost:api.test\r\n\r\n";
@@ -298,7 +298,7 @@ fn edited_bodies_and_duplicate_requests_round_trip_through_wire() {
                 })
                 .map(|h| (h.name, h.value));
             let fields = kept.chain([("Content-Length", length.as_bytes())]);
-            request.head = RequestHead::new(head.method(), head.target(), head.version(), fields);
+            request.head = Head::new(head.method(), head.target(), head.version(), fields);
         }
         request.write(&mut output).unwrap();
         expected.push(request);
@@ -451,7 +451,8 @@ fn message_buffer_bounds_do_not_change_between_messages() {
 
 #[test]
 fn header_line_check_matches_lenient_field_parsing() {
-    use fictionet::stdlib::protocols::http1::{RequestHead, header_line_ok};
+    use fictionet::stdlib::protocols::http1::header_line_ok;
+    use fictionet::stdlib::web::Head;
 
     for (line, valid) in [
         (b"X-Name: value".as_slice(), true),
@@ -469,11 +470,7 @@ fn header_line_check_matches_lenient_field_parsing() {
         assert_eq!(header_line_ok(line), valid, "{line:?}");
         let request = [b"GET / HTTP/1.1\r\n".as_slice(), line, b"\r\n\r\n"].concat();
         if !line.is_empty() {
-            assert_eq!(
-                RequestHead::parse_lenient(&request).is_ok(),
-                valid,
-                "{line:?}"
-            );
+            assert_eq!(Head::parse_lenient(&request).is_ok(), valid, "{line:?}");
         }
     }
 }

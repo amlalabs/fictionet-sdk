@@ -285,7 +285,8 @@ fn a_tower_service_runs_as_a_handler() {
         let mut listener = server.listen(80)?;
         fcx.spawn(move |fcx| async move {
             while let Ok(conn) = listener.accept(&fcx).await {
-                let handler: Arc<dyn httpd::Handler> = Arc::new(httpd::tower(app.clone()));
+                let handler: Arc<dyn httpd::Handler> =
+                    Arc::new(fictionet_extras::httpd::tower(app.clone()));
                 let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
                 fcx.spawn(move |fcx| async move {
                     Ok(httpd::serve_connection(

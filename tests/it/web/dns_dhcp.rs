@@ -90,8 +90,12 @@ fn sites_are_placed_on_first_lookup_even_under_a_used_top_level_domain() {
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             match host {
-                "a.test" => Some(web::Site::new(Plain("a"))),
-                "b.test" => Some(web::Site::new(Plain("b"))),
+                "a.test" => Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                    Plain("a"),
+                ))),
+                "b.test" => Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                    Plain("b"),
+                ))),
                 _ => None,
             }
         })
@@ -134,7 +138,7 @@ fn one_lookup_places_one_site() {
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             host.ends_with(".wild.test")
-                .then(|| web::Site::new(Plain("wild")))
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("wild"))))
         })
         .into_net();
         let handle = net.handle();
@@ -166,7 +170,7 @@ fn an_internationalized_name_is_asked_about_in_ascii() {
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             host.ends_with(".test")
-                .then(|| web::Site::new(Plain("idn")))
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("idn"))))
         })
         .into_net();
         let handle = net.handle();
@@ -193,8 +197,12 @@ fn a_name_above_a_site_can_get_a_site_later() {
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
             match host {
-                "www.shop.test" => Some(web::Site::new(Plain("www"))),
-                "shop.test" if opened.load(Ordering::SeqCst) => Some(web::Site::new(Plain("shop"))),
+                "www.shop.test" => Some(web::SiteConfig::handler(fictionet_extras::httpd::tower(
+                    Plain("www"),
+                ))),
+                "shop.test" if opened.load(Ordering::SeqCst) => Some(web::SiteConfig::handler(
+                    fictionet_extras::httpd::tower(Plain("shop")),
+                )),
                 _ => None,
             }
         })
@@ -231,7 +239,8 @@ fn a_declared_name_below_a_site_leaves_the_site_to_the_callback() {
         let record = asked.clone();
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
-            (host == "shop.test").then(|| web::Site::new(Plain("shop")))
+            (host == "shop.test")
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("shop"))))
         })
         .into_net()
         .host("api", |h| h.dns_name("api.shop.test"));
@@ -260,7 +269,8 @@ fn the_callback_decides_names_under_home_arpa() {
         let record = asked.clone();
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), move |host| {
             record.lock().unwrap().push(host.to_owned());
-            (host == "nas.home.arpa").then(|| web::Site::new(Plain("nas")))
+            (host == "nas.home.arpa")
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("nas"))))
         })
         .into_net();
         let (attacher, attachments) = fictionet::attachments();
@@ -282,7 +292,8 @@ fn a_sites_world_sees_its_gateways_dns_events() {
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let log = seen.clone();
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
-            (host == "a.test").then(|| web::Site::new(Plain("a")))
+            (host == "a.test")
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("a"))))
         })
         .on_dns_event(move |event| {
             let entry = match event {
@@ -327,7 +338,8 @@ fn a_sites_world_sees_its_gateways_dns_events() {
 fn the_gateway_answers_pings_and_counts_toward_the_peer_limit() {
     run_world::world(Duration::from_secs(60), |fcx| async move {
         let net = web::Sites::new(fictionet_extras::network::cdn_pools(), |host| {
-            (host == "a.test").then(|| web::Site::new(Plain("a")))
+            (host == "a.test")
+                .then(|| web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("a"))))
         })
         .into_net()
         .limits(Limits {

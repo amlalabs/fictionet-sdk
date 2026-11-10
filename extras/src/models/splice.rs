@@ -329,7 +329,7 @@ pub(super) async fn serve(
         });
         Ok(Response::builder()
             .header("content-type", "text/event-stream")
-            .body(Body::new(Channel(rx)))?)
+            .body(crate::httpd::from_http(Channel(rx)))?)
     } else {
         if let Some(refused) = run(model, engine, parts, body, tools, response, &mut output).await?
         {
@@ -355,8 +355,7 @@ async fn failed(refused: Response<Body>, output: &mut Output) -> fictionet::Resu
         529 => "overloaded_error",
         _ => "api_error",
     };
-    let bytes = refused
-        .into_body()
+    let bytes = crate::httpd::HttpBody(refused.into_body())
         .collect()
         .await
         .map(|body| body.to_bytes())
@@ -410,7 +409,10 @@ async fn read(
         stop: Value::Null,
     };
     if !streaming {
-        let bytes = response.into_body().collect().await?.to_bytes();
+        let bytes = crate::httpd::HttpBody(response.into_body())
+            .collect()
+            .await?
+            .to_bytes();
         let message: Value = serde_json::from_slice(&bytes)?;
         if output.message.is_null() {
             output.message = message.clone();
@@ -427,7 +429,7 @@ async fn read(
         return Ok(turn);
     }
     let mut decoder = transport::events();
-    let mut body = response.into_body();
+    let mut body = crate::httpd::HttpBody(response.into_body());
     let mut inputs: std::collections::HashMap<usize, String> = Default::default();
     while let Some(frame) = body.frame().await {
         let frame = frame?;

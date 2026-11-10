@@ -463,7 +463,7 @@ fn dechunk(bytes: &[u8]) -> io::Result<Vec<u8>> {
     let mut stream = Stream::new(BodyEvents::new(Framing::Chunked).skip_chunk_extras());
     let mut body = Vec::new();
     let mut done = false;
-    let mut on = |event| match event {
+    let mut on = |event: Event<_>| match event {
         Event::Body(data) => body.extend_from_slice(&data),
         Event::Done => done = true,
         Event::Head(never) => match never {},

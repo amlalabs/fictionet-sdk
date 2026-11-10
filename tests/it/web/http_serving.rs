@@ -125,7 +125,9 @@ fn dates_come_from_the_world() {
                     .fallback(|| async { "hello" });
                 let mut sites =
                     web::Sites::new(fictionet_extras::network::cdn_pools(), move |name: &str| {
-                        (name == "dated.test").then(|| web::Site::new(site.clone()))
+                        (name == "dated.test").then(|| {
+                            web::SiteConfig::handler(fictionet_extras::httpd::tower(site.clone()))
+                        })
                     });
                 if let Some(date) = date {
                     sites = sites.date(date);
@@ -189,7 +191,7 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
         let m = default_machine(&fcx, &attacher);
         assert_eq!(lookup(&fcx, &m, "both.test").await, BOTH_ADDR);
 
-        // Port 80: the handler answers, with an http Target, over HTTP/1.1
+        // Port 80: the handler answers, with an http Site, over HTTP/1.1
         // and HTTP/2 with prior knowledge. No redirect.
         for h2 in [false, true] {
             let mut client = plain_client(&fcx, &m, BOTH_ADDR, h2).await;
@@ -337,41 +339,55 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
         let vhosts = VirtualHosts::new();
         vhosts.insert(
             "127.0.0.1",
-            VHost::new(httpd::tower(web::proxy(
+            VHost::new(web::proxy(
                 &fcx,
                 std::sync::Arc::new(fictionet_host::Client::new()),
-            )?)),
+            )?),
         );
         let conn = fictionet::stdlib::network::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
         let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
-        let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
-        let reply = vhosts.call(
-            Request::builder()
-                .method("POST")
-                .uri("https://127.0.0.1:443/path?q=1")
-                .version(http::Version::HTTP_2)
-                .header("host", "different.test")
-                .header("connection", "x-private")
-                .header("connection", "x-other, upgrade")
-                .header("x-private", "secret")
-                .header("x-other", "secret")
-                .header("upgrade", "websocket")
-                .header("proxy-authorization", "Basic secret")
-                .header("x-public", "kept")
-                .body(web::Body::from("hello"))
-                .unwrap(),
-            &mut ex,
+        let mut ex = httpd::Exchange::new(
+            fictionet::time::Instant::ZERO,
+            &entropy,
+            &conn,
+            fictionet::stdlib::web::httpd::Responses::new(&fictionet::Budget::unlimited()),
         );
+        let request = web::Request {
+            head: web::Head::new(
+                "POST",
+                "https://127.0.0.1:443/path?q=1",
+                fictionet::stdlib::protocols::http1::Version::Http2,
+                [
+                    ("host", "127.0.0.1"),
+                    ("connection", "x-private"),
+                    ("connection", "x-other, upgrade"),
+                    ("x-private", "secret"),
+                    ("x-other", "secret"),
+                    ("upgrade", "websocket"),
+                    ("proxy-authorization", "Basic secret"),
+                    ("x-public", "kept"),
+                ],
+            ),
+            body: web::Body::from("hello"),
+            site: web::Site::connection(&conn),
+        };
+        let reply = vhosts.call(request, &mut ex);
         let httpd::Reply::Later(work) = reply else {
             panic!("the proxy dispatches upstream");
         };
         let response = work(fcx.clone()).await?;
-        assert_eq!(response.status(), 201);
-        assert_eq!(response.headers()["x-public"], "kept");
+        assert_eq!(response.status, 201);
+        assert_eq!(response.fields.get(b"x-public"), Some(b"kept".as_slice()));
         for name in ["connection", "x-private", "x-other", "upgrade"] {
-            assert!(!response.headers().contains_key(name));
+            assert!(response.fields.get(name.as_bytes()).is_none());
         }
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "world");
+        assert_eq!(
+            fictionet_extras::httpd::HttpBody(response.body)
+                .collect()
+                .await?
+                .to_bytes(),
+            "world"
+        );
         let request = server.await.unwrap().to_ascii_lowercase();
         assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
         assert!(request.contains(&format!("host: {address}\r\n")));
@@ -394,7 +410,7 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
             let (attacher, attachments) = fictionet::attachments();
             let upstream = web::proxy(&fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |h| {
-                (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
+                (h == "nowhere.invalid").then(|| web::SiteConfig::handler(upstream.clone()))
             })
             .start(&fcx, attachments)?;
             let m = default_machine(&fcx, &attacher);
@@ -413,7 +429,7 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
 
 /// The proxy site wrapped so that whatever it forwards goes to a test-owned
 /// server on 127.0.0.1 instead of the real network: it points the request
-/// `Target` at that server and keeps its routing as `Sites` set it.
+/// `Site` at that server and keeps its routing as `Sites` set it.
 #[cfg(feature = "web-proxy")]
 #[derive(Clone)]
 struct ToTestUpstream {
@@ -422,23 +438,15 @@ struct ToTestUpstream {
 }
 
 #[cfg(feature = "web-proxy")]
-impl tower_service::Service<Request<web::Body>> for ToTestUpstream {
-    type Response = <web::Proxy as tower_service::Service<Request<web::Body>>>::Response;
-    type Error = fictionet::Error;
-    type Future = <web::Proxy as tower_service::Service<Request<web::Body>>>::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), fictionet::Error>> {
-        self.proxy.poll_ready(cx)
-    }
-
-    fn call(&mut self, mut request: Request<web::Body>) -> Self::Future {
-        let target = request
-            .extensions_mut()
-            .get_mut::<web::Target>()
-            .expect("Sites sets a Target");
-        target.host = "127.0.0.1".to_owned();
-        target.port = self.port;
-        self.proxy.call(request)
+impl web::httpd::Handler for ToTestUpstream {
+    fn call(
+        &self,
+        mut request: web::Request,
+        ex: &mut web::httpd::Exchange<'_>,
+    ) -> web::httpd::Reply {
+        request.site.name = "127.0.0.1".into();
+        request.site.port = self.port;
+        self.proxy.call(request, ex)
     }
 }
 
@@ -482,7 +490,7 @@ async fn the_proxy_refuses_hosts_routed_by_default_host() {
             let proxy = web::proxy(&fcx, std::sync::Arc::new(fictionet_host::Client::new()))?;
             web::Sites::new(fictionet_extras::network::cdn_pools(), move |h| {
                 (h == "allowed.test").then(|| {
-                    web::Site::new(ToTestUpstream {
+                    web::SiteConfig::handler(ToTestUpstream {
                         proxy: proxy.clone(),
                         port,
                     })
@@ -601,7 +609,7 @@ async fn websockets_work_through_sites() {
         run(fictionet::Seed::random(), |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(fictionet_extras::network::cdn_pools(), |h| {
-                (h == "ws.test").then(|| web::Site::handler(echo_socket()))
+                (h == "ws.test").then(|| web::SiteConfig::handler(echo_socket()))
             })
             .start(&fcx, attachments)?;
             let m = default_machine(&fcx, &attacher);
@@ -1047,7 +1055,7 @@ fn eager_sites_send_the_world_date_without_a_lookup() {
                         }),
                     )
                     .fallback(|| async { "hello" });
-                let mut site = web::Site::new(site);
+                let mut site = web::SiteConfig::handler(fictionet_extras::httpd::tower(site));
                 if let Some(date) = date {
                     site = site.date(date);
                 }
@@ -1087,8 +1095,11 @@ async fn forwarding_bypasses_a_world_host_at_the_upstream_address() {
             web::Sites::new(
                 fictionet_extras::network::cdn_pools(),
                 move |name| match name {
-                    "world.test" => Some(web::Site::new(Plain("world")).at(address)),
-                    "forward.test" => Some(web::Site::new(forward.clone())),
+                    "world.test" => Some(
+                        web::SiteConfig::handler(fictionet_extras::httpd::tower(Plain("world")))
+                            .at(address),
+                    ),
+                    "forward.test" => Some(web::SiteConfig::handler(forward.clone())),
                     _ => None,
                 },
             )

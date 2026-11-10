@@ -1,3 +1,4 @@
+use crate::stdlib::web::Response;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
@@ -7,35 +8,36 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::SystemTime;
 
+#[cfg(test)]
 use bytes::Bytes;
-use http::header::HOST;
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Version};
-use http_body::{Body as _, Frame};
+use http::{HeaderValue, StatusCode, Version};
 
-use fictionet::stdlib::codec::{Fail, Stream, base64};
+use fictionet::stdlib::codec::{Fail, base64};
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, CommandOf, Env, Handoff, Handover,
-    Layer, Owned, OwnedWork, Side, StreamCommand, StreamEvent, Successor, Switch, Timers, Top,
-    WorkOwner,
+    Layer, OwnedWork, Side, StreamCommand, StreamEvent, Successor, Switch, Timers, Top, WorkOwner,
 };
 use fictionet::stdlib::network::ConnInfo;
-use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError, RequestHead};
+use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError};
 use fictionet::stdlib::protocols::http2::{DEFAULT_FRAME_SIZE, MAX_WINDOW, Setting};
 use fictionet::stdlib::services::stack::{Job, Tunnel};
+use fictionet::stdlib::web::Head;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
-use super::body::Inner;
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
-use super::response::{Asked, Dates, ResponsePolicy, head_held, request_held, response_held};
+use super::response::{Asked, Dates, ResponsePolicy, response_held};
 use super::sites::no_host;
 use super::{
     Body, Delivery, Exchange, Handler, Later, Limits, PIECE, Received, Reply, Reset, UpgradeHandler,
 };
+use crate::stdlib::web::{Request, Site};
 
 // ---------------------------------------------------------------------------
 // HTTP/1 as a layer
+
+const HEADROOM: usize = 64;
 
 /// HTTP/1 request deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,10 +138,11 @@ enum Phase {
 /// so delivery is counted in written pieces.
 ///
 /// Input storage, decoded heads, owned bodies and wire output are reserved
-/// before allocation. Application-provided body bytes are copied into
-/// reserved storage so an opaque slice cannot retain a larger allocation.
-/// Handler and body-stream internals, opaque HTTP metadata allocations and
-/// extension values remain outside this byte accounting. Past the budget
+/// before allocation. Full bodies carry their backing's reservation;
+/// admission transfers it, copying only when shared storage needs a new
+/// payer. Opaque HTTP body frames are copied into reserved storage.
+/// Handler and body-stream internals and world-owned facts remain outside
+/// this byte accounting. Past the budget
 /// the connection closes with nothing more written.
 ///
 /// A response that hands the connection on with an [`UpgradeHandler`] (a
@@ -153,16 +156,17 @@ pub struct Http1 {
     /// `Date` headers, from the world's date at the start of the run.
     pub(super) dates: Dates,
     conn: ConnInfo,
+    site: Site,
     /// Whether `Upgrade: h2c` hands the connection to HTTP/2.
     h2c: bool,
     pub(super) first_head_deadline: Option<Instant>,
-    stream: Stream<http1::RequestEvents>,
+    stream: http1::RequestStream,
     /// Bytes past the end of HTTP, kept for what comes next.
     after: ChargedBytes,
     phase: Phase,
     timers: Timers<Timer>,
-    head: Option<Owned<RequestHead>>,
-    body: ChargedBytes,
+    head: Option<Head>,
+    body: Chunk,
     too_big: bool,
     responding: Option<Responding>,
     out: VecDeque<StreamCommand>,
@@ -180,8 +184,7 @@ pub struct Http1 {
     /// What the successor gets, once HTTP is over.
     leftover: Vec<StreamEvent>,
     charge: Option<Charge>,
-    /// One body-result allowance, transferred through Work and Done while polling.
-    frame_charge: Option<Charge>,
+    output_pools: Option<(fictionet::Pool, fictionet::Pool)>,
 }
 
 impl Http1 {
@@ -198,16 +201,17 @@ impl Http1 {
             opts,
             dates: Dates::new(None),
             conn: ConnInfo::default(),
+            site: Site::connection(&ConnInfo::default()),
             h2c: false,
             first_head_deadline: None,
-            stream: Stream::new(http1::RequestEvents::with_limits(opts.head)),
+            stream: http1::RequestStream::new(http1::RequestEvents::with_limits(opts.head)),
             after: ChargedBytes::new(&Budget::unlimited()),
             charge: None,
-            frame_charge: None,
+            output_pools: None,
             phase: Phase::Opening,
             timers: Timers::new(),
             head: None,
-            body: ChargedBytes::new(&Budget::unlimited()),
+            body: Chunk::default(),
             too_big: false,
             responding: None,
             out: VecDeque::new(),
@@ -237,9 +241,9 @@ impl Http1 {
         self
     }
 
-    /// Says which connection this is: handlers find it in each request's
-    /// extensions and in their [`Exchange`].
+    /// Sets the trusted connection metadata, borrowed through [`Exchange`].
     pub fn conn(mut self, conn: ConnInfo) -> Self {
+        self.site = Site::connection(&conn);
         self.conn = conn;
         self
     }
@@ -262,7 +266,7 @@ impl Http1 {
     }
 
     /// HTTP/2 for this connection after `Upgrade: h2c`.
-    fn http2(&self, settings: &[Setting], request: Request<Body>) -> Http2Server {
+    fn http2(&self, settings: &[Setting], request: Request) -> Option<Http2Server> {
         Responder::shared(self.handler.clone())
             .limits(self.opts)
             .maybe_observe(self.observe.clone())
@@ -271,46 +275,29 @@ impl Http1 {
             .upgraded(settings, request)
     }
 
-    /// Parsing copies head strings and grows a header vector geometrically.
-    /// A rejected head is boxed, cloned by Stream and copied for dispatch,
-    /// so reserve all three heads. Body events copy one configured block.
-    fn decode_reservation(&self) -> usize {
-        let head = self
-            .opts
-            .head
-            .head
-            .saturating_add(
-                self.opts
-                    .head
-                    .headers
-                    .saturating_mul(2)
-                    .max(4)
-                    .saturating_mul(size_of::<http1::Header>()),
-            )
-            .saturating_add(size_of::<http1::RejectedRequest>());
-        head.saturating_mul(3).max(self.opts.head.body_chunk)
-    }
-
     /// Takes the first charge and starts waiting for the first head.
     fn open(&mut self, env: &mut Env<'_, Report>) {
         self.phase = Phase::Reading;
-        // The decoder's bounded input and temporary heads are paid once.
-        // Retained bodies, heads and output own their reservations separately.
-        let bytes = self
-            .stream
-            .limit()
-            .saturating_mul(2)
-            .saturating_add(self.decode_reservation())
-            .saturating_add(self.dates.held())
-            .saturating_add(PIECE);
-        match env.budget().charge(bytes) {
-            Some(mut charge) => {
-                self.frame_charge = charge.split(PIECE);
-                self.charge = Some(charge);
-            }
-            None => return self.over_budget(env),
-        }
-        self.body = ChargedBytes::new(env.budget());
+        // Input, heads and bodies carry their own backing reservations.
+        // Only the rejected-request record and date state need separate room.
+        let bytes = size_of::<http1::RejectedRequest>().saturating_add(self.dates.held());
+        let Some(charge) = env.budget().charge(bytes) else {
+            return self.over_budget(env);
+        };
+        self.charge = Some(charge);
+        let small = fictionet::Pool::new(env.budget(), 2048, 4);
+        let large = fictionet::Pool::new(env.budget(), 16384 + HEADROOM, 2);
+        // Reserve the reusable small head at open, so its cache is part of
+        // the connection's idle storage rather than an outstanding response.
+        let Some(head) = small.take(env.budget(), HEADROOM) else {
+            return self.over_budget(env);
+        };
+        drop(head);
+        self.stream
+            .decoder()
+            .storage(env.budget().clone(), small.clone(), large.clone());
+        self.output_pools = Some((small, large));
+        self.body = Chunk::default();
         self.after = ChargedBytes::new(env.budget());
         let at = self
             .first_head_deadline
@@ -320,9 +307,10 @@ impl Http1 {
     }
 
     /// Queues bytes whose allocation was reserved before encoding.
-    fn push_out(&mut self, bytes: ChargedBytes) {
+    fn push_out(&mut self, bytes: impl Into<Chunk>) {
+        let bytes = bytes.into();
         self.queued += bytes.len() as u64;
-        self.out.push_back(StreamCommand::Write(Chunk::from(bytes)));
+        self.out.push_back(StreamCommand::Write(bytes));
     }
 
     /// Whether everything queued has been handed below and written.
@@ -338,8 +326,7 @@ impl Http1 {
         env.report(Report::Closing(why));
         self.timers = Timers::new();
         self.head = None;
-        self.body.clear();
-        self.body.trim();
+        self.body = Chunk::default();
         self.responding = None;
         self.work = None;
         self.work_owner.cancel();
@@ -384,13 +371,8 @@ impl Http1 {
                     };
                     self.push_out(out);
                 }
-                let Some(charge) = env.budget().charge(head_held(&head)) else {
-                    self.over_budget(env);
-                    return true;
-                };
-                self.head = Some(Owned::new(head, charge));
-                self.body.clear();
-                self.body.trim();
+                self.head = Some(head);
+                self.body = Chunk::default();
                 self.too_big = false;
                 true
             }
@@ -400,21 +382,13 @@ impl Http1 {
                     self.too_big = true;
                     return true;
                 }
-                if need > self.body.capacity() {
-                    // Grow as a vector does, charging the whole growth first.
-                    let cap = need.max(self.body.capacity() * 2).min(self.opts.body);
-                    if !self.body.grow_to(cap) {
-                        self.over_budget(env);
-                        return true;
-                    }
+                if !self.append_body(bytes, env.budget()) {
+                    self.over_budget(env);
                 }
-                self.body
-                    .extend_within(&bytes)
-                    .expect("body growth reserved room");
                 true
             }
             Some(Ok(H1::Done)) => {
-                let bytes = self.take_body(env.budget());
+                let bytes = self.take_body();
                 let body = Body::from(bytes);
                 let close = self.too_big;
                 self.dispatch(env, body, close, Closing::Done);
@@ -429,9 +403,32 @@ impl Http1 {
 
     /// Move the body's reservation into its shared backing storage. Handler
     /// clones and streams may outlive both this layer and its current job.
-    fn take_body(&mut self, budget: &Budget) -> Bytes {
-        let bytes = std::mem::replace(&mut self.body, ChargedBytes::new(budget));
-        Bytes::from(bytes)
+    fn take_body(&mut self) -> Chunk {
+        std::mem::take(&mut self.body)
+    }
+
+    fn append_body(&mut self, bytes: Chunk, budget: &Budget) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        if self.body.is_empty() {
+            self.body = bytes;
+            return self.body.repay(budget);
+        }
+        if self.body.extend_within(&bytes).is_ok() {
+            return true;
+        }
+        let need = self.body.len() + bytes.len();
+        let capacity = need
+            .max(self.body.len().saturating_mul(2))
+            .min(self.opts.body);
+        let Some(mut joined) = ChargedBytes::with_capacity(budget, capacity) else {
+            return false;
+        };
+        joined.extend_within(&self.body).expect("reserved body");
+        joined.extend_within(&bytes).expect("reserved body");
+        self.body = joined.into();
+        true
     }
 
     /// Answers the request whose head is pending, with `body`. `close`
@@ -442,23 +439,18 @@ impl Http1 {
         };
         let version = version_of(&head);
         let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method() != "CONNECT";
-        let Some(mut request) = to_request(&head, version, body) else {
-            let date = self.dates.at(env.now());
-            let Some(out) = simple_output(env, version, StatusCode::BAD_REQUEST, date) else {
-                return self.over_budget(env);
-            };
-            self.push_out(out);
-            return self.close(env, Closing::Failed);
+        let request = Request {
+            head,
+            body,
+            site: self.site.clone(),
         };
-        request.extensions_mut().insert(self.conn.clone());
-
-        let wants = Asked::of(request.method());
-        let held = request_held(&request);
+        let wants = Asked::of(request.head.method());
+        let held = request.head.held();
         let now = env.now();
         // RFC 9112 section 3.2: an HTTP/1.1 request without Host gets 400
         // from the service, unless its body is too large. The decoder
         // refuses such a head, so only a failure brings one here.
-        let lacks_host = version == Version::HTTP_11 && !request.headers().contains_key(HOST);
+        let lacks_host = version == Version::HTTP_11 && request.head.field(b"host").is_none();
         let received = if self.too_big {
             Received::TooLarge
         } else if close {
@@ -480,51 +472,55 @@ impl Http1 {
         let h2c = (self.h2c && keep_alive && !self.too_big && !lacks_host)
             .then(|| h2c_settings(&request))
             .flatten();
+        let responses = super::Responses::pooled(
+            env.budget(),
+            self.output_pools.as_ref().expect("open pools").0.clone(),
+        );
         let reply = if self.too_big {
             Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
         } else if lacks_host {
-            Reply::Now(no_host())
-        } else if request.headers().contains_key(http::header::UPGRADE)
-            && matches!(&request.body().0, Inner::Stream(_))
+            Reply::Now(no_host(&responses))
+        } else if request.head.field(b"upgrade").is_some()
+            && matches!(&request.body, Body::Stream(_))
         {
             Reply::Now(status_only(StatusCode::BAD_REQUEST))
         } else if let Some(settings) = h2c {
             // The request is HTTP/2's stream 1, observed there: the 101
             // is not its answer.
-            delivery = None;
-            self.next = Some(Next::H2c(Box::new(self.http2(&settings, request))));
-            let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
-            switching
-                .headers_mut()
-                .insert(http::header::UPGRADE, HeaderValue::from_static("h2c"));
-            Reply::Now(switching)
+            if let Some(server) = self.http2(&settings, request) {
+                delivery = None;
+                self.next = Some(Next::H2c(Box::new(server)));
+                let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
+                switching.fields = crate::stdlib::web::Fields::new([("upgrade", b"h2c")]);
+                Reply::Now(switching)
+            } else {
+                Reply::Now(status_only(StatusCode::BAD_REQUEST))
+            }
         } else {
-            self.handler
-                .call(request, &mut Exchange::new(now, env.entropy(), &self.conn))
+            self.handler.call(
+                request,
+                &mut Exchange::new(now, env.entropy(), &self.conn, responses),
+            )
         };
-        let (stage, body_charge) = match reply {
+        let stage = match reply {
             Reply::Now(mut response) => {
-                let Some(charge) = normalize_body(response.body_mut(), env.budget()) else {
+                if !response.fields.admit(env.budget()) || !response.body.admit(env.budget()) {
                     return self.over_budget(env);
-                };
-                (Stage::Made(response), charge)
+                }
+                Stage::Made(response)
             }
             Reply::Later(later) => {
-                let Some(charge) = env.budget().charge(held) else {
-                    return self.over_budget(env);
-                };
                 self.generation += 1;
                 self.work = Some(Work {
                     generation: self.generation,
                     lease: self.work_owner.own(()),
-                    charge: Some(charge),
                     budget: env.budget().clone(),
                     op: Op::Make {
                         later: Some(later),
                         making: None,
                     },
                 });
-                (Stage::Making, None)
+                Stage::Making
             }
         };
         self.timers.cancel(&Timer::Body);
@@ -535,9 +531,8 @@ impl Http1 {
             close: !keep_alive || lacks_host,
             then,
             chunked: false,
-            body_charge,
             stage,
-            rest: Bytes::new(),
+            rest: Chunk::default(),
             base: self.queued,
         });
         self.phase = Phase::Answering;
@@ -545,6 +540,9 @@ impl Http1 {
 
     /// The request bytes failed to decode with `fail`.
     fn fail(&mut self, env: &mut Env<'_, Report>, fail: Fail<RequestError>) {
+        if matches!(&fail, Fail::Protocol(error) if error.reason() == http1::Error::Budget) {
+            return self.over_budget(env);
+        }
         if self.head.is_some() {
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error. Of the unread bytes, only body
@@ -553,14 +551,10 @@ impl Http1 {
             let buffered = self.stream.unread().len();
             let pending = self.stream.decoder().pending_body_len(buffered);
             let added = pending.min(room);
-            let need = self.body.len().saturating_add(added);
-            if !self.body.grow_to(need) {
+            if !self.append_body(self.stream.pending(added), env.budget()) {
                 return self.over_budget(env);
             }
-            self.body
-                .extend_within(&self.stream.unread()[..added])
-                .expect("body growth reserved room");
-            let bytes = self.take_body(env.budget());
+            let bytes = self.take_body();
             let body = partial(bytes, "the request body was cut off");
             self.dispatch(env, body, true, Closing::Failed);
             env.report(Report::Failed(fail));
@@ -572,10 +566,7 @@ impl Http1 {
             && rejected.head.header("host").is_none()
         {
             self.too_big = rejected.received_body_bytes > self.opts.body;
-            let Some(charge) = env.budget().charge(head_held(&rejected.head)) else {
-                return self.over_budget(env);
-            };
-            self.head = Some(Owned::new(rejected.head.clone(), charge));
+            self.head = Some(rejected.head.clone());
             self.dispatch(env, Body::empty(), true, Closing::Failed);
             env.report(Report::Failed(fail));
             return;
@@ -621,6 +612,11 @@ impl Http1 {
             body if !r.rest.is_empty() => {
                 r.stage = body;
                 let piece = r.take_piece();
+                if !r.chunked {
+                    let body_len = piece.len();
+                    self.piece(env, r, piece, body_len);
+                    return true;
+                }
                 let framed = ChargedBytes::with_capacity(
                     env.budget(),
                     piece.len() + 2 * size_of::<usize>() + 4,
@@ -639,16 +635,14 @@ impl Http1 {
                 };
                 let body_len = piece.len();
                 drop(piece);
-                self.piece(env, r, out, body_len);
+                self.piece(env, r, out.into(), body_len);
                 true
             }
             Stage::Body(Some(body)) => {
-                let charge = self.frame_charge.take().expect("one body frame at a time");
                 self.generation += 1;
                 self.work = Some(Work {
                     generation: self.generation,
                     lease: self.work_owner.own(()),
-                    charge: Some(charge),
                     budget: env.budget().clone(),
                     op: Op::Frame(Some(body)),
                 });
@@ -663,7 +657,7 @@ impl Http1 {
                     self.over_budget(env);
                     return true;
                 };
-                self.piece(env, r, out, 0);
+                self.piece(env, r, out.into(), 0);
                 true
             }
             Stage::Body(None) => {
@@ -675,8 +669,9 @@ impl Http1 {
 
     /// Writes the head of `response`, with the first piece of a body held
     /// in full.
-    fn start(&mut self, env: &mut Env<'_, Report>, mut r: Responding, response: Response<Body>) {
-        let (parts, body) = response.into_parts();
+    fn start(&mut self, env: &mut Env<'_, Report>, mut r: Responding, response: Response) {
+        let mut parts = response;
+        let body = std::mem::take(&mut parts.body);
         if let Some((delivery, charge)) = &mut r.delivery {
             // The copy of the response head is paid for before it is made.
             let need = charge.bytes().saturating_add(response_held(&parts));
@@ -690,7 +685,7 @@ impl Http1 {
         if matches!(self.next, Some(Next::H2c(_))) {
             // The service's own 101 to `Upgrade: h2c`.
             r.close = false;
-        } else if hands_on && let Some(handler) = parts.extensions.get::<UpgradeHandler>() {
+        } else if hands_on && let Some(handler) = parts.upgrade.as_ref() {
             self.next = Some(if parts.status == StatusCode::SWITCHING_PROTOCOLS {
                 Next::Upgrade(handler.clone())
             } else {
@@ -702,77 +697,55 @@ impl Http1 {
             // with nothing to take it over, the connection closes.
             r.close = true;
         }
-        let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), r.wants, || {
+        let policy = ResponsePolicy::new(&parts, body.remaining(), r.wants, || {
             self.dates.at(env.now())
         });
-        // Room for the head and the first piece of a body held in full: a
-        // streamed body has nothing to go with the head yet.
-        let first = body.full_len().min(PIECE);
-        let Some(bound) = head_bound(&parts, &policy)
-            .and_then(|n| n.checked_add(first + 2 * size_of::<usize>() + 4))
-        else {
+        let Some(bound) = head_bound(&parts, &policy) else {
             return self.over_budget(env);
         };
-        let Some(mut head) = ChargedBytes::with_capacity(env.budget(), bound) else {
+        let (small, large) = self.output_pools.as_ref().expect("opened connection");
+        let head = if bound <= small.slot() - HEADROOM {
+            small.take(env.budget(), HEADROOM)
+        } else if bound <= large.slot() - HEADROOM {
+            large.take(env.budget(), HEADROOM)
+        } else {
+            bound.checked_add(HEADROOM).and_then(|size| {
+                fictionet::Pool::new(env.budget(), size, 0).take(env.budget(), HEADROOM)
+            })
+        };
+        let Some(mut head) = head else {
             return self.over_budget(env);
         };
-        let close = r.close;
-        match head.fill(|head| Ok::<_, Infallible>(encode(head, r.version, &parts, &policy, close)))
-        {
-            Ok(close) => r.close = close,
-            Err(_) => return self.over_budget(env),
+        let mut encoded = None;
+        head.fill(|room| {
+            let length = room.len();
+            let mut out = room;
+            encoded = Some(encode(&mut out, r.version, &parts, &policy, r.close));
+            length - out.len()
+        });
+        match encoded {
+            Some(Ok(close)) => r.close = close,
+            _ => return self.over_budget(env),
         }
         r.chunked = !policy.bodiless && policy.len.is_none() && r.version != Version::HTTP_10;
-        if policy.bodiless {
-            return self.piece(env, r, head, 0);
-        }
-        // A body held in full goes out with the head, a piece at a time.
-        match body.0 {
-            Inner::Full(bytes) => {
-                r.rest = bytes.unwrap_or_default();
+        let mut body_len = 0;
+        if !policy.bodiless {
+            match body {
+                Body::Full(bytes) if bytes.len() <= head.room() => {
+                    body_len = bytes.len();
+                    head.extend_within(&bytes).expect("body fits head block");
+                }
+                Body::Full(bytes) => r.rest = bytes,
+                stream => r.stage = Stage::Body(Some(stream)),
             }
-            stream => r.stage = Stage::Body(Some(Body(stream))),
         }
-        // A streamed body has nothing held yet, and an empty chunk would
-        // end it before it starts.
-        let piece = r.take_piece();
-        let framed = piece.is_empty()
-            || head
-                .fill(|head| {
-                    r.frame(&piece, head);
-                    Ok::<_, Infallible>(())
-                })
-                .is_ok();
-        if !framed {
-            return self.over_budget(env);
-        }
-        let body_len = piece.len();
-        drop(piece);
         self.piece(env, r, head, body_len)
     }
 
     /// Queues `bytes` of the response, of which `body` are body bytes.
-    fn piece(
-        &mut self,
-        _env: &mut Env<'_, Report>,
-        mut r: Responding,
-        bytes: ChargedBytes,
-        body: usize,
-    ) {
+    fn piece(&mut self, _env: &mut Env<'_, Report>, mut r: Responding, bytes: Chunk, body: usize) {
         if let Some((delivery, _)) = &mut r.delivery {
             delivery.piece(bytes.len(), body);
-        }
-        if r.rest.is_empty() {
-            if self.frame_charge.is_none() {
-                self.frame_charge = r.body_charge.take();
-                // A body frame's room: what it needs past this is charged
-                // before its bytes are copied (`Op::Frame`).
-                if let Some(charge) = &mut self.frame_charge {
-                    charge.shrink_to(PIECE);
-                }
-            } else {
-                r.body_charge = None;
-            }
         }
         self.responding = Some(r);
         self.push_out(bytes);
@@ -830,18 +803,18 @@ struct Responding {
     then: Closing,
     chunked: bool,
     stage: Stage,
-    /// Body bytes not yet written, covered by `body_charge` until the last piece.
-    rest: Bytes,
+    /// Body bytes not yet written. Full bodies carry their own reservation;
+    /// every body piece carries its backing reservation.
+    rest: Chunk,
     /// Where the response starts among the bytes queued.
     base: u64,
-    body_charge: Option<Charge>,
 }
 
 enum Stage {
     /// A handler's work is making the response.
     Making,
     /// The response, to start.
-    Made(Response<Body>),
+    Made(Response),
     /// The head is out; the body's next frames, if it streams.
     Body(Option<Body>),
     /// The next frame is being polled.
@@ -849,10 +822,10 @@ enum Stage {
 }
 
 impl Responding {
-    fn take_piece(&mut self) -> Bytes {
+    fn take_piece(&mut self) -> Chunk {
         let piece = self.rest.split_to(self.rest.len().min(PIECE));
         if self.rest.is_empty() {
-            self.rest = Bytes::new();
+            self.rest = Chunk::default();
         }
         piece
     }
@@ -881,8 +854,9 @@ impl Layer for Http1 {
     fn report_bytes(report: &Report) -> Option<usize> {
         match report {
             Report::Work(_) => None,
-            Report::Failed(Fail::Protocol(RequestError::Rejected(request))) => {
-                Some(size_of::<http1::RejectedRequest>() + head_held(&request.head))
+            Report::Failed(Fail::Protocol(RequestError::Rejected(_))) => {
+                // The head backing carries its own reservation.
+                Some(size_of::<http1::RejectedRequest>())
             }
             Report::Failed(_) | Report::Closing(_) => Some(0),
         }
@@ -943,11 +917,10 @@ impl Layer for Http1 {
                         Admit::Partial(StreamEvent::Data(chunk))
                     });
                 }
-                let n = self.stream.push(&chunk);
+                let n = self.stream.push(&mut chunk);
                 Ok(if n == 0 {
                     Admit::Blocked(StreamEvent::Data(chunk))
-                } else if n < chunk.len() {
-                    chunk.advance(n);
+                } else if !chunk.is_empty() {
                     Admit::Partial(StreamEvent::Data(chunk))
                 } else {
                     Admit::Taken
@@ -1010,7 +983,6 @@ impl Layer for Http1 {
         };
         let failed = match done.answer {
             Answer::Made(Ok(response)) => {
-                r.body_charge = done.charge;
                 r.stage = Stage::Made(response);
                 None
             }
@@ -1018,36 +990,26 @@ impl Layer for Http1 {
             // unanswered.
             Answer::Made(Err(e)) if e.is::<Reset>() => Some(e),
             Answer::Made(Err(e)) => {
-                let Some((response, charge)) = error_output(&e, env.budget()) else {
+                let Some(response) = error_output(&e, env.budget()) else {
                     self.over_budget(env);
                     return Ok(());
                 };
-                r.body_charge = Some(charge);
                 r.stage = Stage::Made(response);
                 None
             }
             Answer::Frame(body, Some(Ok(frame))) => {
-                if let Ok(data) = frame.into_data()
-                    && !data.is_empty()
-                {
-                    r.rest = data;
-                    r.body_charge = done.charge;
-                } else {
-                    self.frame_charge = done.charge;
+                if !frame.is_empty() {
+                    r.rest = frame;
                 }
                 r.stage = Stage::Body(Some(body));
                 None
             }
             Answer::Frame(_, None) => {
-                self.frame_charge = done.charge;
                 r.stage = Stage::Body(None);
                 None
             }
             // The bytes so far may have broken the framing: close.
-            Answer::Frame(_, Some(Err(e))) => {
-                self.frame_charge = done.charge;
-                Some(e)
-            }
+            Answer::Frame(_, Some(Err(e))) => Some(e),
         };
         if let Some(e) = failed {
             env.report(Report::Work(e));
@@ -1113,7 +1075,7 @@ impl Handoff for Http1 {
 }
 
 /// A handler's answer on its way.
-type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
+type Making = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
 
 /// Work [`Http1`] asks the world to do for a response: make a handler's
 /// async answer, or poll a streamed body for its next frame.
@@ -1121,7 +1083,6 @@ pub struct Work {
     generation: u64,
     lease: OwnedWork<()>,
     op: Op,
-    charge: Option<Charge>,
     budget: Budget,
 }
 
@@ -1137,13 +1098,12 @@ enum Op {
 pub struct Done {
     generation: u64,
     answer: Answer,
-    charge: Option<Charge>,
 }
 
 enum Answer {
-    Made(Result<Response<Body>, Error>),
+    Made(Result<Response, Error>),
     /// The body back, with its next frame or its end.
-    Frame(Body, Option<Result<Frame<Bytes>, Error>>),
+    Frame(Body, Option<Result<Chunk, Error>>),
 }
 
 impl Job for Work {
@@ -1173,50 +1133,33 @@ impl Job for Work {
                 let made = made.and_then(|mut response| {
                     // A body all there now goes out with the head, without
                     // work of its own.
-                    response.body_mut().settle(cx);
-                    let charge =
-                        normalize_body(response.body_mut(), &self.budget).ok_or_else(|| {
-                            Error::msg("the response body exceeds the connection budget")
-                        })?;
-                    self.charge = charge;
+                    response.body.settle(cx, &self.budget)?;
+                    if !response.fields.admit(&self.budget) || !response.body.admit(&self.budget) {
+                        return Err(Error::msg(
+                            "the response body exceeds the connection budget",
+                        ));
+                    }
                     Ok(response)
                 });
                 Answer::Made(made)
             }
             Op::Frame(body) => {
                 let frame = match body {
-                    Some(body) => ready!(Pin::new(body).poll_frame(cx)),
+                    Some(body) => ready!(body.poll_next(cx)),
                     None => None,
                 };
                 let frame = frame.map(|frame| {
-                    frame.and_then(|frame| {
-                        let data = match frame.into_data() {
-                            Ok(data) => data,
-                            Err(_) => return Ok(Frame::data(Bytes::new())),
-                        };
-                        let want = PIECE.max(data.len());
-                        let fits = self.charge.as_mut().is_some_and(|charge| {
-                            if want < charge.bytes() {
-                                charge.shrink_to(want);
-                                true
-                            } else {
-                                charge.grow_to(want)
-                            }
-                        });
-                        if !fits {
+                    frame.and_then(|mut data| {
+                        if !data.repay(&self.budget) {
                             return Err(Error::msg("the body frame exceeds the connection budget"));
                         }
-                        Ok(Frame::data(Bytes::copy_from_slice(&data)))
+                        Ok(data)
                     })
                 });
                 Answer::Frame(body.take().unwrap_or_default(), frame)
             }
         };
-        Poll::Ready(Done {
-            generation,
-            charge: self.charge.take(),
-            answer,
-        })
+        Poll::Ready(Done { generation, answer })
     }
 }
 
@@ -1225,30 +1168,33 @@ impl Job for Work {
 /// `Connection` naming `Upgrade` and `HTTP2-Settings`, and one
 /// `HTTP2-Settings` whose base64url holds valid SETTINGS. `None` keeps the
 /// request on HTTP/1.
-fn h2c_settings(request: &Request<Body>) -> Option<Vec<Setting>> {
-    fn tokens<'a>(request: &'a Request<Body>, name: &str) -> impl Iterator<Item = &'a [u8]> {
+fn h2c_settings(request: &Request) -> Option<Vec<Setting>> {
+    fn tokens<'a>(request: &'a Request, name: &'a str) -> impl Iterator<Item = &'a [u8]> {
         request
-            .headers()
-            .get_all(name)
-            .iter()
-            .flat_map(|value| value.as_bytes().split(|b| *b == b','))
+            .head
+            .fields()
+            .filter(move |(key, _)| key.eq_ignore_ascii_case(name.as_bytes()))
+            .flat_map(|(_, value)| value.split(|b| *b == b','))
             .map(<[u8]>::trim_ascii)
     }
-    if request.version() != Version::HTTP_11
-        || !matches!(&request.body().0, Inner::Full(_))
+    if request.head.version() != http1::Version::Http11
+        || !matches!(&request.body, Body::Full(_))
         || !tokens(request, "upgrade").any(|t| t.eq_ignore_ascii_case(b"h2c"))
         || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"upgrade"))
         || !tokens(request, "connection").any(|t| t.eq_ignore_ascii_case(b"http2-settings"))
     {
         return None;
     }
-    let mut values = request.headers().get_all("http2-settings").iter();
+    let mut values = request
+        .head
+        .fields()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(b"http2-settings"))
+        .map(|(_, value)| value);
     let (Some(value), None) = (values.next(), values.next()) else {
         return None;
     };
     // base64url (RFC 4648 section 5), its padding left off.
     let standard: Vec<u8> = value
-        .as_bytes()
         .iter()
         .map(|b| match b {
             b'-' => b'+',
@@ -1278,48 +1224,33 @@ fn h2c_settings(request: &Request<Body>) -> Option<Vec<Setting>> {
 
 /// A request body that ends early: `bytes`, then an error saying `why`.
 /// A handler that reads it frame by frame sees what came.
-fn partial(bytes: Bytes, why: &'static str) -> Body {
-    struct Partial(Option<Bytes>, Option<&'static str>);
-    impl http_body::Body for Partial {
-        type Data = Bytes;
-        type Error = Error;
-        fn poll_frame(
+fn partial(bytes: Chunk, why: &'static str) -> Body {
+    struct Partial(Option<Chunk>, Option<&'static str>);
+    impl super::BodyStream for Partial {
+        fn poll_next(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        ) -> Poll<Option<Result<Chunk, Error>>> {
             let this = self.get_mut();
             if let Some(b) = this.0.take().filter(|b| !b.is_empty()) {
-                return Poll::Ready(Some(Ok(Frame::data(b))));
+                return Poll::Ready(Some(Ok(b)));
             }
-            Poll::Ready(this.1.take().map(|why| Err(fictionet::Error::msg(why))))
+            Poll::Ready(this.1.take().map(|why| Err(Error::msg(why))))
         }
     }
-    Body::new(Partial(Some(bytes), Some(why)))
+    Body::Stream(Box::pin(Partial(Some(bytes), Some(why))))
 }
 
-fn version_of(head: &RequestHead) -> Version {
+fn version_of(head: &Head) -> Version {
     match head.version() {
         http1::Version::Http10 => Version::HTTP_10,
         http1::Version::Http11 => Version::HTTP_11,
+        http1::Version::Http2 => Version::HTTP_2,
     }
-}
-
-fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Request<Body>> {
-    let mut builder = Request::builder()
-        .method(head.method().as_bytes())
-        .uri(head.target())
-        .version(version);
-    let headers = builder.headers_mut()?;
-    for h in head.headers() {
-        let name = HeaderName::from_bytes(h.name.as_bytes()).ok()?;
-        let value = HeaderValue::from_bytes(h.value).ok()?;
-        headers.append(name, value);
-    }
-    builder.body(body).ok()
 }
 
 /// Error bodies are constructed under the same reservation as normal output.
-fn error_output(error: &Error, budget: &Budget) -> Option<(Response<Body>, Charge)> {
+fn error_output(error: &Error, budget: &Budget) -> Option<Response> {
     let (status, prefix, message, suffix) = match error.downcast_ref::<super::BadGateway>() {
         Some(error) => (
             StatusCode::BAD_GATEWAY,
@@ -1342,33 +1273,21 @@ fn error_output(error: &Error, budget: &Budget) -> Option<(Response<Body>, Charg
     bytes.extend_within(prefix.as_bytes()).ok()?;
     bytes.extend_within(message.as_bytes()).ok()?;
     bytes.extend_within(suffix.as_bytes()).ok()?;
-    let (bytes, charge) = bytes.into_parts();
-    let mut response = Response::new(Body::from(bytes));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    Some((response, charge))
-}
-
-/// Application bodies may share an opaque backing allocation. Copy at the
-/// admission boundary so the connection retains only the bytes it reserved.
-/// Application handler and stream internals remain owned by the application.
-fn normalize_body(body: &mut Body, budget: &Budget) -> Option<Option<Charge>> {
-    match &mut body.0 {
-        Inner::Full(Some(bytes)) => {
-            let charge = budget.charge(bytes.len())?;
-            *bytes = Bytes::copy_from_slice(bytes);
-            Some(Some(charge))
-        }
-        _ => Some(None),
-    }
+    let name = "content-type";
+    let value = b"text/plain; charset=utf-8";
+    let size = crate::stdlib::web::Fields::record_size(name.len(), value.len())?;
+    let pool = fictionet::Pool::new(budget, size, 0);
+    let mut fields = crate::stdlib::web::Fields::in_block(pool.take(budget, 0)?).ok()?;
+    fields.push(name, value).ok()?;
+    let mut response = Response::new(Body::from(Chunk::from(bytes)));
+    response.status = status;
+    response.fields = fields;
+    Some(response)
 }
 
 /// Bounds headers plus every generated field. Suppressed application fields
 /// still count, so the reservation never depends on allocating an encoding.
-fn head_bound(parts: &http::response::Parts, policy: &ResponsePolicy) -> Option<usize> {
+fn head_bound(parts: &Response, policy: &ResponsePolicy) -> Option<usize> {
     let fixed = b"HTTP/1.1 ".len()
         + parts.status.as_str().len()
         + 1
@@ -1385,10 +1304,10 @@ fn head_bound(parts: &http::response::Parts, policy: &ResponsePolicy) -> Option<
         .as_ref()
         .map_or(0, |date| b"Date: ".len() + date.len() + 2);
     parts
-        .headers
+        .fields
         .iter()
         .try_fold(fixed.checked_add(date)?, |n, (name, value)| {
-            n.checked_add(name.as_str().len())?
+            n.checked_add(name.len())?
                 .checked_add(value.len())?
                 .checked_add(4)
         })
@@ -1399,71 +1318,84 @@ fn head_bound(parts: &http::response::Parts, policy: &ResponsePolicy) -> Option<
 /// response's `Connection: close` token (except for 101), or an HTTP/1.0
 /// body of unknown length.
 fn encode(
-    out: &mut Vec<u8>,
+    out: &mut impl std::io::Write,
     version: Version,
-    parts: &http::response::Parts,
+    parts: &Response,
     policy: &ResponsePolicy,
     close: bool,
-) -> bool {
+) -> std::io::Result<bool> {
     let status = parts.status;
     let v10 = version == Version::HTTP_10;
     let mut close = close
         || (status != StatusCode::SWITCHING_PROTOCOLS
-            && parts.headers.get_all("connection").iter().any(|value| {
-                value
-                    .as_bytes()
-                    .split(|b| *b == b',')
-                    .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
-            }));
-    out.extend_from_slice(if v10 { b"HTTP/1.0 " } else { b"HTTP/1.1 " });
-    out.extend_from_slice(status.as_str().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(status.canonical_reason().unwrap_or("").as_bytes());
-    out.extend_from_slice(b"\r\n");
-    for (name, value) in &parts.headers {
-        if matches!(
-            name.as_str(),
-            "content-length" | "transfer-encoding" | "connection" | "keep-alive"
-        ) {
+            && parts
+                .fields
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(b"connection"))
+                .any(|(_, value)| {
+                    value
+                        .split(|b| *b == b',')
+                        .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
+                }));
+    out.write_all(if v10 { b"HTTP/1.0 " } else { b"HTTP/1.1 " })?;
+    out.write_all(status.as_str().as_bytes())?;
+    out.write_all(b" ")?;
+    out.write_all(status.canonical_reason().unwrap_or("").as_bytes())?;
+    out.write_all(b"\r\n")?;
+    for (name, value) in parts.fields.iter() {
+        if [
+            b"content-length".as_slice(),
+            b"transfer-encoding",
+            b"connection",
+            b"keep-alive",
+        ]
+        .iter()
+        .any(|skip| name.eq_ignore_ascii_case(skip))
+        {
             continue;
         }
-        title_case(out, name.as_str());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
+        title_case(out, name)?;
+        out.write_all(b": ")?;
+        out.write_all(value)?;
+        out.write_all(b"\r\n")?;
     }
     if let Some(date) = &policy.date {
-        out.extend_from_slice(b"Date: ");
-        out.extend_from_slice(date.as_bytes());
-        out.extend_from_slice(b"\r\n");
+        out.write_all(b"Date: ")?;
+        out.write_all(date.as_bytes())?;
+        out.write_all(b"\r\n")?;
     }
     match policy.len {
-        Some(n) => write!(out, "Content-Length: {n}\r\n").expect("writing into a vector succeeds"),
+        Some(n) => write!(out, "Content-Length: {n}\r\n")?,
         None if policy.bodiless => {}
         None if v10 => close = true,
-        None => out.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
+        None => out.write_all(b"Transfer-Encoding: chunked\r\n")?,
     }
     if status == StatusCode::SWITCHING_PROTOCOLS {
-        out.extend_from_slice(b"Connection: upgrade\r\n");
+        out.write_all(b"Connection: upgrade\r\n")?;
     } else if close && !v10 {
-        out.extend_from_slice(b"Connection: close\r\n");
+        out.write_all(b"Connection: close\r\n")?;
     } else if !close && v10 {
-        out.extend_from_slice(b"Connection: keep-alive\r\n");
+        out.write_all(b"Connection: keep-alive\r\n")?;
     }
-    out.extend_from_slice(b"\r\n");
-    close
+    out.write_all(b"\r\n")?;
+    Ok(close)
 }
 
 /// Writes a field name with each word capitalized (`Content-Type`), as
 /// Apache, nginx and most other HTTP/1 servers do. The `http` crate keeps
 /// names in lowercase, and tools that recognize servers by their replies,
 /// such as `nmap -sV`, match `Server:` with its capital.
-fn title_case(out: &mut Vec<u8>, name: &str) {
+fn title_case(out: &mut impl std::io::Write, name: &[u8]) -> std::io::Result<()> {
     let mut start = true;
-    for b in name.bytes() {
-        out.push(if start { b.to_ascii_uppercase() } else { b });
+    for &b in name {
+        out.write_all(&[if start {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        }])?;
         start = b == b'-';
     }
+    Ok(())
 }
 
 fn simple_output(
@@ -1472,10 +1404,10 @@ fn simple_output(
     status: StatusCode,
     date: Option<HeaderValue>,
 ) -> Option<ChargedBytes> {
-    let (parts, _) = status_only(status).into_parts();
+    let parts = status_only(status);
     let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || date);
     let mut out = ChargedBytes::with_capacity(env.budget(), head_bound(&parts, &policy)?)?;
-    out.fill(|out| Ok::<_, Infallible>(encode(out, version, &parts, &policy, true)))
+    out.fill(|out| encode(out, version, &parts, &policy, true))
         .ok()?;
     Some(out)
 }
@@ -1493,7 +1425,7 @@ mod router_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Count(Arc<AtomicUsize>);
         impl Handler for Count {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 Reply::Now(Response::new(Body::empty()))
             }
@@ -1527,10 +1459,14 @@ mod router_tests {
 
     #[test]
     fn a_handler_retaining_request_bytes_retains_the_backing_reservation() {
-        struct Keep(Arc<Mutex<Option<Bytes>>>);
+        struct Keep(Arc<Mutex<Option<Chunk>>>);
         impl Handler for Keep {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-                *self.0.lock() = request.body().bytes();
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                *self.0.lock() = request.body.bytes();
                 Reply::Now(Response::new(Body::empty()))
             }
         }
@@ -1544,16 +1480,23 @@ mod router_tests {
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\n\r\nbody")
             .unwrap();
         drop(h);
-        assert_eq!(budget.used(), 4);
+        assert_eq!(budget.used(), held.lock().as_ref().unwrap().charged());
         held.lock().take();
         assert_eq!(budget.used(), 0);
     }
 
     #[test]
     fn pending_request_work_keeps_its_memory_after_the_layer_is_dropped() {
-        struct Wait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Wait(Arc<AtomicUsize>);
         impl Handler for Wait {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                let bytes = request.head.held() + request.body.bytes().unwrap().charged();
+                self.0.store(bytes, Ordering::Relaxed);
                 Reply::Later(Box::new(move |_| {
                     Box::pin(async move {
                         let _request = request;
@@ -1563,19 +1506,20 @@ mod router_tests {
             }
         }
         let budget = Budget::new(1 << 20);
+        let retained = Arc::new(AtomicUsize::new(0));
         let mut h = Harness::with_budget(
             fictionet::Seed::from_u64(12),
-            Http1::new(Wait),
+            Http1::new(Wait(retained.clone())),
             budget.clone(),
         );
         h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\n\r\nbody")
             .unwrap();
         let work = h.work().expect("handler work");
-        let reserved = work.charge.as_ref().unwrap().bytes();
-        assert!(reserved >= 4);
+        let reserved = retained.load(Ordering::Relaxed);
+        assert!(reserved > 0);
         drop(h);
         assert!(work.cancelled());
-        assert_eq!(budget.used(), reserved + 4);
+        assert_eq!(budget.used(), reserved);
         drop(work);
         assert_eq!(budget.used(), 0);
     }
@@ -1588,7 +1532,6 @@ mod router_tests {
             generation: 0,
             lease: owner.own(()),
             budget: budget.clone(),
-            charge: Some(budget.charge(PIECE).unwrap()),
             op: Op::Frame(Some(Body::from(vec![b'x'; PIECE + 1]))),
         };
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -1600,7 +1543,7 @@ mod router_tests {
         let Answer::Frame(_, Some(Ok(frame))) = &done.answer else {
             panic!("a frame")
         };
-        assert_eq!(frame.data_ref().unwrap().len(), PIECE + 1);
+        assert_eq!(frame.len(), PIECE + 1);
         drop(done);
         assert_eq!(budget.used(), 0);
     }
@@ -1624,7 +1567,7 @@ mod router_tests {
         }
         struct Answer(Mutex<Option<Bytes>>);
         impl Handler for Answer {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 Reply::Now(Response::new(Body::from(self.0.lock().take().unwrap())))
             }
         }
@@ -1658,7 +1601,7 @@ mod router_tests {
     fn blocked_response_input_capacity_stays_reserved() {
         struct Answer;
         impl Handler for Answer {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 Reply::Now(Response::new(Body::from("body")))
             }
         }
@@ -1674,8 +1617,9 @@ mod router_tests {
             h.push(request).unwrap();
             let layer = h.layer();
             assert!(
-                layer.charge.as_ref().unwrap().bytes()
-                    >= layer.stream.allocated() + layer.stream.held()
+                budget.used()
+                    >= layer.charge.as_ref().unwrap().bytes()
+                        + layer.stream.pending(layer.stream.unread().len()).charged()
             );
         }
         drop(h);
@@ -1683,15 +1627,19 @@ mod router_tests {
     }
 
     #[test]
-    fn delivery_matches_written_body_and_retains_response_extensions() {
+    fn delivery_matches_written_body_and_retains_response_facts() {
         #[derive(Clone)]
         struct Length(usize);
         struct Echo;
         impl Handler for Echo {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-                let bytes = request.body().bytes().unwrap();
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                let bytes = request.body.bytes().unwrap();
                 let mut response = Response::new(Body::from(bytes.clone()));
-                response.extensions_mut().insert(Length(bytes.len()));
+                response.facts = Some(crate::stdlib::web::Facts::new(Length(bytes.len())));
                 Reply::Now(response)
             }
         }
@@ -1723,7 +1671,9 @@ mod router_tests {
                     .response
                     .as_ref()
                     .unwrap()
-                    .extensions
+                    .facts
+                    .as_ref()
+                    .unwrap()
                     .get::<Length>()
                     .unwrap()
                     .0,
@@ -1737,21 +1687,18 @@ mod router_tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let collect = seen.clone();
         struct Waiting;
-        impl http_body::Body for Waiting {
-            type Data = Bytes;
-            type Error = std::convert::Infallible;
-            fn poll_frame(
+        impl super::super::BodyStream for Waiting {
+            fn poll_next(
                 self: Pin<&mut Self>,
                 _: &mut Context<'_>,
-            ) -> Poll<Option<Result<http_body::Frame<Bytes>, std::convert::Infallible>>>
-            {
+            ) -> Poll<Option<Result<Chunk, Error>>> {
                 Poll::Pending
             }
         }
         struct Wait;
         impl Handler for Wait {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-                Reply::Now(Response::new(Body::new(Waiting)))
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+                Reply::Now(Response::new(Body::Stream(Box::pin(Waiting))))
             }
         }
         let mut harness = Harness::new(
@@ -1780,7 +1727,7 @@ mod router_tests {
     fn response_suffix_keeps_the_original_charge() {
         struct Big;
         impl Handler for Big {
-            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
                 Reply::Now(Response::new(Body::from(vec![b'x'; 3 * PIECE])))
             }
         }
@@ -1826,13 +1773,11 @@ mod tests {
     struct Frames(Arc<Mutex<Vec<u8>>>);
 
     impl Handler for Frames {
-        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-            let mut body = request.into_body();
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let mut body = request.body;
             let mut cx = Context::from_waker(std::task::Waker::noop());
-            while let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) {
-                if let Ok(data) = frame.into_data() {
-                    self.0.lock().extend_from_slice(&data);
-                }
+            while let Poll::Ready(Some(Ok(frame))) = body.poll_next(&mut cx) {
+                self.0.lock().extend_from_slice(&frame);
             }
             Reply::Now(Response::new(Body::empty()))
         }
@@ -1872,8 +1817,12 @@ mod tests {
     fn ambiguous_framing_never_dispatches_a_pipelined_request() {
         struct Paths(Arc<Mutex<Vec<String>>>);
         impl Handler for Paths {
-            fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-                self.0.lock().push(request.uri().path().to_owned());
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                self.0.lock().push(request.head.path().to_owned());
                 Reply::Now(Response::new(Body::empty()))
             }
         }
@@ -1946,13 +1895,11 @@ mod tests {
     /// A body that waits until `open` is set, then sends `done`.
     struct Gate(Arc<AtomicBool>, bool);
 
-    impl http_body::Body for Gate {
-        type Data = Bytes;
-        type Error = std::convert::Infallible;
-        fn poll_frame(
+    impl super::super::BodyStream for Gate {
+        fn poll_next(
             mut self: Pin<&mut Self>,
             _: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, std::convert::Infallible>>> {
+        ) -> Poll<Option<Result<Chunk, Error>>> {
             if !self.0.load(Ordering::Relaxed) {
                 return Poll::Pending;
             }
@@ -1960,16 +1907,16 @@ mod tests {
                 return Poll::Ready(None);
             }
             self.1 = true;
-            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"done")))))
+            Poll::Ready(Some(Ok(Chunk::unpaid(b"done".to_vec()))))
         }
     }
 
     struct Slow(Arc<AtomicBool>);
 
     impl Handler for Slow {
-        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
-            let body = if request.uri().path() == "/slow" {
-                Body::new(Gate(self.0.clone(), false))
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let body = if request.head.path() == "/slow" {
+                Body::Stream(Box::pin(Gate(self.0.clone(), false)))
             } else {
                 Body::from("next")
             };
@@ -1997,8 +1944,26 @@ mod tests {
 
     struct Hello;
 
+    #[test]
+    fn http_two_upgrade_refuses_unrepresentable_request_heads() {
+        let server = Http1::new(Hello);
+        for (target, representable) in [("/kept", true), ("http://[", false)] {
+            let request = Request {
+                head: Head::new(
+                    "GET",
+                    target,
+                    http1::Version::Http11,
+                    [("host", "example.test")],
+                ),
+                body: Body::empty(),
+                site: Site::connection(&ConnInfo::default()),
+            };
+            assert_eq!(server.http2(&[], request).is_some(), representable);
+        }
+    }
+
     impl Handler for Hello {
-        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             Reply::Now(Response::new(Body::from("hello")))
         }
     }
@@ -2024,9 +1989,9 @@ mod tests {
     struct Bare101;
 
     impl Handler for Bare101 {
-        fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             let mut response = Response::new(Body::empty());
-            *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+            response.status = StatusCode::SWITCHING_PROTOCOLS;
             Reply::Now(response)
         }
     }
@@ -2054,9 +2019,9 @@ mod tests {
     struct Count(Arc<AtomicUsize>);
 
     impl Handler for Count {
-        fn call(&self, request: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             self.0.fetch_add(1, Ordering::Relaxed);
-            let path = request.uri().path().to_owned();
+            let path = request.head.path().to_owned();
             Reply::Now(Response::new(Body::from(path.repeat(4096))))
         }
     }
@@ -2099,5 +2064,32 @@ mod tests {
             assert_eq!(h.output(), whole, "{step}");
             assert!(!h.ended());
         }
+    }
+}
+
+#[cfg(test)]
+mod body_admission_tests {
+    use super::*;
+    use fictionet::Pool;
+
+    #[test]
+    fn full_body_admission_moves_storage_and_refuses_without_changes() {
+        let owner = Budget::new(4096);
+        let pool = Pool::new(&owner, 512, 2);
+        let mut block = pool.take(&owner, 64).unwrap();
+        block.extend_within(b"response").unwrap();
+        let address = block.as_ptr();
+        let mut body = Body::Full(block);
+        let short = Budget::new(pool.slot() - 1);
+        assert!(!body.admit(&short));
+        assert!(short.used() == 0);
+        assert_eq!(body.bytes().unwrap().as_ptr(), address);
+        let destination = Budget::new(pool.slot());
+        assert!(body.admit(&destination));
+        assert_eq!(body.bytes().unwrap().as_ptr(), address);
+        assert!(destination.used() >= pool.slot());
+        drop(body);
+        assert!(destination.used() == 0);
+        assert!(pool.free() > 0);
     }
 }

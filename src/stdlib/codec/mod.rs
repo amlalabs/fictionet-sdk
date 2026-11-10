@@ -202,7 +202,7 @@
 //! `Upgrade: h2c`; see the `httpd` module docs.
 //!
 //! HTTP/1 capture uses
-//! [`RequestHead::parse_lenient`](super::protocols::http1::RequestHead::parse_lenient)
+//! [`Head::parse_lenient`](super::web::Head::parse_lenient)
 //! to check syntax without endpoint framing rules, and frames bodies in the
 //! observe adapter. It consumes trailers through their final empty line without
 //! putting them in the body preview. The endpoint codecs refuse chunk

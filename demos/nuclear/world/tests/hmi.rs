@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use fictionet::stdlib::network::route::Prefix;
 use fictionet::stdlib::network::{ConnError, ConnectionExt};
-use fictionet::stdlib::protocols::http1::{self, RequestHead, Version};
+use fictionet::stdlib::protocols::http1::{self, Version};
+use fictionet::stdlib::web::Head;
 use fictionet::sync::Mutex;
 use fictionet::{Attacher, Cx, Error, Seed};
 use fictionet_test_support::sandbox::{self, Machine};
@@ -68,7 +69,7 @@ fn start_world_at(
 
 fn get(target: &str) -> http1::Request {
     http1::Request {
-        head: RequestHead::new("GET", target, Version::Http11, [("Host", "hmi01")]),
+        head: Head::new("GET", target, Version::Http11, [("Host", "hmi01")]),
         body: Vec::new(),
     }
 }
@@ -76,7 +77,7 @@ fn get(target: &str) -> http1::Request {
 fn post(target: &str, body: &Value) -> http1::Request {
     let bytes = serde_json::to_vec(body).expect("the body is JSON");
     http1::Request {
-        head: RequestHead::new(
+        head: Head::new(
             "POST",
             target,
             Version::Http11,

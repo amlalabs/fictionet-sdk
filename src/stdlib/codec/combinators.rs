@@ -213,10 +213,16 @@ impl Decode for Lines {
         self.max.saturating_add(2)
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Infallible> {
+        Ok(self.scan(input, eof).map(|line| line.map(<[u8]>::to_vec)))
+    }
+}
+impl Lines {
+    /// Scans a line borrowed from the input, without copying its content.
+    pub fn scan<'a>(&mut self, input: &'a [u8], eof: bool) -> Step<Result<&'a [u8], LineError>> {
         if self.after_cr && !input.is_empty() {
             self.after_cr = false;
             if input.first() == Some(&b'\n') {
-                return Ok(Step::Skip(1));
+                return Step::Skip(1);
             }
         }
         if self.skipping {
@@ -237,13 +243,13 @@ impl Decode for Lines {
                     }
                 }
                 self.skipping = false;
-                return Ok(Step::Skip(n));
+                return Step::Skip(n);
             }
-            return Ok(if input.is_empty() {
+            return if input.is_empty() {
                 Step::Need
             } else {
                 Step::Skip(input.len())
-            });
+            };
         }
         let scan = self.scanned.min(input.len());
         // Stop at capacity even if the caller supplied a larger buffer.
@@ -275,21 +281,21 @@ impl Decode for Lines {
             } else if !cr && self.ending == Ending::Crlf {
                 Err(LineError::BareLf)
             } else {
-                Ok(input.get(..content).unwrap_or_default().to_vec())
+                Ok(input.get(..content).unwrap_or_default())
             };
-            return Ok(Step::Item(line, n));
+            return Step::Item(line, n);
         }
         self.scanned = stop;
         if stop >= self.capacity() {
             self.scanned = 0;
             self.skipping = true;
-            return Ok(Step::Item(Err(LineError::TooLong { max: self.max }), stop));
+            return Step::Item(Err(LineError::TooLong { max: self.max }), stop);
         }
         if eof && !input.is_empty() {
             self.scanned = 0;
-            return Ok(Step::Item(Err(LineError::Unterminated), input.len()));
+            return Step::Item(Err(LineError::Unterminated), input.len());
         }
-        Ok(Step::Need)
+        Step::Need
     }
 }
 

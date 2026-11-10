@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::ConnectionExt;
-use fictionet::stdlib::web::httpd::{self, Body, Exchange, Handler, Reply};
+use fictionet::stdlib::web::httpd::{self, Exchange, Handler, Reply};
 use fictionet::stdlib::world::net::{Arrival, Net, Pools, PortServer};
 use fictionet::{Attachments, Cx};
 use fictionet_extras::reverse_modbus::{Read, Reader};
@@ -34,9 +34,10 @@ type Observe = Arc<dyn Fn(Event) + Send + Sync>;
 struct Maintenance(Observe);
 
 impl Handler for Maintenance {
-    fn call(&self, _: http::Request<Body>, exchange: &mut Exchange<'_>) -> Reply {
+    fn call(&self, _: fictionet::stdlib::web::Request, exchange: &mut Exchange<'_>) -> Reply {
         (self.0)(Event::Request(exchange.conn().clone()));
         Reply::Now(httpd::text(
+            exchange.responses(),
             http::StatusCode::OK,
             "South pumping station\nController online\nService contact: operations\n",
         ))

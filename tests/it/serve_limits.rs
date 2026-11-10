@@ -254,10 +254,12 @@ impl http_body::Body for Unsized {
 struct Streams;
 
 impl Handler for Streams {
-    fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
-        Reply::Now(http::Response::new(Body::new(Unsized(Some(
-            Bytes::from_static(b"streamed\n"),
-        )))))
+    fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+        Reply::Now(fictionet::stdlib::web::Response::from_http(
+            http::Response::new(fictionet_extras::httpd::from_http(Unsized(Some(
+                Bytes::from_static(b"streamed\n"),
+            )))),
+        ))
     }
 }
 
@@ -266,11 +268,13 @@ fn response_policy_agrees_across_http_versions() {
     struct Responses;
 
     impl Handler for Responses {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             let status: u16 = request.uri().path()[1..].parse().unwrap();
             let bytes = Bytes::from_static(b"body");
             let body = if request.headers().contains_key("x-unknown") {
-                Body::new(Unsized(Some(bytes)))
+                fictionet_extras::httpd::from_http(Unsized(Some(bytes)))
             } else {
                 Body::from(bytes)
             };
@@ -281,7 +285,9 @@ fn response_policy_agrees_across_http_versions() {
             if let Some(date) = request.headers().get("x-date") {
                 response = response.header("date", date);
             }
-            Reply::Now(response.body(body).unwrap())
+            Reply::Now(fictionet::stdlib::web::Response::from_http(
+                response.body(body).unwrap(),
+            ))
         }
     }
 
@@ -666,12 +672,19 @@ fn pending_http1_requests_keep_their_body_charge() {
 fn truncated_http1_requests_keep_their_body_charge() {
     struct Partial;
     impl Handler for Partial {
-        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+        fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+            let parts = request.head.to_http().expect("valid request head");
+            let request = http::Request::from_parts(parts, request.body);
             Reply::Later(Box::new(move |fcx| {
                 Box::pin(async move {
                     fcx.sleep(Duration::from_secs(1)).await?;
-                    assert!(request.into_body().collect().await.is_err());
-                    Ok(http::Response::new(Body::empty()))
+                    assert!(
+                        fictionet_extras::httpd::HttpBody(request.into_body())
+                            .collect()
+                            .await
+                            .is_err()
+                    );
+                    Ok(fictionet::stdlib::web::Response::new(Body::empty()))
                 })
             }))
         }
@@ -701,17 +714,33 @@ fn truncated_http1_requests_keep_their_body_charge() {
 #[test]
 fn http1_charges_heads_while_reading_and_metadata_while_waiting() {
     world(Duration::from_secs(10), |fcx| async move {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Waiting(Arc<AtomicUsize>);
+        impl Handler for Waiting {
+            fn call(
+                &self,
+                request: fictionet::stdlib::web::Request,
+                _: &mut Exchange<'_>,
+            ) -> Reply {
+                self.0.store(
+                    request.head.held() + request.body.bytes().unwrap().charged(),
+                    Ordering::Relaxed,
+                );
+                Reply::Later(Box::new(move |fcx| {
+                    Box::pin(async move {
+                        fcx.sleep(Duration::from_secs(1)).await?;
+                        assert_eq!(request.head.field(b"x-large").unwrap().len(), 4096);
+                        assert_eq!(request.body.bytes().unwrap().len(), 1);
+                        Ok(fictionet::stdlib::web::Response::new(Body::empty()))
+                    })
+                }))
+            }
+        }
         let budget = Budget::new(1 << 20);
-        let router = fictionet_test_support::async_handler(
-            |fcx: fictionet::Cx, request: http::Request<bytes::Bytes>| async move {
-                fcx.sleep(Duration::from_secs(1)).await.unwrap();
-                assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
-                http::Response::new(Bytes::new())
-            },
-        );
+        let retained = Arc::new(AtomicUsize::new(0));
         let mut h = layer::Harness::with_budget(
             fictionet::Seed::from_u64(0),
-            Http1::new(router),
+            Http1::new(Waiting(retained.clone())),
             budget.clone(),
         )
         .with_worker(Polling::in_world(fcx.clone()));
@@ -723,18 +752,36 @@ fn http1_charges_heads_while_reading_and_metadata_while_waiting() {
         );
         h.push(head.as_bytes()).unwrap();
         assert!(budget.used() >= base + 4096, "the head waits for the body");
+        let reading = budget.used();
         h.push(b"x").unwrap();
         assert_eq!(h.jobs(), 1);
-        assert!(
-            budget.used() >= base + 4096 && budget.used() < base + 8192,
+        assert_eq!(
+            budget.used(),
+            base + retained.load(Ordering::Relaxed),
             "only the handler retains the request headers"
         );
         fcx.sleep(Duration::from_secs(1)).await?;
         assert!(!poll(&mut h).is_empty());
+        // The bounded large-head pool keeps the block for the next request.
+        // The separate body backing is released when the handler finishes.
+        let cache_places = 2 * std::mem::size_of::<Arc<()>>();
+        assert_eq!(budget.used(), reading + cache_places);
+        drop(h);
+        assert_eq!(budget.used(), 0);
+
+        let mut h = layer::Harness::with_budget(
+            fictionet::Seed::from_u64(0),
+            Http1::new(Waiting(retained)),
+            budget.clone(),
+        )
+        .with_worker(Polling::in_world(fcx.clone()));
+        h.settle().unwrap();
         assert_eq!(budget.used(), base);
 
-        // Leave too little room for the request head.
-        let other = budget.charge(budget.limit() - base - 3000).unwrap();
+        // Admit the input, but leave too little room to build the head.
+        let other = budget
+            .charge(budget.limit() - base - head.len() - 3000)
+            .unwrap();
         assert!(send(&mut h, head.as_bytes()).is_empty());
         assert_eq!(closing(&mut h), Some(Closing::Budget));
         h.push(b"x").unwrap();
@@ -758,14 +805,14 @@ fn metadata_request() -> http::Request<Full<Bytes>> {
 struct WaitingMetadata(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Handler for WaitingMetadata {
-    fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         let waiting = self.0.clone();
         Reply::Later(Box::new(move |_| {
             Box::pin(async move {
                 waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
-                assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
-                Ok(http::Response::new(Body::empty()))
+                assert_eq!(request.head.field(b"x-large").unwrap().len(), 4096);
+                Ok(fictionet::stdlib::web::Response::new(Body::empty()))
             })
         }))
     }
@@ -859,10 +906,12 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             let second = send.send_request(metadata_request());
             fcx.idle().await?;
             assert_eq!(waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
-            // Leave room for the next request's bytes to arrive, but not for
-            // its head to be held.
+            let request_charge = budget.used() - one;
+            // HTTP/2 still materializes an HTTP head before its native
+            // conversion. Allow two native head reservations for that
+            // overlap; the HTTP map also needs its own bookkeeping.
             let other = budget
-                .charge(budget.limit() - budget.used() - 4096)
+                .charge(budget.limit() - budget.used() - 2 * request_charge)
                 .unwrap();
             let two = budget.used();
             assert!(two >= other.bytes() + 2 * 4096);
@@ -870,7 +919,7 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             assert_eq!(waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
             let rejected = budget.used();
             assert_eq!(rejected, two);
-            let request_charge = two - one - other.bytes();
+            assert_eq!(request_charge, two - one - other.bytes());
 
             drop(first);
             fcx.idle().await?;
@@ -943,8 +992,13 @@ impl http_body::Body for WaitingBody {
 struct StreamingMetadata;
 
 impl Handler for StreamingMetadata {
-    fn call(&self, _: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
-        Reply::Now(http::Response::new(Body::new(WaitingBody)))
+    fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+        if request.head.path() == "/warm" {
+            return Reply::Now(fictionet::stdlib::web::Response::new(Body::empty()));
+        }
+        Reply::Now(fictionet::stdlib::web::Response::from_http(
+            http::Response::new(fictionet_extras::httpd::from_http(WaitingBody)),
+        ))
     }
 }
 
@@ -961,11 +1015,18 @@ fn streaming_responses_release_request_metadata() {
         )
         .with_worker(Polling::new());
         h.settle().unwrap();
-        let base = budget.used();
         let head = format!(
             "GET / HTTP/1.1\r\nHost: a.test\r\nX-Large: {}\r\n\r\n",
             "x".repeat(4096)
         );
+        // Warm the same head class before comparing idle storage with a
+        // streaming response. Closing still releases the complete cache.
+        assert!(
+            send(&mut h, head.replace("GET / ", "GET /warm ").as_bytes())
+                .starts_with(b"HTTP/1.1 200")
+        );
+        assert_eq!(h.jobs(), 0);
+        let base = budget.used();
         assert!(send(&mut h, head.as_bytes()).starts_with(b"HTTP/1.1 200"));
         assert_eq!(h.jobs(), 1);
         assert_eq!(budget.used(), base);

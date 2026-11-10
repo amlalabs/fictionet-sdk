@@ -1,6 +1,6 @@
 //! Forwarding HTTP requests to real sites.
 
-use fictionet::stdlib::web::httpd::{self, Body, Handler, Routing, Target};
+use fictionet::stdlib::web::httpd::{self, Body, Handler, Routing};
 use fictionet::{Cx, Error};
 use http::{Request, Response};
 use std::sync::Arc;
@@ -20,14 +20,14 @@ pub type UpstreamFuture =
 /// The supplied transport owns DNS, sockets, TLS and connection pooling.
 /// `fictionet_host::Client` supplies the host HTTP/1.1 transport.
 ///
-/// The proxy forwards to the [`Target`] that [`Sites`](fictionet::stdlib::web::Sites)
+/// The proxy forwards to the [`Site`](super::Site) that [`Sites`](fictionet::stdlib::web::Sites)
 /// puts on each request. The scheme and port come from the agent's connection;
 /// the host comes from the authority or `Host` header. The path and query come
 /// from the request.
 ///
 /// The agent never touches the real internet: its connection ends at the
 /// world. Over HTTPS the agent sees the world's certificate, from
-/// [`Site::tls`](fictionet::stdlib::web::Site::tls), and the real certificate stays between the world and the
+/// [`Site::tls`](fictionet::stdlib::web::SiteConfig::tls), and the real certificate stays between the world and the
 /// real site.
 ///
 /// Only names the callback hands to `proxy(&fcx, client)` are forwarded, so the world
@@ -55,21 +55,13 @@ pub struct Proxy {
     client: Arc<dyn Upstream>,
 }
 
-impl tower_service::Service<Request<Body>> for Proxy {
-    type Response = Response<Body>;
-    type Error = Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        Box::pin(send_upstream(self.client.clone(), request))
+impl Handler for Proxy {
+    fn call(&self, request: super::Request, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        let client = self.client.clone();
+        let responses = ex.responses().clone();
+        httpd::Reply::Later(Box::new(move |_| {
+            Box::pin(send_upstream(client, request, responses))
+        }))
     }
 }
 
@@ -102,23 +94,17 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
     }
 }
 
-/// Forwards one request to its [`Target`] over the world's own network.
+/// Forwards one request to its [`Site`](super::Site) over the world's own network.
 async fn send_upstream(
     client: Arc<dyn Upstream>,
-    request: Request<Body>,
-) -> Result<Response<Body>, Error> {
+    request: super::Request,
+    responses: httpd::Responses,
+) -> Result<super::Response, Error> {
     use http::uri::Scheme;
-    let target = request
-        .extensions()
-        .get::<Target>()
-        .cloned()
-        .ok_or_else(|| {
-            fictionet::Error::msg(
-                "web::proxy serves only requests that web::Sites routed: there is no web::Target",
-            )
-        })?;
+    let target = request.site;
     if target.routing != Routing::Exact {
         let response = httpd::text(
+            &responses,
             http::StatusCode::MISDIRECTED_REQUEST,
             "This proxy does not serve unregistered hosts.\n",
         );
@@ -127,19 +113,20 @@ async fn send_upstream(
     let default_port = (target.scheme == Scheme::HTTP && target.port == 80)
         || (target.scheme == Scheme::HTTPS && target.port == 443);
     let authority = if default_port {
-        target.host.clone()
+        target.name.to_string()
     } else {
-        format!("{}:{}", target.host, target.port)
+        format!("{}:{}", target.name, target.port)
     };
     let origin = format!("{}://{}", target.scheme, authority);
     dispatch(
         client,
-        request,
+        http::Request::from_parts(request.head.to_http()?, request.body),
         |path| Ok(format!("{origin}{path}").parse()?),
         Host::Replace(&authority),
-        Some(&target.host),
+        Some(&target.name),
     )
     .await
+    .map(super::Response::from_http)
 }
 
 /// What [`dispatch`] does with the request's `Host` header.
@@ -191,13 +178,17 @@ async fn dispatch(
 /// preserved. Connection-specific headers are removed in both directions.
 /// `upstream` must have an `http` or `https` scheme and an authority. Its
 /// path is ignored.
-/// The origin does not depend on [`Target`], so default-host requests can
+/// The origin does not depend on [`Site`](super::Site), so default-host requests can
 /// be forwarded here even when their routing is [`Routing::Fallback`].
 /// This handler requires real host I/O and works with any executor.
 /// It uses the supplied transport.
 /// Returns an error for an
 /// upstream without such a scheme or without an authority.
-pub fn forward(_fcx: &Cx, upstream: http::Uri, client: Arc<dyn Upstream>) -> Result<Forward, Error> {
+pub fn forward(
+    _fcx: &Cx,
+    upstream: http::Uri,
+    client: Arc<dyn Upstream>,
+) -> Result<Forward, Error> {
     use http::uri::Scheme;
     let parts = upstream.into_parts();
     match (parts.scheme, parts.authority) {
@@ -223,41 +214,40 @@ pub struct Forward {
     client: Arc<dyn Upstream>,
 }
 
-impl Handler for Forward {
-    fn call(&self, request: Request<Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        httpd::tower(self.clone()).call(request, ex)
+impl Forward {
+    /// Explicitly forwards an allocating HTTP request to the fixed origin.
+    pub fn send(&self, request: Request<Body>) -> UpstreamFuture {
+        let scheme = self.scheme.clone();
+        let authority = self.authority.clone();
+        Box::pin(dispatch(
+            self.client.clone(),
+            request,
+            move |path| {
+                Ok(http::Uri::builder()
+                    .scheme(scheme)
+                    .authority(authority)
+                    .path_and_query(path)
+                    .build()?)
+            },
+            Host::Preserve,
+            None,
+        ))
     }
 }
 
-impl tower_service::Service<Request<Body>> for Forward {
-    type Response = Response<Body>;
-    type Error = Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let client = self.client.clone();
-        let scheme = self.scheme.clone();
-        let authority = self.authority.clone();
-        Box::pin(async move {
-            dispatch(
-                client,
-                request,
-                move |path| {
-                    Ok(http::Uri::builder()
-                        .scheme(scheme)
-                        .authority(authority)
-                        .path_and_query(path)
-                        .build()?)
-                },
-                Host::Preserve,
-                None,
-            )
-            .await
-        })
+impl Handler for Forward {
+    fn call(&self, request: super::Request, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        let forward = self.clone();
+        httpd::Reply::Later(Box::new(move |_| {
+            Box::pin(async move {
+                forward
+                    .send(http::Request::from_parts(
+                        request.head.to_http()?,
+                        request.body,
+                    ))
+                    .await
+                    .map(super::Response::from_http)
+            })
+        }))
     }
 }

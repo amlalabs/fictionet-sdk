@@ -1,12 +1,12 @@
 //! Value comparisons for hickory's DNS writer and parser, and the checks
 //! of `Request::parse` and `fit`.
 
+use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::protocols::dns::dnssec::rdata::DNSSECRData;
 use fictionet::stdlib::protocols::dns::op::{MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, RData, Record, RecordType};
 use fictionet::stdlib::protocols::dns::{Limit, Parsed, Request, Response, fit};
 use fictionet::stdlib::protocols::dns::{ProtoError, op::Message};
-use fictionet::stdlib::network::Transport;
 
 /// Parses `data` as a query over UDP and over TCP. Each gives exactly one
 /// outcome, and the outcome agrees with the bytes: silence only for a
@@ -30,7 +30,10 @@ pub fn parse_request(data: &[u8]) {
                 assert!(query, "a short message or a response became a request");
                 assert_eq!(request.transport, transport);
                 assert_eq!(request.message.metadata.op_code, OpCode::Query);
-                assert_eq!(request.message.queries, [request.question.clone()]);
+                assert_eq!(
+                    request.message.queries.as_slice(),
+                    std::slice::from_ref(&request.question)
+                );
                 let end = 12 + request.question_bytes.len();
                 assert_eq!(data[12..end], request.question_bytes);
                 assert!(request.edns.is_none_or(|edns| edns.version == 0));

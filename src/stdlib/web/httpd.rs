@@ -1,4 +1,4 @@
-//! HTTP as a service: plain handlers, an adapter for tower services (axum
+//! HTTP as a service: plain handlers, with tower adapters in fictionet-extras (axum
 //! included), and name-based virtual hosting.
 //!
 //! [`Http1`] is a [`Layer`](fictionet::stdlib::layer::Layer) over an
@@ -12,7 +12,7 @@
 //!
 //! A [`Handler`] answers one request. Adapters and virtual hosting:
 //!
-//! - [`tower`]: any `tower_service::Service<http::Request<Body>>`, such as an
+//! - `fictionet_extras::httpd::tower`: an allocating adapter for tower services, such as an
 //!   `axum::Router`, run as the connection's work.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
 //!   with several sites at one address does, with the redirect to https and
@@ -51,7 +51,7 @@
 //! requires.
 //!
 //! An upgrade request reaches the native HTTP/1 handler. A handler hands
-//! the connection on by putting an [`UpgradeHandler`] in the extensions of
+//! the connection on by setting [`UpgradeHandler`] in the `upgrade` field of
 //! a `101` answer, or of a 2xx answer to CONNECT: once the answer is
 //! written, HTTP is over, and [`Http1::upgradable`] runs the upgrade
 //! handler on the rest of the stream, with the bytes the client sent past
@@ -95,12 +95,12 @@
 //!
 //! struct Pages;
 //! impl Handler for Pages {
-//!     fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
-//!         let body = match request.uri().path() {
+//!     fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
+//!         let body = match request.head.path() {
 //!             "/hello" => Body::from("hi\n"),
-//!             _ => request.into_body(),
+//!             _ => request.body,
 //!         };
-//!         Reply::Now(http::Response::new(body))
+//!         Reply::Now(fictionet::stdlib::web::Response::new(body))
 //!     }
 //! }
 //! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Pages)).with_worker(Polling::new());
@@ -118,7 +118,7 @@
 //! A world reports typed facts directly from its handlers. For delivery
 //! accounting, [`HttpOptions::observe`] receives the request and response heads,
 //! receipt outcome, and body bytes in completely written pieces. Response
-//! extensions carry world-owned facts without a shared event schema.
+//! facts carry one world-owned typed record without a shared event schema.
 //!
 //! Configure [`Server::observe`] for an individual HTTP server, or
 //! [`Sites::observe_http`](super::Sites::observe_http) for the servers a website
@@ -144,10 +144,10 @@ mod native;
 mod response;
 mod sites;
 
-pub use body::Body;
+pub use body::{Body, BodyStream};
 pub use detect::{Detect, Http, MakeVersion, Versions};
 pub use handlers::{
-    BadGateway, Exchange, Handler, Later, Reply, Reset, Tower, UpgradeHandler, text, tower,
+    BadGateway, Exchange, Handler, Later, Reply, Reset, Responses, UpgradeHandler, text,
 };
 
 pub use http2::{
@@ -161,7 +161,7 @@ pub use native::{
 };
 use response::Dates;
 pub use response::{date_header, http_date};
-pub use sites::{Answer, Routing, Server, Target, VHost, VirtualHosts, normalize, request_host};
+pub use sites::{Answer, Routing, Server, VHost, VirtualHosts};
 
 /// How receipt of a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +180,7 @@ pub enum Received {
 
 /// A finished or interrupted response to a dispatched HTTP request.
 /// Rejections before dispatch (including malformed heads and HTTP/1 body timeouts)
-/// are outside this callback. Request and response extensions belong to the
+/// are outside this callback. Response facts belong to the
 /// world; the server does not interpret them.
 pub struct Observation {
     /// When the request was dispatched.
@@ -190,7 +190,7 @@ pub struct Observation {
     /// The parsed request head, without its body.
     pub request: http::request::Parts,
     /// The response selected for transmission, if one was produced.
-    pub response: Option<http::response::Parts>,
+    pub response: Option<super::ObservedResponse>,
     /// Whether the entire request arrived.
     pub received: Received,
     /// Response body bytes in fully written pieces. An interrupted piece is
@@ -215,18 +215,13 @@ struct Delivery {
 impl Delivery {
     fn new(
         observe: &Option<Observe>,
-        request: &http::Request<Body>,
+        request: &super::Request,
         conn: &ConnInfo,
         at: fictionet::time::Instant,
         received: Received,
     ) -> Option<Self> {
         let observe = observe.as_ref()?.clone();
-        let mut head = http::Request::new(());
-        *head.method_mut() = request.method().clone();
-        *head.uri_mut() = request.uri().clone();
-        *head.version_mut() = request.version();
-        *head.headers_mut() = request.headers().clone();
-        *head.extensions_mut() = request.extensions().clone();
+        let head = http::Request::from_parts(request.head.to_http().ok()?, ());
         let held = response::request_held(&head);
         Some(Self {
             held,
@@ -245,10 +240,10 @@ impl Delivery {
         })
     }
 
-    fn response(&mut self, parts: &http::response::Parts) {
+    fn response(&mut self, parts: &super::Response) {
         if let Some(observation) = &mut self.observation {
             self.held += response::response_held(parts);
-            observation.response = Some(parts.clone());
+            observation.response = Some(parts.observed());
         }
     }
 

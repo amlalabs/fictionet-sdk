@@ -2,10 +2,9 @@
 
 use fictionet::stdlib::codec::Collect;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
-use fictionet::stdlib::protocols::http1::{
-    Chunk, Request, RequestError, RequestEvents, RequestHead, Version,
-};
+use fictionet::stdlib::protocols::http1::{Chunk, Request, RequestError, RequestEvents, Version};
 use fictionet::stdlib::test_support::{assert_write, chunks, decode_all, decode_chunks};
+use fictionet::stdlib::web::Head;
 use fictionet_fuzz::http1::event_limits;
 use libfuzzer_sys::fuzz_target;
 
@@ -52,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(value) = <Request as Wire>::parse(data) {
         let _ = assert_write(&value);
     }
-    if let Ok(value) = <RequestHead as Wire>::parse(data) {
+    if let Ok(value) = <Head as Wire>::parse(data) {
         let _ = assert_write(&value);
     }
     if let Ok(value) = <Chunk as Wire>::parse(data) {
@@ -60,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let bounded = &data[..data.len().min(512)];
     let request = Request {
-        head: RequestHead::new(
+        head: Head::new(
             "POST",
             "/",
             Version::Http11,
