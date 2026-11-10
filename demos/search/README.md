@@ -48,9 +48,10 @@ CLAUDE_CODE_OAUTH_TOKEN_FILE=/path/to/claude-oauth-token \
 ```
 
 Or run it with an Anthropic API key in `ANTHROPIC_API_KEY` and no token file.
-An API key is for a demo other people use: the page then offers Live-Depth
-only, since Live and Edited copy any URL the guest asks for. The guest's
-Claude Code signs in the way the image was built: with an API key when
+A hosted demo, whose workstation runs as a Nitro Sandbox on an EC2 parent,
+offers Live-Depth only, since Live and Edited copy any URL the guest asks
+for. The guest's Claude Code signs in the way the image was built: with an
+API key when
 `ANTHROPIC_API_KEY` is set and `CLAUDE_CODE_OAUTH_TOKEN_FILE` is not, and
 otherwise with a subscription token. Build the image with the same variables
 set as the demo; the build reads neither credential. Without the copied
