@@ -173,23 +173,26 @@ impl Wire for FrameHeader {
     /// Appends a header. Rejects lengths over 24 bits and stream IDs over
     /// 31 bits before changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.length > MAX_FRAME_SIZE || self.stream > MAX_WINDOW {
-            return Err(size("header integer out of range"));
-        }
+        let bytes = self.to_array()?;
         out.try_reserve(HEADER_LEN)
             .map_err(|_| budget("allocation failed"))?;
-        out.extend_from_slice(&[
-            (self.length >> 16) as u8,
-            (self.length >> 8) as u8,
-            self.length as u8,
-            self.kind,
-            self.flags,
-        ]);
-        out.extend_from_slice(&self.stream.to_be_bytes());
+        out.extend_from_slice(&bytes);
         Ok(())
     }
 }
 impl FrameHeader {
+    /// The nine bytes of the header, for a writer that puts them in place
+    /// rather than appending them. Rejects lengths over 24 bits and stream
+    /// IDs over 31 bits.
+    pub fn to_array(&self) -> Result<[u8; HEADER_LEN], Error> {
+        if self.length > MAX_FRAME_SIZE || self.stream > MAX_WINDOW {
+            return Err(size("header integer out of range"));
+        }
+        let [_, length @ ..] = (self.length as u32).to_be_bytes();
+        let [s0, s1, s2, s3] = self.stream.to_be_bytes();
+        let [l0, l1, l2] = length;
+        Ok([l0, l1, l2, self.kind, self.flags, s0, s1, s2, s3])
+    }
     /// The registered frame name, or `UNKNOWN`.
     pub fn name(&self) -> &'static str {
         match self.kind {
@@ -1167,12 +1170,17 @@ impl HeaderBlocks {
             .table_size()
             .saturating_add(self.pending.as_ref().map_or(0, |p| p.bytes.len()))
     }
-    /// Table settings bound or allocated storage, plus fragment allocation.
+    /// Bytes allocated by the compression table and an unfinished block.
     pub fn allocated(&self) -> usize {
         self.table
-            .settings_limit()
-            .max(self.table.held())
+            .held()
             .saturating_add(self.pending.as_ref().map_or(0, |p| p.bytes.capacity()))
+    }
+    /// The most [`allocated`](Self::allocated) reaches while the table's
+    /// settings limit stays where it is: the table's own bound, and an
+    /// unfinished block's storage, which grows to at most the block limit.
+    pub fn most_allocated(&self) -> usize {
+        self.table.most_held().saturating_add(self.limit)
     }
     /// Whether a block waits for CONTINUATION.
     pub fn pending(&self) -> bool {
@@ -1260,11 +1268,16 @@ impl HeaderBlocks {
         {
             return Err(budget("header block exceeds limit"));
         }
-        pending
-            .bytes
-            .try_reserve(fragment.bytes.len())
-            .map_err(|_| budget("header allocation failed"))?;
-        pending.bytes.extend_from_slice(fragment.bytes);
+        // Storage doubles, but never past the block limit.
+        let bytes = &mut pending.bytes;
+        let needed = bytes.len() + fragment.bytes.len();
+        if needed > bytes.capacity() {
+            let target = needed.max(bytes.capacity() * 2).min(self.limit);
+            bytes
+                .try_reserve_exact(target - bytes.len())
+                .map_err(|_| budget("header allocation failed"))?;
+        }
+        bytes.extend_from_slice(fragment.bytes);
         if h.flags & 4 == 0 {
             self.pending = Some(pending);
         } else {
@@ -2463,6 +2476,66 @@ mod tests {
                 }
             }
         }
+    }
+    /// Blocks cut into fragments of every size, some past the block
+    /// limit: header assembly never allocates more than its bound.
+    #[test]
+    fn header_assembly_stays_within_its_bound() {
+        use fictionet::{Entropy, Seed, SeededEntropy};
+        let rng = SeededEntropy::new(Seed::from_u64(9));
+        let below = |n: u64| rng.random_below(n) as usize;
+        let limits = Limits {
+            header_block: 3000,
+            ..Limits::default()
+        };
+        let mut blocks = HeaderBlocks::with_limits(limits);
+        let most = blocks.most_allocated();
+        let mut encoder = hpack::Encoder::new(4096);
+        let (mut whole, mut refused) = (0, 0);
+        for stream in (1..400).step_by(2) {
+            let fields: Vec<_> = (0..below(16))
+                .map(|i| {
+                    let mut value = vec![0; below(400)];
+                    rng.fill_random(&mut value);
+                    hpack::Field::new(format!("x-{i}"), value)
+                })
+                .collect();
+            let mut block = Vec::new();
+            encoder.encode_block(&fields, &mut block).unwrap();
+            let mut rest = &block[..];
+            let mut kind = 1;
+            loop {
+                let n = rest.len().min(1 + below(700));
+                let last = n == rest.len();
+                let frame = raw(kind, if last { 4 } else { 0 }, stream, &rest[..n]);
+                let header = FrameHeader::parse(&frame[..HEADER_LEN]).unwrap();
+                let read = blocks.read(header, &frame[HEADER_LEN..]);
+                assert!(
+                    blocks.allocated() <= most,
+                    "{} > {most}",
+                    blocks.allocated()
+                );
+                match read {
+                    Err(_) => {
+                        // The connection would end here; the encoder's
+                        // table moved on without the decoder.
+                        refused += 1;
+                        blocks = HeaderBlocks::with_limits(limits);
+                        encoder = hpack::Encoder::new(4096);
+                        break;
+                    }
+                    Ok(read) if last => {
+                        assert!(read.block.is_some());
+                        whole += 1;
+                        break;
+                    }
+                    Ok(_) => {}
+                }
+                rest = &rest[n..];
+                kind = 9;
+            }
+        }
+        assert!(whole > 0 && refused > 0, "{whole} whole, {refused} refused");
     }
     #[test]
     fn header_assembly_retains_opening_context() {

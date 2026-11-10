@@ -159,6 +159,11 @@ impl<D: Decode> Stream<D> {
     pub fn allocated(&self) -> usize {
         self.buf.allocated()
     }
+    /// The most [`allocated`](Self::allocated) reaches while the limit
+    /// stays at most what it is now, with no larger suffix handed over.
+    pub fn most_allocated(&self) -> usize {
+        self.buf.most_allocated()
+    }
     /// Cumulative bytes copied by input-buffer compaction and shrinking.
     /// Excludes incoming bytes and allocator moves. Saturates at `usize::MAX`.
     #[cfg(test)]

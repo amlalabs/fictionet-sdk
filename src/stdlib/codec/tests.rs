@@ -178,7 +178,7 @@ fn buffer_compaction_is_amortized_at_full_capacity() {
         b.consume(1);
         assert_eq!(b.push(&[(i % 256) as u8]), 1);
         assert_eq!(b.len(), 127);
-        assert!(b.allocated() <= 254);
+        assert!(b.allocated() <= b.most_allocated());
         assert!(b.moved <= i + 1);
     }
     assert_eq!(b.offset(), 20_000);
@@ -234,11 +234,18 @@ fn buffer_random_operations_match_a_queue() {
     let mut expected = alloc::collections::VecDeque::<u8>::new();
     let mut consumed = 0;
     for _ in 0..4000 {
-        if rng.below(2) == 0 {
+        let op = rng.below(3);
+        if op == 0 {
             let mut bytes = [0; 19];
             rng.fill(&mut bytes);
             let n = b.push(&bytes);
             expected.extend(bytes.iter().take(n));
+        } else if op == 1 {
+            let spare = b.spare();
+            rng.fill(spare);
+            let n = (rng.below(23) as usize).min(spare.len());
+            expected.extend(spare.iter().take(n));
+            b.commit(n);
         } else {
             let n = (rng.below(35) as usize).min(expected.len());
             b.consume(n);
@@ -247,7 +254,7 @@ fn buffer_random_operations_match_a_queue() {
         }
         assert_eq!(b.unread(), expected.make_contiguous());
         assert_eq!(b.offset(), consumed);
-        assert!(b.allocated() <= 62);
+        assert!(b.allocated() <= b.most_allocated());
     }
 }
 #[test]
