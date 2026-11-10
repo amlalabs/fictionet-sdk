@@ -445,21 +445,24 @@ a cancelled pending handler, a completing sibling and parent control.
 ## Proofs against the Rust: `kani/mod.rs`
 
 [`kani/mod.rs`](kani/mod.rs) is compiled into `src/stdlib/layer/mod.rs`
-under `cfg(kani)` (`#[path]` at `mod.rs:214-215`) and calls the production
-code through its public API. It holds sixteen harnesses: the thirteen in
+under `cfg(kani)` (`#[path]` at `mod.rs:225-226`) and calls the production
+code through its public API. It holds twenty-two harnesses: the thirteen in
 the table below, `charges_sum_to_the_budget_and_never_pass_its_limit`
 (under "Refusing a child whose inbox is full"),
 `stream_credit_splits_keep_the_allocation_owned` and
 `work_cancellation_stays_with_its_owner` (under "Shared stream backing
-and cancellation harnesses"). No harness uses `#[kani::stub]`; the
-`-Z stubbing` flag in the combined run below enabled nothing.
+and cancellation harnesses"), `a_shared_chunk_edit_preserves_ownership_and_budget`
+(under "Scoped output and retained receive credit"), and five for the
+charged containers (under "Charged containers and the wake"). No harness
+uses `#[kani::stub]`; the `-Z stubbing` flag in the combined run below
+enabled nothing.
 
 | Harness | Proves |
 | --- | --- |
 | `slots_refuse_past_the_limit` | for every limit up to 3, `insert` takes children while fewer than the limit are live and refuses after, handing the value back; `len` never passes the limit; a removal makes room for exactly one more |
 | `slots_never_answer_a_stale_id` | with two live children, either one closed and its slot given to a successor, twice: the old ids answer no lookup (`contains`, `get`, `get_mut`, `ids`) and remove nothing, every new id differs from every old one, the other child is untouched |
 | `slots_never_answer_another_connections_id` | an id of another `Slots` with the same slot and generation answers nothing, and the reverse |
-| `charges_split_and_drop_within_the_limit` | over every `u8` limit and size: two charges, a split, a new size for the split part, and the three dropped in any order; `used()` is always the sum of the live charges and never past the limit; a split keeps the total and refuses a part larger than the charge; every charge is given back |
+| `charges_split_and_drop_within_the_limit` | over every `u8` limit and size: two charges, a split, a growth or a shrink of the split part, and the three dropped in any order; `used()` is always the sum of the live charges and never past the limit; a split keeps the total and refuses a part larger than the charge; every charge is given back |
 | `timers_in_order_three_names`, `timers_in_order_first_armed_again`, `timers_in_order_second_armed_again`, `timers_in_order_first_armed_twice`, `timers_in_order_one_name_three_times` | three arms at any times, under every pattern of names up to renaming: `next` is the earliest timer, ties go to the earlier arming (arming again is a new arming), `len` counts the names armed, and (all but the first) `get` is each name's last arming |
 | `timers_get_three_names` | after three names armed at any times, `get` gives each its time and a name never armed nothing |
 | `timers_cancel_fire_and_retain_touch_one_name` | after two arms at any times, `cancel`, `fire` at any moment, or `retain` on either name: `cancel` reports and disarms, `fire` disarms exactly a due timer and says so, `retain` disarms, and the other timer is untouched and comes next |
@@ -537,9 +540,9 @@ and `next` is `min_by_key` over them (`timers.rs:75-81`).
 - Concurrent use of a `Budget`: the harness is single-threaded, so the
   atomics are checked as plain counters.
 - Generation and scope overflow (`u64` counters).
-- `Charge::set` on the first charge, which the lifecycle harness
-  `charges_sum_to_the_budget_and_never_pass_its_limit` covers for the same
-  `Budget`.
+- `Charge::grow_to` and `Charge::shrink_to` on the first charge, which the
+  lifecycle harness `charges_sum_to_the_budget_and_never_pass_its_limit`
+  covers for the same `Budget`.
 
 ## Equal-deadline scheduling
 
@@ -870,3 +873,33 @@ Receive credit across original and edited backing is covered by the Rust child
 routing regression; the byte-copy harness does not model the receive-credit
 callback. All these runs used a 10 GiB systemd scope without swap, six Cargo
 build jobs, and, for TLC, two workers with a 2 GiB Java heap.
+
+## Charged containers and the wake
+
+Charges and the containers they pay for became one value: `ChargedBytes`,
+`ChargedDeque`, `ChargedVec` and `BoundedMap` in `src/stdlib/layer/charged.rs`
+grow only by charging first, and `Chunk::repay` pays the new budget before the
+old one lets go. `Charge::set` became `grow_to`, which can refuse, and
+`shrink_to`, which cannot; `charges_split_and_drop_within_the_limit` and
+`charges_sum_to_the_budget_and_never_pass_its_limit` grow or shrink where they
+set. The results recorded above are from those harnesses before the change.
+
+Five harnesses were written for the new code in the same style, fixed
+sequences over symbolic `u8` sizes, and have not been run:
+
+| Harness | Proves |
+| --- | --- |
+| `charge_within_takes_what_fits_or_nothing` | a charge within a range takes its end if it fits, else all the room left if that covers its start, else nothing, changing nothing but the count of refusals |
+| `transfer_within_one_budget_never_raises_used` | moving a charge within one budget changes nothing even when the budget is full; across budgets the target is charged first, a refusal changes neither count, and a move takes exactly the charge from one count to the other |
+| `a_release_after_a_refusal_wakes_once` | a runner that asks after a refusal is woken once by the next release, asking again adds nothing, and asking when nothing was refused wakes nothing |
+| `charged_bytes_capacity_is_its_charge` | for three fixed sizes, bytes are charged their capacity after being made, grown, overrun by a writer that is undone, written and trimmed; a growth without room is refused and everything comes back on drop |
+| `a_refused_growth_changes_nothing` | a refused growth leaves a charge, bytes (their allocation included) and a queue as they were, with the count unchanged |
+
+The model test `random_calls_keep_cover_sum_order_return_move_and_wake` in
+`charged.rs` runs 64 seeded sequences of 400 random calls on two budgets and
+checks every invariant after each call. Each of these changes made it fail,
+along with the named unit test: a release that wakes nobody
+(`a_release_after_a_refusal_wakes_each_waiting_runner_once`), a repay that
+trims before it pays (`a_refused_repay_reallocates_and_releases_nothing`), and
+a runner that asks after memory was freed left waiting
+(`a_runner_that_asks_after_memory_freed_is_woken_at_once`).

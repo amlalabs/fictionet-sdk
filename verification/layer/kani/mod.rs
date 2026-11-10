@@ -1,8 +1,9 @@
 //! Kani proofs over the parts of the layer foundation that hold state of
-//! their own: the child slots of a mux, the budget and its charges, a
-//! layer's timers, and the cursor of a chunk. Compiled only under
-//! `cargo kani`, as a child module of `src/stdlib/layer/mod.rs`, so every
-//! harness calls the production code through its public API.
+//! their own: the child slots of a mux, the budget, its charges and the
+//! containers they pay for, a layer's timers, and the cursor of a chunk.
+//! Compiled only under `cargo kani`, as a child module of
+//! `src/stdlib/layer/mod.rs`, so every harness calls the production code
+//! through its public API.
 //!
 //! The harnesses run fixed sequences of calls over symbolic values and
 //! choices. Harnesses that chose every call symbolically, with a model
@@ -254,6 +255,209 @@ fn charges_sum_to_the_budget_and_never_pass_its_limit() {
         assert_eq!(budget.used(), b.as_ref().map_or(0, Charge::bytes));
     }
     drop(b);
+    assert_eq!(budget.used(), 0);
+}
+
+/// A charge within a range takes its end if that fits, else all the room
+/// left if that covers its start, else nothing, changing nothing but the
+/// count of refusals. Over every `u8` limit, charge held and range.
+#[kani::proof]
+#[kani::unwind(4)]
+fn charge_within_takes_what_fits_or_nothing() {
+    let limit: u8 = kani::any();
+    let budget = Budget::new(limit as usize);
+    let held: u8 = kani::any();
+    kani::assume(held <= limit);
+    let _held = budget.charge(held as usize).unwrap();
+    let (start, end): (u8, u8) = (kani::any(), kani::any());
+    kani::assume(start <= end);
+    let room = (limit - held) as usize;
+    let mark = budget.refusals();
+    match budget.charge_within(start as usize..=end as usize) {
+        Some(charge) => {
+            assert!(start as usize <= room);
+            assert_eq!(charge.bytes(), (end as usize).min(room));
+            assert_eq!(budget.used(), held as usize + charge.bytes());
+        }
+        None => {
+            assert!(start as usize > room);
+            assert_eq!(budget.used(), held as usize);
+            assert_ne!(budget.refusals(), mark);
+        }
+    }
+}
+
+/// Moving a charge within one budget changes nothing, even when the budget
+/// is full and charging before releasing would be refused. Across budgets
+/// the target is charged first, so a refusal changes neither count, and a
+/// move takes exactly the charge from one count to the other. Over every
+/// `u8` limit and size.
+#[kani::proof]
+#[kani::unwind(4)]
+fn transfer_within_one_budget_never_raises_used() {
+    let (first, second): (u8, u8) = (kani::any(), kani::any());
+    let one = Budget::new(first as usize);
+    let other = Budget::new(second as usize);
+    let size: u8 = kani::any();
+    kani::assume(size <= first);
+    let mut charge = one.charge(size as usize).unwrap();
+    let rest = one.charge((first - size) as usize).unwrap();
+    assert!(charge.transfer(&one.clone()));
+    assert_eq!(one.used(), first as usize);
+    let taken: u8 = kani::any();
+    kani::assume(taken <= second);
+    let held = other.charge(taken as usize).unwrap();
+    let moved = charge.transfer(&other);
+    assert_eq!(moved, size <= second - taken);
+    if moved {
+        assert_eq!(one.used(), (first - size) as usize);
+        assert_eq!(other.used(), taken as usize + size as usize);
+        assert!(charge.budget().same(&other));
+    } else {
+        assert_eq!((one.used(), other.used()), (first as usize, taken as usize));
+        assert!(charge.budget().same(&one));
+    }
+    drop((charge, rest, held));
+    assert_eq!((one.used(), other.used()), (0, 0));
+}
+
+/// A runner that asks to be woken after a refusal is woken by the next
+/// release, once: a second release wakes it no more, and asking again
+/// before memory frees adds no second wake. Asking when nothing was
+/// refused wakes nothing. Over every `u8` limit, request and release.
+#[kani::proof]
+#[kani::unwind(4)]
+fn a_release_after_a_refusal_wakes_once() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let limit: u8 = kani::any();
+    let budget = Budget::new(limit as usize);
+    let mut held = budget.charge(limit as usize).unwrap();
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(count.clone());
+    let mark = budget.refusals();
+    budget.wake_when_freed(&waker, mark);
+    let more: u8 = kani::any();
+    kani::assume(more > 0);
+    assert!(budget.charge(more as usize).is_none());
+    budget.wake_when_freed(&waker, mark);
+    budget.wake_when_freed(&waker, mark);
+    assert_eq!(count.0.load(Ordering::Relaxed), 0);
+    let keep: u8 = kani::any();
+    kani::assume(keep < limit);
+    held.shrink_to(keep as usize);
+    assert_eq!(count.0.load(Ordering::Relaxed), 1);
+    drop(held);
+    assert_eq!(count.0.load(Ordering::Relaxed), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Charged containers (src/stdlib/layer/charged.rs)
+
+/// Bytes made from a charge are charged their capacity after every call:
+/// made, grown, written past their room by a writer that is undone, written
+/// within it, and trimmed, over every `u8` limit and byte. A growth the
+/// budget has no room for is refused, and everything is given back when the
+/// bytes are dropped. Sizes are run one by one: a symbolic allocation size
+/// took the solver past the memory cap.
+#[kani::proof]
+#[kani::unwind(7)]
+fn charged_bytes_capacity_is_its_charge() {
+    for (start, grown) in [(0, 2), (2, 4), (4, 3)] {
+        bytes_keep_their_cover(start, grown);
+    }
+}
+
+fn bytes_keep_their_cover(start: usize, grown: usize) {
+    let limit: u8 = kani::any();
+    let budget = Budget::new(limit as usize);
+    let Some(mut bytes) = ChargedBytes::with_capacity(&budget, start) else {
+        assert!(start > limit as usize);
+        assert_eq!(budget.used(), 0);
+        return;
+    };
+    assert_eq!(bytes.charged(), bytes.capacity());
+    assert_eq!(budget.used(), start);
+    assert_eq!(
+        bytes.grow_to(grown),
+        grown <= start || grown <= limit as usize
+    );
+    assert_eq!(bytes.charged(), bytes.capacity());
+    assert_eq!(budget.used(), bytes.charged());
+    let byte: u8 = kani::any();
+    let room = bytes.room();
+    let wrote = bytes.fill(|out| {
+        for _ in 0..=room {
+            out.push(byte);
+        }
+        Ok::<_, ()>(())
+    });
+    assert!(matches!(wrote, Err(WriteFailure::Bound)));
+    assert!(bytes.is_empty());
+    assert_eq!(bytes.capacity(), room);
+    assert_eq!(bytes.charged(), bytes.capacity());
+    assert_eq!(bytes.extend_within(&[byte]).is_ok(), room > 0);
+    bytes.trim();
+    assert_eq!(bytes.charged(), bytes.capacity());
+    assert_eq!(budget.used(), bytes.charged());
+    drop(bytes);
+    assert_eq!(budget.used(), 0);
+}
+
+/// A growth that does not fit changes nothing: a charge keeps its bytes,
+/// bytes keep their allocation, and a queue keeps its places, with the
+/// budget's count as it was. Over every `u8` limit, charge held, growth and
+/// item; allocation sizes are fixed.
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_refused_growth_changes_nothing() {
+    let limit: u8 = kani::any();
+    let budget = Budget::new(limit as usize);
+    let held: u8 = kani::any();
+    kani::assume(held <= limit);
+    let other = budget.charge(held as usize).unwrap();
+    let room = (limit - held) as usize;
+
+    let mut charge = budget.charge(0).unwrap();
+    let to: u8 = kani::any();
+    let grew = charge.grow_to(to as usize);
+    assert_eq!(grew, to as usize <= room);
+    assert_eq!(charge.bytes(), if grew { to as usize } else { 0 });
+    assert_eq!(budget.used(), held as usize + charge.bytes());
+    drop(charge);
+
+    if let Some(mut bytes) = ChargedBytes::with_capacity(&budget, 2) {
+        let (pointer, used) = (bytes.as_ptr(), budget.used());
+        let grew = bytes.grow_to(4);
+        assert_eq!(grew, 2 <= room - 2);
+        if !grew {
+            assert_eq!(bytes.as_ptr(), pointer);
+            assert_eq!(bytes.capacity(), 2);
+            assert_eq!(budget.used(), used);
+        }
+    }
+
+    let mut queue = ChargedDeque::<u16>::new(&budget, 4);
+    let item: u16 = kani::any();
+    let used = budget.used();
+    match queue.push_back(item) {
+        Ok(()) => assert_eq!(queue.charged(), queue.places() * size_of::<u16>()),
+        Err(back) => {
+            assert_eq!(back, item);
+            assert_eq!((queue.len(), queue.places(), queue.charged()), (0, 0, 0));
+            assert_eq!(budget.used(), used);
+        }
+    }
+    drop((other, queue));
     assert_eq!(budget.used(), 0);
 }
 
