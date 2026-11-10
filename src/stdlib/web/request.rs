@@ -117,6 +117,59 @@ impl Head {
         std::str::from_utf8(&self.block[self.target.clone()]).expect("head target is UTF-8")
     }
 
+    /// The host bytes, without a port or trailing dot. No case folding or
+    /// allocation occurs. A Host field takes precedence over an absolute target.
+    pub fn host(&self) -> Option<&[u8]> {
+        let authority = match self.field(b"host") {
+            Some(host) => host,
+            None => {
+                let (scheme, rest) = self.target().split_once("://")?;
+                if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+                    return None;
+                }
+                rest.split(['/', '?', '#']).next()?.as_bytes()
+            }
+        };
+        if !super::super::protocols::http1::valid_authority(authority, false) {
+            return None;
+        }
+        let end = if authority.starts_with(b"[") {
+            authority.iter().position(|b| *b == b']')? + 1
+        } else {
+            authority
+                .iter()
+                .position(|b| *b == b':')
+                .unwrap_or(authority.len())
+        };
+        let mut host = &authority[..end];
+        while let Some(trimmed) = host.strip_suffix(b".") {
+            host = trimmed;
+        }
+        (!host.is_empty()).then_some(host)
+    }
+
+    /// The path and query of an origin or absolute request target.
+    pub fn path_and_query(&self) -> &str {
+        let target = self.target();
+        match target.split_once("://") {
+            Some((_, rest)) => rest.find(['/', '?']).map_or("/", |i| &rest[i..]),
+            None => target,
+        }
+    }
+
+    /// The path, without its query.
+    pub fn path(&self) -> &str {
+        let path = self.path_and_query().split('?').next().unwrap_or("");
+        if path.is_empty() { "/" } else { path }
+    }
+
+    /// The query, if present.
+    pub fn query(&self) -> Option<&str> {
+        self.path_and_query()
+            .split_once('?')
+            .map(|(_, query)| query)
+    }
+
     /// The protocol version.
     pub fn version(&self) -> Version {
         self.version
@@ -250,6 +303,50 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Wire;
     use fictionet::{Budget, Entropy, Pool, Seed, SeededEntropy};
+
+    #[test]
+    fn host_borrows_the_authority_without_case_or_port() {
+        for authority in ["Example.TEST", "Example.TEST.", "Example.TEST.:8080"] {
+            let head = Head::new("GET", "/", Version::Http11, [("Host", authority)]);
+            assert_eq!(head.host(), Some(b"Example.TEST".as_slice()));
+            let target = format!("http://{authority}/path?q=yes");
+            let head = Head::new("GET", &target, Version::Http11, [] as [(&str, &str); 0]);
+            assert_eq!(head.host(), Some(b"Example.TEST".as_slice()));
+        }
+        for authority in [
+            "",
+            "bad host",
+            "host:bad",
+            "user@host",
+            "[::1",
+            "host:65536",
+        ] {
+            let head = Head::new("GET", "/", Version::Http11, [("Host", authority)]);
+            assert!(head.host().is_none());
+        }
+        let head = Head::new("GET", "/", Version::Http11, [("Host", "[::1]:443")]);
+        assert_eq!(head.host(), Some(b"[::1]".as_slice()));
+    }
+
+    #[test]
+    fn host_fields_take_precedence_and_absolute_queries_keep_their_path() {
+        for (target, path, query) in [
+            ("http://elsewhere.test", "/", None),
+            ("http://elsewhere.test?q=yes", "/", Some("q=yes")),
+            ("http://elsewhere.test/path?q=yes", "/path", Some("q=yes")),
+            ("/path?q=yes", "/path", Some("q=yes")),
+        ] {
+            let head = Head::new(
+                "GET",
+                target,
+                Version::Http11,
+                [("Host", "Chosen.TEST.:80")],
+            );
+            assert_eq!(head.host(), Some(b"Chosen.TEST".as_slice()));
+            assert_eq!(head.path(), path);
+            assert_eq!(head.query(), query);
+        }
+    }
 
     #[test]
     fn field_records_round_trip_against_ordered_lists() {

@@ -1962,7 +1962,7 @@ fn lenient_bounds(b: &[u8], request: bool) -> Result<Option<(usize, usize)>, Err
     }
     Ok(None)
 }
-fn valid_authority(value: &[u8], require_port: bool) -> bool {
+pub(crate) fn valid_authority(value: &[u8], require_port: bool) -> bool {
     if value.is_empty()
         || !value.iter().all(|b| b.is_ascii_graphic())
         || value.iter().any(|b| b"/@?#,".contains(b))
