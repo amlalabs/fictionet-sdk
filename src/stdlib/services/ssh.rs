@@ -810,7 +810,7 @@ impl Channel {
     /// once per half window it uses, as OpenSSH tells it, and never runs
     /// dry while room is owed: at zero left, any room owed is due.
     fn adjustment(&self) -> Option<u32> {
-        let owed = self.receive - u64::from(self.advertised);
+        let owed = self.receive.saturating_sub(u64::from(self.advertised));
         let owed = owed.min(u64::from(u32::MAX - self.advertised)) as u32;
         (owed > 0 && owed >= self.advertised).then_some(owed)
     }
