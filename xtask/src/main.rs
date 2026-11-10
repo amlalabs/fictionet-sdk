@@ -9,6 +9,7 @@ mod dns_verify;
 mod gate;
 #[cfg(feature = "host-tools")]
 mod image;
+mod ip_verify;
 mod layer_verify;
 mod mptcp_verify;
 #[cfg(feature = "host-tools")]
@@ -46,6 +47,9 @@ fn main() -> Result {
     }
     if task == "layer-verify" {
         return layer_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "ip-verify" {
+        return ip_verify::run(&args.collect::<Vec<_>>());
     }
     if !matches!(
         task.as_str(),
