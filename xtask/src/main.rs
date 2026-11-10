@@ -17,6 +17,7 @@ mod rawnic;
 // This module owns the host syscall boundary.
 #[allow(unsafe_code)]
 mod ssh_connect;
+mod tcp_rfc_verify;
 #[cfg(feature = "host-tools")]
 mod web;
 #[cfg(feature = "host-tools")]
@@ -40,6 +41,9 @@ fn main() -> Result {
     }
     if task == "mptcp-verify" {
         return mptcp_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "tcp-rfc-verify" {
+        return tcp_rfc_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());

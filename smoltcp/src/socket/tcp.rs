@@ -1901,8 +1901,12 @@ impl<'a> Socket<'a> {
             // This is required by RFC 9293, which states "A TCP implementation MUST support
             // simultaneous open attempts (MUST-10)."
             (State::SynSent, TcpControl::Syn, None) => (),
-            // ACKs in the SYN-SENT state are invalid.
-            (State::SynSent, TcpControl::None, Some(ack_number)) => {
+            // ACKs in the SYN-SENT state are invalid, with or without PSH or FIN.
+            (
+                State::SynSent,
+                TcpControl::None | TcpControl::Psh | TcpControl::Fin,
+                Some(ack_number),
+            ) => {
                 // Ignore an ACK of our SYN without the peer's SYN.
                 if self.acknowledges_syn(ack_number) {
                     return None;
@@ -1924,9 +1928,15 @@ impl<'a> Socket<'a> {
                     return Some(Self::rst_reply(ip_repr, repr));
                 }
             }
-            // Every acknowledgement must be for transmitted but unacknowledged data.
+            // Every acknowledgement must be for transmitted data. An ACK at or
+            // before SND.NXT is new or old; any other, including one half the
+            // sequence space away that `SeqNumber` leaves unordered, is ahead
+            // of what was sent (RFC 9293 section 3.10.7.4).
             (_, _, Some(ack_number)) => {
-                if ack_number >= self.local_seq_no && ack_number > self.local_seq_max {
+                if !matches!(
+                    ack_number.partial_cmp(&self.local_seq_max),
+                    Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
+                ) {
                     return self.challenge_ack_reply(cx, ip_repr, repr);
                 }
             }
@@ -1986,7 +1996,7 @@ impl<'a> Socket<'a> {
 
                     // ACK data and FIN retransmissions per RFC 9293 sections 3.10.7.4 and
                     // 3.8.6.1; rate-limit other challenges per RFC 5961 sections 4.2 and 7.
-                    if !repr.payload.is_empty()
+                    if repr.segment_len() > 0
                         && matches!(
                             repr.control,
                             TcpControl::None | TcpControl::Psh | TcpControl::Fin
@@ -2032,11 +2042,16 @@ impl<'a> Socket<'a> {
         let mut control = repr.control;
         control = control.quash_psh();
 
-        // Ignore a FIN past a gap or outside the receive window.
-        if control == TcpControl::Fin && (window_start < segment_start || segment_end > window_end)
+        // Ignore a FIN past a gap or outside the receive window, and any
+        // FIN after the remote's first: it changes nothing, and the ACK it
+        // carries still counts (RFC 9293 section 3.10.7.4, eighth).
+        if control == TcpControl::Fin
+            && (window_start < segment_start || segment_end > window_end || self.rx_fin_received)
         {
             control = TcpControl::None;
         }
+        // Whether this segment's FIN ends the stream.
+        let fin_taken = control == TcpControl::Fin;
 
         // Validate and update the state.
         match (self.state, control) {
@@ -2164,6 +2179,10 @@ impl<'a> Socket<'a> {
 
             (State::CloseWait, TcpControl::None) => {}
 
+            // Nothing more arrives in TIME-WAIT but the ACK of a closed
+            // window's text, which is answered below.
+            (State::TimeWait, TcpControl::None) => {}
+
             // ACK packets in LAST-ACK state change it to CLOSED.
             (State::LastAck, TcpControl::None) => {
                 if ack_of_fin {
@@ -2277,6 +2296,14 @@ impl<'a> Socket<'a> {
             .add_then_remove_front(payload_offset, payload_len)
         else {
             return Some(self.ack_reply(cx, ip_repr, repr));
+        };
+        // The remote's FIN ends the stream at its sequence number: text held
+        // past it is the remote's error and is never read.
+        let contig_len = if fin_taken {
+            self.assembler = Assembler::new();
+            contig_len.min(payload_offset + payload_len)
+        } else {
+            contig_len
         };
 
         // Place payload octets into the buffer.
@@ -2982,6 +3009,8 @@ pub(crate) mod test {
 
     #[cfg(kani)]
     include!("../../../verification/tcp-port-zero/SocketProof.rs");
+    include!("tcp/rfc_vectors.rs");
+    include!("tcp/rfc_trace.rs");
 
     // =========================================================================================//
     // Constants
@@ -12470,5 +12499,228 @@ pub(crate) mod test {
             }
         );
         assert_eq!(s.recv_slice(&mut [0; 1]), Err(RecvError::Finished));
+    }
+
+    /// RFC 9293 section 3.10.7.4 takes an ACK only when SND.UNA < SEG.ACK
+    /// =< SND.NXT, a distance from SND.UNA of 1 to SND.NXT - SND.UNA modulo
+    /// 2^32. An ACK half the sequence space from SND.UNA is neither before
+    /// nor after it in `SeqNumber`'s order, so no comparison caught it.
+    #[test]
+    fn test_established_ack_half_the_space_away_is_challenged() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..RECV_TEMPL
+            }]
+        );
+        let far = TcpSeqNumber((LOCAL_SEQ + 1).0.wrapping_add(i32::MIN));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(far),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
+        assert_eq!(s.send_queue(), 6);
+        recv_nothing!(s);
+    }
+
+    /// Closed in SYN-RECEIVED before the SYN-ACK went out, the socket counts
+    /// its SYN before the data. An ACK half the space from SND.UNA then read
+    /// as acknowledging 2^31 - 1 octets of an empty tx_buffer, and
+    /// `dequeue_allocated` panicked: a peer could crash the stack.
+    #[test]
+    fn test_closed_syn_received_challenges_an_ack_half_the_space_away() {
+        let mut s = socket_syn_received();
+        s.local_seq_max = LOCAL_SEQ;
+        s.close();
+        assert_eq!(s.state, State::FinWait1);
+        let far = TcpSeqNumber(LOCAL_SEQ.0.wrapping_add(i32::MIN));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(far),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.local_seq_no, LOCAL_SEQ);
+    }
+
+    /// In SYN-SENT an ACK that does not acknowledge the SYN is answered with
+    /// a RST whatever else the segment carries but a SYN or a RST (RFC 9293
+    /// section 3.10.7.3): PSH and FIN change nothing.
+    #[test]
+    fn test_syn_sent_bad_ack_with_psh_or_fin_is_reset() {
+        for control in [TcpControl::Psh, TcpControl::Fin] {
+            let mut s = socket_syn_sent();
+            recv!(
+                s,
+                [TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: LOCAL_SEQ,
+                    ack_number: None,
+                    max_seg_size: Some(BASE_MSS),
+                    window_scale: Some(0),
+                    sack_permitted: true,
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(
+                s,
+                TcpRepr {
+                    control,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: Some(LOCAL_SEQ + 5),
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: LOCAL_SEQ + 5,
+                    ack_number: None,
+                    window_len: 0,
+                    ..RECV_TEMPL
+                })
+            );
+            assert_eq!(s.state, State::SynSent);
+        }
+    }
+
+    /// The peer's FIN retransmitted in TIME-WAIT is acknowledged every time
+    /// (RFC 9293 section 3.10.7.4), however recently a challenge ACK went out.
+    #[test]
+    fn test_time_wait_bare_fin_retransmission_is_acked_after_a_challenge() {
+        let mut s = socket_time_wait(false);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        let ack = Some(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 1),
+            ..RECV_TEMPL
+        });
+        // A SYN draws a challenge ACK, which starts the rate limit.
+        send!(s, time 5_000, TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ + 1000,
+            ack_number: None,
+            ..SEND_TEMPL
+        }, ack);
+        send!(s, time 5_100, TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1),
+            ..SEND_TEMPL
+        }, ack);
+    }
+
+    /// Text at RCV.NXT of a closed window counts for its ACK and is
+    /// answered (RFC 9293 section 3.10.7.4), in TIME-WAIT as elsewhere.
+    #[test]
+    fn test_time_wait_answers_text_in_a_closed_window() {
+        let mut s = socket_fin_wait_2();
+        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.assembler = Assembler::new();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::TimeWait);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                payload: &b"x"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 7),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    /// A FIN after the peer's FIN changes nothing (RFC 9293 section
+    /// 3.10.7.4, eighth: remain in the state), and the ACK it carries counts.
+    #[test]
+    fn test_last_ack_takes_the_ack_beside_a_second_fin() {
+        let mut s = socket_last_ack();
+        s.rx_fin_received = true;
+        s.remote_last_seq = LOCAL_SEQ + 1 + 1;
+        s.local_seq_max = LOCAL_SEQ + 1 + 1;
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1 + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closed);
+    }
+
+    /// The peer's FIN ends the stream: text it sent past the FIN's sequence
+    /// number, held out of order before the FIN came, is never read.
+    #[test]
+    fn test_text_held_past_the_peers_fin_is_not_read() {
+        let mut s = socket_established();
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 2,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"c"[..],
+                ..SEND_TEMPL
+            },
+        );
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"ab"[..],
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state, State::CloseWait);
+        let mut bytes = [0; 4];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(2));
+        assert_eq!(&bytes[..2], b"ab");
+        assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
     }
 }

@@ -49,6 +49,7 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`dns`](dns/README.md) | Lean: the wire format and the answer algorithm (62 theorems, standard axioms only); TLA+: exchanges, resolution (bailiwick, work bounds, negative caching, spoofing), DNSSEC validation | `Gen.lean` vectors replayed by `tests/dns_vectors.rs`; `cargo xtask dns-verify lean|vectors|diff`; models named to the resolver's functions; one control per property | `cargo xtask dns-verify lean` and `diff`; TLC per config |
 | [`mptcp`](mptcp/README.md) | Lean: options, sequence mapping, crypto and IPv4 handling (42 theorems); TLA+: the join handshake, data mapping, the listener's backlog with cookies, the honeypot's observation | `Gen.lean` vectors replayed by `tests/mptcp_vectors.rs`; `cargo xtask mptcp-verify lean|diff`; models named to `extras/src/linux/mptcp.rs`, `tcp/engine.rs`, `demos/honeypot` | `cargo xtask mptcp-verify lean` and `diff`; TLC per config |
 | [`tcp-layer`](tcp-layer/README.md) | the TCP layer's handshakes, accept, close and orphan handling over smoltcp (`Layer.tla`) | model named to `tcp/engine.rs`; SYN cookies are left to `mptcp/tla/Listener.tla` | TLC per config |
+| [`tcp-rfc`](tcp-rfc/README.md) | the smoltcp socket refines RFC 9293 segment arrival with RFC 5961 (`Rfc9293.tla`, `Engine.tla`), with eight named departures; Lean: the arrival rules over the full 32-bit space | `Engine.tla` named to `process`; logs of the real socket replayed against `Rfc9293.tla` (`RfcTrace.tla`, `smoltcp/src/socket/tcp/rfc_trace.rs`); `Gen.lean` vectors replayed through `process` (`rfc_vectors.rs`) | `cargo xtask tcp-rfc-verify trace`, `lean`, `diff`; TLC per config |
 | [`tcp-port-zero`](tcp-port-zero/README.md) | smoltcp's socket with source port zero (`Socket.tla`), port allocation and preparation (`Binding.tla`); the wire and socket in Kani | models named to the vendored smoltcp, `engine.rs`, `hosts.rs`; Kani included in smoltcp's tests | TLC per config; `cargo kani` |
 | [`observer`](observer/README.md) | the passive observer delivers each byte once and in order with holes marked (`Observer.tla`); the same for `Flow` in Kani | model named to `observer/flow.rs`, `observer.rs`; Kani on the production `Flow` | TLC per config; `cargo kani` |
 | [`packet-udp`](packet-udp/README.md) | IP reassembly per scope with the overlap kill, expiry and the cap (`Reassembly.tla`), the IP layer's slots (`Dispatch.tla`), UDP sockets and their queues (`UdpSockets.tla`); headers and checksums in Kani | models named to `network/ip.rs`, `packet.rs`, `udp/sockets.rs`; Kani on the production parsers | TLC per config; `cargo kani` |
@@ -71,6 +72,15 @@ them. The audit of 2026-11-09 found and fixed two:
   while a cookie's was refused. `ingress` now drops it, as Linux does, and
   the handshake sends its SYN-ACK again (`mptcp/tla/Listener.tla`,
   `tcp-layer/README.md`).
+
+The RFC 9293 pass of 2026-11-10 (`tcp-rfc/README.md`) found six bugs in
+the smoltcp socket, each fixed with a test: an ACK half the sequence space
+from SND.UNA was taken as new, which stalled a connection and, on a socket
+closed in SYN-RECEIVED, panicked the stack; a retransmitted bare FIN went
+unanswered behind the challenge-ACK rate limit; SYN-SENT dropped a bad ACK
+with PSH or FIN without a RST; text held past the peer's FIN was read
+before the end of the stream; a second FIN dropped the ACK beside it; and
+TIME-WAIT left a closed window's segment unanswered.
 
 And two found by reading a model's abstractions or a harness against the
 code: an NXDOMAIN's copy under the type it answered outlived the entry
