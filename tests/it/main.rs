@@ -5,6 +5,7 @@ mod common;
 
 mod asn1_codec;
 mod bodies_codec;
+mod budget_oracle;
 mod cme_unknown_enum;
 mod codegen;
 mod compose;

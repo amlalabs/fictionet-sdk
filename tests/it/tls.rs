@@ -239,7 +239,7 @@ fn issue(
 }
 
 /// A server config for `name`, issued by `ca`, offering `alpn`.
-fn server_config(fcx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Arc<ServerConfig> {
+pub(crate) fn server_config(fcx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Arc<ServerConfig> {
     let (chain, key) = issue(fcx, ca, &[name], 2000, 2100, false);
     let mut config = tls::config_builder(fcx, date(2030, 1, 1))
         .with_safe_default_protocol_versions()
@@ -263,7 +263,7 @@ impl rustls::time_provider::TimeProvider for FixedTime {
     }
 }
 
-fn client_config(fcx: &Cx, ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
+pub(crate) fn client_config(fcx: &Cx, ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
     fictionet_test_support::sandbox::client_config(
         fcx,
         date(2030, 1, 1),

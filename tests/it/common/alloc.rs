@@ -121,19 +121,7 @@ pub fn refusing_large<T>(write: impl FnOnce() -> T) -> T {
 // Reallocation requests count their full new size; live bytes change only on
 // success. Freeing fixture storage lowers net live bytes, not requested bytes.
 pub fn measuring<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            MEASUREMENT.set(None);
-        }
-    }
-    MEASUREMENT.with(|cell| {
-        assert!(cell.get().is_none(), "nested allocation measurement");
-        cell.set(Some(Measurement::default()));
-    });
-    let _reset = Reset;
-    let result = operation();
-    let measurement = MEASUREMENT.take().expect("active allocation measurement");
+    let (result, measurement) = measure(operation);
     let stats = measurement.stats;
     assert!(
         stats.allocations < usize::MAX
@@ -151,4 +139,42 @@ pub fn measuring<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
 pub fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let (value, stats) = measuring(f);
     (value, stats.allocations)
+}
+
+/// Runs `operation` and returns the bytes it left allocated on this
+/// thread: what it allocated less what it freed, below zero when it freed
+/// more than it allocated.
+pub fn left_allocated<T>(operation: impl FnOnce() -> T) -> (T, i128) {
+    let (result, measurement) = measure(operation);
+    (result, measurement.live)
+}
+
+/// Runs `f` with this thread's measurement, if any, set aside: what `f`
+/// allocates and frees is not counted.
+pub fn unmeasured<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Measurement>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MEASUREMENT.set(self.0.take());
+        }
+    }
+    let _restore = Restore(MEASUREMENT.take());
+    f()
+}
+
+fn measure<T>(operation: impl FnOnce() -> T) -> (T, Measurement) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MEASUREMENT.set(None);
+        }
+    }
+    MEASUREMENT.with(|cell| {
+        assert!(cell.get().is_none(), "nested allocation measurement");
+        cell.set(Some(Measurement::default()));
+    });
+    let _reset = Reset;
+    let result = operation();
+    let measurement = MEASUREMENT.take().expect("active allocation measurement");
+    (result, measurement)
 }
