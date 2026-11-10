@@ -910,6 +910,108 @@ mod tests {
     }
 
     #[test]
+    fn a_dname_nsec_proves_nothing_below_its_owner() {
+        // RFC 6840 §4.1: names below a DNAME are not the zone's to deny,
+        // but the types at the DNAME's owner are.
+        let zone = name("example.");
+        let records = [
+            nsec("example.", "d.example.", APEX),
+            nsec("d.example.", "example.", &[RecordType::DNAME]),
+        ];
+        assert_eq!(
+            nxdomain(&name("a.d.example."), &zone, &records, 0),
+            Proof::Unproven
+        );
+        assert_eq!(
+            nodata(&name("a.d.example."), RecordType::A, &zone, &records, 0),
+            Proof::Unproven
+        );
+        assert_eq!(
+            nodata(&name("d.example."), RecordType::TXT, &zone, &records, 0),
+            Proof::Proven
+        );
+    }
+
+    #[test]
+    fn an_nsec3_closest_encloser_at_a_cut_or_a_dname_proves_nothing() {
+        // RFC 5155 §8.3: the closest encloser's NSEC3 must not have DNAME,
+        // and may have NS only with SOA.
+        let zone = name("example.");
+        let records = nsec3(
+            "example.",
+            &[
+                ("example.", APEX),
+                ("a.example.", &[RecordType::A]),
+                ("sub.example.", &[RecordType::NS]),
+                ("d.example.", &[RecordType::DNAME]),
+            ],
+            false,
+        );
+        assert_eq!(
+            nxdomain(&name("x.a.example."), &zone, &records, 0),
+            Proof::Proven
+        );
+        for below in ["x.sub.example.", "x.d.example."] {
+            assert_eq!(
+                nxdomain(&name(below), &zone, &records, 0),
+                Proof::Unproven,
+                "{below}"
+            );
+            assert_eq!(
+                nodata(&name(below), RecordType::A, &zone, &records, 0),
+                Proof::Unproven,
+                "{below}"
+            );
+        }
+    }
+
+    #[test]
+    fn nodata_needs_the_cname_bit_clear() {
+        // RFC 6840 §4.3: a record whose bitmap has CNAME denies no type,
+        // or a CNAME answer could be stripped down to NODATA.
+        let zone = name("example.");
+        let records = [nsec("c.example.", "example.", &[RecordType::CNAME])];
+        assert_eq!(
+            nodata(&name("c.example."), RecordType::A, &zone, &records, 0),
+            Proof::Unproven
+        );
+        assert_eq!(
+            alias(&name("c.example."), &zone, &records, 0),
+            Proof::Proven
+        );
+        let records = nsec3(
+            "example.",
+            &[("example.", APEX), ("c.example.", &[RecordType::CNAME])],
+            false,
+        );
+        assert_eq!(
+            nodata(&name("c.example."), RecordType::A, &zone, &records, 0),
+            Proof::Unproven
+        );
+    }
+
+    #[test]
+    fn a_no_ds_proof_needs_the_ns_bit() {
+        // RFC 6840 §4.4: a record at a name that is no delegation cannot
+        // show an unsigned delegation there.
+        let zone = name("example.");
+        let records = [nsec("a.example.", "example.", &[RecordType::A])];
+        assert_eq!(
+            no_ds(&name("a.example."), &zone, &records, 0),
+            Proof::Unproven
+        );
+        let records = nsec3(
+            "example.",
+            &[("example.", APEX), ("a.example.", &[RecordType::A])],
+            false,
+        );
+        assert_eq!(
+            no_ds(&name("a.example."), &zone, &records, 0),
+            Proof::Unproven
+        );
+    }
+
+    #[test]
     fn nsec3_nxdomain_needs_the_closest_encloser_and_the_wildcard() {
         let zone = name("example.");
         let records = nsec3(
