@@ -43,6 +43,9 @@ pub use respond::{Http2Server, Respond, Responder, Work as RespondWork};
 pub enum Timer {
     /// The SETTINGS acknowledgment deadline.
     Deadline,
+    /// A stream's response has waited the write timeout for the client's
+    /// window with nothing sent.
+    Stalled,
 }
 
 /// What [`Http2`] reports about its connection.
@@ -114,7 +117,9 @@ const INPUT: usize = wire::HEADER_LEN + wire::DEFAULT_FRAME_SIZE;
 /// for bytes it no longer holds, and on a stream once its child has read
 /// what it was given, so a child that stops reading stops its own stream
 /// and leaves the others the connection's window. Response bytes go out
-/// within both of the client's windows.
+/// within both of the client's windows; a response that waits for them
+/// the write timeout ([`Limits::write_timeout`]) with nothing sent is reset
+/// with `CANCEL`, its stream alone.
 ///
 /// Input is read a step of a frame at a time from the chunks the transport
 /// delivers ([`wire::FrameReader`]), and nothing holds a whole frame: a
@@ -395,6 +400,12 @@ struct Response {
     queued_bytes: u64,
     /// Body bytes whose whole frames the transport took.
     written_bytes: u64,
+    /// Since when its queued body has waited for the client's window, its
+    /// own or the connection's, with no frame of it sent. `None` while
+    /// the queue is empty or both windows are open. A client that
+    /// withholds its window holds the stream no longer than the write
+    /// timeout.
+    stalled_since: Option<Instant>,
     reply: Reply,
     turn: Turn,
 }
@@ -407,6 +418,17 @@ impl Response {
             matches!(self.reply, Reply::Ending(_))
         } else {
             self.window > 0
+        }
+    }
+
+    /// Notes at `now` whether its queued body waits for the client's
+    /// window, given the connection's `window`: a wait already under way
+    /// keeps its start.
+    fn note_stall(&mut self, window: i32, now: Instant) {
+        if self.queue.is_empty() || (self.window > 0 && window > 0) {
+            self.stalled_since = None;
+        } else {
+            self.stalled_since.get_or_insert(now);
         }
     }
 }
@@ -1049,6 +1071,7 @@ impl Http2 {
                 queue,
                 queued_bytes: 0,
                 written_bytes: 0,
+                stalled_since: None,
                 reply: Reply::Waiting,
                 turn: Turn::Idle,
             },
@@ -2103,6 +2126,9 @@ impl Http2 {
             response.window -= n as i32;
             response.queued_bytes -= n as u64;
             self.send_window -= n as i32;
+            // A frame went: a wait for the window, if one follows, starts
+            // after it.
+            response.stalled_since = None;
             // A frame short of the largest is copied whole into one write,
             // so the transport, and a TLS layer below it, takes the header
             // and payload together. A largest frame keeps its payload in
@@ -2156,6 +2182,15 @@ impl Http2 {
                 Sent::Nothing
             }
         }
+    }
+
+    /// A stream whose queued body has waited the write timeout at `now`
+    /// with no frame of it framed, if one has.
+    fn stalled(&self, now: Instant) -> Option<u32> {
+        self.ids.iter().find_map(|&(id, child)| {
+            let since = self.streams.get(child)?.response.stalled_since?;
+            (since + self.limits.write_timeout <= now).then_some(id)
+        })
     }
 
     /// Gives stream `id`'s child more credit for its body, as the bytes it
@@ -2382,7 +2417,14 @@ impl Layer for Http2 {
             );
             return Ok(true);
         }
-        Ok(false)
+        // A response the client let wait the write timeout for its window
+        // ends with its stream alone; the client's other streams go on.
+        let mut moved = false;
+        while let Some(id) = self.stalled(now) {
+            self.write_reset(env, id, ErrorCode::Cancel);
+            moved = true;
+        }
+        Ok(moved)
     }
 
     fn advance(&mut self, env: &mut Env<'_, Report>) -> Result<bool, Infallible> {
@@ -2416,6 +2458,14 @@ impl Layer for Http2 {
         }
         if self.phase == Phase::Open {
             moved |= self.send(env);
+            // Which responses now wait for the client's window, and since
+            // when: after every event, command and frame sent.
+            let now = env.now();
+            for &(_, child) in self.ids.iter() {
+                if let Some(stream) = self.streams.get_mut(child) {
+                    stream.response.note_stall(self.send_window, now);
+                }
+            }
         }
         if self.phase == Phase::Open && self.draining && self.streams.is_empty() {
             self.close();
@@ -2471,7 +2521,17 @@ impl Layer for Http2 {
         if self.phase != Phase::Open {
             return None;
         }
-        self.settings_deadline.map(|at| (at, Timer::Deadline))
+        let settings = self.settings_deadline.map(|at| (at, Timer::Deadline));
+        let stalled = self
+            .ids
+            .iter()
+            .filter_map(|&(_, child)| self.streams.get(child)?.response.stalled_since)
+            .min()
+            .map(|since| (since + self.limits.write_timeout, Timer::Stalled));
+        settings
+            .into_iter()
+            .chain(stalled)
+            .min_by_key(|&(at, _)| at)
     }
 }
 
@@ -4249,6 +4309,85 @@ mod tests {
             &mut bytes,
         );
         bytes
+    }
+
+    /// A response the client never lets out, by withholding its window,
+    /// ends with its stream once it has waited the write timeout: the
+    /// stream is reset, not before, and the connection goes on.
+    #[test]
+    fn a_response_held_back_by_the_clients_window_is_reset_after_the_write_timeout() {
+        let mut harness = answering(vec![b'w'; 1000], 1000, Budget::unlimited());
+        // The client gives each stream a window of nothing.
+        let mut preface = wire::PREFACE.to_vec();
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting { id: 4, value: 0 }],
+            },
+            &mut preface,
+        );
+        write(
+            &wire::Settings {
+                flags: 1,
+                entries: Vec::new(),
+            },
+            &mut preface,
+        );
+        harness.push(&preface).unwrap();
+        harness.take_output();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        let output = frames(&harness.take_output());
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Headers(h) if h.stream == 1)),
+            "{output:?}"
+        );
+        assert!(!output.iter().any(|f| matches!(f, Frame::Data(_))));
+        let reset = |output: &[Frame]| {
+            output.iter().any(|f| {
+                matches!(f, Frame::Reset(r) if r.stream == 1
+                    && r.code == ErrorCode::Cancel as u32)
+            })
+        };
+        let timeout = Limits::default().write_timeout;
+        harness.advance(timeout - Duration::from_millis(1)).unwrap();
+        assert!(!reset(&frames(&harness.take_output())), "reset early");
+        harness.advance(Duration::from_millis(1)).unwrap();
+        let output = frames(&harness.take_output());
+        assert!(reset(&output), "{output:?}");
+        assert!(!output.iter().any(|f| matches!(f, Frame::GoAway(_))));
+        assert!(!harness.ended());
+
+        // A client that opens the window a little at a time lets a frame
+        // out each time, and each frame starts the wait again.
+        harness.push(&get(&mut encoder, 3, "/")).unwrap();
+        harness.take_output();
+        let mut sent = 0;
+        for _ in 0..4 {
+            harness.advance(timeout - Duration::from_secs(1)).unwrap();
+            let mut update = Vec::new();
+            write(
+                &wire::WindowUpdate {
+                    stream: 3,
+                    flags: 0,
+                    increment: 1,
+                },
+                &mut update,
+            );
+            harness.push(&update).unwrap();
+            let output = frames(&harness.take_output());
+            assert!(
+                !output.iter().any(|f| matches!(f, Frame::Reset(_))),
+                "{output:?}"
+            );
+            sent += output
+                .iter()
+                .filter(|f| matches!(f, Frame::Data(d) if d.stream == 3))
+                .count();
+        }
+        assert_eq!(sent, 4, "a frame for each byte of window");
     }
 
     #[test]

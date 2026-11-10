@@ -315,7 +315,9 @@ pub struct Limits {
     /// All these deadlines use the Fictionet clock. Default 30 seconds.
     pub body_timeout: Duration,
     /// How long a write may take no bytes before the connection ends: a
-    /// client that stopped reading. Default 30 seconds.
+    /// client that stopped reading. HTTP/2: also how long a response may
+    /// wait for the client's flow-control window with nothing sent before
+    /// its stream alone is reset with `CANCEL`. Default 30 seconds.
     pub write_timeout: Duration,
     /// HTTP/2: the most streams open at once on one connection, which
     /// the server announces in its settings. Default 100, the least RFC
