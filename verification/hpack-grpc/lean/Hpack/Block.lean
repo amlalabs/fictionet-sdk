@@ -4,14 +4,18 @@ import Hpack.Table
 /-!
 # Header blocks (RFC 7541 sections 3, 4.2, 6 and 6.3)
 
-A block is read in two layers, as in Rust. `parseBlock` reads the
-representations (section 6) until the bytes end or one cannot be read;
-`applyAll` applies them in order to a `Decoder`, which holds the dynamic
-table, its maximum size, the acknowledged settings limit, and the
-reduction a settings change still requires. The first error of either
-layer, in wire order, is the block's: the parse of a representation never
-depends on the table, so reading them all first and applying them after
-gives the error Rust gives when it reads and applies one at a time.
+A block is read in two layers, as in Rust. `parseRaw` reads the
+representations (section 6) until the bytes end or one cannot be read,
+leaving their strings undecoded as `Representations` does; `applyAllRaw`
+checks each one's owed reduction and name index, decodes its strings, and
+applies it to a `Decoder`, which holds the dynamic table, its maximum
+size, the acknowledged settings limit, and the reduction a settings change
+still requires. The first error of either layer, in wire order, is the
+block's: reading a representation never depends on the table, so reading
+them all first and applying them after gives the error Rust gives when it
+reads and applies one at a time. `parseBlock` and `applyAll` are the same
+block with its strings decoded as they are read; the theorems are stated
+over them, and `decodeBlock_ok_iff` ties them to `decodeBlock`.
 
 The Rust code's resource bounds are part of the model, as named constants:
 `maxString` on each string, encoded or decoded (`MAX_STRING`), `maxBlock` on
@@ -262,6 +266,209 @@ def parseBlock (started : Bool) (bs : Bytes) : List Rep × Option Err :=
 termination_by bs.length
 decreasing_by exact readRep_shorter _ _ _ _ h
 
+/-! ## Representations as Rust reads them
+
+`Representations` reads a block without decoding its strings: each string
+literal's length is checked against `maxString` and its octets must be
+there, and the Huffman code is left to whoever uses the string (`Text`).
+`Table::read_block` then checks the reduction owed and a name's index
+before it decodes the name, and the name before the value. So of two
+faults in one literal, a truncated value, an owed reduction or a bad name
+index comes before an invalid Huffman string. RFC 7541 orders no decoding
+error before another (each ends the connection with `COMPRESSION_ERROR`),
+so `decodeBlock` takes Rust's documented order. `parseBlock` above, which
+decodes as it reads, is the same block seen with its strings decoded:
+`decodeBlock_ok_iff` below shows the two accept the same blocks with the
+same results. -/
+
+/-- A string literal as read and not yet decoded (`Text`): whether it is
+Huffman coded, and its encoded octets. -/
+structure Raw where
+  huff : Bool
+  octets : Bytes
+  deriving DecidableEq, Repr
+
+/-- Section 5.2's grammar without the decoding: a string literal of at most
+`maxString` encoded octets, and the bytes after it (`Reader::text`). -/
+def readRaw (bs : Bytes) : Except Err (Raw × Bytes) :=
+  match bs.head? with
+  | none => .error .truncated
+  | some b =>
+    match readInt 7 bs with
+    | .error e => .error e
+    | .ok (len, rest) =>
+      if maxString < len then .error .stringTooLong
+      else if rest.length < len then .error .truncated
+      else .ok (⟨decide (128 ≤ b), rest.take len⟩, rest.drop len)
+
+/-- A string's octets (`Text::decoded_len`, `Text::decode_into`): a Huffman
+string decodes to at most `maxString` octets. -/
+def Raw.decoded (r : Raw) : Except Err Bytes :=
+  if r.huff then
+    match decode maxString r.octets with
+    | .ok s => .ok s
+    | .error .invalid => .error .huffman
+    | .error .tooLong => .error .stringTooLong
+  else .ok r.octets
+
+/-- A literal's name as read (`hpack::Name`). -/
+inductive RawName where
+  | literal (s : Raw)
+  | index (i : Nat)
+  deriving DecidableEq, Repr
+
+/-- One representation as read (`hpack::Representation`). -/
+inductive RawRep where
+  | indexed (i : Nat)
+  | literal (n : RawName) (v : Raw) (ix : Indexing)
+  | update (size : Nat)
+  deriving DecidableEq, Repr
+
+def RawRep.isUpdate : RawRep → Bool
+  | .update _ => true
+  | _ => false
+
+def readRawName (i : Nat) (rest : Bytes) : Except Err (RawName × Bytes) :=
+  if i = 0 then
+    match readRaw rest with
+    | .error e => .error e
+    | .ok (s, r) => .ok (.literal s, r)
+  else .ok (.index i, rest)
+
+def readRawLiteral (ix : Indexing) (p : Nat) (bs : Bytes) : Except Err (RawRep × Bytes) :=
+  match readInt p bs with
+  | .error e => .error e
+  | .ok (i, rest) =>
+    match readRawName i rest with
+    | .error e => .error e
+    | .ok (n, rest) =>
+      match readRaw rest with
+      | .error e => .error e
+      | .ok (v, rest) => .ok (.literal n v ix, rest)
+
+/-- `Representations::read`: `readRep` with its strings left undecoded. -/
+def readRawRep (started : Bool) (bs : Bytes) : Except Err (RawRep × Bytes) :=
+  match bs.head? with
+  | none => .error .truncated
+  | some b =>
+    if b / 32 = 1 then
+      if started then .error .sizeUpdateOrder
+      else
+        match readInt 5 bs with
+        | .error e => .error e
+        | .ok (n, rest) => .ok (.update n, rest)
+    else if 128 ≤ b then
+      match readInt 7 bs with
+      | .error e => .error e
+      | .ok (i, rest) => if i = 0 then .error .index else .ok (.indexed i, rest)
+    else readRawLiteral (literalKind b).1 (literalKind b).2 bs
+
+theorem readRaw_shorter (bs rest : Bytes) (s : Raw) (h : readRaw bs = .ok (s, rest)) :
+    rest.length < bs.length := by
+  unfold readRaw at h
+  split at h
+  · cases h
+  · split at h
+    · cases h
+    · next len r hr =>
+      have := readInt_shorter 7 _ r len hr
+      split at h
+      · cases h
+      · split at h
+        · cases h
+        · simp only [Except.ok.injEq, Prod.mk.injEq] at h
+          rw [← h.2, List.length_drop]; omega
+
+theorem readRawRep_shorter (started : Bool) (bs rest : Bytes) (r : RawRep)
+    (h : readRawRep started bs = .ok (r, rest)) : rest.length < bs.length := by
+  unfold readRawRep at h
+  split at h
+  · cases h
+  · split at h
+    · split at h
+      · cases h
+      · split at h
+        · cases h
+        · next n r' hr =>
+          simp only [Except.ok.injEq, Prod.mk.injEq] at h
+          rw [← h.2]; exact readInt_shorter _ _ _ _ hr
+    · split at h
+      · split at h
+        · cases h
+        · next i r' hr =>
+          split at h
+          · cases h
+          · simp only [Except.ok.injEq, Prod.mk.injEq] at h
+            rw [← h.2]; exact readInt_shorter _ _ _ _ hr
+      · unfold readRawLiteral at h
+        split at h
+        · cases h
+        · next i r1 hr1 =>
+          have h1 := readInt_shorter _ _ _ _ hr1
+          split at h
+          · cases h
+          · next n r2 hname =>
+            have h2 : r2.length ≤ r1.length := by
+              unfold readRawName at hname
+              split at hname
+              · split at hname
+                · cases hname
+                · next s r hs =>
+                  simp only [Except.ok.injEq, Prod.mk.injEq] at hname
+                  rw [← hname.2]; exact Nat.le_of_lt (readRaw_shorter _ _ _ hs)
+              · simp only [Except.ok.injEq, Prod.mk.injEq] at hname
+                rw [← hname.2]; exact Nat.le_refl _
+            split at h
+            · cases h
+            · next v r3 hv =>
+              simp only [Except.ok.injEq, Prod.mk.injEq] at h
+              rw [← h.2]
+              have := readRaw_shorter _ _ _ hv
+              omega
+
+/-- A block's representations as `Representations` reads them, until the bytes
+end or one cannot be read, with the error that stopped them. -/
+def parseRaw (started : Bool) (bs : Bytes) : List RawRep × Option Err :=
+  if hb : bs = [] then ([], none)
+  else
+    match h : readRawRep started bs with
+    | .error e => ([], some e)
+    | .ok (r, rest) =>
+      let next := parseRaw (started || !r.isUpdate) rest
+      (r :: next.1, next.2)
+termination_by bs.length
+decreasing_by exact readRawRep_shorter _ _ _ _ h
+
+def RawName.decoded : RawName → Except Err Name
+  | .literal s =>
+    match s.decoded with
+    | .error e => .error e
+    | .ok t => .ok (.literal t)
+  | .index i => .ok (.index i)
+
+/-- A representation with its strings decoded, the name first. -/
+def RawRep.decoded : RawRep → Except Err Rep
+  | .indexed i => .ok (.indexed i)
+  | .update n => .ok (.update n)
+  | .literal n v ix =>
+    match n.decoded with
+    | .error e => .error e
+    | .ok n' =>
+      match v.decoded with
+      | .error e => .error e
+      | .ok v' => .ok (.literal n' v' ix)
+
+/-- Every representation decoded, in order. -/
+def decodeAll : List RawRep → Except Err (List Rep)
+  | [] => .ok []
+  | r :: rs =>
+    match r.decoded with
+    | .error e => .error e
+    | .ok x =>
+      match decodeAll rs with
+      | .error e => .error e
+      | .ok xs => .ok (x :: xs)
+
 /-! ## The decoder -/
 
 /-- A decoded header field. `never` is the never-indexed instruction (section 6.2.3). -/
@@ -350,9 +557,51 @@ def applyAll : St → List Rep → Except Err St
     | .error e => .error e
     | .ok st' => applyAll st' rs
 
+/-- What `Table::read_block` checks of a representation before it decodes
+its strings: for a literal, the reduction owed, then its name's index. -/
+def St.precheck (st : St) : RawRep → Option Err
+  | .literal n _ _ =>
+    if st.dec.required.isSome then some .missingSizeUpdate
+    else
+      match n with
+      | .index i => if (lookup st.dec.dyn i).isSome then none else some .index
+      | .literal _ => none
+  | _ => none
+
+/-- `Table::read_block` on one representation as read: the checks before its
+strings, then its strings decoded, then section 6's processing. -/
+def applyRaw (st : St) (r : RawRep) : Except Err St :=
+  match st.precheck r with
+  | some e => .error e
+  | none =>
+    match r.decoded with
+    | .error e => .error e
+    | .ok rep => applyRep st rep
+
+def applyAllRaw : St → List RawRep → Except Err St
+  | st, [] => .ok st
+  | st, r :: rs =>
+    match applyRaw st r with
+    | .error e => .error e
+    | .ok st' => applyAllRaw st' rs
+
 /-- `Table::decode_block`: one complete block, its fields in order and the decoder
-after it. -/
+after it. Each representation is read, then applied, in wire order; the error
+is the first met, in Rust's order. -/
 def decodeBlock (d : Decoder) (bs : Bytes) : Except Err (List Field × Decoder) :=
+  if maxBlock < bs.length then .error .blockTooLong
+  else
+    match applyAllRaw (St.start d) (parseRaw false bs).1 with
+    | .error e => .error e
+    | .ok st =>
+      match (parseRaw false bs).2 with
+      | some e => .error e
+      | none => if st.dec.required.isSome then .error .missingSizeUpdate
+                else .ok (st.out.reverse, st.dec)
+
+/-- The same block over its decoded representations: what it accepts, and
+with what result, is `decodeBlock`'s (`decodeBlock_ok_iff`). -/
+def decodeParsed (d : Decoder) (bs : Bytes) : Except Err (List Field × Decoder) :=
   if maxBlock < bs.length then .error .blockTooLong
   else
     match applyAll (St.start d) (parseBlock false bs).1 with
@@ -362,6 +611,353 @@ def decodeBlock (d : Decoder) (bs : Bytes) : Except Err (List Field × Decoder) 
       | some e => .error e
       | none => if st.dec.required.isSome then .error .missingSizeUpdate
                 else .ok (st.out.reverse, st.dec)
+
+/-! ## Rust's order accepts the blocks the decoded view accepts -/
+
+/-- `readStr` is `readRaw`, then the string decoded. -/
+theorem readStr_eq (bs : Bytes) :
+    readStr bs = (match readRaw bs with
+      | .error e => .error e
+      | .ok (r, rest) =>
+        match r.decoded with
+        | .error e => .error e
+        | .ok s => .ok (s, rest)) := by
+  unfold readStr readRaw Raw.decoded
+  split
+  · rfl
+  · next b _ =>
+    split
+    · rfl
+    · split
+      · rfl
+      · split
+        · rfl
+        · by_cases hh : 128 ≤ b
+          · simp only [hh, ite_true, decide_true]
+            split <;> rfl
+          · simp [hh]
+
+theorem readStr_ok (bs rest s : Bytes) :
+    readStr bs = .ok (s, rest) ↔ ∃ r, readRaw bs = .ok (r, rest) ∧ r.decoded = .ok s := by
+  rw [readStr_eq]
+  constructor
+  · intro h
+    split at h
+    · cases h
+    · next r rest' hr =>
+      split at h
+      · cases h
+      · next s' hs =>
+        simp only [Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨r, hr, hs⟩
+  · rintro ⟨r, hr, hs⟩
+    simp [hr, hs]
+
+theorem readName_ok (i : Nat) (bs rest : Bytes) (n : Name) :
+    readName i bs = .ok (n, rest) ↔
+      ∃ rn, readRawName i bs = .ok (rn, rest) ∧ rn.decoded = .ok n := by
+  unfold readName readRawName
+  split
+  · constructor
+    · intro h
+      split at h
+      · cases h
+      · next s r hs =>
+        simp only [Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        obtain ⟨raw, hraw, hd⟩ := (readStr_ok _ _ _).mp hs
+        exact ⟨.literal raw, by simp [hraw], by simp [RawName.decoded, hd]⟩
+    · rintro ⟨rn, h, hd⟩
+      split at h
+      · cases h
+      · next raw r hraw =>
+        simp only [Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        cases ht : raw.decoded with
+        | error e => simp [RawName.decoded, ht] at hd
+        | ok t =>
+          simp only [RawName.decoded, ht, Except.ok.injEq] at hd
+          subst hd
+          simp [(readStr_ok _ _ _).mpr ⟨raw, hraw, ht⟩]
+  · constructor
+    · intro h
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨rfl, rfl⟩ := h
+      exact ⟨.index i, rfl, rfl⟩
+    · rintro ⟨rn, h, hd⟩
+      simp only [Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨rfl, rfl⟩ := h
+      simp only [RawName.decoded, Except.ok.injEq] at hd
+      rw [hd]
+
+theorem readLiteral_ok (ix : Indexing) (p : Nat) (bs rest : Bytes) (rep : Rep) :
+    readLiteral ix p bs = .ok (rep, rest) ↔
+      ∃ r, readRawLiteral ix p bs = .ok (r, rest) ∧ r.decoded = .ok rep := by
+  unfold readLiteral readRawLiteral
+  split
+  · simp
+  · constructor
+    · intro h
+      split at h
+      · cases h
+      · next n r2 hn =>
+        split at h
+        · cases h
+        · next v r3 hv =>
+          simp only [Except.ok.injEq, Prod.mk.injEq] at h
+          obtain ⟨rfl, rfl⟩ := h
+          obtain ⟨rn, hrn, hdn⟩ := (readName_ok _ _ _ _).mp hn
+          obtain ⟨rv, hrv, hdv⟩ := (readStr_ok _ _ _).mp hv
+          exact ⟨.literal rn rv ix, by simp [hrn, hrv], by simp [RawRep.decoded, hdn, hdv]⟩
+    · rintro ⟨r, h, hd⟩
+      split at h
+      · cases h
+      · next rn r2 hrn =>
+        split at h
+        · cases h
+        · next rv r3 hrv =>
+          simp only [Except.ok.injEq, Prod.mk.injEq] at h
+          obtain ⟨rfl, rfl⟩ := h
+          simp only [RawRep.decoded] at hd
+          split at hd
+          · cases hd
+          · next n' hn' =>
+            split at hd
+            · cases hd
+            · next v' hv' =>
+              simp only [Except.ok.injEq] at hd
+              subst hd
+              simp [(readName_ok _ _ _ _).mpr ⟨rn, hrn, hn'⟩, (readStr_ok _ _ _).mpr ⟨rv, hrv, hv'⟩]
+
+/-- A representation without strings reads alike either way. -/
+theorem ok_plain (x : Rep) (r : RawRep) (hx : r.decoded = .ok x) (a rest : Bytes) (rep : Rep) :
+    (Except.ok (x, a) : Except Err (Rep × Bytes)) = .ok (rep, rest) ↔
+      ∃ r', (Except.ok (r, a) : Except Err (RawRep × Bytes)) = .ok (r', rest) ∧
+        r'.decoded = .ok rep := by
+  constructor
+  · intro h
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    obtain ⟨rfl, rfl⟩ := h
+    exact ⟨r, rfl, hx⟩
+  · rintro ⟨r', h, hd⟩
+    simp only [Except.ok.injEq, Prod.mk.injEq] at h
+    obtain ⟨rfl, rfl⟩ := h
+    rw [hx] at hd
+    simp only [Except.ok.injEq] at hd
+    rw [hd]
+
+theorem readRep_ok (s : Bool) (bs rest : Bytes) (rep : Rep) :
+    readRep s bs = .ok (rep, rest) ↔
+      ∃ r, readRawRep s bs = .ok (r, rest) ∧ r.decoded = .ok rep := by
+  unfold readRep readRawRep
+  split
+  · simp
+  · split
+    · split
+      · simp
+      · split
+        · simp
+        · exact ok_plain _ (.update _) rfl _ _ _
+    · split
+      · split
+        · simp
+        · split
+          · simp
+          · exact ok_plain _ (.indexed _) rfl _ _ _
+      · exact readLiteral_ok _ _ _ _ _
+
+theorem RawRep.decoded_isUpdate (r : RawRep) (rep : Rep) (h : r.decoded = .ok rep) :
+    rep.isUpdate = r.isUpdate := by
+  cases r with
+  | indexed i =>
+    simp only [RawRep.decoded, Except.ok.injEq] at h; subst h; rfl
+  | update n =>
+    simp only [RawRep.decoded, Except.ok.injEq] at h; subst h; rfl
+  | literal n v ix =>
+    simp only [RawRep.decoded] at h
+    split at h
+    · cases h
+    · split at h
+      · cases h
+      · simp only [Except.ok.injEq] at h; subst h; rfl
+
+/-- A block's representations read and decoded as Rust does are the ones
+`parseBlock` reads, and both read to the end. -/
+theorem parse_ok (s : Bool) (bs : Bytes) (reps : List Rep) :
+    parseBlock s bs = (reps, none) ↔
+      ∃ raws, parseRaw s bs = (raws, none) ∧ decodeAll raws = .ok reps := by
+  induction hn : bs.length using Nat.strongRecOn generalizing s bs reps with
+  | _ n ih =>
+    rw [parseBlock, parseRaw]
+    by_cases hb : bs = []
+    · simp only [hb, dite_true, Prod.mk.injEq, and_true]
+      constructor
+      · rintro rfl; exact ⟨[], rfl, rfl⟩
+      · rintro ⟨raws, rfl, hd⟩
+        simp only [decodeAll, Except.ok.injEq] at hd
+        exact hd
+    · rw [dif_neg hb, dif_neg hb]
+      constructor
+      · intro h
+        split at h
+        · simp at h
+        · next rep rest hrep =>
+          simp only [Prod.mk.injEq] at h
+          obtain ⟨rfl, hnone⟩ := h
+          obtain ⟨raw, hraw, hd⟩ := (readRep_ok _ _ _ _).mp hrep
+          have hlt := readRep_shorter _ _ _ _ hrep
+          obtain ⟨raws, hp, hds⟩ := (ih rest.length (by omega) (s || !rep.isUpdate) rest _ rfl).mp
+            (Prod.ext rfl hnone)
+          refine ⟨raw :: raws, ?_, by simp [decodeAll, hd, hds]⟩
+          split
+          · next e he => rw [hraw] at he; cases he
+          · next raw' rest' he =>
+            rw [hraw] at he
+            simp only [Except.ok.injEq, Prod.mk.injEq] at he
+            obtain ⟨rfl, rfl⟩ := he
+            rw [← RawRep.decoded_isUpdate _ _ hd, hp]
+      · rintro ⟨raws, h, hd⟩
+        split at h
+        · simp at h
+        · next raw rest hraw =>
+          simp only [Prod.mk.injEq] at h
+          obtain ⟨rfl, hnone⟩ := h
+          simp only [decodeAll] at hd
+          split at hd
+          · cases hd
+          · next rep hrep =>
+            split at hd
+            · cases hd
+            · next reps' hreps =>
+              simp only [Except.ok.injEq] at hd
+              subst hd
+              have hlt := readRawRep_shorter _ _ _ _ hraw
+              have htail := (ih rest.length (by omega) (s || !raw.isUpdate) rest reps' rfl).mpr
+                ⟨_, Prod.ext rfl hnone, hreps⟩
+              have hread := (readRep_ok s bs rest rep).mpr ⟨raw, hraw, hrep⟩
+              split
+              · next e he => rw [hread] at he; cases he
+              · next rep' rest' he =>
+                rw [hread] at he
+                simp only [Except.ok.injEq, Prod.mk.injEq] at he
+                obtain ⟨rfl, rfl⟩ := he
+                rw [RawRep.decoded_isUpdate _ _ hrep, htail]
+
+theorem applyRaw_ok (st st' : St) (r : RawRep) :
+    applyRaw st r = .ok st' ↔ ∃ rep, r.decoded = .ok rep ∧ applyRep st rep = .ok st' := by
+  unfold applyRaw
+  constructor
+  · intro h
+    split at h
+    · cases h
+    · split at h
+      · cases h
+      · next rep hrep => exact ⟨rep, hrep, h⟩
+  · rintro ⟨rep, hd, ha⟩
+    have hpre : st.precheck r = none := by
+      cases r with
+      | indexed i => rfl
+      | update n => rfl
+      | literal n v ix =>
+        simp only [RawRep.decoded] at hd
+        split at hd
+        · cases hd
+        · next n' hn =>
+          split at hd
+          · cases hd
+          · simp only [Except.ok.injEq] at hd
+            subst hd
+            simp only [applyRep] at ha
+            simp only [St.precheck]
+            split at ha
+            · cases ha
+            · next hreq =>
+              rw [if_neg hreq]
+              cases n with
+              | literal s => rfl
+              | index i =>
+                simp only [RawName.decoded, Except.ok.injEq] at hn
+                subst hn
+                simp only [resolveName] at ha
+                split at ha
+                · cases ha
+                · next x hx =>
+                  cases hl : lookup st.dec.dyn i
+                  · rw [hl] at hx; cases hx
+                  · simp [hl]
+    simp [hpre, hd, ha]
+
+theorem applyAllRaw_ok (st st' : St) (raws : List RawRep) :
+    applyAllRaw st raws = .ok st' ↔
+      ∃ reps, decodeAll raws = .ok reps ∧ applyAll st reps = .ok st' := by
+  induction raws generalizing st with
+  | nil =>
+    simp only [applyAllRaw, decodeAll, Except.ok.injEq]
+    constructor
+    · rintro rfl; exact ⟨[], rfl, rfl⟩
+    · rintro ⟨reps, rfl, h⟩
+      simp only [applyAll, Except.ok.injEq] at h
+      exact h
+  | cons r rs ih =>
+    simp only [applyAllRaw]
+    constructor
+    · intro h
+      split at h
+      · cases h
+      · next st1 h1 =>
+        obtain ⟨rep, hd, ha⟩ := (applyRaw_ok _ _ _).mp h1
+        obtain ⟨reps, hds, has⟩ := (ih st1).mp h
+        exact ⟨rep :: reps, by simp [decodeAll, hd, hds], by simp [applyAll, ha, has]⟩
+    · rintro ⟨reps, hd, ha⟩
+      simp only [decodeAll] at hd
+      split at hd
+      · cases hd
+      · next rep hrep =>
+        split at hd
+        · cases hd
+        · next reps' hreps =>
+          simp only [Except.ok.injEq] at hd
+          subst hd
+          simp only [applyAll] at ha
+          split at ha
+          · cases ha
+          · next st1 h1 =>
+            have h1' := (applyRaw_ok _ _ _).mpr ⟨rep, hrep, h1⟩
+            simp only [h1']
+            exact (ih st1).mpr ⟨reps', hreps, ha⟩
+
+/-- `decodeBlock`, in Rust's order, accepts exactly the blocks `decodeParsed`
+accepts, with the same fields and decoder after; the two differ only in which
+error a block with more than one fault reports. -/
+theorem decodeBlock_ok_iff (d : Decoder) (bs : Bytes) (x : List Field × Decoder) :
+    decodeBlock d bs = .ok x ↔ decodeParsed d bs = .ok x := by
+  unfold decodeBlock decodeParsed
+  split
+  · simp
+  · constructor
+    · intro h
+      split at h
+      · cases h
+      · next st hst =>
+        split at h
+        · cases h
+        · next hn =>
+          obtain ⟨reps, hd, ha⟩ := (applyAllRaw_ok _ _ _).mp hst
+          have hp : parseBlock false bs = (reps, none) :=
+            (parse_ok false bs reps).mpr ⟨_, Prod.ext rfl hn, hd⟩
+          simpa [hp, ha] using h
+    · intro h
+      split at h
+      · cases h
+      · next st hst =>
+        split at h
+        · cases h
+        · next hn =>
+          obtain ⟨raws, hp, hd⟩ := (parse_ok false bs _).mp (Prod.ext rfl hn)
+          have ha : applyAllRaw (St.start d) raws = .ok st :=
+            (applyAllRaw_ok _ _ _).mpr ⟨_, hd, hst⟩
+          simpa [hp, ha] using h
 
 /-! ## What a block keeps -/
 

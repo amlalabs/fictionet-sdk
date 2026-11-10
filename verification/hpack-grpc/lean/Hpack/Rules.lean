@@ -341,7 +341,8 @@ theorem decode_ok (d : Decoder) (bs : Bytes) (fs : List Field) (d' : Decoder)
     bs.length ≤ maxBlock ∧ (parseBlock false bs).2 = none ∧
     ∃ st, applyAll (St.start d) (parseBlock false bs).1 = .ok st ∧ st.dec = d' ∧
       st.out.reverse = fs ∧ d'.required = none := by
-  unfold decodeBlock at h
+  rw [decodeBlock_ok_iff] at h
+  unfold decodeParsed at h
   split at h
   · cases h
   · next hb =>

@@ -446,7 +446,8 @@ theorem block_round_trip (enc : Encoder) (dec : Decoder) (pol : Policy) (fs : Li
     (ordered_block _ _ (fun w hw => (hu w hw).1) (fun w hw => (cw w hw).2))
   refine ⟨st3.dec, ?_, ?_, rfl⟩
   · simp only [Encoder.block] at hlen ⊢
-    unfold decodeBlock
+    rw [decodeBlock_ok_iff]
+    unfold decodeParsed
     rw [if_neg (by omega), hparse]
     simp only [List.map_append]
     rw [applyAll_append _ _ _ _ hst2, hst3]

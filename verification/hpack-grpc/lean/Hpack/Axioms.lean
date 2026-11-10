@@ -36,6 +36,7 @@ fails if any line names an axiom other than `propext`, `Quot.sound` and
 -- Blocks and size updates (sections 4.2, 6, 6.3)
 #print axioms Hpack.parse_write
 #print axioms Hpack.parse_updates_first
+#print axioms Hpack.decodeBlock_ok_iff
 #print axioms Hpack.decode_reduced
 #print axioms Hpack.acks_then_block
 #print axioms Hpack.decode_updates
