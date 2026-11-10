@@ -250,8 +250,16 @@ impl Handler for BothJson {
         match request.uri().path() {
             "/resolve" => doh::resolve(&self.0, &request, ex),
             "/dns-query" if doh::asks_dns_json(&request) => doh::dns_json(&self.0, &request, ex),
-            "/dns-query" => Reply::Now(httpd::text(StatusCode::BAD_REQUEST, "No query.\n")),
-            _ => Reply::Now(httpd::text(StatusCode::NOT_FOUND, "Not found.\n")),
+            "/dns-query" => Reply::Now(httpd::text(
+                ex.responses(),
+                StatusCode::BAD_REQUEST,
+                "No query.\n",
+            )),
+            _ => Reply::Now(httpd::text(
+                ex.responses(),
+                StatusCode::NOT_FOUND,
+                "Not found.\n",
+            )),
         }
     }
 }

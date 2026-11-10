@@ -1590,6 +1590,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "fictionet",
+ "fictionet-extras",
  "fictionet-test-support",
  "futures-util",
  "hickory-net",

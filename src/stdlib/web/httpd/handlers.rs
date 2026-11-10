@@ -23,6 +23,7 @@ pub struct Exchange<'a> {
     now: Instant,
     entropy: &'a dyn fictionet::Entropy,
     conn: &'a ConnInfo,
+    responses: Responses,
 }
 
 impl<'a> Exchange<'a> {
@@ -32,8 +33,19 @@ impl<'a> Exchange<'a> {
         now: Instant,
         entropy: &'a dyn fictionet::Entropy,
         conn: &'a ConnInfo,
+        responses: Responses,
     ) -> Exchange<'a> {
-        Exchange { now, entropy, conn }
+        Exchange {
+            now,
+            entropy,
+            conn,
+            responses,
+        }
+    }
+
+    /// Charged response storage shared with this connection.
+    pub fn responses(&self) -> &Responses {
+        &self.responses
     }
 
     /// The run's clock when the request was read.
@@ -112,12 +124,57 @@ pub(super) fn status_only(status: StatusCode) -> Response {
     r
 }
 
-/// A short plain-text response.
-pub fn text(status: StatusCode, body: &str) -> Response {
-    let mut response = Response::new(Body::from(body.to_owned()));
+/// Response storage that can also be retained by asynchronous handlers.
+#[derive(Clone)]
+pub struct Responses {
+    budget: fictionet::Budget,
+    pool: fictionet::Pool,
+}
+
+impl Responses {
+    /// A reusable cache charged to its owner.
+    pub fn new(budget: &fictionet::Budget) -> Self {
+        Self::pooled(budget, fictionet::Pool::new(budget, 2048, 4))
+    }
+    pub(crate) fn pooled(budget: &fictionet::Budget, pool: fictionet::Pool) -> Self {
+        Self {
+            budget: budget.clone(),
+            pool,
+        }
+    }
+    /// An empty field block. Refusal leaves the budget unchanged.
+    pub fn fields(&self) -> Option<crate::stdlib::web::Fields> {
+        crate::stdlib::web::Fields::in_block(self.pool.take(&self.budget, 0)?).ok()
+    }
+    /// Copies bytes into a charged block, reusing small backings.
+    pub fn body(&self, bytes: &[u8]) -> Option<Body> {
+        if bytes.is_empty() {
+            return Some(Body::empty());
+        }
+        let mut block = if bytes.len() <= self.pool.slot() {
+            self.pool.take(&self.budget, 0)?
+        } else {
+            crate::stdlib::layer::ChargedBytes::with_capacity(&self.budget, bytes.len())?.into()
+        };
+        block.extend_within(bytes).ok()?;
+        Some(Body::Full(block))
+    }
+}
+
+/// A short plain-text response, or an empty unavailable response if storage is refused.
+pub fn text(storage: &Responses, status: StatusCode, body: &str) -> Response {
+    let Some(body) = storage.body(body.as_bytes()) else {
+        return status_only(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let Some(mut fields) = storage.fields() else {
+        return status_only(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    fields
+        .push("content-type", b"text/plain; charset=utf-8")
+        .expect("small field fits");
+    let mut response = Response::new(body);
     response.status = status;
-    response.fields =
-        crate::stdlib::web::Fields::new([("content-type", b"text/plain; charset=utf-8")]);
+    response.fields = fields;
     response
 }
 

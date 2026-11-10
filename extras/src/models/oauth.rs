@@ -433,8 +433,7 @@ impl OAuth {
         let exchange = async {
             let response = self.forward.send(request).await?;
             let status = response.status();
-            let bytes = response
-                .into_body()
+            let bytes = crate::httpd::HttpBody(response.into_body())
                 .collect()
                 .await
                 .map_err(|_| Error::msg("OAuth response could not be read"))?
@@ -530,8 +529,7 @@ impl OAuth {
         if request.method() != http::Method::POST || request.uri().path() != self.login.path() {
             return Ok(oauth_error(404, "invalid_request"));
         }
-        let bytes = request
-            .into_body()
+        let bytes = crate::httpd::HttpBody(request.into_body())
             .collect()
             .await
             .map_err(|_| Error::msg("OAuth request could not be read"))?
@@ -637,9 +635,18 @@ impl httpd::Handler for OAuth {
     fn call(
         &self,
         request: fictionet::stdlib::web::Request,
-        exchange: &mut httpd::Exchange<'_>,
+        _exchange: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
-        crate::httpd::tower(self.clone()).call(request, exchange)
+        let service = self.clone();
+        httpd::Reply::Later(Box::new(move |_| {
+            Box::pin(async move {
+                let parts = request.head.to_http()?;
+                let response = service
+                    .serve(Request::from_parts(parts, request.body))
+                    .await?;
+                Ok(fictionet::stdlib::web::Response::from_http(response))
+            })
+        }))
     }
 }
 fn oauth_error(status: u16, error: &str) -> Response<Body> {

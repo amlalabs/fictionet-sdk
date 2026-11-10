@@ -1,6 +1,5 @@
 //! Immutable package files stored under their upstream host and path.
 
-use bytes::Bytes;
 use fictionet::stdlib::web::httpd::{Exchange, Handler, Reply};
 use fictionet::stdlib::web::{Fields, Response};
 use fictionet::{
@@ -11,8 +10,6 @@ use fictionet::{
     },
 };
 use http::StatusCode;
-use http_body::{Body as HttpBody, Frame};
-use http_body_util::BodyExt;
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
@@ -141,16 +138,25 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
     fn call(&self, request: web::Request, ex: &mut Exchange<'_>) -> Reply {
         let mirror = self.clone();
         let conn = ex.conn().clone();
+        let responses = ex.responses().clone();
         Reply::Later(Box::new(move |cx| {
             Box::pin(async move {
                 let mut request = request;
                 if mirror.closed.load(Ordering::Acquire) {
-                    return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
+                    return Ok(web::httpd::text(
+                        &responses,
+                        StatusCode::FORBIDDEN,
+                        "Forbidden\n",
+                    ));
                 }
                 let path = key(&request).map(|key| mirror.root.join(key));
                 let _download = mirror.download.lock().await;
                 if mirror.closed.load(Ordering::Acquire) {
-                    return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
+                    return Ok(web::httpd::text(
+                        &responses,
+                        StatusCode::FORBIDDEN,
+                        "Forbidden\n",
+                    ));
                 }
                 if let Some(path) = &path {
                     match tokio::fs::File::open(path).await {
@@ -171,11 +177,15 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
                     );
                 }
                 if mirror.closed.load(Ordering::Acquire) {
-                    return Ok(web::httpd::text(StatusCode::FORBIDDEN, "Forbidden\n"));
+                    return Ok(web::httpd::text(
+                        &responses,
+                        StatusCode::FORBIDDEN,
+                        "Forbidden\n",
+                    ));
                 }
                 let reply = mirror
                     .upstream
-                    .call(request, &mut Exchange::new(cx.now(), &cx, &conn));
+                    .call(request, &mut Exchange::new(cx.now(), &cx, &conn, responses));
                 let response = match reply {
                     Reply::Now(response) => response,
                     Reply::Later(work) => work(cx).await?,
@@ -208,11 +218,10 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
                     .await?;
                 let mut body = response.body;
                 let mut length = 0u64;
-                while let Some(frame) = body.frame().await {
-                    if let Ok(bytes) = frame?.into_data() {
-                        file.write_all(&bytes).await?;
-                        length += bytes.len() as u64;
-                    }
+                while let Some(frame) = std::future::poll_fn(|cx| body.poll_next(cx)).await {
+                    let bytes = frame?;
+                    file.write_all(&bytes).await?;
+                    length += bytes.len() as u64;
                 }
                 if expected.is_some_and(|expected| expected != length) {
                     return Err(Error::msg("incomplete package download"));
@@ -228,7 +237,7 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
 
 async fn file_response(file: tokio::fs::File) -> Answer {
     let length = file.metadata().await?.len();
-    let mut response = Response::new(Body::new(FileBody { file }));
+    let mut response = Response::new(Body::Stream(Box::pin(FileBody { file })));
     response.fields = Fields::new([
         ("content-length", length.to_string().as_str()),
         ("content-type", "application/octet-stream"),
@@ -238,22 +247,20 @@ async fn file_response(file: tokio::fs::File) -> Answer {
 struct FileBody {
     file: tokio::fs::File,
 }
-impl HttpBody for FileBody {
-    type Data = Bytes;
-    type Error = Error;
-    fn poll_frame(
+impl web::httpd::BodyStream for FileBody {
+    fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    ) -> Poll<Option<Result<fictionet::Chunk, Error>>> {
         let mut bytes = [0; 64 << 10];
         let mut buffer = tokio::io::ReadBuf::new(&mut bytes);
         match Pin::new(&mut self.file).poll_read(cx, &mut buffer) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(Ok(())) if buffer.filled().is_empty() => Poll::Ready(None),
-            Poll::Ready(Ok(())) => Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
-                buffer.filled(),
-            ))))),
+            Poll::Ready(Ok(())) => {
+                Poll::Ready(Some(Ok(fictionet::Chunk::unpaid(buffer.filled().to_vec()))))
+            }
         }
     }
 }

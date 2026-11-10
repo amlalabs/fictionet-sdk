@@ -72,7 +72,11 @@ enum Answer {
 /// `ct=application/dns-message` asks for the message itself.
 pub fn resolve(fronts: &Fronts, request: &Request<Body>, ex: &mut Exchange<'_>) -> Reply {
     if *request.method() != Method::GET {
-        let mut response = httpd::text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n");
+        let mut response = httpd::text(
+            ex.responses(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Method not allowed.\n",
+        );
         response.fields = Fields::new([
             ("content-type", "text/plain; charset=utf-8"),
             ("allow", "GET"),
@@ -80,7 +84,7 @@ pub fn resolve(fronts: &Fronts, request: &Request<Body>, ex: &mut Exchange<'_>) 
         return Reply::Now(response);
     }
     let Some(form) = form(request) else {
-        return Reply::Now(bad_query_string());
+        return Reply::Now(bad_query_string(ex));
     };
     let answer = match urlencoded_form::first(&form.pairs, "ct") {
         Some(DNS_MESSAGE) => Answer::Message,
@@ -107,7 +111,7 @@ pub fn asks_dns_json(request: &Request<Body>) -> bool {
 /// parameters, answered as `application/dns-json`.
 pub fn dns_json(fronts: &Fronts, request: &Request<Body>, ex: &mut Exchange<'_>) -> Reply {
     let Some(form) = form(request) else {
-        return Reply::Now(bad_query_string());
+        return Reply::Now(bad_query_string(ex));
     };
     json_reply(fronts, &form.pairs, Answer::Json(DNS_JSON), ex)
 }
@@ -117,8 +121,12 @@ fn form(request: &Request<Body>) -> Option<Form> {
     Form::parse(request.uri().query().unwrap_or("").as_bytes()).ok()
 }
 
-fn bad_query_string() -> Response {
-    httpd::text(StatusCode::BAD_REQUEST, "Bad query string.\n")
+fn bad_query_string(ex: &Exchange<'_>) -> Response {
+    httpd::text(
+        ex.responses(),
+        StatusCode::BAD_REQUEST,
+        "Bad query string.\n",
+    )
 }
 
 /// The reply to the JSON API question in `pairs`, put to the resolver
@@ -133,6 +141,7 @@ fn json_reply(
 ) -> Reply {
     let Some(client) = fronts.client(ex.conn()) else {
         return Reply::Now(httpd::text(
+            ex.responses(),
             StatusCode::MISDIRECTED_REQUEST,
             "This server does not serve that host.\n",
         ));
@@ -142,10 +151,12 @@ fn json_reply(
         Err(error) => return Reply::Now(json_error(error)),
     };
     let resolver = fronts.resolver().clone();
+    let responses = ex.responses().clone();
     Reply::Later(Box::new(move |fcx| {
         Box::pin(async move {
             let Some(reply) = resolver.query(&fcx, client, query).await else {
                 return Ok(httpd::text(
+                    &responses,
                     StatusCode::BAD_REQUEST,
                     "The query is not a DNS query.\n",
                 ));
@@ -554,6 +565,7 @@ impl Handler for Google {
     fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
         let Ok(parts) = request.head.to_http() else {
             return httpd::Reply::Now(httpd::text(
+                ex.responses(),
                 http::StatusCode::BAD_REQUEST,
                 "Invalid HTTP request.\n",
             ));
@@ -609,6 +621,7 @@ impl Handler for Cloudflare {
             .is_some_and(|host| host.eq_ignore_ascii_case(b"cloudflare-dns.com"));
         let Ok(parts) = request.head.to_http() else {
             return httpd::Reply::Now(httpd::text(
+                ex.responses(),
                 http::StatusCode::BAD_REQUEST,
                 "Invalid HTTP request.\n",
             ));
@@ -660,9 +673,10 @@ pub fn quad9(_fronts: Fronts) -> Arc<dyn Handler> {
 struct Quad9;
 
 impl Handler for Quad9 {
-    fn call(&self, request: fictionet::stdlib::web::Request, _ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
         let Ok(parts) = request.head.to_http() else {
             return httpd::Reply::Now(httpd::text(
+                ex.responses(),
                 http::StatusCode::BAD_REQUEST,
                 "Invalid HTTP request.\n",
             ));
@@ -670,6 +684,7 @@ impl Handler for Quad9 {
         let request = http::Request::from_parts(parts, request.body);
         if !no_query(&request) {
             return Reply::Now(httpd::text(
+                ex.responses(),
                 StatusCode::NOT_FOUND,
                 "there is no endpoint configured for this path",
             ));
@@ -678,7 +693,7 @@ impl Handler for Quad9 {
             None | Some("") => "DoH non-compliant query",
             Some(_) => "DoH unable to decode BASE64-URL",
         };
-        Reply::Now(httpd::text(StatusCode::BAD_REQUEST, text))
+        Reply::Now(httpd::text(ex.responses(), StatusCode::BAD_REQUEST, text))
     }
 }
 
@@ -704,9 +719,10 @@ impl OpenDns {
 }
 
 impl Handler for OpenDns {
-    fn call(&self, request: fictionet::stdlib::web::Request, _ex: &mut Exchange<'_>) -> Reply {
+    fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
         let Ok(parts) = request.head.to_http() else {
             return httpd::Reply::Now(httpd::text(
+                ex.responses(),
                 http::StatusCode::BAD_REQUEST,
                 "Invalid HTTP request.\n",
             ));

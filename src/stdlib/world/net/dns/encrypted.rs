@@ -732,25 +732,26 @@ impl Handler for Doh {
                 StatusCode::MISDIRECTED_REQUEST,
                 "This server does not serve that host.\n",
             );
-            return Reply::Now(refusal.response());
+            return Reply::Now(refusal.response(ex.responses()));
         };
         let query = match ask(&request) {
             Asked::Query(query) => query,
-            Asked::Refused(refusal) => return Reply::Now(refusal.response()),
+            Asked::Refused(refusal) => return Reply::Now(refusal.response(ex.responses())),
             Asked::Elsewhere(refusal) => {
                 return match &self.fallback {
                     Some(fallback) => fallback.call(request, ex),
-                    None => Reply::Now(refusal.response()),
+                    None => Reply::Now(refusal.response(ex.responses())),
                 };
             }
         };
+        let responses = ex.responses().clone();
         let resolver = self.front.resolver.clone();
         Reply::Later(Box::new(move |fcx| {
             Box::pin(async move {
                 let Some(answer) = resolver.query(fcx, client, query).await else {
                     let refusal =
                         Refusal::Text(StatusCode::BAD_REQUEST, "The query is not a DNS query.\n");
-                    return Ok(refusal.response());
+                    return Ok(refusal.response(&responses));
                 };
                 Ok(message_response(answer))
             })
@@ -778,12 +779,15 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn response(self) -> fictionet::stdlib::web::Response {
+    fn response(self, storage: &httpd::Responses) -> fictionet::stdlib::web::Response {
         match self {
-            Refusal::Text(status, text) => httpd::text(status, text),
+            Refusal::Text(status, text) => httpd::text(storage, status, text),
             Refusal::Method(allowed) => {
-                let mut response =
-                    httpd::text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n");
+                let mut response = httpd::text(
+                    storage,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Method not allowed.\n",
+                );
                 response.fields = fictionet::stdlib::web::Fields::new([
                     ("content-type", "text/plain; charset=utf-8"),
                     ("allow", allowed),

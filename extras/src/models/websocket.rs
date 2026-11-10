@@ -627,7 +627,7 @@ async fn relay(
         }
         Ok(response) => {
             let (parts, body) = response.into_parts();
-            let bytes = body
+            let bytes = crate::httpd::HttpBody(body)
                 .collect()
                 .await
                 .map(|body| body.to_bytes())
@@ -647,7 +647,7 @@ async fn events(response: Response<Body>, note: &impl Fn(Out)) -> fictionet::Res
         .headers()
         .get("content-type")
         .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
-    let mut body = response.into_body();
+    let mut body = crate::httpd::HttpBody(response.into_body());
     if !stream {
         let bytes = body.collect().await?.to_bytes();
         let response: Value =

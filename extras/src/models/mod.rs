@@ -776,7 +776,7 @@ impl Model {
                 .body(Body::from(body.clone()))?);
         }
         let (mut parts, body) = request.into_parts();
-        let bytes = match body.collect().await {
+        let bytes = match crate::httpd::HttpBody(body).collect().await {
             Ok(body) => body.to_bytes(),
             Err(_) => {
                 return Ok(self.provider.error(
@@ -937,7 +937,8 @@ impl Model {
             Ok(response) => {
                 call.status = response.status().as_u16();
                 let sse = transport::Framing::of(&response) == transport::Framing::Events;
-                Ok(response.map(|body| Body::new(response::Metered::new(body, call, sse))))
+                Ok(response
+                    .map(|body| crate::httpd::from_http(response::Metered::new(body, call, sse))))
             }
             Err(error) => {
                 call.stop = "transport_error".into();
@@ -957,6 +958,7 @@ impl httpd::Handler for Model {
     ) -> httpd::Reply {
         let Ok(parts) = request.head.to_http() else {
             return httpd::Reply::Now(httpd::text(
+                exchange.responses(),
                 http::StatusCode::BAD_REQUEST,
                 "Invalid HTTP request.\n",
             ));

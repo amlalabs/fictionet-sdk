@@ -1573,10 +1573,11 @@ impl Handler for WebServer {
     fn call(
         &self,
         request: fictionet::stdlib::web::Request,
-        _: &mut httpd::Exchange<'_>,
+        ex: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
         let Ok(parts) = request.head.to_http() else {
             return httpd::Reply::Now(httpd::text(
+                ex.responses(),
                 http::StatusCode::BAD_REQUEST,
                 "Invalid HTTP request.\n",
             ));

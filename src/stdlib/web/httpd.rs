@@ -144,9 +144,11 @@ mod native;
 mod response;
 mod sites;
 
-pub use body::Body;
+pub use body::{Body, BodyStream};
 pub use detect::{Detect, Http, MakeVersion, Versions};
-pub use handlers::{BadGateway, Exchange, Handler, Later, Reply, Reset, UpgradeHandler, text};
+pub use handlers::{
+    BadGateway, Exchange, Handler, Later, Reply, Reset, Responses, UpgradeHandler, text,
+};
 
 pub use http2::{
     Ending, ExchangeCommand, ExchangeEvent, Grpc, GrpcCommand, GrpcEvent, Http2, Http2Server,

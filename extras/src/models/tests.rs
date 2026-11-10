@@ -25,7 +25,10 @@ fn claude_code_policy_limits_require_credentials() {
                 .await?;
             assert_eq!(response.status(), 200);
             assert_eq!(response.headers()["content-type"], "application/json");
-            let body = response.into_body().collect().await?.to_bytes();
+            let body = crate::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes();
             assert_eq!(body, r#"{"restrictions":{}}"#);
             for credential in [None, Some("wrong")] {
                 let mut request = Request::get(path);
@@ -35,7 +38,10 @@ fn claude_code_policy_limits_require_credentials() {
                 let response = site.clone().send(request.body(Body::empty())?).await?;
                 assert_eq!(response.status(), 401);
                 assert_eq!(response.headers()["content-type"], "application/json");
-                let body = response.into_body().collect().await?.to_bytes();
+                let body = crate::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes();
                 let body: Value = serde_json::from_slice(&body)?;
                 assert_eq!(body["error"]["type"], "authentication_error");
             }
@@ -177,7 +183,10 @@ fn swap_stream_and_budget_against_upstream() {
                 .send(request("/v1/messages?beta=true", &placeholder))
                 .await?;
             assert_eq!(response.status(), 200);
-            let body = response.into_body().collect().await?.to_bytes();
+            let body = crate::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes();
             let text = std::str::from_utf8(&body).unwrap();
             assert!(!text.contains("sk-ant-api03-private"));
             assert!(text.contains("<ANTHROPIC_API_KEY>"));
@@ -266,11 +275,7 @@ fn bearer_and_google_keys_and_usage() {
                         .body(Body::from(r#"{"model":"small"}"#))
                         .unwrap()
                 };
-                let body = site
-                    .clone()
-                    .send(request())
-                    .await?
-                    .into_body()
+                let body = crate::httpd::HttpBody(site.clone().send(request()).await?.into_body())
                     .collect()
                     .await?
                     .to_bytes();
@@ -343,13 +348,21 @@ fn cached_input_counts_once_toward_budget() {
                 };
                 let response = model.clone().send(request()).await?;
                 assert_eq!(response.status(), 200);
-                response.into_body().collect().await?;
+                crate::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?;
                 assert_eq!(model.ledger.lock().unwrap().input, total);
                 let refused = model.clone().send(request()).await?;
                 assert_eq!(refused.status(), provider.stop().status());
                 assert_eq!(
-                    refused.into_body().collect().await?.to_bytes(),
-                    provider.stop().into_body().collect().await?.to_bytes()
+                    crate::httpd::HttpBody(refused.into_body())
+                        .collect()
+                        .await?
+                        .to_bytes(),
+                    crate::httpd::HttpBody(provider.stop().into_body())
+                        .collect()
+                        .await?
+                        .to_bytes()
                 );
                 assert_eq!(model.ledger.lock().unwrap().calls, 1);
                 Ok(())
@@ -459,7 +472,13 @@ fn codex_catalog_openrouter_requires_supplied_catalog() {
                 )
                 .await?;
             assert_eq!(response.status(), 200);
-            assert_eq!(response.into_body().collect().await?.to_bytes(), catalog);
+            assert_eq!(
+                crate::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
+                catalog
+            );
             Ok(())
         },
     ))
@@ -677,7 +696,9 @@ fn codex_catalog_forward_origin_is_separate_from_model_calls() {
                         .body(Body::from(r#"{"model":"gpt-5","input":"Hello"}"#))?
                 };
                 let response = site.clone().send(request).await?;
-                response.into_body().collect().await?;
+                crate::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?;
             }
             Ok(())
         },
@@ -754,7 +775,9 @@ fn guest_credentials_follow_each_request_without_replacement() {
                         )
                         .await?;
                     assert_eq!(response.status(), 200);
-                    response.into_body().collect().await?;
+                    crate::httpd::HttpBody(response.into_body())
+                        .collect()
+                        .await?;
                 }
                 Ok(())
             },
@@ -1027,7 +1050,10 @@ fn usage_in_a_long_stream_event_counts_toward_the_budget() {
                 .body(Body::from(body.to_string()))?;
             let response = model.clone().send(request).await?;
             assert_eq!(response.status(), 200);
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let bytes = crate::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes();
             assert!(std::str::from_utf8(&bytes)?.contains("response.completed"));
             let ledger = model.ledger.lock().unwrap();
             assert_eq!((ledger.input, ledger.output), (5, 2));
@@ -1075,7 +1101,10 @@ fn usage_in_a_long_json_response_counts_toward_the_budget() {
                 .body(Body::from(body.to_string()))?;
             let response = model.clone().send(request).await?;
             assert_eq!(response.status(), 200);
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let bytes = crate::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes();
             assert_eq!(
                 serde_json::from_slice::<Value>(&bytes)?["usage"]["input_tokens"],
                 5
@@ -1095,7 +1124,10 @@ fn the_provider_receives_only_the_validated_json_value() {
     impl web::Upstream for Transport {
         fn request(self: Arc<Self>, request: Request<Body>) -> web::UpstreamFuture {
             Box::pin(async move {
-                let bytes = request.into_body().collect().await?.to_bytes();
+                let bytes = crate::httpd::HttpBody(request.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes();
                 let wire = std::str::from_utf8(&bytes).unwrap();
                 assert!(!wire.contains("web_search_preview"));
                 assert!(!wire.contains("https://example.com"));
@@ -1112,7 +1144,7 @@ fn the_provider_receives_only_the_validated_json_value() {
         let body = r#"{"model":"small","tools":[{"type":"web_search_preview"}],"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image"}]}],"tools":[{"type":"function","name":"local","parameters":{}}],"input":"local text"}"#;
         let response = model.send(Request::post("/v1/responses").header("authorization", "Bearer local-token").body(Body::from(body))?).await?;
         assert_eq!(response.status(), 200);
-        response.into_body().collect().await?;
+        crate::httpd::HttpBody(response.into_body()).collect().await?;
         Ok(())
     })).unwrap();
 }
@@ -1156,7 +1188,7 @@ async fn long_lived_claude_token_stays_on_the_host() {
             .header("x-api-key", "unused").header("cookie", "unused")
             .body(Body::from(r#"{"model":"claude","max_tokens":10,"messages":[{"role":"user","content":"Hello"}]}"#))?).await?;
         assert_eq!(response.status(), 200);
-        let body = response.into_body().collect().await?.to_bytes();
+        let body = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains("sk-ant-oat01-host-private"));
         assert!(body.contains("<Claude OAuth token>"));

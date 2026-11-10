@@ -230,8 +230,7 @@ impl Authenticated {
         let status = response.status().as_u16();
         let response = transport::sanitize(response, self.key.secret.clone())
             .map_err(|e| self.key.redact(&e.to_string()))?;
-        let bytes = response
-            .into_body()
+        let bytes = crate::httpd::HttpBody(response.into_body())
             .collect()
             .await
             .map_err(|e| self.key.redact(&e.to_string()))?
@@ -320,8 +319,7 @@ impl Transport for Https {
         Box::pin(async move {
             let response = self.incoming(cx, headers, body).await?;
             let status = response.status().as_u16();
-            let body = response
-                .into_body()
+            let body = crate::httpd::HttpBody(response.into_body())
                 .collect()
                 .await
                 .map_err(|e| e.to_string())?

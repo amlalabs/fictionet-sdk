@@ -346,7 +346,12 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
         );
         let conn = fictionet::stdlib::network::ConnInfo::new(1, address, "10.0.0.2:5000".parse()?);
         let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
-        let mut ex = httpd::Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
+        let mut ex = httpd::Exchange::new(
+            fictionet::time::Instant::ZERO,
+            &entropy,
+            &conn,
+            fictionet::stdlib::web::httpd::Responses::new(&fictionet::Budget::unlimited()),
+        );
         let request = web::Request {
             head: web::Head::new(
                 "POST",
@@ -376,7 +381,13 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
         for name in ["connection", "x-private", "x-other", "upgrade"] {
             assert!(response.fields.get(name.as_bytes()).is_none());
         }
-        assert_eq!(response.body.collect().await?.to_bytes(), "world");
+        assert_eq!(
+            fictionet_extras::httpd::HttpBody(response.body)
+                .collect()
+                .await?
+                .to_bytes(),
+            "world"
+        );
         let request = server.await.unwrap().to_ascii_lowercase();
         assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
         assert!(request.contains(&format!("host: {address}\r\n")));

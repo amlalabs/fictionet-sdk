@@ -32,8 +32,7 @@ impl Transport for ProviderTransport {
             use http_body_util::BodyExt;
             let response = self.incoming(cx, headers, body).await?;
             let status = response.status().as_u16();
-            let body = response
-                .into_body()
+            let body = fictionet_extras::httpd::HttpBody(response.into_body())
                 .collect()
                 .await
                 .map_err(|e| e.to_string())?

@@ -39,11 +39,12 @@ pub(super) fn response_held(_parts: &Response) -> usize {
 }
 
 /// The response for a handler error: `502` for [`BadGateway`], else `500`.
-pub(super) fn error_response(e: &Error) -> Response {
+pub(super) fn error_response(storage: &super::Responses, e: &Error) -> Response {
     if e.is::<BadGateway>() {
-        text(StatusCode::BAD_GATEWAY, &format!("{e}\n"))
+        text(storage, StatusCode::BAD_GATEWAY, &format!("{e}\n"))
     } else {
         text(
+            storage,
             StatusCode::INTERNAL_SERVER_ERROR,
             "The site failed to answer.\n",
         )

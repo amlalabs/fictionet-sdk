@@ -50,7 +50,11 @@ async fn fixed_upstream_preserves_request_and_removes_connection_headers() {
         assert!(!response.headers().contains_key("x-other"));
         assert!(!response.headers().contains_key("upgrade"));
         assert_eq!(
-            response.into_body().collect().await.unwrap().to_bytes(),
+            fictionet_extras::httpd::HttpBody(response.into_body())
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
             "world"
         );
         let request = server.await.unwrap().to_ascii_lowercase();

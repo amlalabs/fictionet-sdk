@@ -67,14 +67,14 @@ pub struct HttpCase {
 #[derive(Clone)]
 pub struct Page(pub Bytes);
 
-impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Page {
+impl tower_service::Service<Request<fictionet_extras::httpd::HttpBody>> for Page {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
-    fn call(&mut self, _: Request<fictionet::stdlib::web::Body>) -> Self::Future {
+    fn call(&mut self, _: Request<fictionet_extras::httpd::HttpBody>) -> Self::Future {
         std::future::ready(Ok(Response::new(Full::new(self.0.clone()))))
     }
 }

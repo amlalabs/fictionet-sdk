@@ -56,9 +56,12 @@ pub struct Proxy {
 }
 
 impl Handler for Proxy {
-    fn call(&self, request: super::Request, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+    fn call(&self, request: super::Request, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
         let client = self.client.clone();
-        httpd::Reply::Later(Box::new(move |_| Box::pin(send_upstream(client, request))))
+        let responses = ex.responses().clone();
+        httpd::Reply::Later(Box::new(move |_| {
+            Box::pin(send_upstream(client, request, responses))
+        }))
     }
 }
 
@@ -92,11 +95,16 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
 }
 
 /// Forwards one request to its [`Site`](super::Site) over the world's own network.
-async fn send_upstream(client: Arc<dyn Upstream>, request: super::Request) -> Result<super::Response, Error> {
+async fn send_upstream(
+    client: Arc<dyn Upstream>,
+    request: super::Request,
+    responses: httpd::Responses,
+) -> Result<super::Response, Error> {
     use http::uri::Scheme;
     let target = request.site;
     if target.routing != Routing::Exact {
         let response = httpd::text(
+            &responses,
             http::StatusCode::MISDIRECTED_REQUEST,
             "This proxy does not serve unregistered hosts.\n",
         );
@@ -117,7 +125,8 @@ async fn send_upstream(client: Arc<dyn Upstream>, request: super::Request) -> Re
         Host::Replace(&authority),
         Some(&target.name),
     )
-    .await.map(super::Response::from_http)
+    .await
+    .map(super::Response::from_http)
 }
 
 /// What [`dispatch`] does with the request's `Host` header.
@@ -175,7 +184,11 @@ async fn dispatch(
 /// It uses the supplied transport.
 /// Returns an error for an
 /// upstream without such a scheme or without an authority.
-pub fn forward(_fcx: &Cx, upstream: http::Uri, client: Arc<dyn Upstream>) -> Result<Forward, Error> {
+pub fn forward(
+    _fcx: &Cx,
+    upstream: http::Uri,
+    client: Arc<dyn Upstream>,
+) -> Result<Forward, Error> {
     use http::uri::Scheme;
     let parts = upstream.into_parts();
     match (parts.scheme, parts.authority) {
@@ -206,17 +219,35 @@ impl Forward {
     pub fn send(&self, request: Request<Body>) -> UpstreamFuture {
         let scheme = self.scheme.clone();
         let authority = self.authority.clone();
-        Box::pin(dispatch(self.client.clone(), request,
-            move |path| Ok(http::Uri::builder().scheme(scheme).authority(authority).path_and_query(path).build()?),
-            Host::Preserve, None))
+        Box::pin(dispatch(
+            self.client.clone(),
+            request,
+            move |path| {
+                Ok(http::Uri::builder()
+                    .scheme(scheme)
+                    .authority(authority)
+                    .path_and_query(path)
+                    .build()?)
+            },
+            Host::Preserve,
+            None,
+        ))
     }
 }
 
 impl Handler for Forward {
     fn call(&self, request: super::Request, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
         let forward = self.clone();
-        httpd::Reply::Later(Box::new(move |_| Box::pin(async move {
-            forward.send(http::Request::from_parts(request.head.to_http()?, request.body)).await.map(super::Response::from_http)
-        })))
+        httpd::Reply::Later(Box::new(move |_| {
+            Box::pin(async move {
+                forward
+                    .send(http::Request::from_parts(
+                        request.head.to_http()?,
+                        request.body,
+                    ))
+                    .await
+                    .map(super::Response::from_http)
+            })
+        }))
     }
 }

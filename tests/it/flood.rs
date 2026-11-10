@@ -35,7 +35,7 @@ const ACK: u8 = 0x10;
 #[derive(Clone)]
 struct Hello;
 
-impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Hello {
+impl tower_service::Service<Request<fictionet_extras::httpd::HttpBody>> for Hello {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<Result<Self::Response, Infallible>>;
@@ -44,7 +44,7 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Hello {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: Request<fictionet::stdlib::web::Body>) -> Self::Future {
+    fn call(&mut self, _: Request<fictionet_extras::httpd::HttpBody>) -> Self::Future {
         std::future::ready(Ok(Response::new(Full::new(Bytes::from_static(b"hello\n")))))
     }
 }

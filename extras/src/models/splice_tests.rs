@@ -122,7 +122,11 @@ pub(super) fn write_trailer(socket: &mut std::net::TcpStream, trailer: &str, siz
 }
 async fn collected(response: Response<Body>, stream: bool) -> Value {
     assert_eq!(response.status(), 200);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let bytes = crate::httpd::HttpBody(response.into_body())
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     if !stream {
         return serde_json::from_slice(&bytes).unwrap();
     }
@@ -353,7 +357,7 @@ fn token_counting_with_web_tools_and_history_returns_the_count() {
         let mut body = json!({"model":"claude","messages":[{"role":"user","content":"Search for page"}],"tools":tools});
         let counted = model.clone().send(request("/v1/messages/count_tokens", &body)).await?;
         assert_eq!(counted.status(), 200);
-        assert_eq!(counted.into_body().collect().await?.to_bytes(), r#"{"input_tokens":42}"#);
+        assert_eq!(crate::httpd::HttpBody(counted.into_body()).collect().await?.to_bytes(), r#"{"input_tokens":42}"#);
         body["max_tokens"] = json!(100);
         let answer = collected(model.clone().send(request("/v1/messages", &body)).await?, false).await;
         assert_eq!(answer["content"][0]["type"], "server_tool_use");
@@ -362,7 +366,7 @@ fn token_counting_with_web_tools_and_history_returns_the_count() {
         // Both calls are spent; counting stays free.
         let counted = model.clone().send(request("/v1/messages/count_tokens", &body)).await?;
         assert_eq!(counted.status(), 200);
-        assert_eq!(counted.into_body().collect().await?.to_bytes(), r#"{"input_tokens":42}"#);
+        assert_eq!(crate::httpd::HttpBody(counted.into_body()).collect().await?.to_bytes(), r#"{"input_tokens":42}"#);
         assert_eq!(model.ledger.lock().unwrap().calls, 2);
         Ok(())
     })).unwrap();
@@ -456,7 +460,7 @@ fn continuation_refusal(stream: bool, source: Refusal) {
             Response::builder().status(status).header("content-type", "application/json").header("retry-after", "7").body(Body::from(upstream_body.to_string()))?
         };
         let (expected_parts, expected_body) = expected.into_parts();
-        let expected_bytes = expected_body.collect().await?.to_bytes();
+        let expected_bytes = crate::httpd::HttpBody(expected_body).collect().await?.to_bytes();
         let expected_json: Value = serde_json::from_slice(&expected_bytes)?;
         let key = credential.wire(Provider::Anthropic, false);
         let model = Model::at(&cx, Provider::Anthropic, credential, format!("http://{address}").parse()?)?.search(Arc::new(Pages(AtomicUsize::new(0))));
@@ -466,7 +470,7 @@ fn continuation_refusal(stream: bool, source: Refusal) {
         let answer = model.clone().send(request).await?;
         if stream {
             assert_eq!(answer.status(), 200);
-            let bytes = answer.into_body().collect().await?.to_bytes();
+            let bytes = crate::httpd::HttpBody(answer.into_body()).collect().await?.to_bytes();
             let mut decoder = fictionet::stdlib::codec::Stream::new(fictionet::stdlib::protocols::sse::Events::new());
             let mut events = Vec::new();
             fictionet::stdlib::codec::try_pump(&mut decoder, &bytes, |event| {
@@ -485,7 +489,7 @@ fn continuation_refusal(stream: bool, source: Refusal) {
                     assert_eq!(answer.headers().get(name), Some(value));
                 }
             }
-            assert_eq!(answer.into_body().collect().await?.to_bytes(), expected_bytes);
+            assert_eq!(crate::httpd::HttpBody(answer.into_body()).collect().await?.to_bytes(), expected_bytes);
         }
         assert_eq!(model.ledger.lock().unwrap().calls, if matches!(source, Refusal::Upstream(_, _)) { 2 } else { 1 });
         cx.cancel();

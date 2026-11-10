@@ -256,7 +256,9 @@ struct Streams;
 impl Handler for Streams {
     fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         Reply::Now(fictionet::stdlib::web::Response::from_http(
-            http::Response::new(Body::new(Unsized(Some(Bytes::from_static(b"streamed\n"))))),
+            http::Response::new(fictionet_extras::httpd::from_http(Unsized(Some(
+                Bytes::from_static(b"streamed\n"),
+            )))),
         ))
     }
 }
@@ -272,7 +274,7 @@ fn response_policy_agrees_across_http_versions() {
             let status: u16 = request.uri().path()[1..].parse().unwrap();
             let bytes = Bytes::from_static(b"body");
             let body = if request.headers().contains_key("x-unknown") {
-                Body::new(Unsized(Some(bytes)))
+                fictionet_extras::httpd::from_http(Unsized(Some(bytes)))
             } else {
                 Body::from(bytes)
             };
@@ -676,7 +678,12 @@ fn truncated_http1_requests_keep_their_body_charge() {
             Reply::Later(Box::new(move |fcx| {
                 Box::pin(async move {
                     fcx.sleep(Duration::from_secs(1)).await?;
-                    assert!(request.into_body().collect().await.is_err());
+                    assert!(
+                        fictionet_extras::httpd::HttpBody(request.into_body())
+                            .collect()
+                            .await
+                            .is_err()
+                    );
                     Ok(fictionet::stdlib::web::Response::new(Body::empty()))
                 })
             }))
@@ -953,7 +960,7 @@ struct StreamingMetadata;
 impl Handler for StreamingMetadata {
     fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         Reply::Now(fictionet::stdlib::web::Response::from_http(
-            http::Response::new(Body::new(WaitingBody)),
+            http::Response::new(fictionet_extras::httpd::from_http(WaitingBody)),
         ))
     }
 }

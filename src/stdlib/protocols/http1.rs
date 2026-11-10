@@ -388,11 +388,11 @@ impl ResponseHead {
 /// Collect per body when the inner value needs EOF. `Assemble` can join Body
 /// events with an empty final fragment at Done while passing heads through.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event<H> {
+pub enum Event<H, B = Vec<u8>> {
     /// A complete head, before any body bytes are consumed.
     Head(H),
     /// A non-empty block of body bytes.
-    Body(Vec<u8>),
+    Body(B),
     /// The current message is complete.
     Done,
 }
@@ -530,9 +530,172 @@ impl RequestEvents {
     }
 }
 
+/// HTTP request input retained as contiguous chunks. Only an incomplete
+/// protocol unit crossing deliveries is copied into charged storage.
+pub(crate) struct RequestStream {
+    dec: RequestEvents,
+    input: fictionet::Chunk,
+    eof: bool,
+    done: bool,
+}
+
+impl RequestStream {
+    pub(crate) fn new(dec: RequestEvents) -> Self {
+        Self {
+            dec,
+            input: fictionet::Chunk::default(),
+            eof: false,
+            done: false,
+        }
+    }
+    pub(crate) fn decoder(&mut self) -> &mut RequestEvents {
+        &mut self.dec
+    }
+    pub(crate) fn limit(&self) -> usize {
+        self.dec.capacity()
+    }
+    pub(crate) fn unread(&self) -> &[u8] {
+        &self.input
+    }
+    pub(crate) fn pending(&self, n: usize) -> fictionet::Chunk {
+        self.input.slice(0..n)
+    }
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
+    pub(crate) fn end(&mut self) {
+        self.eof = true;
+    }
+    pub(crate) fn push(&mut self, chunk: &mut fictionet::Chunk) -> usize {
+        let n = chunk
+            .len()
+            .min(self.limit().saturating_sub(self.input.len()));
+        if n == 0 {
+            return 0;
+        }
+        let (budget, small, large) = self.dec.storage.as_ref().expect("connection storage");
+        if self.input.is_empty() {
+            if !chunk.repay(budget) {
+                return 0;
+            }
+            self.input = chunk.split_to(n);
+        } else {
+            let need = self.input.len() + n;
+            let Some(mut joined) = (if need <= small.slot() {
+                small.take(budget, 0)
+            } else if need <= large.slot() {
+                large.take(budget, 0)
+            } else {
+                fictionet::stdlib::layer::ChargedBytes::with_capacity(budget, need)
+                    .map(fictionet::Chunk::from)
+            }) else {
+                return 0;
+            };
+            joined.extend_within(&self.input).expect("reserved input");
+            joined.extend_within(&chunk[..n]).expect("reserved input");
+            self.input = joined;
+            chunk.advance(n);
+        }
+        n
+    }
+    pub(crate) fn next(
+        &mut self,
+    ) -> Option<Result<Event<Head, fictionet::Chunk>, crate::stdlib::codec::Fail<RequestError>>>
+    {
+        use crate::stdlib::codec::Fail;
+        if self.done {
+            return None;
+        }
+        loop {
+            // Body pieces follow delivery boundaries rather than waiting for
+            // a whole configured block. Head and framing limits stay fixed.
+            let step = self
+                .dec
+                .scan_request(&self.input, self.eof, true)
+                .map(|step| {
+                    step.map(|event| match event {
+                        BorrowedEvent::Head(head) => Event::Head(head),
+                        BorrowedEvent::Body(bytes) => {
+                            let start = bytes.as_ptr() as usize - self.input.as_ptr() as usize;
+                            Event::Body(self.input.slice(start..start + bytes.len()))
+                        }
+                        BorrowedEvent::Done => Event::Done,
+                    })
+                });
+            match step {
+                Ok(Step::Item(event, n)) => {
+                    self.input.advance(n);
+                    if self.input.is_empty() {
+                        self.input = fictionet::Chunk::default();
+                    }
+                    return Some(Ok(event));
+                }
+                Ok(Step::Skip(n)) => {
+                    self.input.advance(n);
+                    if self.input.is_empty() {
+                        self.input = fictionet::Chunk::default();
+                    }
+                }
+                Ok(Step::End) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(Step::Need) if !self.eof && self.input.len() < self.limit() => return None,
+                Ok(Step::Need) if self.eof && self.input.is_empty() => {
+                    self.done = true;
+                    return None;
+                }
+                other => {
+                    self.done = true;
+                    return Some(Err(match other {
+                        Err(error) => Fail::Protocol(error),
+                        _ if self.eof => Fail::Truncated {
+                            unread: self.input.len(),
+                        },
+                        _ => Fail::Stuck {
+                            unread: self.input.len(),
+                            capacity: self.limit(),
+                        },
+                    }));
+                }
+            }
+        }
+    }
+}
+
 impl Default for RequestEvents {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod retained_input_tests {
+    use super::*;
+    use fictionet::{Budget, Chunk, Pool};
+
+    #[test]
+    fn consumed_input_releases_its_backing_including_empty_lines() {
+        let budget = Budget::new(1 << 20);
+        let small = Pool::new(&budget, 2048, 4);
+        let large = Pool::new(&budget, 16384 + 64, 2);
+        let mut decoder = RequestEvents::new();
+        decoder.storage(budget.clone(), small.clone(), large.clone());
+        let mut stream = RequestStream::new(decoder);
+        for wire in [b"\r\n".as_slice(), b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"] {
+            let mut input = Chunk::unpaid(wire.to_vec());
+            assert_eq!(stream.push(&mut input), wire.len());
+            drop(input);
+            while let Some(event) = stream.next() {
+                drop(event.unwrap());
+            }
+            assert!(stream.unread().is_empty());
+            assert_eq!(budget.used(), small.charged() + large.charged());
+        }
+        drop(stream);
+        drop(small);
+        drop(large);
+        assert_eq!(budget.used(), 0);
     }
 }
 
@@ -545,7 +708,7 @@ impl Decode for RequestEvents {
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, RequestError> {
         Ok(self
-            .scan_request(input, eof)?
+            .scan_request(input, eof, false)?
             .map(BorrowedEvent::into_owned))
     }
 }
@@ -698,7 +861,7 @@ impl Decode for BodyEvents {
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
         Ok(self
             .core
-            .body(input, eof)?
+            .body(input, eof, false)?
             .map_or(Step::End, |step| step.map(BorrowedEvent::into_owned)))
     }
 }
@@ -892,8 +1055,9 @@ impl RequestEvents {
         &mut self,
         input: &'a [u8],
         eof: bool,
+        partial: bool,
     ) -> Result<Step<BorrowedEvent<'a, Head>>, RequestError> {
-        if let Some(step) = self.core.body(input, eof)? {
+        if let Some(step) = self.core.body(input, eof, partial)? {
             return Ok(step);
         }
         if self.core.scanned == 0 {
@@ -936,7 +1100,7 @@ impl RequestEvents {
                     self.core.begin(framing, true);
                     let mut rest = &input[n..];
                     loop {
-                        match self.core.body::<Head>(rest, eof) {
+                        match self.core.body::<Head>(rest, eof, false) {
                             Ok(Some(Step::Item(BorrowedEvent::Body(bytes), used))) => {
                                 received_body_bytes += bytes.len();
                                 rest = &rest[used..];
@@ -971,7 +1135,7 @@ impl Framed<Head> for RequestEvents {
         input: &'a [u8],
         eof: bool,
     ) -> Result<Step<BorrowedEvent<'a, Head>>, Error> {
-        self.scan_request(input, eof)
+        self.scan_request(input, eof, false)
             .map_err(|error| error.reason())
     }
     fn reader(&self) -> &Reader {
@@ -988,7 +1152,7 @@ impl Framed<ResponseHead> for ResponseEvents {
         input: &'a [u8],
         eof: bool,
     ) -> Result<Step<BorrowedEvent<'a, ResponseHead>>, Error> {
-        if let Some(step) = self.core.body(input, eof)? {
+        if let Some(step) = self.core.body(input, eof, false)? {
             return Ok(step);
         }
         let Some(n) = self.core.head(input)? else {
@@ -1134,7 +1298,7 @@ fn collect_body(
     let mut at = 0;
     loop {
         let rest = bytes.get(at..).ok_or(Error::State)?;
-        let n = match reader.body::<()>(rest, true)? {
+        let n = match reader.body::<()>(rest, true, false)? {
             Some(Step::Item(BorrowedEvent::Body(data), n)) => {
                 body.extend_from_slice(data);
                 n
@@ -1491,6 +1655,7 @@ impl Reader {
         &mut self,
         input: &'a [u8],
         eof: bool,
+        partial: bool,
     ) -> Result<Option<Step<BorrowedEvent<'a, H>>>, Error> {
         let step = match self.state {
             State::Head => return Ok(None),
@@ -1514,7 +1679,8 @@ impl Reader {
                 let n = usize::try_from(left)
                     .unwrap_or(usize::MAX)
                     .min(self.limits.body_chunk);
-                if input.len() < n {
+                let n = if partial { n.min(input.len()) } else { n };
+                if input.len() < n || n == 0 {
                     Step::Need
                 } else {
                     let remaining = left.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
@@ -2293,7 +2459,7 @@ where
     let mut done = false;
     // A handler refusal stops at the first Done. None marks completion;
     // Some(error) marks a refused value or an oversized owned body.
-    let mut collect = |event| -> Result<(), Option<Error>> {
+    let mut collect = |event: Event<_>| -> Result<(), Option<Error>> {
         match event {
             Event::Head(h) => head = Some(h),
             Event::Body(data) => {

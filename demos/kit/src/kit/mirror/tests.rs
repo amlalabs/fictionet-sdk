@@ -1,6 +1,8 @@
 use super::*;
+use bytes::Bytes;
 use fictionet::stdlib::web::Site;
 use http::{Request, Response, header};
+use http_body_util::BodyExt;
 use std::sync::{Mutex, atomic::AtomicUsize};
 
 const PACKAGE: &str = "/ubuntu/pool/main/p/package/package_1_amd64.deb";
@@ -60,7 +62,12 @@ async fn send(mirror: &Mirror<Upstream>, request: Request<Body>) -> Answer {
                 body,
                 site: Site::connection(&Default::default()),
             },
-            &mut httpd::Exchange::new(cx.now(), &cx, &Default::default()),
+            &mut httpd::Exchange::new(
+                cx.now(),
+                &cx,
+                &Default::default(),
+                fictionet::stdlib::web::httpd::Responses::new(&fictionet::Budget::unlimited()),
+            ),
         );
         let response = match reply {
             httpd::Reply::Now(response) => Ok(response),
@@ -73,7 +80,11 @@ async fn send(mirror: &Mirror<Upstream>, request: Request<Body>) -> Answer {
     output.lock().unwrap().take().unwrap()
 }
 async fn bytes(response: web::Response) -> Bytes {
-    response.body.collect().await.unwrap().to_bytes()
+    fictionet_extras::httpd::HttpBody(response.body)
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
 }
 
 #[tokio::test]

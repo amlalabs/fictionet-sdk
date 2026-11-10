@@ -260,7 +260,7 @@ pub(super) fn sites(fcx: &Cx) -> TestSites {
 #[derive(Clone)]
 pub(super) struct Plain(pub(super) &'static str);
 
-impl tower_service::Service<Request<web::Body>> for Plain {
+impl tower_service::Service<Request<fictionet_extras::httpd::HttpBody>> for Plain {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<Result<Self::Response, Infallible>>;
@@ -269,7 +269,7 @@ impl tower_service::Service<Request<web::Body>> for Plain {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<web::Body>) -> Self::Future {
+    fn call(&mut self, request: Request<fictionet_extras::httpd::HttpBody>) -> Self::Future {
         let t = request
             .extensions()
             .get::<web::Site>()
@@ -291,7 +291,7 @@ impl tower_service::Service<Request<web::Body>> for Plain {
 #[derive(Clone)]
 struct Broken;
 
-impl tower_service::Service<Request<web::Body>> for Broken {
+impl tower_service::Service<Request<fictionet_extras::httpd::HttpBody>> for Broken {
     type Response = Response<Full<Bytes>>;
     type Error = std::io::Error;
     type Future = std::future::Ready<Result<Self::Response, std::io::Error>>;
@@ -300,7 +300,7 @@ impl tower_service::Service<Request<web::Body>> for Broken {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _: Request<web::Body>) -> Self::Future {
+    fn call(&mut self, _: Request<fictionet_extras::httpd::HttpBody>) -> Self::Future {
         std::future::ready(Err(std::io::Error::other("broken on purpose")))
     }
 }

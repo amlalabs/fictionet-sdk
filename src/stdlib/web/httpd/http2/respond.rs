@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::SystemTime;
 
-use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
-use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::layer::{Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top};
 use fictionet::stdlib::network::ConnInfo;
@@ -319,24 +317,29 @@ impl State {
         self.wants = Asked::of(request.head.method());
         let now = env.now();
         self.delivery = Delivery::new(&responder.observe, &request, &responder.conn, now, received);
+        let responses = super::super::Responses::new(env.budget());
         let reply = match received {
             Received::Complete => responder.handler.call(
                 request,
-                &mut Exchange::new(now, env.entropy(), &responder.conn),
+                &mut Exchange::new(now, env.entropy(), &responder.conn, responses.clone()),
             ),
             Received::TooLarge => Reply::Now(text(
+                &responses,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "The request body is too large.\n",
             )),
             Received::Budget => Reply::Now(text(
+                &responses,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "The server cannot hold this request now.\n",
             )),
             Received::Timeout => Reply::Now(text(
+                &responses,
                 StatusCode::REQUEST_TIMEOUT,
                 "The request body took too long.\n",
             )),
             Received::CutOff => Reply::Now(text(
+                &responses,
                 StatusCode::BAD_REQUEST,
                 "The request body was cut off.\n",
             )),
@@ -385,7 +388,7 @@ impl State {
             response
         } else {
             drop(response);
-            let mut response = over_budget();
+            let mut response = over_budget(&super::super::Responses::new(&budget));
             if !self.hold(env, response_held(&response) + delivery)
                 || !response.fields.admit(&budget)
                 || !response.body.admit(&budget)
@@ -407,7 +410,7 @@ impl State {
             delivery.response(&parts);
         }
         // No `Date` here: the connection adds it when it frames the head.
-        let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), self.wants, || None);
+        let policy = ResponsePolicy::new(&parts, body.remaining(), self.wants, || None);
         let Ok(mut headers) =
             HeaderMap::try_with_capacity(parts.fields.iter().len().saturating_add(1))
         else {
@@ -606,26 +609,32 @@ impl Layer for Respond {
             Answer::Made(Ok(response)) => state.made(env, response),
             // An error on the stream's work resets it unanswered.
             Answer::Made(Err(error)) if error.is::<Reset>() => state.reset(),
-            Answer::Made(Err(error)) => state.made(env, error_response(&error)),
+            Answer::Made(Err(error)) => state.made(
+                env,
+                error_response(&super::super::Responses::new(env.budget()), &error),
+            ),
             Answer::Frame(..) if !matches!(state.stage, Stage::Polling) => {}
-            Answer::Frame(body, Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
-                    // The head is out, so a chunk the budget cannot hold
-                    // resets this stream alone.
-                    match Chunk::copy_of(env.budget(), &data) {
-                        Some(chunk) => {
-                            state.rest = chunk;
-                            state.stage = Stage::Body(Some(body));
-                        }
-                        None => state.reset(),
-                    }
+            Answer::Frame(body, Some(Ok(mut chunk))) => {
+                if chunk.repay(env.budget()) {
+                    state.rest = chunk;
+                    state.stage = Stage::Body(Some(body));
+                } else {
+                    state.reset();
                 }
-                Err(frame) => match frame.into_trailers() {
-                    Ok(trailers) => state.stage = Stage::Ending(Some(Box::new(trailers))),
-                    Err(_) => state.stage = Stage::Body(Some(body)),
-                },
-            },
-            Answer::Frame(_, None) => state.stage = Stage::Ending(None),
+            }
+            Answer::Frame(mut body, None) => {
+                let trailers = body.take_trailers().map(|fields| {
+                    let mut headers = HeaderMap::new();
+                    for (name, value) in fields.iter() {
+                        headers.append(
+                            HeaderName::from_bytes(name).expect("validated name"),
+                            HeaderValue::from_bytes(value).expect("validated value"),
+                        );
+                    }
+                    Box::new(headers)
+                });
+                state.stage = Stage::Ending(trailers);
+            }
             Answer::Frame(_, Some(Err(_))) => state.reset(),
         }
         Ok(())
@@ -684,7 +693,7 @@ pub struct Done {
 enum Answer {
     Made(Result<Response, Error>),
     /// The body back, with its next frame or its end.
-    Frame(Body, Option<Result<Frame<Bytes>, Error>>),
+    Frame(Body, Option<Result<Chunk, Error>>),
 }
 
 impl Job for Work {
@@ -711,7 +720,7 @@ impl Job for Work {
             }
             Op::Frame(body) => {
                 let frame = match body {
-                    Some(body) => ready!(Pin::new(body).poll_frame(cx)),
+                    Some(body) => ready!(body.poll_next(cx)),
                     None => None,
                 };
                 Answer::Frame(body.take().unwrap_or_default(), frame)
@@ -739,8 +748,9 @@ pub(super) fn response_held(response: &Response) -> usize {
     )
 }
 
-fn over_budget() -> Response {
+fn over_budget(storage: &super::super::Responses) -> Response {
     text(
+        storage,
         StatusCode::SERVICE_UNAVAILABLE,
         "The server cannot hold this response now.\n",
     )

@@ -8,7 +8,8 @@ use std::task::{Context, Poll};
 
 use crate::pages::{Asked, Meta, Pages};
 use bytes::Bytes;
-use fictionet::stdlib::web::{self, Body};
+use fictionet::stdlib::web;
+use fictionet_extras::httpd::HttpBody as Body;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};

@@ -160,10 +160,11 @@ impl VirtualHosts {
 impl Handler for VirtualHosts {
     fn call(&self, mut request: Request, ex: &mut Exchange<'_>) -> Reply {
         let Some(host) = request.head.host() else {
-            return Reply::Now(no_host());
+            return Reply::Now(no_host(ex.responses()));
         };
         let misdirected = || {
             let mut response = text(
+                ex.responses(),
                 StatusCode::MISDIRECTED_REQUEST,
                 "This server does not serve that host.\n",
             );
@@ -183,6 +184,7 @@ impl Handler for VirtualHosts {
                 let slash = if path.starts_with('?') { "/" } else { "" };
                 let location = format!("https://{host}{slash}{path}");
                 let mut response = text(
+                    ex.responses(),
                     StatusCode::MOVED_PERMANENTLY,
                     &format!("Moved to {location}\n"),
                 );
@@ -207,8 +209,12 @@ impl Handler for VirtualHosts {
 /// The answer to a request that names no host: `400`, with `answer`
 /// [`Answer::NoHost`] in its `answer` field. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
 /// gives it to an HTTP/1.1 request without `Host` before any handler.
-pub(super) fn no_host() -> crate::stdlib::web::Response {
-    let mut response = text(StatusCode::BAD_REQUEST, "The request names no host.\n");
+pub(super) fn no_host(storage: &super::Responses) -> crate::stdlib::web::Response {
+    let mut response = text(
+        storage,
+        StatusCode::BAD_REQUEST,
+        "The request names no host.\n",
+    );
     response.answer = Some(Answer::NoHost);
     response
 }

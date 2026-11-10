@@ -717,7 +717,7 @@ mod clients {
         complete: bool,
     }
     struct RecordedBody {
-        inner: httpd::Body,
+        inner: fictionet_extras::httpd::HttpBody,
         cx: Cx,
         fact: Option<RequestFact>,
         facts: Arc<Mutex<Vec<RequestFact>>>,
@@ -790,7 +790,7 @@ mod clients {
                     http::Response::builder()
                         .header("content-type", "application/octet-stream")
                         .header("x-content-type-options", "nosniff")
-                        .body(httpd::Body::new(Interrupted(true)))
+                        .body(fictionet_extras::httpd::from_http(Interrupted(true)))
                         .unwrap(),
                 ))
             } else {
@@ -804,8 +804,8 @@ mod clients {
                         httpd::Reply::Now(response) => response,
                         httpd::Reply::Later(work) => work(cx.clone()).await?,
                     };
-                    response.body = httpd::Body::new(RecordedBody {
-                        inner: response.body,
+                    response.body = fictionet_extras::httpd::from_http(RecordedBody {
+                        inner: fictionet_extras::httpd::HttpBody(response.body),
                         cx,
                         fact: Some(fact),
                         facts,
@@ -1776,7 +1776,7 @@ fn failing_response_body_is_an_internal_stream_error() {
             _: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
             httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
-                http::Response::new(httpd::Body::new(Broken)),
+                http::Response::new(fictionet_extras::httpd::from_http(Broken)),
             ))
         }
     }
@@ -1878,7 +1878,9 @@ fn streamed_chunk_over_budget_resets_only_its_stream() {
             let parts = request.head.to_http().expect("valid request head");
             let request = http::Request::from_parts(parts, request.body);
             let body = if request.uri().path() == "/large" {
-                httpd::Body::new(http_body_util::Full::new(Bytes::from(vec![b'x'; 200_000])))
+                fictionet_extras::httpd::from_http(http_body_util::Full::new(Bytes::from(
+                    vec![b'x'; 200_000],
+                )))
             } else {
                 httpd::Body::from("ok")
             };

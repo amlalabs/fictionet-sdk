@@ -183,7 +183,7 @@ fn both_logins_refresh_once_and_persist_rotated_tokens() {
             let req = Request::post(login.path()).body(Body::from(json!({"grant_type":"refresh_token","client_id":login.client(),"refresh_token":refresh}).to_string()))?;
             let response = Service::call(&mut authority.clone(), req).await?;
             assert_eq!(response.status(), 200);
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let bytes = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
             let body: Value = serde_json::from_slice(&bytes)?;
             assert!(authority.accepts(body["access_token"].as_str().unwrap()));
             assert!(!String::from_utf8_lossy(&bytes).contains("rotated-"));
@@ -413,7 +413,7 @@ fn codex_guest_login_keeps_identity_and_refresh_returns_the_current_token() {
                 let response = Service::call(&mut authority.clone(), request).await?;
                 assert_eq!(response.status(), 200);
                 let body: Value =
-                    serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                    serde_json::from_slice(&crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes())?;
                 assert_eq!(decode(body["id_token"].as_str().unwrap())["email"], "analyst@example.com");
                 issued.push(body["access_token"].as_str().unwrap().to_owned());
             }
@@ -512,10 +512,12 @@ fn chatgpt_login_swaps_the_bearer_adds_the_account_and_stops_like_codex_limits()
                 .send(get("/backend-api/wham/accounts/check", &guest))
                 .await?;
             assert_eq!(account.status(), 200);
-            account.into_body().collect().await?;
+            crate::httpd::HttpBody(account.into_body())
+                .collect()
+                .await?;
             let call = model.clone().send(post()).await?;
             assert_eq!(call.status(), 200);
-            call.into_body().collect().await?;
+            crate::httpd::HttpBody(call.into_body()).collect().await?;
             // The listing was free; the one model call used the budget.
             let stop = model.clone().send(post()).await?;
             assert_eq!(stop.status(), 429);
@@ -523,8 +525,12 @@ fn chatgpt_login_swaps_the_bearer_adds_the_account_and_stops_like_codex_limits()
             let reset: u64 = stop.headers()["x-codex-primary-reset-at"]
                 .to_str()?
                 .parse()?;
-            let body: Value =
-                serde_json::from_slice(&stop.into_body().collect().await?.to_bytes())?;
+            let body: Value = serde_json::from_slice(
+                &crate::httpd::HttpBody(stop.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
+            )?;
             // Codex renders this as "You've hit your usage limit. Visit
             // https://chatgpt.com/settings/usage to purchase more credits or try again at ..."
             // for a Pro plan.

@@ -106,9 +106,9 @@ impl httpd::Handler for Http {
             return upgrade(request);
         }
         if request.uri().path() == "/reset" {
-            return httpd::Reply::Now(fictionet::stdlib::web::Response::new(httpd::Body::new(
-                BrokenBody,
-            )));
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::new(
+                fictionet_extras::httpd::from_http(BrokenBody),
+            ));
         }
         let draw = ex.random_u64();
         httpd::Reply::Now(fictionet::stdlib::web::Response::new(

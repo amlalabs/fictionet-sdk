@@ -1,277 +1,212 @@
+use crate::stdlib::web::Fields;
+use fictionet::{Budget, Chunk, Error};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{Buf, Bytes};
-use http_body::{Frame, SizeHint};
-
-use fictionet::{Budget, Chunk, Error};
-
-// ---------------------------------------------------------------------------
-// Bodies
-
-type Boxed = Pin<Box<dyn http_body::Body<Data = Bytes, Error = Error> + Send>>;
+/// A native body stream. Each piece retains its storage and reservation.
+pub trait BodyStream: Send {
+    /// The next piece, an error, or the end. Pending must arrange a wake.
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Chunk, Error>>>;
+    /// The exact number of bytes remaining, when known.
+    fn remaining(&self) -> Option<u64> {
+        None
+    }
+    /// Whether polling would return the end immediately.
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+    /// Trailing fields, available after the end of the data.
+    fn take_trailers(self: Pin<&mut Self>) -> Option<Fields> {
+        None
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct BodyRefused;
-
 impl std::fmt::Display for BodyRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("the response body exceeds the connection budget")
     }
 }
-
 impl std::error::Error for BodyRefused {}
 
-/// The body of every request a handler gets and every response it
-/// returns: bytes known in full, or a stream of them.
-///
-/// The service reads a request's body before calling the handler. On
-/// native HTTP/1, a cut-off body reaches a custom [`Handler`](super::Handler) or tower
-/// service as a stream of the bytes received, followed by an error.
-/// HTTP/1 upgrade requests and HTTP/2 requests with body collection errors
-/// are rejected before calling any handler.
-/// A response's body may stream, as a tower service's does; one whose
-/// length is known goes out with `content-length`.
-/// Full bodies retain their chunk and its reservation without boxing.
-/// Converting opaque `Bytes` copies; polling a full body through
-/// `http_body::Body` allocates a `Bytes` owner. Native delivery uses the
-/// chunk directly.
+/// A complete body or a stream of retained chunks.
 pub enum Body {
     /// All bytes, retaining their backing and its reservation.
     Full(Chunk),
-    /// A body polled through the allocating HTTP body interface.
-    Stream(Boxed),
+    /// Lazily produced chunks, with one box for the stream.
+    Stream(Pin<Box<dyn BodyStream>>),
 }
-
 impl Body {
-    /// No bytes.
-    pub fn empty() -> Body {
-        Body::Full(Chunk::default())
+    /// No bytes and no allocation.
+    pub fn empty() -> Self {
+        Self::Full(Chunk::default())
     }
-
-    /// Any `http_body::Body`, with its data as `Bytes`.
-    pub fn new<B>(body: B) -> Body
-    where
-        B: http_body::Body + Send + 'static,
-        B::Data: Send,
-        B::Error: Into<Error>,
-    {
-        Body::Stream(Box::pin(IntoBytes(Box::pin(body))))
+    /// A shared view of a complete body.
+    pub fn bytes(&self) -> Option<Chunk> {
+        match self {
+            Self::Full(b) => Some(b.clone()),
+            Self::Stream(_) => None,
+        }
     }
-
-    /// Takes a stream's bytes when they are all there now, so that no work
-    /// is needed to read them: one frame of data and then its end, or the
-    /// end at once. A stream with more to give, or an error first, stays a
-    /// stream, with what was taken from it still first.
+    /// Poll the next native chunk.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Chunk, Error>>> {
+        match self {
+            Self::Full(b) => Poll::Ready((!b.is_empty()).then(|| Ok(std::mem::take(b)))),
+            Self::Stream(s) => s.as_mut().poll_next(cx),
+        }
+    }
+    /// The exact number of bytes remaining, when known.
+    pub fn remaining(&self) -> Option<u64> {
+        match self {
+            Self::Full(b) => Some(b.len() as u64),
+            Self::Stream(s) => s.remaining(),
+        }
+    }
+    /// Whether the data has ended.
+    pub fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Full(b) => b.is_empty(),
+            Self::Stream(s) => s.is_end_stream(),
+        }
+    }
+    /// Trailing fields after data has ended.
+    pub fn take_trailers(&mut self) -> Option<Fields> {
+        match self {
+            Self::Full(_) => None,
+            Self::Stream(s) => s.as_mut().take_trailers(),
+        }
+    }
+    pub(super) fn admit(&mut self, budget: &Budget) -> bool {
+        match self {
+            Self::Full(b) => b.repay(budget),
+            Self::Stream(_) => true,
+        }
+    }
     pub(super) fn settle(
         &mut self,
         cx: &mut Context<'_>,
         budget: &Budget,
     ) -> Result<(), BodyRefused> {
-        let Body::Stream(stream) = self else {
+        let Self::Stream(stream) = self else {
             return Ok(());
         };
-        if stream.is_end_stream() {
-            *self = Body::Full(Chunk::default());
+        let Poll::Ready(first) = stream.as_mut().poll_next(cx) else {
+            return Ok(());
+        };
+        if first.is_none() {
+            let trailers = stream.as_mut().take_trailers();
+            *self = if trailers.is_some() {
+                Self::Stream(Box::pin(Prefixed {
+                    first: None,
+                    rest: Self::empty(),
+                    trailers,
+                }))
+            } else {
+                Self::empty()
+            };
             return Ok(());
         }
-        let Poll::Ready(first) = stream.as_mut().poll_frame(cx) else {
-            return Ok(());
-        };
-        let Some(first) = first else {
-            *self = Body::Full(Chunk::default());
-            return Ok(());
-        };
-        if let Ok(frame) = &first
-            && let Some(data) = frame.data_ref()
-            && stream.is_end_stream()
-        {
-            *self = Body::Full(Chunk::copy_of(budget, data).ok_or(BodyRefused)?);
+        if stream.is_end_stream() && matches!(&first, Some(Ok(_))) {
+            let Some(Ok(mut data)) = first else {
+                unreachable!()
+            };
+            if !data.repay(budget) {
+                return Err(BodyRefused);
+            }
+            let trailers = stream.as_mut().take_trailers();
+            *self = if trailers.is_some() {
+                Self::Stream(Box::pin(Prefixed {
+                    first: Some(Ok(data)),
+                    rest: Self::empty(),
+                    trailers,
+                }))
+            } else {
+                Self::Full(data)
+            };
             return Ok(());
         }
-        let rest = std::mem::replace(stream, Box::pin(Body::empty()));
-        *self = Body::Stream(Box::pin(Prefixed {
-            first: Some(first),
+        let rest = std::mem::replace(self, Self::empty());
+        *self = Self::Stream(Box::pin(Prefixed {
+            first,
             rest,
+            trailers: None,
         }));
         Ok(())
     }
-
-    /// Moves a full body's backing reservation to the receiving budget.
-    /// A stream pays for its frames when they are polled.
-    pub(super) fn admit(&mut self, budget: &Budget) -> bool {
-        match self {
-            Self::Full(bytes) => bytes.repay(budget),
-            Self::Stream(_) => true,
-        }
-    }
-
-    /// A shared view of the full body, without allocating or copying.
-    /// The view keeps the backing's reservation until it is dropped.
-    pub fn bytes(&self) -> Option<Chunk> {
-        match self {
-            Body::Full(b) => Some(b.clone()),
-            Body::Stream(_) => None,
-        }
+}
+impl Default for Body {
+    fn default() -> Self {
+        Self::empty()
     }
 }
-
 impl std::fmt::Debug for Body {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Body::Full(b) => write!(f, "Body({} bytes)", b.len()),
-            Body::Stream(_) => f.write_str("Body(stream)"),
+            Self::Full(b) => write!(f, "Body({} bytes)", b.len()),
+            Self::Stream(_) => f.write_str("Body(stream)"),
         }
     }
 }
-
-impl Default for Body {
-    fn default() -> Body {
-        Body::empty()
-    }
-}
-
 impl From<Chunk> for Body {
     fn from(bytes: Chunk) -> Self {
         Self::Full(bytes)
     }
 }
-
-impl From<Bytes> for Body {
-    /// Copies opaque storage so its unexposed backing is not retained.
-    fn from(b: Bytes) -> Body {
-        Body::from(b.to_vec())
-    }
-}
-
 impl From<Vec<u8>> for Body {
-    fn from(b: Vec<u8>) -> Body {
-        if b.is_empty() {
-            Body::empty()
+    fn from(bytes: Vec<u8>) -> Self {
+        if bytes.is_empty() {
+            Self::empty()
         } else {
-            Body::Full(Chunk::unpaid(b))
+            Self::Full(Chunk::unpaid(bytes))
         }
     }
 }
-
 impl From<String> for Body {
-    fn from(s: String) -> Body {
-        Body::from(s.into_bytes())
+    fn from(s: String) -> Self {
+        Self::from(s.into_bytes())
     }
 }
-
 impl From<&'static str> for Body {
-    fn from(s: &'static str) -> Body {
-        Body::from(s.as_bytes().to_vec())
+    fn from(s: &'static str) -> Self {
+        Self::from(s.as_bytes().to_vec())
+    }
+}
+impl From<bytes::Bytes> for Body {
+    fn from(b: bytes::Bytes) -> Self {
+        Self::from(b.to_vec())
     }
 }
 
-impl http_body::Body for Body {
-    type Data = Bytes;
-    type Error = Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
-        match self.get_mut() {
-            Body::Full(b) => Poll::Ready(
-                (!b.is_empty()).then(|| Ok(Frame::data(Bytes::from_owner(std::mem::take(b))))),
-            ),
-            Body::Stream(s) => s.as_mut().poll_frame(cx),
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        match self {
-            Body::Full(b) => b.is_empty(),
-            Body::Stream(s) => s.is_end_stream(),
-        }
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        match self {
-            Body::Full(b) => SizeHint::with_exact(b.len() as u64),
-            Body::Stream(s) => s.size_hint(),
-        }
-    }
-}
-
-/// A stream with a frame already taken from it, which comes first.
 struct Prefixed {
-    first: Option<Result<Frame<Bytes>, Error>>,
-    rest: Boxed,
+    first: Option<Result<Chunk, Error>>,
+    rest: Body,
+    trailers: Option<Fields>,
 }
-
-impl http_body::Body for Prefixed {
-    type Data = Bytes;
-    type Error = Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+impl BodyStream for Prefixed {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Chunk, Error>>> {
         let this = self.get_mut();
         if let Some(first) = this.first.take() {
             return Poll::Ready(Some(first));
         }
-        this.rest.as_mut().poll_frame(cx)
+        this.rest.poll_next(cx)
     }
-
+    fn remaining(&self) -> Option<u64> {
+        self.rest.remaining()?.checked_add(
+            self.first
+                .as_ref()
+                .and_then(|v| v.as_ref().ok())
+                .map_or(0, |b| b.len() as u64),
+        )
+    }
     fn is_end_stream(&self) -> bool {
-        self.first.is_none() && self.rest.is_end_stream()
+        self.first.is_none() && self.trailers.is_none() && self.rest.is_end_stream()
     }
-
-    fn size_hint(&self) -> SizeHint {
-        let mut hint = self.rest.size_hint();
-        if let Some(Ok(frame)) = &self.first
-            && let Some(data) = frame.data_ref()
-        {
-            // The upper bound moves first: each setter checks the bounds
-            // against the other.
-            let more = data.len() as u64;
-            if let Some(upper) = hint.upper() {
-                hint.set_upper(upper + more);
-            }
-            hint.set_lower(hint.lower() + more);
-        }
-        hint
+    fn take_trailers(self: Pin<&mut Self>) -> Option<Fields> {
+        let this = self.get_mut();
+        this.trailers.take().or_else(|| this.rest.take_trailers())
     }
 }
-
-/// A body with its data as `Bytes` and its errors as [`Error`]. It passes
-/// on the size hint, so a known length is sent as `content-length`.
-struct IntoBytes<B>(Pin<Box<B>>);
-
-impl<B> http_body::Body for IntoBytes<B>
-where
-    B: http_body::Body,
-    B::Error: Into<Error>,
-{
-    type Data = Bytes;
-    type Error = Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
-        self.0.as_mut().poll_frame(cx).map(|f| {
-            f.map(|r| {
-                r.map(|f| f.map_data(|mut d| d.copy_to_bytes(d.remaining())))
-                    .map_err(Into::into)
-            })
-        })
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.0.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.0.size_hint()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,10 +232,23 @@ mod tests {
 
     #[test]
     fn settling_a_ready_frame_requires_its_whole_reservation() {
-        let payload = Bytes::from_static(b"one ready frame");
+        let payload = Chunk::unpaid(b"one ready frame".to_vec());
+        struct Ready(Chunk);
+        impl BodyStream for Ready {
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Chunk, Error>>> {
+                let data = std::mem::take(&mut self.get_mut().0);
+                Poll::Ready((!data.is_empty()).then_some(Ok(data)))
+            }
+            fn is_end_stream(&self) -> bool {
+                self.0.is_empty()
+            }
+        }
         for limit in [0, payload.len() - 1, payload.len()] {
             let budget = Budget::new(limit);
-            let mut body = Body::new(http_body_util::Full::new(payload.clone()));
+            let mut body = Body::Stream(Box::pin(Ready(Chunk::unpaid(payload.to_vec()))));
             let mut cx = Context::from_waker(std::task::Waker::noop());
             let result = body.settle(&mut cx, &budget);
             assert_eq!(result.is_ok(), limit >= payload.len());

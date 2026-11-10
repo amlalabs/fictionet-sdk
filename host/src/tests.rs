@@ -169,11 +169,7 @@ fn run<F>(test: impl FnOnce(Cx) -> F + Send)
 where
     F: std::future::Future<Output = Result<(), Error>> + Send + 'static,
 {
-    fictionet::block_on(fictionet::run(
-        Seed::from_u64(1),
-        test,
-    ))
-    .unwrap();
+    fictionet::block_on(fictionet::run(Seed::from_u64(1), test)).unwrap();
 }
 
 async fn poll_once<F: Future + ?Sized>(mut future: Pin<&mut F>) -> Poll<F::Output> {
@@ -199,8 +195,14 @@ fn content_length_and_chunked_responses_reuse_connections() {
             for (expected, length) in [("hello", Some(5)), ("world", None)] {
                 let response = forward.send(request()).await?;
                 assert_eq!(response.status(), 200);
-                assert_eq!(response.body().size_hint().exact(), length);
-                assert_eq!(response.into_body().collect().await?.to_bytes(), expected);
+                assert_eq!(response.body().remaining(), length);
+                assert_eq!(
+                    fictionet_extras::httpd::HttpBody(response.into_body())
+                        .collect()
+                        .await?
+                        .to_bytes(),
+                    expected
+                );
             }
             server.join().unwrap();
             Ok(())
@@ -229,7 +231,13 @@ fn empty_requests_declare_a_length_only_when_their_method_expects_content() {
             *request.method_mut() = method.parse()?;
             let response = forward.send(request).await?;
             assert_eq!(response.status(), 204);
-            assert!(response.into_body().collect().await?.to_bytes().is_empty());
+            assert!(
+                fictionet_extras::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes()
+                    .is_empty()
+            );
         }
         server.join().unwrap();
         Ok(())
@@ -249,7 +257,8 @@ fn large_responses_stream_beyond_the_owned_codec_limit() {
                 }
                 socket.flush().unwrap();
             });
-            let mut body = forward.send(request()).await?.into_body();
+            let mut body =
+                fictionet_extras::httpd::HttpBody(forward.send(request()).await?.into_body());
             let mut received = 0;
             while let Some(frame) = body.frame().await {
                 let data = frame?.into_data().unwrap();
@@ -278,7 +287,10 @@ fn close_delimited_responses_and_redirects_are_passed_through() {
             assert_eq!(response.headers()["location"], "/elsewhere?q=2");
             assert!(!response.headers().contains_key("connection"));
             assert_eq!(
-                response.into_body().collect().await?.to_bytes(),
+                fictionet_extras::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
                 "redirect body"
             );
             server.join().unwrap();
@@ -305,7 +317,7 @@ fn close_delimited_events_arrive_before_the_server_closes() {
             let response = forward.send(request()).await?;
             assert_eq!(response.status(), 200);
             assert_eq!(response.headers()["content-type"], "text/event-stream");
-            let mut body = response.into_body();
+            let mut body = fictionet_extras::httpd::HttpBody(response.into_body());
             let mut first = Vec::new();
             while first.len() < b"data: first\n\n".len() {
                 let frame = body.frame().await.expect("the first event is missing")?;
@@ -355,7 +367,10 @@ fn tls_without_close_notify_uses_the_response_framing() {
             });
             let client = trusted_client(trust);
             let forward = forward(&fcx, Arc::new(client), true, address);
-            let body = forward.send(request()).await?.into_body().collect().await;
+            let body =
+                fictionet_extras::httpd::HttpBody(forward.send(request()).await?.into_body())
+                    .collect()
+                    .await;
             if complete {
                 assert_eq!(body?.to_bytes(), "hello");
             } else {
@@ -396,8 +411,14 @@ fn head_204_304_and_interim_responses_have_no_body() {
                 *request.method_mut() = method.parse()?;
                 let response = forward.send(request).await?;
                 assert_eq!(response.status(), status);
-                assert_eq!(response.body().size_hint().exact(), Some(body.len() as u64));
-                assert_eq!(response.into_body().collect().await?.to_bytes(), body);
+                assert_eq!(response.body().remaining(), Some(body.len() as u64));
+                assert_eq!(
+                    fictionet_extras::httpd::HttpBody(response.into_body())
+                        .collect()
+                        .await?
+                        .to_bytes(),
+                    body
+                );
             }
             server.join().unwrap();
             Ok(())
@@ -421,7 +442,13 @@ fn chunk_extensions_and_trailers_are_skipped() {
         // to its end.
         for _ in 0..2 {
             let response = forward.send(request()).await?;
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "hello");
+            assert_eq!(
+                fictionet_extras::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
+                "hello"
+            );
         }
         server.join().unwrap();
         Ok(())
@@ -445,7 +472,13 @@ fn connection_close_responses_are_not_reused() {
         let forward = forward(&fcx, Arc::new(Client::new()), false, address);
         for _ in 0..2 {
             let response = forward.send(request()).await?;
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+            assert_eq!(
+                fictionet_extras::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
+                "ok"
+            );
         }
         server.join().unwrap();
         Ok(())
@@ -510,7 +543,13 @@ fn a_pooled_connection_the_server_closed_is_replaced_for_idempotent_requests() {
             });
             let forward = forward(&fcx, Arc::new(client), tls, address);
             let response = forward.send(request()).await?;
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+            assert_eq!(
+                fictionet_extras::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
+                "ok"
+            );
             idle_closed.recv()?;
             for request in [request(), {
                 let mut again = request();
@@ -519,14 +558,26 @@ fn a_pooled_connection_the_server_closed_is_replaced_for_idempotent_requests() {
                 again
             }] {
                 let response = forward.send(request).await?;
-                assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+                assert_eq!(
+                    fictionet_extras::httpd::HttpBody(response.into_body())
+                        .collect()
+                        .await?
+                        .to_bytes(),
+                    "ok"
+                );
             }
             let mut once = request();
             *once.method_mut() = Method::POST;
             *once.body_mut() = Body::from("once");
             assert!(forward.send(once).await.is_err());
             let response = forward.send(request()).await?;
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+            assert_eq!(
+                fictionet_extras::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
+                "ok"
+            );
             server.join().unwrap();
             Ok(())
         });
@@ -551,7 +602,13 @@ fn tls_sends_and_checks_the_dns_name() {
         // also moves on from a refused address.
         let forward = forward(&fcx, Arc::new(client), true, format!("localhost:{port}"));
         let response = forward.send(request()).await?;
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+        assert_eq!(
+            fictionet_extras::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes(),
+            "ok"
+        );
         server.join().unwrap();
         Ok(())
     });
@@ -605,7 +662,8 @@ fn a_large_upload_streams_while_the_server_echoes_it() {
             }
             socket.flush().unwrap();
         });
-        let mut body = forward.send(upload(size)).await?.into_body();
+        let mut body =
+            fictionet_extras::httpd::HttpBody(forward.send(upload(size)).await?.into_body());
         let mut received = 0;
         while let Some(frame) = body.frame().await {
             let data = frame?.into_data().unwrap();
@@ -645,7 +703,13 @@ fn an_early_answer_during_an_upload_reaches_the_world() {
                 });
                 let response = forward.send(upload(size)).await?;
                 assert_eq!(response.status(), 413);
-                assert_eq!(response.into_body().collect().await?.to_bytes(), "too much");
+                assert_eq!(
+                    fictionet_extras::httpd::HttpBody(response.into_body())
+                        .collect()
+                        .await?
+                        .to_bytes(),
+                    "too much"
+                );
                 server.join().unwrap();
                 Ok(())
             });
@@ -731,11 +795,7 @@ async fn serve_one(fcx: &Cx, forward: fictionet::stdlib::web::Forward) -> String
 
 /// Serves one request through `forward`, checks that it answered 502 and
 /// recorded the error and the origin it tried, and returns the answer.
-async fn bad_gateway(
-    fcx: &Cx,
-    forward: fictionet::stdlib::web::Forward,
-    _origin: &str,
-) -> String {
+async fn bad_gateway(fcx: &Cx, forward: fictionet::stdlib::web::Forward, _origin: &str) -> String {
     let output = serve_one(fcx, forward).await;
     assert!(
         output.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
@@ -864,7 +924,13 @@ fn dropping_a_request_while_it_connects_frees_its_slot() {
         assert_eq!(client.slots.available_permits(), 0);
         drop(connecting);
         let response = waiting.await?;
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+        assert_eq!(
+            fictionet_extras::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes(),
+            "ok"
+        );
         server.join().unwrap();
         Ok(())
     });
@@ -908,7 +974,13 @@ fn exchanges_past_the_cap_wait_for_a_slot() {
         answer.send(())?;
         for call in calls {
             let response = call.await?;
-            assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+            assert_eq!(
+                fictionet_extras::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes(),
+                "ok"
+            );
         }
         server.join().unwrap();
         Ok(())
@@ -966,7 +1038,11 @@ fn raw_paths_and_encoded_responses_pass_through() {
         assert_eq!(response.headers()["content-encoding"], "gzip");
         assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
         assert_eq!(
-            response.into_body().collect().await?.to_bytes().as_ref(),
+            fictionet_extras::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes()
+                .as_ref(),
             b"\x1f\x8bopaque"
         );
         server.join().unwrap();
@@ -991,7 +1067,13 @@ fn a_response_keeps_its_runtime_after_the_handler_is_dropped() {
         let response = forward.send(request()).await?;
         drop(forward);
         release.send(())?;
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+        assert_eq!(
+            fictionet_extras::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes(),
+            "ok"
+        );
         server.join().unwrap();
         Ok(())
     });
@@ -1040,14 +1122,20 @@ fn request_bodies_of_unknown_length_stream_as_chunks() {
         });
         let mut request = request();
         *request.method_mut() = Method::POST;
-        *request.body_mut() = Body::new(http_body_util::StreamBody::new(
+        *request.body_mut() = fictionet_extras::httpd::from_http(http_body_util::StreamBody::new(
             futures_util::stream::iter([
                 Ok::<_, Error>(Frame::data(Bytes::from_static(b"one"))),
                 Ok(Frame::data(Bytes::from_static(b"two"))),
             ]),
         ));
         let response = forward.send(request).await?;
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+        assert_eq!(
+            fictionet_extras::httpd::HttpBody(response.into_body())
+                .collect()
+                .await?
+                .to_bytes(),
+            "ok"
+        );
         server.join().unwrap();
         Ok(())
     });

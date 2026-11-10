@@ -37,6 +37,7 @@ impl Handler for Maintenance {
     fn call(&self, _: fictionet::stdlib::web::Request, exchange: &mut Exchange<'_>) -> Reply {
         (self.0)(Event::Request(exchange.conn().clone()));
         Reply::Now(httpd::text(
+            exchange.responses(),
             http::StatusCode::OK,
             "South pumping station\nController online\nService contact: operations\n",
         ))

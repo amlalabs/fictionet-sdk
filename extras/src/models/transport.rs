@@ -146,8 +146,8 @@ pub(super) fn sanitize(
         *value = http::HeaderValue::from_bytes(secret.redact(&text).as_bytes())?;
     }
     Ok(response.map(|body| {
-        Body::new(Scrubbed {
-            body,
+        crate::httpd::from_http(Scrubbed {
+            body: crate::httpd::HttpBody(body),
             secret,
             pending: Vec::new(),
             streaming: framing == Framing::Events,
@@ -237,7 +237,7 @@ fn holds(text: &str, secret: &Secret) -> bool {
 }
 
 struct Scrubbed {
-    body: Body,
+    body: crate::httpd::HttpBody,
     secret: Secret,
     pending: Vec<u8>,
     streaming: bool,
@@ -464,14 +464,17 @@ mod tests {
                         "x-opaque",
                         http::HeaderValue::from_bytes(b"\xff private-key").unwrap(),
                     )
-                    .body(Body::new(Chunks(frames.collect())))?;
+                    .body(crate::httpd::from_http(Chunks(frames.collect())))?;
                 let response = sanitize(response, secret.clone())?;
                 assert_eq!(response.headers()["x-diagnostic"], "<provider key>");
                 assert!(
                     !String::from_utf8_lossy(response.headers()["x-opaque"].as_bytes())
                         .contains("private-key")
                 );
-                let body = response.into_body().collect().await?.to_bytes();
+                let body = crate::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes();
                 let output = String::from_utf8(body.to_vec())?;
                 assert!(!output.contains("private"), "{output}");
                 assert_eq!(output.matches("<provider key>").count(), 3);
@@ -490,7 +493,11 @@ mod tests {
                 secret.clone(),
             )?;
             assert_eq!(
-                response.into_body().collect().await?.to_bytes().as_ref(),
+                crate::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await?
+                    .to_bytes()
+                    .as_ref(),
                 b"null"
             );
             let response = sanitize(
@@ -499,7 +506,12 @@ mod tests {
                     .body(Body::from("data: {broken private\\u002dkey\n\n"))?,
                 secret,
             )?;
-            assert!(response.into_body().collect().await.is_err());
+            assert!(
+                crate::httpd::HttpBody(response.into_body())
+                    .collect()
+                    .await
+                    .is_err()
+            );
             Ok(())
         }))
         .unwrap();
@@ -513,7 +525,7 @@ mod tests {
                 let (first, second) = "private-key".split_at(split);
                 let value = json!({"content":[{"type":"text","text":format!("Before {first}")},{"type":"text","text":format!("{second} after")} ]});
                 let response = sanitize(Response::new(Body::from(value.to_string())), secret.clone())?;
-                let value: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                let value: Value = serde_json::from_slice(&crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes())?;
                 let assembled = format!("{}{}", value["content"][0]["text"].as_str().unwrap(), value["content"][1]["text"].as_str().unwrap());
                 assert_eq!(assembled, "Before <provider key> after");
                 for chat in [false, true] {
@@ -524,8 +536,8 @@ mod tests {
                     };
                     let input = format!("data: {}\n\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\ndata: {}\n\ndata: {}\n\n", event(&format!("Before {first}")), event(second), event(" after"));
                     let frames = input.bytes().map(|byte| Ok(Frame::data(Bytes::from(vec![byte])))).collect();
-                    let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::new(Chunks(frames)))?, secret.clone())?;
-                    let body = response.into_body().collect().await?.to_bytes();
+                    let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(crate::httpd::from_http(Chunks(frames)))?, secret.clone())?;
+                    let body = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
                     let output = std::str::from_utf8(&body)?;
                     let values: Vec<Value> = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(serde_json::from_str).collect::<Result<_, _>>()?;
                     assert_eq!(values.len(), 4);
@@ -546,7 +558,7 @@ mod tests {
             let parts = [r#"{"value":"private\u00"#, r#"2dkey"}"#];
             let input: String = parts.into_iter().map(|partial| format!("data: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}))).collect();
             let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let bytes = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
             let output = std::str::from_utf8(&bytes)?;
             let arguments: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["delta"]["partial_json"].as_str().unwrap().to_owned()).collect();
             let value: Value = serde_json::from_str(&arguments)?;
@@ -569,7 +581,7 @@ mod tests {
             .map(|event| format!("data: {event}\n\n"))
             .collect();
             let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let bytes = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
             let output = std::str::from_utf8(&bytes)?;
             let events: Vec<Value> = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(serde_json::from_str).collect::<Result<_, _>>()?;
             assert_eq!(events.len(), 2);
@@ -588,12 +600,12 @@ mod tests {
             let arguments = r#"{"n":123456789012345678901234567890,"pi":3.14159265358979323846}"#;
             let body = json!({"output":[{"type":"function_call","name":"multiply","call_id":"call_1","arguments":arguments}]});
             let response = sanitize(Response::new(Body::from(body.to_string())), secret.clone())?;
-            let value: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+            let value: Value = serde_json::from_slice(&crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes())?;
             assert_eq!(value["output"][0]["arguments"], arguments);
             let (first, second) = arguments.split_at(20);
             let input: String = [first, second].into_iter().map(|partial| format!("data: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}))).collect();
             let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::from(input))?, secret)?;
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let bytes = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
             let output = std::str::from_utf8(&bytes)?;
             let assembled: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["delta"]["partial_json"].as_str().unwrap().to_owned()).collect();
             assert_eq!(assembled, arguments);
@@ -608,8 +620,8 @@ mod tests {
             let parts = [r#"{"value":"private-"#, r#"key"}"#];
             let input: String = parts.into_iter().map(|partial| format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"function_call":{"arguments":partial}}}]}))).collect();
             let frames = input.bytes().map(|byte| Ok(Frame::data(Bytes::from(vec![byte])))).collect();
-            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::new(Chunks(frames)))?, secret)?;
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(crate::httpd::from_http(Chunks(frames)))?, secret)?;
+            let bytes = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
             let output = std::str::from_utf8(&bytes)?;
             let arguments: String = output.lines().filter_map(|line| line.strip_prefix("data: ")).map(|line| serde_json::from_str::<Value>(line).unwrap()["choices"][0]["delta"]["function_call"]["arguments"].as_str().unwrap().to_owned()).collect();
             let value: Value = serde_json::from_str(&arguments)?;
@@ -623,8 +635,8 @@ mod tests {
         fictionet::block_on(fictionet::lab(fictionet::Seed::from_u64(11), |_| async {
             let input = b"id: report\r\nevent: message\r\ndata: {\"content\":[{\"type\":\"text\",\"text\":\"private-\"},\r\ndata: {\"type\":\"text\",\"text\":\"key\"}]}\r\n\r\n";
             let frames = input.iter().map(|byte| Ok(Frame::data(Bytes::from(vec![*byte])))).collect();
-            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(Body::new(Chunks(frames)))?, Secret::new("provider key", "private-key".into())?)?;
-            let bytes = response.into_body().collect().await?.to_bytes();
+            let response = sanitize(Response::builder().header("content-type", "text/event-stream").body(crate::httpd::from_http(Chunks(frames)))?, Secret::new("provider key", "private-key".into())?)?;
+            let bytes = crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes();
             let event = sse::Event::parse(&bytes)?;
             assert_eq!(event.id, "report");
             assert_eq!(event.event, "message");
@@ -643,7 +655,7 @@ mod tests {
                 (json!({"choices":[{"message":{"content":[{"text":"private-"},{"text":"key"}]}}]}), ["/choices/0/message/content/0/text", "/choices/0/message/content/1/text"]),
             ] {
                 let response = sanitize(Response::new(Body::from(body.to_string())), Secret::new("provider key", "private-key".into())?)?;
-                let value: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                let value: Value = serde_json::from_slice(&crate::httpd::HttpBody(response.into_body()).collect().await?.to_bytes())?;
                 let text: String = pointers.into_iter().map(|path| value.pointer(path).unwrap().as_str().unwrap()).collect();
                 assert_eq!(text, "<provider key>");
             }
