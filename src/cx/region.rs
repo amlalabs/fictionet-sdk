@@ -242,6 +242,12 @@ impl Region {
     pub(crate) fn take_error(&self) -> Option<crate::Error> {
         self.state.lock().error.take()
     }
+
+    /// How many wakers outside the run wait for a cancel here.
+    #[cfg(test)]
+    pub(crate) fn foreign_waits(&self) -> usize {
+        self.state.lock().foreign.len()
+    }
 }
 
 #[cfg(test)]

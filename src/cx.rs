@@ -273,8 +273,6 @@ impl Cx {
     /// returns runs as its own task. The returned [`Task`] lets you wait for
     /// it with [`Task::join`]. Dropping the `Task` does not stop the work:
     /// the region owns it, not the handle.
-    /// The task's recorded parent is the current task in this run, if any.
-    /// Spawning from another run or outside a world task leaves no parent.
     ///
     /// If the region has completed, the returned task joins with
     /// [`JoinError::Cancelled`]. `work` is still called to construct the
@@ -533,7 +531,7 @@ impl Cx {
     /// or from a task of this run, removes its previous registration.
     /// Registering the waker that is registered already takes no lock.
     pub fn register_cancel(&self, waker: &Waker, wait: &mut CancelWait) -> bool {
-        if crate::run::is_current_task(&self.run, waker) {
+        if self.run.is_polling(waker) {
             wait.clear();
             return self.is_cancelled();
         }

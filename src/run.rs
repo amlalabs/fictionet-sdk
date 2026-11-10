@@ -1,20 +1,14 @@
 use fictionet::sync::Mutex;
-use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::JoinError;
 use crate::cx::{JoinState, Region, is_cancel};
 use crate::{Cx, Result, Seed};
-
-/// Run ids, unique in the process. They are only compared for equality,
-/// never recorded, serialized, ordered or hashed into anything a world
-/// sees, so they do not affect determinism.
-static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// Runs a world in real time, as one future that any executor can poll.
 ///
@@ -159,10 +153,7 @@ where
         region: root.clone(),
         job_lease: None,
     };
-    let future = {
-        let _guard = CurrentGuard::enter(shared.id, id, Waker::noop());
-        world(cx)
-    };
+    let future = world(cx);
     if root.try_start_task() {
         shared.queue.lock().incoming.push(NewTask {
             id,
@@ -182,7 +173,9 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 pub(crate) struct RunShared {
     pub(crate) environment: Arc<crate::environment::RunEnvironment>,
     queue: Mutex<Queue>,
-    pub(crate) id: u64,
+    /// The waker of the task the run is polling now, as `Waker::data`
+    /// gives it, or null between polls.
+    current: AtomicPtr<()>,
 }
 
 #[derive(Default)]
@@ -258,7 +251,6 @@ impl RunShared {
     }
 
     fn new(seed: Seed, mode: crate::RunMode) -> Arc<Self> {
-        let run_id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         let environment = Arc::new(crate::environment::RunEnvironment::new(seed, mode));
         Arc::new(Self {
             environment,
@@ -266,8 +258,16 @@ impl RunShared {
                 next_id: 1,
                 ..Queue::default()
             }),
-            id: run_id,
+            current: AtomicPtr::new(std::ptr::null_mut()),
         })
+    }
+
+    /// Whether `waker` is the waker of the task this run is polling right
+    /// now. Such a task needs no cancel registration: cancelling any
+    /// region polls every task of the run.
+    pub(crate) fn is_polling(&self, waker: &Waker) -> bool {
+        let current = self.current.load(Ordering::Relaxed);
+        !current.is_null() && std::ptr::eq(current, waker.data())
     }
 
     /// Adds a task. Gives the future back if the run is gone.
@@ -360,53 +360,24 @@ struct Slot {
     join: Arc<JoinState>,
 }
 
-/// A task number qualified by its run.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RunTask {
-    pub(crate) run: u64,
-    pub(crate) id: u64,
-}
+/// Notes in the run which task waker it is polling, and clears the note
+/// when the poll ends, even by a panic.
+struct Polling<'a>(&'a AtomicPtr<()>);
 
-#[derive(Clone, Copy)]
-struct CurrentTask {
-    task: RunTask,
-    waker: *const (),
-}
-
-thread_local! {
-    /// The run, task and waker being polled on this thread, if any.
-    static CURRENT: Cell<Option<CurrentTask>> = const { Cell::new(None) };
-}
-
-/// Whether `waker` is the waker of the task of `run` that is being polled
-/// on this thread right now.
-pub(crate) fn is_current_task(run: &Arc<RunShared>, waker: &Waker) -> bool {
-    CURRENT.with(|c| {
-        c.get()
-            .is_some_and(|t| t.task.run == run.id && t.waker == waker.data())
-    })
-}
-
-/// Restores the current task when a poll ends, even by a panic.
-struct CurrentGuard {
-    previous: Option<CurrentTask>,
-}
-
-impl CurrentGuard {
-    fn enter(run: u64, id: u64, waker: &Waker) -> Self {
-        let current = CurrentTask {
-            task: RunTask { run, id },
-            waker: waker.data(),
-        };
-        Self {
-            previous: CURRENT.with(|c| c.replace(Some(current))),
-        }
+impl<'a> Polling<'a> {
+    fn enter(current: &'a AtomicPtr<()>, waker: &Waker) -> Self {
+        // Relaxed is enough. The task's own poll reads it on this thread. A
+        // waker compared from another thread was made after any waker that
+        // once had its address was freed, which was after the store that
+        // cleared this, so the load cannot see a freed waker's address.
+        current.store(waker.data().cast_mut(), Ordering::Relaxed);
+        Polling(current)
     }
 }
 
-impl Drop for CurrentGuard {
+impl Drop for Polling<'_> {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.replace(self.previous.take()));
+        self.0.store(std::ptr::null_mut(), Ordering::Relaxed);
     }
 }
 
@@ -478,7 +449,7 @@ impl RunState {
             };
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
-                let _guard = CurrentGuard::enter(self.shared.id, id, &slot.waker);
+                let _polling = Polling::enter(&self.shared.current, &slot.waker);
                 slot.future
                     .as_mut()
                     .poll(&mut Context::from_waker(&slot.waker))
@@ -628,7 +599,7 @@ impl Drop for RunState {
 mod tests {
     use super::*;
     use crate::time::ms;
-    use crate::{Cancelled, block_on};
+    use crate::{CancelWait, Cancelled, block_on};
 
     #[test]
     fn outer_waiter_replacement_and_close_release_wakers_outside_the_lock() {
@@ -737,6 +708,53 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the lab never jumped its clock while a task waited on idle");
         assert_eq!(out, Ok(()));
+    }
+
+    /// The run itself knows which task it polls. A task registering its own
+    /// waker needs no cancel registration; any other waker, here a no-op
+    /// one and the waker of another run's task polled inside this one, is
+    /// registered. Between polls no waker counts as the task's, and the
+    /// task still hears a cancel.
+    #[test]
+    fn only_the_task_being_polled_skips_the_cancel_registration() {
+        block_on(lab(Seed::from_u64(0), |fcx| async move {
+            let mut wait = CancelWait::default();
+            let mut own = None;
+            std::future::poll_fn(|cx| {
+                assert!(!fcx.register_cancel(cx.waker(), &mut wait));
+                own = Some(cx.waker().clone());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fcx.region.foreign_waits(), 0);
+            let own = own.unwrap();
+            assert!(!fcx.run.is_polling(Waker::noop()));
+            assert!(!fcx.register_cancel(Waker::noop(), &mut wait));
+            assert_eq!(fcx.region.foreign_waits(), 1);
+            // Another run, polled inside this task, has its own task.
+            let outer = fcx.clone();
+            block_on(lab(Seed::from_u64(1), move |inner| async move {
+                std::future::poll_fn(|cx| {
+                    assert!(inner.run.is_polling(cx.waker()));
+                    assert!(!outer.run.is_polling(cx.waker()));
+                    Poll::Ready(())
+                })
+                .await;
+                Ok(())
+            }))?;
+            // The waker of this task, once this task is not being polled.
+            let checked = Arc::new(AtomicBool::new(false));
+            let seen = checked.clone();
+            let shared = fcx.run.clone();
+            let other = fcx.spawn(move |_| async move {
+                seen.store(!shared.is_polling(&own), Ordering::SeqCst);
+                Ok(())
+            });
+            assert!(other.join(&fcx).await.is_ok());
+            assert!(checked.load(Ordering::SeqCst));
+            Ok(())
+        }))
+        .unwrap();
     }
 
     /// `Cx::region` awaited outside the run is a wait on a `Cx` clone:

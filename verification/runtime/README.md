@@ -55,7 +55,7 @@ from `arm`), `Cx::race` and `Cx::yield_now` (plain compositions of the modeled
 waits), foreign cancel wakers in `RegionState::foreign` (`register_cancel`,
 `update_foreign`, `CancelWait`; the Rust tests in `src/cx/region.rs` check
 their release order), `Region::child`'s list of children, the heap rebuild in
-`Timers`, `block_on`, and the thread-local current task that `is_current_task`
+`Timers`, `block_on`, and the run's note of the task it polls, which `RunShared::is_polling`
 reads. Panics, memory and the `Waker` contract are assumed. Tasks in the
 models end, sleep, idle or wait as they choose; the models do not say what
 world code does, only what the runtime does with it.

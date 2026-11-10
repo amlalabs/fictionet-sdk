@@ -174,8 +174,8 @@ The real clock with an origin (its registrations are the lab's code; the host
 driver it arms is the `Timers` spec); `Cx::race` and `Cx::yield_now`; the
 foreign cancel wakers of `RegionState::foreign` and `Cx::register_cancel`
 (their release order has unit tests in `src/cx/region.rs`); `Region::child`'s
-list of children; the heap rebuild in `Timers`; `block_on`; the thread-local
-current task that `is_current_task` reads; panics; memory; the `Waker`
+list of children; the heap rebuild in `Timers`; `block_on`; the run's note
+of the task it polls, which `RunShared::is_polling` reads; panics; memory; the `Waker`
 contract. The bounds are two tasks per spec, deadlines 1 and 2 in the lab, one
 stale wake per task, two harness deadlines, and instants 0 to 3 for the host
 timers. The models say what the runtime does with a task's choices, not what
