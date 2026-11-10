@@ -1,5 +1,11 @@
-//! The test binary's allocator: it counts and measures allocations on the
-//! calling thread, and can refuse large requests.
+//! A test binary's allocator: it counts and measures allocations on the
+//! calling thread, and can refuse large requests. Include it with
+//! `#[path]` as a module of the binary; it installs itself as the global
+//! allocator. tests/it uses it, and the replays' cost bounds
+//! (cost.rs beside it) read it.
+
+// Each binary that includes it uses only part of it.
+#![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -132,6 +138,13 @@ pub fn measuring<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
         "allocation measurement saturated"
     );
     (result, stats)
+}
+
+/// As [`measuring`], and also the bytes `operation` left allocated, as
+/// [`left_allocated`] gives them.
+pub fn measuring_left<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats, i128) {
+    let (result, measurement) = measure(operation);
+    (result, measurement.stats, measurement.live)
 }
 
 /// Runs `f` and counts the allocations and reallocations it makes on this

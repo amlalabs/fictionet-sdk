@@ -86,11 +86,11 @@ impl Report {
         }
     }
 
-    fn pass(&mut self, line: String) {
+    pub(crate) fn pass(&mut self, line: String) {
         self.lines.push(line);
     }
 
-    fn fail(&mut self, line: String) {
+    pub(crate) fn fail(&mut self, line: String) {
         self.lines.push(format!("FAILED: {line}"));
         self.failures += 1;
     }
@@ -123,7 +123,7 @@ impl Report {
 
 /// Runs `command`, writing what it prints to `log` as it prints it, and gives
 /// that text and whether it exited successfully.
-fn logged(command: &mut Command, log: &Path) -> Result<(String, bool)> {
+pub(crate) fn logged(command: &mut Command, log: &Path) -> Result<(String, bool)> {
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -137,7 +137,7 @@ fn logged(command: &mut Command, log: &Path) -> Result<(String, bool)> {
 }
 
 /// `program` in its own scope of `fictionet-work.slice`, at most `memory`.
-fn scoped(program: impl AsRef<std::ffi::OsStr>, memory: &str) -> Command {
+pub(crate) fn scoped(program: impl AsRef<std::ffi::OsStr>, memory: &str) -> Command {
     let mut command = Command::new("systemd-run");
     command.args([
         "--user",
@@ -304,6 +304,12 @@ pub fn diff(project: &Project, seeds: &[u64]) -> Result<Report> {
             } else {
                 report.fail(format!("seed {seed}: {line}"));
             }
+        }
+        // A test that holds its steps to cost bounds (verification/
+        // resources/cost.rs) prints a line for each kind it costed; a
+        // bound broken fails the test, and its log names the step.
+        for line in text.lines().filter(|line| line.contains(" cost: ")) {
+            report.pass(format!("seed {seed}: {line}"));
         }
         if !passed {
             report.fail(format!(

@@ -2,6 +2,9 @@
 //! features of the modules that use it. Helpers that other test binaries
 //! share are in the fictionet-test-support crate.
 
+/// The binary's counting allocator, which replays share for their cost
+/// bounds (see verification/README.md, "Resource properties").
+#[path = "../../../verification/resources/alloc.rs"]
 pub mod alloc;
 pub mod echo_stack;
 pub mod io;

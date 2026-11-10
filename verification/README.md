@@ -59,6 +59,82 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`world-layers`](world-layers/README.md) | per-peer admission with holds and releases (`Admission.tla`), staging a machine's ports (`Staging.tla`); packet dispatch in Kani | models named to `world/net/hosts.rs`, `tcp.rs`, `children.rs` | TLC per config; `cargo kani` |
 | [`world-net`](world-net/README.md) | attachments and routes (`Attachments.tla`), the port table (`Ports.tla`), the routing table (`Table.tla`), cables (`Cable.tla`); prefixes in Kani | models named to `world/net/attachments.rs`, `network/route.rs`, `cable.rs` | TLC per config; `cargo kani` |
 
+## Resource properties
+
+The models above check what a protocol does. Resource properties check
+what a step costs: that storage grows only after it is paid for, and that
+the bytes a step copies stay linear in its input. A step can be RFC-correct
+and still break them. The HPACK decoder copied an entry's name and value,
+up to 64 KiB each, before it evicted, outside its charge, even for an entry
+larger than the table. Joining a TLS handshake message was quadratic and
+uncapped, and so was HTTP/1 head assembly.
+
+The shared pieces are in [`resources/`](resources). An area adds all three
+layers:
+
+1. **TLA+: storage is reserved before it grows.** A step in TLA+ is
+   atomic, so an entry added and the old ones dropped in one step look
+   the same as the reverse order. `resources/tla/Resources.tla` makes the
+   transient visible. A model keeps a store `[held, peak, reserved]` for
+   each part of the code that holds storage. Each step starts with
+   `Begin`. The model threads the store through every allocation and
+   free with `Grow` and `Shrink`, in the code's order, and through every
+   charge with `Reserve`, `ReserveTo` and `Release`. Then it checks three
+   invariants. `Paid`: no moment held more than was reserved. `WithinLimit`:
+   the reservation stays within the budget's limit. `Tracks`: the store
+   holds what the model's state says, which catches a step that forgot to
+   thread it. Add `EXTENDS Resources`, and give TLC
+   `-DTLA-Library=<repository>/verification/resources/tla`. Give the
+   resource configs a control that does the old order and must violate
+   `Paid`.
+2. **Kani: production code allocates no more than its charge.** Kani
+   ignores `#[global_allocator]`, so `resources/kani/counting.rs` stubs
+   the standard library's allocation functions with ones that count. To
+   use it, include the file at the crate root as `counting` (see its
+   header). Write each harness as `counted_proof! { ... }` instead of
+   `#[kani::proof]`, and run it with `cargo kani -Z stubbing -Z c-ffi`.
+   Inside the harness, build the state inside `measure` so that the
+   counter sees all of it. Take the charge the code pays (the area's
+   `most_held()`, or whatever the code charges), then run one step on any
+   input of up to N bytes. Then state two bounds as inequalities. The
+   step's `Cost.peak` is at most the charge. The bytes the step asked for
+   (read `so_far()` before and after) are at most `per × input + fixed`.
+   Name `per` and `fixed`, and say where each comes from. Never assert an
+   exact count. The harness `the_counter_sees_every_allocation` fails if a
+   toolchain routes allocations around the stubs.
+3. **Replays: every step of a trace or vector run is costed.**
+   `resources/alloc.rs` is the counting global allocator. It is the one
+   `tests/it` uses, now shared. `resources/cost.rs` is the recorder.
+   Include both with `#[path]` in the replay's test binary, and run each
+   step through `Costs::step(input, charge, linear, ...)`. The step fails
+   if the bytes live at once (counted from the session's start) pass the
+   charge, or if the bytes asked for pass the `Linear` bound. Build what
+   the session replays inside its steps. Make what the caller pays for
+   before the step, such as the budget or a block sized to its bound.
+   `Costs::held_charge` keeps a charge the way a holder keeps one that it
+   never gives back. Each test prints a `cost:` line per kind, and the
+   area's `diff` command reports it.
+
+Bytes copied are measured as bytes asked of the allocator. Every copy
+into fresh storage is asked for first, so a step that copies all it holds
+on each delivery breaks a linear bound once the input is long enough. A
+copy into storage the step already holds is not counted. Where that
+matters (a pool that recycles blocks), state the bound on what the pool
+is charged instead.
+
+Show that each layer catches the bug it is for. In a scratch commit,
+restore the old code and confirm the Kani bound and the replay fail. For
+the TLA+ model, the control config does the same. Record all of it in the
+area's README. A bound that fails on the current code is a finding: report
+it and fix the code. Never loosen the bound until it passes.
+
+Wire the layers into the area's verify command with `xtask/src/resources.rs`.
+`resources::kani` runs the named harnesses with the counting stubs.
+`resources::tlc` runs the named configs and checks each against its first
+line (`\* Must pass` or `\* Must violate <invariant>`). HPACK's is
+`cargo xtask hpack-verify resources`. Its replay costs run in
+`hpack-verify diff`.
+
 ## What the models found in the code
 
 Each area's README lists its own findings with the commits that fixed

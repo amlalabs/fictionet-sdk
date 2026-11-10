@@ -317,6 +317,13 @@
 // Protocol files use the same imports here and when copied into a user crate.
 extern crate self as fictionet;
 
+/// Counts what the code under a Kani proof allocates: see
+/// verification/resources/kani/counting.rs.
+#[cfg(kani)]
+#[allow(unsafe_code)]
+#[path = "../verification/resources/kani/counting.rs"]
+mod counting;
+
 mod attach;
 mod block_on;
 mod cable;

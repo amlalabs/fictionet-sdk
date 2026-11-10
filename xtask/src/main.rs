@@ -19,6 +19,7 @@ mod lean_vectors;
 mod mptcp_verify;
 #[cfg(feature = "host-tools")]
 mod rawnic;
+mod resources;
 #[cfg(feature = "host-tools")]
 // This module owns the host syscall boundary.
 #[allow(unsafe_code)]
