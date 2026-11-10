@@ -58,7 +58,7 @@ impl<'a> Datagram<'a> {
     /// An IPv4 zero checksum means no checksum and is accepted. IPv6
     /// requires a nonzero checksum field. Mixed address families fail.
     pub fn checksum_ok(&self, src: IpAddr, dst: IpAddr) -> bool {
-        src.is_ipv4() == dst.is_ipv4() && ip::udp_checksum_ok(src, dst, self.bytes)
+        ip::udp_checksum_ok(src, dst, self.bytes)
     }
 }
 

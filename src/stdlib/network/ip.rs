@@ -1117,7 +1117,9 @@ impl Header {
 
     /// Reads the header of a whole packet as a host that is its
     /// destination takes it in, fragment or not. An IPv4 header with a
-    /// wrong checksum discards the packet (RFC 1122, section 3.2.1.2).
+    /// wrong checksum discards the packet (RFC 1122, section 3.2.1.2), and
+    /// so does an IPv4 source that is the limited broadcast address or a
+    /// multicast address (section 3.2.1.3).
     /// IPv6 extension headers are checked as RFC 8200 asks (sections 4.1
     /// to 4.6):
     ///
@@ -1221,11 +1223,19 @@ fn v4(bytes: &[u8], truncated: bool) -> Option<Header> {
 }
 
 /// Reads the IPv4 header of a whole packet as a host takes it in: one
-/// with a wrong header checksum is discarded (RFC 1122, section 3.2.1.2).
+/// with a wrong header checksum is discarded (RFC 1122, section 3.2.1.2),
+/// and so is one from the limited broadcast address or a multicast
+/// address, which no datagram may come from (section 3.2.1.3). A
+/// directed broadcast source is not caught here: the reader does not know
+/// the subnet.
 #[inline]
 fn v4_checked(bytes: &[u8]) -> Option<Header> {
     let h = v4(bytes, false)?;
-    (checksum(&bytes[..h.payload.start]) == 0).then_some(h)
+    let IpAddr::V4(src) = h.src else {
+        return None;
+    };
+    (checksum(&bytes[..h.payload.start]) == 0 && !src.is_broadcast() && !src.is_multicast())
+        .then_some(h)
 }
 
 /// The header of an IPv6 packet whose chain [`chain6`] walked.
@@ -1618,10 +1628,11 @@ pub fn transport_checksum(src: IpAddr, dst: IpAddr, protocol: u8, data: &[u8]) -
 /// Whether a UDP datagram from `src` to `dst` has a good checksum. A zero
 /// checksum field means "no checksum" over IPv4. Over IPv6 it is never
 /// valid (RFC 8200, section 8.1): a sender whose sum comes out as zero
-/// sends `0xffff` instead.
+/// sends `0xffff` instead. Addresses of two families have no pseudo-header,
+/// and never have a good checksum.
 #[inline]
 pub fn udp_checksum_ok(src: IpAddr, dst: IpAddr, udp: &[u8]) -> bool {
-    if udp.len() < 8 {
+    if udp.len() < 8 || src.is_ipv4() != dst.is_ipv4() {
         return false;
     }
     if udp[6..8] == [0, 0] {
@@ -2899,5 +2910,36 @@ mod tests {
         u[6..8].copy_from_slice(&[0x12, 0x34]);
         assert!(!udp_checksum_ok(v6a, v6b, &u));
         assert!(!udp_checksum_ok(v4a, v4b, &u));
+    }
+
+    #[test]
+    fn addresses_of_two_families_have_no_good_udp_checksum() {
+        let v4: IpAddr = "10.0.0.2".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        // A zero field means "no checksum" only over IPv4, and two families
+        // have no pseudo-header at all, so no field is right for them.
+        let u = [0, 1, 0, 2, 0, 8, 0, 0];
+        assert!(udp_checksum_ok(v4, v4, &u));
+        assert!(!udp_checksum_ok(v4, v6, &u));
+        assert!(!udp_checksum_ok(v6, v4, &u));
+    }
+
+    #[test]
+    fn a_host_takes_nothing_from_a_broadcast_or_multicast_source() {
+        let dst: IpAddr = "10.0.0.1".parse().unwrap();
+        let from = |src: &str| packet(src.parse().unwrap(), dst, protocol::UDP, &[0; 8]).0;
+        // RFC 1122 section 3.2.1.3: a host silently discards a datagram from
+        // the limited broadcast address or a class D (multicast) address.
+        for src in ["255.255.255.255", "224.0.0.1", "239.255.255.250"] {
+            let p = from(src);
+            assert!(Header::parse(&p).is_some(), "{src} is read");
+            assert_eq!(Header::check(&p), Err(Reject::Discard), "{src}");
+            assert_eq!(Header::parse_whole(&p), None, "{src}");
+        }
+        // The unspecified address is a host that does not know its address
+        // yet, as a DHCP client, and is taken; so are other addresses.
+        for src in ["0.0.0.0", "10.0.0.2", "223.255.255.255", "240.0.0.1"] {
+            assert!(Header::check(&from(src)).is_ok(), "{src}");
+        }
     }
 }
