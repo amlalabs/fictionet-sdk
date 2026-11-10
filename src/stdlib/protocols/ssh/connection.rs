@@ -336,7 +336,7 @@ impl Dimensions {
             pixel_height: r.uint32()?,
         })
     }
-    fn write(&self, w: &mut Payload) -> Result<(), Error> {
+    fn write(&self, w: &mut Payload<'_>) -> Result<(), Error> {
         w.uint32(self.columns)?;
         w.uint32(self.rows)?;
         w.uint32(self.pixel_width)?;
@@ -353,7 +353,7 @@ impl TcpIp {
             originator_port: r.uint32()?,
         })
     }
-    fn write(&self, w: &mut Payload) -> Result<(), Error> {
+    fn write(&self, w: &mut Payload<'_>) -> Result<(), Error> {
         w.string(self.host.as_bytes())?;
         w.uint32(self.port)?;
         w.string(self.originator.as_bytes())?;
@@ -423,7 +423,7 @@ impl SessionRequest {
         })
     }
 
-    fn write(&self, w: &mut Payload) -> Result<(), Error> {
+    fn write(&self, w: &mut Payload<'_>) -> Result<(), Error> {
         match self {
             Self::Pty {
                 terminal,
@@ -432,19 +432,21 @@ impl SessionRequest {
             } => {
                 w.string(terminal.as_bytes())?;
                 dimensions.write(w)?;
-                if modes.len() > (MAX_PAYLOAD - 1) / 5 {
+                if modes.len() > (MAX_PAYLOAD - 1) / 5
+                    || modes
+                        .iter()
+                        .any(|mode| mode.opcode == 0 || mode.opcode >= 160)
+                {
                     return Err(Error::Unwritable);
                 }
-                let mut data = Vec::with_capacity(modes.len() * 5 + 1);
+                // The modes as one string, written in place: each opcode
+                // and its value, then the terminator.
+                w.uint32((modes.len() * 5 + 1) as u32)?;
                 for mode in modes {
-                    if mode.opcode == 0 || mode.opcode >= 160 {
-                        return Err(Error::Unwritable);
-                    }
-                    data.push(mode.opcode);
-                    data.extend_from_slice(&mode.value.to_be_bytes());
+                    w.byte(mode.opcode)?;
+                    w.uint32(mode.value)?;
                 }
-                data.push(0);
-                w.string(&data)?;
+                w.byte(0)?;
             }
             Self::Shell => (),
             Self::Exec(command) => w.string(command)?,
@@ -588,22 +590,25 @@ impl Wire for Message {
     }
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut w = Payload::new(match self {
-            Self::GlobalRequest { .. } => 80,
-            Self::RequestSuccess(_) => 81,
-            Self::RequestFailure => 82,
-            Self::ChannelOpen { .. } => 90,
-            Self::ChannelOpenConfirmation { .. } => 91,
-            Self::ChannelOpenFailure { .. } => 92,
-            Self::WindowAdjust { .. } => 93,
-            Self::Data { .. } => 94,
-            Self::ExtendedData { .. } => 95,
-            Self::Eof(_) => 96,
-            Self::Close(_) => 97,
-            Self::ChannelRequest { .. } => 98,
-            Self::ChannelSuccess(_) => 99,
-            Self::ChannelFailure(_) => 100,
-        });
+        let mut w = Payload::new(
+            out,
+            match self {
+                Self::GlobalRequest { .. } => 80,
+                Self::RequestSuccess(_) => 81,
+                Self::RequestFailure => 82,
+                Self::ChannelOpen { .. } => 90,
+                Self::ChannelOpenConfirmation { .. } => 91,
+                Self::ChannelOpenFailure { .. } => 92,
+                Self::WindowAdjust { .. } => 93,
+                Self::Data { .. } => 94,
+                Self::ExtendedData { .. } => 95,
+                Self::Eof(_) => 96,
+                Self::Close(_) => 97,
+                Self::ChannelRequest { .. } => 98,
+                Self::ChannelSuccess(_) => 99,
+                Self::ChannelFailure(_) => 100,
+            },
+        )?;
         match self {
             Self::GlobalRequest {
                 want_reply,
@@ -718,7 +723,8 @@ impl Wire for Message {
                 request.write(&mut w)?;
             }
         }
-        w.finish(out)
+        w.finish();
+        Ok(())
     }
 }
 

@@ -210,3 +210,59 @@ fn an_ssh_key_exchange_allocates_at_most_its_scratch() {
         }
     }
 }
+
+/// Checking a signed SSH request allocates at most what
+/// `Request::most_verify_heap` states, for users and keys of every
+/// length the generator reaches. Ed25519 checks allocate nothing in
+/// `ring`, so everything counted is the request's own.
+#[test]
+fn checking_an_ssh_signature_allocates_at_most_its_bound() {
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::protocols::ssh::auth::{Method, Request};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn string(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let rng = SeededEntropy::new(Seed::from_u64(23));
+    for _ in 0..64 {
+        let mut seed = [0; 32];
+        rng.fill_random(&mut seed);
+        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let mut key = Vec::new();
+        string(&mut key, b"ssh-ed25519");
+        string(&mut key, pair.public_key().as_ref());
+        let session_id: Vec<u8> = (0..rng.random_below(65)).map(|b| b as u8).collect();
+        let mut request = Request {
+            user: "u".repeat(rng.random_below(2000) as usize),
+            service: "ssh-connection".into(),
+            method: Method::PublicKey {
+                algorithm: "ssh-ed25519".into(),
+                key,
+                signature: Some(Vec::new()),
+            },
+        };
+        let prefix = request.to_bytes().unwrap();
+        let mut signed = Vec::new();
+        string(&mut signed, &session_id);
+        signed.extend_from_slice(&prefix[..prefix.len() - 4]);
+        let signature = pair.sign(&signed);
+        let mut blob = Vec::new();
+        string(&mut blob, b"ssh-ed25519");
+        string(&mut blob, signature.as_ref());
+        if let Method::PublicKey { signature, .. } = &mut request.method {
+            *signature = Some(blob);
+        }
+        let raw = request.to_bytes().unwrap();
+        let (verified, stats) = measuring(|| request.verify_public_key(&session_id, &raw));
+        assert!(verified.unwrap());
+        let bound = Request::most_verify_heap(raw.len(), session_id.len());
+        assert!(
+            stats.peak_live_bytes <= bound,
+            "checking {} bytes allocated {}, more than the bound {bound}",
+            raw.len(),
+            stats.peak_live_bytes
+        );
+    }
+}

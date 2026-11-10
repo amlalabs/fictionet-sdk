@@ -174,7 +174,7 @@ impl Wire for Request {
     }
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut w = Payload::new(50);
+        let mut w = Payload::new(out, 50)?;
         w.string(self.user.as_bytes())?;
         w.name(&self.service)?;
         w.name(self.method.name())?;
@@ -219,11 +219,23 @@ impl Wire for Request {
                 w.raw(data)?;
             }
         }
-        w.finish(out)
+        w.finish();
+        Ok(())
     }
 }
 
 impl Request {
+    /// The most [`verify_public_key`](Self::verify_public_key) allocates
+    /// for a request of `raw` bytes and a session identifier of
+    /// `session_id` bytes, all of it freed before it returns: the request
+    /// parsed again (its [`HeapBound`]), the signed data (the identifier
+    /// and less than the request), and the signature padded to the
+    /// modulus, which lies within the request. What `ring` allocates to
+    /// check an RSA signature is its own.
+    pub fn most_verify_heap(raw: usize, session_id: usize) -> usize {
+        Self::most_heap(raw) + (4 + session_id + raw) + raw
+    }
+
     /// Verify an Ed25519 or RSA SHA256 or SHA512 proof over the session
     /// identifier and exact received request prefix. A probe, unsupported algorithm, mismatched
     /// request or invalid signature returns false. Malformed key or signature
@@ -503,35 +515,20 @@ impl Wire for Message {
     }
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut w = Payload::new(match self {
+        let number = match self {
             Self::Request(request) => return request.write(out),
-            Self::Failure { .. } => 51,
+            Self::Failure {
+                methods,
+                partial_success,
+            } => return write_failure(methods.iter().map(String::as_str), *partial_success, out),
             Self::Success => 52,
             Self::Banner { .. } => 53,
             Self::PublicKeyOk { .. } | Self::PasswordChange { .. } | Self::InfoRequest { .. } => 60,
             Self::InfoResponse(_) => 61,
-        });
+        };
+        let mut w = Payload::new(out, number)?;
         match self {
-            Self::Request(_) => unreachable!(),
-            Self::Failure {
-                methods,
-                partial_success,
-            } => {
-                let mut size = 0usize;
-                for method in methods {
-                    if !super::is_name(method.as_bytes()) {
-                        return Err(Error::Unwritable);
-                    }
-                    size = size
-                        .checked_add(method.len() + 1)
-                        .ok_or(Error::Unwritable)?;
-                    if size > MAX_PAYLOAD {
-                        return Err(Error::Unwritable);
-                    }
-                }
-                w.string(methods.join(",").as_bytes())?;
-                w.byte(u8::from(*partial_success))?;
-            }
+            Self::Request(_) | Self::Failure { .. } => unreachable!(),
             Self::Success => (),
             Self::Banner { message, language } => {
                 w.string(message.as_bytes())?;
@@ -567,7 +564,8 @@ impl Wire for Message {
                 }
             }
         }
-        w.finish(out)
+        w.finish();
+        Ok(())
     }
 }
 
@@ -595,20 +593,77 @@ pub(super) fn rest(r: &mut Reader<'_>) -> Vec<u8> {
     data
 }
 
-pub(super) struct Payload(Vec<u8>);
-
-impl Payload {
-    pub(super) fn new(number: u8) -> Self {
-        Self(vec![number])
-    }
-    pub(super) fn raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if bytes.len() > MAX_PAYLOAD - self.0.len() {
+/// Appends one FAILURE (51) naming `methods`, as [`Message::Failure`]
+/// writes it, from names it does not own, so a caller that names its
+/// methods by static strings writes it into its own room without building
+/// a vector of strings first. `out` is unchanged on error.
+pub fn write_failure<'a>(
+    methods: impl Iterator<Item = &'a str> + Clone,
+    partial_success: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let mut size = 0usize;
+    for method in methods.clone() {
+        if !super::is_name(method.as_bytes()) {
             return Err(Error::Unwritable);
         }
-        self.0
+        size = size
+            .checked_add(method.len() + 1)
+            .ok_or(Error::Unwritable)?;
+        if size > MAX_PAYLOAD {
+            return Err(Error::Unwritable);
+        }
+    }
+    let mut w = Payload::new(out, 51)?;
+    // The names and the commas between them.
+    w.uint32(size.saturating_sub(1) as u32)?;
+    for (i, method) in methods.enumerate() {
+        if i > 0 {
+            w.byte(b',')?;
+        }
+        w.raw(method.as_bytes())?;
+    }
+    w.byte(u8::from(partial_success))?;
+    w.finish();
+    Ok(())
+}
+
+/// A payload written in place at the end of `out`, at most
+/// [`MAX_PAYLOAD`] bytes of it. Dropped before [`finish`](Self::finish),
+/// as on an error, it takes back what it wrote, so `out` is unchanged.
+pub(super) struct Payload<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+    finished: bool,
+}
+
+impl Drop for Payload<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.out.truncate(self.start);
+        }
+    }
+}
+
+impl<'a> Payload<'a> {
+    pub(super) fn new(out: &'a mut Vec<u8>, number: u8) -> Result<Self, Error> {
+        let start = out.len();
+        let mut payload = Self {
+            out,
+            start,
+            finished: false,
+        };
+        payload.byte(number)?;
+        Ok(payload)
+    }
+    pub(super) fn raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len() > MAX_PAYLOAD - (self.out.len() - self.start) {
+            return Err(Error::Unwritable);
+        }
+        self.out
             .try_reserve_exact(bytes.len())
             .map_err(|_| Error::Unwritable)?;
-        self.0.extend_from_slice(bytes);
+        self.out.extend_from_slice(bytes);
         Ok(())
     }
     pub(super) fn byte(&mut self, byte: u8) -> Result<(), Error> {
@@ -636,11 +691,9 @@ impl Payload {
         }
         self.uint32(count as u32)
     }
-    pub(super) fn finish(self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.try_reserve_exact(self.0.len())
-            .map_err(|_| Error::Unwritable)?;
-        out.extend_from_slice(&self.0);
-        Ok(())
+    /// Keeps what was written.
+    pub(super) fn finish(mut self) {
+        self.finished = true;
     }
 }
 
@@ -834,6 +887,15 @@ mod tests {
         }
     }
 
+    /// Fields written as a payload writes them, without its number.
+    fn fields(write: impl FnOnce(&mut Payload<'_>) -> Result<(), Error>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut w = Payload::new(&mut out, 0).unwrap();
+        write(&mut w).unwrap();
+        w.finish();
+        out.split_off(1)
+    }
+
     #[test]
     fn randomized_signed_request_roundtrips() {
         use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -842,29 +904,32 @@ mod tests {
             let mut seed = [0; 32];
             g.fill(&mut seed);
             let pair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
-            let mut key = Payload::new(0);
-            key.name("ssh-ed25519").unwrap();
-            key.string(pair.public_key().as_ref()).unwrap();
+            let key = fields(|w| {
+                w.name("ssh-ed25519")?;
+                w.string(pair.public_key().as_ref())
+            });
             let session_id = g.bytes(64);
             let mut request = Request {
                 user: g.text(100),
                 service: "ssh-connection".into(),
                 method: Method::PublicKey {
                     algorithm: "ssh-ed25519".into(),
-                    key: key.0[1..].to_vec(),
+                    key,
                     signature: Some(Vec::new()),
                 },
             };
-            let mut signed = Payload::new(0);
-            signed.string(&session_id).unwrap();
             let prefix = request.to_bytes().unwrap();
-            signed.raw(&prefix[..prefix.len() - 4]).unwrap();
-            let signature = pair.sign(&signed.0[1..]);
-            let mut signature_blob = Payload::new(0);
-            signature_blob.name("ssh-ed25519").unwrap();
-            signature_blob.string(signature.as_ref()).unwrap();
+            let signed = fields(|w| {
+                w.string(&session_id)?;
+                w.raw(&prefix[..prefix.len() - 4])
+            });
+            let signature = pair.sign(&signed);
+            let blob = fields(|w| {
+                w.name("ssh-ed25519")?;
+                w.string(signature.as_ref())
+            });
             if let Method::PublicKey { signature, .. } = &mut request.method {
-                *signature = Some(signature_blob.0[1..].to_vec());
+                *signature = Some(blob);
             }
             let bytes = request.to_bytes().unwrap();
             let parsed = Request::parse(&bytes).unwrap();
