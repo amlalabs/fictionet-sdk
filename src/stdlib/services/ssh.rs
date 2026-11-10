@@ -970,6 +970,18 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             Err(WriteFailure::Bound) => Err(TransportError::State.into()),
         }
     }
+    /// Queues `event` for the channels. Events are raised only while fewer
+    /// than four wait, and a step stops raising at four, so the queue's
+    /// eight places always hold them: a full queue is a broken state that
+    /// fails the connection rather than growing.
+    fn raise(
+        &mut self,
+        event: MuxEvent<ChannelPort, Top, Owned<channel::Opening>>,
+    ) -> Result<(), Error> {
+        self.up
+            .push_back(event)
+            .map_err(|_| TransportError::State.into())
+    }
     fn write(&mut self, env: &Env<'_, Ended>, payload: &[u8]) -> Result<(), Error> {
         if self
             .out
@@ -1249,15 +1261,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                         closed: false,
                     })
                     .map_err(|_| TransportError::State)?;
-                assert!(
-                    self.up
-                        .push_back(MuxEvent::Opened(
-                            child,
-                            opening,
-                            max_packet.min(PACKET) as u64,
-                        ))
-                        .is_ok()
-                );
+                self.raise(MuxEvent::Opened(
+                    child,
+                    opening,
+                    max_packet.min(PACKET) as u64,
+                ))?;
             }
             wire::Message::WindowAdjust { recipient, bytes } => {
                 let id = self.id(recipient)?;
@@ -1286,31 +1294,20 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     .budget()
                     .charge(ssh::MAX_PAYLOAD * 2)
                     .ok_or(Error::Budget)?;
-                assert!(
-                    self.up
-                        .push_back(MuxEvent::Child(
-                            id,
-                            ChannelEvent::Request {
-                                want_reply,
-                                request: Owned::new(request, charge),
-                            },
-                        ))
-                        .is_ok()
-                );
+                self.raise(MuxEvent::Child(
+                    id,
+                    ChannelEvent::Request {
+                        want_reply,
+                        request: Owned::new(request, charge),
+                    },
+                ))?;
             }
             wire::Message::ChannelSuccess(recipient) | wire::Message::ChannelFailure(recipient) => {
                 let id = self.id(recipient)?;
-                assert!(
-                    self.up
-                        .push_back(MuxEvent::Child(
-                            id,
-                            ChannelEvent::Reply(matches!(
-                                message,
-                                wire::Message::ChannelSuccess(_)
-                            )),
-                        ))
-                        .is_ok()
-                );
+                self.raise(MuxEvent::Child(
+                    id,
+                    ChannelEvent::Reply(matches!(message, wire::Message::ChannelSuccess(_))),
+                ))?;
             }
             wire::Message::Eof(recipient) => {
                 let id = self.id(recipient)?;
@@ -1319,14 +1316,10 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     return Err(TransportError::State.into());
                 }
                 channel.eof = true;
-                assert!(
-                    self.up
-                        .push_back(MuxEvent::Child(
-                            id,
-                            ChannelEvent::Stream(StreamEvent::Ended),
-                        ))
-                        .is_ok()
-                );
+                self.raise(MuxEvent::Child(
+                    id,
+                    ChannelEvent::Stream(StreamEvent::Ended),
+                ))?;
             }
             wire::Message::Close(recipient) => {
                 let id = self.id(recipient)?;
@@ -1334,14 +1327,10 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 if !channel.closed {
                     self.send(env, &wire::Message::Close(channel.peer))?;
                 }
-                assert!(
-                    self.up
-                        .push_back(MuxEvent::Child(
-                            id,
-                            ChannelEvent::Stream(StreamEvent::Reset),
-                        ))
-                        .is_ok()
-                );
+                self.raise(MuxEvent::Child(
+                    id,
+                    ChannelEvent::Stream(StreamEvent::Reset),
+                ))?;
             }
             _ => return Err(TransportError::State.into()),
         }
@@ -1382,17 +1371,13 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         if !data.repay(env.budget()) {
             return Err(Error::Budget);
         }
-        assert!(
-            self.up
-                .push_back(MuxEvent::Child(
-                    id,
-                    match kind {
-                        Some(kind) => ChannelEvent::Extended { kind, data },
-                        None => ChannelEvent::Stream(StreamEvent::Data(data)),
-                    },
-                ))
-                .is_ok()
-        );
+        self.raise(MuxEvent::Child(
+            id,
+            match kind {
+                Some(kind) => ChannelEvent::Extended { kind, data },
+                None => ChannelEvent::Stream(StreamEvent::Data(data)),
+            },
+        ))?;
         Ok(())
     }
     fn packet(
@@ -1537,7 +1522,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 } else {
                     let units = channel.window.min(channel.max_packet) as u64;
                     channel.granted = units;
-                    assert!(self.up.push_back(MuxEvent::Credit(id, units)).is_ok());
+                    self.raise(MuxEvent::Credit(id, units))?;
                 }
                 return Ok(true);
             }
@@ -1594,10 +1579,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             if self.pending_packets.len() >= 128 || held + payload.len() > OUTPUT_LIMIT {
                 return Err(TransportError::State.into());
             }
-            let mut kept = ChargedBytes::with_capacity(env.budget(), payload.capacity())
-                .ok_or(Error::Budget)?;
-            kept.extend_within(&payload)
-                .expect("packet capacity covers its bytes");
+            let kept = ChargedBytes::copy_of(env.budget(), &payload).ok_or(Error::Budget)?;
             self.pending_packets
                 .push_back((sequence, kept))
                 .map_err(|_| Error::Budget)?;
@@ -1672,14 +1654,10 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         if let Some((id, bytes)) = flight.child
                             && self.channels.contains(id)
                         {
-                            assert!(
-                                self.up
-                                    .push_back(MuxEvent::Child(
-                                        id,
-                                        ChannelEvent::Stream(StreamEvent::Written(bytes)),
-                                    ))
-                                    .is_ok()
-                            );
+                            self.raise(MuxEvent::Child(
+                                id,
+                                ChannelEvent::Stream(StreamEvent::Written(bytes)),
+                            ))?;
                         }
                     }
                     if n > 0 && self.up.len() >= 4 {
@@ -1727,7 +1705,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                     } else {
                         self.channels.remove(id);
                         self.refuse(env, peer)?;
-                        assert!(self.up.push_back(MuxEvent::Closed(id)).is_ok());
+                        self.raise(MuxEvent::Closed(id))?;
                     }
                 }
             }
@@ -1754,7 +1732,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                                 self.next_channel = wire;
                             }
                             self.refuse(env, peer)?;
-                            assert!(self.up.push_back(MuxEvent::Closed(id)).is_ok());
+                            self.raise(MuxEvent::Closed(id))?;
                         }
                     }
                     ChannelCommand::Stream(StreamCommand::Write(data)) => {
@@ -1774,14 +1752,10 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                     ChannelCommand::Stream(StreamCommand::Reset) | ChannelCommand::Close => {
                         self.channels.get_mut(id).unwrap().closed = true;
                         self.send(env, &wire::Message::Close(peer))?;
-                        assert!(
-                            self.up
-                                .push_back(MuxEvent::Child(
-                                    id,
-                                    ChannelEvent::Stream(StreamEvent::Reset),
-                                ))
-                                .is_ok()
-                        );
+                        self.raise(MuxEvent::Child(
+                            id,
+                            ChannelEvent::Stream(StreamEvent::Reset),
+                        ))?;
                     }
                     ChannelCommand::Reply(accepted) => self.send(
                         env,

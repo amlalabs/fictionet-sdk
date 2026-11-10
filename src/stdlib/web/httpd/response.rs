@@ -34,6 +34,11 @@ pub(super) fn headers_held(headers: &HeaderMap) -> usize {
             .sum::<usize>()
 }
 
+/// What a copy of a response head holds, counted as for [`request_held`].
+pub(super) fn response_held(parts: &http::response::Parts) -> usize {
+    std::mem::size_of::<http::response::Parts>() + headers_held(&parts.headers)
+}
+
 pub(super) fn head_held(head: &RequestHead) -> usize {
     head.held()
 }

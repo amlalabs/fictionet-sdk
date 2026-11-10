@@ -28,7 +28,7 @@ use fictionet::{Cx, Error};
 use super::body::Inner;
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
-use super::response::{Asked, Dates, ResponsePolicy, head_held, headers_held, request_held};
+use super::response::{Asked, Dates, ResponsePolicy, head_held, request_held, response_held};
 use super::sites::no_host;
 use super::{
     Body, Delivery, Exchange, Handler, Later, Limits, PIECE, Received, Reply, Reset, UpgradeHandler,
@@ -201,13 +201,13 @@ impl Http1 {
             h2c: false,
             first_head_deadline: None,
             stream: Stream::new(http1::RequestEvents::with_limits(opts.head)),
-            after: ChargedBytes::with_capacity(&Budget::unlimited(), 0).unwrap(),
+            after: ChargedBytes::new(&Budget::unlimited()),
             charge: None,
             frame_charge: None,
             phase: Phase::Opening,
             timers: Timers::new(),
             head: None,
-            body: ChargedBytes::with_capacity(&Budget::unlimited(), 0).unwrap(),
+            body: ChargedBytes::new(&Budget::unlimited()),
             too_big: false,
             responding: None,
             out: VecDeque::new(),
@@ -310,8 +310,8 @@ impl Http1 {
             }
             None => return self.over_budget(env),
         }
-        self.body = ChargedBytes::with_capacity(env.budget(), 0).unwrap();
-        self.after = ChargedBytes::with_capacity(env.budget(), 0).unwrap();
+        self.body = ChargedBytes::new(env.budget());
+        self.after = ChargedBytes::new(env.budget());
         let at = self
             .first_head_deadline
             .take()
@@ -431,10 +431,7 @@ impl Http1 {
     /// Move the body's reservation into its shared backing storage. Handler
     /// clones and streams may outlive both this layer and its current job.
     fn take_body(&mut self, budget: &Budget) -> Bytes {
-        let bytes = std::mem::replace(
-            &mut self.body,
-            ChargedBytes::with_capacity(budget, 0).unwrap(),
-        );
+        let bytes = std::mem::replace(&mut self.body, ChargedBytes::new(budget));
         let (bytes, charge) = bytes.into_parts();
         Bytes::from_owner(Owned::new(bytes, charge))
     }
@@ -471,15 +468,17 @@ impl Http1 {
         } else {
             Received::Complete
         };
-        let mut observation = if self.observe.is_some() {
-            let Some(charge) = env.budget().charge(held) else {
-                return self.over_budget(env);
-            };
-            Some(charge)
-        } else {
-            None
+        // The observation's copy of the head is paid for before it is made.
+        let mut delivery = match &self.observe {
+            Some(_) => {
+                let Some(charge) = env.budget().charge(held) else {
+                    return self.over_budget(env);
+                };
+                Delivery::new(&self.observe, &request, &self.conn, now, received)
+                    .map(|delivery| (delivery, charge))
+            }
+            None => None,
         };
-        let mut delivery = Delivery::new(&self.observe, &request, &self.conn, now, received);
         let h2c = (self.h2c && keep_alive && !self.too_big && !lacks_host)
             .then(|| h2c_settings(&request))
             .flatten();
@@ -495,7 +494,6 @@ impl Http1 {
             // The request is HTTP/2's stream 1, observed there: the 101
             // is not its answer.
             delivery = None;
-            observation = None;
             self.next = Some(Next::H2c(Box::new(self.http2(&settings, request))));
             let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
             switching
@@ -534,7 +532,6 @@ impl Http1 {
         self.timers.cancel(&Timer::Body);
         self.responding = Some(Responding {
             delivery,
-            observation,
             version,
             wants,
             close: !keep_alive || lacks_host,
@@ -610,7 +607,7 @@ impl Http1 {
         let Some(mut r) = self.responding.take() else {
             return false;
         };
-        if let Some(delivery) = &mut r.delivery {
+        if let Some((delivery, _)) = &mut r.delivery {
             delivery.update(self.written.saturating_sub(r.base));
         }
         match std::mem::replace(&mut r.stage, Stage::Body(None)) {
@@ -682,15 +679,9 @@ impl Http1 {
     /// in full.
     fn start(&mut self, env: &mut Env<'_, Report>, mut r: Responding, response: Response<Body>) {
         let (parts, body) = response.into_parts();
-        if let Some(delivery) = &mut r.delivery {
-            let charge = r
-                .observation
-                .as_mut()
-                .expect("an observation owns its reservation");
-            let need = charge
-                .bytes()
-                .saturating_add(size_of::<http::response::Parts>())
-                .saturating_add(headers_held(&parts.headers));
+        if let Some((delivery, charge)) = &mut r.delivery {
+            // The copy of the response head is paid for before it is made.
+            let need = charge.bytes().saturating_add(response_held(&parts));
             if !charge.grow_to(need) {
                 return self.over_budget(env);
             }
@@ -770,7 +761,7 @@ impl Http1 {
         bytes: ChargedBytes,
         body: usize,
     ) {
-        if let Some(delivery) = &mut r.delivery {
+        if let Some((delivery, _)) = &mut r.delivery {
             delivery.piece(bytes.len(), body);
         }
         if r.rest.is_empty() {
@@ -792,7 +783,7 @@ impl Http1 {
     /// The response is written: wait for the next request, close, or
     /// hand the connection on.
     fn finish(&mut self, env: &mut Env<'_, Report>, mut r: Responding) {
-        if let Some(mut delivery) = r.delivery.take() {
+        if let Some((mut delivery, _)) = r.delivery.take() {
             delivery.finish(self.written.saturating_sub(r.base), true);
         }
         if self.next.is_some() {
@@ -819,10 +810,7 @@ impl Http1 {
                 .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
         }
         if !self.after.is_empty() {
-            let mut bytes = std::mem::replace(
-                &mut self.after,
-                ChargedBytes::with_capacity(env.budget(), 0).unwrap(),
-            );
+            let mut bytes = std::mem::replace(&mut self.after, ChargedBytes::new(env.budget()));
             bytes.trim();
             self.leftover
                 .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
@@ -836,8 +824,9 @@ impl Http1 {
 
 /// A response being made or written.
 struct Responding {
-    delivery: Option<Delivery>,
-    observation: Option<Charge>,
+    /// The observation being made and the charge for its copies of the
+    /// request and response heads.
+    delivery: Option<(Delivery, Charge)>,
     version: Version,
     wants: Asked,
     close: bool,

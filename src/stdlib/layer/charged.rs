@@ -48,6 +48,12 @@ impl Charge {
 }
 
 impl ChargedBytes {
+    /// No bytes and no room yet, which costs nothing, counted against
+    /// `budget` as it grows.
+    pub fn new(budget: &Budget) -> ChargedBytes {
+        Charge::nothing(budget).into_bytes()
+    }
+
     /// Room for `capacity` bytes, charged before it is allocated. `None`,
     /// with nothing allocated, if the budget has no room.
     pub fn with_capacity(budget: &Budget, capacity: usize) -> Option<ChargedBytes> {
