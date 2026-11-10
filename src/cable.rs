@@ -98,28 +98,38 @@ struct Direction {
     /// The receiver, once it found the queue empty.
     receiver: Parked,
     /// What the queued packets cost, as [`PacketQueue`](crate::relay::PacketQueue)
-    /// counts it. A sender adds a packet's cost before it queues the packet,
-    /// and the receiver takes it off after it took the packet, so this is
-    /// never less than what the queue holds.
+    /// counts it, on a cable with a limit. A sender adds a packet's cost
+    /// before it queues the packet, and the receiver takes it off after it
+    /// took the packet, so this is never less than what the queue holds. A
+    /// cable without a limit counts nothing.
     bytes: AtomicUsize,
     /// One end was dropped.
     closed: AtomicBool,
 }
 
 impl Direction {
-    /// Counts `cost` against `limit`. False, with nothing counted, past it.
-    fn reserve(&self, cost: usize, limit: Option<usize>) -> bool {
+    /// Counts `packet` against `limit`. False, with nothing counted, past
+    /// it.
+    fn reserve(&self, packet: &Packet, limit: Option<usize>) -> bool {
+        let Some(limit) = limit else {
+            return true;
+        };
+        let Some(cost) = charge(packet) else {
+            return false;
+        };
         self.bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-                let total = held.checked_add(cost)?;
-                limit.is_none_or(|limit| total <= limit).then_some(total)
+                held.checked_add(cost).filter(|&total| total <= limit)
             })
             .is_ok()
     }
 
-    fn release(&self, packet: &Packet) {
-        let cost = charge(packet).expect("a queued packet was counted");
-        self.bytes.fetch_sub(cost, Ordering::Relaxed);
+    /// Takes what [`reserve`](Direction::reserve) counted for `packet` off.
+    fn release(&self, packet: &Packet, limit: Option<usize>) {
+        if limit.is_some() {
+            let cost = charge(packet).expect("a queued packet was counted");
+            self.bytes.fetch_sub(cost, Ordering::Relaxed);
+        }
     }
 }
 
@@ -164,7 +174,7 @@ impl End {
                 }
             }
         };
-        dir.release(&packet);
+        dir.release(&packet, self.cable.limit);
         Some(Ok(packet))
     }
 }
@@ -194,15 +204,12 @@ impl Interface for End {
         if dir.closed.load(Ordering::Acquire) {
             return;
         }
-        let Some(cost) = charge(&packet) else {
-            return;
-        };
-        if !dir.reserve(cost, self.cable.limit) {
+        if !dir.reserve(&packet, self.cable.limit) {
             return;
         }
         if let Err(lost) = self.peer.send(packet) {
             // The other end is gone, and its queue with it.
-            dir.release(&lost.0);
+            dir.release(&lost.0, self.cable.limit);
             return;
         }
         dir.receiver.wake();
@@ -226,7 +233,8 @@ impl Drop for End {
 }
 
 impl End {
-    /// The bytes waiting for this end to read, counted as for a limit.
+    /// The bytes waiting for this end to read, counted as for a limit. A
+    /// cable without a limit counts nothing.
     #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
         self.cable.dirs[self.side].bytes.load(Ordering::Relaxed)
@@ -436,6 +444,30 @@ mod tests {
             receiver.join().unwrap();
             drop(sender.join().unwrap());
         }
+    }
+
+    /// A cable without a limit keeps no count, and still carries every
+    /// packet.
+    #[test]
+    fn an_unlimited_cable_counts_nothing() {
+        let (mut a, mut b) = pair();
+        for i in 0..100u32 {
+            b.send(Packet(i.to_le_bytes().to_vec()));
+        }
+        assert_eq!(a.queued(), 0);
+        crate::block_on(crate::lab(crate::Seed::from_u64(0), |fcx| async move {
+            let mut cx = Context::from_waker(Waker::noop());
+            for i in 0..100u32 {
+                let Poll::Ready(Ok(got)) = a.poll_recv(&fcx, &mut cx) else {
+                    panic!("packet {i} was sent");
+                };
+                assert_eq!(got.0, i.to_le_bytes());
+            }
+            assert_eq!(a.queued(), 0);
+            drop(b);
+            Ok(())
+        }))
+        .unwrap();
     }
 
     #[test]
