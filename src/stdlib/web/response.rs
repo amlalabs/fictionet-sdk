@@ -2,6 +2,8 @@ use super::{
     Body, Fields,
     httpd::{Answer, UpgradeHandler},
 };
+use fictionet::stdlib::protocols::fields::record_size;
+use fictionet::{Budget, Chunk};
 use http::StatusCode;
 use std::any::Any;
 use std::sync::Arc;
@@ -56,12 +58,7 @@ impl Response {
         let (mut parts, body) = response.into_parts();
         Self {
             status: parts.status,
-            fields: Fields::new(
-                parts
-                    .headers
-                    .iter()
-                    .map(|(n, v)| (n.as_str(), v.as_bytes())),
-            ),
+            fields: Fields::from(&parts.headers),
             body,
             upgrade: parts.extensions.remove::<UpgradeHandler>(),
             answer: parts.extensions.remove::<Answer>(),
@@ -90,4 +87,25 @@ pub struct ObservedResponse {
     pub answer: Option<Answer>,
     /// The world's record.
     pub facts: Option<Facts>,
+}
+
+impl From<&http::HeaderMap> for Fields {
+    /// The map's fields, in its order, in one block of exactly their size,
+    /// allocated here and paid for by no budget until
+    /// [`repay`](Fields::repay) moves it to one.
+    fn from(map: &http::HeaderMap) -> Fields {
+        let size = map
+            .iter()
+            .try_fold(0usize, |size, (name, value)| {
+                size.checked_add(record_size(name.as_str().len(), value.len())?)
+            })
+            .expect("a header map's fields fit a record");
+        let mut fields =
+            Fields::in_block(Chunk::block(&Budget::unlimited(), 0, size).expect("unlimited"));
+        for (name, value) in map {
+            let written = fields.push_in_place(name.as_str().as_bytes(), value.as_bytes());
+            assert!(written, "the block was sized for every field");
+        }
+        fields
+    }
 }

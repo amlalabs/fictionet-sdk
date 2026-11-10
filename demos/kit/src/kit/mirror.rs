@@ -238,7 +238,7 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
 async fn file_response(file: tokio::fs::File) -> Answer {
     let length = file.metadata().await?.len();
     let mut response = Response::new(Body::Stream(Box::pin(FileBody { file })));
-    response.fields = Fields::new([
+    response.fields = Fields::unpaid([
         ("content-length", length.to_string().as_str()),
         ("content-type", "application/octet-stream"),
     ]);

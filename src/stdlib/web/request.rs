@@ -1,8 +1,7 @@
-use super::fields::{Records, length_size, write_length};
-use std::ops::Range;
+use fictionet::stdlib::protocols::fields::{self, Fields, record_size};
 
-use fictionet::Chunk;
 use fictionet::stdlib::protocols::http1::{Error, FieldRef, Version};
+use fictionet::{Budget, Chunk};
 
 /// A handler's request, retaining its head and body storage.
 pub struct Request {
@@ -47,23 +46,27 @@ impl Site {
     }
 }
 
-/// A request head in one backing. Field records preserve order, duplicates,
-/// and spelling. Cloning shares that backing without allocating.
+/// A request head in one block of [`Fields`]: the pseudo-fields first,
+/// `:method` and the target's (`:path` for HTTP/1; `:scheme`,
+/// `:authority` and `:path` as an HTTP/2 client sent them), then the
+/// fields, which keep their order, duplicates and spelling. An HTTP/2 head
+/// is the block HPACK decoded into, unchanged. Cloning shares the block
+/// without allocating.
 #[derive(Clone)]
 pub struct Head {
-    block: Chunk,
-    method: Range<usize>,
-    target: Range<usize>,
-    fields: Range<usize>,
-    count: usize,
+    fields: Fields,
+    /// How many of the records are pseudo-fields.
+    pseudo: usize,
     pub(crate) version: Version,
 }
 
 impl Head {
-    pub(crate) fn record_size(name: usize, value: usize) -> Option<usize> {
-        name.checked_add(value)?
-            .checked_add(length_size(name) + length_size(value))
+    /// The block size [`in_block`](Self::in_block) needs for `method` and
+    /// `target`, before the fields. `None` past what a record can hold.
+    pub(crate) fn start_size(method: usize, target: usize) -> Option<usize> {
+        record_size(b":method".len(), method)?.checked_add(record_size(b":path".len(), target)?)
     }
+
     /// Builds an explicitly allocated head. HTTP validation happens when
     /// writing it; decoders validate before handing a head to a service.
     pub fn new<N: AsRef<str>, V: AsRef<[u8]>>(
@@ -72,102 +75,114 @@ impl Head {
         version: Version,
         fields: impl IntoIterator<Item = (N, V)>,
     ) -> Self {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(method.as_bytes());
-        bytes.extend_from_slice(target.as_bytes());
-        let start = bytes.len();
-        let mut count = 0;
+        let unlimited = Budget::unlimited();
+        let mut records = Fields::new();
+        let pseudo = [(&b":method"[..], method), (b":path", target)];
+        for (name, value) in pseudo {
+            assert!(
+                records.push(&unlimited, name, value.as_bytes()),
+                "an unlimited budget"
+            );
+        }
         for (name, value) in fields {
             let (name, value) = (name.as_ref().as_bytes(), value.as_ref());
-            write_length(name.len(), |part| bytes.extend_from_slice(part));
-            write_length(value.len(), |part| bytes.extend_from_slice(part));
-            bytes.extend_from_slice(name);
-            bytes.extend_from_slice(value);
-            count += 1;
+            assert!(records.push(&unlimited, name, value), "an unlimited budget");
         }
-        let end = bytes.len();
         Self {
-            block: Chunk::unpaid(bytes),
-            method: 0..method.len(),
-            target: method.len()..start,
-            fields: start..end,
-            count,
+            fields: records,
+            pseudo: 2,
             version,
         }
     }
 
+    /// A head written into `block`, an empty chunk its taker paid for:
+    /// `method` and `target` now, the fields with [`push`](Self::push).
     pub(crate) fn in_block(
-        mut block: Chunk,
+        block: Chunk,
         method: &str,
-        target: &[&str],
+        target: &str,
         version: Version,
     ) -> Result<Self, Error> {
-        let length = target
-            .iter()
-            .try_fold(method.len(), |len, part| len.checked_add(part.len()));
-        if !block.is_empty() || length.is_none_or(|length| length > block.room()) {
+        if !block.is_empty() {
             return Err(Error::HeadTooLong);
         }
-        block
-            .extend_within(method.as_bytes())
-            .map_err(|_| Error::HeadTooLong)?;
-        for part in target {
-            block
-                .extend_within(part.as_bytes())
-                .map_err(|_| Error::HeadTooLong)?;
+        let mut fields = Fields::in_block(block);
+        if !fields.push_in_place(b":method", method.as_bytes())
+            || !fields.push_in_place(b":path", target.as_bytes())
+        {
+            return Err(Error::HeadTooLong);
         }
-        let start = block.len();
         Ok(Self {
-            block,
-            method: 0..method.len(),
-            target: method.len()..start,
-            fields: start..start,
-            count: 0,
+            fields,
+            pseudo: 2,
             version,
         })
     }
 
+    /// The head of an HTTP/2 request, in the block its connection decoded
+    /// it into: `fields` holds the pseudo-fields first, and the connection
+    /// checked them as RFC 9113 section 8.3 asks. `None` for a method,
+    /// scheme, authority or path that is not visible ASCII.
+    pub(crate) fn http2(fields: Fields) -> Option<Self> {
+        let pseudo = fields
+            .iter()
+            .take_while(|(name, _)| name.starts_with(b":"))
+            .count();
+        let visible = |value: &[u8]| value.iter().all(|b| b.is_ascii_graphic());
+        let head = Self {
+            fields,
+            pseudo,
+            version: Version::Http2,
+        };
+        let pseudo_visible = head
+            .fields
+            .iter()
+            .take(head.pseudo)
+            .all(|(_, value)| visible(value));
+        pseudo_visible.then_some(head)
+    }
+
+    /// Appends a field in the block's room. A field past it, or a block
+    /// another holder shares, changes nothing.
     pub(crate) fn push(&mut self, name: &str, value: &[u8]) -> Result<(), Error> {
-        let need = name
-            .len()
-            .checked_add(value.len())
-            .and_then(|n| n.checked_add(length_size(name.len()) + length_size(value.len())))
-            .ok_or(Error::HeadTooLong)?;
-        if need > self.block.room() || self.block.fill(|_| 0).is_none() {
-            return Err(Error::HeadTooLong);
+        if self.fields.push_in_place(name.as_bytes(), value) {
+            Ok(())
+        } else {
+            Err(Error::HeadTooLong)
         }
-        write_length(name.len(), |part| {
-            self.block
-                .extend_within(part)
-                .expect("reserved record room")
-        });
-        write_length(value.len(), |part| {
-            self.block
-                .extend_within(part)
-                .expect("reserved record room")
-        });
-        for bytes in [name.as_bytes(), value] {
-            self.block
-                .extend_within(bytes)
-                .map_err(|_| Error::HeadTooLong)?;
-        }
-        self.fields.end = self.block.len();
-        self.count += 1;
-        Ok(())
+    }
+
+    /// The value of the pseudo-field `name`, colon and all.
+    fn pseudo(&self, name: &[u8]) -> Option<&str> {
+        let (_, value) = self
+            .fields
+            .iter()
+            .take(self.pseudo)
+            .find(|(field, _)| *field == name)?;
+        Some(std::str::from_utf8(value).expect("pseudo-fields are ASCII"))
     }
 
     /// The method token, with its original case.
     pub fn method(&self) -> &str {
-        std::str::from_utf8(&self.block[self.method.clone()]).expect("head method is UTF-8")
+        self.pseudo(b":method").unwrap_or_default()
     }
 
-    /// The original request target.
+    /// The request target: the original one of an HTTP/1 request, and the
+    /// `:path` of an HTTP/2 request, or its `:authority` for a CONNECT.
     pub fn target(&self) -> &str {
-        std::str::from_utf8(&self.block[self.target.clone()]).expect("head target is UTF-8")
+        self.pseudo(b":path")
+            .or_else(|| self.pseudo(b":authority"))
+            .unwrap_or_default()
+    }
+
+    /// The scheme an HTTP/2 client sent in `:scheme`.
+    pub fn scheme(&self) -> Option<&str> {
+        self.pseudo(b":scheme")
     }
 
     /// The host bytes, without a port or trailing dot. No case folding or
-    /// allocation occurs. An absolute target's authority takes precedence over Host.
+    /// allocation occurs. An absolute target's authority takes precedence
+    /// over HTTP/2's `:authority`, and that over Host.
     pub fn host(&self) -> Option<&[u8]> {
         let authority = match self.target().split_once("://") {
             Some((scheme, rest)) => {
@@ -176,7 +191,10 @@ impl Head {
                 }
                 rest.split(['/', '?', '#']).next()?.as_bytes()
             }
-            None => self.field(b"host")?,
+            None => match self.pseudo(b":authority") {
+                Some(authority) => authority.as_bytes(),
+                None => self.field(b"host")?,
+            },
         };
         if !super::super::protocols::http1::valid_authority(authority, false) {
             return None;
@@ -223,15 +241,12 @@ impl Head {
         self.version
     }
 
-    /// All fields in their original order.
-    pub fn fields(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + Clone {
-        Records {
-            bytes: &self.block[self.fields.clone()],
-            left: self.count,
-        }
+    /// All fields in their original order, without the pseudo-fields.
+    pub fn fields(&self) -> std::iter::Skip<fields::Iter<'_>> {
+        self.fields.iter().skip(self.pseudo)
     }
 
-    pub(crate) fn pairs(&self) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + Clone {
+    pub(crate) fn pairs(&self) -> std::iter::Skip<fields::Iter<'_>> {
         self.fields()
     }
 
@@ -257,21 +272,50 @@ impl Head {
 
     /// The capacity retained by this head, including unused pool space.
     pub fn held(&self) -> usize {
-        self.block.capacity()
+        self.fields.capacity()
     }
 
-    /// Allocates an `http` request head.
+    /// Allocates an `http` request head. An HTTP/2 head's URI is made from
+    /// its pseudo-fields, and a client's split `cookie` fields are joined
+    /// with `"; "` (RFC 9113 section 8.2.3).
     pub fn to_http(&self) -> Result<http::request::Parts, http::Error> {
-        let mut request = http::Request::builder()
-            .method(self.method())
-            .uri(self.target())
-            .version(match self.version {
-                Version::Http10 => http::Version::HTTP_10,
-                Version::Http11 => http::Version::HTTP_11,
-                Version::Http2 => http::Version::HTTP_2,
-            });
+        let mut request = http::Request::builder().method(self.method());
+        request = match self.version {
+            Version::Http10 => request.version(http::Version::HTTP_10).uri(self.target()),
+            Version::Http11 => request.version(http::Version::HTTP_11).uri(self.target()),
+            Version::Http2 => {
+                let request = request.version(http::Version::HTTP_2);
+                match self.pseudo(b":authority") {
+                    Some(authority) => {
+                        let mut uri = http::Uri::builder().authority(authority);
+                        if let Some(scheme) = self.scheme() {
+                            uri = uri.scheme(scheme);
+                        }
+                        if let Some(path) = self.pseudo(b":path") {
+                            uri = uri.path_and_query(path);
+                        }
+                        request.uri(uri.build()?)
+                    }
+                    None => request.uri(self.target()),
+                }
+            }
+        };
+        let mut cookie: Option<Vec<u8>> = None;
         for (name, value) in self.fields() {
-            request = request.header(name, value);
+            if self.version == Version::Http2 && name == b"cookie" {
+                match &mut cookie {
+                    Some(joined) => {
+                        joined.extend_from_slice(b"; ");
+                        joined.extend_from_slice(value);
+                    }
+                    None => cookie = Some(value.to_vec()),
+                }
+            } else {
+                request = request.header(name, value);
+            }
+        }
+        if let Some(cookie) = cookie {
+            request = request.header(http::header::COOKIE, cookie);
         }
         Ok(request.body(())?.into_parts().0)
     }
@@ -279,10 +323,7 @@ impl Head {
 
 impl PartialEq for Head {
     fn eq(&self, other: &Self) -> bool {
-        self.method() == other.method()
-            && self.target() == other.target()
-            && self.version == other.version
-            && self.fields().eq(other.fields())
+        self.version == other.version && self.fields.iter().eq(other.fields.iter())
     }
 }
 impl Eq for Head {}
@@ -386,7 +427,7 @@ mod tests {
             let mut head = Head::in_block(
                 pool.take(&budget, 0).unwrap(),
                 "POST",
-                &["/path", "?", "q=yes"],
+                "/path?q=yes",
                 Version::Http11,
             )
             .unwrap();
@@ -421,21 +462,16 @@ mod tests {
     fn a_full_head_block_refuses_another_record_without_changing_fields() {
         let budget = Budget::new(1 << 20);
         let pool = Pool::new(&budget, 2048, 2);
-        let mut head = Head::in_block(
-            pool.take(&budget, 0).unwrap(),
-            "GET",
-            &["/"],
-            Version::Http11,
-        )
-        .unwrap();
+        let mut head =
+            Head::in_block(pool.take(&budget, 0).unwrap(), "GET", "/", Version::Http11).unwrap();
         head.push("Host", b"example.test").unwrap();
-        let room = head.block.room();
+        let room = head.fields.block().map_or(0, Chunk::room);
         let length = (0..room)
-            .find(|&n| Head::record_size(1, n) == Some(room))
+            .find(|&n| record_size(1, n) == Some(room))
             .unwrap();
         let value = vec![b'x'; length];
         head.push("X", &value).unwrap();
-        assert_eq!(head.block.room(), 0);
+        assert_eq!(head.fields.block().map_or(0, Chunk::room), 0);
         let before: Vec<_> = head
             .fields()
             .map(|(n, v)| (n.to_vec(), v.to_vec()))
@@ -452,13 +488,8 @@ mod tests {
     fn shared_head_storage_cannot_be_extended() {
         let budget = Budget::new(4096);
         let pool = Pool::new(&budget, 2048, 1);
-        let mut head = Head::in_block(
-            pool.take(&budget, 0).unwrap(),
-            "GET",
-            &["/"],
-            Version::Http11,
-        )
-        .unwrap();
+        let mut head =
+            Head::in_block(pool.take(&budget, 0).unwrap(), "GET", "/", Version::Http11).unwrap();
         head.push("Host", b"example.test").unwrap();
         let copy = head.clone();
         assert_eq!(head.push("X", b"value"), Err(Error::HeadTooLong));

@@ -80,23 +80,23 @@ pub fn read(bytes: &[u8], prefix: u8) -> Result<(u64, usize), Error> {
 /// Refuses widths outside one through eight and flags inside the prefix.
 /// Leaves `out` unchanged on error. Appends at most [`MAX_BYTES`] bytes.
 /// Protocols with a smaller integer limit must check that limit before calling.
-pub fn write(out: &mut Vec<u8>, prefix: u8, flags: u8, value: u64) -> Result<(), Error> {
+pub fn write(out: &mut impl Extend<u8>, prefix: u8, flags: u8, value: u64) -> Result<(), Error> {
     let mask = mask(prefix)?;
     if flags & mask != 0 {
         return Err(Error::Flags);
     }
     let max = u64::from(mask);
     if value < max {
-        out.push(flags | value as u8);
+        out.extend([flags | value as u8]);
         return Ok(());
     }
-    out.push(flags | mask);
+    out.extend([flags | mask]);
     let mut rest = value - max;
     while rest >= 128 {
-        out.push((rest & 127) as u8 | 128);
+        out.extend([(rest & 127) as u8 | 128]);
         rest >>= 7;
     }
-    out.push(rest as u8);
+    out.extend([rest as u8]);
     Ok(())
 }
 

@@ -1,9 +1,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
 
-use crate::{PACKET_COST, Packet};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{Budget, Charge};
+use crate::{PACKET_COST, Packet};
 
 /// A packet FIFO. Each packet costs the memory it keeps alive (its
 /// backing's capacity) plus [`PACKET_COST`] for its place. A queue with a

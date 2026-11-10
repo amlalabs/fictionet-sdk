@@ -39,8 +39,9 @@
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
     codec::{Decode, Fail, Step, Storage, Stream, Wire, be32},
-    protocols::hpack,
+    protocols::{fields::Fields, hpack},
 };
+use fictionet::{Budget, Chunk};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The client's connection preface from RFC 9113, Section 3.4.
@@ -475,6 +476,99 @@ fn setting_valid(s: Setting) -> Result<(), Error> {
         _ => Ok(()),
     }
 }
+/// One six-byte SETTINGS entry, checked.
+fn setting(b: &[u8]) -> Result<Setting, Error> {
+    let [i0, i1, ..] = *b else {
+        return Err(size("setting"));
+    };
+    let s = Setting {
+        id: u16::from_be_bytes([i0, i1]),
+        value: u32_at(b, 2)?,
+    };
+    setting_valid(s)?;
+    Ok(s)
+}
+
+/// A frame that carries neither data nor a header block, read from its
+/// fixed fields: everything [`FrameReader`] reads whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Control {
+    /// Stream dependency and weight.
+    Priority(Priority),
+    /// Stream cancellation.
+    Reset(Reset),
+    /// Liveness probe or acknowledgment.
+    Ping(Ping),
+    /// Connection shutdown. Its debug bytes are skipped, not kept: `debug`
+    /// is empty.
+    GoAway(GoAway),
+    /// Flow-control credit.
+    WindowUpdate(WindowUpdate),
+    /// An extension frame, its payload skipped.
+    Unknown,
+}
+
+/// The frame of kind 2, 3, 6, 7 or 8 that header `h` begins, from `b`:
+/// its whole payload, or for GOAWAY at least its first eight bytes, whose
+/// debug bytes it leaves out.
+fn control(h: FrameHeader, b: &[u8]) -> Result<Control, Error> {
+    let (stream, flags) = (h.stream, h.flags);
+    Ok(match h.kind {
+        2 => {
+            let dependency = dependency(b)?;
+            if dependency.stream == stream {
+                return Err(protocol("stream depends on itself"));
+            }
+            Control::Priority(Priority {
+                stream,
+                flags,
+                dependency,
+            })
+        }
+        3 => Control::Reset(Reset {
+            stream,
+            flags,
+            code: u32_at(b, 0)?,
+        }),
+        6 => Control::Ping(Ping {
+            flags,
+            opaque: b.try_into().map_err(|_| size("PING length"))?,
+        }),
+        7 => Control::GoAway(GoAway {
+            flags,
+            last_stream: u32_at(b, 0)? & MAX_WINDOW,
+            code: u32_at(b, 4)?,
+            debug: Vec::new(),
+        }),
+        8 => {
+            let increment = u32_at(b, 0)? & MAX_WINDOW;
+            if increment == 0 {
+                return Err(protocol("zero window increment"));
+            }
+            Control::WindowUpdate(WindowUpdate {
+                stream,
+                flags,
+                increment,
+            })
+        }
+        _ => Control::Unknown,
+    })
+}
+
+impl Control {
+    /// The frame this is, for the kinds whose payload it holds whole.
+    fn into_frame(self) -> Frame {
+        match self {
+            Control::Priority(p) => Frame::Priority(p),
+            Control::Reset(r) => Frame::Reset(r),
+            Control::Ping(p) => Frame::Ping(p),
+            Control::GoAway(g) => Frame::GoAway(g),
+            Control::WindowUpdate(w) => Frame::WindowUpdate(w),
+            Control::Unknown => unreachable!("an extension frame keeps its payload"),
+        }
+    }
+}
+
 impl Frame {
     /// Parses a complete payload and validates standalone frame rules.
     pub fn parse_payload(h: FrameHeader, b: &[u8]) -> Result<Self, Error> {
@@ -517,35 +611,11 @@ impl Frame {
                     padding: payload.padding.map(<[u8]>::to_vec),
                 })
             }
-            2 => {
-                let dependency = dependency(b)?;
-                if dependency.stream == stream {
-                    return Err(protocol("stream depends on itself"));
-                }
-                Self::Priority(Priority {
-                    stream,
-                    flags,
-                    dependency,
-                })
-            }
-            3 => Self::Reset(Reset {
-                stream,
-                flags,
-                code: u32_at(b, 0)?,
-            }),
+            2 | 3 => control(h, b)?.into_frame(),
             4 => {
                 let mut entries = Vec::new();
                 for b in b.as_chunks::<6>().0 {
-                    let id = u16::from_be_bytes([
-                        *b.first().ok_or_else(|| size("setting"))?,
-                        *b.get(1).ok_or_else(|| size("setting"))?,
-                    ]);
-                    let s = Setting {
-                        id,
-                        value: u32_at(b, 2)?,
-                    };
-                    setting_valid(s)?;
-                    entries.push(s);
+                    entries.push(setting(b)?);
                 }
                 Self::Settings(Settings { flags, entries })
             }
@@ -563,26 +633,13 @@ impl Frame {
                     padding: payload.padding.map(<[u8]>::to_vec),
                 })
             }
-            6 => Self::Ping(Ping {
-                flags,
-                opaque: b.try_into().map_err(|_| size("PING length"))?,
-            }),
-            7 => Self::GoAway(GoAway {
-                flags,
-                last_stream: u32_at(b, 0)? & MAX_WINDOW,
-                code: u32_at(b, 4)?,
-                debug: b.get(8..).ok_or_else(|| size("GOAWAY length"))?.to_vec(),
-            }),
-            8 => {
-                let increment = u32_at(b, 0)? & MAX_WINDOW;
-                if increment == 0 {
-                    return Err(protocol("zero window increment"));
-                }
-                Self::WindowUpdate(WindowUpdate {
-                    stream,
-                    flags,
-                    increment,
-                })
+            6 | 8 => control(h, b)?.into_frame(),
+            7 => {
+                let Control::GoAway(mut goaway) = control(h, b)? else {
+                    unreachable!("a GOAWAY's fields are a GOAWAY")
+                };
+                goaway.debug = b.get(8..).ok_or_else(|| size("GOAWAY length"))?.to_vec();
+                Self::GoAway(goaway)
             }
             9 => Self::Continuation(Continuation {
                 stream,
@@ -940,28 +997,478 @@ impl Decode for Inputs {
         };
         let item = match Frame::decode_payload(header, &bytes[HEADER_LEN..]) {
             Ok(frame) => Input::Frame(frame),
-            Err(error) => {
-                let scope = if header.stream != 0
-                    && ((header.kind == 2
-                        && matches!(
-                            error.code,
-                            ErrorCode::ProtocolError | ErrorCode::FrameSizeError
-                        ))
-                        || (header.kind == 8 && error.code == ErrorCode::ProtocolError))
-                {
-                    ErrorScope::Stream
-                } else {
-                    ErrorScope::Connection
-                };
-                Input::Refused {
+            Err(error) => Input::Refused {
+                header,
+                error,
+                scope: scope_of(header, error),
+                oversized: false,
+            },
+        };
+        Ok(Step::Item(item, total))
+    }
+}
+
+/// The scope of an error in a frame's payload: a PRIORITY that is
+/// malformed, or a WINDOW_UPDATE with a zero increment, on a stream,
+/// concerns that stream; every other, the connection.
+fn scope_of(header: FrameHeader, error: Error) -> ErrorScope {
+    let stream = header.stream != 0
+        && ((header.kind == 2
+            && matches!(
+                error.code,
+                ErrorCode::ProtocolError | ErrorCode::FrameSizeError
+            ))
+            || (header.kind == 8 && error.code == ErrorCode::ProtocolError));
+    if stream {
+        ErrorScope::Stream
+    } else {
+        ErrorScope::Connection
+    }
+}
+
+/// The most bytes [`FrameReader`] gathers in one place: a frame header,
+/// which is longer than any frame's fixed fields (eight for PING and
+/// GOAWAY, six for a SETTINGS entry or a padded HEADERS with priority).
+const GATHER: usize = HEADER_LEN;
+
+/// One step of a frame, as [`FrameReader`] reads it. A frame that is not
+/// refused is a [`Begin`], then its SETTINGS entries or its content in
+/// pieces, then an [`End`](Read::End).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Read {
+    /// The client's complete connection preface.
+    Preface,
+    /// A frame refused as [`Input::Refused`] refuses it. Nothing more of
+    /// it is read: its payload is skipped.
+    Refused {
+        /// The frame header, including the advertised payload length.
+        header: FrameHeader,
+        /// Why the frame was refused.
+        error: Error,
+        /// Protocol error scope; connection state can require escalation.
+        scope: ErrorScope,
+        /// The payload exceeds the configured limit.
+        oversized: bool,
+    },
+    /// A frame begins: its header and fixed fields are read and checked.
+    Begin(Begin),
+    /// The next entry of the SETTINGS frame begun last, checked.
+    Setting(Setting),
+    /// The next bytes of the content of the DATA, HEADERS, PUSH_PROMISE or
+    /// CONTINUATION frame begun last: its data or its header block
+    /// fragment, without padding. A piece of the input, sharing its
+    /// backing: nothing is copied.
+    Content(Chunk),
+    /// The frame begun last is over: its content and padding are read.
+    End(FrameHeader),
+}
+
+/// What a frame is, read from its header and fixed fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Begin {
+    /// DATA with `len` bytes of data, its padding left out.
+    Data {
+        /// The frame header.
+        header: FrameHeader,
+        /// The data bytes that come as content.
+        len: usize,
+    },
+    /// HEADERS with `len` bytes of header block fragment.
+    Headers {
+        /// The frame header.
+        header: FrameHeader,
+        /// Its priority fields, present exactly when flag 0x20 is set.
+        priority: Option<Dependency>,
+        /// The fragment bytes that come as content.
+        len: usize,
+    },
+    /// PUSH_PROMISE with `len` bytes of header block fragment.
+    PushPromise {
+        /// The frame header.
+        header: FrameHeader,
+        /// The promised stream, greater than zero.
+        promised: u32,
+        /// The fragment bytes that come as content.
+        len: usize,
+    },
+    /// CONTINUATION: its whole payload is fragment, `header.length` bytes.
+    Continuation {
+        /// The frame header.
+        header: FrameHeader,
+    },
+    /// SETTINGS: its entries come as [`Read::Setting`].
+    Settings {
+        /// The frame header.
+        header: FrameHeader,
+    },
+    /// A frame of fixed fields only. GOAWAY's debug bytes and an extension
+    /// frame's payload are skipped.
+    Control {
+        /// The frame header.
+        header: FrameHeader,
+        /// What it says.
+        control: Control,
+    },
+}
+
+impl Begin {
+    /// The frame's header.
+    pub fn header(&self) -> FrameHeader {
+        match self {
+            Begin::Data { header, .. }
+            | Begin::Headers { header, .. }
+            | Begin::PushPromise { header, .. }
+            | Begin::Continuation { header }
+            | Begin::Settings { header }
+            | Begin::Control { header, .. } => *header,
+        }
+    }
+}
+
+/// Where a [`FrameReader`] is in its input.
+#[derive(Clone, Copy, Debug)]
+enum Phase {
+    /// This many bytes of the client preface matched.
+    Preface(usize),
+    /// Between frames: gathering the next header.
+    Header,
+    /// Gathering `want` bytes of fixed fields of `header`'s frame.
+    Fields { header: FrameHeader, want: usize },
+    /// `left` bytes of content, then `pad` bytes of padding.
+    Content {
+        header: FrameHeader,
+        left: usize,
+        pad: usize,
+    },
+    /// `left` bytes of SETTINGS entries.
+    Settings { header: FrameHeader, left: usize },
+    /// `left` bytes to skip, then the end of `end`'s frame, if it was not
+    /// refused.
+    Skip {
+        left: usize,
+        end: Option<FrameHeader>,
+    },
+}
+
+/// HTTP/2 frames read from input that comes in pieces, a step at a time,
+/// copying no content.
+///
+/// It reads what [`Inputs`] reads and refuses what it refuses, with the
+/// same codes and scopes, but it never holds a frame: a frame header or a
+/// frame's fixed fields split across pieces are gathered in a few bytes of
+/// its own, and content (DATA's data, a header block fragment) comes out
+/// as pieces of the input ([`Read::Content`]) as soon as they arrive. A
+/// frame larger than the limit is refused and skipped, as are a GOAWAY's
+/// debug bytes and an extension frame's payload. It allocates nothing.
+///
+/// A frame whose fixed fields are malformed is refused once they are read;
+/// a SETTINGS entry, when it is reached, after the entries before it.
+#[derive(Clone, Debug)]
+pub struct FrameReader {
+    limit: usize,
+    phase: Phase,
+    gathered: [u8; GATHER],
+    have: usize,
+}
+
+impl FrameReader {
+    /// Reads frames without a preface, bounded by `limit` payload bytes.
+    /// Limits above the 24-bit wire maximum are clamped.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_FRAME_SIZE),
+            phase: Phase::Header,
+            gathered: [0; GATHER],
+            have: 0,
+        }
+    }
+
+    /// Requires the client preface before frames.
+    pub fn client_side(limit: usize) -> Self {
+        Self {
+            phase: Phase::Preface(0),
+            ..Self::with_limit(limit)
+        }
+    }
+
+    /// Changes the accepted payload limit for the frames after this one.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.min(MAX_FRAME_SIZE);
+    }
+
+    /// Reads the next step from the front of `input`, taking the bytes it
+    /// reads from it. `None` when `input` is used up before a step is
+    /// whole: what it read of the step so far is kept for the next call.
+    /// An error is a connection error the input cannot recover from.
+    pub fn next(&mut self, input: &mut Chunk) -> Option<Result<Read, Error>> {
+        loop {
+            match self.phase {
+                Phase::Preface(matched) => {
+                    if input.is_empty() {
+                        return None;
+                    }
+                    let n = (PREFACE.len() - matched).min(input.len());
+                    if input[..n] != PREFACE[matched..matched + n] {
+                        return Some(Err(protocol("invalid client preface")));
+                    }
+                    input.advance(n);
+                    if matched + n < PREFACE.len() {
+                        self.phase = Phase::Preface(matched + n);
+                        return None;
+                    }
+                    self.phase = Phase::Header;
+                    return Some(Ok(Read::Preface));
+                }
+                Phase::Header => {
+                    if !self.gather(input, HEADER_LEN) {
+                        return None;
+                    }
+                    let [a, b, c, kind, flags, s0, s1, s2, s3] = self.gathered;
+                    let header = FrameHeader {
+                        length: (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c),
+                        kind,
+                        flags,
+                        stream: u32::from_be_bytes([s0, s1, s2, s3]) & MAX_WINDOW,
+                    };
+                    if let Some(read) = self.begin(header) {
+                        return Some(Ok(read));
+                    }
+                }
+                Phase::Fields { header, want } => {
+                    if !self.gather(input, want) {
+                        return None;
+                    }
+                    return Some(Ok(self.fields(header, want)));
+                }
+                Phase::Content { header, left, pad } => {
+                    if left == 0 {
+                        self.phase = Phase::Skip {
+                            left: pad,
+                            end: Some(header),
+                        };
+                        continue;
+                    }
+                    if input.is_empty() {
+                        return None;
+                    }
+                    let n = left.min(input.len());
+                    self.phase = Phase::Content {
+                        header,
+                        left: left - n,
+                        pad,
+                    };
+                    return Some(Ok(Read::Content(input.split_to(n))));
+                }
+                Phase::Settings { header, left } => {
+                    if left == 0 {
+                        self.phase = Phase::Header;
+                        return Some(Ok(Read::End(header)));
+                    }
+                    if !self.gather(input, 6) {
+                        return None;
+                    }
+                    let left = left - 6;
+                    return Some(Ok(match setting(&self.gathered[..6]) {
+                        Ok(entry) => {
+                            self.phase = Phase::Settings { header, left };
+                            Read::Setting(entry)
+                        }
+                        Err(error) => self.refuse(header, error, left),
+                    }));
+                }
+                Phase::Skip { left, end } => {
+                    let n = left.min(input.len());
+                    input.advance(n);
+                    if n < left {
+                        self.phase = Phase::Skip {
+                            left: left - n,
+                            end,
+                        };
+                        return None;
+                    }
+                    self.phase = Phase::Header;
+                    if let Some(header) = end {
+                        return Some(Ok(Read::End(header)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The input is over: an error if it ended inside the preface or a
+    /// frame.
+    pub fn finish(&self) -> Result<(), Error> {
+        match self.phase {
+            Phase::Preface(0) => Ok(()),
+            Phase::Header if self.have == 0 => Ok(()),
+            _ => Err(protocol("truncated HTTP/2 frame")),
+        }
+    }
+
+    /// Gathers bytes from `input` until `want` are gathered. Whether they
+    /// are; once they are, the next gathering starts afresh.
+    fn gather(&mut self, input: &mut Chunk, want: usize) -> bool {
+        let n = (want - self.have).min(input.len());
+        self.gathered[self.have..self.have + n].copy_from_slice(&input[..n]);
+        input.advance(n);
+        self.have += n;
+        if self.have < want {
+            return false;
+        }
+        self.have = 0;
+        true
+    }
+
+    /// Refuses `header`'s frame for `error` in its payload, as [`Inputs`]
+    /// scopes it, and skips the `left` bytes of it not yet read.
+    fn refuse(&mut self, header: FrameHeader, error: Error, left: usize) -> Read {
+        self.refuse_as(header, error, scope_of(header, error), false, left)
+    }
+
+    fn refuse_as(
+        &mut self,
+        header: FrameHeader,
+        error: Error,
+        scope: ErrorScope,
+        oversized: bool,
+        left: usize,
+    ) -> Read {
+        self.phase = Phase::Skip { left, end: None };
+        Read::Refused {
+            header,
+            error,
+            scope,
+            oversized,
+        }
+    }
+
+    /// Checks a header just read and sets up the rest of its frame. The
+    /// step to give now, if there is one before the fixed fields.
+    fn begin(&mut self, header: FrameHeader) -> Option<Read> {
+        let length = header.length;
+        if length > self.limit {
+            let error = size("frame exceeds configured limit");
+            return Some(self.refuse_as(header, error, ErrorScope::Connection, true, length));
+        }
+        // A PRIORITY on a stream is that stream's error, checked below.
+        if !(header.kind == 2 && header.stream != 0)
+            && let Err(error) = header.validate()
+        {
+            return Some(self.refuse_as(header, error, ErrorScope::Connection, false, length));
+        }
+        let padded = usize::from(header.flags & 8 != 0);
+        let want = match header.kind {
+            0 => padded,
+            1 => padded + if header.flags & 0x20 != 0 { 5 } else { 0 },
+            2 if length != 5 => {
+                let error = size("invalid frame payload length");
+                return Some(self.refuse(header, error, length));
+            }
+            2 => 5,
+            3 | 8 => 4,
+            5 => padded + 4,
+            6 | 7 => 8,
+            4 => {
+                self.phase = Phase::Settings {
                     header,
-                    error,
-                    scope,
-                    oversized: false,
+                    left: length,
+                };
+                return Some(Read::Begin(Begin::Settings { header }));
+            }
+            9 => {
+                self.phase = Phase::Content {
+                    header,
+                    left: length,
+                    pad: 0,
+                };
+                return Some(Read::Begin(Begin::Continuation { header }));
+            }
+            _ => {
+                self.phase = Phase::Skip {
+                    left: length,
+                    end: Some(header),
+                };
+                let control = Control::Unknown;
+                return Some(Read::Begin(Begin::Control { header, control }));
+            }
+        };
+        if length < want {
+            // A payload too short for its fields: FRAME_SIZE_ERROR (RFC
+            // 9113 section 4.2).
+            return Some(self.refuse(header, size("frame too short for its fields"), length));
+        }
+        self.phase = Phase::Fields { header, want };
+        None
+    }
+
+    /// The frame `header` begins, from its `want` fixed fields, gathered:
+    /// its [`Begin`], with the rest of it set up, or its refusal.
+    fn fields(&mut self, header: FrameHeader, want: usize) -> Read {
+        let gathered = self.gathered;
+        let fixed = &gathered[..want];
+        let rest = header.length - want;
+        if !matches!(header.kind, 0 | 1 | 5) {
+            return match control(header, fixed) {
+                Ok(control) => {
+                    self.phase = Phase::Skip {
+                        left: rest,
+                        end: Some(header),
+                    };
+                    Read::Begin(Begin::Control { header, control })
+                }
+                Err(error) => self.refuse(header, error, rest),
+            };
+        }
+        let padded = header.flags & 8 != 0;
+        let (pad, fields) = match fixed.split_first() {
+            Some((&pad, fields)) if padded => (usize::from(pad), fields),
+            _ => (0, fixed),
+        };
+        // Padding that leaves too few bytes for the fields is a
+        // PROTOCOL_ERROR (RFC 9113 sections 6.1, 6.2 and 6.6).
+        let Some(content) = (header.length - usize::from(padded)).checked_sub(pad) else {
+            return self.refuse(header, protocol("padding longer than payload"), rest);
+        };
+        let Some(len) = content.checked_sub(fields.len()) else {
+            return self.refuse(header, protocol("padding covers required fields"), rest);
+        };
+        let begin = match header.kind {
+            0 => Begin::Data { header, len },
+            1 => {
+                let priority = match fields.is_empty() {
+                    true => None,
+                    false => match dependency(fields) {
+                        Ok(priority) => Some(priority),
+                        Err(error) => return self.refuse(header, error, rest),
+                    },
+                };
+                Begin::Headers {
+                    header,
+                    priority,
+                    len,
+                }
+            }
+            _ => {
+                let promised = match u32_at(fields, 0) {
+                    Ok(promised) => promised & MAX_WINDOW,
+                    Err(error) => return self.refuse(header, error, rest),
+                };
+                if promised == 0 {
+                    return self.refuse(header, protocol("promised stream is zero"), rest);
+                }
+                Begin::PushPromise {
+                    header,
+                    promised,
+                    len,
                 }
             }
         };
-        Ok(Step::Item(item, total))
+        self.phase = Phase::Content {
+            header,
+            left: len,
+            pad,
+        };
+        Read::Begin(begin)
     }
 }
 
@@ -1066,7 +1573,7 @@ pub enum Event {
         /// Stream identifier.
         stream: u32,
         /// Decoded fields, in wire order.
-        fields: Vec<hpack::Field>,
+        fields: Fields,
         /// END_STREAM on the initiating HEADERS frame.
         end: bool,
     },
@@ -1084,7 +1591,7 @@ pub enum Event {
         /// Stream identifier.
         stream: u32,
         /// Decoded fields, including any grpc-status.
-        fields: Vec<hpack::Field>,
+        fields: Fields,
     },
     /// The stream was reset.
     Reset {
@@ -1117,24 +1624,22 @@ pub enum Event {
         /// Promised stream.
         promised: u32,
         /// Decoded request fields.
-        fields: Vec<hpack::Field>,
+        fields: Fields,
     },
     /// An extension frame that was ignored by connection state.
     Unknown(Unknown),
 }
-/// A block that waits for CONTINUATION. Its fragments so far are in the
+/// The block being read: the frame that opened it and what that frame
+/// said. Its fragments so far, when they had to be joined, are in the
 /// assembly storage.
+#[derive(Clone, Copy)]
 struct Pending {
     stream: u32,
     end: bool,
     promised: Option<u32>,
 }
-struct HeaderFragment<'a> {
-    bytes: &'a [u8],
-    promised: Option<u32>,
-}
-/// The complete header block, or the opening context while awaiting fragments.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Where a header block stands once a frame of it is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockRead {
     /// The frame's stream.
     pub stream: u32,
@@ -1142,23 +1647,39 @@ pub struct BlockRead {
     pub end: bool,
     /// The stream a PUSH_PROMISE promises.
     pub promised: Option<u32>,
-    /// The decoded block once its final fragment arrives.
-    pub block: Option<hpack::Block>,
+    /// The block is whole and was decoded into the caller's fields; until
+    /// then it waits for CONTINUATION.
+    pub complete: bool,
 }
 /// Endpoint header assembly and HPACK decoding for one direction.
-/// Every returned field is complete. Oversized decoded lists still update
-/// the compression table and set [`hpack::Block::more`] for caller rejection.
+/// Every decoded field is complete. Oversized decoded lists still update
+/// the compression table and are counted in the [`Fields`] they are
+/// decoded into, for the caller to reject.
 ///
-/// A block split into CONTINUATION frames is joined in storage `S`: a
-/// vector, or a container whose growth is paid for first, such as a
-/// layer's [`ChargedBytes`](fictionet::stdlib::layer::ChargedBytes). A
-/// block that arrives whole is decoded from its frame and needs none.
+/// A block that arrives whole, in one HEADERS frame whose fragment is in
+/// one piece, is decoded from where it lies. A block split into
+/// CONTINUATION frames, or a fragment that came in pieces, is joined in
+/// storage `S`: a vector, or a container whose growth is paid for first,
+/// such as a layer's [`ChargedBytes`](fictionet::stdlib::layer::ChargedBytes).
+///
+/// A frame is read either whole ([`read`](Self::read)) or in steps, as a
+/// reader that gets its input in pieces does: [`begin`](Self::begin) with
+/// its header, [`join`](Self::join) each piece of its fragment, then
+/// [`end_frame`](Self::end_frame), and, for a block it completes,
+/// [`decode`](Self::decode) with the caller's choice of fields.
 pub struct HeaderBlocks<S = Vec<u8>> {
     table: hpack::Table,
+    /// The block being read, from its first frame's header to its last.
     pending: Option<Pending>,
-    /// The fragments of the pending block, joined; empty, with nothing
-    /// allocated, between split blocks.
+    /// The frame being read ends its block.
+    last: bool,
+    /// The fragment bytes of the frame being read.
+    frame_len: usize,
+    /// The fragments of the pending block, joined; empty between blocks,
+    /// with its floor allocated.
     assembly: S,
+    /// The storage the assembly keeps between blocks ([`keep`](Self::keep)).
+    floor: usize,
     limit: usize,
     decoded: usize,
 }
@@ -1177,15 +1698,33 @@ impl<S: Storage> HeaderBlocks<S> {
         Self {
             table: hpack::Table::new(4096),
             pending: None,
+            last: false,
+            frame_len: 0,
             assembly: storage,
             limit: limits.header_block,
             decoded: limits.header_list,
+            floor: 0,
         }
     }
 
     /// The assembly storage, to see what pays for it.
     pub fn storage(&self) -> &S {
         &self.assembly
+    }
+
+    /// Keeps `floor` bytes of assembly storage, within the block limit,
+    /// from now on: grown to it now, and given back no further than it
+    /// after each block, so a block split across frames or pieces that
+    /// fits in it is joined without growing. `false`, changing nothing,
+    /// if the storage cannot grow to it.
+    #[must_use = "a refused floor keeps no storage"]
+    pub fn keep(&mut self, floor: usize) -> bool {
+        let floor = floor.min(self.limit);
+        if !self.assembly.grow_within(floor..=floor) {
+            return false;
+        }
+        self.floor = floor;
+        true
     }
 
     fn assembly_capacity(&self, len: usize, capacity: usize, fragment: usize) -> usize {
@@ -1206,45 +1745,16 @@ impl<S: Storage> HeaderBlocks<S> {
         }
     }
 
-    /// The fragment `frame` carries and whether it ends its block, if it
-    /// carries one.
-    fn fragment_of(frame: &Frame) -> Option<(&[u8], bool)> {
-        match frame {
-            Frame::Headers(f) => Some((&f.fragment, f.flags & 4 != 0)),
-            Frame::PushPromise(f) => Some((&f.fragment, f.flags & 4 != 0)),
-            Frame::Continuation(f) => Some((&f.fragment, f.flags & 4 != 0)),
-            _ => None,
-        }
+    /// The most a block whose encoded bytes come to `len` keeps once
+    /// decoded with this direction's limit, as the table is now. A caller
+    /// pays for it before [`decode`](Self::decode) decodes the block.
+    pub fn most_block(&self, len: usize) -> hpack::BlockBound {
+        self.table.most_block(len, self.decoded)
     }
 
-    /// Grows the assembly storage so that reading `frame` needs no more:
-    /// room for its fragment after the pending block's, when it has to be
-    /// joined to them. `false`, changing nothing, if the storage refuses.
-    /// A frame that needs no joining, or that reading will refuse, needs
-    /// no room.
-    #[must_use = "a refused reservation leaves no room for the fragment"]
-    pub fn reserve(&mut self, frame: &Frame) -> bool {
-        let Some((fragment, last)) = Self::fragment_of(frame) else {
-            return true;
-        };
-        let len = self.joined();
-        let needed = len.saturating_add(fragment.len());
-        if (len == 0 && last) || needed > self.limit || needed <= self.assembly.capacity() {
-            return true;
-        }
-        let target = self.assembly_capacity(len, self.assembly.capacity(), fragment.len());
-        self.assembly.grow_within(needed..=target)
-    }
-
-    /// The most the block `frame` ends keeps once decoded, as the table is
-    /// now: `None` if the frame does not end a block. A caller pays for
-    /// it before [`read_frame`](Self::read_frame) decodes the block.
-    pub fn most_block(&self, frame: &Frame) -> Option<hpack::BlockBound> {
-        let (fragment, last) = Self::fragment_of(frame)?;
-        last.then(|| {
-            self.table
-                .most_block(self.joined().saturating_add(fragment.len()), self.decoded)
-        })
+    /// The encoded bytes of the pending block joined so far.
+    pub fn joined_len(&self) -> usize {
+        self.joined()
     }
 
     /// The most the compression table holds while the settings limit stays
@@ -1271,53 +1781,22 @@ impl<S: Storage> HeaderBlocks<S> {
     pub fn most_allocated(&self) -> usize {
         self.table.most_held().saturating_add(self.limit)
     }
-    /// Whether a block waits for CONTINUATION.
+    /// Whether a block waits for CONTINUATION, or for the rest of the
+    /// frame being read.
     pub fn pending(&self) -> bool {
         self.pending.is_some()
     }
-    /// Reads a complete frame payload and enforces continuation sequencing.
-    pub fn read(&mut self, h: FrameHeader, payload: &[u8]) -> Result<BlockRead, Error> {
-        let fragment = if matches!(h.kind, 1 | 5 | 9) {
-            let payload = HeaderPayload::parse(payload, h.kind, h.flags)?;
-            Some(HeaderFragment {
-                bytes: payload.fragment,
-                promised: if h.kind == 5 {
-                    Some(u32_at(payload.fields, 0)? & MAX_WINDOW)
-                } else {
-                    None
-                },
-            })
-        } else {
-            None
-        };
-        self.read_fragment(h, fragment)
-    }
-    /// Reads a frame already decoded by the shared frame decoder.
-    pub fn read_frame(&mut self, frame: &Frame) -> Result<BlockRead, Error> {
-        self.read_parsed(frame.header(0), frame)
-    }
-    fn read_parsed(&mut self, h: FrameHeader, frame: &Frame) -> Result<BlockRead, Error> {
-        let fragment = match frame {
-            Frame::Headers(f) => Some(HeaderFragment {
-                bytes: &f.fragment,
-                promised: None,
-            }),
-            Frame::PushPromise(f) => Some(HeaderFragment {
-                bytes: &f.fragment,
-                promised: Some(f.promised),
-            }),
-            Frame::Continuation(f) => Some(HeaderFragment {
-                bytes: &f.fragment,
-                promised: None,
-            }),
-            _ => None,
-        };
-        self.read_fragment(h, fragment)
-    }
-    fn read_fragment(
+
+    /// Starts reading a header-block frame with header `h`: HEADERS,
+    /// PUSH_PROMISE with the stream it `promised`, or CONTINUATION, whose
+    /// fragment is `fragment` bytes.
+    /// Enforces continuation sequencing. Returns the block's stream and
+    /// the END_STREAM of its opening HEADERS.
+    pub fn begin(
         &mut self,
         h: FrameHeader,
-        fragment: Option<HeaderFragment<'_>>,
+        promised: Option<u32>,
+        fragment: usize,
     ) -> Result<BlockRead, Error> {
         if self
             .pending
@@ -1326,65 +1805,156 @@ impl<S: Storage> HeaderBlocks<S> {
         {
             return Err(protocol("interleaved header block"));
         }
-        let mut out = BlockRead {
-            stream: h.stream,
-            end: h.kind == 1 && h.flags & 1 != 0,
-            promised: None,
-            block: None,
-        };
-        let Some(fragment) = fragment else {
-            return Ok(out);
-        };
-        let len = self.joined();
         let pending = if h.kind == 9 {
             self.pending
-                .take()
                 .ok_or_else(|| protocol("CONTINUATION without a header block"))?
         } else {
             Pending {
                 stream: h.stream,
-                end: out.end,
-                promised: fragment.promised,
+                end: h.kind == 1 && h.flags & 1 != 0,
+                promised,
             }
         };
-        out.end = pending.end;
-        out.promised = pending.promised;
-        let Some(needed) = len
-            .checked_add(fragment.bytes.len())
-            .filter(|&n| n <= self.limit)
-        else {
-            self.assembly.shrink_to(0);
-            return Err(budget("header block exceeds limit"));
+        self.pending = Some(pending);
+        self.last = h.flags & 4 != 0;
+        self.frame_len = fragment;
+        Ok(BlockRead {
+            stream: h.stream,
+            end: pending.end,
+            promised: pending.promised,
+            complete: false,
+        })
+    }
+
+    /// Whether `fragment`, all of the fragment of the frame begun last,
+    /// is a whole block: nothing joined before it, and the frame ends the
+    /// block. Such a block is decoded from where it lies.
+    pub fn is_whole(&self, fragment: usize) -> bool {
+        self.last && self.joined() == 0 && fragment == self.frame_len
+    }
+
+    /// Joins `piece`, the next bytes of the fragment of the frame begun
+    /// last, to the pending block. `Ok(false)`, changing nothing, when the
+    /// storage refuses room for it, so the caller can join it again once
+    /// memory frees. A block past the direction's limit is an error.
+    pub fn join(&mut self, piece: &[u8]) -> Result<bool, Error> {
+        let len = self.joined();
+        let Some(needed) = len.checked_add(piece.len()).filter(|&n| n <= self.limit) else {
+            self.assembly.clear_to(self.floor);
+            return Err(self::budget("header block exceeds limit"));
         };
-        // A complete block already lives in the frame. Only fragmented
-        // blocks need storage to join their pieces.
-        let encoded = if len == 0 && h.flags & 4 != 0 {
-            fragment.bytes
-        } else {
-            if needed > self.assembly.capacity() {
-                let target =
-                    self.assembly_capacity(len, self.assembly.capacity(), fragment.bytes.len());
-                if !self.assembly.grow_within(needed..=target) {
-                    self.assembly.shrink_to(0);
-                    return Err(budget("header allocation failed"));
-                }
+        if needed > self.assembly.capacity() {
+            let target = self.assembly_capacity(len, self.assembly.capacity(), piece.len());
+            if !self.assembly.grow_within(needed..=target) {
+                return Ok(false);
             }
-            // Within the capacity, so this cannot fail.
-            let resized = self.assembly.resize_within(needed);
-            debug_assert!(resized, "the assembly has room for the fragment");
-            self.assembly.bytes_mut()[len..needed].copy_from_slice(fragment.bytes);
-            &self.assembly.bytes()[..needed]
-        };
-        if h.flags & 4 == 0 {
-            self.pending = Some(pending);
-            return Ok(out);
         }
-        let decoded = self.table.decode_block(encoded, self.decoded);
+        // Within the capacity, so this cannot fail.
+        let resized = self.assembly.resize_within(needed);
+        debug_assert!(resized, "the assembly has room for the fragment");
+        self.assembly.bytes_mut()[len..needed].copy_from_slice(piece);
+        Ok(true)
+    }
+
+    /// Ends the frame begun last: whether it ends its block, which the
+    /// caller then decodes.
+    pub fn end_frame(&self) -> bool {
+        self.last
+    }
+
+    /// Decodes the block the last frame ended into `out`, its room
+    /// charged to `budget`: from `whole`, the block as it lies when it
+    /// came whole ([`is_whole`](Self::is_whole)), or else from what was
+    /// joined. The joined fragments go, and the next frame starts a new
+    /// block.
+    pub fn decode(
+        &mut self,
+        whole: Option<&[u8]>,
+        out: &mut Fields,
+        budget: &Budget,
+    ) -> Result<(), Error> {
+        self.pending = None;
+        let encoded = match whole {
+            Some(whole) => whole,
+            None => self.assembly.bytes(),
+        };
+        let decoded = self.table.decode_block(encoded, out, budget, self.decoded);
         // The block is decoded: its joined fragments go.
-        self.assembly.shrink_to(0);
-        out.block =
-            Some(decoded.map_err(|_| error(ErrorCode::CompressionError, "invalid HPACK block"))?);
-        Ok(out)
+        self.assembly.clear_to(self.floor);
+        decoded.map_err(|_| error(ErrorCode::CompressionError, "invalid HPACK block"))
+    }
+
+    /// Reads a complete frame payload, enforces continuation sequencing,
+    /// and decodes a block the frame completes into `out`, charging its
+    /// room to `budget`. A frame that cannot be joined for want of storage
+    /// is an error.
+    pub fn read(
+        &mut self,
+        h: FrameHeader,
+        payload: &[u8],
+        out: &mut Fields,
+        budget: &Budget,
+    ) -> Result<BlockRead, Error> {
+        if !matches!(h.kind, 1 | 5 | 9) {
+            return self.read_fragment(h, None, out, budget);
+        }
+        let payload = HeaderPayload::parse(payload, h.kind, h.flags)?;
+        let promised = if h.kind == 5 {
+            Some(u32_at(payload.fields, 0)? & MAX_WINDOW)
+        } else {
+            None
+        };
+        self.read_fragment(h, Some((payload.fragment, promised)), out, budget)
+    }
+    /// Reads a frame already decoded by the shared frame decoder, as
+    /// [`read`](Self::read) does.
+    pub fn read_frame(
+        &mut self,
+        frame: &Frame,
+        out: &mut Fields,
+        budget: &Budget,
+    ) -> Result<BlockRead, Error> {
+        let fragment = match frame {
+            Frame::Headers(f) => Some((&f.fragment[..], None)),
+            Frame::PushPromise(f) => Some((&f.fragment[..], Some(f.promised))),
+            Frame::Continuation(f) => Some((&f.fragment[..], None)),
+            _ => None,
+        };
+        self.read_fragment(frame.header(0), fragment, out, budget)
+    }
+    fn read_fragment(
+        &mut self,
+        h: FrameHeader,
+        fragment: Option<(&[u8], Option<u32>)>,
+        out: &mut Fields,
+        budget: &Budget,
+    ) -> Result<BlockRead, Error> {
+        let Some((fragment, promised)) = fragment else {
+            if self.pending.is_some() {
+                return Err(protocol("interleaved header block"));
+            }
+            return Ok(BlockRead {
+                stream: h.stream,
+                end: h.kind == 1 && h.flags & 1 != 0,
+                promised: None,
+                complete: false,
+            });
+        };
+        let mut read = self.begin(h, promised, fragment.len())?;
+        if self.is_whole(fragment.len()) {
+            self.decode(Some(fragment), out, budget)?;
+            read.complete = true;
+            return Ok(read);
+        }
+        if !self.join(fragment)? {
+            self.assembly.clear_to(self.floor);
+            return Err(self::budget("header allocation failed"));
+        }
+        if self.end_frame() {
+            self.decode(None, out, budget)?;
+            read.complete = true;
+        }
+        Ok(read)
     }
 }
 struct StreamState {
@@ -1427,6 +1997,9 @@ struct SettingsUpdate {
 pub struct Session {
     frames: Stream<Inputs>,
     blocks: HeaderBlocks,
+    /// Pays for decoded header blocks: a direction has no limit of its
+    /// own beyond [`Limits`].
+    budget: Budget,
     limits: Limits,
     settings: SettingsState,
     peer: SettingsState,
@@ -1463,6 +2036,7 @@ impl Session {
                 Inputs::with_limit(limit)
             }),
             blocks: HeaderBlocks::with_limits(limits),
+            budget: Budget::unlimited(),
             limits,
             settings: SettingsState::default(),
             peer: SettingsState::default(),
@@ -1844,8 +2418,9 @@ impl Session {
             self.first = false;
         }
         let h = frame.header(length);
-        let block = self.blocks.read_parsed(h, &frame)?;
-        if block.block.as_ref().is_some_and(|block| block.more != 0) {
+        let mut fields = Fields::new();
+        let block = self.blocks.read_frame(&frame, &mut fields, &self.budget)?;
+        if block.complete && fields.left_out() != 0 {
             return Err(budget("decoded header list exceeds limit"));
         }
         if matches!(&frame, Frame::Headers(f) if f.priority.as_ref().is_some_and(|p| p.stream == f.stream))
@@ -1859,8 +2434,7 @@ impl Session {
         {
             return Ok(None);
         }
-        if let Some(block_fields) = block.block {
-            let fields = block_fields.headers;
+        if block.complete {
             if let Some(promised) = block.promised {
                 if self.side == Side::Client {
                     return Err(protocol("client sent PUSH_PROMISE"));
@@ -1874,7 +2448,7 @@ impl Session {
             }
             let informational = fields
                 .iter()
-                .any(|f| f.name == b":status" && f.value.first() == Some(&b'1'));
+                .any(|(name, value)| name == b":status" && value.first() == Some(&b'1'));
             let s = self.stream_state(block.stream)?;
             if s.closed {
                 return Err(error(ErrorCode::StreamClosed, "headers on ended stream"));
@@ -2402,6 +2976,18 @@ mod tests {
     fn settings() -> Vec<u8> {
         raw(4, 0, 0, &[])
     }
+    /// A block's fields as owned fields, marks included, to compare with
+    /// the fields that were encoded.
+    fn owned(fields: &Fields) -> Vec<hpack::Field> {
+        fields
+            .iter_marked()
+            .map(|(name, value, never_index)| hpack::Field {
+                name: name.to_vec(),
+                value: value.to_vec(),
+                never_index,
+            })
+            .collect()
+    }
     fn run(bytes: &[u8], chunk: usize) -> Vec<Result<Event, Error>> {
         let mut c = Session::client_side(Limits::default());
         let mut out = Vec::new();
@@ -2558,14 +3144,22 @@ mod tests {
                         ];
                         let mut raw_blocks = HeaderBlocks::with_limits(Limits::default());
                         let mut parsed_blocks = HeaderBlocks::with_limits(Limits::default());
+                        let budget = Budget::unlimited();
                         for bytes in frames {
                             let header = FrameHeader::parse(&bytes[..HEADER_LEN]).unwrap();
                             let frame = Frame::parse(&bytes).unwrap();
                             assert_eq!(frame.header(bytes.len() - HEADER_LEN), header);
+                            let (mut from_raw, mut from_parsed) = (Fields::new(), Fields::new());
                             assert_eq!(
-                                raw_blocks.read(header, &bytes[HEADER_LEN..]),
-                                parsed_blocks.read_parsed(header, &frame),
+                                raw_blocks.read(
+                                    header,
+                                    &bytes[HEADER_LEN..],
+                                    &mut from_raw,
+                                    &budget
+                                ),
+                                parsed_blocks.read_frame(&frame, &mut from_parsed, &budget),
                             );
+                            assert_eq!(from_raw, from_parsed);
                             assert_eq!(raw_blocks.held(), parsed_blocks.held());
                             assert_eq!(raw_blocks.pending(), parsed_blocks.pending());
                         }
@@ -2606,15 +3200,10 @@ mod tests {
                 let last = n == rest.len();
                 let frame = raw(kind, if last { 4 } else { 0 }, stream, &rest[..n]);
                 let header = FrameHeader::parse(&frame[..HEADER_LEN]).unwrap();
-                let parsed = Frame::parse(&frame).unwrap();
-                let bound = blocks.most_block(&parsed);
-                assert!(blocks.reserve(&parsed));
-                let reserved = blocks.storage().capacity();
-                let read = blocks.read(header, &frame[HEADER_LEN..]);
-                assert!(
-                    blocks.storage().capacity() <= reserved,
-                    "reading took more storage than was reserved for it"
-                );
+                let bound = blocks.most_block(blocks.joined_len() + n);
+                let mut fields = Fields::new();
+                let budget = Budget::unlimited();
+                let read = blocks.read(header, &frame[HEADER_LEN..], &mut fields, &budget);
                 assert!(
                     blocks.allocated() <= most,
                     "{} > {most}",
@@ -2630,9 +3219,10 @@ mod tests {
                         break;
                     }
                     Ok(read) if last => {
-                        use fictionet::stdlib::codec::Heap;
-                        let block = read.block.unwrap();
-                        assert!(block.heap() <= bound.unwrap().heap());
+                        assert!(read.complete);
+                        let record = fictionet::stdlib::protocols::fields::RECORD;
+                        let written = fields.octets() + fields.len() * record;
+                        assert!(written <= bound.bytes(), "{written} > {}", bound.bytes());
                         assert_eq!(blocks.storage().capacity(), 0, "the joined block stayed");
                         whole += 1;
                         break;
@@ -2645,6 +3235,35 @@ mod tests {
         }
         assert!(whole > 0 && refused > 0, "{whole} whole, {refused} refused");
     }
+    /// Storage kept for joining stays between blocks: a split block that
+    /// fits it is joined in it, and one that does not grows it, which
+    /// gives the growth back once the block is decoded. Both decode to
+    /// their fields.
+    #[test]
+    fn kept_assembly_storage_stays_between_blocks() {
+        let mut blocks = HeaderBlocks::with_limits(Limits::default());
+        assert!(blocks.keep(64));
+        let kept = blocks.storage().capacity();
+        assert!(kept >= 64);
+        let budget = Budget::unlimited();
+        for (stream, len) in [(1, 40), (3, 200), (5, 64)] {
+            // `len` fields of :method GET, each one indexed byte.
+            let block = vec![0x82; len];
+            let mut fields = Fields::new();
+            for (kind, flags, fragment) in [(1, 0, &block[..len / 2]), (9, 4, &block[len / 2..])] {
+                let frame = raw(kind, flags, stream, fragment);
+                let header = FrameHeader::parse(&frame[..HEADER_LEN]).unwrap();
+                blocks
+                    .read(header, &frame[HEADER_LEN..], &mut fields, &budget)
+                    .unwrap();
+                if len <= kept {
+                    assert_eq!(blocks.storage().capacity(), kept);
+                }
+            }
+            assert_eq!(fields.len(), len);
+            assert_eq!(blocks.storage().capacity(), kept, "the kept storage stayed");
+        }
+    }
     #[test]
     fn header_assembly_retains_opening_context() {
         for kind in [1, 5] {
@@ -2654,45 +3273,41 @@ mod tests {
             } else {
                 (vec![0x82], None, true)
             };
+            let budget = Budget::unlimited();
+            let mut fields = Fields::new();
             let first = raw(kind, u8::from(end), 1, &body);
+            let header = FrameHeader::parse(&first[..9]).unwrap();
             assert_eq!(
                 blocks
-                    .read(FrameHeader::parse(&first[..9]).unwrap(), &first[9..])
+                    .read(header, &first[9..], &mut fields, &budget)
                     .unwrap(),
                 BlockRead {
                     stream: 1,
                     end,
                     promised,
-                    block: None,
+                    complete: false,
                 }
             );
             assert!(blocks.pending());
+            assert!(
+                fields.is_empty(),
+                "nothing is decoded before the block ends"
+            );
             let last = raw(9, 4, 1, &[0x84]);
+            let header = FrameHeader::parse(&last[..9]).unwrap();
             assert_eq!(
                 blocks
-                    .read(FrameHeader::parse(&last[..9]).unwrap(), &last[9..])
+                    .read(header, &last[9..], &mut fields, &budget)
                     .unwrap(),
                 BlockRead {
                     stream: 1,
                     end,
                     promised,
-                    block: Some(hpack::Block {
-                        headers: vec![
-                            hpack::Field {
-                                name: b":method".to_vec(),
-                                value: b"GET".to_vec(),
-                                never_index: false,
-                            },
-                            hpack::Field {
-                                name: b":path".to_vec(),
-                                value: b"/".to_vec(),
-                                never_index: false,
-                            },
-                        ],
-                        more: 0,
-                    }),
+                    complete: true,
                 }
             );
+            let decoded: Vec<_> = fields.iter().collect();
+            assert_eq!(decoded, [(&b":method"[..], &b"GET"[..]), (b":path", b"/")]);
             assert!(!blocks.pending());
         }
     }
@@ -2855,10 +3470,10 @@ mod tests {
         let expected = run(&bytes, bytes.len());
         assert_eq!(run(&bytes, 1), expected);
         assert!(
-            matches!(&expected[2], Ok(Event::Headers { fields: h, end: false, .. }) if h == &fields)
+            matches!(&expected[2], Ok(Event::Headers { fields: h, end: false, .. }) if owned(h) == fields)
         );
         assert!(
-            matches!(&expected[4], Ok(Event::Trailers { fields, .. }) if fields[0].name == b"grpc-status")
+            matches!(&expected[4], Ok(Event::Trailers { fields, .. }) if owned(fields)[0].name == b"grpc-status")
         );
         assert_eq!(
             decode_chunks(
@@ -3119,7 +3734,7 @@ mod tests {
             assert!(accept(&mut c, &raw(9, 4, 1, &[1, b'y'])).is_empty());
             let events = accept(&mut c, &raw(1, 4, 3, &[0x82, 0xbe]));
             assert!(matches!(&events[..], [Event::Headers { fields, .. }]
-                if fields[1] == hpack::Field::new("x", "y")));
+                if owned(fields)[1] == hpack::Field::new("x", "y")));
             assert!(c.failed().is_none());
         }
     }
@@ -3398,7 +4013,7 @@ mod tests {
         assert_eq!(c.peer().header_table_size, 2048);
         let events = accept(&mut c, &raw(1, 4, 1, &[0x88]));
         assert!(matches!(&events[..], [Event::Headers { fields, .. }]
-            if fields == &[hpack::Field::new(":status", "200")]));
+            if owned(fields) == [hpack::Field::new(":status", "200")]));
         assert_eq!(c.blocks.table.settings_limit(), 4096);
 
         accept(&mut c, &raw(4, 1, 0, &[]));
@@ -3574,6 +4189,244 @@ mod tests {
                 ),
                 decode_all(|| Inputs::with_limit(128), &bytes)
             );
+        }
+    }
+
+    /// What a frame says, with what [`FrameReader`] skips left out: the
+    /// padding octets, GOAWAY's debug bytes and an extension frame's
+    /// payload. Refusals compare by code and scope.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Seen {
+        Preface,
+        Frame(Frame),
+        Refused(FrameHeader, ErrorCode, ErrorScope, bool),
+    }
+
+    fn seen(input: Input) -> Seen {
+        match input {
+            Input::Preface => Seen::Preface,
+            Input::Refused {
+                header,
+                error,
+                scope,
+                oversized,
+            } => Seen::Refused(header, error.code, scope, oversized),
+            Input::Frame(mut frame) => {
+                match &mut frame {
+                    Frame::Data(f) => f.padding = None,
+                    Frame::Headers(f) => f.padding = None,
+                    Frame::PushPromise(f) => f.padding = None,
+                    Frame::GoAway(f) => f.debug.clear(),
+                    Frame::Unknown(f) => f.payload.clear(),
+                    _ => {}
+                }
+                Seen::Frame(frame)
+            }
+        }
+    }
+
+    /// The frames a reader's steps make up, as [`seen`] shows them.
+    fn fold(steps: Vec<Read>) -> Vec<Seen> {
+        let mut out = Vec::new();
+        let mut begun = None;
+        let mut content = Vec::new();
+        let mut entries = Vec::new();
+        for step in steps {
+            match step {
+                Read::Preface => out.push(Seen::Preface),
+                Read::Refused {
+                    header,
+                    error,
+                    scope,
+                    oversized,
+                } => {
+                    assert!(begun.is_none() || matches!(begun, Some(Begin::Settings { .. })));
+                    begun = None;
+                    entries.clear();
+                    out.push(Seen::Refused(header, error.code, scope, oversized));
+                }
+                Read::Begin(begin) => {
+                    assert!(begun.is_none(), "a frame begins inside another");
+                    begun = Some(begin);
+                }
+                Read::Setting(entry) => entries.push(entry),
+                Read::Content(piece) => {
+                    assert!(!piece.is_empty(), "content comes in pieces with bytes");
+                    content.extend_from_slice(&piece);
+                }
+                Read::End(header) => {
+                    let begin = begun.take().expect("a frame ends after it begins");
+                    assert_eq!(begin.header(), header);
+                    let (stream, flags) = (header.stream, header.flags);
+                    let content = std::mem::take(&mut content);
+                    let frame = match begin {
+                        Begin::Data { len, .. } => {
+                            assert_eq!(content.len(), len);
+                            Frame::Data(Data {
+                                stream,
+                                flags,
+                                data: content,
+                                padding: None,
+                            })
+                        }
+                        Begin::Headers { priority, len, .. } => {
+                            assert_eq!(content.len(), len);
+                            Frame::Headers(Headers {
+                                stream,
+                                flags,
+                                fragment: content,
+                                priority,
+                                padding: None,
+                            })
+                        }
+                        Begin::PushPromise { promised, len, .. } => {
+                            assert_eq!(content.len(), len);
+                            Frame::PushPromise(PushPromise {
+                                stream,
+                                flags,
+                                promised,
+                                fragment: content,
+                                padding: None,
+                            })
+                        }
+                        Begin::Continuation { .. } => Frame::Continuation(Continuation {
+                            stream,
+                            flags,
+                            fragment: content,
+                        }),
+                        Begin::Settings { .. } => Frame::Settings(Settings {
+                            flags,
+                            entries: std::mem::take(&mut entries),
+                        }),
+                        Begin::Control {
+                            control: Control::Unknown,
+                            ..
+                        } => Frame::Unknown(Unknown {
+                            kind: header.kind,
+                            flags,
+                            stream,
+                            payload: Vec::new(),
+                        }),
+                        Begin::Control { control, .. } => control.into_frame(),
+                    };
+                    out.push(Seen::Frame(frame));
+                }
+            }
+        }
+        assert!(begun.is_none(), "a frame was left unfinished");
+        out
+    }
+
+    /// A frame of a random kind, flags, stream and payload, its length
+    /// right: most are malformed in some way, some are not.
+    fn random_frame(rng: &mut fictionet::stdlib::codec::Lcg, out: &mut Vec<u8>) {
+        let kind = rng.below(11) as u8;
+        let flags = [0, 1, 4, 5, 8, 9, 0x20, 0x24, 0x2d, 0xff][rng.index(10)];
+        let stream = rng.below(4) as u32;
+        let mut body = rng.bytes(40);
+        // Often a payload of the length its kind wants, to get past the
+        // header's checks.
+        match (kind, rng.below(3)) {
+            (2, 0) => body.resize(5, 0),
+            (3 | 8, 0) => body.resize(4, 1),
+            (4, 0) => body.truncate(body.len() / 6 * 6),
+            (6 | 7, 0) => body.resize(8 + usize::from(kind == 7) * body.len(), 2),
+            (0 | 1 | 5, 0) if !body.is_empty() => body[0] = (body.len() / 3) as u8,
+            _ => {}
+        }
+        out.extend(raw(kind, flags, stream, &body));
+    }
+
+    /// The reader reads what [`Inputs`] reads, whole or in pieces: the
+    /// same frames, the same refusals with the same codes and scopes, in
+    /// the same order, over random streams of frames, malformed or not,
+    /// cut into random pieces, with and without the preface, and past the
+    /// size limit. It never gives empty content, and every frame that
+    /// begins ends.
+    #[test]
+    fn the_reader_reads_what_whole_frames_read_in_any_pieces() {
+        use fictionet::stdlib::test_support::rounds;
+        let mut rng = fictionet::stdlib::codec::Lcg::new(0x4852);
+        for round in 0..rounds(400) {
+            let preface = round % 4 == 0;
+            let limit = if round % 3 == 0 {
+                24
+            } else {
+                DEFAULT_FRAME_SIZE
+            };
+            let mut bytes = Vec::new();
+            if preface {
+                bytes.extend_from_slice(PREFACE);
+            }
+            for _ in 0..rng.below(12) {
+                random_frame(&mut rng, &mut bytes);
+            }
+            let make = || {
+                if preface {
+                    Inputs::client_side(limit)
+                } else {
+                    Inputs::with_limit(limit)
+                }
+            };
+            let (items, failure) = decode_all(make, &bytes);
+            assert!(failure.is_none(), "{failure:?}");
+            let want: Vec<Seen> = items.into_iter().map(seen).collect();
+            let mut reader = if preface {
+                FrameReader::client_side(limit)
+            } else {
+                FrameReader::with_limit(limit)
+            };
+            let mut steps = Vec::new();
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                let n = 1 + rng.index(rest.len().min(30));
+                let mut input = Chunk::unpaid(rest[..n].to_vec());
+                rest = &rest[n..];
+                while let Some(step) = reader.next(&mut input) {
+                    steps.push(step.unwrap());
+                }
+                assert!(input.is_empty(), "the reader leaves input it could read");
+            }
+            assert_eq!(reader.finish(), Ok(()));
+            assert_eq!(fold(steps), want, "{bytes:02x?}");
+        }
+    }
+
+    /// Content is the input itself, never a copy: each piece shares the
+    /// backing of the input it came from, and a frame that came whole in
+    /// one input comes out in one piece.
+    #[test]
+    fn content_is_a_piece_of_the_input() {
+        let mut bytes = raw(0, 9, 1, b"\x03payload...");
+        bytes.extend(raw(1, 4, 3, &[0x82, 0x86, 0x84]));
+        let mut input = Chunk::unpaid(bytes);
+        let mut reader = FrameReader::with_limit(DEFAULT_FRAME_SIZE);
+        let mut pieces = Vec::new();
+        while let Some(step) = reader.next(&mut input) {
+            if let Read::Content(piece) = step.unwrap() {
+                assert!(piece.shares(&input));
+                pieces.push(piece.to_vec());
+            }
+        }
+        assert_eq!(pieces, [b"payload".to_vec(), vec![0x82, 0x86, 0x84]]);
+    }
+
+    /// Input that ends inside the preface or a frame is truncated; input
+    /// that ends between frames is not.
+    #[test]
+    fn input_that_ends_inside_a_frame_is_truncated() {
+        let frame = raw(6, 0, 0, b"12345678");
+        for cut in 0..=frame.len() {
+            let mut reader = FrameReader::with_limit(DEFAULT_FRAME_SIZE);
+            let mut input = Chunk::unpaid(frame[..cut].to_vec());
+            while reader.next(&mut input).is_some() {}
+            assert_eq!(reader.finish().is_ok(), cut == 0 || cut == frame.len());
+        }
+        for cut in 0..PREFACE.len() {
+            let mut reader = FrameReader::client_side(DEFAULT_FRAME_SIZE);
+            let mut input = Chunk::unpaid(PREFACE[..cut].to_vec());
+            while reader.next(&mut input).is_some() {}
+            assert_eq!(reader.finish().is_ok(), cut == 0);
         }
     }
 }

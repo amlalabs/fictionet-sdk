@@ -106,9 +106,7 @@ impl Stack {
             } => {
                 if dir == 0 {
                     self.h2[1].peer_open(stream).unwrap();
-                    self.requests.push(
-                        grpc::Request::parse(fields.iter().map(|f| (&f.name, &f.value))).unwrap(),
-                    );
+                    self.requests.push(grpc::Request::parse(&fields).unwrap());
                 }
                 if end {
                     self.calls.end(&(dir, stream));
@@ -134,9 +132,7 @@ impl Stack {
                 self.calls.end(&(dir, stream));
                 self.drain_calls();
                 self.calls.remove(&(dir, stream));
-                self.statuses.push(grpc::Status::from_trailers(
-                    fields.iter().map(|f| (&f.name, &f.value)),
-                ));
+                self.statuses.push(grpc::Status::from_trailers(&fields));
             }
             http2::Event::Settings(s) => self.h2[1 - dir].peer_settings(&s).unwrap(),
             http2::Event::WindowUpdate(w) => self.h2[1 - dir].peer_window_update(&w).unwrap(),

@@ -87,7 +87,7 @@ impl Grpc {
             up: VecDeque::new(),
             partial: Vec::new(),
             checked: 0,
-            charge: opening.charge,
+            charge: None,
             next: None,
             message: None,
             head_sent: false,
@@ -95,36 +95,9 @@ impl Grpc {
             read_over: false,
             client_ended: false,
         };
-        let request = &opening.request;
-        let pseudo = [
-            (":method", request.method().as_str().to_owned()),
-            (
-                ":scheme",
-                request.uri().scheme_str().unwrap_or("http").to_owned(),
-            ),
-            (
-                ":path",
-                request
-                    .uri()
-                    .path_and_query()
-                    .map_or(String::new(), |p| p.as_str().to_owned()),
-            ),
-        ];
-        let authority = request
-            .uri()
-            .authority()
-            .map(|a| (":authority", a.as_str().to_owned()));
-        let fields = pseudo
-            .iter()
-            .map(|(n, v)| (n.as_bytes(), v.as_bytes()))
-            .chain(authority.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())))
-            .chain(
-                request
-                    .headers()
-                    .iter()
-                    .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes())),
-            );
-        match grpc::Request::parse(fields) {
+        // The call is read from the head's fields as they came; the head's
+        // block goes back to the connection when `opening` is dropped.
+        match grpc::Request::parse(opening.head.fields()) {
             Ok(call) => {
                 grpc.content_type = call.content_type.clone();
                 grpc.up

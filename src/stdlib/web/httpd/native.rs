@@ -491,7 +491,7 @@ impl Http1 {
                 delivery = None;
                 self.next = Some(Next::H2c(Box::new(server)));
                 let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
-                switching.fields = crate::stdlib::web::Fields::new([("upgrade", b"h2c")]);
+                switching.fields = crate::stdlib::web::Fields::unpaid([("upgrade", b"h2c")]);
                 Reply::Now(switching)
             } else {
                 Reply::Now(status_only(StatusCode::BAD_REQUEST))
@@ -504,7 +504,7 @@ impl Http1 {
         };
         let stage = match reply {
             Reply::Now(mut response) => {
-                if !response.fields.admit(env.budget()) || !response.body.admit(env.budget()) {
+                if !response.fields.repay(env.budget()) || !response.body.admit(env.budget()) {
                     return self.over_budget(env);
                 }
                 Stage::Made(response)
@@ -1134,7 +1134,7 @@ impl Job for Work {
                     // A body all there now goes out with the head, without
                     // work of its own.
                     response.body.settle(cx, &self.budget)?;
-                    if !response.fields.admit(&self.budget) || !response.body.admit(&self.budget) {
+                    if !response.fields.repay(&self.budget) || !response.body.admit(&self.budget) {
                         return Err(Error::msg(
                             "the response body exceeds the connection budget",
                         ));
@@ -1273,12 +1273,13 @@ fn error_output(error: &Error, budget: &Budget) -> Option<Response> {
     bytes.extend_within(prefix.as_bytes()).ok()?;
     bytes.extend_within(message.as_bytes()).ok()?;
     bytes.extend_within(suffix.as_bytes()).ok()?;
-    let name = "content-type";
+    let name = b"content-type";
     let value = b"text/plain; charset=utf-8";
-    let size = crate::stdlib::web::Fields::record_size(name.len(), value.len())?;
-    let pool = fictionet::Pool::new(budget, size, 0);
-    let mut fields = crate::stdlib::web::Fields::in_block(pool.take(budget, 0)?).ok()?;
-    fields.push(name, value).ok()?;
+    let size = crate::stdlib::protocols::fields::record_size(name.len(), value.len())?;
+    let mut fields = crate::stdlib::web::Fields::in_block(Chunk::block(budget, 0, size)?);
+    if !fields.push_in_place(name, value) {
+        return None;
+    }
     let mut response = Response::new(Body::from(Chunk::from(bytes)));
     response.status = status;
     response.fields = fields;

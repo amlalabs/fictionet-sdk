@@ -535,9 +535,8 @@
 
 pub mod httpd;
 mod response;
+pub use crate::stdlib::protocols::fields::Fields;
 pub use response::{Facts, ObservedResponse, Response};
-mod fields;
-pub use fields::Fields;
 mod request;
 pub use request::{Head, Request, Site};
 

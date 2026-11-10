@@ -25,6 +25,7 @@ pub mod dtls;
 pub mod enip;
 pub mod fast;
 pub mod fastcgi;
+pub mod fields;
 pub mod fix;
 pub mod ftp;
 pub mod geneve;

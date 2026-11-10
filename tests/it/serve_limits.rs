@@ -531,6 +531,7 @@ fn http2_caps_the_streams_a_connection_opens() {
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
     let idle = h2_input();
+    let budget = Budget::new(idle + 16_000);
     world::seeded_world(
         fictionet::Seed::from_u64(7),
         Duration::from_secs(60),
@@ -572,10 +573,11 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
                     body: 9000,
                     ..Limits::default()
                 },
-                // Room for one read of the largest request and for a
-                // 7500-byte body once, but not for it twice: the body comes
-                // up charged and is copied into the request.
-                budget: Some(Budget::new(idle + 16_000)),
+                // Room for one read of the largest request and for a body
+                // within the limit: the body comes up in the chunks it was
+                // read in, which go back as it is copied into the request,
+                // so it is held once.
+                budget: Some(budget.clone()),
                 ..HttpOptions::default()
             };
             serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
@@ -622,9 +624,18 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
             // Within the budget and the limit.
             let (status, body) = ask(http::Method::POST, "/echo", vec![b'a'; 1500]).await?;
             assert_eq!((status, body.len()), (200, 1500));
-            // Within the limit, past the budget.
-            let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 7500]).await?;
+            // Within the limit, past the budget: what is left of it is
+            // less than the body.
+            let taken = budget
+                .charge(budget.limit() - budget.used() - 4096)
+                .unwrap();
+            let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 8800]).await?;
             assert_eq!(status, 503);
+            drop(taken);
+            // Within the budget, with no room for the echo's frame to be
+            // copied whole: its payload goes out in place.
+            let (status, body) = ask(http::Method::POST, "/echo", vec![b'e'; 8800]).await?;
+            assert_eq!((status, body.len()), (200, 8800));
             // Past the limit.
             let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 9500]).await?;
             assert_eq!(status, 413);
@@ -907,11 +918,11 @@ fn http2_pending_metadata_releases_on_reset_and_region_cancellation() {
             fcx.idle().await?;
             assert_eq!(waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
             let request_charge = budget.used() - one;
-            // HTTP/2 still materializes an HTTP head before its native
-            // conversion. Allow two native head reservations for that
-            // overlap; the HTTP map also needs its own bookkeeping.
+            // Leave room for the next request's bytes to arrive, but not for
+            // its head to be held: the head is decoded into a block, and the
+            // handler takes that block.
             let other = budget
-                .charge(budget.limit() - budget.used() - 2 * request_charge)
+                .charge(budget.limit() - budget.used() - 4096)
                 .unwrap();
             let two = budget.used();
             assert!(two >= other.bytes() + 2 * 4096);

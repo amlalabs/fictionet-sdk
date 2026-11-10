@@ -130,7 +130,7 @@ pub fn encoded_len(s: &[u8]) -> Result<usize, Error> {
 
 /// Appends encoded bytes with EOS prefix padding. Refuses input above
 /// [`MAX_STRING`] and leaves `out` unchanged on error.
-pub fn encode(s: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+pub fn encode(s: &[u8], out: &mut impl Extend<u8>) -> Result<(), Error> {
     if s.len() > MAX_STRING {
         return Err(Error::Unwritable);
     }
@@ -141,13 +141,13 @@ pub fn encode(s: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         bits += len;
         while bits >= 8 {
             bits -= 8;
-            out.push((acc >> bits) as u8);
+            out.extend([(acc >> bits) as u8]);
         }
         acc &= (1 << bits) - 1;
     }
     if bits > 0 {
         let pad = 8 - bits;
-        out.push(((acc << pad) | ((1 << pad) - 1)) as u8);
+        out.extend([((acc << pad) | ((1 << pad) - 1)) as u8]);
     }
     Ok(())
 }
@@ -181,7 +181,57 @@ fn symbol(code: u32, len: usize) -> Option<u16> {
 /// # Ok::<(), fictionet::stdlib::protocols::huffman::Error>(())
 /// ```
 pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity((bytes.len().saturating_mul(8) / 5).min(limit));
+    let mut out = Vec::with_capacity(most_decoded(bytes.len()).min(limit));
+    walk(bytes, |octet| {
+        if out.len() >= limit {
+            return Err(Error::TooLong);
+        }
+        out.push(octet);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Decodes a Huffman string into the start of `out`, writing nothing
+/// past it, and returns how many octets it wrote. Refuses invalid codes,
+/// EOS and padding as [`decode_limited`] does, and output longer than
+/// `out` as [`Error::TooLong`]. Allocates nothing.
+pub fn decode_into(bytes: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    let mut written = 0;
+    walk(bytes, |octet| {
+        let slot = out.get_mut(written).ok_or(Error::TooLong)?;
+        *slot = octet;
+        written += 1;
+        Ok(())
+    })?;
+    Ok(written)
+}
+
+/// How many octets a Huffman string decodes to, checking it as
+/// [`decode_limited`] does, with at most `limit` of them. Allocates
+/// nothing.
+pub fn decoded_len(bytes: &[u8], limit: usize) -> Result<usize, Error> {
+    let mut len = 0usize;
+    walk(bytes, |_| {
+        if len >= limit {
+            return Err(Error::TooLong);
+        }
+        len += 1;
+        Ok(())
+    })?;
+    Ok(len)
+}
+
+/// The most octets `len` encoded bytes decode to: the shortest code is
+/// five bits.
+pub fn most_decoded(len: usize) -> usize {
+    len.saturating_mul(8) / 5
+}
+
+/// Reads the codes of `bytes` in order, handing each decoded octet to
+/// `emit`, and checks the padding at the end. The one decoder every
+/// entry point above shares.
+fn walk(bytes: &[u8], mut emit: impl FnMut(u8) -> Result<(), Error>) -> Result<(), Error> {
     let (mut code, mut len) = (0u32, 0usize);
     for byte in bytes {
         for bit in (0..8).rev() {
@@ -194,17 +244,14 @@ pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
                 if sym == 256 {
                     return Err(Error::InvalidCode);
                 }
-                if out.len() >= limit {
-                    return Err(Error::TooLong);
-                }
-                out.push(sym as u8);
+                emit(sym as u8)?;
                 code = 0;
                 len = 0;
             }
         }
     }
     if len < 8 && code == (1 << len) - 1 {
-        Ok(out)
+        Ok(())
     } else {
         Err(Error::InvalidCode)
     }
@@ -318,6 +365,41 @@ mod tests {
         assert_eq!(decode_limited(&[0x1f], 0), Err(Error::TooLong));
         assert_eq!(decode_limited(&[0xff], 1), Err(Error::InvalidCode));
         assert_eq!(decode_limited(&[0x1f], usize::MAX).unwrap(), b"a");
+    }
+
+    /// Decoding into a slice or only counting agrees with decoding into a
+    /// vector on every input: the same octets, the same length, the same
+    /// refusals, and a slice one octet short is refused as too long.
+    #[test]
+    fn every_decoder_agrees_with_the_vector_decoder() {
+        use fictionet::{Entropy, Seed, SeededEntropy};
+        let entropy = SeededEntropy::new(Seed::from_u64(7));
+        for round in 0..2000 {
+            let len = (entropy.random_u64() % 24) as usize;
+            let bytes: Vec<u8> = if round % 2 == 0 {
+                // Valid strings, from random text.
+                let text: Vec<u8> = (0..len).map(|_| entropy.random_u64() as u8).collect();
+                HuffmanString(text).to_bytes().unwrap()
+            } else {
+                (0..len).map(|_| entropy.random_u64() as u8).collect()
+            };
+            let limit = most_decoded(bytes.len());
+            let want = decode_limited(&bytes, limit);
+            let mut out = vec![0xaa; limit];
+            let got = decode_into(&bytes, &mut out).map(|n| out[..n].to_vec());
+            assert_eq!(got, want, "{bytes:02x?}");
+            assert_eq!(
+                decoded_len(&bytes, limit),
+                want.as_ref().map(Vec::len).map_err(|e| *e)
+            );
+            if let Ok(want) = &want
+                && let Some(short) = want.len().checked_sub(1)
+            {
+                let mut out = vec![0; short];
+                assert_eq!(decode_into(&bytes, &mut out), Err(Error::TooLong));
+                assert_eq!(decoded_len(&bytes, short), Err(Error::TooLong));
+            }
+        }
     }
 
     /// The bits of `codes`, each `(code, length)`, then `pad` bits of

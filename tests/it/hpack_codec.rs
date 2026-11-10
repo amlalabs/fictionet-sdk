@@ -10,6 +10,7 @@ use fictionet::stdlib::{
     },
     test_support,
 };
+use fictionet::{Budget, stdlib::protocols::fields::Fields};
 
 #[test]
 fn wire_contracts_and_collection_at_eof() {
@@ -68,9 +69,20 @@ fn settings_table_eviction_and_round_trips_through_public_api() {
         fields[2].never_index = rng.coin();
         let mut bytes = Vec::new();
         encoder.encode_block(&fields, &mut bytes).unwrap();
-        let block = decoder.decode_block(&bytes, hpack::MAX_DECODED).unwrap();
-        assert_eq!(block.more, 0);
-        assert_eq!(block.headers, fields);
+        let mut block = Fields::new();
+        decoder
+            .decode_block(&bytes, &mut block, &Budget::unlimited(), hpack::MAX_DECODED)
+            .unwrap();
+        assert_eq!(block.left_out(), 0);
+        let decoded: Vec<Field> = block
+            .iter_marked()
+            .map(|(name, value, never_index)| Field {
+                name: name.to_vec(),
+                value: value.to_vec(),
+                never_index,
+            })
+            .collect();
+        assert_eq!(decoded, fields);
         assert_eq!(decoder.table_size(), encoder.table_size());
         assert!(decoder.table_size() <= decoder.settings_limit());
     }
@@ -104,10 +116,16 @@ fn fields_huffman_strings_and_prefix_integers_keep_the_public_contracts() {
     let mut encoder = hpack::Encoder::default();
     let mut bytes = Vec::new();
     encoder.encode_block(&[field], &mut bytes).unwrap();
-    let result = hpack::Table::default()
-        .decode_block(&bytes, hpack::MAX_DECODED)
+    let mut result = Fields::new();
+    hpack::Table::default()
+        .decode_block(
+            &bytes,
+            &mut result,
+            &Budget::unlimited(),
+            hpack::MAX_DECODED,
+        )
         .unwrap();
-    assert_eq!(result.headers[0].name, b"x-owned");
+    assert_eq!(result.iter().next().unwrap().0, b"x-owned");
     assert_eq!(
         huffman::decode(&huffman::HuffmanString(vec![0, 255]).to_bytes().unwrap()).unwrap(),
         [0, 255]

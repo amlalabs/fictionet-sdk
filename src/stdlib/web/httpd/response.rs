@@ -248,7 +248,7 @@ mod tests {
     fn a_handler_date_is_kept_without_making_one() {
         let mut response = Response::new(crate::stdlib::web::Body::empty());
         response.fields =
-            crate::stdlib::web::Fields::new([("date", b"Sun, 06 Nov 1994 08:49:37 GMT")]);
+            crate::stdlib::web::Fields::unpaid([("date", b"Sun, 06 Nov 1994 08:49:37 GMT")]);
         let parts = response;
         let mut made = false;
         let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || {

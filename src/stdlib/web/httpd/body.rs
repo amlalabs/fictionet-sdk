@@ -77,6 +77,14 @@ impl Body {
             Self::Stream(s) => s.as_mut().take_trailers(),
         }
     }
+    /// The bytes a body held in full keeps allocated, which
+    /// [`admit`](Self::admit) charges at most; none for a stream.
+    pub(super) fn capacity(&self) -> usize {
+        match self {
+            Self::Full(b) => b.capacity(),
+            Self::Stream(_) => 0,
+        }
+    }
     pub(super) fn admit(&mut self, budget: &Budget) -> bool {
         match self {
             Self::Full(b) => b.repay(budget),
@@ -103,7 +111,7 @@ impl Body {
             let mut trailers = stream.as_mut().take_trailers();
             if trailers
                 .as_mut()
-                .is_some_and(|fields| !fields.admit(budget))
+                .is_some_and(|fields| !fields.repay(budget))
             {
                 return Err(BodyRefused);
             }
@@ -319,12 +327,15 @@ mod tests {
         }
         for with_data in [false, true] {
             for enough in [false, true] {
-                let fields = Fields::new([("x-end", b"value".as_slice())]);
+                let fields = Fields::unpaid([("x-end", b"value".as_slice())]);
                 let data = with_data.then(|| Chunk::unpaid(b"data".to_vec()));
-                let need = fields.held() + data.as_ref().map_or(0, Chunk::len);
+                let need = fields.capacity() + data.as_ref().map_or(0, Chunk::len);
                 let retained = fields
                     .iter()
-                    .map(|(name, value)| Fields::record_size(name.len(), value.len()).unwrap())
+                    .map(|(name, value)| {
+                        crate::stdlib::protocols::fields::record_size(name.len(), value.len())
+                            .unwrap()
+                    })
                     .sum::<usize>()
                     + data.as_ref().map_or(0, Chunk::len);
                 let budget = Budget::new(need - usize::from(!enough));
@@ -343,7 +354,7 @@ mod tests {
                     let trailers = body.take_trailers().unwrap();
                     assert_eq!(trailers.get(b"x-end"), Some(b"value".as_slice()));
                     drop(body);
-                    assert_eq!(budget.used(), trailers.held());
+                    assert_eq!(budget.used(), trailers.capacity());
                     drop(trailers);
                 } else {
                     drop(body);

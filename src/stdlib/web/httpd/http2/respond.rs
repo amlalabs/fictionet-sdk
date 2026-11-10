@@ -10,7 +10,9 @@ use std::time::SystemTime;
 
 use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 
-use fictionet::stdlib::layer::{Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top};
+use fictionet::stdlib::layer::{
+    Budget, Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top,
+};
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http2::{ErrorCode, Setting};
 use fictionet::stdlib::services::stack::Job;
@@ -107,20 +109,13 @@ impl Responder {
         request: crate::stdlib::web::Request,
     ) -> Option<Http2Server> {
         let parts = request.head.to_http().ok()?;
-        let body = request.body;
-        let mut head = Request::from_parts(parts, ());
-        *head.version_mut() = http::Version::HTTP_2;
-        let body = body
+        let head = Request::from_parts(parts, ());
+        let body = request
+            .body
             .bytes()
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| Chunk::unpaid(bytes.to_vec()));
-        let opening = Opening {
-            request: Box::new(head),
-            ended: body.is_none(),
-            at: Instant::ZERO,
-            charge: None,
-        };
-        Some(self.server(Http2::upgraded(self.limits, settings, opening, body)))
+        Some(self.server(Http2::upgraded(self.limits, settings, head, body)))
     }
 
     fn server(&self, mut connection: Http2) -> Http2Server {
@@ -133,8 +128,8 @@ impl Responder {
         let limit = (self.limits.streams as usize).min(4096);
         Chain::new(
             connection,
-            Children::new(limit, Http2::WINDOW, move |_, opening, _| {
-                Some(Respond::new(shared.clone(), opening))
+            Children::new(limit, Http2::WINDOW, move |_, opening, budget| {
+                Respond::new(shared.clone(), opening, budget)
             }),
         )
     }
@@ -151,15 +146,17 @@ impl Responder {
 /// credit, then its trailers or its end. The response replaces the request
 /// in the budget; one the budget cannot hold gets `503`, and a streamed
 /// chunk it cannot hold resets this stream alone.
+///
+/// The handler takes a [`Head`](crate::stdlib::web::Head) that is the
+/// block the connection decoded the request's head into, with its charge:
+/// nothing is copied or converted, and the block goes back to the
+/// connection when the handler drops the head. A stream whose
+/// pseudo-fields are not visible ASCII is reset with `PROTOCOL_ERROR`.
 pub struct Respond {
-    state: Box<State>,
-}
-
-struct State {
     responder: Arc<Responder>,
-    head: Option<Request<()>>,
-    /// What this exchange holds besides the request's body: the request's
-    /// head, then the response's head. Response chunks carry their own charge.
+    head: Option<crate::stdlib::web::Head>,
+    /// What this exchange holds besides the request's head and body: the
+    /// response's head. Response chunks carry their own charge.
     charge: Option<Charge>,
     /// The request's body as it is collected, which carries its charge.
     body: Option<ChargedBytes>,
@@ -195,32 +192,50 @@ enum Stage {
 }
 
 impl Respond {
-    fn new(responder: Arc<Responder>, opening: Opening) -> Respond {
+    /// The exchange `opening` starts, its head the block the connection
+    /// decoded it into, with the room to answer `503` charged to `budget`
+    /// first. `None`, with nothing charged, when the budget has no room for
+    /// it: the stream is refused before its handler runs.
+    fn new(responder: Arc<Responder>, opening: Opening, budget: &Budget) -> Option<Respond> {
+        let reserve = budget.charge(answer_reserve())?;
         let deadline = (!opening.ended).then(|| opening.at + responder.limits.body_timeout);
-        Respond {
-            state: Box::new(State {
-                responder,
-                head: Some(*opening.request),
-                charge: opening.charge,
-                body: None,
-                deadline,
-                ended: opening.ended,
-                stage: Stage::Collecting,
-                wants: Asked::Body,
-                delivery: None,
-                next: None,
-                rest: Chunk::default(),
-                generation: 0,
-                work: None,
-            }),
-        }
+        let head = crate::stdlib::web::Head::http2(opening.head.into_fields());
+        let (stage, next) = match head {
+            Some(_) => (Stage::Collecting, None),
+            // A head the connection could check but whose pseudo-fields
+            // are not visible ASCII is the client's error on this stream
+            // alone.
+            None => (
+                Stage::Done,
+                Some(ExchangeCommand::Reset(ErrorCode::ProtocolError)),
+            ),
+        };
+        Some(Respond {
+            responder,
+            head,
+            charge: Some(reserve),
+            body: None,
+            deadline: deadline.filter(|_| next.is_none()),
+            ended: opening.ended,
+            stage,
+            wants: Asked::Body,
+            delivery: None,
+            next,
+            rest: Chunk::default(),
+            generation: 0,
+            work: None,
+        })
     }
-}
 
-impl State {
     /// Charges `bytes` in place of what is charged now. Returns whether it
     /// fits.
     fn hold(&mut self, env: &Env<'_, Infallible>, bytes: usize) -> bool {
+        // More than the whole budget never fits, and this exchange answers
+        // that itself (`503`): it is not asked for, so it is not taken for
+        // a need of the child's that no release could meet.
+        if bytes > env.budget().limit() {
+            return false;
+        }
         match &mut self.charge {
             Some(charge) if bytes < charge.bytes() => {
                 charge.shrink_to(bytes);
@@ -272,60 +287,7 @@ impl State {
         };
         self.deadline = None;
         let responder = self.responder.clone();
-        let (parts, ()) = head.into_parts();
         let body = self.body.take().map(Chunk::from).unwrap_or_default();
-        let uri = &parts.uri;
-        let target = [
-            uri.scheme_str().unwrap_or(""),
-            if uri.scheme().is_some() { "://" } else { "" },
-            uri.authority().map_or("", |a| a.as_str()),
-            uri.path(),
-            if uri.query().is_some() { "?" } else { "" },
-            uri.query().unwrap_or(""),
-        ];
-        let size = parts.headers.iter().fold(
-            target
-                .iter()
-                .try_fold(parts.method.as_str().len(), |len, part| {
-                    len.checked_add(part.len())
-                }),
-            |size, (name, value)| {
-                size?.checked_add(crate::stdlib::web::Head::record_size(
-                    name.as_str().len(),
-                    value.as_bytes().len(),
-                )?)
-            },
-        );
-        let Some(block) = size.and_then(|size| {
-            let charge = env.budget().charge(size)?;
-            Some(
-                Chunk::paid(vec![0; size], charge)
-                    .expect("reserved head")
-                    .slice(0..0),
-            )
-        }) else {
-            self.reset();
-            return;
-        };
-        let mut head = crate::stdlib::web::Head::in_block(
-            block,
-            parts.method.as_str(),
-            &target,
-            crate::stdlib::protocols::http1::Version::Http2,
-        )
-        .expect("reserved request head");
-        for (name, value) in &parts.headers {
-            head.push(name.as_str(), value.as_bytes())
-                .expect("reserved field records");
-        }
-        drop(parts);
-        if responder.observe.is_none()
-            && let Some(charge) = &mut self.charge
-        {
-            // Release request storage but keep the admission owner's view.
-            // Response refusals are handled here, outside the runner's view.
-            charge.shrink_to(0);
-        }
         let request = crate::stdlib::web::Request {
             head,
             body: Body::from(body),
@@ -383,14 +345,14 @@ impl State {
     /// other streams.
     fn made(&mut self, env: &Env<'_, Infallible>, mut response: Response, settle: bool) {
         let delivery = self.delivery.as_ref().map_or(0, |d| d.held);
-        let fits = self.hold(env, response_held(&response) + delivery);
-        // Response admission uses the head's account: this owner handles
-        // its refusal with a service-unavailable response. A body poll's
-        // refusal instead belongs to the child runner and resets the stream.
-        let budget = self
-            .charge
-            .as_ref()
-            .map_or_else(|| env.budget().clone(), |charge| charge.budget().clone());
+        let budget = env.budget().clone();
+        // Storage past the whole limit never fits, and this exchange
+        // answers that itself with `503`: it is not charged, so it is not
+        // taken for a need of the child's that no release could meet. A
+        // body poll's refusal instead belongs to the child runner.
+        let storable = response.fields.capacity() <= budget.limit()
+            && response.body.capacity() <= budget.limit();
+        let fits = storable && self.hold(env, response_held(&response) + delivery);
         let settled = if fits && settle && matches!(response.body, Body::Stream(_)) {
             let waker = env.waker();
             response
@@ -400,14 +362,14 @@ impl State {
         } else {
             fits
         };
-        let response = if settled && response.fields.admit(&budget) && response.body.admit(&budget)
+        let response = if settled && response.fields.repay(&budget) && response.body.admit(&budget)
         {
             response
         } else {
             drop(response);
             let mut response = over_budget(&super::super::Responses::unpooled(&budget));
             if !self.hold(env, response_held(&response) + delivery)
-                || !response.fields.admit(&budget)
+                || !response.fields.repay(&budget)
                 || !response.body.admit(&budget)
             {
                 self.reset();
@@ -556,41 +518,40 @@ impl Layer for Respond {
         env: &mut Env<'_, Infallible>,
         event: ExchangeEvent,
     ) -> Result<fictionet::stdlib::layer::Admit<ExchangeEvent>, Infallible> {
-        let state = &mut *self.state;
-        let collecting = matches!(state.stage, Stage::Collecting) && !state.ended;
+        let collecting = matches!(self.stage, Stage::Collecting) && !self.ended;
         match event {
-            ExchangeEvent::Data(chunk) if collecting => state.collect(env, chunk),
+            ExchangeEvent::Data(chunk) if collecting => self.collect(env, chunk),
             // A body past its answer is dropped as it comes.
             ExchangeEvent::Data(_) => {}
             ExchangeEvent::Trailers(_) | ExchangeEvent::End if collecting => {
-                state.dispatch(env, Received::Complete);
+                self.dispatch(env, Received::Complete);
             }
             ExchangeEvent::Trailers(_) | ExchangeEvent::End => {}
             // The body limit comes before the budget, as it does for bytes
             // the connection could hold.
             ExchangeEvent::Overflow(dropped) if collecting => {
-                let past = state.collected() as u64 + dropped > state.responder.limits.body as u64;
+                let past = self.collected() as u64 + dropped > self.responder.limits.body as u64;
                 let received = if past {
                     Received::TooLarge
                 } else {
                     Received::Budget
                 };
-                state.dispatch(env, received);
+                self.dispatch(env, received);
             }
             ExchangeEvent::Overflow(_) => {}
             ExchangeEvent::Written(n) => {
-                if let Some(delivery) = &mut state.delivery {
+                if let Some(delivery) = &mut self.delivery {
                     delivery.written(n);
                 }
             }
             ExchangeEvent::Closed { why, written } => {
-                if let Some(mut delivery) = state.delivery.take() {
+                if let Some(mut delivery) = self.delivery.take() {
                     delivery.written(written);
                     delivery.end(why == Ending::Done);
                 }
-                state.stage = Stage::Done;
-                state.work = None;
-                state.next = None;
+                self.stage = Stage::Done;
+                self.work = None;
+                self.next = None;
             }
         }
         Ok(fictionet::stdlib::layer::Admit::Taken)
@@ -605,39 +566,37 @@ impl Layer for Respond {
     }
 
     fn on_timer(&mut self, env: &mut Env<'_, Infallible>, _: ()) -> Result<bool, Infallible> {
-        let state = &mut *self.state;
-        if state.deadline.is_none_or(|at| at > env.now()) {
+        if self.deadline.is_none_or(|at| at > env.now()) {
             return Ok(false);
         }
-        state.deadline = None;
-        if matches!(state.stage, Stage::Collecting) {
-            state.dispatch(env, Received::Timeout);
+        self.deadline = None;
+        if matches!(self.stage, Stage::Collecting) {
+            self.dispatch(env, Received::Timeout);
         }
         Ok(true)
     }
 
     fn on_done(&mut self, env: &mut Env<'_, Infallible>, done: Done) -> Result<(), Infallible> {
-        let state = &mut *self.state;
-        if done.generation != state.generation {
+        if done.generation != self.generation {
             return Ok(());
         }
         match done.answer {
-            Answer::Made(_) if !matches!(state.stage, Stage::Making) => {}
-            Answer::Made(Ok(response)) => state.made(env, response, true),
+            Answer::Made(_) if !matches!(self.stage, Stage::Making) => {}
+            Answer::Made(Ok(response)) => self.made(env, response, true),
             // An error on the stream's work resets it unanswered.
-            Answer::Made(Err(error)) if error.is::<Reset>() => state.reset(),
-            Answer::Made(Err(error)) => state.made(
+            Answer::Made(Err(error)) if error.is::<Reset>() => self.reset(),
+            Answer::Made(Err(error)) => self.made(
                 env,
                 error_response(&super::super::Responses::unpooled(env.budget()), &error),
                 false,
             ),
-            Answer::Frame(..) if !matches!(state.stage, Stage::Polling) => {}
+            Answer::Frame(..) if !matches!(self.stage, Stage::Polling) => {}
             Answer::Frame(body, Some(Ok(mut chunk))) => {
                 if chunk.repay(env.budget()) {
-                    state.rest = chunk;
-                    state.stage = Stage::Body(Some(body));
+                    self.rest = chunk;
+                    self.stage = Stage::Body(Some(body));
                 } else {
-                    state.reset();
+                    self.reset();
                 }
             }
             Answer::Frame(mut body, None) => {
@@ -651,24 +610,23 @@ impl Layer for Respond {
                     }
                     Box::new(headers)
                 });
-                state.stage = Stage::Ending(trailers);
+                self.stage = Stage::Ending(trailers);
             }
-            Answer::Frame(_, Some(Err(_))) => state.reset(),
+            Answer::Frame(_, Some(Err(_))) => self.reset(),
         }
         Ok(())
     }
 
     fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
-        let state = &mut *self.state;
-        if matches!(state.stage, Stage::Collecting) && state.ended && state.head.is_some() {
-            state.dispatch(env, Received::Complete);
+        if matches!(self.stage, Stage::Collecting) && self.ended && self.head.is_some() {
+            self.dispatch(env, Received::Complete);
             return Ok(true);
         }
-        Ok(state.respond())
+        Ok(self.respond())
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<ExchangeCommand> {
-        self.state.next.take()
+        self.next.take()
     }
 
     fn take_event(&mut self) -> Option<Infallible> {
@@ -676,11 +634,11 @@ impl Layer for Respond {
     }
 
     fn take_work(&mut self) -> Option<Work> {
-        self.state.work.take()
+        self.work.take()
     }
 
     fn deadline(&self) -> Option<(Instant, ())> {
-        self.state.deadline.map(|at| (at, ()))
+        self.deadline.map(|at| (at, ()))
     }
 }
 
@@ -749,21 +707,29 @@ impl Job for Work {
 }
 
 pub(super) fn response_held(response: &Response) -> usize {
-    // Bound HeaderMap's rounded capacity plus duplicate slots, under the
-    // same public-size accounting as headers_held. Field backing storage
-    // carries its own reservation until conversion finishes.
-    let slots = response
-        .fields
-        .iter()
-        .len()
+    fields_held(response.fields.len(), response.fields.octets())
+}
+
+/// What the head of a response with `count` fields of `octets` name and
+/// value bytes holds once its fields are in a header map: the map's
+/// rounded capacity plus duplicate slots, under the same public-size
+/// accounting as `headers_held`, and the octets. Field backing storage
+/// carries its own reservation until conversion finishes.
+fn fields_held(count: usize, octets: usize) -> usize {
+    count
         .saturating_add(1)
-        .saturating_mul(4);
-    response.fields.iter().fold(
-        slots
-            .saturating_mul(std::mem::size_of::<(HeaderName, HeaderValue)>())
-            .saturating_add(20),
-        |held, (name, value)| held.saturating_add(name.len()).saturating_add(value.len()),
-    )
+        .saturating_mul(4)
+        .saturating_mul(std::mem::size_of::<(HeaderName, HeaderValue)>())
+        .saturating_add(20)
+        .saturating_add(octets)
+}
+
+/// What a stream holds from its opening so that it can always answer
+/// `503`: the head of [`over_budget`]'s response, which has one field. A
+/// stream the budget has no room for this is refused before its handler
+/// runs.
+fn answer_reserve() -> usize {
+    fields_held(1, "content-type".len() + "text/plain; charset=utf-8".len())
 }
 
 fn over_budget(storage: &super::super::Responses) -> Response {

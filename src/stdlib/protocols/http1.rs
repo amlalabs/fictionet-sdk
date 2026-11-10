@@ -2295,7 +2295,11 @@ fn request_syntax_in(
     let line = split_head(b, lenient, |name, value| {
         size = size
             .checked_add(
-                Head::record_size(name.of(b).len(), value.of(b).len()).ok_or(Error::HeadTooLong)?,
+                fictionet::stdlib::protocols::fields::record_size(
+                    name.of(b).len(),
+                    value.of(b).len(),
+                )
+                .ok_or(Error::HeadTooLong)?,
             )
             .ok_or(Error::HeadTooLong)?;
         Ok(())
@@ -2303,11 +2307,10 @@ fn request_syntax_in(
     let (method, target, version) = request_line(line, lenient)?;
     let method = std::str::from_utf8(method.of(line)).map_err(|_| Error::StartLine)?;
     let target = std::str::from_utf8(target.of(line)).map_err(|_| Error::StartLine)?;
-    size = size
-        .checked_add(method.len())
-        .and_then(|n| n.checked_add(target.len()))
+    size = Head::start_size(method.len(), target.len())
+        .and_then(|start| size.checked_add(start))
         .ok_or(Error::HeadTooLong)?;
-    let mut head = Head::in_block(block(size)?, method, &[target], version)?;
+    let mut head = Head::in_block(block(size)?, method, target, version)?;
     split_head(b, lenient, |name, value| {
         head.push(
             std::str::from_utf8(name.of(b)).map_err(|_| Error::Header)?,

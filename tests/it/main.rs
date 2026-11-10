@@ -31,6 +31,7 @@ mod handoff_codec;
 mod heap_measure;
 mod hpack_codec;
 mod http1;
+mod http2_allocations;
 mod http2_grpc;
 mod http2_server;
 mod httpd;

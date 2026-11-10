@@ -157,13 +157,16 @@ impl PartialTable {
                     indexing,
                 } => {
                     let name = match name {
-                        hpack::Name::Literal(name) => Some(Arc::<[u8]>::from(name)),
+                        hpack::Name::Literal(name) => {
+                            Some(Arc::<[u8]>::from(name.to_vec(hpack::MAX_BLOCK * 8 / 5)?))
+                        }
                         hpack::Name::Index(index) => match self.table.name(index)? {
                             name @ Some(_) => name,
                             None if self.unsure => None,
                             None => return Err(hpack::Error::Index),
                         },
                     };
+                    let value = value.to_vec(hpack::MAX_BLOCK * 8 / 5)?;
                     out.keep(
                         limit,
                         &mut used,
@@ -1990,7 +1993,12 @@ mod tests {
         assert_eq!(d.table_capacity(), Some(4096));
         assert_eq!(pairs(&d.decode_all(&[0xbe])), [("x", "old")]);
         assert_eq!(
-            hpack::Table::default().decode_block(&bytes, MAX_DECODED),
+            hpack::Table::default().decode_block(
+                &bytes,
+                &mut fictionet::stdlib::protocols::fields::Fields::new(),
+                &fictionet::Budget::unlimited(),
+                MAX_DECODED
+            ),
             Err(hpack::Error::StringTooLong)
         );
     }

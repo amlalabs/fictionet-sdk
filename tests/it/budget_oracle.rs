@@ -37,7 +37,7 @@ use fictionet::stdlib::network::ip::{Fields, packet_with, transport_checksum};
 use fictionet::stdlib::network::packet::{CheckedIpPacket, Origin};
 use fictionet::stdlib::network::transport::TcpControl;
 use fictionet::stdlib::network::{ConnInfo, tcp};
-use fictionet::stdlib::protocols::{hpack, http2};
+use fictionet::stdlib::protocols::{fields, hpack, http2};
 use fictionet::stdlib::services::ca::Ca;
 use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::services::tls;
@@ -76,12 +76,20 @@ fn complete_headers_need_no_assembly_copy() {
     };
     let mut model = hpack::Table::new(4096);
     let mut blocks = http2::HeaderBlocks::with_limits(limits);
+    let budget = fictionet::Budget::unlimited();
     let (expected, direct) = allocations(|| {
+        let mut fields = fields::Fields::new();
         model
-            .decode_block(&head.fragment, limits.header_list)
-            .unwrap()
+            .decode_block(&head.fragment, &mut fields, &budget, limits.header_list)
+            .unwrap();
+        fields
     });
-    let (actual, assembled) = allocations(|| blocks.read_frame(&frame).unwrap().block.unwrap());
+    let (actual, assembled) = allocations(|| {
+        let mut fields = fields::Fields::new();
+        let read = blocks.read_frame(&frame, &mut fields, &budget).unwrap();
+        assert!(read.complete);
+        fields
+    });
     assert_eq!(actual, expected);
     assert!(
         assembled <= direct,

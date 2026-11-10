@@ -77,7 +77,7 @@ pub fn resolve(fronts: &Fronts, request: &Request<Body>, ex: &mut Exchange<'_>) 
             StatusCode::METHOD_NOT_ALLOWED,
             "Method not allowed.\n",
         );
-        response.fields = Fields::new([
+        response.fields = Fields::unpaid([
             ("content-type", "text/plain; charset=utf-8"),
             ("allow", "GET"),
         ]);
@@ -171,7 +171,7 @@ fn json_error(error: String) -> Response {
     let body = Value::Object(vec![("error".to_owned(), Value::from(error))]);
     let mut response = Response::new(Body::from(body.to_bytes().unwrap_or_default()));
     response.status = StatusCode::BAD_REQUEST;
-    response.fields = Fields::new([("content-type", JSON)]);
+    response.fields = Fields::unpaid([("content-type", JSON)]);
     response
 }
 
@@ -184,7 +184,7 @@ fn answered(reply: Vec<u8>, answer: Answer) -> Response {
     };
     let mut response = Response::new(Body::from(to_json(&message)));
     let cache = freshness(&message).map(|seconds| format!("max-age={seconds}"));
-    response.fields = Fields::new(
+    response.fields = Fields::unpaid(
         std::iter::once(("content-type", media))
             .chain(cache.as_deref().map(|value| ("cache-control", value))),
     );
@@ -526,7 +526,7 @@ fn http_reply(status: StatusCode, media: Option<&'static str>, body: String) -> 
     let mut response = Response::new(Body::from(body));
     response.status = status;
     if let Some(media) = media {
-        response.fields = Fields::new([("content-type", media)]);
+        response.fields = Fields::unpaid([("content-type", media)]);
     }
     response
 }
@@ -653,7 +653,7 @@ impl Handler for Cloudflare {
             body.to_owned(),
         );
         if let Ok(location) = HeaderValue::from_str(&format!("https://one.one.one.one{target}")) {
-            response.fields = Fields::new(
+            response.fields = Fields::unpaid(
                 response
                     .fields
                     .iter()

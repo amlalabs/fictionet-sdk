@@ -272,6 +272,7 @@
 //! | [`protocols::enip`] | EtherNet/IP encapsulation and CIP messages. |
 //! | [`protocols::fast`] | FAST 1.1 templates, dictionaries, encoding and decoding. |
 //! | [`protocols::fastcgi`] | FastCGI records, requests, responses and session bookkeeping. |
+//! | [`protocols::fields`] | Header fields held in one block of bytes. |
 //! | [`protocols::fix`] | FIX messages, repeating groups and sessions. |
 //! | [`protocols::ftp`] | FTP control commands, replies and features. |
 //! | [`protocols::geneve`] | Geneve tunnel headers and options. |

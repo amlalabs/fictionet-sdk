@@ -90,11 +90,7 @@ where
                 )))),
                 Err(frame) => {
                     if let Ok(fields) = frame.into_trailers() {
-                        this.trailers = Some(Fields::new(
-                            fields
-                                .iter()
-                                .map(|(name, value)| (name.as_str(), value.as_bytes())),
-                        ));
+                        this.trailers = Some(Fields::from(&fields));
                     }
                     this.ended = true;
                     Poll::Ready(None)

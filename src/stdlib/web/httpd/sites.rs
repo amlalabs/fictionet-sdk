@@ -188,7 +188,7 @@ impl Handler for VirtualHosts {
                     StatusCode::MOVED_PERMANENTLY,
                     &format!("Moved to {location}\n"),
                 );
-                response.fields = crate::stdlib::web::Fields::new([
+                response.fields = crate::stdlib::web::Fields::unpaid([
                     ("content-type", "text/plain; charset=utf-8"),
                     ("location", location.as_str()),
                 ]);

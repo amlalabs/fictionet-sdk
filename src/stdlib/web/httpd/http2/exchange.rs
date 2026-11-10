@@ -1,9 +1,10 @@
 //! The carrier between an HTTP/2 connection and the exchange on each of
 //! its streams.
 
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 
-use fictionet::stdlib::layer::{Budget, Charge, Chunk, Credited, Port};
+use fictionet::stdlib::layer::{Budget, Chunk, Credited, Port};
+use fictionet::stdlib::protocols::fields::Fields;
 use fictionet::stdlib::protocols::http2::ErrorCode;
 use fictionet::time::Instant;
 
@@ -39,25 +40,190 @@ impl Port for HttpExchange {
 /// checked it.
 #[derive(Debug)]
 pub struct Opening {
-    /// The request without its body. Its version is the connection's.
-    pub request: Box<http::Request<()>>,
+    /// The request without its body.
+    pub head: RequestHead,
     /// Whether the request has no body: it ended with its head.
     pub ended: bool,
     /// When the head arrived, on the run's clock.
     pub at: Instant,
-    /// What the head is charged to the connection's budget. The child
-    /// keeps it while it holds the head.
-    pub charge: Option<Charge>,
 }
 
-/// A request's trailers, as the connection read and checked them.
-#[derive(Debug)]
+/// A request's head as the connection decoded and checked it: its fields,
+/// pseudo-fields first, in the one block HPACK decoded them into
+/// ([`Fields`]). The block carries what pays for it, so whoever holds the
+/// head holds its charge, and the block goes back to the connection when
+/// the head is dropped. Reading it allocates nothing;
+/// [`to_http`](Self::to_http) makes an [`http::Request`] of it, which does.
+///
+/// The connection checked it as RFC 9113 section 8.3 asks: `:method` is a
+/// token and comes once; a CONNECT has an `:authority` and no `:scheme` or
+/// `:path`, any other method a `:scheme` and a `:path`; every regular
+/// field is in lower case and not connection-specific; and every
+/// `content-length` agrees.
+#[derive(Clone, Debug)]
+pub struct RequestHead {
+    fields: Fields,
+    content_length: Option<u64>,
+}
+
+impl RequestHead {
+    /// A head the connection checked.
+    pub(super) fn new(fields: Fields, content_length: Option<u64>) -> RequestHead {
+        RequestHead {
+            fields,
+            content_length,
+        }
+    }
+
+    /// Every field, in the order it came, pseudo-fields first.
+    pub fn fields(&self) -> &Fields {
+        &self.fields
+    }
+
+    /// The block of fields, with what pays for it.
+    pub fn into_fields(self) -> Fields {
+        self.fields
+    }
+
+    /// The value of the pseudo-field `:name`.
+    fn pseudo(&self, name: &[u8]) -> Option<&[u8]> {
+        self.fields
+            .iter()
+            .take_while(|(field, _)| field.starts_with(b":"))
+            .find(|(field, _)| &field[1..] == name)
+            .map(|(_, value)| value)
+    }
+
+    /// `:method`.
+    pub fn method(&self) -> &[u8] {
+        self.pseudo(b"method").unwrap_or_default()
+    }
+
+    /// `:scheme`, which every request but a CONNECT has.
+    pub fn scheme(&self) -> Option<&[u8]> {
+        self.pseudo(b"scheme")
+    }
+
+    /// `:authority`, if the request has one.
+    pub fn authority(&self) -> Option<&[u8]> {
+        self.pseudo(b"authority")
+    }
+
+    /// `:path`, which every request but a CONNECT has.
+    pub fn path(&self) -> Option<&[u8]> {
+        self.pseudo(b"path")
+    }
+
+    /// The regular fields, in order.
+    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.fields
+            .iter()
+            .skip_while(|(field, _)| field.starts_with(b":"))
+    }
+
+    /// The body's length, if `content-length` gives it.
+    pub fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    /// The most [`to_http`](Self::to_http)'s request holds, counted as
+    /// the server counts a request's head: its parts, its strings, and its
+    /// header map's places and octets. A map made for `n` fields has
+    /// fewer than `2n` places, and grows past that only when names
+    /// collide in runs of 128, so only with 128 fields or more, and to
+    /// fewer than `8n`; a value joined from several `cookie` fields adds
+    /// two octets for each.
+    pub fn most_http(&self) -> usize {
+        let fields = self.fields.len();
+        let places = if fields < 128 { 2 * fields } else { 8 * fields };
+        (places + fields)
+            .saturating_mul(size_of::<(HeaderName, HeaderValue)>())
+            .saturating_add(self.fields.octets())
+            .saturating_add(2 * fields)
+            .saturating_add(size_of::<http::request::Parts>())
+    }
+
+    /// The head as an [`http::Request`], its version HTTP/2, its URI made
+    /// from the pseudo-fields, and its fields in a map, a client's split
+    /// `cookie` fields joined with `"; "` (RFC 9113 section 8.2.3). It
+    /// allocates. `None` for an authority or path the `http` crate does
+    /// not take.
+    pub fn to_http(&self) -> Option<http::Request<()>> {
+        let method = Method::from_bytes(self.method()).ok()?;
+        let mut uri = http::uri::Parts::default();
+        uri.authority = self
+            .authority()
+            .map(http::uri::Authority::try_from)
+            .transpose()
+            .ok()?;
+        if method != Method::CONNECT {
+            if uri.authority.is_some() {
+                uri.scheme = Some(http::uri::Scheme::try_from(self.scheme()?).ok()?);
+            }
+            uri.path_and_query = Some(http::uri::PathAndQuery::try_from(self.path()?).ok()?);
+        }
+        let mut headers: HeaderMap = HeaderMap::with_capacity(self.fields.len());
+        let mut cookie: Option<Vec<u8>> = None;
+        for (name, value) in self.headers() {
+            if name == b"cookie"
+                && let Some(first) = headers.get(http::header::COOKIE)
+            {
+                let joined = cookie.get_or_insert_with(|| first.as_bytes().to_vec());
+                joined.extend_from_slice(b"; ");
+                joined.extend_from_slice(value);
+            } else {
+                headers.append(
+                    HeaderName::from_bytes(name).ok()?,
+                    HeaderValue::from_bytes(value).ok()?,
+                );
+            }
+        }
+        if let Some(cookie) = cookie {
+            headers.insert(http::header::COOKIE, HeaderValue::from_bytes(&cookie).ok()?);
+        }
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(http::Uri::from_parts(uri).ok()?)
+            .version(http::Version::HTTP_2)
+            .body(())
+            .ok()?;
+        *request.headers_mut() = headers;
+        Some(request)
+    }
+}
+
+/// A request's trailers, as the connection decoded and checked them: in
+/// one block, which carries what pays for it, charged at the most the
+/// encoded block could hold before it was decoded. Whoever holds them
+/// holds the charge, and it goes back when they are dropped.
+#[derive(Clone, Debug)]
 pub struct RequestTrailers {
-    /// The fields.
-    pub fields: HeaderMap,
-    /// What the trailers are charged to the connection's budget. Whoever
-    /// holds them keeps it, and it goes back when they are dropped.
-    pub charge: Charge,
+    fields: Fields,
+}
+
+impl RequestTrailers {
+    /// Trailers the connection checked.
+    pub(super) fn new(fields: Fields) -> RequestTrailers {
+        RequestTrailers { fields }
+    }
+
+    /// The fields, in order.
+    pub fn fields(&self) -> &Fields {
+        &self.fields
+    }
+
+    /// The fields in a map. It allocates.
+    pub fn to_http(&self) -> HeaderMap {
+        let mut map = HeaderMap::with_capacity(self.fields.len());
+        for (name, value) in self.fields.iter() {
+            if let (Ok(name), Ok(value)) =
+                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+            {
+                map.append(name, value);
+            }
+        }
+        map
+    }
 }
 
 /// What comes up an exchange.
@@ -67,7 +233,7 @@ pub enum ExchangeEvent {
     /// the child's credit.
     Data(Chunk),
     /// The request's trailers. The request has ended.
-    Trailers(Box<RequestTrailers>),
+    Trailers(RequestTrailers),
     /// The request has ended.
     End,
     /// The connection could not hold the next this many bytes of the

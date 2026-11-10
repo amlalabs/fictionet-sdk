@@ -213,7 +213,7 @@ fn warm_now_fields_and_full_body_encode_without_allocating() {
             assert_eq!(request.body.bytes().unwrap().as_ref(), b"body");
             let mut fields = ex.responses().fields().unwrap();
             for _ in 0..10 {
-                fields.push("X-Field", b"value").unwrap();
+                assert!(fields.push_in_place(b"X-Field", b"value"));
             }
             let mut response = Response::new(Body::Full(self.body.clone()));
             response.fields = fields;

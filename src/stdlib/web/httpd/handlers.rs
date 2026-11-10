@@ -152,14 +152,9 @@ impl Responses {
     pub fn fields(&self) -> Option<crate::stdlib::web::Fields> {
         let block = match &self.pool {
             Some(pool) => pool.take(&self.budget, 0)?,
-            None => {
-                let charge = self.budget.charge(2048)?;
-                fictionet::Chunk::paid(vec![0; 2048], charge)
-                    .expect("reserved fields")
-                    .slice(0..0)
-            }
+            None => fictionet::Chunk::block(&self.budget, 0, 2048)?,
         };
-        crate::stdlib::web::Fields::in_block(block).ok()
+        Some(crate::stdlib::web::Fields::in_block(block))
     }
     /// Copies bytes into a charged block, reusing small backings.
     pub fn body(&self, bytes: &[u8]) -> Option<Body> {
@@ -186,9 +181,8 @@ pub fn text(storage: &Responses, status: StatusCode, body: &str) -> Response {
     let Some(mut fields) = storage.fields() else {
         return status_only(StatusCode::SERVICE_UNAVAILABLE);
     };
-    fields
-        .push("content-type", b"text/plain; charset=utf-8")
-        .expect("small field fits");
+    let written = fields.push_in_place(b"content-type", b"text/plain; charset=utf-8");
+    assert!(written, "a small field fits an empty block");
     let mut response = Response::new(body);
     response.status = status;
     response.fields = fields;

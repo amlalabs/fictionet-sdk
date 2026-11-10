@@ -118,12 +118,12 @@ mod http {
                     at += n;
                 }
                 let frame = http2::Frame::parse(&bytes)?;
-                if let Some(block) = blocks.read_frame(&frame)?.block {
-                    status = block
-                        .headers
-                        .into_iter()
-                        .find(|h| h.name == b":status")
-                        .map(|h| h.value);
+                let mut fields = fictionet::stdlib::protocols::fields::Fields::new();
+                if blocks
+                    .read_frame(&frame, &mut fields, &fictionet::Budget::unlimited())?
+                    .complete
+                {
+                    status = fields.get(b":status").map(<[u8]>::to_vec);
                 }
                 match frame {
                     http2::Frame::Settings(s) if s.flags & 1 == 0 => {

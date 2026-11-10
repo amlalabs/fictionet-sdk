@@ -788,7 +788,7 @@ impl Refusal {
                     StatusCode::METHOD_NOT_ALLOWED,
                     "Method not allowed.\n",
                 );
-                response.fields = fictionet::stdlib::web::Fields::new([
+                response.fields = fictionet::stdlib::web::Fields::unpaid([
                     ("content-type", "text/plain; charset=utf-8"),
                     ("allow", allowed),
                 ]);
@@ -916,7 +916,7 @@ pub fn message_response(answer: Vec<u8>) -> Response {
     let freshness = read_message(&answer).ok().as_ref().and_then(freshness);
     let mut response = Response::new(Body::from(answer));
     let cache = freshness.map(|seconds| format!("max-age={seconds}"));
-    response.fields = Fields::new(
+    response.fields = Fields::unpaid(
         std::iter::once(("content-type", DNS_MESSAGE))
             .chain(cache.as_deref().map(|value| ("cache-control", value))),
     );
