@@ -57,6 +57,13 @@ struct RegionState {
     completed: bool,
     /// Woken when `live` drops to zero.
     done: Option<Waker>,
+    /// How many times this region was renewed ([`Region::renew`]). A
+    /// renewal starts it with no children, so a region made in it before
+    /// is no longer among them, and is never renewed under it again.
+    renewals: u64,
+    /// The parent's `renewals` when this region was made in it, or last
+    /// renewed under it.
+    made_in: u64,
 }
 
 impl Region {
@@ -71,24 +78,71 @@ impl Region {
     }
 
     pub(crate) fn child(self: &Arc<Self>) -> Arc<Region> {
-        let child = Arc::new(Region {
-            run: self.run.clone(),
-            parent: Some(Arc::downgrade(self)),
-            cancelled: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            state: Mutex::default(),
-        });
-        {
+        let child = {
             let mut state = self.state.lock();
+            let child = Arc::new(Region {
+                run: self.run.clone(),
+                parent: Some(Arc::downgrade(self)),
+                cancelled: AtomicBool::new(false),
+                stopped: AtomicBool::new(false),
+                state: Mutex::new(RegionState {
+                    made_in: state.renewals,
+                    ..RegionState::default()
+                }),
+            });
             if state.children.len() >= 16 && state.children.len().is_power_of_two() {
                 state.children.retain(|c| c.strong_count() > 0);
             }
             state.children.push(Arc::downgrade(&child));
-        }
+            child
+        };
         if self.is_cancelled() {
             child.cancel();
         }
         child
+    }
+
+    /// Makes this region, whose tasks have all ended and which nothing
+    /// else holds, the region of a new job under `parent`, the region it
+    /// was made in: no error, no tasks, admission open, and cancelled only
+    /// if `parent` is. Returns whether it could; it cannot, and nothing
+    /// changes, when something else holds it, it was made elsewhere, or
+    /// `parent` was renewed since, which left it out of `parent`'s
+    /// children.
+    ///
+    /// The parent's lock orders this against the parent's cancel, which
+    /// takes its children under that lock and cancels each after: a cancel
+    /// that set the parent's flag before this read it leaves this region
+    /// cancelled, and one after takes this region with the parent's
+    /// children and cancels it once this returns.
+    pub(crate) fn renew(self: &Arc<Self>, parent: &Arc<Region>) -> bool {
+        if Arc::strong_count(self) != 1
+            || !self
+                .parent
+                .as_ref()
+                .is_some_and(|made_in| std::ptr::eq(made_in.as_ptr(), Arc::as_ptr(parent)))
+        {
+            return false;
+        }
+        let siblings = parent.state.lock();
+        let mut state = self.state.lock();
+        if state.live != 0 || state.made_in != siblings.renewals {
+            return false;
+        }
+        // The children it had are gone or held by no context, so no task
+        // can start in them; it starts with none, and they are never
+        // renewed under it.
+        let old = std::mem::take(&mut *state);
+        state.renewals = old.renewals + 1;
+        state.made_in = siblings.renewals;
+        self.stopped.store(false, Ordering::Release);
+        self.cancelled
+            .store(parent.is_cancelled(), Ordering::Release);
+        drop(state);
+        drop(siblings);
+        // Dropped outside the locks: dropping a waker can run any code.
+        drop(old);
+        true
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -265,6 +319,73 @@ mod tests {
         assert!(root.poll_done(&mut cx).is_pending());
         sibling.task_done(false);
         assert!(root.poll_done(&mut cx).is_ready());
+    }
+
+    /// A region whose work ended, failed and was cancelled is new again
+    /// once renewed under its parent: no error, admission open, not
+    /// cancelled, and still among the parent's children, so the parent's
+    /// cancel reaches it. It is not renewed while something else holds it
+    /// or under another parent, and under a cancelled parent it stays
+    /// cancelled.
+    #[test]
+    fn a_renewed_region_is_new_and_still_its_parents_child() {
+        let root = Region::root(Weak::new());
+        let other = Region::root(Weak::new());
+        let job = root.child();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(job.try_start_task());
+        job.record_error(crate::Error::msg("a task of the job failed"));
+        job.task_done(true);
+        assert!(job.poll_done(&mut cx).is_ready());
+        assert!(job.is_cancelled());
+
+        let held = job.clone();
+        assert!(!job.renew(&root), "another holds it");
+        drop(held);
+        assert!(!job.renew(&other), "it was made under another region");
+        assert!(job.is_cancelled(), "a refusal changes nothing");
+
+        assert!(job.renew(&root));
+        assert!(!job.is_cancelled());
+        assert!(job.take_error().is_none());
+        assert!(job.try_start_task(), "admission is open again");
+        assert!(
+            root.poll_done(&mut cx).is_pending(),
+            "its task counts above"
+        );
+        job.task_done(false);
+        assert!(root.poll_done(&mut cx).is_ready());
+
+        root.cancel();
+        assert!(job.is_cancelled(), "the parent's cancel reaches it");
+        assert!(job.renew(&root));
+        assert!(
+            job.is_cancelled(),
+            "under a cancelled parent it stays cancelled"
+        );
+    }
+
+    /// A renewal starts a region with no children, so a region made in it
+    /// before is never renewed under it again: it would be out of its
+    /// parent's reach. One made after the renewal is.
+    #[test]
+    fn a_region_made_before_its_parent_was_renewed_is_not_renewed() {
+        let root = Region::root(Weak::new());
+        let job = root.child();
+        let nested = job.child();
+        job.cancel();
+        assert!(job.renew(&root));
+        assert!(!nested.renew(&job), "its parent was renewed since");
+        assert!(nested.is_cancelled(), "a refusal changes nothing");
+        let later = job.child();
+        later.cancel();
+        assert!(later.renew(&job));
+        assert!(!later.is_cancelled());
+        job.cancel();
+        assert!(
+            later.is_cancelled(),
+            "the renewed parent's cancel reaches it"
+        );
     }
 
     #[test]
