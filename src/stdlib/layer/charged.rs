@@ -190,6 +190,16 @@ impl Deref for ChargedBytes {
     }
 }
 
+impl From<ChargedBytes> for bytes::Bytes {
+    fn from(bytes: ChargedBytes) -> Self {
+        if bytes.is_empty() {
+            Self::new()
+        } else {
+            Self::from_owner(Owned::new(bytes.bytes, bytes.charge))
+        }
+    }
+}
+
 impl std::fmt::Debug for ChargedBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChargedBytes")

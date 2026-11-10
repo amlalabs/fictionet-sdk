@@ -432,8 +432,7 @@ impl Http1 {
     /// clones and streams may outlive both this layer and its current job.
     fn take_body(&mut self, budget: &Budget) -> Bytes {
         let bytes = std::mem::replace(&mut self.body, ChargedBytes::new(budget));
-        let (bytes, charge) = bytes.into_parts();
-        Bytes::from_owner(Owned::new(bytes, charge))
+        Bytes::from(bytes)
     }
 
     /// Answers the request whose head is pending, with `body`. `close`
