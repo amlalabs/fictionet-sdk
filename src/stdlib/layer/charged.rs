@@ -253,6 +253,16 @@ impl DerefMut for ChargedBytes {
     }
 }
 
+impl From<ChargedBytes> for bytes::Bytes {
+    fn from(bytes: ChargedBytes) -> Self {
+        if bytes.is_empty() {
+            Self::new()
+        } else {
+            Self::from_owner(Owned::new(bytes.bytes, bytes.charge))
+        }
+    }
+}
+
 impl std::fmt::Debug for ChargedBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChargedBytes")
@@ -573,20 +583,31 @@ impl<T> ChargedVec<T> {
     /// back, changing nothing, if the growth does not fit the budget or
     /// the vector holds `most` items.
     pub fn push(&mut self, item: T) -> Result<(), T> {
-        let len = self.items.len();
-        if len >= self.most {
+        if !self.reserve(1) {
             return Err(item);
-        }
-        if len == self.items.capacity() {
-            let Some(more) =
-                charge_places(&mut self.charge, len, len + 1, self.most, size_of::<T>())
-            else {
-                return Err(item);
-            };
-            self.items.reserve_exact(more);
         }
         self.items.push(item);
         Ok(())
+    }
+
+    /// Reserves additional places before allocation. Refusal leaves the
+    /// vector and its charge unchanged.
+    #[must_use]
+    pub fn reserve(&mut self, additional: usize) -> bool {
+        let len = self.items.len();
+        let places = self.items.capacity();
+        let Some(wanted) = len.checked_add(additional).filter(|&n| n <= self.most) else {
+            return false;
+        };
+        if wanted <= places {
+            return true;
+        }
+        let Some(more) = charge_places(&mut self.charge, places, wanted, self.most, size_of::<T>())
+        else {
+            return false;
+        };
+        self.items.reserve_exact(places + more - len);
+        true
     }
 
     /// Takes the last item. Its place stays paid for.
@@ -860,6 +881,26 @@ mod tests {
 
     use fictionet::stdlib::layer::{Refusals, Waiter};
     use fictionet::{Entropy, Seed, SeededEntropy};
+
+    #[test]
+    fn vector_reservations_pay_before_pushes_and_refuse_without_changes() {
+        for places in 1..32 {
+            let budget = Budget::new(places * size_of::<u64>());
+            let mut values = ChargedVec::new(&budget, places + 1);
+            assert!(values.reserve(places));
+            let reserved = budget.used();
+            for value in 0..places as u64 {
+                values.push(value).unwrap();
+                assert_eq!(budget.used(), reserved);
+            }
+            assert!(!values.reserve(1));
+            assert_eq!(budget.used(), reserved);
+            assert!(values.iter().copied().eq(0..places as u64));
+            values.clear();
+            values.shrink_to(0);
+            assert_eq!(budget.used(), 0);
+        }
+    }
 
     /// A runner's waker that counts its wakes.
     #[derive(Default)]

@@ -763,3 +763,58 @@ was not measured. The stage reports name two candidates: the
 reallocation that gives back a chunk's spare capacity on admission, and
 the HTTP/1 handoff bytes that are now copied. TCP bulk is unchanged in
 instructions, allocations and packets.
+
+## The HTTP fixes after the budget redesign (`comp/bfix-http`)
+
+Two costs were left open by the budget redesign: an idle HTTP/2
+connection was charged about 90 KiB more than before it, and HTTP/1 made
+about two more allocations per request.
+
+The counting allocator found the two HTTP/1 allocations:
+
+- An empty request body still got a shared owner for its charge. An
+  empty `ChargedBytes` now becomes empty `Bytes`, giving its charge back;
+  a nonempty one keeps its charge until the last clone is dropped.
+- TLS allocated a buffer of the largest record for each write, and threw
+  it away when rustls handed over its own ciphertext. TLS now reserves
+  the record as a charge and makes a buffer from it only for output it
+  copies.
+
+HTTP/2 no longer charges input and header assembly at their bounds when
+the connection opens:
+
+- The frame decoder's input and header assembly share one charge, which
+  starts at one frame of input. Each growth is charged first, and the
+  charge goes back down to what they hold, never below that one frame.
+  Input past the frame is given back once the connection is idle.
+- A header block that arrives whole in one frame is decoded from that
+  frame. Only a block split into CONTINUATION frames is copied together.
+- The five lists of streams get places as streams are admitted, one per
+  open stream in each list, and go back to their small floor when no
+  stream is open. A stream that does not get its places is refused.
+- The list of recent resets stays charged at its bound, 50 entries, when
+  the connection opens. Recording a reset then needs no memory, so a
+  connection at its budget keeps refusing streams one by one.
+- A protocol error ends the connection with the GOAWAY paid for at the
+  start, so its error code goes out even when the budget is full.
+
+An idle connection is now charged 20,794 bytes, against 116,979 before
+these fixes. The test checks it against the layout before the redesign
+(one frame of input, the places each queue keeps, the reset list, the
+child slots, the dates and the final GOAWAY) rather than a fixed number.
+
+The HTTP bench process, `perf stat -e instructions:u`, plain bench
+profile (no frame pointers or line tables, so compare only within this
+table). Allocations are Divan's exact counts, the median of three
+samples.
+
+| Workload | Before (b1d241d87) | After |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 116.51 G | 116.53 G |
+| HTTP/1 allocations, 101,010 requests | 5,854,771 | 5,654,731 |
+| HTTP/2 allocations, 101,010 requests | 9,097,038 | 8,697,040 |
+
+HTTP/1 is back to the 5.65 M of 47a901718. HTTP/2 makes about four fewer
+allocations per request: the TLS record buffers, the copy of each header block,
+and the input buffer that is no longer freed and made again between
+requests. Instructions are unchanged.

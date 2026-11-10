@@ -117,6 +117,33 @@ fn client_hello_at_every_split_and_records_in_seeded_chunks() {
 }
 
 #[test]
+fn small_ciphertext_does_not_allocate_a_maximum_record() {
+    block_on(lab(Seed::from_u64(14), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let (mut server, mut client) = handshake(config, client_config, 1);
+        let plaintext = vec![b'p'; 1024];
+        let command = StreamCommand::Write(Chunk::unpaid(plaintext.clone()));
+        let (_, stats) = crate::common::alloc::measuring(|| {
+            assert!(matches!(
+                server.driver().command(command).unwrap(),
+                Admit::Taken
+            ));
+            server.driver().run().unwrap();
+        });
+        assert!(stats.largest_request <= 2 * plaintext.len(), "{stats:?}");
+        server.settle()?;
+        receive(&mut client, &server.take_output());
+        let mut received = vec![0; plaintext.len()];
+        client.reader().read_exact(&mut received)?;
+        assert_eq!(received, plaintext);
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
 fn ciphertext_completion_is_not_admission_and_close_follows_data() {
     block_on(lab(Seed::from_u64(14), |fcx| async move {
         let ca = Ca::new(&fcx, "Test CA")?;

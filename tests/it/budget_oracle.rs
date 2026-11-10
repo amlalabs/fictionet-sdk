@@ -55,6 +55,39 @@ use crate::common::alloc::{left_allocated, unmeasured};
 /// comment.
 const SLACK: i128 = 8 << 10;
 
+#[test]
+fn complete_headers_need_no_assembly_copy() {
+    use crate::common::alloc::allocations;
+    let limits = http2::Limits::default();
+    let mut encoded = Vec::new();
+    hpack::Encoder::new(0)
+        .encode_block(&[hpack::Field::new(":method", "GET")], &mut encoded)
+        .unwrap();
+    let frame = http2::Frame::Headers(http2::Headers {
+        stream: 1,
+        flags: 4,
+        fragment: encoded,
+        priority: None,
+        padding: None,
+    });
+    let http2::Frame::Headers(head) = &frame else {
+        unreachable!()
+    };
+    let mut model = hpack::Table::new(4096);
+    let mut blocks = http2::HeaderBlocks::with_limits(limits);
+    let (expected, direct) = allocations(|| {
+        model
+            .decode_block(&head.fragment, limits.header_list)
+            .unwrap()
+    });
+    let (actual, assembled) = allocations(|| blocks.read_frame(&frame).unwrap().block.unwrap());
+    assert_eq!(actual, expected);
+    assert!(
+        assembled <= direct,
+        "{assembled} allocations versus {direct} for decoding"
+    );
+}
+
 /// One stack's heap, counted step by step, and the budget it is checked
 /// against.
 struct Oracle {

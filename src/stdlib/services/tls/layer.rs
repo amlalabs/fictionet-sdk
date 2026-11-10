@@ -12,7 +12,7 @@ use rustls::server::{Accepted, AcceptedAlert, Acceptor, ServerConnection};
 use super::HandshakeError;
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
+    Admit, ByteStream, Charge, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
 };
 use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
@@ -122,7 +122,7 @@ pub struct TlsLayer {
     work: bool,
     deadline: Timers<()>,
     initialized: bool,
-    output_reserve: Option<ChargedBytes>,
+    output_reserve: Option<Charge>,
     alert: Option<AcceptedAlert>,
     reject: bool,
     first_byte: Option<u8>,
@@ -291,7 +291,7 @@ impl TlsLayer {
     /// has no room.
     fn reserve_output(&mut self, env: &Env<'_, ()>) -> bool {
         if self.output_reserve.is_none() {
-            self.output_reserve = ChargedBytes::with_capacity(env.budget(), RECORD);
+            self.output_reserve = env.budget().charge(RECORD);
         }
         self.output_reserve.is_some()
     }
@@ -573,11 +573,11 @@ impl Layer for TlsLayer {
             if !self.reserve_output(env) {
                 return Ok(false);
             }
-            let mut output = self.output_reserve.take().unwrap();
+            let room = self.output_reserve.take().unwrap();
             // The reservation holds the largest record, so a single whole
             // record goes down in the buffer rustls encrypted it into, paid
             // for by the reservation's charge. Anything else is written
-            // into the reservation, which takes no more than it holds:
+            // into a buffer made from the reservation:
             // several records coalesced, the rest of a split record, the
             // rejection, or the alert. Either way what goes down is charged
             // what its allocation holds, and the rest goes back.
@@ -587,14 +587,14 @@ impl Layer for TlsLayer {
                 self.tls
                     .as_mut()
                     .unwrap()
-                    .take_sendable_tls_chunk(output.capacity())
+                    .take_sendable_tls_chunk(room.bytes())
             };
             let bytes = if let Some(record) = owned {
-                let (_, room) = output.into_parts();
                 Chunk::adopt(record, room).map_err(|_| {
                     HandshakeError::Failed("ciphertext outgrew its reservation".to_owned())
                 })?
             } else {
+                let mut output = room.into_bytes();
                 let result = if self.reject {
                     output.write_all(&UNRECOGNIZED_NAME)
                 } else if let Some(alert) = self.alert.as_mut() {

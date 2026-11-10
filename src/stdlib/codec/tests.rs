@@ -238,7 +238,9 @@ fn buffer_random_operations_match_a_queue() {
         if op == 0 {
             let mut bytes = [0; 19];
             rng.fill(&mut bytes);
+            let bound = b.capacity_for(bytes.len());
             let n = b.push(&bytes);
+            assert!(b.allocated() <= bound);
             expected.extend(bytes.iter().take(n));
         } else if op == 1 {
             let spare = b.spare();

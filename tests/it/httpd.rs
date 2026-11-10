@@ -18,6 +18,32 @@ use world::world;
 // ---------------------------------------------------------------------------
 // HTTP/1 as a layer
 
+#[test]
+fn sharing_charged_bytes_keeps_only_nonempty_storage() {
+    use crate::common::alloc::allocations;
+    use fictionet::stdlib::layer::{Budget, ChargedBytes};
+    let budget = Budget::unlimited();
+    for capacity in [0, 1, 1024] {
+        let buffer = ChargedBytes::with_capacity(&budget, capacity).unwrap();
+        let (_, model) = allocations(Bytes::new);
+        let (bytes, actual) = allocations(|| Bytes::from(buffer));
+        assert!(bytes.is_empty());
+        assert!(
+            actual <= model,
+            "empty storage needs no shared owner: {actual} > {model}"
+        );
+        assert_eq!(budget.used(), 0);
+    }
+    let buffer = ChargedBytes::copy_of(&budget, b"retained").unwrap();
+    let bytes = Bytes::from(buffer);
+    let retained = bytes.clone();
+    drop(bytes);
+    assert!(budget.used() >= retained.len());
+    assert_eq!(&retained[..], b"retained");
+    drop(retained);
+    assert_eq!(budget.used(), 0);
+}
+
 pub(crate) type H = Harness<Http1>;
 
 /// Serves with `http1`, polling its work with no world.
