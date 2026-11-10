@@ -128,8 +128,12 @@ impl Interface {
         }
     }
 
-    /// Try a known connection before the general socket lookup. Packet
-    /// validation and socket acceptance still apply.
+    /// Receives one packet whose 4-tuple belongs to the connection `target`.
+    /// The segment goes to `target`, or, if `target` is closed and takes
+    /// nothing, to no socket: it is answered as one for a closed port, and
+    /// no listening socket takes it. A `target` in LISTEN owns no tuple, so
+    /// the packet then goes through the general lookup. Packet validation
+    /// and socket acceptance still apply.
     pub fn poll_ingress_targeted(
         &mut self,
         timestamp: Instant,

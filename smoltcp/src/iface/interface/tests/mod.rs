@@ -214,14 +214,26 @@ fn targeted_ingress_keeps_connection_precedence_and_validates_input() {
     assert!(device.tx_queue.is_empty());
     assert_eq!(sockets.get(target).state(), State::SynReceived);
 
+    // Once the owner is closed, a SYN for its tuple is answered as one for
+    // a closed port, and the listener does not take it.
+    sockets.get_mut(target).abort();
+    device.tx_queue.clear();
+    device.rx_queue.push_back(bytes.clone());
+    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    assert_eq!(sockets.get(target).state(), State::Closed);
+    assert_eq!(sockets.get(listener).state(), State::Listen);
+    let answer = device.tx_queue.pop_front().expect("a RST answers the SYN");
+    assert!(TcpPacket::new_checked(&answer[20..]).unwrap().rst());
+
+    // A segment for a tuple no connection owns finds the listener.
     let mut other = bytes;
     let mut tcp = TcpPacket::new_unchecked(&mut other[20..]);
     tcp.set_src_port(4244);
     tcp.fill_checksum(&ip.src_addr(), &ip.dst_addr());
     device.rx_queue.push_back(other);
-    iface.poll_ingress_targeted(Instant::ZERO, &mut device, &mut sockets, target);
+    iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
     assert_eq!(sockets.get(listener).state(), State::SynReceived);
-    assert_eq!(sockets.get(target).remote_endpoint().unwrap().port, 4242);
+    assert_eq!(sockets.get(listener).remote_endpoint().unwrap().port, 4244);
 }
 
 #[test]

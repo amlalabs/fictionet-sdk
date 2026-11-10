@@ -266,6 +266,77 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
     .unwrap();
 }
 
+/// A connection that was reset while its child is still open keeps its
+/// tuple. A SYN for that tuple belongs to it, not to a listening socket:
+/// no idle socket answers it or changes.
+#[test]
+fn a_syn_for_a_reset_connection_still_held_is_not_taken_by_a_listener() {
+    block_on(run(Seed::from_u64(1), |fcx| async move {
+        let (_raw, side) = pair();
+        let local: SocketAddr = "10.0.0.1:80".parse()?;
+        let peer: SocketAddr = "10.0.0.2:1234".parse()?;
+        let ep = endpoint(&fcx, side, local.ip());
+        let _listener = ep.listen(local.port())?;
+        let mut st = ep.shared.lock();
+        let now = smol_now(&fcx);
+        let (h, _) = established(&mut st, now, local, peer);
+        let _child = st.adopt(h);
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            now,
+            segment(peer, local, 101, 0, 4).0,
+        );
+        assert_eq!(st.get(h).state(), TcpState::Closed);
+        assert_eq!(st.by_tuple[&(local, peer)], h);
+        let mut idle = Vec::new();
+        for _ in 0..4 {
+            let mut socket = new_socket(MIN_BUFFER);
+            socket.0.listen(local.port()).unwrap();
+            idle.push(st.add_socket(&fcx, socket));
+        }
+        st.listeners
+            .get_mut(&local.port())
+            .unwrap()
+            .idle
+            .extend(idle.iter().copied());
+        let _ = egress(&mut st, now);
+        for slot in st.sockets.set.changed().collect::<Vec<_>>() {
+            st.sockets.set.acknowledge_changed(slot);
+        }
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            now,
+            segment(peer, local, 9000, 0, 2).0,
+        );
+        assert!(
+            idle.iter().all(|&i| st.get(i).state() == TcpState::Listen),
+            "an idle listening socket took a SYN for a tuple a connection holds"
+        );
+        assert!(
+            st.sockets
+                .set
+                .changed()
+                .all(|slot| st.sockets.ids[slot.index()] == Some(h)),
+            "only the connection that owns the tuple may change"
+        );
+        assert_eq!(st.by_tuple[&(local, peer)], h);
+        let answers = egress(&mut st, now);
+        assert!(
+            answers.iter().all(|p| {
+                let t = Header::parse_whole(p).unwrap().payload(p);
+                t[13] & 0x12 != 0x12
+            }),
+            "no SYN-ACK answers a SYN for a held tuple"
+        );
+        drop(st);
+        fcx.cancel();
+        Ok(())
+    }))
+    .unwrap();
+}
+
 #[test]
 fn receive_credit_survives_a_full_event_queue() {
     block_on(run(Seed::from_u64(1), |fcx| async move {
