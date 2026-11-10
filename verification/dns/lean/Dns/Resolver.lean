@@ -887,4 +887,128 @@ def runAll (net : Net) (any : AnyResponse) (cfg : Config) : State → List Reque
       (some r :: rs, st'')
     | none => ([none], st)
 
+/-! ## QNAME minimisation (RFC 9156)
+
+The model above sends every server the whole question. Rust can minimise instead (`Config::minimise`): each
+server is asked for the name one or a few labels below what is known, with QTYPE A, and only the last query
+carries the whole question (RFC 9156 §3). `Minimise.next` is the rule `Minimise::next_labels` computes for each
+query; the theorems state the bounds RFC 9156 §2.3 sets. What a minimised reply does to the resolution (a
+referral moves the cut down, NODATA or an answer passes through the name, NXDOMAIN turns minimisation off) is
+not modelled here. -/
+
+/-- The bounds of RFC 9156 §2.3: at most `maxQueries` minimised queries (MAX_MINIMISE_COUNT), the first
+`oneLabel` of them adding one label each (MINIMISE_ONE_LAB). -/
+structure Minimise where
+  maxQueries : Nat
+  oneLabel : Nat
+deriving DecidableEq, Repr
+
+/-- How many labels of a name of `total` labels the next minimised query shows, when `known` are known (the cut
+asked, or a deeper name a minimised query passed through) and `steps` minimised queries went before; `none`
+when the whole question goes next. After the first `oneLabel` queries, the labels not yet shown are divided over
+the queries left, rounding down, so the remainder goes to the later ones (RFC 9156 §2.3). -/
+def Minimise.add (m : Minimise) (known total steps : Nat) : Nat :=
+  if steps < m.oneLabel then 1 else max 1 ((total - known) / (m.maxQueries - steps))
+
+/-- The labels the next minimised query shows: `known` plus `Minimise.add`, or `none` for the whole question. -/
+def Minimise.next (m : Minimise) (known total steps : Nat) : Option Nat :=
+  if total ≤ known + 1 ∨ m.maxQueries ≤ steps then none
+  else if total ≤ known + m.add known total steps then none
+  else some (known + m.add known total steps)
+
+/-- The labels each minimised query shows when every one passes through its name, from `known` labels after
+`steps` queries, until the whole question goes. `fuel` only makes the definition total: `run_ends` shows `total`
+is always enough. -/
+def Minimise.run (m : Minimise) (total : Nat) : Nat → Nat → Nat → List Nat
+  | 0, _, _ => []
+  | fuel + 1, known, steps =>
+    match m.next known total steps with
+    | none => []
+    | some l => l :: m.run total fuel l (steps + 1)
+
+/-- A minimised query names an ancestor of QNAME strictly below what is known, and never QNAME itself, which is
+asked with its own QTYPE (RFC 9156 §3); within the first `oneLabel` queries it shows exactly one label more
+(RFC 9156 §2.3). -/
+theorem minimise_shows_more {m : Minimise} {known total steps l : Nat} (h : m.next known total steps = some l) :
+    known < l ∧ l < total ∧ steps < m.maxQueries ∧ (steps < m.oneLabel → l = known + 1) := by
+  have hpos : 1 ≤ m.add known total steps := by
+    unfold Minimise.add
+    split
+    · exact Nat.le_refl 1
+    · exact Nat.le_max_left 1 _
+  unfold Minimise.next at h
+  by_cases hc : total ≤ known + 1 ∨ m.maxQueries ≤ steps
+  · rw [if_pos hc] at h; cases h
+  · rw [if_neg hc] at h
+    by_cases hl : total ≤ known + m.add known total steps
+    · rw [if_pos hl] at h; cases h
+    · rw [if_neg hl] at h
+      obtain rfl := Option.some.inj h
+      exact ⟨by omega, by omega, by omega, fun hs => by simp [Minimise.add, hs]⟩
+
+theorem run_spec (m : Minimise) (total : Nat) :
+    ∀ fuel known steps, (∀ l ∈ m.run total fuel known steps, known < l ∧ l < total) ∧
+      (m.run total fuel known steps).length + steps ≤ max steps m.maxQueries ∧
+      (m.run total fuel known steps).length + known + 1 ≤ max (known + 1) total
+  | 0, known, steps => by
+    refine ⟨fun l hl => by simp [Minimise.run] at hl, ?_, ?_⟩ <;> simp only [Minimise.run, List.length_nil] <;> omega
+  | fuel + 1, known, steps => by
+    unfold Minimise.run
+    cases hn : m.next known total steps with
+    | none =>
+      simp only
+      refine ⟨fun l hl => by simp at hl, ?_, ?_⟩ <;> simp only [List.length_nil] <;> omega
+    | some l =>
+      simp only
+      obtain ⟨h1, h2, h3, _⟩ := minimise_shows_more hn
+      obtain ⟨ih1, ih2, ih3⟩ := run_spec m total fuel l (steps + 1)
+      refine ⟨fun x hx => ?_, ?_, ?_⟩
+      · rcases List.mem_cons.mp hx with rfl | hx
+        · exact ⟨h1, h2⟩
+        · have := ih1 x hx; omega
+      · simp only [List.length_cons]; omega
+      · simp only [List.length_cons]; omega
+
+theorem run_fuel (m : Minimise) (total j : Nat) :
+    ∀ fuel known steps, total ≤ fuel + known → m.run total (fuel + j) known steps = m.run total fuel known steps
+  | 0, known, steps, h => by
+    have hn : m.next known total steps = none := by
+      unfold Minimise.next
+      simp only [show total ≤ known + 1 by omega, true_or, ↓reduceIte]
+    cases j with
+    | zero => rfl
+    | succ j => simp only [Nat.zero_add, Minimise.run, hn]
+  | fuel + 1, known, steps, h => by
+    rw [show fuel + 1 + j = (fuel + j) + 1 by omega]
+    unfold Minimise.run
+    cases hn : m.next known total steps with
+    | none => rfl
+    | some l =>
+      have := (minimise_shows_more hn).1
+      simp only [run_fuel m total j fuel l (steps + 1) (by omega)]
+
+/-- Passing through every name it asks, a resolution sends at most `maxQueries` minimised queries, and at most
+one per label between what is known and QNAME, each showing more labels than the one before; `total` steps of
+fuel already give the whole sequence, so more change nothing, and the whole question follows it
+(RFC 9156 §2.3). -/
+theorem run_ends (m : Minimise) (total known : Nat) :
+    (m.run total total known 0).length ≤ m.maxQueries ∧
+      (m.run total total known 0).length + known + 1 ≤ max (known + 1) total ∧
+      (m.run total total known 0).Pairwise (· < ·) ∧
+      ∀ j, m.run total (total + j) known 0 = m.run total total known 0 := by
+  have mono : ∀ fuel known steps, (m.run total fuel known steps).Pairwise (· < ·) := by
+    intro fuel
+    induction fuel with
+    | zero => intro _ _; simp [Minimise.run]
+    | succ fuel ih =>
+      intro known steps
+      unfold Minimise.run
+      cases hn : m.next known total steps with
+      | none => simp
+      | some l =>
+        simp only
+        exact List.pairwise_cons.mpr ⟨fun x hx => ((run_spec m total fuel l (steps + 1)).1 x hx).1, ih _ _⟩
+  obtain ⟨_, h2, h3⟩ := run_spec m total total known 0
+  exact ⟨by omega, h3, mono _ _ _, fun j => run_fuel m total j total known 0 (by omega)⟩
+
 end Dns.Resolver

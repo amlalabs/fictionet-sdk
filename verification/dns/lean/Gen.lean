@@ -832,8 +832,14 @@ def signedCase : G String := do
   let (sp, z) ← rSignedZone
   let keys ← rKeys true
   let denial ← rDenial
-  let w : Window := ⟨100, ← pick #[200, 200, 150, 300]⟩
-  let t ← pick #[50, 100, 150, 150, 199, 200, 250]
+  -- RRSIG times are serial numbers (RFC 4034 §3.1.5): some windows end 2^31 or more after they begin, some
+  -- times are more than 2^31 past the expiration, which serial arithmetic reads as before the inception, and
+  -- some cases move window and time past 2^32, where the RRSIG fields wrap.
+  let w : Window := ⟨100, ← pick #[200, 200, 200, 200, 150, 300, 100 + 2147483648, 100 + 2147483658]⟩
+  let t ← pick #[50, 100, 150, 150, 150, 199, 200, 250, 200 + 2147483649]
+  let shift ← pick #[0, 0, 4294967146]
+  let w : Window := ⟨w.inception + shift, w.expiration + shift⟩
+  let t := t + shift
   let q : Request := ⟨← rQname z, ← rQtype⟩
   let sz : SignedZone Sch := SignedZone.make z (keys.map (·.signer)) w denial
   -- The zone's DNSKEY set as it reaches the validator.
@@ -967,11 +973,13 @@ def chainCase : G String := do
     [⟨child, 86400, [lb "ns" :: child], [⟨lb "ns" :: child, 1, 86400, [.a [192, 0, 2, 53]]⟩], ds⟩]⟩
   let childSpec : Spec := ⟨child, 3600, soa child, [⟨child, 2, 3600, [.ns (lb "ns" :: child)]⟩,
       ⟨lb "ns" :: child, 1, 3600, [.a [192, 0, 2, 53]]⟩, ⟨lb "www" :: child, 1, 300, [.a [192, 0, 2, 80]]⟩], []⟩
-  let pw : Window := ⟨100, ← pick #[200, 200, 120]⟩
-  let cw : Window := ⟨100, ← pick #[200, 200, 120]⟩
+  -- As in `signedCase`, some windows and times reach past 2^32, where RRSIG times wrap (RFC 4034 §3.1.5).
+  let shift ← pick #[0, 0, 0, 4294967146]
+  let pw : Window := ⟨100 + shift, (← pick #[200, 200, 120, 100 + 2147483648]) + shift⟩
+  let cw : Window := ⟨100 + shift, (← pick #[200, 200, 120]) + shift⟩
   let pd ← rDenial
   let cd ← rDenial
-  let t ← pick #[150, 150, 110, 250]
+  let t := (← pick #[150, 150, 110, 250]) + shift
   let pz : SignedZone Sch := ⟨parentSpec.assemble, parentKeys.map (·.signer), pw, pd⟩
   let cz : SignedZone Sch := ⟨childSpec.assemble, childKeys.map (·.signer), cw, cd⟩
   let zoneIn (sp : Spec) (ks : List KeySpec) (w : Window) (d : Denial) : String :=
@@ -1029,8 +1037,16 @@ instance : Inhabited Rank := ⟨.glue⟩
 instance : Inhabited Validation := ⟨.notPerformed⟩
 instance : Inhabited Cache.Key := ⟨⟨[], 1⟩⟩
 
+/-- The keys offers are made for: one type at each name, the names in a line from `example.` down to
+`x.nope.example.`, so an NXDOMAIN at one name answers for the names below it (RFC 8020 §2) and data at one name
+ends an NXDOMAIN above it. -/
 def cacheKeys : Array Cache.Key := #[⟨[lb "www", lb "example"], 1⟩, ⟨[lb "mail", lb "example"], 15⟩,
-  ⟨[lb "nope", lb "example"], 1⟩]
+  ⟨[lb "nope", lb "example"], 1⟩, ⟨[lb "x", lb "nope", lb "example"], 1⟩, ⟨[lb "example"], 1⟩]
+
+/-- The keys served: those, other types at their names, which an NXDOMAIN answers too (RFC 2308 §5), and a name
+below them all. -/
+def serveKeys : Array Cache.Key := cacheKeys ++ #[⟨[lb "www", lb "example"], 16⟩, ⟨[lb "nope", lb "example"], 15⟩,
+  ⟨[lb "y", lb "x", lb "nope", lb "example"], 1⟩]
 
 instance : Inhabited Negative := ⟨.nxDomain⟩
 instance : Inhabited FailureKind := ⟨.unknown⟩
@@ -1066,7 +1082,7 @@ def rOffer : G Offer := do
 
 def cacheCase : G String := do
   let lim : Limits := ⟨← pick #[3600, 604800], ← pick #[5, 30, 300]⟩
-  let n ← rRange 3 12
+  let n ← rRange 3 20
   let mut c : Cache := ⟨0, []⟩
   let mut now := 0
   let mut ops : Array String := #[]
@@ -1086,7 +1102,7 @@ def cacheCase : G String := do
       c := advance c
       ops := ops.push (jobj [("op", jstr "advance"), ("time", jnat now)])
     | _ =>
-      let k ← pick cacheKeys
+      let k ← pick serveKeys
       ops := ops.push (jobj [("op", jstr "serve"), ("time", jnat now), ("key", keyJson k)])
       results := results.push (servedJson (serve now c k))
   return jobj [("input", jobj [("limits", jobj [("max_ttl", jnat lim.maxTtl), ("failure_ttl", jnat lim.failureTtl)]),
@@ -1209,6 +1225,42 @@ def resolverCase : G String := do
 
 end ResolverVectors
 
+/-! ## Key tags and QNAME minimisation -/
+
+section KeyTagVectors
+open Dnssec
+
+/-- A DNSKEY's flags, algorithm, and public key, and its key tag (RFC 4034 Appendix B, RFC 6840 §5.5). The
+lengths reach the empty key, keys shorter than the three octets algorithm 1 reads, odd and even lengths, and
+keys long enough that the sum carries past 16 bits. -/
+def keytagCase : G String := do
+  let flags ← pick #[256, 257, 384, 385, 0, 1, 65535, ← rNat 65536]
+  let alg ← pick #[1, 1, 5, 8, 13, 15, 16, 253, ← rNat 256]
+  let len ← pick #[0, 1, 2, 3, 4, 31, 32, 64, 65, 96, 128, 260, 513]
+  let pub ← rBytes len
+  return jobj [("input", jobj [("flags", jnat flags), ("algorithm", jnat alg), ("public_key", jstr (hex pub))]),
+    ("expected", jobj [("tag", jnat (keyTagOf flags alg pub))])]
+
+end KeyTagVectors
+
+section MinimiseVectors
+open Resolver
+
+instance : Inhabited Resolver.Minimise := ⟨⟨10, 4⟩⟩
+
+/-- One minimised query: the bounds, the labels known and in all, the queries before it, and the labels it
+shows (`Resolver.Minimise.next`), or null for the whole question. -/
+def minimiseCase : G String := do
+  let m : Resolver.Minimise ← pick #[⟨10, 4⟩, ⟨10, 4⟩, ⟨3, 1⟩, ⟨5, 5⟩, ⟨1, 0⟩, ⟨0, 0⟩, ⟨← rNat 12, ← rNat 12⟩]
+  let total ← rRange 0 40
+  let known ← rNat (total + 2)
+  let steps ← rNat (m.maxQueries + 3)
+  return jobj [("input", jobj [("max_queries", jnat m.maxQueries), ("one_label", jnat m.oneLabel),
+      ("known", jnat known), ("total", jnat total), ("steps", jnat steps)]),
+    ("expected", jobj [("labels", optNat (m.next known total steps))])]
+
+end MinimiseVectors
+
 /-! ## Output -/
 
 def cases (n : Nat) (g : G String) : G (List String) := rList n g
@@ -1217,7 +1269,8 @@ def kinds : List (String × Nat × G String) :=
   [("names", 400, namesCase), ("wire", 400, wireCase), ("fit", 300, fitCase),
     ("respond", 400, respondCase), ("zone", 400, zoneCase), ("partial", 300, partialCase),
     ("signed", 300, signedCase), ("policy", 200, policyCase), ("chain", 200, chainCase),
-    ("cache", 200, cacheCase), ("resolver", 200, resolverCase)]
+    ("cache", 200, cacheCase), ("resolver", 200, resolverCase),
+    ("keytag", 300, keytagCase), ("minimise", 300, minimiseCase)]
 
 def main (args : List String) : IO UInt32 := do
   match args with

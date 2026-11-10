@@ -73,8 +73,10 @@ not compare whole, with why.
 | `signed` | `Zone::signed`, `answer` with DO=1, `validate_rrset`, `validate_denial` | the answer's records and RRSIGs (for ANY, the NSEC and DNSKEY RRsets at the name too), its denial records, the DNSKEY RRset, and the validation of each answer RRset, paired by owner and type, and of the denial, its SOA RRset included, under the zone's own anchor or, for a zone below a signed parent, along the chain from the parent's anchor across the delegation, with the parent's DNSKEY RRset and its denial of the DS RRset compared too; NSEC3 zones hold their NSEC3PARAM RRset on both sides |
 | `policy` | `AlgorithmPolicy::treat`, under `AlgorithmPolicy::iana` where the vector names `iana` | the treatment of a DS record's algorithm and digest type, so the policy Rust ships is held to the one the Lean theorems are about |
 | `chain` | `check_chain` | the problems reported, as a set |
-| `cache` | `resolver::Cache` | what each lookup serves, with TTLs counted down |
+| `cache` | `resolver::Cache` | what each lookup serves, with TTLs counted down, looking first for an NXDOMAIN at the name or a Secure one above it, as `Resolver::cached` does (RFC 2308 §5, RFC 8020 §2) |
 | `resolver` | `Resolver` driven by `memory::drive` over `AuthorityEngine`s of the zones | each answer, the answers under the work bound with nothing lost, the final cache, and the answers with some servers dead |
+| `keytag` | `dnssec::key_tag` | the key tag of a DNSKEY's flags, algorithm, and public key (RFC 4034 Appendix B, RFC 6840 §5.5) |
+| `minimise` | `resolver::Minimise::next_labels`, which `Resolver::next_question` calls | how many labels the next minimised query shows, or the whole question (RFC 9156 §2.3) |
 
 Signatures in `signed.json` and `chain.json` are symbolic (Lean's
 `Dnssec.Symbolic.scheme`): a key is a number, and a signature is the private

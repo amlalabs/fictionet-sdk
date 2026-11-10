@@ -12,7 +12,7 @@ resolver. It also holds an executable Lean reference that writes test vectors fo
 ```sh
 cd verification/dns/lean
 lake build                       # every proof, Dns/Axioms.lean, and the generator; fails on any error
-lake exe gen <dir> <seed>        # writes <dir>/{names,wire,fit,respond,zone,partial,signed,policy,chain,cache,resolver}.json
+lake exe gen <dir> <seed>        # writes <dir>/{names,wire,fit,respond,zone,partial,signed,policy,chain,cache,resolver,keytag,minimise}.json
 ```
 
 `lake build` prints the axioms of every headline theorem from `Dns/Axioms.lean`. Each line must list only
@@ -31,12 +31,12 @@ gives the same files.
 | `Dns/Zone.lean` | nodes, cuts, glue, empty non-terminals, wildcards, CNAME, DNAME; `answer`; the builder | `nxdomain_iff`, `ent_is_nodata`, `referral_iff_below_cut`, `referral_aa_false`, `negative_has_soa`, `neg_ttl_min`, `answer_in_zone`, `wildcard_blocked_by_node`, `dname_yx_iff_long`, `builder_rejects_iff` |
 | `Dns/Partial.lean` | views with present, absent, and unknown facts; `answerPartial`; `Lazy` zones | `answer_partial_sound`, `agreeing_zone_exists`, `unknown_never_negative`, `lazy_view_one_revision` |
 | `Dns/Exchange.lean` | tokens, generations, the matching rule of the step contract | `obsolete_ignored`, `match_requires_tuple`, `advance_clears` |
-| `Dns/Dnssec.lean` | keys, DS, RRSIGs, NSEC and NSEC3 as records; `class SigScheme` and a concrete symbolic instance; the validator; offline signing with complete chains; online covering records | `secure_sound`, `secure_complete`, `insecure_needs_proof`, `insecure_complete`, `optout_wildcard_insecure`, `optout_never_secure_denial`, `nsec_cover_sound`, `white_lie_covers_only_qname`, `cover_unknown_is_unknown`, `signed_answers_validate` |
+| `Dns/Dnssec.lean` | keys, DS, RRSIGs, NSEC and NSEC3 as records; `class SigScheme` and a concrete symbolic instance; the validator; offline signing with complete chains; online covering records | `secure_sound`, `secure_complete`, `insecure_needs_proof`, `insecure_complete`, `optout_wildcard_insecure`, `optout_never_secure_denial`, `nsec_cover_sound`, `white_lie_covers_only_qname`, `cover_unknown_is_unknown`, `signed_answers_validate`, `window_linear`, `window_wraps`, `window_half_unordered`, `keyTag_alg1`, `keyTag_lt` |
 | `Dns/Policy.lean` | the IANA registry rows RFC 9904 and RFC 9905 set; `iana` derived from them | `sha1_never_secure`, `unsupported_is_insecure_not_bogus`, `not_performed_never_ad`, `iana_matches_registry` |
 | `Dns/Records.lean` | providers and signers as functions to published records; `Signed<D>` over any facts | `lazy_agrees_complete`, `signer_agnostic`, `validate_records_only` |
 | `Dns/Chain.lean` | `check_chain` over a tree of signed zones; the problems as propositions | `check_sound`, `check_complete`, `check_reports_real` |
-| `Dns/Cache.lean` | entries with rank, expiry, validation, and generation; failures apart from negatives | `served_ttl_le_original`, `expired_never_served`, `failure_never_negative`, `rrsig_caps_ttl`, `rank_monotone` |
-| `Dns/Resolver.lean` | `step : State → Event → State × List Out` over correct servers answering with `Zone.answer` | `measure_decreases`, `resolve_terminates`, `resolve_correct`, `glue_never_served` |
+| `Dns/Cache.lean` | entries with rank, expiry, validation, and generation; failures apart from negatives; NXDOMAIN kept under ANY and found from the names below | `served_ttl_le_original`, `expired_never_served`, `failure_never_negative`, `rrsig_caps_ttl`, `rank_monotone`, `nxdomain_every_type`, `nxdomain_below`, `data_ends_nxdomain`, `nodata_keyed_by_type` |
+| `Dns/Resolver.lean` | `step : State → Event → State × List Out` over correct servers answering with `Zone.answer`; the QNAME minimisation rule | `measure_decreases`, `resolve_terminates`, `resolve_correct`, `glue_never_served`, `minimise_shows_more`, `run_ends` |
 | `Dns/Axioms.lean` | `#print axioms` for each headline theorem, and an example applying it to a concrete input | only the three standard axioms |
 | `Gen.lean` | `lake exe gen <dir> <seed>` | writes the vectors below |
 
@@ -87,6 +87,11 @@ What each theorem says:
 | `white_lie_covers_only_qname` | an NSEC3 white lie covers only the hash of the name it was made for |
 | `cover_unknown_is_unknown` | an online covering record never rests on an unknown fact: an unknown name, or an unknown fact on the way up to the closest encloser, gives `unknown` and no record (`cover_knows`: a record for a name's nonexistence exists only when the view knows the name absent, its closest encloser present, and the wildcard there absent) |
 | `signed_answers_validate` | every RRset a signed zone serves from its own nodes, with the RRSIGs it serves for them, validates Secure under the zone's own anchor while the window holds, with honest signers using validated algorithms and a SEP key |
+| `window_linear` | a signature window shorter than 2^31 seconds holds at every second from its inception to its expiration, wherever 2^32 falls between them (RFC 4034 §3.1.5, RFC 1982) |
+| `window_wraps` | moving a window and the time by the same number of seconds changes nothing, so a window across the wrap of the 32-bit fields holds exactly when the same window away from it does |
+| `window_half_unordered` | values exactly 2^31 apart are unordered (RFC 1982 §3.2): a time 2^31 seconds from an end is outside the window, and a window 2^31 seconds long never holds |
+| `keyTag_alg1` | an algorithm 1 key's tag is the third-to-last and second-to-last octets of its public key (RFC 4034 Appendix B.1 as RFC 6840 §5.5 corrects it) |
+| `keyTag_lt` | every other key tag, the Appendix B sum with its carry folded in, is a 16-bit value |
 | `sha1_never_secure` | under `iana`, an RRset signed only with algorithm 5 or 7 is never Secure |
 | `unsupported_is_insecure_not_bogus` | a DS set the policy wholly does not support makes the zone Insecure, whatever its DNSKEY set and signatures are, at the anchor and (`unsupported_link_insecure`) at any link a secure chain reaches; `sha1_ds_insecure` is the RSASHA1 case under `iana` |
 | `not_performed_never_ad` | with no anchors nothing is validated, and AD is set only for Secure data |
@@ -101,10 +106,16 @@ What each theorem says:
 | `failure_never_negative` | a cached failure never answers NXDOMAIN or NODATA; while it lives it answers SERVFAIL |
 | `rrsig_caps_ttl` | a Secure RRset's entry expires no later than its RRSIG |
 | `rank_monotone` | an offer that does not replace the live entry for its key changes nothing: data at a lower rank, or a failure over data that answers clients |
+| `nxdomain_every_type` | a live NXDOMAIN, kept under ANY, is what the cache serves for its name with every type, whatever is cached under that type (RFC 2308 §5) |
+| `nxdomain_below` | a live Secure NXDOMAIN answers every question for a name below its own, by itself or by an NXDOMAIN closer to the name (RFC 8020 §2) |
+| `data_ends_nxdomain` | data or NODATA that takes its key leaves no live NXDOMAIN of its rank or below at its name or above, under any type an NXDOMAIN was kept under (RFC 8020 §2; the rule of `Cache::exists`, whose copies under the types asked were once left behind) |
+| `nodata_keyed_by_type` | NODATA is served for a key only from an entry under that very key, so it never answers another type (RFC 2308 §5) |
 | `measure_decreases` | every step of a resolution spends work or finishes it |
 | `resolve_terminates` | a resolution always ends, whatever the network loses |
 | `resolve_correct` | whatever is lost, the answer is the hierarchy's answer (`spec`, from the root down) or SERVFAIL, and the cache stays sound; with nothing lost, root hints, and work for one query per label and one more, it is the hierarchy's answer |
 | `glue_never_served` | every RRset in an answer is in the answer section of an authoritative server's answer to that question |
+| `minimise_shows_more` | a minimised query names an ancestor of QNAME strictly below what is known and never QNAME itself, comes before the `maxQueries`-th, and within the first `oneLabel` queries shows exactly one label more (RFC 9156 §2.3, §3) |
+| `run_ends` | passing through every name it asks, a resolution sends at most `maxQueries` minimised queries, at most one per label between what is known and QNAME, each showing more labels than the one before, and then the whole question |
 
 Supporting results: `answer_never_unknown` (a complete zone never
 answers Unknown), `build_wf` (the builder makes well-formed zones), `lazy_answer` (a lazy view's answer is,
@@ -143,6 +154,8 @@ form `\# <length> <hex>`. Octets are lowercase hex.
 | `policy.json` | `algorithm`, `digest`, `policy`: the string `iana` for `Policy.iana`, which the test reads as Rust's `AlgorithmPolicy::iana`, or a random one (`validate`, `digests`, `max_nsec3_iterations`) | `treatment`: `supported`, `unsupported_algorithm`, or `unsupported_digest` |
 | `chain.json` | `tree`: the parent and the child `sub`, each with `zone`, `keys`, `window`, `denial`; `time`; `policy` | `problems`: `ds_mismatch`, `no_ds_proof_missing` (with `parent`, `child`), `window_closed` (`apex`, `time`), `unsupported_algorithm` (`apex`, `algorithm`) |
 | `cache.json` | `limits` (`max_ttl`, `failure_ttl`); `ops`: `offer` (positive, negative, or failure, with time; a positive or negative one with its validation, `sig_expires`, and `original_ttl`), `advance`, `serve` (key and time) | `served`: for each `serve` in order, `null` or the served positive RRset with its TTL counted down and its validation, the negative with its SOA, or the failure |
+| `keytag.json` | `flags`, `algorithm`, `public_key` (hex) | `tag` (`Dnssec.keyTagOf`) |
+| `minimise.json` | `max_queries`, `one_label`, `known`, `total`, `steps` | `labels`, or null for the whole question (`Resolver.Minimise.next`) |
 | `resolver.json` | `zones` (a root and some of `test.`, `example.`, `sub.example.`, each server at an address of its own), `hints`, `work`, `any`, `questions`, `losses` (one per query sent, in order; `true` is lost), `dead` (servers that never answer) | `answers` (a response per question; a question past the script uses no loss), `dead_answers` (a response per question with the `dead` servers never answering and work to spare), `lossy_answers` (per question, under the loss script with work to spare, the `response` and the servers its losses made it give up on, `gone`), and the final `cache` (each item with its rank: a cut's NS set, glue, or a question and its answer) |
 
 Symbolic keys and signatures in `signed.json` and `chain.json`. A key is a number below 256. Its DNSKEY's
@@ -153,7 +166,9 @@ signs with `p = key + 1000`, so its signatures never verify. A `mistag` key's RR
 `key + 512`, signed over that tag, which names no key. A DS digest is the hex of the identity encoding of the owner
 and the key (`Dnssec.Symbolic.scheme.digest`: the owner's canonical wire form, then the SEP bit, the algorithm,
 and the key octet). NSEC3 hashes are real: SHA-1 over the owner's canonical wire form with an empty salt and no
-extra iterations, in base32hex. RRSIG times are decimal. Validation results are `{"result": "secure"}`,
+extra iterations, in base32hex. RRSIG times are decimal, the window's seconds modulo 2^32. Some windows and
+times in `signed.json` and `chain.json` lie past 2^32 seconds, some windows are 2^31 seconds long or longer, and
+some times are more than 2^31 seconds past the expiration, so serial arithmetic and the wrap are compared too. Validation results are `{"result": "secure"}`,
 `not_performed`, `indeterminate`, `insecure` with `why`, or `bogus` with the EDE `ede` (RFC 8914).
 
 ## Modelling choices (read before trusting a theorem)
@@ -260,11 +275,19 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   above the policy's limit make a denial Insecure once its signature verifies (RFC 9276 §3.2); `iana` uses
   100, which RFC 9276 Appendix A found interoperable. A DNAME's synthesized CNAME is not validated through its DNAME, so `signed.json` zones
   have no DNAME.
+- **Denial records from above a cut.** RFC 6840 §4.1 forbids using an NSEC or NSEC3 with NS and without SOA, or
+  with DNAME, to deny names below its owner, and RFC 5155 §8.3 a closest encloser whose NSEC3 is such a record.
+  Rust's `proof.rs` keeps both rules (`Nsecs::covering`, `Nsec3s::closest_encloser`, with unit tests), and the
+  model keeps the CNAME bit rule of RFC 6840 §4.3 and the NS bit rule of §4.4. The model's `nx`, `nodata`, and
+  `closest3` do not yet have the §4.1 rule: they would accept a parent's cut NSEC as denying a name in the child.
+  Signed zones never send such a record for such a name, so `signed.json` does not reach the difference.
 - **Offline signing** signs the DNSKEY set with the SEP keys and everything else with the other keys (all
   keys when every key or no key has the bit). `Gen.lean` gives each zone keys of one algorithm; with keys of
   several, Rust makes that split within each algorithm, so every RRset is signed with each one (RFC 4035
   §2.2). The NSEC chain runs over the names that hold nodes, in
-  canonical order. The NSEC3 chain also covers empty non-terminals; with opt-out it leaves out unsigned
+  canonical order. An RRSIG carries its window's ends modulo 2^32, and the validator compares them with the time in
+  serial number arithmetic (`serialWindow`, RFC 4034 §3.1.5, RFC 1982 §3.2), as Rust's `SerialNumber` does; a
+  window whose expiration is not at or after its inception holds at no time (EDE 25). The NSEC3 chain also covers empty non-terminals; with opt-out it leaves out unsigned
   delegations and the empty non-terminals only they need. Records and denial carry the zone's negative TTL
   (RFC 9077 §3); the DNSKEY set carries the SOA's TTL. An NSEC3 zone holds an NSEC3PARAM RRset at its apex
   (`SignedZone.make`, RFC 5155 §7.1): SHA-1, flags 0, no extra iterations, an empty salt, with the negative
@@ -297,15 +320,25 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
   clock; RRSIG expirations arrive converted. A negative entry ranks as an authoritative answer. A failure
   ranks below all data, so any data replaces it, and it replaces any entry that answers no client. An offer
   carries its validation, which Rust records after the store with `Cache::validated`, so `entryFor` applies
-  the caps validation puts on an entry when it is stored. Data that ends a cached NXDOMAIN at or above its
-  name (RFC 8020) is left out: the generated keys are at three different names.
+  the caps validation puts on an entry when it is stored. An NXDOMAIN is kept under ANY (type 255), for every
+  type at its name (RFC 2308 §5), and under the type it answered; NODATA under its name and type. A lookup finds
+  an NXDOMAIN at the name, or a Secure one at a name above it, before the entry for its key (`nxAbove`, as
+  `Resolver::cached` does; RFC 8020 §2, which §4 lets a resolver apply to validated NXDOMAINs only). An NXDOMAIN
+  that live data or NODATA of higher rank at or below its name contradicts is not kept, and data or NODATA
+  removes every live NXDOMAIN of no higher rank at or above its name. `cache.json` offers keys at five names in
+  a line from `example.` down and serves other types and a deeper name too. When an NXDOMAIN is validated, Rust
+  also applies the result to the copies of an earlier NXDOMAIN at the name that hold the same records; the model
+  does not, and `cache.json` offers one type per name, so it never meets that case.
 - **The resolver** follows referrals that go strictly down toward the name and asks a cut's servers in order,
   one query each, taking the next on a loss or a bizarre referral. Servers are named by the NS targets and
   answer with their zone's answer; a cut with no zone in the net never answers. It starts from the deepest
   cached cut at or above the name, except the name itself for DS, which its parent answers. CNAME and DNAME
   targets outside the answering zone are not chased and glueless NS addresses are not resolved; the
   hierarchy's answer `spec` is defined the same way, so `resolve_correct` compares like with like. `follow`
-  recurses on the distance from the zone's apex to the name.
+  recurses on the distance from the zone's apex to the name. The model asks every server the whole question;
+  `Minimise.next` states, apart, the rule by which Rust's `Minimise::next_labels` picks each minimised query's
+  name (RFC 9156 §2.3). How the resolver reacts to a minimised reply (a referral, NODATA, NXDOMAIN, which turns
+  minimisation off) is in neither model.
 
 ## How the Lean definitions correspond to the Rust code
 
@@ -342,3 +375,7 @@ extra iterations, in base32hex. RRSIG times are decimal. Validation results are 
 | `Chain.check`, `Chain.Problem` | `zone::chain::{check_chain, ChainProblem}` |
 | `Cache.Cache`, `Entry`, `Rank`, `insert`, `serve`, `advance` | `resolver::cache::{Cache, Entry, Rank}` and their store, lookup, and generation rules |
 | `Resolver.step`, `start`, `run`, `runAll` | `Resolver` as an `Engine`, driven by `memory::drive` over a `MemoryNet` with scripted losses |
+| `Resolver.Minimise`, `Minimise.next` | `resolver::Minimise`, `Minimise::next_labels`, which `Resolver::next_question` calls |
+| `Dnssec.keyTagOf`, `dnskeyRdata` | `dnssec::key_tag` |
+| `Dnssec.serialLt`, `serialLe`, `serialWindow`, `Window.holds` | hickory's `SerialNumber` order, used by `Check::signature` in `validate.rs` and `inside` in `chain.rs` |
+| `Cache.nxAt`, `nxAbove`, `showsExists`, `dropNxAbove` | `Cache::nxdomain_above`, `shows_exists`, `exists` |
