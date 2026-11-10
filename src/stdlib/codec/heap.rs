@@ -37,6 +37,16 @@ pub trait Heap {
 pub trait HeapBound: Heap {
     /// The most a value parsed from `len` wire bytes can hold.
     fn most_heap(len: usize) -> usize;
+
+    /// The most the value parsed from `bytes` can hold, as far as the
+    /// bytes tell before they are parsed: for a message, its kind, read
+    /// from a header, can hold far less than the most any kind holds.
+    /// Law: `T::parse(bytes)?.heap() <= T::most_heap_of(bytes)
+    /// <= T::most_heap(bytes.len())`. Without a header to read, it is
+    /// [`most_heap`](Self::most_heap).
+    fn most_heap_of(bytes: &[u8]) -> usize {
+        Self::most_heap(bytes.len())
+    }
 }
 
 macro_rules! holds_nothing {
@@ -215,7 +225,8 @@ pub const fn most_list_places<T>(len: usize, per_item: usize) -> usize {
 }
 
 /// Parses `bytes` with `parse`, paid for on `budget`: the type's bound for
-/// that many bytes is charged before the parse, and the charge shrinks to
+/// those bytes ([`HeapBound::most_heap_of`]) is charged before the parse,
+/// and the charge shrinks to
 /// what the value holds after it. `None`, with nothing parsed, when the
 /// budget has no room for the bound: the charge was refused, and the
 /// caller waits for memory as for any refusal (rule 9). A parse error
@@ -225,7 +236,7 @@ pub fn parse_paid<T: HeapBound, E>(
     bytes: &[u8],
     parse: impl FnOnce(&[u8]) -> Result<T, E>,
 ) -> Option<Result<Owned<T>, E>> {
-    let mut charge = budget.charge(T::most_heap(bytes.len()))?;
+    let mut charge = budget.charge(T::most_heap_of(bytes))?;
     Some(parse(bytes).map(|value| {
         let held = value.heap();
         debug_assert!(
@@ -276,8 +287,9 @@ macro_rules! heap_of {
 }
 
 /// Checks the [`HeapBound`] law for `T` and its parse over `inputs`: every
-/// input that parses holds at most the bound for its length. At least one
-/// must parse, so a check over inputs that all fail cannot pass.
+/// input that parses holds at most the bound for its bytes, which is at
+/// most the bound for its length. At least one must parse, so a check
+/// over inputs that all fail cannot pass.
 #[cfg(test)]
 pub(crate) fn assert_heap_bound<T: HeapBound, E>(
     inputs: impl IntoIterator<Item = impl AsRef<[u8]>>,
@@ -289,10 +301,17 @@ pub(crate) fn assert_heap_bound<T: HeapBound, E>(
         if let Ok(value) = parse(bytes) {
             parsed += 1;
             assert!(
-                value.heap() <= T::most_heap(bytes.len()),
+                value.heap() <= T::most_heap_of(bytes),
                 "{} bytes parse into a value holding {} bytes, more than the bound {}",
                 bytes.len(),
                 value.heap(),
+                T::most_heap_of(bytes)
+            );
+            assert!(
+                T::most_heap_of(bytes) <= T::most_heap(bytes.len()),
+                "the bound for {} bytes, {}, is more than the bound for any of their length, {}",
+                bytes.len(),
+                T::most_heap_of(bytes),
                 T::most_heap(bytes.len())
             );
         }
@@ -468,6 +487,55 @@ mod tests {
         let failed = parse_paid(&budget, b"no colon", Tagged::parse);
         assert!(matches!(failed, Some(Err(()))));
         assert_eq!(budget.used(), 0, "a failed parse holds nothing");
+    }
+
+    /// A message whose first byte says its kind: `n` holds nothing, `s`
+    /// holds the rest as a string.
+    struct Kinded {
+        text: Option<String>,
+    }
+
+    heap_of! { Kinded { text } }
+
+    impl Kinded {
+        fn parse(bytes: &[u8]) -> Result<Kinded, ()> {
+            match bytes.split_first() {
+                Some((b'n', _)) => Ok(Kinded { text: None }),
+                Some((b's', rest)) => std::str::from_utf8(rest)
+                    .map(|text| Kinded {
+                        text: Some(text.to_owned()),
+                    })
+                    .map_err(drop),
+                _ => Err(()),
+            }
+        }
+    }
+
+    impl HeapBound for Kinded {
+        fn most_heap(len: usize) -> usize {
+            len
+        }
+        fn most_heap_of(bytes: &[u8]) -> usize {
+            match bytes.first() {
+                Some(b'n') => 0,
+                _ => Self::most_heap(bytes.len()),
+            }
+        }
+    }
+
+    /// The charge before the parse is the bound for the bytes, so a kind
+    /// that holds nothing is parsed with no room at all, and the law holds
+    /// for each kind.
+    #[test]
+    fn parse_paid_charges_the_bound_of_the_bytes() {
+        let inputs = [&b"n"[..], b"nothing held", b"s", b"some text"];
+        assert_heap_bound(inputs, Kinded::parse);
+        let budget = Budget::new(0);
+        for input in inputs {
+            let paid = parse_paid(&budget, input, Kinded::parse);
+            assert_eq!(paid.is_some(), input[0] == b'n');
+        }
+        assert_eq!(budget.used(), 0);
     }
 
     /// A bound without room is a refusal on the budget, so the caller's
