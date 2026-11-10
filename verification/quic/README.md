@@ -70,3 +70,38 @@ Off-path responses, migration accounting, recovery, stream storage,
 HTTP/3 and QPACK still need their own verification. The arithmetic change
 allocates nothing; the engine's existing allocations remain outside the
 resource claims until the three resource verification layers are added.
+
+## Datagram send completion
+
+`Datagram::with_completion` requests a `DatagramEvent::Sent` after the
+local send attempt retires. This includes local drops and is not a claim
+of network delivery. The native UDP layer retires sends when handing their
+packets below; the socket runner does so after `DatagramSocket::send_to`.
+Completions are ordered, consume no receive credit, and pass refused
+receive input through the urgent path. Closing cancels outstanding
+completions. Callers must request completion only from carriers implementing
+this contract; all in-tree datagram transports implement it.
+
+The native layer retains a dropped tracked send in its existing bounded
+queue until earlier sends retire. This prevents a later local drop from
+completing an earlier packet that is still waiting. The socket runner
+keeps one completion inline and offers it before receive input. Neither
+path allocates a separate completion queue. Datagram credit admission now
+also repays the retained payload to the receiving budget.
+
+`DatagramCompletion.tla` models the ordered queue and completion extraction.
+Its base passes safety and progress under weak fairness: 287 generated
+states, 160 distinct, depth 8. The controls violate `AfterHandoff` when
+completion happens at admission, `OnceInOrder` when extraction fails to
+clear pending completions, and `CompletionsProgress` when receive blocking
+also blocks completion. The last is a temporal counterexample with a
+stuttering suffix. Run these configs as above, with
+`DatagramCompletion.tla` as the module.
+
+Production tests cover tracked and untracked empty datagrams, local drops,
+completion before credit is granted, exactly-once urgent extraction, a
+socket-backed sender waiting for completion before its next send, and
+payload ownership after budget refusal. All 4,329 SDK library tests passed
+on 2026-11-10. The model does not yet replay production traces or prove
+allocation costs; the existing UDP queue storage still has its documented
+count limits rather than a heap reservation.

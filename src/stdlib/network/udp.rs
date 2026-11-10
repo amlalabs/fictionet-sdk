@@ -530,6 +530,7 @@ fn route(
                 mailbox.notify = true;
             }
         }
+        MuxEvent::Child(_, DatagramEvent::Sent(_)) => {}
         MuxEvent::Credit(id, units) => {
             if let Some(mailbox) = mailbox(sockets, ports, id) {
                 mailbox.credit += units;

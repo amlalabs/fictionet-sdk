@@ -233,6 +233,10 @@ pub struct Datagrams<M>(PhantomData<fn() -> M>);
 impl<M> Port for Datagrams<M> {
     type Event = DatagramEvent<M>;
     type Command = DatagramCommand<M>;
+
+    fn urgent(event: &Self::Event) -> bool {
+        matches!(event, DatagramEvent::Sent(_))
+    }
 }
 
 /// One whole datagram and where it is from or going.
@@ -240,12 +244,32 @@ impl<M> Port for Datagrams<M> {
 pub struct Datagram<M> {
     payload: Chunk,
     meta: M,
+    completion: bool,
 }
 
 impl<M> Datagram<M> {
     /// A datagram of `payload`, from or to `meta`.
     pub fn new(payload: Chunk, meta: M) -> Datagram<M> {
-        Datagram { payload, meta }
+        Datagram {
+            payload,
+            meta,
+            completion: false,
+        }
+    }
+
+    /// Requests a completion when the lower transport retires this send
+    /// attempt. Completion does not guarantee delivery: a local drop also
+    /// retires the attempt. Completions count only datagrams that request
+    /// them, in send order, and may be combined in one event. Closing the
+    /// carrier cancels completions still outstanding.
+    pub fn with_completion(mut self) -> Self {
+        self.completion = true;
+        self
+    }
+
+    /// Whether this datagram requests a send completion.
+    pub fn wants_completion(&self) -> bool {
+        self.completion
     }
 
     /// Its bytes.
@@ -273,6 +297,10 @@ impl<M> Datagram<M> {
 pub enum DatagramEvent<M> {
     /// One datagram.
     Datagram(Datagram<M>),
+    /// This many requested send attempts have retired at the lower
+    /// transport. This is independent of receive credit and must be
+    /// accepted even while incoming datagrams are blocked.
+    Sent(u64),
     /// The socket closed: no more datagrams.
     Ended,
 }
@@ -287,12 +315,26 @@ pub enum DatagramCommand<M> {
 }
 
 impl<M> Credited for DatagramEvent<M> {
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        match self {
+            Self::Datagram(datagram) => datagram.payload.repay(budget),
+            _ => true,
+        }
+    }
+
     fn credit(&self) -> u64 {
         u64::from(matches!(self, DatagramEvent::Datagram(_)))
     }
 }
 
 impl<M> Credited for DatagramCommand<M> {
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        match self {
+            Self::Send(datagram) => datagram.payload.repay(budget),
+            Self::End => true,
+        }
+    }
+
     fn credit(&self) -> u64 {
         u64::from(matches!(self, DatagramCommand::Send(_)))
     }
@@ -367,6 +409,14 @@ pub struct Mux<C, K, O = ()>(PhantomData<fn(C, K, O)>);
 impl<C: Port, K: Port, O> Port for Mux<C, K, O> {
     type Event = MuxEvent<C, K, O>;
     type Command = MuxCommand<C, K>;
+
+    fn urgent(event: &Self::Event) -> bool {
+        match event {
+            MuxEvent::Child(_, event) => C::urgent(event),
+            MuxEvent::Control(event) => K::urgent(event),
+            _ => false,
+        }
+    }
 }
 
 /// What comes up from a multiplexed connection.

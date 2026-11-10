@@ -19,6 +19,30 @@ use fictionet::stdlib::codec::{Ending, Lines, Stream};
 use fictionet::stdlib::services::stack::{BoxError, Boxed, Job};
 use fictionet::{Entropy, Seed, SeededEntropy};
 
+#[test]
+fn datagram_payloads_keep_their_charge_and_refuse_without_losing_bytes() {
+    let budget = Budget::new(1024);
+    let small = Budget::new(0);
+    let payload = vec![42; 128];
+    let mut command = DatagramCommand::Send(Datagram::new(Chunk::unpaid(payload.clone()), ()));
+    assert!(!command.reserve(&small));
+    assert_eq!(small.used(), 0);
+    assert!(command.reserve(&budget));
+    assert!(budget.used() >= payload.len());
+    let DatagramCommand::Send(datagram) = command else {
+        unreachable!()
+    };
+    assert_eq!(datagram.payload(), payload);
+    let mut event = DatagramEvent::Datagram(datagram);
+    let paid = budget.used();
+    assert!(event.reserve(&budget));
+    assert_eq!(budget.used(), paid);
+    drop(event);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(DatagramEvent::<()>::Sent(1).credit(), 0);
+    assert!(Datagrams::<()>::urgent(&DatagramEvent::Sent(1)));
+}
+
 // ---------------------------------------------------------------------------
 // A transform: every byte XORed with a key, both ways
 

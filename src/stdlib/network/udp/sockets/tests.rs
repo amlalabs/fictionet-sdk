@@ -149,6 +149,59 @@ fn seen(events: Vec<Up>) -> Vec<Seen> {
 }
 
 #[test]
+fn send_completions_follow_handoff_and_pass_receive_credit() {
+    let entropy = SeededEntropy::new(Seed::from_u64(11));
+    let budget = Budget::unlimited();
+    let mut reports = fictionet::stdlib::layer::Observations::new(0);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut reports);
+    let mut udp = UdpLayer::new(HOST.parse().unwrap(), &entropy);
+    assert!(matches!(
+        udp.on_command(
+            &mut env,
+            control(UdpControl::Bind {
+                request: Request(0),
+                port: 53,
+            })
+        ),
+        Ok(Admit::Taken)
+    ));
+    let Some(MuxEvent::Opened(child, _, _)) = udp.take_event() else {
+        panic!("socket not opened")
+    };
+    assert!(matches!(udp.take_event(), Some(MuxEvent::Credit(_, _))));
+    let peer = addr("10.0.0.2:1234");
+    // A valid send, a local drop, and an untracked send share one queue.
+    // A local drop must not complete the earlier send before its handoff.
+    for (to, tracked) in [(peer, true), (addr("[::1]:1234"), true), (peer, false)] {
+        let datagram = Datagram::new(Chunk::unpaid(Vec::new()), to);
+        let datagram = if tracked {
+            datagram.with_completion()
+        } else {
+            datagram
+        };
+        assert!(matches!(
+            udp.on_command(&mut env, child.send(DatagramCommand::Send(datagram))),
+            Ok(Admit::Taken)
+        ));
+    }
+    assert!(udp.take_event().is_none());
+    assert!(udp.take_urgent().is_none());
+    assert!(udp.take_command(&mut env).is_some());
+    assert!(
+        matches!(udp.take_urgent(), Some(MuxEvent::Child(id, DatagramEvent::Sent(1))) if id == child.id())
+    );
+    assert!(udp.take_urgent().is_none());
+    assert!(udp.take_command(&mut env).is_some());
+    assert!(
+        matches!(udp.take_urgent(), Some(MuxEvent::Child(id, DatagramEvent::Sent(1))) if id == child.id())
+    );
+    assert!(udp.take_command(&mut env).is_none());
+    assert!(udp.take_urgent().is_none());
+    assert!(matches!(udp.take_event(), Some(MuxEvent::Credit(_, 3))));
+    assert!(udp.take_event().is_none());
+}
+
+#[test]
 fn a_bound_socket_gets_each_datagram_whole_with_its_peer() {
     let mut d = stack(Budget::unlimited());
     let (child, bound, _) = bind(&mut d, 4, 53);
@@ -634,6 +687,7 @@ impl Layer for Echo {
         self.out.push_back(match event {
             DatagramEvent::Datagram(d) => DatagramCommand::Send(d),
             DatagramEvent::Ended => DatagramCommand::End,
+            DatagramEvent::Sent(_) => return Ok(Admit::Taken),
         });
         Ok(Admit::Taken)
     }
