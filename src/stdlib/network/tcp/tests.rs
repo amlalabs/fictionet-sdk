@@ -2049,7 +2049,10 @@ fn data_segment(
 }
 
 /// Drives the stack at one fixed time, without running its background task.
+/// Its storage is reserved first, as every entry point of the layer does
+/// before it sends: the packets it writes come from that pool.
 fn egress(st: &mut TcpLayer, now: smoltcp::time::Instant) -> Vec<Vec<u8>> {
+    assert!(st.reserve_storage(&Budget::unlimited()));
     while st.egress(now) {}
     let mut packets = std::mem::take(&mut st.output.tx);
     for p in &mut packets {
